@@ -1,0 +1,6 @@
+1,METHOD,main,main.main,main.main(),src/app.go,17,22,false
+2,METHOD,helper,main.helper,main.helper() int,src/app.go,5,7,false
+3,METHOD,check,main.check,main.check(int) bool,src/app.go,9,11,false
+4,METHOD,sink,main.sink,main.sink(int),src/app.go,13,15,false
+5,METHOD,Println,fmt.Println,fmt.Println(...any) (int; error),<empty>,,,true
+6,METHOD,ghost,main.ghost,main.ghost(),src/missing.go,1,3,false
