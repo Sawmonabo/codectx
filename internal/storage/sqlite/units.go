@@ -849,9 +849,6 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 // change.
 func (s *Store) Activate(ctx context.Context, gen, expectedActive model.GenerationID, health model.GenerationHealth,
 	capabilities []model.CapabilityState, normalizationVersion string) (model.Binding, error) {
-	if expectedActive < 0 {
-		return model.Binding{}, invalid("expected active generation must not be negative")
-	}
 	if !health.Valid() {
 		return model.Binding{}, invalid("generation health %q is not a known health", health)
 	}

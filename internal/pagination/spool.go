@@ -25,11 +25,15 @@ type Spools struct {
 	maxBytes int64
 	leases   LeaseStore
 
-	// mu guards used, the bytes every live spool has reserved. Reservations
-	// are taken before a write, so concurrent spools share one budget instead
-	// of each measuring the directory and racing past the cap together.
-	mu   sync.Mutex
-	used int64
+	// mu guards used, the bytes every live spool has reserved, and reserved,
+	// the per-spool reservations taken by this process. Reservations are
+	// taken before a write, so concurrent spools share one budget instead of
+	// each measuring the directory and racing past the cap together, and a
+	// spool's bytes are returned as the amount it reserved, not as whatever
+	// had reached disk when it was removed.
+	mu       sync.Mutex
+	used     int64
+	reserved map[string]int64
 }
 
 // SpoolHeader binds a spool to the cursor that references it. Open rejects a
@@ -72,7 +76,7 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, internalErr("spool directory: " + err.Error())
 	}
-	s := &Spools{dir: dir, maxBytes: maxBytes, leases: leases}
+	s := &Spools{dir: dir, maxBytes: maxBytes, leases: leases, reserved: map[string]int64{}}
 	used, err := s.diskBytes()
 	if err != nil {
 		return nil, err
@@ -81,8 +85,9 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	return s, nil
 }
 
-// reserve claims n bytes of the shared budget or fails without claiming any.
-func (s *Spools) reserve(n int64) error {
+// reserve claims n bytes of the shared budget for spool id or fails without
+// claiming any.
+func (s *Spools) reserve(id string, n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.used+n > s.maxBytes {
@@ -90,12 +95,34 @@ func (s *Spools) reserve(n int64) error {
 			Message: "query spool exceeds its disk budget", Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}
 	}
 	s.used += n
+	s.reserved[id] += n
 	return nil
 }
 
-// release returns n bytes to the budget.
-func (s *Spools) release(n int64) {
+// unreserve gives n bytes of spool id's reservation back after a failed write.
+func (s *Spools) unreserve(id string, n int64) {
 	s.mu.Lock()
+	s.used -= n
+	s.reserved[id] -= n
+	if s.reserved[id] <= 0 {
+		delete(s.reserved, id)
+	}
+	if s.used < 0 {
+		s.used = 0
+	}
+	s.mu.Unlock()
+}
+
+// forget returns everything spool id reserved once its file is gone. A spool
+// created by an earlier process has no reservation here; its on-disk size,
+// which was counted at NewSpools or the last Sweep, is returned instead.
+func (s *Spools) forget(id string, onDisk int64) {
+	s.mu.Lock()
+	n, ok := s.reserved[id]
+	if !ok {
+		n = onDisk
+	}
+	delete(s.reserved, id)
 	s.used -= n
 	if s.used < 0 {
 		s.used = 0
@@ -157,7 +184,7 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 func (sp *Spool) discard() {
 	sp.file.Close()
 	os.Remove(sp.path)
-	sp.owner.release(sp.written)
+	sp.owner.forget(sp.header.SpoolID, sp.written)
 	sp.file, sp.w = nil, nil
 }
 
@@ -178,17 +205,17 @@ func (sp *Spool) Append(record []byte) error {
 
 func (sp *Spool) writeFrame(p []byte) error {
 	need := int64(4 + len(p))
-	if err := sp.owner.reserve(need); err != nil {
+	if err := sp.owner.reserve(sp.header.SpoolID, need); err != nil {
 		return err
 	}
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], uint32(len(p)))
 	if _, err := sp.w.Write(length[:]); err != nil {
-		sp.owner.release(need)
+		sp.owner.unreserve(sp.header.SpoolID, need)
 		return internalErr("spool write: " + err.Error())
 	}
 	if _, err := sp.w.Write(p); err != nil {
-		sp.owner.release(need)
+		sp.owner.unreserve(sp.header.SpoolID, need)
 		return internalErr("spool write: " + err.Error())
 	}
 	sp.written += need
@@ -303,78 +330,97 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 }
 
 // Release removes one spool once its cursor chain ends or its lease is
-// released, returning its bytes to the budget. A missing spool is not an error.
+// released, returning the bytes it reserved to the budget. A missing spool is
+// not an error.
 func (s *Spools) Release(spoolID string) error {
 	if !model.ValidHexID(spoolID) {
 		return cursorInvalid("spool id is malformed")
 	}
-	return s.remove(filepath.Join(s.dir, spoolPrefix+spoolID))
+	return s.remove(spoolID)
 }
 
-func (s *Spools) remove(path string) error {
+// remove deletes spool id's file and returns its reservation. A removal
+// failure leaves the accounting untouched: the bytes are still on disk.
+func (s *Spools) remove(id string) error {
+	path := filepath.Join(s.dir, spoolPrefix+id)
 	var size int64
 	if info, err := os.Stat(path); err == nil {
 		size = info.Size()
 	}
 	err := os.Remove(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return internalErr("spool release: " + err.Error())
 	}
-	s.release(size)
+	s.forget(id, size)
 	return nil
 }
 
 // Sweep removes spools whose lease is gone or expired at now, and files with
 // no readable header that are older than the create grace window, then
-// reconciles the budget with the bytes still on disk and reports them.
+// reconciles the budget with what is live: each remaining spool counts as the
+// larger of its on-disk size and the bytes this process has reserved for it,
+// so an open spool's buffered frames are never given away. A file that cannot
+// be removed stays counted and its error is returned with the live total.
 // Callers run it on a schedule and at startup recovery, not per query.
 func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return 0, internalErr("spool sweep: " + err.Error())
 	}
+	var errs []error
+	live := map[string]int64{}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), spoolPrefix) {
 			continue
 		}
+		id := strings.TrimPrefix(e.Name(), spoolPrefix)
 		path := filepath.Join(s.dir, e.Name())
 		info, err := e.Info()
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return 0, internalErr("spool sweep: " + err.Error())
 		}
 		h, ok := spoolHeader(path)
+		dead := false
 		if !ok {
 			// No header yet: a Create in progress within the grace window is
 			// live; anything older is a crashed Create.
-			if now.Sub(info.ModTime()) > headerlessGrace {
-				os.Remove(path)
-				continue
+			dead = now.Sub(info.ModTime()) > headerlessGrace
+		} else {
+			expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
+			if err != nil {
+				var typed *model.Error
+				if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
+					return 0, err
+				}
+				dead = true
+			} else {
+				dead = !now.Before(expiry)
 			}
-			liveBytes += info.Size()
+		}
+		if dead {
+			if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				errs = append(errs, internalErr("spool sweep: "+rerr.Error()))
+				live[id] = info.Size()
+			}
 			continue
 		}
-		expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
-		if err != nil {
-			var typed *model.Error
-			if errors.As(err, &typed) && typed.Code == model.CodeCursorInvalid {
-				os.Remove(path)
-				continue
-			}
-			return 0, err
-		}
-		if !now.Before(expiry) {
-			os.Remove(path)
-			continue
-		}
-		liveBytes += info.Size()
+		live[id] = info.Size()
 	}
 	s.mu.Lock()
+	for id := range s.reserved {
+		if _, ok := live[id]; !ok {
+			delete(s.reserved, id)
+		}
+	}
+	for id, size := range live {
+		liveBytes += max(size, s.reserved[id])
+	}
 	s.used = liveBytes
 	s.mu.Unlock()
-	return liveBytes, nil
+	return liveBytes, errors.Join(errs...)
 }
 
 func spoolHeader(path string) (SpoolHeader, bool) {

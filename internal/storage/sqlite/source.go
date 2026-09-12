@@ -57,6 +57,11 @@ func (s *Store) PutBlob(ctx context.Context, b model.BlobRecord) error {
 				// Capture has republished the object: a row the grace protocol
 				// demoted to trash or quarantine is live again, or the snapshot
 				// about to name it would reference a blob collection is removing.
+				// Only the state flips; the existing blob_blocks and
+				// line_checkpoints rows are kept, so this relies on the grace
+				// protocol (Task 20) never dropping those rows before the blobs
+				// row itself. A blob whose rows are gone is a missing blob, and
+				// isNoRows below inserts it in full.
 				_, err := tx.ExecContext(ctx, `UPDATE blobs SET state = ? WHERE hash = ?`, string(model.BlobReady), hash)
 				return wrap("blobs", err)
 			}

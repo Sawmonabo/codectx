@@ -163,8 +163,15 @@ func TestSpoolsFollowTheirLease(t *testing.T) {
 	if live, err := spools.Sweep(ctx, now); err != nil || live == 0 {
 		t.Fatalf("Sweep during an open spool = %d live bytes %v; want the header counted, not the spool deleted", live, err)
 	}
+	headerOnly, _ := spools.Sweep(ctx, now)
 	if err := sp.Append([]byte("frontier-1")); err != nil {
 		t.Fatalf("Append: %v", err)
+	}
+	// The appended frame is still buffered; a sweep must reconcile the budget
+	// to the bytes reserved, not to what has reached disk, or the open spool's
+	// frames would be given away to another query.
+	if live, err := spools.Sweep(ctx, now); err != nil || live != headerOnly+4+int64(len("frontier-1")) {
+		t.Fatalf("Sweep with a buffered frame = %d live bytes %v, want %d (header + reserved frame)", live, err, headerOnly+4+int64(len("frontier-1")))
 	}
 	if err := sp.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
