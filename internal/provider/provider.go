@@ -46,6 +46,12 @@ type Detection struct {
 	// InputPaths are the root-relative inputs detection recognized, bounded by
 	// MaxDetectionInputs.
 	InputPaths []string `json:"input_paths,omitempty"`
+	// ObservedVersion is the exact tool version detection observed for an
+	// external analyzer (for example the output of a trusted `--version`
+	// probe). It is empty for bundled providers. The coordinator folds it into
+	// UnitSpec.ProviderVersion so units are keyed by the tool that actually
+	// produced them; Descriptor() itself stays static.
+	ObservedVersion string `json:"observed_version,omitempty"`
 }
 
 // Validate enforces the detection shape against the provider's descriptor:
@@ -72,6 +78,9 @@ func (d Detection) Validate(desc model.ProviderDescriptor) error {
 		if !declared {
 			return outputInvalid(desc.ID, "detection claims a capability the descriptor does not declare").WithDetail("capability", c)
 		}
+	}
+	if len(d.ObservedVersion) > model.MaxIdentifierBytes {
+		return outputInvalid(desc.ID, "detection observed version exceeds its bound")
 	}
 	if len(d.InputPaths) > MaxDetectionInputs {
 		return outputInvalid(desc.ID, "detection lists more inputs than the bound")
