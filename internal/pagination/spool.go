@@ -33,7 +33,17 @@ type Spools struct {
 	// had reached disk when it was removed.
 	mu       sync.Mutex
 	used     int64
-	reserved map[string]int64
+	reserved map[string]reservation
+	// seq numbers reservations in creation order so a sweep can tell a spool
+	// created after its directory snapshot from one whose file is gone.
+	seq int64
+}
+
+// reservation is what one spool has claimed from the budget and when its
+// first claim was made.
+type reservation struct {
+	bytes int64
+	seq   int64
 }
 
 // SpoolHeader binds a spool to the cursor that references it. Open rejects a
@@ -76,7 +86,7 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, internalErr("spool directory: " + err.Error())
 	}
-	s := &Spools{dir: dir, maxBytes: maxBytes, leases: leases, reserved: map[string]int64{}}
+	s := &Spools{dir: dir, maxBytes: maxBytes, leases: leases, reserved: map[string]reservation{}}
 	used, err := s.diskBytes()
 	if err != nil {
 		return nil, err
@@ -95,7 +105,13 @@ func (s *Spools) reserve(id string, n int64) error {
 			Message: "query spool exceeds its disk budget", Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}
 	}
 	s.used += n
-	s.reserved[id] += n
+	r, ok := s.reserved[id]
+	if !ok {
+		s.seq++
+		r.seq = s.seq
+	}
+	r.bytes += n
+	s.reserved[id] = r
 	return nil
 }
 
@@ -103,9 +119,12 @@ func (s *Spools) reserve(id string, n int64) error {
 func (s *Spools) unreserve(id string, n int64) {
 	s.mu.Lock()
 	s.used -= n
-	s.reserved[id] -= n
-	if s.reserved[id] <= 0 {
+	r := s.reserved[id]
+	r.bytes -= n
+	if r.bytes <= 0 {
 		delete(s.reserved, id)
+	} else {
+		s.reserved[id] = r
 	}
 	if s.used < 0 {
 		s.used = 0
@@ -118,9 +137,9 @@ func (s *Spools) unreserve(id string, n int64) {
 // which was counted at NewSpools or the last Sweep, is returned instead.
 func (s *Spools) forget(id string, onDisk int64) {
 	s.mu.Lock()
-	n, ok := s.reserved[id]
-	if !ok {
-		n = onDisk
+	n := onDisk
+	if r, ok := s.reserved[id]; ok {
+		n = r.bytes
 	}
 	delete(s.reserved, id)
 	s.used -= n
@@ -363,6 +382,12 @@ func (s *Spools) remove(id string) error {
 // be removed stays counted and its error is returned with the live total.
 // Callers run it on a schedule and at startup recovery, not per query.
 func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err error) {
+	// The directory listing is a snapshot; a spool created after it is not in
+	// the listing but is live, so the reconciliation below keeps every
+	// reservation made from this point on.
+	s.mu.Lock()
+	start := s.seq
+	s.mu.Unlock()
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return 0, internalErr("spool sweep: " + err.Error())
@@ -410,13 +435,19 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 		live[id] = info.Size()
 	}
 	s.mu.Lock()
-	for id := range s.reserved {
-		if _, ok := live[id]; !ok {
-			delete(s.reserved, id)
+	for id, r := range s.reserved {
+		if _, ok := live[id]; ok {
+			continue
 		}
+		if r.seq > start {
+			// Created after the listing: live, nothing on disk observed yet.
+			live[id] = 0
+			continue
+		}
+		delete(s.reserved, id)
 	}
 	for id, size := range live {
-		liveBytes += max(size, s.reserved[id])
+		liveBytes += max(size, s.reserved[id].bytes)
 	}
 	s.used = liveBytes
 	s.mu.Unlock()
