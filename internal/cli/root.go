@@ -29,7 +29,7 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 			// Help is human output. A machine consumer that asks for JSON
 			// without naming a command gets the envelope, not usage text.
 			if jsonRequested(cmd, args) {
-				return &Error{Code: CodeArgumentInvalid, Message: "no command given; run \"codectx --help\" for the command list"}
+				return &model.Error{Code: model.CodeArgumentInvalid, Message: "no command given; run \"codectx --help\" for the command list"}
 			}
 			return cmd.Help()
 		},
@@ -38,7 +38,7 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root.SetErr(stderr)
 	root.PersistentFlags().Bool(jsonFlag, false, "emit one machine-stable JSON envelope on stdout")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
-		return &Error{Code: CodeArgumentInvalid, Message: err.Error()}
+		return &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	})
 	root.AddCommand(newVersionCommand(build))
 	return root
@@ -56,11 +56,11 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 	if cmd == nil {
 		cmd = root
 	}
-	// Every command Run path returns *Error, so an untyped error can only be
-	// Cobra rejecting the flags or the command name: the exit-2 class.
-	var typed *Error
+	// Every command Run path returns *model.Error, so an untyped error can only
+	// be Cobra rejecting the flags or the command name: the exit-2 class.
+	var typed *model.Error
 	if !errors.As(err, &typed) {
-		typed = &Error{Code: CodeArgumentInvalid, Message: err.Error()}
+		typed = &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
 	if jsonRequested(cmd, args) {
 		if writeErr := writeEnvelope(root.OutOrStdout(), failureEnvelope(build.SchemaVersion, cmd.Name(), typed)); writeErr != nil {
@@ -91,13 +91,6 @@ func jsonRequested(cmd *cobra.Command, args []string) bool {
 	return false
 }
 
-type versionData struct {
-	Version       string `json:"version"`
-	Commit        string `json:"commit"`
-	Toolchain     string `json:"toolchain"`
-	SchemaVersion string `json:"schema_version"`
-}
-
 func newVersionCommand(build model.BuildInfo) *cobra.Command {
 	return &cobra.Command{
 		Use:           "version",
@@ -106,20 +99,17 @@ func newVersionCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			data := versionData{
-				Version:       build.Version,
-				Commit:        build.Commit,
-				Toolchain:     build.Toolchain,
-				SchemaVersion: build.SchemaVersion,
-			}
+			// BuildInfo carries the explicit wire tags, so the version
+			// payload is the build record itself rather than a second copy of
+			// the same four fields.
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), data))
+				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), build))
 			}
 			_, err := fmt.Fprintf(out, "codectx %s (commit %s, %s, schema %s)\n",
-				data.Version, data.Commit, data.Toolchain, data.SchemaVersion)
+				build.Version, build.Commit, build.Toolchain, build.SchemaVersion)
 			if err != nil {
-				return &Error{Code: CodeInternal, Message: "failed to write output: " + err.Error()}
+				return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
 			}
 			return nil
 		},

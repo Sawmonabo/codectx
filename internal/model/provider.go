@@ -1,0 +1,327 @@
+package model
+
+// Neutral provider descriptors and run metadata live here so that storage can
+// record provenance and the coordinator can schedule work without either
+// importing the other, and without any package importing a provider's native
+// handles (Sections 7.1, 11.1).
+
+// InvalidationScope is the unit granularity a provider reprocesses. A file-local
+// provider reprocesses only changed files; a package or workspace provider
+// reruns its declared larger unit.
+type InvalidationScope string
+
+const (
+	InvalidationFile      InvalidationScope = "file"
+	InvalidationPackage   InvalidationScope = "package"
+	InvalidationWorkspace InvalidationScope = "workspace"
+)
+
+// Valid reports whether s is a known wire spelling.
+func (s InvalidationScope) Valid() bool {
+	switch s {
+	case InvalidationFile, InvalidationPackage, InvalidationWorkspace:
+		return true
+	}
+	return false
+}
+
+// RunState is the lowercase provider-run vocabulary of Section 22.
+type RunState string
+
+const (
+	RunRunning   RunState = "running"
+	RunSucceeded RunState = "succeeded"
+	RunPartial   RunState = "partial"
+	RunSkipped   RunState = "skipped"
+	RunTimedOut  RunState = "timed_out"
+	RunFailed    RunState = "failed"
+	RunCanceled  RunState = "canceled"
+)
+
+// Valid reports whether s is a known wire spelling.
+func (s RunState) Valid() bool {
+	switch s {
+	case RunRunning, RunSucceeded, RunPartial, RunSkipped, RunTimedOut, RunFailed, RunCanceled:
+		return true
+	}
+	return false
+}
+
+// CapabilityStateValue is the per-capability, per-scope freshness vocabulary of
+// Sections 13.3 and 22. A disabled optional tool is unavailable while the base
+// generation stays fresh; an enabled provider that failed is failed.
+type CapabilityStateValue string
+
+const (
+	CapabilityFresh       CapabilityStateValue = "fresh"
+	CapabilityPartial     CapabilityStateValue = "partial"
+	CapabilityStale       CapabilityStateValue = "stale"
+	CapabilityUnavailable CapabilityStateValue = "unavailable"
+	CapabilityFailed      CapabilityStateValue = "failed"
+)
+
+// Valid reports whether s is a known wire spelling.
+func (s CapabilityStateValue) Valid() bool {
+	switch s {
+	case CapabilityFresh, CapabilityPartial, CapabilityStale, CapabilityUnavailable, CapabilityFailed:
+		return true
+	}
+	return false
+}
+
+// GenerationHealth is the whole-generation health vocabulary of Sections 13.3
+// and 22.
+type GenerationHealth string
+
+const (
+	HealthFresh    GenerationHealth = "fresh"
+	HealthDegraded GenerationHealth = "degraded"
+	HealthFailed   GenerationHealth = "failed"
+)
+
+// Valid reports whether h is a known wire spelling.
+func (h GenerationHealth) Valid() bool {
+	switch h {
+	case HealthFresh, HealthDegraded, HealthFailed:
+		return true
+	}
+	return false
+}
+
+// GenerationStatus is the generations.status lifecycle vocabulary. Only active
+// is served to ordinary queries.
+type GenerationStatus string
+
+const (
+	GenerationStaging    GenerationStatus = "staging"
+	GenerationActive     GenerationStatus = "active"
+	GenerationSuperseded GenerationStatus = "superseded"
+	GenerationFailed     GenerationStatus = "failed"
+)
+
+// Valid reports whether s is a known wire spelling.
+func (s GenerationStatus) Valid() bool {
+	switch s {
+	case GenerationStaging, GenerationActive, GenerationSuperseded, GenerationFailed:
+		return true
+	}
+	return false
+}
+
+// UnitState is the units.state lifecycle vocabulary. Only a sealed unit is
+// eligible for generation membership; building, failed and quarantined output
+// is invisible to queries.
+type UnitState string
+
+const (
+	UnitBuilding    UnitState = "building"
+	UnitSealed      UnitState = "sealed"
+	UnitFailed      UnitState = "failed"
+	UnitQuarantined UnitState = "quarantined"
+)
+
+// Valid reports whether s is a known wire spelling.
+func (s UnitState) Valid() bool {
+	switch s {
+	case UnitBuilding, UnitSealed, UnitFailed, UnitQuarantined:
+		return true
+	}
+	return false
+}
+
+// SourceBinding records whether a unit's facts are provably about the captured
+// bytes. Section 11.4 forbids silently upgrading externally supplied data:
+// without a verified input-hash association the unit stays unverified and is
+// isolated from strict canonical compiler facts.
+type SourceBinding string
+
+const (
+	SourceBindingVerified   SourceBinding = "verified"
+	SourceBindingUnverified SourceBinding = "unverified"
+)
+
+// Valid reports whether b is a known wire spelling.
+func (b SourceBinding) Valid() bool {
+	return b == SourceBindingVerified || b == SourceBindingUnverified
+}
+
+// LeaseOwnerKind is the retention_leases owner vocabulary. A lease pins the
+// generation or snapshot its owner still needs, so GC cannot collect it.
+type LeaseOwnerKind string
+
+const (
+	LeaseQuery   LeaseOwnerKind = "query"
+	LeaseCursor  LeaseOwnerKind = "cursor"
+	LeaseSession LeaseOwnerKind = "session"
+	LeaseStaging LeaseOwnerKind = "staging"
+)
+
+// Valid reports whether k is a known wire spelling.
+func (k LeaseOwnerKind) Valid() bool {
+	switch k {
+	case LeaseQuery, LeaseCursor, LeaseSession, LeaseStaging:
+		return true
+	}
+	return false
+}
+
+// ProviderDescriptor is a provider's static identity and scheduling contract.
+// The Section 11.1 sketch carries no JSON tags; the explicit lowercase tags
+// below are required because this record reaches the status and doctor wire
+// surfaces.
+type ProviderDescriptor struct {
+	ID                string            `json:"id"`
+	Version           string            `json:"version"`
+	Capabilities      []string          `json:"capabilities"`
+	DependsOn         []string          `json:"depends_on"`
+	InvalidationScope InvalidationScope `json:"invalidation_scope"`
+	Required          bool              `json:"required"`
+}
+
+// Validate enforces the descriptor's identity and bounded declaration lists.
+func (d ProviderDescriptor) Validate() error {
+	if err := requireField("provider_descriptor.id", d.ID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("provider_descriptor.version", d.Version, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundCount("provider_descriptor.capabilities", len(d.Capabilities), MaxCapabilityStates); err != nil {
+		return err
+	}
+	for i, c := range d.Capabilities {
+		if err := requireField(indexed("provider_descriptor.capabilities", i), c, MaxIdentifierBytes); err != nil {
+			return err
+		}
+	}
+	if err := boundCount("provider_descriptor.depends_on", len(d.DependsOn), MaxFilterValues); err != nil {
+		return err
+	}
+	for i, dep := range d.DependsOn {
+		if err := requireField(indexed("provider_descriptor.depends_on", i), dep, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if dep == d.ID {
+			return invalid("provider_descriptor %q declares itself as a dependency", truncateForMessage(d.ID))
+		}
+	}
+	if !d.InvalidationScope.Valid() {
+		return invalid("provider_descriptor.invalidation_scope %q is not a known scope",
+			truncateForMessage(string(d.InvalidationScope)))
+	}
+	return nil
+}
+
+// UnitSpec names one immutable unit of provider work. InputHash and
+// DependencyHash are aggregate digests folded with Hasher over the canonical
+// inputs the unit read and the keys of its declared dependencies; a unit may be
+// reused only when both still match (Section 9.4).
+type UnitSpec struct {
+	ID              UnitID `json:"id"`
+	ProviderID      string `json:"provider_id"`
+	ProviderVersion string `json:"provider_version"`
+	ScopeKey        string `json:"scope_key"`
+	InputHash       string `json:"input_hash"`
+	DependencyHash  string `json:"dependency_hash"`
+}
+
+// Validate enforces the units table constraints. Unlike Evidence, it cannot
+// verify that ID matches NewUnitID: that derivation also consumes the analysis
+// config hash, which Section 11.1 keeps off this record. Unit identity is
+// therefore producer-owned here, and the store must recompute it at seal time.
+func (s UnitSpec) Validate() error {
+	if err := requireID("unit_spec.id", string(s.ID)); err != nil {
+		return err
+	}
+	if err := requireField("unit_spec.provider_id", s.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("unit_spec.provider_version", s.ProviderVersion, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("unit_spec.scope_key", s.ScopeKey, MaxScopeKeyBytes); err != nil {
+		return err
+	}
+	if err := requireID("unit_spec.input_hash", s.InputHash); err != nil {
+		return err
+	}
+	if err := requireID("unit_spec.dependency_hash", s.DependencyHash); err != nil {
+		return err
+	}
+	return nil
+}
+
+// CapabilityState reports one provider capability at one scope. The machine
+// reason code is kept separate from user-readable remediation (Section 13.3).
+type CapabilityState struct {
+	ProviderID     string               `json:"provider_id"`
+	Capability     string               `json:"capability"`
+	Scope          string               `json:"scope"`
+	State          CapabilityStateValue `json:"state"`
+	DiagnosticCode string               `json:"diagnostic_code,omitempty"`
+}
+
+// Validate enforces the generation_capabilities constraints.
+func (c CapabilityState) Validate() error {
+	if err := requireField("capability_state.provider_id", c.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("capability_state.capability", c.Capability, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("capability_state.scope", c.Scope, MaxScopeKeyBytes); err != nil {
+		return err
+	}
+	if !c.State.Valid() {
+		return invalid("capability_state.state %q is not a known capability state", truncateForMessage(string(c.State)))
+	}
+	if err := boundField("capability_state.diagnostic_code", c.DiagnosticCode, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateCapabilityStates bounds and checks a completeness list; every public
+// result carries one.
+func validateCapabilityStates(field string, states []CapabilityState) error {
+	if err := boundCount(field, len(states), MaxCapabilityStates); err != nil {
+		return err
+	}
+	for _, s := range states {
+		if err := s.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ProviderResult is what one provider run reports back to the coordinator. The
+// Section 11.1 sketch carries no JSON tags; the explicit tags below are
+// required because run counters surface in status and doctor output.
+type ProviderResult struct {
+	RunID          ProviderRunID     `json:"run_id"`
+	State          RunState          `json:"state"`
+	Capabilities   []CapabilityState `json:"capabilities"`
+	RecordsEmitted uint64            `json:"records_emitted"`
+	BytesProcessed uint64            `json:"bytes_processed"`
+}
+
+// Validate enforces the provider_runs constraints.
+func (r ProviderResult) Validate() error {
+	if err := requireID("provider_result.run_id", string(r.RunID)); err != nil {
+		return err
+	}
+	if !r.State.Valid() {
+		return invalid("provider_result.state %q is not a known run state", truncateForMessage(string(r.State)))
+	}
+	if err := validateCapabilityStates("provider_result.capabilities", r.Capabilities); err != nil {
+		return err
+	}
+	if err := boundSigned64("provider_result.records_emitted", r.RecordsEmitted); err != nil {
+		return err
+	}
+	if err := boundSigned64("provider_result.bytes_processed", r.BytesProcessed); err != nil {
+		return err
+	}
+	return nil
+}

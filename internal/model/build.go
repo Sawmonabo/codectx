@@ -19,10 +19,10 @@ var (
 // BuildInfo describes the running binary. It is captured once at the process
 // boundary and passed down; nothing reads link-time state further in.
 type BuildInfo struct {
-	Version       string
-	Commit        string
-	Toolchain     string
-	SchemaVersion string
+	Version       string `json:"version"`
+	Commit        string `json:"commit"`
+	Toolchain     string `json:"toolchain"`
+	SchemaVersion string `json:"schema_version"`
 }
 
 // CurrentBuildInfo reports the build identity of this binary.
