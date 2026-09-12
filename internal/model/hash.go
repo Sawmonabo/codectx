@@ -41,13 +41,6 @@ func (h *Hasher) AddString(component string) {
 	h.h.Write([]byte(component))
 }
 
-// AddBytes appends one length-framed component without converting to string.
-func (h *Hasher) AddBytes(component []byte) {
-	binary.BigEndian.PutUint64(h.length[:], uint64(len(component)))
-	h.h.Write(h.length[:])
-	h.h.Write(component)
-}
-
 // Sum returns the lowercase hex digest. The hasher may continue to be used
 // afterwards; Sum does not reset or consume it.
 func (h *Hasher) Sum() string {
@@ -92,12 +85,4 @@ func DecodeID(id string) ([]byte, error) {
 		return nil, invalid("identifier is not valid hex: %v", err)
 	}
 	return raw, nil
-}
-
-// EncodeID converts stored bytes back to the public lowercase hex ID.
-func EncodeID(raw []byte) (string, error) {
-	if len(raw) != sha256.Size {
-		return "", invalid("stored identifier is %d bytes, want %d", len(raw), sha256.Size)
-	}
-	return hex.EncodeToString(raw), nil
 }

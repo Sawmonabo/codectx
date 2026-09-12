@@ -333,7 +333,7 @@ func (o Observation) Validate() error {
 	if err := requireID("observation_record.id", string(o.ID)); err != nil {
 		return err
 	}
-	return ObservationRequest{
+	req := ObservationRequest{
 		SessionID:     o.SessionID,
 		ActorID:       o.ActorID,
 		ExpectedScope: o.ScopeVersion,
@@ -341,7 +341,20 @@ func (o Observation) Validate() error {
 		References:    o.References,
 		Review:        o.Review,
 		Note:          o.Note,
-	}.Validate()
+	}
+	if err := req.Validate(); err != nil {
+		return err
+	}
+	// Identity is derived, exactly as it is for Evidence. Every input to
+	// NewObservationID is reconstructed above, so a mismatch means the producer
+	// invented an ID; accepting it would let one resubmitted observation be
+	// stored twice and defeat the Section 17.2 idempotence the sorted derivation
+	// exists to provide.
+	if want := NewObservationID(req); o.ID != want {
+		return invalid("observation_record.id %q does not match the identity derived from its fields (%q)",
+			truncateForMessage(string(o.ID)), want)
+	}
+	return nil
 }
 
 // NewObservationID derives observation identity from session, actor, scope,
@@ -722,7 +735,7 @@ func (c Capsule) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("capsule.coverage", len(c.Coverage), MaxRecordsPerResult); err != nil {
+	if err := boundCount("capsule.coverage", len(c.Coverage), MaxCoverageFilesPerCapsule); err != nil {
 		return err
 	}
 	for _, f := range c.Coverage {
@@ -747,9 +760,6 @@ func (c Capsule) Validate() error {
 	return nil
 }
 
-// CapsulePage is one bounded page of a capsule. Section 17.3 requires paginated
-// or streamed export when a capsule exceeds the generic response budget, so the
-// header travels with each page and the heavy lists are paged separately.
 // CapsuleView selects which of the capsule's bounded record lists a page
 // projects. The spellings are the Capsule field's own JSON tags, so the view
 // name and the list it returns cannot drift apart. It is closed for the same
@@ -776,6 +786,9 @@ func (v CapsuleView) Valid() bool {
 	return false
 }
 
+// CapsulePage is one bounded page of a capsule. Section 17.3 requires paginated
+// or streamed export when a capsule exceeds the generic response budget, so the
+// header travels with each page and the heavy lists are paged separately.
 type CapsulePage struct {
 	Meta           QueryMeta              `json:"meta"`
 	SessionID      SessionID              `json:"session_id"`
@@ -807,10 +820,54 @@ func (p CapsulePage) Validate() error {
 	if !p.View.Valid() {
 		return invalid("capsule_page.view %q is not a known capsule view", truncateForMessage(string(p.View)))
 	}
-	items := len(p.AcceptedFacts) + len(p.RejectedFacts) + len(p.Contradictions) +
-		len(p.Unresolved) + len(p.Coverage) + len(p.Waivers)
-	if err := boundCount("capsule_page items", items, MaxCapsuleItemsPerPage); err != nil {
+	// A page projects exactly one view. Populating a second list would make the
+	// cursor ambiguous — it advances through one projection — and would let a
+	// reader page past records it never saw.
+	lists := []struct {
+		view  CapsuleView
+		count int
+	}{
+		{CapsuleViewAcceptedFacts, len(p.AcceptedFacts)},
+		{CapsuleViewRejectedFacts, len(p.RejectedFacts)},
+		{CapsuleViewContradictions, len(p.Contradictions)},
+		{CapsuleViewUnresolved, len(p.Unresolved)},
+		{CapsuleViewCoverage, len(p.Coverage)},
+		{CapsuleViewWaivers, len(p.Waivers)},
+	}
+	items := 0
+	for _, l := range lists {
+		if l.count > 0 && l.view != p.View {
+			return invalid("capsule_page declares view %q but also carries %d %s records",
+				p.View, l.count, l.view)
+		}
+		items += l.count
+	}
+	if err := boundCount("capsule_page items", items, MaxPageItems); err != nil {
 		return err
+	}
+	for _, group := range [][]FactReference{p.AcceptedFacts, p.RejectedFacts} {
+		for _, f := range group {
+			if err := f.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	for _, group := range [][]ObservationReference{p.Contradictions, p.Unresolved} {
+		for _, o := range group {
+			if err := o.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	for _, f := range p.Coverage {
+		if err := f.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, w := range p.Waivers {
+		if err := w.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -30,6 +30,11 @@ const (
 	// MaxRawChunkBytes is the configured raw source maximum of Section 16.2.
 	// Section 20.1's coverage.max_chunk_bytes may lower it, never raise it.
 	MaxRawChunkBytes = 1048576
+	// MaxChunkContentBytes bounds the encoded body of one chunk response.
+	// Section 20.2 requires the raw chunk plus its worst-case wire encoding to
+	// fit the source response budget, and base64 is the widest encoding this
+	// package admits: ceil(MaxRawChunkBytes/3)*4.
+	MaxChunkContentBytes = ((MaxRawChunkBytes + 2) / 3) * 4
 
 	MaxPageItems               = 200 // Section 20.1 resources.max_page_items
 	MaxQueryTextBytes          = 8192
@@ -43,7 +48,12 @@ const (
 	MaxCapabilityStates        = 256
 	MaxObservationReferences   = 64
 	MaxReceiptsPerConfirmation = 16 // Section 20.1 coverage.max_receipts_per_confirmation
-	MaxCapsuleItemsPerPage     = 200
+	// MaxCoverageFilesPerCapsule is a structural ceiling only: a capsule may
+	// honestly record coverage for every file a context session could touch, and
+	// Section 20.1's workspace.max_files tops out at 250000. The operative limit
+	// is the configured max_capsule_bytes byte budget, which the workflow layer
+	// enforces; this constant exists so the list is finite, not to size it.
+	MaxCoverageFilesPerCapsule = 250000
 	// MaxRecordsPerResult bounds any list a single result carries that is not
 	// itself a Page: Section 6 requires an explicit finite bound on every
 	// response, and Section 17.3 requires the capsule's lists to be bounded.
@@ -153,4 +163,36 @@ func requireNonNegative(field string, v int64) *Error {
 // indexed names one element of a bounded array in a rejection message.
 func indexed(field string, i int) string {
 	return field + "[" + strconv.Itoa(i) + "]"
+}
+
+// requireGeneration rejects a negative generation pin. Zero means "the active
+// generation", per the zero-value convention documented on PageRequest.
+func requireGeneration(field string, id GenerationID) *Error {
+	if id < 0 {
+		return invalid("%s must not be negative, got %d", field, id)
+	}
+	return nil
+}
+
+// boundStrings bounds both the length of a filter list and each element.
+func boundStrings(field string, values []string, maxCount, maxBytes int) *Error {
+	if err := boundCount(field, len(values), maxCount); err != nil {
+		return err
+	}
+	for i, v := range values {
+		if err := requireField(indexed(field, i), v, maxBytes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// boundDefaultable enforces the zero-means-default convention on a request
+// bound: negative is always invalid, zero defers to configuration, and a
+// positive value is accepted as given.
+func boundDefaultable(field string, v int) *Error {
+	if v < 0 {
+		return invalid("%s is %d; it must not be negative, and 0 means the configured default", field, v)
+	}
+	return nil
 }

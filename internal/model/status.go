@@ -106,8 +106,8 @@ func (c Coherence) Valid() bool {
 // the minimal set Sections 13.2, 13.3 and 19.2 name explicitly: the active
 // snapshot/generation binding, per-capability coverage, generation health,
 // coherence with the worktree, and the watch coverage and last reconciliation
-// that Section 13.2 requires be reported. Resource accounting is reported
-// separately by DoctorReport so an ordinary status stays cheap.
+// that Section 13.2 requires be reported, plus the optional Section 23 resource
+// block, which is nil unless the caller asked for it.
 type IndexStatus struct {
 	Binding            Binding            `json:"binding"`
 	Health             GenerationHealth   `json:"health"`
@@ -122,6 +122,80 @@ type IndexStatus struct {
 	LastReconciledAt   *time.Time         `json:"last_reconciled_at,omitempty"`
 	ActivatedAt        *time.Time         `json:"activated_at,omitempty"`
 	Warnings           []string           `json:"warnings,omitempty"`
+	// Resources is the Section 23 accounting block. It is nil on an ordinary
+	// status so a cheap call stays cheap; Task 20 populates it.
+	Resources *ResourceReport `json:"resources,omitempty"`
+}
+
+// ResourceReport is the resource accounting Section 23 requires status to
+// expose. Every field is a pointer because Section 23 is explicit that an
+// unavailable metric is recorded as unavailable, never as zero: a nil field
+// means "not measured on this platform or not sampled", while a zero value is a
+// real measurement of zero. Collapsing the two would let a missing RSS reading
+// read as a process using no memory. Task 20 owns measurement and populates it.
+type ResourceReport struct {
+	ParentRSSBytes        *uint64 `json:"parent_rss_bytes,omitempty"`
+	PeakParentRSSBytes    *uint64 `json:"peak_parent_rss_bytes,omitempty"`
+	BaseWorkerRSSBytes    *uint64 `json:"base_worker_rss_bytes,omitempty"`
+	GoManagedBytes        *uint64 `json:"go_managed_bytes,omitempty"`
+	NativeWorkerBytes     *uint64 `json:"native_worker_bytes,omitempty"`
+	QueryReservationBytes *uint64 `json:"query_reservation_bytes,omitempty"`
+	CacheReservationBytes *uint64 `json:"cache_reservation_bytes,omitempty"`
+	QueueReservationBytes *uint64 `json:"queue_reservation_bytes,omitempty"`
+	LiveSubprocesses      *int64  `json:"live_subprocesses,omitempty"`
+	PendingEvents         *int64  `json:"pending_events,omitempty"`
+	DatabaseBytes         *uint64 `json:"database_bytes,omitempty"`
+	WALBytes              *uint64 `json:"wal_bytes,omitempty"`
+	TempBytes             *uint64 `json:"temp_bytes,omitempty"`
+	CASBytes              *uint64 `json:"cas_bytes,omitempty"`
+	UnitsReused           *int64  `json:"units_reused,omitempty"`
+	UnitsParsed           *int64  `json:"units_parsed,omitempty"`
+}
+
+// Validate enforces the signed-64 storage bound on every measured byte count
+// and rejects a negative count.
+func (r ResourceReport) Validate() error {
+	for _, f := range []struct {
+		field string
+		value *uint64
+	}{
+		{"resources.parent_rss_bytes", r.ParentRSSBytes},
+		{"resources.peak_parent_rss_bytes", r.PeakParentRSSBytes},
+		{"resources.base_worker_rss_bytes", r.BaseWorkerRSSBytes},
+		{"resources.go_managed_bytes", r.GoManagedBytes},
+		{"resources.native_worker_bytes", r.NativeWorkerBytes},
+		{"resources.query_reservation_bytes", r.QueryReservationBytes},
+		{"resources.cache_reservation_bytes", r.CacheReservationBytes},
+		{"resources.queue_reservation_bytes", r.QueueReservationBytes},
+		{"resources.database_bytes", r.DatabaseBytes},
+		{"resources.wal_bytes", r.WALBytes},
+		{"resources.temp_bytes", r.TempBytes},
+		{"resources.cas_bytes", r.CASBytes},
+	} {
+		if f.value == nil {
+			continue
+		}
+		if err := boundSigned64(f.field, *f.value); err != nil {
+			return err
+		}
+	}
+	for _, f := range []struct {
+		field string
+		value *int64
+	}{
+		{"resources.live_subprocesses", r.LiveSubprocesses},
+		{"resources.pending_events", r.PendingEvents},
+		{"resources.units_reused", r.UnitsReused},
+		{"resources.units_parsed", r.UnitsParsed},
+	} {
+		if f.value == nil {
+			continue
+		}
+		if err := requireNonNegative(f.field, *f.value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Validate enforces the status shape.
@@ -153,6 +227,11 @@ func (s IndexStatus) Validate() error {
 	}
 	if err := boundStrings("index_status.warnings", s.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
+	}
+	if s.Resources != nil {
+		if err := s.Resources.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

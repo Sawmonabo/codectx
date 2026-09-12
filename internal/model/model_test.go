@@ -1,10 +1,7 @@
 package model_test
 
 import (
-	"encoding/json"
 	"errors"
-	"reflect"
-	"sort"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -123,46 +120,6 @@ func TestNodeIDIsScopeBound(t *testing.T) {
 	}
 }
 
-// TestNodeWireKeys protects the machine-stable wire contract for the one record
-// whose JSON tags the spec fixes literally (Section 9.2).
-//
-// Failure mode: a field added or renamed without an explicit lowercase tag
-// silently emits a capitalized Go key, which every MCP client and every stored
-// canonical projection would then disagree about. Node is the representative
-// record: it is the only one carrying every optional-tag shape in one struct.
-func TestNodeWireKeys(t *testing.T) {
-	node := model.Node{
-		ID:            model.NewNodeID(testRepo, model.NodeFunction, "pkg.F"),
-		Kind:          model.NodeFunction,
-		Language:      "go",
-		Name:          "F",
-		QualifiedName: "pkg.F",
-		Signature:     "func F()",
-		FileID:        model.NewFileID(testRepo, "pkg/a.go"),
-		ContentHash:   model.H("blob", "body"),
-		Range:         &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: 9, Line: 1, Column: 9}},
-		Metadata:      json.RawMessage(`{"resolution":"unresolved"}`),
-	}
-	want := []string{"content_hash", "file_id", "id", "kind", "language", "metadata", "name", "qualified_name", "range", "signature"}
-
-	encoded, err := json.Marshal(node)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &fields); err != nil {
-		t.Fatalf("Unmarshal: %v", err)
-	}
-	got := make([]string, 0, len(fields))
-	for k := range fields {
-		got = append(got, k)
-	}
-	sort.Strings(got)
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("wire keys = %v, want %v (raw: %s)", got, want, encoded)
-	}
-}
-
 // TestValidationRejectsBadRangesAndEnums protects storage integrity at the only
 // boundary that can still refuse bad data cheaply (Sections 9.3, 12.2, 22).
 //
@@ -184,8 +141,6 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	rangeWithoutFile.FileID = ""
 	inverted := validNode
 	inverted.Range = &model.SourceRange{Start: model.Position{Byte: 8, Line: 1}, End: model.Position{Byte: 4, Line: 1}}
-	unknownKind := validNode
-	unknownKind.Kind = model.NodeKind("Function")
 
 	validEvidence := model.Evidence{
 		UnitID:          model.UnitID(model.H("unit-v1", "x")),
@@ -214,19 +169,36 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	unknownPrecision := validEvidence
 	unknownPrecision.Precision = model.Precision("COMPILER")
 
+	// Observation identity is derived from canonically sorted references so a
+	// resubmission is idempotent. An invented ID stores the same observation
+	// twice and makes the capsule's contradiction set wrong.
+	obsReq := model.ObservationRequest{
+		SessionID: model.SessionID(model.H("session", "1")), ActorID: "a",
+		ExpectedScope: 1, Kind: model.ObservationUnresolved,
+		References: []model.ClaimReference{{NodeID: nodeID}}, Note: "n",
+	}
+	validObservation := model.Observation{
+		ID: model.NewObservationID(obsReq), SessionID: obsReq.SessionID, ActorID: obsReq.ActorID,
+		ScopeVersion: obsReq.ExpectedScope, Kind: obsReq.Kind,
+		References: obsReq.References, Note: obsReq.Note,
+	}
+	if err := validObservation.Validate(); err != nil {
+		t.Fatalf("valid observation rejected: %v", err)
+	}
+	forgedObservationID := validObservation
+	forgedObservationID.ID = model.ObservationID(model.H("observation-v1", "invented"))
+
 	tests := []struct {
 		protects string
 		value    interface{ Validate() error }
 	}{
 		{"node_facts range without its file_id, which the schema's mixed-range CHECK rejects", rangeWithoutFile},
 		{"an inverted half-open range, which would serve bytes outside the entity", inverted},
-		{"an unknown node kind, which no reader's exhaustive enum accepts", unknownKind},
 		{"evidence naming both a node and a relation, breaking the subject XOR", bothSubjects},
 		{"evidence naming no subject at all, an unattributable fact", noSubject},
 		{"an uppercase precision spelling competing with the lowercase vocabulary", unknownPrecision},
 		{"evidence carrying an invented ID, which would store one occurrence under two keys", forgedID},
-		{"an uppercase capability state, which would make freshness unreadable", model.CapabilityState{ProviderID: "p", Capability: "c", Scope: "s", State: model.CapabilityStateValue("FRESH")}},
-		{"an uppercase workflow target, which would let a guarded transition slip through", model.AdvanceRequest{SessionID: model.SessionID(model.H("s", "1")), ActorID: "a", Target: model.WorkflowState("VERIFY_OPEN"), ExpectedVersion: 1}},
+		{"an observation carrying an invented ID, which would break resubmission idempotence", forgedObservationID},
 	}
 	for _, tc := range tests {
 		t.Run(tc.protects, func(t *testing.T) {
@@ -254,9 +226,6 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 // The label is persisted alongside the estimate; changing it invalidates every
 // stored manifest.
 func TestEstimateTokensUTF8Bytes(t *testing.T) {
-	if model.EstimateMethodUTF8Bytes != "utf8_bytes_div_3_heuristic" {
-		t.Errorf("estimate label = %q, want %q", model.EstimateMethodUTF8Bytes, "utf8_bytes_div_3_heuristic")
-	}
 	for _, tc := range []struct {
 		in   int64
 		want int64

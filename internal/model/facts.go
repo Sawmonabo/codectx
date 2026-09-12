@@ -122,12 +122,30 @@ type Node struct {
 	ContentHash   string          `json:"content_hash,omitempty"`
 	Range         *SourceRange    `json:"range,omitempty"`
 	Metadata      json.RawMessage `json:"metadata,omitempty"`
+	// SemanticSource labels where this node came from. The zero value and
+	// SemanticCanonical both mean a sealed canonical fact; SemanticLSP marks an
+	// ephemeral overlay answer, which has no canonical NodeID because nothing
+	// was sealed, so its pinned file and range carry the whole result.
+	SemanticSource SemanticSource `json:"semantic_source"`
 }
 
 // Validate enforces the node_facts constraints, including the mixed-range check
 // and the bounded, strictly typed metadata payload.
 func (n Node) Validate() error {
-	if err := requireID("node.id", string(n.ID)); err != nil {
+	if err := validateResultSource("node.semantic_source", n.SemanticSource); err != nil {
+		return err
+	}
+	if n.SemanticSource == SemanticLSP {
+		if err := optionalID("node.id", string(n.ID)); err != nil {
+			return err
+		}
+		if err := requireID("node.file_id", string(n.FileID)); err != nil {
+			return err
+		}
+		if n.Range == nil {
+			return invalid("node.range is required for an lsp overlay node")
+		}
+	} else if err := requireID("node.id", string(n.ID)); err != nil {
 		return err
 	}
 	if !n.Kind.Valid() {

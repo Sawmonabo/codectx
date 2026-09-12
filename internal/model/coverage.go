@@ -140,6 +140,12 @@ func (r ReadChunkResponse) Validate() error {
 	if !r.Encoding.Valid() {
 		return invalid("read_chunk_response.encoding %q is not a known encoding", truncateForMessage(string(r.Encoding)))
 	}
+	// Section 20.2 requires the raw chunk plus its worst-case wire encoding to
+	// fit the source response budget; without this bound a single response could
+	// exceed the wire ceiling Section 16.2 fixes.
+	if err := boundField("read_chunk_response.content", r.Content, MaxChunkContentBytes); err != nil {
+		return err
+	}
 	if !r.Coverage.Valid() {
 		return invalid("read_chunk_response.coverage %q is not a known coverage state", truncateForMessage(string(r.Coverage)))
 	}
@@ -201,9 +207,14 @@ func (r AcknowledgeRequest) Validate() error {
 // FileCoverage is one file's honest coverage record: the pinned hash, its size,
 // the confirmed served bytes and whether a waiver applies (Section 17.3).
 // Waived is reported separately because a waiver never fabricates coverage.
+//
+// There is no path: it is derivable from FileID through the snapshot, and
+// carrying a second spelling of the same identity would put a value in the
+// capsule's canonical hash that the hash cannot verify. Requirement is kept
+// beyond the Section 17.3 list because a capsule reader judging readiness needs
+// to know whether an unserved file was required or merely offered.
 type FileCoverage struct {
 	FileID         FileID        `json:"file_id"`
-	Path           string        `json:"path"`
 	ContentHash    string        `json:"content_hash"`
 	Size           int64         `json:"size"`
 	ConfirmedBytes int64         `json:"confirmed_bytes"`
@@ -218,9 +229,6 @@ func (c FileCoverage) Validate() error {
 	if err := requireID("file_coverage.file_id", string(c.FileID)); err != nil {
 		return err
 	}
-	if err := requireField("file_coverage.path", c.Path, MaxPathBytes); err != nil {
-		return err
-	}
 	if err := requireID("file_coverage.content_hash", c.ContentHash); err != nil {
 		return err
 	}
@@ -231,7 +239,7 @@ func (c FileCoverage) Validate() error {
 		return err
 	}
 	if c.ConfirmedBytes > c.Size {
-		return invalid("file_coverage %q confirms %d bytes of a %d-byte file", truncateForMessage(c.Path), c.ConfirmedBytes, c.Size)
+		return invalid("file_coverage %q confirms %d bytes of a %d-byte file", c.FileID, c.ConfirmedBytes, c.Size)
 	}
 	if !c.Requirement.Valid() {
 		return invalid("file_coverage.requirement %q is not a known requirement", truncateForMessage(string(c.Requirement)))
@@ -241,7 +249,7 @@ func (c FileCoverage) Validate() error {
 	}
 	if c.State == CoverageFullServed && c.ConfirmedBytes != c.Size {
 		return invalid("file_coverage %q claims full_served with %d of %d bytes confirmed",
-			truncateForMessage(c.Path), c.ConfirmedBytes, c.Size)
+			c.FileID, c.ConfirmedBytes, c.Size)
 	}
 	return nil
 }

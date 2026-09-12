@@ -89,8 +89,11 @@ func (b Budget) Validate() error {
 		{"budget.max_files", int64(b.MaxFiles)},
 		{"budget.max_slices", int64(b.MaxSlices)},
 	} {
-		if f.value <= 0 {
-			return invalid("%s is %d; a budget must be positive and zero never means unlimited", f.field, f.value)
+		// Zero defers to the configured budget; see the PageRequest convention.
+		// Section 20.2 is explicit that zero never means unlimited, and the
+		// default it resolves to is itself finite.
+		if f.value < 0 {
+			return invalid("%s is %d; it must not be negative, and 0 means the configured default", f.field, f.value)
 		}
 	}
 	return nil
@@ -407,7 +410,10 @@ type ContextPageRequest struct {
 	Page      PageRequest `json:"page"`
 }
 
-// Validate enforces the request shape.
+// Validate enforces the request shape. There is deliberately no cursor/generation
+// conflict check here as there is on every generation-pinned query request: a
+// context page names no generation at all, because the session already pins one
+// and the caller cannot repin it.
 func (r ContextPageRequest) Validate() error {
 	if err := requireID("context_page.session_id", string(r.SessionID)); err != nil {
 		return err

@@ -2,7 +2,14 @@ package model
 
 // PageRequest is the shared pagination input. A supplied cursor already selects
 // its pinned generation, so a request that also names a generation or changes a
-// filter is rejected rather than silently repinned (Section 14.4).
+// filter is rejected rather than silently repinned (Sections 14.1, 14.4).
+//
+// Zero-value convention for every request bound in this package — Limit here,
+// ReadChunkRequest.MaxBytes, GraphRequest.MaxDepth/MaxVisited/MaxEdges and the
+// Budget fields: zero means "use the configured or endpoint default", a negative
+// value is invalid, and a positive value is taken as given. Section 20.2 is
+// explicit that no zero or negative setting ever means unlimited; the default a
+// zero resolves to is itself a finite configured bound.
 type PageRequest struct {
 	Limit  int    `json:"limit"`
 	Cursor string `json:"cursor,omitempty"`
@@ -19,6 +26,61 @@ func (p PageRequest) Validate() error {
 	return nil
 }
 
+// ValidatePinned bounds the page and enforces the Section 14.1 rule that a
+// request may not name both a cursor and a generation: the cursor already pins
+// one, so honouring the second would silently repin the query onto a different
+// generation and return results the caller's earlier pages cannot be compared
+// against. Every request embedding both a PageRequest and a GenerationID calls
+// this instead of Validate.
+func (p PageRequest) ValidatePinned(field string, generation GenerationID) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if err := requireGeneration(field+".generation_id", generation); err != nil {
+		return err
+	}
+	if p.Cursor != "" && generation != 0 {
+		return invalid("%s names both a cursor and a generation_id; a cursor already pins its generation", field)
+	}
+	return nil
+}
+
+// OverlayBinding labels a result that came from the LSP working-tree overlay
+// rather than from sealed canonical facts. Section 11.6 requires query metadata
+// to carry the overlay provider, version and input digest whenever LSP is used,
+// and Section 19.3 requires overlay results to be distinctly labeled: without
+// this a caller cannot tell an ephemeral dirty-worktree answer from a fact the
+// index will still agree with tomorrow.
+type OverlayBinding struct {
+	ProviderID      string `json:"provider_id"`
+	ProviderVersion string `json:"provider_version"`
+	InputDigest     string `json:"input_digest"`
+}
+
+// Validate enforces the overlay label's shape.
+func (b OverlayBinding) Validate() error {
+	if err := requireField("overlay.provider_id", b.ProviderID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireField("overlay.provider_version", b.ProviderVersion, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := requireID("overlay.input_digest", b.InputDigest); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateResultSource checks the semantic source carried on a result record,
+// where the zero value means canonical. It exists so Node and
+// ReferenceOccurrence cannot drift apart on what an overlay record may omit.
+func validateResultSource(field string, s SemanticSource) *Error {
+	if s != "" && !s.Valid() {
+		return invalid("%s %q is not a known semantic source", field, truncateForMessage(string(s)))
+	}
+	return nil
+}
+
 // QueryMeta accompanies every public result: the generation it was read from,
 // per-capability completeness, whether the answer was truncated and why, and a
 // continuation cursor when safe continuation exists.
@@ -28,6 +90,9 @@ type QueryMeta struct {
 	Truncated        bool              `json:"truncated"`
 	TruncationReason string            `json:"truncation_reason,omitempty"`
 	NextCursor       string            `json:"next_cursor,omitempty"`
+	// Overlay is set only when the result came from the LSP overlay; a nil
+	// overlay means every record in the result is a canonical fact.
+	Overlay *OverlayBinding `json:"overlay,omitempty"`
 }
 
 // Validate enforces the result metadata contract, including the rule that a
@@ -47,6 +112,11 @@ func (m QueryMeta) Validate() error {
 	}
 	if err := boundField("meta.next_cursor", m.NextCursor, MaxTokenBytes); err != nil {
 		return err
+	}
+	if m.Overlay != nil {
+		if err := m.Overlay.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -180,20 +250,12 @@ func (r SearchRequest) Validate() error {
 	if err := boundStrings("search.paths", r.Paths, MaxFilterValues, MaxPathBytes); err != nil {
 		return err
 	}
-	if err := r.Page.Validate(); err != nil {
+	if err := r.Page.ValidatePinned("search", r.GenerationID); err != nil {
 		return err
-	}
-	if r.Page.Cursor != "" && r.GenerationID != 0 {
-		return invalid("search names both a cursor and a generation_id; a cursor already pins its generation")
 	}
 	return nil
 }
 
-// SearchHit is one deduplicated search result. Section 14.2 fixes its contents:
-// the canonical entity or file chunk that was matched, the integer ranking
-// component with its retrieval tier, bounded reasons and the occurrence count
-// that deduplication folded away. It carries no source body — Section 19.3
-// reserves those for codectx_read_source.
 // SearchTier is the retrieval tier that produced a hit. Section 14.2 fixes
 // exactly these five tiers and makes the tier the FIRST tie-breaker in the
 // deterministic ranking, ahead of score: an unrecognized spelling would not fail
@@ -231,6 +293,11 @@ func (t SearchTier) Rank() int {
 // Valid reports whether t is a known wire spelling.
 func (t SearchTier) Valid() bool { return t.Rank() < len(searchTiers) }
 
+// SearchHit is one deduplicated search result. Section 14.2 fixes its contents:
+// the canonical entity or file chunk that was matched, the integer ranking
+// component with its retrieval tier, bounded reasons and the occurrence count
+// that deduplication folded away. It carries no source body — Section 19.3
+// reserves those for codectx_read_source.
 type SearchHit struct {
 	NodeID          NodeID       `json:"node_id,omitempty"`
 	FileID          FileID       `json:"file_id"`
@@ -305,9 +372,6 @@ type SymbolRequest struct {
 // Validate enforces the request shape, including the Section 11.6 rule that a
 // live-query route names the pinned file/range or symbol input it needs.
 func (r SymbolRequest) Validate() error {
-	if err := requireGeneration("symbol.generation_id", r.GenerationID); err != nil {
-		return err
-	}
 	if !r.Operation.Valid() {
 		return invalid("symbol.operation %q is not a known symbol operation", truncateForMessage(string(r.Operation)))
 	}
@@ -330,7 +394,7 @@ func (r SymbolRequest) Validate() error {
 	} else if err := requireTrimmed("symbol.query", r.Query, MaxQueryTextBytes); err != nil {
 		return err
 	}
-	if err := r.Page.Validate(); err != nil {
+	if err := r.Page.ValidatePinned("symbol", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
@@ -349,9 +413,6 @@ type ReferenceRequest struct {
 
 // Validate enforces the request shape.
 func (r ReferenceRequest) Validate() error {
-	if err := requireGeneration("reference.generation_id", r.GenerationID); err != nil {
-		return err
-	}
 	if err := requireID("reference.node_id", string(r.NodeID)); err != nil {
 		return err
 	}
@@ -364,7 +425,7 @@ func (r ReferenceRequest) Validate() error {
 	if err := boundField("reference.profile", r.Profile, MaxIdentifierBytes); err != nil {
 		return err
 	}
-	if err := r.Page.Validate(); err != nil {
+	if err := r.Page.ValidatePinned("reference", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
@@ -384,24 +445,51 @@ type ReferenceOccurrence struct {
 	FileID     FileID       `json:"file_id,omitempty"`
 	Path       string       `json:"path,omitempty"`
 	Range      *SourceRange `json:"range,omitempty"`
+	// SemanticSource labels where this occurrence came from. The zero value and
+	// SemanticCanonical both mean a sealed canonical fact; SemanticLSP marks an
+	// ephemeral overlay answer that has no canonical relation or evidence row,
+	// so its IDs are empty and its file/range carry the whole result.
+	SemanticSource SemanticSource `json:"semantic_source"`
 }
 
 // Validate enforces the occurrence shape.
 func (o ReferenceOccurrence) Validate() error {
-	if err := requireID("reference_occurrence.relation_id", string(o.RelationID)); err != nil {
+	if err := validateResultSource("reference_occurrence.semantic_source", o.SemanticSource); err != nil {
 		return err
 	}
-	if err := requireID("reference_occurrence.evidence_id", string(o.EvidenceID)); err != nil {
-		return err
+	overlay := o.SemanticSource == SemanticLSP
+	for _, f := range []struct {
+		field string
+		value string
+	}{
+		{"reference_occurrence.relation_id", string(o.RelationID)},
+		{"reference_occurrence.evidence_id", string(o.EvidenceID)},
+		{"reference_occurrence.from_node_id", string(o.FromNodeID)},
+		{"reference_occurrence.to_node_id", string(o.ToNodeID)},
+	} {
+		// An overlay occurrence is not a canonical fact: no relation was sealed
+		// and no evidence row exists, so these IDs may legitimately be absent.
+		// Whatever is present must still be a well-formed ID.
+		check := requireID
+		if overlay {
+			check = optionalID
+		}
+		if err := check(f.field, f.value); err != nil {
+			return err
+		}
+	}
+	if overlay {
+		// The pinned file and range are then the only thing that makes the
+		// occurrence verifiable, so they become mandatory in their place.
+		if err := requireID("reference_occurrence.file_id", string(o.FileID)); err != nil {
+			return err
+		}
+		if o.Range == nil {
+			return invalid("reference_occurrence.range is required for an lsp overlay occurrence")
+		}
 	}
 	if !o.Kind.Valid() {
 		return invalid("reference_occurrence.kind %q is not a known relation kind", truncateForMessage(string(o.Kind)))
-	}
-	if err := requireID("reference_occurrence.from_node_id", string(o.FromNodeID)); err != nil {
-		return err
-	}
-	if err := requireID("reference_occurrence.to_node_id", string(o.ToNodeID)); err != nil {
-		return err
 	}
 	if !o.Precision.Valid() {
 		return invalid("reference_occurrence.precision %q is not a known precision class", truncateForMessage(string(o.Precision)))
@@ -435,9 +523,6 @@ type GraphRequest struct {
 // Validate enforces bounded seeds, depth and work budgets. A zero bound means
 // "use the configured default", never "unlimited" (Section 20.1).
 func (r GraphRequest) Validate() error {
-	if err := requireGeneration("graph.generation_id", r.GenerationID); err != nil {
-		return err
-	}
 	if len(r.Start) == 0 {
 		return invalid("graph.start is required")
 	}
@@ -460,16 +545,20 @@ func (r GraphRequest) Validate() error {
 	if !r.Direction.Valid() {
 		return invalid("graph.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
 	}
-	if err := requireNonNegative("graph.max_depth", int64(r.MaxDepth)); err != nil {
-		return err
+	// Zero defers to the configured traversal caps; see PageRequest.
+	for _, b := range []struct {
+		field string
+		value int
+	}{
+		{"graph.max_depth", r.MaxDepth},
+		{"graph.max_visited", r.MaxVisited},
+		{"graph.max_edges", r.MaxEdges},
+	} {
+		if err := boundDefaultable(b.field, b.value); err != nil {
+			return err
+		}
 	}
-	if err := requireNonNegative("graph.max_visited", int64(r.MaxVisited)); err != nil {
-		return err
-	}
-	if err := requireNonNegative("graph.max_edges", int64(r.MaxEdges)); err != nil {
-		return err
-	}
-	if err := r.Page.Validate(); err != nil {
+	if err := r.Page.ValidatePinned("graph", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
@@ -700,13 +789,10 @@ type OverviewRequest struct {
 
 // Validate enforces the request shape.
 func (r OverviewRequest) Validate() error {
-	if err := requireGeneration("overview.generation_id", r.GenerationID); err != nil {
-		return err
-	}
 	if err := requireNonNegative("overview.depth", int64(r.Depth)); err != nil {
 		return err
 	}
-	if err := r.Page.Validate(); err != nil {
+	if err := r.Page.ValidatePinned("overview", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
@@ -767,22 +853,3 @@ func (i OverviewItem) Validate() error {
 // requireGeneration validates an optional generation selector. Zero means
 // "select the active generation once at request start" (Section 14.1); a
 // negative value is a client bug, not a sentinel.
-func requireGeneration(field string, id GenerationID) *Error {
-	if id < 0 {
-		return invalid("%s must not be negative, got %d", field, id)
-	}
-	return nil
-}
-
-// boundStrings bounds both the length of a filter list and each element.
-func boundStrings(field string, values []string, maxCount, maxBytes int) *Error {
-	if err := boundCount(field, len(values), maxCount); err != nil {
-		return err
-	}
-	for i, v := range values {
-		if err := requireField(indexed(field, i), v, maxBytes); err != nil {
-			return err
-		}
-	}
-	return nil
-}
