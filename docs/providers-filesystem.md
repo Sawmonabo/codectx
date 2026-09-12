@@ -80,9 +80,20 @@ identity.
 - the file's lexical search chunks (below).
 
 `filesystem.Classify` is the single path classification table (ruling
-R7-4). `filesystem.Language(path)` is the language tag Tasks 8 and 9 select
-files by; the tags for the bundled grammars match `tree_sitter.languages`.
-Recognition-only formats are Dockerfile and compose files, GitHub Actions,
+R7-4). The language half of it lives in `internal/lang`: `lang.Of(path)` is
+the one place a path becomes a language tag, so the tag a snapshot records in
+its manifest and the tag a provider selects files by cannot drift apart. Its
+table is the union of the two that had diverged — it returns the same tag for
+every path the snapshot table recognized and adds the documentation, build and
+configuration extensions. `filesystem.Language(path)` is a thin call to it and
+stays the name Tasks 8 and 9 use; the tags for the bundled grammars match
+`tree_sitter.languages`.
+
+Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
+description) are emitted by `filesystem`, not by `manifest`: classification is
+a pure function of the path that the file's own unit already evaluates, so no
+manifest unit needs to be scheduled just to publish one node. `manifest`
+handles only the formats that require parsing. Recognition-only formats are Dockerfile and compose files, GitHub Actions,
 GitLab CI, CircleCI, Jenkins, Travis, Azure Pipelines and Bitbucket
 Pipelines, Terraform, kustomize and Helm charts, Gradle, Bazel, CMake and
 Make, OpenAPI, GraphQL, protobuf and SQL, and AsciiDoc, reStructuredText,
@@ -108,6 +119,11 @@ a split line has no overlap. The window held in memory is one chunk.
 A chunk's search key is `H("search-chunk-v1", file, content hash, start,
 end)`; its body is exactly the bytes of `[start,end)`.
 
+`model.SearchUnit.Bytes` is a required value field, so a name-only document
+whose node the parser could not place carries the empty range `[0,0)`. Read
+`[0,0)` as "this document has no byte range", never as the first zero bytes of
+the file; a document that really covers bytes always has `End > Start`.
+
 Admission affects declared coverage only, never CAS retention or source
 serving. The `search` capability is reported per file:
 
@@ -119,6 +135,11 @@ serving. The `search` capability is reported per file:
 | otherwise | `fresh` | |
 
 The `structure` capability is always `fresh` for a unit that seals.
+
+`CTX_PROVIDER_UNAVAILABLE` for binary content is a reuse of an existing
+Section 22 family, because `internal/model` is frozen: the honest code would
+be a dedicated `CTX_BINARY_CONTENT`. It is ledgered as a shared-helper change,
+not worked around here.
 
 ## What `manifest` emits per file
 
@@ -139,8 +160,28 @@ never of the kinds.
 | `package.json` | `encoding/json`; ranges from one token walk | `package`, metadata `version`, `private`, `workspaces` (globs unexpanded), `scripts` (never executed) | `dependencies`/`devDependencies`/`peerDependencies`/`optionalDependencies` → kinds `runtime`/`dev`/`peer`/`optional` |
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
-| `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property` |
+| `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
 | Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact) | ATX headings → name-only search documents of the document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+
+A Maven child both **inherits its identity from** `<parent>` (a missing
+`groupId` or `version` is taken from it and the field is listed in the node's
+`inherited` metadata) **and depends on it**: the same `<parent>` element also
+produces a `depends_on` edge to `maven:<parent group>:<parent artifact>` with
+`kind: build` and `role: parent`. The two are not alternatives — inheritance
+is what the child's coordinates are, the edge is the build-time dependency the
+POM declares — and both come from the one element, at its byte range. `build`
++ `role: parent` is used rather than an `extends` relation because the
+relation set of Section 11.2 is closed.
+
+A `<exclusions>` block is deliberately not indexed: an exclusion is a negative
+statement about a transitive graph this provider does not resolve, and
+emitting its coordinates as a dependency would be a wrong fact, not a missing
+one.
+
+TOML evidence ranges come from a bounded line scan (`maxTOMLLines`, 200000).
+A manifest with more lines than that gets an empty layout and every fact of
+it carries evidence without a range: the documented degradation is evidence
+without a range, never a guessed one.
 
 Every fact carries evidence at precision `syntax` with the exact byte range
 of the declaring line, element or token when the parser exposes one;

@@ -75,9 +75,6 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 			return skipped, model.Canceled(err)
 		}
 		window := c.buf[:c.filled]
-		if c.start == c.size && c.size > 0 {
-			return skipped, nil
-		}
 		chunk, err := source.PlanChunk(window, c.start, c.size, uint32(ChunkBytes))
 		if err != nil {
 			return skipped, err

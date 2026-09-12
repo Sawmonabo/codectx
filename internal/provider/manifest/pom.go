@@ -26,14 +26,18 @@ type pomDependency struct {
 	group, artifact, version, scope, typ string
 	optional                             bool
 	start, end                           int
+	// depth is len(stack) at the element that opened this dependency, so
+	// only its direct children (len(stack) == depth+1 while that child is
+	// ending) may set a coordinate.
+	depth int
 }
 
 type pomModel struct {
-	group, artifact, version, packaging, name string
-	parent                                    *pomDependency
-	modules                                   []pomEntry
-	dependencies, managed                     []pomDependency
-	properties                                map[string]string
+	group, artifact, version, packaging string
+	parent                              *pomDependency
+	modules                             []pomEntry
+	dependencies, managed               []pomDependency
+	properties                          map[string]string
 }
 
 type pomEntry struct {
@@ -193,7 +197,7 @@ func parsePom(data []byte) (pomModel, bool) {
 			text.Reset()
 			switch strings.Join(stack, "/") {
 			case "project/dependencies/dependency", "project/dependencyManagement/dependencies/dependency", "project/parent":
-				cur = &pomDependency{start: before}
+				cur = &pomDependency{start: before, depth: len(stack)}
 			case "project/modules/module":
 				entryStart = before
 			}
@@ -214,8 +218,6 @@ func parsePom(data []byte) (pomModel, bool) {
 				m.version = val
 			case "project/packaging":
 				m.packaging = val
-			case "project/name":
-				m.name = val
 			case "project/modules/module":
 				m.modules = append(m.modules, pomEntry{val, entryStart, end})
 			case "project/parent":
@@ -229,7 +231,11 @@ func parsePom(data []byte) (pomModel, bool) {
 				m.managed, cur = append(m.managed, *cur), nil
 			default:
 				switch {
-				case cur != nil && len(stack) >= 2:
+				// Only a direct child of the open <dependency>/<parent>
+				// carries its coordinates: a <groupId> nested inside
+				// <exclusions><exclusion> describes the exclusion, and
+				// letting it through would overwrite the real dependency.
+				case cur != nil && len(stack) == cur.depth+1:
 					setCoordinate(cur, stack[len(stack)-1], val)
 				case len(stack) == 3 && stack[1] == "properties":
 					if len(m.properties) < MaxEntries {

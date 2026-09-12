@@ -171,8 +171,11 @@ func (e *Emitter) Relation(from model.NodeID, kind model.RelationKind, to model.
 }
 
 // Symbol queues a name-only search document for a node of this unit: names
-// and signature, never a body (Section 11.2). rng is the node's source range
-// or nil.
+// and signature, never a body (Section 11.2). rng is the node's source range,
+// or nil when the parser could not place the node; model.SearchUnit.Bytes is
+// a required value field, so "no range" is written as the empty range [0,0)
+// and consumers must read it as "this document has no byte range" rather than
+// as the first zero bytes of the file.
 func (e *Emitter) Symbol(node model.Node, rng *model.SourceRange) {
 	doc := model.SearchUnit{NodeID: node.ID, FileID: e.file.ID, Path: e.file.Path, Kind: node.Kind,
 		Name: node.Name, QualifiedName: node.QualifiedName, Signature: node.Signature}
@@ -340,7 +343,7 @@ func Detail(kv ...string) string {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	budget := (model.MaxDetailBytes - 64) / len(keys)
+	budget := max((model.MaxDetailBytes-64)/len(keys), 1)
 	for _, k := range keys {
 		fields[k] = cut(fields[k], budget)
 	}

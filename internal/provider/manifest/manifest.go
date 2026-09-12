@@ -151,11 +151,6 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	e.AddBytes(uint64(len(data)))
 	u := &unit{e: e, data: data, cursor: source.NewCursor(data), capability: capability, state: model.CapabilityFresh}
-	// The file node is the filesystem unit's; resolving the same candidate
-	// hits its alias, so `defines` starts from the identity it published.
-	if u.file, err = e.Node(ctx, filesystem.PathCandidate(ID, model.NodeFile, rel), filesystem.Attrs{Precision: model.PrecisionSyntax, Located: true}); err != nil {
-		return model.ProviderResult{}, err
-	}
 	switch cls.Format {
 	case filesystem.FormatGoMod:
 		err = u.goMod(ctx)
@@ -187,11 +182,32 @@ type unit struct {
 	e      *filesystem.Emitter
 	data   []byte
 	cursor *source.Cursor
-	file   model.Node
+
+	// file is the file node `defines` starts from, resolved on first use.
+	// A format that defines nothing from the file (Markdown emits its
+	// document node directly) never resolves it, so no unit pays for a
+	// candidate it does not name.
+	file     model.Node
+	fileSeen bool
 
 	capability string
 	state      model.CapabilityStateValue
 	code       string
+}
+
+// fileNode resolves this manifest's own file node. The node is the
+// filesystem unit's; resolving the same candidate hits the alias that unit
+// published, so `defines` starts from the identity already in the index.
+func (u *unit) fileNode(ctx context.Context) (model.Node, error) {
+	if u.fileSeen {
+		return u.file, nil
+	}
+	node, err := u.e.Node(ctx, filesystem.PathCandidate(ID, model.NodeFile, u.e.File().Path), filesystem.Attrs{Precision: model.PrecisionSyntax, Located: true})
+	if err != nil {
+		return model.Node{}, err
+	}
+	u.file, u.fileSeen = node, true
+	return node, nil
 }
 
 // malformed records that the file did not parse as its format. It is a
@@ -231,11 +247,15 @@ func (u *unit) defines(ctx context.Context, kind model.NodeKind, qualified, name
 	fv := u.e.File()
 	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: provider.ScopeWorkspace, NativeKey: string(kind) + ":" + qualified,
 		Kind: kind, Language: language, Name: name, QualifiedName: qualified, FileID: fv.ID, ContentHash: fv.ContentHash}
+	file, err := u.fileNode(ctx)
+	if err != nil {
+		return model.Node{}, err
+	}
 	node, err := u.e.Node(ctx, cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng, Located: true, Metadata: filesystem.Metadata(meta)})
 	if err != nil {
 		return model.Node{}, err
 	}
-	if err := u.e.Relation(u.file.ID, model.RelDefines, node.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng}); err != nil {
+	if err := u.e.Relation(file.ID, model.RelDefines, node.ID, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng}); err != nil {
 		return model.Node{}, err
 	}
 	u.e.Symbol(node, rng)
