@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,6 +272,13 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 		w.childOut.CloseWithError(errWorkerGone)
 		p.mu.Lock()
 		delete(p.live, w)
+		// A worker can die while it sits idle — its lifetime timeout, a crash,
+		// an external kill — and an exited worker is not reusable, so it leaves
+		// the idle list with the live map. Otherwise idle could outnumber live
+		// and the next caller would be handed a dead worker, spending on a
+		// certain errWorkerGone the one retry a real parse failure needs. Its
+		// TTL timer may still fire; expire finds nothing and does nothing.
+		p.idle = slices.DeleteFunc(p.idle, func(x *worker) bool { return x == w })
 		p.exited++
 		p.cond.Broadcast()
 		p.mu.Unlock()
