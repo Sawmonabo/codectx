@@ -408,16 +408,24 @@ func (r Resolution) Validate() error {
 }
 
 // NodeFact is one Node plus the bounded evidence that publishes it, as emitted
-// through provider.Sink.PutNodes (Section 11.1).
+// through provider.Sink.PutNodes (Section 11.1). CanonicalKey is the
+// canonical_entity_key of Section 9.1 that, with the repository and Node.Kind,
+// derives Node.ID; storage records it in the node_ids dictionary and rejects a
+// fact whose ID does not derive from it.
 type NodeFact struct {
-	Node     Node       `json:"node"`
-	Evidence []Evidence `json:"evidence"`
+	Node         Node       `json:"node"`
+	CanonicalKey string     `json:"canonical_key"`
+	Evidence     []Evidence `json:"evidence"`
 }
 
 // Validate enforces that a published node fact has supporting evidence before
-// seal and that every evidence row names this node.
+// seal, carries the canonical key its identity derives from, and that every
+// evidence row names this node.
 func (f NodeFact) Validate() error {
 	if err := f.Node.Validate(); err != nil {
+		return err
+	}
+	if err := requireField("node_fact.canonical_key", f.CanonicalKey, MaxNativeKeyBytes); err != nil {
 		return err
 	}
 	if len(f.Evidence) == 0 {
