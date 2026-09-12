@@ -93,7 +93,9 @@ Recognition-only nodes (a Dockerfile, a Terraform file, an OpenAPI
 description) are emitted by `filesystem`, not by `manifest`: classification is
 a pure function of the path that the file's own unit already evaluates, so no
 manifest unit needs to be scheduled just to publish one node. `manifest`
-handles only the formats that require parsing. Recognition-only formats are Dockerfile and compose files, GitHub Actions,
+handles only the formats that require parsing.
+
+Recognition-only formats are Dockerfile and compose files, GitHub Actions,
 GitLab CI, CircleCI, Jenkins, Travis, Azure Pipelines and Bitbucket
 Pipelines, Terraform, kustomize and Helm charts, Gradle, Bazel, CMake and
 Make, OpenAPI, GraphQL, protobuf and SQL, and AsciiDoc, reStructuredText,

@@ -87,7 +87,7 @@ var fixture = map[string]string{
 	// One 40001-byte line: the 32 KiB budget falls inside a two-byte rune,
 	// so the split must back off to the rune boundary at 32767.
 	"docs/long.txt": "x" + strings.Repeat("é", 20000),
-	// 600 lines of 61 bytes = 36600 bytes: over one chunk, and cut on a
+	// 600 lines of 59 bytes = 35400 bytes: over one chunk, and cut on a
 	// line boundary, so consecutive chunks must overlap by whole lines.
 	"docs/wide.txt":   strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing elit sed\n", 600),
 	"assets/logo.bin": "PNG\x00\x00binary",

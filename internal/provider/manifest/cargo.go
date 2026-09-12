@@ -68,11 +68,10 @@ func (u *unit) cargo(ctx context.Context) error {
 			BuildDependencies map[string]any `toml:"build-dependencies"`
 		} `toml:"target"`
 	}
-	// The pinned decoder has no []byte or zero-copy path: NewDecoder reads
-	// the whole reader and converts it to a string anyway
-	// (toml@v1.6.0 decode.go:162-167), so this single conversion is the
-	// cheapest decode available.
-	if _, err := toml.Decode(string(u.data), &doc); err != nil {
+	// The pinned decoder has no zero-copy path (parse takes a string,
+	// toml@v1.6.0 parse.go:32), but Unmarshal accepts the bytes directly
+	// and avoids the extra copy a string conversion would add.
+	if err := toml.Unmarshal(u.data, &doc); err != nil {
 		u.malformed()
 		return nil
 	}
