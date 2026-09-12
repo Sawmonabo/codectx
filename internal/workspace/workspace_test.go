@@ -135,8 +135,29 @@ func TestWalkForceIncludeOverridesPolicy(t *testing.T) {
 	policy.ForceInclude = func(rel string) bool {
 		return rel == "vendor/lib.go" || rel == "a.txt" || rel == ".git/config" || rel == "data/blobs/object"
 	}
+
+	// Without a directory-level answer, an excluded directory is not read at
+	// all. A file hook alone must not turn every excluded directory into a full
+	// traversal: that is what makes a large ignored tree an expense, and its
+	// entry cap a way to abort the whole walk.
+	assertWalk(t, root, policy, []string{"a.txt", "a/b", "sub/dir/file.go", "z.txt"})
+
+	var asked []string
+	policy.ForceIncludeDir = func(relDir string) bool {
+		asked = append(asked, relDir)
+		return relDir == "vendor"
+	}
+	assertWalk(t, root, policy, []string{"a.txt", "a/b", "sub/dir/file.go", "vendor/lib.go", "z.txt"})
+	for _, dir := range asked {
+		if dir == "sub" || dir == "a" {
+			t.Errorf("ForceIncludeDir was consulted for %q, which is not excluded", dir)
+		}
+	}
+}
+
+func assertWalk(t *testing.T, root Root, policy Policy, want []string) {
+	t.Helper()
 	got := collect(t, root, policy)
-	want := []string{"a.txt", "a/b", "sub/dir/file.go", "vendor/lib.go", "z.txt"}
 	if len(got) != len(want) {
 		t.Fatalf("walked %v, want %v", got, want)
 	}
@@ -144,6 +165,37 @@ func TestWalkForceIncludeOverridesPolicy(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("walked %v, want %v", got, want)
 		}
+	}
+}
+
+// TestUnopenedRootIsRefused protects the zero-value guard: a Root that was
+// never opened by Discover carries no confined handle, and every accessor must
+// say so rather than dereference it.
+func TestUnopenedRootIsRefused(t *testing.T) {
+	var zero Root
+	if _, err := zero.Open("a.txt"); err == nil {
+		t.Error("Open on an unopened workspace succeeded")
+	}
+	if _, err := zero.Lstat("a.txt"); err == nil {
+		t.Error("Lstat on an unopened workspace succeeded")
+	}
+	if err := Walk(context.Background(), zero, Policy{MaxFiles: 1}, func(File) error { return nil }); err == nil {
+		t.Error("Walk on an unopened workspace succeeded")
+	}
+}
+
+// TestLstatDoesNotFollow protects the naming of the metadata accessor: it
+// reports the link itself. A caller told "Stat" would reasonably assume the
+// target, and a symlink silently resolved is how foreign bytes end up
+// attributed to the repository.
+func TestLstatDoesNotFollow(t *testing.T) {
+	root, _ := safeTree(t)
+	info, err := root.Lstat("escape")
+	if err != nil {
+		t.Fatalf("Lstat: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Lstat reported mode %s, want the symlink itself", info.Mode())
 	}
 }
 

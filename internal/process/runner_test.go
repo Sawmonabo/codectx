@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -74,11 +75,11 @@ func TestCancellationKillsTheProcessTree(t *testing.T) {
 			t.Fatalf("Run returned %v, want it to unwrap to context.Canceled", err)
 		} else {
 			var typed *model.Error
-			if !errors.As(err, &typed) {
+			if !errors.As(err, &typed) || typed.Code != model.CodeCanceled {
 				// internal/cli reports an untyped error as the exit-2 usage
 				// class, which would label a deliberate cancellation a bad
 				// command line.
-				t.Fatalf("Run returned the untyped %v, want a typed *model.Error", err)
+				t.Fatalf("Run returned %v, want a typed %s", err, model.CodeCanceled)
 			}
 		}
 	case <-time.After(10 * time.Second):
@@ -140,6 +141,44 @@ func TestOutputLimitTerminates(t *testing.T) {
 	if int64(len(result.Stdout)) > 4096 {
 		t.Errorf("captured %d bytes of stdout, over the 4096-byte limit", len(result.Stdout))
 	}
+
+	// A child that crosses the limit and then exits successfully is still a
+	// truncated run: reporting success would hand the caller a partial result
+	// it has no way to recognize as partial.
+	//
+	// The slow sink makes the ordering deterministic. The child writes its
+	// bytes into the pipe buffer and exits immediately, so the run is already
+	// over before the drain finishes delivering the first sixteen of them and
+	// discovers the truncation.
+	slow := &slowWriter{delay: 100 * time.Millisecond}
+	result, err = runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", `printf '%04096d' 0; exit 0`},
+		Dir:            dir,
+		Stdout:         slow,
+		MaxStdoutBytes: 16,
+		MaxStderrBytes: 4096,
+		Timeout:        30 * time.Second,
+		Grace:          5 * time.Second,
+	})
+	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+		t.Fatalf("Run returned %v for a truncated but successful child, want a typed %s", err, model.CodeResourceLimit)
+	}
+	if !result.OutputTruncated {
+		t.Error("Result does not report the truncation")
+	}
+}
+
+// slowWriter delays its first write, which is how a test pins the ordering
+// between a child exiting and its output being delivered.
+type slowWriter struct {
+	delay time.Duration
+	once  sync.Once
+}
+
+func (w *slowWriter) Write(b []byte) (int, error) {
+	w.once.Do(func() { time.Sleep(w.delay) })
+	return len(b), nil
 }
 
 // TestArgvReachesTheChildLiterally protects the no-shell rule: every argument
@@ -195,19 +234,88 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 
 // TestSpecRejectsUntrustedExecution protects the trust boundary: a relative or
 // PATH-resolved command is not an approved executable, and running one would
-// let whatever is first on PATH act with this tool's authority.
+// let whatever is first on PATH act with this tool's authority. A file that is
+// not executable was never an approved tool either, and saying so names the
+// profile instead of failing later with a bare permission error.
 func TestSpecRejectsUntrustedExecution(t *testing.T) {
 	runner, dir := testRunner(t)
+	notExecutable := filepath.Join(dir, "tool")
+	if err := os.WriteFile(notExecutable, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for _, path := range []string{"echo", notExecutable} {
+		_, err := runner.Run(context.Background(), Spec{
+			Path:           path,
+			Dir:            dir,
+			MaxStdoutBytes: 16,
+			MaxStderrBytes: 16,
+			Timeout:        time.Second,
+			Grace:          time.Second,
+		})
+		var typed *model.Error
+		if !errors.As(err, &typed) || typed.Code != model.CodeTrustRequired {
+			t.Fatalf("Run(%q) returned %v, want a typed %s", path, err, model.CodeTrustRequired)
+		}
+	}
+}
+
+// TestStdinIsBoundedAndReleased protects the two ways a bounded input goes
+// wrong: input silently dropped at the bound, and the pipe descriptors leaking
+// when the run fails before the copy ever starts. A server that leaks two
+// descriptors per failed analyzer run stops being able to open files at all.
+func TestStdinIsBoundedAndReleased(t *testing.T) {
+	requireExecutable(t, "/bin/cat")
+	runner, dir := testRunner(t)
+
 	_, err := runner.Run(context.Background(), Spec{
-		Path:           "echo",
+		Path:           "/bin/cat",
 		Dir:            dir,
-		MaxStdoutBytes: 16,
-		MaxStderrBytes: 16,
-		Timeout:        time.Second,
-		Grace:          time.Second,
+		Stdin:          strings.NewReader(strings.Repeat("a", 4096)),
+		MaxStdinBytes:  16,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        30 * time.Second,
+		Grace:          200 * time.Millisecond,
 	})
 	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodeTrustRequired {
-		t.Fatalf("Run returned %v, want a typed %s", err, model.CodeTrustRequired)
+	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+		t.Fatalf("Run returned %v for input over its bound, want a typed %s", err, model.CodeResourceLimit)
 	}
+
+	// A file with the execute bit that is not a valid image fails at exec,
+	// which is the early return that runs after the stdin pipe exists.
+	broken := filepath.Join(dir, "broken")
+	if err := os.WriteFile(broken, []byte{0x00, 0x01, 0x02}, 0o700); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	before := openDescriptors(t)
+	for range 32 {
+		_, err := runner.Run(context.Background(), Spec{
+			Path:           broken,
+			Dir:            dir,
+			Stdin:          strings.NewReader("input"),
+			MaxStdinBytes:  16,
+			MaxStdoutBytes: 4096,
+			MaxStderrBytes: 4096,
+			Timeout:        30 * time.Second,
+			Grace:          200 * time.Millisecond,
+		})
+		if err == nil {
+			t.Fatal("Run reported success for a file that is not an executable image")
+		}
+	}
+	if after := openDescriptors(t); after > before+4 {
+		t.Fatalf("32 failed runs left %d open descriptors, up from %d", after, before)
+	}
+}
+
+// openDescriptors counts this process's open files, skipping the test when the
+// platform offers no cheap way to ask.
+func openDescriptors(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skipf("open descriptors cannot be counted here: %v", err)
+	}
+	return len(entries)
 }

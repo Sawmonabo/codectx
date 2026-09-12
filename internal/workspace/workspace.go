@@ -111,6 +111,9 @@ func (r Root) Close() error {
 // refer to that same file. A symlink swapped in between the two steps therefore
 // fails instead of silently redirecting the read.
 func (r Root) Open(rel string) (*os.File, error) {
+	if r.root == nil {
+		return nil, notFound("the workspace is not open")
+	}
 	clean, err := r.checkPath(rel)
 	if err != nil {
 		return nil, err
@@ -138,10 +141,15 @@ func (r Root) Open(rel string) (*os.File, error) {
 	return f, nil
 }
 
-// Stat reports metadata for one path inside the workspace without following a
+// Lstat reports metadata for one path inside the workspace without following a
 // final-component symlink, so the caller learns what the entry is rather than
-// what it points at.
-func (r Root) Stat(rel string) (fs.FileInfo, error) {
+// what it points at. The name says so: a caller reaching for Stat would
+// reasonably expect the opposite, and a symlink silently resolved is how a
+// capture attributes foreign bytes to the repository.
+func (r Root) Lstat(rel string) (fs.FileInfo, error) {
+	if r.root == nil {
+		return nil, notFound("the workspace is not open")
+	}
 	clean, err := r.checkPath(rel)
 	if err != nil {
 		return nil, err

@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // Hash domains for the three separate fingerprints of Section 20.2. The version
@@ -27,6 +28,10 @@ func (c Config) SourcePolicyHash() string {
 		quoteBool(c.Workspace.IndexGenerated),
 		quoteBool(c.Workspace.IndexVendor),
 		quoteInt(c.Workspace.MaxFiles),
+		// The toggles above select built-in classification lists, so the lists
+		// themselves are policy: a build shipping a different one captures a
+		// different set of files from the same bytes.
+		workspace.ExclusionDigest(),
 	)
 }
 
@@ -70,6 +75,15 @@ func (c Config) AnalysisConfigHash() string {
 			h.AddString(arg)
 		}
 		h.AddString(string(a.Network))
+		// The environment an analyzer may see is an input to what it produces:
+		// a profile that gains a variable can resolve different dependencies
+		// from the same source and must not reuse the earlier units.
+		env := append([]string(nil), a.EnvAllowlist...)
+		sort.Strings(env)
+		h.AddString(quoteInt(int64(len(env))))
+		for _, name := range env {
+			h.AddString(name)
+		}
 	}
 	return h.Sum()
 }

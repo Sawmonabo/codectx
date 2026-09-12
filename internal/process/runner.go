@@ -23,8 +23,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -148,6 +150,12 @@ func (s Spec) validate() error {
 	if !info.Mode().IsRegular() {
 		return trustRequired("%q is not a regular file", s.Path)
 	}
+	if !isExecutable(info) {
+		// A readable but non-executable path is not an approved tool. Starting
+		// it would fail later with a bare EACCES that says nothing about which
+		// profile named it.
+		return trustRequired("%q is not executable", s.Path)
+	}
 	if !filepath.IsAbs(s.Dir) || strings.ContainsRune(s.Dir, 0) {
 		return trustRequired("the working directory %q is not an absolute private directory", s.Dir)
 	}
@@ -243,6 +251,10 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	if err != nil {
 		return result, err
 	}
+	// Both ends are closed here unless the pump takes them over after a
+	// successful start. Without this, every early return below leaks two
+	// descriptors, which a long-lived server exhausts.
+	defer stdin.closeIfIdle()
 	// The pipes are created here rather than through Cmd.StdoutPipe so that
 	// this package owns both ends: closing the read end is what unblocks a
 	// drain whose writer is a descendant that has not yet exited.
@@ -261,7 +273,15 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		return result, unavailable("%s could not be started: %v", filepath.Base(spec.Path), err)
 	}
 	if err := job.started(cmd); err != nil {
+		// The child is outside the tree control that failed, so stopping the
+		// group or job would reach nothing. It is killed directly, which is
+		// also what unblocks the wait: on Windows it is still suspended, and
+		// waiting on a suspended process that no job will terminate never
+		// returns.
 		job.terminate(cmd, true)
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
 		cmd.Wait()
 		return result, internalError("the child could not be placed under process-tree control: %v", err)
 	}
@@ -269,6 +289,9 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// see end of file, however promptly the child exits.
 	outPipe.closeWriter()
 	errPipe.closeWriter()
+	// The child now has its own copy of the stdin read end, so the parent's is
+	// released; otherwise the child never sees end of file.
+	stdin.start()
 
 	// The two streams are drained concurrently: draining one after the other
 	// deadlocks as soon as the child fills the pipe buffer of the other.
@@ -278,16 +301,16 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	go func() { defer drains.Done(); outPipe.drain() }()
 	go func() { defer drains.Done(); errPipe.drain() }()
 	go func() { drains.Wait(); close(drained) }()
-	if stdin != nil {
-		go stdin.pump()
-	}
 
 	timer := time.NewTimer(spec.Timeout)
 	defer timer.Stop()
 
 	waiter := newWaiter(cmd)
-	reason := waitForExit(ctx, timer.C, job, cmd, spec, outPipe, errPipe, waiter)
-	waitErr := waiter.wait()
+	reason, unreaped := waitForExit(ctx, timer.C, job, cmd, spec, outPipe, errPipe, waiter)
+	var waitErr error
+	if !unreaped {
+		waitErr = waiter.wait()
+	}
 
 	// Reaping the direct child says nothing about its descendants: they may
 	// still hold the write ends of the pipes. The drains are given the same
@@ -309,9 +332,25 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// exited on its own just after crossing the limit.
 	result.OutputTruncated = outPipe.limited() || errPipe.limited()
 
-	switch reason {
-	case stopOutputLimit:
+	if unreaped {
+		// Nothing was reaped, so there is no status to report; claiming exit 0
+		// would describe a process that may still be running as a clean run.
+		result.ExitCode = -1
+		pid := -1
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+		return result, internalError("%s did not exit after being killed", filepath.Base(spec.Path)).
+			WithDetail("pid", strconv.Itoa(pid)).
+			WithDetail("stop_reason", reason.String())
+	}
+	// A stream that crossed its limit is a refusal even when the child then
+	// exited successfully: the caller would otherwise receive truncated output
+	// reported as a complete run.
+	if reason == stopOutputLimit || result.OutputTruncated {
 		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
+	}
+	switch reason {
 	case stopTimeout:
 		result.TimedOut = true
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
@@ -323,6 +362,9 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		return result, err
 	}
 	if err := errPipe.err(); err != nil {
+		return result, err
+	}
+	if err := stdin.wait(spec.Grace); err != nil {
 		return result, err
 	}
 	if waitErr != nil {
@@ -357,14 +399,32 @@ const (
 	stopOutputLimit
 )
 
+func (r stopReason) String() string {
+	switch r {
+	case stopCanceled:
+		return "canceled"
+	case stopTimeout:
+		return "timeout"
+	case stopOutputLimit:
+		return "output_limit"
+	default:
+		return "exited"
+	}
+}
+
 // waitForExit blocks until the child exits or something requires the tree to be
 // stopped, then performs the graceful-then-forced termination.
+//
+// The second result reports that the tree did not exit even after the forced
+// termination. The wait is bounded because a process wedged in an
+// uninterruptible kernel operation cannot be killed at all, and blocking on it
+// would hang the caller with no diagnosis.
 func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, cmd *exec.Cmd,
-	spec Spec, outPipe, errPipe *streamPipe, w *waiter) stopReason {
+	spec Spec, outPipe, errPipe *streamPipe, w *waiter) (stopReason, bool) {
 	var reason stopReason
 	select {
 	case <-w.exited:
-		return stopNone
+		return stopNone, false
 	case <-ctx.Done():
 		reason = stopCanceled
 	case <-timeout:
@@ -383,10 +443,17 @@ func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, 
 	case <-w.exited:
 	case <-time.After(spec.Grace):
 		w.terminate(job, cmd, true)
-		<-w.exited
+		select {
+		case <-w.exited:
+		case <-time.After(forcedExitGrace):
+			return reason, true
+		}
 	}
-	return reason
+	return reason, false
 }
+
+// forcedExitGrace bounds the wait for a tree that has already been killed.
+const forcedExitGrace = 5 * time.Second
 
 // waiter reaps the child exactly once and guards termination against it.
 //
@@ -457,22 +524,109 @@ func configureStdin(cmd *exec.Cmd, spec Spec) (*stdinPump, error) {
 		return nil, internalError("a stdin pipe cannot be created: %v", err)
 	}
 	cmd.Stdin = pr
-	return &stdinPump{src: spec.Stdin, dst: pw, limit: spec.MaxStdinBytes, childEnd: pr}, nil
+	return &stdinPump{src: spec.Stdin, dst: pw, limit: spec.MaxStdinBytes, childEnd: pr,
+		done: make(chan struct{})}, nil
 }
 
 // stdinPump copies a bounded amount of input to the child and then closes its
 // stdin, so a child waiting for more input sees end of file instead of hanging.
+//
+// Both descriptors belong to the pump once it has started and to the runner's
+// deferred close until then, so neither leaks on any path.
 type stdinPump struct {
 	src      io.Reader
 	dst      *os.File
 	childEnd *os.File
 	limit    int64
+
+	done chan struct{}
+	// failure is written by pump and read only after done is closed.
+	failure error
+
+	mu        sync.Mutex
+	started   bool
+	closeOnce sync.Once
+}
+
+// start releases the parent's copy of the child's end and begins the copy. It
+// is a no-op for a run with no stdin.
+func (p *stdinPump) start() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.started = true
+	p.mu.Unlock()
+	// The child holds its own copy from here on; the parent's would otherwise
+	// keep the pipe open forever.
+	p.childEnd.Close()
+	go p.pump()
+}
+
+// closeIfIdle releases both ends unless the pump has taken them over.
+func (p *stdinPump) closeIfIdle() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	started := p.started
+	p.mu.Unlock()
+	if !started {
+		p.closeBoth()
+	}
+}
+
+func (p *stdinPump) closeBoth() {
+	p.closeOnce.Do(func() {
+		p.dst.Close()
+		p.childEnd.Close()
+	})
 }
 
 func (p *stdinPump) pump() {
-	io.Copy(p.dst, io.LimitReader(p.src, p.limit))
-	p.dst.Close()
-	p.childEnd.Close()
+	defer close(p.done)
+	n, err := io.Copy(p.dst, io.LimitReader(p.src, p.limit))
+	if err == nil && n == p.limit {
+		// io.Copy stops at the bound without saying whether anything was left.
+		// Silently truncating a child's input would produce a result computed
+		// from bytes the caller never agreed to drop.
+		var probe [1]byte
+		if extra, _ := p.src.Read(probe[:]); extra > 0 {
+			err = resourceLimit("stdin exceeded its %d-byte bound", p.limit)
+		}
+	}
+	if err != nil && !isBrokenPipe(err) {
+		// A child that closes stdin early is normal and not a failure; any
+		// other copy error means the child received input nobody can account
+		// for.
+		p.failure = err
+	}
+	p.closeBoth()
+}
+
+// wait returns the copy error once the pump has finished, bounding the wait: a
+// descendant that inherited stdin and never reads can otherwise keep the copy
+// blocked after the child itself is gone.
+func (p *stdinPump) wait(grace time.Duration) error {
+	if p == nil {
+		return nil
+	}
+	select {
+	case <-p.done:
+		return p.failure
+	case <-time.After(grace):
+		// Closing the write end unblocks the copy; the result is no longer
+		// waited for, because nothing can consume it.
+		p.closeBoth()
+		return nil
+	}
+}
+
+// isBrokenPipe reports the ordinary "the child stopped reading" errors.
+func isBrokenPipe(err error) bool {
+	return errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, os.ErrClosed)
 }
 
 func trustRequired(format string, args ...any) *model.Error {
@@ -508,17 +662,12 @@ func internalError(format string, args ...any) *model.Error {
 // *model.Error. That typing is not cosmetic: internal/cli maps an untyped
 // error to the exit-2 usage class, which would report a deliberate
 // cancellation as an invalid command line.
-//
-// Section 22 lists no cancellation family, so this uses the deadline family of
-// the same exit-7 class ("hard query/resource/deadline limit, or explicit
-// incomplete work" in Section 18.2). A dedicated CTX_CANCELED code in
-// internal/model would be more precise; see the Task 3 report.
 func canceled(err error) error {
 	if err == nil {
 		err = context.Canceled
 	}
 	typed := &model.Error{
-		Code:        model.CodeQueryDeadline,
+		Code:        model.CodeCanceled,
 		Message:     "the run was canceled before it completed",
 		Remediation: "run the operation again when it should finish",
 	}

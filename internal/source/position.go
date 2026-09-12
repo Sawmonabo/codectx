@@ -46,15 +46,46 @@ func (e ColumnEncoding) Valid() bool {
 // concurrent use.
 type Cursor struct {
 	data []byte
-	// line and lineStart are the cached line number and its first byte.
+	// base is the file offset of data[0] and baseLine the one-based line that
+	// starts there. Both are zero and one for a whole-file cursor.
+	base     uint64
+	baseLine uint32
+	// line and lineStart are the cached line number and its first byte, the
+	// latter relative to data.
 	line      uint32
 	lineStart int
 }
 
 // NewCursor returns a cursor over one file's exact bytes.
 func NewCursor(data []byte) *Cursor {
-	return &Cursor{data: data, line: 1, lineStart: 0}
+	return &Cursor{data: data, baseLine: 1, line: 1, lineStart: 0}
 }
+
+// NewCursorAt returns a cursor over a window of a file: data holds the bytes
+// beginning at startByte, which must be the first byte of the one-based line
+// startLine.
+//
+// This is what makes the sparse checkpoints of an Index usable. Serving a range
+// from the middle of a large file would otherwise have to rescan the file from
+// byte zero to learn a line number, or grow a second position implementation
+// that counts lines its own way and disagrees with this one at the first CRLF.
+// Both coordinates are reported in whole-file terms.
+//
+// A window that does not start on a line boundary is rejected: every line and
+// column the cursor then reports would be wrong by a whole line.
+func NewCursorAt(data []byte, startByte uint64, startLine uint32) (*Cursor, error) {
+	if startLine == 0 {
+		return nil, invalid("line numbers are one-based; a window cannot start at line 0")
+	}
+	if len(data) > 0 && !utf8.RuneStart(data[0]) {
+		return nil, invalid("the window starts at byte %d, inside a UTF-8 sequence", startByte)
+	}
+	return &Cursor{data: data, base: startByte, baseLine: startLine, line: startLine, lineStart: 0}, nil
+}
+
+// Window reports the file offset the cursor's bytes start at and the line that
+// begins there.
+func (c *Cursor) Window() (uint64, uint32) { return c.base, c.baseLine }
 
 // Offset converts a one-based line and a column counted in enc to the byte
 // offset it names. The returned offset may equal the file size: an EOF position
@@ -72,7 +103,7 @@ func (c *Cursor) Offset(line, column uint32, enc ColumnEncoding) (uint64, error)
 	if err != nil {
 		return 0, invalid("line %d column %d (%s): %v", line, column, enc, err)
 	}
-	return uint64(start + offset), nil
+	return c.base + uint64(start+offset), nil
 }
 
 // SourceRange converts a provider's four coordinates to the half-open byte
@@ -112,16 +143,19 @@ func (c *Cursor) SourceRange(startLine, startColumn, endLine, endColumn uint32, 
 // offset must be a rune boundary: Section 16.2 rejects an offset into a
 // continuation byte rather than serving from the middle of a character.
 func (c *Cursor) PositionAt(offset uint64) (model.Position, error) {
-	if offset > uint64(len(c.data)) {
-		return model.Position{}, invalid("byte offset %d is past the %d-byte file", offset, len(c.data))
+	if offset < c.base {
+		return model.Position{}, invalid("byte offset %d is before the window, which starts at %d", offset, c.base)
 	}
-	idx := int(offset)
+	if offset-c.base > uint64(len(c.data)) {
+		return model.Position{}, invalid("byte offset %d is past the %d bytes at offset %d", offset, len(c.data), c.base)
+	}
+	idx := int(offset - c.base)
 	if idx < len(c.data) && !utf8.RuneStart(c.data[idx]) {
 		return model.Position{}, invalid("byte offset %d is inside a UTF-8 sequence", offset)
 	}
 	// Counting from the start is correct regardless of the cache, and the cache
 	// makes the common forward case cheap.
-	line, start := uint32(1), 0
+	line, start := c.baseLine, 0
 	if c.lineStart <= idx {
 		line, start = c.line, c.lineStart
 	}
@@ -143,7 +177,10 @@ func (c *Cursor) lineStartOf(line uint32) (int, error) {
 	if line < 1 {
 		return 0, invalid("line %d is not one-based", line)
 	}
-	current, start := uint32(1), 0
+	if line < c.baseLine {
+		return 0, invalid("line %d is before line %d, where this window starts", line, c.baseLine)
+	}
+	current, start := c.baseLine, 0
 	if c.line <= line {
 		current, start = c.line, c.lineStart
 	}

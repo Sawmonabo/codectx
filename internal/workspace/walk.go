@@ -8,9 +8,9 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -91,19 +91,18 @@ type Policy struct {
 	// exclusions or any safety rule: neither .git, nor the data directory, nor
 	// a symlink escape, nor the file budget is negotiable.
 	ForceInclude func(rel string) bool
-}
-
-// PolicyFor builds the traversal policy a configuration describes. The Git
-// owner then fills in Ignore and ForceInclude. It lives here so that the
-// mapping from configuration to traversal exists exactly once.
-func PolicyFor(cfg config.Config) Policy {
-	return Policy{
-		FollowSymlinks: cfg.Workspace.FollowSymlinks,
-		IndexVendor:    cfg.Workspace.IndexVendor,
-		IndexGenerated: cfg.Workspace.IndexGenerated,
-		MaxFiles:       cfg.Workspace.MaxFiles,
-		DataDir:        cfg.Storage.DataDir,
-	}
+	// ForceIncludeDir answers the same question for a whole directory: may
+	// anything beneath relDir be forced back in? An excluded directory is read
+	// only when this says yes, so "vendor" with index_vendor disabled is not
+	// traversed at all unless a tracked path actually lies inside it. Without
+	// it, a single ForceInclude hook would turn every excluded directory into a
+	// full traversal, and a huge ignored directory could abort the walk on the
+	// entry cap alone.
+	ForceIncludeDir func(relDir string) bool
+	// IncludeUntracked is carried for the Git owner, which decides from it
+	// whether an untracked file is eligible. Walk does not interpret it: it
+	// cannot know what Git tracks, and guessing would contradict the snapshot.
+	IncludeUntracked bool
 }
 
 // Walk streams every eligible file in deterministic order, calling visit once
@@ -191,15 +190,17 @@ func (w *walker) visitEntry(ctx context.Context, rel string, e entry, excluded b
 		// Unconditional: not source, and not subject to any include hook.
 		return nil
 	}
-	forced := w.policy.ForceInclude != nil && w.policy.ForceInclude(rel)
 	if e.isDir {
-		childExcluded := excluded || (!forced && w.dirExcluded(rel, e.name))
-		if childExcluded && w.policy.ForceInclude == nil {
-			// Nothing inside can be forced back in, so the subtree is not read.
+		childExcluded := excluded || w.dirExcluded(rel, e.name)
+		if childExcluded && !w.mayForceInside(rel) {
+			// Nothing inside can be forced back in, so the subtree is not read
+			// at all: not listed, not counted against the entry cap, not a
+			// source of errors.
 			return nil
 		}
 		return w.walkDir(ctx, rel, e.info, childExcluded)
 	}
+	forced := w.policy.ForceInclude != nil && w.policy.ForceInclude(rel)
 	if !e.info.Mode().IsRegular() {
 		// Devices, sockets, pipes and unresolved links are not source bytes.
 		return nil
@@ -223,6 +224,12 @@ func (w *walker) visitEntry(ctx context.Context, rel string, e entry, excluded b
 		Mode:    e.info.Mode(),
 		ModTime: e.info.ModTime().UnixNano(),
 	})
+}
+
+// mayForceInside reports whether the policy claims some path beneath an
+// excluded directory must still be visited.
+func (w *walker) mayForceInside(relDir string) bool {
+	return w.policy.ForceIncludeDir != nil && w.policy.ForceIncludeDir(relDir)
 }
 
 func (w *walker) dirExcluded(rel, name string) bool {
@@ -346,3 +353,38 @@ func dataDirRelative(rootPath, dataDir string) string {
 	}
 	return slashed
 }
+
+// ExclusionDigest is a stable digest of the built-in vendor and generated
+// classification lists.
+//
+// These lists decide which files exist as far as the rest of the system is
+// concerned, exactly like the configured toggles that switch them on and off.
+// A build that ships a different list therefore produces a different capture
+// from the same bytes and the same configuration, and the source fingerprint
+// has to say so; otherwise a stored snapshot would be reused under a policy it
+// was not captured under.
+func ExclusionDigest() string {
+	h := model.NewHasher(domainExclusions)
+	for _, set := range []map[string]bool{vendorDirs, generatedDirs} {
+		names := make([]string, 0, len(set))
+		for name := range set {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		h.AddString(strconv.Itoa(len(names)))
+		for _, name := range names {
+			h.AddString(name)
+		}
+	}
+	suffixes := append([]string(nil), generatedSuffixes...)
+	slices.Sort(suffixes)
+	h.AddString(strconv.Itoa(len(suffixes)))
+	for _, suffix := range suffixes {
+		h.AddString(suffix)
+	}
+	return h.Sum()
+}
+
+// domainExclusions keeps the digest in its own hash domain, so it can never
+// collide with another fingerprint over the same strings.
+const domainExclusions = "workspace-exclusions-v1"

@@ -3,6 +3,7 @@
 package process
 
 import (
+	"io/fs"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -66,9 +67,20 @@ func (j *jobObject) started(cmd *exec.Cmd) error {
 	}
 	defer windows.CloseHandle(handle)
 	if err := windows.AssignProcessToJobObject(j.handle, handle); err != nil {
+		// The child is suspended and outside the job, so nothing else will ever
+		// stop it: terminating the job would reach an empty job, and waiting on
+		// a suspended process never returns. It is killed through the handle
+		// already held here.
+		windows.TerminateProcess(handle, 1)
 		return err
 	}
-	return resumeProcess(pid)
+	if err := resumeProcess(pid); err != nil {
+		// A child that cannot be resumed is inert but still holding its
+		// descriptors and its place in the job.
+		windows.TerminateProcess(handle, 1)
+		return err
+	}
+	return nil
 }
 
 // resumeProcess resumes every thread of the newly created process.
@@ -139,3 +151,7 @@ func (j *jobObject) close() {
 // signalOf has no Windows meaning: a process terminated by the job reports an
 // ordinary exit code, not a signal.
 func signalOf(*exec.ExitError) (int, bool) { return 0, false }
+
+// isExecutable has no Windows meaning: the filesystem carries no execute bit,
+// and whether an image can run is decided by the loader when it is started.
+func isExecutable(fs.FileInfo) bool { return true }

@@ -55,7 +55,7 @@ and still requires an approved profile.
 | `include_untracked` | `true` | project | Index files Git does not track. Ignore rules apply to untracked discovery; tracked files are indexed even when an ignore pattern matches them. |
 | `index_generated` | `false` | project | Index paths classified as generated (see below). |
 | `index_vendor` | `false` | project | Index vendored dependency directories (see below). |
-| `max_files` | `250000` | project (lower only) | Maximum files in one workspace. Exceeding it is `CTX_RESOURCE_LIMIT`, never a truncated index. |
+| `max_files` | `250000` | project (lower only) | Maximum files in one workspace. Exceeding it is `CTX_RESOURCE_LIMIT`, never a truncated index. It is a budget, not a response ceiling: it may be set as large as the workspace needs. |
 | `max_parse_file_bytes` | `5242880` | project (lower only) | Largest file admitted to structural parsing. |
 | `max_search_file_bytes` | `26214400` | project (lower only) | Largest file admitted to search indexing. |
 
@@ -90,6 +90,11 @@ feedback loop.
 A path that Git tracks overrides an ignore match and the vendor and generated
 toggles. It does not override the unconditional exclusions, the symlink policy,
 path validation, or the file budget.
+
+An excluded directory is not read at all unless some tracked path is known to
+lie inside it. Disabling `index_vendor` therefore costs nothing on a repository
+with a large `node_modules`: the directory is never listed, so it cannot be
+walked and cannot fail the per-directory entry limit either.
 
 ## `[index]` — scheduling
 
@@ -194,7 +199,7 @@ approved; nothing in the configuration layer runs anything.
 | `version_constraint` | yes | The version the caller must observe before admitting output. |
 | `checksum` | no | Expected lowercase SHA-256 hex of the executable. This is how a writable-repository executable substitution is detected. |
 | `args` | no | Fixed argument array. Only the substitutions `${input_dir}`, `${output_file}`, `${work_dir}` and `${manifest}` may appear; any other `${...}` is rejected rather than passed through literally. |
-| `env_allowlist` | no | Names of environment variables the child may receive. Anything not named is absent from the child environment entirely. |
+| `env_allowlist` | no | Names of environment variables the child may receive. Anything not named is absent from the child environment entirely. It is a fingerprint input: changing it invalidates the units the profile produced. |
 | `work_dir` | yes | Absolute private working directory. |
 | `memory_budget_bytes` | yes | Memory reservation for one run. |
 | `disk_budget_bytes` | yes | Temporary disk reservation for one run. |
@@ -253,6 +258,10 @@ relationships that must hold:
   `resources.max_source_response_bytes`, which itself fits the 7 MiB ceiling.
 - `resources.max_metadata_response_bytes` < `resources.max_source_response_bytes`.
 - `resources.max_provider_record_bytes` ≤ `index.batch_bytes` ≤ `index.queue_bytes`.
+  One record must fit one batch, and one batch must fit the queue reservation.
+  There is no separate ceiling on a record beyond that: `index.batch_bytes` is
+  the real constraint, and inventing a second one would refuse a configuration
+  that is internally consistent.
 - `resources.max_concurrent_graph_queries` ≤ `resources.max_concurrent_queries`.
 - `max_concurrent_queries × query_memory_bytes` + `cache_bytes` + `queue_bytes`
   ≤ `resources.base_memory_budget_bytes`.
@@ -268,9 +277,17 @@ setting does not invalidate work that did not depend on it:
 
 | Fingerprint | Covers | Invalidates |
 |---|---|---|
-| **Source policy** | `follow_symlinks`, `include_untracked`, `index_generated`, `index_vendor`, `max_files` | the snapshot identity |
-| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes`, every `providers.*` selection, and every approved profile's executable, version constraint, checksum, arguments and network posture | unit identity and the analysis key |
+| **Source policy** | `follow_symlinks`, `include_untracked`, `index_generated`, `index_vendor`, `max_files`, and a digest of this build's built-in vendor and generated classification lists | the snapshot identity |
+| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes`, every `providers.*` selection, and every approved profile's executable, version constraint, checksum, arguments, environment allowlist and network posture | unit identity and the analysis key |
 | **Context policy** | the whole `[context]` table | manifest identity |
+
+The exclusion lists are in the source fingerprint because the toggles alone do
+not decide eligibility: `index_vendor = false` means something different in a
+build that classifies a different set of directories as vendored, and the
+snapshot identity has to say so rather than reuse a capture taken under the
+other list. An analyzer's environment allowlist is in the analysis fingerprint
+for the same reason: a profile that gains a variable can resolve different
+dependencies from identical source.
 
 Operational settings — worker counts, batch sizes, cache sizes, idle TTLs, the
 data directory, transport and logging — are in none of them. They change how the

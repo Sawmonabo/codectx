@@ -2,9 +2,11 @@ package process
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // drainBufferBytes is the fixed read buffer one stream uses. It is not a
@@ -39,6 +41,9 @@ type streamPipe struct {
 
 	closeWriterOnce sync.Once
 	closeReaderOnce sync.Once
+	// readerClosed records that the read end was closed deliberately, so the
+	// resulting read error is not mistaken for a lost stream.
+	readerClosed atomic.Bool
 }
 
 // newStreamPipe creates one stream's pipe and points the command's stream at
@@ -77,6 +82,12 @@ func (p *streamPipe) drain() {
 			}
 		}
 		if err != nil {
+			if !errors.Is(err, io.EOF) && !p.readerClosed.Load() && p.failure == nil {
+				// End of file means the writers are gone, and a deliberate
+				// close is the runner giving up on a surviving descendant.
+				// Anything else means output was lost without anyone noticing.
+				p.failure = internalError("the child's output stream could not be read: %v", err)
+			}
 			return
 		}
 	}
@@ -111,7 +122,12 @@ func (p *streamPipe) err() error { return p.failure }
 func (p *streamPipe) closeWriter() { p.closeWriterOnce.Do(func() { p.w.Close() }) }
 
 // closeReader unblocks a drain whose writers have not all exited.
-func (p *streamPipe) closeReader() { p.closeReaderOnce.Do(func() { p.r.Close() }) }
+func (p *streamPipe) closeReader() {
+	p.closeReaderOnce.Do(func() {
+		p.readerClosed.Store(true)
+		p.r.Close()
+	})
+}
 
 func (p *streamPipe) closeAll() {
 	p.closeWriter()

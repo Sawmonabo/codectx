@@ -162,6 +162,43 @@ func TestIndexMatchesRecomputation(t *testing.T) {
 	if got := idx.CheckpointFor(idx.Size); got.Byte > idx.Size {
 		t.Fatalf("CheckpointFor(EOF) returned byte %d beyond the file", got.Byte)
 	}
+
+	// A range outside the recorded blocks must be refused. Returning an empty
+	// range instead would let a caller "verify" a served range against no
+	// blocks at all and report it as integrity-checked.
+	if _, _, err := idx.BlockRange(0, idx.Size+1); err == nil {
+		t.Error("BlockRange accepted a range past the end of the file")
+	}
+	first, last, err := idx.BlockRange(BlockBytes, BlockBytes+1)
+	if err != nil || first != 1 || last != 2 {
+		t.Fatalf("BlockRange(64Ki, 64Ki+1) = %d, %d, %v, want 1, 2, nil", first, last, err)
+	}
+
+	// The checkpoints must be usable without a second position implementation:
+	// a cursor over the window that starts at one reports whole-file
+	// coordinates that agree with a cursor over the whole file.
+	cp := idx.CheckpointFor(uint64(len(data)) / 2)
+	window, err := NewCursorAt(data[cp.Byte:], cp.Byte, cp.Line)
+	if err != nil {
+		t.Fatalf("NewCursorAt: %v", err)
+	}
+	whole2 := NewCursor(data)
+	for _, offset := range []uint64{cp.Byte, cp.Byte + 1, uint64(len(data))} {
+		got, err := window.PositionAt(offset)
+		if err != nil {
+			t.Fatalf("window.PositionAt(%d): %v", offset, err)
+		}
+		want, err := whole2.PositionAt(offset)
+		if err != nil {
+			t.Fatalf("PositionAt(%d): %v", offset, err)
+		}
+		if got != want {
+			t.Fatalf("window.PositionAt(%d) = %+v, want %+v", offset, got, want)
+		}
+	}
+	if _, err := window.PositionAt(cp.Byte - 1); err == nil && cp.Byte > 0 {
+		t.Error("a window cursor answered for a byte before its own window")
+	}
 }
 
 // TestPlanChunkBoundaries protects the Section 16.2 chunking contract: a chunk
@@ -211,6 +248,17 @@ func TestPlanChunkBoundaries(t *testing.T) {
 	}
 	if chunk.PartialLine || chunk.NextOffset != nil || chunk.Range.End != uint64(len(tail)) {
 		t.Fatalf("chunk = %+v, want the whole file, complete, at end of file", chunk)
+	}
+
+	// The zero-length end-of-file receipt is valid on its own terms: refusing
+	// it for a budget that cannot carry a code point would make an empty file
+	// unreadable and unconfirmable.
+	eof, err := PlanChunk(nil, uint64(len(tail)), uint64(len(tail)), 1)
+	if err != nil {
+		t.Fatalf("PlanChunk on the end-of-file receipt: %v", err)
+	}
+	if eof.Range.Start != uint64(len(tail)) || eof.Range.End != eof.Range.Start || eof.NextOffset != nil {
+		t.Fatalf("end-of-file chunk = %+v, want the zero-length receipt at %d", eof, len(tail))
 	}
 
 	empty, err := PlanChunk(nil, 0, 0, 64)

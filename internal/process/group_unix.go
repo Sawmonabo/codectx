@@ -3,6 +3,7 @@
 package process
 
 import (
+	"io/fs"
 	"os/exec"
 	"syscall"
 )
@@ -56,4 +57,11 @@ func signalOf(err *exec.ExitError) (int, bool) {
 		return 0, false
 	}
 	return int(status.Signal()), true
+}
+
+// isExecutable reports whether the file carries an execute bit. A tool the
+// operator approved but did not make executable is a configuration error, not
+// a run to attempt.
+func isExecutable(info fs.FileInfo) bool {
+	return info.Mode().Perm()&0o111 != 0
 }

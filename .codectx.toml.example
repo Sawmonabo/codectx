@@ -9,8 +9,10 @@
 # never widen anything. A key that authorizes execution, relaxes a safety
 # toggle, names a path root, or raises a limit is rejected with
 # CTX_TRUST_REQUIRED, and a key that does not exist is rejected with
-# CTX_CONFIG_INVALID. Every setting here may only lower the effective value the
-# user configuration resolved.
+# CTX_CONFIG_INVALID. A numeric limit here may only lower the value the user
+# configuration resolved; raising one is CTX_TRUST_REQUIRED. The remaining keys
+# select from what the user configuration already permits. Each key's exact
+# trust level is the one docs/configuration.md gives it.
 #
 # All keys are optional. Only the keys actually present are merged.
 # See docs/configuration.md for the full reference and the trust model.
@@ -31,7 +33,7 @@ index_generated = false
 index_vendor = false
 
 # Upper bound on the number of files this workspace may contain. Exceeding it is
-# a typed CTX_RESOURCE_LIMIT, never a silently truncated index.
+# a typed CTX_RESOURCE_LIMIT, never a silently truncated index. Lower only.
 max_files = 250000
 
 # Analysis admission limits. A file larger than these is still captured and

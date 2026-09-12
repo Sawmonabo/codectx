@@ -34,9 +34,6 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 	if windowStart > fileSize {
 		return Chunk{}, invalid("offset %d is past the %d-byte file", windowStart, fileSize)
 	}
-	if maxBytes < utf8.UTFMax {
-		return Chunk{}, invalid("a chunk budget of %d bytes cannot carry one UTF-8 code point", maxBytes)
-	}
 	available := fileSize - windowStart
 	if uint64(len(window)) > available {
 		return Chunk{}, invalid("the window holds %d bytes but only %d remain in the file", len(window), available)
@@ -51,6 +48,13 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 			Range:    model.ByteRange{Start: windowStart, End: windowStart},
 			Encoding: model.EncodingUTF8,
 		}, nil
+	}
+	// The budget must hold at least one code point, but only for a chunk that
+	// must carry bytes: Sections 16.2 and 16.3 make the zero-length end-of-file
+	// receipt valid on its own terms, and refusing it would make an empty file
+	// unreadable and unconfirmable.
+	if maxBytes < utf8.UTFMax {
+		return Chunk{}, invalid("a chunk budget of %d bytes cannot carry one UTF-8 code point", maxBytes)
 	}
 	if !utf8.RuneStart(window[0]) {
 		return Chunk{}, invalid("offset %d is inside a UTF-8 sequence", windowStart)

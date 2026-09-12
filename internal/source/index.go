@@ -192,17 +192,22 @@ func (i Index) CheckpointFor(offset uint64) Checkpoint {
 // BlockRange returns the half-open index range of the blocks covering the byte
 // range [start,end). Range serving verifies exactly these blocks; it does not
 // claim that any block it did not read was revalidated.
-func (i Index) BlockRange(start, end uint64) (int, int) {
-	if end <= start {
-		return 0, 0
+func (i Index) BlockRange(start, end uint64) (int, int, error) {
+	if end < start {
+		return 0, 0, invalid("byte range ends at %d before it starts at %d", end, start)
+	}
+	if end > i.Size {
+		return 0, 0, invalid("byte range ends at %d, past the %d-byte file", end, i.Size)
+	}
+	if end == start {
+		// An empty range verifies nothing, and saying so is not the same as
+		// silently returning the first block as if it had been checked.
+		return 0, 0, nil
 	}
 	first := int(start / BlockBytes)
 	last := int((end - 1) / BlockBytes)
-	if last >= len(i.Blocks) {
-		last = len(i.Blocks) - 1
+	if first >= len(i.Blocks) || last >= len(i.Blocks) {
+		return 0, 0, invalid("byte range [%d,%d) is not covered by the %d recorded blocks", start, end, len(i.Blocks))
 	}
-	if first > last {
-		return 0, 0
-	}
-	return first, last + 1
+	return first, last + 1, nil
 }
