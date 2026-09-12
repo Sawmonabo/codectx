@@ -64,7 +64,7 @@ func LockWorkspace(ctx context.Context, dataDir string, wait time.Duration) (*Wo
 		select {
 		case <-ctx.Done():
 			f.Close()
-			return nil, canceled(ctx.Err())
+			return nil, model.Canceled(ctx.Err())
 		case <-time.After(lockPollInterval):
 		}
 	}

@@ -1,6 +1,10 @@
 package model
 
-import "fmt"
+import (
+	"context"
+	"errors"
+	"fmt"
+)
 
 // Stable error families of Section 22. Every service raises one of these codes;
 // internal/cli maps them to the Section 18.2 exit-code table. They live here
@@ -95,4 +99,22 @@ func (e *Error) WithRemediation(text string) *Error {
 // invalid builds the CTX_ARGUMENT_INVALID rejection used by every validator.
 func invalid(format string, args ...any) *Error {
 	return &Error{Code: CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
+}
+
+// Canceled types work the caller stopped: a CTX_CANCELED error joined with the
+// context error, so errors.Is still distinguishes a deadline from a
+// cancellation while errors.As finds the typed code. Section 22 requires that
+// cancellation is never reported as a crash, and internal/cli maps an untyped
+// error to the exit-2 usage class, which would call a deliberate stop an
+// invalid command. A nil err is treated as context.Canceled.
+func Canceled(err error) error {
+	if err == nil {
+		err = context.Canceled
+	}
+	typed := &Error{Code: CodeCanceled, Message: "the operation was canceled before it completed",
+		Remediation: "run the operation again when it should finish"}
+	if errors.Is(err, context.DeadlineExceeded) {
+		typed.Message = "the caller's deadline expired before the operation completed"
+	}
+	return errors.Join(typed, err)
 }

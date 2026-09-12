@@ -46,11 +46,14 @@ func (u storeUnit) Seal(ctx context.Context) error { return u.store.SealUnit(ctx
 func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, limits Limits, pool *Pool) (model.ProviderResult, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	sink, err := NewBatchSink(out, limits, pool, cancel)
-	if err != nil {
-		return failedResult(req.Run, model.RunFailed, sink), err
+	var result model.ProviderResult
+	sink, err := NewBatchSink(runCtx, out, limits, pool, cancel)
+	if err == nil {
+		// Discard on every path: a provider that erred or was canceled with
+		// records still queued must return their bytes to the shared pool.
+		defer sink.Discard()
+		result, err = p.IndexUnit(runCtx, req, sink)
 	}
-	result, err := p.IndexUnit(runCtx, req, sink)
 	if err == nil {
 		err = sink.Flush(runCtx)
 	}
@@ -100,9 +103,14 @@ func failedResult(run model.ProviderRunID, state model.RunState, sink *BatchSink
 	return r
 }
 
-// stateOf maps a failure to its Section 22 run state. A sink write failure
+// stateOf maps a failure to its Section 22 run state. An expired deadline is
+// timed_out whether it arrives bare or typed as CTX_CANCELED (model.Canceled
+// joins the two), so it takes precedence over the code. A sink write failure
 // joined with the cancellation it caused is a failure, not a cancellation.
 func stateOf(err error) model.RunState {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return model.RunTimedOut
+	}
 	var typed *model.Error
 	if errors.As(err, &typed) {
 		switch typed.Code {
@@ -115,9 +123,6 @@ func stateOf(err error) model.RunState {
 			return model.RunTimedOut
 		}
 		return model.RunFailed
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return model.RunTimedOut
 	}
 	if errors.Is(err, context.Canceled) {
 		return model.RunCanceled

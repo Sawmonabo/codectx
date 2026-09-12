@@ -45,10 +45,12 @@ type StoredAlias struct {
 	CanonicalKey string
 }
 
-// MaxAliasLookup bounds one alias lookup: the primary identity plus the bounded
-// ambiguous list a Resolution may carry. A lookup can never grow with the
-// number of aliases stored.
-const MaxAliasLookup = model.MaxAmbiguousCandidates + 1
+// MaxAliasLookup bounds one alias lookup: the primary identity, the bounded
+// ambiguous list a Resolution may carry, and one more row so the resolver can
+// tell "exactly at the bound" from "more than the bound" and refuse rather
+// than silently drop an equally supported identity. A lookup can never grow
+// with the number of aliases stored.
+const MaxAliasLookup = model.MaxAmbiguousCandidates + 2
 
 // LookupAliases returns the distinct identities that (scopeKey, nativeKey) is
 // aliased to by the given units, restricted to units that are sealed, ordered

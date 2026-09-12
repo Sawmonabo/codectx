@@ -88,17 +88,23 @@ one indexing run).
 - **Flush at the smaller limit.** A batch flushes as soon as the next record
   would exceed *either* `BatchRecords` or `BatchBytes`. The batch that is
   written contains exactly the records that fit.
-- **Block, never exceed.** When the pool is exhausted a call first flushes
-  the sink's own queued batches, then waits for another sink to release. It
-  never waits while holding the sink lock and returns promptly with
-  `CTX_CANCELED` when the context ends.
+- **Block, never exceed.** When the pool is exhausted a call charges or
+  subscribes to the next release under one pool lock (no release can slip
+  between the two), then asks every live sink — its own included — to persist
+  what it has queued, and only then waits. It never waits while holding a sink
+  lock and returns promptly with `CTX_CANCELED` when the context ends.
 - **No bypass.** A single record over `max_provider_record_bytes` is
   `CTX_RESOURCE_LIMIT` with `Details["limit"]` naming the bound. Nothing is
   queued or written.
-- **Failure cancels producers.** A failed write latches the sink, releases
-  and discards what was queued, and cancels the unit's context, so every
-  goroutine producing into that unit stops. Later calls return the latched
-  error.
+- **Failure cancels producers.** A failed write latches the sink, drops every
+  queued batch and returns its bytes to the pool in one release, and cancels
+  the unit's context, so every goroutine producing into that unit stops.
+  Later calls return the latched error.
+- **Discard on every path.** `Discard` drops whatever is still queued,
+  returns its bytes and removes the sink from the pool's live set. It is
+  idempotent and a no-op after a clean `Flush`. `RunUnit` defers it, so a
+  provider that erred or was canceled with records queued never shrinks the
+  pool for the rest of the run.
 - **Reference order.** Nodes are always flushed before relations, aliases and
   search documents, because those rows reference node identities the same
   unit may have minted. Within a batch records are sorted by their stable key
@@ -107,14 +113,23 @@ one indexing run).
 Byte accounting is the documented deterministic size function in `sink.go`
 (`NodeFactBytes`, `RelationFactBytes`, `AliasBytes`, `SearchUnitBytes`): a
 fixed overhead per record and per evidence row plus every string the record
-carries. It is a superset of the estimate `UnitWriter` applies, so a batch the
-sink admits is never refused by a writer configured with the same bounds.
+carries (including `Node.SemanticSource` and `NodeFact.CanonicalKey`). It is a
+superset of the estimate `UnitWriter` applies, so a batch the sink admits is
+never refused by a writer configured with the same bounds.
 
 Ownership: a slice handed to a `Put` method belongs to the sink afterwards.
-The provider must not retain or mutate it. A producer holds at most one
-outstanding `Reserve` while it calls `Put` for the decoded record; the
-coordinator sizes concurrency so `queue_bytes` covers concurrent producers
-times twice `max_provider_record_bytes`, which is what guarantees progress.
+The provider must not retain or mutate it.
+
+Sizing: a producer holds at most one outstanding `Reserve` while it calls
+`Put` for the decoded record, so `queue_bytes ≥ concurrency × 2 ×
+max_provider_record_bytes` is the minimum that guarantees every producer can
+always make progress; the coordinator bounds concurrency accordingly. Because
+an acquirer flushes the other live sinks' queued batches before it waits, a
+sink that has stopped producing with a half-filled batch cannot pin the pool:
+its queued bytes are persisted (under its own lock and its own run context,
+so a failure belongs to its unit) and returned. What the rule above still
+bounds is bytes held by reservations that are in use, which no other party
+may release.
 
 ## Running a unit: sealed after validation or deleted
 
@@ -131,7 +146,16 @@ output is never attached to a generation and can never be queried.
 
 The returned `ProviderResult` always names the run and a terminal state. A
 write failure that cancelled the provider is reported as `failed` with the
-write error, not as `canceled`.
+write error, not as `canceled`. An expired deadline is `timed_out` whether it
+arrives as a bare `context.DeadlineExceeded` or typed through
+`model.Canceled`; that check precedes the error-code mapping. `RunUnit` does
+not complete the provider run: the caller (the Task 12 coordinator) reports
+the aggregate over a provider's units with `Store.CompleteProviderRun`,
+passing `provider.CodeOf(err)` as the diagnostic code.
+
+Misconfigured bounds — a non-positive limit, a record bound above the batch
+bound, a batch bound above the pool capacity — are `CTX_ARGUMENT_INVALID` at
+construction, not resource exhaustion.
 
 Reuse is decided before `BeginUnit`: the coordinator derives the unit key
 (`model.NewUnitID` over provider, version, scope, config hash, input digest
@@ -158,8 +182,11 @@ Resolution order (Section 9.4):
    (`Store.LookupAliases`, bounded at `MaxAliasLookup`, read-only, one short
    transaction). A hit is basis `native_key`. The identity with the smallest
    canonical key is primary; the rest, in the same order, form the bounded
-   `Ambiguous` list the provider records as `may_refer_to` edges. An alias
-   match adopts the stored kind, because the identity already exists.
+   `Ambiguous` list the provider records as `may_refer_to` edges. The lookup
+   fetches one row more than a `Resolution` can hold; more equally supported
+   identities than `MaxAmbiguousCandidates` is `CTX_PROVIDER_OUTPUT_INVALID`
+   with `Details["limit"]`, never a silent truncation. An alias match adopts
+   the stored kind, because the identity already exists.
 2. **Minted identity** by `reconcile.CanonicalKey(candidate)`, the single
    implementation of Section 9.1's `canonical_entity_key`:
    - file and range present → `source_location`: key over the file's path

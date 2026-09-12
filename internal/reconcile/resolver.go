@@ -59,8 +59,10 @@ func New(store AliasStore, repo model.RepositoryID, deps []model.UnitID) (*Resol
 // match on the strong key, then on the native key, wins with basis
 // native_key; the primary identity is the one with the smallest canonical key
 // and the rest form the bounded ambiguous list in the same order, so equal
-// candidates are retained rather than chosen by completion order. Without an
-// alias match the identity is minted by CanonicalKey.
+// candidates are retained rather than chosen by completion order. More
+// alternatives than MaxAmbiguousCandidates is CTX_PROVIDER_OUTPUT_INVALID,
+// never a silent truncation. Without an alias match the identity is minted by
+// CanonicalKey.
 //
 // An alias match adopts the stored kind: the identity already exists in a
 // completed dependency and a fact under it must carry that kind, which
@@ -83,6 +85,15 @@ func (r *Resolver) Resolve(ctx context.Context, c model.NodeCandidate) (model.Re
 		if len(hits) == 0 {
 			continue
 		}
+		if len(hits) > model.MaxAmbiguousCandidates+1 {
+			// More equally supported identities than a Resolution can retain.
+			// Dropping one would silently lose a may_refer_to alternative, so the
+			// dependency output is refused as over the bound instead.
+			return model.Resolution{}, &model.Error{Code: model.CodeProviderOutputInvalid,
+				Message: "native key is aliased to more identities than the ambiguity bound can retain",
+				Details: map[string]string{"limit": "max_ambiguous_candidates", "limit_value": strconv.Itoa(model.MaxAmbiguousCandidates),
+					"scope_key": c.ScopeKey}}
+		}
 		// The store orders by canonical key; sorting again keeps the contract
 		// local to this package rather than trusting the query alone.
 		slices.SortFunc(hits, func(a, b sqlite.StoredAlias) int {
@@ -92,9 +103,6 @@ func (r *Resolver) Resolve(ctx context.Context, c model.NodeCandidate) (model.Re
 		node.ID, node.Kind = primary.NodeID, primary.Kind
 		res := model.Resolution{Node: node, Basis: model.MatchNativeKey, CanonicalKey: primary.CanonicalKey}
 		for _, h := range hits[1:] {
-			if len(res.Ambiguous) == model.MaxAmbiguousCandidates {
-				break
-			}
 			res.Ambiguous = append(res.Ambiguous, h.NodeID)
 		}
 		return res, res.Validate()

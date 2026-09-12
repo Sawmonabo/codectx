@@ -3,7 +3,6 @@ package provider
 import (
 	"cmp"
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -22,42 +21,54 @@ type Limits struct {
 	MaxRecordBytes int64
 }
 
-// Validate rejects a limit that would mean unlimited or a record bound no
-// batch could hold (config.validate enforces the same relation on the
-// configured values).
+// Validate rejects a configuration that would mean unlimited or a record
+// bound no batch could hold (config.validate enforces the same relation on
+// the configured values). A bad bound is a configuration rejection, not
+// resource exhaustion.
 func (l Limits) Validate() error {
 	if l.BatchRecords <= 0 || l.BatchBytes <= 0 || l.MaxRecordBytes <= 0 {
-		return resourceLimit(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; every bound must be positive",
+		return invalid(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; every bound must be positive",
 			l.BatchRecords, l.BatchBytes, l.MaxRecordBytes))
 	}
 	if l.MaxRecordBytes > l.BatchBytes {
-		return resourceLimit(fmt.Sprintf("max record bytes %d exceed batch bytes %d; such a record could never be flushed", l.MaxRecordBytes, l.BatchBytes))
+		return invalid(fmt.Sprintf("max record bytes %d exceed batch bytes %d; such a record could never be flushed", l.MaxRecordBytes, l.BatchBytes))
 	}
 	return nil
 }
+
+// MaxLiveSinks bounds the sinks one pool tracks at a time. The coordinator
+// runs far fewer units concurrently; the bound exists so the registry is
+// finite, not to size it.
+const MaxLiveSinks = 1024
 
 // Pool is the retained-byte reservation shared by every sink of one indexing
 // run (index.queue_bytes). Queued records and outstanding decode reservations
 // are both charged against it, so the bytes providers hold before persistence
 // are bounded across concurrent units, not only per batch.
+//
+// The pool also tracks its live sinks. An acquirer that cannot be charged
+// first asks every live sink, its own included, to persist what it has
+// queued, so one sink that has stopped producing cannot pin the pool with a
+// half-filled batch while another starves.
 type Pool struct {
 	capacity int64
 
 	mu      sync.Mutex
 	used    int64
 	changed chan struct{}
+	sinks   []*BatchSink
 }
 
 // NewPool bounds the pool at capacity bytes.
 func NewPool(capacity int64) (*Pool, error) {
 	if capacity <= 0 {
-		return nil, resourceLimit("the sink byte pool capacity must be positive")
+		return nil, invalid("the sink byte pool capacity must be positive")
 	}
 	return &Pool{capacity: capacity, changed: make(chan struct{})}, nil
 }
 
-// tryAcquire charges n without blocking.
-func (p *Pool) tryAcquire(n int64) bool {
+// tryCharge charges n without blocking.
+func (p *Pool) tryCharge(n int64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.used+n > p.capacity {
@@ -69,6 +80,9 @@ func (p *Pool) tryAcquire(n int64) bool {
 
 // release returns n and wakes every waiter so it can retry.
 func (p *Pool) release(n int64) {
+	if n <= 0 {
+		return
+	}
 	p.mu.Lock()
 	p.used -= n
 	close(p.changed)
@@ -76,18 +90,54 @@ func (p *Pool) release(n int64) {
 	p.mu.Unlock()
 }
 
-// wait blocks until the pool changes or ctx ends. It never acquires; the
-// caller retries tryAcquire, so no goroutine holds a sink lock while blocked.
-func (p *Pool) wait(ctx context.Context) error {
-	p.mu.Lock()
-	ch := p.changed
-	p.mu.Unlock()
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return canceled(ctx.Err())
+// acquire charges n, blocking until it fits or ctx ends. The charge attempt
+// and the subscription to the next release happen under one hold of p.mu, so
+// a release between the two cannot be missed. Before waiting, the acquirer
+// relieves pressure by flushing every live sink's queued batches; if that
+// released anything it retries at once. Nothing is held while blocked.
+func (p *Pool) acquire(ctx context.Context, n int64) error {
+	for {
+		p.mu.Lock()
+		if p.used+n <= p.capacity {
+			p.used += n
+			p.mu.Unlock()
+			return nil
+		}
+		ch := p.changed
+		sinks := slices.Clone(p.sinks)
+		p.mu.Unlock()
+
+		relieved := false
+		for _, s := range sinks {
+			if s.relieve() {
+				relieved = true
+			}
+		}
+		if relieved {
+			continue
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return model.Canceled(ctx.Err())
+		}
 	}
+}
+
+func (p *Pool) register(s *BatchSink) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.sinks) >= MaxLiveSinks {
+		return resourceLimit(fmt.Sprintf("the pool already tracks %d live sinks", MaxLiveSinks))
+	}
+	p.sinks = append(p.sinks, s)
+	return nil
+}
+
+func (p *Pool) unregister(s *BatchSink) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sinks = slices.DeleteFunc(p.sinks, func(x *BatchSink) bool { return x == s })
 }
 
 // Used reports the bytes currently charged.
@@ -117,11 +167,12 @@ func evidenceBytes(list []model.Evidence) int64 {
 	return n
 }
 
-// NodeFactBytes is the retained-byte estimate of one node fact.
+// NodeFactBytes is the retained-byte estimate of one node fact: every string
+// of the node, the canonical key and the evidence.
 func NodeFactBytes(f model.NodeFact) int64 {
 	n := f.Node
 	return recordOverhead + int64(len(n.ID)+len(n.Kind)+len(n.Language)+len(n.Name)+len(n.QualifiedName)+len(n.Signature)+
-		len(n.FileID)+len(n.ContentHash)+len(n.Metadata)+len(f.CanonicalKey)) + evidenceBytes(f.Evidence)
+		len(n.FileID)+len(n.ContentHash)+len(n.Metadata)+len(n.SemanticSource)+len(f.CanonicalKey)) + evidenceBytes(f.Evidence)
 }
 
 // RelationFactBytes is the retained-byte estimate of one relation fact.
@@ -148,13 +199,16 @@ type batch[T any] struct {
 
 // BatchSink is the Sink handed to a provider for one unit. It owns every
 // record from acceptance until the destination has persisted it: a record is
-// admitted only after its bytes are reserved in the pool, a batch flushes as
+// admitted only after its bytes are charged to the pool, a batch flushes as
 // soon as the next record would exceed either limit, and a failed write
-// latches the sink, cancels every producer of the unit and discards what was
-// queued. Nothing here reaches the database except through the destination,
-// which in production is storage's UnitWriter. It is safe for concurrent use
-// by a provider's workers; writes to the destination are serialized.
+// latches the sink, discards every queued batch (returning its bytes) and
+// cancels every producer of the unit. Nothing here reaches the database
+// except through the destination, which in production is storage's
+// UnitWriter. It is safe for concurrent use by a provider's workers; writes
+// to the destination are serialized. The owner must call Discard when the
+// unit is finished, whatever the outcome; RunUnit does.
 type BatchSink struct {
+	ctx    context.Context
 	dst    Sink
 	limits Limits
 	pool   *Pool
@@ -166,24 +220,32 @@ type BatchSink struct {
 	aliases   batch[model.NativeAlias]
 	search    batch[model.SearchUnit]
 	failed    error
+	discarded bool
 	records   uint64
 	bytes     uint64
 }
 
-// NewBatchSink binds a sink to its destination, limits and shared pool. cancel
-// is invoked with the write error when a required write fails, so every
-// goroutine producing into this unit observes cancellation.
-func NewBatchSink(dst Sink, limits Limits, pool *Pool, cancel context.CancelCauseFunc) (*BatchSink, error) {
-	if dst == nil || pool == nil || cancel == nil {
-		return nil, invalid("a batch sink needs a destination, a pool and a cancel function")
+// NewBatchSink binds a sink to its destination, limits and shared pool and
+// registers it with the pool. ctx is the unit's run context; it is the
+// context under which another acquirer may flush this sink's queued batches
+// to relieve pool pressure. cancel is invoked with the write error when a
+// required write fails, so every goroutine producing into this unit observes
+// cancellation.
+func NewBatchSink(ctx context.Context, dst Sink, limits Limits, pool *Pool, cancel context.CancelCauseFunc) (*BatchSink, error) {
+	if ctx == nil || dst == nil || pool == nil || cancel == nil {
+		return nil, invalid("a batch sink needs a context, a destination, a pool and a cancel function")
 	}
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}
 	if limits.BatchBytes > pool.capacity {
-		return nil, resourceLimit(fmt.Sprintf("batch bytes %d exceed the pool capacity %d; a full batch could never be admitted", limits.BatchBytes, pool.capacity))
+		return nil, invalid(fmt.Sprintf("batch bytes %d exceed the pool capacity %d; a full batch could never be admitted", limits.BatchBytes, pool.capacity))
 	}
-	return &BatchSink{dst: dst, limits: limits, pool: pool, cancel: cancel}, nil
+	s := &BatchSink{ctx: ctx, dst: dst, limits: limits, pool: pool, cancel: cancel}
+	if err := pool.register(s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // Records and Bytes report what the sink accepted so far, for the provider's
@@ -202,27 +264,18 @@ func (s *BatchSink) Reserve(ctx context.Context, n int64) (release func(), err e
 	if n > s.limits.MaxRecordBytes {
 		return nil, s.overLimit(n, "max_provider_record_bytes", s.limits.MaxRecordBytes)
 	}
-	for {
-		if err := s.failure(); err != nil {
-			return nil, err
-		}
-		if s.pool.tryAcquire(n) {
-			var once sync.Once
-			return func() { once.Do(func() { s.pool.release(n) }) }, nil
-		}
-		// Our own queued batches may be what fills the pool; flushing them
-		// releases their share before we wait on anyone else.
-		flushed, err := s.flushIfPending(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if flushed {
-			continue
-		}
-		if err := s.pool.wait(ctx); err != nil {
-			return nil, err
-		}
+	if err := s.failure(); err != nil {
+		return nil, err
 	}
+	if err := s.pool.acquire(ctx, n); err != nil {
+		return nil, err
+	}
+	if err := s.failure(); err != nil {
+		s.pool.release(n)
+		return nil, err
+	}
+	var once sync.Once
+	return func() { once.Do(func() { s.pool.release(n) }) }, nil
 }
 
 // PutNodes accepts node facts. Batches are sorted by node ID before they are
@@ -268,47 +321,59 @@ func (s *BatchSink) PutSearchUnits(ctx context.Context, docs []model.SearchUnit)
 }
 
 // put admits one record: it rejects an oversize record before anything is
-// queued, flushes the batch that would overflow, reserves the record's bytes
-// (flushing its own queued batches or waiting on the pool without holding
-// the sink lock) and only then appends.
+// queued, flushes the batch that would overflow, charges the record's bytes
+// (without holding the sink lock while blocked) and only then appends. The
+// overflow check is repeated after a blocking charge because another worker
+// may have appended meanwhile.
 func put[T any](s *BatchSink, ctx context.Context, b *batch[T], item T, size int64) error {
 	if size > s.limits.MaxRecordBytes {
 		return s.overLimit(size, "max_provider_record_bytes", s.limits.MaxRecordBytes)
 	}
-	for {
-		s.mu.Lock()
-		if s.failed != nil {
-			err := s.failed
-			s.mu.Unlock()
-			return err
-		}
-		if len(b.items)+1 > s.limits.BatchRecords || b.bytes+size > s.limits.BatchBytes {
-			if err := flush(s, ctx, b); err != nil {
-				s.mu.Unlock()
-				return err
-			}
-		}
-		if s.pool.tryAcquire(size) {
-			b.items = append(b.items, item)
-			b.bytes += size
-			s.records++
-			s.bytes += uint64(size)
-			s.mu.Unlock()
-			return nil
-		}
-		if s.pendingLocked() > 0 {
-			err := s.flushAllLocked(ctx)
-			s.mu.Unlock()
-			if err != nil {
-				return err
-			}
-			continue
-		}
+	s.mu.Lock()
+	if err := admit(s, ctx, b, size); err != nil {
 		s.mu.Unlock()
-		if err := s.pool.wait(ctx); err != nil {
-			return err
-		}
+		return err
 	}
+	if s.pool.tryCharge(size) {
+		appendItem(s, b, item, size)
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+	if err := s.pool.acquire(ctx, size); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := admit(s, ctx, b, size); err != nil {
+		s.pool.release(size)
+		return err
+	}
+	appendItem(s, b, item, size)
+	return nil
+}
+
+// admit checks the latch under the sink lock and flushes the batch that would
+// overflow.
+func admit[T any](s *BatchSink, ctx context.Context, b *batch[T], size int64) error {
+	if s.failed != nil {
+		return s.failed
+	}
+	if s.discarded {
+		return invalid("the sink was discarded; the unit is finished")
+	}
+	if len(b.items)+1 > s.limits.BatchRecords || b.bytes+size > s.limits.BatchBytes {
+		return flush(s, ctx, b)
+	}
+	return nil
+}
+
+// appendItem queues one charged record under the sink lock.
+func appendItem[T any](s *BatchSink, b *batch[T], item T, size int64) {
+	b.items = append(b.items, item)
+	b.bytes += size
+	s.records++
+	s.bytes += uint64(size)
 }
 
 // Flush persists every queued batch in reference order: nodes first, because
@@ -323,6 +388,47 @@ func (s *BatchSink) Flush(ctx context.Context) error {
 	return s.flushAllLocked(ctx)
 }
 
+// Discard ends the sink: whatever is still queued is dropped and its bytes
+// returned to the pool in one release, and the sink leaves the pool's live
+// set. It is idempotent and a no-op after a successful Flush left nothing
+// queued. The owner calls it on every path so a provider that erred or was
+// canceled with records queued never shrinks the pool for the rest of the
+// run.
+func (s *BatchSink) Discard() {
+	s.mu.Lock()
+	freed := s.dropLocked()
+	s.discarded = true
+	s.mu.Unlock()
+	s.pool.release(freed)
+	s.pool.unregister(s)
+}
+
+// dropLocked empties every batch and returns the bytes they held.
+func (s *BatchSink) dropLocked() int64 {
+	freed := s.pendingLocked()
+	s.nodes = batch[model.NodeFact]{}
+	s.relations = batch[model.RelationFact]{}
+	s.aliases = batch[model.NativeAlias]{}
+	s.search = batch[model.SearchUnit]{}
+	return freed
+}
+
+// relieve is the pool's request to persist this sink's queued batches so an
+// acquirer can proceed. It runs under the sink's own lock, so it serializes
+// with the sink's producers, and under the sink's own run context, so a
+// failure belongs to this unit. It reports whether any bytes were returned.
+func (s *BatchSink) relieve() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failed != nil || s.discarded || s.pendingLocked() == 0 {
+		return false
+	}
+	// A failed flush releases the batch and discards the rest, so bytes are
+	// returned either way.
+	_ = s.flushAllLocked(s.ctx)
+	return true
+}
+
 func (s *BatchSink) failure() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -331,18 +437,6 @@ func (s *BatchSink) failure() error {
 
 func (s *BatchSink) pendingLocked() int64 {
 	return s.nodes.bytes + s.relations.bytes + s.aliases.bytes + s.search.bytes
-}
-
-func (s *BatchSink) flushIfPending(ctx context.Context) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.failed != nil {
-		return false, s.failed
-	}
-	if s.pendingLocked() == 0 {
-		return false, nil
-	}
-	return true, s.flushAllLocked(ctx)
 }
 
 func (s *BatchSink) flushAllLocked(ctx context.Context) error {
@@ -360,9 +454,10 @@ func (s *BatchSink) flushAllLocked(ctx context.Context) error {
 
 // flush writes one batch under the sink lock. Any batch other than nodes
 // first flushes the pending nodes, so a relation, alias or search row never
-// reaches the writer before an identity it references. The pool bytes are
-// released whether the write succeeded or not: on failure the records are
-// discarded, the failure is latched and every producer is cancelled with it.
+// reaches the writer before an identity it references. The written batch's
+// bytes are released whether the write succeeded or not; on failure the
+// remaining batches are dropped and released too, the failure is latched and
+// every producer is cancelled with it.
 func flush[T any](s *BatchSink, ctx context.Context, b *batch[T]) error {
 	if _, isNodes := any(b).(*batch[model.NodeFact]); !isNodes && len(s.nodes.items) > 0 {
 		if err := flush(s, ctx, &s.nodes); err != nil {
@@ -377,18 +472,21 @@ func flush[T any](s *BatchSink, ctx context.Context, b *batch[T]) error {
 	err := s.write(ctx, items)
 	s.pool.release(bytes)
 	if err != nil {
-		s.fail(err)
+		s.failLocked(err)
 		return err
 	}
 	return nil
 }
 
-// fail latches the first write failure and cancels the unit's producers.
-func (s *BatchSink) fail(err error) {
-	if s.failed == nil {
-		s.failed = err
-		s.cancel(err)
+// failLocked latches the first write failure, returns every still-queued
+// byte to the pool and cancels the unit's producers.
+func (s *BatchSink) failLocked(err error) {
+	if s.failed != nil {
+		return
 	}
+	s.failed = err
+	s.pool.release(s.dropLocked())
+	s.cancel(err)
 }
 
 // write sorts one batch by its stable key and hands it to the destination.
@@ -417,15 +515,4 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 func (s *BatchSink) overLimit(size int64, limit string, bound int64) error {
 	return resourceLimit(fmt.Sprintf("a single record of %d bytes exceeds %s (%d); it cannot be admitted in any batch", size, limit, bound)).
 		WithDetail("limit", limit).WithDetail("record_bytes", strconv.FormatInt(size, 10)).WithDetail("limit_bytes", strconv.FormatInt(bound, 10))
-}
-
-// canceled types a context end the way internal/process does: errors.Is still
-// sees the context error and errors.As finds the CTX_CANCELED code, so the CLI
-// never reports a deliberate stop as an invalid command.
-func canceled(err error) error {
-	typed := &model.Error{Code: model.CodeCanceled, Message: "the unit was canceled before its output was persisted"}
-	if errors.Is(err, context.DeadlineExceeded) {
-		typed.Message = "the deadline expired before the unit's output was persisted"
-	}
-	return errors.Join(typed, err)
 }

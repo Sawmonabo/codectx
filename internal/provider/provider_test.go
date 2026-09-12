@@ -56,12 +56,13 @@ func TestSinkBoundsAreEnforcedAtTheBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, cancel := context.WithCancelCause(ctx)
+	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
-	sink, err := provider.NewBatchSink(dst, limits, pool, cancel)
+	sink, err := provider.NewBatchSink(runCtx, dst, limits, pool, cancel)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer sink.Discard()
 	for i := 0; i < 7; i++ {
 		if err := sink.PutAliases(ctx, []model.NativeAlias{alias}); err != nil {
 			t.Fatalf("PutAliases(%d): %v", i, err)
@@ -142,6 +143,9 @@ func TestFailedWriteCancelsProducersAndDiscardsTheUnit(t *testing.T) {
 	}
 	if state, exists := h.UnitState(t, unit); exists {
 		t.Fatalf("failed unit still exists in state %q; unsealed output must be deleted", state)
+	}
+	if used := h.Pool.Used(); used != 0 {
+		t.Fatalf("pool still charges %d bytes after the failed unit was discarded; the run's reservation would shrink for every later unit", used)
 	}
 	if _, err := h.Store.Activate(ctx, h.Gen, 0, model.HealthFresh, nil, "norm-v1"); err == nil {
 		t.Fatal("generation activated with the failed unit's output attached")
