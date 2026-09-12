@@ -60,6 +60,15 @@ with the worker's first stderr line. The exact modules and versions are in
 `internal/provider/treesitter/lang/lang.go`; `go.mod` is the source of truth
 for what is linked.
 
+### Detection
+
+`Detect` inspects nothing in the repository: the grammars are linked into the
+worker executable, so availability is decided by that file alone (a regular,
+executable path). It never opens a repository file and never walks the root. A
+repository with no supported source file therefore reports the provider
+`available` and simply gets zero units planned for it, which is the honest
+outcome — an available provider with nothing to do, not an unavailable one.
+
 ## Unit scope and node identity
 
 One unit per file, scope key `"file:" + path`. The provider reads the scope
@@ -85,6 +94,26 @@ symbols without rescanning):
 
 - `("file:"+path, "module:"+path)` → file module.
 - `("file:"+path, qualified name)` → every declaration.
+- `("file:"+path, "decl:"+name+"@"+path+":"+startLine+"-"+endLine)` → every
+  declaration. This is the cross-provider declaration key fixed by controller
+  ruling, shared byte-for-byte with the `joern` provider, whose exported
+  `METHOD` strong key is exactly this string:
+
+  ```
+  scope key  file:<path>
+  native key decl:<identifier token as written>@<path>:<first line>-<last line>
+  ```
+
+  Lines are one-based and the span is inclusive, so the last line is the line
+  the declaration's final byte lies on, not the half-open end position's. The
+  path is the same root-relative slash path the unit's scope key carries.
+  Nothing is normalized — no case folding, no qualification, no receiver
+  prefix: the identifier is the token the source spells. Publishing this alias
+  is what merges the two providers' identities for one function instead of
+  leaving two correct but unrelated nodes. A key over `MaxNativeKeyBytes` is
+  omitted rather than truncated (a truncated key would be a different, possibly
+  colliding claim); the declaration keeps its own identity and its
+  qualified-name alias either way.
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
   are the two languages where a declared package clause makes members visible
@@ -108,7 +137,11 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 
 Occurrences past `MaxEvidencePerFact` (64) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
-silently.
+silently. The unresolved callees one file may mint are bounded the same way: at
+most 2000 distinct placeholders, after which a cross-file call is counted, not
+minted, and the file is `partial`. Without that bound a generated or minified
+file with tens of thousands of distinct callee names would publish a node, a
+relation and evidence for each.
 
 Search units: one per declaration, ID `H("treesitter-search-v1", fileID,
 nodeID)`, body = attached documentation (comment markers stripped) plus the
@@ -123,7 +156,7 @@ recorded) with one `structure` capability state at the file's scope:
 | State | DiagnosticCode | Meaning |
 |---|---|---|
 | `fresh` | – | parsed without syntax errors, every record within bounds |
-| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, or evidence past the per-fact bound was dropped |
+| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was dropped, or the file reached the 2000 distinct unresolved-callee bound |
 | `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than `workspace.max_parse_file_bytes`; not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
 
@@ -140,8 +173,10 @@ disagrees with the manifest (`CTX_SOURCE_INTEGRITY`).
 `FileVersion.Language` from the snapshot manifest wins when it names a pinned
 language; otherwise the extension decides (`.go .py .pyi .js .mjs .cjs .jsx
 .ts .mts .cts .tsx .java .rs .c .h .cc .cpp .cxx .hpp .hh .hxx`). `.h` is parsed as
-C: a C parse of a C++ header yields ERROR nodes and a `partial` state, which
-is an honest report; guessing C++ from a neighbouring `.cpp` would not be.
+C: a C parse of a C++ header yields ERROR nodes and a `partial` state with
+`CTX_COVERAGE_INCOMPLETE`, which is an honest report and the expected outcome
+for a C++ header named `.h`; guessing C++ from a neighbouring `.cpp` would not
+be.
 
 ## Worker process
 
@@ -196,12 +231,20 @@ defer ts.Close()
 Every frame is a 4-byte big-endian payload length, a 1-byte kind and a JSON
 payload (ruling R8-3). Both sides refuse to allocate for a length over the
 cap they expect: the parent caps every frame from the child at
-`wire.MaxFactFrameBytes` = 64 KiB (at or below the smallest
-`max_provider_record_bytes` any sink is configured with, so a fact that fits
-the frame fits the sink); the worker caps a request at the same and a source
+`wire.MaxFactFrameBytes` = 64 KiB; the worker caps a request at the same and a source
 frame at the `SourceBytes` the request declared, itself at most
 `wire.MaxSourceBytes` = 64 MiB. The parent enforces
 `workspace.max_parse_file_bytes` before any request is sent.
+
+The frame cap does not bound the sink record a frame becomes; the parent's own
+bounds do. The largest fact the parent can build is one node or relation
+carrying `MaxEvidencePerFact` (64) evidence rows of roughly 620 bytes of
+identifiers and positions plus a native key of at most `MaxNativeKeyBytes`
+(2048): about 167 KiB, well under the 4 MiB `max_provider_record_bytes` a sink
+is configured with. Facts are handed to the sink in slices of at most 1000
+records (the default `index.batch_records`, which the `Sink` interface does not
+expose), in put order, and the builder drops its reference to each group as it
+hands it over, so a unit's output is never held twice.
 
 ```
 worker → parent   Hello{pid, fingerprint, languages}          once, first
@@ -225,9 +268,15 @@ truncation, never sent oversize.
 
 ### Lifecycle
 
-- The pool holds at most `MaxWorkers` workers; a unit takes a slot (or waits
-  for one, promptly returning on cancellation), reuses an idle worker or
-  starts one, and reads the hello within 30 seconds.
+- `MaxWorkers` bounds live worker *processes*, not concurrent parses: a worker
+  occupies its place in the pool from before it is started until the runner has
+  reaped it, so an idle worker and one still shutting down both still count. A
+  unit reuses an idle worker, starts one when the pool is under its bound, or
+  waits (promptly returning on cancellation) until a worker goes idle or a
+  process exits; it then reads the hello within 30 seconds. Bounding callers
+  instead would let a caller start a fresh worker while an expiring one still
+  held its runner slot and memory reservation, and the runner would then refuse
+  an admission the pool itself caused.
 - A healthy worker returns to the idle list under `WorkerIdleTTL`; expiry
   closes its stdin, the worker exits on EOF and the runner reaps it.
 - A worker is recycled (stopped after its current parse) when it has done
@@ -245,13 +294,17 @@ truncation, never sent oversize.
   Startup failures (the runner's trust refusal, admission refusal, a missing
   hello, a fingerprint mismatch), per-file error frames, cancellation and
   timeouts are not retried.
-- `Close` closes every idle worker's stdin, kills every busy one and waits
-  for the runner to reap each.
-- `Stats()` is the aggregate accounting of Section 22: live and idle workers,
-  started and exited counts, parses, retries, the sum of the resident set
-  each live worker last reported (from `/proc/self/statm` in the worker), the
-  parent's own resident set and the live worker PIDs. A value that cannot be
-  measured is -1, never 0.
+- `Close` closes every idle worker's stdin — concurrently, since each exits on
+  EOF within the grace and serial stops would cost one grace after another —
+  kills every worker that is not idle, and waits for the runner to reap each.
+- `Stats()` is the aggregate accounting of Section 22: `Processes` (every
+  worker process the runner has not yet reaped, idle ones included, never more
+  than `index.max_parser_workers`), `IdleWorkers` (its reusable subset) and
+  `BusyWorkers` (the rest: parsing, or on their way out), started and exited
+  counts, parses, retries, the sum of the resident set each live worker last
+  reported, the parent's own resident set and the live worker PIDs. Both sides
+  measure RSS with the same `wire.ResidentBytes` helper over
+  `/proc/self/statm`. A value that cannot be measured is -1, never 0.
 
 ### Native lifecycle in the worker (ruling R8-2)
 
@@ -313,6 +366,8 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | fact frame | 64 KiB | both sides |
 | declarations / imports / references per file | 20000 / 4000 / 60000 | both sides |
 | evidence per fact | 64 | parent |
+| distinct unresolved callees per file | 2000 | parent; past it the file is `partial` |
+| records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
 | signature | `MaxSignatureBytes` (4 KiB), whitespace-collapsed | parent |
 | workers | `index.max_parser_workers` (default 2) | pool |

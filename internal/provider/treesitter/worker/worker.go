@@ -28,7 +28,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"strings"
 
 	ts "github.com/tree-sitter/go-tree-sitter"
 
@@ -164,7 +163,10 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	if err := ex.run(query, root, em); err != nil {
 		return err
 	}
-	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated || em.truncated, RSSBytes: residentBytes()}
+	done := wire.Done{Package: ex.pkg, SyntaxErrors: root.HasError(), Truncated: ex.truncated || em.truncated}
+	if rss, ok := wire.ResidentBytes(); ok {
+		done.RSSBytes = uint64(rss)
+	}
 	return wire.WriteJSON(out, wire.KindDone, done, wire.MaxFactFrameBytes)
 }
 
@@ -211,21 +213,3 @@ func (e *emitter) put(kind wire.Kind, v any) error {
 func (e *emitter) decl(d wire.Decl) error  { return e.put(wire.KindDecl, d) }
 func (e *emitter) imp(i wire.Import) error { return e.put(wire.KindImport, i) }
 func (e *emitter) ref(r wire.Ref) error    { return e.put(wire.KindRef, r) }
-
-// residentBytes reports the process RSS on Linux and 0 elsewhere; the parent
-// records 0 as unavailable, never as a measurement.
-func residentBytes() uint64 {
-	data, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0
-	}
-	pages, err := strconv.ParseUint(fields[1], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return pages * uint64(os.Getpagesize())
-}

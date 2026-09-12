@@ -22,6 +22,17 @@ const (
 	maxDocBytes    = 8 << 10
 	capabilityName = "structure"
 	searchDomain   = "treesitter-search-v1"
+	// maxUnresolvedCallees bounds the distinct cross-file callees one file may
+	// mint a placeholder for. A generated or minified file can hold tens of
+	// thousands of distinct unresolved names, each of which would be a node, a
+	// relation and evidence; past the bound the call is counted and the file's
+	// structural coverage is reported partial instead.
+	maxUnresolvedCallees = 2000
+	// maxPutRecords bounds one hand-off to the sink, so a unit's facts stream
+	// through it in bounded slices rather than one slice the size of the whole
+	// file's output. provider.Sink does not expose the sink's Limits, so this
+	// matches the default index.batch_records.
+	maxPutRecords = 1000
 )
 
 // declKinds is the vocabulary the worker may report; anything else is a
@@ -50,11 +61,14 @@ type builder struct {
 	byName   map[string][]int
 	module   model.Resolution
 	nodes    []model.NodeFact
+	nodeAt   map[model.NodeID]int
 	rels     map[model.RelationID]*model.RelationFact
 	relOrder []model.RelationID
 	aliases  []model.NativeAlias
 	search   []model.SearchUnit
-	// dropped counts occurrences past the per-fact evidence bound.
+	// dropped counts what this file's bounds kept out of the facts:
+	// occurrences past the per-fact evidence bound and calls past the
+	// unresolved-callee bound. Any of it makes the file's coverage partial.
 	dropped int
 }
 
@@ -78,8 +92,9 @@ func outputInvalid(msg string) *model.Error {
 // returns the facts in put order: every node before any relation, alias or
 // search document that references it.
 func (b *builder) build() error {
-	b.scope = "file:" + b.fv.Path
+	b.scope = ScopePrefix + b.fv.Path
 	b.rels = map[model.RelationID]*model.RelationFact{}
+	b.nodeAt = map[model.NodeID]int{}
 	b.byName = map[string][]int{}
 	var err error
 	if b.fileRng, err = b.rangeOf(0, uint32(len(b.src))); err != nil {
@@ -150,10 +165,17 @@ func (b *builder) validateDecls() error {
 				return outputInvalid("nested declaration lies outside its parent")
 			}
 		}
+		// The signature and documentation offsets are cut from the pinned
+		// bytes, so they go through rangeOf like every other offset: it is
+		// what rejects an offset inside a UTF-8 sequence, which would
+		// otherwise put a broken rune in a Signature or a Body.
+		if _, err := b.rangeOf(d.Start, d.SigEnd); err != nil {
+			return err
+		}
 		f := declFact{Decl: d, kind: kind, rng: rng, sig: collapse(string(b.src[d.Start:d.SigEnd]), model.MaxSignatureBytes)}
 		if d.DocEnd > 0 {
-			if d.DocStart > d.DocEnd || uint64(d.DocEnd) > uint64(len(b.src)) {
-				return outputInvalid("documentation range does not fit the pinned bytes")
+			if _, err := b.rangeOf(d.DocStart, d.DocEnd); err != nil {
+				return err
 			}
 			f.doc = cleanDoc(string(b.src[d.DocStart:d.DocEnd]))
 		}
@@ -224,12 +246,47 @@ func (b *builder) resolveDecls() error {
 			b.putRelation(b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
 		}
 		b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		if key := b.declKey(d); key != "" {
+			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: res.Node.ID})
+		}
 		if pkg := b.packageScope(); pkg != "" && d.Parent < 0 {
 			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
 		}
 		b.search = append(b.search, b.searchUnit(d))
 	}
 	return nil
+}
+
+// declKey is the cross-provider declaration key of the controller's ruling,
+// the one string a semantic provider and this one both compute for the same
+// declaration:
+//
+//	scope  "file:" + path
+//	key    "decl:" + <identifier token as written> + "@" + path + ":" + <first line> + "-" + <last line>
+//
+// Lines are one-based and the span is inclusive, so the last line is the line
+// the declaration's final byte lies on, not the half-open end position's.
+// Nothing is normalized: the identifier is the token the source spells, the
+// path is the same root-relative slash path the unit's scope key carries.
+// Joern's exported METHOD key is byte-for-byte this string, so publishing it
+// as an alias is what merges the two providers' identities for one function
+// instead of leaving two correct but unrelated nodes.
+//
+// A key over MaxNativeKeyBytes is omitted rather than truncated: a truncated
+// key would be a different, possibly colliding identity claim. The
+// declaration keeps its own identity and its qualified-name alias either way.
+func (b *builder) declKey(d *declFact) string {
+	endLine := d.rng.End.Line
+	if d.End > d.Start && b.src[d.End-1] == '\n' {
+		// The half-open end sits at the start of the next line; the
+		// declaration's last line is the one before it.
+		endLine--
+	}
+	key := "decl:" + d.Name + "@" + b.fv.Path + ":" + strconv.FormatUint(uint64(d.rng.Start.Line), 10) + "-" + strconv.FormatUint(uint64(endLine), 10)
+	if len(key) > model.MaxNativeKeyBytes {
+		return ""
+	}
+	return key
 }
 
 // packageScope is the language's package-level alias scope for top-level
@@ -324,6 +381,14 @@ func (b *builder) refs() error {
 			}
 			res, ok := unresolved[key]
 			if !ok {
+				if len(unresolved) >= maxUnresolvedCallees {
+					// Past the bound the call is counted, not minted: a file
+					// with more distinct cross-file callees than this is
+					// reported partial rather than allowed to publish an
+					// unbounded number of placeholder nodes and relations.
+					b.dropped++
+					continue
+				}
 				if res, err = b.resolve(model.NodeCandidate{ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: key,
 					Kind: kind, Language: b.lang.Name, Name: r.Name}); err != nil {
 					return err
@@ -331,7 +396,7 @@ func (b *builder) refs() error {
 				unresolved[key] = res
 				b.putNode(res, rng, key, map[string]any{"resolution": "unresolved", "callee": r.Name})
 			} else {
-				b.addEvidence(b.nodeIndex(res.Node.ID), rng, key)
+				b.addEvidence(res.Node.ID, rng, key)
 			}
 			b.putRelation(from, model.RelCalls, res.Node.ID, rng, key, "unresolved")
 		}
@@ -404,20 +469,16 @@ func (b *builder) putNode(res model.Resolution, rng *model.SourceRange, nativeKe
 	}
 	b.nodes = append(b.nodes, model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey,
 		Evidence: []model.Evidence{b.evidence(node.ID, "", rng, nativeKey, "")}})
+	// The index makes a repeat occurrence of an identity a map lookup. Without
+	// it a file whose every call is unresolved rescans the published facts per
+	// occurrence, which is quadratic in the file's references.
+	b.nodeAt[node.ID] = len(b.nodes) - 1
 }
 
-// nodeIndex finds a node fact already published by this builder.
-func (b *builder) nodeIndex(id model.NodeID) int {
-	for i := len(b.nodes) - 1; i >= 0; i-- {
-		if b.nodes[i].Node.ID == id {
-			return i
-		}
-	}
-	return -1
-}
-
-func (b *builder) addEvidence(i int, rng *model.SourceRange, nativeKey string) {
-	if i < 0 {
+// addEvidence records another occurrence of a node this builder published.
+func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey string) {
+	i, ok := b.nodeAt[id]
+	if !ok {
 		return
 	}
 	if len(b.nodes[i].Evidence) >= model.MaxEvidencePerFact {
@@ -468,25 +529,49 @@ func (b *builder) searchUnit(d *declFact) model.SearchUnit {
 	}
 }
 
-// emit hands the facts to the sink in reference order.
-func (b *builder) emit(sink provider.Sink) (records uint64, err error) {
-	if err := sink.PutNodes(b.ctx, b.nodes); err != nil {
-		return 0, err
-	}
+// emit hands the facts to the sink in reference order: every node before any
+// relation, alias or search document that names it. Each kind streams in
+// slices of at most maxPutRecords, and the builder drops its reference to
+// each group once it is handed over, so the unit's output is not held in the
+// heap a second time while the sink persists it.
+func (b *builder) emit(sink provider.Sink) (uint64, error) {
 	rels := make([]model.RelationFact, 0, len(b.relOrder))
 	for _, id := range b.relOrder {
 		rels = append(rels, *b.rels[id])
 	}
-	if err := sink.PutRelations(b.ctx, rels); err != nil {
+	b.rels, b.relOrder = nil, nil
+	records := uint64(len(b.nodes) + len(rels) + len(b.aliases) + len(b.search))
+
+	nodes, aliases, search := b.nodes, b.aliases, b.search
+	b.nodes, b.nodeAt, b.aliases, b.search = nil, nil, nil, nil
+	if err := putChunked(b.ctx, nodes, sink.PutNodes); err != nil {
 		return 0, err
 	}
-	if err := sink.PutAliases(b.ctx, b.aliases); err != nil {
+	if err := putChunked(b.ctx, rels, sink.PutRelations); err != nil {
 		return 0, err
 	}
-	if err := sink.PutSearchUnits(b.ctx, b.search); err != nil {
+	if err := putChunked(b.ctx, aliases, sink.PutAliases); err != nil {
 		return 0, err
 	}
-	return uint64(len(b.nodes) + len(rels) + len(b.aliases) + len(b.search)), nil
+	if err := putChunked(b.ctx, search, sink.PutSearchUnits); err != nil {
+		return 0, err
+	}
+	return records, nil
+}
+
+// putChunked hands items to one Put in bounded slices, keeping their order.
+// Each chunk is capped so the sink cannot append into the next chunk's bytes,
+// and no chunk is read or written again once it is handed over: ownership of
+// a handed-off slice belongs to the sink (Section 11.1).
+func putChunked[T any](ctx context.Context, items []T, put func(context.Context, []T) error) error {
+	for len(items) > 0 {
+		n := min(len(items), maxPutRecords)
+		if err := put(ctx, items[:n:n]); err != nil {
+			return err
+		}
+		items = items[n:]
+	}
+	return nil
 }
 
 // collapse trims s, folds runs of whitespace into one space and bounds it.
