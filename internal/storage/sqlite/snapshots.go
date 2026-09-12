@@ -13,6 +13,15 @@ import (
 // progress) or a retention lease naming the snapshot (a source read), and
 // because a snapshot exists before any generation references it.
 
+// ReasonNotFound is the Details["reason"] value that marks a lookup which
+// found no row, so a caller can tell an absent snapshot or file from a
+// malformed argument under the shared CTX_ARGUMENT_INVALID code.
+const ReasonNotFound = "not_found"
+
+func notFound(format string, args ...any) *model.Error {
+	return invalid(format, args...).WithDetail("reason", ReasonNotFound)
+}
+
 // Snapshot reads one stored header exactly as PutSnapshot wrote it.
 func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapshot, error) {
 	raw, err := idBlob("snapshot.id", string(id))
@@ -28,7 +37,7 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 			capture_consistency, created_at FROM snapshots WHERE id = ?`, raw).
 			Scan(&repo, &snap.HeadObjectID, &snap.SourcePolicyHash, &snap.ManifestHash, &count, &bytes, &snap.CaptureConsistency, &created)
 		if isNoRows(err) {
-			return invalid("snapshot %s does not exist", id)
+			return notFound("snapshot %s does not exist", id)
 		}
 		if err != nil {
 			return wrap("snapshots", err)
@@ -65,7 +74,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 			if err := rows.Err(); err != nil {
 				return wrap("snapshot_files", err)
 			}
-			return invalid("file %s is not in snapshot %s", file, id)
+			return notFound("file %s is not in snapshot %s", file, id)
 		}
 		fv, err = scanFile(rows)
 		return err

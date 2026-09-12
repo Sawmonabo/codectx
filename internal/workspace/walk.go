@@ -205,13 +205,16 @@ func (w *walker) visitEntry(ctx context.Context, rel string, e entry, excluded b
 		}
 		return w.walkDir(ctx, rel, e.info, childExcluded)
 	}
-	forced := w.policy.ForceInclude != nil && w.policy.ForceInclude(rel)
 	if !e.info.Mode().IsRegular() {
 		// Devices, sockets, pipes and unresolved links are not source bytes.
 		return nil
 	}
-	if !forced && (excluded || w.fileExcluded(rel)) {
-		return nil
+	if excluded || w.fileExcluded(rel) {
+		// Only a file policy would drop is worth asking the Git owner about;
+		// an eligible file costs no lookup.
+		if w.policy.ForceInclude == nil || !w.policy.ForceInclude(rel) {
+			return nil
+		}
 	}
 	w.seen++
 	if w.seen%cancelCheckInterval == 0 {

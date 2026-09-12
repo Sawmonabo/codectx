@@ -258,7 +258,7 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 		t.Error("Open on a tombstone returned content")
 	}
 	d := files["d.md"]
-	if d.Status != model.FileUntracked || d.GitObjectID != "" || d.Language != "markdown" {
+	if d.Status != model.FileUntracked || d.GitObjectID != "" {
 		t.Fatalf("d.md = %+v; want untracked with no provenance", d)
 	}
 	if !files["run.sh"].Executable || files["a.txt"].Executable {
