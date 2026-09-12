@@ -54,9 +54,10 @@
    - [11.1 Provider Contract and Unit Ownership](#111-provider-contract-and-unit-ownership)
    - [11.2 Filesystem, Documentation, and Manifest Providers](#112-filesystem-documentation-and-manifest-providers)
    - [11.3 Tree-sitter Structural Provider](#113-tree-sitter-structural-provider)
-   - [11.4 SCIP Import and Approved Local Indexers](#114-scip-import-and-approved-local-indexers)
+   - [11.4 SCIP Import and Managed Indexers](#114-scip-import-and-managed-indexers)
    - [11.5 LSP Snapshot-Qualified Working-Tree Overlay](#115-lsp-snapshot-qualified-working-tree-overlay)
    - [11.6 Joern Deep-Analysis Provider](#116-joern-deep-analysis-provider)
+   - [11.7 Managed Analyzer Toolchain](#117-managed-analyzer-toolchain)
 - [12. Storage Architecture](#12-storage-architecture)
    - [12.1 SQLite Operating Model](#121-sqlite-operating-model)
    - [12.2 Current Schema and Reusable Units](#122-current-schema-and-reusable-units)
@@ -134,6 +135,7 @@
    - [Task 19: Implement the MCP Server and Typed Current-Protocol Tool Contracts](#task-19-implement-the-mcp-server-and-typed-current-protocol-tool-contracts)
    - [Task 20: Complete Diagnostics, Retention, Resource Accounting, and Integrated Fault Isolation](#task-20-complete-diagnostics-retention-resource-accounting-and-integrated-fault-isolation)
    - [Task 21: Complete End-to-End, Performance, Offline, Documentation, Packaging, and Release Gates](#task-21-complete-end-to-end-performance-offline-documentation-packaging-and-release-gates)
+   - [Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix](#task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix)
 - [31. Verification Matrix](#31-verification-matrix)
 - [32. Definition of Done](#32-definition-of-done)
 - [33. Authoritative References](#33-authoritative-references)
@@ -291,13 +293,13 @@ The installation is layered so absence of a heavyweight analyzer never makes the
 
 The initial product shall not:
 
-- Generate, edit, or patch repository code on behalf of the agent, or act as a general build/execution tool. An explicitly approved semantic indexer may need compiler processing; that activity runs against a private snapshot materialization and is subject to the analyzer trust policy, not silently treated as safe parsing.
+- Generate, edit, or patch repository code on behalf of the agent, or act as a general build/execution tool. A managed semantic indexer may need compiler processing; that activity runs against a private snapshot materialization under the tool lock policy of Section 11.7, not silently treated as safe parsing.
 - Include an LLM, chat UI, prompt engine, or autonomous coding loop.
 - Require embeddings or a vector database.
 - Claim that static analysis captures all dynamic dispatch, reflection, generated runtime behavior, or remote service behavior.
 - Claim that a served source range proves an AI model cognitively read or understood it.
 - Become a distributed, multi-tenant SaaS platform in the first release.
-- Auto-download or silently execute unapproved analyzer binaries.
+- Execute any analyzer that is not a lock-pinned, checksum-verified managed tool or an explicit user-level override, or fetch anything the embedded tool lock does not name.
 - Treat provider-generated natural-language summaries as canonical truth.
 - Follow symlinks outside the repository root by default.
 - Index binaries, build outputs, package caches, vendored dependencies, or generated trees by default.
@@ -327,7 +329,7 @@ Subagent handoffs include the exact policy above, the task scope, the pinned rev
 4. **Snapshot pinning everywhere.** Every result binds to an immutable snapshot and generation. Stable entity keys never authorize use outside that binding.
 5. **Fast by avoiding unnecessary work.** Reuse unchanged analysis units and source blobs; stream inputs; bound memory; use indexed queries; avoid duplicate parsing, whole-repository copies, and per-result database calls.
 6. **Capability-preserving resource control.** Apply admission, backpressure, cache eviction, sequential execution, and bounded disk spooling before rejecting work. Never silently omit facts, languages, source, or evidence to meet a benchmark.
-7. **No provider lock-in or hidden network requirement.** Canonical Go contracts do not expose analyzer-native types. Installed tools are detected separately from permission to execute them.
+7. **No provider lock-in or hidden network requirement.** Canonical Go contracts do not expose analyzer-native types. The only network the product performs is fetching lock-pinned, checksum-verified analyzer payloads into its private tool store; `tools.offline = true` or the offline bundle removes even that.
 8. **Read-only repository behavior.** Source writes, project hooks, and arbitrary commands are not core features. All state and private analyzer workspaces live under the private data directory.
 9. **Small, explicit abstractions.** One existing owner per behavior. Interfaces exist at real substitution, process, persistence, or consumer boundaries, not around every function.
 10. **Clean-room and maintainable implementation.** Adopt mature permissively licensed components. Do not copy restricted competitors. Keep tests focused on critical invariants; do not build a test framework or generate getter/mock boilerplate.
@@ -346,8 +348,8 @@ These constraints apply to every task and to all dispatched workers.
 | Execution | Section 5.1 is enforced before decisions and edits; whole-file reading, caller/state/contract tracing, and reuse inspection are required for every actor. |
 | Language and licensing | All product-owned production and automation logic is Go; module language baseline `go 1.27`, initial CI/release toolchain `go1.27.1`, Apache-2.0 project license. SQL, TOML, CI YAML, fixture languages, and embedded grammar/query data are declarative resources, not prohibited product executables. |
 | Greenfield | Change architecture and code in place, update all consumers and docs, remove obsolete paths. No backward-compatibility work, migration layers, transitional shims, dual APIs, or legacy preservation. |
-| External dependencies | Pin exact tested versions/checksums. No moving `latest`, unbounded minimum-version promises, silent installation, or silent toolchain downloads at runtime. |
-| No paid dependencies | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation. Optional analyzer networking is separately controlled and reported. |
+| External dependencies | Pin exact tested versions/checksums. No moving `latest`, unbounded minimum-version promises, or execution of an unpinned tool. Analyzer payloads and their runtimes are fetched only from the embedded tool lock and verified before use (Section 11.7). |
+| No paid dependencies | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation other than lock-pinned tool fetches through the one toolchain owner. Analyzer-internal networking is declared per profile and reported. |
 | Repository safety | No source writes; safe root-relative opens, not string validation alone. Analyzer materializations cannot share writable hard links with source or CAS. |
 | Memory | No whole-repository file list, graph, protobuf index, token corpus, or result set retained in Go heap. Memory admission counts bytes, concurrency, parser processes, SQLite buffers, caches, and output serialization. |
 | Resource limits | Every queue, batch, cache, record, request, traversal, process, temporary tree, and response has an explicit finite bound. Limits never masquerade as complete results. |
@@ -424,7 +426,7 @@ Acquire workspace indexing lock and resource reservation
   -> discover eligible paths as a stream
   -> capture every eligible source into CAS; build immutable source manifest
   -> create staging generation and provider plan
-  -> execute bounded base units; run approved optional providers
+  -> execute bounded base units; run managed optional providers
   -> validate/seal each unit and normalize its facts with provenance
   -> build lexical documents once per unit; reconcile deterministic identities
   -> validate generation membership, source bindings, capabilities and FTS
@@ -814,8 +816,8 @@ Batches are capped by **both records and retained bytes**, including strings, ev
 | filesystem/docs | none | file plus deterministic ancestor identities | base index |
 | manifest | filesystem | manifest/package and its dependency inputs | base index |
 | tree-sitter | filesystem | file-local extraction | base parser worker |
-| scip | filesystem, tree-sitter; manifest when profile needs it | declared package/workspace | approved optional index |
-| joern | filesystem, tree-sitter | declared package/workspace | approved optional index |
+| scip | filesystem, tree-sitter; manifest when profile needs it | declared package/workspace | managed optional index |
+| joern | filesystem, tree-sitter | declared package/workspace | managed optional index |
 | lsp | pinned files and available canonical structural facts | query workspace | optional query overlay, not `Provider.IndexUnit` |
 
 The LSP manager is a separate query adapter sharing the process runner, source conversion, and capability vocabulary; it is not forced into a nonexistent on-demand indexing enum. Optional provider absence is distinct from failure: a disabled/unconfigured optional provider is `unavailable` without making a healthy base generation falsely fail. An enabled requested capability that fails makes overall health `degraded` and preserves the precise missing scope.
@@ -846,23 +848,25 @@ Each worker owns its parser/tree/query/cursor. Close native objects deterministi
 
 The official binding requires explicit native lifecycle handling. A reported `ParseWithOptions` leak is a dependency-review risk, not proof that any arbitrary pinned release is fixed or affected. Inspect the chosen binding's complete relevant lifecycle/cancellation files, pin a verified revision, and cover the actual callback path in the shared repeated-parse resource check. Do not add a local compatibility shim or trust deprecated timeout APIs blindly. [4](#ref-4) [5](#ref-5) [26](#ref-26)
 
-<a id="114-scip-import-and-approved-local-indexers"></a>
-### 11.4 SCIP Import and Approved Local Indexers
+<a id="114-scip-import-and-managed-indexers"></a>
+### 11.4 SCIP Import and Managed Indexers
 
-Support generic local `.scip` import and approved installed profiles such as `scip-go`, `scip-typescript`, and `scip-java`. Profiles specify executable, exact version/arguments, input scope, output path, timeout, resource budgets, and evidence binding. No shell command string, package installation, or network fetch is inferred.
+Support generic local `.scip` import and the six managed indexer profiles of Section 11.7: `scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer scip`, and `scip-clang`. A profile is product-owned code: the lock entry it runs, the fixed argument array with typed substitutions, the input scope and trigger files, the output path, the timeout and resource budgets, the environment allowlist, the declared network posture, and the evidence binding. The user configures nothing; a repository whose trigger files match runs the matching profile with the managed tool. No shell command string is inferred and no tool outside the lock is executed unless the user explicitly overrides that profile's executable in user-level configuration.
 
 Decode top-level protobuf wire fields incrementally with a bounded reader; official generated messages are used only for bounded individual records. Do not `io.ReadAll` or unmarshal an entire index, and do not assume one document is small. Bound nested message length, field size, recursion, occurrences, and total spool bytes before allocation. Large document records are walked incrementally; a disk-backed native-symbol map or two-pass import resolves forward references and external symbols without an unbounded in-memory symbol table. Keep local symbols document-scoped; duplicate occurrences deduplicate by semantic evidence key without collapsing distinct source ranges. [6](#ref-6) [23](#ref-23)
 
 Validate UTF-8/UTF-16/UTF-32 positions against the exact file. Project root, a matching path, timestamps, or an indexer version alone do not prove the index analyzed these bytes. A codectx-invoked profile records captured input hashes. A supplied index must have matching embedded source text or a verified input-hash manifest to qualify as exact-source compiler evidence. Without that association, import remains available but is marked `source_binding=unverified`, isolated from strict canonical compiler facts, and surfaced for discovery/diagnosis. Never silently upgrade stale externally supplied data to precise evidence.
 
+Compiler-precise indexing needs the project's own dependencies to be resolvable inside the private materialization: `node_modules` present for TypeScript and Python packages installed for scip-python, a warm Go module cache, a Cargo registry cache, a `compile_commands.json` for scip-clang, and a build tool that can resolve Java dependencies. A profile runs with its declared network posture and fails typed (`dependencies_unresolved`) when they are not; the structural baseline still serves the repository and the status/doctor output names the missing prerequisite. This is the same boundary CodeQL's autobuild has and it is disclosed, not hidden. [37](#ref-37) [43](#ref-43) [44](#ref-44) [45](#ref-45)
+
 <a id="115-lsp-snapshot-qualified-working-tree-overlay"></a>
 ### 11.5 LSP Snapshot-Qualified Working-Tree Overlay
 
-LSP provides on-demand document/workspace symbols, definition, references, implementations, type definition, and call hierarchy when the approved local server advertises them. Use private materialized bytes from the pinned dirty-worktree snapshot, not mutable live files mislabeled as historical truth. Source and dependency inputs are qualified together. Unsaved editor buffers remain outside V1 because CLI/MCP does not own the editor synchronization stream.
+LSP provides on-demand document/workspace symbols, definition, references, implementations, type definition, and call hierarchy when the managed server advertises them. Use private materialized bytes from the pinned dirty-worktree snapshot, not mutable live files mislabeled as historical truth. Source and dependency inputs are qualified together. Unsaved editor buffers remain outside V1 because CLI/MCP does not own the editor synchronization stream.
 
 The LSP client owns Content-Length framing, initialize/initialized and shutdown/exit lifecycle, bounded outstanding requests, out-of-order responses, cancellation, document synchronization, and negotiated position encoding. LSP lifecycle is distinct from the MCP 2026 protocol. Treat server-initiated requests explicitly: return supported bounded read-only configuration, otherwise a protocol error; never perform `workspace/applyEdit`, run project commands, or follow external URIs. Validate returned ranges and locations against the materialization. [7](#ref-7)
 
-The manager starts only trusted enabled profiles lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, and `jdtls` where installed and approved. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP/Joern. The complete advertised live-query feature set remains available as a labeled overlay.
+The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP/Joern. The complete advertised live-query feature set remains available as a labeled overlay.
 
 <a id="116-joern-deep-analysis-provider"></a>
 ### 11.6 Joern Deep-Analysis Provider
@@ -875,13 +879,53 @@ joern-export [profile-owned CPG path] --repr=all --format=neo4jcsv --out <privat
 joern-export [profile-owned CPG path] --repr=pdg --format=graphml --out <private pdg>
 ```
 
-The bracketed operands denote profile fields whose exact argv must be captured from the installed pinned tool's help and tested real invocation in Task 11; they are not shell fragments or production placeholders. Version/help detection itself executes code and therefore requires trusted executable approval.
+The bracketed operands denote profile fields whose exact argv is captured from the managed pinned tool's help and tested real invocation in the Task 22 matrix; they are not shell fragments or production placeholders. Version/help detection itself executes code and therefore runs only against a lock-verified binary.
 
 Stream CSV and XML with field/record/depth caps enforced **before** a standard decoder can allocate an unbounded field. Use an on-disk native-ID map for arbitrary graph ordering; do not drop forward edges because a lookup window expired. Map only profile-owned CPG labels. Unknown labels are counted and reported. A dependence edge does not alone prove an end-to-end source-to-sink exploit or complete dataflow. Verify actual CPG overlays and exported labels; do not assume all Joern versions require the same overlay command. The export and common-issues documentation describe version-sensitive behavior. [8](#ref-8) [9](#ref-9) [10](#ref-10) [27](#ref-27)
 
-Missing tools are unavailable; a timeout, malformed export, or unsupported profile is failed/partial with no unsealed facts admitted. A real pinned-tool smoke run is required before claiming that profile works, although ordinary tests use small checked-in exports. Remove materializations, CPGs, and exports on every termination path. Server mode is outside V1 and must not be introduced as a shortcut.
-Live-query routing is explicit: symbol/reference/call-hierarchy requests accept `semantic_source=canonical|lsp` (default canonical), a trusted profile selector, and the required pinned file/range or symbol input. The CLI exposes `--semantic-source` on those commands; MCP uses the same typed field. `find_symbol` supports document/workspace symbol operations, and references supports implementation/type-definition operations. Query metadata contains a labeled overlay provider/version/input digest when LSP is used. Unsupported LSP methods return unavailable capability, not a silently substituted canonical answer. Context compilation always requests canonical mode.
+A tool the lock does not provide for the current platform is unavailable with a typed platform reason; a timeout, malformed export, or unsupported profile is failed/partial with no unsealed facts admitted. The real pinned tool runs in the Task 22 CI matrix before the profile is documented as working, although ordinary tests use small checked-in exports. Remove materializations, CPGs, and exports on every termination path. Server mode is outside V1 and must not be introduced as a shortcut. Joern is disabled by default because of its runtime cost, not because it needs setup: `providers.joern.enabled = true` is the only step.
+Live-query routing is explicit: symbol/reference/call-hierarchy requests accept `semantic_source=canonical|lsp` (default canonical), a managed profile selector, and the required pinned file/range or symbol input. The CLI exposes `--semantic-source` on those commands; MCP uses the same typed field. `find_symbol` supports document/workspace symbol operations, and references supports implementation/type-definition operations. Query metadata contains a labeled overlay provider/version/input digest when LSP is used. Unsupported LSP methods return unavailable capability, not a silently substituted canonical answer. Context compilation always requests canonical mode.
 
+
+<a id="117-managed-analyzer-toolchain"></a>
+### 11.7 Managed Analyzer Toolchain
+
+A user installs codectx and every supported language works at its best available precision. The product owns every external analyzer and every runtime those analyzers need. Nothing is looked up on PATH, nothing is installed by the user, and nothing runs that the shipped binary did not pin. This is CodeQL's distribution model: one bundle with every extractor and its own runtime, plus on-demand fetch of pinned packs for the slim install. It is also mise's lockfile model: an exact version, a per-platform URL, and a SHA-256 per artifact, verified before anything executes. [37](#ref-37) [38](#ref-38) [39](#ref-39) [40](#ref-40)
+
+**Tool lock.** The binary embeds `internal/toolchain/tools.lock.json`. One entry per tool: `name`, `version`, `kind` (`indexer`, `server`, `cpg`, `runtime`), `license`, `upstream`, `runtime` (empty, `node` or `jdk`), `entry` (payload-relative executable, script or jar), `entry_sha256`, and a `platforms` map from `<os>_<arch>` to `{url, sha256, size}`. A platform absent from the map means the tool is unavailable there, reported as such, never a failure. The lock is data; the profile argv, triggers, and budgets are product code that names a lock entry.
+
+**Payloads.** Every payload is a uniform `<name>-<version>-<os>-<arch>.tar.gz` published as an asset of a `tools-v<n>` release of the codectx repository and produced by the release-time Go program `internal/tools/toollock`. That program downloads each upstream distribution (GitHub release assets, `registry.npmjs.org` tarballs, `nodejs.org/dist`, Adoptium Temurin, `download.eclipse.org/jdtls`), verifies it against the upstream-published digest, runs any install step the distribution needs at build time (`npm ci --omit=dev` for Node packages, a `go build` of `gopls`, which has no upstream binaries), normalizes the tree, and writes the lock. The runtime never runs `npm`, `pip`, `coursier`, `go install`, or any package manager. Re-hosting means one URL scheme, one archive format, one digest per artifact, and no dependence on upstream retention or renames; the license of every redistributed payload is recorded in the lock and in `THIRD_PARTY_LICENSES.md`. [41](#ref-41) [42](#ref-42) [46](#ref-46)
+
+**Store.** Payloads live under `<data_dir>/tools/<name>/<version>/` with mode `0o700`. Install is atomic: fetch to `<data_dir>/tools/.staging/<random>/` with the byte cap, verify size and SHA-256 against the lock, extract with root confinement (reject absolute paths, `..`, symlinks whose target leaves the payload, hard links, devices, and more than the declared file count and bytes), fsync, then rename into place and write a `.complete` file carrying the payload digest. A cross-process file lock serializes installs of the same tool. A directory without `.complete` is invisible and swept. Versions not named by the current lock are removed by retention after a binary upgrade.
+
+**Resolution.** `toolchain.Resolver.Resolve(ctx, name)` returns the runnable tool in this order: the user-level `[tools.override.<name>]` if present (absolute executable, exact version, SHA-256, verified on every run start); otherwise the store entry whose `.complete` digest matches the lock and whose `entry` hashes to `entry_sha256`; otherwise, unless `tools.offline = true`, a fetch of the lock payload, after which the store entry is used. A runtime-dependent tool resolves its runtime the same way and the result's `ArgvPrefix` carries the launcher, for example `[<store>/node/<v>/bin/node, <store>/scip-typescript/<v>/dist/main.js]` or `[<store>/jdk/<v>/bin/java, -jar, <store>/scip-java/<v>/scip-java.jar]`. Unavailability is typed: `CTX_TOOL_OFFLINE`, `CTX_TOOL_UNSUPPORTED_PLATFORM`, `CTX_TOOL_FETCH_FAILED`, `CTX_TOOL_DIGEST_MISMATCH`, `CTX_TOOL_OVERRIDE_INVALID`. Fetch failures are retried within one fixed attempt/deadline budget and then reported; a digest mismatch is never retried and never executed.
+
+**Network.** `internal/toolchain` is the only package in the product that imports `net/http`, and CI enforces that with a build-time check. It fetches only URLs that appear in the embedded lock, or the same path under `tools.mirror` when set, follows at most three redirects to the same host set, honors the standard proxy environment, and bounds bytes and time. `tools.offline = true` makes every fetch a typed refusal without opening a socket. The release bundle is the slim binary with the store pre-populated for one platform and needs no network at all. Ordinary logging records tool name, version, digest, byte count, and elapsed time for each fetch, and nothing else. This is the Zed lesson applied: a silent runtime download is acceptable only when every byte is pinned and verified; Zed's unverified auto-download is the anti-pattern. [40](#ref-40)
+
+**Inference.** Which managed tools a repository needs is inferred from evidence the snapshot already holds, as Sourcegraph auto-indexing infers jobs from repository files: the SCIP trigger files and the LSP root markers of Sections 11.4 and 11.5, together with the language table. Nothing is fetched for a language the repository does not contain. `codectx tools prefetch --all` and the bundle exist for CI and offline hosts, not as a required step. [39](#ref-39)
+
+**Supported matrix.** Platform keys follow Section 24. Exact versions and digests are lock contents produced at Task 22 from the real upstream releases, not values asserted here.
+
+| Tool | Kind | Languages | Runtime | Upstream distribution | Platforms |
+|---|---|---|---|---|---|
+| `node` | runtime | — | — | `nodejs.org/dist` current LTS, `SHASUMS256.txt` | all six |
+| `jdk` | runtime | — | — | Adoptium Temurin 21 LTS JDK | all six |
+| `scip-go` | indexer | go | — | `sourcegraph/scip-go` release binaries | all six |
+| `scip-typescript` | indexer | typescript, tsx, javascript | node | npm `@sourcegraph/scip-typescript` | all six |
+| `scip-python` | indexer | python | node | npm `@sourcegraph/scip-python` | all six |
+| `scip-java` | indexer | java | jdk | `sourcegraph/scip-java` release; run as `java -jar` under the managed JDK so Windows is covered without the dropped upstream launcher | all six, verified per platform at Task 22 |
+| `rust-analyzer` | indexer and server | rust | — | `rust-lang/rust-analyzer` release; `rust-analyzer scip <path> --output` for SCIP, `rust-analyzer` for LSP | all six |
+| `scip-clang` | indexer | c, cpp | — | `sourcegraph/scip-clang` release binaries | linux and darwin only; Windows uses `clangd` for precise C/C++ |
+| `gopls` | server | go | — | built at release time from `golang.org/x/tools/gopls` at the pinned version | all six |
+| `typescript-language-server` | server | typescript, tsx, javascript | node | npm `typescript-language-server` with `typescript` | all six |
+| `pyright` | server | python | node | npm `pyright` | all six |
+| `clangd` | server | c, cpp | — | `clangd/clangd` release archives | as published upstream |
+| `jdtls` | server | java | jdk | `download.eclipse.org/jdtls/milestones` tarball | all six |
+| `joern` | cpg | Section 11.6 languages | jdk | `joernio/joern` per-platform `joern-cli` archives | as published upstream |
+
+**Lifecycle commands.** `codectx tools status` lists every lock entry with installed/available/unsupported/override state and the languages it unlocks; `tools prefetch [--all | --for-repo PATH]` installs ahead of time; `tools verify` rehashes the store; `tools gc` removes versions the current lock does not name. `doctor` includes the same report. None of these is required for ordinary use.
+
+**Verification.** Every profile is exercised against the real lock payload on Linux and macOS in the CI matrix of Task 21 before the docs may call it supported; Windows runs every entry the lock provides there. "Unverified against a real tool" is a CI failure, not a documentation label. [39](#ref-39) [41](#ref-41)
 
 ---
 
@@ -1371,7 +1415,7 @@ An alias may identify a node defined by a completed dependency rather than copyi
 <a id="131-scheduling-and-invalidation"></a>
 ### 13.1 Scheduling and Invalidation
 
-The coordinator owns trusted detection, the provider DAG, resource reservations, unit scheduling, reuse, capability reporting, and activation. Reuse must be demonstrated by equal UnitID and validated input/dependency membership, not assumed because a file's path is unchanged. File-local providers reprocess changed files only; semantic providers use their declared package/workspace unit. A source addition, deletion, rename, changed manifest, build flag, query/grammar version, or dependency catalog can invalidate downstream units.
+The coordinator owns tool and trigger detection, the provider DAG, resource reservations, unit scheduling, reuse, capability reporting, and activation. Reuse must be demonstrated by equal UnitID and validated input/dependency membership, not assumed because a file's path is unchanged. File-local providers reprocess changed files only; semantic providers use their declared package/workspace unit. A source addition, deletion, rename, changed manifest, build flag, query/grammar version, or dependency catalog can invalidate downstream units.
 
 Stage data on disk; compute dependency closure with bounded queues and indexed reverse dependency lookups. If a semantic provider cannot safely invalidate locally, rerun its declared larger unit and report it. Do not secretly rerun every base provider over the full repository on each small edit. A no-op refresh emits reuse counts and performs no parse or FTS rewrite.
 
@@ -1766,13 +1810,17 @@ codectx context advance SESSION verify|consolidate|complete --actor ID --expecte
 codectx context capsule SESSION --actor ID [--limit N] [--cursor TOKEN] [--json]
 codectx context close SESSION --actor ID [--json]
 codectx context export SESSION --actor ID --output FILE
+codectx tools status [--json]
+codectx tools prefetch [--all | --for-repo PATH] [--json]
+codectx tools verify [--json]
+codectx tools gc [--json]
 codectx mcp serve --repo PATH [--watch]
 codectx version [--json]
 ```
 
 `record --input` reads bounded typed observation JSON, including source references and structured scope review; simple `--relation`, `--node`, `--source file:start:end`, and `--note` flags remain supported for ordinary observations, mutually exclusive with `--input`. A source flag resolves its hash from the pinned session, never the live file. All list commands support the same cursor policy. Applicable commands also accept `--repo`, `--generation`, and bounded `--timeout` options; graph options include visited/edge caps. Context byte/file/slice budgets have explicit flags in addition to the token-estimate `--budget` shorthand.
 
-A supplied SCIP index is configured through a trusted local import profile with its exact path and optional hash manifest; `index --scip-index PATH --scip-inputs PATH` is the explicit CLI convenience. Indexer execution profiles are selected only from trusted user-level configuration. `init` is the only ordinary command writing project configuration; it refuses overwrite unless explicitly forced. `context export` writes only the explicitly selected output and refuses to overwrite source or existing files without a specific user request.
+`index --scip-index PATH --scip-inputs PATH` imports a supplied index with its optional input-hash manifest. Managed indexer profiles need no configuration; `tools` commands are conveniences for CI and offline hosts, never a prerequisite (Section 11.7). `init` is the only ordinary command writing project configuration; it refuses overwrite unless explicitly forced. `context export` writes only the explicitly selected output and refuses to overwrite source or existing files without a specific user request.
 
 <a id="182-output-and-exit-codes"></a>
 ### 18.2 Output and Exit Codes
@@ -1792,7 +1840,7 @@ A supplied SCIP index is configured through a trusted local import profile with 
 Every `--json` request emits one bounded envelope with `schema_version`, `command`, `ok`, `data`, `warnings`, and `error`, including domain/argument errors after JSON mode is selected. JSON error data goes to stdout in that envelope, while logs go to stderr; do not also print a conflicting human error or call `os.Exit` inside services. Partial results on a hard limit use the same envelope with their explicit incompleteness and code 7. A broken stdout pipe fails the command and does not confirm source receipt delivery.
 
 Human output may truncate display while showing omitted counts and continuation. The service result is not silently truncated by a renderer. Install signal cancellation at the process boundary; all rows, processes, leases and reservations are released on cancellation. Help/version remain cheap and usable without Git, a database, or optional analyzers.
-Symbol, reference and call-hierarchy commands expose `--semantic-source canonical|lsp` and a trusted `--profile` selector; canonical is the default. `symbol --operation resolve|document-symbols|workspace-symbols|definition` selects the typed symbol operation. These flags are forwarded by the shared facade, keeping every supported LSP operation reachable rather than leaving an unwired manager.
+Symbol, reference and call-hierarchy commands expose `--semantic-source canonical|lsp` and a `--profile` selector naming a managed server; canonical is the default. `symbol --operation resolve|document-symbols|workspace-symbols|definition` selects the typed symbol operation. These flags are forwarded by the shared facade, keeping every supported LSP operation reachable rather than leaving an unwired manager.
 
 Exploratory consolidation with recorded waivers additionally requires the explicit user-level `allow_exploratory_waiver_consolidation` setting; it is disabled by default, forbidden in project config, and never changes strict readiness.
 
@@ -1913,6 +1961,14 @@ wal_high_water_bytes = 67108864
 closed_session_retention = "7d"
 query_cursor_ttl = "15m"
 
+[tools]
+# Managed analyzer toolchain (Section 11.7). Nothing here is required.
+offline = false
+cache_dir = ""
+mirror = ""
+max_fetch_bytes = 2147483648
+fetch_timeout = "10m"
+
 [providers.tree_sitter]
 enabled = true
 languages = ["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]
@@ -1930,8 +1986,8 @@ max_outstanding_requests = 8
 idle_ttl = "60s"
 
 [providers.joern]
+# Off by default for runtime cost only; true is the whole setup.
 enabled = false
-profile = "pinned-default"
 timeout = "45m"
 
 [context]
@@ -1968,11 +2024,11 @@ Validate related values together: source chunk plus worst-case wire encoding mus
 <a id="202-trust-and-fingerprints"></a>
 ### 20.2 Trust and Fingerprints
 
-Project config may select source inclusion, language and safe query preferences, but cannot authorize executables, arbitrary argv/env, shell interpreters, network access, broader path roots, weakened strict gates, or larger security ceilings. Those controls require explicit user-level configuration/CLI policy. Exploratory waiver consolidation is user-only and never weakens strict read readiness. `enabled="auto"` means use an available **already approved** profile, not execute anything found on PATH. Resolve binaries to absolute paths, record version/checksum, and reject writable-repository executable substitution. Detection via `--version` or `--help` is still execution.
+Trust is the embedded tool lock (Section 11.7). A managed tool is runnable because its payload digest and entry digest match the lock the shipped binary carries; there is no approval step and nothing is looked up on PATH. Project config may select source inclusion, language and safe query preferences, but cannot set any `[tools]` key, authorize executables, arbitrary argv/env, shell interpreters, network access, broader path roots, weakened strict gates, or larger security ceilings. Those controls require explicit user-level configuration/CLI policy. Exploratory waiver consolidation is user-only and never weakens strict read readiness. `enabled="auto"` means run every managed profile whose trigger evidence the snapshot holds.
 
-Approved profiles define exact executable paths/version constraints, fixed argument arrays with typed validated substitutions, private work directories, environment allowlists, optional analyzer memory budgets, and network policy. Profile templates cannot inject shell fragments. No cloud/AI credential fields exist in core.
+`[tools.override.<name>]` is the only way to run a tool the lock did not ship: an absolute executable, an exact version and a required SHA-256, verified on every run start. Profile argv, environment allowlists, budgets, work directories, and network posture are product code, not configuration; an override changes the binary, never the invocation. Detection via `--version` or `--help` is still execution and runs only against a lock-verified or override-verified binary. No cloud/AI credential fields exist in core.
 
-Separate fingerprints: source eligibility/byte policy for SnapshotID; analyzer/query/grammar/build inputs for UnitID and AnalysisKey; context ranking/budget policy for ManifestID; operational worker counts, logging and UI formatting are not semantic source inputs. Changing a safety limit affects completeness/result metadata when work is limited, but must not silently reuse a complete result produced under a different effective requirement.
+Separate fingerprints: source eligibility/byte policy for SnapshotID; analyzer/query/grammar/build inputs, including the tool name, version and payload digest, for UnitID and AnalysisKey; context ranking/budget policy for ManifestID; operational worker counts, logging and UI formatting are not semantic source inputs. Changing a safety limit affects completeness/result metadata when work is limited, but must not silently reuse a complete result produced under a different effective requirement.
 
 ---
 
@@ -1985,11 +2041,11 @@ Threats include malicious repository files/configuration, hostile filenames, sym
 |---|---|
 | Filesystem | Root-confined opens; reject absolute/unmapped paths, `..` escapes, NULs and unsupported file types; handle case sensitivity and Unicode without aliasing distinct valid paths. Use OS-specific safe-opening semantics. |
 | Git | One shared argv-based runner; NUL-delimited paths; avoid hooks/filter execution and optional index writes; set safe process environment and treat configured Git helpers as untrusted execution. |
-| Analyzer execution | Explicit trusted executable/profile; no shell interpolation; private snapshot materialization; allowlisted environment; bounded stdin/stdout/stderr, temporary bytes and runtime. |
-| Project code execution | Compilers/indexers may load plugins, build macros or project configuration. Explicitly disclose this, require trusted profiles, and isolate accordingly; argv alone is not a sandbox. |
+| Analyzer execution | Lock-verified managed tool or digest-verified user override; product-owned argv; no shell interpolation; private snapshot materialization; allowlisted environment; bounded stdin/stdout/stderr, temporary bytes and runtime. |
+| Project code execution | Compilers/indexers may load plugins, build macros or project configuration. Explicitly disclose this in status/doctor output, run only lock-verified tools against private materializations, and isolate accordingly; argv alone is not a sandbox. |
 | Process trees | Unix process groups and Windows Job Objects, graceful stop then bounded forced termination, wait/drain and cleanup. Prevent Windows child escape during process/job assignment using supported atomic/suspended-launch mechanics. |
 | Native parser | Same-binary worker process; bounded input/IPC; validate every result; native crashes cannot kill MCP/CLI serving. |
-| Network | Core has no outbound network path. Strong analyzer denial uses an OS sandbox/container/namespace or equivalent deployment control; proxy clearing/environment flags are not a security boundary. |
+| Network | The only outbound path is `internal/toolchain` fetching lock-named payloads, build-checked as the sole `net/http` importer and disabled by `tools.offline` or the bundle. Strong analyzer denial uses an OS sandbox/container/namespace or equivalent deployment control; proxy clearing/environment flags are not a security boundary. |
 | Provider data | Validate protocol lengths before allocation, nested depth, record fields, canonical IDs, source hashes, range encoding, capability claims, and visible endpoints. |
 | API | Typed bounded inputs, session actor checks, signed cursors/receipts, schema validation and cancellation. No source bodies in generic tools. |
 | Private storage | User-private directories/files where supported, no writable hard links, no secrets/source in routine logs, quotas and explicit retention. |
@@ -2028,7 +2084,7 @@ CTX_DISK_FULL                 CTX_STORAGE_CORRUPT
 
 Errors have a typed code, safe message, bounded structured details, retryability and remediation. Cancellation is not logged as an unexpected crash. Retry only transient operations with a fixed attempt/deadline budget; never retry a malformed input, bad source hash or denied trust decision as if it were a temporary network fault.
 
-`doctor` checks build/toolchain pins, workspace/data-directory permissions, free space, SQLite schema/FTS/WAL, active pointer, recent capture/freshness, sample CAS blocks, bundled grammar availability, trusted analyzer/profile status, orphan temporary state and session/lease retention. `--deep` performs expensive integrity and parser smoke checks explicitly. No full database scan occurs on every version/search command.
+`doctor` checks build/toolchain pins, workspace/data-directory permissions, free space, SQLite schema/FTS/WAL, active pointer, recent capture/freshness, sample CAS blocks, bundled grammar availability, managed toolchain status per lock entry, orphan temporary state and session/lease retention. `--deep` performs expensive integrity and parser smoke checks explicitly. No full database scan occurs on every version/search command.
 
 Status exposes current and peak parent RSS, aggregate base-worker RSS, Go-managed memory, native-worker memory, query/cache/queue reservations, live subprocesses, pending events, DB/WAL/temp/CAS bytes, unit reuse and parse counts, capability limits, and per-stage timing. Record unavailable metrics as unavailable, not zero. Peak process-tree memory is sampled concurrently, not calculated by adding unrelated per-process historical peaks. There is no remote metrics or telemetry endpoint in V1.
 
@@ -2044,7 +2100,7 @@ These are **proposed engineering acceptance budgets**, not observed results. The
 
 Reference workload: 1 million eligible source lines, 10,000 files, approximately 80 MiB source, all required languages represented, fixed generated source/graph seeds, representative manifests/tests/configuration/docs and a high-fanout case. Reference machine: 8 logical cores, 8 GiB RAM, local SSD, pinned OS/toolchain/build. Publish exact hardware, filesystem, cache state, grammar/provider versions, configuration, line/file/byte/node/edge counts and fixture hashes. Test real repositories as an additional signal, not a moving substitute for the fixed fixture.
 
-Base means parent process **plus all mandatory parser workers**, not only Go heap. Report approved SCIP/LSP/Joern individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
+Base means parent process **plus all mandatory parser workers**, not only Go heap. Report managed SCIP/LSP/Joern individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
 
 <a id="232-initial-release-budgets"></a>
 ### 23.2 Initial Release Budgets
@@ -2117,6 +2173,8 @@ codectx_<version>_darwin_amd64.tar.gz
 codectx_<version>_darwin_arm64.tar.gz
 codectx_<version>_windows_amd64.zip
 codectx_<version>_windows_arm64.zip
+codectx-bundle_<version>_<os>_<arch>.tar.gz   (slim binary plus pre-populated tool store, one per target)
+tools-v<n>/<tool>-<version>-<os>-<arch>.tar.gz  (lock payloads, a separate release)
 checksums.txt
 sbom.spdx.json
 THIRD_PARTY_LICENSES.md
@@ -2124,7 +2182,7 @@ THIRD_PARTY_LICENSES.md
 
 Ship the binary, bundled pinned grammars, LICENSE/NOTICE, documented default config, shell completions, checksums and SBOM. The private Tree-sitter worker is a mode of that same binary, not another installed service. Official Tree-sitter bindings use native code, so release builds must not claim `CGO_ENABLED=0` portability; SQLite's CGo-free driver does not remove Tree-sitter's native requirements. Build with `-trimpath`, pinned toolchain and deterministic version metadata; a wall-clock build timestamp must not defeat reproducibility. [4](#ref-4) [13](#ref-13)
 
-Profiles remain local base, local precise (approved SCIP/LSP), and local deep (approved Joern). All integrations exist in V1 even when the external tool is absent. Do not bundle third-party analyzers without a specific licensing/version decision or auto-install them. A future team server is outside V1. No supported profile requires a paid service or AI API key.
+Profiles remain local base (bundled grammars), local precise (managed SCIP/LSP), and local deep (managed Joern). The slim archive fetches lock payloads on first use; the bundle archive carries the store pre-populated for its platform and never touches the network. Every redistributed tool and runtime has a recorded license and version in the lock and in `THIRD_PARTY_LICENSES.md` (Section 11.7). A future team server is outside V1. No supported profile requires a paid service or AI API key.
 
 The data directory is workspace/installation-specific. Rebuild and pruning commands make destructive consequences explicit. An incompatible schema is not automatically migrated, and an existing user's session artifacts are not silently deleted by a new binary. Version mismatches fail clearly; greenfield development changes are in place, not a reason to add a compatibility system.
 Release SBOM generation uses the pinned selected SPDX or CycloneDX tooling, with native grammar assets included. [19](#ref-19) [20](#ref-20)
@@ -2169,7 +2227,7 @@ The same tests can satisfy multiple verification-matrix rows. Full source readin
 The release is acceptable only when demonstrated evidence supports every item:
 
 - Base indexing succeeds offline without optional analyzers and includes all required languages, files, symbols, scopes, imports/exports, structural calls/references, tests, manifests, dependencies, configuration, documents and source ranges.
-- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; approved Joern profiles contribute only export-supported deep facts.
+- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; managed Joern profiles contribute only export-supported deep facts.
 - Every retained source remains readable after worktree edits and Git history changes; unsafe paths, wrong hashes, invalid coordinates and unverified imports cannot become trusted facts.
 - Unit reuse avoids reprocessing unchanged source and correctly invalidates changed dependencies, including new/deleted files and provider/config changes. Failed units do not leak and generations publish atomically.
 - All queries remain pinned, paginated, explainable and deterministic; unrelated staging/retained generations do not change canonical lexical scores. Hard bounds and incomplete capability are always visible.
@@ -2205,7 +2263,10 @@ This is a falsifiable definition of acceptance, not a claim that static analysis
 | Watch notifications are incomplete | Stale source | Recursive directory management and periodic content reconciliation, not Git hints alone. |
 | Separate processes index concurrently | Lost publication or excessive memory | Workspace indexing lock and finite contention policy. |
 | Long reads pin WAL / GC races with new leases | Disk growth or missing source | Short transactions, WAL backpressure, coordinated leases/GC grace checks. |
-| Analyzer runs hooks or follows unsafe config | Repository writes or disclosure | Trusted user-only profile, private inputs, process/OS controls and explicit limitations. |
+| Analyzer runs hooks or follows unsafe config | Repository writes or disclosure | Lock-verified tool, product-owned argv, private inputs, process/OS controls and explicit limitations. |
+| Upstream tool asset removed, renamed or changed | Managed install fails or runs unexpected bytes | Payloads re-hosted under codectx `tools-v<n>` releases; lock digest and size checked before extraction; `tools.mirror` for private hosts. |
+| Lock argv drifts from the real tool | Profile silently produces nothing | Task 22 CI matrix runs every lock entry per release on each platform; unverified means failing. |
+| Fetch path becomes a general network capability | Hidden outbound traffic | Single `net/http` importer enforced at build; only lock URLs; `tools.offline` and bundle. |
 | Schema mismatch destroys session evidence | Lost audit/source | Fail closed, explicit new-cache rebuild; no automatic migration or deletion. |
 | Tests become another large framework | Slow development and maintenance | Few shared critical suites, table cases and one resource harness; remove redundant tests. |
 | Performance claimed without execution | False assurance | Published reproducible measurements; mark targets unverified until run. |
@@ -2237,6 +2298,8 @@ internal/provider/treesitter/languages/  pinned grammar and query packs
 internal/provider/scip/            wire import, aliases, source binding, profiles
 internal/provider/lsp/             bounded client, manager, snapshot-qualified overlay
 internal/provider/joern/           pinned exports, streaming import and normalization
+internal/toolchain/                embedded tool lock, verified fetch, atomic store, resolver, runtime launchers
+internal/tools/toollock/           release-time lock and payload generator
 internal/reconcile/                deterministic canonical resolution and lineage
 internal/index/                    unit planning, scheduling, invalidation, watch/status
 internal/pagination/               shared cursor signing, leases and bounded spools
@@ -2251,7 +2314,7 @@ internal/diagnostics/              typed health/resource/doctor reporting
 internal/retention/                coordinated unreachable-object collection
 internal/e2e/                      shared critical workflow fixture
 internal/bench/                    one fixture generator and resource benchmark harness
-internal/tools/                    only thin Go automation actually needed by CI
+internal/tools/                    only thin Go automation actually needed by CI and release
 
 testdata/                          small polyglot, SCIP, LSP and Joern fixtures
 docs/                              architecture, providers, MCP, operations,
@@ -2276,7 +2339,8 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Syntax parsing | Official Tree-sitter Go binding and grammars | Mature syntax engine; own extraction queries and bounded worker lifecycle. |
 | Precise interchange | Official SCIP schema/bindings and protobuf primitives | Stream validated records, do not invent a competing symbol protocol. |
 | Live semantics | Small bounded LSP client/manager | Only required read-only methods and profiles, not an editor or generic command executor. |
-| Deep analysis | Optional installed Joern | Integrate built-in exports; no copied CPG engine or product Scala code. |
+| Deep analysis | Managed Joern | Integrate built-in exports; no copied CPG engine or product Scala code. |
+| Analyzer distribution | Product-owned tool lock with re-hosted payloads and a stdlib fetch/verify/extract path | No package manager, npm, coursier or `go install` at runtime; runtimes (Node, JDK) are lock entries too. |
 | Database/FTS | SQLite through `modernc.org/sqlite`, FTS5 | Embedded indexed store; own generation membership/scoped ranking where required. |
 | Watch | `fsnotify` with reconciliation | Notifications are hints; avoid a bespoke filesystem watcher. |
 | CLI/config | Cobra and pinned TOML parser | Own strict policy validation, not a global dynamic configuration framework. |
@@ -2312,11 +2376,12 @@ The sections above are normative and travel with this plan. Tasks are coherent r
 6 -> 7 and 8                            base providers
 6 -> 9, 10 and 11                       optional adapter development
 7 + 8 -> 12                            usable base coordinator
-9/10/11 -> same registry/query hooks    integrate without blocking base milestone
+9 + 10 + 11 -> 22                       managed toolchain rewrites the three profile boundaries; runs parallel to 12
+12 + 22 -> app composition              integration owner wires toolchain.Resolver into provider composition
 5 + 12 -> 13 and 14                     independent search and graph
 13 + 14 -> 15 -> 16 -> 17               context, coverage, workflow + facade
 17 -> 18 and 19                        independent CLI / MCP adapters
-1–19 -> 20 -> 21                       integrated hardening / measured release
+1–19, 22 -> 20 -> 21                   integrated hardening / measured release (21 runs the real-tool matrix)
 ```
 
 Runtime provider dependency order is still enforced when source tasks are developed in parallel. Task 5 consumes neutral model metadata, not future provider implementations. Task 4 already has the Task 3 runner. Graph accepts resolved IDs and does not depend on Search. Both product adapters consume the facade delivered by Task 17. These constraints remove the original task-order/import-cycle ambiguity.
@@ -2328,12 +2393,12 @@ Runtime provider dependency order is still enforced when source tasks are develo
 |---|---|---|
 | M0 Foundation | 1–6 | Pinned Go project, safe process/source boundaries, CAS, current SQLite schema and provider/unit runtime. |
 | M1 Base intelligence | 7–8, 12–14 | Offline full-language base index, genuinely incremental refresh, search/graph/impact. |
-| M2 Precise/deep capability | 9–11 | Trusted SCIP, full supported LSP query overlay and version-verified Joern integration. |
+| M2 Precise/deep capability | 9–11, 22 | Managed six-indexer SCIP, full supported LSP query overlay and version-verified Joern, every profile proven against its lock payload in CI. |
 | M3 Context/workflow | 15–17 | Deterministic complete scope, bounded slices, actor receipts/review, strict gates and typed facade. |
 | M4 Product interfaces | 18–20 | CLI/MCP parity, diagnostic/retention/resource integration. |
-| M5 Release | 21 | Measured performance/capability parity, offline and six-target artifacts. |
+| M5 Release | 21 | Measured performance/capability parity, offline and six-target slim and bundle artifacts. |
 
-Introduce the shared fixture and resource harness when first needed, not only at Task 21. Task 8 creates `TestParserResourcePlateau`; Task 12 extends the harness with `TestIncrementalReuse`; Task 21 implements `TestResourceBudgets` and published benchmarks. These are named implementation deliverables, not tests claimed to exist in the supplied attachment. Package-focused checks run per task; full suite/race/protocol/resource checks run at integration milestones and final release. Exact external tool profile/version verification is a Task 9–11 deliverable, not an invented pin in this specification.
+Introduce the shared fixture and resource harness when first needed, not only at Task 21. Task 8 creates `TestParserResourcePlateau`; Task 12 extends the harness with `TestIncrementalReuse`; Task 21 implements `TestResourceBudgets` and published benchmarks. These are named implementation deliverables, not tests claimed to exist in the supplied attachment. Package-focused checks run per task; full suite/race/protocol/resource checks run at integration milestones and final release. Exact external tool version and digest pins are a Task 22 lock deliverable and its CI matrix, not an invented pin in this specification.
 
 <a id="task-1-bootstrap-the-go-module-cli-shell-and-dependency-policy"></a>
 ### Task 1: Bootstrap the Go Module, CLI Shell, and Dependency Policy
@@ -2550,18 +2615,18 @@ git diff --check
 <a id="task-9-implement-streaming-scip-import-and-explicit-local-indexer-profiles"></a>
 ### Task 9: Implement Streaming SCIP Import and Explicit Local Indexer Profiles
 
-**Deliverable:** Generic precise-index import and trusted installed indexer execution with validated exact-source binding and bounded memory.
+**Deliverable:** Generic precise-index import and managed indexer execution with validated exact-source binding and bounded memory.
 
 **Files and ownership:** `internal/provider/scip/`, small SCIP fixtures and provider docs; only the composition owner changes shared registry wiring.
 
 **Dependencies / consumes:** Task 6 provider/runner/resolver; Task 4 materialization; runtime filesystem/Tree-sitter dependencies from Tasks 7–8.
 
-**Produces / contract:** SCIP provider, source-binding validation, scoped native aliases, typed approved indexer profiles and explicit import CLI/service request fields.
+**Produces / contract:** SCIP provider, source-binding validation, scoped native aliases, typed indexer profiles (tool resolution moves to Task 22) and explicit import CLI/service request fields.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend one small canonical protobuf fixture with a forward/external reference, repeated same-edge occurrences, document-local symbols, UTF-8/16/32 ranges and source-hash mismatch. A generated streamed input/resource case proves memory is bounded even for a large document field.
 - [ ] **Step 2: Implement the complete production path.** Walk top-level and nested wire fields incrementally; generated protobuf records must be size-limited before decode. Use an on-disk identifier mapping/two passes for unresolved ordering; do not retain a whole index or symbol graph. Map definitions/references/implementations and supported relationships with exact evidence. Duplicate relation IDs do not erase separate occurrence ranges. Missing encoding or source proof remains explicit rather than guessed.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Approved profiles execute already-installed tools against private snapshots with input-hash manifests. Supplied unverified indexes remain importable for discovery/quarantine but cannot silently enter strict compiler evidence. Validate executable trust, output path, output length, profile scope and version. Attach only completed validated units; preserve unrelated base capability on failure. Document exact profile commands after real-tool verification.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Profiles execute managed tools against private snapshots with input-hash manifests. Supplied unverified indexes remain importable for discovery/quarantine but cannot silently enter strict compiler evidence. Validate executable trust, output path, output length, profile scope and version. Attach only completed validated units; preserve unrelated base capability on failure. Document exact profile commands after real-tool verification.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -2586,7 +2651,7 @@ git diff --check
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One fake-server lifecycle scenario exercises initialization, out-of-order replies, negotiated UTF positions, cancellation, hostile URI, unsupported method/server request and shutdown; add cases to that fixture rather than mock every method separately.
-- [ ] **Step 2: Implement the complete production path.** Implement Content-Length framing with length/depth/outstanding-request bounds and context deadlines, then the required LSP initialize/initialized and shutdown/exit exchange. Start trusted profiles lazily against private snapshot materializations; synchronize owned documents and validate all returned coordinates. Keep results labeled with source/dependency hashes and server/version. Reject writes, arbitrary commands and external URI reads. LSP is not the MCP protocol and does not use MCP discovery.
+- [ ] **Step 2: Implement the complete production path.** Implement Content-Length framing with length/depth/outstanding-request bounds and context deadlines, then the required LSP initialize/initialized and shutdown/exit exchange. Start managed profiles lazily against private snapshot materializations; synchronize owned documents and validate all returned coordinates. Keep results labeled with source/dependency hashes and server/version. Reject writes, arbitrary commands and external URI reads. LSP is not the MCP protocol and does not use MCP discovery.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Bound one default server, overlay bytes, outstanding calls and idle TTL. Expose all advertised supported methods through the typed query boundary while keeping ephemeral enrichment separate from deterministic canonical plans. Profile detection does not auto-authorize execution. On server failure, release pending calls/processes/temp input and report unavailable/failed overlay without erasing base facts. No unsaved-editor claim or future-persistence placeholder remains.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
@@ -2612,7 +2677,7 @@ git diff --check
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one export fixture with calls/control/data dependence, unknown labels, forward IDs, malformed/oversized records and mismatched source paths. One process-fault case proves a failed export does not admit partial invalid facts. Real pinned-tool smoke validates exact CLI arguments before the profile is declared supported.
-- [ ] **Step 2: Implement the complete production path.** Resolve trusted parse/export paths and capture actual version/help contract. Run built-in export formats against private source/CPG paths; inspect resulting overlay metadata instead of assuming historical commands. Cap CSV fields/XML depth before decoder allocation, stream results, and use a disk mapping for native IDs. Normalize only supported labels and distinguish data dependence from an unproven full semantic source-to-sink claim.
+- [ ] **Step 2: Implement the complete production path.** Resolve managed parse/export tools and capture actual version/help contract. Run built-in export formats against private source/CPG paths; inspect resulting overlay metadata instead of assuming historical commands. Cap CSV fields/XML depth before decoder allocation, stream results, and use a disk mapping for native IDs. Normalize only supported labels and distinguish data dependence from an unproven full semantic source-to-sink claim.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Count unknown labels and missing capabilities, retain explicit partial scope, and fail unsupported profiles rather than guess compatibility. No product-owned Scala/shell helper or interpreter server. Bound entire analyzer tree memory/temp/output, close processes, delete private inputs/exports and leave base generation intact on optional failure. Record full process-tree metrics separately from base metrics and update provider/license docs.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
@@ -2632,7 +2697,7 @@ git diff --check
 
 **Files and ownership:** `internal/index/` coordinator/scheduler/invalidation/watch/status and concrete provider composition under `internal/app/`.
 
-**Dependencies / consumes:** Tasks 4–8 are sufficient for base completion. Tasks 9–11 integrate via the same registry as they finish; absence does not block a usable base milestone.
+**Dependencies / consumes:** Tasks 4–8 are sufficient for base completion. Tasks 9–11 integrate via the same registry as they finish, and Task 22's `toolchain.Resolver` is what the composition hands them; absence does not block a usable base milestone.
 
 **Produces / contract:** `Coordinator.Index`, Refresh, Watch and Status; explicit reuse/invalidation/capture/publication metrics and one cross-process workspace owner.
 
@@ -2845,7 +2910,7 @@ git diff --check
 
 **Dependencies / consumes:** Tasks 3–19 already implement their own safety/resource controls. This task integrates and validates them across process and persistence boundaries.
 
-**Produces / contract:** Typed Doctor report, live/peak resource report, retention collector and recovery procedure with explicit unsupported-metric/platform limitations.
+**Produces / contract:** Typed Doctor report including the toolchain status of every lock entry, live/peak resource report, retention collector (which also sweeps tool-store staging and versions the lock no longer names) and recovery procedure with explicit unsupported-metric/platform limitations.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the existing E2E/storage/process fault fixture for disk full, corrupt active pointer/blob, long reader/WAL pressure, canceled writes, child process tree, stale lease/GC and structured diagnostic privacy. Add only uncovered critical cases, not another parallel adversarial suite.
@@ -2870,14 +2935,14 @@ git diff --check
 
 **Files and ownership:** `internal/e2e/`, `internal/bench/`, minimal adopted-tool automation, CI/offline/release workflows, all operations/user/provider/performance docs, SECURITY/CONTRIBUTING and license/SBOM outputs.
 
-**Dependencies / consumes:** All Tasks 1–20, including all optional integration contracts and actual supported-provider profile validation. No new speculative core subsystem.
+**Dependencies / consumes:** All Tasks 1–20 and 22, including all optional integration contracts and the real-tool matrix. No new speculative core subsystem.
 
 **Produces / contract:** Release archives/checksums/SBOM, benchmark and capability-parity report, complete updated specification/docs and verification evidence.
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use the one complete index/search/impact/plan/read/confirm/review/consolidate/capsule scenario through CLI and real MCP. Extend it for incremental mutation and old-session retained reads. The shared performance matrix checks memory/latency/reuse, and the offline run uses the compiled binary with all build dependencies prepared before isolation.
-- [ ] **Step 2: Implement the complete production path.** Measure Section 23 reference and low-memory workloads using release builds, including parser worker/native memory and full optional process tree. Validate exact capability/fact/query fingerprints before accepting an optimization. Use network-disabled Linux execution plus attempted-socket auditing where supported; no test downloads modules/grammars during isolated runtime. Build/test all six OS/arch combinations with compatible native toolchains. Generate SBOM and native/module license inventory using pinned existing tools; do not write a new release framework.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Complete quick start, source/provenance limitations, strict actor workflow with receipts/review, trusted analyzer setup, configuration, retention/rebuild, diagnosis and performance evidence. Check all document anchors/cross-references and command/model parity. Report any unmet budget or unverified platform/profile as a blocker rather than declaring success. Stage/commit reviewed generated files before checking clean-tree status; do not require an empty diff before the release changes have been committed.
+- [ ] **Step 2: Implement the complete production path.** Measure Section 23 reference and low-memory workloads using release builds, including parser worker/native memory and full optional process tree. Validate exact capability/fact/query fingerprints before accepting an optimization. Use network-disabled Linux execution plus attempted-socket auditing where supported; no test downloads modules/grammars during isolated runtime. Build/test all six OS/arch combinations with compatible native toolchains; build the six bundle archives by running `codectx tools prefetch --all` into a fresh store per target and verify a bundle indexes the polyglot fixture with networking disabled. Run the Task 22 tools matrix as a release gate. Generate SBOM and native/module license inventory using pinned existing tools; do not write a new release framework.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Complete quick start, source/provenance limitations, strict actor workflow with receipts/review, managed toolchain behavior and offline/bundle use, configuration, retention/rebuild, diagnosis and performance evidence. Check all document anchors/cross-references and command/model parity. Report any unmet budget or unverified platform/profile as a blocker rather than declaring success. Stage/commit reviewed generated files before checking clean-tree status; do not require an empty diff before the release changes have been committed.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
@@ -2889,6 +2954,101 @@ go test -race ./... -count=1
 go build -trimpath -o ./bin/codectx ./cmd/codectx
 go test ./internal/bench -run TestResourceBudgets -count=1
 go test ./internal/bench -run '^$' -bench . -benchmem -count=5
+git diff --check
+```
+
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
+
+<a id="task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix"></a>
+### Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix
+
+**Deliverable:** Every SCIP, LSP, and Joern profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
+
+**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/joern/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
+
+**Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`, `joern.ProfileFromConfig`); `model.Error` codes; `lang.Of`.
+
+**Produces / contract:**
+
+```go
+package toolchain
+
+type Platform struct{ OS, Arch string }          // "linux","darwin","windows" × "amd64","arm64"
+func Current() Platform
+
+type Payload struct{ URL string; SHA256 string; Size int64 }
+type Entry struct {
+    Name, Version, Kind, License, Upstream string
+    Runtime     string            // "", "node", "jdk"
+    Entry       string            // payload-relative executable/script/jar
+    EntrySHA256 string
+    Platforms   map[string]Payload // "linux_amd64" ...
+}
+type Lock struct{ LockVersion int; Tools map[string]Entry }
+func Embedded() Lock                               // parsed once from tools.lock.json; panics only at init on a malformed lock
+
+type Source string // "managed" | "override"
+type Tool struct {
+    Name, Version string
+    Root         string   // store or override directory, absolute
+    Executable   string   // absolute; for runtime tools this is the runtime binary
+    ArgvPrefix   []string // full launcher argv, e.g. [node, main.js]; Executable == ArgvPrefix[0]
+    Env          []string // runtime variables the child needs (JAVA_HOME), nothing inherited
+    Checksum     string   // lowercase hex SHA-256 of Executable at resolution time
+    Source       Source
+}
+
+type Options struct {
+    DataDir       string        // <data_dir>/tools is created 0o700
+    Offline       bool
+    Mirror        string        // optional URL prefix replacing the lock's asset host
+    MaxFetchBytes int64
+    FetchTimeout  time.Duration
+    Overrides     map[string]config.ToolOverride
+    Log           *slog.Logger
+}
+type Resolver struct{ /* unexported */ }
+func New(opts Options) (*Resolver, error)
+func (r *Resolver) Resolve(ctx context.Context, name string) (Tool, error)   // typed CTX_TOOL_* errors
+func (r *Resolver) Status(ctx context.Context) []Status                      // every lock entry, name order
+func (r *Resolver) Prefetch(ctx context.Context, names []string) error
+func (r *Resolver) Verify(ctx context.Context) ([]Status, error)
+func (r *Resolver) GC(ctx context.Context) (removed int, err error)
+
+type State string // "installed" | "available" | "unsupported_platform" | "override" | "corrupt"
+type Status struct{ Name, Version string; State State; Languages []string; Detail string }
+```
+
+```go
+package config
+
+type Tools struct {
+    Offline       bool               `toml:"offline"`
+    CacheDir      string             `toml:"cache_dir"`
+    Mirror        string             `toml:"mirror"`
+    MaxFetchBytes int64              `toml:"max_fetch_bytes"`
+    FetchTimeout  Duration           `toml:"fetch_timeout"`
+    Override      map[string]ToolOverride `toml:"override"` // user configuration only
+}
+type ToolOverride struct {
+    Executable string `toml:"executable"` // absolute
+    Version    string `toml:"version"`    // exact
+    Checksum   string `toml:"checksum"`   // required lowercase hex SHA-256
+}
+```
+
+Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Tool}` with `profileKinds` extended to `scip-python` (triggers `pyproject.toml`, `setup.py`, `requirements.txt`, `setup.cfg`), `rust-analyzer` (trigger `Cargo.toml`, argv `scip ${input_dir} --output ${output_file}`), and `scip-clang` (trigger `compile_commands.json`, argv `--compdb-path ${input_dir}/compile_commands.json --index-output-path ${output_file}`); each profile carries its fixed argv, env allowlist, budgets, timeout, and network posture as Go values, verified against the real tool in this task. `lsp.Trusted(cfg, name)` becomes `lsp.Resolve(ctx, resolver, cfg, name)`; `joern.ProfileFromConfig` becomes `joern.Resolve(ctx, resolver, cfg)` with `Parse`/`Export` tools from the `joern` entry under the `jdk` runtime. `provider.Detection.DiagnosticCode` carries the `CTX_TOOL_*` reason when a tool cannot be resolved, so `status`/`doctor` name the exact cause.
+
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Read all three profile files, their run/open paths, `config.Analyzer` and every consumer, `process.Runner`, the confined opener, and `snapshot` materialization in full. Record missing/unread context rather than guessing. Every subagent performs its own read.
+- [ ] **Step 1: Protect the critical behavior with the minimum test set.** Four critical invariants, one table test each: a payload whose SHA-256 or size disagrees with the lock is neither extracted nor executed and leaves no store directory; an archive containing an absolute path, `..`, a symlink escaping the payload, a hard link, or more files/bytes than declared is rejected before any byte lands outside staging; `Offline: true` resolves a missing tool to `CTX_TOOL_OFFLINE` without a dial (use an `http.Transport` whose `DialContext` fails the test); a store directory without `.complete`, or whose `entry` hash disagrees with `entry_sha256`, is invisible and repaired by a fresh install. Serve fixtures from `httptest` with a two-file tarball built in the test; no real download in unit tests.
+- [ ] **Step 2: Implement the complete production path.** Embed the lock with `embed`; validate it at init (unique names, lowercase hex digests, positive sizes, runtime references that exist, entry paths that are relative and confined). Implement the fetcher as the single `net/http` owner with byte cap, timeout, same-host redirect limit, mirror substitution, and `HTTP_PROXY` support; stream to staging while hashing, never buffer a payload. Extract with the confined opener semantics of Section 21, preserving executable bits and applying `0o700` directories. Rename into place after fsync; write `.complete`. Serialize per-tool installs with a lock file. Resolve runtimes first and compose `ArgvPrefix`; hash the entry executable at every resolution. Delete `config.Analyzer`, `SortedAnalyzers`, `validateAnalyzers`, the `analyzers` fingerprint contribution and every consumer; add `config.Tools` with validation (absolute override paths, exact versions, required checksums, project configuration cannot set `[tools]`). Fold tool name, version and payload digest into `UnitSpec.ProviderVersion` and the LSP input digest so a tool change invalidates units. Rewrite the three profile files and add the three new SCIP profiles. Write `internal/tools/toollock` (download upstream, verify upstream digest, build-time `npm ci --omit=dev` and `go build` for `gopls`, normalize, tar.gz, compute digests, emit the lock and a license table). Publish the first `tools-v1` release assets and commit the generated lock.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** Add `codectx tools status|prefetch|verify|gc [--json]` on the shared facade; extend `doctor` and `status` with the toolchain report; the `CTX_TOOL_*` codes map to exit 5 (provider unavailable) except `CTX_TOOL_OVERRIDE_INVALID`, which is exit 3. Add the `net/http` import check to CI (`go list -deps -f` over `./cmd/codectx` fails on any importer outside `internal/toolchain`). Add `.github/workflows/tools-matrix.yml`: for each lock entry on `ubuntu-latest`, `macos-latest`, and `windows-latest`, `codectx tools prefetch --all` then the provider smoke run against the polyglot fixture; a profile whose smoke fails cannot be documented as supported. Update `docs/toolchain.md`, `docs/providers-scip.md`, `docs/providers-lsp.md`, `docs/providers-joern.md`, `docs/configuration.md`, README quick start, `THIRD_PARTY_LICENSES.md` (Node, Temurin, jdtls EPL-2.0, clangd Apache-2.0 with LLVM exception, rust-analyzer MIT/Apache-2.0, scip-* Apache-2.0, pyright MIT, typescript-language-server MIT, TypeScript Apache-2.0, Joern Apache-2.0) and remove every "unverified against a real tool" label that the matrix now proves.
+- [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
+
+```bash
+go test ./internal/toolchain ./internal/config ./internal/provider/scip ./internal/provider/lsp ./internal/provider/joern -count=1
+go run ./internal/tools/toollock -check   # lock digests match published tools-v1 assets
+go vet ./...
 git diff --check
 ```
 
@@ -2913,9 +3073,10 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Genuine incremental unit reuse | 9, 12–13, 23 | 5–9, 11–14 | No-change parse/FTS counters; changed dependency/add/delete/rename invalidation; retained provenance. |
 | Atomic publication and optional failure isolation | 11–13 | 5–12, 20 | Unsealed invisibility, failed-unit cleanup, rollback, concurrent reader and workspace-lock checks. |
 | Complete bundled structural baseline | 4, 11.3 | 7–8, 21 | All nine grammars in shared polyglot fixture and native-target smoke; no optional tool required. |
-| Exact-source SCIP | 11.4 | 9 | Source-binding/position/local-symbol/occurrence fixtures, streamed memory check and supported-profile smoke. |
-| Full supported LSP overlay | 11.5 | 10 | Actual protocol fake-server lifecycle and required-method table; private pinned input and cleanup. |
-| Joern deep integration | 11.6 | 11 | CSV/GraphML fixture, actual pinned version/argv/overlay smoke, missing-capability reporting. |
+| Exact-source SCIP | 11.4 | 9, 22 | Source-binding/position/local-symbol/occurrence fixtures, streamed memory check and real-tool smoke for all six indexers. |
+| Managed analyzer toolchain | 11.7, 20, 21, 24 | 22, 20, 21 | Digest/size mismatch never extracted or executed; confined extraction; offline never dials; atomic store; single `net/http` importer; per-platform CI matrix runs every lock entry. |
+| Full supported LSP overlay | 11.5 | 10, 22 | Actual protocol fake-server lifecycle and required-method table; private pinned input and cleanup. |
+| Joern deep integration | 11.6 | 11, 22 | CSV/GraphML fixture, actual pinned version/argv/overlay smoke, missing-capability reporting. |
 | Canonical node and relation provenance | 9, 11–12 | 2, 5–11 | Node facts, aliases and range-bearing relation evidence with scope/source identity; ambiguity retained. |
 | Stable generation-scoped lexical ranking | 12.4, 14 | 5, 13, 15 | Scores/hash unchanged by unrelated unit/generation insert/activation/pruning; near-tie platform checks. |
 | Bounded graph and pagination | 14 | 5, 13–14 | Cycle/fanout, edge/node/depth/work limits, signed cursor, lease and deterministic continuation. |
@@ -2927,7 +3088,7 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Leases, bounded retention and recovery | 10, 12, 20, 22 | 5, 16, 20 | Concurrent pin/GC, open-session retention, expired audit cleanup, abandoned staging and disk-full cases. |
 | Aggregate RAM/native/process performance | 20, 23 | 3, 5, 8–16, 20–21 | Reference benchmark/soak report, capability fingerprints, process-tree RSS and real latency distributions. |
 | Minimal critical tests | 25, 30 | All | Small shared suites, explicit risk for added tests, no repeated trivial/golden/mock coverage. |
-| Cross-platform release completeness | 24 | 1, 8, 19–21 | All six target artifacts and native smoke evidence, including Windows arm64. |
+| Cross-platform release completeness | 24 | 1, 8, 19–22 | All six slim and bundle artifacts and native smoke evidence, including Windows arm64. |
 | Full updated documentation and citations | All, 33 | All | TOC/link/code/schema validation, interfaces/commands reflected consistently and current source notes. |
 
 ---
@@ -2935,10 +3096,10 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 <a id="32-definition-of-done"></a>
 ## 32. Definition of Done
 
-- [ ] All 21 tasks have their actual required producer/consumer dependencies implemented, reviewed and wired; optional integrations are not replaced by stubs or deferred contracts.
+- [ ] All 22 tasks have their actual required producer/consumer dependencies implemented, reviewed and wired; optional integrations are not replaced by stubs or deferred contracts.
 - [ ] Every worker and reviewer applied the full-file read/trace/reuse policy to the actual code. The lead verified real changes, callers and wiring rather than accepting summaries.
 - [ ] No known unresolved in-scope correctness/resource defect, dead consumer, unreachable production path, duplicate shared behavior, compatibility/migration scaffolding, speculative infrastructure or undocumented mandatory dependency remains.
-- [ ] All required base and optional capabilities in Section 4 are implemented, with precise unavailable/partial/failure reporting where external tools are absent or limited.
+- [ ] All required base and optional capabilities in Section 4 are implemented. Every managed tool of Section 11.7 installs itself from the lock with no user configuration, and unavailability is reported with its typed platform/offline/fetch reason.
 - [ ] Source snapshots retain exact captured bytes; unit reuse is input-safe; generations are atomic; pinned queries and open sessions survive later activation and Git/worktree changes.
 - [ ] All public responses are bounded, generation/snapshot-qualified and explicit about completeness. Canonical search/context does not change because unrelated generations change.
 - [ ] Strict readiness requires each actor's own complete confirmed source, current-scope review, complete declared boundaries and fresh write-time validation. Search hits, acknowledgments, another actor's coverage and waivers cannot bypass it.
@@ -2956,7 +3117,7 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 <a id="33-authoritative-references"></a>
 ## 33. Authoritative References
 
-References 1–21 retain the original architecture's source set; 22–36 support the corrections and more specific contracts in this revision. Current version and protocol facts were checked on 2026-09-04. These sources support dependency behavior and design rationale; the new resource budgets, actor policy, reusable-unit model and acceptance gates are explicit product design decisions, not externally certified performance results.
+References 1–21 retain the original architecture's source set; 22–36 support the corrections and more specific contracts in this revision; 37–46 support the managed analyzer toolchain. Current version and protocol facts were checked on 2026-09-04 and the toolchain sources on 2026-09-12. These sources support dependency behavior and design rationale; the new resource budgets, actor policy, reusable-unit model and acceptance gates are explicit product design decisions, not externally certified performance results.
 
 Pin exact dependency/grammar/profile revisions and checksums during implementation. A link to a moving default branch is a source citation, not a reproducible dependency pin. The Tree-sitter issue is a reported risk, not evidence that the selected future build has or has fixed the defect. External profile commands must be verified against the installed pinned distribution. No source is presented as proof that codectx itself has been built or benchmarked.
 
@@ -3143,3 +3304,53 @@ Pin exact dependency/grammar/profile revisions and checksums during implementati
 ---
 
 **End of complete revised design specification and implementation plan.**
+
+<a id="ref-37"></a>
+37. **CodeQL CLI bundle and pack download**  
+   <https://docs.github.com/en/code-security/codeql-cli/using-the-advanced-functionality-of-the-codeql-cli/codeql-cli-reference> and <https://docs.github.com/en/code-security/codeql-cli/codeql-cli-manual/pack-download>  
+   Single bundle with every extractor and its own runtime; on-demand pinned pack download for the slim CLI.
+
+<a id="ref-38"></a>
+38. **mise lockfile**  
+   <https://mise.jdx.dev/dev-tools/mise-lock.html>  
+   Exact version, per-platform URL and checksum per tool, verified on install.
+
+<a id="ref-39"></a>
+39. **Sourcegraph auto-indexing inference and scip-io indexer orchestration**  
+   <https://sourcegraph.com/docs/code-search/code-navigation/auto_indexing> and <https://github.com/GlitterKill/scip-io>  
+   Evidence-driven inference of which indexers a repository needs; pinned hash-verified indexer installs.
+
+<a id="ref-40"></a>
+40. **Zed language-server auto-download discussion and checksum defect**  
+   <https://news.ycombinator.com/item?id=40902826> and <https://github.com/bug-ops/deps-zed/issues/14>  
+   Silent runtime download without verification is the anti-pattern the lock model avoids.
+
+<a id="ref-41"></a>
+41. **Mason registry and Trunk hermetic tool cache**  
+   <https://github.com/mason-org/mason.nvim> and <https://docs.trunk.io/code-quality/linters/configure-linters>  
+   Declarative tool registry with platform targets and a private bin directory; pinned hermetic tool cache.
+
+<a id="ref-42"></a>
+42. **Node.js distribution index and checksums**  
+   <https://nodejs.org/dist/>  
+   `SHASUMS256.txt` per release used by the lock generator.
+
+<a id="ref-43"></a>
+43. **SCIP indexers: scip-python, scip-clang, scip-java**  
+   <https://github.com/sourcegraph/scip-python>, <https://github.com/sourcegraph/scip-clang>, <https://github.com/sourcegraph/scip-java>  
+   Upstream distributions, platform coverage (no Windows scip-clang) and dependency-resolution requirements.
+
+<a id="ref-44"></a>
+44. **rust-analyzer `scip` subcommand**  
+   <https://rust-lang.github.io/rust-analyzer/src/rust_analyzer/cli/scip.rs.html>  
+   `rust-analyzer scip <path> --output <file>`; one binary serves both SCIP and LSP profiles.
+
+<a id="ref-45"></a>
+45. **Eclipse JDT Language Server**  
+   <https://github.com/eclipse-jdtls/eclipse.jdt.ls>  
+   Milestone tarball distribution, Java 21 minimum, equinox launcher argv and `-data` requirement.
+
+<a id="ref-46"></a>
+46. **Adoptium Temurin releases**  
+   <https://adoptium.net/temurin/releases/>  
+   JDK 21 LTS per-platform archives with published SHA-256 digests for the managed `jdk` runtime.
