@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/codectx-project/codectx/internal/cli"
-	"github.com/codectx-project/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/cli"
+	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // TestVersionEnvelope protects the machine-stable CLI boundary of Section 18.2:

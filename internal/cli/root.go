@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/codectx-project/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/spf13/cobra"
 )
 

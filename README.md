@@ -40,8 +40,8 @@ identity without embedding a build timestamp:
 
 ```bash
 go build -trimpath \
-  -ldflags "-X github.com/codectx-project/codectx/internal/model.version=$VERSION \
-            -X github.com/codectx-project/codectx/internal/model.commit=$(git rev-parse HEAD)" \
+  -ldflags "-X github.com/Sawmonabo/codectx/internal/model.version=$VERSION \
+            -X github.com/Sawmonabo/codectx/internal/model.commit=$(git rev-parse HEAD)" \
   -o ./bin/codectx ./cmd/codectx
 ```
 

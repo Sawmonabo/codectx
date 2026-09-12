@@ -9,7 +9,7 @@ import "runtime"
 const SchemaVersion = "1"
 
 // version and commit are overridden at link time with
-// -ldflags "-X github.com/codectx-project/codectx/internal/model.version=...".
+// -ldflags "-X github.com/Sawmonabo/codectx/internal/model.version=...".
 // No wall-clock build timestamp is embedded, so builds stay reproducible.
 var (
 	version = "dev"

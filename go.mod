@@ -1,4 +1,4 @@
-module github.com/codectx-project/codectx
+module github.com/Sawmonabo/codectx
 
 go 1.27
 
