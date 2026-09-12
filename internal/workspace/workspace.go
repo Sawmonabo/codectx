@@ -13,6 +13,7 @@
 package workspace
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -63,11 +64,11 @@ type File struct {
 func Discover(start string) (Root, error) {
 	abs, err := filepath.Abs(start)
 	if err != nil {
-		return Root{}, pathError("workspace root %q cannot be resolved: %v", start, err)
+		return Root{}, causedBy(pathError("workspace root %q cannot be resolved: %v", start, err), err)
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
-		return Root{}, notFound("workspace %q cannot be opened: %v", abs, err)
+		return Root{}, causedBy(notFound("workspace %q cannot be opened: %v", abs, err), err)
 	}
 	if !info.IsDir() {
 		abs = filepath.Dir(abs)
@@ -90,7 +91,7 @@ func Discover(start string) (Root, error) {
 
 	opened, err := os.OpenRoot(rootPath)
 	if err != nil {
-		return Root{}, notFound("workspace %q cannot be opened: %v", rootPath, err)
+		return Root{}, causedBy(notFound("workspace %q cannot be opened: %v", rootPath, err), err)
 	}
 	return Root{Path: rootPath, HasGit: gitPath != "", GitPath: gitPath, root: opened}, nil
 }
@@ -120,19 +121,19 @@ func (r Root) Open(rel string) (*os.File, error) {
 	}
 	before, err := r.root.Lstat(clean)
 	if err != nil {
-		return nil, pathError("%q cannot be opened: %v", rel, err)
+		return nil, causedBy(pathError("%q cannot be opened: %v", rel, err), err)
 	}
 	if !before.Mode().IsRegular() {
 		return nil, pathError("%q is %s, not a regular file", rel, describeMode(before.Mode()))
 	}
 	f, err := r.root.Open(clean)
 	if err != nil {
-		return nil, pathError("%q cannot be opened: %v", rel, err)
+		return nil, causedBy(pathError("%q cannot be opened: %v", rel, err), err)
 	}
 	after, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, pathError("%q cannot be inspected after opening: %v", rel, err)
+		return nil, causedBy(pathError("%q cannot be inspected after opening: %v", rel, err), err)
 	}
 	if !after.Mode().IsRegular() || !os.SameFile(before, after) {
 		f.Close()
@@ -156,7 +157,7 @@ func (r Root) Lstat(rel string) (fs.FileInfo, error) {
 	}
 	info, err := r.root.Lstat(clean)
 	if err != nil {
-		return nil, pathError("%q cannot be inspected: %v", rel, err)
+		return nil, causedBy(pathError("%q cannot be inspected: %v", rel, err), err)
 	}
 	return info, nil
 }
@@ -209,6 +210,18 @@ func describeMode(mode fs.FileMode) string {
 	default:
 		return "an unsupported file type"
 	}
+}
+
+// causedBy joins a typed rejection with the operating-system error behind it,
+// so a caller can still ask errors.Is(err, fs.ErrNotExist) or errors.As for a
+// *fs.PathError while errors.As continues to find the *model.Error. A capture
+// needs the distinction: a tracked path that is absent is a deletion, a path
+// that cannot be inspected for any other reason is a failure.
+func causedBy(typed *model.Error, cause error) error {
+	if cause == nil {
+		return typed
+	}
+	return errors.Join(typed, cause)
 }
 
 func pathError(format string, args ...any) *model.Error {
