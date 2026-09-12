@@ -31,13 +31,20 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// mainGo is the one fixture document. Line 2 (one-based) carries a two-byte
+// mainGo is the queried fixture document. Line 2 (one-based) carries a two-byte
 // and a four-byte code point before the queried identifier, so UTF-8, UTF-16
 // and UTF-32 columns for the same byte all differ.
 const mainGo = "package main\n" +
 	"var s = \"héllo😀\"; var y = 1\n" +
 	"func héllo(y int) int { return y }\n" +
 	"func other() int { return héllo(1) }\n"
+
+// utilGo is the second fixture document. It exists so the call-hierarchy
+// site-attribution branches can be told apart: the outgoing-call peer lives
+// here while the call sites stay in main.go. It is deliberately two lines
+// long, so main.go's line-2 coordinates cannot validate against it.
+const utilGo = "package main\n" +
+	"func helper() int { return 2 }\n"
 
 // TestFakeServerLifecycle is the one authorized fake-server scenario. Each
 // case names the failure mode it protects:
@@ -49,6 +56,9 @@ const mainGo = "package main\n" +
 //     source);
 //   - cancellation releases the call and sends $/cancelRequest: a call that
 //     never returns leaks its slot (resource leak);
+//   - call sites attributed to the caller's document rather than the peer's:
+//     a site validated against the wrong file names different bytes (wrong
+//     source);
 //   - hostile / external URIs are never followed and never appear as snapshot
 //     results (repository safety);
 //   - an unadvertised method is unavailable, not a substituted answer (false
@@ -64,7 +74,7 @@ func TestFakeServerLifecycle(t *testing.T) {
 }
 
 func runScenario(t *testing.T, enc string) {
-	h := providertest.New(t, map[string]string{"main.go": mainGo})
+	h := providertest.New(t, map[string]string{"main.go": mainGo, "util.go": utilGo})
 	file := h.File(t, "main.go")
 	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 2, MemoryBudgetBytes: 1 << 30, DiskBudgetBytes: 1 << 30})
 	if err != nil {
@@ -198,12 +208,15 @@ func runScenario(t *testing.T, enc string) {
 		bytesOf(calls.Items[0].Sites[0]) != "héllo" || calls.Items[0].Sites[0].Range.Start.Byte != at("héllo(1)", 1).Byte {
 		t.Fatalf("IncomingCalls = %+v, %v", calls.Items, err)
 	}
-	// Outgoing calls take the other site-attribution branch: the sites belong
-	// to the queried caller's document, not the peer's, and must resolve to
-	// the exact bytes there.
+	// Outgoing calls take the other site-attribution branch, and the two ends
+	// of the edge are in different files: the peer item is in util.go while
+	// the sites belong to the queried caller's document, main.go, and must
+	// resolve to the exact bytes there. Attributing the sites to the peer
+	// would validate main.go's coordinates against util.go.
 	out, err := ov.OutgoingCalls(ctx, items.Items[0], 10)
-	if err != nil || len(out.Items) != 1 || out.Items[0].Item.Name != "other" || len(out.Items[0].Sites) != 1 ||
-		out.Items[0].Sites[0].File != items.Items[0].Location.File ||
+	if err != nil || len(out.Items) != 1 || out.Items[0].Item.Name != "helper" ||
+		out.Items[0].Item.Location.Path != "util.go" || len(out.Items[0].Sites) != 1 ||
+		out.Items[0].Sites[0].File != items.Items[0].Location.File || out.Items[0].Sites[0].Path != "main.go" ||
 		bytesOf(out.Items[0].Sites[0]) != "y" || out.Items[0].Sites[0].Range.Start.Byte != at("y }", 1).Byte {
 		t.Fatalf("OutgoingCalls = %+v, %v", out.Items, err)
 	}

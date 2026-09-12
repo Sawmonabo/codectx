@@ -282,7 +282,9 @@ func (s *server) handleServerRequest(method string, params json.RawMessage) (any
 	case "workspace/applyEdit":
 		return nil, &rpcError{Code: rpcMethodNotFound, Message: "codectx never applies edits: the materialization is read-only input"}
 	default:
-		return nil, &rpcError{Code: rpcMethodNotFound, Message: "codectx does not serve " + method}
+		// The method name is the peer's, bounded only by the frame size, so it
+		// is truncated before it is echoed back into a reply.
+		return nil, &rpcError{Code: rpcMethodNotFound, Message: "codectx does not serve " + truncate(method, 64)}
 	}
 }
 

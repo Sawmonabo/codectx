@@ -93,7 +93,7 @@ Bounds, all finite:
 | server lifetime | the approval's `timeout` | the runner terminates the tree |
 | materialized bytes, cached pinned bytes, bytes sent, bytes received | `Options.MaxOverlayBytes` (default 512 MiB) | materialization refused; cache evicts LRU; the server is failed |
 | one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
-| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable |
+| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable — a request reports it to its caller, an answer to a server-initiated request is dropped and the writer goroutine continues |
 | header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels — the line bound is applied to the chunk the reader holds before it is accumulated | protocol error, connection failed |
 | queued answers to server-initiated requests | 4 | the reply is dropped; the reader never blocks on a write |
 | documents held open on the server | 16 | `didClose` of the least recently opened |
@@ -113,6 +113,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 - **Cancellation.** When a call's context ends the client sends
   `$/cancelRequest`, forgets the id and returns `CTX_CANCELED` (or
   `CTX_PROVIDER_TIMEOUT` for a deadline). The connection stays usable.
+  `conn.write` itself is not context-aware, so a call can wait on the writer
+  lock behind a frame the server has not yet consumed; that wait is bounded by
+  the server's own progress and ultimately by the approval's `timeout`
+  terminating the tree, not by `providers.lsp.request_timeout`.
 - **Server-initiated requests** are handled by explicit policy:
   `workspace/configuration` is answered with `null` per item (at most 64
   items) — codectx supplies no settings; **everything else** is answered with
@@ -125,7 +129,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   The answer is **queued** (at most four) for one dedicated writer goroutine:
   the goroutine that reads the server's output never writes, because a write
   parks on the server's stdin while the server is parked writing stdout that
-  only the reader drains. A full queue drops the reply rather than blocking.
+  only the reader drains. A full queue drops the reply rather than blocking,
+  and so does a reply the frame bound refuses — its id and method name come
+  from the server, so one long-named server request must not be able to stop
+  every later answer. The writer exits only once the connection is failed.
 - **Position encoding.** The client offers `utf-8`, `utf-32`, `utf-16` in
   that order; the server's `positionEncoding` (default `utf-16`) is used for
   every coordinate in both directions. A choice the client did not offer is
