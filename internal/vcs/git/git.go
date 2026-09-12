@@ -7,12 +7,19 @@
 // the index and the worktree; none of them runs hooks, writes the index
 // (GIT_OPTIONAL_LOCKS=0) or asks a terminal for credentials. The two ways
 // `git status` could start a configured executable are closed explicitly: the
-// fsmonitor hook is disabled, and every configured clean/smudge filter driver
-// is neutralized for the run, so a file whose stat changed is re-hashed by Git
-// with its built-in conversions only (Section 21). PATH is never passed. Git
-// object IDs this package reports are provenance only: the bytes a snapshot
-// retains are always read from the worktree, because attributes can make a
-// checkout differ from its blob.
+// fsmonitor hook is disabled with -c, and every configured clean/smudge filter
+// driver is neutralized for the run through GIT_CONFIG_COUNT and paired
+// GIT_CONFIG_KEY_<i>/GIT_CONFIG_VALUE_<i> variables (Git >= 2.31), so a file
+// whose stat changed is re-hashed by Git with its built-in conversions only
+// (Section 21). The environment route is deliberate: `-c key=value` splits at
+// the first '=', so a driver whose name contains '=' would slip past a -c
+// override; the paired variables carry key and value separately and are
+// unambiguous for any driver name. PATH is withheld from the child, but that
+// is hygiene, not a control: Git runs filters and hooks through `sh -c`, which
+// supplies its own default PATH, so only the neutralization above prevents
+// execution. Git object IDs this package reports are provenance only: the
+// bytes a snapshot retains are always read from the worktree, because
+// attributes can make a checkout differ from its blob.
 package git
 
 import (
@@ -58,7 +65,8 @@ const (
 // configuration; USERPROFILE and SYSTEMROOT are what Git for Windows needs to
 // start at all; the temporary-directory variables let Git create its scratch
 // files where the operator expects. Nothing else -- no credentials, proxies or
-// PATH -- crosses the boundary.
+// PATH -- crosses the boundary. (Withholding PATH does not stop a configured
+// helper from running; see the package comment.)
 var envAllowlist = []string{"HOME", "XDG_CONFIG_HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP", "TMP"}
 
 // fixedEnv is the safe process environment of Section 21, set on every run.
@@ -70,7 +78,8 @@ var fixedEnv = []string{
 }
 
 // safeConfig disables the one repository-configurable executable the commands
-// used here would otherwise start.
+// used here would otherwise start. A fixed key with no user-controlled text is
+// safe as a -c argument; filter neutralization is not (see filterOverrides).
 var safeConfig = []string{"-c", "core.fsmonitor=false"}
 
 // Git executes plumbing against one absolute Git executable.
@@ -195,7 +204,7 @@ func (g *Git) ListIndex(ctx context.Context, root string, maxEntries int64, visi
 		return visit(IndexEntry{Path: string(path), Mode: string(fields[1]), ObjectID: string(fields[2]), Stage: stage,
 			SkipWorktree: fields[0][0] == 'S'})
 	})
-	return g.stream(ctx, root, p, maxEntries, "ls-files", "-z", "-s", "-t")
+	return g.stream(ctx, root, nil, p, maxEntries, "ls-files", "-z", "-s", "-t")
 }
 
 // Status streams every path that differs from HEAD, and every untracked
@@ -205,10 +214,11 @@ func (g *Git) ListIndex(ctx context.Context, root string, maxEntries int64, visi
 //
 // Git re-hashes a tracked file whose stat information changed, and that hash
 // would normally run the file's configured clean filter. Every configured
-// driver is neutralized for this run, so no filter executes; the consequence,
-// documented in docs/snapshots.md, is that such a file may be labelled
-// modified although Git with filters would call it clean. The label is
-// provenance; the captured bytes are authoritative either way.
+// driver is neutralized for this run through the child environment, so no
+// filter executes; the consequence, documented in docs/snapshots.md, is that
+// such a file may be labelled modified although Git with filters would call
+// it clean. The label is provenance; the captured bytes are authoritative
+// either way.
 func (g *Git) Status(ctx context.Context, root string, untracked bool, maxEntries int64, visit func(Change) error) error {
 	overrides, err := g.filterOverrides(ctx, root)
 	if err != nil {
@@ -248,19 +258,23 @@ func (g *Git) Status(ctx context.Context, root string, untracked bool, maxEntrie
 		}
 		return corruptOutput("status", record)
 	})
-	args := append(overrides, "status", "-z", "--porcelain=v2", "--no-renames")
+	args := []string{"status", "-z", "--porcelain=v2", "--no-renames"}
 	if untracked {
 		args = append(args, "--untracked-files=all")
 	} else {
 		args = append(args, "--untracked-files=no")
 	}
-	return g.stream(ctx, root, p, maxEntries, args...)
+	return g.stream(ctx, root, overrides, p, maxEntries, args...)
 }
 
 // filterOverrides enumerates the configured clean/smudge filter drivers at
-// every configuration level Git would consult and returns the -c arguments
-// that neutralize each one: an empty clean and process command is no command,
-// and required=false keeps Git from failing on the absence.
+// every configuration level Git would consult and returns the environment
+// variables that neutralize each one for a single run: GIT_CONFIG_COUNT plus
+// GIT_CONFIG_KEY_<i>/GIT_CONFIG_VALUE_<i> pairs. An empty clean and process
+// command is no command, and required=false keeps Git from failing on the
+// absence. Key and value travel in separate variables, so a driver name
+// containing '=' (legal in a config subsection) cannot be misparsed the way
+// `-c filter.<name>.clean=` would be. Nil means no driver is configured.
 func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error) {
 	var out bytes.Buffer
 	result, err := g.run(ctx, root, &out, maxConfigBytes, "config", "-z", "--get-regexp", `^filter\..+\.(clean|process|required)$`)
@@ -272,7 +286,7 @@ func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error
 		return nil, err
 	}
 	seen := map[string]bool{}
-	var args []string
+	var env []string
 	for _, record := range bytes.Split(out.Bytes(), []byte{0}) {
 		key, _, _ := bytes.Cut(record, []byte{'\n'})
 		if len(key) == 0 {
@@ -289,9 +303,15 @@ func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error
 				Message: fmt.Sprintf("more than %d filter drivers are configured", maxFilterDrivers)}
 		}
 		seen[driver] = true
-		args = append(args, "-c", "filter."+driver+".clean=", "-c", "filter."+driver+".process=", "-c", "filter."+driver+".required=false")
+		for _, kv := range [...][2]string{{"clean", ""}, {"process", ""}, {"required", "false"}} {
+			i := strconv.Itoa(len(env) / 2)
+			env = append(env, "GIT_CONFIG_KEY_"+i+"=filter."+driver+"."+kv[0], "GIT_CONFIG_VALUE_"+i+"="+kv[1])
+		}
 	}
-	return args, nil
+	if env == nil {
+		return nil, nil
+	}
+	return append(env, "GIT_CONFIG_COUNT="+strconv.Itoa(len(env)/2)), nil
 }
 
 // zeroObjectID is the all-zero ID of the same length: porcelain v2 prints it
@@ -364,14 +384,15 @@ func isHexObjectID(s string) bool {
 }
 
 // stream runs one listing command, feeding its stdout through p as it arrives.
-// The stdout bound is derived from the entry budget: a listing longer than the
-// configured file budget is a typed limit, never a truncated manifest.
-func (g *Git) stream(ctx context.Context, root string, p *parser, maxEntries int64, args ...string) error {
+// extraEnv is appended to the fixed environment for this run only. The stdout
+// bound is derived from the entry budget: a listing longer than the configured
+// file budget is a typed limit, never a truncated manifest.
+func (g *Git) stream(ctx context.Context, root string, extraEnv []string, p *parser, maxEntries int64, args ...string) error {
 	if maxEntries <= 0 {
 		return &model.Error{Code: model.CodeResourceLimit, Message: "git listing needs a positive entry budget"}
 	}
 	p.maxRecords = maxEntries
-	_, err := g.run(ctx, root, p, maxEntries*maxRecordBytes, args...)
+	_, err := g.runEnv(ctx, root, extraEnv, p, maxEntries*maxRecordBytes, args...)
 	if p.err != nil {
 		// The parser's own typed rejection is the cause; the runner only saw
 		// its sink refuse bytes.
@@ -387,16 +408,27 @@ func (g *Git) stream(ctx context.Context, root string, p *parser, maxEntries int
 // sink. The Result is returned alongside the error so callers can interpret
 // exit codes the command documents.
 func (g *Git) run(ctx context.Context, root string, sink io.Writer, maxStdout int64, args ...string) (process.Result, error) {
+	return g.runEnv(ctx, root, nil, sink, maxStdout, args...)
+}
+
+// runEnv is run with extraEnv appended to a copy of the fixed environment.
+// process.Spec.Env replaces the child environment wholesale, so the copy
+// carries everything the child may see; g.env itself is never appended to.
+func (g *Git) runEnv(ctx context.Context, root string, extraEnv []string, sink io.Writer, maxStdout int64, args ...string) (process.Result, error) {
 	if !filepath.IsAbs(root) {
 		return process.Result{}, internal("git working directory must be absolute")
 	}
 	var stderr bytes.Buffer
 	argv := append(append([]string(nil), safeConfig...), args...)
+	env := g.env
+	if len(extraEnv) > 0 {
+		env = append(append(make([]string, 0, len(g.env)+len(extraEnv)), g.env...), extraEnv...)
+	}
 	result, err := g.runner.Run(ctx, process.Spec{
 		Path:           g.path,
 		Args:           argv,
 		Dir:            root,
-		Env:            g.env,
+		Env:            env,
 		Stdout:         sink,
 		Stderr:         &stderr,
 		MaxStdoutBytes: maxStdout,

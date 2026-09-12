@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -419,5 +420,58 @@ func TestNonGitCaptureIsExact(t *testing.T) {
 	}
 	if got, err := f.readAll(view, files["src/main.go"].ID); err != nil || string(got) != "package main\n" {
 		t.Fatalf("Open = %q, %v", got, err)
+	}
+}
+
+// TestNoConfiguredCommandExecutesDuringCapture protects the Section 21
+// security invariant that capture never runs a user-configured command. Git
+// re-hashes a tracked file whose stat changed and would run its clean filter
+// to do so; the builder must neutralize every driver, including one whose
+// name contains '=' — a `-c filter.<name>.clean=` override is split by Git at
+// the first '=' and leaves such a driver active. The capture must still
+// succeed with the exact worktree bytes.
+func TestNoConfiguredCommandExecutesDuringCapture(t *testing.T) {
+	f := newFixture(t, true)
+	filtered := []byte("filtered by a driver named with '='\n")
+	plain := []byte("filtered by a plainly named driver\n")
+	f.write("e.txt", filtered, 0o644)
+	f.write("p.txt", plain, 0o644)
+	f.gitCmd("add", "e.txt", "p.txt")
+	f.gitCmd("commit", "-q", "-m", "files")
+
+	// Configured only after the commit, so no setup command runs a filter:
+	// the capture is the first thing that could.
+	marker := filepath.Join(f.repoDir, "MARKER")
+	f.gitCmd("config", "filter.a=b.clean", "touch MARKER")
+	f.gitCmd("config", "filter.plain.clean", "touch MARKER")
+	f.write(".gitattributes", []byte("e.txt filter=a=b\np.txt filter=plain\n"), 0o644)
+	stale := time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, rel := range []string{"e.txt", "p.txt"} {
+		if err := os.Chtimes(filepath.Join(f.repoDir, rel), stale, stale); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("MARKER exists before the capture (%v); the fixture ran a filter", err)
+	}
+
+	_, view := f.build(f.builder())
+
+	if _, err := os.Lstat(marker); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("a configured clean filter executed during capture: MARKER lstat = %v", err)
+	}
+	m := f.manifest(view)
+	for rel, want := range map[string][]byte{"e.txt": filtered, "p.txt": plain} {
+		fv, ok := m[rel]
+		if !ok {
+			t.Fatalf("%s missing from the manifest", rel)
+		}
+		got, err := f.readAll(view, fv.ID)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s: retained %q (%v), want the exact worktree bytes %q", rel, got, err, want)
+		}
+	}
+	if _, ok := m["MARKER"]; ok {
+		t.Fatal("MARKER was captured; a filter ran before the walk")
 	}
 }

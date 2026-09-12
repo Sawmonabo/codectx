@@ -66,11 +66,14 @@ type Notes struct {
 	// tracked ones.
 	SkippedSymlinks int
 	// SkippedNonRegular counts tracked paths whose worktree entry is not a
-	// regular file (a directory, device or socket in place of a file). They
-	// are not source bytes and are not deletions.
+	// regular file (a directory, device or socket in place of a file). The
+	// file Git tracks is no longer a file at that path, so each is also a
+	// deleted tombstone; the count says why.
 	SkippedNonRegular int
-	// ExcludedTracked counts tracked regular files the unconditional
-	// exclusions kept out: the data directory inside the workspace.
+	// ExcludedTracked counts tracked regular files the walk did not reach:
+	// inside the data directory when it lies in the workspace, or behind a
+	// symlinked directory component pruned under follow_symlinks = false.
+	// They remain regular files, so they are neither captured nor tombstoned.
 	ExcludedTracked int
 	// Retries is how many validation passes found changes and recaptured.
 	Retries int
@@ -462,11 +465,17 @@ func (c *capture) reconcileUnseen(ctx context.Context, r row, pass int, detectOn
 			return err
 		}
 		if !gone {
-			// Present but not walked: not a regular file, or a regular file
-			// the unconditional exclusions keep out. Reported, not
-			// tombstoned: the path was not deleted.
 			c.noteUnwalked(info)
-			return nil
+			if info.Mode().IsRegular() {
+				// A regular file the walk did not reach (excluded or behind
+				// a pruned symlink). It exists and is a file, so it is not
+				// deleted; it is reported, not tombstoned.
+				return nil
+			}
+			// Replaced by a directory, device or socket: the file Git tracks
+			// is no longer a file at this path. Tombstoned exactly as the
+			// mid-capture branch below does, so the manifest does not depend
+			// on whether the replacement happened before or during the walk.
 		}
 		if pass > 1 {
 			*changes++
@@ -505,7 +514,9 @@ func (c *capture) reconcileUnseen(ctx context.Context, r row, pass int, detectOn
 	return c.st.drop(ctx, r.path)
 }
 
-// noteUnwalked classifies a present tracked path the walk did not emit.
+// noteUnwalked classifies a present tracked path the walk did not emit: a
+// regular file the walk could not reach (inside the data directory, or behind
+// a symlinked directory component) or a non-regular replacement.
 func (c *capture) noteUnwalked(info fs.FileInfo) {
 	if info.Mode().IsRegular() {
 		c.b.notes.ExcludedTracked++
