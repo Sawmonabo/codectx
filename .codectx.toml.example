@@ -1,0 +1,53 @@
+# codectx project configuration (.codectx.toml)
+#
+# This file is committed to the repository, so it is written by whoever can
+# write the repository. It therefore carries the least trust in codectx's
+# configuration model, and only the keys shown below may appear in it.
+#
+# It may narrow what codectx does to this repository: which files are eligible,
+# which languages are parsed, and the default size of a compiled context. It can
+# never widen anything. A key that authorizes execution, relaxes a safety
+# toggle, names a path root, or raises a limit is rejected with
+# CTX_TRUST_REQUIRED, and a key that does not exist is rejected with
+# CTX_CONFIG_INVALID. Every setting here may only lower the effective value the
+# user configuration resolved.
+#
+# All keys are optional. Only the keys actually present are merged.
+# See docs/configuration.md for the full reference and the trust model.
+
+version = 1
+
+[workspace]
+# Index files that Git does not track. Untracked discovery still honors ignore
+# rules; tracked files are indexed even when an ignore pattern matches them.
+include_untracked = true
+
+# Index paths classified as generated. The classification is a fixed built-in
+# list documented in docs/configuration.md; it is not configurable here.
+index_generated = false
+
+# Index vendored dependency directories (vendor, node_modules, third_party,
+# bower_components, Godeps).
+index_vendor = false
+
+# Upper bound on the number of files this workspace may contain. Exceeding it is
+# a typed CTX_RESOURCE_LIMIT, never a silently truncated index.
+max_files = 250000
+
+# Analysis admission limits. A file larger than these is still captured and
+# still readable as source; it is reported as skipped for parsing or search with
+# an explicit capability reason.
+max_parse_file_bytes = 5242880
+max_search_file_bytes = 26214400
+
+[providers.tree_sitter]
+# Languages to parse structurally, from the grammars bundled with this build.
+languages = ["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]
+
+[context]
+# Defaults for a context request that does not state its own budget. A request
+# may always ask for less.
+default_phase = "sweep"
+default_estimated_tokens = 80000
+default_max_bytes = 524288
+default_max_files = 200
