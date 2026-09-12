@@ -113,7 +113,11 @@ symbols without rescanning):
   leaving two correct but unrelated nodes. A key over `MaxNativeKeyBytes` is
   omitted rather than truncated (a truncated key would be a different, possibly
   colliding claim); the declaration keeps its own identity and its
-  qualified-name alias either way.
+  qualified-name alias either way. The omission is counted, so the file's
+  capability state becomes `partial` with `CTX_COVERAGE_INCOMPLETE`: a
+  declaration without this key will not merge with the semantic provider's
+  node for the same function, which is missing coverage, not a silent
+  simplification.
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
   are the two languages where a declared package clause makes members visible
@@ -156,7 +160,7 @@ recorded) with one `structure` capability state at the file's scope:
 | State | DiagnosticCode | Meaning |
 |---|---|---|
 | `fresh` | – | parsed without syntax errors, every record within bounds |
-| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was dropped, or the file reached the 2000 distinct unresolved-callee bound |
+| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was dropped, the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
 | `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than `workspace.max_parse_file_bytes`; not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
 
@@ -367,6 +371,7 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | declarations / imports / references per file | 20000 / 4000 / 60000 | both sides |
 | evidence per fact | 64 | parent |
 | distinct unresolved callees per file | 2000 | parent; past it the file is `partial` |
+| cross-provider declaration key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
 | signature | `MaxSignatureBytes` (4 KiB), whitespace-collapsed | parent |

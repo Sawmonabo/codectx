@@ -67,8 +67,9 @@ type builder struct {
 	aliases  []model.NativeAlias
 	search   []model.SearchUnit
 	// dropped counts what this file's bounds kept out of the facts:
-	// occurrences past the per-fact evidence bound and calls past the
-	// unresolved-callee bound. Any of it makes the file's coverage partial.
+	// occurrences past the per-fact evidence bound, calls past the
+	// unresolved-callee bound and declaration keys over MaxNativeKeyBytes.
+	// Any of it makes the file's coverage partial.
 	dropped int
 }
 
@@ -248,6 +249,14 @@ func (b *builder) resolveDecls() error {
 		b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
 		if key := b.declKey(d); key != "" {
 			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: res.Node.ID})
+		} else {
+			// The cross-provider key did not fit and was omitted rather than
+			// truncated. That is a record this file should have published and
+			// did not: without it the semantic provider's declaration for the
+			// same function resolves to a second identity. It is counted, so
+			// the file reports partial / CTX_COVERAGE_INCOMPLETE instead of
+			// claiming structural coverage it does not have.
+			b.dropped++
 		}
 		if pkg := b.packageScope(); pkg != "" && d.Parent < 0 {
 			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
@@ -275,6 +284,10 @@ func (b *builder) resolveDecls() error {
 // A key over MaxNativeKeyBytes is omitted rather than truncated: a truncated
 // key would be a different, possibly colliding identity claim. The
 // declaration keeps its own identity and its qualified-name alias either way.
+// The omission is counted in b.dropped by the caller, because a declaration
+// whose cross-provider key is missing will not merge with the semantic
+// provider's node for the same function: the file's structural coverage is
+// genuinely incomplete and says so.
 func (b *builder) declKey(d *declFact) string {
 	endLine := d.rng.End.Line
 	if d.End > d.Start && b.src[d.End-1] == '\n' {
