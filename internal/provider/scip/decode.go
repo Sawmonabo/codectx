@@ -1,0 +1,634 @@
+package scip
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"strconv"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+// SCIP field numbers and enum values (scip.proto, github.com/scip-code/scip
+// v0.10.0). The generated Go bindings are a separate Go module that the
+// pinned root module does not contain, so the handful of records this
+// provider needs are decoded here with the bounded wire reader; every record
+// is size-limited before it is read.
+const (
+	fieldIndexMetadata        = 1
+	fieldIndexDocuments       = 2
+	fieldIndexExternalSymbols = 3
+
+	fieldMetadataToolInfo     = 2
+	fieldMetadataProjectRoot  = 3
+	fieldMetadataTextEncoding = 4
+	fieldToolInfoName         = 1
+	fieldToolInfoVersion      = 2
+
+	fieldDocumentRelativePath = 1
+	fieldDocumentOccurrences  = 2
+	fieldDocumentSymbols      = 3
+	fieldDocumentLanguage     = 4
+	fieldDocumentText         = 5
+	fieldDocumentEncoding     = 6
+
+	fieldOccurrenceRange              = 1
+	fieldOccurrenceSymbol             = 2
+	fieldOccurrenceRoles              = 3
+	fieldOccurrenceEnclosingRange     = 7
+	fieldOccurrenceSingleRange        = 8
+	fieldOccurrenceMultiRange         = 9
+	fieldOccurrenceSingleEnclosing    = 10
+	fieldOccurrenceMultiEnclosing     = 11
+	fieldSymbolInfoSymbol             = 1
+	fieldSymbolInfoRelationships      = 4
+	fieldSymbolInfoKind               = 5
+	fieldSymbolInfoDisplayName        = 6
+	fieldSymbolInfoSignature          = 7
+	fieldSignatureText                = 5
+	fieldRelationshipSymbol           = 1
+	fieldRelationshipIsReference      = 2
+	fieldRelationshipIsImplementation = 3
+	fieldRelationshipIsTypeDefinition = 4
+	fieldRelationshipIsDefinition     = 5
+
+	roleDefinition  = 0x1
+	roleImport      = 0x2
+	roleWriteAccess = 0x4
+	roleReadAccess  = 0x8
+
+	encodingUnspecified = 0
+	encodingUTF8        = 1
+	encodingUTF16       = 2
+	encodingUTF32       = 3
+
+	// maxRelationships bounds one symbol's relationship list; the record is
+	// already size-bounded, this keeps the decoded slice small as well.
+	maxRelationships = 4096
+)
+
+// metadata is the bounded Index.metadata record.
+type metadata struct {
+	toolName, toolVersion, projectRoot string
+	textEncoding                       int32
+}
+
+// occurrence is one decoded Occurrence. rng and enclosing are SCIP ranges of
+// three (single line) or four values, zero-based lines and columns in the
+// document's position encoding.
+type occurrence struct {
+	symbol       string
+	roles        int32
+	rng          []int32
+	enclosing    []int32
+	hasEnclosing bool
+}
+
+// relationship is one SymbolInformation.relationships entry.
+type relationship struct {
+	symbol string
+	flags  int32 // bit 0 reference, 1 implementation, 2 type definition, 3 definition
+}
+
+const (
+	relReference      = 1
+	relImplementation = 2
+	relTypeDefinition = 4
+	relDefinition     = 8
+)
+
+// symbolInfo is one decoded SymbolInformation.
+type symbolInfo struct {
+	symbol, displayName, signature string
+	kind                           int32
+	relationships                  []relationship
+}
+
+// document is the summary the walker reports when a Document record ends:
+// everything needed to bind it to a snapshot file. It never carries the text;
+// the text is hashed as it streams past.
+type document struct {
+	index       int64
+	path        string
+	language    string
+	encoding    int32
+	hasText     bool
+	textHash    string
+	occurrences int64
+}
+
+// walker streams one index through the wire reader. Callbacks that are nil
+// mean the walker skips that record kind without decoding it, which is how
+// the binding pre-pass reads only paths and text hashes.
+type walker struct {
+	limits Limits
+	// buf holds the record being read; strs holds strings cut from it while
+	// it is decoded. They must be distinct: decoding reads from buf.
+	buf, strs []byte
+	// reserved is the buffer capacity last reported through onGrow.
+	reserved int64
+
+	// onGrow is told when the record buffer grows, so the owner can charge
+	// the new capacity against the sink's byte pool before it is used.
+	onGrow       func(context.Context, int64) error
+	onMetadata   func(metadata) error
+	onOccurrence func(doc int64, seq int64, o occurrence, recordBytes int64) error
+	onSymbol     func(doc int64, s symbolInfo, recordBytes int64) error
+	onDocument   func(document) error
+	onExternal   func(s symbolInfo, recordBytes int64) error
+}
+
+// record reads one bounded record into the walker's buffer and reports a
+// grown buffer to the owner.
+func (w *walker) record(ctx context.Context, r *reader, n int64, what string) error {
+	var err error
+	if w.buf, err = r.bytes(n, w.limits.MaxRecordBytes, what, w.buf); err != nil {
+		return err
+	}
+	if w.onGrow != nil && int64(cap(w.buf)) > w.reserved {
+		w.reserved = int64(cap(w.buf))
+		return w.onGrow(ctx, w.reserved)
+	}
+	return nil
+}
+
+// walk consumes the whole index of size bytes.
+func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed int64, err error) {
+	r := newReader(src, size)
+	var docs int64
+	for !r.done() {
+		if err := ctx.Err(); err != nil {
+			return *r.consumed, model.Canceled(err)
+		}
+		field, wt, err := r.tag()
+		if err != nil {
+			return *r.consumed, err
+		}
+		if wt != wireBytes {
+			if err := r.skip(wt); err != nil {
+				return *r.consumed, err
+			}
+			continue
+		}
+		n, err := r.length()
+		if err != nil {
+			return *r.consumed, err
+		}
+		switch field {
+		case fieldIndexMetadata:
+			if w.onMetadata == nil {
+				err = r.discardSub(n)
+				break
+			}
+			if err = w.record(ctx, r, n, "metadata record"); err != nil {
+				break
+			}
+			var m metadata
+			if m, err = decodeMetadata(w.buf); err == nil {
+				err = w.onMetadata(m)
+			}
+		case fieldIndexDocuments:
+			if docs++; docs > w.limits.MaxDocuments {
+				return *r.consumed, overLimit("documents", docs, w.limits.MaxDocuments)
+			}
+			var doc *reader
+			if doc, err = r.sub(n); err == nil {
+				err = w.document(ctx, doc, docs-1)
+			}
+		case fieldIndexExternalSymbols:
+			if w.onExternal == nil {
+				err = r.discardSub(n)
+				break
+			}
+			if err = w.record(ctx, r, n, "symbol record"); err != nil {
+				break
+			}
+			var s symbolInfo
+			if s, err = decodeSymbolInfo(w.buf); err == nil {
+				err = w.onExternal(s, n)
+			}
+		default:
+			err = r.discardSub(n)
+		}
+		if err != nil {
+			return *r.consumed, err
+		}
+	}
+	return *r.consumed, nil
+}
+
+// document walks one Document record field by field. Occurrence and symbol
+// records are read individually within their bound; the text is streamed
+// through a hasher and never held.
+func (w *walker) document(ctx context.Context, r *reader, index int64) error {
+	d := document{index: index}
+	hasher := sha256.New()
+	var seq int64
+	for !r.done() {
+		if err := ctx.Err(); err != nil {
+			return model.Canceled(err)
+		}
+		field, wt, err := r.tag()
+		if err != nil {
+			return err
+		}
+		if wt != wireBytes {
+			if field == fieldDocumentEncoding && wt == wireVarint {
+				v, err := r.varint()
+				if err != nil {
+					return err
+				}
+				d.encoding = int32(v)
+				continue
+			}
+			if err := r.skip(wt); err != nil {
+				return err
+			}
+			continue
+		}
+		n, err := r.length()
+		if err != nil {
+			return err
+		}
+		switch field {
+		case fieldDocumentRelativePath:
+			if w.buf, err = r.bytes(n, int64(model.MaxPathBytes), "document path", w.buf); err != nil {
+				return err
+			}
+			d.path = string(w.buf)
+		case fieldDocumentLanguage:
+			if w.buf, err = r.bytes(n, int64(model.MaxLanguageBytes), "document language", w.buf); err != nil {
+				return err
+			}
+			d.language = string(w.buf)
+		case fieldDocumentText:
+			d.hasText = true
+			if err := r.stream(n, hasher); err != nil {
+				return err
+			}
+		case fieldDocumentOccurrences:
+			if d.occurrences++; d.occurrences > w.limits.MaxOccurrencesPerDocument {
+				return overLimit("occurrences per document", d.occurrences, w.limits.MaxOccurrencesPerDocument)
+			}
+			if w.onOccurrence == nil {
+				if err := r.discardSub(n); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := w.record(ctx, r, n, "occurrence record"); err != nil {
+				return err
+			}
+			o, err := w.decodeOccurrence(w.buf)
+			if err != nil {
+				return err
+			}
+			if err := w.onOccurrence(index, seq, o, n); err != nil {
+				return err
+			}
+			seq++
+		case fieldDocumentSymbols:
+			if w.onSymbol == nil {
+				if err := r.discardSub(n); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := w.record(ctx, r, n, "symbol record"); err != nil {
+				return err
+			}
+			s, err := decodeSymbolInfo(w.buf)
+			if err != nil {
+				return err
+			}
+			if err := w.onSymbol(index, s, n); err != nil {
+				return err
+			}
+		default:
+			if err := r.discardSub(n); err != nil {
+				return err
+			}
+		}
+	}
+	if d.path == "" {
+		return malformed("document " + strconv.FormatInt(index, 10) + " has no relative_path")
+	}
+	if d.hasText {
+		d.textHash = hex.EncodeToString(hasher.Sum(nil))
+	}
+	if w.onDocument == nil {
+		return nil
+	}
+	return w.onDocument(d)
+}
+
+// decodeOccurrence decodes one bounded Occurrence record. The deprecated
+// packed range fields and the typed single/multi-line ranges are both
+// accepted; a record carrying neither has no range and is malformed.
+//
+// A record may carry both forms. The typed range wins whatever order the
+// fields arrive in: which coordinates this provider converts must not depend
+// on a writer's field order, or the same index would yield different evidence
+// bytes from one encoder to the next. Both forms are still consumed, so the
+// record stays in sync.
+func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
+	r := newReader(bytes.NewReader(buf), int64(len(buf)))
+	var o occurrence
+	var legacyRange, legacyEnclosing []int32
+	var rangeTyped, enclosingTyped, enclosingSeen bool
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return o, err
+		}
+		switch field {
+		case fieldOccurrenceRange:
+			if legacyRange, err = r.ints(wt, legacyRange[:0], 4); err != nil {
+				return o, err
+			}
+		case fieldOccurrenceEnclosingRange:
+			enclosingSeen = true
+			if legacyEnclosing, err = r.ints(wt, legacyEnclosing[:0], 4); err != nil {
+				return o, err
+			}
+		case fieldOccurrenceSingleRange, fieldOccurrenceMultiRange, fieldOccurrenceSingleEnclosing, fieldOccurrenceMultiEnclosing:
+			if wt != wireBytes {
+				return o, malformed("typed range has an unexpected wire type")
+			}
+			n, err := r.length()
+			if err != nil {
+				return o, err
+			}
+			body, err := r.sub(n)
+			if err != nil {
+				return o, err
+			}
+			vals, err := decodeTypedRange(body, field == fieldOccurrenceSingleRange || field == fieldOccurrenceSingleEnclosing)
+			if err != nil {
+				return o, err
+			}
+			if field == fieldOccurrenceSingleRange || field == fieldOccurrenceMultiRange {
+				o.rng, rangeTyped = vals, true
+			} else {
+				o.enclosing, enclosingTyped, enclosingSeen = vals, true, true
+			}
+		case fieldOccurrenceSymbol:
+			if wt != wireBytes {
+				return o, malformed("occurrence symbol has an unexpected wire type")
+			}
+			if o.symbol, w.strs, err = r.str(model.MaxNativeKeyBytes, "occurrence symbol", w.strs); err != nil {
+				return o, err
+			}
+		case fieldOccurrenceRoles:
+			if wt != wireVarint {
+				return o, malformed("occurrence roles have an unexpected wire type")
+			}
+			v, err := r.varint()
+			if err != nil {
+				return o, err
+			}
+			o.roles = int32(v)
+		default:
+			if err := r.skip(wt); err != nil {
+				return o, err
+			}
+		}
+	}
+	if !rangeTyped {
+		o.rng = legacyRange
+	}
+	if !enclosingTyped {
+		o.enclosing = legacyEnclosing
+	}
+	o.hasEnclosing = enclosingSeen
+	if len(o.rng) != 3 && len(o.rng) != 4 {
+		return o, malformed("occurrence range has " + strconv.Itoa(len(o.rng)) + " values, want 3 or 4")
+	}
+	if o.hasEnclosing && len(o.enclosing) != 3 && len(o.enclosing) != 4 {
+		return o, malformed("enclosing range has " + strconv.Itoa(len(o.enclosing)) + " values, want 3 or 4")
+	}
+	return o, nil
+}
+
+// decodeTypedRange reads a SingleLineRange {line, start, end} or a
+// MultiLineRange {start_line, start_char, end_line, end_char} into the
+// deprecated flat form so one conversion path serves both.
+func decodeTypedRange(r *reader, single bool) ([]int32, error) {
+	vals := make([]int32, 4)
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return nil, err
+		}
+		if wt != wireVarint || field < 1 || field > 4 {
+			if err := r.skip(wt); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		v, err := r.varint()
+		if err != nil {
+			return nil, err
+		}
+		vals[field-1] = int32(v)
+	}
+	if single {
+		return vals[:3], nil
+	}
+	return vals, nil
+}
+
+// decodeSymbolInfo decodes one bounded SymbolInformation record: symbol,
+// kind, display name, signature text and relationships. Documentation is
+// skipped; it is not a fact this provider publishes.
+func decodeSymbolInfo(buf []byte) (symbolInfo, error) {
+	r := newReader(bytes.NewReader(buf), int64(len(buf)))
+	var s symbolInfo
+	var scratch []byte
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return s, err
+		}
+		switch {
+		case field == fieldSymbolInfoKind && wt == wireVarint:
+			v, err := r.varint()
+			if err != nil {
+				return s, err
+			}
+			s.kind = int32(v)
+		case field == fieldSymbolInfoSymbol && wt == wireBytes:
+			if s.symbol, scratch, err = r.str(model.MaxNativeKeyBytes, "symbol", scratch); err != nil {
+				return s, err
+			}
+		case field == fieldSymbolInfoDisplayName && wt == wireBytes:
+			if s.displayName, scratch, err = r.str(model.MaxNameBytes, "display name", scratch); err != nil {
+				return s, err
+			}
+		case field == fieldSymbolInfoSignature && wt == wireBytes:
+			n, err := r.length()
+			if err != nil {
+				return s, err
+			}
+			sig, err := r.sub(n)
+			if err != nil {
+				return s, err
+			}
+			if s.signature, err = decodeSignature(sig); err != nil {
+				return s, err
+			}
+		case field == fieldSymbolInfoRelationships && wt == wireBytes:
+			n, err := r.length()
+			if err != nil {
+				return s, err
+			}
+			body, err := r.sub(n)
+			if err != nil {
+				return s, err
+			}
+			rel, err := decodeRelationship(body)
+			if err != nil {
+				return s, err
+			}
+			if len(s.relationships) >= maxRelationships {
+				return s, overLimit("relationships per symbol", int64(len(s.relationships))+1, maxRelationships)
+			}
+			s.relationships = append(s.relationships, rel)
+		default:
+			if err := r.skip(wt); err != nil {
+				return s, err
+			}
+		}
+	}
+	if s.symbol == "" {
+		return s, malformed("symbol information has no symbol")
+	}
+	return s, nil
+}
+
+// decodeSignature reads Signature.text, bounded at the signature ceiling;
+// a longer signature is dropped rather than truncated into a wrong one.
+func decodeSignature(r *reader) (string, error) {
+	var text string
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return "", err
+		}
+		if field != fieldSignatureText || wt != wireBytes {
+			if err := r.skip(wt); err != nil {
+				return "", err
+			}
+			continue
+		}
+		n, err := r.length()
+		if err != nil {
+			return "", err
+		}
+		if n > int64(model.MaxSignatureBytes) {
+			if err := r.discardSub(n); err != nil {
+				return "", err
+			}
+			continue
+		}
+		buf, err := r.bytes(n, n, "signature", nil)
+		if err != nil {
+			return "", err
+		}
+		text = string(buf)
+	}
+	return text, nil
+}
+
+func decodeRelationship(r *reader) (relationship, error) {
+	var rel relationship
+	var scratch []byte
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return rel, err
+		}
+		switch {
+		case field == fieldRelationshipSymbol && wt == wireBytes:
+			if rel.symbol, scratch, err = r.str(model.MaxNativeKeyBytes, "relationship symbol", scratch); err != nil {
+				return rel, err
+			}
+		case wt == wireVarint && field >= fieldRelationshipIsReference && field <= fieldRelationshipIsDefinition:
+			v, err := r.varint()
+			if err != nil {
+				return rel, err
+			}
+			if v != 0 {
+				rel.flags |= 1 << (field - fieldRelationshipIsReference)
+			}
+		default:
+			if err := r.skip(wt); err != nil {
+				return rel, err
+			}
+		}
+	}
+	if rel.symbol == "" {
+		return rel, malformed("relationship has no symbol")
+	}
+	return rel, nil
+}
+
+// decodeMetadata reads the tool identity and text encoding of the index.
+func decodeMetadata(buf []byte) (metadata, error) {
+	r := newReader(bytes.NewReader(buf), int64(len(buf)))
+	var m metadata
+	var scratch []byte
+	for !r.done() {
+		field, wt, err := r.tag()
+		if err != nil {
+			return m, err
+		}
+		switch {
+		case field == fieldMetadataTextEncoding && wt == wireVarint:
+			v, err := r.varint()
+			if err != nil {
+				return m, err
+			}
+			m.textEncoding = int32(v)
+		case field == fieldMetadataProjectRoot && wt == wireBytes:
+			if m.projectRoot, scratch, err = r.str(model.MaxPathBytes, "project root", scratch); err != nil {
+				return m, err
+			}
+		case field == fieldMetadataToolInfo && wt == wireBytes:
+			n, err := r.length()
+			if err != nil {
+				return m, err
+			}
+			sub, err := r.sub(n)
+			if err != nil {
+				return m, err
+			}
+			for !sub.done() {
+				f, w, err := sub.tag()
+				if err != nil {
+					return m, err
+				}
+				switch {
+				case f == fieldToolInfoName && w == wireBytes:
+					if m.toolName, scratch, err = sub.str(model.MaxIdentifierBytes, "tool name", scratch); err != nil {
+						return m, err
+					}
+				case f == fieldToolInfoVersion && w == wireBytes:
+					if m.toolVersion, scratch, err = sub.str(model.MaxIdentifierBytes, "tool version", scratch); err != nil {
+						return m, err
+					}
+				default:
+					if err := sub.skip(w); err != nil {
+						return m, err
+					}
+				}
+			}
+		default:
+			if err := r.skip(wt); err != nil {
+				return m, err
+			}
+		}
+	}
+	return m, nil
+}
