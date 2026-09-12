@@ -85,10 +85,13 @@ the runner's code when the probe fails). The probe executes code, which is
 why detection needs the approved absolute path from user configuration and
 `auto` never runs anything found on `PATH`.
 
-After a successful detection the descriptor version becomes
-`1/pinned-default/parse=<v>,export=<v>`. Section 9.1 keys unit identity on the
+`Descriptor()` is static: its version is always `1/pinned-default` (adapter
+version and profile name). The observed tool versions are returned separately,
+as `Detection.ObservedVersion = "parse=<v>,export=<v>"`; the coordinator folds
+that into `UnitSpec.ProviderVersion`. Section 9.1 keys unit identity on the
 exact provider version, and the installed Joern release is the provider's
-semantics: a unit built by one release is never reused for another.
+semantics, so a unit built by one release is never reused for another — but
+detection reports the release, it never mutates the descriptor.
 
 ## Run lifecycle
 
@@ -109,6 +112,18 @@ after parse; each export directory and the scratch database against
 return path (success, provider error, timeout, cancellation). A crash of the
 codectx process itself can leave a `runs/run-*` directory behind; removing
 orphans under `work_dir` is a `doctor` concern (Task 20).
+
+**Accepted gap — SQLite temporary b-trees.** The scratch database is opened
+with `temp_store(FILE)` so SQLite spills to disk instead of into the Go
+process's heap (the recursive `REACHING_DEF` walk in `project` is the main
+consumer). Those temporary files are created in the operating system's temp
+directory, not under `work_dir`, so they are outside the
+`joern-export.disk_budget_bytes` accounting and outside the run directory's
+removal. They are unlinked by SQLite when the statement or connection ends;
+the accepted consequence is that a run's peak disk use can exceed the
+profile's budget by the size of one walk's working set. Ruling: accepted gap,
+not worked around — the alternative (`temp_store(MEMORY)`) would move an
+unbounded structure into the heap, which Section 6 forbids outright.
 
 The coordinator must declare every non-deleted file of the snapshot as the
 unit's input: the provider materializes `FileSelection{}` and binds facts to
@@ -145,6 +160,15 @@ PDG node ids differ from the CSV ids contributes nothing rather than
 something wrong. Scratch growth is checked against the disk budget every
 4096 rows.
 
+**Dangling edges.** An edge whose endpoints the export never defined is a
+loss, and the run is reported `partial` with
+`CTX_SOURCE_BINDING_UNVERIFIED`. Only the edges the projection actually
+consumes are counted: a `CALL` edge with either end missing, and a `CONTAINS`
+edge **whose destination is a staged `CALL` node** and whose source is
+missing. A real export contains many `CONTAINS` edges from other sources
+(`FILE CONTAINS METHOD`, `TYPE_DECL CONTAINS METHOD`); those are structure
+this profile never reads, and counting them would mark every run partial.
+
 ### Label vocabulary
 
 | Joern | Handling |
@@ -152,7 +176,7 @@ something wrong. Scratch growth is checked against the disk budget every
 | `CALL` edge (site → METHOD) | `calls` from the METHOD that `CONTAINS` the site to the target |
 | `CDG` edge between two anchored sites | `control_depends_on` dependent target → controlling target |
 | `REACHING_DEF` walk (depth ≤ 8) between two anchored sites | `data_flows_to` source target → destination target |
-| `CONTAINS` | structure only (site → enclosing method, site → file) |
+| `CONTAINS` | METHOD → call site (filename inheritance and calls attribution) |
 | every other label in the CPG schema list in `scratch.go` | known, ignored |
 | anything else | counted; reported as capability `unsupported_label:<LABEL>` = `unavailable` (32 distinct by name, then `unsupported_labels:untracked`) |
 
@@ -201,15 +225,35 @@ Resolution goes through `req.Resolver` with this candidate:
 |---|---|---|
 | `ScopeKey` | `"file:" + path` | `provider.ScopeWorkspace` |
 | `NativeKey` | `joern:method:<FULL_NAME>` | same |
-| `StrongKey` | `decl:<NAME>@<path>:<line>-<line_end>` | none |
+| `StrongKey` | `decl:<NAME>@<path>:<LINE_NUMBER>-<LINE_NUMBER_END>` | none |
 | `Kind` | `function` (an alias match adopts the stored kind) | `function` |
 | `Language` | the snapshot file's language | normalized `META_DATA.LANGUAGE` |
 | `FileID`, `ContentHash`, `Range` | the pinned file and verified line span | none |
 
-The strong key is the **declaration-location contract** (Ruling R11-3): a
-structural provider that aliases its declarations under
-`("file:"+path, "decl:<name>@<path>:<start>-<end>")` makes the Joern method
-resolve to the same node with basis `native_key`. Without a hit the resolver
+The strong key is the **declaration-location contract**, fixed by controller
+ruling (R11-3, fix round 1). The exact strings are:
+
+```text
+scope key:  "file:" + <root-relative slash path>
+strong key: "decl:" + <identifier token as written>
+            + "@" + <root-relative slash path>
+            + ":" + <start line> + "-" + <end line>
+```
+
+Lines are **one-based and the span is inclusive**. The identifier is the
+token the producing tool saw, byte for byte: no case folding, no
+unqualifying, no normalization of any kind. For Joern it is the METHOD's
+`NAME` attribute (a METHOD with no `NAME` publishes no strong key, since it
+has no identifier token); the path is `FILENAME` normalized to a
+root-relative slash path; the lines are `LINE_NUMBER` and `LINE_NUMBER_END`
+(falling back to `LINE_NUMBER` when the end is absent or smaller). A key that
+would exceed `MaxNativeKeyBytes` is omitted rather than truncated — a
+truncated key would collide. `emit.go`'s `declarationKey` is the single
+producer of this string.
+
+A structural provider that aliases its declarations under that
+`(scope key, strong key)` pair makes the Joern method resolve to the same
+node with basis `native_key`. Without a hit the resolver
 mints a Joern-local identity from the file and range (`source_location`) or,
 for external methods, from the qualified name (`structural_key`); an
 unresolved basis marks metadata `{"resolution":"unresolved"}`. Ambiguous
@@ -255,8 +299,9 @@ never logged.
 ## Reuse
 
 `AnalysisConfigHash` already folds the analyzer executables, version
-constraints, checksums and environment allowlist; the descriptor version
-folds the observed tool versions. Pin `checksum` too: with a wildcard
+constraints, checksums and environment allowlist; `Detection.ObservedVersion`
+carries the tool versions the coordinator folds into `UnitSpec.ProviderVersion`.
+Pin `checksum` too: with a wildcard
 constraint, two patch releases that print the same `--version` line would
 otherwise share unit identity.
 
@@ -282,7 +327,11 @@ row) whose METHOD rows carry `FILENAME` relative to the input directory,
 whose CALL rows carry `METHOD_FULL_NAME`, `LINE_NUMBER`, `COLUMN_NUMBER`,
 `CODE`, and whose edge files include `CALL`, `CONTAINS`, `CDG` and
 `REACHING_DEF`; (4) the GraphML node ids equal the CSV `:ID` values and edge
-labels are `CDG` / `DDG`. Any difference is a one-line change to
+labels are `CDG` / `DDG`; (5) the run's capabilities are `fresh`, not
+`partial` — **`CONTAINS` sources other than `METHOD` are expected** (`FILE`
+and `TYPE_DECL` contain methods), so a `partial` run with
+`CTX_SOURCE_BINDING_UNVERIFIED` means real dangling `CALL` edges or unmatched
+source paths, never ordinary `CONTAINS` structure. Any difference is a one-line change to
 `PinnedDefault()` or the label tables in `scratch.go`; only then may the
 docs drop the unverified marker. The checked-in fixture under
 `internal/provider/joern/testdata` mirrors this expected layout.
