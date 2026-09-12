@@ -107,8 +107,17 @@ one indexing run).
   pool for the rest of the run.
 - **Reference order.** Nodes are always flushed before relations, aliases and
   search documents, because those rows reference node identities the same
-  unit may have minted. Within a batch records are sorted by their stable key
-  so the transaction shape depends on content, not on worker timing.
+  unit may have minted. Within a batch records are sorted by their stable
+  key. Under pool pressure another sink may flush a partial batch at a time
+  this provider did not choose, so the grouping of rows into transactions
+  varies with timing; the persisted identities and rows do not.
+- **Hand a node fact to the sink before any relation, alias or search
+  document that references its identity.** Batch flush timing is not under
+  the provider's control, and storage requires a relation's endpoints and an
+  alias's target to be registered identities when the row is written. A
+  provider that violates this passes a quiet run and fails under pressure;
+  `providertest.Conform` runs the provider once with one-record batches so
+  the violation fails deterministically.
 
 Byte accounting is the documented deterministic size function in `sink.go`
 (`NodeFactBytes`, `RelationFactBytes`, `AliasBytes`, `SearchUnitBytes`): a
@@ -142,7 +151,10 @@ and alias targets visible through the dependency closure) followed by the
 state flip and generation membership. On any other outcome — provider error,
 write failure, cancellation, timeout, or a `partial`/`failed` result — the
 unit is failed: `UnitWriter.Fail` deletes every row it wrote. Failed partial
-output is never attached to a generation and can never be queried.
+output is never attached to a generation and can never be queried. The
+writer is single-owner: `RunUnit` discards the sink (waiting out any
+in-flight relief write and leaving the pool) before it calls `Seal` or
+`Fail`, so no write can overlap either.
 
 The returned `ProviderResult` always names the run and a terminal state. A
 write failure that cancelled the provider is reported as `failed` with the
@@ -215,5 +227,6 @@ and `Run` drive a unit through exactly the production `BeginUnit`, sink,
 resolver, seal and fail paths; `Func` is a provider assembled from functions;
 `Recorder` captures the identities a run persisted; `Conform(t, p, files,
 scope, inputs)` checks the descriptor, detection, a succeeded sealed unit and
-that a second run over an identical repository yields the same unit identity
-and the same persisted identities.
+that a second run over an identical repository — with one-record batches, so
+every `Put` is persisted immediately — yields the same unit identity and the
+same persisted identities.

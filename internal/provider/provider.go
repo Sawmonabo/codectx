@@ -113,6 +113,13 @@ type Resolver interface {
 // blocks while the sink's retained-byte reservation is exhausted and returns
 // promptly on cancellation; a single record over the configured limit is a
 // CTX_RESOURCE_LIMIT failure, not a bypass.
+//
+// Hand a node fact to the sink before any relation, alias or search document
+// that references its identity. Batch flush timing is not under the
+// provider's control: a batch may be persisted at any call, including by
+// another unit relieving pool pressure, and storage requires a relation's
+// endpoints and an alias's target to be registered identities when the row
+// is written.
 type Sink interface {
 	PutNodes(context.Context, []model.NodeFact) error
 	PutRelations(context.Context, []model.RelationFact) error
