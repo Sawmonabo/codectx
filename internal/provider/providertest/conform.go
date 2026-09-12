@@ -117,11 +117,12 @@ func (r *Recorder) Identities() []string {
 // bytes, so unchanged facts could never be shared between snapshots and
 // unit reuse would silently compare unequal keys.
 //
-// The second run uses a one-record batch, so every Put is persisted at once.
-// A provider that hands a relation, alias or search document to the sink
-// before the node fact it references then fails here deterministically,
-// instead of only under pool pressure in production where flush timing is
-// not the provider's to control.
+// In the second run every Put is followed by a Flush of the real sink, so
+// each record is persisted before the provider's next call. A provider that
+// hands a relation, alias or search document to the sink before the node fact
+// it references then fails here deterministically (storage rejects the
+// unregistered identity), instead of only under pool pressure in production
+// where flush timing is not the provider's to control.
 func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKey string, inputs []string) {
 	t.Helper()
 	if err := p.Descriptor().Validate(); err != nil {
@@ -142,11 +143,11 @@ func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKe
 		}
 		u := h.Plan(t, p, scopeKey, inputs)
 		rec := &Recorder{UnitOutput: h.Begin(t, u, inputs)}
-		limits := Limits
+		run := p
 		if i == 1 {
-			limits.BatchRecords = 1
+			run = flushEveryPut{Provider: p}
 		}
-		result, err := provider.RunUnit(h.ctx, p, u.Request, rec, limits, h.Pool)
+		result, err := provider.RunUnit(h.ctx, run, u.Request, rec, Limits, h.Pool)
 		if err != nil {
 			t.Fatalf("RunUnit: %v", err)
 		}
@@ -164,4 +165,53 @@ func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKe
 	if !slices.Equal(runs[0].ids, runs[1].ids) {
 		t.Fatalf("persisted identities differ across identical repositories:\n%v\n%v", runs[0].ids, runs[1].ids)
 	}
+}
+
+// flushable is the sink RunUnit hands a provider: the Sink methods plus the
+// batch flush the harness triggers after every call.
+type flushable interface {
+	provider.Sink
+	Flush(context.Context) error
+}
+
+// flushEveryPut wraps a provider so the sink it sees persists after every
+// Put. The wrapper changes when rows reach storage, never which rows.
+type flushEveryPut struct {
+	provider.Provider
+}
+
+func (w flushEveryPut) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	fs, ok := sink.(flushable)
+	if !ok {
+		return model.ProviderResult{}, &model.Error{Code: model.CodeInternal, Message: "conformance run received a sink that cannot be flushed"}
+	}
+	return w.Provider.IndexUnit(ctx, req, flushing{fs})
+}
+
+// flushing forwards each Put to the real sink and then flushes it.
+type flushing struct {
+	sink flushable
+}
+
+func (f flushing) PutNodes(ctx context.Context, facts []model.NodeFact) error {
+	return f.then(ctx, f.sink.PutNodes(ctx, facts))
+}
+
+func (f flushing) PutRelations(ctx context.Context, facts []model.RelationFact) error {
+	return f.then(ctx, f.sink.PutRelations(ctx, facts))
+}
+
+func (f flushing) PutAliases(ctx context.Context, aliases []model.NativeAlias) error {
+	return f.then(ctx, f.sink.PutAliases(ctx, aliases))
+}
+
+func (f flushing) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
+	return f.then(ctx, f.sink.PutSearchUnits(ctx, docs))
+}
+
+func (f flushing) then(ctx context.Context, err error) error {
+	if err != nil {
+		return err
+	}
+	return f.sink.Flush(ctx)
 }

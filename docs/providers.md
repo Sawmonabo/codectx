@@ -116,8 +116,8 @@ one indexing run).
   the provider's control, and storage requires a relation's endpoints and an
   alias's target to be registered identities when the row is written. A
   provider that violates this passes a quiet run and fails under pressure;
-  `providertest.Conform` runs the provider once with one-record batches so
-  the violation fails deterministically.
+  `providertest.Conform` runs the provider once with a sink that is flushed
+  after every `Put`, so the violation fails deterministically.
 
 Byte accounting is the documented deterministic size function in `sink.go`
 (`NodeFactBytes`, `RelationFactBytes`, `AliasBytes`, `SearchUnitBytes`): a
@@ -227,6 +227,6 @@ and `Run` drive a unit through exactly the production `BeginUnit`, sink,
 resolver, seal and fail paths; `Func` is a provider assembled from functions;
 `Recorder` captures the identities a run persisted; `Conform(t, p, files,
 scope, inputs)` checks the descriptor, detection, a succeeded sealed unit and
-that a second run over an identical repository — with one-record batches, so
-every `Put` is persisted immediately — yields the same unit identity and the
-same persisted identities.
+that a second run over an identical repository — with the sink flushed after
+every `Put`, so each record is persisted before the provider's next call —
+yields the same unit identity and the same persisted identities.
