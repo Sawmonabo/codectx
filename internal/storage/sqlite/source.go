@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -44,12 +45,20 @@ func (s *Store) PutBlob(ctx context.Context, b model.BlobRecord) error {
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var size int64
-		err := tx.QueryRowContext(ctx, `SELECT size_bytes FROM blobs WHERE hash = ?`, hash).Scan(&size)
+		var state model.BlobState
+		err := tx.QueryRowContext(ctx, `SELECT size_bytes, state FROM blobs WHERE hash = ?`, hash).Scan(&size, &state)
 		switch {
 		case err == nil:
 			if size != b.Size {
 				return &model.Error{Code: model.CodeSourceIntegrity,
 					Message: "blob is already retained with a different size; the content hash does not match its bytes"}
+			}
+			if state != model.BlobReady {
+				// Capture has republished the object: a row the grace protocol
+				// demoted to trash or quarantine is live again, or the snapshot
+				// about to name it would reference a blob collection is removing.
+				_, err := tx.ExecContext(ctx, `UPDATE blobs SET state = ? WHERE hash = ?`, string(model.BlobReady), hash)
+				return wrap("blobs", err)
 			}
 			return nil
 		case !isNoRows(err):
@@ -176,12 +185,12 @@ func (s *Store) PutSnapshot(ctx context.Context, snap model.Snapshot, files func
 	}
 	if err != nil {
 		// Leave no half-imported snapshot behind; the next attempt would
-		// otherwise have to detect and replace it.
-		s.write(ctx, func(tx *sql.Tx) error {
+		// otherwise have to detect and replace it. A cleanup failure is
+		// reported with the cause, not hidden behind it.
+		return errors.Join(err, s.write(ctx, func(tx *sql.Tx) error {
 			_, derr := tx.ExecContext(ctx, `DELETE FROM snapshots WHERE id = ?`, snapID)
 			return wrap("snapshots", derr)
-		})
-		return err
+		}))
 	}
 	return nil
 }

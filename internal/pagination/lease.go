@@ -17,6 +17,10 @@ type LeaseStore interface {
 	AcquireLease(ctx context.Context, lease model.Lease) error
 	RenewLease(ctx context.Context, id string, expiresAt time.Time) error
 	ReleaseLease(ctx context.Context, id string) error
+	// LeaseExpiry reports when a live lease expires; a released or unknown
+	// lease is CTX_CURSOR_INVALID. Spools consult it instead of the expiry
+	// their header was created with, which a renewal makes stale.
+	LeaseExpiry(ctx context.Context, id string) (time.Time, error)
 }
 
 // Leases acquires, renews and releases retention leases with one configured

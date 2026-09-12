@@ -194,8 +194,14 @@ type NodeFilter struct {
 // one. limit is capped at model.MaxPageItems.
 func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.NodeID, limit int) ([]StoredNode, error) {
 	limit = pageLimit(limit)
-	if f.Name == "" && f.QualifiedName == "" && f.QualifiedPrefix == "" {
-		return nil, invalid("node filter must name a name, qualified name or qualified-name prefix")
+	predicates := 0
+	for _, p := range []string{f.Name, f.QualifiedName, f.QualifiedPrefix} {
+		if p != "" {
+			predicates++
+		}
+	}
+	if predicates != 1 {
+		return nil, invalid("node filter must name exactly one of name, qualified name or qualified-name prefix")
 	}
 	if len(f.Kinds) > model.MaxFilterValues {
 		return nil, invalid("node filter has %d kinds, limit %d", len(f.Kinds), model.MaxFilterValues)
@@ -604,47 +610,101 @@ func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.Searc
 // is enforced by the search service on top.
 const maxQueryTokens = model.MaxQueryTextBytes
 
-// Tokenize splits text with the exact unicode61 tokenizer search_fts uses, via
-// a throwaway FTS5 table on the private in-memory connection. Tokens are
-// returned in document order, duplicates included, so the caller can count
-// term and phrase occurrences without reimplementing Unicode tokenization.
-func (s *Store) Tokenize(ctx context.Context, text string) ([]string, error) {
-	if len(text) > model.MaxQueryTextBytes {
-		return nil, invalid("query text exceeds %d bytes", model.MaxQueryTextBytes)
-	}
+// tokenizerDDL declares a throwaway FTS5 table with exactly search_fts's
+// indexed columns and tokenizer, plus the vocabulary view that exposes each
+// token instance. It lives on the private in-memory connection and holds no
+// data between calls.
+var tokenizerDDL = []string{
+	`CREATE VIRTUAL TABLE IF NOT EXISTS tok USING fts5(name, qualified_name, signature, path, body, tokenize='unicode61', detail='full')`,
+	`CREATE VIRTUAL TABLE IF NOT EXISTS tok_vocab USING fts5vocab(tok, 'instance')`,
+}
+
+// withTokenizer runs fn in a transaction on the tokenizer connection that is
+// always rolled back, so inserted documents never outlive the call.
+func (s *Store) withTokenizer(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	conn, err := s.tokenizer.Conn(ctx)
 	if err != nil {
-		return nil, wrap("tokenizer", err)
+		return wrap("tokenizer", err)
 	}
 	defer conn.Close()
-	for _, ddl := range []string{
-		`CREATE VIRTUAL TABLE IF NOT EXISTS query_tokens USING fts5(text, tokenize='unicode61', detail='full')`,
-		`CREATE VIRTUAL TABLE IF NOT EXISTS query_vocab USING fts5vocab(query_tokens, 'instance')`,
-	} {
+	for _, ddl := range tokenizerDDL {
 		if _, err := conn.ExecContext(ctx, ddl); err != nil {
-			return nil, wrap("tokenizer", err)
+			return wrap("tokenizer", err)
 		}
 	}
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, wrap("tokenizer", err)
+		return wrap("tokenizer", err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO query_tokens(rowid, text) VALUES(1, ?)`, text); err != nil {
-		return nil, wrap("tokenizer", err)
+	return fn(tx)
+}
+
+// Tokenize splits text with the exact unicode61 tokenizer search_fts uses.
+// Tokens are returned in document order, duplicates included, so the caller
+// can count term and phrase occurrences without reimplementing Unicode
+// tokenization.
+func (s *Store) Tokenize(ctx context.Context, text string) ([]string, error) {
+	if len(text) > model.MaxQueryTextBytes {
+		return nil, invalid("query text exceeds %d bytes", model.MaxQueryTextBytes)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT term FROM query_vocab WHERE doc = 1 ORDER BY offset LIMIT ?`, maxQueryTokens)
-	if err != nil {
-		return nil, wrap("tokenizer", err)
-	}
-	defer rows.Close()
 	var terms []string
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return nil, wrap("tokenizer", err)
+	err := s.withTokenizer(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO tok(rowid, body) VALUES(1, ?)`, text); err != nil {
+			return wrap("tokenizer", err)
 		}
-		terms = append(terms, t)
+		rows, err := tx.QueryContext(ctx, `SELECT term FROM tok_vocab WHERE doc = 1 ORDER BY offset LIMIT ?`, maxQueryTokens)
+		if err != nil {
+			return wrap("tokenizer", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t string
+			if err := rows.Scan(&t); err != nil {
+				return wrap("tokenizer", err)
+			}
+			terms = append(terms, t)
+		}
+		return wrap("tokenizer", rows.Err())
+	})
+	return terms, err
+}
+
+// countTokens returns, for each document, the number of token instances the
+// index tokenizer produces across every indexed column. It is the one source
+// of search_units.token_count.
+func (s *Store) countTokens(ctx context.Context, docs []model.SearchUnit) ([]int64, error) {
+	counts := make([]int64, len(docs))
+	if len(docs) == 0 {
+		return counts, nil
 	}
-	return terms, wrap("tokenizer", rows.Err())
+	err := s.withTokenizer(ctx, func(tx *sql.Tx) error {
+		ins, err := tx.PrepareContext(ctx, `INSERT INTO tok(rowid, name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?, ?)`)
+		if err != nil {
+			return wrap("tokenizer", err)
+		}
+		defer ins.Close()
+		for i, d := range docs {
+			if _, err := ins.ExecContext(ctx, int64(i+1), d.Name, d.QualifiedName, d.Signature, d.Path, d.Body); err != nil {
+				return wrap("tokenizer", err)
+			}
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT doc, count(*) FROM tok_vocab GROUP BY doc`)
+		if err != nil {
+			return wrap("tokenizer", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var doc, n int64
+			if err := rows.Scan(&doc, &n); err != nil {
+				return wrap("tokenizer", err)
+			}
+			if doc < 1 || doc > int64(len(docs)) {
+				return corrupt("tokenizer reported document %d outside the batch", doc)
+			}
+			counts[doc-1] = n
+		}
+		return wrap("tokenizer", rows.Err())
+	})
+	return counts, err
 }

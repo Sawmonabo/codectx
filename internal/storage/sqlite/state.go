@@ -63,9 +63,11 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 	}
 	idRaw, _ := model.DecodeID(string(m.ID))
 	snapRaw, _ := model.DecodeID(string(m.Binding.SnapshotID))
-	completeness, err := json.Marshal(m.Completeness)
+	keyRaw, _ := model.DecodeID(string(m.Binding.AnalysisKey))
+	header, err := json.Marshal(manifestHeader{Completeness: m.Completeness, ScopeComplete: m.ScopeComplete,
+		EstimateMethod: m.EstimateMethod, Budget: m.Budget})
 	if err != nil {
-		return internal("completeness: " + err.Error())
+		return internal("manifest header: " + err.Error())
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var stored string
@@ -89,9 +91,18 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		if string(g.snapshot) != string(snapRaw) || idHex(g.repo) != string(m.Binding.RepositoryID) {
 			return invalid("manifest binding does not match generation %d's repository and snapshot", m.Binding.GenerationID)
 		}
+		var storedKey []byte
+		if err := tx.QueryRowContext(ctx, `SELECT analysis_key FROM generations WHERE id = ?`, g.id).Scan(&storedKey); err != nil {
+			return wrap("generations", err)
+		}
+		if string(storedKey) != string(keyRaw) {
+			return &model.Error{Code: model.CodeVersionConflict,
+				Message:     fmt.Sprintf("manifest binding carries an analysis key that is not generation %d's", m.Binding.GenerationID),
+				Remediation: "re-pin the generation and compile again"}
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO context_manifests(id, generation_id, snapshot_id, phase, request_hash, policy_version, request_json,
 			completeness_json, canonical_hash, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			idRaw, g.id, snapRaw, string(m.Phase), m.RequestHash, m.PolicyVersion, string(requestJSON), string(completeness), m.CanonicalHash, formatTime(m.CreatedAt)); err != nil {
+			idRaw, g.id, snapRaw, string(m.Phase), m.RequestHash, m.PolicyVersion, string(requestJSON), string(header), m.CanonicalHash, formatTime(m.CreatedAt)); err != nil {
 			return wrap("context_manifests", err)
 		}
 		nodeVisible, err := tx.PrepareContext(ctx, `SELECT 1 FROM node_facts nf JOIN generation_units gu ON gu.unit_id = nf.unit_id WHERE gu.generation_id = ? AND nf.node_id = ? LIMIT 1`)
@@ -176,8 +187,18 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 	})
 }
 
-// Manifest reads one manifest header with its binding. Budget is not a stored
-// column; it lives in the request payload the compiler owns.
+// manifestHeader is the strict typed shape of context_manifests.completeness_json:
+// the header fields the frozen schema has no column for. Storing them here,
+// rather than deriving them at read time, is what lets Manifest return exactly
+// the header PutManifest was given.
+type manifestHeader struct {
+	Completeness   []model.CapabilityState `json:"completeness"`
+	ScopeComplete  bool                    `json:"scope_complete"`
+	EstimateMethod string                  `json:"estimate_method"`
+	Budget         model.Budget            `json:"budget"`
+}
+
+// Manifest reads one manifest header with its binding, exactly as written.
 func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.ContextManifest, error) {
 	raw, err := idBlob("manifest_id", string(id))
 	if err != nil {
@@ -187,12 +208,12 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		var repo, snap, key []byte
 		var gen int64
-		var completeness, created string
+		var header, created string
 		err := tx.QueryRowContext(ctx, `SELECT cm.generation_id, g.repository_id, cm.snapshot_id, g.analysis_key, cm.phase, cm.request_hash, cm.policy_version,
 			cm.completeness_json, cm.canonical_hash, cm.created_at,
 			(SELECT count(*) FROM context_entries ce WHERE ce.manifest_id = cm.id), (SELECT count(*) FROM context_slices cs WHERE cs.manifest_id = cm.id)
 			FROM context_manifests cm JOIN generations g ON g.id = cm.generation_id WHERE cm.id = ?`, raw).
-			Scan(&gen, &repo, &snap, &key, &m.Phase, &m.RequestHash, &m.PolicyVersion, &completeness, &m.CanonicalHash, &created, &m.EntryCount, &m.SliceCount)
+			Scan(&gen, &repo, &snap, &key, &m.Phase, &m.RequestHash, &m.PolicyVersion, &header, &m.CanonicalHash, &created, &m.EntryCount, &m.SliceCount)
 		if isNoRows(err) {
 			return invalid("manifest %s does not exist", id)
 		}
@@ -202,10 +223,11 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 		m.ID = id
 		m.Binding = model.Binding{RepositoryID: model.RepositoryID(idHex(repo)), SnapshotID: model.SnapshotID(idHex(snap)),
 			GenerationID: model.GenerationID(gen), AnalysisKey: model.AnalysisKey(idHex(key))}
-		if err := json.Unmarshal([]byte(completeness), &m.Completeness); err != nil {
-			return corrupt("manifest completeness is not readable")
+		var h manifestHeader
+		if err := json.Unmarshal([]byte(header), &h); err != nil {
+			return corrupt("manifest header is not readable")
 		}
-		m.EstimateMethod = model.EstimateMethodUTF8Bytes
+		m.Completeness, m.ScopeComplete, m.EstimateMethod, m.Budget = h.Completeness, h.ScopeComplete, h.EstimateMethod, h.Budget
 		m.CreatedAt, err = parseTime(created)
 		return err
 	})
@@ -522,7 +544,7 @@ func (s *Store) AdvanceSession(ctx context.Context, req model.AdvanceRequest) (m
 			closedAt = formatTime(now)
 		}
 		raw, _ := model.DecodeID(string(req.SessionID))
-		if err := exec1(tx, ctx, &model.Error{Code: model.CodeVersionConflict, Message: "session state version has moved; reload and retry"},
+		if err := exec1(ctx, tx, &model.Error{Code: model.CodeVersionConflict, Message: "session state version has moved; reload and retry"},
 			`UPDATE read_sessions SET workflow_state = ?, state_version = state_version + 1, closed_at = ? WHERE id = ? AND state_version = ?`,
 			string(req.Target), closedAt, raw, req.ExpectedVersion); err != nil {
 			return err
@@ -570,7 +592,7 @@ func (s *Store) IncludeManifest(ctx context.Context, req model.IncludeRequest, m
 			return &model.Error{Code: model.CodeSessionSuperseded, Message: "manifest generation/snapshot binding cannot change within a session"}
 		}
 		raw, _ := model.DecodeID(string(req.SessionID))
-		if err := exec1(tx, ctx, &model.Error{Code: model.CodeVersionConflict, Message: "session state version has moved; reload and retry"},
+		if err := exec1(ctx, tx, &model.Error{Code: model.CodeVersionConflict, Message: "session state version has moved; reload and retry"},
 			`UPDATE read_sessions SET manifest_id = ?, scope_version = scope_version + 1, state_version = state_version + 1 WHERE id = ? AND state_version = ?`,
 			manifestRaw, raw, req.ExpectedVersion); err != nil {
 			return err
@@ -589,9 +611,12 @@ func (s *Store) IncludeManifest(ctx context.Context, req model.IncludeRequest, m
 	return status, err
 }
 
-// IssueChunk persists an issued, not yet confirmed, chunk. The chunk must name
-// a file and content hash in the session's pinned scope; the schema's foreign
-// key to session_files makes another snapshot's bytes unrepresentable.
+// IssueChunk persists an issued, not yet confirmed, chunk for the session's
+// actor. Like every session mutation it loads the session first, so a wrong
+// actor, a closed or an expired session is refused before any row is written.
+// The chunk must name a file and content hash in the session's pinned scope;
+// the schema's foreign key to session_files makes another snapshot's bytes
+// unrepresentable.
 func (s *Store) IssueChunk(ctx context.Context, c model.IssuedChunk) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -601,6 +626,9 @@ func (s *Store) IssueChunk(ctx context.Context, c model.IssuedChunk) error {
 	fileRaw, _ := model.DecodeID(string(c.FileID))
 	hashRaw, _ := model.DecodeID(c.ContentHash)
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := s.session(ctx, tx, c.SessionID, c.ActorID, time.Now()); err != nil {
+			return err
+		}
 		var size int64
 		err := tx.QueryRowContext(ctx, `SELECT sf.size_bytes FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
 			WHERE s.session_id = ? AND s.file_id = ? AND s.content_hash = ?`, sessionRaw, fileRaw, hashRaw).Scan(&size)
@@ -954,8 +982,9 @@ func (s *Store) Observations(ctx context.Context, session model.SessionID, actor
 	return out, err
 }
 
-// PutCapsule stores the deterministic completion record once. A second call
-// returns the first stored capsule unchanged (Section 17.3).
+// PutCapsule stores the deterministic completion record once, for a session
+// whose consolidate phase is open. A second call returns the first stored
+// capsule unchanged (Section 17.3).
 func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule, error) {
 	if err := c.Validate(); err != nil {
 		return model.Capsule{}, err
@@ -972,9 +1001,10 @@ func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule,
 	err = s.write(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, c.SessionID, c.ActorID, time.Now())
 		if err != nil {
-			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
-				return err
-			}
+			return err
+		}
+		if rec.State != model.StateConsolidateOpen {
+			return conflict("session is %s; a capsule is produced only while consolidate is open", rec.State)
 		}
 		if rec.Binding != c.Binding {
 			return invalid("capsule binding does not match its session's generation and snapshot")
@@ -983,6 +1013,9 @@ func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule,
 		var existing string
 		err = tx.QueryRowContext(ctx, `SELECT capsule_json FROM context_capsules WHERE session_id = ?`, sessionRaw).Scan(&existing)
 		if err == nil {
+			// Decode into a fresh value: unmarshalling over the caller's capsule
+			// would keep any field the stored record omits.
+			stored = model.Capsule{}
 			if json.Unmarshal([]byte(existing), &stored) != nil {
 				return corrupt("stored capsule is not readable")
 			}

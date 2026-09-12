@@ -68,8 +68,11 @@ func (s *Store) initSchema(ctx context.Context) error {
 // Recover is startup recovery for the indexing owner (Section 12.3). The
 // caller must hold the workspace indexing lock: it marks every staging
 // generation failed, deletes the unsealed units and running runs those
-// generations left behind, and drops expired leases. The active pointer is
-// never touched.
+// generations left behind, then runs the same collection tail as
+// DeleteGeneration (unreachable units, orphan runs, expired leases,
+// unreferenced snapshots and files), so a crash between a deletion's steps
+// leaves nothing a second Recover would treat differently. The active pointer
+// is never touched.
 func (s *Store) Recover(ctx context.Context, now time.Time) error {
 	var staging []int64
 	err := s.read(ctx, func(tx *sql.Tx) error {
@@ -95,10 +98,7 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 			return err
 		}
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE expires_at <= ?`, formatTime(now))
-		return wrap("expire leases", err)
-	})
+	return s.sweep(ctx, now, nil)
 }
 
 // Check runs the integrity checks Section 12.1 reserves for initialization,
@@ -145,6 +145,9 @@ func (s *Store) Check(ctx context.Context, deep bool) error {
 // bounded row counts plus database and WAL bytes on disk.
 type Stats struct {
 	Generations   int64
+	Snapshots     int64
+	Files         int64
+	Blobs         int64
 	Units         int64
 	NodeFacts     int64
 	RelationFacts int64
@@ -156,46 +159,64 @@ type Stats struct {
 	WALBytes      int64
 }
 
-// Stats reads the row counts in one read transaction and sizes the files.
+// Stats reads the row counts in one read transaction and sizes the files. A
+// file size that cannot be read is an error, never reported as zero.
 func (s *Store) Stats(ctx context.Context) (Stats, error) {
 	var st Stats
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		return tx.QueryRowContext(ctx, `SELECT
-			(SELECT count(*) FROM generations), (SELECT count(*) FROM units),
-			(SELECT count(*) FROM node_facts), (SELECT count(*) FROM relation_facts),
+			(SELECT count(*) FROM generations), (SELECT count(*) FROM snapshots), (SELECT count(*) FROM files), (SELECT count(*) FROM blobs),
+			(SELECT count(*) FROM units), (SELECT count(*) FROM node_facts), (SELECT count(*) FROM relation_facts),
 			(SELECT count(*) FROM evidence), (SELECT count(*) FROM search_units),
 			(SELECT count(*) FROM retention_leases), (SELECT count(*) FROM read_sessions)`).
-			Scan(&st.Generations, &st.Units, &st.NodeFacts, &st.RelationFacts, &st.Evidence, &st.SearchUnits, &st.Leases, &st.Sessions)
+			Scan(&st.Generations, &st.Snapshots, &st.Files, &st.Blobs, &st.Units, &st.NodeFacts, &st.RelationFacts, &st.Evidence, &st.SearchUnits, &st.Leases, &st.Sessions)
 	})
 	if err != nil {
 		return Stats{}, wrap("stats", err)
 	}
-	st.DatabaseBytes = fileSize(s.path)
-	st.WALBytes = fileSize(s.path + "-wal")
+	if st.DatabaseBytes, err = fileSize(s.path, false); err != nil {
+		return Stats{}, err
+	}
+	if st.WALBytes, err = s.walBytes(); err != nil {
+		return Stats{}, err
+	}
 	return st, nil
 }
 
-func fileSize(path string) int64 {
+// fileSize stats path. With absentIsZero a missing file is legitimately zero
+// bytes (the WAL is removed by a checkpoint); any other failure is returned so
+// a caller never mistakes "unreadable" for "empty".
+func fileSize(path string, absentIsZero bool) (int64, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return 0
+		if absentIsZero && errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, internal("stat " + path + ": " + err.Error())
 	}
-	return info.Size()
+	return info.Size(), nil
 }
+
+func (s *Store) walBytes() (int64, error) { return fileSize(s.path+"-wal", true) }
 
 // MaintainWAL is the writer-owned passive checkpoint of Section 12.1. It
 // reports the WAL size and whether it still exceeds the configured high-water
 // mark after a passive checkpoint, in which case the caller applies indexing
 // backpressure. It runs between batches, never inside a query.
 func (s *Store) MaintainWAL(ctx context.Context) (walBytes int64, backpressure bool, err error) {
-	if fileSize(s.path+"-wal") < s.opts.WALHighWaterBytes {
-		return fileSize(s.path + "-wal"), false, nil
+	if walBytes, err = s.walBytes(); err != nil {
+		return 0, false, err
+	}
+	if walBytes < s.opts.WALHighWaterBytes {
+		return walBytes, false, nil
 	}
 	var busy, logFrames, checkpointed int64
 	if err := s.writer.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
 		return 0, false, wrap("wal_checkpoint", err)
 	}
-	walBytes = fileSize(s.path + "-wal")
+	if walBytes, err = s.walBytes(); err != nil {
+		return 0, false, err
+	}
 	return walBytes, walBytes >= s.opts.WALHighWaterBytes || busy != 0, nil
 }
 

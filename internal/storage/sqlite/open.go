@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -119,10 +120,10 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
 	}
-	writerPragmas := append(common, pragma{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)})
-	readerPragmas := append(common,
-		pragma{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
-		pragma{"query_only", "ON", "1"})
+	writerPragmas := slices.Concat(common, []pragma{{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
+	readerPragmas := slices.Concat(common, []pragma{
+		{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
+		{"query_only", "ON", "1"}})
 
 	s.writer, err = openPool(abs, writerPragmas, "immediate", 1)
 	if err != nil {
@@ -301,7 +302,7 @@ func (s *Store) read(ctx context.Context, fn func(tx *sql.Tx) error) error {
 }
 
 // exec1 runs a statement that must affect exactly one row.
-func exec1(tx *sql.Tx, ctx context.Context, conflict *model.Error, query string, args ...any) error {
+func exec1(ctx context.Context, tx *sql.Tx, conflict *model.Error, query string, args ...any) error {
 	res, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return wrap(query, err)

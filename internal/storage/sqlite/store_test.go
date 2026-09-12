@@ -8,6 +8,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,7 @@ const (
 	providerID      = "treesitter"
 	providerVersion = "1.0.0"
 	configHash      = "cfg"
+	actorID         = "agent-1"
 )
 
 func newFixture(t *testing.T, dbPath string) *fixture {
@@ -110,10 +112,19 @@ func (f *fixture) snapshot(tag string, files ...fileFixture) model.Snapshot {
 	return snap
 }
 
-// unit builds, fills and seals one file-scoped unit for ff inside gen. The
-// node's canonical key and the search document are derived from the path so
-// the same file content yields the same unit across snapshots.
-func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, deps ...model.UnitID) model.UnitID {
+// providerTokenCount is the deliberately wrong token count every fixture
+// document asserts; storage must compute its own from the indexed text.
+const providerTokenCount = 3
+
+// searchDoc is the lexical document fixture.unit publishes for ff.
+func (f *fixture) searchDoc(ff fileFixture) model.SearchUnit {
+	return model.SearchUnit{ID: model.H("search-test", ff.path, ff.hash), NodeID: f.nodeID(ff), FileID: ff.id, Path: ff.path,
+		Kind: model.NodeFunction, Name: "F", QualifiedName: ff.path + ".F",
+		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: string(ff.content), TokenCount: providerTokenCount}
+}
+
+// begin opens a file-scoped unit for ff inside gen without sealing it.
+func (f *fixture) begin(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, deps ...model.UnitID) *store.UnitWriter {
 	f.t.Helper()
 	input := model.UnitInput{FileID: ff.id, ContentHash: ff.hash}
 	h := model.NewUnitInputHasher()
@@ -129,33 +140,44 @@ func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileF
 	if err != nil {
 		f.t.Fatalf("BeginUnit(%s): %v", ff.path, err)
 	}
+	return w
+}
+
+// unit builds, fills and seals one file-scoped unit for ff inside gen. The
+// node's canonical key and the search document are derived from the path so
+// the same file content yields the same unit across snapshots.
+func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, deps ...model.UnitID) model.UnitID {
+	f.t.Helper()
+	w := f.begin(gen, run, ff, deps...)
 	key := model.CanonicalNodeKey(ff.path, "F")
 	nodeID := model.NewNodeID(f.repo, model.NodeFunction, key)
-	if err := w.PutNodeIdentities(f.ctx, []model.NodeIdentity{{ID: nodeID, Kind: model.NodeFunction, CanonicalKey: key}}); err != nil {
-		f.t.Fatalf("PutNodeIdentities: %v", err)
-	}
 	rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: uint64(len(ff.content)), Line: 1, Column: uint32(len(ff.content))}}
-	ev := model.Evidence{UnitID: spec.ID, ProviderID: providerID, ProviderVersion: providerVersion, OriginRunID: run,
+	ev := model.Evidence{UnitID: w.UnitID(), ProviderID: providerID, ProviderVersion: providerVersion, OriginRunID: run,
 		NodeID: nodeID, Precision: model.PrecisionSyntax, FileID: ff.id, ContentHash: ff.hash, Range: rng}
 	ev.ID = model.NewEvidenceID(ev)
 	node := model.Node{ID: nodeID, Kind: model.NodeFunction, Language: "go", Name: "F", QualifiedName: ff.path + ".F",
 		FileID: ff.id, ContentHash: ff.hash, Range: rng}
-	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, Evidence: []model.Evidence{ev}}}); err != nil {
+	// A fact whose ID does not derive from (repository, kind, canonical key) is
+	// malformed provider output: accepting it would let two keys share one
+	// identity row.
+	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: "other-key", Evidence: []model.Evidence{ev}}}); err == nil {
+		f.t.Fatal("PutNodes accepted a node whose ID does not derive from its canonical key")
+	} else {
+		wantCode(f.t, err, model.CodeProviderOutputInvalid)
+	}
+	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: key, Evidence: []model.Evidence{ev}}}); err != nil {
 		f.t.Fatalf("PutNodes: %v", err)
 	}
 	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: ff.path, NativeKey: "F", NodeID: nodeID}}); err != nil {
 		f.t.Fatalf("PutAliases: %v", err)
 	}
-	doc := model.SearchUnit{ID: model.H("search-test", ff.path, ff.hash), NodeID: nodeID, FileID: ff.id, Path: ff.path,
-		Kind: model.NodeFunction, Name: "F", QualifiedName: ff.path + ".F",
-		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: string(ff.content), TokenCount: 3}
-	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{doc}); err != nil {
+	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{f.searchDoc(ff)}); err != nil {
 		f.t.Fatalf("PutSearchUnits: %v", err)
 	}
 	if err := f.s.SealUnit(f.ctx, w); err != nil {
 		f.t.Fatalf("SealUnit(%s): %v", ff.path, err)
 	}
-	return spec.ID
+	return w.UnitID()
 }
 
 func (f *fixture) nodeID(ff fileFixture) model.NodeID {
@@ -171,10 +193,13 @@ func (f *fixture) run(gen model.GenerationID) model.ProviderRunID {
 	return run
 }
 
-func (f *fixture) activate(gen model.GenerationID) model.Binding {
+var fixtureCaps = []model.CapabilityState{{ProviderID: providerID, Capability: "structure", Scope: "workspace", State: model.CapabilityFresh}}
+
+// activate publishes gen, asserting that expected is the active generation at
+// the moment the pointer flips.
+func (f *fixture) activate(gen, expected model.GenerationID) model.Binding {
 	f.t.Helper()
-	caps := []model.CapabilityState{{ProviderID: providerID, Capability: "structure", Scope: "workspace", State: model.CapabilityFresh}}
-	b, err := f.s.Activate(f.ctx, gen, model.HealthFresh, caps, "norm-v1")
+	b, err := f.s.Activate(f.ctx, gen, expected, model.HealthFresh, fixtureCaps, "norm-v1")
 	if err != nil {
 		f.t.Fatalf("Activate(%d): %v", gen, err)
 	}
@@ -188,6 +213,21 @@ func (f *fixture) stats() store.Stats {
 		f.t.Fatalf("Stats: %v", err)
 	}
 	return st
+}
+
+// indexedTokens counts the tokens storage's own tokenizer yields for every
+// column search_fts indexes, which is what token_count must equal.
+func (f *fixture) indexedTokens(doc model.SearchUnit) int64 {
+	f.t.Helper()
+	var n int64
+	for _, col := range []string{doc.Name, doc.QualifiedName, doc.Signature, doc.Path, doc.Body} {
+		terms, err := f.s.Tokenize(f.ctx, col)
+		if err != nil {
+			f.t.Fatalf("Tokenize: %v", err)
+		}
+		n += int64(len(terms))
+	}
+	return n
 }
 
 func wantCode(t *testing.T, err error, code string) {
@@ -216,7 +256,10 @@ func TestStorePublicationScenario(t *testing.T) {
 
 	a := f.file("pkg/a.go", "package pkg\nfunc A() {}\n")
 	b1 := f.file("pkg/b.go", "package pkg\nfunc B() {}\n")
-	snap1 := f.snapshot("one", a, b1)
+	// c.go exists only in the first snapshot, so its files row becomes
+	// unreferenced once that snapshot is collected.
+	c := f.file("pkg/c.go", "package pkg\n")
+	snap1 := f.snapshot("one", a, b1, c)
 
 	// Generation 1: build both units and publish.
 	gen1, err := f.s.BeginGeneration(ctx, f.repo, snap1.ID, model.H("semantic"))
@@ -237,7 +280,14 @@ func TestStorePublicationScenario(t *testing.T) {
 	} else {
 		wantCode(t, err, model.CodeNoActiveGeneration)
 	}
-	bind1 := f.activate(gen1)
+	// Activation is a compare-and-swap on the pointer: a coordinator that
+	// believes another generation is active must not publish over it.
+	if _, err := f.s.Activate(ctx, gen1, 99, model.HealthFresh, fixtureCaps, "norm-v1"); err == nil {
+		t.Fatal("Activate published with a wrong expected active generation")
+	} else {
+		wantCode(t, err, model.CodeVersionConflict)
+	}
+	bind1 := f.activate(gen1, 0)
 	if bind1.GenerationID != gen1 || bind1.AnalysisKey == "" {
 		t.Fatalf("binding after activation = %+v", bind1)
 	}
@@ -279,6 +329,13 @@ func TestStorePublicationScenario(t *testing.T) {
 	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != gen1 {
 		t.Fatalf("active generation = %d during staging, want %d", got, gen1)
 	}
+	// Two exact predicates on one filter are contradictory; the reader must
+	// refuse rather than silently apply one of them.
+	if _, err := reader1.Nodes(ctx, store.NodeFilter{Name: "F", QualifiedName: "pkg/a.go.F"}, "", 10); err == nil {
+		t.Fatal("Nodes accepted a filter with both name and qualified_name")
+	} else {
+		wantCode(t, err, model.CodeArgumentInvalid)
+	}
 
 	// Phase: unchanged reuse. Attaching unitA writes only a membership row: no
 	// new node, evidence, alias or search rows.
@@ -299,9 +356,8 @@ func TestStorePublicationScenario(t *testing.T) {
 	}
 	run3 := f.run(gen3)
 	depUnit := f.unit(gen3, run3, a, unitA)
-	_ = depUnit
 	// gen3 has depUnit but not its dependency unitA as a member.
-	if _, err := f.s.Activate(ctx, gen3, model.HealthFresh, nil, "norm-v1"); err == nil {
+	if _, err := f.s.Activate(ctx, gen3, gen1, model.HealthFresh, nil, "norm-v1"); err == nil {
 		t.Fatal("Activate published a generation whose member depends on a non-member unit")
 	}
 	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != gen1 {
@@ -313,9 +369,14 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.Abort(ctx, gen3); err != nil {
 		t.Fatalf("Abort: %v", err)
 	}
+	// Abort deletes only unsealed output; the sealed dependent unit keeps its
+	// provenance and stays reusable.
+	if origin, err := f.s.UnitOrigin(ctx, depUnit); err != nil || origin != run3 {
+		t.Fatalf("sealed unit lost after Abort: %v %v", origin, err)
+	}
 
 	// Publish gen2; gen1 is superseded but still pinned by reader1.
-	bind2 := f.activate(gen2)
+	bind2 := f.activate(gen2, gen1)
 	if bind2.AnalysisKey == bind1.AnalysisKey {
 		t.Fatal("analysis key did not change although unit membership changed")
 	}
@@ -326,17 +387,14 @@ func TestStorePublicationScenario(t *testing.T) {
 	if _, err := reader1.Node(ctx, f.nodeID(a)); err != nil {
 		t.Fatalf("pinned reader lost access to its generation: %v", err)
 	}
-	if err := f.s.DeleteGeneration(ctx, gen1); err == nil {
-		t.Fatal("DeleteGeneration collected a generation with a live lease")
-	} else {
-		wantCode(t, err, model.CodeWorkspaceBusy)
-	}
 
-	// Phase: pin/GC race. Readers pin and read gen2 while gen1's deletion is
-	// retried; every successful pin must read its fact, and deletion of gen1
-	// only succeeds once reader1 releases its lease.
+	// Phase: pin/GC race. Readers pin and read gen2 while a collector retries
+	// DeleteGeneration(gen1) concurrently. Every attempt made before reader1
+	// releases its lease must be refused as busy; the first attempt after the
+	// release succeeds and no later attempt may run against a half-deleted row.
 	var wg sync.WaitGroup
-	raceErr := make(chan error, 8)
+	var released atomic.Bool
+	raceErr := make(chan error, 64)
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -356,21 +414,47 @@ func TestStorePublicationScenario(t *testing.T) {
 			}
 		}()
 	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for attempt := 0; attempt < 10_000; attempt++ {
+			err := f.s.DeleteGeneration(ctx, gen1)
+			if err == nil {
+				if !released.Load() {
+					raceErr <- errors.New("DeleteGeneration succeeded while reader1 still held its lease")
+				}
+				return
+			}
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy || !typed.Retryable {
+				raceErr <- err
+				return
+			}
+			if attempt == 20 {
+				// Release only once the collector has been refused repeatedly,
+				// so the busy path is exercised under real contention.
+				released.Store(true)
+				if err := reader1.Close(); err != nil {
+					raceErr <- err
+					return
+				}
+			}
+		}
+		raceErr <- errors.New("DeleteGeneration never succeeded after the lease was released")
+	}()
 	wg.Wait()
 	close(raceErr)
 	for err := range raceErr {
-		t.Fatalf("pinned reader failed during concurrent pins: %v", err)
+		t.Fatalf("pin/GC race: %v", err)
 	}
-	if err := reader1.Close(); err != nil {
-		t.Fatalf("reader1.Close: %v", err)
-	}
-	if err := f.s.DeleteGeneration(ctx, gen1); err != nil {
-		t.Fatalf("DeleteGeneration(gen1) after lease release: %v", err)
+	if _, err := f.s.GenerationStatus(ctx, gen1); err == nil {
+		t.Fatal("gen1 still exists after DeleteGeneration succeeded")
 	}
 
 	// Phase: provenance retained. unitA still carries run1 as its origin even
 	// though gen1, which created it, is gone; unitB1 was unreachable and is
-	// collected together with its FTS rows.
+	// collected together with its FTS rows; snap1 and c.go's file row, now
+	// referenced by nothing, are collected too.
 	if run, err := f.s.ProviderRun(ctx, run1); err != nil {
 		t.Fatalf("run1 provenance lost after deleting its generation: %v", err)
 	} else if run.GenerationID != 0 {
@@ -385,41 +469,72 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.Check(ctx, true); err != nil {
 		t.Fatalf("FTS/database integrity after FTS-aware deletion: %v", err)
 	}
+	afterGC := f.stats()
+	if afterGC.Snapshots != 1 || afterGC.Files != 2 {
+		t.Fatalf("after collecting gen1: %d snapshots %d files, want 1 snapshot and 2 files (c.go collected)", afterGC.Snapshots, afterGC.Files)
+	}
 	reader2, err := f.s.PinGeneration(ctx, f.repo, 0, time.Minute)
 	if err != nil {
 		t.Fatalf("PinGeneration(gen2): %v", err)
 	}
+	if n, err := reader2.Node(ctx, f.nodeID(b2)); err != nil || n.UnitID != unitB2 {
+		t.Fatalf("active reader node = %+v %v, want gen2's unit %s", n, err, unitB2)
+	}
 	if ids, err := reader2.Match(ctx, `"changed"`, 0, 10); err != nil || len(ids) != 1 {
 		t.Fatalf("Match(changed) = %v %v, want exactly the gen2 b.go document", ids, err)
 	}
-	if ids, err := reader2.Match(ctx, `"B"`, 0, 10); err != nil || len(ids) != 1 {
+	ids, err := reader2.Match(ctx, `"B"`, 0, 10)
+	if err != nil || len(ids) != 1 {
 		t.Fatalf("Match(B) = %v %v, want only the retained document; the deleted unit's FTS row must be gone", ids, err)
 	}
+	// Phase: length statistics agree with the index. token_count is computed
+	// by storage with the index tokenizer; the provider's value is ignored.
+	docB, err := reader2.SearchUnit(ctx, ids[0])
+	if err != nil {
+		t.Fatalf("SearchUnit: %v", err)
+	}
+	wantB := f.indexedTokens(f.searchDoc(b2))
+	if docB.TokenCount != wantB || docB.TokenCount == providerTokenCount {
+		t.Fatalf("stored token_count = %d, want %d indexed tokens (provider asserted %d)", docB.TokenCount, wantB, providerTokenCount)
+	}
 	docs, tokens, err := reader2.SearchStats(ctx)
-	if err != nil || docs != 2 || tokens != 6 {
-		t.Fatalf("SearchStats = %d docs %d tokens %v, want 2 docs 6 tokens", docs, tokens, err)
+	if wantTokens := wantB + f.indexedTokens(f.searchDoc(a)); err != nil || docs != 2 || tokens != wantTokens {
+		t.Fatalf("SearchStats = %d docs %d tokens %v, want 2 docs %d tokens", docs, tokens, err, wantTokens)
 	}
 	if terms, err := f.s.Tokenize(ctx, "Foo_bar baz.Qux"); err != nil || len(terms) != 4 {
 		t.Fatalf("Tokenize = %v %v, want 4 unicode61 tokens", terms, err)
 	}
-	_ = unitB2
 
-	// Phase: cross-snapshot FK. A session pinned to snap2 cannot record a
-	// chunk issued for snap1's bytes of b.go.
+	// Phase: manifests and sessions. A manifest must carry the generation's
+	// analysis key, and reading it back must reproduce the header written.
 	manifest := model.ContextManifest{ID: model.ManifestID(model.H("manifest", "m1")), Binding: bind2, Phase: model.PhaseSweep,
 		RequestHash: model.H("req"), PolicyVersion: "p1", CanonicalHash: model.H("canon"), EntryCount: 1, SliceCount: 1,
-		EstimateMethod: model.EstimateMethodUTF8Bytes, CreatedAt: time.Now().UTC()}
+		Budget: model.Budget{MaxEstimatedTokens: 1000, MaxBytes: 4096, MaxFiles: 10, MaxSlices: 2}, Completeness: fixtureCaps, ScopeComplete: true,
+		EstimateMethod: "test-estimator", CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
 	entries := []model.ContextEntry{{Ordinal: 0, FileID: b2.id, Requirement: model.RequirementFull, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10, Reasons: []string{"seed"}}}
 	slices := []model.ContextSlice{{Index: 0, EntryOrdinals: []int{0}, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10}}
+	wrongKey := manifest
+	wrongKey.Binding.AnalysisKey = model.AnalysisKey(model.H("not", "this"))
+	if err := f.s.PutManifest(ctx, wrongKey, []byte(`{"task":"t"}`), entries, slices, nil); err == nil {
+		t.Fatal("PutManifest accepted a binding whose analysis key is not the generation's")
+	}
 	if err := f.s.PutManifest(ctx, manifest, []byte(`{"task":"t"}`), entries, slices, nil); err != nil {
 		t.Fatalf("PutManifest: %v", err)
 	}
-	open := model.SessionOpen{ID: model.SessionID(model.H("session", "1")), ActorID: "agent-1", OpenRequestHash: model.H("open"),
+	if got, err := f.s.Manifest(ctx, manifest.ID); err != nil {
+		t.Fatalf("Manifest: %v", err)
+	} else if got.EstimateMethod != manifest.EstimateMethod || got.Budget != manifest.Budget || !got.ScopeComplete || len(got.Completeness) != 1 {
+		t.Fatalf("manifest read back = %+v, want the header that was written %+v", got, manifest)
+	}
+	open := model.SessionOpen{ID: model.SessionID(model.H("session", "1")), ActorID: actorID, OpenRequestHash: model.H("open"),
 		ManifestID: manifest.ID, ExpiresAt: time.Now().Add(time.Hour).UTC()}
 	if _, err := f.s.OpenSession(ctx, open); err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
-	stale := model.IssuedChunk{ID: model.H("chunk", "1"), SessionID: open.ID, FileID: b1.id, ContentHash: b1.hash,
+	// Phase: cross-snapshot FK. A session pinned to snap2 cannot record a
+	// chunk issued for snap1's bytes of b.go, and no other actor can issue
+	// chunks into this session at all.
+	stale := model.IssuedChunk{ID: model.H("chunk", "1"), SessionID: open.ID, ActorID: actorID, FileID: b1.id, ContentHash: b1.hash,
 		Bytes: model.ByteRange{Start: 0, End: 8}, ExpiresAt: time.Now().Add(time.Minute).UTC()}
 	if err := f.s.IssueChunk(ctx, stale); err == nil {
 		t.Fatal("IssueChunk accepted a chunk for another snapshot's bytes of a session file")
@@ -427,22 +542,99 @@ func TestStorePublicationScenario(t *testing.T) {
 	fresh := stale
 	fresh.ID = model.H("chunk", "2")
 	fresh.ContentHash = b2.hash
+	other := fresh
+	other.ActorID = "someone-else"
+	if err := f.s.IssueChunk(ctx, other); err == nil {
+		t.Fatal("IssueChunk accepted another actor's chunk into this session")
+	} else {
+		wantCode(t, err, model.CodeActorMismatch)
+	}
 	if err := f.s.IssueChunk(ctx, fresh); err != nil {
 		t.Fatalf("IssueChunk(current snapshot): %v", err)
 	}
+	// A capsule is the consolidate phase's completion record; a sweep session
+	// has nothing to consolidate yet.
+	capsule := model.Capsule{SessionID: open.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
+		ScopeVersion: 1, CanonicalHash: model.H("capsule"), CreatedAt: time.Now().UTC()}
+	if _, err := f.s.PutCapsule(ctx, capsule); err == nil {
+		t.Fatal("PutCapsule stored a capsule for a session that is not in consolidate_open")
+	} else {
+		wantCode(t, err, model.CodeVersionConflict)
+	}
 	if err := reader2.Close(); err != nil {
 		t.Fatalf("reader2.Close: %v", err)
+	}
+
+	// Phase: recovery. A generation left staging with a half-built unit is
+	// failed by Recover, its unsealed output deleted and its collected
+	// leftovers swept exactly as DeleteGeneration's tail would; the active
+	// pointer is untouched. A second Recover is a no-op.
+	gen4, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"))
+	if err != nil {
+		t.Fatalf("BeginGeneration(4): %v", err)
+	}
+	run4 := f.run(gen4)
+	// A dependency changes the unit key, so this is a new unit over b.go
+	// rather than a rebuild of the sealed one.
+	f.begin(gen4, run4, b2, unitA)
+	// An expired lease is exactly the kind of leftover only the collection
+	// tail removes; Recover must run that tail, not just fail the generation.
+	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: gen2, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
+	if err := f.s.AcquireLease(ctx, expired); err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	beforeRecover := f.stats()
+	if err := f.s.Recover(ctx, time.Now()); err != nil {
+		t.Fatalf("Recover: %v", err)
+	}
+	if st, _ := f.s.GenerationStatus(ctx, gen4); st != model.GenerationFailed {
+		t.Fatalf("gen4 status after Recover = %s, want failed", st)
+	}
+	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != gen2 {
+		t.Fatalf("Recover moved the active pointer to %d", got)
+	}
+	afterRecover := f.stats()
+	if afterRecover.Units != beforeRecover.Units-1 {
+		t.Fatalf("Recover left %d units, want the building unit deleted from %d", afterRecover.Units, beforeRecover.Units)
+	}
+	if afterRecover.Leases != beforeRecover.Leases-1 {
+		t.Fatalf("Recover left %d leases, want the expired lease swept from %d", afterRecover.Leases, beforeRecover.Leases)
+	}
+	if err := f.s.Recover(ctx, time.Now()); err != nil {
+		t.Fatalf("second Recover: %v", err)
+	}
+	if again := f.stats(); again != afterRecover {
+		t.Fatalf("Recover is not idempotent: %+v then %+v", afterRecover, again)
 	}
 	if err := f.s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Phase: schema fingerprint mismatch fails closed. A tampered fingerprint
-	// must refuse to open; the database is not migrated or reset.
+	// Phase: a blob demoted to trash by the grace protocol is restored when
+	// capture publishes the same content again; otherwise a snapshot could
+	// name a blob that collection is about to remove.
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	hashRaw, _ := model.DecodeID(c.hash)
+	if _, err := raw.Exec(`UPDATE blobs SET state = 'trash' WHERE hash = ?`, hashRaw); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	f2 := newFixture(t, dbPath)
+	f2.file(c.path, string(c.content))
+	if err := f2.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = sql.Open("sqlite", dbPath)
+	var state string
+	if err := raw.QueryRow(`SELECT state FROM blobs WHERE hash = ?`, hashRaw).Scan(&state); err != nil || state != "ready" {
+		t.Fatalf("re-put blob state = %q %v, want ready", state, err)
+	}
+
+	// Phase: schema fingerprint mismatch fails closed. A tampered fingerprint
+	// must refuse to open; the database is not migrated or reset.
 	if _, err := raw.Exec(`UPDATE schema_meta SET fingerprint = 'not-this-schema'`); err != nil {
 		t.Fatal(err)
 	}

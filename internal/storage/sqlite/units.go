@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,9 +16,6 @@ const (
 	domainMembership   = "generation-units-v1"
 	domainCapabilities = "generation-capabilities-v1"
 )
-
-// gcBatchUnits bounds one collection transaction.
-const gcBatchUnits = 200
 
 // BeginGeneration opens a staging generation over snapshot. Staging facts are
 // invisible to every reader until Activate publishes the pointer.
@@ -97,7 +95,7 @@ func (s *Store) CompleteProviderRun(ctx context.Context, result model.ProviderRe
 		return internal("counters: " + err.Error())
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
-		return exec1(tx, ctx, conflict("provider run %s is not running", result.RunID),
+		return exec1(ctx, tx, conflict("provider run %s is not running", result.RunID),
 			`UPDATE provider_runs SET status = ?, counters_json = ?, diagnostic_code = ?, completed_at = ? WHERE id = ? AND status = 'running'`,
 			string(result.State), string(counters), diagnosticCode, formatTime(time.Now()), raw)
 	})
@@ -268,8 +266,10 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 		return nil, err
 	}
 	if err := w.streamInputs(ctx, snapshot, inputs); err != nil {
-		w.Fail(ctx)
-		return nil, err
+		// The unit row and any inputs already written must not linger as a
+		// building unit; a failure to remove them is reported alongside the
+		// cause rather than hidden behind it.
+		return nil, errors.Join(err, w.Fail(ctx))
 	}
 	return w, nil
 }
@@ -369,44 +369,12 @@ func (w *UnitWriter) checkEvidence(list []model.Evidence) error {
 	return nil
 }
 
-// PutNodeIdentities registers node_ids dictionary rows. Identity is recomputed
-// from repository, kind and canonical key; an identity with no visible fact is
-// never a query result, so registering more than is published is harmless.
-func (w *UnitWriter) PutNodeIdentities(ctx context.Context, ids []model.NodeIdentity) error {
-	if w.done {
-		return conflict("unit %s is no longer building", w.build.Spec.ID)
-	}
-	var bytes int64
-	for _, id := range ids {
-		if err := id.Validate(); err != nil {
-			return err
-		}
-		if model.NewNodeID(w.repo, id.Kind, id.CanonicalKey) != id.ID {
-			return &model.Error{Code: model.CodeProviderOutputInvalid,
-				Message: "node identity does not derive from its repository, kind and canonical key"}
-		}
-		bytes += recordOverhead + int64(len(id.CanonicalKey))
-	}
-	if err := w.s.checkBatch(len(ids), bytes); err != nil {
-		return err
-	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
-		stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO node_ids(id, repository_id, kind, canonical_key) VALUES(?, ?, ?, ?)`)
-		if err != nil {
-			return wrap("node_ids", err)
-		}
-		defer stmt.Close()
-		for _, id := range ids {
-			raw, _ := model.DecodeID(string(id.ID))
-			if _, err := stmt.ExecContext(ctx, raw, w.repoRaw, string(id.Kind), id.CanonicalKey); err != nil {
-				return wrap("node_ids", err)
-			}
-		}
-		return nil
-	})
-}
-
-// PutNodes stores node facts with their evidence in one transaction.
+// PutNodes stores node facts with their evidence in one transaction. Each
+// fact's identity is recomputed from the repository, its kind and its
+// canonical key (Section 9.1) and registered in the node_ids dictionary before
+// the fact row references it; a fact whose ID does not derive, or whose kind
+// disagrees with the identity already registered under that ID, is malformed
+// provider output.
 func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
@@ -419,17 +387,31 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 		if f.Node.SemanticSource == model.SemanticLSP {
 			return &model.Error{Code: model.CodeProviderOutputInvalid, Message: "an lsp overlay node is never a canonical fact"}
 		}
+		if model.NewNodeID(w.repo, f.Node.Kind, f.CanonicalKey) != f.Node.ID {
+			return &model.Error{Code: model.CodeProviderOutputInvalid,
+				Message: "node id does not derive from its repository, kind and canonical key", Details: map[string]string{"node_id": string(f.Node.ID)}}
+		}
 		if err := w.checkEvidence(f.Evidence); err != nil {
 			return err
 		}
 		n := f.Node
-		bytes += recordOverhead + int64(len(n.Name)+len(n.QualifiedName)+len(n.Signature)+len(n.Language)+len(n.Metadata)) + evidenceBytes(f.Evidence)
+		bytes += recordOverhead + int64(len(n.Name)+len(n.QualifiedName)+len(n.Signature)+len(n.Language)+len(n.Metadata)+len(f.CanonicalKey)) + evidenceBytes(f.Evidence)
 	}
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
+			ids, err := tx.PrepareContext(ctx, `INSERT INTO node_ids(id, repository_id, kind, canonical_key) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
+			if err != nil {
+				return err
+			}
+			defer ids.Close()
+			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
+			if err != nil {
+				return err
+			}
+			defer kindOf.Close()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
@@ -439,6 +421,17 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 			for _, f := range facts {
 				n := f.Node
 				nodeRaw, _ := model.DecodeID(string(n.ID))
+				if _, err := ids.ExecContext(ctx, nodeRaw, w.repoRaw, string(n.Kind), f.CanonicalKey); err != nil {
+					return err
+				}
+				var kind model.NodeKind
+				if err := kindOf.QueryRowContext(ctx, nodeRaw).Scan(&kind); err != nil {
+					return err
+				}
+				if kind != n.Kind {
+					return &model.Error{Code: model.CodeProviderOutputInvalid,
+						Message: "node kind disagrees with the identity already registered under this id", Details: map[string]string{"node_id": string(n.ID)}}
+				}
 				fileRaw, err := w.inputFile(ctx, tx, n.FileID, n.ContentHash)
 				if err != nil {
 					return err
@@ -555,6 +548,11 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 // PutSearchUnits stores lexical documents and their FTS index rows in the same
 // transaction. The FTS insert is explicit: the external-content table is never
 // maintained by cascade or by row counts (Section 12.2).
+//
+// token_count is computed here with the index's own unicode61 tokenizer over
+// exactly the columns search_fts indexes, so the Section 12.4 length
+// statistics agree with the index. SearchUnit.TokenCount is informational on
+// input and ignored; on read it is the stored, authoritative value.
 func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
@@ -569,8 +567,12 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err := w.s.checkBatch(len(docs), bytes); err != nil {
 		return err
 	}
+	tokenCounts, err := w.s.countTokens(ctx, docs)
+	if err != nil {
+		return err
+	}
 	var inserted int64
-	err := w.s.write(ctx, func(tx *sql.Tx) error {
+	err = w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
 			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -583,12 +585,12 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 				return err
 			}
 			defer index.Close()
-			for _, d := range docs {
+			for i, d := range docs {
 				keyRaw, _ := model.DecodeID(d.ID)
 				fileRaw, _ := model.DecodeID(string(d.FileID))
 				nodeRaw, _ := optionalBlob("search_unit.node_id", string(d.NodeID))
 				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nodeRaw, fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
-					int64(d.Bytes.Start), int64(d.Bytes.End), d.Body, d.TokenCount)
+					int64(d.Bytes.Start), int64(d.Bytes.End), d.Body, tokenCounts[i])
 				if err != nil {
 					return err
 				}
@@ -768,7 +770,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		if docs != w.ftsDocs {
 			return corrupt("unit %s has %d search documents but emitted %d index rows", w.build.Spec.ID, docs, w.ftsDocs)
 		}
-		if err := exec1(tx, ctx, conflict("unit %s is no longer building", w.build.Spec.ID),
+		if err := exec1(ctx, tx, conflict("unit %s is no longer building", w.build.Spec.ID),
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
@@ -839,10 +841,17 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 }
 
 // Activate validates the frozen membership, computes the AnalysisKey and runs
-// exactly the Section 12.3 pointer transaction. Any failure rolls back every
-// status and pointer change.
-func (s *Store) Activate(ctx context.Context, gen model.GenerationID, health model.GenerationHealth,
+// exactly the Section 12.3 pointer transaction. expectedActive is the
+// generation the caller believes is published (zero: none); it is compared
+// with active_generations inside the same immediate transaction and a
+// mismatch is CTX_VERSION_CONFLICT, so a coordinator never publishes over a
+// pointer it has not seen. Any failure rolls back every status and pointer
+// change.
+func (s *Store) Activate(ctx context.Context, gen, expectedActive model.GenerationID, health model.GenerationHealth,
 	capabilities []model.CapabilityState, normalizationVersion string) (model.Binding, error) {
+	if expectedActive < 0 {
+		return model.Binding{}, invalid("expected active generation must not be negative")
+	}
 	if !health.Valid() {
 		return model.Binding{}, invalid("generation health %q is not a known health", health)
 	}
@@ -862,6 +871,18 @@ func (s *Store) Activate(ctx context.Context, gen model.GenerationID, health mod
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
+		}
+		var current int64
+		if err := activeGeneration(ctx, tx, g.repo, &current); err != nil {
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeNoActiveGeneration {
+				return err
+			}
+		}
+		if current != int64(expectedActive) {
+			return &model.Error{Code: model.CodeVersionConflict,
+				Message:     fmt.Sprintf("active generation is %d, not the expected %d; another activation intervened", current, expectedActive),
+				Remediation: "re-read the active generation and decide again whether to publish"}
 		}
 		checks := []struct {
 			what  string
@@ -929,14 +950,14 @@ func (s *Store) Activate(ctx context.Context, gen model.GenerationID, health mod
 		snapshotID := model.SnapshotID(idHex(g.snapshot))
 		key := model.NewAnalysisKey(snapshotID, Fingerprint, membership.Sum(), capsHash.Sum(), normalizationVersion, g.semantic)
 		keyRaw, _ := model.DecodeID(string(key))
-		if err := exec1(tx, ctx, conflict("generation %d left staging during activation", gen),
+		if err := exec1(ctx, tx, conflict("generation %d left staging during activation", gen),
 			`UPDATE generations SET analysis_key = ?, health = ? WHERE id = ? AND status = 'staging'`, keyRaw, string(health), g.id); err != nil {
 			return err
 		}
 
 		// Section 12.3, verbatim in effect: exactly one row must flip to active.
 		now := formatTime(time.Now())
-		if err := exec1(tx, ctx, conflict("generation %d could not be activated: not staging or no analysis key", gen),
+		if err := exec1(ctx, tx, conflict("generation %d could not be activated: not staging or no analysis key", gen),
 			`UPDATE generations SET status='active', activated_at=? WHERE id=? AND repository_id=? AND status='staging' AND analysis_key IS NOT NULL`,
 			now, g.id, g.repo); err != nil {
 			return err
@@ -978,7 +999,7 @@ func foldColumn(ctx context.Context, tx *sql.Tx, h *model.Hasher, query string, 
 // pointer is untouched.
 func (s *Store) Abort(ctx context.Context, gen model.GenerationID) error {
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		if err := exec1(tx, ctx, conflict("generation %d is not staging", gen),
+		if err := exec1(ctx, tx, conflict("generation %d is not staging", gen),
 			`UPDATE generations SET status = 'failed', health = 'failed' WHERE id = ? AND status = 'staging'`, int64(gen)); err != nil {
 			return err
 		}
@@ -1044,213 +1065,4 @@ func (s *Store) UnitOrigin(ctx context.Context, unit model.UnitID) (model.Provid
 		return wrap("units", err)
 	})
 	return model.ProviderRunID(idHex(origin)), err
-}
-
-// DeleteGeneration removes a failed or superseded generation's membership and
-// metadata, then collects units no retained generation or dependent unit
-// reaches, in reverse dependency order through the FTS-aware deletion
-// procedure, then orphan identities and origin runs (Section 12.4). A live
-// lease or a retained session referencing the generation blocks deletion with
-// a retryable CTX_WORKSPACE_BUSY. Blob collection is a separate grace-protocol
-// step and is not performed here.
-func (s *Store) DeleteGeneration(ctx context.Context, gen model.GenerationID) error {
-	var snapshot []byte
-	err := s.write(ctx, func(tx *sql.Tx) error {
-		g, err := s.generationRow(ctx, tx, gen, "")
-		if err != nil {
-			return err
-		}
-		if g.status != model.GenerationFailed && g.status != model.GenerationSuperseded {
-			return conflict("generation %d is %s; only failed or superseded generations are deleted", gen, g.status)
-		}
-		snapshot = g.snapshot
-		var leases, sessions int64
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM retention_leases WHERE generation_id = ? AND expires_at > ?`, g.id, formatTime(time.Now())).Scan(&leases); err != nil {
-			return wrap("retention_leases", err)
-		}
-		if leases != 0 {
-			return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
-				Message: fmt.Sprintf("generation %d is retained by %d live leases", gen, leases)}
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM context_manifests WHERE generation_id = ?
-			AND NOT EXISTS (SELECT 1 FROM read_sessions rs WHERE rs.manifest_id = context_manifests.id)
-			AND NOT EXISTS (SELECT 1 FROM session_manifests sm WHERE sm.manifest_id = context_manifests.id)`, g.id); err != nil {
-			return wrap("context_manifests", err)
-		}
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM read_sessions WHERE generation_id = ?`, g.id).Scan(&sessions); err != nil {
-			return wrap("read_sessions", err)
-		}
-		if sessions != 0 {
-			return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
-				Message:     fmt.Sprintf("generation %d is referenced by %d retained sessions", gen, sessions),
-				Remediation: "sessions are pruned under the closed-session retention policy before their generation can be collected"}
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE generation_id = ?`, g.id); err != nil {
-			return wrap("retention_leases", err)
-		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM generations WHERE id = ?`, g.id)
-		return wrap("generations", err)
-	})
-	if err != nil {
-		return err
-	}
-	if err := s.collectUnreachableUnits(ctx); err != nil {
-		return err
-	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
-			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
-			return wrap("provider_runs", err)
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE snapshot_id = ? AND expires_at <= ?`, snapshot, formatTime(time.Now())); err != nil {
-			return wrap("retention_leases", err)
-		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM snapshots WHERE id = ?
-			AND NOT EXISTS (SELECT 1 FROM generations g WHERE g.snapshot_id = snapshots.id)
-			AND NOT EXISTS (SELECT 1 FROM retention_leases l WHERE l.snapshot_id = snapshots.id)
-			AND NOT EXISTS (SELECT 1 FROM read_sessions rs WHERE rs.snapshot_id = snapshots.id)`, snapshot)
-		return wrap("snapshots", err)
-	})
-}
-
-// collectUnreachableUnits deletes, in bounded batches, every non-building unit
-// that no generation selects and no remaining unit depends on. Each pass
-// removes leaves only, so dependencies are deleted after their dependents.
-func (s *Store) collectUnreachableUnits(ctx context.Context) error {
-	return s.collectUnits(ctx, `SELECT u.id FROM units u WHERE u.state <> 'building'
-		AND NOT EXISTS (SELECT 1 FROM generation_units gu WHERE gu.unit_id = u.id)
-		AND NOT EXISTS (SELECT 1 FROM unit_dependencies ud WHERE ud.dependency_id = u.id) LIMIT ?2`, 0)
-}
-
-// collectUnits repeatedly selects up to gcBatchUnits unit rows with query
-// (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
-// transaction per batch, until the query returns nothing.
-func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error {
-	for {
-		var deleted int
-		err := s.write(ctx, func(tx *sql.Tx) error {
-			rows, err := tx.QueryContext(ctx, query, arg, gcBatchUnits)
-			if err != nil {
-				return wrap("units", err)
-			}
-			ids := make([]int64, 0, gcBatchUnits)
-			for rows.Next() {
-				var id int64
-				if err := rows.Scan(&id); err != nil {
-					rows.Close()
-					return wrap("units", err)
-				}
-				ids = append(ids, id)
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return wrap("units", err)
-			}
-			for _, id := range ids {
-				if err := s.deleteUnit(ctx, tx, id); err != nil {
-					return err
-				}
-			}
-			deleted = len(ids)
-			return nil
-		})
-		if err != nil || deleted == 0 {
-			return err
-		}
-	}
-}
-
-// deleteUnit is the one unit deletion procedure (Section 12.4). It issues the
-// FTS delete with each document's indexed values before the content rows go,
-// removes facts, then the identities only this unit referenced, then the unit.
-// Callers never `DELETE FROM units` directly. Membership rows are deliberately
-// not touched: every caller has already established the unit is unreachable,
-// and if one ever were not, the generation_units foreign key aborts the
-// transaction rather than silently shrinking a retained generation.
-func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error {
-	steps := []string{
-		`CREATE TEMP TABLE IF NOT EXISTS gc_nodes(id BLOB PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS gc_relations(id BLOB PRIMARY KEY) WITHOUT ROWID`,
-		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM node_facts WHERE unit_id = ?1`,
-		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM native_aliases WHERE unit_id = ?1`,
-		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,
-		`INSERT INTO search_fts(search_fts, rowid, name, qualified_name, signature, path, body)
-			SELECT 'delete', rowid, name, qualified_name, signature, path, body FROM search_units WHERE unit_id = ?1`,
-		`DELETE FROM search_units WHERE unit_id = ?1`,
-		`DELETE FROM evidence WHERE unit_id = ?1`,
-		`DELETE FROM native_aliases WHERE unit_id = ?1`,
-		`DELETE FROM relation_facts WHERE unit_id = ?1`,
-		`DELETE FROM node_facts WHERE unit_id = ?1`,
-		`DELETE FROM relation_ids WHERE id IN (SELECT id FROM gc_relations)
-			AND NOT EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.relation_id = relation_ids.id)`,
-		`DELETE FROM node_ids WHERE id IN (SELECT id FROM gc_nodes)
-			AND NOT EXISTS (SELECT 1 FROM node_facts nf WHERE nf.node_id = node_ids.id)
-			AND NOT EXISTS (SELECT 1 FROM native_aliases na WHERE na.node_id = node_ids.id)
-			AND NOT EXISTS (SELECT 1 FROM relation_ids ri WHERE ri.from_node_id = node_ids.id OR ri.to_node_id = node_ids.id)
-			AND NOT EXISTS (SELECT 1 FROM context_entries ce WHERE ce.node_id = node_ids.id)`,
-		`DELETE FROM gc_nodes`,
-		`DELETE FROM gc_relations`,
-		`DELETE FROM unit_inputs WHERE unit_id = ?1`,
-		`DELETE FROM unit_dependencies WHERE unit_id = ?1`,
-		`DELETE FROM units WHERE id = ?1`,
-	}
-	for _, q := range steps {
-		if _, err := tx.ExecContext(ctx, q, unitRow); err != nil {
-			return wrap("delete unit", err)
-		}
-	}
-	return nil
-}
-
-// AcquireLease records a retention lease. The generation and snapshot it names
-// must exist; leases on staging or failed generations are permitted so a
-// build's own state stays retained.
-func (s *Store) AcquireLease(ctx context.Context, lease model.Lease) error {
-	if err := lease.Validate(); err != nil {
-		return err
-	}
-	idRaw, _ := model.DecodeID(lease.ID)
-	snapRaw, err := optionalBlob("lease.snapshot_id", string(lease.SnapshotID))
-	if err != nil {
-		return err
-	}
-	var genArg any
-	if lease.GenerationID != 0 {
-		genArg = int64(lease.GenerationID)
-	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		if lease.GenerationID != 0 {
-			if _, err := s.generationRow(ctx, tx, lease.GenerationID, ""); err != nil {
-				return err
-			}
-		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO retention_leases(id, generation_id, snapshot_id, owner_kind, expires_at) VALUES(?, ?, ?, ?, ?)`,
-			idRaw, genArg, snapRaw, string(lease.OwnerKind), formatTime(lease.ExpiresAt))
-		return wrap("retention_leases", err)
-	})
-}
-
-// RenewLease extends a live lease. An expired or released lease is
-// CTX_CURSOR_INVALID: continuation never silently repins.
-func (s *Store) RenewLease(ctx context.Context, id string, expiresAt time.Time) error {
-	raw, err := idBlob("lease.id", id)
-	if err != nil {
-		return err
-	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		return exec1(tx, ctx, &model.Error{Code: model.CodeCursorInvalid, Message: "lease has expired or was released"},
-			`UPDATE retention_leases SET expires_at = ? WHERE id = ? AND expires_at > ?`, formatTime(expiresAt), raw, formatTime(time.Now()))
-	})
-}
-
-// ReleaseLease drops a lease; a lease already gone is not an error.
-func (s *Store) ReleaseLease(ctx context.Context, id string) error {
-	raw, err := idBlob("lease.id", id)
-	if err != nil {
-		return err
-	}
-	return s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `DELETE FROM retention_leases WHERE id = ?`, raw)
-		return wrap("retention_leases", err)
-	})
 }

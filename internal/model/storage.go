@@ -212,30 +212,6 @@ func (b UnitBuild) Validate() error {
 	return nil
 }
 
-// NodeIdentity is one node_ids dictionary row. The dictionary is written by
-// reconciliation before facts reference it; an identity with no visible fact
-// is never a query result (Section 12.2).
-type NodeIdentity struct {
-	ID           NodeID   `json:"id"`
-	Kind         NodeKind `json:"kind"`
-	CanonicalKey string   `json:"canonical_key"`
-}
-
-// Validate enforces shape; the store additionally recomputes ID against its
-// repository with NewNodeID.
-func (n NodeIdentity) Validate() error {
-	if err := requireID("node_identity.id", string(n.ID)); err != nil {
-		return err
-	}
-	if !n.Kind.Valid() {
-		return invalid("node_identity.kind %q is not a known node kind", truncateForMessage(string(n.Kind)))
-	}
-	if err := requireField("node_identity.canonical_key", n.CanonicalKey, MaxNativeKeyBytes); err != nil {
-		return err
-	}
-	return nil
-}
-
 // Lease is one retention_leases row: an owner's promise that the generation
 // and/or snapshot it names must survive collection until ExpiresAt.
 type Lease struct {
@@ -326,6 +302,7 @@ func (s SessionOpen) Validate() error {
 type IssuedChunk struct {
 	ID          string    `json:"id"`
 	SessionID   SessionID `json:"session_id"`
+	ActorID     string    `json:"actor_id"`
 	FileID      FileID    `json:"file_id"`
 	ContentHash string    `json:"content_hash"`
 	Bytes       ByteRange `json:"bytes"`
@@ -339,6 +316,9 @@ func (c IssuedChunk) Validate() error {
 		return err
 	}
 	if err := requireID("issued_chunk.session_id", string(c.SessionID)); err != nil {
+		return err
+	}
+	if err := requireField("issued_chunk.actor_id", c.ActorID, MaxIdentifierBytes); err != nil {
 		return err
 	}
 	if err := requireID("issued_chunk.file_id", string(c.FileID)); err != nil {
