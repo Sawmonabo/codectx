@@ -273,7 +273,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		Capabilities: p.capabilities(sc, em)}
 	slog.Info("joern unit imported", "component", "provider.joern", "unit", string(req.Unit.ID), "run", string(req.Run),
 		"records", em.records, "export_bytes", result.BytesProcessed, "methods_matched", em.matched, "methods_external", em.external,
-		"methods_dropped", em.dropped, "occurrences_without_range", em.noRange, "evidence_clipped", em.clipped,
+		"methods_dropped", em.dropped, "no_strong_key", em.noStrongKey, "occurrences_without_range", em.noRange, "evidence_clipped", em.clipped,
 		"dangling_call_edges", sc.dangling, "unknown_labels", sc.unknownN)
 	return result, nil
 }
