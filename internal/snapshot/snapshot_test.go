@@ -63,7 +63,7 @@ func newFixture(t *testing.T, withGit bool) *fixture {
 		if err != nil {
 			t.Skipf("git is unavailable: %v", err)
 		}
-		f.git, err = git.New(runner, f.gitPath, time.Minute)
+		f.git, err = git.New(ctx, runner, f.gitPath, time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
