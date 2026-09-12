@@ -74,24 +74,36 @@ For a Git workspace the builder runs, through the shared process runner:
 | Sparse checkout | `git -c core.fsmonitor=false config --type=bool --default=false core.sparseCheckout` |
 | Index (modes, object IDs, skip-worktree tag) | `git -c core.fsmonitor=false ls-files -z -s -t` |
 | Configured filter drivers | `git -c core.fsmonitor=false config -z --get-regexp '^filter\..+\.(clean\|process\|required)$'` |
-| Changes and untracked paths | `git -c core.fsmonitor=false [-c filter.<d>.clean= -c filter.<d>.process= -c filter.<d>.required=false ...] status -z --porcelain=v2 --no-renames --untracked-files=all` (`=no` when `include_untracked = false`) |
+| Changes and untracked paths | `git -c core.fsmonitor=false status -z --porcelain=v2 --no-renames --untracked-files=all` (`=no` when `include_untracked = false`), with `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<i>`/`GIT_CONFIG_VALUE_<i>` in the environment neutralizing every enumerated driver (see below) |
 | Repair source | `git -c core.fsmonitor=false cat-file blob <oid>` |
 
 The child environment is exactly `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C` plus, when set in
 the parent, `HOME`, `XDG_CONFIG_HOME`, `USERPROFILE`, `SYSTEMROOT`, `TMPDIR`,
-`TEMP`, `TMP`. `PATH` is deliberately absent. Nothing else is inherited. The
-git executable is resolved from `PATH` once (`git.Locate`) and recorded as an
-absolute path; every run uses that path with a literal argument array. None of
-these commands runs hooks or writes the index.
+`TEMP`, `TMP`, and — for the status run only — the filter neutralization
+variables described next. `PATH` is deliberately absent, but that is hygiene,
+not a control: Git starts filters and hooks through `sh -c`, which supplies
+its own default `PATH`, so withholding it does **not** prevent a configured
+helper from executing. Nothing else is inherited. The git executable is
+resolved from `PATH` once (`git.Locate`) and recorded as an absolute path;
+every run uses that path with a literal argument array. None of these commands
+runs hooks or writes the index.
 
 **No filter or helper executes during capture.** `git status` re-hashes a
 tracked file whose stat information changed, and Git would run the file's
 configured `clean` (or long-running `process`) filter to do so. Before every
 status run the configured drivers are enumerated at every configuration level
-Git consults and each is neutralized for that run with `-c` overrides (an
-empty command is no command; `required=false` keeps Git from failing on the
-absence). `core.fsmonitor` is forced off for the same reason. The one visible
+Git consults (bounded at 256 drivers) and each is neutralized for that run
+through the child environment: `GIT_CONFIG_COUNT=N` with paired
+`GIT_CONFIG_KEY_<i>=filter.<driver>.clean|process|required` and
+`GIT_CONFIG_VALUE_<i>=` (empty; `false` for `required`), which Git ≥ 2.31
+applies as the highest-priority configuration. An empty command is no command
+and `required=false` keeps Git from failing on the absence. The environment
+carries key and value separately, so a driver whose name contains `=` (legal
+in a config subsection) is neutralized correctly; a `-c filter.<name>.clean=`
+argument would be split by Git at the first `=` and leave such a driver
+active. `core.fsmonitor` is forced off with a fixed `-c` argument that
+contains no user-controlled text. The one visible
 consequence: a clean file that a filter transforms on checkin, whose stat
 changed since Git last hashed it, is re-hashed raw and may be labelled
 `modified` where Git with its filters would call it clean. The status column
@@ -138,10 +150,13 @@ Untracked files under an excluded directory (for example `vendor/` with
   fetched.
 - **Skipped symlinks**, **skipped non-regular entries** (a tracked path whose
   worktree entry is now a directory, device or socket), **excluded tracked
-  files** (tracked regular files inside the data directory when it lies in the
-  workspace) and the number of validation **retries**. A tracked file replaced
-  by a non-regular entry after it was captured becomes a `deleted` tombstone:
-  the file Git tracks is no longer a file at that path. A staged deletion
+  files** (a tracked regular file the walk did not reach: inside the data
+  directory when it lies in the workspace, or behind a symlinked directory
+  component pruned under `follow_symlinks = false`) and the number of
+  validation **retries**. A tracked file replaced by a non-regular entry
+  becomes a `deleted` tombstone whether the replacement happened before the
+  capture or during it — the file Git tracks is no longer a file at that
+  path, and the manifest must not depend on timing. A staged deletion
   (`git rm`) is a tombstone carrying HEAD's object ID as provenance.
 
 Path lists in the notes are capped at 32 entries; the counts beside them are
