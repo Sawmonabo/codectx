@@ -12,6 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
+	"strings"
 )
 
 // Subcommand is the hidden argv[1] under which the codectx binary runs as a
@@ -36,9 +39,13 @@ const (
 )
 
 // Bounds. MaxFactFrameBytes is the per-record cap the parent enforces on
-// every frame from the child; it is at most the smallest
-// max_provider_record_bytes any sink is configured with. MaxSourceBytes is
-// the worker's absolute ceiling on one source frame; the parent's configured
+// every frame from the child. It does not bound the sink record a frame
+// becomes; the bound that does is the parent's own: the largest fact it can
+// build is one node or relation carrying MaxEvidencePerFact (64) evidence
+// rows of about 620 bytes of identifiers and positions plus a native key of
+// at most MaxNativeKeyBytes (2048), so about 167 KiB, well under the 4 MiB
+// max_provider_record_bytes a sink is configured with. MaxSourceBytes is the
+// worker's absolute ceiling on one source frame; the parent's configured
 // workspace.max_parse_file_bytes is enforced before a request is ever sent.
 const (
 	MaxFactFrameBytes = 64 << 10
@@ -191,4 +198,25 @@ func Read(r io.Reader, max int) (Kind, []byte, error) {
 		return 0, nil, err
 	}
 	return Kind(hdr[4]), payload, nil
+}
+
+// ResidentBytes reports this process's resident set size and false when the
+// platform cannot report it. Both sides measure the same way — the worker to
+// put its RSS in the Done frame, the parent for its own — so the aggregate
+// accounting of Section 22 sums one measurement, not two definitions. A
+// caller records an unmeasurable value as unavailable, never as zero.
+func ResidentBytes() (int64, bool) {
+	data, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0, false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0, false
+	}
+	pages, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil || pages < 0 {
+		return 0, false
+	}
+	return pages * int64(os.Getpagesize()), true
 }

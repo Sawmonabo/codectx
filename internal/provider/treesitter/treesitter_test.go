@@ -161,13 +161,13 @@ func TestLanguageFixtures(t *testing.T) {
 					t.Fatalf("evidence range [%d,%d) is not in the unit's file", e.Range.Start.Byte, e.Range.End.Byte)
 				}
 			}
-			if p.Stats().LiveWorkers > 2 {
-				t.Fatalf("live workers = %d, over the pool bound", p.Stats().LiveWorkers)
+			if p.Stats().Processes > 2 {
+				t.Fatalf("worker processes = %d, over the pool bound", p.Stats().Processes)
 			}
 		})
 	}
 	p.Close()
-	if s := p.Stats(); s.LiveWorkers != 0 || s.WorkersExited != s.WorkersStarted {
+	if s := p.Stats(); s.Processes != 0 || s.WorkersExited != s.WorkersStarted {
 		t.Fatalf("after Close: %+v, want every started worker exited", s)
 	}
 }

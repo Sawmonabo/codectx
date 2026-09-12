@@ -18,7 +18,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -164,16 +163,6 @@ func (p *Provider) Detect(_ context.Context, _ workspace.Root, _ workspace.Polic
 		return provider.Detection{Available: false, DiagnosticCode: model.CodeProviderUnavailable}, nil
 	}
 	return provider.Detection{Available: true, Capabilities: []string{capabilityName}}, nil
-}
-
-// Languages are the supported language names, sorted.
-func (p *Provider) Languages() []string {
-	out := make([]string, 0, len(p.languages))
-	for name := range p.languages {
-		out = append(out, name)
-	}
-	slices.Sort(out)
-	return out
 }
 
 // LanguageOf reports the pinned language for a manifest row: the snapshot's

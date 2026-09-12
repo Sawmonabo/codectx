@@ -42,10 +42,9 @@ const (
 // it started has exited.
 //
 // Failure mode: a native object the worker did not close (a tree, a query
-// cursor, a cgo handle saved per parse) grows the worker's RSS by a bounded
-// amount per parse, which over hundreds of parses of one file is a slope,
-// not a plateau; a worker the parent stopped tracking without stopping would
-// still be alive after Close.
+// cursor) grows the worker's RSS by a bounded amount per parse, which over
+// hundreds of parses of one file is a slope, not a plateau; a worker the
+// parent stopped tracking without stopping would still be alive after Close.
 func TestParserResourcePlateau(t *testing.T) {
 	if testing.Short() {
 		t.Skip("resource plateau benchmark; run without -short")
@@ -71,7 +70,7 @@ func TestParserResourcePlateau(t *testing.T) {
 	defer p.Close()
 
 	// One source per language, each large enough that a per-parse leak of a
-	// tree or a saved handle is visible against the allocator's noise.
+	// tree or a query cursor is visible against the allocator's noise.
 	sources := map[string][]byte{}
 	for _, name := range []string{"sample.go", "sample.py", "sample.ts", "sample.rs", "sample.cpp"} {
 		src, err := os.ReadFile(filepath.Join("..", "provider", "treesitter", "testdata", name))
@@ -121,8 +120,8 @@ func TestParserResourcePlateau(t *testing.T) {
 
 	p.Close()
 	s := p.Stats()
-	if s.LiveWorkers != 0 || s.WorkersExited != s.WorkersStarted {
-		t.Fatalf("after Close: %d live, %d started, %d exited", s.LiveWorkers, s.WorkersStarted, s.WorkersExited)
+	if s.Processes != 0 || s.WorkersExited != s.WorkersStarted {
+		t.Fatalf("after Close: %d live, %d started, %d exited", s.Processes, s.WorkersStarted, s.WorkersExited)
 	}
 	for _, pid := range pids {
 		if pid <= 0 {

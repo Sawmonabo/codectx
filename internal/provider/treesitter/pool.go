@@ -6,10 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -41,16 +40,27 @@ var errWorkerGone = errors.New("treesitter: parser worker exited")
 // pool is the bounded lazy set of parser workers (Section 11.3, 23.4): at
 // most max live at once, started on demand, kept idle for idleTTL, recycled
 // when a lifetime bound approaches and torn down on cancellation.
+//
+// max bounds live processes, not concurrent parses. A worker occupies its
+// place in live from before it is started until the runner has reaped it, so
+// an idle worker, and one still shutting down, both still count. Bounding
+// callers instead would let a caller start a fresh worker while an expiring
+// one is still alive and still holding its runner slot and memory
+// reservation, and the runner would refuse the admission the pool itself
+// caused.
 type pool struct {
 	runner   *process.Runner
 	cmd      WorkerCommand
 	dir      string
+	max      int
 	idleTTL  time.Duration
 	parseTTL time.Duration
 	memory   int64
-	slots    chan struct{}
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// cond wakes acquirers when a worker becomes idle, a process exits or the
+	// pool closes: the three events that can let a waiting caller proceed.
+	cond   *sync.Cond
 	idle   []*worker
 	live   map[*worker]bool
 	closed bool
@@ -62,16 +72,26 @@ type pool struct {
 // worker is one parser subprocess owned by the pool.
 type worker struct {
 	p      *pool
+	ctx    context.Context
 	cancel context.CancelFunc
-	in     *io.PipeWriter
-	out    *io.PipeReader
-	done   chan struct{}
+	// in and out are the parent's ends of the worker's stdin and stdout;
+	// childIn and childOut are the ends the runner gives the process.
+	in       *io.PipeWriter
+	out      *io.PipeReader
+	childIn  *io.PipeReader
+	childOut *io.PipeWriter
+	done     chan struct{}
 	// result and runErr are written by the run goroutine before done closes.
 	result process.Result
 	runErr error
 
-	pid      int
-	rss      uint64
+	// pid and rss are written by the goroutine driving the worker and read by
+	// stats from any goroutine, so both are atomic rather than guarded by the
+	// pool lock the writers do not hold.
+	pid atomic.Int64
+	rss atomic.Uint64
+	// The remaining fields belong to the goroutine that holds the worker
+	// between acquire and release.
 	parses   int
 	bytesIn  int64
 	bytesOut int64
@@ -80,44 +100,87 @@ type worker struct {
 }
 
 func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, idleTTL, parseTTL time.Duration, memory int64) *pool {
-	return &pool{runner: runner, cmd: cmd, dir: dir, idleTTL: idleTTL, parseTTL: parseTTL, memory: memory,
-		slots: make(chan struct{}, max), live: map[*worker]bool{}}
+	p := &pool{runner: runner, cmd: cmd, dir: dir, max: max, idleTTL: idleTTL, parseTTL: parseTTL, memory: memory,
+		live: map[*worker]bool{}}
+	p.cond = sync.NewCond(&p.mu)
+	return p
 }
 
-// acquire takes a worker slot, reusing an idle worker or starting one.
+// newWorker builds one worker's plumbing. Nothing here can fail and nothing
+// here starts a process: it exists so a worker is never registered in the
+// pool in a state where stopping it would use a nil pipe or cancel function.
+func newWorker(p *pool) *worker {
+	childIn, in := io.Pipe()
+	out, childOut := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	return &worker{p: p, ctx: ctx, cancel: cancel, in: in, out: out, childIn: childIn, childOut: childOut,
+		done: make(chan struct{}), started: time.Now()}
+}
+
+// acquire returns a worker to parse with: an idle one when the pool has one,
+// otherwise a newly started process, waiting when max processes are already
+// alive. It returns promptly on cancellation.
 func (p *pool) acquire(ctx context.Context) (*worker, error) {
-	select {
-	case p.slots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, model.Canceled(ctx.Err())
-	}
 	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		<-p.slots
-		return nil, &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
+	for {
+		if p.closed {
+			p.mu.Unlock()
+			return nil, &model.Error{Code: model.CodeInternal, Message: "the treesitter provider is closed"}
+		}
+		if n := len(p.idle); n > 0 {
+			w := p.idle[n-1]
+			p.idle = p.idle[:n-1]
+			w.timer.Stop()
+			p.mu.Unlock()
+			return w, nil
+		}
+		if len(p.live) < p.max {
+			// The worker is fully constructed — pipes, context, cancel — and
+			// takes its place in live and in the wait group under the same hold
+			// close waits behind, so neither a second acquirer nor a concurrent
+			// close can see a process about to start as absent or half-built.
+			w := newWorker(p)
+			p.live[w] = true
+			p.started++
+			p.wg.Add(1)
+			p.mu.Unlock()
+			if err := p.start(ctx, w); err != nil {
+				return nil, err
+			}
+			return w, nil
+		}
+		if err := p.wait(ctx); err != nil {
+			p.mu.Unlock()
+			return nil, err
+		}
 	}
-	if n := len(p.idle); n > 0 {
-		w := p.idle[n-1]
-		p.idle = p.idle[:n-1]
-		w.timer.Stop()
-		p.mu.Unlock()
-		return w, nil
+}
+
+// wait blocks until the pool changes or ctx ends, releasing and retaking p.mu
+// the way sync.Cond does. The context watch is what makes a cond wait
+// cancelable: it broadcasts once ctx is done so the waiter re-checks.
+func (p *pool) wait(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return model.Canceled(err)
 	}
-	p.mu.Unlock()
-	w, err := p.start(ctx)
-	if err != nil {
-		<-p.slots
-		return nil, err
+	stop := context.AfterFunc(ctx, func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.cond.Broadcast()
+	})
+	p.cond.Wait()
+	stop()
+	if err := ctx.Err(); err != nil {
+		return model.Canceled(err)
 	}
-	return w, nil
+	return nil
 }
 
 // release returns a worker after a parse. A worker that is unhealthy or has
 // consumed its share of a lifetime bound is stopped; otherwise it goes idle
-// under a TTL timer.
+// under a TTL timer. Its place in live is given up only when the process has
+// exited, which is what keeps live processes bounded.
 func (p *pool) release(w *worker, healthy bool) {
-	defer func() { <-p.slots }()
 	if !healthy || w.exhausted() {
 		w.stop(!healthy)
 		return
@@ -130,6 +193,7 @@ func (p *pool) release(w *worker, healthy bool) {
 	}
 	p.idle = append(p.idle, w)
 	w.timer = time.AfterFunc(p.idleTTL, func() { p.expire(w) })
+	p.cond.Broadcast()
 	p.mu.Unlock()
 }
 
@@ -151,53 +215,64 @@ func (p *pool) expire(w *worker) {
 	}
 }
 
-// close stops every worker and waits for the runner to reap each one.
+// close stops every worker and waits for the runner to reap each one. An idle
+// worker exits on the end of its stdin, which takes up to the grace, so the
+// idle set is stopped concurrently rather than one grace after another; the
+// rest — busy or already shutting down — are killed.
 func (p *pool) close() {
 	p.mu.Lock()
 	p.closed = true
 	idle := p.idle
 	p.idle = nil
+	idleSet := make(map[*worker]bool, len(idle))
+	for _, w := range idle {
+		idleSet[w] = true
+	}
 	var busy []*worker
 	for w := range p.live {
-		busy = append(busy, w)
+		if !idleSet[w] {
+			busy = append(busy, w)
+		}
 	}
+	p.cond.Broadcast()
 	p.mu.Unlock()
+	var stopping sync.WaitGroup
 	for _, w := range idle {
 		w.timer.Stop()
-		w.stop(false)
+		stopping.Add(1)
+		go func() {
+			defer stopping.Done()
+			w.stop(false)
+		}()
 	}
+	stopping.Wait()
 	for _, w := range busy {
 		w.stop(true)
 	}
 	p.wg.Wait()
 }
 
-// start launches one worker through the runner and reads its hello frame.
-func (p *pool) start(ctx context.Context) (*worker, error) {
-	inR, inW := io.Pipe()
-	outR, outW := io.Pipe()
-	wctx, cancel := context.WithCancel(context.Background())
-	w := &worker{p: p, cancel: cancel, in: inW, out: outR, done: make(chan struct{}), started: time.Now()}
+// start launches the registered worker w through the runner and reads its
+// hello frame. w already holds its place in live and in the wait group; the
+// run goroutine gives both up once the runner has reaped the process,
+// whatever happens here.
+func (p *pool) start(ctx context.Context, w *worker) error {
 	spec := process.Spec{
 		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir,
-		Stdin: inR, MaxStdinBytes: workerStdinBudget,
-		Stdout: outW, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
+		Stdin: w.childIn, MaxStdinBytes: workerStdinBudget,
+		Stdout: w.childOut, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
 		Timeout: workerLifetime, Grace: workerGrace, MemoryReservationBytes: p.memory,
 	}
-	p.mu.Lock()
-	p.live[w] = true
-	p.started++
-	p.mu.Unlock()
-	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		w.result, w.runErr = p.runner.Run(wctx, spec)
+		w.result, w.runErr = p.runner.Run(w.ctx, spec)
 		// Unblock any parent write or read: the worker cannot answer any more.
-		inR.CloseWithError(errWorkerGone)
-		outW.CloseWithError(errWorkerGone)
+		w.childIn.CloseWithError(errWorkerGone)
+		w.childOut.CloseWithError(errWorkerGone)
 		p.mu.Lock()
 		delete(p.live, w)
 		p.exited++
+		p.cond.Broadcast()
 		p.mu.Unlock()
 		close(w.done)
 	}()
@@ -218,16 +293,16 @@ func (p *pool) start(ctx context.Context) (*worker, error) {
 		if w.runErr != nil {
 			// The runner's typed refusal (trust, admission, start failure)
 			// or termination explains the missing hello better than the pipe.
-			return nil, w.runErr
+			return w.runErr
 		}
 		if ctx.Err() != nil {
-			return nil, model.Canceled(ctx.Err())
+			return model.Canceled(ctx.Err())
 		}
-		return nil, (&model.Error{Code: model.CodeProviderUnavailable, Message: "the parser worker did not start: " + err.Error()}).
+		return (&model.Error{Code: model.CodeProviderUnavailable, Message: "the parser worker did not start: " + err.Error()}).
 			WithDetail("worker_stderr", w.stderrLine())
 	}
-	w.pid = hello.PID
-	return w, nil
+	w.pid.Store(int64(hello.PID))
+	return nil
 }
 
 // watch cancels the worker when ctx ends or the deadline passes before the
@@ -397,7 +472,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
-			w.rss = ex.done.RSSBytes
+			w.rss.Store(ex.done.RSSBytes)
 			return ex, nil
 		case wire.KindError:
 			var e wire.Error
@@ -415,11 +490,18 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 }
 
 // Stats is the aggregate parent-plus-worker resource view of Section 22:
-// live and idle worker counts, lifetime counters and resident memory. A
+// process and idle worker counts, lifetime counters and resident memory. A
 // value that cannot be measured is -1, never zero.
 type Stats struct {
-	LiveWorkers    int    `json:"live_workers"`
+	// Processes is every worker process the runner has not yet reaped: busy,
+	// idle and shutting down alike. It never exceeds index.max_parser_workers.
+	Processes int `json:"processes"`
+	// IdleWorkers is the reusable subset of Processes, and BusyWorkers the
+	// rest: parsing for a caller, or on their way out. The two are reported
+	// separately because one number cannot say whether the pool is saturated
+	// with work or merely holding warm processes.
 	IdleWorkers    int    `json:"idle_workers"`
+	BusyWorkers    int    `json:"busy_workers"`
 	WorkersStarted uint64 `json:"workers_started"`
 	WorkersExited  uint64 `json:"workers_exited"`
 	Parses         uint64 `json:"parses"`
@@ -435,34 +517,21 @@ type Stats struct {
 func (p *pool) stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := Stats{LiveWorkers: len(p.live), IdleWorkers: len(p.idle), WorkersStarted: p.started, WorkersExited: p.exited,
-		Parses: p.parses, Retries: p.retries, ParentRSSBytes: residentBytes("/proc/self/statm")}
+	s := Stats{Processes: len(p.live), IdleWorkers: len(p.idle), BusyWorkers: len(p.live) - len(p.idle),
+		WorkersStarted: p.started, WorkersExited: p.exited, Parses: p.parses, Retries: p.retries, ParentRSSBytes: -1}
+	if rss, ok := wire.ResidentBytes(); ok {
+		s.ParentRSSBytes = rss
+	}
 	for w := range p.live {
-		s.WorkerPIDs = append(s.WorkerPIDs, w.pid)
-		if w.rss == 0 || s.WorkerRSSBytes < 0 {
+		s.WorkerPIDs = append(s.WorkerPIDs, int(w.pid.Load()))
+		rss := w.rss.Load()
+		if rss == 0 || s.WorkerRSSBytes < 0 {
 			s.WorkerRSSBytes = -1
 			continue
 		}
-		s.WorkerRSSBytes += int64(w.rss)
+		s.WorkerRSSBytes += int64(rss)
 	}
 	return s
-}
-
-// residentBytes reads an RSS from a statm file, -1 when unavailable.
-func residentBytes(statm string) int64 {
-	data, err := os.ReadFile(statm)
-	if err != nil {
-		return -1
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return -1
-	}
-	pages, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil {
-		return -1
-	}
-	return pages * int64(os.Getpagesize())
 }
 
 func short(s string) string {
