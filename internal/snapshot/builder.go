@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -235,7 +236,7 @@ func (b *Builder) fileVersion(r row) model.FileVersion {
 		Size:        r.size,
 		ContentHash: r.hash,
 		GitObjectID: r.oid,
-		Language:    languageOf(r.path),
+		Language:    lang.Of(r.path),
 		Executable:  r.executable,
 	}
 }
