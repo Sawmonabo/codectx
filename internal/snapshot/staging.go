@@ -56,6 +56,11 @@ func openStaging(ctx context.Context, dir string) (*staging, error) {
 		return nil, err
 	}
 	path := filepath.Join(dir, stagingPrefix+id[:16]+".db")
+	// The DSN shape (file URL plus _pragma=name(value) pairs) is the same one
+	// internal/storage/sqlite/open.go builds for the durable store. The two
+	// differ in every value (this one trades durability for speed), and the
+	// driver DSN grammar is the shared contract; if a third caller appears the
+	// builder belongs in one place.
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "cache_size(-4096)", "locking_mode(EXCLUSIVE)"} {
 		q.Add("_pragma", p)
@@ -95,9 +100,6 @@ func (s *staging) wrap(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
 	return ioError(op, err)
 }
 
@@ -114,10 +116,13 @@ func (s *staging) putIndex(ctx context.Context, path, mode, oid string) error {
 
 // putChange records one `git status` row. A later row for the same path wins,
 // which is what makes a path both deleted from the index and present as
-// untracked read as untracked: Git lists the untracked entry last.
-func (s *staging) putChange(ctx context.Context, path, change string) error {
-	return s.exec(ctx, "staging status", `INSERT INTO entries(path, change) VALUES(?, ?)
-		ON CONFLICT(path) DO UPDATE SET change = excluded.change`, path, change)
+// untracked read as untracked: Git lists the untracked entry last. headOID is
+// kept only for a path the index no longer names, where it is the only
+// provenance a staged deletion has.
+func (s *staging) putChange(ctx context.Context, path, change, headOID string) error {
+	return s.exec(ctx, "staging status", `INSERT INTO entries(path, change, oid) VALUES(?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET change = excluded.change,
+			oid = CASE WHEN entries.tracked = 1 THEN entries.oid ELSE excluded.oid END`, path, change, headOID)
 }
 
 // resetChanges clears the status view before a reconciliation re-run, so a

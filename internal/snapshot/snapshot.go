@@ -25,6 +25,7 @@
 package snapshot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -43,6 +44,8 @@ const (
 	lockFileName       = "workspace.lock"
 	stagingPrefix      = "capture-"
 	materializePrefix  = "mat-"
+	casTmpDirName      = "tmp"
+	casTmpPrefix       = "put-"
 )
 
 // CASDir is the content-addressed store location under a data directory.
@@ -55,23 +58,30 @@ func StagingDir(dataDir string) string { return filepath.Join(dataDir, stagingDi
 func MaterializeDir(dataDir string) string { return filepath.Join(dataDir, materializeDirName) }
 
 // Sweep is startup recovery for this package's temporary state: staging
-// databases left by a crashed capture and materializations whose owning
-// process is gone. The caller holds the workspace lock, so no capture is in
-// progress; a live materialization is recognized by the lock its owner still
-// holds and is left alone. A file that cannot be removed is reported with the
-// rest, never silently skipped.
+// databases and unpublished CAS temporaries left by a crashed capture, and
+// materializations whose owning process is gone. The caller holds the
+// workspace lock, so no capture is in progress; a live materialization is
+// recognized by the lock its owner still holds and is left alone. A Repair
+// running outside the lock may lose its temporary to this sweep; CAS.publish
+// reports that as a retryable busy condition. A file that cannot be removed is
+// reported with the rest, never silently skipped.
 func Sweep(dataDir string) error {
 	var errs []error
-	entries, err := os.ReadDir(StagingDir(dataDir))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, internal("staging directory: %v", err))
-	}
-	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), stagingPrefix) {
-			continue
+	for _, dir := range []struct{ path, prefix string }{
+		{StagingDir(dataDir), stagingPrefix},
+		{filepath.Join(CASDir(dataDir), casTmpDirName), casTmpPrefix},
+	} {
+		entries, err := os.ReadDir(dir.path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, ioError("recovery listing", err))
 		}
-		if err := os.Remove(filepath.Join(StagingDir(dataDir), e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, internal("staging cleanup: %v", err))
+		for _, e := range entries {
+			if !strings.HasPrefix(e.Name(), dir.prefix) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir.path, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, ioError("recovery cleanup", err))
+			}
 		}
 	}
 	if err := sweepMaterializations(MaterializeDir(dataDir)); err != nil {
@@ -99,17 +109,69 @@ func resourceLimit(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeResourceLimit, Message: fmt.Sprintf(format, args...)}
 }
 
-// ioError maps a filesystem failure under the data directory to its Section
-// 22 family: disk exhaustion is its own code, everything else is internal.
-// Paths are not included; the caller names the operation.
+// ioError maps a filesystem failure to its Section 22 family: disk exhaustion
+// is its own code, cancellation stays cancellation, everything else is
+// internal. The message carries the operation and the bare cause (the errno
+// behind a *fs.PathError, *os.LinkError or *os.SyscallError), never the path
+// text: a repository or data-directory path is not something an error may
+// carry into logs.
 func ioError(op string, err error) error {
 	var typed *model.Error
 	if errors.As(err, &typed) {
 		return err
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return canceled(err)
+	}
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the data directory's disk is full",
 			Remediation: "free disk space or move storage.data_dir to a larger volume"}
 	}
-	return internal("%s: %v", op, err)
+	return internal("%s: %v", op, bareCause(err))
+}
+
+// bareCause strips the path from the OS error wrappers, keeping only the
+// operating-system reason.
+func bareCause(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Err
+	}
+	var se *os.SyscallError
+	if errors.As(err, &se) {
+		return se.Err
+	}
+	return err
+}
+
+// canceled reports work the caller stopped, joined with the context error so
+// errors.Is still distinguishes a deadline from a cancellation while errors.As
+// finds the typed code (the internal/process convention).
+func canceled(err error) error {
+	typed := &model.Error{Code: model.CodeCanceled, Message: "the operation was canceled before it completed",
+		Remediation: "run the operation again when it should finish"}
+	if errors.Is(err, context.DeadlineExceeded) {
+		typed.Message = "the caller's deadline expired before the operation completed"
+	}
+	return errors.Join(typed, err)
+}
+
+// typed maps any error leaving this package to a *model.Error chain: a bare
+// context error from a walk or a staging query becomes the typed cancellation.
+func typed(err error) error {
+	if err == nil {
+		return nil
+	}
+	var t *model.Error
+	if errors.As(err, &t) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return canceled(err)
+	}
+	return err
 }

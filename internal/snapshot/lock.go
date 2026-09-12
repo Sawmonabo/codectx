@@ -2,7 +2,6 @@ package snapshot
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -65,7 +64,7 @@ func LockWorkspace(ctx context.Context, dataDir string, wait time.Duration) (*Wo
 		select {
 		case <-ctx.Done():
 			f.Close()
-			return nil, errors.Join(&model.Error{Code: model.CodeCanceled, Message: "the wait for the workspace lock was canceled"}, ctx.Err())
+			return nil, canceled(ctx.Err())
 		case <-time.After(lockPollInterval):
 		}
 	}

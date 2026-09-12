@@ -31,7 +31,7 @@ func OpenCAS(dir string) (*CAS, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, invalid("the CAS directory must be an absolute path")
 	}
-	tmp := filepath.Join(dir, "tmp")
+	tmp := filepath.Join(dir, casTmpDirName)
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		return nil, ioError("CAS directory", err)
 	}
@@ -77,9 +77,9 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
 // failure. Repair uses this so a wrong reconstruction never enters the store.
 func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
 	if err := ctx.Err(); err != nil {
-		return model.BlobRecord{}, err
+		return model.BlobRecord{}, canceled(err)
 	}
-	tmp, err := os.CreateTemp(c.tmp, "put-*")
+	tmp, err := os.CreateTemp(c.tmp, casTmpPrefix+"*")
 	if err != nil {
 		return model.BlobRecord{}, ioError("CAS temporary file", err)
 	}
@@ -130,8 +130,11 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 
 // publish links tmp to final atomically. An existing final is the same
 // content by construction of the name, so it is kept and only its size is
-// checked; a filesystem without hard links falls back to a rename that is
-// attempted only while final is absent.
+// checked. A filesystem without hard links falls back to a rename, attempted
+// only while final is absent; a publisher racing into that window replaces
+// the object with byte-identical content, which changes nothing a reader can
+// observe. A temporary that vanished is the startup sweep running without the
+// workspace lock held here (Repair): retryable, not corruption.
 func (c *CAS) publish(tmp, final string, size int64) error {
 	err := os.Link(tmp, final)
 	if err == nil {
@@ -143,10 +146,22 @@ func (c *CAS) publish(tmp, final string, size int64) error {
 	if _, statErr := os.Lstat(final); statErr == nil {
 		return c.checkExisting(final, size)
 	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return sweptTemporary()
+	}
 	if err := os.Rename(tmp, final); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return sweptTemporary()
+		}
 		return ioError("CAS publish", err)
 	}
 	return nil
+}
+
+func sweptTemporary() error {
+	return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message:     "the object's temporary file was removed by a concurrent recovery sweep before publication",
+		Remediation: "retry; run repair under the workspace lock to exclude the sweep"}
 }
 
 func (c *CAS) checkExisting(final string, size int64) error {
@@ -187,7 +202,7 @@ func indexOf(rec model.BlobRecord) source.Index {
 // exposed. Memory is one block.
 func (c *CAS) Open(ctx context.Context, rec model.BlobRecord) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, canceled(err)
 	}
 	if err := rec.Validate(); err != nil {
 		return nil, err
@@ -302,7 +317,7 @@ func verifyBlock(data []byte, rec model.BlobRecord, i int) error {
 // that plus two partial blocks.
 func (c *CAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, canceled(err)
 	}
 	if err := rec.Validate(); err != nil {
 		return nil, err

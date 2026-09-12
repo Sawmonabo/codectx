@@ -5,11 +5,14 @@
 // absolute executable resolved once, and a fixed environment allowlist: the
 // child never inherits the parent's environment. The commands used here read
 // the index and the worktree; none of them runs hooks, writes the index
-// (GIT_OPTIONAL_LOCKS=0) or asks a terminal for credentials. The fsmonitor
-// hook is disabled explicitly because `git status` would otherwise run a
-// repository-configured executable. Git object IDs this package reports are
-// provenance only: the bytes a snapshot retains are always read from the
-// worktree, because attributes can make a checkout differ from its blob.
+// (GIT_OPTIONAL_LOCKS=0) or asks a terminal for credentials. The two ways
+// `git status` could start a configured executable are closed explicitly: the
+// fsmonitor hook is disabled, and every configured clean/smudge filter driver
+// is neutralized for the run, so a file whose stat changed is re-hashed by Git
+// with its built-in conversions only (Section 21). PATH is never passed. Git
+// object IDs this package reports are provenance only: the bytes a snapshot
+// retains are always read from the worktree, because attributes can make a
+// checkout differ from its blob.
 package git
 
 import (
@@ -43,6 +46,11 @@ const (
 	// stderrExcerptBytes bounds the sanitized Git diagnostic carried in an
 	// error message.
 	stderrExcerptBytes = 200
+	// maxFilterDrivers bounds the configured filter drivers a run neutralizes;
+	// more than this is not a repository, it is a configuration attack.
+	maxFilterDrivers = 256
+	// maxConfigBytes bounds the filter enumeration output.
+	maxConfigBytes = 1 << 20
 )
 
 // envAllowlist names the parent variables a Git child may see. HOME and
@@ -95,8 +103,7 @@ func New(runner *process.Runner, executable string, timeout time.Duration) (*Git
 		return nil, internal("git requires the shared process runner")
 	}
 	if !filepath.IsAbs(executable) {
-		return nil, &model.Error{Code: model.CodeTrustRequired,
-			Message: fmt.Sprintf("git executable %q is not an absolute path", executable)}
+		return nil, &model.Error{Code: model.CodeTrustRequired, Message: "the git executable path is not absolute"}
 	}
 	if timeout <= 0 {
 		timeout = DefaultTimeout
@@ -113,7 +120,7 @@ func New(runner *process.Runner, executable string, timeout time.Duration) (*Git
 // Executable is the recorded absolute path.
 func (g *Git) Executable() string { return g.path }
 
-// IndexEntry is one `git ls-files -s` row: what the index tracks at a path.
+// IndexEntry is one `git ls-files -s -t` row: what the index tracks at a path.
 type IndexEntry struct {
 	Path string
 	// Mode is the octal index mode: 100644 or 100755 for a file, 120000 for a
@@ -121,6 +128,9 @@ type IndexEntry struct {
 	Mode     string
 	ObjectID string
 	Stage    int
+	// SkipWorktree marks a sparse-checkout entry: tracked, deliberately not
+	// checked out. Its absence from the worktree is not a deletion.
+	SkipWorktree bool
 }
 
 // Index modes with capture consequences.
@@ -142,10 +152,13 @@ const (
 )
 
 // Change is one path Git reports as differing from HEAD or as untracked.
-// Paths Git considers clean are not reported at all.
+// Paths Git considers clean are not reported at all. HeadObjectID is HEAD's
+// blob for the path when HEAD has one, which is the only provenance a staged
+// deletion still carries.
 type Change struct {
-	Path string
-	Kind ChangeKind
+	Path         string
+	Kind         ChangeKind
+	HeadObjectID string
 }
 
 // Head returns the full object ID HEAD resolves to, or "" for a repository
@@ -163,30 +176,44 @@ func (g *Git) Head(ctx context.Context, root string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-// ListIndex streams every index entry (`git ls-files -z -s`) to visit. The
-// output is parsed as it arrives; no repository-sized list is built here.
+// ListIndex streams every index entry (`git ls-files -z -s -t`) to visit. The
+// output is parsed as it arrives; no repository-sized list is built here. The
+// tag column distinguishes skip-worktree (sparse) entries from checked-out
+// ones.
 func (g *Git) ListIndex(ctx context.Context, root string, maxEntries int64, visit func(IndexEntry) error) error {
 	p := newParser(func(record []byte) error {
-		// "<mode> <oid> <stage>\t<path>"
+		// "<tag> <mode> <oid> <stage>\t<path>"
 		meta, path, ok := bytes.Cut(record, []byte{'\t'})
 		fields := bytes.Fields(meta)
-		if !ok || len(fields) != 3 || len(path) == 0 {
+		if !ok || len(fields) != 4 || len(fields[0]) != 1 || len(path) == 0 {
 			return corruptOutput("ls-files", record)
 		}
-		stage, err := strconv.Atoi(string(fields[2]))
+		stage, err := strconv.Atoi(string(fields[3]))
 		if err != nil {
 			return corruptOutput("ls-files", record)
 		}
-		return visit(IndexEntry{Path: string(path), Mode: string(fields[0]), ObjectID: string(fields[1]), Stage: stage})
+		return visit(IndexEntry{Path: string(path), Mode: string(fields[1]), ObjectID: string(fields[2]), Stage: stage,
+			SkipWorktree: fields[0][0] == 'S'})
 	})
-	return g.stream(ctx, root, p, maxEntries, "ls-files", "-z", "-s")
+	return g.stream(ctx, root, p, maxEntries, "ls-files", "-z", "-s", "-t")
 }
 
 // Status streams every path that differs from HEAD, and every untracked
 // non-ignored path when untracked is set, to visit. Rename detection is off so
 // a rename arrives as a deletion and an addition, matching path identity.
 // Ignore rules are applied by Git itself to untracked discovery.
+//
+// Git re-hashes a tracked file whose stat information changed, and that hash
+// would normally run the file's configured clean filter. Every configured
+// driver is neutralized for this run, so no filter executes; the consequence,
+// documented in docs/snapshots.md, is that such a file may be labelled
+// modified although Git with filters would call it clean. The label is
+// provenance; the captured bytes are authoritative either way.
 func (g *Git) Status(ctx context.Context, root string, untracked bool, maxEntries int64, visit func(Change) error) error {
+	overrides, err := g.filterOverrides(ctx, root)
+	if err != nil {
+		return err
+	}
 	skipNext := false
 	p := newParser(func(record []byte) error {
 		if skipNext {
@@ -208,16 +235,20 @@ func (g *Git) Status(ctx context.Context, root string, untracked bool, maxEntrie
 			// "2 ... <X><score> <path>" followed by the original path record
 			// "u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>"
 			fieldCount := map[byte]int{'1': 8, '2': 9, 'u': 10}[record[0]]
-			path, xy, ok := splitFields(record, fieldCount)
+			fields, path, ok := splitFields(record, fieldCount)
 			if !ok {
 				return corruptOutput("status", record)
 			}
 			skipNext = record[0] == '2'
-			return visit(Change{Path: path, Kind: classify(xy)})
+			ch := Change{Path: path, Kind: classify(fields[1])}
+			if record[0] != 'u' && fields[6] != zeroObjectID(fields[6]) {
+				ch.HeadObjectID = fields[6]
+			}
+			return visit(ch)
 		}
 		return corruptOutput("status", record)
 	})
-	args := []string{"status", "-z", "--porcelain=v2", "--no-renames"}
+	args := append(overrides, "status", "-z", "--porcelain=v2", "--no-renames")
 	if untracked {
 		args = append(args, "--untracked-files=all")
 	} else {
@@ -226,24 +257,63 @@ func (g *Git) Status(ctx context.Context, root string, untracked bool, maxEntrie
 	return g.stream(ctx, root, p, maxEntries, args...)
 }
 
-// splitFields returns the path after n space-separated fields and the second
-// field (XY).
-func splitFields(record []byte, n int) (path, xy string, ok bool) {
+// filterOverrides enumerates the configured clean/smudge filter drivers at
+// every configuration level Git would consult and returns the -c arguments
+// that neutralize each one: an empty clean and process command is no command,
+// and required=false keeps Git from failing on the absence.
+func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error) {
+	var out bytes.Buffer
+	result, err := g.run(ctx, root, &out, maxConfigBytes, "config", "-z", "--get-regexp", `^filter\..+\.(clean|process|required)$`)
+	if err != nil {
+		if result.ExitCode == 1 && !result.TimedOut && !result.Canceled {
+			// Nothing matched: no driver is configured anywhere.
+			return nil, nil
+		}
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var args []string
+	for _, record := range bytes.Split(out.Bytes(), []byte{0}) {
+		key, _, _ := bytes.Cut(record, []byte{'\n'})
+		if len(key) == 0 {
+			continue
+		}
+		// "filter.<driver>.<var>": the driver may itself contain dots.
+		name := string(key[len("filter."):])
+		driver := name[:strings.LastIndexByte(name, '.')]
+		if seen[driver] {
+			continue
+		}
+		if len(seen) >= maxFilterDrivers {
+			return nil, &model.Error{Code: model.CodeResourceLimit,
+				Message: fmt.Sprintf("more than %d filter drivers are configured", maxFilterDrivers)}
+		}
+		seen[driver] = true
+		args = append(args, "-c", "filter."+driver+".clean=", "-c", "filter."+driver+".process=", "-c", "filter."+driver+".required=false")
+	}
+	return args, nil
+}
+
+// zeroObjectID is the all-zero ID of the same length: porcelain v2 prints it
+// for a side that has no object, such as HEAD for an added path.
+func zeroObjectID(like string) string { return strings.Repeat("0", len(like)) }
+
+// splitFields returns the first n space-separated fields and the path that
+// follows them.
+func splitFields(record []byte, n int) (fields []string, path string, ok bool) {
 	rest := record
 	for i := 0; i < n; i++ {
 		field, tail, found := bytes.Cut(rest, []byte{' '})
 		if !found {
-			return "", "", false
+			return nil, "", false
 		}
-		if i == 1 {
-			xy = string(field)
-		}
+		fields = append(fields, string(field))
 		rest = tail
 	}
-	if len(rest) == 0 || len(xy) != 2 {
-		return "", "", false
+	if len(rest) == 0 || len(fields[1]) != 2 {
+		return nil, "", false
 	}
-	return string(rest), xy, true
+	return fields, string(rest), true
 }
 
 // classify maps a porcelain XY pair to a change kind. A deletion on either

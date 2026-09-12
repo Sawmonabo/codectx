@@ -37,16 +37,18 @@ Consequences worth stating plainly:
 ```text
 FileID       = H("file-v1", repository_id, path)
 ManifestHash = fold over rows in bytewise path order of
-               (path, status, size, content_hash, executable, language)
+               (path, status, size, content_hash, executable)
 SnapshotID   = H("snapshot-v1", repository_id, head_object_id,
                  source_policy_hash, ManifestHash)
 ```
 
 The manifest is folded entry by entry from on-disk staging with
 `model.Hasher`; no repository-sized string is built. Git object IDs are
-provenance and are excluded from the hash; timestamps are excluded. Language is
-derived from the path by the single table in `internal/snapshot/language.go`
-and is part of the row, so it is part of the hash.
+provenance and are excluded from the hash; timestamps are excluded. The
+language column is derived from the path by the single table in
+`internal/snapshot/language.go` and stored on the row for analyzers to select
+by, but it is not source identity and is not folded: a change to that table
+must not re-identify unchanged bytes.
 
 ### `capture_consistency`
 
@@ -70,19 +72,33 @@ For a Git workspace the builder runs, through the shared process runner:
 |---|---|
 | HEAD provenance | `git -c core.fsmonitor=false rev-parse --verify --quiet HEAD` |
 | Sparse checkout | `git -c core.fsmonitor=false config --type=bool --default=false core.sparseCheckout` |
-| Index (modes, object IDs) | `git -c core.fsmonitor=false ls-files -z -s` |
-| Changes and untracked paths | `git -c core.fsmonitor=false status -z --porcelain=v2 --no-renames --untracked-files=all` (`=no` when `include_untracked = false`) |
+| Index (modes, object IDs, skip-worktree tag) | `git -c core.fsmonitor=false ls-files -z -s -t` |
+| Configured filter drivers | `git -c core.fsmonitor=false config -z --get-regexp '^filter\..+\.(clean\|process\|required)$'` |
+| Changes and untracked paths | `git -c core.fsmonitor=false [-c filter.<d>.clean= -c filter.<d>.process= -c filter.<d>.required=false ...] status -z --porcelain=v2 --no-renames --untracked-files=all` (`=no` when `include_untracked = false`) |
 | Repair source | `git -c core.fsmonitor=false cat-file blob <oid>` |
 
 The child environment is exactly `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `LC_ALL=C` plus, when set in
 the parent, `HOME`, `XDG_CONFIG_HOME`, `USERPROFILE`, `SYSTEMROOT`, `TMPDIR`,
-`TEMP`, `TMP`. Nothing else is inherited. The git executable is resolved from
-`PATH` once (`git.Locate`) and recorded as an absolute path; every run uses that
-path with a literal argument array. None of these commands runs hooks or writes
-the index; `core.fsmonitor` is forced off because `git status` would otherwise
-start a repository-configured executable. The operator's own (user-level) Git
-configuration is honored, consistent with the trust model in
+`TEMP`, `TMP`. `PATH` is deliberately absent. Nothing else is inherited. The
+git executable is resolved from `PATH` once (`git.Locate`) and recorded as an
+absolute path; every run uses that path with a literal argument array. None of
+these commands runs hooks or writes the index.
+
+**No filter or helper executes during capture.** `git status` re-hashes a
+tracked file whose stat information changed, and Git would run the file's
+configured `clean` (or long-running `process`) filter to do so. Before every
+status run the configured drivers are enumerated at every configuration level
+Git consults and each is neutralized for that run with `-c` overrides (an
+empty command is no command; `required=false` keeps Git from failing on the
+absence). `core.fsmonitor` is forced off for the same reason. The one visible
+consequence: a clean file that a filter transforms on checkin, whose stat
+changed since Git last hashed it, is re-hashed raw and may be labelled
+`modified` where Git with its filters would call it clean. The status column
+is provenance; the captured bytes are authoritative and identical either way.
+Built-in conversions (`text`, `eol`, `ident`) are not filters and still apply,
+so an `eol=crlf` file stays `tracked`. The operator's own (user-level) Git
+configuration is otherwise honored, consistent with the trust model in
 `docs/configuration.md`.
 
 Output is NUL-delimited and parsed as it streams into the capture's private
@@ -110,9 +126,9 @@ Untracked files under an excluded directory (for example `vendor/` with
 
 `Builder.Notes()` reports, for the most recent build:
 
-- **Sparse checkout** (`core.sparseCheckout = true`): tracked paths absent
-  from the worktree are still recorded as `deleted` — the snapshot describes
-  the worktree — but the note tells a reader why.
+- **Sparse checkout** (`core.sparseCheckout = true`): index entries carrying
+  the skip-worktree bit (`ls-files -t` tag `S`) were never checked out. They
+  are neither captured nor recorded as deletions; `SparseSkipped` counts them.
 - **Submodules**: a tracked `.gitmodules` and each gitlink (`160000`) path.
   Submodule contents are another repository and are neither captured nor
   recursed into; nothing is fetched.
@@ -120,7 +136,13 @@ Untracked files under an excluded directory (for example `vendor/` with
   `version https://git-lfs.github.com/spec/v1`. The pointer is what the
   worktree holds, so the pointer is what is retained; the large object is not
   fetched.
-- **Skipped symlinks** and the number of validation **retries**.
+- **Skipped symlinks**, **skipped non-regular entries** (a tracked path whose
+  worktree entry is now a directory, device or socket), **excluded tracked
+  files** (tracked regular files inside the data directory when it lies in the
+  workspace) and the number of validation **retries**. A tracked file replaced
+  by a non-regular entry after it was captured becomes a `deleted` tombstone:
+  the file Git tracks is no longer a file at that path. A staged deletion
+  (`git rm`) is a tombstone carrying HEAD's object ID as provenance.
 
 Path lists in the notes are capped at 32 entries; the counts beside them are
 complete.
@@ -138,9 +160,17 @@ the same pass, while the bytes are written to a private temporary file. The
 file is fsynced, made read-only and published with `os.Link` to a name derived
 only from the validated digest; an object already present is kept (its size is
 checked), never replaced. Where hard links are unavailable a rename is used
-only while the target is absent. The bucket directory is fsynced on Unix; on
-Windows there is no directory fsync and NTFS journaling is what makes the new
-name durable — this is the documented platform difference.
+only while the target is absent; a publisher racing into that window replaces
+the object with byte-identical content, which no reader can observe. The
+bucket directory is fsynced on Unix; on Windows there is no directory fsync
+and NTFS journaling is what makes the new name durable — this is the
+documented platform difference.
+
+Unpublished temporaries live under `cas/tmp/put-*`. A capture writes them
+under the workspace lock. `Sweep` removes whatever is there, so a `Repair`
+that runs without the lock can lose its temporary to a concurrent sweep; the
+publication then fails with a retryable `CTX_WORKSPACE_BUSY` rather than
+corrupting anything, and the caller retries (or repairs under the lock).
 
 The block digests and checkpoints are persisted with `storage.PutBlob` before
 the manifest row that names the blob is written, and `PutSnapshot` refuses a
@@ -214,20 +244,23 @@ outermost owner acquires it once and passes it to `Builder.Lock`; a builder
 given no lock acquires one for the duration of the capture.
 
 `snapshot.Sweep(dataDir)`, run by the lock holder at startup, removes staging
-databases left by a crashed capture and abandoned materializations.
+databases and unpublished CAS temporaries left by a crashed capture, and
+abandoned materializations.
 
 ## Errors
 
 | Situation | Code |
 |---|---|
 | Worktree kept changing after two recaptures | `CTX_SNAPSHOT_UNSTABLE` (retryable) |
-| Missing, truncated, oversized or corrupt blob; repair digest mismatch | `CTX_SOURCE_INTEGRITY` |
-| Lock held by another process | `CTX_WORKSPACE_BUSY` (retryable) |
+| Missing, truncated, oversized or corrupt blob; repair digest mismatch; repair source object unavailable | `CTX_SOURCE_INTEGRITY` |
+| Lock held by another process; CAS temporary swept during an unlocked repair | `CTX_WORKSPACE_BUSY` (retryable) |
+| Caller canceled or its deadline passed | `CTX_CANCELED` (joined with the context error) |
 | File budget, listing bound, read ceiling, materialization bound | `CTX_RESOURCE_LIMIT` |
 | Data directory disk full | `CTX_DISK_FULL` |
 | Git repository without a git executable, git failure | `CTX_PROVIDER_UNAVAILABLE` |
 | Git output this build cannot parse | `CTX_PROVIDER_OUTPUT_INVALID` |
 | Path or range shape errors | `CTX_ARGUMENT_INVALID` |
 
-Log lines carry identifiers and counts only: never a source body, and never a
-repository path.
+Log lines and error messages carry identifiers, counts, operation names and
+bare operating-system reasons only: never a source body, and never a
+repository or data-directory path.

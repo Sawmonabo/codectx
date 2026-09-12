@@ -71,8 +71,7 @@ func (v *View) EachFile(ctx context.Context, sel model.FileSelection, fn func(mo
 		for _, p := range paths {
 			fv, err := v.catalog.SnapshotFile(ctx, v.header.ID, model.NewFileID(v.header.RepositoryID, p))
 			if err != nil {
-				var typed *model.Error
-				if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
+				if isNotFound(err) {
 					continue
 				}
 				return err
@@ -99,6 +98,19 @@ func (v *View) EachFile(ctx context.Context, sel model.FileSelection, fn func(mo
 		}
 		after = page[len(page)-1].Path
 	}
+}
+
+// Not-found contract with the catalog: storage marks a lookup that found no
+// row with this detail (sqlite.ReasonNotFound), which distinguishes "the
+// snapshot has no such file" from a malformed argument under the same code.
+const (
+	detailReason   = "reason"
+	reasonNotFound = "not_found"
+)
+
+func isNotFound(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid && typed.Details[detailReason] == reasonNotFound
 }
 
 // file resolves a manifest row that carries content.
@@ -239,10 +251,17 @@ func (v *View) Repair(ctx context.Context, id model.FileID, src RepairSource) er
 	pw.Close()
 	putErr := <-done
 	var typed *model.Error
-	if errors.As(catErr, &typed) && typed.Code == model.CodeResourceLimit {
-		// The bound was the recorded size plus one: the object is not the
-		// blob the manifest describes.
-		return integrity("Git object is larger than the recorded blob").WithDetail("content_hash", rec.Hash)
+	if errors.As(catErr, &typed) {
+		switch typed.Code {
+		case model.CodeResourceLimit:
+			// The bound was the recorded size plus one: the object is not
+			// the blob the manifest describes.
+			return integrity("Git object is larger than the recorded blob").WithDetail("content_hash", rec.Hash)
+		case model.CodeProviderUnavailable:
+			// Git cannot produce the object (pruned, or the repository is
+			// gone): the blob stays missing and nothing can repair it.
+			return integrity("Git object recorded as provenance is not available; %s", typed.Message).WithDetail("content_hash", rec.Hash)
+		}
 	}
 	if catErr != nil {
 		return catErr

@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -59,9 +58,20 @@ type Notes struct {
 	// large content was not fetched.
 	LFSPointers     []string
 	LFSPointerCount int
+	// SparseSkipped counts skip-worktree index entries: tracked paths a
+	// sparse checkout deliberately left out. They are neither captured nor
+	// recorded as deletions.
+	SparseSkipped int
 	// SkippedSymlinks counts symbolic links excluded by policy, including
 	// tracked ones.
 	SkippedSymlinks int
+	// SkippedNonRegular counts tracked paths whose worktree entry is not a
+	// regular file (a directory, device or socket in place of a file). They
+	// are not source bytes and are not deletions.
+	SkippedNonRegular int
+	// ExcludedTracked counts tracked regular files the unconditional
+	// exclusions kept out: the data directory inside the workspace.
+	ExcludedTracked int
 	// Retries is how many validation passes found changes and recaptured.
 	Retries int
 }
@@ -105,8 +115,11 @@ type Builder struct {
 	OperatorFrozen bool
 	Logger         *slog.Logger
 
-	// afterCapture runs after each file is read and recorded; the unstable-
-	// capture test uses it to change the file under the builder.
+	// afterCapture runs after each file is read and recorded. It exists for
+	// exactly one caller: the unstable-capture test, which must change a file
+	// between the read and the validation pass to prove the retry bound and
+	// the typed failure. No production code sets it; a sleep-based race would
+	// be flaky and a filesystem hook does not exist.
 	afterCapture func(rel string)
 	notes        Notes
 }
@@ -140,13 +153,13 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	c := &capture{b: b, st: st}
 	head, err := c.enumerateGit(ctx)
 	if err != nil {
-		return model.Snapshot{}, err
+		return model.Snapshot{}, typed(err)
 	}
 	for pass := 1; ; pass++ {
 		detectOnly := pass >= 2+maxRetries
 		changes, err := c.pass(ctx, pass, detectOnly)
 		if err != nil {
-			return model.Snapshot{}, err
+			return model.Snapshot{}, typed(err)
 		}
 		if pass > 1 && changes == 0 {
 			break
@@ -169,12 +182,14 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r)) })
 	})
 	if err != nil {
-		return model.Snapshot{}, err
+		return model.Snapshot{}, typed(err)
 	}
 	b.logger().Info("snapshot captured", "component", "snapshot", "repository_id", string(b.Repository),
 		"snapshot_id", string(snap.ID), "file_count", snap.FileCount, "source_bytes", snap.SourceBytes,
 		"retries", b.notes.Retries, "submodules", b.notes.SubmoduleCount, "lfs_pointers", b.notes.LFSPointerCount,
-		"skipped_symlinks", b.notes.SkippedSymlinks, "duration", time.Since(started))
+		"sparse_skipped", b.notes.SparseSkipped, "skipped_symlinks", b.notes.SkippedSymlinks,
+		"skipped_non_regular", b.notes.SkippedNonRegular, "excluded_tracked", b.notes.ExcludedTracked,
+		"duration", time.Since(started))
 	return snap, nil
 }
 
@@ -185,7 +200,7 @@ func (b *Builder) validate() error {
 	case !filepath.IsAbs(b.Policy.DataDir):
 		return invalid("snapshot builder needs an absolute data directory in its policy")
 	case b.Policy.MaxFiles <= 0:
-		return resourceLimit("snapshot builder needs a positive file budget")
+		return invalid("snapshot builder needs a positive file budget; no zero or negative bound means unlimited")
 	case !model.ValidHexID(string(b.Repository)):
 		return invalid("snapshot builder needs a repository identity")
 	case !model.ValidHexID(b.SourcePolicyHash):
@@ -250,6 +265,13 @@ func (c *capture) enumerateGit(ctx context.Context) (string, error) {
 		if e.Path == ".gitmodules" {
 			c.b.notes.Gitmodules = true
 		}
+		if e.SkipWorktree {
+			// A sparse checkout never materialized this path. Staging does
+			// not learn it, so its absence is neither a deletion nor a
+			// forced include; the count reports it.
+			c.b.notes.SparseSkipped++
+			return nil
+		}
 		return c.st.putIndex(ctx, e.Path, e.Mode, e.ObjectID)
 	})
 	return head, err
@@ -264,7 +286,8 @@ func (c *capture) enumerateGit(ctx context.Context) (string, error) {
 func (c *capture) pass(ctx context.Context, pass int, detectOnly bool) (int, error) {
 	b := c.b
 	// The unseen sweep below recomputes these from scratch every pass.
-	b.notes.SkippedSymlinks, b.notes.Submodules, b.notes.SubmoduleCount = 0, nil, 0
+	b.notes.SkippedSymlinks, b.notes.SkippedNonRegular, b.notes.ExcludedTracked = 0, 0, 0
+	b.notes.Submodules, b.notes.SubmoduleCount = nil, 0
 	changes := 0
 	policy := b.Policy
 	if b.Root.HasGit {
@@ -272,7 +295,7 @@ func (c *capture) pass(ctx context.Context, pass int, detectOnly bool) (int, err
 			return 0, err
 		}
 		err := b.Git.Status(ctx, b.Root.Path, policy.IncludeUntracked, policy.MaxFiles, func(ch git.Change) error {
-			return c.st.putChange(ctx, ch.Path, string(ch.Kind))
+			return c.st.putChange(ctx, ch.Path, string(ch.Kind), ch.HeadObjectID)
 		})
 		if err != nil {
 			return 0, err
@@ -373,7 +396,7 @@ func (c *capture) captureFile(ctx context.Context, f workspace.File, r row, stat
 	b := c.b
 	file, err := b.Root.Open(f.Path)
 	if err != nil {
-		if gone, gerr := c.missing(f.Path); gerr == nil && gone {
+		if _, gone, ierr := c.inspect(f.Path); ierr == nil && gone {
 			// Deleted between the listing and the open; the unseen sweep
 			// records it.
 			return nil
@@ -386,11 +409,8 @@ func (c *capture) captureFile(ctx context.Context, f workspace.File, r row, stat
 	if err != nil {
 		return err
 	}
-	post, err := b.Root.Lstat(f.Path)
-	if err != nil {
-		if gone, gerr := c.missing(f.Path); gerr == nil && gone {
-			return nil
-		}
+	post, gone, err := c.inspect(f.Path)
+	if err != nil || gone {
 		return err
 	}
 	if post.Size() != rec.Size || post.ModTime().UnixNano() != f.ModTime {
@@ -437,11 +457,16 @@ func (c *capture) reconcileUnseen(ctx context.Context, r row, pass int, detectOn
 			b.notes.addSubmodule(r.path)
 			return nil
 		}
-		gone, err := c.missing(r.path)
-		if err != nil || !gone {
-			// Present but excluded unconditionally (inside the data
-			// directory) or not a regular file: not source, not a deletion.
+		info, gone, err := c.inspect(r.path)
+		if err != nil {
 			return err
+		}
+		if !gone {
+			// Present but not walked: not a regular file, or a regular file
+			// the unconditional exclusions keep out. Reported, not
+			// tombstoned: the path was not deleted.
+			c.noteUnwalked(info)
+			return nil
 		}
 		if pass > 1 {
 			*changes++
@@ -451,44 +476,56 @@ func (c *capture) reconcileUnseen(ctx context.Context, r row, pass int, detectOn
 		}
 		return c.st.tombstone(ctx, r.path, pass)
 	}
-	gone, err := c.missing(r.path)
+	info, gone, err := c.inspect(r.path)
 	if err != nil {
 		return err
 	}
 	if r.status == model.FileDeleted {
-		if gone {
-			return c.st.markSeen(ctx, r.path, pass)
+		// Still gone, or reappeared as something the walk does not emit:
+		// the tombstone stands either way.
+		if !gone {
+			c.noteUnwalked(info)
 		}
-		// Reappeared but not walked: not a regular eligible file any more.
-		// The tombstone stands.
 		return c.st.markSeen(ctx, r.path, pass)
 	}
-	// A captured file the walk no longer reaches: gone, or no longer eligible.
+	// A captured file the walk no longer reaches: gone, replaced by a
+	// non-regular entry, or no longer eligible.
 	*changes++
 	if detectOnly {
 		return nil
 	}
-	if gone && (r.tracked || git.ChangeKind(r.change) == git.ChangeDeleted) {
+	tracked := r.tracked || git.ChangeKind(r.change) == git.ChangeDeleted
+	if !gone {
+		c.noteUnwalked(info)
+	}
+	if tracked && (gone || !info.Mode().IsRegular()) {
+		// The file Git tracks is no longer a file at this path.
 		return c.st.tombstone(ctx, r.path, pass)
 	}
 	return c.st.drop(ctx, r.path)
 }
 
-// missing reports whether rel no longer exists. The confined Lstat says only
-// that a path cannot be inspected; the plain Lstat that follows classifies a
-// failure as absence versus any other error, and reads nothing.
-func (c *capture) missing(rel string) (bool, error) {
-	if _, err := c.b.Root.Lstat(rel); err == nil {
-		return false, nil
+// noteUnwalked classifies a present tracked path the walk did not emit.
+func (c *capture) noteUnwalked(info fs.FileInfo) {
+	if info.Mode().IsRegular() {
+		c.b.notes.ExcludedTracked++
+	} else {
+		c.b.notes.SkippedNonRegular++
 	}
-	_, err := os.Lstat(filepath.Join(c.b.Root.Path, filepath.FromSlash(rel)))
+}
+
+// inspect stats rel through the confined root. gone is true when the path no
+// longer exists; any other failure to inspect it is an error, because a path
+// that cannot be examined is not known to be deleted.
+func (c *capture) inspect(rel string) (fs.FileInfo, bool, error) {
+	info, err := c.b.Root.Lstat(rel)
 	if err == nil {
-		return false, nil
+		return info, false, nil
 	}
 	if errors.Is(err, fs.ErrNotExist) {
-		return true, nil
+		return nil, true, nil
 	}
-	return false, ioError("worktree stat", err)
+	return nil, false, err
 }
 
 // header folds the sorted manifest into its aggregate digest and builds the
@@ -508,7 +545,6 @@ func (c *capture) header(ctx context.Context, head string) (model.Snapshot, erro
 		h.AddString(strconv.FormatInt(r.size, 10))
 		h.AddString(r.hash)
 		h.AddString(strconv.FormatInt(boolInt(r.executable), 10))
-		h.AddString(languageOf(r.path))
 		count++
 		total += uint64(r.size)
 		return nil
