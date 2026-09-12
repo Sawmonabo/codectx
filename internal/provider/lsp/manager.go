@@ -76,7 +76,12 @@ type Manager struct {
 
 	mu      sync.Mutex
 	servers map[serverKey]*entry
-	closed  bool
+	// live holds every server whose process tree has not yet been reaped,
+	// including servers that failed and were forgotten. Close waits on it, so
+	// "Close returns once every process tree is reaped" is true of a failed
+	// server too, not only of the ones still holding a slot.
+	live   map[*server]struct{}
+	closed bool
 }
 
 // entry is one server slot: ready is closed once the start attempt finished,
@@ -146,7 +151,7 @@ func New(opts Options) (*Manager, error) {
 	if opts.MaxFrameBytes > opts.MaxOverlayBytes {
 		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %d", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
-	return &Manager{opts: opts, servers: make(map[serverKey]*entry)}, nil
+	return &Manager{opts: opts, servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
 }
 
 // Open returns an overlay over view answered by profile, starting the server
@@ -173,7 +178,13 @@ func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Pro
 			srv, err := startServer(ctx, m, view, profile)
 			m.mu.Lock()
 			e.srv, e.err = srv, err
-			if err != nil && m.servers[key] == e {
+			// A server that failed between starting and being recorded has
+			// already been through forget, which found no entry to remove
+			// because e.srv was still nil. Removing it here, under the same
+			// lock that publishes it, is what keeps the dead entry from being
+			// handed to every later Open. The identity check matters: expire
+			// or forget may have replaced this entry already.
+			if e2, ok := m.servers[key]; ok && e2 == e && (err != nil || srv.running() != nil) {
 				delete(m.servers, key)
 			}
 			m.mu.Unlock()
@@ -272,8 +283,24 @@ func (m *Manager) forget(s *server) {
 	}
 }
 
+// track registers a started server until its process tree is reaped; untrack
+// is called from the exit path, after the materialization is removed.
+func (m *Manager) track(s *server) {
+	m.mu.Lock()
+	m.live[s] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *Manager) untrack(s *server) {
+	m.mu.Lock()
+	delete(m.live, s)
+	m.mu.Unlock()
+}
+
 // Close stops every server and refuses further opens. It returns once every
-// process tree is reaped and every materialization removed.
+// process tree is reaped and every materialization removed, including the
+// trees of servers that failed and were forgotten: those are stopped through
+// the same path, which for an already dying server is the wait for its exit.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	m.closed = true
@@ -282,12 +309,19 @@ func (m *Manager) Close() error {
 		entries = append(entries, e)
 		delete(m.servers, k)
 	}
+	live := make([]*server, 0, len(m.live))
+	for s := range m.live {
+		live = append(live, s)
+	}
 	m.mu.Unlock()
 	for _, e := range entries {
 		<-e.ready
 		if e.srv != nil {
 			e.srv.stop()
 		}
+	}
+	for _, s := range live {
+		s.stop()
 	}
 	return nil
 }

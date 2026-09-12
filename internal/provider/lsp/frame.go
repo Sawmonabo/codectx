@@ -77,16 +77,17 @@ func readFrame(r *bufio.Reader, maxBytes int64) ([]byte, error) {
 
 // readHeaderLine reads one CRLF-terminated header line without the terminator.
 // A bare LF is accepted as the terminator too; the protocol requires CRLF, and
-// a server that sends LF is still unambiguous. The line is bounded before it
-// is buffered.
+// a server that sends LF is still unambiguous. The bound is checked against
+// the chunk the reader already holds before it is appended, so an over-long
+// line is never copied into the accumulator.
 func readHeaderLine(r *bufio.Reader) (string, error) {
 	var line []byte
 	for {
 		chunk, err := r.ReadSlice('\n')
-		line = append(line, chunk...)
-		if len(line) > maxHeaderLineBytes {
+		if len(line)+len(chunk) > maxHeaderLineBytes {
 			return "", outputInvalid("message header line exceeds %d bytes", maxHeaderLineBytes)
 		}
+		line = append(line, chunk...)
 		if err == nil {
 			break
 		}
@@ -97,16 +98,16 @@ func readHeaderLine(r *bufio.Reader) (string, error) {
 	return strings.TrimRight(string(line), "\r\n"), nil
 }
 
-// writeFrame writes one framed message. The payload is already bounded by the
-// caller: every outgoing message is built here from typed values.
+// writeFrame writes one framed message as two writes: the short header and
+// then the payload itself. Concatenating them would copy the whole payload a
+// second time for no benefit, and the payload is already bounded by
+// MaxFrameBytes in conn.write. The caller holds the writer lock, so the two
+// writes cannot be interleaved with another message's.
 func writeFrame(w io.Writer, payload []byte) error {
-	var b strings.Builder
-	b.Grow(len(payload) + 32)
-	b.WriteString("Content-Length: ")
-	b.WriteString(strconv.Itoa(len(payload)))
-	b.WriteString("\r\n\r\n")
-	b.Write(payload)
-	if _, err := io.WriteString(w, b.String()); err != nil {
+	if _, err := io.WriteString(w, "Content-Length: "+strconv.Itoa(len(payload))+"\r\n\r\n"); err != nil {
+		return streamError(err)
+	}
+	if _, err := w.Write(payload); err != nil {
 		return streamError(err)
 	}
 	return nil
