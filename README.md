@@ -1,8 +1,8 @@
 # codectx
 
-Local-first codebase intelligence for software-development agents: a Go CLI and
-MCP server that index a local Git repository, keep the exact indexed bytes, and
-answer bounded structural queries offline.
+Codebase intelligence for software-development agents: a Go CLI and MCP server
+that index a Git repository, keep the exact indexed bytes, and answer bounded
+structural queries.
 
 **Status: pre-release.** Only `codectx version` exists today; the commands below
 land in later tasks and are shown as the target contract.
@@ -17,10 +17,9 @@ codectx context plan --task "Add retry semantics to PaymentService.Authorize" --
 codectx mcp serve --repo .
 ```
 
-No API key, no hosted service and no mandatory network access at runtime. If
-only the bundled structural providers are available the commands still work and
-report their precision; installed SCIP, LSP or Joern tooling enriches the same
-graph and query APIs without changing the agent integration.
+If only the bundled structural providers are available the commands still work
+and report their precision; installed SCIP, LSP or Joern tooling enriches the
+same graph and query APIs without changing the agent integration.
 
 ## Output contract
 

@@ -20,7 +20,7 @@ const jsonFlag = "json"
 func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "codectx",
-		Short: "Local-first codebase intelligence for development agents",
+		Short: "Codebase intelligence for development agents",
 		Long: "codectx indexes a local repository and answers bounded structural " +
 			"queries offline, through this CLI and an MCP server.",
 		SilenceErrors: true,

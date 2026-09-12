@@ -7,7 +7,7 @@
 **Supersedes:** The 2026-09-03 combined specification, in full.  
 **Working module path:** `github.com/Sawmonabo/codectx`  
 **Project license:** Apache License 2.0  
-**Goal:** Build a local-first, deterministic codebase-intelligence and context-management system that indexes software repositories, exposes precise structural and semantic queries through a Go CLI and MCP server, and compiles task-specific, snapshot-pinned context for AI agents without requiring any paid service, AI API, embedding API, cloud database, or token purchase.
+**Goal:** Build a deterministic codebase-intelligence and context-management system that indexes software repositories, exposes precise structural and semantic queries through a Go CLI and MCP server, and compiles task-specific, snapshot-pinned context for AI agents without requiring any paid service, AI API, embedding API, cloud database, or token purchase.
 
 **Architecture:** A Go application with immutable source snapshots, reusable immutable analysis units, generation-qualified canonical facts, SQLite/FTS5, bounded local analyzer workers, a query engine, a deterministic context compiler, and an actor-scoped source-coverage and workflow gate. CLI and MCP share typed application services.
 
@@ -347,7 +347,7 @@ These constraints apply to every task and to all dispatched workers.
 | Language and licensing | All product-owned production and automation logic is Go; module language baseline `go 1.27`, initial CI/release toolchain `go1.27.1`, Apache-2.0 project license. SQL, TOML, CI YAML, fixture languages, and embedded grammar/query data are declarative resources, not prohibited product executables. |
 | Greenfield | Change architecture and code in place, update all consumers and docs, remove obsolete paths. No backward-compatibility work, migration layers, transitional shims, dual APIs, or legacy preservation. |
 | External dependencies | Pin exact tested versions/checksums. No moving `latest`, unbounded minimum-version promises, silent installation, or silent toolchain downloads at runtime. |
-| Local-first | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation. Optional analyzer networking is separately controlled and reported. |
+| No paid dependencies | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation. Optional analyzer networking is separately controlled and reported. |
 | Repository safety | No source writes; safe root-relative opens, not string validation alone. Analyzer materializations cannot share writable hard links with source or CAS. |
 | Memory | No whole-repository file list, graph, protobuf index, token corpus, or result set retained in Go heap. Memory admission counts bytes, concurrency, parser processes, SQLite buffers, caches, and output serialization. |
 | Resource limits | Every queue, batch, cache, record, request, traversal, process, temporary tree, and response has an explicit finite bound. Limits never masquerade as complete results. |
