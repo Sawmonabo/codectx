@@ -5,7 +5,7 @@
 **Status:** Revised greenfield design and implementation baseline; application behavior and performance require implementation evidence.  
 **Revision date:** 2026-09-04  
 **Supersedes:** The 2026-09-03 combined specification, in full.  
-**Working module path:** `github.com/codectx-project/codectx`  
+**Working module path:** `github.com/Sawmonabo/codectx`  
 **Project license:** Apache License 2.0  
 **Goal:** Build a local-first, deterministic codebase-intelligence and context-management system that indexes software repositories, exposes precise structural and semantic queries through a Go CLI and MCP server, and compiles task-specific, snapshot-pinned context for AI agents without requiring any paid service, AI API, embedding API, cloud database, or token purchase.
 
@@ -2348,7 +2348,7 @@ Introduce the shared fixture and resource harness when first needed, not only at
 
 - [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
 - [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** One CLI version-envelope case proves exact channels/fields and operation without a workspace. Reuse it later rather than adding separate equivalent golden files. Verify formatting/license policy through tools, not redundant Go tests.
-- [ ] **Step 2: Implement the complete production path.** Use `module github.com/codectx-project/codectx`, `go 1.27`, and `toolchain go1.27.1`; pin CI to that toolchain and disable runtime toolchain auto-download behavior in shipped operation. Add Cobra when consumed and pin resolved versions/checksums. Version/help must not open SQLite, detect analyzers, spawn parser workers or import an eagerly initialized service graph. Output errors through the single envelope policy. Use standard error propagation; only main chooses exit codes.
+- [ ] **Step 2: Implement the complete production path.** Use `module github.com/Sawmonabo/codectx`, `go 1.27`, and `toolchain go1.27.1`; pin CI to that toolchain and disable runtime toolchain auto-download behavior in shipped operation. Add Cobra when consumed and pin resolved versions/checksums. Version/help must not open SQLite, detect analyzers, spawn parser workers or import an eagerly initialized service graph. Output errors through the single envelope policy. Use standard error propagation; only main chooses exit codes.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Adopt existing pinned Go-native dependency/license/SBOM tooling where it covers the requirement, with only small policy glue if needed. Inventory generated grammar/native assets when they arrive, not just module license labels. CI starts with formatting, `go vet`, tests/build and `go mod verify`. A review exception must be explicit and evidence-backed, not an unknown-license pass.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
