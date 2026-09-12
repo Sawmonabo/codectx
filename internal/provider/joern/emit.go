@@ -40,11 +40,16 @@ type emitter struct {
 	materializationRoot string
 
 	records  uint64
-	dropped  uint64 // methods refused: unmatched source path or oversized attribute
+	dropped  uint64 // methods refused: unmatched source path, oversized attribute or scope key
 	clipped  uint64 // evidence rows over MaxEvidencePerFact
 	noRange  uint64 // located facts whose coordinates did not verify
 	matched  uint64 // methods resolved to a dependency's declaration
 	external uint64
+	// noStrongKey counts located methods that published no declaration-location
+	// strong key (no NAME, no LINE_NUMBER, or a key over MaxNativeKeyBytes) and
+	// therefore fall back to source-location minting. Reported, not a defect:
+	// the identity is still sound, only unshared with the structural provider.
+	noStrongKey uint64
 }
 
 // locate resolves every projected method and call site to the pinned file
@@ -386,7 +391,18 @@ func (e *emitter) identify(ctx context.Context) error {
 			detail := "joern:METHOD external"
 			if m.external == 0 {
 				rel := normalizePath(m.filename, e.materializationRoot)
-				cand.ScopeKey = "file:" + rel
+				scope := "file:" + rel
+				// A legal but very long path would make the candidate fail
+				// NodeCandidate.Validate and abort the whole unit; the method
+				// is refused the same way an oversized attribute is.
+				if len(scope) > model.MaxScopeKeyBytes {
+					e.dropped++
+					if _, err := e.sc.db.ExecContext(ctx, `UPDATE loc SET ok = 0 WHERE id = ?`, m.id); err != nil {
+						return internalErr("joern identify: %v", err)
+					}
+					continue
+				}
+				cand.ScopeKey = scope
 				cand.Language = m.lang
 				cand.FileID, cand.ContentHash = model.FileID(m.fileID), m.hash
 				if m.rng != "" {
@@ -399,14 +415,20 @@ func (e *emitter) identify(ctx context.Context) error {
 				// The strong key carries the identifier token exactly as the
 				// export wrote it; a method with no NAME has no such token and
 				// therefore no strong key (the FULL_NAME fallback used for the
-				// candidate's Name would not be the contracted string).
-				if m.line.Valid && m.name != "" {
+				// candidate's Name would not be the contracted string). Each
+				// path that publishes no key is counted so the omission is
+				// visible rather than silent.
+				if !m.line.Valid || m.name == "" {
+					e.noStrongKey++
+				} else {
 					last := m.line.Int64
 					if m.lineEnd.Valid && m.lineEnd.Int64 >= last {
 						last = m.lineEnd.Int64
 					}
 					if key := declarationKey(m.name, rel, m.line.Int64, last); len(key) <= model.MaxNativeKeyBytes {
 						cand.StrongKey = key
+					} else {
+						e.noStrongKey++
 					}
 				}
 				detail = "joern:METHOD"

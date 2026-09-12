@@ -207,8 +207,10 @@ absolute under it) must be a file of the snapshot; a method whose path is not
 (`src/missing.go` in the fixture) is **dropped together with every relation
 touching it** and the run's capabilities are reported `partial` with
 `CTX_SOURCE_BINDING_UNVERIFIED`. A fact bound to bytes that are not its
-source is worse than no fact. `IS_EXTERNAL` methods (library targets) have no
-location by design.
+source is worse than no fact. A method whose name, qualified name, signature,
+native key or `"file:" + path` scope key exceeds its `internal/model` bound is
+dropped the same way, rather than failing the unit on validation.
+`IS_EXTERNAL` methods (library targets) have no location by design.
 
 Ranges are verified against the pinned bytes read through
 `req.Content.Open`, one file at a time, files up to 4 MiB (larger files keep
@@ -250,6 +252,12 @@ root-relative slash path; the lines are `LINE_NUMBER` and `LINE_NUMBER_END`
 would exceed `MaxNativeKeyBytes` is omitted rather than truncated — a
 truncated key would collide. `emit.go`'s `declarationKey` is the single
 producer of this string.
+
+Methods without a strong key (no `NAME`, no `LINE_NUMBER`, or a key over
+`MaxNativeKeyBytes`) fall back to source-location minting; they are counted
+as `no_strong_key` on the `joern unit imported` log line. The identity is
+still sound, only unshared with the structural provider, so this does **not**
+drive capabilities to `partial`.
 
 A structural provider that aliases its declarations under that
 `(scope key, strong key)` pair makes the Joern method resolve to the same
