@@ -83,10 +83,6 @@ func NewCursorAt(data []byte, startByte uint64, startLine uint32) (*Cursor, erro
 	return &Cursor{data: data, base: startByte, baseLine: startLine, line: startLine, lineStart: 0}, nil
 }
 
-// Window reports the file offset the cursor's bytes start at and the line that
-// begins there.
-func (c *Cursor) Window() (uint64, uint32) { return c.base, c.baseLine }
-
 // Offset converts a one-based line and a column counted in enc to the byte
 // offset it names. The returned offset may equal the file size: an EOF position
 // is valid.

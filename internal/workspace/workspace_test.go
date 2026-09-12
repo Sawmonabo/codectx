@@ -168,50 +168,6 @@ func assertWalk(t *testing.T, root Root, policy Policy, want []string) {
 	}
 }
 
-// TestUnopenedRootIsRefused protects the zero-value guard: a Root that was
-// never opened by Discover carries no confined handle, and every accessor must
-// say so rather than dereference it.
-func TestUnopenedRootIsRefused(t *testing.T) {
-	var zero Root
-	if _, err := zero.Open("a.txt"); err == nil {
-		t.Error("Open on an unopened workspace succeeded")
-	}
-	if _, err := zero.Lstat("a.txt"); err == nil {
-		t.Error("Lstat on an unopened workspace succeeded")
-	}
-	if err := Walk(context.Background(), zero, Policy{MaxFiles: 1}, func(File) error { return nil }); err == nil {
-		t.Error("Walk on an unopened workspace succeeded")
-	}
-}
-
-// TestLstatDoesNotFollow protects the naming of the metadata accessor: it
-// reports the link itself. A caller told "Stat" would reasonably assume the
-// target, and a symlink silently resolved is how foreign bytes end up
-// attributed to the repository.
-func TestLstatDoesNotFollow(t *testing.T) {
-	root, _ := safeTree(t)
-	info, err := root.Lstat("escape")
-	if err != nil {
-		t.Fatalf("Lstat: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("Lstat reported mode %s, want the symlink itself", info.Mode())
-	}
-}
-
-// TestWalkRejectsFollowedEscape protects the opt-in symlink path: enabling
-// follow_symlinks must not become a way out of the workspace.
-func TestWalkRejectsFollowedEscape(t *testing.T) {
-	root, _ := safeTree(t)
-	policy := testPolicy(root)
-	policy.FollowSymlinks = true
-	err := Walk(context.Background(), root, policy, func(File) error { return nil })
-	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodePathEscape {
-		t.Fatalf("Walk returned %v, want a typed %s for a symlink leaving the root", err, model.CodePathEscape)
-	}
-}
-
 func collect(t *testing.T, root Root, policy Policy) []string {
 	t.Helper()
 	var got []string

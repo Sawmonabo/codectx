@@ -251,10 +251,12 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	if err != nil {
 		return result, err
 	}
-	// Both ends are closed here unless the pump takes them over after a
-	// successful start. Without this, every early return below leaks two
-	// descriptors, which a long-lived server exhausts.
-	defer stdin.closeIfIdle()
+	// Every return below goes through this: the descriptors are closed whether
+	// or not the copy ever started, and a copy that did start is given a
+	// bounded chance to finish. Without it a failed run leaks two descriptors
+	// and parks a goroutine on a pipe nobody will ever read, which a
+	// long-lived server does not survive.
+	defer stdin.stop(spec.Grace)
 	// The pipes are created here rather than through Cmd.StdoutPipe so that
 	// this package owns both ends: closing the read end is what unblocks a
 	// drain whose writer is a descendant that has not yet exited.
@@ -364,7 +366,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// a refusal: the caller would otherwise receive truncated output reported
 	// as a complete run.
 	if result.OutputTruncated {
-		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
+		return result, resourceLimit("%s exceeded its output limit; the output is truncated", filepath.Base(spec.Path))
 	}
 	if err := outPipe.err(); err != nil {
 		return result, err
@@ -372,7 +374,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	if err := errPipe.err(); err != nil {
 		return result, err
 	}
-	if err := stdin.wait(spec.Grace); err != nil {
+	if err := stdin.stop(spec.Grace); err != nil {
 		return result, err
 	}
 	if waitErr != nil {
@@ -554,6 +556,8 @@ type stdinPump struct {
 	mu        sync.Mutex
 	started   bool
 	closeOnce sync.Once
+	stopOnce  sync.Once
+	stopErr   error
 }
 
 // start releases the parent's copy of the child's end and begins the copy. It
@@ -571,17 +575,42 @@ func (p *stdinPump) start() {
 	go p.pump()
 }
 
-// closeIfIdle releases both ends unless the pump has taken them over.
-func (p *stdinPump) closeIfIdle() {
+// stop releases both ends and reports the copy error, once, from whichever
+// return path reaches it first.
+//
+// A copy that has started is given grace to finish on its own; after that the
+// write end is closed, which is what unblocks a copy parked on a pipe that a
+// surviving descendant still holds open. If even that does not free it, the
+// goroutine is blocked inside the caller's own Reader, where nothing here can
+// reach it: the run returns anyway rather than waiting on it forever.
+func (p *stdinPump) stop(grace time.Duration) error {
 	if p == nil {
-		return
+		return nil
 	}
-	p.mu.Lock()
-	started := p.started
-	p.mu.Unlock()
-	if !started {
+	p.stopOnce.Do(func() {
+		p.mu.Lock()
+		started := p.started
+		p.mu.Unlock()
+		if !started {
+			p.closeBoth()
+			return
+		}
+		select {
+		case <-p.done:
+			p.stopErr = p.failure
+			return
+		case <-time.After(grace):
+		}
 		p.closeBoth()
-	}
+		select {
+		case <-p.done:
+			p.stopErr = p.failure
+		case <-time.After(grace):
+			// failure is not read here: the pump may still be running, and
+			// reading what it writes would be a race.
+		}
+	})
+	return p.stopErr
 }
 
 func (p *stdinPump) closeBoth() {
@@ -610,24 +639,6 @@ func (p *stdinPump) pump() {
 		p.failure = err
 	}
 	p.closeBoth()
-}
-
-// wait returns the copy error once the pump has finished, bounding the wait: a
-// descendant that inherited stdin and never reads can otherwise keep the copy
-// blocked after the child itself is gone.
-func (p *stdinPump) wait(grace time.Duration) error {
-	if p == nil {
-		return nil
-	}
-	select {
-	case <-p.done:
-		return p.failure
-	case <-time.After(grace):
-		// Closing the write end unblocks the copy; the result is no longer
-		// waited for, because nothing can consume it.
-		p.closeBoth()
-		return nil
-	}
 }
 
 // isBrokenPipe reports the ordinary "the child stopped reading" errors.

@@ -332,8 +332,6 @@ var AnalyzerSubstitutions = map[string]bool{
 	"manifest":    true,
 }
 
-// Defaults returns the built-in configuration of Section 20.1. Storage.DataDir
-// is empty here and is resolved against the workspace root by Load.
 // TraversalPolicy is the traversal policy this configuration describes. The Git
 // owner then fills in Ignore, ForceInclude and ForceIncludeDir from what the
 // repository actually tracks.
@@ -352,6 +350,8 @@ func (c Config) TraversalPolicy() workspace.Policy {
 	}
 }
 
+// Defaults returns the built-in configuration of Section 20.1. Storage.DataDir
+// is empty here and is resolved against the workspace root by Load.
 func Defaults() Config {
 	return Config{
 		Version: SchemaVersion,

@@ -146,10 +146,12 @@ func TestOutputLimitTerminates(t *testing.T) {
 	// truncated run: reporting success would hand the caller a partial result
 	// it has no way to recognize as partial.
 	//
-	// The slow sink makes the ordering deterministic. The child writes its
-	// bytes into the pipe buffer and exits immediately, so the run is already
-	// over before the drain finishes delivering the first sixteen of them and
-	// discovers the truncation.
+	// The slow sink is what makes the child's exit win the race: it writes 4 KiB
+	// into the pipe buffer and exits at once, while the drain is held inside its
+	// first delivery for 100 ms before it can notice the truncation. The margin
+	// is large, not infinite; if it ever proves tight the assertion still holds
+	// on the other ordering, which is the case the first half of this test
+	// covers.
 	slow := &slowWriter{delay: 100 * time.Millisecond}
 	result, err = runner.Run(context.Background(), Spec{
 		Path:           "/bin/sh",
@@ -307,6 +309,43 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 	if after := openDescriptors(t); after > before+4 {
 		t.Fatalf("32 failed runs left %d open descriptors, up from %d", after, before)
 	}
+
+	// The same must hold when the run ends through one of the stop decisions
+	// rather than by the child exiting: the copy is still in flight there, and
+	// a run that returns without closing the write end leaves it parked on a
+	// pipe forever.
+	requireExecutable(t, "/bin/sh")
+	before = openDescriptors(t)
+	for range 16 {
+		_, err := runner.Run(context.Background(), Spec{
+			Path:           "/bin/sh",
+			Args:           []string{"-c", "while :; do echo aaaaaaaaaaaaaaaaaaaaaaaa; done"},
+			Dir:            dir,
+			Stdin:          &endlessReader{},
+			MaxStdinBytes:  1 << 20,
+			MaxStdoutBytes: 64,
+			MaxStderrBytes: 64,
+			Timeout:        30 * time.Second,
+			Grace:          50 * time.Millisecond,
+		})
+		if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+			t.Fatalf("Run returned %v, want a typed %s", err, model.CodeResourceLimit)
+		}
+	}
+	if after := openDescriptors(t); after > before+4 {
+		t.Fatalf("16 truncated runs left %d open descriptors, up from %d", after, before)
+	}
+}
+
+// endlessReader supplies input the child will never finish reading, which is
+// what keeps the copy in flight when the run is stopped.
+type endlessReader struct{}
+
+func (*endlessReader) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = 'x'
+	}
+	return len(b), nil
 }
 
 // openDescriptors counts this process's open files, skipping the test when the

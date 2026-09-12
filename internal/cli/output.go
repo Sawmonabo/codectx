@@ -78,7 +78,10 @@ func ExitCode(err error) int {
 		model.CodeActorMismatch:
 		return 6
 	case model.CodeQueryTruncated, model.CodeQueryDeadline, model.CodeResourceLimit,
-		model.CodeMinimumBudget, model.CodeDiskFull:
+		model.CodeMinimumBudget, model.CodeDiskFull, model.CodeCanceled:
+		// Cancellation belongs to the "explicit incomplete work" class: the
+		// operator stopped the work themselves, so it is neither a defect nor
+		// an invalid command line.
 		return 7
 	case model.CodeVersionConflict, model.CodeWorkspaceBusy, model.CodeSessionSuperseded,
 		model.CodeSessionExpired, model.CodeCursorInvalid, model.CodeScopeChanged:
