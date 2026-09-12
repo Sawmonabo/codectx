@@ -13,7 +13,8 @@
 //
 // Facts are exact-source compiler evidence only when the index provably
 // describes the pinned bytes (codectx invoked the indexer, or every document
-// carries matching embedded text or a matching input-hash manifest entry).
+// carries matching embedded text or a row of a qualifying input-hash
+// manifest, which must commit to the index's own digest).
 // Anything else is imported with source_binding=unverified: still available
 // for discovery, never silently upgraded (Section 11.4). See
 // docs/providers-scip.md.
@@ -136,7 +137,11 @@ type Options struct {
 	// snapshot (the explicit import request field), or empty.
 	Import string
 	// Manifest is the root-relative path of an optional input-hash manifest
-	// (`<sha256>  <path>` lines) supplied with the index.
+	// supplied with the index. It verifies the index only in the v1 format
+	// (see importer.loadManifest): the header, the SHA-256 of the index bytes
+	// themselves, then one `<sha256>  <path>` row per file. A list of file
+	// hashes that does not commit to the index is an assertion about some
+	// index, not about this one, and proves nothing.
 	Manifest string
 	// Analyzers are the approved profiles of the user configuration; only
 	// those named after a known SCIP indexer kind are used.
@@ -187,7 +192,10 @@ func New(o Options) (*Provider, error) {
 	if o.Manifest != "" && o.Import == "" {
 		return nil, invalid("a scip input-hash manifest needs an index to describe")
 	}
-	profs := profiles(o.Analyzers)
+	profs, err := profiles(o.Analyzers)
+	if err != nil {
+		return nil, err
+	}
 	if len(profs) > 0 && o.Runner == nil {
 		return nil, invalid("scip profiles require the shared process runner")
 	}
@@ -222,6 +230,13 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 		out = append(out, ImportScope(p.importPath))
 	}
 	for _, prof := range p.profiles {
+		// A profile whose tool is not installed plans no unit: a planned unit
+		// materializes the whole snapshot before the run and would then fail
+		// on the missing binary, which is work and a failed unit for an
+		// absence Detect already reports honestly.
+		if !executableInstalled(prof.Executable) {
+			continue
+		}
 		for _, trig := range prof.kind.triggers {
 			if recognized[trig] {
 				out = append(out, ProfileScope(prof.Name))
@@ -277,22 +292,22 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 		}
 		return model.SourceBindingVerified, nil
 	}
+	fv, err := p.importFile(ctx, view, scopeKey)
+	if err != nil {
+		return "", err
+	}
 	sc, err := openScratch(ctx, p.workDir, p.limits.MaxSpoolBytes)
 	if err != nil {
 		return "", err
 	}
 	defer sc.close()
-	im := &importer{p: p, req: provider.UnitRequest{Content: view}, sc: sc, ctx: ctx}
-	open, err := p.importOpener(ctx, view, scopeKey)
-	if err != nil {
-		return "", err
-	}
+	im := &importer{p: p, req: provider.UnitRequest{Content: view}, sc: sc, ctx: ctx, indexHash: fv.ContentHash}
 	if p.manifestPath != "" {
 		if err := im.loadManifest(ctx); err != nil {
 			return "", err
 		}
 	}
-	binding, _, err := im.scanBinding(ctx, open)
+	binding, _, err := im.scanBinding(ctx, p.fileOpener(view, fv))
 	return binding, err
 }
 
@@ -312,16 +327,23 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 			return model.ProviderResult{}, err
 		}
 		im.profile = &prof
+		// The profile's work directory is the private root of every run; it
+		// belongs to codectx, not to the user's shell, so it is created with
+		// private permissions rather than assumed to exist.
+		if err := os.MkdirAll(prof.WorkDir, 0o700); err != nil {
+			return model.ProviderResult{}, internal("scip profile work directory: " + err.Error())
+		}
 		runDir, err := os.MkdirTemp(prof.WorkDir, "scip-run-")
 		if err != nil {
 			return model.ProviderResult{}, internal("scip run directory: " + err.Error())
 		}
 		defer os.RemoveAll(runDir)
 		workDir = runDir
-		output, err := p.runProfile(ctx, prof, req.Content, runDir)
+		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir)
 		if err != nil {
 			return model.ProviderResult{}, err
 		}
+		im.manifestSHA = manifestSHA
 		open = func(context.Context) (io.ReadCloser, int64, error) {
 			f, err := os.Open(output)
 			if err != nil {
@@ -334,15 +356,19 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 			}
 			return f, info.Size(), nil
 		}
-	} else if open, err = p.importOpener(ctx, req.Content, req.Unit.ScopeKey); err != nil {
-		return model.ProviderResult{}, err
+	} else {
+		fv, ferr := p.importFile(ctx, req.Content, req.Unit.ScopeKey)
+		if ferr != nil {
+			return model.ProviderResult{}, ferr
+		}
+		im.indexHash, open = fv.ContentHash, p.fileOpener(req.Content, fv)
 	}
 	if im.sc, err = openScratch(ctx, workDir, p.limits.MaxSpoolBytes); err != nil {
-		return model.ProviderResult{}, err
+		return model.ProviderResult{}, im.decorate(err)
 	}
 	defer im.sc.close()
 	if err := im.run(ctx, open); err != nil {
-		return model.ProviderResult{}, err
+		return model.ProviderResult{}, im.decorate(err)
 	}
 	return im.result(), nil
 }
@@ -358,11 +384,14 @@ func (p *Provider) profileFor(scopeKey string) (Profile, error) {
 	return Profile{}, invalid("scip unit scope names profile " + name + ", which is not an approved SCIP indexer profile")
 }
 
-// importOpener resolves an import scope key to the snapshot file it names.
-func (p *Provider) importOpener(ctx context.Context, view model.SnapshotView, scopeKey string) (opener, error) {
+// importFile resolves an import scope key to the pinned snapshot file it
+// names. Its ContentHash is the SHA-256 of the index bytes themselves, which
+// is what a supplied input-hash manifest must commit to before it can verify
+// anything (see importer.loadManifest).
+func (p *Provider) importFile(ctx context.Context, view model.SnapshotView, scopeKey string) (model.FileVersion, error) {
 	path, ok := strings.CutPrefix(scopeKey, scopeImport)
 	if !ok || path == "" || path != p.importPath {
-		return nil, invalid("scip unit scope " + scopeKey + " is neither the configured import nor an approved profile")
+		return model.FileVersion{}, invalid("scip unit scope " + scopeKey + " is neither the configured import nor an approved profile")
 	}
 	var fv model.FileVersion
 	var found bool
@@ -373,16 +402,21 @@ func (p *Provider) importOpener(ctx context.Context, view model.SnapshotView, sc
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return model.FileVersion{}, err
 	}
 	if !found {
-		return nil, &model.Error{Code: model.CodeProviderUnavailable, Message: "the snapshot holds no scip index at " + path}
+		return model.FileVersion{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "the snapshot holds no scip index at " + path}
 	}
 	if fv.Size > p.limits.MaxIndexBytes {
-		return nil, overLimit("index bytes", fv.Size, p.limits.MaxIndexBytes)
+		return model.FileVersion{}, overLimit("index bytes", fv.Size, p.limits.MaxIndexBytes)
 	}
+	return fv, nil
+}
+
+// fileOpener streams one pinned snapshot file, once per pass.
+func (p *Provider) fileOpener(view model.SnapshotView, fv model.FileVersion) opener {
 	return func(ctx context.Context) (io.ReadCloser, int64, error) {
 		rc, _, err := view.Open(ctx, fv.ID)
 		return rc, fv.Size, err
-	}, nil
+	}
 }

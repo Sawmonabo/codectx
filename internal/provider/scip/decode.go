@@ -178,7 +178,7 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 		switch field {
 		case fieldIndexMetadata:
 			if w.onMetadata == nil {
-				err = r.sub(n).discard()
+				err = r.discardSub(n)
 				break
 			}
 			if err = w.record(ctx, r, n, "metadata record"); err != nil {
@@ -192,10 +192,13 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 			if docs++; docs > w.limits.MaxDocuments {
 				return *r.consumed, overLimit("documents", docs, w.limits.MaxDocuments)
 			}
-			err = w.document(ctx, r.sub(n), docs-1)
+			var doc *reader
+			if doc, err = r.sub(n); err == nil {
+				err = w.document(ctx, doc, docs-1)
+			}
 		case fieldIndexExternalSymbols:
 			if w.onExternal == nil {
-				err = r.sub(n).discard()
+				err = r.discardSub(n)
 				break
 			}
 			if err = w.record(ctx, r, n, "symbol record"); err != nil {
@@ -206,7 +209,7 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 				err = w.onExternal(s, n)
 			}
 		default:
-			err = r.sub(n).discard()
+			err = r.discardSub(n)
 		}
 		if err != nil {
 			return *r.consumed, err
@@ -269,7 +272,7 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 				return overLimit("occurrences per document", d.occurrences, w.limits.MaxOccurrencesPerDocument)
 			}
 			if w.onOccurrence == nil {
-				if err := r.sub(n).discard(); err != nil {
+				if err := r.discardSub(n); err != nil {
 					return err
 				}
 				continue
@@ -287,7 +290,7 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 			seq++
 		case fieldDocumentSymbols:
 			if w.onSymbol == nil {
-				if err := r.sub(n).discard(); err != nil {
+				if err := r.discardSub(n); err != nil {
 					return err
 				}
 				continue
@@ -303,7 +306,7 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 				return err
 			}
 		default:
-			if err := r.sub(n).discard(); err != nil {
+			if err := r.discardSub(n); err != nil {
 				return err
 			}
 		}
@@ -323,9 +326,17 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 // decodeOccurrence decodes one bounded Occurrence record. The deprecated
 // packed range fields and the typed single/multi-line ranges are both
 // accepted; a record carrying neither has no range and is malformed.
+//
+// A record may carry both forms. The typed range wins whatever order the
+// fields arrive in: which coordinates this provider converts must not depend
+// on a writer's field order, or the same index would yield different evidence
+// bytes from one encoder to the next. Both forms are still consumed, so the
+// record stays in sync.
 func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 	r := newReader(bytes.NewReader(buf), int64(len(buf)))
 	var o occurrence
+	var legacyRange, legacyEnclosing []int32
+	var rangeTyped, enclosingTyped, enclosingSeen bool
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
@@ -333,12 +344,12 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 		}
 		switch field {
 		case fieldOccurrenceRange:
-			if o.rng, err = r.ints(wt, o.rng[:0], 4); err != nil {
+			if legacyRange, err = r.ints(wt, legacyRange[:0], 4); err != nil {
 				return o, err
 			}
 		case fieldOccurrenceEnclosingRange:
-			o.hasEnclosing = true
-			if o.enclosing, err = r.ints(wt, o.enclosing[:0], 4); err != nil {
+			enclosingSeen = true
+			if legacyEnclosing, err = r.ints(wt, legacyEnclosing[:0], 4); err != nil {
 				return o, err
 			}
 		case fieldOccurrenceSingleRange, fieldOccurrenceMultiRange, fieldOccurrenceSingleEnclosing, fieldOccurrenceMultiEnclosing:
@@ -349,14 +360,18 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 			if err != nil {
 				return o, err
 			}
-			vals, err := decodeTypedRange(r.sub(n), field == fieldOccurrenceSingleRange || field == fieldOccurrenceSingleEnclosing)
+			body, err := r.sub(n)
+			if err != nil {
+				return o, err
+			}
+			vals, err := decodeTypedRange(body, field == fieldOccurrenceSingleRange || field == fieldOccurrenceSingleEnclosing)
 			if err != nil {
 				return o, err
 			}
 			if field == fieldOccurrenceSingleRange || field == fieldOccurrenceMultiRange {
-				o.rng = vals
+				o.rng, rangeTyped = vals, true
 			} else {
-				o.enclosing, o.hasEnclosing = vals, true
+				o.enclosing, enclosingTyped, enclosingSeen = vals, true, true
 			}
 		case fieldOccurrenceSymbol:
 			if wt != wireBytes {
@@ -380,6 +395,13 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 			}
 		}
 	}
+	if !rangeTyped {
+		o.rng = legacyRange
+	}
+	if !enclosingTyped {
+		o.enclosing = legacyEnclosing
+	}
+	o.hasEnclosing = enclosingSeen
 	if len(o.rng) != 3 && len(o.rng) != 4 {
 		return o, malformed("occurrence range has " + strconv.Itoa(len(o.rng)) + " values, want 3 or 4")
 	}
@@ -449,7 +471,11 @@ func decodeSymbolInfo(buf []byte) (symbolInfo, error) {
 			if err != nil {
 				return s, err
 			}
-			if s.signature, err = decodeSignature(r.sub(n)); err != nil {
+			sig, err := r.sub(n)
+			if err != nil {
+				return s, err
+			}
+			if s.signature, err = decodeSignature(sig); err != nil {
 				return s, err
 			}
 		case field == fieldSymbolInfoRelationships && wt == wireBytes:
@@ -457,7 +483,11 @@ func decodeSymbolInfo(buf []byte) (symbolInfo, error) {
 			if err != nil {
 				return s, err
 			}
-			rel, err := decodeRelationship(r.sub(n))
+			body, err := r.sub(n)
+			if err != nil {
+				return s, err
+			}
+			rel, err := decodeRelationship(body)
 			if err != nil {
 				return s, err
 			}
@@ -497,7 +527,7 @@ func decodeSignature(r *reader) (string, error) {
 			return "", err
 		}
 		if n > int64(model.MaxSignatureBytes) {
-			if err := r.sub(n).discard(); err != nil {
+			if err := r.discardSub(n); err != nil {
 				return "", err
 			}
 			continue
@@ -570,7 +600,10 @@ func decodeMetadata(buf []byte) (metadata, error) {
 			if err != nil {
 				return m, err
 			}
-			sub := r.sub(n)
+			sub, err := r.sub(n)
+			if err != nil {
+				return m, err
+			}
 			for !sub.done() {
 				f, w, err := sub.tag()
 				if err != nil {
