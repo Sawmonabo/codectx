@@ -56,8 +56,8 @@ const EstimateMethodUTF8Bytes = "utf8_bytes_div_3_heuristic"
 // a heuristic, not a conservative guarantee for every tokenizer; exact byte
 // limits are enforced independently.
 func EstimateTokensUTF8Bytes(n int64) (int64, error) {
-	if n < 0 {
-		return 0, invalid("source byte count must not be negative, got %d", n)
+	if err := requireNonNegative("source byte count", n); err != nil {
+		return 0, err
 	}
 	// Equivalent to ceil(n/3), without n+2 overflow or loading file bytes.
 	tokens := n / 3
@@ -77,8 +77,10 @@ type Budget struct {
 	MaxSlices          int   `json:"max_slices"`
 }
 
-// Validate enforces that no budget field is zero or negative. Section 20.1 is
-// explicit that no zero or negative setting means unlimited.
+// Validate rejects a negative budget field. Zero is accepted and means "use the
+// configured budget", per the zero-value convention documented on PageRequest;
+// Section 20.2 is explicit that zero never means unlimited, and the configured
+// default a zero resolves to is itself finite.
 func (b Budget) Validate() error {
 	for _, f := range []struct {
 		field string
@@ -89,11 +91,8 @@ func (b Budget) Validate() error {
 		{"budget.max_files", int64(b.MaxFiles)},
 		{"budget.max_slices", int64(b.MaxSlices)},
 	} {
-		// Zero defers to the configured budget; see the PageRequest convention.
-		// Section 20.2 is explicit that zero never means unlimited, and the
-		// default it resolves to is itself finite.
-		if f.value < 0 {
-			return invalid("%s is %d; it must not be negative, and 0 means the configured default", f.field, f.value)
+		if err := requireNonNegative(f.field, f.value); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -123,7 +122,7 @@ func (r ContextRequest) Validate() error {
 	if err := r.Budget.Validate(); err != nil {
 		return err
 	}
-	if err := requireGeneration("context.generation_id", r.GenerationID); err != nil {
+	if err := requireNonNegative("context.generation_id", int64(r.GenerationID)); err != nil {
 		return err
 	}
 	return nil

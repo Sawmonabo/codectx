@@ -36,7 +36,7 @@ func (p PageRequest) ValidatePinned(field string, generation GenerationID) error
 	if err := p.Validate(); err != nil {
 		return err
 	}
-	if err := requireGeneration(field+".generation_id", generation); err != nil {
+	if err := requireNonNegative(field+".generation_id", int64(generation)); err != nil {
 		return err
 	}
 	if p.Cursor != "" && generation != 0 {
@@ -230,9 +230,6 @@ type SearchRequest struct {
 // Validate enforces the Section 14.1 rule that query text, filters and limits
 // are all checked before any retrieval work begins.
 func (r SearchRequest) Validate() error {
-	if err := requireGeneration("search.generation_id", r.GenerationID); err != nil {
-		return err
-	}
 	if err := requireTrimmed("search.query", r.Query, MaxQueryTextBytes); err != nil {
 		return err
 	}
@@ -554,7 +551,7 @@ func (r GraphRequest) Validate() error {
 		{"graph.max_visited", r.MaxVisited},
 		{"graph.max_edges", r.MaxEdges},
 	} {
-		if err := boundDefaultable(b.field, b.value); err != nil {
+		if err := requireNonNegative(b.field, int64(b.value)); err != nil {
 			return err
 		}
 	}
@@ -627,7 +624,7 @@ type PathRequest struct {
 
 // Validate enforces the request shape.
 func (r PathRequest) Validate() error {
-	if err := requireGeneration("path.generation_id", r.GenerationID); err != nil {
+	if err := requireNonNegative("path.generation_id", int64(r.GenerationID)); err != nil {
 		return err
 	}
 	if err := requireID("path.from", string(r.From)); err != nil {
@@ -849,7 +846,3 @@ func (i OverviewItem) Validate() error {
 	}
 	return nil
 }
-
-// requireGeneration validates an optional generation selector. Zero means
-// "select the active generation once at request start" (Section 14.1); a
-// negative value is a client bug, not a sentinel.

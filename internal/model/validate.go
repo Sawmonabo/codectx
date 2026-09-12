@@ -151,8 +151,17 @@ func boundSigned64(field string, v uint64) *Error {
 	return nil
 }
 
-// requireNonNegative enforces the `>= 0` checks the schema applies to sizes,
-// ordinals, counts and budgets.
+// requireNonNegative is the single non-negativity check in this package. It
+// covers both of the shapes that need one, because they have the same rule:
+//
+//   - stored quantities (sizes, ordinals, counts), where the schema's `>= 0`
+//     CHECK is the authority and zero is an ordinary value; and
+//   - request bounds and generation selectors, where zero means "use the
+//     configured or endpoint default" / "the active generation" per the
+//     convention documented on PageRequest, and a negative value is a client
+//     bug rather than a sentinel.
+//
+// In neither case does zero mean unlimited (Section 20.2).
 func requireNonNegative(field string, v int64) *Error {
 	if v < 0 {
 		return invalid("%s must not be negative, got %d", field, v)
@@ -165,15 +174,6 @@ func indexed(field string, i int) string {
 	return field + "[" + strconv.Itoa(i) + "]"
 }
 
-// requireGeneration rejects a negative generation pin. Zero means "the active
-// generation", per the zero-value convention documented on PageRequest.
-func requireGeneration(field string, id GenerationID) *Error {
-	if id < 0 {
-		return invalid("%s must not be negative, got %d", field, id)
-	}
-	return nil
-}
-
 // boundStrings bounds both the length of a filter list and each element.
 func boundStrings(field string, values []string, maxCount, maxBytes int) *Error {
 	if err := boundCount(field, len(values), maxCount); err != nil {
@@ -183,16 +183,6 @@ func boundStrings(field string, values []string, maxCount, maxBytes int) *Error 
 		if err := requireField(indexed(field, i), v, maxBytes); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-// boundDefaultable enforces the zero-means-default convention on a request
-// bound: negative is always invalid, zero defers to configuration, and a
-// positive value is accepted as given.
-func boundDefaultable(field string, v int) *Error {
-	if v < 0 {
-		return invalid("%s is %d; it must not be negative, and 0 means the configured default", field, v)
 	}
 	return nil
 }
