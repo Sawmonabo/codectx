@@ -1,0 +1,115 @@
+// Package snapshot captures exact worktree bytes into an immutable manifest
+// and the local content-addressed store, serves them back with verified
+// integrity, and materializes private copies for external analyzers
+// (Section 10).
+//
+// A snapshot is the bytes actually read from the worktree, never HEAD. Git is
+// consulted only for membership, status and provenance through internal/vcs/
+// git; every byte comes from the root-confined opener in internal/workspace
+// and lands in the CAS before the manifest that names it is written. Reads go
+// to the CAS at the recorded content hash and nowhere else: not the live
+// checkout, not Git.
+//
+// Nothing here holds a repository-sized structure in the Go heap. Membership
+// is joined and ordered in a private on-disk staging database that lives for
+// one capture, the manifest is hashed and imported as a stream, and every read
+// buffers at most a bounded number of 64-KiB blocks.
+//
+// Data-directory layout owned by this package:
+//
+//	<data>/workspace.lock   cross-process indexing/GC coordination lock
+//	<data>/cas/hh/<hash>    immutable blobs named by validated SHA-256
+//	<data>/cas/tmp/         private files being written before publication
+//	<data>/staging/         per-capture staging databases
+//	<data>/materialize/     private analyzer materializations
+package snapshot
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+const (
+	casDirName         = "cas"
+	stagingDirName     = "staging"
+	materializeDirName = "materialize"
+	lockFileName       = "workspace.lock"
+	stagingPrefix      = "capture-"
+	materializePrefix  = "mat-"
+)
+
+// CASDir is the content-addressed store location under a data directory.
+func CASDir(dataDir string) string { return filepath.Join(dataDir, casDirName) }
+
+// StagingDir holds per-capture staging databases.
+func StagingDir(dataDir string) string { return filepath.Join(dataDir, stagingDirName) }
+
+// MaterializeDir holds private analyzer materializations.
+func MaterializeDir(dataDir string) string { return filepath.Join(dataDir, materializeDirName) }
+
+// Sweep is startup recovery for this package's temporary state: staging
+// databases left by a crashed capture and materializations whose owning
+// process is gone. The caller holds the workspace lock, so no capture is in
+// progress; a live materialization is recognized by the lock its owner still
+// holds and is left alone. A file that cannot be removed is reported with the
+// rest, never silently skipped.
+func Sweep(dataDir string) error {
+	var errs []error
+	entries, err := os.ReadDir(StagingDir(dataDir))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errs = append(errs, internal("staging directory: %v", err))
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), stagingPrefix) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(StagingDir(dataDir), e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, internal("staging cleanup: %v", err))
+		}
+	}
+	if err := sweepMaterializations(MaterializeDir(dataDir)); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// Error helpers. Every failure leaving this package is a *model.Error.
+
+func internal(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
+}
+
+func invalid(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
+}
+
+func integrity(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeSourceIntegrity, Message: fmt.Sprintf(format, args...),
+		Remediation: "run `codectx doctor --deep`; a missing blob with recorded Git provenance can be repaired explicitly"}
+}
+
+func resourceLimit(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeResourceLimit, Message: fmt.Sprintf(format, args...)}
+}
+
+// ioError maps a filesystem failure under the data directory to its Section
+// 22 family: disk exhaustion is its own code, everything else is internal.
+// Paths are not included; the caller names the operation.
+func ioError(op string, err error) error {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the data directory's disk is full",
+			Remediation: "free disk space or move storage.data_dir to a larger volume"}
+	}
+	return internal("%s: %v", op, err)
+}
