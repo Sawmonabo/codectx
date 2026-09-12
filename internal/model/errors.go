@@ -40,6 +40,14 @@ const (
 	// them names the exit-2 class, so this code names it. Every Validate method
 	// in this package reports structural rejections with it.
 	CodeArgumentInvalid = "CTX_ARGUMENT_INVALID"
+	// CodeCanceled is a run the caller stopped: a deliberate, complete-in-
+	// itself outcome, not a failure. Section 22 requires cancellation not to be
+	// reported as an unexpected crash and already names `canceled` as a run
+	// state; its family list "includes" the codes it names, which is what lets
+	// this one be named here. internal/cli maps it to exit 7, the "explicit
+	// incomplete work" class of the Section 18.2 table, alongside the other
+	// bounds a caller can hit deliberately.
+	CodeCanceled = "CTX_CANCELED"
 	// CodeInternal is the exit-10 class: a defect, not a user-correctable input.
 	CodeInternal = "CTX_INTERNAL"
 )

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/cli"
@@ -108,6 +109,43 @@ func TestVersionEnvelope(t *testing.T) {
 			}
 			if env.Error.Message == "" {
 				t.Errorf("error.message is empty")
+			}
+		})
+	}
+}
+
+// TestExitCodeClasses covers the codes no command can be made to produce from
+// the command line, and which would otherwise reach the exit-10 defect class by
+// default. It uses ExitCode directly because Execute can only surface what a
+// command returns, and no command cancels itself.
+func TestExitCodeClasses(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{
+			// The runner joins the typed error with the context error so both
+			// errors.Is and errors.As keep working; the exit class must survive
+			// that wrapping.
+			name: "cancellation as the runner reports it",
+			err:  errors.Join(&model.Error{Code: model.CodeCanceled, Message: "canceled"}, context.Canceled),
+			want: 7,
+		},
+		{
+			name: "cancellation on its own",
+			err:  &model.Error{Code: model.CodeCanceled, Message: "canceled"},
+			want: 7,
+		},
+		{
+			name: "an unrecognized code is a defect, not a guess",
+			err:  &model.Error{Code: "CTX_NOT_A_REAL_CODE", Message: "unknown"},
+			want: 10,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cli.ExitCode(tc.err); got != tc.want {
+				t.Fatalf("ExitCode(%v) = %d, want %d", tc.err, got, tc.want)
 			}
 		})
 	}
