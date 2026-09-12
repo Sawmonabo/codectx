@@ -40,8 +40,8 @@ import (
 //	textDocument/documentSymbol      the functions of the file, nested under one container
 //	textDocument/prepareCallHierarchy the identifier at the position
 //	callHierarchy/incomingCalls      one caller: the function on line 3 calling at "héllo(1)"
-//	callHierarchy/outgoingCalls      one callee with a call site on the queried
-//	                                 item's own line ("y }")
+//	callHierarchy/outgoingCalls      one callee in util.go with a call site on
+//	                                 the queried item's own line in main.go ("y }")
 //	workspace/symbol                 not advertised; recorded if ever received
 //	shutdown, exit                   recorded; exit terminates the process
 
@@ -208,16 +208,24 @@ func (f *fakeServer) handle(msg message) int {
 		json.Unmarshal(msg.Params, &p)
 		var it callHierarchyItem
 		json.Unmarshal(p.Item, &it)
-		funcs := f.functions(it.URI)
-		callee := funcs[len(funcs)-1]
-		// The site of an outgoing call is in the queried item's own document,
-		// not the peer's: "y }" is on the queried function's line.
+		// The callee lives in the *other* fixture file and the call site in
+		// the queried item's own document, so the two ends of the edge are
+		// distinguishable: an implementation that attributed the sites to the
+		// peer would validate main.go's coordinates against util.go.
+		calleeURI := "file://" + filepath.ToSlash(filepath.Join(filepath.Dir(uriPath(it.URI)), "util.go"))
+		funcs := f.functions(calleeURI)
+		if len(funcs) == 0 {
+			// Never panic on an empty slice: a dead child would look like a
+			// provider failure rather than a missing fixture file.
+			f.reply(msg, nil, &rpcError{Code: -32803, Message: "no function in " + calleeURI})
+			return -1
+		}
 		site, err := f.find(it.URI, "y }", 2)
 		if err != nil {
 			f.reply(msg, nil, &rpcError{Code: -32803, Message: err.Error()})
 			return -1
 		}
-		f.reply(msg, []any{map[string]any{"to": f.item(it.URI, callee), "fromRanges": []any{site.rng}}}, nil)
+		f.reply(msg, []any{map[string]any{"to": f.item(calleeURI, funcs[0]), "fromRanges": []any{site.rng}}}, nil)
 	case "workspace/symbol":
 		f.event("seen-workspace-symbol")
 		f.reply(msg, []any{}, nil)

@@ -121,14 +121,6 @@ func (c *conn) run() error {
 		if err := json.Unmarshal(payload, &msg); err != nil {
 			return outputInvalid("message is not a JSON-RPC object: %v", err)
 		}
-		// A literal null id is the protocol's "no id": on a notification some
-		// servers spell it out, and on a response it is an error the server
-		// could not attribute to a call. Normalizing it here keeps a null-id
-		// notification out of serveRequest and an unattributable error from
-		// ending the connection.
-		if msg.ID != nil && string(*msg.ID) == "null" {
-			msg.ID = nil
-		}
 		switch {
 		case msg.Method != "" && msg.ID != nil:
 			c.serveRequest(msg)
@@ -142,8 +134,10 @@ func (c *conn) run() error {
 			}
 		case msg.Error != nil:
 			// A parse or invalid-request error the server could not attribute
-			// to a request. There is nothing to route it to; the next call
-			// that fails reports the reason.
+			// to a request, spelled `"id": null` on the wire — encoding/json
+			// nils the pointer for a JSON null, so it arrives here with no id.
+			// There is nothing to route it to; the next call that fails
+			// reports the reason.
 		default:
 			return outputInvalid("message has neither a method nor an id")
 		}
@@ -198,15 +192,19 @@ func (c *conn) serveRequest(msg message) {
 }
 
 // writeReplies is the one goroutine that writes answers to server-initiated
-// requests. It exits when the connection fails or a write fails, so it never
-// outlives the stream.
+// requests. It exits only when the connection is latched failed, so a single
+// unwritable reply cannot silently stop every later one: an oversized reply
+// is refused after marshalling with nothing written, and the peer chooses the
+// id and the method name that make it oversized. Such a reply is dropped and
+// the loop continues; nothing waits on it and the server's own request
+// timeout applies. A raw stream error latches nothing here, so the loop
+// continues and parks on the select until the reader sees the stream end and
+// the server's failure path closes done.
 func (c *conn) writeReplies() {
 	for {
 		select {
 		case msg := <-c.replies:
-			// A write failure is surfaced by the next call or by the reader
-			// seeing the stream close; nothing waits on this response.
-			if err := c.write(msg); err != nil {
+			if err := c.write(msg); err != nil && c.failed() != nil {
 				return
 			}
 		case <-c.done:
@@ -301,8 +299,11 @@ func (c *conn) forget(id int64) bool {
 // truncated frame would leave the server mid-message.
 //
 // An outgoing message over the frame bound is refused before the lock and
-// before the accounting: nothing was written, so the stream is still intact
-// and the connection stays usable. The bound is immutable and needs no lock.
+// before the accounting: nothing was written, so the stream is still intact.
+// The refusal is returned to the caller for a request and dropped by
+// writeReplies for a reply — a reply carries the peer's id and method name, so
+// the peer, not this client, decides whether one is oversized, and the
+// connection stays usable either way. The bound is immutable and needs no lock.
 func (c *conn) write(msg message) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
