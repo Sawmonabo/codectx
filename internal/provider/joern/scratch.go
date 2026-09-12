@@ -96,6 +96,7 @@ CREATE TABLE nodes(id TEXT PRIMARY KEY, label TEXT NOT NULL, name TEXT NOT NULL 
 	signature TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '', line INTEGER, line_end INTEGER, col INTEGER,
 	code TEXT NOT NULL DEFAULT '', is_external INTEGER NOT NULL DEFAULT 0, method_full_name TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
 CREATE TABLE edges(src TEXT NOT NULL, dst TEXT NOT NULL, label TEXT NOT NULL, variable TEXT NOT NULL DEFAULT '', PRIMARY KEY(src, dst, label, variable)) WITHOUT ROWID;
+CREATE INDEX nodes_by_position ON nodes(filename, COALESCE(line, -1), id);
 CREATE INDEX edges_by_dst ON edges(dst, label);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE anchors(node TEXT PRIMARY KEY, method TEXT NOT NULL) WITHOUT ROWID;
@@ -110,6 +111,11 @@ CREATE TABLE rels(rel_id TEXT NOT NULL, ev_id TEXT NOT NULL, from_id TEXT NOT NU
 
 // openScratch creates the run's staging database. Durability is deliberately
 // off: the file is private, single-writer and deleted with the run directory.
+// temp_store(FILE) keeps SQLite's temporary b-trees (the recursive walk in
+// project is the main consumer) on disk rather than in the Go process's
+// memory, but they land in the OS temp directory, outside this provider's
+// disk budget: an accepted gap, documented in docs/providers-joern.md
+// under "Run lifecycle".
 func openScratch(ctx context.Context, path string, budget int64) (*scratch, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)"} {
@@ -278,11 +284,21 @@ func (s *scratch) project(ctx context.Context) error {
 	if n > maxDerivedRows {
 		return resourceLimit("the Joern export projects to more than %d relation occurrences", maxDerivedRows).WithDetail("limit", "max_derived_rows")
 	}
-	// Only the call structure has endpoints that must be staged nodes: a CALL
-	// edge joins a CALL site to a METHOD and a CONTAINS edge starts at one.
+	// Dangling means an edge this projection consumes names an endpoint the
+	// export never defined. A CALL edge joins a staged CALL site to a staged
+	// METHOD, so either end missing is a loss. CONTAINS is consumed only
+	// where it delivers a CALL site (filename inheritance and calls
+	// attribution), and only its source is read; a CONTAINS whose destination
+	// is not a CALL is structure this profile never looks at, and a real
+	// export has many of them (FILE CONTAINS METHOD, TYPE_DECL CONTAINS
+	// METHOD), so counting those would mark every run partial. Edges are
+	// staged before their endpoints' labels are known (every edges_* file
+	// sorts before every nodes_* file), so the filter is applied here rather
+	// than at staging time.
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM edges e WHERE (e.label = 'CALL'
 		AND (NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src) OR NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.dst)))
-		OR (e.label = 'CONTAINS' AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src))`).Scan(&s.dangling)
+		OR (e.label = 'CONTAINS' AND EXISTS (SELECT 1 FROM nodes c WHERE c.id = e.dst AND c.label = 'CALL')
+		AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = e.src))`).Scan(&s.dangling)
 	if err != nil {
 		return internalErr("joern projection: %v", err)
 	}

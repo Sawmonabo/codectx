@@ -150,6 +150,13 @@ func importGraphMLFile(ctx context.Context, sc *scratch, path string) (int64, er
 			case "key":
 				id, name := attr(t, "id"), attr(t, "attr.name")
 				if id != "" {
+					// The key table is retained for the whole file, so it is
+					// bounded like a CSV header: an export that declares more
+					// attributes than a record may carry is refused, not
+					// accumulated.
+					if _, seen := keys[id]; !seen && len(keys) >= maxFields {
+						return br.consumed, resourceLimit("Joern GraphML %s declares more than %d attribute keys", filepath.Base(path), maxFields).WithDetail("limit", "max_graphml_keys")
+					}
 					if name == "" {
 						name = id
 					}

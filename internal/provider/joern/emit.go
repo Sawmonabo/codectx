@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"math"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -91,10 +92,17 @@ func (e *emitter) locateFile(ctx context.Context, filename string) error {
 	if data != nil {
 		cursor, lines = source.NewCursor(data), &lineIndex{data: data}
 	}
-	after := ""
+	// Items are paged in line order, not id order, so the shared lineIndex
+	// only ever scans forward: a page break never sends it back to byte 0.
+	// COALESCE keys the NULL lines (nodes the export gave no coordinates)
+	// ahead of every real line, and the id tie-break makes the boundary
+	// total. The cursor starts below every representable line so that no row
+	// can be filtered out of the first page: a line a malformed export made
+	// negative must still be visited and refused, never silently skipped.
+	afterLine, afterID := int64(math.MinInt64), ""
 	for {
 		rows, err := e.sc.db.QueryContext(ctx, `SELECT n.id, n.label, n.code, n.line, n.line_end, n.col, n.is_external FROM loc l JOIN nodes n ON n.id = l.id
-			WHERE n.filename = ? AND n.id > ? ORDER BY n.id LIMIT ?`, filename, after, pageSize)
+			WHERE n.filename = ? AND (COALESCE(n.line, -1), n.id) > (?, ?) ORDER BY COALESCE(n.line, -1), n.id LIMIT ?`, filename, afterLine, afterID, pageSize)
 		if err != nil {
 			return internalErr("joern locate: %v", err)
 		}
@@ -147,7 +155,11 @@ func (e *emitter) locateFile(ctx context.Context, filename string) error {
 				return internalErr("joern locate: %v", err)
 			}
 		}
-		after = page[len(page)-1].id
+		last := page[len(page)-1]
+		afterLine, afterID = -1, last.id
+		if last.line.Valid {
+			afterLine = last.line.Int64
+		}
 	}
 }
 
@@ -222,11 +234,11 @@ func (e *emitter) rangeOf(cursor *source.Cursor, lines *lineIndex, it located) *
 	if cursor == nil || !it.line.Valid || it.line.Int64 < 1 {
 		return nil
 	}
-	start, _, ok := lines.bounds(it.line.Int64)
+	lineStart, _, ok := lines.bounds(it.line.Int64)
 	if !ok {
 		return nil
 	}
-	end := -1
+	start, end := lineStart, -1
 	if it.label == labelCall && it.code != "" && it.col.Valid {
 		for _, col := range []int64{it.col.Int64 - 1, it.col.Int64} {
 			if col < 0 {
@@ -244,7 +256,10 @@ func (e *emitter) rangeOf(cursor *source.Cursor, lines *lineIndex, it located) *
 		if it.label == labelMethod && it.lineEnd.Valid && it.lineEnd.Int64 >= last {
 			last = it.lineEnd.Int64
 		}
-		_, lineEnd, ok := lines.bounds(last)
+		// Resolved without moving the shared cursor: a method's last line is
+		// beyond the items that follow it in line order, and parking there
+		// would force the next one to rescan from byte 0.
+		_, lineEnd, ok := lines.boundsFrom(it.line.Int64, lineStart, last)
 		if !ok {
 			return nil
 		}
@@ -266,36 +281,55 @@ func (e *emitter) rangeOf(cursor *source.Cursor, lines *lineIndex, it located) *
 }
 
 // lineIndex finds the content bounds of a one-based line by scanning forward
-// from the last answer, so a file's items sorted by position cost one pass.
+// from its last answer. locateFile asks for lines in increasing order and
+// rangeOf never parks it on a method's end line, so one file costs one pass;
+// an out-of-order request is still correct, it just rescans from byte 0.
 type lineIndex struct {
 	data  []byte
 	line  int64
 	start int
 }
 
+// bounds resolves line and advances the shared cursor to it.
 func (l *lineIndex) bounds(line int64) (start, end int, ok bool) {
-	if l.line == 0 || line < l.line {
-		l.line, l.start = 1, 0
+	start, end, ok = l.scan(l.line, l.start, line)
+	if !ok {
+		return 0, 0, false
 	}
-	for l.line < line {
-		next := bytes.IndexByte(l.data[l.start:], '\n')
+	l.line, l.start = line, start
+	return start, end, true
+}
+
+// boundsFrom resolves line from a caller-held position without moving the
+// shared cursor.
+func (l *lineIndex) boundsFrom(fromLine int64, fromStart int, line int64) (start, end int, ok bool) {
+	return l.scan(fromLine, fromStart, line)
+}
+
+func (l *lineIndex) scan(fromLine int64, fromStart int, line int64) (start, end int, ok bool) {
+	if fromLine == 0 || line < fromLine {
+		fromLine, fromStart = 1, 0
+	}
+	start = fromStart
+	for fromLine < line {
+		next := bytes.IndexByte(l.data[start:], '\n')
 		if next < 0 {
 			return 0, 0, false
 		}
-		l.start += next + 1
-		l.line++
+		start += next + 1
+		fromLine++
 	}
-	if l.start > len(l.data) || (l.start == len(l.data) && line > 1 && (len(l.data) == 0 || l.data[len(l.data)-1] == '\n')) {
+	if start > len(l.data) || (start == len(l.data) && line > 1 && (len(l.data) == 0 || l.data[len(l.data)-1] == '\n')) {
 		return 0, 0, false
 	}
 	end = len(l.data)
-	if next := bytes.IndexByte(l.data[l.start:], '\n'); next >= 0 {
-		end = l.start + next
+	if next := bytes.IndexByte(l.data[start:], '\n'); next >= 0 {
+		end = start + next
 	}
-	if end > l.start && l.data[end-1] == '\r' {
+	if end > start && l.data[end-1] == '\r' {
 		end--
 	}
-	return l.start, end, true
+	return start, end, true
 }
 
 // identify resolves every kept METHOD to canonical identity through the
@@ -362,12 +396,18 @@ func (e *emitter) identify(ctx context.Context) error {
 					}
 					cand.Range = &r
 				}
-				if m.line.Valid {
+				// The strong key carries the identifier token exactly as the
+				// export wrote it; a method with no NAME has no such token and
+				// therefore no strong key (the FULL_NAME fallback used for the
+				// candidate's Name would not be the contracted string).
+				if m.line.Valid && m.name != "" {
 					last := m.line.Int64
 					if m.lineEnd.Valid && m.lineEnd.Int64 >= last {
 						last = m.lineEnd.Int64
 					}
-					cand.StrongKey = declarationKey(name, rel, m.line.Int64, last)
+					if key := declarationKey(m.name, rel, m.line.Int64, last); len(key) <= model.MaxNativeKeyBytes {
+						cand.StrongKey = key
+					}
 				}
 				detail = "joern:METHOD"
 			}
@@ -407,10 +447,18 @@ func (e *emitter) identify(ctx context.Context) error {
 	}
 }
 
-// declarationKey is the cross-provider strong key for a declaration: its
-// short name, root-relative path and one-based line span. A structural
-// provider that aliases its declarations under this key in scope
-// "file:"+path makes the Joern method resolve to the same node.
+// declarationKey is the fixed cross-provider strong key for a declaration
+// (controller ruling, fix round 1):
+//
+//	scope: "file:" + <root-relative slash path>
+//	key:   "decl:" + <identifier token as written> + "@" + <root-relative slash path> +
+//	       ":" + <start line> + "-" + <end line>
+//
+// Lines are one-based and the span is inclusive. The identifier is the token
+// the producing tool saw, with no case folding, unqualifying or other
+// normalization. A structural provider that aliases its declarations under
+// this key in scope "file:"+path makes the Joern method resolve to the same
+// node.
 func declarationKey(name, rel string, line, lineEnd int64) string {
 	return "decl:" + name + "@" + rel + ":" + strconv.FormatInt(line, 10) + "-" + strconv.FormatInt(lineEnd, 10)
 }

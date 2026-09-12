@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -25,8 +24,9 @@ import (
 const (
 	providerID = "joern"
 	// adapterVersion changes whenever this package's mapping, projection or
-	// argument arrays change; it is folded into every unit identity together
-	// with the profile name and the observed tool versions.
+	// argument arrays change; with the profile name it is the static
+	// descriptor version. The observed tool versions travel separately, in
+	// Detection.ObservedVersion.
 	adapterVersion = "1"
 
 	// Capabilities the pinned profile publishes. reads/writes are not among
@@ -43,6 +43,13 @@ const (
 	probeOutputBytes = 64 << 10
 	toolOutputBytes  = 64 << 20
 	toolGrace        = 10 * time.Second
+
+	// probeMemoryReservation is what the version probe reserves with the
+	// runner. A probe starts a JVM that prints a line and exits; charging it
+	// the profile's whole analysis budget would serialise detection against
+	// real work for no reason. It writes nothing, so it reserves no disk.
+	probeMemoryReservation = 256 << 20
+	probeDiskReservation   = 0
 )
 
 var dependsOn = []string{"filesystem", "treesitter"}
@@ -52,9 +59,6 @@ var dependsOn = []string{"filesystem", "treesitter"}
 type Provider struct {
 	profile Profile
 	runner  *process.Runner
-
-	mu       sync.Mutex
-	observed string // "parse=<v>,export=<v>" after a successful detection
 }
 
 // New binds a validated profile to the shared process runner.
@@ -68,18 +72,13 @@ func New(profile Profile, runner *process.Runner) (*Provider, error) {
 	return &Provider{profile: profile, runner: runner}, nil
 }
 
-// Descriptor is the static contract. After a successful Detect the version
-// also names the observed tool versions, so a unit built by one Joern release
-// is never reused for another: Section 9.1 keys units on the exact provider
-// version, and the tool is the provider's semantics.
+// Descriptor is the static contract; it never changes with detection. The
+// installed Joern release is still part of this provider's semantics, so
+// Detect reports it in Detection.ObservedVersion and the coordinator folds
+// that into UnitSpec.ProviderVersion (Section 9.1): a unit built by one Joern
+// release is never reused for another.
 func (p *Provider) Descriptor() model.ProviderDescriptor {
-	v := adapterVersion + "/" + p.profile.Name
-	p.mu.Lock()
-	if p.observed != "" {
-		v += "/" + p.observed
-	}
-	p.mu.Unlock()
-	return model.ProviderDescriptor{ID: providerID, Version: v,
+	return model.ProviderDescriptor{ID: providerID, Version: adapterVersion + "/" + p.profile.Name,
 		Capabilities:      []string{CapabilityCalls, CapabilityControlDependence, CapabilityDataDependence},
 		DependsOn:         dependsOn,
 		InvalidationScope: model.InvalidationWorkspace}
@@ -91,7 +90,9 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // is why it needs the approved absolute path from configuration and never a
 // PATH lookup. A missing tool is unavailable; a checksum or version that is
 // not the approved one is CTX_TRUST_REQUIRED; a probe that fails carries the
-// runner's code. Detection reads nothing from the repository.
+// runner's code. Detection reads nothing from the repository. The observed
+// versions are returned as ObservedVersion, never written back into the
+// descriptor.
 func (p *Provider) Detect(ctx context.Context, _ workspace.Root, _ workspace.Policy) (provider.Detection, error) {
 	if err := os.MkdirAll(p.profile.WorkDir, 0o700); err != nil {
 		return provider.Detection{}, internalErr("joern work directory: %v", err)
@@ -104,7 +105,9 @@ func (p *Provider) Detect(ctx context.Context, _ workspace.Root, _ workspace.Pol
 		if code := checkTool(t.tool); code != "" {
 			return provider.Detection{Available: false, DiagnosticCode: code}, nil
 		}
-		res, err := p.runTool(ctx, t.name+"-probe", t.tool, p.profile.VersionArgs, p.profile.WorkDir, nil, probeOutputBytes)
+		res, err := p.runTool(ctx, runOpts{name: t.name + "-probe", tool: t.tool, args: p.profile.VersionArgs,
+			dir: p.profile.WorkDir, maxOutputBytes: probeOutputBytes,
+			memoryReservationBytes: probeMemoryReservation, diskReservationBytes: probeDiskReservation})
 		if err != nil {
 			if ctx.Err() != nil {
 				return provider.Detection{}, err
@@ -122,10 +125,8 @@ func (p *Provider) Detect(ctx context.Context, _ workspace.Root, _ workspace.Pol
 		}
 		versions = append(versions, t.name+"="+truncate(v, 64))
 	}
-	p.mu.Lock()
-	p.observed = strings.Join(versions, ",")
-	p.mu.Unlock()
-	return provider.Detection{Available: true, Capabilities: p.Descriptor().Capabilities}, nil
+	return provider.Detection{Available: true, Capabilities: p.Descriptor().Capabilities,
+		ObservedVersion: truncate(strings.Join(versions, ","), model.MaxIdentifierBytes)}, nil
 }
 
 // checkTool inspects one executable without running it.
@@ -202,7 +203,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 
 	cpg := filepath.Join(runDir, "cpg.bin")
 	exportAll, exportPDG := filepath.Join(runDir, "export-all"), filepath.Join(runDir, "export-pdg")
-	values := map[string]string{PlaceholderInputDir: mat.Root(), PlaceholderCPG: cpg}
+	values := map[string]string{placeholderInputDir: mat.Root(), placeholderCPG: cpg}
 	steps := []struct {
 		name string
 		tool Tool
@@ -218,13 +219,15 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 			if err := os.Mkdir(st.out, 0o700); err != nil {
 				return model.ProviderResult{}, internalErr("joern export directory: %v", err)
 			}
-			values[PlaceholderOutDir] = st.out
+			values[placeholderOutDir] = st.out
 		}
 		args, err := substitute(st.args, values)
 		if err != nil {
 			return model.ProviderResult{}, err
 		}
-		if _, err := p.runTool(ctx, st.name, st.tool, args, runDir, io.Discard, toolOutputBytes); err != nil {
+		if _, err := p.runTool(ctx, runOpts{name: st.name, tool: st.tool, args: args, dir: runDir, out: io.Discard,
+			maxOutputBytes: toolOutputBytes, memoryReservationBytes: st.tool.MemoryBudgetBytes,
+			diskReservationBytes: st.tool.DiskBudgetBytes}); err != nil {
 			return model.ProviderResult{}, err
 		}
 		budget, what := p.profile.Parse.DiskBudgetBytes, runDir
@@ -276,12 +279,15 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 }
 
 // capabilities reports each published capability at workspace scope: fresh
-// when every method bound and every occurrence fit, otherwise partial with
-// the reason; and one unavailable row per unknown label the export carried.
+// when every method bound, every occurrence carried a verified range and
+// every evidence row fit; otherwise partial with the reason (an occurrence
+// whose coordinates did not verify is an unverified source binding like a
+// dropped method, not a separate outcome); and one unavailable row per
+// unknown label the export carried.
 func (p *Provider) capabilities(sc *scratch, em *emitter) []model.CapabilityState {
 	state, code := model.CapabilityFresh, ""
 	switch {
-	case em.dropped > 0 || sc.dangling > 0:
+	case em.dropped > 0 || sc.dangling > 0 || em.noRange > 0:
 		state, code = model.CapabilityPartial, model.CodeSourceBindingUnverified
 	case em.clipped > 0:
 		state, code = model.CapabilityPartial, model.CodeResourceLimit
@@ -307,21 +313,36 @@ func (p *Provider) capabilities(sc *scratch, em *emitter) []model.CapabilityStat
 	return out
 }
 
+// runOpts is one invocation of one approved tool. The reservations are
+// explicit rather than taken from the tool, because the version probe costs a
+// fraction of an analysis run and must not hold the analysis budget.
+type runOpts struct {
+	name                   string
+	tool                   Tool
+	args                   []string
+	dir                    string
+	out                    io.Writer
+	maxOutputBytes         int64
+	memoryReservationBytes int64
+	diskReservationBytes   int64
+}
+
 // runTool runs one approved tool through the shared runner with the
-// profile's environment allowlist and budgets, and records the process
-// metrics (exit, duration, output bytes, stop reason, reservations) as a
-// structured log entry: never the child's output. The error is the runner's.
-func (p *Provider) runTool(ctx context.Context, name string, tool Tool, args []string, dir string, out io.Writer, outputBytes int64) (process.Result, error) {
+// profile's environment allowlist and the caller's reservations, and records
+// the process metrics (exit, duration, output bytes, stop reason,
+// reservations) as a structured log entry: never the child's output. The
+// error is the runner's.
+func (p *Provider) runTool(ctx context.Context, o runOpts) (process.Result, error) {
 	res, err := p.runner.Run(ctx, process.Spec{
-		Path: tool.Path, Args: args, Dir: dir, Env: p.env(),
-		Stdout: out, Stderr: out, MaxStdoutBytes: outputBytes, MaxStderrBytes: outputBytes,
-		Timeout: tool.Timeout, Grace: toolGrace,
-		MemoryReservationBytes: tool.MemoryBudgetBytes, DiskReservationBytes: tool.DiskBudgetBytes,
+		Path: o.tool.Path, Args: o.args, Dir: o.dir, Env: p.env(),
+		Stdout: o.out, Stderr: o.out, MaxStdoutBytes: o.maxOutputBytes, MaxStderrBytes: o.maxOutputBytes,
+		Timeout: o.tool.Timeout, Grace: toolGrace,
+		MemoryReservationBytes: o.memoryReservationBytes, DiskReservationBytes: o.diskReservationBytes,
 	})
-	slog.Info("joern tool finished", "component", "provider.joern", "tool", name, "exit_code", res.ExitCode, "duration", res.Duration,
+	slog.Info("joern tool finished", "component", "provider.joern", "tool", o.name, "exit_code", res.ExitCode, "duration", res.Duration,
 		"stdout_bytes", res.StdoutBytes, "stderr_bytes", res.StderrBytes, "timed_out", res.TimedOut, "canceled", res.Canceled,
 		"output_truncated", res.OutputTruncated, "signaled", res.Signaled,
-		"memory_reservation_bytes", tool.MemoryBudgetBytes, "disk_reservation_bytes", tool.DiskBudgetBytes, "error", provider.CodeOf(err))
+		"memory_reservation_bytes", o.memoryReservationBytes, "disk_reservation_bytes", o.diskReservationBytes, "error", provider.CodeOf(err))
 	return res, err
 }
 

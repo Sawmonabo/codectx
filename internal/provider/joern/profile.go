@@ -41,11 +41,12 @@ const (
 
 // Typed argv placeholders. The arrays are owned by this package for the
 // pinned profile, never by configuration, so a profile can never turn a
-// repository-controlled value into a different argument shape.
+// repository-controlled value into a different argument shape; nothing
+// outside the package substitutes them, so they stay unexported.
 const (
-	PlaceholderInputDir = "${input_dir}"
-	PlaceholderCPG      = "${cpg}"
-	PlaceholderOutDir   = "${out_dir}"
+	placeholderInputDir = "${input_dir}"
+	placeholderCPG      = "${cpg}"
+	placeholderOutDir   = "${out_dir}"
 )
 
 // Tool is one approved executable of the profile.
@@ -101,9 +102,9 @@ func PinnedDefault() Profile {
 	return Profile{
 		Name:          ProfileName,
 		VersionArgs:   []string{"--version"},
-		ParseArgs:     []string{PlaceholderInputDir, "--output", PlaceholderCPG},
-		ExportAllArgs: []string{PlaceholderCPG, "--repr=all", "--format=neo4jcsv", "--out", PlaceholderOutDir},
-		ExportPDGArgs: []string{PlaceholderCPG, "--repr=pdg", "--format=graphml", "--out", PlaceholderOutDir},
+		ParseArgs:     []string{placeholderInputDir, "--output", placeholderCPG},
+		ExportAllArgs: []string{placeholderCPG, "--repr=all", "--format=neo4jcsv", "--out", placeholderOutDir},
+		ExportPDGArgs: []string{placeholderCPG, "--repr=pdg", "--format=graphml", "--out", placeholderOutDir},
 		Network:       config.NetworkDenied,
 	}
 }
