@@ -116,6 +116,12 @@ func (r *Recorder) Identities() []string {
 // iteration or wall time would publish different canonical IDs for the same
 // bytes, so unchanged facts could never be shared between snapshots and
 // unit reuse would silently compare unequal keys.
+//
+// The second run uses a one-record batch, so every Put is persisted at once.
+// A provider that hands a relation, alias or search document to the sink
+// before the node fact it references then fails here deterministically,
+// instead of only under pool pressure in production where flush timing is
+// not the provider's to control.
 func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKey string, inputs []string) {
 	t.Helper()
 	if err := p.Descriptor().Validate(); err != nil {
@@ -136,7 +142,11 @@ func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKe
 		}
 		u := h.Plan(t, p, scopeKey, inputs)
 		rec := &Recorder{UnitOutput: h.Begin(t, u, inputs)}
-		result, err := provider.RunUnit(h.ctx, p, u.Request, rec, Limits, h.Pool)
+		limits := Limits
+		if i == 1 {
+			limits.BatchRecords = 1
+		}
+		result, err := provider.RunUnit(h.ctx, p, u.Request, rec, limits, h.Pool)
 		if err != nil {
 			t.Fatalf("RunUnit: %v", err)
 		}

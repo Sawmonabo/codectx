@@ -43,19 +43,26 @@ func (u storeUnit) Seal(ctx context.Context) error { return u.store.SealUnit(ctx
 // fails, so every producer goroutine stops promptly. Cleanup uses a context
 // that survives that cancellation. The returned result always names req.Run
 // and a terminal state; the error explains a non-succeeded state.
+//
+// The writer behind out is single-owner: it has no lock of its own, and Seal
+// and Fail must never overlap a write. While the sink is live another
+// acquirer may flush its queued batches into the writer to relieve pool
+// pressure, so the sink is discarded (which waits for any such write and
+// then leaves the pool) before Seal or Fail is called on any path. The
+// deferred Discard is only the idempotent safety net.
 func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, limits Limits, pool *Pool) (model.ProviderResult, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	var result model.ProviderResult
 	sink, err := NewBatchSink(runCtx, out, limits, pool, cancel)
 	if err == nil {
-		// Discard on every path: a provider that erred or was canceled with
-		// records still queued must return their bytes to the shared pool.
 		defer sink.Discard()
 		result, err = p.IndexUnit(runCtx, req, sink)
-	}
-	if err == nil {
-		err = sink.Flush(runCtx)
+		if err == nil {
+			err = sink.Flush(runCtx)
+		}
+		// From here on the writer belongs to this function alone.
+		sink.Discard()
 	}
 	if err == nil {
 		err = checkResult(result, req)

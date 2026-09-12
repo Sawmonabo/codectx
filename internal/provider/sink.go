@@ -97,6 +97,11 @@ func (p *Pool) release(n int64) {
 // released anything it retries at once. Nothing is held while blocked.
 func (p *Pool) acquire(ctx context.Context, n int64) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			// Checked before relieving: relief may issue one write per live
+			// sink, and a canceled acquirer must not perform any of them.
+			return model.Canceled(err)
+		}
 		p.mu.Lock()
 		if p.used+n <= p.capacity {
 			p.used += n
