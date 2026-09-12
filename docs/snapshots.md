@@ -97,7 +97,11 @@ Git consults (bounded at 256 drivers) and each is neutralized for that run
 through the child environment: `GIT_CONFIG_COUNT=N` with paired
 `GIT_CONFIG_KEY_<i>=filter.<driver>.clean|process|required` and
 `GIT_CONFIG_VALUE_<i>=` (empty; `false` for `required`), which Git ≥ 2.31
-applies as the highest-priority configuration. An empty command is no command
+applies as the highest-priority configuration. A Git older than
+`git.MinimumVersion` (2.31.0) ignores these variables and would run the
+filters, so `git.New` runs `git version` once per handle and refuses an older
+or unreadable Git with a non-retryable `CTX_PROVIDER_UNAVAILABLE`
+("install Git 2.31.0 or newer") before any capture. An empty command is no command
 and `required=false` keeps Git from failing on the absence. The environment
 carries key and value separately, so a driver whose name contains `=` (legal
 in a config subsection) is neutralized correctly; a `-c filter.<name>.clean=`
@@ -272,7 +276,7 @@ abandoned materializations.
 | Caller canceled or its deadline passed | `CTX_CANCELED` (joined with the context error) |
 | File budget, listing bound, read ceiling, materialization bound | `CTX_RESOURCE_LIMIT` |
 | Data directory disk full | `CTX_DISK_FULL` |
-| Git repository without a git executable, git failure | `CTX_PROVIDER_UNAVAILABLE` |
+| Git repository without a git executable, Git older than 2.31.0, git failure | `CTX_PROVIDER_UNAVAILABLE` |
 | Git output this build cannot parse | `CTX_PROVIDER_OUTPUT_INVALID` |
 | Path or range shape errors | `CTX_ARGUMENT_INVALID` |
 

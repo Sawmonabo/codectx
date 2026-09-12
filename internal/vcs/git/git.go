@@ -14,7 +14,10 @@
 // (Section 21). The environment route is deliberate: `-c key=value` splits at
 // the first '=', so a driver whose name contains '=' would slip past a -c
 // override; the paired variables carry key and value separately and are
-// unambiguous for any driver name. PATH is withheld from the child, but that
+// unambiguous for any driver name. A Git older than MinimumVersion ignores
+// those variables and would run the filters, so New refuses such a Git with a
+// typed CTX_PROVIDER_UNAVAILABLE before any capture: the check fails closed.
+// PATH is withheld from the child, but that
 // is hygiene, not a control: Git runs filters and hooks through `sh -c`, which
 // supplies its own default PATH, so only the neutralization above prevents
 // execution. Git object IDs this package reports are provenance only: the
@@ -40,11 +43,22 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 )
 
+// MinimumVersion is the oldest Git this package will drive. 2.31.0 introduced
+// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<i>/GIT_CONFIG_VALUE_<i>, the mechanism that
+// neutralizes configured filter drivers for the status run; an older Git
+// silently ignores the variables and would execute user-configured commands
+// during capture, so New refuses it.
+const MinimumVersion = "2.31.0"
+
 const (
 	// DefaultTimeout bounds one plumbing run. Listing a quarter-million-file
 	// index is seconds; a run that takes longer than this is stuck.
 	DefaultTimeout = 10 * time.Minute
-	grace          = 5 * time.Second
+	// versionTimeout bounds the one `git version` run New performs.
+	versionTimeout = 30 * time.Second
+	// maxVersionBytes bounds that command's output; the line is short.
+	maxVersionBytes = 4 << 10
+	grace           = 5 * time.Second
 	// maxStderrBytes bounds diagnostics; Git's error text is short.
 	maxStderrBytes = 64 << 10
 	// maxRecordBytes bounds one NUL-delimited record: the longest legal path
@@ -105,9 +119,12 @@ func Locate() (string, error) {
 	return abs, nil
 }
 
-// New records the absolute executable and captures the allowlisted environment
-// once. timeout <= 0 selects DefaultTimeout.
-func New(runner *process.Runner, executable string, timeout time.Duration) (*Git, error) {
+// New records the absolute executable, captures the allowlisted environment
+// once, and runs `git version` once through the runner to refuse a Git older
+// than MinimumVersion (a typed, non-retryable CTX_PROVIDER_UNAVAILABLE). That
+// is the only process New spawns; captures do not repeat it. timeout <= 0
+// selects DefaultTimeout.
+func New(ctx context.Context, runner *process.Runner, executable string, timeout time.Duration) (*Git, error) {
 	if runner == nil {
 		return nil, internal("git requires the shared process runner")
 	}
@@ -123,7 +140,88 @@ func New(runner *process.Runner, executable string, timeout time.Duration) (*Git
 			env = append(env, name+"="+value)
 		}
 	}
-	return &Git{runner: runner, path: executable, env: env, timeout: timeout}, nil
+	g := &Git{runner: runner, path: executable, env: env, timeout: timeout}
+	if err := g.checkVersion(ctx); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// checkVersion runs `git version` and rejects a Git below MinimumVersion or
+// one whose banner this package cannot read. The executable's own directory
+// is the working directory: `git version` consults no repository.
+func (g *Git) checkVersion(ctx context.Context) error {
+	var out bytes.Buffer
+	probe := *g
+	probe.timeout = versionTimeout
+	if _, err := probe.run(ctx, filepath.Dir(g.path), &out, maxVersionBytes, "version"); err != nil {
+		return err
+	}
+	version, ok := parseVersion(out.String())
+	if !ok {
+		return tooOld("git version output %q is not understood", excerpt(out.Bytes()))
+	}
+	if compareVersions(version, mustParseVersion(MinimumVersion)) < 0 {
+		return tooOld("git %d.%d.%d is older than %s, which is the oldest release whose GIT_CONFIG_COUNT keeps configured filters from running during capture",
+			version[0], version[1], version[2], MinimumVersion)
+	}
+	return nil
+}
+
+// parseVersion reads the "git version X.Y.Z" banner, tolerating suffixes such
+// as ".windows.1", "-rc0" or "+dfsg". A missing patch component is zero.
+func parseVersion(banner string) ([3]int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(banner), "git version ")
+	if !ok {
+		return [3]int{}, false
+	}
+	rest, _, _ = strings.Cut(rest, " ")
+	end := strings.IndexFunc(rest, func(r rune) bool { return r != '.' && (r < '0' || r > '9') })
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	var v [3]int
+	parts := strings.Split(rest, ".")
+	if len(parts) < 2 || len(parts) > 4 {
+		return v, false
+	}
+	for i, part := range parts {
+		if i == 3 {
+			// "2.31.0.1" style fourth component: not part of the release.
+			break
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 || part == "" {
+			return [3]int{}, false
+		}
+		v[i] = n
+	}
+	return v, true
+}
+
+func mustParseVersion(s string) [3]int {
+	v, ok := parseVersion("git version " + s)
+	if !ok {
+		panic("git: MinimumVersion is not a version")
+	}
+	return v
+}
+
+func compareVersions(a, b [3]int) int {
+	for i := range a {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func tooOld(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeProviderUnavailable, Message: fmt.Sprintf(format, args...),
+		Remediation: "install Git " + MinimumVersion + " or newer"}
 }
 
 // Executable is the recorded absolute path.
