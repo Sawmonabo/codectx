@@ -17,12 +17,12 @@
 // unambiguous for any driver name. A Git older than MinimumVersion ignores
 // those variables and would run the filters, so New refuses such a Git with a
 // typed CTX_PROVIDER_UNAVAILABLE before any capture: the check fails closed.
-// PATH is withheld from the child, but that
-// is hygiene, not a control: Git runs filters and hooks through `sh -c`, which
-// supplies its own default PATH, so only the neutralization above prevents
-// execution. Git object IDs this package reports are provenance only: the
-// bytes a snapshot retains are always read from the worktree, because
-// attributes can make a checkout differ from its blob.
+// PATH is withheld from the child, but that is hygiene, not a control: Git
+// runs filters and hooks through `sh -c`, which supplies its own default PATH,
+// so only the neutralization above prevents execution. Git object IDs this
+// package reports are provenance only: the bytes a snapshot retains are always
+// read from the worktree, because attributes can make a checkout differ from
+// its blob.
 package git
 
 import (
