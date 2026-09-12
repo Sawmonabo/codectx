@@ -201,7 +201,7 @@ func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 	select {
 	case r.slots <- struct{}{}:
 	case <-ctx.Done():
-		return nil, canceled(ctx.Err())
+		return nil, model.Canceled(ctx.Err())
 	}
 	r.mu.Lock()
 	overMemory := r.memoryUsed+spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes
@@ -360,7 +360,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	case stopTimeout:
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
 	case stopCanceled:
-		return result, canceled(ctx.Err())
+		return result, model.Canceled(ctx.Err())
 	}
 	// The child exited on its own, but a stream that crossed its limit is still
 	// a refusal: the caller would otherwise receive truncated output reported
@@ -671,27 +671,4 @@ func invalidArgument(format string, args ...any) *model.Error {
 
 func internalError(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
-}
-
-// canceled reports a run the caller stopped.
-//
-// The result is joined rather than replaced: errors.Is still recognizes
-// context.Canceled and context.DeadlineExceeded, so a caller can distinguish a
-// deadline from a cancellation, while errors.As still finds a typed
-// *model.Error. That typing is not cosmetic: internal/cli maps an untyped
-// error to the exit-2 usage class, which would report a deliberate
-// cancellation as an invalid command line.
-func canceled(err error) error {
-	if err == nil {
-		err = context.Canceled
-	}
-	typed := &model.Error{
-		Code:        model.CodeCanceled,
-		Message:     "the run was canceled before it completed",
-		Remediation: "run the operation again when it should finish",
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		typed.Message = "the caller's deadline expired before the run completed"
-	}
-	return errors.Join(typed, err)
 }

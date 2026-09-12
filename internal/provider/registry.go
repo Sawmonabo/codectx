@@ -142,7 +142,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 	enablement func(providerID string) config.Enablement) (Selection, error) {
 	var sel Selection
 	active := make(map[string]bool, len(r.order))
-	inactiveState := make(map[string]model.CapabilityStateValue, len(r.order))
+	inactive := make(map[string]inactiveProvider, len(r.order))
 	for _, id := range r.order {
 		p := r.byID[id]
 		d := p.Descriptor()
@@ -150,7 +150,11 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		if enablement != nil {
 			mode = enablement(id)
 		}
-		state, code := detect(ctx, p, d, mode, root, policy, active, inactiveState)
+		state, code := detect(ctx, p, d, mode, root, policy, active, inactive)
+		if err := ctx.Err(); err != nil {
+			// A stopped selection is not a list of failed providers.
+			return Selection{}, model.Canceled(err)
+		}
 		if state == "" {
 			active[id] = true
 			sel.Active = append(sel.Active, p)
@@ -161,7 +165,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 				Message: fmt.Sprintf("required provider %q is %s and no generation can be built without it", id, state)}).
 				WithDetail("provider_id", id).WithDetail("diagnostic_code", code)
 		}
-		inactiveState[id] = state
+		inactive[id] = inactiveProvider{state: state, code: code}
 		for _, c := range d.Capabilities {
 			sel.Inactive = append(sel.Inactive, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code})
 		}
@@ -169,10 +173,17 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 	return sel, nil
 }
 
+// inactiveProvider records why a provider will not run, so a dependent can
+// carry the same category and diagnostic code.
+type inactiveProvider struct {
+	state model.CapabilityStateValue
+	code  string
+}
+
 // detect decides one provider. An empty state means active; otherwise the
 // state and diagnostic code the inactive capability rows carry.
 func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode config.Enablement, root workspace.Root, policy workspace.Policy,
-	active map[string]bool, inactive map[string]model.CapabilityStateValue) (model.CapabilityStateValue, string) {
+	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string) {
 	if mode == config.Disabled {
 		return model.CapabilityUnavailable, model.CodeProviderUnavailable
 	}
@@ -180,17 +191,18 @@ func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode co
 		if active[dep] {
 			continue
 		}
-		// The dependency's category propagates: an optional provider waiting on
-		// a disabled tool is absent, one waiting on a failed enabled tool has
-		// failed too.
-		return inactive[dep], model.CodeProviderUnavailable
+		// The dependency's category and diagnostic propagate: an optional
+		// provider waiting on a disabled tool is absent for that reason, one
+		// waiting on a failed enabled tool has failed for the same reason.
+		why := inactive[dep]
+		return why.state, why.code
 	}
 	det, err := p.Detect(ctx, root, policy)
 	if err == nil {
 		err = det.Validate(d)
 	}
 	if err != nil {
-		return model.CapabilityFailed, codeOf(err)
+		return model.CapabilityFailed, CodeOf(err)
 	}
 	if det.Available {
 		return "", ""
@@ -201,9 +213,14 @@ func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode co
 	return model.CapabilityFailed, det.DiagnosticCode
 }
 
-// codeOf extracts the Section 22 code from a detection error; a cancellation
-// is reported as such rather than as a provider failure.
-func codeOf(err error) string {
+// CodeOf extracts the Section 22 code an error carries for a diagnostic
+// column: the typed code when there is one, CTX_CANCELED for a bare context
+// end (a cancellation is never recorded as a provider crash) and CTX_INTERNAL
+// otherwise. A nil error has no code.
+func CodeOf(err error) string {
+	if err == nil {
+		return ""
+	}
 	var typed *model.Error
 	if errors.As(err, &typed) {
 		return typed.Code

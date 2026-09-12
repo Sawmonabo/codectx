@@ -77,7 +77,7 @@ func (c *CAS) Put(ctx context.Context, r io.Reader) (model.BlobRecord, error) {
 // failure. Repair uses this so a wrong reconstruction never enters the store.
 func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobRecord, error) {
 	if err := ctx.Err(); err != nil {
-		return model.BlobRecord{}, canceled(err)
+		return model.BlobRecord{}, model.Canceled(err)
 	}
 	tmp, err := os.CreateTemp(c.tmp, casTmpPrefix+"*")
 	if err != nil {
@@ -202,7 +202,7 @@ func indexOf(rec model.BlobRecord) source.Index {
 // exposed. Memory is one block.
 func (c *CAS) Open(ctx context.Context, rec model.BlobRecord) (io.ReadCloser, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, canceled(err)
+		return nil, model.Canceled(err)
 	}
 	if err := rec.Validate(); err != nil {
 		return nil, err
@@ -317,7 +317,7 @@ func verifyBlock(data []byte, rec model.BlobRecord, i int) error {
 // that plus two partial blocks.
 func (c *CAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, canceled(err)
+		return nil, model.Canceled(err)
 	}
 	if err := rec.Validate(); err != nil {
 		return nil, err

@@ -109,7 +109,7 @@ func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel
 	var total int64
 	return view.EachFile(ctx, sel, func(fv model.FileVersion) error {
 		if err := ctx.Err(); err != nil {
-			return canceled(err)
+			return model.Canceled(err)
 		}
 		if fv.Status == model.FileDeleted {
 			return nil

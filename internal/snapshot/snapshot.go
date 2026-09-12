@@ -121,7 +121,7 @@ func ioError(op string, err error) error {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return canceled(err)
+		return model.Canceled(err)
 	}
 	if errors.Is(err, syscall.ENOSPC) {
 		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the data directory's disk is full",
@@ -148,18 +148,6 @@ func bareCause(err error) error {
 	return err
 }
 
-// canceled reports work the caller stopped, joined with the context error so
-// errors.Is still distinguishes a deadline from a cancellation while errors.As
-// finds the typed code (the internal/process convention).
-func canceled(err error) error {
-	typed := &model.Error{Code: model.CodeCanceled, Message: "the operation was canceled before it completed",
-		Remediation: "run the operation again when it should finish"}
-	if errors.Is(err, context.DeadlineExceeded) {
-		typed.Message = "the caller's deadline expired before the operation completed"
-	}
-	return errors.Join(typed, err)
-}
-
 // typed maps any error leaving this package to a *model.Error chain: a bare
 // context error from a walk or a staging query becomes the typed cancellation.
 func typed(err error) error {
@@ -171,7 +159,7 @@ func typed(err error) error {
 		return err
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return canceled(err)
+		return model.Canceled(err)
 	}
 	return err
 }

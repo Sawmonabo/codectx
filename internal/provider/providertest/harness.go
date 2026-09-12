@@ -7,7 +7,6 @@ package providertest
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -236,7 +235,7 @@ func (h *Harness) Run(t *testing.T, p provider.Provider, scopeKey string, inputs
 	u := h.Plan(t, p, scopeKey, inputs, deps...)
 	out := h.Begin(t, u, inputs)
 	result, err := provider.RunUnit(h.ctx, p, u.Request, out, Limits, h.Pool)
-	if cerr := h.Store.CompleteProviderRun(h.ctx, result, codeOf(err)); cerr != nil {
+	if cerr := h.Store.CompleteProviderRun(h.ctx, result, provider.CodeOf(err)); cerr != nil {
 		t.Fatalf("CompleteProviderRun: %v", cerr)
 	}
 	return result, u.Build.Spec.ID, err
@@ -260,16 +259,4 @@ func Evidence(req provider.UnitRequest, node model.NodeID, precision model.Preci
 		OriginRunID: req.Run, NodeID: node, Precision: precision, FileID: fv.ID, ContentHash: fv.ContentHash, Range: rng}
 	e.ID = model.NewEvidenceID(e)
 	return e
-}
-
-// codeOf is the diagnostic code CompleteProviderRun records for err.
-func codeOf(err error) string {
-	if err == nil {
-		return ""
-	}
-	var typed *model.Error
-	if errors.As(err, &typed) {
-		return typed.Code
-	}
-	return model.CodeInternal
 }
