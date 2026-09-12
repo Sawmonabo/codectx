@@ -198,7 +198,13 @@ func runScenario(t *testing.T, enc string) {
 		bytesOf(calls.Items[0].Sites[0]) != "héllo" || calls.Items[0].Sites[0].Range.Start.Byte != at("héllo(1)", 1).Byte {
 		t.Fatalf("IncomingCalls = %+v, %v", calls.Items, err)
 	}
-	if out, err := ov.OutgoingCalls(ctx, items.Items[0], 10); err != nil || len(out.Items) != 0 {
+	// Outgoing calls take the other site-attribution branch: the sites belong
+	// to the queried caller's document, not the peer's, and must resolve to
+	// the exact bytes there.
+	out, err := ov.OutgoingCalls(ctx, items.Items[0], 10)
+	if err != nil || len(out.Items) != 1 || out.Items[0].Item.Name != "other" || len(out.Items[0].Sites) != 1 ||
+		out.Items[0].Sites[0].File != items.Items[0].Location.File ||
+		bytesOf(out.Items[0].Sites[0]) != "y" || out.Items[0].Sites[0].Range.Start.Byte != at("y }", 1).Byte {
 		t.Fatalf("OutgoingCalls = %+v, %v", out.Items, err)
 	}
 

@@ -158,6 +158,11 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		MemoryReservationBytes: p.MemoryBudgetBytes,
 		DiskReservationBytes:   p.DiskBudgetBytes,
 	}
+	// From here a process tree exists (or is about to) and onExit will run, so
+	// the manager tracks the server until that happens even if it never
+	// becomes a usable entry. Registering before the goroutine starts means
+	// untrack can never run before track.
+	m.track(s)
 	started := make(chan error, 1)
 	go func() {
 		_, err := m.opts.Runner.Run(runCtx, spec)
@@ -303,6 +308,9 @@ func (s *server) onExit(runErr error) {
 		s.fail(err)
 	}
 	close(s.exited)
+	// Only now, with the tree reaped and the materialization gone, does Close
+	// no longer have to wait for this server.
+	s.manager.untrack(s)
 }
 
 // fail latches the server as failed: pending calls are released with err,
@@ -476,6 +484,16 @@ func (s *server) ensureOpen(d *document) error {
 	if !isText(d.data) {
 		return invalid("file %s is not UTF-8 text; a language server cannot address positions in it", d.version.Path)
 	}
+	uri := s.uris.uri(d.version.Path)
+	// The didOpen payload carries the whole file as one JSON string. Refuse an
+	// oversized document here, before the text is copied into a string and a
+	// payload, rather than building a frame the bound would reject anyway.
+	// Escaping can still push a file that passes this check over the bound;
+	// conn.write is the guarantee, this is the check that avoids the copy.
+	if size := int64(len(d.data)) + int64(len(uri)) + didOpenOverheadBytes; size > s.opts.MaxFrameBytes {
+		return resourceLimit("file %s does not fit one %d-byte protocol message", d.version.Path, s.opts.MaxFrameBytes).
+			WithDetail("limit", "max_frame_bytes")
+	}
 	for len(s.openOrder) >= maxOpenDocuments {
 		oldest := s.openOrder[0]
 		s.openOrder = s.openOrder[1:]
@@ -486,7 +504,7 @@ func (s *server) ensureOpen(d *document) error {
 		}
 	}
 	err := s.conn.notify("textDocument/didOpen", didOpenParams{TextDocument: textDocumentItem{
-		URI: s.uris.uri(d.version.Path), LanguageID: languageID(d.version.Language), Version: 1, Text: string(d.data),
+		URI: uri, LanguageID: languageID(d.version.Language), Version: 1, Text: string(d.data),
 	}})
 	if err != nil {
 		return err
@@ -498,6 +516,12 @@ func (s *server) ensureOpen(d *document) error {
 
 // maxOpenDocuments bounds the documents a server holds open for this client.
 const maxOpenDocuments = 16
+
+// didOpenOverheadBytes over-estimates the didOpen envelope around the text
+// and its URI: the JSON-RPC frame header, the method and the parameter names.
+// It only has to exceed the fixed part; the escaped text is bounded by
+// conn.write.
+const didOpenOverheadBytes = 256
 
 // languageID maps a snapshot manifest language tag to the LSP languageId.
 // The tags agree except for TSX; JSX files carry the manifest's "javascript".

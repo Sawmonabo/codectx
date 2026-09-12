@@ -149,8 +149,15 @@ func Trusted(cfg config.Config, name string) (Profile, error) {
 	if approval.VersionConstraint == "" {
 		return Profile{}, trustRequired("language server %q is approved without a version constraint", name).WithDetail("profile", name)
 	}
-	if approval.WorkDir == "" || approval.Timeout <= 0 || approval.MemoryBudgetBytes <= 0 || approval.DiskBudgetBytes <= 0 {
-		return Profile{}, trustRequired("language server %q is approved without a work directory, timeout or budgets", name).WithDetail("profile", name)
+	// The work directory must be absolute here, not only at the runner: the
+	// server start creates it before the runner ever inspects it, and a
+	// relative path would be created under whatever directory the process
+	// happens to be in.
+	if !filepath.IsAbs(approval.WorkDir) {
+		return Profile{}, trustRequired("language server %q is approved with a non-absolute work directory", name).WithDetail("profile", name)
+	}
+	if approval.Timeout <= 0 || approval.MemoryBudgetBytes <= 0 || approval.DiskBudgetBytes <= 0 {
+		return Profile{}, trustRequired("language server %q is approved without a timeout or budgets", name).WithDetail("profile", name)
 	}
 	args := def.Args
 	if len(approval.Args) > 0 {

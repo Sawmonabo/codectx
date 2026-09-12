@@ -120,15 +120,10 @@ type callHierarchyCallsParams struct {
 	Item json.RawMessage `json:"item"`
 }
 
-type callHierarchyIncomingCall struct {
-	From       callHierarchyItem `json:"from"`
-	FromRanges []lspRange        `json:"fromRanges"`
-}
-
-type callHierarchyOutgoingCall struct {
-	To         callHierarchyItem `json:"to"`
-	FromRanges []lspRange        `json:"fromRanges"`
-}
+// An incoming or outgoing call is decoded in overlay.calls with the peer item
+// kept as a json.RawMessage, so that the item can be echoed back verbatim.
+// There is no typed call edge here, because a typed one would discard the raw
+// item.
 
 // initializeParams declares exactly what this client can do. Position
 // encodings are listed in preference order; UTF-16 is last because the

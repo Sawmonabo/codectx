@@ -27,7 +27,10 @@ A `Profile` is runnable, and `Trusted(cfg, name)` is its only constructor:
 | `providers.lsp.enabled = false` | `CTX_PROVIDER_UNAVAILABLE` |
 | `name` is not one of the six definitions | `CTX_ARGUMENT_INVALID` |
 | no `[analyzers.<name>]` in the **user** configuration | `CTX_TRUST_REQUIRED` |
-| approval lacks absolute executable, version constraint, work dir, timeout or budgets | `CTX_TRUST_REQUIRED` |
+| approval's `executable` is not an absolute path | `CTX_TRUST_REQUIRED` |
+| approval has no `version_constraint` | `CTX_TRUST_REQUIRED` |
+| approval's `work_dir` is not an absolute path | `CTX_TRUST_REQUIRED` |
+| approval lacks a timeout or a memory or disk budget | `CTX_TRUST_REQUIRED` |
 | args use `${output_file}` or `${manifest}` | `CTX_ARGUMENT_INVALID` |
 
 `enabled = "auto"` therefore means "use an already approved profile"; nothing
@@ -36,7 +39,12 @@ the definition's default argv entirely when present; `${input_dir}` is the
 materialization root and `${work_dir}` the private working directory. The
 child environment is exactly the approval's `env_allowlist` resolved from the
 parent, nothing else; a server that needs `HOME`, `PATH` or a toolchain
-variable needs it listed.
+variable needs it listed. `work_dir` must be absolute because the overlay
+creates it before the server starts: a relative one would be created under
+whatever directory the process happens to be in. It is a real working
+directory, not a scratch path — `jdtls` is started with `-data ${work_dir}`
+and writes its workspace state there by design; the materialization is the
+server's read-only input and is never its data directory.
 
 | Definition | Languages | Default argv | Root markers |
 |---|---|---|---|
@@ -84,8 +92,10 @@ Bounds, all finite:
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
 | server lifetime | the approval's `timeout` | the runner terminates the tree |
 | materialized bytes, cached pinned bytes, bytes sent, bytes received | `Options.MaxOverlayBytes` (default 512 MiB) | materialization refused; cache evicts LRU; the server is failed |
-| one message | `Options.MaxFrameBytes` (default 8 MiB), checked before allocation | the connection is failed |
-| header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels | protocol error, connection failed |
+| one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
+| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable |
+| header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels — the line bound is applied to the chunk the reader holds before it is accumulated | protocol error, connection failed |
+| queued answers to server-initiated requests | 4 | the reply is dropped; the reader never blocks on a write |
 | documents held open on the server | 16 | `didClose` of the least recently opened |
 | handshake, shutdown | `Options.StartTimeout` (60 s), `Options.StopTimeout` (5 s) | start fails; the runner forces the stop |
 
@@ -110,7 +120,12 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   client never applies an edit, never runs a command
   (`workspace/executeCommand` is never sent) and never opens a URI on a
   server's behalf. Notifications (`window/logMessage`,
-  `textDocument/publishDiagnostics`, `$/progress`) are read and dropped.
+  `textDocument/publishDiagnostics`, `$/progress`) are read and dropped, as
+  is a response the server could not attribute to a request (`"id": null`).
+  The answer is **queued** (at most four) for one dedicated writer goroutine:
+  the goroutine that reads the server's output never writes, because a write
+  parks on the server's stdin while the server is parked writing stdout that
+  only the reader drains. A full queue drops the reply rather than blocking.
 - **Position encoding.** The client offers `utf-8`, `utf-32`, `utf-16` in
   that order; the server's `positionEncoding` (default `utf-16`) is used for
   every coordinate in both directions. A choice the client did not offer is
@@ -126,8 +141,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   `languageId` (`tsx` maps to `typescriptreact`; JSX files carry the
   manifest's `javascript`). The bytes never change while the snapshot is
   pinned, so `didChange` is never sent. A file that is not UTF-8 text has no
-  addressable positions: `CTX_ARGUMENT_INVALID`. Servers whose
-  `textDocumentSync` is `None` are not sent open/close.
+  addressable positions: `CTX_ARGUMENT_INVALID`. A file too large to carry in
+  one protocol message is refused with `CTX_RESOURCE_LIMIT` before its text is
+  copied anywhere. Servers whose `textDocumentSync` is `None` are not sent
+  open/close.
 - **URIs.** Only a `file:` URI without authority is a location. It is mapped
   back under the materialization root to a snapshot path and then to a
   `FileID`; the bytes come from the view. A `file:` URI outside the root (a
@@ -193,10 +210,44 @@ the server so the next `Open` starts a fresh one. Overlays still holding the
 failed server answer `CTX_PROVIDER_UNAVAILABLE` naming the cause. No
 canonical fact is touched, because none is ever written here.
 
+`Manager.Close` returns once **every** process tree is reaped and every
+materialization removed, including the trees of servers that failed and were
+forgotten: the manager keeps a server on a `live` set from the moment its
+runner goroutine starts until its exit path has removed the materialization,
+and `Close` stops everything on that set as well as everything still holding a
+slot. `Servers()` counts only the slots, not the set, so a crashed server that
+has already been forgotten does not keep it above zero.
+
 Detection of an unexpected exit is bounded by the runner's stdin handling:
 the runner's input pump parks on the client's stdin reader after the child
 dies and `Run` returns after twice the grace (`Options.StopTimeout`); the
 Task 10 report names the shared change that would make it immediate.
+
+## Documented residuals
+
+These are deliberate and bounded, not defects; each is named here so a reader
+does not have to rediscover it.
+
+- **A server's lifetime is the approval's `timeout`.** There is no separate
+  lifetime setting: the value that bounds one analyzer run bounds a whole
+  language server here, and when it elapses the runner terminates the tree and
+  the next `Open` starts a fresh server. An operator approving a server for
+  interactive use approves a `timeout` of that length.
+- **`Options.MaxOverlayBytes` has no configuration key yet** and defaults to
+  512 MiB. It bounds the materialized snapshot, the pinned bytes cached for
+  coordinate conversion, and the bytes exchanged with the server over its
+  lifetime — all three separately. The composer (Task 20) is expected to
+  derive it from a resource setting, for example a share of
+  `resources.max_temp_bytes`, rather than leaving the package default in
+  place.
+- **`jdtls` writes into `work_dir` by design.** Its default argv is
+  `-data ${work_dir}`, so the private working directory is also its workspace
+  data directory and it accumulates state there across runs. Approving
+  `jdtls` means approving that write. No snapshot byte and no repository file
+  is ever written: the materialization is read-only input and the checkout is
+  never touched.
+- **Unexpected-exit detection is delayed** by twice the grace, as described
+  above.
 
 ## Consumers
 

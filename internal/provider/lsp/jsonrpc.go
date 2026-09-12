@@ -61,11 +61,28 @@ type conn struct {
 
 	slots chan struct{}
 
+	// replies queues answers to server-initiated requests for the one
+	// dedicated writer goroutine. The reader must never write a reply itself:
+	// a write parks on the child's stdin while the child is parked writing
+	// stdout that only the reader drains, which deadlocks the pair and, while
+	// the write lock is held, makes every call block before it can honour its
+	// own deadline. The queue is small and a full queue drops the reply.
+	replies chan message
+	// done is closed by fail so the writer goroutine cannot outlive the
+	// connection.
+	done chan struct{}
+
 	mu      sync.Mutex
 	nextID  int64
 	pending map[int64]chan reply
 	failure error
 }
+
+// maxQueuedReplies bounds the answers to server-initiated requests waiting to
+// be written. Four is more than any server has outstanding against a client
+// that answers everything with a constant; beyond it the server is not
+// waiting for an answer it can use.
+const maxQueuedReplies = 4
 
 // reply is what a waiting call receives: the server's response, or the typed
 // failure that ended the connection while the call was outstanding.
@@ -82,6 +99,8 @@ func newConn(rw io.ReadWriter, maxFrame, maxWrite int64, maxOutstanding int, han
 		maxWrite: maxWrite,
 		handler:  handler,
 		slots:    make(chan struct{}, maxOutstanding),
+		replies:  make(chan message, maxQueuedReplies),
+		done:     make(chan struct{}),
 		pending:  make(map[int64]chan reply),
 	}
 }
@@ -89,6 +108,7 @@ func newConn(rw io.ReadWriter, maxFrame, maxWrite int64, maxOutstanding int, han
 // run reads messages until the stream ends or a protocol error occurs. It
 // returns the reason, which the owner uses to fail the connection.
 func (c *conn) run() error {
+	go c.writeReplies()
 	for {
 		payload, err := readFrame(c.reader, c.maxFrame)
 		if err != nil {
@@ -101,6 +121,14 @@ func (c *conn) run() error {
 		if err := json.Unmarshal(payload, &msg); err != nil {
 			return outputInvalid("message is not a JSON-RPC object: %v", err)
 		}
+		// A literal null id is the protocol's "no id": on a notification some
+		// servers spell it out, and on a response it is an error the server
+		// could not attribute to a call. Normalizing it here keeps a null-id
+		// notification out of serveRequest and an unattributable error from
+		// ending the connection.
+		if msg.ID != nil && string(*msg.ID) == "null" {
+			msg.ID = nil
+		}
 		switch {
 		case msg.Method != "" && msg.ID != nil:
 			c.serveRequest(msg)
@@ -112,6 +140,10 @@ func (c *conn) run() error {
 			if err := c.deliver(msg); err != nil {
 				return err
 			}
+		case msg.Error != nil:
+			// A parse or invalid-request error the server could not attribute
+			// to a request. There is nothing to route it to; the next call
+			// that fails reports the reason.
 		default:
 			return outputInvalid("message has neither a method nor an id")
 		}
@@ -139,23 +171,48 @@ func (c *conn) deliver(msg message) error {
 }
 
 // serveRequest answers a server-initiated request through the handler and
-// writes the response. The handler decides; this method only frames.
+// hands the response to the writer goroutine. The handler decides; this
+// method only frames. It never writes: it runs on the reader goroutine, and a
+// reader that blocks on a write stops draining the server's output, which is
+// exactly what the server is waiting on to drain the client's input.
 func (c *conn) serveRequest(msg message) {
 	result, rpcErr := c.handler(msg.Method, msg.Params)
-	reply := message{JSONRPC: "2.0", ID: msg.ID}
+	out := message{JSONRPC: "2.0", ID: msg.ID}
 	if rpcErr != nil {
-		reply.Error = rpcErr
+		out.Error = rpcErr
 	} else {
 		raw, err := json.Marshal(result)
 		if err != nil {
-			reply.Error = &rpcError{Code: rpcInvalidRequest, Message: "the client could not encode its response"}
+			out.Error = &rpcError{Code: rpcInvalidRequest, Message: "the client could not encode its response"}
 		} else {
-			reply.Result = raw
+			out.Result = raw
 		}
 	}
-	// A write failure here is surfaced by the next call or by the reader
-	// seeing the stream close; nothing waits on this response.
-	_ = c.write(reply)
+	select {
+	case c.replies <- out:
+	default:
+		// The queue is full: the server is asking faster than its own stream
+		// can carry the answers. Dropping is the bounded outcome; the server's
+		// request timeout applies. Blocking here would deadlock the pair.
+	}
+}
+
+// writeReplies is the one goroutine that writes answers to server-initiated
+// requests. It exits when the connection fails or a write fails, so it never
+// outlives the stream.
+func (c *conn) writeReplies() {
+	for {
+		select {
+		case msg := <-c.replies:
+			// A write failure is surfaced by the next call or by the reader
+			// seeing the stream close; nothing waits on this response.
+			if err := c.write(msg); err != nil {
+				return
+			}
+		case <-c.done:
+			return
+		}
+	}
 }
 
 // call sends one request and waits for its response. It holds one of the
@@ -242,10 +299,18 @@ func (c *conn) forget(id int64) bool {
 // write frames and sends one message under the writer lock, charging it
 // against the lifetime byte cap. Exceeding the cap fails the connection: a
 // truncated frame would leave the server mid-message.
+//
+// An outgoing message over the frame bound is refused before the lock and
+// before the accounting: nothing was written, so the stream is still intact
+// and the connection stays usable. The bound is immutable and needs no lock.
 func (c *conn) write(msg message) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return outputInvalid("message cannot be encoded: %v", err)
+	}
+	if int64(len(payload)) > c.maxFrame {
+		return resourceLimit("an outgoing %s message is %d bytes, over the %d-byte frame bound",
+			methodOf(msg), len(payload), c.maxFrame).WithDetail("limit", "max_frame_bytes")
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
@@ -263,7 +328,10 @@ func (c *conn) write(msg message) error {
 }
 
 // fail latches the connection and releases every pending call with err. It
-// is idempotent; the first reason wins.
+// is idempotent; the first reason wins. The latch is what makes close(c.done)
+// happen exactly once, so the close must stay inside this critical section,
+// after the early return: a second close would panic where a second map swap
+// would not.
 func (c *conn) fail(err error) {
 	c.mu.Lock()
 	if c.failure != nil {
@@ -273,6 +341,7 @@ func (c *conn) fail(err error) {
 	c.failure = err
 	pending := c.pending
 	c.pending = make(map[int64]chan reply)
+	close(c.done)
 	c.mu.Unlock()
 	for _, ch := range pending {
 		ch <- reply{err: err}
@@ -284,6 +353,15 @@ func (c *conn) failed() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.failure
+}
+
+// methodOf names an outgoing message for a bounded error message; a response
+// has no method of its own.
+func methodOf(msg message) string {
+	if msg.Method == "" {
+		return "response"
+	}
+	return truncate(msg.Method, 64)
 }
 
 type cancelParams struct {
