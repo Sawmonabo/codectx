@@ -383,18 +383,29 @@ func (c NodeCandidate) Validate() error {
 // supported alternatives that Section 9.4 requires be retained as may_refer_to
 // edges instead of silently picking the first candidate.
 type Resolution struct {
-	Node      Node       `json:"node"`
-	Basis     MatchBasis `json:"basis"`
-	Ambiguous []NodeID   `json:"ambiguous,omitempty"`
+	Node  Node       `json:"node"`
+	Basis MatchBasis `json:"basis"`
+	// CanonicalKey is the canonical_entity_key of Section 9.1 that Node.ID
+	// derives from. The resolver (internal/reconcile) is the single owner of
+	// canonical-key derivation: for a minted identity it computes the key, for
+	// an alias match it returns the key already registered for that node. A
+	// provider copies it into NodeFact.CanonicalKey verbatim; storage rejects a
+	// fact whose ID does not derive from the key it carries.
+	CanonicalKey string   `json:"canonical_key"`
+	Ambiguous    []NodeID `json:"ambiguous,omitempty"`
 }
 
-// Validate enforces the resolution shape and its ambiguity bound.
+// Validate enforces the resolution shape, its canonical key and its ambiguity
+// bound.
 func (r Resolution) Validate() error {
 	if err := r.Node.Validate(); err != nil {
 		return err
 	}
 	if !r.Basis.Valid() {
 		return invalid("resolution.basis %q is not a known match basis", truncateForMessage(string(r.Basis)))
+	}
+	if err := requireField("resolution.canonical_key", r.CanonicalKey, MaxNativeKeyBytes); err != nil {
+		return err
 	}
 	if err := boundCount("resolution.ambiguous", len(r.Ambiguous), MaxAmbiguousCandidates); err != nil {
 		return err
