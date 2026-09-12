@@ -11,9 +11,18 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/cli"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
 )
 
 func main() {
+	// The parser worker re-executes this binary under a hidden argv[1]. It is
+	// dispatched before any flag parsing, logging or configuration so a worker
+	// never inherits parent state or writes to the parent's streams.
+	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
+		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
 	build := model.CurrentBuildInfo()
