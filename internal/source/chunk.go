@@ -82,9 +82,9 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 			// for a newline that may never come.
 			partial = true
 		}
-	} else if n := len(body); n > 0 && body[n-1] != '\n' {
-		partial = true
 	}
+	// A final line without a newline is preserved as it is, not reported as
+	// partial: partial_line means a line was split, and this one was not.
 	if end == 0 {
 		return Chunk{}, invalid("a %d-byte budget cannot make progress at offset %d", maxBytes, windowStart)
 	}

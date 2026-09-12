@@ -500,12 +500,30 @@ func internalError(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
 }
 
-// canceled preserves the context error so callers can distinguish a deadline
-// from a cancellation. Section 22 requires cancellation not to be reported as
-// an unexpected failure.
+// canceled reports a run the caller stopped.
+//
+// The result is joined rather than replaced: errors.Is still recognizes
+// context.Canceled and context.DeadlineExceeded, so a caller can distinguish a
+// deadline from a cancellation, while errors.As still finds a typed
+// *model.Error. That typing is not cosmetic: internal/cli maps an untyped
+// error to the exit-2 usage class, which would report a deliberate
+// cancellation as an invalid command line.
+//
+// Section 22 lists no cancellation family, so this uses the deadline family of
+// the same exit-7 class ("hard query/resource/deadline limit, or explicit
+// incomplete work" in Section 18.2). A dedicated CTX_CANCELED code in
+// internal/model would be more precise; see the Task 3 report.
 func canceled(err error) error {
 	if err == nil {
 		err = context.Canceled
 	}
-	return err
+	typed := &model.Error{
+		Code:        model.CodeQueryDeadline,
+		Message:     "the run was canceled before it completed",
+		Remediation: "run the operation again when it should finish",
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		typed.Message = "the caller's deadline expired before the run completed"
+	}
+	return errors.Join(typed, err)
 }

@@ -70,6 +70,16 @@ func TestCancellationKillsTheProcessTree(t *testing.T) {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("Run reported success for a cancelled child")
+		} else if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run returned %v, want it to unwrap to context.Canceled", err)
+		} else {
+			var typed *model.Error
+			if !errors.As(err, &typed) {
+				// internal/cli reports an untyped error as the exit-2 usage
+				// class, which would label a deliberate cancellation a bad
+				// command line.
+				t.Fatalf("Run returned the untyped %v, want a typed *model.Error", err)
+			}
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return after cancellation")
@@ -158,6 +168,28 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 	want := strings.Join(args, " ") + "\n"
 	if string(result.Stdout) != want {
 		t.Fatalf("child received %q, want %q", result.Stdout, want)
+	}
+
+	// The same run proves the other half of the boundary: a Spec that names no
+	// environment gives the child none. An os/exec Cmd with a nil Env inherits
+	// the parent's, which would hand every analyzer this process's tokens,
+	// proxy settings and paths.
+	requireExecutable(t, "/bin/sh")
+	t.Setenv("CODECTX_TEST_SECRET", "leaked")
+	result, err = runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", `echo "${CODECTX_TEST_SECRET-absent}"`},
+		Dir:            dir,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        30 * time.Second,
+		Grace:          200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if strings.TrimSpace(string(result.Stdout)) != "absent" {
+		t.Fatalf("child saw %q for an unlisted variable, want it absent", result.Stdout)
 	}
 }
 

@@ -204,6 +204,15 @@ func TestPlanChunkBoundaries(t *testing.T) {
 		t.Fatal("PlanChunk accepted an offset inside a UTF-8 sequence")
 	}
 
+	tail := []byte("alpha\nbeta")
+	chunk, err = PlanChunk(tail, 0, uint64(len(tail)), 64)
+	if err != nil {
+		t.Fatalf("PlanChunk on a file without a trailing newline: %v", err)
+	}
+	if chunk.PartialLine || chunk.NextOffset != nil || chunk.Range.End != uint64(len(tail)) {
+		t.Fatalf("chunk = %+v, want the whole file, complete, at end of file", chunk)
+	}
+
 	empty, err := PlanChunk(nil, 0, 0, 64)
 	if err != nil {
 		t.Fatalf("PlanChunk on an empty file: %v", err)

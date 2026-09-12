@@ -139,7 +139,8 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 // TestProjectPermittedFieldsApply proves the permitted half of the trust split
 // actually takes effect: rejecting everything would pass the table above.
 func TestProjectPermittedFieldsApply(t *testing.T) {
-	cfg, err := loadFixture(t, "", "version = 1\n[workspace]\nindex_vendor = true\nmax_files = 1000\n")
+	cfg, err := loadFixture(t, "", "version = 1\n[workspace]\nindex_vendor = true\nmax_files = 1000\n"+
+		"[providers.tree_sitter]\nlanguages = [\"go\"]\n")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -148,5 +149,11 @@ func TestProjectPermittedFieldsApply(t *testing.T) {
 	}
 	if cfg.Workspace.MaxFiles != 1000 {
 		t.Errorf("project workspace.max_files is %d, want 1000", cfg.Workspace.MaxFiles)
+	}
+	// A configured list replaces the default list. If decoding overwrote a
+	// prefix and kept the tail, every fingerprint and every grammar selection
+	// would silently include languages nobody asked for.
+	if got := cfg.Providers.TreeSitter.Languages; len(got) != 1 || got[0] != "go" {
+		t.Errorf("providers.tree_sitter.languages = %v, want exactly [go]", got)
 	}
 }
