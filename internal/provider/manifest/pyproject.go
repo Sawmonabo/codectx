@@ -46,6 +46,10 @@ func (u *unit) pyproject(ctx context.Context) error {
 			} `toml:"poetry"`
 		} `toml:"tool"`
 	}
+	// The pinned decoder has no []byte or zero-copy path: NewDecoder reads
+	// the whole reader and converts it to a string anyway
+	// (toml@v1.6.0 decode.go:162-167), so this single conversion is the
+	// cheapest decode available.
 	if _, err := toml.Decode(string(u.data), &doc); err != nil {
 		u.malformed()
 		return nil

@@ -4,6 +4,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -33,87 +34,11 @@ const (
 	FormatMarkdown    = "markdown"
 )
 
-// languageByExtension is the single path-to-language table of R7-4. The tags
-// for the bundled grammars match tree_sitter.languages in
-// docs/configuration.md so Task 8 selects files by the same spelling.
-var languageByExtension = map[string]string{
-	".go": "go",
-	".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
-	".ts": "typescript", ".mts": "typescript", ".cts": "typescript",
-	".tsx":        "tsx",
-	".py":         "python",
-	".pyi":        "python",
-	".java":       "java",
-	".rs":         "rust",
-	".c":          "c",
-	".h":          "c",
-	".cc":         "cpp",
-	".cpp":        "cpp",
-	".cxx":        "cpp",
-	".hpp":        "cpp",
-	".hh":         "cpp",
-	".hxx":        "cpp",
-	".cs":         "csharp",
-	".rb":         "ruby",
-	".php":        "php",
-	".kt":         "kotlin",
-	".kts":        "kotlin",
-	".swift":      "swift",
-	".scala":      "scala",
-	".sh":         "shell",
-	".bash":       "shell",
-	".sql":        "sql",
-	".proto":      "protobuf",
-	".json":       "json",
-	".yaml":       "yaml",
-	".yml":        "yaml",
-	".toml":       "toml",
-	".xml":        "xml",
-	".md":         "markdown",
-	".markdown":   "markdown",
-	".rst":        "rst",
-	".adoc":       "asciidoc",
-	".asciidoc":   "asciidoc",
-	".txt":        "text",
-	".html":       "html",
-	".css":        "css",
-	".graphql":    "graphql",
-	".gql":        "graphql",
-	".graphqls":   "graphql",
-	".tf":         "terraform",
-	".tfvars":     "terraform",
-	".cmake":      "cmake",
-	".bzl":        "starlark",
-	".gradle":     "groovy",
-	".mk":         "make",
-	".dockerfile": "dockerfile",
-}
-
-// languageByBasename covers files that carry no extension.
-var languageByBasename = map[string]string{
-	"Makefile":        "make",
-	"makefile":        "make",
-	"GNUmakefile":     "make",
-	"Dockerfile":      "dockerfile",
-	"Jenkinsfile":     "groovy",
-	"BUILD":           "starlark",
-	"BUILD.bazel":     "starlark",
-	"WORKSPACE":       "starlark",
-	"WORKSPACE.bazel": "starlark",
-	"MODULE.bazel":    "starlark",
-	"CMakeLists.txt":  "cmake",
-}
-
 // Language returns the language tag for a root-relative path, or "" when the
-// path says nothing. Classification is by extension and basename only: no
-// file is opened to guess, and an unknown path honestly has no language.
-func Language(rel string) string {
-	base := path.Base(rel)
-	if lang, ok := languageByBasename[base]; ok {
-		return lang
-	}
-	return languageByExtension[strings.ToLower(path.Ext(base))]
-}
+// path says nothing. The table itself lives in internal/lang, which is the
+// one place a path becomes a language tag (R7-4); the name is kept here
+// because it is what the analyzer providers call.
+func Language(rel string) string { return lang.Of(rel) }
 
 // byBasename maps exact basenames to their format and node kind.
 var byBasename = map[string]Classification{
@@ -213,12 +138,17 @@ func isCompose(lower string) bool {
 	return strings.HasSuffix(lower, ".yml") || strings.HasSuffix(lower, ".yaml")
 }
 
+// isOpenAPI recognizes an OpenAPI/Swagger description by its basename. The
+// extension is the last one (so `openapi.v3.yaml` is YAML) and the stem is
+// the first dot-component of what remains, so a versioned name is recognized
+// while `myopenapi.yaml` is not.
 func isOpenAPI(lower string) bool {
-	stem, ext, _ := strings.Cut(lower, ".")
-	if stem != "openapi" && stem != "swagger" {
+	ext := path.Ext(lower)
+	if ext != ".yaml" && ext != ".yml" && ext != ".json" {
 		return false
 	}
-	return ext == "yaml" || ext == "yml" || ext == "json"
+	stem, _, _ := strings.Cut(strings.TrimSuffix(lower, ext), ".")
+	return stem == "openapi" || stem == "swagger"
 }
 
 // inADRDirectory reports whether some component of dir is "adr" or "adrs".

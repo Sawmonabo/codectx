@@ -18,9 +18,12 @@ import (
 
 // fixture is the polyglot repository both tests run over: one manifest per
 // supported ecosystem exercising the dependency kinds, explicit workspace
-// inheritance, an unresolved dynamic value and property reference, a
-// malformed manifest, a Markdown document with headings and source links,
-// and a file whose single line is longer than a search chunk.
+// inheritance, an unresolved dynamic value and property reference, a Maven
+// <exclusions> block whose coordinates must not be taken for the enclosing
+// dependency's, a malformed manifest, a Markdown document with headings and
+// source links, a file whose single line is longer than a search chunk, and
+// a multi-line file longer than a chunk so the line-boundary overlap is
+// exercised.
 var fixture = map[string]string{
 	"go.mod":  "module example.com/app\n\ngo 1.27\n\nrequire (\n\tgithub.com/a/b v1.2.3\n\tgithub.com/c/d v0.1.0 // indirect\n)\n\nreplace github.com/a/b => ../b\n",
 	"go.work": "go 1.27\n\nuse (\n\t.\n\t./tools\n)\n",
@@ -56,6 +59,12 @@ var fixture = map[string]string{
       <groupId>com.google.guava</groupId>
       <artifactId>guava</artifactId>
       <version>${guava.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.excluded</groupId>
+          <artifactId>badlib</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
     <dependency>
       <groupId>junit</groupId>
@@ -77,7 +86,10 @@ var fixture = map[string]string{
 	"docs/README.md":    "# Service\n\nSee [go.mod](../go.mod) and [the web app](../web/) or <https://example.com>.\n\n```\n# not a heading\n[nope](../nope.go)\n```\n\n## Usage\n",
 	// One 40001-byte line: the 32 KiB budget falls inside a two-byte rune,
 	// so the split must back off to the rune boundary at 32767.
-	"docs/long.txt":   "x" + strings.Repeat("é", 20000),
+	"docs/long.txt": "x" + strings.Repeat("é", 20000),
+	// 600 lines of 61 bytes = 36600 bytes: over one chunk, and cut on a
+	// line boundary, so consecutive chunks must overlap by whole lines.
+	"docs/wide.txt":   strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing elit sed\n", 600),
 	"assets/logo.bin": "PNG\x00\x00binary",
 }
 
@@ -102,7 +114,12 @@ func newProviders(t *testing.T) (*filesystem.Provider, *manifest.Provider) {
 // node and a `depends_on` edge could reach storage before its endpoints.
 func TestManifestConform(t *testing.T) {
 	_, mf := newProviders(t)
+	paths := make([]string, 0, len(fixture))
 	for path := range fixture {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
 		if manifest.Recognize(path) {
 			providertest.Conform(t, mf, fixture, filesystem.ScopeKey(path), []string{path})
 		}
@@ -116,9 +133,11 @@ func TestManifestConform(t *testing.T) {
 // protects: a dependency kind collapsed by deduplication (react is both
 // runtime and dev), an inherited or dynamic value invented instead of left
 // unresolved, a malformed manifest failing the provider run instead of its
-// own capability, a link or module resolved to the wrong path, and a chunk
-// whose body is not the exact source bytes of its range (wrong chunk bytes
-// is wrong source served).
+// own capability, a link or module resolved to the wrong path, a nested
+// <exclusions> coordinate overwriting the dependency that encloses it, and a
+// chunk whose body is not the exact source bytes of its range or whose
+// overlap with the previous chunk is unbounded or leaves a gap (wrong chunk
+// bytes is wrong source served).
 func TestCanonicalFacts(t *testing.T) {
 	fs, mf := newProviders(t)
 	h := providertest.New(t, fixture)
@@ -140,7 +159,9 @@ func TestCanonicalFacts(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("canonical facts differ:\n--- got\n%s\n--- want\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
-	// Every chunk body must be exactly the bytes of its range.
+	// Every chunk body must be exactly the bytes of its range, and the
+	// chunks of one file must advance with a bounded overlap.
+	chunks := map[string][]model.SearchUnit{}
 	for _, doc := range cap.search {
 		if doc.Kind != model.NodeFile {
 			continue
@@ -151,6 +172,22 @@ func TestCanonicalFacts(t *testing.T) {
 		}
 		if len(doc.Body) > filesystem.ChunkBytes {
 			t.Fatalf("chunk %s [%d,%d) is %d bytes, over the 32 KiB ceiling", doc.Path, doc.Bytes.Start, doc.Bytes.End, len(doc.Body))
+		}
+		chunks[doc.Path] = append(chunks[doc.Path], doc)
+	}
+	for path, docs := range chunks {
+		sort.Slice(docs, func(i, j int) bool { return docs[i].Bytes.Start < docs[j].Bytes.Start })
+		for i := 1; i < len(docs); i++ {
+			prev, cur := docs[i-1], docs[i]
+			if cur.Bytes.Start > prev.Bytes.End || cur.Bytes.End <= prev.Bytes.End {
+				t.Fatalf("chunks %s [%d,%d) and [%d,%d) leave a gap or make no progress",
+					path, prev.Bytes.Start, prev.Bytes.End, cur.Bytes.Start, cur.Bytes.End)
+			}
+			over := fixture[path][cur.Bytes.Start:prev.Bytes.End]
+			if len(over) > filesystem.MaxOverlapBytes || strings.Count(over, "\n") > filesystem.MaxOverlapLines {
+				t.Fatalf("chunks %s [%d,%d) and [%d,%d) overlap by %d bytes / %d lines, over the bound",
+					path, prev.Bytes.Start, prev.Bytes.End, cur.Bytes.Start, cur.Bytes.End, len(over), strings.Count(over, "\n"))
+			}
 		}
 	}
 }
@@ -315,15 +352,17 @@ node directory tools
 node directory web
 node document docs/README.md lang=markdown located {"format":"markdown"}
 node document docs/long.txt lang=text located {"format":"text"}
+node document docs/wide.txt lang=text located {"format":"text"}
 node file Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":75}
 node file assets/logo.bin located {"binary":true,"executable":false,"size":11}
 node file broken/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":23}
 node file crates/core/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":190}
 node file docs/README.md lang=markdown located {"binary":false,"executable":false,"format":"markdown","size":142}
 node file docs/long.txt lang=text located {"binary":false,"executable":false,"format":"text","size":40001}
+node file docs/wide.txt lang=text located {"binary":false,"executable":false,"format":"text","size":35400}
 node file go.mod located {"binary":false,"executable":false,"format":"gomod","size":135}
 node file go.work located {"binary":false,"executable":false,"format":"gowork","size":29}
-node file java/pom.xml lang=xml located {"binary":false,"executable":false,"format":"pom","size":871}
+node file java/pom.xml lang=xml located {"binary":false,"executable":false,"format":"pom","size":1035}
 node file py/pyproject.toml lang=toml located {"binary":false,"executable":false,"format":"pyproject","size":262}
 node file web/package.json lang=json located {"binary":false,"executable":false,"format":"packagejson","size":284}
 node module go:example.com/app lang=go located {"go":"1.27"}
@@ -342,6 +381,7 @@ rel contains directory crates -> directory crates/core syntax
 rel contains directory crates/core -> file crates/core/Cargo.toml syntax
 rel contains directory docs -> file docs/README.md syntax
 rel contains directory docs -> file docs/long.txt syntax
+rel contains directory docs -> file docs/wide.txt syntax
 rel contains directory java -> file java/pom.xml syntax
 rel contains directory py -> file py/pyproject.toml syntax
 rel contains directory web -> file web/package.json syntax
@@ -359,6 +399,7 @@ rel defines file Cargo.toml -> configuration cargo:workspace:Cargo.toml [12,35) 
 rel defines file crates/core/Cargo.toml -> package cargo:core [10,23) syntax
 rel defines file docs/README.md -> document docs/README.md heuristic
 rel defines file docs/long.txt -> document docs/long.txt heuristic
+rel defines file docs/wide.txt -> document docs/wide.txt heuristic
 rel defines file go.mod -> module go:example.com/app [0,22) syntax
 rel defines file go.work -> configuration go:work:go.work syntax
 rel defines file java/pom.xml -> package maven:org.acme:svc syntax
@@ -371,10 +412,10 @@ rel depends_on package cargo:core -> dependency cargo:anyhow [111,123) syntax {"
 rel depends_on package cargo:core -> dependency cargo:cc [181,189) syntax {"kind":"build","requirement":"1"}
 rel depends_on package cargo:core -> dependency cargo:serde [82,110) syntax {"inherited":"workspace","kind":"runtime"}
 rel depends_on package cargo:core -> dependency cargo:tempfile [144,158) syntax {"kind":"dev","requirement":"3"}
-rel depends_on package maven:org.acme:svc -> dependency maven:com.google.guava:guava [323,474) syntax {"kind":"runtime","requirement":"${guava.version}","unresolved":"property"}
-rel depends_on package maven:org.acme:svc -> dependency maven:junit:junit [479,633) syntax {"kind":"test","requirement":"4.13","scope":"test"}
+rel depends_on package maven:org.acme:svc -> dependency maven:com.google.guava:guava [323,638) syntax {"kind":"runtime","requirement":"${guava.version}","unresolved":"property"}
+rel depends_on package maven:org.acme:svc -> dependency maven:junit:junit [643,797) syntax {"kind":"test","requirement":"4.13","scope":"test"}
 rel depends_on package maven:org.acme:svc -> dependency maven:org.acme:parent [34,149) syntax {"kind":"build","requirement":"1.0","role":"parent"}
-rel depends_on package maven:org.acme:svc -> dependency maven:org.projectlombok:lombok [638,841) syntax {"kind":"optional","optional":"true","requirement":"1.18","scope":"provided"}
+rel depends_on package maven:org.acme:svc -> dependency maven:org.projectlombok:lombok [802,1005) syntax {"kind":"optional","optional":"true","requirement":"1.18","scope":"provided"}
 rel depends_on package npm:@acme/web -> dependency npm:fsevents [260,280) syntax {"kind":"optional","requirement":"^2.3.0"}
 rel depends_on package npm:@acme/web -> dependency npm:react [164,182) syntax {"kind":"dev","requirement":"^18.0.0"}
 rel depends_on package npm:@acme/web -> dependency npm:react [97,115) syntax {"kind":"runtime","requirement":"^18.0.0"}
@@ -397,10 +438,10 @@ search dependency crates/core/Cargo.toml [181,189) name=cc qn=cargo:cc
 search dependency crates/core/Cargo.toml [82,110) name=serde qn=cargo:serde
 search dependency go.mod [44,65) name=github.com/a/b qn=go:github.com/a/b
 search dependency go.mod [67,88) name=github.com/c/d qn=go:github.com/c/d
-search dependency java/pom.xml [323,474) name=com.google.guava:guava qn=maven:com.google.guava:guava
+search dependency java/pom.xml [323,638) name=com.google.guava:guava qn=maven:com.google.guava:guava
 search dependency java/pom.xml [34,149) name=org.acme:parent qn=maven:org.acme:parent
-search dependency java/pom.xml [479,633) name=junit:junit qn=maven:junit:junit
-search dependency java/pom.xml [638,841) name=org.projectlombok:lombok qn=maven:org.projectlombok:lombok
+search dependency java/pom.xml [643,797) name=junit:junit qn=maven:junit:junit
+search dependency java/pom.xml [802,1005) name=org.projectlombok:lombok qn=maven:org.projectlombok:lombok
 search dependency py/pyproject.toml [141,149) name=pytest qn=pypi:pytest
 search dependency py/pyproject.toml [179,185) name=ruff qn=pypi:ruff
 search dependency py/pyproject.toml [215,226) name=hatchling qn=pypi:hatchling
@@ -414,15 +455,18 @@ search document docs/README.md [0,0) name=README.md qn=docs/README.md
 search document docs/README.md [0,9) name=Service
 search document docs/README.md [133,141) name=Usage
 search document docs/long.txt [0,0) name=long.txt qn=docs/long.txt
+search document docs/wide.txt [0,0) name=wide.txt qn=docs/wide.txt
 search file Cargo.toml [0,75)
 search file broken/Cargo.toml [0,23)
 search file crates/core/Cargo.toml [0,190)
 search file docs/README.md [0,142)
 search file docs/long.txt [0,32767)
 search file docs/long.txt [32767,40001)
+search file docs/wide.txt [0,32745)
+search file docs/wide.txt [32627,35400)
 search file go.mod [0,135)
 search file go.work [0,29)
-search file java/pom.xml [0,871)
+search file java/pom.xml [0,1035)
 search file py/pyproject.toml [0,262)
 search file web/package.json [0,284)
 search module go.mod [0,22) name=example.com/app qn=go:example.com/app

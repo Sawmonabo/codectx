@@ -23,8 +23,18 @@ type tomlSection struct {
 	first, end int    // line index range of the section body, half open
 }
 
+// maxTOMLLines bounds the layout: one line span is 16 bytes, so a manifest
+// of many very short lines would otherwise amplify max_parse_file_bytes
+// several times over in the unit's heap. Over the cap the layout is empty,
+// and every fact of that manifest carries evidence without a range — the
+// documented degradation, never a guessed range.
+const maxTOMLLines = 200000
+
 func layoutTOML(data []byte) tomlLayout {
 	var l tomlLayout
+	if bytes.Count(data, []byte("\n")) >= maxTOMLLines {
+		return l
+	}
 	for off := 0; off <= len(data); {
 		next := bytes.IndexByte(data[off:], '\n')
 		if next < 0 {
