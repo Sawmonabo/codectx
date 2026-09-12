@@ -187,6 +187,20 @@ func (p *pool) release(w *worker, healthy bool) {
 		return
 	}
 	p.mu.Lock()
+	if !p.live[w] {
+		// The process died during or just after this parse — its own lifetime
+		// timeout, a crash, an external kill — and the run goroutine has
+		// already taken it out of live. Returning it to idle would break
+		// idle ⊆ live, make BusyWorkers negative and hand the next caller a
+		// dead worker, spending on a certain errWorkerGone the single retry a
+		// real parse failure needs. It is still stopped rather than dropped:
+		// that closes the parent's end of its stdin and waits out the reap,
+		// so the run goroutine — and with it the pool's wait-group entry —
+		// completes before this caller moves on.
+		p.mu.Unlock()
+		w.stop(false)
+		return
+	}
 	if p.closed {
 		p.mu.Unlock()
 		w.stop(false)
@@ -298,10 +312,20 @@ func (p *pool) start(ctx context.Context, w *worker) error {
 	}
 	if err != nil {
 		w.stop(true)
-		if w.runErr != nil {
-			// The runner's typed refusal (trust, admission, start failure)
-			// or termination explains the missing hello better than the pipe.
-			return w.runErr
+		// w.result and w.runErr belong to the run goroutine until done
+		// closes, and stop gives up after stopTimeout without that having
+		// happened, so they are read only behind the same guard stderrLine
+		// uses. Reading them on the timed-out branch races the runner.
+		select {
+		case <-w.done:
+			if w.runErr != nil {
+				// The runner's typed refusal (trust, admission, start failure)
+				// or termination explains the missing hello better than the pipe.
+				return w.runErr
+			}
+		default:
+			return &model.Error{Code: model.CodeProviderUnavailable,
+				Message: "the parser worker did not start and did not exit within " + stopTimeout.String() + ": " + err.Error()}
 		}
 		if ctx.Err() != nil {
 			return model.Canceled(ctx.Err())
@@ -525,6 +549,20 @@ type Stats struct {
 func (p *pool) stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// idle ⊆ live, each worker at most once: a worker enters idle only from
+	// release while it is still live, and leaves it with the live map in the
+	// run goroutine. If that ever broke, BusyWorkers would read negative and
+	// acquire would hand out an exited worker. Clamping the number here would
+	// report a plausible figure over a corrupt pool, so the inconsistency is
+	// fatal instead — the cause is the defect, not the arithmetic.
+	if len(p.idle) > len(p.live) {
+		panic(fmt.Sprintf("treesitter: pool invariant broken: %d idle workers, %d live", len(p.idle), len(p.live)))
+	}
+	for _, w := range p.idle {
+		if !p.live[w] {
+			panic("treesitter: pool invariant broken: an idle worker is not live")
+		}
+	}
 	s := Stats{Processes: len(p.live), IdleWorkers: len(p.idle), BusyWorkers: len(p.live) - len(p.idle),
 		WorkersStarted: p.started, WorkersExited: p.exited, Parses: p.parses, Retries: p.retries, ParentRSSBytes: -1}
 	if rss, ok := wire.ResidentBytes(); ok {
