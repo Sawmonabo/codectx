@@ -1,0 +1,6 @@
+# codectx
+/bin/
+/.superpowers/
+/.worktrees/
+*.test
+*.out
