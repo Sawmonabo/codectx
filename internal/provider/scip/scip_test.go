@@ -9,7 +9,9 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -233,7 +235,7 @@ func TestCanonicalFixture(t *testing.T) {
 	got.edge(t, foo.Node.ID, model.RelReads, xa.Node.ID)
 
 	// Import and implementation relationships.
-	fileA := got.byNativeKey(t, "document:pkg/a.go", a.ID)
+	fileA := got.byNativeKey(t, "file:pkg/a.go", a.ID)
 	got.edge(t, fileA.Node.ID, model.RelImports, got.byNativeKey(t, symFmt, "").Node.ID)
 	got.edge(t, got.byNativeKey(t, symC, b.ID).Node.ID, model.RelImplements, got.byNativeKey(t, symI, b.ID).Node.ID)
 
@@ -282,14 +284,47 @@ func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 	files = nil
 	p := newProvider(t, "index.scip")
 
+	// The live heap is sampled for the duration of the run and the peak is
+	// kept: a before/after pair proves nothing, because a buffer that held the
+	// whole document is already garbage by the time the run returns. Sampling
+	// every 5 ms is often enough to catch a peak that lasts as long as a
+	// document walk and rare enough that the stop-the-world of ReadMemStats
+	// does not distort the run. TotalAlloc is deliberately not used: it counts
+	// bytes allocated over time, which a correct streaming decoder also grows.
 	runtime.GC()
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+	var peak atomic.Uint64
+	peak.Store(base.HeapAlloc)
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		var m runtime.MemStats
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				runtime.ReadMemStats(&m)
+				for seen := peak.Load(); m.HeapAlloc > seen; seen = peak.Load() {
+					if peak.CompareAndSwap(seen, m.HeapAlloc) {
+						break
+					}
+				}
+			}
+		}
+	}()
 	got, result := run(t, h, p, scip.ImportScope("index.scip"), []string{"index.scip", "big.go"})
-	runtime.ReadMemStats(&after)
+	close(done)
+	<-stopped
 
 	if result.BytesProcessed != uint64(2*indexLen) {
 		t.Fatalf("processed %d index bytes, want %d (two full streaming passes); bytes were skipped", result.BytesProcessed, 2*indexLen)
+	}
+	if len(result.Capabilities) == 0 {
+		t.Fatal("the run reported no capability states")
 	}
 	if result.Capabilities[0].DiagnosticCode != model.CodeSourceBindingUnverified {
 		t.Fatalf("a document whose text is not the captured file must be unverified, got %+v", result.Capabilities[0])
@@ -297,11 +332,11 @@ func TestStreamedLargeDocumentBoundedHeap(t *testing.T) {
 	if len(got.nodes) < 2 || len(got.relations) < 1 {
 		t.Fatalf("large document yielded %d nodes and %d relations; occurrences were lost", len(got.nodes), len(got.relations))
 	}
-	growth := int64(after.HeapSys) - int64(before.HeapSys)
+	growth := int64(peak.Load()) - int64(base.HeapAlloc)
 	if growth > textBytes/2 {
-		t.Fatalf("heap grew by %d bytes while walking a %d-byte document; the document was materialized", growth, textBytes)
+		t.Fatalf("live heap peaked %d bytes above the baseline while walking a %d-byte document; the document was materialized", growth, textBytes)
 	}
-	t.Logf("heap growth %d bytes for a %d-byte document with %d occurrences", growth, textBytes, occurrences)
+	t.Logf("peak live heap %d bytes above baseline for a %d-byte document with %d occurrences", growth, textBytes, occurrences)
 }
 
 // bigIndex hand-encodes one SCIP index: metadata, then a single document

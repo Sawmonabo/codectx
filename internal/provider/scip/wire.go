@@ -116,9 +116,18 @@ func (r *reader) length() (int64, error) {
 // sub charges n bytes to r and returns a reader confined to exactly them. The
 // caller finishes it with discard so the parent's position stays correct
 // whatever the nested message contained.
-func (r *reader) sub(n int64) *reader {
+//
+// n is checked against what is left of the enclosing message: a fixed-width
+// field cut from a message with fewer bytes left would otherwise drive
+// remaining negative and desynchronize every later field of that message,
+// which is how a malformed index turns into wrong facts rather than a
+// refusal.
+func (r *reader) sub(n int64) (*reader, error) {
+	if n < 0 || n > r.remaining {
+		return nil, malformed("a nested field is longer than the message that holds it")
+	}
 	r.remaining -= n
-	return &reader{src: r.src, remaining: n, consumed: r.consumed}
+	return &reader{src: r.src, remaining: n, consumed: r.consumed}, nil
 }
 
 // discard drops whatever remains of this reader's message in bounded chunks.
@@ -184,25 +193,25 @@ func (r *reader) skip(wt wireType) error {
 		_, err := r.varint()
 		return err
 	case wireFixed64:
-		return r.sub(8).discardChecked()
+		return r.discardSub(8)
 	case wireFixed32:
-		return r.sub(4).discardChecked()
+		return r.discardSub(4)
 	default:
 		n, err := r.length()
 		if err != nil {
 			return err
 		}
-		return r.sub(n).discard()
+		return r.discardSub(n)
 	}
 }
 
-// discardChecked is discard for a fixed-width field, which must be present in
-// full.
-func (r *reader) discardChecked() error {
-	if r.remaining < 0 {
-		return malformed("message ends inside a fixed-width field")
+// discardSub drops the next n bytes of this message as one nested field.
+func (r *reader) discardSub(n int64) error {
+	sub, err := r.sub(n)
+	if err != nil {
+		return err
 	}
-	return r.discard()
+	return sub.discard()
 }
 
 // ints reads a repeated int32 field: packed (a length-delimited run of
@@ -225,7 +234,10 @@ func (r *reader) ints(wt wireType, out []int32, max int) ([]int32, error) {
 	if err != nil {
 		return out, err
 	}
-	sub := r.sub(n)
+	sub, err := r.sub(n)
+	if err != nil {
+		return out, err
+	}
 	for !sub.done() {
 		v, err := sub.varint()
 		if err != nil {

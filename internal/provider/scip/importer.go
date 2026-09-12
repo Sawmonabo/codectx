@@ -18,6 +18,13 @@ import (
 // supplied index, a private run file for a profile's output.
 type opener func(context.Context) (io.ReadCloser, int64, error)
 
+// fileNativeKey is the workspace-scoped native key prefix of a file node. It
+// is the filesystem provider's key for the same node (R7-2), repeated here
+// because that provider lives in another wave worktree; after the wave merges
+// it and the candidate in enclosingNode consolidate into one shared file-node
+// helper beside filesystem.PathCandidate.
+const fileNativeKey = "file:"
+
 // importer runs one unit. The import is two passes over the index plus one
 // binding pre-pass, all streaming:
 //
@@ -47,6 +54,14 @@ type importer struct {
 	// ctx is the run context, carried for the walker's document callback,
 	// which takes none.
 	ctx context.Context
+
+	// indexHash is the SHA-256 of the index bytes being imported, which a
+	// supplied manifest must commit to; manifestUsable records whether the
+	// supplied manifest proved to be a verification rather than an assertion.
+	indexHash      string
+	manifestUsable bool
+	// manifestSHA is the digest of the input manifest a profile run wrote.
+	manifestSHA string
 
 	release    func()
 	reserved   int64
@@ -134,12 +149,14 @@ func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceB
 				verified++
 				return nil
 			}
-			var hash string
-			if found, err := im.sc.row(ctx, `SELECT hash FROM manifest WHERE path = ?`, []any{d.path}, &hash); err != nil {
-				return err
-			} else if found && hash == fv.ContentHash {
-				verified++
-				return nil
+			if im.manifestUsable {
+				var hash string
+				if found, err := im.sc.row(ctx, `SELECT hash FROM manifest WHERE path = ?`, []any{d.path}, &hash); err != nil {
+					return err
+				} else if found && hash == fv.ContentHash {
+					verified++
+					return nil
+				}
 			}
 			unverified++
 			return nil
@@ -192,6 +209,17 @@ func (im *importer) reserve(ctx context.Context, n int64) error {
 	return nil
 }
 
+// decorate names the profile run behind a failure. A profile unit's
+// diagnostics have to carry the declared network posture and the digest of
+// the input manifest that binds the run, because the manifest file itself
+// dies with the run directory.
+func (im *importer) decorate(err error) error {
+	if im.profile == nil {
+		return err
+	}
+	return im.p.profileError(*im.profile, im.manifestSHA, err)
+}
+
 func (im *importer) close() {
 	if im.release != nil {
 		im.release()
@@ -215,9 +243,22 @@ func (im *importer) lookup(ctx context.Context, p string) (model.FileVersion, bo
 	return out, found, err
 }
 
-// loadManifest streams the supplied input-hash manifest (`<sha256>  <path>`
-// lines) into the scratch table. Its lines are bounded and the file is a
-// snapshot input like the index itself.
+// loadManifest streams the supplied input-hash manifest into the scratch
+// table and decides whether it verifies anything at all. Its lines are
+// bounded and the file is a snapshot input like the index itself.
+//
+// A bare list of `<sha256>  <path>` lines is a user assertion, not a
+// verification: nothing ties it to the index being imported, so the same list
+// would "prove" any index. A supplied manifest therefore qualifies only when
+//
+//   - its first line is the v1 header and its second names the SHA-256 of the
+//     exact index bytes this unit is importing, and
+//   - every row names a file the snapshot holds at exactly that content hash.
+//
+// Anything else leaves manifestUsable false, so the manifest proves nothing
+// and the binding falls back to embedded text: unverified rather than
+// exact, never a hard failure, because a manifest that does not describe this
+// snapshot is an ordinary discovery import (Section 11.4).
 func (im *importer) loadManifest(ctx context.Context) error {
 	fv, ok, err := im.lookup(ctx, im.p.manifestPath)
 	if err != nil {
@@ -236,25 +277,53 @@ func (im *importer) loadManifest(ctx context.Context) error {
 	defer rc.Close()
 	sc := bufio.NewScanner(rc)
 	sc.Buffer(make([]byte, 0, 4096), model.IDHexLen+2+model.MaxPathBytes)
+	var lineNo, rows int
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
+		lineNo++
+		switch lineNo {
+		case 1:
+			if line != manifestHeader {
+				return nil
+			}
+			continue
+		case 2:
+			declared, ok := strings.CutPrefix(line, manifestIndexLine)
+			if declared = strings.TrimSpace(declared); !ok || declared != im.indexHash {
+				return nil
+			}
+			continue
+		}
 		hash, rest, ok := strings.Cut(line, " ")
 		if !ok || !model.ValidHexID(hash) {
-			return malformed("input-hash manifest line is not `<sha256>  <path>`")
+			return nil
+		}
+		listed := strings.TrimLeft(rest, " ")
+		pinned, found, err := im.lookup(ctx, listed)
+		if err != nil {
+			return err
+		}
+		if !found || pinned.ContentHash != hash {
+			return nil
 		}
 		if err := im.sc.charge(int64(len(line))); err != nil {
 			return err
 		}
-		if err := im.sc.exec(ctx, `INSERT OR REPLACE INTO manifest(path, hash) VALUES(?, ?)`, strings.TrimLeft(rest, " "), hash); err != nil {
+		if err := im.sc.exec(ctx, `INSERT OR REPLACE INTO manifest(path, hash) VALUES(?, ?)`, listed, hash); err != nil {
 			return err
 		}
+		rows++
 	}
 	if err := sc.Err(); err != nil {
 		return malformed("input-hash manifest cannot be read: " + err.Error())
 	}
+	if lineNo < 2 || rows == 0 {
+		return nil
+	}
+	im.manifestUsable = true
 	return nil
 }
 
@@ -710,15 +779,22 @@ func (im *importer) enclosingNode(ctx context.Context, ds *docSource, rng *model
 	if node != "" {
 		return model.NodeID(node), nil
 	}
-	// The file node this provider owns for a document: keyed on the path and
-	// the pinned file, with the whole file as its evidence range.
+	// The file node a file-level occurrence points out of. The candidate is
+	// the one the filesystem provider publishes for the same path — a
+	// workspace-scoped `file:<path>` alias, no defining file and no range — so
+	// resolving it against that declared dependency adopts the identity that
+	// already exists instead of minting a second file node for one path. It
+	// carries no Language because the language of a path is internal/lang,
+	// which Task 7 owns and this worktree does not hold; deriving it here
+	// would be a parallel implementation that drifts. Language is a
+	// publishing unit's own attribute, so omitting it changes no identity.
 	end, err := ds.cur.PositionAt(uint64(len(ds.data)))
 	if err != nil {
 		return "", err
 	}
 	whole := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1, Column: 0}, End: end}
-	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: "file:" + ds.doc.path, NativeKey: "document:" + ds.doc.path, Kind: model.NodeFile,
-		Language: ds.doc.language, Name: path.Base(ds.doc.path), QualifiedName: ds.doc.path, FileID: ds.doc.file.ID, ContentHash: ds.doc.file.ContentHash}
+	cand := model.NodeCandidate{ProviderID: ID, ScopeKey: provider.ScopeWorkspace, NativeKey: fileNativeKey + ds.doc.path,
+		Kind: model.NodeFile, Name: path.Base(ds.doc.path), QualifiedName: ds.doc.path}
 	res, err := im.req.Resolver.Resolve(ctx, cand)
 	if err != nil {
 		return "", err
@@ -741,11 +817,19 @@ func (im *importer) passRelationships(ctx context.Context) error {
 		start, end        int64
 	}
 	var rows []relRow
+	var afterDoc int64 = -1
 	var after string
+	// Rows are ordered by the document that holds the source symbol's
+	// definition, so consecutive rows share a document and its pinned bytes
+	// are read once per pass rather than once per relationship row. The
+	// keyset cursor is the compound (def_doc, key, target) the order is over;
+	// a cursor over the key alone would skip or repeat rows under it.
+	var ds *docSource
 	for {
 		rows = rows[:0]
 		err := im.sc.each(ctx, `SELECT r.key, r.target, r.flags, s.node, s.def_doc, s.def_start, s.def_end FROM rel r JOIN sym s ON s.key = r.key
-			WHERE s.node <> '' AND s.def_doc >= 0 AND r.key || char(0) || r.target > ? ORDER BY r.key, r.target LIMIT 256`, []any{after},
+			WHERE s.node <> '' AND s.def_doc >= 0 AND (s.def_doc > ? OR (s.def_doc = ? AND r.key || char(0) || r.target > ?))
+			ORDER BY s.def_doc, r.key, r.target LIMIT 256`, []any{afterDoc, afterDoc, after},
 			func(scan func(...any) error) error {
 				var r relRow
 				if err := scan(&r.key, &r.target, &r.flags, &r.node, &r.docIdx, &r.start, &r.end); err != nil {
@@ -761,18 +845,20 @@ func (im *importer) passRelationships(ctx context.Context) error {
 			return nil
 		}
 		for _, r := range rows {
-			after = r.key + "\x00" + r.target
-			d, ok, err := im.docByIndex(ctx, r.docIdx)
-			if err != nil {
-				return err
+			afterDoc, after = r.docIdx, r.key+"\x00"+r.target
+			if ds == nil || ds.doc.idx != r.docIdx {
+				d, ok, err := im.docByIndex(ctx, r.docIdx)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return internal("scip scratch names a document that was never recorded")
+				}
+				if ds, err = im.loadSource(ctx, d); err != nil {
+					return err
+				}
 			}
-			if !ok {
-				return internal("scip scratch names a document that was never recorded")
-			}
-			ds, err := im.loadSource(ctx, d)
-			if err != nil {
-				return err
-			}
+			d := ds.doc
 			start, err := ds.cur.PositionAt(uint64(r.start))
 			if err != nil {
 				return err
@@ -879,6 +965,12 @@ func (im *importer) result() model.ProviderResult {
 	if im.partialCode != "" {
 		state = model.CapabilityPartial
 	}
+	// The run state stays succeeded even when a capability is partial:
+	// provider.RunUnit admits only a succeeded result ("only a succeeded unit
+	// is admitted") and fails the unit otherwise, so reporting RunPartial
+	// here would make every unverified import unsealable — the opposite of
+	// Section 11.4's "importable for discovery". Degradation is reported
+	// through the capability states below, which is the channel that exists.
 	r := model.ProviderResult{RunID: im.req.Run, State: model.RunSucceeded, RecordsEmitted: im.records, BytesProcessed: im.indexBytes}
 	for _, c := range capabilities {
 		r.Capabilities = append(r.Capabilities, model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode})

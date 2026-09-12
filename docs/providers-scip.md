@@ -7,7 +7,7 @@ decoder.
 | Input | Unit scope key | Source binding |
 |---|---|---|
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
-| An approved installed indexer profile (`[analyzers.scip-go]`, `[analyzers.scip-typescript]`, `[analyzers.scip-java]`) run by codectx against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction; the run records a captured input-hash manifest |
+| An approved installed indexer profile (`[analyzers.scip-go]`, `[analyzers.scip-typescript]`, `[analyzers.scip-java]`) run by codectx against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
 The descriptor is `scip`, version `1`, capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
@@ -16,12 +16,20 @@ The descriptor is `scip`, version `1`, capabilities `precise_definitions`,
 
 ## Coordinator contract
 
+The coordinator of Section 11.1 (Task 12, `internal/app`) is the consumer of
+every exported name here: `scip.New`, `Descriptor`, `Detect`,
+`Scopes`/`ImportScope`/`ProfileScope`, `Verify` and `IndexUnit`. Nothing else
+in the tree calls them until that coordinator exists.
+
 - `Detect` inspects declared inputs only through the confined root: the
   import path, and the trigger manifests of each profile (`go.mod`;
   `package.json`/`tsconfig.json`; `pom.xml`/`build.gradle`/`build.gradle.kts`)
   together with the profile executable's existence. It never runs a tool.
   Nothing usable is `CTX_PROVIDER_UNAVAILABLE`.
-- `Scopes(detection)` lists the unit scope keys to plan.
+- `Scopes(detection)` lists the unit scope keys to plan. A profile whose
+  executable is not installed plans no unit, and `runProfile` refuses with
+  `CTX_PROVIDER_UNAVAILABLE` before anything is materialized, so a missing
+  tool never costs a snapshot materialization or a failed unit.
 - `Verify(ctx, view, scopeKey)` decides `UnitBuild.SourceBinding` before the
   unit is opened. `IndexUnit` repeats the check and reports it in its
   capability states, so a unit opened as verified whose index is not is
@@ -80,14 +88,37 @@ these bytes and does not); under an unverified binding it is skipped and
 counted.
 
 A document proves its bytes by embedded `text` whose SHA-256 equals the
-pinned content hash, or by a matching line in the supplied manifest
-(`<sha256>  <root-relative path>`, one per line). A supplied index is
-`verified` only when at least one document is proven and none fails; an
-index with no proven document is `unverified`. Unverified facts are still
-published for discovery, but the unit carries `source_binding=unverified`,
-every node's metadata says `"source_binding":"unverified"`, and every
-capability is `partial` with `CTX_SOURCE_BINDING_UNVERIFIED`. Project root,
-matching paths, timestamps and tool versions prove nothing.
+pinned content hash, or by a matching row of a **qualifying** input-hash
+manifest.
+
+A bare list of `<sha256>  <path>` lines does not qualify. Nothing in such a
+list ties it to the index being imported, so the same list would "prove" any
+index at all: it is a user assertion, not a verification. A supplied manifest
+verifies only when
+
+```
+codectx-scip-manifest v1
+index-sha256 <hex sha256 of the exact .scip bytes being imported>
+<sha256>  <root-relative path>
+...
+```
+
+its first line is that header, its second names the SHA-256 of the exact index
+bytes this unit imports, and **every** row names a file the snapshot holds at
+exactly that content hash. A manifest that fails any of these proves nothing:
+the import continues with `CTX_SOURCE_BINDING_UNVERIFIED`, it is never a hard
+failure. A codectx-invoked profile writes exactly this format.
+
+Verification is decided over the documents that name snapshot files. A
+document whose `relative_path` the snapshot does not hold abstains: it neither
+proves nor disproves the binding, and it is skipped and counted when facts are
+emitted. A supplied index is `verified` only when at least one in-snapshot
+document is proven and none of them fails; an index with no proven document is
+`unverified`. Unverified facts are still published for discovery, but the unit
+carries `source_binding=unverified`, every node's metadata says
+`"source_binding":"unverified"`, and every capability is `partial` with
+`CTX_SOURCE_BINDING_UNVERIFIED`. Project root, matching paths, timestamps and
+tool versions prove nothing.
 
 ## Identity and alias scopes (ruling R9-1)
 
@@ -99,7 +130,7 @@ Every node goes through `req.Resolver`; the provider copies
 | `local N` | `file:<path>` | located (file + definition range), no qualified name |
 | global | `pkg:<manager> <package-name> <version>` from the symbol's package descriptor | located; qualified name = the raw descriptor string (`pkg/Foo().`) |
 | symbol never defined in the index (external) | as above | unlocated: structural key over scope, qualified name, kind; metadata `"scip_external":true`; evidence is the referencing occurrence |
-| the provider's per-document file node | `file:<path>`, native key `document:<path>` | kind `file`, qualified name = path, evidence `[0, size)` |
+| the file node a file-level occurrence points out of | `workspace`, native key `file:<path>` | exactly the filesystem provider's file candidate: kind `file`, name `path.Base`, qualified name = path, no defining file, no range, no language. Resolving it against the declared `filesystem` dependency adopts that provider's identity instead of minting a second file node for one path; SCIP's own evidence row (`[0, size)` of the pinned file) stays on it |
 
 Name is `display_name`, else the last descriptor's name. Signature is
 `signature_documentation.text` when it fits the signature ceiling.
@@ -145,8 +176,17 @@ references bind to; a later definition keeps its own located identity.
 `resources.max_provider_record_bytes` (4 MiB); 1,000,000 documents; 4,000,000
 occurrences per document; 4 GiB spooled; one source file 5 MiB (a larger file
 is skipped, `partial` with `CTX_RESOURCE_LIMIT`); materialization 4 GiB;
-manifest 64 MiB. The record buffer is charged against the sink's byte pool
-through `Reserve` when the sink offers it.
+manifest 64 MiB.
+
+The record buffer — the only buffer sized by untrusted index bytes — is
+charged against the sink's byte pool through `Reserve` when the sink offers
+it. One document's source bytes are **not** charged: `BatchSink.Reserve`
+refuses a reservation above `resources.max_provider_record_bytes` (4 MiB),
+while a source file is bounded by `MaxSourceFileBytes` (5 MiB), so the charge
+is impossible for exactly the largest case. At most one document's source is
+held at a time, so a unit retains up to `MaxSourceFileBytes` (5 MiB) outside
+the pool's accounting, on top of the pool's own budget. That buffer is sized
+by the pinned snapshot file, whose size is checked before the read.
 
 ## Profiles (ruling R9-2: unverified against a real tool)
 
@@ -161,16 +201,46 @@ executed through the shared `internal/process` runner with an argv array
 only (ruling R9-3: no shell anywhere), with the typed substitutions
 `${input_dir}` (the materialization root, also the working directory),
 `${output_file}` (a private file under the run directory), `${work_dir}` and
-`${manifest}` (the captured `<sha256>  <path>` manifest of every
-materialized file). The child environment is exactly the allowlisted
-variables. The run is bounded by the smaller of the profile timeout and
+`${manifest}`, applied in a fixed order so one configuration always yields one
+argv. The child environment is exactly the allowlisted variables.
+
+`${manifest}` is the path codectx writes the run's input manifest to. That
+file is written **after** the tool exits, because its second line commits to
+the SHA-256 of the index the tool produced, so a tool cannot read it during
+its own run; the placeholder is still substituted because an unsubstituted one
+would reach the child as the literal text `${manifest}`. The run is bounded by the smaller of the profile timeout and
 `providers.scip.timeout`, by the profile's memory and disk budgets, and by 1
 MiB of captured output per stream. After the run the output must be a
 regular file within `MaxIndexBytes`, its metadata must name the profile's
 tool, and the tool version must satisfy `version_constraint` (an exact
 version or space-separated comparators such as `>=0.1.20 <0.2.0`); a
-mismatch is `CTX_TRUST_REQUIRED`. A configured `checksum` is verified against
-the executable before it runs.
+mismatch is `CTX_TRUST_REQUIRED`. A profile with no `version_constraint` is
+refused outright: an unconstrained tool is not an approval.
+
+Once the run has produced its index, codectx writes the run's input manifest
+under the run directory in the v1 format above — including the SHA-256 of the
+index the run just produced, which is why it cannot be written before the run.
+The file dies with the run directory; the durable records are the manifest's
+own digest, reported as `input_manifest_sha256` on every diagnostic this path
+returns, and `UnitSpec.InputHash`, which the coordinator computes over the
+unit's declared inputs.
+
+**Executable trust.** A configured `checksum` is verified against the
+executable immediately before it runs. A profile **without** a `checksum` runs
+whatever binary is at the configured path at that moment: the absolute path is
+the whole of the approval. Even with a checksum, the digest is computed by
+reading the file and the kernel then executes the path again, so a writable
+path can be swapped between the hash and the `execve` (a time-of-check to
+time-of-use window). Approve tools at paths only a trusted account can write,
+and prefer a `checksum` so an ordinary substitution is detected.
+
+**Network.** `network` is a **declared posture that codectx records and does
+not enforce**. There is no sandbox behind it: an indexer run under
+`network = "denied"` can still reach the network, because resolving
+dependencies is what several of these tools do. The value is the posture the
+profile was approved under; it is carried on every diagnostic the profile path
+returns (`network=<value>`) so a report says what was approved, and
+`network = "allowed"` is the user's explicit opt-in, never a refusal.
 
 ```toml
 [analyzers.scip-go]

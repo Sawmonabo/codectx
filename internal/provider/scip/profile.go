@@ -1,9 +1,11 @@
 package scip
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -44,49 +46,85 @@ type Profile struct {
 }
 
 // profiles keeps the approved analyzers whose name is a known SCIP indexer
-// kind, sorted by name. Analyzers with other names belong to other providers
-// and are ignored here.
-func profiles(all []config.Analyzer) []Profile {
+// kind, in the order given (config.SortedAnalyzers sorts by name). Analyzers
+// with other names belong to other providers and are ignored here.
+//
+// An empty version constraint is refused rather than defaulted: satisfies("")
+// accepts every version, so an unconstrained profile would admit output from
+// any build of the tool as approved. config.validateAnalyzers already refuses
+// it for a loaded configuration; this is the same refusal at the boundary a
+// programmatic Options.Analyzers crosses, because the check it guards is a
+// trust decision.
+func profiles(all []config.Analyzer) ([]Profile, error) {
 	var out []Profile
 	for _, a := range all {
-		if kind, ok := profileKinds[a.Name]; ok {
-			out = append(out, Profile{Analyzer: a, kind: kind})
+		kind, ok := profileKinds[a.Name]
+		if !ok {
+			continue
 		}
+		if strings.TrimSpace(a.VersionConstraint) == "" {
+			return nil, invalid("scip profile " + a.Name + " has no version constraint; an unconstrained tool is not an approval")
+		}
+		out = append(out, Profile{Analyzer: a, kind: kind})
 	}
-	return out
+	return out, nil
 }
 
-// run executes one approved profile against a private materialization of the
-// snapshot and returns the path of the validated index it produced. The
-// caller owns runDir and removes it on every path; the index is inside it.
+// substitutions are the typed argv placeholders of a profile, in a fixed
+// order. An ordered slice rather than a map: map iteration order is random,
+// and the argv a profile is run with must be a deterministic function of its
+// configuration (Section 6). The names do not prefix one another, so a single
+// pass over them is exact.
+type substitution struct{ name, value string }
+
+// runProfile executes one approved profile against a private materialization
+// of the snapshot and returns the path of the validated index it produced and
+// the SHA-256 of the input manifest that binds the run. The caller owns runDir
+// and removes it on every path; the index and the manifest are inside it.
 //
 // The tool sees exactly: the materialized snapshot files as its working
 // directory, the typed argv substitutions, the allowlisted environment
-// variables and nothing else. There is no shell (ruling R9-3). The captured
-// input-hash manifest of the materialized files is written beside the output
-// as the record of what the tool analyzed.
-func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string) (string, error) {
+// variables and nothing else. There is no shell (ruling R9-3).
+//
+// The input manifest is written after the run, because its first lines commit
+// to the SHA-256 of the index the run produced and that digest does not exist
+// until the tool has written it. The manifest file dies with runDir; its own
+// digest is the durable record and is carried on every diagnostic this path
+// returns. The unit's durable binding is UnitSpec.InputHash, which the
+// coordinator computes over the declared inputs.
+func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string) (indexPath, manifestSHA string, err error) {
 	if p.runner == nil {
-		return "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"}
+		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"})
+	}
+	// The executable is checked before anything is materialized: a profile
+	// whose tool is not installed is honest absence, not a unit that fails
+	// after copying the whole snapshot to disk.
+	if !executableInstalled(prof.Executable) {
+		return "", "", p.profileError(prof, "", (&model.Error{Code: model.CodeProviderUnavailable,
+			Message: "scip profile " + prof.Name + " is configured but " + prof.Executable + " is not an installed executable"}).
+			WithRemediation("Install the indexer at the approved path or remove the profile."))
 	}
 	if err := checkExecutable(prof.Analyzer); err != nil {
-		return "", err
+		return "", "", p.profileError(prof, "", err)
 	}
 	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes})
 	if err != nil {
-		return "", err
+		return "", "", p.profileError(prof, "", err)
 	}
 	defer mat.Close()
-	manifestPath := filepath.Join(runDir, "inputs.manifest")
-	if err := writeManifest(ctx, view, manifestPath); err != nil {
-		return "", err
-	}
 	output := filepath.Join(runDir, "index.scip")
-	subs := map[string]string{"input_dir": mat.Root(), "output_file": output, "work_dir": runDir, "manifest": manifestPath}
+	manifestPath := filepath.Join(runDir, "inputs.manifest")
+	// Every name in config.AnalyzerSubstitutions is substituted, including
+	// ${manifest}: an unsubstituted placeholder reaches the child as a literal
+	// argument, which is exactly the silent misdirection that closed set
+	// exists to prevent. ${manifest} is the path codectx writes the run's
+	// input manifest to once the run is over, so a tool cannot read it during
+	// its own run; see the note in the report on retiring it.
+	subs := []substitution{{"input_dir", mat.Root()}, {"output_file", output}, {"work_dir", runDir}, {"manifest", manifestPath}}
 	args := make([]string, 0, len(prof.Args))
 	for _, a := range prof.Args {
-		for name, value := range subs {
-			a = strings.ReplaceAll(a, "${"+name+"}", value)
+		for _, sub := range subs {
+			a = strings.ReplaceAll(a, "${"+sub.name+"}", sub.value)
 		}
 		args = append(args, a)
 	}
@@ -107,22 +145,66 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		MemoryReservationBytes: prof.MemoryBudgetBytes, DiskReservationBytes: prof.DiskBudgetBytes,
 	})
 	if err != nil {
-		return "", err
+		return "", "", p.profileError(prof, "", err)
 	}
 	// The output must be a regular file the tool wrote inside the run
 	// directory, within the index bound. A symlink is refused: the decoder
 	// would otherwise read whatever it points at as the tool's output.
 	info, err := os.Lstat(output)
 	if err != nil {
-		return "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.kind.tool + " produced no index at its output path"}
+		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.kind.tool + " produced no index at its output path"})
 	}
 	if !info.Mode().IsRegular() {
-		return "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.kind.tool + " output is not a regular file"}
+		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.kind.tool + " output is not a regular file"})
 	}
 	if info.Size() > p.limits.MaxIndexBytes {
-		return "", overLimit("index bytes", info.Size(), p.limits.MaxIndexBytes)
+		return "", "", p.profileError(prof, "", overLimit("index bytes", info.Size(), p.limits.MaxIndexBytes))
 	}
-	return output, nil
+	indexSHA, err := fileSHA256(output)
+	if err != nil {
+		return "", "", p.profileError(prof, "", err)
+	}
+	manifestSHA, err = writeManifest(ctx, view, manifestPath, indexSHA)
+	if err != nil {
+		return "", "", p.profileError(prof, "", err)
+	}
+	return output, manifestSHA, nil
+}
+
+// profileError carries the run-level facts a profile diagnostic must name:
+// the declared network posture (config.Analyzer.Network is a posture codectx
+// records and does not enforce, so a diagnostic has to say which posture the
+// run was approved under) and, once it exists, the digest of the input
+// manifest that binds the run to its inputs.
+//
+// model.Error.Details is the only run-level diagnostic channel the frozen
+// provider contract offers: model.CapabilityState carries a diagnostic code
+// and nothing else, and model.ProviderResult carries no details at all. See
+// the report's "Shared-helper changes needed".
+func (p *Provider) profileError(prof Profile, manifestSHA string, err error) error {
+	var typed *model.Error
+	if !errors.As(err, &typed) {
+		return err
+	}
+	typed = typed.WithDetail("profile", prof.Name).WithDetail("network", string(prof.Network))
+	if manifestSHA != "" {
+		typed = typed.WithDetail("input_manifest_sha256", manifestSHA)
+	}
+	return typed
+}
+
+// fileSHA256 is the lowercase hex SHA-256 of a file this provider produced.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", internal("scip index digest: " + err.Error())
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", internal("scip index digest: " + err.Error())
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 const (
@@ -154,28 +236,51 @@ func checkExecutable(a config.Analyzer) error {
 	return nil
 }
 
-// writeManifest records the content hash of every materialized file, one
-// `<sha256>  <path>` line per file in manifest order, streaming from the
-// snapshot view so no file list is held.
-func writeManifest(ctx context.Context, view model.SnapshotView, path string) error {
+// Input-manifest format (v1). A manifest is a claim about which bytes an
+// index describes, so it has to commit to the index as well as to the files:
+// without the index digest the same list of file hashes would "verify" any
+// index at all, which is an assertion and not a verification.
+//
+//	codectx-scip-manifest v1
+//	index-sha256 <hex>
+//	<sha256>  <root-relative path>
+//	...
+const (
+	manifestHeader    = "codectx-scip-manifest v1"
+	manifestIndexLine = "index-sha256 "
+)
+
+// writeManifest records the run's inputs in the v1 format: the digest of the
+// index the run produced, then the content hash of every materialized file,
+// one line per file in manifest order, streaming from the snapshot view so no
+// file list is held. It returns the SHA-256 of the manifest bytes, which
+// therefore commits to both the index and every input.
+func writeManifest(ctx context.Context, view model.SnapshotView, path, indexSHA string) (string, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return internal("scip manifest: " + err.Error())
+		return "", internal("scip manifest: " + err.Error())
 	}
-	err = view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
-		if fv.Status == model.FileDeleted {
-			return nil
-		}
-		_, err := fmt.Fprintf(f, "%s  %s\n", fv.ContentHash, fv.Path)
-		return err
-	})
+	h := sha256.New()
+	w := bufio.NewWriter(io.MultiWriter(f, h))
+	if _, err = fmt.Fprintf(w, "%s\n%s%s\n", manifestHeader, manifestIndexLine, indexSHA); err == nil {
+		err = view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+			if fv.Status == model.FileDeleted {
+				return nil
+			}
+			_, err := fmt.Fprintf(w, "%s  %s\n", fv.ContentHash, fv.Path)
+			return err
+		})
+	}
+	if err == nil {
+		err = w.Flush()
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		return internal("scip manifest: " + err.Error())
+		return "", internal("scip manifest: " + err.Error())
 	}
-	return nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // checkTool verifies that the produced index names the profile's tool and a
