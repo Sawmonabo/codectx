@@ -331,6 +331,13 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// Truncation is reported whenever it happened, including when the child
 	// exited on its own just after crossing the limit.
 	result.OutputTruncated = outPipe.limited() || errPipe.limited()
+	// The flags describe why the tree was stopped, and they are set from that
+	// decision alone. A cancelled run whose child happened to overrun its
+	// output while being torn down is still a cancelled run: Section 22
+	// requires cancellation not to be reported as a failure, and a Result that
+	// denied it would make the two disagree.
+	result.TimedOut = reason == stopTimeout
+	result.Canceled = reason == stopCanceled
 
 	if unreaped {
 		// Nothing was reaped, so there is no status to report; claiming exit 0
@@ -344,19 +351,20 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 			WithDetail("pid", strconv.Itoa(pid)).
 			WithDetail("stop_reason", reason.String())
 	}
-	// A stream that crossed its limit is a refusal even when the child then
-	// exited successfully: the caller would otherwise receive truncated output
-	// reported as a complete run.
-	if reason == stopOutputLimit || result.OutputTruncated {
-		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
-	}
+	// An explicit stop decision is why the run ended, so it names the error.
 	switch reason {
+	case stopOutputLimit:
+		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
 	case stopTimeout:
-		result.TimedOut = true
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
 	case stopCanceled:
-		result.Canceled = true
 		return result, canceled(ctx.Err())
+	}
+	// The child exited on its own, but a stream that crossed its limit is still
+	// a refusal: the caller would otherwise receive truncated output reported
+	// as a complete run.
+	if result.OutputTruncated {
+		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
 	}
 	if err := outPipe.err(); err != nil {
 		return result, err

@@ -98,6 +98,11 @@ type Policy struct {
 	// it, a single ForceInclude hook would turn every excluded directory into a
 	// full traversal, and a huge ignored directory could abort the walk on the
 	// entry cap alone.
+	//
+	// It is asked about every directory on the way down, not only the outermost
+	// excluded one, so it must answer true for each ancestor of a forced path:
+	// a hook that recognizes "vendor" but not "vendor/sub" prunes the subtree
+	// and drops the tracked file beneath it.
 	ForceIncludeDir func(relDir string) bool
 	// IncludeUntracked is carried for the Git owner, which decides from it
 	// whether an untracked file is eligible. Walk does not interpret it: it
