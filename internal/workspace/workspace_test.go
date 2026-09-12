@@ -168,6 +168,19 @@ func assertWalk(t *testing.T, root Root, policy Policy, want []string) {
 	}
 }
 
+// TestWalkRejectsFollowedEscape protects the opt-in symlink path: enabling
+// follow_symlinks must not become a way out of the workspace.
+func TestWalkRejectsFollowedEscape(t *testing.T) {
+	root, _ := safeTree(t)
+	policy := testPolicy(root)
+	policy.FollowSymlinks = true
+	err := Walk(context.Background(), root, policy, func(File) error { return nil })
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodePathEscape {
+		t.Fatalf("Walk returned %v, want a typed %s for a symlink leaving the root", err, model.CodePathEscape)
+	}
+}
+
 func collect(t *testing.T, root Root, policy Policy) []string {
 	t.Helper()
 	var got []string
