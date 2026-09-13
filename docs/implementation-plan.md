@@ -56,7 +56,7 @@
    - [11.3 Tree-sitter Structural Provider](#113-tree-sitter-structural-provider)
    - [11.4 SCIP Import and Managed Indexers](#114-scip-import-and-managed-indexers)
    - [11.5 LSP Snapshot-Qualified Working-Tree Overlay](#115-lsp-snapshot-qualified-working-tree-overlay)
-   - [11.6 Joern Deep-Analysis Provider](#116-joern-deep-analysis-provider)
+   - [11.6 Dependence Provider](#116-dependence-provider)
    - [11.7 Managed Analyzer Toolchain](#117-managed-analyzer-toolchain)
 - [12. Storage Architecture](#12-storage-architecture)
    - [12.1 SQLite Operating Model](#121-sqlite-operating-model)
@@ -124,7 +124,7 @@
    - [Task 8: Implement the Tree-sitter Structural Provider](#task-8-implement-the-tree-sitter-structural-provider)
    - [Task 9: Implement Streaming SCIP Import and Explicit Local Indexer Profiles](#task-9-implement-streaming-scip-import-and-explicit-local-indexer-profiles)
    - [Task 10: Implement the LSP Snapshot-Qualified Working-Tree Overlay](#task-10-implement-the-lsp-snapshot-qualified-working-tree-overlay)
-   - [Task 11: Implement the Optional Joern Deep-Analysis Adapter](#task-11-implement-the-optional-joern-deep-analysis-adapter)
+   - [Task 11: Implement the Dependence Provider over the Managed Graph Engine](#task-11-implement-the-dependence-provider-over-the-managed-graph-engine)
    - [Task 12: Implement the Index Coordinator, Incremental Invalidation, Watch Mode, and Atomic Refresh](#task-12-implement-the-index-coordinator-incremental-invalidation-watch-mode-and-atomic-refresh)
    - [Task 13: Implement Exact, Symbol, Path, and Generation-Scoped FTS5 Search](#task-13-implement-exact-symbol-path-and-generation-scoped-fts5-search)
    - [Task 14: Implement Bounded Graph Traversal, Dependency Paths, and Impact Analysis](#task-14-implement-bounded-graph-traversal-dependency-paths-and-impact-analysis)
@@ -174,7 +174,7 @@ The platform is written in Go. Mature compiler and analysis systems are integrat
 - Tree-sitter supplies incremental syntax trees.
 - SCIP supplies compiler-derived definitions, references, occurrences, and relationships.
 - LSP supplies live working-tree semantics when a local language server is available.
-- Joern supplies optional call, control-flow, and data-flow facts for languages its frontends support.
+- A managed dependence engine supplies on-demand control-dependence, data-dependence and fallback call facts for all nine languages.
 
 All provider facts are normalized into a canonical, generation-qualified graph with source provenance. Sealed analysis units are reused without copying unchanged facts into each generation. Optional-provider failure degrades the affected capability; required-provider failure preserves the last usable generation. Native parser work is isolated from the serving process. These guarantees require the failure and resource checks specified below.
 
@@ -257,7 +257,7 @@ The first generally usable release shall provide:
 - Structural facts for Go, JavaScript, TypeScript/TSX, Python, Java, Rust, C, and C++ through pinned Tree-sitter grammars.
 - Generic SCIP protobuf import plus configurable local SCIP indexer profiles.
 - Optional LSP live-overlay support over local subprocesses.
-- Optional Joern import/query support over a local subprocess.
+- On-demand dependence analysis (control and data dependence) over a managed local engine.
 - Common manifest extraction for `go.mod`, `package.json`, `pyproject.toml`, `Cargo.toml`, and `pom.xml`.
 - Markdown and plain-text documentation indexing.
 - A canonical graph with evidence and precision classes.
@@ -282,7 +282,7 @@ The installation is layered so absence of a heavyweight analyzer never makes the
 | Manifest/docs providers | packages, dependencies, configs, docs | Yes | No |
 | Local SCIP indexers | precise definitions/references/relationships | No; strongly recommended | No |
 | Local language servers | snapshot-qualified dirty-worktree semantic overlay | No | No |
-| Local Joern | deep call/control/data-flow facts | No | No |
+| Local dependence engine | control/data dependence and fallback call facts, on demand | No | No |
 | Local embedding plugin | conceptual retrieval enhancement | Outside core | No, if self-hosted |
 | Cloud AI or embedding provider | optional future plugin only | Never | Optional and non-core |
 
@@ -392,7 +392,7 @@ Go toolchain release facts are documented in [1](#ref-1) and [32](#ref-32). SQLi
        |                         |                         |
  Git/worktree capture      Provenance + aliases      Local bounded workers
                                                      /     |      \
-                                               Tree-sitter SCIP   Joern
+                                               Tree-sitter SCIP   dependence
                                                child pool  local  local
 
  LSP: on-demand, private snapshot-qualified query overlay through the same
@@ -404,7 +404,7 @@ Go toolchain release facts are documented in [1](#ref-1) and [32](#ref-32). SQLi
 
 `internal/model` contains data contracts and validation, with no dependency on services, providers, or storage. `internal/storage` owns SQL, unit publication, generation pinning, retention metadata, and transactions. Providers own their native formats and emit bounded canonical batches. `internal/process` owns child lifecycle for Git, parser workers, SCIP, LSP, and Joern. `internal/source` owns byte/range/encoding conversion shared across source serving and adapters. CLI and MCP perform request translation and rendering only.
 
-No package outside a provider's implementation imports its Tree-sitter handles, SCIP protobuf, LSP wire structs, or Joern IDs. There is no storage-to-provider import cycle: neutral provider descriptors and run metadata live in the model package. Application composition is concrete; consumers receive only the small service interfaces they actually use. Do not introduce `Graph(...) (any, error)` or an undefined `query` package.
+No package outside a provider's implementation imports its Tree-sitter handles, SCIP protobuf, LSP wire structs, or dependence-engine IDs. There is no storage-to-provider import cycle: neutral provider descriptors and run metadata live in the model package. Application composition is concrete; consumers receive only the small service interfaces they actually use. Do not introduce `Graph(...) (any, error)` or an undefined `query` package.
 
 <a id="72-process-model"></a>
 ### 7.2 Process Model
@@ -634,7 +634,7 @@ Every public result envelope carries `Binding`, completeness, and pagination. A 
 <a id="93-evidence-precision-and-source-coordinates"></a>
 ### 9.3 Evidence, Precision, and Source Coordinates
 
-Precision classes remain `compiler`, `language_server`, `static_analysis`, `syntax`, and `heuristic`. They describe origin, not calibrated confidence or guaranteed soundness. Deterministic ranking weights are not probabilities.
+Precision classes remain `compiler`, `language_server`, `static_analysis`, `syntax`, and `heuristic`. They describe origin, not calibrated confidence or guaranteed soundness. Deterministic ranking weights are not probabilities, and no numeric confidence is published anywhere: a name-resolved node carries factual attributes instead, `resolution` (`exact`, `import`, `same_module`, `unique_name`, `ambiguous`, `unresolved`) and `candidates` (the count considered), and ambiguity is a retained `may_refer_to` relation.
 
 ```go
 type Evidence struct {
@@ -817,7 +817,7 @@ Batches are capped by **both records and retained bytes**, including strings, ev
 | manifest | filesystem | manifest/package and its dependency inputs | base index |
 | tree-sitter | filesystem | file-local extraction | base parser worker |
 | scip | filesystem, tree-sitter; manifest when profile needs it | declared package/workspace | managed optional index |
-| joern | filesystem, tree-sitter | declared package/workspace | managed optional index |
+| dependence | filesystem, tree-sitter; SCIP aliases when present | frontend-native project per language; workspace for C/C++ | managed optional index, on demand |
 | lsp | pinned files and available canonical structural facts | query workspace | optional query overlay, not `Provider.IndexUnit` |
 
 The LSP manager is a separate query adapter sharing the process runner, source conversion, and capability vocabulary; it is not forced into a nonexistent on-demand indexing enum. Optional provider absence is distinct from failure: a disabled/unconfigured optional provider is `unavailable` without making a healthy base generation falsely fail. An enabled requested capability that fails makes overall health `degraded` and preserves the precise missing scope.
@@ -848,6 +848,8 @@ Each worker owns its parser/tree/query/cursor. Close native objects deterministi
 
 The official binding requires explicit native lifecycle handling. A reported `ParseWithOptions` leak is a dependency-review risk, not proof that any arbitrary pinned release is fixed or affected. Inspect the chosen binding's complete relevant lifecycle/cancellation files, pin a verified revision, and cover the actual callback path in the shared repeated-parse resource check. Do not add a local compatibility shim or trust deprecated timeout APIs blindly. [4](#ref-4) [5](#ref-5) [26](#ref-26)
 
+Call sites are syntax facts. Every call site publishes an alias `callsite:<path>:<start>-<end>` in scope `file:<path>` (1-based inclusive byte range of the callee identifier) attached to its callee node, and the callee node carries the `resolution` and `candidates` attributes of Section 9.3. The SCIP importer publishes the same alias for each reference occurrence whose range equals a call site in the same file version, so the reconciler merges the syntactic callee with the compiler-resolved symbol and the `calls` relation acquires a precise target while both evidence rows remain. SCIP alone cannot mark a call: no indexer distinguishes a call-site reference from a function-value reference, and none sets a write role, so call identification and read/write positions are syntax facts joined to resolved symbols.
+
 <a id="114-scip-import-and-managed-indexers"></a>
 ### 11.4 SCIP Import and Managed Indexers
 
@@ -868,22 +870,23 @@ The LSP client owns Content-Length framing, initialize/initialized and shutdown/
 
 The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP/Joern. The complete advertised live-query feature set remains available as a labeled overlay.
 
-<a id="116-joern-deep-analysis-provider"></a>
-### 11.6 Joern Deep-Analysis Provider
+<a id="116-dependence-provider"></a>
+### 11.6 Dependence Provider
 
-Joern remains an optional local provider of supported calls, control dependence, reads/writes, and data-dependence facts. Use its built-in noninteractive tools and exact tested profile, not product-owned Scala scripts or an exposed interpreter server:
+The `dependence` provider supplies control dependence, intraprocedural-plus-capture data dependence, and fallback call facts for the nine supported languages through a managed code-property-graph engine. The engine is a Section 11.7 lock entry; its name appears in the repository, the lock, and the license inventory, never in a command, a config key, a provider id, an evidence detail, or a query result, so a future engine change is a backend swap and not a product change. Use the engine's built-in noninteractive tools and one exact tested argv per step, not product-owned analysis scripts or an exposed interpreter server:
 
 ```text
-joern-parse <private pinned materialization> [profile-owned output arguments]
-joern-export [profile-owned CPG path] --repr=all --format=neo4jcsv --out <private export>
-joern-export [profile-owned CPG path] --repr=pdg --format=graphml --out <private pdg>
+parse:  <engine>-parse --language <frontend> <private unit materialization> --output <private cpg>
+export: <engine>-export <private cpg> --repr=all --format=neo4jcsv --out <private export>
 ```
 
-The bracketed operands denote profile fields whose exact argv is captured from the managed pinned tool's help and tested real invocation in the Task 22 matrix; they are not shell fragments or production placeholders. Version/help detection itself executes code and therefore runs only against a lock-verified binary.
+One parse handles exactly one language, so the coordinator schedules one unit per (language, frontend-native project): a Go module, a Maven or Gradle module, a `package.json`/`tsconfig.json` project, a Python package with its environment, a Cargo package (which needs `cargo` on the engine's allowlisted PATH). C and C++ are one unit per repository with real include paths, because header resolution spans the whole tree. A call whose target lives in another unit keeps its edge and the callee's fully qualified name on an external stub; the reconciler aliases that stub to the real declaration from the other unit or from SCIP. The single `all` export already carries every edge family the provider imports (`CALL`, `CDG`, `REACHING_DEF`, `CONTAINS`); no second export exists, and `--repr=pdg|cdg|ddg` is not implemented for CSV or GraphML in the pinned engine.
 
-Stream CSV and XML with field/record/depth caps enforced **before** a standard decoder can allocate an unbounded field. Use an on-disk native-ID map for arbitrary graph ordering; do not drop forward edges because a lookup window expired. Map only profile-owned CPG labels. Unknown labels are counted and reported. A dependence edge does not alone prove an end-to-end source-to-sink exploit or complete dataflow. Verify actual CPG overlays and exported labels; do not assume all Joern versions require the same overlay command. The export and common-issues documentation describe version-sensitive behavior. [8](#ref-8) [9](#ref-9) [10](#ref-10) [27](#ref-27)
+The provider is extraction-lazy. Nothing runs during an ordinary index. With `providers.dependence.enabled = "auto"` (the default), the first query that requests a dependence fact schedules the needed units in the background and answers with a typed `pending` capability until they seal; `true` runs the units in every index; `false` disables the provider. The parsed graph is cached per (unit inputs hash, engine payload digest) under the private data directory and reused across generations, so a repository whose source did not change pays nothing on refresh. The engine's per-method definition cap (`--max-num-def`) is left at its default; the provider captures the engine's stderr, counts the methods it reports skipping, and publishes `data_flows_to` as `partial` with that count rather than discarding the warning. Reads/writes are not published by this provider: neither the engine nor any SCIP indexer emits a write role, and a fact that cannot be sourced is reported unavailable, not approximated.
 
-A tool the lock does not provide for the current platform is unavailable with a typed platform reason; a timeout, malformed export, or unsupported profile is failed/partial with no unsealed facts admitted. The real pinned tool runs in the Task 22 CI matrix before the profile is documented as working, although ordinary tests use small checked-in exports. Remove materializations, CPGs, and exports on every termination path. Server mode is outside V1 and must not be introduced as a shortcut. Joern is disabled by default because of its runtime cost, not because it needs setup: `providers.joern.enabled = true` is the only step.
+Stream CSV with field/record/depth caps enforced **before** a standard decoder can allocate an unbounded field. Use an on-disk native-ID map for arbitrary graph ordering; do not drop forward edges because a lookup window expired. Map only profile-owned labels; count and report unknown labels. External methods that carry a snapshot file location are declarations in another unit, not junk, and are kept. A dependence edge does not alone prove an end-to-end source-to-sink exploit or complete dataflow; data dependence through closures and globals crosses method boundaries and its evidence detail says so. Verify actual overlays and exported labels against the pinned engine release; do not assume all releases require the same commands. [8](#ref-8) [9](#ref-9) [10](#ref-10) [27](#ref-27)
+
+A tool the lock does not provide for the current platform is unavailable with a typed platform reason; a timeout, malformed export, or unsupported unit is failed/partial with no unsealed facts admitted. The real pinned engine runs in the Task 22 CI matrix on every language before the docs call the provider supported. Remove materializations, graphs not selected for the cache, and exports on every termination path. Server mode is outside V1 and must not be introduced as a shortcut.
 Live-query routing is explicit: symbol/reference/call-hierarchy requests accept `semantic_source=canonical|lsp` (default canonical), a managed profile selector, and the required pinned file/range or symbol input. The CLI exposes `--semantic-source` on those commands; MCP uses the same typed field. `find_symbol` supports document/workspace symbol operations, and references supports implementation/type-definition operations. Query metadata contains a labeled overlay provider/version/input digest when LSP is used. Unsupported LSP methods return unavailable capability, not a silently substituted canonical answer. Context compilation always requests canonical mode.
 
 
@@ -921,7 +924,7 @@ A user installs codectx and every supported language works at its best available
 | `pyright` | server | python | node | npm `pyright` | all six |
 | `clangd` | server | c, cpp | — | `clangd/clangd` release archives | as published upstream |
 | `jdtls` | server | java | jdk | `download.eclipse.org/jdtls/milestones` tarball | all six |
-| `joern` | cpg | Section 11.6 languages | jdk | `joernio/joern` per-platform `joern-cli` archives | as published upstream |
+| `joern` | cpg (backend of the `dependence` provider) | all nine languages; Rust requires `cargo` on the allowlisted PATH | jdk | `joernio/joern` per-platform `joern-cli` archives (astgen helpers bundled) | linux amd64/arm64, darwin amd64/arm64, windows arm64 as published |
 
 **Lifecycle commands.** `codectx tools status` lists every lock entry with installed/available/unsupported/override state and the languages it unlocks; `tools prefetch [--all | --for-repo PATH]` installs ahead of time; `tools verify` rehashes the store; `tools gc` removes versions the current lock does not name. `doctor` includes the same report. None of these is required for ordinary use.
 
@@ -1985,10 +1988,11 @@ max_servers = 1
 max_outstanding_requests = 8
 idle_ttl = "60s"
 
-[providers.joern]
-# Off by default for runtime cost only; true is the whole setup.
-enabled = false
+[providers.dependence]
+# auto = run on the first query that asks for dependence facts; true = every index; false = off.
+enabled = "auto"
 timeout = "45m"
+cache_bytes = 4294967296
 
 [context]
 default_phase = "sweep"
@@ -2100,7 +2104,7 @@ These are **proposed engineering acceptance budgets**, not observed results. The
 
 Reference workload: 1 million eligible source lines, 10,000 files, approximately 80 MiB source, all required languages represented, fixed generated source/graph seeds, representative manifests/tests/configuration/docs and a high-fanout case. Reference machine: 8 logical cores, 8 GiB RAM, local SSD, pinned OS/toolchain/build. Publish exact hardware, filesystem, cache state, grammar/provider versions, configuration, line/file/byte/node/edge counts and fixture hashes. Test real repositories as an additional signal, not a moving substitute for the fixed fixture.
 
-Base means parent process **plus all mandatory parser workers**, not only Go heap. Report managed SCIP/LSP/Joern individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
+Base means parent process **plus all mandatory parser workers**, not only Go heap. Report managed SCIP/LSP/dependence engines individually and as a concurrently sampled full process-tree total when enabled. Optional analyzer memory is not hidden, but it is not dishonestly promised to fit the base parser budget.
 
 <a id="232-initial-release-budgets"></a>
 ### 23.2 Initial Release Budgets
@@ -2182,7 +2186,7 @@ THIRD_PARTY_LICENSES.md
 
 Ship the binary, bundled pinned grammars, LICENSE/NOTICE, documented default config, shell completions, checksums and SBOM. The private Tree-sitter worker is a mode of that same binary, not another installed service. Official Tree-sitter bindings use native code, so release builds must not claim `CGO_ENABLED=0` portability; SQLite's CGo-free driver does not remove Tree-sitter's native requirements. Build with `-trimpath`, pinned toolchain and deterministic version metadata; a wall-clock build timestamp must not defeat reproducibility. [4](#ref-4) [13](#ref-13)
 
-Profiles remain local base (bundled grammars), local precise (managed SCIP/LSP), and local deep (managed Joern). The slim archive fetches lock payloads on first use; the bundle archive carries the store pre-populated for its platform and never touches the network. Every redistributed tool and runtime has a recorded license and version in the lock and in `THIRD_PARTY_LICENSES.md` (Section 11.7). A future team server is outside V1. No supported profile requires a paid service or AI API key.
+Profiles remain local base (bundled grammars), local precise (managed SCIP/LSP), and local deep (managed dependence engine). The slim archive fetches lock payloads on first use; the bundle archive carries the store pre-populated for its platform and never touches the network. Every redistributed tool and runtime has a recorded license and version in the lock and in `THIRD_PARTY_LICENSES.md` (Section 11.7). A future team server is outside V1. No supported profile requires a paid service or AI API key.
 
 The data directory is workspace/installation-specific. Rebuild and pruning commands make destructive consequences explicit. An incompatible schema is not automatically migrated, and an existing user's session artifacts are not silently deleted by a new binary. Version mismatches fail clearly; greenfield development changes are in place, not a reason to add a compatibility system.
 Release SBOM generation uses the pinned selected SPDX or CycloneDX tooling, with native grammar assets included. [19](#ref-19) [20](#ref-20)
@@ -2202,7 +2206,7 @@ Tests exist to protect critical product behavior, not to maximize file count, mo
 |---|---|
 | Source identity and safety | One table/property fixture covering stable hashes, changing files, Git/worktree transformations, path escape, source ranges/encoding, CAS corruption and full retained reads. Prevents reading/writing the wrong bytes. |
 | Storage and incremental publication | One integration fixture covering reusable units, changed dependency invalidation, optional partial-output failure, atomic activation, FKs, query/session leases and GC races. Prevents stale/mixed facts or lost source. |
-| Provider boundary | Shared conformance fixture plus small native-format cases for each required grammar/SCIP/LSP/Joern profile. Covers malformed lengths, cancellation, source binding and process cleanup. Prevents false facts, OOM and hangs. |
+| Provider boundary | Shared conformance fixture plus small native-format cases for each required grammar/SCIP/LSP/dependence profile. Covers malformed lengths, cancellation, source binding and process cleanup. Prevents false facts, OOM and hangs. |
 | Search, graph and context | One deterministic fixture covering exact/lexical order, unrelated-generation ranking isolation, ambiguity, cycles/limits, required full files, scope gaps and budget/slicing boundaries. Prevents incomplete context presented as complete. |
 | Actor coverage and workflow | One state-machine fixture covering delivery receipts, duplicates, wrong actor/hash, empty/long/invalid-UTF8 files, scope changes, waiver behavior and guarded transitions. Prevents false full-read readiness. |
 | Product boundary | One end-to-end flow exercised by CLI and real MCP transport, sharing expected domain data. Covers offline/no-source-write behavior, JSON/protocol channels, version conflicts and cleanup. Prevents disconnected or incorrectly wired features. |
@@ -2227,7 +2231,7 @@ The same tests can satisfy multiple verification-matrix rows. Full source readin
 The release is acceptable only when demonstrated evidence supports every item:
 
 - Base indexing succeeds offline without optional analyzers and includes all required languages, files, symbols, scopes, imports/exports, structural calls/references, tests, manifests, dependencies, configuration, documents and source ranges.
-- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; managed Joern profiles contribute only export-supported deep facts.
+- SCIP enrichment preserves exact-source provenance and symbol identity; LSP offers all advertised supported live queries as a labeled snapshot-qualified overlay; the dependence provider contributes only export-supported deep facts.
 - Every retained source remains readable after worktree edits and Git history changes; unsafe paths, wrong hashes, invalid coordinates and unverified imports cannot become trusted facts.
 - Unit reuse avoids reprocessing unchanged source and correctly invalidates changed dependencies, including new/deleted files and provider/config changes. Failed units do not leak and generations publish atomically.
 - All queries remain pinned, paginated, explainable and deterministic; unrelated staging/retained generations do not change canonical lexical scores. Hard bounds and incomplete capability are always visible.
@@ -2297,7 +2301,8 @@ internal/provider/treesitter/      worker lifecycle, extraction, language regist
 internal/provider/treesitter/languages/  pinned grammar and query packs
 internal/provider/scip/            wire import, aliases, source binding, profiles
 internal/provider/lsp/             bounded client, manager, snapshot-qualified overlay
-internal/provider/joern/           pinned exports, streaming import and normalization
+internal/provider/dependence/      frontend-native units, graph cache, streaming CSV import and normalization
+internal/provider/dependence/joern/  pinned engine argv, stderr parsing, label map
 internal/toolchain/                embedded tool lock, verified fetch, atomic store, resolver, runtime launchers
 internal/tools/toollock/           release-time lock and payload generator
 internal/reconcile/                deterministic canonical resolution and lineage
@@ -2316,7 +2321,7 @@ internal/e2e/                      shared critical workflow fixture
 internal/bench/                    one fixture generator and resource benchmark harness
 internal/tools/                    only thin Go automation actually needed by CI and release
 
-testdata/                          small polyglot, SCIP, LSP and Joern fixtures
+testdata/                          small polyglot, SCIP, LSP and dependence-export fixtures
 docs/                              architecture, providers, MCP, operations,
                                    configuration, performance, threat model
 .github/workflows/                 CI, offline and native-target release jobs
@@ -2339,7 +2344,7 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Syntax parsing | Official Tree-sitter Go binding and grammars | Mature syntax engine; own extraction queries and bounded worker lifecycle. |
 | Precise interchange | Official SCIP schema/bindings and protobuf primitives | Stream validated records, do not invent a competing symbol protocol. |
 | Live semantics | Small bounded LSP client/manager | Only required read-only methods and profiles, not an editor or generic command executor. |
-| Deep analysis | Managed Joern | Integrate built-in exports; no copied CPG engine or product Scala code. |
+| Deep analysis | Managed Joern behind the neutral `dependence` provider | Integrate built-in exports; no copied CPG engine or product Scala code; engine swappable without a product-surface change. |
 | Analyzer distribution | Product-owned tool lock with re-hosted payloads and a stdlib fetch/verify/extract path | No package manager, npm, coursier or `go install` at runtime; runtimes (Node, JDK) are lock entries too. |
 | Database/FTS | SQLite through `modernc.org/sqlite`, FTS5 | Embedded indexed store; own generation membership/scoped ranking where required. |
 | Watch | `fsnotify` with reconciliation | Notifications are hints; avoid a bespoke filesystem watcher. |
@@ -2351,7 +2356,7 @@ There is no `migrations/`, legacy provider path, duplicate graph/search cursor i
 | Redis/Kafka/Postgres/Neo4j/distributed platform | Not included | No V1 need; unnecessary operational and memory overhead. |
 | CKB/Code Knowledge Backend | Do not adopt or copy implementation | Its source-available license imposes commercial-use conditions; retain the clean-room decision. This is not a judgment about its feature quality. |
 
-Do not add a generic plugin or retriever abstraction merely to leave a theoretical extension point. Existing provider interfaces are justified by concrete Tree-sitter/SCIP/Joern implementations, and the LSP query boundary has actual consumers. Recheck precise dependency and asset licenses when pinning them. OSI/copyleft/custom restrictions require explicit review rather than an invented assertion that all transitive components are permissive. [2](#ref-2) [4](#ref-4) [6](#ref-6) [13](#ref-13) [21](#ref-21)
+Do not add a generic plugin or retriever abstraction merely to leave a theoretical extension point. Existing provider interfaces are justified by concrete Tree-sitter/SCIP/dependence implementations, and the LSP query boundary has actual consumers. Recheck precise dependency and asset licenses when pinning them. OSI/copyleft/custom restrictions require explicit review rather than an invented assertion that all transitive components are permissive. [2](#ref-2) [4](#ref-4) [6](#ref-6) [13](#ref-13) [21](#ref-21)
 The original graph-ranked repository-map precedent is retained as background only; no third-party implementation is copied. [18](#ref-18)
 
 
@@ -2393,7 +2398,7 @@ Runtime provider dependency order is still enforced when source tasks are develo
 |---|---|---|
 | M0 Foundation | 1–6 | Pinned Go project, safe process/source boundaries, CAS, current SQLite schema and provider/unit runtime. |
 | M1 Base intelligence | 7–8, 12–14 | Offline full-language base index, genuinely incremental refresh, search/graph/impact. |
-| M2 Precise/deep capability | 9–11, 22 | Managed six-indexer SCIP, full supported LSP query overlay and version-verified Joern, every profile proven against its lock payload in CI. |
+| M2 Precise/deep capability | 9–11, 22 | Managed six-indexer SCIP, full supported LSP query overlay and version-verified dependence provider, every profile proven against its lock payload in CI. |
 | M3 Context/workflow | 15–17 | Deterministic complete scope, bounded slices, actor receipts/review, strict gates and typed facade. |
 | M4 Product interfaces | 18–20 | CLI/MCP parity, diagnostic/retention/resource integration. |
 | M5 Release | 21 | Measured performance/capability parity, offline and six-target slim and bundle artifacts. |
@@ -2664,30 +2669,30 @@ git diff --check
 - [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
 
 
-<a id="task-11-implement-the-optional-joern-deep-analysis-adapter"></a>
-### Task 11: Implement the Optional Joern Deep-Analysis Adapter
+<a id="task-11-implement-the-dependence-provider-over-the-managed-graph-engine"></a>
+### Task 11: Implement the Dependence Provider over the Managed Graph Engine
 
-**Deliverable:** A real version-pinned local Joern parse/export/import path providing evidence-supported deep relations with independent resource/failure reporting.
+**Deliverable:** A real version-pinned parse/export/import path providing evidence-supported control-dependence, data-dependence and fallback call facts per frontend-native unit, extraction-lazy and cached, with independent resource/failure and partial-analysis reporting, and no engine name on any product surface.
 
-**Files and ownership:** `internal/provider/joern/`, small Neo4j CSV/GraphML fixtures, exact profile metadata and optional real-tool CI job.
+**Files and ownership:** `internal/provider/dependence/` (provider, units, cache, CSV import, emit) with the engine adapter in `internal/provider/dependence/joern/`, small Neo4j CSV fixtures, `docs/providers-dependence.md`.
 
-**Dependencies / consumes:** Task 6 runner/resolver; Task 4 private materialization; completed structural runtime dependencies from Tasks 7–8.
+**Dependencies / consumes:** Task 6 runner/resolver; Task 4 private materialization; completed structural runtime dependencies from Tasks 7–8; Task 22 `toolchain.Resolver` for the engine and its JDK.
 
-**Produces / contract:** Joern Provider and typed profile describing exact executable/version/argv, supported labels/overlays, source inputs and capability completeness.
+**Produces / contract:** `dependence` Provider with `Descriptor().ID == "dependence"`, `ProviderVersion` = adapter version plus engine payload digest; unit scope `pkg:<frontend-native project key>` per language (workspace scope only for C/C++); `Detection.Capabilities` naming `control_depends_on`, `data_flows_to`, `calls`; `partial` state with `skipped_methods` count; evidence details `cdg`, `reaching_def`, `reaching_def capture`, `call`.
 
-- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one export fixture with calls/control/data dependence, unknown labels, forward IDs, malformed/oversized records and mismatched source paths. One process-fault case proves a failed export does not admit partial invalid facts. Real pinned-tool smoke validates exact CLI arguments before the profile is declared supported.
-- [ ] **Step 2: Implement the complete production path.** Resolve managed parse/export tools and capture actual version/help contract. Run built-in export formats against private source/CPG paths; inspect resulting overlay metadata instead of assuming historical commands. Cap CSV fields/XML depth before decoder allocation, stream results, and use a disk mapping for native IDs. Normalize only supported labels and distinguish data dependence from an unproven full semantic source-to-sink claim.
-- [ ] **Step 3: Wire consumers, failure handling and documentation.** Count unknown labels and missing capabilities, retain explicit partial scope, and fail unsupported profiles rather than guess compatibility. No product-owned Scala/shell helper or interpreter server. Bound entire analyzer tree memory/temp/output, close processes, delete private inputs/exports and leave base generation intact on optional failure. Record full process-tree metrics separately from base metrics and update provider/license docs.
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Install the pinned engine release on the development machine, run every argv below against the polyglot fixture in each of the nine languages, and record observed version, payload SHA-256 and raw output before deciding anything. Every subagent performs its own read.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Use one export fixture with calls/control/data dependence, unknown labels, forward IDs, an external method carrying a snapshot filename, malformed/oversized records and mismatched source paths. One process-fault case proves a failed export does not admit partial invalid facts. One stderr case proves a skipped-method warning yields `partial` with the count rather than a sealed complete unit.
+- [ ] **Step 2: Implement the complete production path.** Resolve engine and JDK through the toolchain resolver; always pass `--language <frontend>` (`c`, `golang`, `pythonsrc`, `javasrc`, `jssrc`, `rust`); one unit per frontend-native project, C/C++ whole-repository with include paths; single `--repr=all --format=neo4jcsv` export, no GraphML or DOT path; cache the parsed graph per (unit inputs hash, engine digest) under the data directory with retention; capture stderr through the runner's bounded buffer and parse the skip warnings; cap CSV fields before decoder allocation, stream results, and use a disk mapping for native IDs. Normalize only supported labels; keep external methods that carry a snapshot location and alias them by full name; publish data dependence through captures and globals with its own detail rather than the intraprocedural label.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** `providers.dependence.enabled = auto|true|false` with `auto` default and the `pending` capability contract of Section 11.6; count unknown labels and missing capabilities; fail unsupported units rather than guess compatibility. No product-owned analysis script or interpreter server. Bound the entire analyzer tree memory/temp/output, close processes, delete private inputs/exports and leave the base generation intact on optional failure. Record full process-tree metrics separately from base metrics. Docs name the engine only in `docs/providers-dependence.md` and `THIRD_PARTY_LICENSES.md`.
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
-go test ./internal/provider/joern ./internal/process -count=1
+go test ./internal/provider/dependence/... ./internal/process -count=1
 go vet ./...
 git diff --check
 ```
 
-- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate. No known in-scope defect, dead consumer, duplicate implementation, silent capability reduction, engine name on a product surface, or missing critical evidence may be carried forward as complete. Update task/architecture/source documentation in the same change.
 
 
 <a id="task-12-implement-the-index-coordinator-incremental-invalidation-watch-mode-and-atomic-refresh"></a>
@@ -2962,9 +2967,9 @@ git diff --check
 <a id="task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix"></a>
 ### Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix
 
-**Deliverable:** Every SCIP, LSP, and Joern profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
+**Deliverable:** Every SCIP, LSP, and dependence profile runs from a lock-pinned, checksum-verified tool the product installs itself, with the six-indexer and six-server matrix of Section 11.7 and no user configuration. `config.Analyzer` and `[analyzers.<name>]` are deleted in place; the release-time lock generator and the CI real-tool matrix inputs exist.
 
-**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/joern/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
+**Files and ownership:** `internal/toolchain/` (lock schema and embedded `tools.lock.json`, store, fetcher, extractor, resolver, runtime launchers, typed errors), `internal/tools/toollock/` (release-time generator), rewritten profile files `internal/provider/scip/profile.go`, `internal/provider/lsp/profile.go`, `internal/provider/dependence/joern/profile.go`, new SCIP profiles for `scip-python`, `rust-analyzer scip`, and `scip-clang`, `internal/config/` removal of `Analyzer` and addition of `Tools`, `internal/cli/tools.go`, `.github/workflows/tools-matrix.yml`, `docs/toolchain.md`, provider docs, `THIRD_PARTY_LICENSES.md`. The integration owner wires `toolchain.Resolver` into `internal/app` composition alongside Task 12.
 
 **Dependencies / consumes:** Task 3 `config.Config`, `process.Runner`, and the confined opener; Task 6 `provider.Detection` (`Available`, `DiagnosticCode`, `ObservedVersion`); Tasks 9–11 profile call sites (`scip.runProfile`, `lsp.Trusted`/`Manager.Open`, `joern.ProfileFromConfig`); `model.Error` codes; `lang.Of`.
 
@@ -3046,7 +3051,7 @@ Profiles become product code: `scip.Profile{Kind profileKind; Tool toolchain.Too
 - [ ] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
 
 ```bash
-go test ./internal/toolchain ./internal/config ./internal/provider/scip ./internal/provider/lsp ./internal/provider/joern -count=1
+go test ./internal/toolchain ./internal/config ./internal/provider/scip ./internal/provider/lsp ./internal/provider/dependence/... -count=1
 go run ./internal/tools/toollock -check   # lock digests match published tools-v1 assets
 go vet ./...
 git diff --check
@@ -3076,7 +3081,7 @@ The same focused test or review artifact may satisfy multiple rows. A requiremen
 | Exact-source SCIP | 11.4 | 9, 22 | Source-binding/position/local-symbol/occurrence fixtures, streamed memory check and real-tool smoke for all six indexers. |
 | Managed analyzer toolchain | 11.7, 20, 21, 24 | 22, 20, 21 | Digest/size mismatch never extracted or executed; confined extraction; offline never dials; atomic store; single `net/http` importer; per-platform CI matrix runs every lock entry. |
 | Full supported LSP overlay | 11.5 | 10, 22 | Actual protocol fake-server lifecycle and required-method table; private pinned input and cleanup. |
-| Joern deep integration | 11.6 | 11, 22 | CSV/GraphML fixture, actual pinned version/argv/overlay smoke, missing-capability reporting. |
+| Dependence integration | 11.6 | 11, 22 | CSV fixture, real pinned engine run per language, partial reporting from skipped methods, no engine name on a product surface. |
 | Canonical node and relation provenance | 9, 11–12 | 2, 5–11 | Node facts, aliases and range-bearing relation evidence with scope/source identity; ambiguity retained. |
 | Stable generation-scoped lexical ranking | 12.4, 14 | 5, 13, 15 | Scores/hash unchanged by unrelated unit/generation insert/activation/pruning; near-tie platform checks. |
 | Bounded graph and pagination | 14 | 5, 13–14 | Cycle/fanout, edge/node/depth/work limits, signed cursor, lease and deterministic continuation. |
