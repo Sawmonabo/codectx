@@ -1,0 +1,21 @@
+### xtools golang Xmx=default
+tree_peak_sum_kb=4808312 tree_peak_single_kb=4678372 procs_at_peak=4 exit=0
+time_wall=16.64 s largest_rss_kb=4791536
+### xtools golang Xmx=500m
+tree_peak_sum_kb=1020176 tree_peak_single_kb=895424 procs_at_peak=4 exit=0
+time_wall=23.15 s largest_rss_kb=980844
+### xtools golang Xmx=1500m
+tree_peak_sum_kb=1940172 tree_peak_single_kb=1804580 procs_at_peak=4 exit=0
+time_wall=23.73 s largest_rss_kb=1811908
+### export xtools default
+tree_peak_sum_kb=1201392 tree_peak_single_kb=1199392 procs_at_peak=2 exit=0
+time_wall=5.10 s largest_rss_kb=1198968
+### export xtools Xmx=1g
+tree_peak_sum_kb=731348 tree_peak_single_kb=729344 procs_at_peak=2 exit=0
+time_wall=4.52 s largest_rss_kb=728156
+### export xtools Xmx=512m
+tree_peak_sum_kb=530044 tree_peak_single_kb=528048 procs_at_peak=2 exit=0
+time_wall=4.53 s largest_rss_kb=527052
+te1=145476kb
+te2=145476kb
+te3=145476kb

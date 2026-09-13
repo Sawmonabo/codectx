@@ -1,0 +1,50 @@
+### ripgrep LOC=56386 crates=cli core globset grep ignore index matcher pcre2 printer regex searcher 
+## dir=ripgrep
+tree_peak_sum_kb=1856564 tree_peak_single_kb=1715316 procs_at_peak=4 exit=0
+parse time_wall=10.69 s largest_rss_kb=1773580 exit=0
+cpg_kb=5680 FILE=103 METHOD=4616 CALL=56692 CDG=52223 REACHING_DEF=257818
+## dir=ripgrep/crates/cli/
+tree_peak_sum_kb=1075012 tree_peak_single_kb=816468 procs_at_peak=5 exit=0
+parse time_wall=6.03 s largest_rss_kb=823732 exit=0
+cpg_kb=352 FILE=9 METHOD=290 CALL=1635 CDG=1541 REACHING_DEF=8428
+## dir=ripgrep/crates/core/
+tree_peak_sum_kb=1121312 tree_peak_single_kb=863072 procs_at_peak=5 exit=0
+parse time_wall=7.41 s largest_rss_kb=920560 exit=0
+cpg_kb=1536 FILE=23 METHOD=1696 CALL=15130 CDG=12120 REACHING_DEF=73605
+## dir=ripgrep/crates/globset/
+tree_peak_sum_kb=1084200 tree_peak_single_kb=824872 procs_at_peak=5 exit=0
+parse time_wall=5.94 s largest_rss_kb=832168 exit=0
+cpg_kb=552 FILE=6 METHOD=397 CALL=3630 CDG=4222 REACHING_DEF=17576
+## dir=ripgrep/crates/grep/
+tree_peak_sum_kb=1066828 tree_peak_single_kb=805524 procs_at_peak=5 exit=0
+parse time_wall=5.31 s largest_rss_kb=812868 exit=0
+cpg_kb=136 FILE=3 METHOD=52 CALL=130 CDG=165 REACHING_DEF=816
+## dir=ripgrep/crates/ignore/
+tree_peak_sum_kb=1115336 tree_peak_single_kb=857920 procs_at_peak=5 exit=0
+parse time_wall=10.76 s largest_rss_kb=877472 exit=0
+cpg_kb=1268 FILE=13 METHOD=856 CALL=12018 CDG=8905 REACHING_DEF=41894
+## dir=ripgrep/crates/index/
+tree_peak_sum_kb=988516 tree_peak_single_kb=743136 procs_at_peak=5 exit=0
+parse time_wall=12.32 s largest_rss_kb=818684 exit=0
+cpg_kb=392 FILE=4 METHOD=234 CALL=2248 CDG=2808 REACHING_DEF=10896
+## dir=ripgrep/crates/matcher/
+tree_peak_sum_kb=1070172 tree_peak_single_kb=813404 procs_at_peak=5 exit=0
+parse time_wall=7.91 s largest_rss_kb=820544 exit=0
+cpg_kb=332 FILE=6 METHOD=271 CALL=1352 CDG=833 REACHING_DEF=8011
+## dir=ripgrep/crates/pcre2/
+tree_peak_sum_kb=1005360 tree_peak_single_kb=746868 procs_at_peak=5 exit=0
+parse time_wall=9.61 s largest_rss_kb=808084 exit=0
+cpg_kb=196 FILE=4 METHOD=118 CALL=415 CDG=244 REACHING_DEF=2464
+## dir=ripgrep/crates/printer/
+tree_peak_sum_kb=1099292 tree_peak_single_kb=860084 procs_at_peak=5 exit=0
+parse time_wall=12.10 s largest_rss_kb=867328 exit=0
+cpg_kb=904 FILE=13 METHOD=642 CALL=7424 CDG=6474 REACHING_DEF=37127
+## dir=ripgrep/crates/regex/
+tree_peak_sum_kb=1070212 tree_peak_single_kb=824476 procs_at_peak=5 exit=0
+parse time_wall=10.29 s largest_rss_kb=831684 exit=0
+cpg_kb=468 FILE=10 METHOD=371 CALL=2825 CDG=3350 REACHING_DEF=13456
+## dir=ripgrep/crates/searcher/
+tree_peak_sum_kb=1084632 tree_peak_single_kb=843776 procs_at_peak=5 exit=0
+parse time_wall=12.65 s largest_rss_kb=850588 exit=0
+cpg_kb=664 FILE=11 METHOD=380 CALL=4825 CDG=5911 REACHING_DEF=23577
+DONE

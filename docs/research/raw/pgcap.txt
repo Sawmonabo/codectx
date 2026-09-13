@@ -1,0 +1,17 @@
+### postgres-4g (c) parse_cap=4g
+tree_peak_sum_kb=6546712 tree_peak_single_kb=6544708 procs_at_peak=2 exit=0
+parse time_wall=61.30 s largest_rss_kb=6622176 exit=0
+skipped_methods=9 
+cpg_kb=181996
+tree_peak_sum_kb=1993112 tree_peak_single_kb=1991112 procs_at_peak=2 exit=1
+Command exited with non-zero status 1
+export(1g) time_wall=2.48 s largest_rss_kb=2005444 exit=1
+OutOfMemoryError
+CALL= CDG= METHOD=
+### postgres-2g (c) parse_cap=2g
+tree_peak_sum_kb=2654960 tree_peak_single_kb=2517164 procs_at_peak=3 exit=1
+Command exited with non-zero status 1
+parse time_wall=30.60 s largest_rss_kb=2517964 exit=1
+skipped_methods=0 OutOfMemoryError:
+no cpg
+DONE
