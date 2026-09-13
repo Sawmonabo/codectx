@@ -1,0 +1,58 @@
+### m32-default (pythonsrc) Xmx=default
+parse wall=104.91 s rss=18406768 KB exit=0
+skipped_methods=2
+cpg_kb=275084
+export wall=94.73 s rss=9512412 KB exit=0
+csv_kb=4950216
+CALL=44695131
+CDG=1307034
+REACHING_DEF=13811726
+METHOD=231552 FILE=2596
+### m32-4g (pythonsrc) Xmx=4g
+parse wall=86.50 s rss=6024484 KB exit=1
+skipped_methods=2
+Exception in thread "main" java.lang.OutOfMemoryError: Java heap space
+cpg_kb=111640
+export wall=1.48 s rss=2403136 KB exit=1
+csv_kb=0
+CALL=
+CDG=
+REACHING_DEF=
+METHOD= FILE=
+### k8s-default (golang) Xmx=default
+parse wall=17.71 s rss=3234680 KB exit=0
+skipped_methods=0
+cpg_kb=552
+export wall=0.89 s rss=295536 KB exit=0
+csv_kb=5716
+CALL=3236
+CDG=4281
+REACHING_DEF=34945
+METHOD=2478 FILE=36
+### k8s-8g (golang) Xmx=8g
+parse wall=17.44 s rss=2478168 KB exit=0
+skipped_methods=0
+cpg_kb=552
+export wall=0.88 s rss=321024 KB exit=0
+csv_kb=5700
+CALL=3236
+CDG=4281
+REACHING_DEF=35015
+METHOD=2478 FILE=36
+### unit api LOC=438877 Xmx=4g
+parse wall=23.90 s rss=4903380 KB exit=0
+### unit apiextensions-apiserver LOC=120558 Xmx=4g
+parse wall=8.15 s rss=3929608 KB exit=0
+### unit apimachinery LOC=143404 Xmx=4g
+parse wall=8.33 s rss=3375432 KB exit=0
+### unit apiserver LOC=304975 Xmx=4g
+parse wall=11.36 s rss=3375188 KB exit=0
+### unit client-go LOC=344975 Xmx=4g
+parse wall=9.91 s rss=2763256 KB exit=0
+### unit code-generator LOC=133599 Xmx=4g
+parse wall=7.86 s rss=2511692 KB exit=0
+### unit kubectl LOC=136949 Xmx=4g
+parse wall=5.85 s rss=3335104 KB exit=1
+### scip-go k8s
+scip-go wall=0.06 s rss=15748 KB exit=1
+DONE

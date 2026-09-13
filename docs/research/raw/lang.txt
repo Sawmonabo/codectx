@@ -1,0 +1,121 @@
+### git-default (c) parse_cap=default export_cap=default
+tree_peak_sum_kb=5569724 tree_peak_single_kb=5567728 procs_at_peak=2 exit=0
+parse time_wall=16.32 s largest_rss_kb=5672628 exit=0
+skipped_methods=4 
+cpg_kb=62704
+tree_peak_sum_kb=5479164 tree_peak_single_kb=5477160 procs_at_peak=2 exit=0
+export time_wall=17.34 s largest_rss_kb=5475552 exit=0
+csv_kb=650036
+CALL=470155
+CDG=851506
+REACHING_DEF=3138182
+METHOD=237663 FILE=980
+### git-2g (c) parse_cap=2g export_cap=1g
+tree_peak_sum_kb=3296176 tree_peak_single_kb=3294172 procs_at_peak=2 exit=0
+parse time_wall=17.14 s largest_rss_kb=3297972 exit=0
+skipped_methods=4 
+cpg_kb=62688
+tree_peak_sum_kb=1321928 tree_peak_single_kb=1319928 procs_at_peak=2 exit=0
+export time_wall=16.83 s largest_rss_kb=1318552 exit=0
+csv_kb=650036
+CALL=470155
+CDG=851506
+REACHING_DEF=3138182
+METHOD=237663 FILE=980
+### tokio-default (rust) parse_cap=default export_cap=default
+tree_peak_sum_kb=2917848 tree_peak_single_kb=2666308 procs_at_peak=5 exit=0
+parse time_wall=50.50 s largest_rss_kb=2705464 exit=0
+skipped_methods=0 
+cpg_kb=20
+tree_peak_sum_kb=162944 tree_peak_single_kb=160940 procs_at_peak=2 exit=0
+export time_wall=1.15 s largest_rss_kb=180136 exit=0
+csv_kb=140
+CALL=
+CDG=
+REACHING_DEF=
+METHOD= FILE=1
+### tokio-1g (rust) parse_cap=1g export_cap=512m
+tree_peak_sum_kb=2919584 tree_peak_single_kb=2671216 procs_at_peak=5 exit=0
+parse time_wall=49.32 s largest_rss_kb=2710316 exit=0
+skipped_methods=0 
+cpg_kb=20
+tree_peak_sum_kb=151524 tree_peak_single_kb=149520 procs_at_peak=2 exit=0
+export time_wall=1.14 s largest_rss_kb=159564 exit=0
+csv_kb=140
+CALL=
+CDG=
+REACHING_DEF=
+METHOD= FILE=1
+### both-default (jssrc) parse_cap=default export_cap=default
+tree_peak_sum_kb=4764352 tree_peak_single_kb=4762348 procs_at_peak=2 exit=0
+parse time_wall=17.86 s largest_rss_kb=5012836 exit=0
+skipped_methods=4 
+cpg_kb=13252
+tree_peak_sum_kb=1037608 tree_peak_single_kb=1035612 procs_at_peak=2 exit=0
+export time_wall=5.63 s largest_rss_kb=1034368 exit=0
+csv_kb=192800
+CALL=176698
+CDG=81040
+REACHING_DEF=1083532
+METHOD=24507 FILE=261
+### both-1g (jssrc) parse_cap=1g export_cap=512m
+tree_peak_sum_kb=1308276 tree_peak_single_kb=1171000 procs_at_peak=3 exit=0
+parse time_wall=17.81 s largest_rss_kb=1428540 exit=0
+skipped_methods=4 
+cpg_kb=13256
+tree_peak_sum_kb=489232 tree_peak_single_kb=487232 procs_at_peak=2 exit=0
+export time_wall=5.75 s largest_rss_kb=487932 exit=0
+csv_kb=192800
+CALL=176698
+CDG=81040
+REACHING_DEF=1083532
+METHOD=24507 FILE=261
+### spring-default (javasrc) parse_cap=default export_cap=default
+tree_peak_sum_kb=7909020 tree_peak_single_kb=7778732 procs_at_peak=4 exit=0
+parse time_wall=37.63 s largest_rss_kb=7778812 exit=0
+skipped_methods=0 
+cpg_kb=59832
+tree_peak_sum_kb=3026620 tree_peak_single_kb=3024616 procs_at_peak=2 exit=0
+export time_wall=17.91 s largest_rss_kb=3023316 exit=0
+csv_kb=709272
+CALL=420249
+CDG=480262
+REACHING_DEF=2653083
+METHOD=64691 FILE=5508
+### spring-6g (javasrc) parse_cap=6g export_cap=2g
+tree_peak_sum_kb=6366876 tree_peak_single_kb=6229756 procs_at_peak=4 exit=0
+parse time_wall=135.53 s largest_rss_kb=6305636 exit=0
+skipped_methods=0 
+cpg_kb=59844
+tree_peak_sum_kb=1478160 tree_peak_single_kb=1476160 procs_at_peak=2 exit=0
+export time_wall=20.25 s largest_rss_kb=1474856 exit=0
+csv_kb=709272
+CALL=420249
+CDG=480258
+REACHING_DEF=2653077
+METHOD=64691 FILE=5508
+### postgres-default (c) parse_cap=default export_cap=default
+tree_peak_sum_kb=10224464 tree_peak_single_kb=10222464 procs_at_peak=2 exit=0
+parse time_wall=45.84 s largest_rss_kb=10220808 exit=0
+skipped_methods=9 
+cpg_kb=182020
+tree_peak_sum_kb=6512032 tree_peak_single_kb=6510032 procs_at_peak=2 exit=0
+export time_wall=49.66 s largest_rss_kb=6508944 exit=0
+csv_kb=2020412
+CALL=1415788
+CDG=3122296
+REACHING_DEF=9265358
+METHOD=638817 FILE=2441
+### postgres-8g (c) parse_cap=8g export_cap=2g
+tree_peak_sum_kb=9769200 tree_peak_single_kb=9767200 procs_at_peak=2 exit=0
+parse time_wall=45.72 s largest_rss_kb=10045728 exit=0
+skipped_methods=9 
+cpg_kb=181992
+tree_peak_sum_kb=2751844 tree_peak_single_kb=2749844 procs_at_peak=2 exit=0
+export time_wall=49.83 s largest_rss_kb=2779148 exit=0
+csv_kb=2020412
+CALL=1415788
+CDG=3122296
+REACHING_DEF=9265358
+METHOD=638817 FILE=2441
+DONE

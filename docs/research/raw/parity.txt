@@ -1,0 +1,24 @@
+### TS parity r3/app/both
+whole: methods_internal=4331 methods_external=1063 CALL_to_internal=11148 CALL_to_external=165550 (operators=100096) CDG=81040 REACHING_DEF=1083532
+unit:definitions: methods_internal=153 methods_external=50 CALL_to_internal=105 CALL_to_external=29096 (operators=25286) CDG=1873 REACHING_DEF=109077
+unit:lib: methods_internal=68 methods_external=17 CALL_to_internal=0 CALL_to_external=4615 (operators=4019) CDG=9464 REACHING_DEF=206593
+unit:schemas: methods_internal=2826 methods_external=619 CALL_to_internal=3205 CALL_to_external=61777 (operators=45928) CDG=20501 REACHING_DEF=455268
+unit:utils: methods_internal=1275 methods_external=532 CALL_to_internal=1803 CALL_to_external=47115 (operators=24712) CDG=48932 REACHING_DEF=311675
+### Python parity redglass/packages
+whole: methods_internal=26451 methods_external=34635 CALL_to_internal=44887 CALL_to_external=2410857 (operators=343679) CDG=276219 REACHING_DEF=2947436
+unit:agent_runtime: methods_internal=1469 methods_external=1667 CALL_to_internal=1452 CALL_to_external=24568 (operators=16011) CDG=10261 REACHING_DEF=154225
+unit:contracts: methods_internal=1596 methods_external=1019 CALL_to_internal=311 CALL_to_external=15294 (operators=12017) CDG=5522 REACHING_DEF=94373
+unit:core: methods_internal=191 methods_external=186 CALL_to_internal=54 CALL_to_external=1853 (operators=1502) CDG=777 REACHING_DEF=11526
+unit:infra: methods_internal=12328 methods_external=20311 CALL_to_internal=16270 CALL_to_external=890397 (operators=181413) CDG=159727 REACHING_DEF=1529260
+unit:pipeline: methods_internal=8190 methods_external=8925 CALL_to_internal=15630 CALL_to_external=376245 (operators=101886) CDG=79429 REACHING_DEF=886529
+unit:testing: methods_internal=1192 methods_external=1166 CALL_to_internal=564 CALL_to_external=14745 (operators=9999) CDG=8241 REACHING_DEF=88020
+unit:tools: methods_internal=1485 methods_external=1866 CALL_to_internal=1147 CALL_to_external=30978 (operators=18882) CDG=12262 REACHING_DEF=186746
+### max-num-def retry m32 (skipped=2 at 4000)
+tree_peak_sum_kb=8172480 tree_peak_single_kb=8037964 procs_at_peak=4 exit=1
+Command exited with non-zero status 1
+retry time_wall=100.53 s largest_rss_kb=8089616 exit=1
+skipped_methods_after=0
+fisio/fisio/common/test_utils/constants.py:<module> has more than 4000 definitions
+utils/customer/AEP/tenable/test_residual_risk_asset_csv_dump.py:<module> has more than 4000 definitions
+REACHING_DEF_after=
+DONE

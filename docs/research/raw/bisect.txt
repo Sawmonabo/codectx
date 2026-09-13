@@ -1,0 +1,12 @@
+collections LOC=216 2.05 s 299260 KB exit=0 
+components LOC=41194 9.70 s 1937548 KB exit=0 
+definitions LOC=61 1.99 s 296940 KB exit=0 
+imports LOC=135053 23.78 s 2992648 KB exit=0 
+lib LOC=20514 38.15 s 2593464 KB exit=0 
+plugins LOC=1514 2.53 s 468068 KB exit=0 
+startup LOC=25 1.91 s 291752 KB exit=0 
+styles LOC=3648 3.71 s 578256 KB exit=0 
+unitTests LOC=975 1.42 s 174268 KB exit=0 
+utils LOC=82 2.06 s 291348 KB exit=0 
+views LOC=120243 19.38 s 3072240 KB exit=0 
+DONE

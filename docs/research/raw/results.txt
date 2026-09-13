@@ -1,0 +1,44 @@
+### xtools (golang) ./xtools 
+parse wall=11.86 s rss=7232272 KB exit=0
+skipped_methods=0
+cpg_kb=14308
+export wall=4.48 s rss=1227716 KB exit=0
+csv_kb=145476
+CALL=110619
+CDG=101330
+REACHING_DEF=746941
+METHOD=90102 FILE=1713
+### xtools-xmx2g (golang) ./xtools -J-Xmx2g
+parse wall=8.84 s rss=6887104 KB exit=0
+skipped_methods=0
+cpg_kb=14304
+export wall=4.22 s rss=1210952 KB exit=0
+csv_kb=145484
+CALL=110619
+CDG=101330
+REACHING_DEF=746962
+METHOD=90101 FILE=1713
+### r3app (jssrc) /home/sabossedgh/repos/r3/app 
+parse wall=165.96 s rss=12201364 KB exit=1
+skipped_methods=12
+2026-09-13 19:00:56.135 WARN  RecoverForJavaScriptFile  Unhandled field structure (BLOCK,new Error()),(FIELD_IDENTIFIER,stack) @ server/lib/publish/_utils.js#L2
+2026-09-13 19:00:56.135 WARN  RecoverForJavaScriptFile  Unhandled field structure (BLOCK,new Error()),(FIELD_IDENTIFIER,stack) @ server/lib/publish/_utils.js#L3
+2026-09-13 19:01:24.317 WARN  RecoverForJavaScriptFile  Unhandled field structure (BLOCK,new Error()),(FIELD_IDENTIFIER,stack) @ server/lib/publish/_utils.js#L2
+cpg_kb=84228
+export wall=1.30 s rss=1992996 KB exit=1
+csv_kb=0
+CALL=
+CDG=
+REACHING_DEF=
+METHOD= FILE=
+### redglass (pythonsrc) /home/sabossedgh/repos/redglass 
+parse wall=25.84 s rss=6977712 KB exit=0
+skipped_methods=1
+cpg_kb=97708
+export wall=27.50 s rss=5249988 KB exit=0
+csv_kb=1265608
+CALL=5040949
+CDG=412743
+REACHING_DEF=4104561
+METHOD=83508 FILE=2090
+DONE

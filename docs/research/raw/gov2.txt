@@ -1,0 +1,17 @@
+### xtools-800m Xmx=800m
+parse wall=10.90 s rss=1114240 KB exit=0
+cpg_kb=14312
+### xtools-500m Xmx=500m
+parse wall=12.96 s rss=988388 KB exit=0
+cpg_kb=14308
+### redglass-2g Xmx=2g
+parse wall=36.99 s rss=3899544 KB exit=0
+cpg_kb=97716
+### redglass-1g Xmx=1g
+parse wall=7.99 s rss=1341896 KB exit=1
+java.lang.OutOfMemoryError: Java heap space
+no cpg
+### xtools/internal subtree (no go.mod)
+parse wall=3.57 s rss=396568 KB exit=0
+cpg_kb=68
+DONE

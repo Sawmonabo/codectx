@@ -1,0 +1,22 @@
+### tokio-crate (rust) dir=tokio/tokio Xmx=2g
+[workspace]
+resolver = "2"
+members = [
+tree_peak_sum_kb=2775092 tree_peak_single_kb=2525636 procs_at_peak=5 exit=0
+parse time_wall=55.24 s largest_rss_kb=2570976 exit=0
+cpg_kb=16
+tree_peak_sum_kb=147816 tree_peak_single_kb=145812 procs_at_peak=2 exit=0
+export time_wall=1.12 s largest_rss_kb=174584 exit=0
+csv_kb=124
+CALL=
+CDG=
+REACHING_DEF=
+METHOD= FILE=1
+### kubectl-retry (golang) Xmx=default
+Command exited with non-zero status 1
+parse time_wall=6.23 s largest_rss_kb=5424872 exit=1
+Caused by: java.util.NoSuchElementException: next on empty iterator
+### scip-go k8s (workspace mode)
+scip-go wall=151.77 s rss=4225140 KB exit=0
+scip_bytes=317399375
+DONE

@@ -1,0 +1,10 @@
+### xtools JAVA_OPTS=-Xmx3g
+parse wall=9.66 s rss=2920388 KB exit=0
+cpg_kb=14308
+### xtools JAVA_OPTS=-Xmx1500m
+parse wall=9.67 s rss=1932504 KB exit=0
+cpg_kb=14308
+### xtools/gopls subtree only (shard below module)
+parse wall=0.22 s rss=77548 KB exit=1
+gopls LOC 0
+DONE

@@ -1,0 +1,14 @@
+### r3/app/imports (jssrc)
+parse wall=9.73 s rss=2970824 KB exit=0
+METHOD=31971 CALL=77114 CDG=55274 RD=500907
+### r3/app/lib (jssrc)
+parse wall=5.73 s rss=1146160 KB exit=0
+METHOD=9716 CALL=24563 CDG=23828 RD=184403
+### r3/app/client (jssrc)
+parse wall=108.25 s rss=8879072 KB exit=1
+java.lang.RuntimeException: Assignment statement with 3 arguments
+METHOD= CALL= CDG= RD=
+### r3/app/both (jssrc)
+parse wall=17.27 s rss=5214836 KB exit=0
+METHOD=24507 CALL=176698 CDG=81040 RD=1083532
+DONE
