@@ -24,7 +24,13 @@ type Handler interface {
 func (s *Server) Start() error {
 	inner := func() { fmt.Println(str.ToUpper(greeting)) }
 	inner()
+	// len is a builtin: no declaration of this file can be its callee.
+	s.port = len(日本語(s.Name))
 	return helper(s.Name)
 }
+
+// 日本語 is a non-ASCII callee, so a call-site byte range counted in runes
+// instead of bytes selects the wrong token at both ends.
+func 日本語(name string) string { return name + greeting }
 
 func helper(name string) error { return nil }

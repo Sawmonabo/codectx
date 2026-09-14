@@ -61,6 +61,13 @@ const (
 	MaxDeclsPerFile   = 20000
 	MaxImportsPerFile = 4000
 	MaxRefsPerFile    = 60000
+	// MaxQualifierBytes bounds Ref.Qualifier. A call's receiver is an
+	// arbitrary expression -- `a.b(x).c(y).Scan(&v)` has a receiver hundreds
+	// of bytes long -- so the worker reports a qualifier only when it is a
+	// name of at most this many bytes and leaves it empty otherwise, rather
+	// than sending an unbounded string the parent must refuse. It is at most
+	// model.MaxNameBytes; facts.go proves that at compile time.
+	MaxQualifierBytes = 512
 )
 
 // Hello is the worker's identity: the PID for accounting, the language
@@ -115,15 +122,27 @@ type Import struct {
 // Ref is one reference occurrence: a call site or a type reference.
 type Ref struct {
 	// Kind is "call" or "type".
-	Kind  string `json:"kind"`
+	Kind string `json:"kind"`
+	// Start and End bound the whole reference expression: the call
+	// expression for a call, the identifier itself for a type reference.
 	Start uint32 `json:"start"`
 	End   uint32 `json:"end"`
-	Name  string `json:"name"`
+	// NameStart and NameEnd bound the callee/type identifier token alone.
+	// They are what the Section 11.3 callsite alias is built from, and what
+	// a SCIP occurrence covers, so the two providers name the same range;
+	// the enclosing expression's range would not join anything.
+	NameStart uint32 `json:"name_start"`
+	NameEnd   uint32 `json:"name_end"`
+	Name      string `json:"name"`
 	// Scope is the ordinal of the enclosing declaration or -1 for module level.
 	Scope int `json:"scope"`
-	// Qualified reports a receiver/object/scope qualifier; QualifierIsImport
-	// reports that the qualifier is a name an import in this file introduced,
-	// which makes the target cross-file.
+	// Qualified reports that the call named a receiver/object/scope
+	// qualifier; Qualifier is that qualifier when it is a name within
+	// MaxQualifierBytes and empty when the receiver is a larger expression,
+	// which is a callee this file cannot name rather than a string to
+	// truncate. QualifierIsImport reports that the qualifier is a name an
+	// import in this file introduced, which makes the target cross-file; it
+	// is decided from the receiver's full text, never the bounded copy.
 	Qualified         bool   `json:"qualified,omitempty"`
 	Qualifier         string `json:"qualifier,omitempty"`
 	QualifierIsImport bool   `json:"qualifier_is_import,omitempty"`
