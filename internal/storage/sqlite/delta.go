@@ -59,6 +59,8 @@ type Replaced struct {
 	Scopes []string
 	// Keys are the producer fact keys the import replaced or dropped. It is
 	// consumed once.
+	// Each key must be a lowercase hex digest (model.ValidHexID); anything
+	// else is refused.
 	Keys iter.Seq[string]
 	// IndexLevel drops the previous unit's index-level bucket: the facts and
 	// evidence that name no file. Providers that republish every unlocated
@@ -85,7 +87,7 @@ type CarryOverStats struct {
 // present, so the fresh import always wins over its predecessor.
 //
 // Carrying a row asserts that its source has not changed, so the whole call is
-// refused unless every file the previous unit declared as an input, and that
+// refused unless every file the previous unit located facts in, and that
 // Replaced does not name, is declared by this unit with the same content hash.
 // A file that was edited but not named, or deleted from the snapshot, is
 // therefore a typed refusal and never a stale fact.

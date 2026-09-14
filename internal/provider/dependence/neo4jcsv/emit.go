@@ -833,6 +833,10 @@ func (e *emitter) emitNodes(ctx context.Context) error {
 // ascending and without duplicates. Duplicates are ordinary — two entities of
 // one identity, or two occurrences of one edge, can share a key — and storage
 // refuses a list that holds one.
+// sortedKeys is the key list stored for one fact. There is deliberately no
+// per-fact bound: dropping a key would blind removal detection for that fact,
+// and every key is one of the query's rows, so maxDerivedRows is the only
+// ceiling (51 keys on one relation was the measured peak on this repository).
 func sortedKeys(keys []string) []string {
 	slices.Sort(keys)
 	return slices.Compact(keys)

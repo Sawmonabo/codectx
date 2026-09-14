@@ -194,7 +194,7 @@ rep.Manifest.Diff(previous, func(c scip.Change) error {
     }
     return nil
 })
-stats, _ := w.CarryOver(ctx, prev, replaced)
+_, _ = w.CarryOver(ctx, prev, replaced)
 
 fresh := filepath.Join(workDir, "manifest")
 rep.Manifest.Save(fresh)
