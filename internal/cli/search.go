@@ -101,8 +101,9 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			return writeSearchTable(out, result)
 		},
 	}
-	addQueryFlags(cmd)
-	addPageFlags(cmd)
+	addQueryFlags(cmd, true)
+	addLimitFlag(cmd)
+	addCursorFlag(cmd)
 	cmd.Flags().StringArray(searchKindFlag, nil, "keep only hits of this node kind; repeat the flag for more than one")
 	cmd.Flags().StringArray(searchLanguageFlag, nil, "keep only hits in this language; repeat the flag for more than one")
 	return cmd

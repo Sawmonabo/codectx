@@ -1465,7 +1465,11 @@ func TestDeltaImportInvariants(t *testing.T) {
 				t.Fatalf("PinGeneration(%d): %v", gen, err)
 			}
 			defer r.Close()
-			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", model.MaxPageItems)
+			// 256 is the limit the graph engine actually passes (its
+			// adjacencyBatch), which is ABOVE model.MaxPageItems: pageLimit
+			// clamps it, and a row calling with exactly MaxPageItems would
+			// never exercise that clamp at all.
+			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", 256)
 			if err != nil {
 				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
 			}
