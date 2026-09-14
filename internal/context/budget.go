@@ -403,5 +403,7 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 		WithDetail("manifest_bytes", fmt.Sprint(total)).
 		WithDetail("cap", "context.max_manifest_bytes").
 		WithDetail("cap_bytes", fmt.Sprint(b.MaxManifestBytes)).
-		WithRemediation("narrow the task or lower the per-request budget; context.max_manifest_bytes is a deployment bound a request cannot raise")
+		WithRemediation("narrow the task or lower the per-request budget; if the REQUIRED scope alone exceeds the cap " +
+			"neither applies -- required context is never dropped -- and only raising context.max_manifest_bytes in " +
+			"the deployment configuration, which a request cannot do, admits this task")
 }

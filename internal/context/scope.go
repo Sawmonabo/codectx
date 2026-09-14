@@ -175,9 +175,12 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 
 	for _, e := range impact.Entries {
 		c := candidate{
-			NodeID:      e.NodeID,
-			FileID:      e.FileID,
-			Path:        e.Path,
+			NodeID: e.NodeID,
+			FileID: e.FileID,
+			// ImpactEntry.Name is the entry's qualified name, which this
+			// candidate carries as its label until hydrateFiles replaces it
+			// with the file path FileID resolves to.
+			Path:        e.Name,
 			Requirement: boundaryRequirement(e.Kind, e.Depth),
 			Origin:      originExpansion,
 			Depth:       e.Depth,
