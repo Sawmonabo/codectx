@@ -641,6 +641,12 @@ func (p *stdinPump) stop(grace time.Duration) error {
 
 func (p *stdinPump) closeBoth() {
 	p.closeOnce.Do(func() {
+		// A caller-supplied reader is the only thing the pump can still be
+		// parked inside after both pipe ends are gone; closing it is what
+		// releases that goroutine.
+		if c, ok := p.src.(io.Closer); ok {
+			c.Close()
+		}
 		p.dst.Close()
 		p.childEnd.Close()
 	})

@@ -38,6 +38,11 @@ func safeTree(t *testing.T) (Root, string) {
 	} {
 		mustWrite(t, filepath.Join(root, filepath.FromSlash(rel)), rel)
 	}
+	// An empty directory: ReadDir reports io.EOF for it, which once aborted
+	// the whole walk (and every snapshot capture) as CTX_PATH_ESCAPE.
+	if err := os.MkdirAll(filepath.Join(root, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlinks are unavailable in this environment: %v", err)
 	}
