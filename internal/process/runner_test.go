@@ -358,3 +358,71 @@ func openDescriptors(t *testing.T) int {
 	}
 	return len(entries)
 }
+
+// TestLiveSubprocessCountUnwindsOnFailure protects the Section 23 live
+// subprocess figure against the one way it can go permanently wrong: a counter
+// that is raised when a child starts and lowered only when the run succeeds.
+//
+// Failure mode: every timeout, cancellation, output refusal and non-zero exit
+// would leave the count one higher than the truth, so a long-lived server
+// eventually reports a machine full of children that all exited, and the memory
+// accounting built on that figure refuses work forever. The count is therefore
+// asserted to rise while a child is genuinely running -- without which the
+// unwind assertion would pass on a counter that never counts -- and to return to
+// its starting value after a run that failed.
+func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, dir := testRunner(t)
+	if got := runner.LiveSubprocesses(); got != 0 {
+		t.Fatalf("a fresh runner reports %d live children, want 0", got)
+	}
+
+	// A child that outlives its timeout: the increment has happened, the run
+	// fails, and the decrement must still be on the way out.
+	observed := make(chan int64, 1)
+	go func() {
+		var peak int64
+		for i := 0; i < 200; i++ {
+			if n := runner.LiveSubprocesses(); n > peak {
+				peak = n
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		observed <- peak
+	}()
+	_, err := runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", "sleep 30"},
+		Dir:            dir,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        300 * time.Millisecond,
+		Grace:          200 * time.Millisecond,
+	})
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeProviderTimeout {
+		t.Fatalf("Run returned %v, want a typed %s", err, model.CodeProviderTimeout)
+	}
+	if peak := <-observed; peak == 0 {
+		t.Fatal("the live count never rose while a child was running, so the unwind below proves nothing")
+	}
+	if got := runner.LiveSubprocesses(); got != 0 {
+		t.Fatalf("after a run that timed out the runner reports %d live children, want 0", got)
+	}
+
+	// A child that exits non-zero on its own is the other failure shape.
+	if _, err := runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", "exit 3"},
+		Dir:            dir,
+		MaxStdoutBytes: 4096,
+		MaxStderrBytes: 4096,
+		Timeout:        30 * time.Second,
+		Grace:          time.Second,
+	}); err == nil {
+		t.Fatal("a child that exited 3 was reported as a clean run")
+	}
+	if got := runner.LiveSubprocesses(); got != 0 {
+		t.Fatalf("after a non-zero exit the runner reports %d live children, want 0", got)
+	}
+}
