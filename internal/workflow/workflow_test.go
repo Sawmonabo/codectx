@@ -89,6 +89,121 @@ func TestWorkflowScenarios(t *testing.T) {
 			}
 		}},
 		// L2 rows
+		// An include invalidates the prior scope review by moving the scope
+		// version, never by deleting it, and the coverage the actor already
+		// earned at the same content hash survives the INSERT OR IGNORE
+		// derivation. A service that extended scope without the version bump
+		// would leave a stale review satisfying the gate; one that deleted the
+		// observation or the coverage would destroy the audit record and send
+		// the actor back to re-read bytes it has already confirmed.
+		{"include invalidates the prior scope review while same-hash coverage survives", func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			before := h.session(fixtureSession)
+			servedHash := h.file(fixtureSession, fileFull).hash
+
+			// The review is inserted through the store rather than through
+			// Record: the eight-category and citation rules are L3's guard, and
+			// this row needs only a review the gate would count as current.
+			oreq := model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: before.ScopeVersion,
+				Kind: model.ObservationScopeReview, Note: "scope reviewed at the planned scope",
+				Review: &model.ScopeReview{
+					ManifestHash: fixtureID("manifest", "canonical"), ScopeVersion: before.ScopeVersion,
+				},
+			}
+			review := model.Observation{
+				ID: model.NewObservationID(oreq), SessionID: oreq.SessionID, ActorID: oreq.ActorID,
+				ScopeVersion: oreq.ExpectedScope, Kind: oreq.Kind, Review: oreq.Review,
+				Note: oreq.Note, CreatedAt: fixtureNow,
+			}
+			if err := h.store.PutObservation(ctx, review); err != nil {
+				t.Fatalf("record the scope review the include must invalidate: %v", err)
+			}
+
+			// What the recompile returns: a second immutable manifest on the
+			// session's own binding that pulls one further file into scope.
+			included := model.ManifestID(fixtureID("manifest", "included"))
+			extra := model.FileID(fixtureID("file", "included"))
+			h.store.mu.Lock()
+			m := h.store.manifests[fixtureManifest]
+			m.ID, m.EntryCount, m.CanonicalHash = included, 1, fixtureID("manifest", "included", "canonical")
+			h.store.manifests[included] = m
+			h.store.entries[included] = []model.ContextEntry{{
+				Ordinal: 0, FileID: extra, Requirement: model.RequirementFull,
+				ScoreMicros: 900, EstimatedBytes: 10, EstimatedTokens: 2, Reasons: []string{"seed"},
+			}}
+			h.store.current[extra] = fixtureID("hash", "included")
+			h.store.compiled = m
+			h.store.mu.Unlock()
+
+			_, err := h.svc.Include(ctx, model.IncludeRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+				Seeds: []string{"internal/c/included.go"}, ExpectedVersion: before.StateVersion,
+			})
+			// Include's tail projects the new record through L4's status, which
+			// is still a stub in this lane; its store-visible work is committed
+			// by then, so this row asserts on the store. When L4 lands the error
+			// is nil and every assertion below is unchanged.
+			if err != nil && err.Error() != errUnimplemented("status").Error() {
+				t.Fatalf("include: %v", err)
+			}
+
+			after := h.session(fixtureSession)
+			// The review is untouched at the scope version it was recorded
+			// under -- nothing was deleted or rewritten.
+			prior, err := h.store.Observations(ctx, fixtureSession, fixtureActor,
+				model.ObservationScopeReview, before.ScopeVersion, "", 0)
+			if err != nil {
+				t.Fatalf("read the prior scope review: %v", err)
+			}
+			if len(prior) != 1 || prior[0].ID != review.ID {
+				t.Fatalf("the include did not leave the prior scope review intact: %+v", prior)
+			}
+			// ...and it no longer counts, because no review is current at the
+			// session's new scope version.
+			current, err := h.store.Observations(ctx, fixtureSession, fixtureActor,
+				model.ObservationScopeReview, after.ScopeVersion, "", 0)
+			if err != nil {
+				t.Fatalf("read the current scope review: %v", err)
+			}
+			if len(current) != 0 {
+				t.Fatalf("a scope review still satisfies scope version %d after the include: %+v", after.ScopeVersion, current)
+			}
+			if after.ScopeVersion != before.ScopeVersion+1 {
+				t.Fatalf("scope version is %d after the include; want %d", after.ScopeVersion, before.ScopeVersion+1)
+			}
+			if after.ManifestID != included {
+				t.Fatalf("the session's current manifest is %q; want the recompiled %q", after.ManifestID, included)
+			}
+			// Same-actor same-hash coverage survives, so the include costs the
+			// actor a review and not its confirmed reads.
+			cov, err := h.store.Coverage(ctx, fixtureSession, fixtureActor, "", 0)
+			if err != nil {
+				t.Fatalf("read coverage after the include: %v", err)
+			}
+			var full *model.FileCoverage
+			for i := range cov {
+				if cov[i].FileID == fileFull {
+					full = &cov[i]
+				}
+			}
+			if full == nil {
+				t.Fatalf("the include dropped %q from the session's scope", fileFull)
+			}
+			if full.ContentHash != servedHash || full.State != model.CoverageFullServed {
+				t.Fatalf("coverage of the fully served file is %q/%s after the include; want %q/%s",
+					full.ContentHash, full.State, servedHash, model.CoverageFullServed)
+			}
+			inScope := false
+			for _, c := range cov {
+				if c.FileID == extra {
+					inScope = true
+				}
+			}
+			if !inScope {
+				t.Fatalf("the recompiled manifest's file %q never entered the session's scope", extra)
+			}
+		}},
 		// L3 rows
 		//
 		// A scope review is the one observation that can claim a file was read,
