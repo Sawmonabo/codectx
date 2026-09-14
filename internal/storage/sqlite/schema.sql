@@ -12,7 +12,12 @@ CREATE TABLE blobs (
     hash BLOB PRIMARY KEY CHECK(length(hash) = 32),
     size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
     state TEXT NOT NULL CHECK(state IN ('ready','quarantined','trash')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    -- When the Section 10.4 collector demoted this blob out of 'ready'. The
+    -- grace window before the second reachability check and the deletion is
+    -- measured from it, so a restore that flips the state back to 'ready'
+    -- clears it: a ready blob is never mid-grace.
+    trashed_at TEXT CHECK(trashed_at IS NULL OR state <> 'ready')
 );
 CREATE TABLE blob_blocks (
     blob_hash BLOB NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
@@ -418,6 +423,12 @@ CREATE TABLE retention_leases (
     snapshot_id BLOB REFERENCES snapshots(id),
     owner_kind TEXT NOT NULL CHECK(owner_kind IN ('query','cursor','session','staging')),
     expires_at TEXT NOT NULL,
+    -- The owner this lease was taken for, so a lease can be found from its
+    -- owner and released when the owner ends. Lease identifiers otherwise flow
+    -- one way only, which is why a closed session's lease survived it and an
+    -- idempotent re-open minted a second one. It is NULL for an owner that has
+    -- no stable identity of its own, such as a staging lease.
+    owner_ref BLOB CHECK(owner_ref IS NULL OR length(owner_ref) = 32),
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
@@ -452,3 +463,11 @@ CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
 CREATE INDEX idx_lease_expiry ON retention_leases(expires_at);
+-- One live lease per owner, enforced by the schema rather than by the caller
+-- remembering to look first: an idempotent re-open that acquires again is
+-- refused instead of pinning a generation twice. The partial index leaves
+-- owner-less leases unconstrained.
+CREATE UNIQUE INDEX idx_lease_owner ON retention_leases(owner_kind, owner_ref) WHERE owner_ref IS NOT NULL;
+-- The grace pass asks for the trashed blobs whose window has elapsed; without
+-- this index that question is a full scan of blobs on every collection pass.
+CREATE INDEX idx_blob_trash ON blobs(state, trashed_at);
