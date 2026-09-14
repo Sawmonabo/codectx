@@ -33,6 +33,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
+	"github.com/Sawmonabo/codectx/internal/workflow"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -159,6 +160,9 @@ type stack struct {
 	repo     model.RepositoryID
 	search   *search.Service
 	coverage *coverage.Service
+	// workflow is the Section 17 guard, review and capsule service the facade
+	// routes every session mutation through. INT wires it.
+	workflow *workflow.Service
 
 	// views memoises the per-snapshot read view the coverage service opens
 	// through its SourceOpener. A view is pinned to one immutable snapshot, so
