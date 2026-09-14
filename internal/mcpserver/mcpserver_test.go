@@ -266,9 +266,23 @@ func newTestHandlers(f *fakeServices) *handlers {
 // jsonschema inference fails for any In or Out type, so simply reaching the
 // return statement is the reflection smoke test for the whole surface.
 func newTestServer(f *fakeServices) *mcp.Server {
-	s := mcp.NewServer(&mcp.Implementation{Name: "codectx", Version: "0.0.0-test"}, nil)
-	register(s, newTestHandlers(f))
-	return s
+	// Built through New, never by hand: New is where limitMiddleware is
+	// installed, so a server assembled here directly would certify a wiring
+	// nobody ships and no bound could ever be exercised over the transport.
+	h := newTestHandlers(f)
+	s, err := New(Options{
+		Index:    h.index,
+		Explore:  h.explore,
+		Context:  h.context,
+		Diagnose: h.diagnose,
+		Config:   h.cfg,
+		Build:    h.build,
+		Logger:   h.log,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return s.mcp
 }
 
 // connect runs a real mcp.Client against the server over the SDK's in-memory
@@ -503,6 +517,32 @@ var scenarios = []scenario{
 	},
 
 	// L1 rows.
+	{
+		// Failure mode: the raw tools/call frame stops being capped before it is
+		// decoded. A post-decode cap has already paid the unmarshal and the
+		// schema walk over attacker-sized input, which is the allocation the
+		// bound exists to prevent; the frame is json.RawMessage at the receiving
+		// middleware precisely so the cap can precede it.
+		//
+		// The payload is BOTH oversized and missing every required field of
+		// codectx_search, so the two orders answer differently: gate first gives
+		// CTX_RESOURCE_LIMIT, gate after decoding gives the SDK's schema
+		// validation error. That difference is what pins the ordering rather
+		// than merely the existence of a cap.
+		name: "oversized tool arguments are refused before decoding",
+		tool: "codectx_search",
+		args: map[string]any{"pad": strings.Repeat("x", 300_000)},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if !res.IsError {
+				t.Fatalf("oversized arguments were accepted: %+v", res.StructuredContent)
+			}
+			text := firstText(res)
+			if !strings.HasPrefix(text, model.CodeResourceLimit+":") {
+				t.Errorf("tool error = %q, want the %s refusal that precedes decoding",
+					text, model.CodeResourceLimit)
+			}
+		},
+	},
 
 	// L2 rows.
 	{
