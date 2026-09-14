@@ -61,6 +61,13 @@ func fixtureRelationID(i int) model.RelationID { return model.RelationID(fmt.Spr
 // test sets, so a truncation case has something real to truncate.
 const fixtureLeafCount = 40
 
+// fixtureWideCount is the fan-out of n-wide, the hub that exists purely to
+// exceed fixtureEdgePageLimit's clamp: reading its neighbourhood whole needs a
+// SECOND keyset page, which is the only way a loop that ends on a short page
+// can be told apart from one that ends on an empty page. n-wide hangs off no
+// package and nothing else reaches it, so it changes no other scenario's answer.
+const fixtureWideCount = model.MaxPageItems + 60
+
 // graphFixture is a deterministic in-memory Adjacency. Relations are stored
 // once, sorted by RelationID, so every read is keyset-ordered without the test
 // having to sort anything.
@@ -107,6 +114,10 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for i := 0; i < fixtureLeafCount; i++ {
 		addNode(fmt.Sprintf("n-leaf-%02d", i), model.NodeFunction, fmt.Sprintf("leaf%02d", i))
 	}
+	addNode("n-wide", model.NodeFunction, "n-wide")
+	for i := 0; i < fixtureWideCount; i++ {
+		addNode(fmt.Sprintf("n-wide-leaf-%03d", i), model.NodeFunction, fmt.Sprintf("wide%03d", i))
+	}
 
 	// edges are declared in a stable order; RelationIDs are assigned from it so
 	// the keyset order is reproducible from the source alone.
@@ -151,6 +162,11 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	}
 	// n-a calls the hub, so the fan-out is reachable from the same seed as the cycle.
 	edges = append(edges, edge{"n-a", model.RelCalls, "n-hub"})
+	// n-wide's fan-out is declared last so every relation id above keeps the
+	// position it had before this hub existed.
+	for i := 0; i < fixtureWideCount; i++ {
+		edges = append(edges, edge{"n-wide", model.RelCalls, fmt.Sprintf("n-wide-leaf-%03d", i)})
+	}
 
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
@@ -199,17 +215,30 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	return f
 }
 
+// fixtureEdgePageLimit is the clamp sqlite.pageLimit applies to every
+// Adjacency.Edges call: any limit above model.MaxPageItems, and any
+// non-positive one, comes back as model.MaxPageItems. The fixture applies it
+// verbatim, because a fake that honours whatever limit it is given lets a
+// keyset loop that ends on "short page" pass while the shipped reader silently
+// truncates every walk.
+func fixtureEdgePageLimit(limit int) int {
+	if limit <= 0 || limit > model.MaxPageItems {
+		return model.MaxPageItems
+	}
+	return limit
+}
+
 // Edges returns the visible edges touching any of nodes, keyset-ordered by
 // RelationID after `after`, at most limit rows. It follows the Adjacency
-// contract: an empty kinds slice is "no kind filter", and a non-positive limit
-// is treated as unbounded here only because a test may omit it -- a real
-// implementation may reject it.
+// contract: an empty kinds slice is "no kind filter", and the requested limit
+// is clamped exactly as the shipped reader clamps it.
 func (f *graphFixture) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	f.EdgeCalls++
+	limit = fixtureEdgePageLimit(limit)
 	want := make(map[model.NodeID]bool, len(nodes))
 	for _, n := range nodes {
 		want[n] = true
@@ -241,7 +270,7 @@ func (f *graphFixture) Edges(ctx context.Context, nodes []model.NodeID, directio
 			}
 		}
 		out = append(out, r)
-		if limit > 0 && len(out) == limit {
+		if len(out) == limit {
 			break
 		}
 	}
@@ -379,6 +408,57 @@ func TestGraphScenarios(t *testing.T) {
 				if f.EdgeCalls >= fixtureLeafCount {
 					t.Fatalf("%d Edges round trips for a %d-edge hub: the frontier was not batched",
 						f.EdgeCalls, fixtureLeafCount)
+				}
+			},
+		},
+
+		{
+			// The keyset loops ask Adjacency.Edges for adjacencyBatch (256)
+			// rows, but the shipped reader clamps any limit above
+			// model.MaxPageItems (200) down to it. A loop that ends on "the
+			// page came back shorter than I asked for" therefore ends after its
+			// FIRST page always, reads 200 of n-wide's 260 edges, and reports
+			// the result as complete -- a capped neighbourhood presented as
+			// exhaustive, and a directly connected target reported the way a
+			// genuinely unreachable one is. Both walks that page edges are
+			// pinned here: expand's levelEdges and pathWalk.expandBatch.
+			name: "traverse/fan-out past the storage page clamp is read whole",
+			run: func(t *testing.T, f *graphFixture) {
+				limits := fixtureLimits()
+				// The page bound must sit above the fan-out, so the only thing
+				// that can cut the answer short is the keyset loop itself.
+				limits.MaxPageItems = fixtureWideCount + 1
+				e, err := New(Options{Adjacency: f, Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				wide := fixtureNodeID("n-wide")
+				got, err := e.Callees(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{wide},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("Callees: %v", err)
+				}
+				if len(got.Relations) != fixtureWideCount || got.EdgeCount != int64(fixtureWideCount) {
+					t.Fatalf("returned %d relations (edge_count %d) for a %d-edge hub: the keyset walk stopped on its first page",
+						len(got.Relations), got.EdgeCount, fixtureWideCount)
+				}
+				if got.Meta.Truncated {
+					t.Fatalf("truncated=%v reason=%q: a complete neighbourhood must not be reported as cut short",
+						got.Meta.Truncated, got.Meta.TruncationReason)
+				}
+				// The last leaf by relation id is the one a first-page-only walk
+				// never sees, so a one-hop route to it is the honest test of
+				// "unreachable" against "never read".
+				last := fixtureNodeID(fmt.Sprintf("n-wide-leaf-%03d", fixtureWideCount-1))
+				route, err := e.ShortestPath(context.Background(), model.PathRequest{From: wide, To: last})
+				if err != nil {
+					t.Fatalf("ShortestPath: %v", err)
+				}
+				if len(route.Paths) != 1 {
+					t.Fatalf("paths = %d (truncated %v, reason %q), want the one 1-hop route: a reachable target was reported unreachable",
+						len(route.Paths), route.Meta.Truncated, route.Meta.TruncationReason)
 				}
 			},
 		},

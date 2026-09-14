@@ -533,9 +533,13 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 	fmt.Fprintf(b, "occurrences %d in %d distinct %s\n", len(items), len(distinct),
 		plural(len(distinct), "relation", "relations"))
 	for _, o := range items {
-		location := o.Path
+		// References deliberately never sets Path -- resolving it would cost one
+		// file read per distinct file on a port with no batched file lookup --
+		// so the location is rendered from what the occurrence actually carries:
+		// the file id and the byte range that locate it exactly.
+		location := string(o.FileID)
 		if o.Range != nil {
-			location = fmt.Sprintf("%s:%d", o.Path, o.Range.Start.Line)
+			location = fmt.Sprintf("%s:%d:%d", o.FileID, o.Range.Start.Line, o.Range.Start.Column)
 		}
 		fmt.Fprintf(b, "  %-18s %-10s %s\n", clip(string(o.Kind), 18), clip(string(o.Precision), 10), clip(location, 100))
 	}
@@ -567,7 +571,11 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	}
 	fmt.Fprintf(b, "entries     %d\n", len(entries))
 	for _, e := range entries {
-		fmt.Fprintf(b, "  %s  %-9s depth %d  score %d  %s\n", e.NodeID, e.Direction, e.Depth,
+		// ImpactEntry.Path carries the entry's QUALIFIED NAME: model.Node has no
+		// file path, and the hydration fills this field from QualifiedName. The
+		// column is labelled for what it holds, so a reader does not take it
+		// for a file path sitting next to a FileID.
+		fmt.Fprintf(b, "  %s  %-9s depth %d  score %d  name %s\n", e.NodeID, e.Direction, e.Depth,
 			e.ScoreMicros, clip(e.Path, 70))
 		for _, reason := range e.Reasons {
 			fmt.Fprintf(b, "    %s\n", clip(reason, 100))
@@ -590,14 +598,21 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	}
 }
 
-// addTraversalFlags declares the walk budgets. withEdges is false for `path`,
-// whose request carries no edge budget: a flag with no field behind it would be
-// help text describing a request the command cannot build.
-func addTraversalFlags(cmd *cobra.Command, withEdges bool) {
+// addTraversalFlags declares the walk budgets. paged is false for `path`
+// alone, which is both the one command whose request carries no edge budget and
+// the one that is not paged -- a flag with no field behind it would be help
+// text describing a request the command cannot build, and "cumulative across
+// pages" on a command that has no pages describes a workflow it cannot perform.
+func addTraversalFlags(cmd *cobra.Command, paged bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
-	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit, cumulative across pages"+zeroBoundHelp)
-	if withEdges {
-		cmd.Flags().Int(queryEdgesFlag, 0, "maximum distinct relations the walk may admit, cumulative across pages"+zeroBoundHelp)
+	acrossPages := ""
+	if paged {
+		acrossPages = ", cumulative across pages"
+	}
+	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+acrossPages+zeroBoundHelp)
+	if paged {
+		cmd.Flags().Int(queryEdgesFlag, 0,
+			"maximum distinct relations the walk may admit, cumulative across pages"+zeroBoundHelp)
 	}
 }
 

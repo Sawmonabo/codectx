@@ -118,8 +118,11 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	if req.SemanticSource == model.SemanticLSP {
 		// No traversal, no gate and no deadline: the answer is the disclosure
 		// itself, and running the canonical walk anyway would be the silent
-		// substitution Section 11.6 forbids.
-		return model.Page[model.ReferenceOccurrence]{
+		// substitution Section 11.6 forbids. The page still validates before it
+		// leaves -- this is the one return path that used to skip it, and an
+		// unavailability disclosure is no more exempt from its own contract
+		// than an answer is.
+		page = model.Page[model.ReferenceOccurrence]{
 			Meta: model.QueryMeta{
 				Binding: binding,
 				Completeness: []model.CapabilityState{{
@@ -131,17 +134,27 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 					Details:        map[string]string{"reason": "semantic_source_unavailable"},
 				}},
 			},
-		}, nil
+		}
+		if err := page.Validate(); err != nil {
+			return model.Page[model.ReferenceOccurrence]{}, err
+		}
+		return page, nil
 	}
 
+	// The deadline wraps the gate as well as the walk, exactly as the traversal
+	// and path entries do it: waiting for a slot is admitted work like any
+	// other, so waiting past the request deadline is the CTX_RESOURCE_LIMIT the
+	// caller must see rather than an unbounded queue. `codectx refs` carries no
+	// deadline of its own unless --timeout is set, so acquiring first would
+	// block behind two concurrent graph queries forever.
+	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
+	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {
 			return model.Page[model.ReferenceOccurrence]{}, err
 		}
 		defer e.gate.Release()
 	}
-	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
-	defer cancel()
 
 	queryHash := referenceQueryHash(req.NodeID, req.Operation)
 	after, err := e.resumeReferences(req, queryHash)
@@ -331,14 +344,20 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 				after = r.ID
 				continue
 			}
+			// clipped describes THIS page. A relation whose occurrences
+			// overflow the page but which is then deferred whole to the next
+			// page has clipped nothing here, so the flag is only adopted once
+			// the clipped occurrences are actually appended below.
+			occClipped := false
 			if len(occ) > pageLimit {
-				occ, clipped = occ[:pageLimit], true
+				occ, occClipped = occ[:pageLimit], true
 			}
 			if len(items) > 0 && len(items)+len(occ) > pageLimit {
 				// Stop on the relation boundary: this relation belongs whole
 				// to the next page.
 				return items, last, true, clipped, nil
 			}
+			clipped = clipped || occClipped
 			sorted := append([]model.Evidence(nil), occ...)
 			sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
 			for _, row := range sorted {
@@ -372,9 +391,10 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 				return items, last, more, clipped, nil
 			}
 		}
-		if len(rels) < adjacencyBatch {
-			return items, last, false, clipped, nil
-		}
+		// No short-page break: the reader clamps the requested limit down to
+		// model.MaxPageItems, so a short page is the normal case. `after`
+		// advanced on every relation above, and the empty-page check at the
+		// head of the loop is what ends the walk.
 	}
 }
 

@@ -25,7 +25,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	if err := continuationUnavailable(req.Page.Cursor); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	ctx, done, err := beginImpactQuery(ctx, e)
+	ctx, deadline, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
@@ -45,22 +45,28 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		markTruncated(&meta, reasonDependence)
 	}
 
-	b := &budget{deadline: e.now().Add(e.limits.QueryTimeout)}
+	b := &budget{deadline: deadline, now: e.now}
 	acc := newImpactAccumulator(req.Start, b,
 		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
 		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
 	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
-		Direction: req.Direction,
-		Kinds:     kinds,
-		MaxDepth:  resolveBound(req.MaxDepth, e.limits.MaxDepth),
-		Budget:    b,
-		BatchSize: adjacencyBatch,
+		Direction:     req.Direction,
+		Kinds:         kinds,
+		MaxDepth:      resolveBound(req.MaxDepth, e.limits.MaxDepth),
+		Budget:        b,
+		BatchSize:     adjacencyBatch,
+		FrontierBytes: e.limits.FrontierBytes,
 	}, acc.Visit)
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	if acc.reason != "" {
+	switch {
+	case acc.reason != "":
 		markTruncated(&meta, acc.reason)
+	case b.frontierHit:
+		// The rollup summarises the edges the walk read; a level the frontier
+		// budget cut short must not read as the whole neighbourhood.
+		markTruncated(&meta, reasonFrontierBytes)
 	}
 
 	items, rollupErr := e.rollupPackages(ctx, acc.Relations())
@@ -206,10 +212,12 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 }
 
 // maxContainerPages bounds the keyset walk over one batch's containment edges.
-// A node normally has one container, so this is generous headroom rather than a
-// working limit -- but the loop still has an explicit finite bound, because an
-// unbounded "read until done" is exactly how a pathological graph becomes an
-// unbounded query.
+// A batch is at most adjacencyBatch (256) nodes and the reader returns at most
+// model.MaxPageItems (200) rows per page, so 16 pages carry 3200 containment
+// edges -- twelve containers per node in the worst batch. That is generous
+// headroom rather than a working limit, but the loop still has an explicit
+// finite bound, because an unbounded "read until done" is exactly how a
+// pathological graph becomes an unbounded query.
 const maxContainerPages = 16
 
 // containsEdges reads the incoming `contains` edges of one batch of nodes,
@@ -226,7 +234,10 @@ func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID) ([]mod
 			return nil, err
 		}
 		out = append(out, rels...)
-		if len(rels) < adjacencyBatch {
+		// Only an empty page ends the walk: the reader clamps the requested
+		// limit down to model.MaxPageItems, so testing for a short page would
+		// stop after the first one and under-roll every package.
+		if len(rels) == 0 {
 			break
 		}
 		after = rels[len(rels)-1].ID

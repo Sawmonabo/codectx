@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -26,7 +27,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	if err := continuationUnavailable(req.Page.Cursor); err != nil {
 		return model.ImpactResult{}, err
 	}
-	ctx, done, err := beginImpactQuery(ctx, e)
+	ctx, deadline, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
@@ -45,22 +46,28 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		markTruncated(&meta, reasonDependence)
 	}
 
-	b := &budget{deadline: e.now().Add(e.limits.QueryTimeout)}
+	b := &budget{deadline: deadline, now: e.now}
 	acc := newImpactAccumulator(req.Start, b,
 		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
 		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
 	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
-		Direction: req.Direction,
-		Kinds:     kinds,
-		MaxDepth:  resolveBound(req.MaxDepth, e.limits.MaxDepth),
-		Budget:    b,
-		BatchSize: adjacencyBatch,
+		Direction:     req.Direction,
+		Kinds:         kinds,
+		MaxDepth:      resolveBound(req.MaxDepth, e.limits.MaxDepth),
+		Budget:        b,
+		BatchSize:     adjacencyBatch,
+		FrontierBytes: e.limits.FrontierBytes,
 	}, acc.Visit)
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 		return model.ImpactResult{}, err
 	}
-	if acc.reason != "" {
+	switch {
+	case acc.reason != "":
 		markTruncated(&meta, acc.reason)
+	case b.frontierHit:
+		// A level the frontier budget cut short is truncation the caller must
+		// see: the ranking below is over the edges that were read, not all of them.
+		markTruncated(&meta, reasonFrontierBytes)
 	}
 
 	entries := acc.Entries(e.limits.MaxReasonPaths)
@@ -104,16 +111,20 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 // It is a free function taking the engine rather than a method so the
 // impact-family files can share it without claiming a name a sibling lane may
 // want on Engine.
-func beginImpactQuery(ctx context.Context, e *Engine) (context.Context, func(), error) {
-	ctx, cancel := context.WithTimeout(ctx, e.limits.QueryTimeout)
+func beginImpactQuery(ctx context.Context, e *Engine) (context.Context, time.Time, func(), error) {
+	// One clock: the deadline is measured on the ENGINE clock, the same one the
+	// walk budget compares against, and it is returned so the caller reuses this
+	// instant instead of recomputing a later one after the gate wait.
+	deadline := e.now().Add(e.limits.QueryTimeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	if e.gate == nil {
-		return ctx, cancel, nil
+		return ctx, deadline, cancel, nil
 	}
 	if err := e.gate.Acquire(ctx); err != nil {
 		cancel()
-		return nil, nil, err
+		return nil, time.Time{}, nil, err
 	}
-	return ctx, func() {
+	return ctx, deadline, func() {
 		e.gate.Release()
 		cancel()
 	}, nil
@@ -328,7 +339,17 @@ func (a *impactAccumulator) Relations() []model.Relation { return a.edges }
 // route always outranks a longer one and no float ever enters the ordering.
 // The order is (ScoreMicros desc, Depth asc, Path asc, NodeID asc); Path is
 // filled during hydration, so ties settle on NodeID here and stay stable.
-func (a *impactAccumulator) Entries(maxPaths int) []model.ImpactEntry {
+//
+// reasonPaths is context.max_reason_paths_per_entry. The accumulator records
+// ONE parent per admitted node -- the edge that first reached it, which is the
+// edge the entry's reason names -- so there is exactly one route to
+// reconstruct and a positive bound admits it while a zero bound suppresses it.
+// Enumerating alternate routes would mean keeping every parent of every node
+// for the whole walk, which is the frontier blow-up MaxVisited exists to
+// prevent; `path` is the command that answers "the equal-cost routes", and it
+// is where this key bounds a count greater than one. docs/queries.md states
+// the split.
+func (a *impactAccumulator) Entries(reasonPaths int) []model.ImpactEntry {
 	entries := make([]model.ImpactEntry, 0, len(a.order))
 	for _, id := range a.order {
 		n := a.byNode[id]
@@ -339,7 +360,7 @@ func (a *impactAccumulator) Entries(maxPaths int) []model.ImpactEntry {
 			ScoreMicros: 1_000_000 / (1 + n.cost),
 			Reasons:     n.reasons,
 		}
-		if p, ok := a.path(n); ok && maxPaths > 0 {
+		if p, ok := a.path(n); ok && reasonPaths > 0 {
 			entry.Paths = []model.RelationPath{p}
 		}
 		entries = append(entries, entry)
