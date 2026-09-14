@@ -412,9 +412,9 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	maxEdges := int64(resolveBound(req.MaxEdges, e.limits.MaxEdges))
 	maxItems := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
 
-	// The deferred-dependence disclosure happens before the walk: a missing
-	// dependence edge must not read as a genuine absence of edges.
-	pending, err := e.pendingDependence(ctx, kinds)
+	// The capability disclosure happens before the walk: a missing dependence
+	// edge must not read as a genuine absence of edges.
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
@@ -496,7 +496,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if reason == "" && b.frontierHit {
 		reason = reasonFrontierBytes
 	}
-	if reason == "" && len(pending) > 0 {
+	if reason == "" && deferred {
 		reason = reasonDependence
 	}
 	// A continuation is offered for exactly one stop: the page filled up while
@@ -527,7 +527,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	result := model.GraphResult{
 		Meta: model.QueryMeta{
 			Binding:          e.adjacency.Binding(),
-			Completeness:     pending,
+			Completeness:     caps,
 			Truncated:        reason != "",
 			TruncationReason: reason,
 			NextCursor:       nextCursor,
@@ -550,13 +550,31 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	return result, nil
 }
 
-// pendingDependence reports the deferred dependence capability rows a request
-// touching a dependence-only relation kind must disclose. It returns the rows
-// unchanged in State and DiagnosticCode, folding a promotion's queue position
-// into Details when a promoter is available; in report mode there is no
-// promoter and the rows are reported without promoting. A failed promotion
-// never fails the query -- the answer is still correct, just still incomplete.
-func (e *Engine) pendingDependence(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, error) {
+// completeness is the ONE capability derivation every graph answer uses. It
+// reads the pinned generation's capability report through the same
+// Adjacency.Capabilities port search reads it through (search.go:210), so the
+// graph family discloses the same rows `search` and `symbol` do rather than
+// reporting no capabilities at all.
+//
+// The deferred-dependence disclosure is folded INTO those rows, not appended to
+// them: a deferred row is one of the generation's own capability rows, enriched
+// here with the promotion's queue position. Appending would publish the row
+// twice and push a full report past model.MaxCapabilityStates, which the
+// answer's own Validate then rejects.
+//
+// deferred reports whether a request touching a dependence-only relation kind
+// found deferred units; that, and never the length of rows, is what makes an
+// answer truncated -- every generation carries capability rows, so a
+// length test would report every answer as incomplete.
+//
+// In report mode there is no promoter and the rows are disclosed without
+// promoting. A failed promotion never fails the query: the answer is still
+// correct, just still incomplete.
+func (e *Engine) completeness(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, bool, error) {
+	rows, err := e.adjacency.Capabilities(ctx)
+	if err != nil {
+		return nil, false, err
+	}
 	wanted := map[model.RelationKind]bool{}
 	for _, k := range kinds {
 		wanted[k] = true
@@ -569,35 +587,34 @@ func (e *Engine) pendingDependence(ctx context.Context, kinds []model.RelationKi
 		}
 	}
 	if !touches {
-		return nil, nil
+		return rows, false, nil
 	}
-	caps, err := e.adjacency.Capabilities(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.CapabilityState
-	for _, c := range caps {
+	deferred := false
+	for i, c := range rows {
 		if c.ProviderID != dependenceProviderID || c.Details["reason"] != reasonUnitsDeferred {
 			continue
 		}
-		row := c
-		if e.promoter != nil {
-			if p, err := e.promoter.Promote(ctx, dependenceProviderID, c.Scope); err == nil {
-				// WithDetail clones the map, truncates the value and refuses to
-				// grow past MaxCapabilityDetails, so folding a queue position in
-				// can neither mutate the reader's row nor build a row that then
-				// fails its own Validate and fails the query it was disclosing.
-				row = row.WithDetail("units", strconv.Itoa(p.Units)).
-					WithDetail("position", strconv.Itoa(p.Position))
-				if p.Estimate > 0 {
-					// An unmeasured duration is reported as unmeasured, never invented.
-					row = row.WithDetail("estimate_ms", strconv.FormatInt(p.Estimate.Milliseconds(), 10))
-				}
-			}
+		deferred = true
+		if e.promoter == nil {
+			continue
 		}
-		rows = append(rows, row)
+		p, err := e.promoter.Promote(ctx, dependenceProviderID, c.Scope)
+		if err != nil {
+			continue
+		}
+		// WithDetail clones the map, truncates the value and refuses to
+		// grow past MaxCapabilityDetails, so folding a queue position in
+		// can neither mutate the reader's row nor build a row that then
+		// fails its own Validate and fails the query it was disclosing.
+		row := c.WithDetail("units", strconv.Itoa(p.Units)).
+			WithDetail("position", strconv.Itoa(p.Position))
+		if p.Estimate > 0 {
+			// An unmeasured duration is reported as unmeasured, never invented.
+			row = row.WithDetail("estimate_ms", strconv.FormatInt(p.Estimate.Milliseconds(), 10))
+		}
+		rows[i] = row
 	}
-	return rows, nil
+	return rows, deferred, nil
 }
 
 const (

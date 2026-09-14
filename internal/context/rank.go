@@ -400,11 +400,15 @@ func boostsFor(cand candidate, routed routeScore,
 	return total, reasons
 }
 
-// isCapturedChange reports the Section 15.3 active-change statuses.
+// isCapturedChange reports the Section 15.3 active-change statuses. They are
+// the Section 15.2 step 6 admission set, read from the one changedStatuses
+// definition rather than re-spelled here: a second list would let the boost and
+// the seed step disagree about what a captured change is.
 func isCapturedChange(s model.FileStatus) bool {
-	switch s {
-	case model.FileModified, model.FileAdded, model.FileUntracked:
-		return true
+	for _, changed := range changedStatuses {
+		if s == changed {
+			return true
+		}
 	}
 	return false
 }
