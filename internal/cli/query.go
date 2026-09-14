@@ -555,8 +555,13 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 		//
 		// References deliberately never sets Path -- resolving it would cost one
 		// file read per distinct file on a port with no batched file lookup --
-		// so the location is the file id, refined to :line:column when the
-		// occurrence carries a range (the language server overlay's rows do).
+		// so the location is the file id, refined by whichever interval the
+		// occurrence carries. A sealed occurrence carries a byte interval and
+		// is printed `@start-end`, because the evidence table stores offsets
+		// and no line or column; deriving a line from an offset needs the file
+		// itself, and printing a made-up one would be worse than printing the
+		// offsets. Only an overlay row, whose language server speaks positions,
+		// can be refined to :line:column.
 		location := string(o.FileID)
 		if o.Path != "" {
 			// The overlay is the only producer that sets Path, and it is text
@@ -565,8 +570,11 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 			// width, and a path carrying a newline would forge a table row.
 			location = tableCell(o.Path)
 		}
-		if o.Range != nil {
+		switch {
+		case o.Range != nil:
 			location = fmt.Sprintf("%s:%d:%d", location, o.Range.Start.Line, o.Range.Start.Column)
+		case o.Bytes != nil:
+			location = fmt.Sprintf("%s@%d-%d", location, o.Bytes.Start, o.Bytes.End)
 		}
 		fmt.Fprintf(b, "  %-18s %-16s %s at %s  evidence %s\n", clip(string(o.Kind), 18),
 			clip(string(o.Precision), 16), occurrenceOrigin(o), clip(location, 100), occurrenceEvidence(o))
@@ -575,13 +583,20 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 
 // occurrenceOrigin names the end of the edge the caller did not ask about: the
 // referencing node for a reference or an implementation, the referenced type
-// for a type definition. It is printed as a full node id because that is what
-// the operator feeds straight back to `refs` or `symbol` to see where the site
-// is; a clipped id would name nothing they can ask about. An overlay row that
-// sealed no canonical edge has no such id and says so rather than printing an
-// empty column that reads as a node whose id is unknown.
+// for a type definition. The qualified name leads, because that is what tells
+// the operator which symbol this is, and the full node id follows it rather
+// than being replaced by it: the id is what they feed straight back to `refs`
+// or `symbol`, and a clipped or absent id would name nothing they can ask
+// about. A node this generation publishes no fact for keeps the id alone. An
+// overlay row that sealed no canonical edge has no id and says so rather than
+// printing an empty column that reads as a node whose id is unknown.
 func occurrenceOrigin(o model.ReferenceOccurrence) string {
 	switch {
+	case o.FromNodeID != "" && o.FromName != "":
+		// The name is provider-supplied text, so it goes through the same cell
+		// sanitizer the other human tables use: a name carrying a newline
+		// would forge a table row.
+		return "from " + tableCell(o.FromName) + " " + string(o.FromNodeID)
 	case o.FromNodeID != "":
 		return "from " + string(o.FromNodeID)
 	case o.ToNodeID != "":

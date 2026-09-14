@@ -216,7 +216,10 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
 	// fixture that carried ids alone could not tell a hydrated occurrence from
-	// an unhydrated one.
+	// an unhydrated one. The interval is a ByteRange with a nil Range, which is
+	// exactly what a row read back from storage carries -- the evidence table
+	// stores start_byte/end_byte and no line or column -- so a hydration path
+	// that dropped it could not pass here either.
 	evidenceRow := func(rel model.RelationID, i, n int) model.Evidence {
 		return model.Evidence{
 			ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-%d", i, n))),
@@ -227,10 +230,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 			RelationID:      rel,
 			Precision:       model.PrecisionSyntax,
 			FileID:          model.FileID(fixtureID("file-1")),
-			Range: &model.SourceRange{
-				Start: model.Position{Byte: uint64(i) * 16, Line: uint32(i) + 1, Column: 0},
-				End:   model.Position{Byte: uint64(i)*16 + 8, Line: uint32(i) + 1, Column: 8},
-			},
+			Bytes:           &model.ByteRange{Start: uint64(i) * 16, End: uint64(i)*16 + 8},
 		}
 	}
 	for i, e := range edges {
@@ -1161,6 +1161,15 @@ func TestGraphScenarios(t *testing.T) {
 				if len(refs.Items) != 1 || refs.Items[0].FromNodeID != fixtureNodeID("n-ref-caller") {
 					t.Fatalf("referencePage: references returned %d occurrences (%+v), want the single one from n-ref-caller; it sorts past the first clamped page of evidence-free relations",
 						len(refs.Items), refs.Items)
+				}
+				// The occurrence must also be locatable and attributable: the
+				// stored byte interval has to survive hydration, and the
+				// from-node's qualified name has to be filled from the page's
+				// one batched node read. Without either, every occurrence of a
+				// symbol renders as the same anonymous row.
+				if got := refs.Items[0]; got.Bytes == nil || got.FromName != "n-ref-caller" {
+					t.Fatalf("occurrence %+v: want the stored byte interval carried through and from_name %q",
+						got, "n-ref-caller")
 				}
 			},
 		},

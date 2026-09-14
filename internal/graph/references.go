@@ -174,6 +174,9 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
+	if err := e.nameOrigins(ctx, items); err != nil {
+		return model.Page[model.ReferenceOccurrence]{}, err
+	}
 
 	// The same capability disclosure every other graph answer carries, from the
 	// same helper, so `refs` reports the generation's capabilities rather than
@@ -218,6 +221,60 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 		}
 	}
 	return page, nil
+}
+
+// nameOrigins fills each occurrence's FromName from ONE batched node read per
+// page. It runs here, on the whole page, rather than inside referencePage: that
+// method returns from four places, and decorating inside it would leave some
+// pages named and others blank.
+//
+// The read is bounded by construction -- a page holds at most
+// model.MaxPageItems occurrences, so it can name at most that many distinct
+// from-nodes, well inside the storage batch limit -- so there is no chunking
+// and, above all, no per-row lookup.
+//
+// A node the pinned generation does not publish simply gets no name; the id is
+// still there and the renderers fall back to it. A read FAILURE is propagated
+// instead, for the same reason hasMoreRelations propagates its probe: a
+// swallowed error would make "this generation publishes no fact for that node"
+// indistinguishable from "the store could not be read".
+func (e *Engine) nameOrigins(ctx context.Context, items []model.ReferenceOccurrence) error {
+	ids := make([]model.NodeID, 0, len(items))
+	seen := make(map[model.NodeID]struct{}, len(items))
+	for _, o := range items {
+		if o.FromNodeID == "" {
+			continue
+		}
+		if _, dup := seen[o.FromNodeID]; dup {
+			continue
+		}
+		seen[o.FromNodeID] = struct{}{}
+		ids = append(ids, o.FromNodeID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	nodes, err := e.adjacency.NodesByID(ctx, ids)
+	if err != nil {
+		return err
+	}
+	names := make(map[model.NodeID]string, len(nodes))
+	for _, n := range nodes {
+		// Qualified first, plain name second: the qualified spelling is what
+		// tells two same-named methods apart, and a provider that sealed none
+		// leaves the plain name as the only thing there is to say.
+		if name := n.QualifiedName; name != "" {
+			names[n.ID] = name
+			continue
+		}
+		if n.Name != "" {
+			names[n.ID] = n.Name
+		}
+	}
+	for i := range items {
+		items[i].FromName = names[items[i].FromNodeID]
+	}
+	return nil
 }
 
 // nextReferenceCursor mints the continuation for a page that stopped on a
@@ -384,9 +441,15 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 					// and resolving it would cost one file read per distinct
 					// file on a port that offers no batched file lookup, while
 					// FileID plus Range already locates the occurrence exactly.
-					Precision:      row.Precision,
-					FileID:         row.FileID,
+					Precision: row.Precision,
+					FileID:    row.FileID,
+					// Range and Bytes are the same interval from the two sides
+					// of persistence, and a hydrated evidence row carries the
+					// byte one: the table keeps no line or column. Both are
+					// copied rather than one converted into the other, because
+					// a line number is not derivable from an offset here.
 					Range:          row.Range,
+					Bytes:          row.Bytes,
 					SemanticSource: model.SemanticCanonical,
 				})
 			}
