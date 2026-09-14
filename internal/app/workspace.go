@@ -26,16 +26,34 @@ type Workspace struct {
 	coord *index.Coordinator
 }
 
-// OpenWorkspace composes the workspace for a run that will index. wait is how
-// long it waits for the workspace lock before reporting CTX_WORKSPACE_BUSY;
-// wait <= 0 tries once. rebuild opens an explicitly requested new cache beside
-// the configured one and leaves the existing database untouched (Section 12.2).
+// OpenOptions are the caller-supplied inputs of an indexing open. They are one
+// exported struct because the CLI now resolves four independent flags into
+// them -- the lock wait, `--rebuild`, and the `--scip-index`/`--scip-inputs`
+// pair -- and four positional parameters that must agree read worse than one
+// value that carries the agreement.
+type OpenOptions struct {
+	// Wait is how long the open waits for the workspace lock before reporting
+	// CTX_WORKSPACE_BUSY; Wait <= 0 tries once.
+	Wait time.Duration
+	// Rebuild opens an explicitly requested new cache beside the configured
+	// one and leaves the existing database untouched (Section 12.2).
+	Rebuild bool
+	// SCIPImport is the root-relative path of a supplied SCIP index inside the
+	// snapshot, and SCIPManifest the root-relative path of the optional
+	// input-hash manifest that describes it. Both are passed to the SCIP
+	// provider as they are: scip.New validates them and rejects a manifest
+	// with no index to describe, so neither is re-checked on the way here.
+	SCIPImport, SCIPManifest string
+}
+
+// OpenWorkspace composes the workspace for a run that will index.
 //
 // A payload an admitted unit needs is installed on demand, by the unit
 // (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
 // at unit time, not a missing capability and not a cost this call pays.
-func OpenWorkspace(ctx context.Context, repo string, wait time.Duration, rebuild bool) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeIndex, wait: wait, rebuild: rebuild})
+func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeIndex, wait: o.Wait, rebuild: o.Rebuild,
+		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
 // OpenWorkspaceForReport composes the workspace for a read-only report. It

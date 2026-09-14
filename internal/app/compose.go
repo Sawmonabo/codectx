@@ -119,6 +119,13 @@ type openOptions struct {
 	// what `index --rebuild` means in Section 12.2: an explicitly requested new
 	// cache, with the existing database left exactly as it was.
 	rebuild bool
+	// scipImport and scipManifest are the supplied SCIP index and its optional
+	// input-hash manifest, both root-relative inside the snapshot. Only
+	// OpenWorkspace sets them -- a report imports nothing -- but they live on
+	// this struct because it is the one value openStack takes, and openStack
+	// composes the SCIP provider for every mode. An empty pair is a build that
+	// imports no supplied index, which is what every open did before the flags.
+	scipImport, scipManifest string
 }
 
 // stack is everything a workspace owns below the coordinator. It exists apart
@@ -398,6 +405,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// does not hold is still planned and fetched by the first unit that needs
 	// it; construction installs nothing either way.
 	sp, err := scip.New(ctx, scip.Options{
+		Import:   o.scipImport,
+		Manifest: o.scipManifest,
 		Resolver: s.resolver,
 		Runner:   shared,
 		Timeout:  cfg.Providers.SCIP.Timeout.Std(),
