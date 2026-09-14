@@ -697,12 +697,25 @@ func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cf
 	return w
 }
 
-// putNode publishes one keyed node fact. ff nil places the fact in the unit's
-// index-level bucket: no file, no range, and evidence that names neither.
-func (f *fixture) putNode(w *store.UnitWriter, run model.ProviderRunID, scope, name, key string, ff *fileFixture) model.NodeID {
+// keyList renders readable fixture labels as the sorted lowercase digests the
+// fact-key contract requires, so a test reads as "this fact is backed by these
+// producer keys" while storage sees the shape a real producer publishes.
+func keyList(labels ...string) []string {
+	keys := make([]string, len(labels))
+	for i, l := range labels {
+		keys[i] = model.H("fixture-fact-key", l)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// putNode publishes one node fact backed by the given producer keys. ff nil
+// places the fact in the unit's index-level bucket: no file, no range, and
+// evidence that names neither.
+func (f *fixture) putNode(w *store.UnitWriter, run model.ProviderRunID, scope, name string, ff *fileFixture, labels ...string) model.NodeID {
 	f.t.Helper()
 	fact := f.nodeFact(w, run, scope, name, ff)
-	if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{key}); err != nil {
+	if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, [][]string{keyList(labels...)}); err != nil {
 		f.t.Fatalf("PutKeyedNodes(%s): %v", name, err)
 	}
 	return fact.Node.ID
@@ -724,8 +737,8 @@ func (f *fixture) nodeFact(w *store.UnitWriter, run model.ProviderRunID, scope, 
 	return model.NodeFact{Node: node, CanonicalKey: canonical, Evidence: []model.Evidence{ev}}
 }
 
-// putRelation publishes one keyed relation. ff nil places its only occurrence
-// in the index-level bucket.
+// putRelation publishes one relation backed by one producer key. ff nil places
+// its only occurrence in the index-level bucket.
 func (f *fixture) putRelation(w *store.UnitWriter, run model.ProviderRunID, from, to model.NodeID, key string, ff *fileFixture) {
 	f.t.Helper()
 	id := model.NewRelationID(f.repo, from, model.RelCalls, to)
@@ -737,7 +750,7 @@ func (f *fixture) putRelation(w *store.UnitWriter, run model.ProviderRunID, from
 	}
 	ev.ID = model.NewEvidenceID(ev)
 	rel := model.Relation{ID: id, From: from, Kind: model.RelCalls, To: to}
-	if err := w.PutKeyedRelations(f.ctx, []model.RelationFact{{Relation: rel, Evidence: []model.Evidence{ev}}}, []string{key}); err != nil {
+	if err := w.PutKeyedRelations(f.ctx, []model.RelationFact{{Relation: rel, Evidence: []model.Evidence{ev}}}, [][]string{keyList(key)}); err != nil {
 		f.t.Fatalf("PutKeyedRelations(%s): %v", key, err)
 	}
 }
@@ -754,7 +767,7 @@ func (f *fixture) fillScope(w *store.UnitWriter, run model.ProviderRunID, a, b f
 // its lexical document.
 func (f *fixture) fillFile(w *store.UnitWriter, run model.ProviderRunID, ff fileFixture) model.NodeID {
 	f.t.Helper()
-	id := f.putNode(w, run, ff.path, "F", "key:node:"+ff.path, &ff)
+	id := f.putNode(w, run, ff.path, "F", &ff, "key:node:"+ff.path)
 	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: "file:" + ff.path, NativeKey: "F", NodeID: id}}); err != nil {
 		f.t.Fatalf("PutAliases(%s): %v", ff.path, err)
 	}
@@ -769,7 +782,7 @@ func (f *fixture) fillFile(w *store.UnitWriter, run model.ProviderRunID, ff file
 // bucket, which a per-path delta never replaces.
 func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a fileFixture) {
 	f.t.Helper()
-	external := f.putNode(w, run, "workspace", "X", "key:node:external", nil)
+	external := f.putNode(w, run, "workspace", "X", nil, "key:node:external")
 	caller := model.NewNodeID(f.repo, model.NodeFunction, model.CanonicalNodeKey(a.path, "F"))
 	f.putRelation(w, run, caller, external, "key:rel:external", nil)
 	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: "workspace", NativeKey: "X", NodeID: external}}); err != nil {
@@ -783,8 +796,9 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
 var factColumns = []struct{ table, cols string }{
-	{"node_facts", "lower(hex(node_id)), language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json, fact_key"},
-	{"relation_facts", "lower(hex(relation_id)), fact_key"},
+	{"node_facts", "lower(hex(node_id)), language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
+	{"relation_facts", "lower(hex(relation_id))"},
+	{"fact_keys", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), fact_key"},
 	{"native_aliases", "scope_key, native_key, lower(hex(node_id))"},
 	{"search_units", "lower(hex(search_key)), lower(hex(coalesce(node_id, x''))), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
 	{"evidence", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key, detail, content_hash_bound"},
@@ -882,7 +896,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		stats, err := wDelta.CarryOver(f.ctx, prev, store.Replaced{
 			Files:  []model.FileID{a2.id},
 			Scopes: []string{"file:" + a2.path},
-			Keys:   slices.Values([]string{"key:node:" + a2.path}),
+			Keys:   slices.Values(keyList("key:node:" + a2.path)),
 		})
 		if err != nil {
 			t.Fatalf("CarryOver: %v", err)
@@ -929,7 +943,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		w1 := f.beginScope(gen1, run1, configHash, a, b)
 		f.fillFile(w1, run1, a)
 		f.fillFile(w1, run1, b)
-		gone := f.putNode(w1, run1, "pkg/b.go", "Gone", "key:node:gone", &b)
+		gone := f.putNode(w1, run1, "pkg/b.go", "Gone", &b, "key:node:gone")
 		if err := f.s.SealUnit(f.ctx, w1); err != nil {
 			t.Fatalf("SealUnit: %v", err)
 		}
@@ -943,7 +957,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 		run2 := f.run(gen2)
 		w2 := f.beginScope(gen2, run2, "cfg-delta", a, b)
-		if _, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{Keys: slices.Values([]string{"key:node:gone"})}); err != nil {
+		if _, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{Keys: slices.Values(keyList("key:node:gone"))}); err != nil {
 			t.Fatalf("CarryOver: %v", err)
 		}
 		if err := f.s.SealUnit(f.ctx, w2); err != nil {
@@ -977,13 +991,17 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 	})
 
-	t.Run("a repeated identity under a second key is refused", func(t *testing.T) {
-		// A stored fact row holds one delta key. A producer whose keys are
-		// finer than the identities they resolve to would leave a row keyed by
-		// one of its several keys; a later refresh that removes only that key,
-		// while the others still hold, drops a fact the source still contains
-		// — and nothing re-emits it, because its surviving keys are unchanged.
-		f := newFixture(t, filepath.Join(t.TempDir(), "codectx.db"))
+	t.Run("a divergent repeated identity is refused", func(t *testing.T) {
+		// The fact insert yields to the row already written, so a second
+		// observation of one identity that DESCRIBES IT DIFFERENTLY would be
+		// dropped with no counter and no diagnostic — and because CarryOver
+		// runs last, the full path would keep the first description while the
+		// delta path kept the fresh one. The same source would then seal two
+		// different units depending on how each was built. An identical
+		// repeat, which is what two workers and a subdivided unit produce, must
+		// stay free, and a repeat may add keys.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
 		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		snap := f.snapshot("one", a)
 		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
@@ -993,14 +1011,119 @@ func TestDeltaImportInvariants(t *testing.T) {
 		run := f.run(gen)
 		w := f.beginScope(gen, run, configHash, a)
 		fact := f.nodeFact(w, run, "pkg/a.go", "F", &a)
-		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:one"}); err != nil {
+		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, [][]string{keyList("key:one")}); err != nil {
 			t.Fatalf("PutKeyedNodes: %v", err)
 		}
-		wantCode(t, w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:two"}), model.CodeProviderOutputInvalid)
-		// The same key again is the ordinary repeat a deduplicating sink
-		// produces and must still be accepted.
-		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:one"}); err != nil {
-			t.Fatalf("repeat under the same key: %v", err)
+		// The same identity, described differently, with its own occurrence.
+		divergent := fact
+		divergent.Node.Signature = "func F(x int)"
+		ev := fact.Evidence[0]
+		ev.NativeKey = "divergent-occurrence"
+		ev.ID = model.NewEvidenceID(ev)
+		divergent.Evidence = []model.Evidence{ev}
+		wantCode(t, w.PutKeyedNodes(f.ctx, []model.NodeFact{divergent}, [][]string{keyList("key:one")}), model.CodeProviderOutputInvalid)
+		// An identical repeat, and a repeat that adds a second key, are both
+		// ordinary: one fact is backed by every key that produced it.
+		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, [][]string{keyList("key:one")}); err != nil {
+			t.Fatalf("identical repeat: %v", err)
+		}
+		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, [][]string{keyList("key:one", "key:two")}); err != nil {
+			t.Fatalf("repeat under a second key: %v", err)
+		}
+		if err := f.s.SealUnit(f.ctx, w); err != nil {
+			t.Fatalf("SealUnit: %v", err)
+		}
+
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		row := unitRowID(t, raw, w.UnitID())
+		var leaked int64
+		if err := raw.QueryRow(`SELECT count(*) FROM evidence WHERE unit_id = ? AND native_key = ?`, row, "divergent-occurrence").Scan(&leaked); err != nil {
+			t.Fatal(err)
+		}
+		if leaked != 0 {
+			t.Errorf("the refused fact's evidence was stored anyway")
+		}
+		if n := unitRows(t, raw, "fact_keys", row); n != 2 {
+			t.Errorf("the fact carries %d keys, want both keys it was published under", n)
+		}
+	})
+
+	t.Run("a fact is carried unless any of its keys is replaced", func(t *testing.T) {
+		// A published fact is backed by every key that produced it, and its
+		// producer re-emits the whole fact as soon as ONE of those keys
+		// changes. Carrying a fact because some other key of it still holds
+		// would therefore keep a stale copy beside the fresh one; dropping a
+		// fact none of whose keys was replaced would lose a fact the source
+		// still contains, with nothing to re-emit it.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
+		snap := f.snapshot("one", a, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		w1 := f.beginScope(gen1, run1, configHash, a, b)
+		f.fillFile(w1, run1, a)
+		f.fillFile(w1, run1, b)
+		partly := f.putNode(w1, run1, "pkg/b.go", "Partly", &b, "key:partly:1", "key:partly:2")
+		stable := f.putNode(w1, run1, "pkg/b.go", "Stable", &b, "key:stable:1", "key:stable:2")
+		if err := f.s.SealUnit(f.ctx, w1); err != nil {
+			t.Fatalf("SealUnit: %v", err)
+		}
+
+		// One of Partly's two keys is replaced and none of Stable's. No bucket
+		// is replaced, so only the keys decide.
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run2 := f.run(gen2)
+		w2 := f.beginScope(gen2, run2, "cfg-delta", a, b)
+		if _, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{Keys: slices.Values(keyList("key:partly:1"))}); err != nil {
+			t.Fatalf("CarryOver: %v", err)
+		}
+		if err := f.s.SealUnit(f.ctx, w2); err != nil {
+			t.Fatalf("SealUnit(delta): %v", err)
+		}
+
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		row := unitRowID(t, raw, w2.UnitID())
+		for _, want := range []struct {
+			what    string
+			id      model.NodeID
+			carried bool
+		}{{"a fact with one replaced key", partly, false}, {"a fact with no replaced key", stable, true}} {
+			idRaw, _ := model.DecodeID(string(want.id))
+			var n int64
+			if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if (n != 0) != want.carried {
+				t.Errorf("%s: carried=%v, want %v", want.what, n != 0, want.carried)
+			}
+			// A carried fact keeps every key it was published under, or the
+			// successor holds facts no later refresh can replace or remove.
+			if err := raw.QueryRow(`SELECT count(*) FROM fact_keys WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			wantKeys := int64(0)
+			if want.carried {
+				wantKeys = 2
+			}
+			if n != wantKeys {
+				t.Errorf("%s: carried %d keys, want %d", want.what, n, wantKeys)
+			}
 		}
 	})
 
