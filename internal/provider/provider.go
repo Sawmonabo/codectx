@@ -80,11 +80,10 @@ func (d Detection) WithDetail(key, value string) Detection {
 	}
 	details := make(map[string]string, len(d.Details)+1)
 	maps.Copy(details, d.Details)
-	// The truncation is model's own. CapabilityState.WithDetail applies exactly
-	// the bound Validate checks below, and the helper underneath it is not
-	// exported, so borrowing the method keeps one implementation of the rule
-	// rather than a second copy that can drift from the bound it must satisfy.
-	details[key] = model.CapabilityState{}.WithDetail(key, value).Details[key]
+	// model.TruncateDetail is the same implementation CapabilityState.WithDetail
+	// applies, so a detail bounded here and one bounded there cannot drift from
+	// the bound Validate checks below.
+	details[key] = model.TruncateDetail(value)
 	d.Details = details
 	return d
 }
