@@ -91,6 +91,37 @@ func (f *fakeTools) GC(context.Context) (int, error) {
 	return f.collected, f.err
 }
 
+// fakeBlobs and fakeObjects stand in for the two halves of the grace protocol:
+// the store phases and the CAS. They advance no state of their own: the
+// protocol's invariants live in SQL and are proved against the real store in
+// storage/sqlite/store_test.go, so a collector-level assertion on a fake would
+// only restate that Collect called a method. They exist so a sweep row can
+// drive a whole pass without a database behind it.
+
+type fakeBlobs struct {
+	quarantined, trashed, restored int64
+	deleted                        []string
+	err                            error
+}
+
+func (f *fakeBlobs) QuarantineBlobs(context.Context, time.Time, int) (int64, error) {
+	return f.quarantined, f.err
+}
+
+func (f *fakeBlobs) TrashBlobs(context.Context, int) (int64, int64, error) {
+	return f.trashed, f.restored, f.err
+}
+
+func (f *fakeBlobs) CollectBlobs(context.Context, time.Time, int) ([]string, int64, error) {
+	return f.deleted, 0, f.err
+}
+
+type fakeObjects struct {
+	err error
+}
+
+func (f *fakeObjects) Remove(string) error { return f.err }
+
 // newTestCollector builds a Collector over the fakes with a fixed clock and a
 // temporary data directory. A row replaces the dependency it drives.
 func newTestCollector(t *testing.T, opts Options) *Collector {
@@ -106,6 +137,12 @@ func newTestCollector(t *testing.T, opts Options) *Collector {
 	}
 	if opts.Tools == nil {
 		opts.Tools = &fakeTools{}
+	}
+	if opts.Blobs == nil {
+		opts.Blobs = &fakeBlobs{}
+	}
+	if opts.Objects == nil {
+		opts.Objects = &fakeObjects{}
 	}
 	if opts.Config.DataDir == "" {
 		opts.Config.DataDir = t.TempDir()
