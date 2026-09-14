@@ -1804,6 +1804,8 @@ Direct verify planning is allowed only with at least one resolved seed. Direct c
 
 Historical consolidation does not require that the current worktree still match, but the resulting capsule must report supersession and cannot be presented as an approval to modify the current code. Completion is a workflow state, not a claim that implementation is correct.
 
+The readiness answer has exactly one producer: the workflow gate above. Every operation that returns a session status -- plan, status, acknowledge, waive, record and advance -- reports that same `ready_for_implementation`, `strict_gate_satisfied` and `guarantee_limit`, so an actor can see the gate a review just opened without attempting a transition to find out, and no weaker second evaluation exists to disagree with it. Completing to `complete` seals the capsule inside the transition guard and moves the state only after the capsule's hash is verified; sealing is never a separate step the caller runs first.
+
 <a id="172-observations-and-source-backed-review"></a>
 ### 17.2 Observations and Source-Backed Review
 
@@ -1816,7 +1818,7 @@ Observation IDs hash session/actor/scope/kind and canonically sorted semantic re
 <a id="173-waivers-and-deterministic-capsules"></a>
 ### 17.3 Waivers and Deterministic Capsules
 
-A waiver records session/actor, required file, pinned content hash, nonempty reason and UTC timestamp. It neither updates coverage nor makes `ready_for_implementation=true`. The default execution policy does not use waivers to bypass the user's full-file requirement. An exploratory override must be explicit and visible in every downstream capsule/status.
+A waiver records session/actor, required file, pinned content hash, nonempty reason and UTC timestamp. It neither updates coverage nor makes `ready_for_implementation=true`, and it never counts toward `fully_served_files`: a waived file is reported in the waived count only, so the served count stays coverage that was actually earned. The default execution policy does not use waivers to bypass the user's full-file requirement. An exploratory override must be explicit and visible in every downstream capsule/status.
 
 ```go
 type Capsule struct {
@@ -1879,7 +1881,7 @@ codectx context waive SESSION FILE --actor ID --reason TEXT [--json]
 codectx context record SESSION --actor ID --kind KIND --expected-scope N --input FILE [--json]
 codectx context advance SESSION verify|consolidate|complete --actor ID --expected-version N [--json]
 codectx context capsule SESSION --actor ID [--limit N] [--cursor TOKEN] [--json]
-codectx context close SESSION --actor ID [--json]
+codectx context close SESSION --actor ID --expected-version N [--json]
 codectx context export SESSION --actor ID --output FILE
 codectx tools status [--json]
 codectx tools prefetch [--all | --for-repo PATH] [--json]
@@ -1909,6 +1911,8 @@ codectx version [--json]
 | 10 | Internal error. |
 
 Every `--json` request emits one bounded envelope with `schema_version`, `command`, `ok`, `data`, `warnings`, and `error`, including domain/argument errors after JSON mode is selected. JSON error data goes to stdout in that envelope, while logs go to stderr; do not also print a conflicting human error or call `os.Exit` inside services. Partial results on a hard limit use the same envelope with their explicit incompleteness and code 7. A broken stdout pipe fails the command and does not confirm source receipt delivery.
+
+`context include`, `context advance` and `context close` all take the same required `--expected-version N` compare-and-swap guard under one declaration, so each one's help names what the version guards rather than repeating a generic sentence. Human `context` output prints `guarantee_limit` beside the two readiness booleans whenever it is set -- the point-in-time limit when the gate is open, the unmet precondition when it is shut -- wrapped rather than clipped, so a human reader is never shown a bare `yes` or an unexplained `no`.
 
 Human output may truncate display while showing omitted counts and continuation. The service result is not silently truncated by a renderer. Install signal cancellation at the process boundary; all rows, processes, leases and reservations are released on cancellation. Help/version remain cheap and usable without Git, a database, or optional analyzers.
 Symbol, reference and call-hierarchy commands expose `--semantic-source canonical|lsp` and a `--profile` selector naming a managed server; canonical is the default. `symbol --operation resolve|document-symbols|workspace-symbols|definition` selects the typed symbol operation. These flags are forwarded by the shared facade, keeping every supported LSP operation reachable rather than leaving an unwired manager.
@@ -2918,7 +2922,7 @@ git diff --check
 **Produces / contract:** Advance/Include/Record/Waive/Close with version guards; capsule builder; concrete app composition and narrow typed consumer interfaces for all Section 18/19 operations.
 
 - [x] **Step 0: Complete the read, trace, reuse and resource gate.** Apply Section 30.1 to the actual current files and callers before deciding or editing. Record missing/unread context rather than guessing. Every subagent performs its own read.
-- [x] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the single workflow fixture for direct verify, scope-version review invalidation, conflicting transitions, unserved files, a required waiver that never grants strict readiness, blocking unresolved boundaries, wrong-actor mutations, supersession and idempotent capsule retrieval.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** Extend the single workflow fixture for direct verify, scope-version review invalidation, conflicting transitions, unserved files, a required waiver that never grants strict readiness, blocking unresolved boundaries, wrong-actor mutations, supersession and idempotent capsule retrieval. *(Unchecked by the Task 17 fix round: the §17.1 service guards -- resolved scope, consolidation readiness with its waiver branch, and the blocking review entry -- had no row and survived mutation. The fix round's workflow lane adds them; the controller re-checks this box at merge only once those rows are in the diff. See wave-e-review-T17.md F0/F1.)*
 - [x] **Step 2: Implement the complete production path.** Implement state/current-manifest/history changes atomically. Source-backed scope review covers every category in Section 17 and requires confirmed same-actor full files. Include adds discovered pinned scope and invalidates old review. Readiness requires complete scope, required reads, no bypass and current-source validation; completed historical reads alone are not write permission. Validate observation IDs/reference membership and use semantic hashes for duplicate idempotency.
 - [ ] **Step 3: Wire consumers, failure handling and documentation.** Build capsules from stored explicit observations/evidence/coverage/waivers only and preserve all timestamps as audit metadata outside the canonical hash. Add per-request or immediately-before-write source revalidation for strict readiness and expose the guarantee limits. Define typed app methods for overview, symbol/reference/graph, context pages/next/include/close, diagnostics and export as well as the original operations. Wire the explicit canonical/LSP semantic-source selector and symbol/reference operation enums so the full LSP query manager has actual CLI/MCP consumers. Interface declarations depend only on model contracts; app must not import CLI/MCP, preventing cycles. *(Left unchecked deliberately: capsules, per-request revalidation, the exposed guarantee limit, the semantic-source selector and the operation enums all landed, but `Overview` and `Doctor` have no producer in this repository and stand as typed purpose-named refusals ledgered for Task 20, and `Close` still does not release the session lease -- `pagination.Leases` offers no lookup from a session to the lease `OpenSession` minted, so releasing it needs the Task 20 retention work. See T17-INT-report.md.)*
 - [x] **Step 4: Run the focused verification below.** These are commands to run during implementation, not claimed results of this document review. Diagnose failures, rerun after fixes, and record the actual result and resource evidence.
