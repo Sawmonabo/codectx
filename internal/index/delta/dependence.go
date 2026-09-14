@@ -14,26 +14,23 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-const (
-	// KindDependenceKeys is the delta-state kind of the fact key set one
-	// sealed dependence unit published.
-	KindDependenceKeys = "dependence.fact_keys"
-	// KindDependenceInputs is the delta-state kind of that same unit's input
-	// manifest: the file identities and content hashes it declared.
-	//
-	// It exists because Replaced.Files is the complement storage checks a
-	// carry-over against (checkCarriedInputs), and nothing else can produce
-	// it. A dependence fact key is a digest of the fact, not of the file it
-	// came from, so a changed key cannot be mapped back to a path; storage
-	// holds the predecessor's unit_inputs rows but exports no reader for
-	// them. Store.UnitInputs would make this kind unnecessary — see the lane
-	// report.
-	KindDependenceInputs = "dependence.unit_inputs"
-)
+// KindDependenceKeys is the delta-state kind of the fact key set one sealed
+// dependence unit published. It is the only state this applier stores: the
+// replaced-file set is a merge join of Store.UnitInputs against this unit's
+// own inputs (see inputs.go), so the predecessor's declared files need no
+// second copy.
+const KindDependenceKeys = "dependence.fact_keys"
 
 // dependenceApplier builds one dependence unit as a per-fact delta. The
 // engine renumbers its node ids on every run, so the unit of replacement is
 // the id-independent fact key rather than a file or a document.
+//
+// What it can save is asymmetric, and Result.Filtered is how a caller sees
+// which side it landed on: a refresh that changes or removes any file the
+// predecessor declared emits in full and inherits nothing, because naming an
+// edited path in Replaced.Files drops rows a filtered emit would never
+// republish (see Apply). Only an addition-only refresh keeps the filter and
+// inherits rows.
 type dependenceApplier struct {
 	store  *sqlite.Store
 	p      *dependence.Provider
@@ -48,15 +45,6 @@ func NewDependence(store *sqlite.Store, p *dependence.Provider, limits provider.
 }
 
 func (a *dependenceApplier) Kind() string { return KindDependenceKeys }
-
-// prevState is a usable predecessor: both of its delta-state artifacts, read
-// back and validated. Either one missing means a full build, because the key
-// set alone cannot name a replaced bucket and the manifest alone cannot name a
-// replaced fact.
-type prevState struct {
-	keys   neo4jcsv.KeySet
-	inputs string // the predecessor's input manifest, spilled to this build's work dir
-}
 
 // errStopKeys unwinds the replaced-key stream when storage stops consuming it.
 var errStopKeys = errors.New("delta: replaced key stream stopped")
@@ -74,36 +62,24 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 	}
 	defer os.RemoveAll(dir)
 
-	prev, err := a.previous(ctx, req, dir)
+	prev, reason, err := a.previous(ctx, req, dir)
 	if err != nil {
 		return Result{}, err
 	}
 
 	b := &build{store: a.store, p: a.p, limits: a.limits, pool: a.pool, req: req}
-	b.res.Full = prev == nil
-
-	// The fresh input manifest is written as storage streams the inputs it is
-	// already reading, in the ascending file order BeginUnit requires, so the
-	// merge join below never sorts and never holds the file list.
-	freshInputs := filepath.Join(dir, "inputs")
-	b.req.Inputs = teeInputs(freshInputs, req.Inputs)
+	b.res.Full, b.res.FullReason = prev == nil, reason
 
 	keysPath := filepath.Join(dir, "keys")
 	var (
-		rep           dependence.Report
-		replacedFiles []model.FileID
-		supplied      bool
+		rep         dependence.Report
+		anyReplaced bool
+		supplied    bool
 	)
 
 	b.index = func(ctx context.Context, ureq provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
 		opts := dependence.ImportOptions{KeysPath: keysPath}
 		if prev != nil {
-			// The tee has run to completion inside BeginUnit, so both
-			// manifests are closed and complete by the time this reads them.
-			var err error
-			if replacedFiles, err = diffInputs(prev.inputs, freshInputs); err != nil {
-				return model.ProviderResult{}, err
-			}
 			// THE INVARIANT: a filtered emit may only be requested when no
 			// file the predecessor declared changed or went away, because
 			// Replaced.Files drops buckets a filtered emit does not
@@ -117,10 +93,21 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			// previous keys makes the import emit every relation, which is
 			// always correct and costs import work only. A refresh that only
 			// added files keeps its filter: an added path names nothing of
-			// the predecessor, so replacedFiles is empty and the delta is
+			// the predecessor, so the replaced set is empty and the delta is
 			// still worth having.
-			if len(replacedFiles) == 0 {
-				opts.PreviousKeys = prev.keys
+			//
+			// The question here is only whether that set is empty, so the
+			// walk stops at the first member; the set itself is streamed
+			// into Replaced.Files at carry-over.
+			err := replacedInputs(ctx, a.store, req.Previous, req.Inputs, func(model.FileID) error {
+				anyReplaced = true
+				return errStopInputs
+			})
+			if err != nil {
+				return model.ProviderResult{}, err
+			}
+			if !anyReplaced {
+				opts.PreviousKeys = *prev
 			}
 			supplied = !opts.PreviousKeys.Empty()
 		}
@@ -133,15 +120,17 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 		if rep.Keys.Empty() {
 			// A unit the provider subdivided publishes no whole-unit key set,
 			// so there is nothing a later refresh could diff against and
-			// nothing this one could have carried.
-			b.res.Full = true
+			// nothing this one could have carried. The predecessor was
+			// healthy, which is why the reason is recorded rather than folded
+			// into "unusable".
+			b.res.Full, b.res.FullReason = true, FullSubdivided
 			return nil
 		}
 		if prev != nil {
 			// The delta is measured here, against the predecessor's own key
 			// set, so it is the real delta even on the runs where the import
 			// was deliberately given no previous keys.
-			d, err := rep.Keys.Diff(prev.keys, nil)
+			d, err := rep.Keys.Diff(*prev, nil)
 			if err != nil {
 				return err
 			}
@@ -150,9 +139,22 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			// filtered mirrors neo4jcsv.deltaFilter over what this build
 			// actually passed: only then did the import leave the unchanged
 			// relations, and the facts that name no file, unpublished.
-			filtered := supplied && d.Removed == 0
+			b.res.Filtered = supplied && d.Removed == 0
+			var filesErr error
 			replaced := sqlite.Replaced{
-				Files: replacedFiles,
+				// The replaced files are streamed from the same merge join
+				// the emptiness check above ran, walked a second time rather
+				// than remembered: a refresh over a moved branch names every
+				// file of the project and Section 6 forbids holding that
+				// list.
+				Files: func(yield func(model.FileID) bool) {
+					filesErr = replacedInputs(ctx, a.store, req.Previous, req.Inputs, func(f model.FileID) error {
+						if !yield(f) {
+							return errStopInputs
+						}
+						return nil
+					})
+				},
 				// Scopes stays empty: a dependence alias is carried only
 				// while the node fact it names is, and nodes and aliases are
 				// emitted whole on every dependence import, so the alias rows
@@ -165,7 +167,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 				// republished them. Under a filtered emit it must be kept, or
 				// an unchanged relation whose only evidence is unlocated
 				// loses it and the unit cannot seal.
-				IndexLevel: !filtered,
+				IndexLevel: !b.res.Filtered,
 			}
 			// Replaced.Keys is the complement: every key the fresh set added
 			// and every key the predecessor held and it does not. It is
@@ -173,7 +175,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			// and the error is checked after storage has finished with it.
 			var diffErr error
 			replaced.Keys = func(yield func(string) bool) {
-				_, diffErr = rep.Keys.Diff(prev.keys, func(key string, removed bool) error {
+				_, diffErr = rep.Keys.Diff(*prev, func(key string, removed bool) error {
 					if !yield(key) {
 						return errStopKeys
 					}
@@ -187,72 +189,64 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			// CarryOverStats is then the evidence that the unfiltered emit
 			// really did republish everything, instead of an assumption about
 			// the emitter that nothing checks.
-			if b.res.Carried, err = w.CarryOver(ctx, req.Previous, replaced); err != nil {
-				return err
+			b.res.Carried, err = w.CarryOver(ctx, req.Previous, replaced)
+			// The two stream errors are checked before the call's own: a
+			// stream that failed mid-walk staged fewer replaced entries than
+			// the applier named, so CarryOver's success would be a unit that
+			// kept rows it was told to drop.
+			if filesErr != nil {
+				return filesErr
 			}
 			if diffErr != nil {
 				return diffErr
+			}
+			if err != nil {
+				return err
 			}
 		} else {
 			b.res.Delta = Stats{Changed: int64(rep.Delta.Changed),
 				Unchanged: int64(rep.Delta.Unchanged), Removed: int64(rep.Delta.Removed)}
 		}
-		if err := putState(ctx, w, KindDependenceKeys, rep.Keys.Path()); err != nil {
-			return err
-		}
-		return putState(ctx, w, KindDependenceInputs, freshInputs)
+		return putState(ctx, w, KindDependenceKeys, rep.Keys.Path())
 	}
 	return b.run(ctx)
 }
 
-// previous loads the predecessor's key set and input manifest. Anything short
-// of both — no predecessor, no stored state, state this build cannot read —
-// means a full build, because a full build is always correct and refusing here
-// would turn a recoverable state into a failed capability.
-func (a *dependenceApplier) previous(ctx context.Context, req Request, dir string) (*prevState, error) {
+// previous loads the predecessor's fact key set. No predecessor, no stored
+// state, state this build cannot read and a stored set with no key in it all
+// mean a full build, because a full build is always correct and refusing here
+// would turn a recoverable state into a failed capability. The returned reason
+// says which it was, so a coordinator can tell an invalidated predecessor from
+// one that never existed.
+func (a *dependenceApplier) previous(ctx context.Context, req Request, dir string) (*neo4jcsv.KeySet, string, error) {
 	if req.Previous == "" {
-		return nil, nil
+		return nil, FullNoPredecessor, nil
 	}
 	rawKeys, err := a.state(ctx, req.Previous, KindDependenceKeys)
-	if err != nil || rawKeys == nil {
-		return nil, err
+	if err != nil {
+		return nil, "", err
 	}
-	rawInputs, err := a.state(ctx, req.Previous, KindDependenceInputs)
-	if err != nil || rawInputs == nil {
-		return nil, err
+	if rawKeys == nil {
+		return nil, FullNoState, nil
 	}
 	keysFile, err := writeState(dir, "previous-keys", rawKeys)
 	if err != nil {
-		return nil, err
-	}
-	inputsFile, err := writeState(dir, "previous-inputs", rawInputs)
-	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	keys, err := neo4jcsv.LoadKeySet(keysFile)
 	if err != nil {
 		slog.Warn("a stored dependence fact key set could not be read; the unit is built in full",
 			"component", component, "unit", string(req.Previous), "kind", KindDependenceKeys, "error", err)
-		return nil, nil
+		return nil, FullStateUnreadable, nil
 	}
 	// A predecessor that published no key stored no fact_keys row either — a
 	// unit with no source seals honestly that way — and CarryOver refuses a
 	// replaced-key set against a unit that stored none. There is also nothing
 	// to inherit. Both make it an unusable predecessor rather than a failure.
 	if keys.Count() == 0 {
-		return nil, nil
+		return nil, FullNoState, nil
 	}
-	// The manifest is opened now rather than at the diff, so an unreadable one
-	// degrades to a full build like the key set does instead of failing a unit
-	// that is already half built.
-	rows, err := openInputRows(inputsFile)
-	if err != nil {
-		slog.Warn("a stored dependence unit input manifest could not be read; the unit is built in full",
-			"component", component, "unit", string(req.Previous), "kind", KindDependenceInputs, "error", err)
-		return nil, nil
-	}
-	rows.close()
-	return &prevState{keys: keys, inputs: inputsFile}, nil
+	return &keys, "", nil
 }
 
 // state reads one delta-state payload, reporting a missing one as nil.

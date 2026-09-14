@@ -596,13 +596,29 @@ func TestStorePublicationScenario(t *testing.T) {
 	if bindCarry.AnalysisKey == bind2.AnalysisKey {
 		t.Fatal("a generation carrying a stale unit has the same analysis key as the fresh generation with the same membership; a stale answer is indistinguishable from a fresh one")
 	}
-	carried, err := f.s.CarriedUnits(ctx, genCarry)
+	carried, err := f.s.CarriedUnits(ctx, genCarry, "", "", 0)
 	if err != nil {
 		t.Fatalf("CarriedUnits: %v", err)
 	}
 	if len(carried) != 1 || carried[0].Unit != unitB2 || carried[0].Carry != (store.Carry{DistanceGenerations: 2, DistanceFiles: 1}) {
 		t.Fatalf("CarriedUnits = %+v, want only unitB2 with its recorded distance", carried)
 	}
+
+	// A ref of its own, holding a unit no other generation selects. Every
+	// generation so far selects exactly the same two units, so deleting any of
+	// them frees nothing and retention has nothing it could report as
+	// reclaimable; this is the generation that makes that figure measurable.
+	genOwn, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "release")
+	if err != nil {
+		t.Fatalf("BeginGeneration(release): %v", err)
+	}
+	runOwn := f.run(genOwn)
+	wOwn := f.beginScope(genOwn, runOwn, "cfg-release", b2)
+	f.fillFile(wOwn, runOwn, b2)
+	if err := f.s.SealUnit(ctx, wOwn); err != nil {
+		t.Fatalf("SealUnit(release): %v", err)
+	}
+	f.activate(genOwn, genCarry)
 
 	// The publication half: over a snapshot whose a.go changed, unitA can no
 	// longer be reused, and carrying it must be admitted at attach AND at
@@ -624,7 +640,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.AttachUnit(ctx, genStale, unitB2); err != nil {
 		t.Fatalf("AttachUnit(unitB2): %v", err)
 	}
-	bindStale := f.activate(genStale, genCarry)
+	bindStale := f.activate(genStale, genOwn)
 	if bindStale.AnalysisKey == bindCarry.AnalysisKey {
 		t.Fatal("two generations over different snapshots share an analysis key")
 	}
@@ -645,22 +661,29 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("Abort(deleted input): %v", err)
 	}
 
-	// Phase: retention by distinct ref (Section 12.4). Three refs have been
-	// indexed — "main" (gen2), "feature" (genCarry) and "topic" (genStale,
-	// active) — so retention keeps each ref's most recent generation and
-	// sweeps what no retained ref keeps. A byte limit then evicts the least
-	// recently used refs first. The failure mode is unambiguous: evicting the
-	// published generation leaves the workspace serving nothing, and sweeping
-	// a generation a retained session still holds destroys the source a
-	// coverage receipt was issued against.
-	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 3}, time.Now())
+	// Phase: retention by distinct ref (Section 12.4). Four refs have been
+	// indexed — "main" (gen2), "feature" (genCarry), "release" (genOwn) and
+	// "topic" (genStale, active) — so retention keeps each ref's most recent
+	// generation and sweeps what no retained ref keeps. A byte limit then
+	// evicts the least recently used refs first. The failure mode is
+	// unambiguous: evicting the published generation leaves the workspace
+	// serving nothing, and sweeping a generation a retained session still
+	// holds destroys the source a coverage receipt was issued against.
+	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4}, time.Now())
 	if err != nil {
 		t.Fatalf("RetainByRef: %v", err)
 	}
-	if r1.RefsRetained != 3 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
-		t.Fatalf("RetainByRef(3 refs) = %+v, want every ref retained and the two failed generations swept", r1)
+	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
+		t.Fatalf("RetainByRef(4 refs) = %+v, want every ref retained and the two failed generations swept", r1)
 	}
-	for _, gen := range []model.GenerationID{gen2, genCarry, genStale} {
+	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
+	// stricter limit could free, so `status` can warn before a disk fills. A
+	// silent zero here is a warning that never fires.
+	if r1.BytesReclaimable <= 0 {
+		t.Fatalf("RetainByRef(%+v) reported no reclaimable bytes although two non-active "+
+			"generations are retained; ruling Q10 measures it even when unlimited", r1)
+	}
+	for _, gen := range []model.GenerationID{gen2, genCarry, genOwn, genStale} {
 		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
@@ -668,15 +691,17 @@ func TestStorePublicationScenario(t *testing.T) {
 	// A limit nothing fits under: every ref but the active one is evicted, and
 	// gen2 is swept only insofar as nothing else holds it — the read session
 	// opened above does, so it stays.
-	r2, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 3, MaxRetainedBytes: 1}, time.Now())
+	r2, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4, MaxRetainedBytes: 1}, time.Now())
 	if err != nil {
 		t.Fatalf("RetainByRef(byte limit): %v", err)
 	}
-	if r2.RefsRetained != 1 || r2.GenerationsSwept != 1 {
-		t.Fatalf("RetainByRef(byte limit) = %+v, want only the active ref retained and the one collectable generation swept", r2)
+	if r2.RefsRetained != 1 || r2.GenerationsSwept != 2 {
+		t.Fatalf("RetainByRef(byte limit) = %+v, want only the active ref retained and the two collectable generations swept", r2)
 	}
-	if _, err := f.s.GenerationStatus(ctx, genCarry); err == nil {
-		t.Fatal("an evicted ref's generation survived the byte limit")
+	for _, gen := range []model.GenerationID{genCarry, genOwn} {
+		if _, err := f.s.GenerationStatus(ctx, gen); err == nil {
+			t.Fatalf("an evicted ref's generation %d survived the byte limit", gen)
+		}
 	}
 	if _, err := f.s.GenerationStatus(ctx, gen2); err != nil {
 		t.Fatalf("retention swept a generation a retained session still holds: %v", err)
@@ -1022,8 +1047,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		f.fillFile(wDelta, run3, a2)
 		f.fillIndexLevel(wDelta, run3, a2)
 		stats, err := wDelta.CarryOver(f.ctx, prev, store.Replaced{
-			Files:  []model.FileID{a2.id},
-			Scopes: []string{"file:" + a2.path},
+			Files:  slices.Values([]model.FileID{a2.id}),
+			Scopes: slices.Values([]string{"file:" + a2.path}),
 			Keys:   slices.Values(keyList("key:node:" + a2.path)),
 		})
 		if err != nil {

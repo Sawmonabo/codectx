@@ -15,10 +15,15 @@
 //  4. store the fresh delta state and seal.
 //
 // A predecessor that is absent, stored no state, or stored state this build
-// cannot read is not an error: the unit is built in full and Result.Full says
-// so. Everything else is a typed failure of the whole unit, which leaves the
-// predecessor sealed, published and untouched — the new unit's rows, carried
-// ones included, are its own copies and Fail deletes them.
+// cannot read is not an error: the unit is built in full and Result.Full and
+// Result.FullReason say so. That degradation covers provider-written state
+// only — the SCIP document manifest and the dependence key set. A failure to
+// read what storage itself holds (the predecessor's declared inputs) is not a
+// recoverable state but a broken store, and fails the unit like any other
+// storage error. Everything else is likewise a typed failure of the whole
+// unit, which leaves the predecessor sealed, published and untouched — the new
+// unit's rows, carried ones included, are its own copies and Fail deletes
+// them.
 package delta
 
 import (
@@ -43,9 +48,13 @@ type Request struct {
 	Generation model.GenerationID
 	Previous   model.UnitID // zero: full build
 	Build      model.UnitBuild
-	Inputs     func(yield func(model.UnitInput) error) error
-	Unit       provider.UnitRequest
-	WorkDir    string
+	// Inputs yields the unit's declared inputs in ascending FileID order. It
+	// must be re-iterable: storage streams it to open the unit, and the
+	// dependence applier walks it again to merge-join it against the
+	// predecessor's stored inputs rather than keeping the file list.
+	Inputs  func(yield func(model.UnitInput) error) error
+	Unit    provider.UnitRequest
+	WorkDir string
 }
 
 func (r Request) validate() error {
@@ -67,6 +76,25 @@ func (r Request) validate() error {
 	return nil
 }
 
+// Reasons a unit was built in full. Only FullNoPredecessor, FullNoState and
+// FullStateUnreadable mean the previous unit could not be inherited from;
+// FullSubdivided is a healthy predecessor this run cannot describe itself
+// against, so a coordinator must not count it as an invalidation.
+const (
+	// FullNoPredecessor: the request named none (a first build, or a scope
+	// the previous generation did not select).
+	FullNoPredecessor = "no_predecessor"
+	// FullNoState: the predecessor stored no delta state of this kind, or
+	// stored one with nothing to diff against.
+	FullNoState = "no_previous_state"
+	// FullStateUnreadable: the predecessor's stored state exists and this
+	// build cannot read it.
+	FullStateUnreadable = "unreadable_previous_state"
+	// FullSubdivided: the provider subdivided the unit for memory, so this
+	// run publishes no whole-unit state a later refresh could diff against.
+	FullSubdivided = "subdivided"
+)
+
 // Result is one built unit: what the provider reported, what was inherited
 // rather than re-imported, and the delta that decided it.
 type Result struct {
@@ -74,7 +102,20 @@ type Result struct {
 	Result  model.ProviderResult
 	Carried sqlite.CarryOverStats
 	Delta   Stats
-	Full    bool // predecessor absent or unusable
+	// Full says the unit was built without inheriting anything, and
+	// FullReason says which of the four cases above it was. A coordinator
+	// projecting invalidation counts must read the reason: only a missing or
+	// unusable predecessor invalidated a previous unit.
+	Full       bool
+	FullReason string
+	// Filtered says the provider's import ran against the predecessor's own
+	// state and therefore emitted only what changed. A delta whose
+	// Filtered is false re-imported everything and inherited nothing, even
+	// though the predecessor was present and usable — for the dependence
+	// applier that is every refresh that changed or removed a declared file.
+	// Result.Carried being all zero does not distinguish that from a
+	// predecessor with nothing to give.
+	Filtered bool
 }
 
 // Applier builds one unit of one provider as a delta against its predecessor.
