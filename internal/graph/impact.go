@@ -50,7 +50,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	acc := newImpactAccumulator(req.Start, b,
 		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
 		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
-	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
+	_, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
 		MaxDepth:      resolveBound(req.MaxDepth, e.limits.MaxDepth),

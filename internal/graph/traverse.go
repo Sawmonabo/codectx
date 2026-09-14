@@ -51,17 +51,17 @@ func edgeRowBytes(r edgeRow) int64 {
 // visitor is the one place that compares the two. That keeps a resumed page
 // from spending a fresh budget.
 func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) error {
+	visit func(frontierState, model.Relation) error) (walkState, error) {
 	if a == nil {
-		return (&model.Error{Code: model.CodeInternal,
+		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires an adjacency reader"}).WithDetail("operation", "expand")
 	}
 	if o.Budget == nil {
-		return (&model.Error{Code: model.CodeInternal,
+		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a budget"}).WithDetail("operation", "expand")
 	}
 	if visit == nil {
-		return (&model.Error{Code: model.CodeInternal,
+		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a visitor"}).WithDetail("operation", "expand")
 	}
 	batch := o.BatchSize
@@ -69,28 +69,64 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		batch = adjacencyBatch
 	}
 
-	// Seeds enter at depth 0 in request order, de-duplicated, then sorted by
-	// NodeID: the frozen (depth asc, NodeID asc) order starts here.
 	admittedNode := make(map[model.NodeID]bool, len(seeds))
-	var frontier []frontierState
-	for _, s := range seeds {
-		if s == "" || admittedNode[s] {
-			continue
-		}
-		admittedNode[s] = true
-		frontier = append(frontier, frontierState{Node: s})
-	}
-	sort.Slice(frontier, func(i, j int) bool { return frontier[i].Node < frontier[j].Node })
-	o.Budget.visited += int64(len(frontier))
-
 	// A relation is admitted at most once for the whole walk: a cycle, an
 	// overlapping batch or a DirectionBoth edge whose two endpoints are both on
 	// the frontier must not be counted or emitted twice.
 	admittedRel := map[model.RelationID]bool{}
+	var (
+		frontier []frontierState
+		// carry is the NEXT level as the page that issued the cursor had
+		// already built it, held aside until the re-read level completes.
+		carry     []frontierState
+		depth     int
+		skipOwner model.NodeID
+		skipKey   model.RelationID
+	)
+	if o.Resume == nil {
+		// Seeds enter at depth 0 in request order, de-duplicated, then sorted by
+		// NodeID: the frozen (depth asc, NodeID asc) order starts here.
+		for _, s := range seeds {
+			if s == "" || admittedNode[s] {
+				continue
+			}
+			admittedNode[s] = true
+			frontier = append(frontier, frontierState{Node: s})
+		}
+		o.Budget.visited += int64(len(frontier))
+	} else {
+		// A resume never re-enters the seeds: they are already in the visited
+		// set the issuing page spooled, and re-admitting them would spend the
+		// cumulative visited budget a second time for the same nodes.
+		for n := range o.Resume.Visited {
+			admittedNode[n] = true
+		}
+		depth = o.Resume.Cursor.Depth
+		skipOwner, skipKey = o.Resume.Cursor.LastOwner, o.Resume.Cursor.LastKey
+		for _, fs := range o.Resume.Frontier {
+			if fs.Depth == depth {
+				frontier = append(frontier, fs)
+			} else {
+				carry = append(carry, fs)
+			}
+			// Seeding admittedRel with the relation each frontier node was
+			// DISCOVERED by is what keeps a DirectionBoth walk from emitting one
+			// edge on two pages. Re-reading a frontier node returns the edge that
+			// reached it, which the issuing page already admitted; every node
+			// this page expands is either in this spooled frontier (Via-seeded
+			// here) or was discovered by this page itself (covered by the
+			// in-page admittedRel below).
+			if fs.Via != "" {
+				admittedRel[fs.Via] = true
+			}
+		}
+		sort.Slice(carry, func(i, j int) bool { return carry[i].Node < carry[j].Node })
+	}
+	sort.Slice(frontier, func(i, j int) bool { return frontier[i].Node < frontier[j].Node })
 
-	for depth := 0; depth < o.MaxDepth && len(frontier) > 0; depth++ {
+	for ; depth < o.MaxDepth && len(frontier) > 0; depth++ {
 		if err := checkWalk(ctx, o.Budget); err != nil {
-			return err
+			return walkState{}, err
 		}
 		level := make(map[model.NodeID]frontierState, len(frontier))
 		nodes := make([]model.NodeID, 0, len(frontier))
@@ -99,21 +135,32 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			nodes = append(nodes, st.Node)
 		}
 
-		rows, err := levelEdges(ctx, a, nodes, level, o, batch, admittedRel)
+		rows, err := levelEdges(ctx, a, nodes, level, o, batch, admittedRel, skipOwner, skipKey)
 		if err != nil {
-			return err
+			return walkState{}, err
 		}
+		// Only the level a cursor stopped inside is skipped; every level after
+		// it is read whole.
+		skipOwner, skipKey = "", ""
 		// A level that spent the frontier budget is still emitted -- the edges
 		// it did read are facts -- but the walk stops after it rather than
 		// expanding a level it knows is incomplete.
 
-		var next []frontierState
+		next := carry
+		carry = nil
 		for _, row := range rows {
 			if err := visit(row.owner, row.rel); err != nil {
 				if errors.Is(err, errStopExpansion) {
-					return nil
+					// A deliberate mid-level stop. The continuation re-reads
+					// THIS level from the row just admitted and keeps the next
+					// level as far as it was built, so no edge is read twice and
+					// none is skipped.
+					stopped := make([]frontierState, 0, len(frontier)+len(next))
+					stopped = append(stopped, frontier...)
+					stopped = append(stopped, next...)
+					return walkState{Depth: depth, Frontier: stopped, Admitted: admittedNode}, nil
 				}
-				return err
+				return walkState{}, err
 			}
 			admittedRel[row.rel.ID] = true
 			o.Budget.edges++
@@ -130,12 +177,28 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			})
 		}
 		if o.Budget.frontierHit {
-			return nil
+			return walkState{Admitted: admittedNode}, nil
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
 	}
-	return nil
+	// A walk that falls out of the loop ran to completion: an empty Frontier is
+	// what tells the caller there is nothing to continue from.
+	return walkState{Depth: depth, Admitted: admittedNode}, nil
+}
+
+// walkState is where a walk stopped. A page that stopped on its item limit
+// turns it into the continuation the next page resumes from; a walk that ran to
+// completion leaves Frontier empty and mints nothing.
+type walkState struct {
+	// Depth is the level that was being expanded when the walk stopped.
+	Depth int
+	// Frontier holds that level together with the next level as far as it was
+	// built. Each record carries its own depth, so a resumed walk measures
+	// MaxDepth from the original seeds rather than from its own frontier.
+	Frontier []frontierState
+	// Admitted is every node the walk has admitted, cumulative across pages.
+	Admitted map[model.NodeID]bool
 }
 
 // edgeRow is one edge of a level attributed to the frontier node it left from,
@@ -151,8 +214,12 @@ type edgeRow struct {
 // at most batch ids, and each batch is keyset-paged by relation id, so the
 // number of round trips grows with the frontier divided by the batch size --
 // never with the frontier itself.
+// skipOwner/skipKey, when set, are a resumed page's keyset position: every row
+// at or before (skipOwner, skipKey) in the frozen emission order belongs to an
+// earlier page and is dropped before it costs a frontier byte.
 func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level map[model.NodeID]frontierState,
-	o expandOptions, batch int, admittedRel map[model.RelationID]bool) ([]edgeRow, error) {
+	o expandOptions, batch int, admittedRel map[model.RelationID]bool,
+	skipOwner model.NodeID, skipKey model.RelationID) ([]edgeRow, error) {
 	var (
 		rows  []edgeRow
 		spent int64
@@ -186,6 +253,10 @@ chunks:
 					continue
 				}
 				row := edgeRow{owner: owner, rel: rel, neighbor: neighbor}
+				if skipKey != "" && (row.owner.Node < skipOwner ||
+					(row.owner.Node == skipOwner && row.rel.ID <= skipKey)) {
+					continue
+				}
 				if o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
 					// The level does not fit in the configured frontier budget.
 					// Stopping here and disclosing it is the honest answer; the
@@ -268,21 +339,21 @@ func checkWalk(ctx context.Context, b *budget) error {
 // relation allowlist, reporting the direction it walked and the visited and
 // edge counts it spent.
 func (e *Engine) Neighbors(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, req.Direction, req.Relations, nil)
+	return e.traverse(ctx, req, neighborsEndpoint, req.Direction, req.Relations, nil)
 }
 
 // Callers expands incoming `calls` edges. It pins both the direction and the
 // relation itself; a request that contradicts either is rejected with
 // CTX_ARGUMENT_INVALID rather than having the field silently ignored.
 func (e *Engine) Callers(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, model.DirectionIncoming, []model.RelationKind{model.RelCalls},
+	return e.traverse(ctx, req, callersEndpoint, model.DirectionIncoming, []model.RelationKind{model.RelCalls},
 		pinnedCalls(model.DirectionIncoming, "callers"))
 }
 
 // Callees expands outgoing `calls` edges, pinning direction and relation the
 // same way Callers does.
 func (e *Engine) Callees(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, model.DirectionOutgoing, []model.RelationKind{model.RelCalls},
+	return e.traverse(ctx, req, calleesEndpoint, model.DirectionOutgoing, []model.RelationKind{model.RelCalls},
 		pinnedCalls(model.DirectionOutgoing, "callees"))
 }
 
@@ -313,17 +384,27 @@ func pinnedCalls(dir model.Direction, op string) func(model.GraphRequest) error 
 	}
 }
 
+// Endpoint names bind a continuation to the operation that issued it, the way
+// referenceEndpoint does: a cursor minted by callees means nothing to callers
+// even at the same generation and seeds, and resumeTraversal rejects it.
+const (
+	neighborsEndpoint = "graph.neighbors"
+	callersEndpoint   = "graph.callers"
+	calleesEndpoint   = "graph.callees"
+)
+
 // continuationUnavailable rejects a request carrying a traversal cursor.
 // Silently ignoring a cursor would restart the walk from the seeds while the
 // caller believed it was resuming, which would double-spend the cumulative
 // budget the cursor exists to carry, so a typed refusal is the honest answer.
 //
-// The traversal cursor CODEC exists (cursor.go: traversalCursor,
-// resumeTraversal, nextTraversalCursor, and the spool spill it writes), but no
-// operation issues or consumes one yet: the walks below expand from their seeds
-// in a single page. Offering the continuation is the work of threading
-// resumeTraversal into this function and nextTraversalCursor into the result,
-// and is deliberately not done here.
+// The traversal operations above DO page: Neighbors, Callers and Callees mint
+// and resume a traversalCursor. This refusal is what remains for the two
+// impact-family operations, whose page boundary is not a keyset position at
+// all: Impact ranks the whole walk and cuts the ranked list, and
+// PackageDependencies aggregates it, so neither has a (owner, relation) stop to
+// resume from. Their CLI commands declare no --cursor flag; the refusal covers
+// the API path, where a caller can still set Page.Cursor.
 func continuationUnavailable(cursor string) error {
 	if cursor == "" {
 		return nil
@@ -347,7 +428,7 @@ func resolveBound(requested, configured int) int {
 // are what the operation actually walks; pin, when non-nil, is the operation's
 // own request check, run after the shared validation so it can trust the
 // request's shape.
-func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model.Direction,
+func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint string, dir model.Direction,
 	kinds []model.RelationKind, pin func(model.GraphRequest) error) (res model.GraphResult, err error) {
 	// One deferred mapping covers Neighbors, Callers and Callees: a bare
 	// context failure from the adjacency reader becomes the Section 8 code for
@@ -360,9 +441,6 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 		if err := pin(req); err != nil {
 			return model.GraphResult{}, err
 		}
-	}
-	if err := continuationUnavailable(req.Page.Cursor); err != nil {
-		return model.GraphResult{}, err
 	}
 	// The deadline wraps the gate as well as the walk, so waiting for a slot
 	// past the request deadline is the resource limit the caller must see, and
@@ -397,15 +475,31 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 	// the gate wait: a deadline recomputed after it would outlive the request's
 	// own by however long the wait took.
 	b := &budget{deadline: deadline, now: e.now}
+	// The query hash binds a continuation to this exact normalized walk, so a
+	// cursor presented to a differently filtered or differently bounded query is
+	// CTX_CURSOR_INVALID rather than a silently repinned answer.
+	queryHash := traversalQueryHash(dir, kinds, req.Start, maxDepth, maxItems)
+	var resume *resumeState
+	if req.Page.Cursor != "" {
+		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, endpoint, queryHash, deadline)
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+		// The resumed budget carries the earlier pages' cumulative spend by
+		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
+		b = resume.Budget
+	}
 	var (
 		relations  []model.Relation
 		walkReason string
+		lastOwner  model.NodeID
+		lastKey    model.RelationID
 	)
 	endpoints := map[model.NodeID]bool{}
 	for _, s := range req.Start {
 		endpoints[s] = true
 	}
-	visit := func(_ frontierState, rel model.Relation) error {
+	visit := func(owner frontierState, rel model.Relation) error {
 		switch {
 		case b.edges >= maxEdges:
 			walkReason = reasonEdgeBudget
@@ -418,18 +512,23 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 			return errStopExpansion
 		}
 		relations = append(relations, rel)
+		// The keyset position a continuation resumes from: the owner names the
+		// frontier node whose chunk the row came from, the relation id the row.
+		lastOwner, lastKey = owner.Node, rel.ID
 		endpoints[rel.From] = true
 		endpoints[rel.To] = true
 		return nil
 	}
-	if err := expand(ctx, e.adjacency, req.Start, expandOptions{
+	state, err := expand(ctx, e.adjacency, req.Start, expandOptions{
 		Direction:     dir,
 		Kinds:         kinds,
 		MaxDepth:      maxDepth,
 		Budget:        b,
 		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
-	}, visit); err != nil {
+		Resume:        resume,
+	}, visit)
+	if err != nil {
 		return model.GraphResult{}, err
 	}
 
@@ -452,12 +551,39 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 	if reason == "" && len(pending) > 0 {
 		reason = reasonDependence
 	}
+	// A continuation is offered for exactly one stop: the page filled up while
+	// the walk still had a frontier. Every other truncation reason means the
+	// walk cannot usefully go on -- a spent visited or edge budget is cumulative
+	// and a resumed page would stop at once, and a level the frontier byte
+	// ceiling cut short would be cut short again.
+	var nextCursor string
+	if reason == reasonPageFull && len(state.Frontier) > 0 {
+		visited := make([]model.NodeID, 0, len(state.Admitted))
+		for id := range state.Admitted {
+			visited = append(visited, id)
+		}
+		sort.Slice(visited, func(i, j int) bool { return visited[i] < visited[j] })
+		nextCursor, err = e.nextTraversalCursor(b, continuation{
+			Endpoint:  endpoint,
+			QueryHash: queryHash,
+			LeaseID:   e.leaseID(),
+			Depth:     state.Depth,
+			LastOwner: lastOwner,
+			LastKey:   lastKey,
+			Frontier:  state.Frontier,
+			Visited:   visited,
+		})
+		if err != nil {
+			return model.GraphResult{}, err
+		}
+	}
 	result := model.GraphResult{
 		Meta: model.QueryMeta{
 			Binding:          e.adjacency.Binding(),
 			Completeness:     pending,
 			Truncated:        reason != "",
 			TruncationReason: reason,
+			NextCursor:       nextCursor,
 		},
 		Direction: dir,
 		Nodes:     nodes,
