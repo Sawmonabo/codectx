@@ -2,6 +2,8 @@ package coverage
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -718,6 +720,81 @@ var scenarios = []scenario{
 	// L1 rows
 
 	// L2 rows
+	{
+		// Protects the receipt codec's two bindings: the purpose discriminator,
+		// which is the only thing stopping a cursor token from being spent as a
+		// source receipt, and the chunk id the payload carries into the one
+		// ConfirmChunks call. Breaking either grants full-read credit for bytes
+		// no issued chunk was ever echoed for. It deliberately asserts nothing
+		// about interval merging or confirm idempotency -- those are Task 5's
+		// and are already tested there.
+		name: "receipt purpose and chunk binding",
+		run: func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			// Built directly rather than through New: the row exercises the
+			// receipt path, not the composition root.
+			svc := &Service{
+				sessions: h.store, signer: h.sign, limits: fixtureLimits(),
+				now: func() time.Time { return h.now },
+			}
+			f := h.file(model.FileID(hexID(0x21)))
+			rec, err := h.store.Session(ctx, sessionA, actorA)
+			if err != nil {
+				t.Fatalf("session: %v", err)
+			}
+			chunk := model.IssuedChunk{
+				ID: hexID(0x50), SessionID: sessionA, ActorID: actorA,
+				FileID: f.id, ContentHash: f.hash(),
+				Bytes:     model.ByteRange{Start: 0, End: uint64(len(f.data))},
+				ExpiresAt: h.now.Add(time.Hour),
+			}
+			if err := h.store.IssueChunk(ctx, chunk); err != nil {
+				t.Fatalf("issue chunk: %v", err)
+			}
+			payload := receiptPayload{
+				SessionID: sessionA, ActorID: actorA, SnapshotID: snapshotID,
+				FileID: f.id, ContentHash: f.hash(),
+				Start: chunk.Bytes.Start, End: chunk.Bytes.End, ChunkID: chunk.ID,
+			}
+			token, err := svc.encodeReceipt(payload, h.now.Add(time.Hour))
+			if err != nil {
+				t.Fatalf("encode receipt: %v", err)
+			}
+
+			// The same payload bytes signed for the cursor purpose. Only the
+			// purpose differs, so nothing but the discriminator can reject it.
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			cursorToken, err := h.sign.Sign(pagination.PurposeCursor, raw, h.now.Add(time.Hour))
+			if err != nil {
+				t.Fatalf("sign cursor token: %v", err)
+			}
+			var typedErr *model.Error
+			if err := svc.confirmReceipts(ctx, rec, []string{cursorToken}); !errors.As(err, &typedErr) ||
+				typedErr.Code != model.CodeCursorInvalid {
+				t.Fatalf("cursor-purpose token confirmed as a receipt: %v", err)
+			}
+			if got := h.oracle(sessionA, f.id).confirmedBytes(); got != 0 {
+				t.Fatalf("rejected token credited %d bytes", got)
+			}
+
+			// The real receipt, echoed twice: the first grants exactly the
+			// chunk's bytes and the replay neither fails nor adds more.
+			for i := 0; i < 2; i++ {
+				if err := svc.confirmReceipts(ctx, rec, []string{token}); err != nil {
+					t.Fatalf("confirm %d: %v", i+1, err)
+				}
+				h.checkOracle(sessionA, actorA, f.id)
+			}
+			set := h.oracle(sessionA, f.id)
+			if set.state() != model.CoverageFullServed || set.confirmedBytes() != int64(len(f.data)) {
+				t.Fatalf("after two confirms: %s with %d of %d bytes",
+					set.state(), set.confirmedBytes(), len(f.data))
+			}
+		},
+	},
 
 	// L3 rows
 
