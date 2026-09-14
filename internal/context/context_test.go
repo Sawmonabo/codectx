@@ -302,7 +302,15 @@ func TestContextCompilerScenario(t *testing.T) {
 				ambiguous := []string{"internal/order/place_read.go", "internal/order/place_write.go"}
 				versions := make([]model.FileVersion, 0, len(fixtureFiles)+len(ambiguous))
 				var sourceBytes uint64
+				// The oversized artifact is left out: it carries one line
+				// checkpoint for 600 KB, so hydrating a lexical hit inside it is a
+				// typed resource limit that would stop the lexical step before it
+				// contributes. Section 15.4 budgeting is the L4 row's subject, not
+				// this one's.
 				for _, spec := range fixtureFiles {
+					if spec.path == "internal/order/generated.go" {
+						continue
+					}
 					versions = append(versions, fx.File(spec.path))
 					sourceBytes += uint64(len(spec.content))
 				}
@@ -344,6 +352,27 @@ func TestContextCompilerScenario(t *testing.T) {
 				run, err := fx.Store.BeginProviderRun(fx.ctx, fx.Gen, fixtureProviderID, fixtureProviderVersion)
 				if err != nil {
 					t.Fatalf("BeginProviderRun: %v", err)
+				}
+				// Units are content-addressed and already sealed, so the snapshot's
+				// original facts are attached rather than rebuilt: without them the
+				// generation would answer neither the exact-resolution step nor the
+				// lexical one, and the row would silently prove four steps of seven.
+				for _, spec := range fixtureFiles {
+					if spec.path == "internal/order/generated.go" {
+						continue
+					}
+					fv := fx.File(spec.path)
+					in := model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash}
+					h := model.NewUnitInputHasher()
+					if err := h.Add(in); err != nil {
+						t.Fatalf("unit input hash(%s): %v", fv.Path, err)
+					}
+					id := model.NewUnitID(model.UnitSpec{ProviderID: fixtureProviderID,
+						ProviderVersion: fixtureProviderVersion, ScopeKey: fv.Path,
+						InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}, fixtureConfigHash)
+					if err := fx.Store.AttachUnit(fx.ctx, fx.Gen, id); err != nil {
+						t.Fatalf("AttachUnit(%s): %v", fv.Path, err)
+					}
 				}
 				for _, path := range ambiguous {
 					fx.sealUnit(run, fx.File(path), "Place", model.NodeFunction)
@@ -400,6 +429,18 @@ func TestContextCompilerScenario(t *testing.T) {
 					t.Fatalf("extractSeeds: %v", err)
 				}
 
+				// Every Section 15.2 step contributes, so the order assertion below
+				// covers the whole chain instead of a subset of it.
+				contributed := map[originKind]bool{}
+				for _, cnd := range seeds.Candidates {
+					contributed[cnd.Origin] = true
+				}
+				for _, step := range []originKind{originExplicitSeed, originBacktick, originPathToken,
+					originExactResolve, originLexical, originChangedFile} {
+					if !contributed[step] {
+						t.Fatalf("Section 15.2 step %d produced no seed; the row would prove only part of the order", step)
+					}
+				}
 				// The steps append in order, so the origins a compile produces are
 				// non-decreasing. Reordering any two steps breaks this.
 				for i := 1; i < len(seeds.Candidates); i++ {

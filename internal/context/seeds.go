@@ -182,6 +182,14 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 		Page:         model.PageRequest{Limit: c.pageLimit()},
 	})
 	if err != nil {
+		// A bound the lexical tier could not serve within is a capability
+		// reduction, not a failed compile: the weakest discovery step stops
+		// contributing and the scope is reported incomplete (Section 14.4).
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeResourceLimit {
+			out.Unresolved = true
+			return nil
+		}
 		return contextErr(ctx, err)
 	}
 	for _, hit := range page.Items {
@@ -258,9 +266,11 @@ func (c *Compiler) resolveSymbol(ctx context.Context, gen model.GenerationID, qu
 	})
 	if err != nil {
 		var typed *model.Error
-		// A token that is not a legal query is an unresolved identity, not a
-		// failed compile: it falls through to its exclusion reason.
-		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
+		// A token that is not a legal query, or one the resolver could not
+		// answer within its bounds, is an unresolved identity rather than a
+		// failed compile: it falls through to its exclusion reason, which is
+		// what leaves the scope incomplete.
+		if errors.As(err, &typed) && (typed.Code == model.CodeArgumentInvalid || typed.Code == model.CodeResourceLimit) {
 			return nil, nil
 		}
 		return nil, contextErr(ctx, err)
