@@ -293,8 +293,10 @@ func (c *Compiler) snapshotFile(ctx context.Context, reader *sqlite.PinnedReader
 	return model.FileVersion{}, contextErr(ctx, err)
 }
 
-// pageLimit is the Section 20.1 resources.max_page_items bound every seed batch
-// is issued under.
+// pageLimit is the Section 20.1 resources.max_page_items bound every bounded
+// read in this package is issued under -- seed batches, the evidence batch
+// behind per-edge precision, and the file and edge hydrations the compile runs
+// once each. One helper, so no two passes can page at different sizes.
 func (c *Compiler) pageLimit() int {
 	if n := c.cfg.Resources.MaxPageItems; n > 0 && n <= model.MaxPageItems {
 		return n
