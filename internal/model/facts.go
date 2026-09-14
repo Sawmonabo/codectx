@@ -223,8 +223,20 @@ type Evidence struct {
 	FileID          FileID        `json:"file_id,omitempty"`
 	ContentHash     string        `json:"content_hash,omitempty"`
 	Range           *SourceRange  `json:"range,omitempty"`
-	NativeKey       string        `json:"native_key,omitempty"`
-	Detail          string        `json:"detail,omitempty"`
+	// Bytes is the same interval as Range seen from the other side of
+	// persistence. The evidence table stores start_byte/end_byte and no line or
+	// column, so a QUERY row hydrated from storage carries Bytes and a nil
+	// Range; only a fact on its way IN, straight from a provider, carries
+	// Range. Identity is settled at ingest and is not re-derived here:
+	// NewEvidenceID reads Range, so a hydrated row must never be re-hashed --
+	// the one path that does re-identify stored evidence, the carry-over in
+	// sqlite/delta.go, rebuilds Range from the same two offsets for exactly
+	// that reason and does not use this field. Readers must not synthesise a
+	// Range from Bytes either: a one-based line is not derivable from an offset
+	// without the file, and inventing one would fabricate a location.
+	Bytes     *ByteRange `json:"bytes,omitempty"`
+	NativeKey string     `json:"native_key,omitempty"`
+	Detail    string     `json:"detail,omitempty"`
 }
 
 // Validate enforces the evidence table constraints: the subject XOR, the
@@ -265,6 +277,9 @@ func (e Evidence) Validate() error {
 		return err
 	}
 	if err := validateLocatedRange("evidence.range", e.FileID, e.Range); err != nil {
+		return err
+	}
+	if err := validateLocatedBytes("evidence.bytes", e.FileID, e.Bytes); err != nil {
 		return err
 	}
 	if err := boundField("evidence.native_key", e.NativeKey, MaxNativeKeyBytes); err != nil {
