@@ -74,7 +74,15 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		s.Close()
 		return nil, err
 	}
-	return &Workspace{s: s, coord: coord}, nil
+	w := &Workspace{s: s, coord: coord}
+	// The compiler is composed last because its graph factory is w.Query, so
+	// it cannot exist before the workspace it queries through.
+	if err := s.openCompiler(w.Query); err != nil {
+		coord.Close()
+		s.Close()
+		return nil, err
+	}
+	return w, nil
 }
 
 // Coordinator is the index coordinator over this workspace.
@@ -132,6 +140,18 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 		return nil, nil, err
 	}
 	return engine, reader.Close, nil
+}
+
+// Compile compiles one immutable context manifest over this workspace
+// (Section 15). It is the single entry point to the context compiler: the
+// compiler pins its own generation per request, so this needs no workspace lock
+// and answers in a report as it does in an indexing session.
+//
+// The manifest it returns is the header; the entries, slices and exclusions are
+// read back through the store's manifest pages, which is the surface the
+// coverage session of Task 16 walks.
+func (w *Workspace) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
+	return w.s.compiler.Compile(ctx, req)
 }
 
 // Close releases the coordinator and then everything below it, in reverse.

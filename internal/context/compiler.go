@@ -61,7 +61,24 @@ type Compiler struct {
 // a missing one is a wiring defect that must fail there and not per compile,
 // where it would look like a data problem.
 func New(o Options) (*Compiler, error) {
-	return nil, &model.Error{Code: model.CodeInternal, Message: "context compiler New is not implemented"}
+	switch {
+	case o.Store == nil:
+		return nil, argumentInvalid("context compiler requires a store")
+	case o.Repo == "":
+		return nil, argumentInvalid("context compiler requires a repository identity")
+	case o.Search == nil:
+		return nil, argumentInvalid("context compiler requires a search service")
+	case o.Graph == nil:
+		return nil, argumentInvalid("context compiler requires a graph factory")
+	case o.Now == nil:
+		return nil, argumentInvalid("context compiler requires a clock")
+	}
+	log := o.Logger
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &Compiler{store: o.Store, repo: o.Repo, search: o.Search, graph: o.Graph,
+		cfg: o.Config, now: o.Now, log: log}, nil
 }
 
 // Compile produces the immutable manifest for req. It pins one generation for
@@ -69,14 +86,264 @@ func New(o Options) (*Compiler, error) {
 // request, so an activation mid-compile can never split one manifest across two
 // generations (Section 15.1). A timeout or cancellation returns an explicit
 // incomplete answer and never persists a manifest.
+//
+// The pass order is load-bearing. Seeds and scope decide WHAT is required
+// before anything is scored, file metadata is hydrated ONCE for the whole
+// candidate set before ranking (the active-change boost reads Status, and the
+// budget pass reuses the same rows rather than issuing a second read), and the
+// budget runs last, where it may refuse a request but may never shrink the
+// required scope it was handed.
 func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
-	return model.ContextManifest{}, &model.Error{Code: model.CodeInternal, Message: "context compiler Compile is not implemented"}
+	if c == nil {
+		return model.ContextManifest{}, &model.Error{Code: model.CodeInternal, Message: "the context compiler was not composed"}
+	}
+	if err := req.Validate(); err != nil {
+		return model.ContextManifest{}, err
+	}
+	if timeout := c.cfg.Resources.QueryTimeout.Std(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	reader, err := c.store.PinGeneration(ctx, c.repo, req.GenerationID, c.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	// Opened first, so released last: the graph engine below reads through this
+	// same pinned generation, and a lease dropped under it would be a reader
+	// outliving what it reads.
+	defer reader.Close()
+	binding := reader.Binding()
+	gen := binding.GenerationID
+	if gen == 0 {
+		return model.ContextManifest{}, &model.Error{Code: model.CodeNoActiveGeneration,
+			Message: "no generation is active for this repository"}
+	}
+
+	// Section 15.1: a repeated request reuses the immutable manifest rather
+	// than recompiling it, and the identity is computable before any pass runs.
+	id, _ := manifestIdentity(binding, req, c.cfg)
+	if m, ok, err := c.reuseManifest(ctx, id); err != nil {
+		return model.ContextManifest{}, err
+	} else if ok {
+		return m, nil
+	}
+
+	seeds, err := c.extractSeeds(ctx, reader, gen, req)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	caps, err := reader.Capabilities(ctx)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+
+	engine, release, err := c.graph(ctx, gen)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	defer release()
+
+	// An unresolved seed is carried INTO the expansion rather than around it:
+	// expandScope is what decides whether an unresolvable identity is the
+	// discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit
+	// boundary, and it can only decide that if it sees the exclusions.
+	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
+		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	scopeComplete := scoped.ScopeComplete && !seeds.Unresolved
+
+	files, err := c.hydrateFiles(ctx, reader, scoped.Candidates)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	relations, complete, err := c.relationsOnPaths(ctx, reader, scoped.Candidates)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	if !complete {
+		// A route whose edges could not all be read is scored as inadmissible,
+		// which changes the ranking. Disclosing it keeps that from being a
+		// silent difference between two compiles of one generation.
+		scopeComplete = false
+	}
+
+	ranked, err := c.rank(ctx, reader, scoped.Candidates, relations)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+
+	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	packed, err := buildPlan(ranked, files, resolved)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+
+	// The deadline can fire inside ranking or budgeting without any call
+	// returning an error, and Section 14.4 forbids persisting a manifest that a
+	// cancelled compile produced: the answer is explicitly incomplete instead.
+	if err := ctx.Err(); err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+
+	// The stored budget is the RESOLVED one: a persisted zero would read as
+	// "unlimited" to every later consumer, when it meant "the configured
+	// default" at compile time.
+	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
+		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
+	m, err := c.persistManifest(ctx, binding, req, stored, packed, scoped.Completeness, scopeComplete)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
+		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
+	return m, nil
 }
 
 // Close releases the compiler's own resources. It does not close the injected
 // Store or Search service, which the composition root owns.
-func (c *Compiler) Close() error {
-	return &model.Error{Code: model.CodeInternal, Message: "context compiler Close is not implemented"}
+func (c *Compiler) Close() error { return nil }
+
+// logger is the compiler's log sink. New always sets one, but Compile is also
+// reachable from a Compiler built field by field, so the discarding default is
+// applied here too rather than left as a nil dereference in the one line that
+// logs.
+func (c *Compiler) logger() *slog.Logger {
+	if c.log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return c.log
+}
+
+// hydrateFiles reads Size, Path and Status for every candidate's file in
+// bounded batches and writes them onto the candidates in place.
+//
+// It runs ONCE, before ranking: the Section 15.3 active-change boost reads
+// Status, and the Section 15.4 budget sizes an entry from Size, so a compile
+// that hydrated per pass would issue the same read twice and could observe two
+// different answers. The rows are returned as well as applied, so the budget
+// pass consumes exactly what ranking saw.
+//
+// FilesByID omits an id the pinned snapshot does not hold and returns file_id
+// order rather than input order, so the result is indexed by id here and a
+// candidate whose file is invisible keeps a zero size, which buildPlan excludes
+// with that reason rather than sizing as empty.
+func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader,
+	cands []candidate) ([]model.FileVersion, error) {
+	seen := map[model.FileID]struct{}{}
+	ids := make([]model.FileID, 0, len(cands))
+	for _, cand := range cands {
+		if cand.FileID == "" || cand.Excluded != "" {
+			continue
+		}
+		if _, dup := seen[cand.FileID]; dup {
+			continue
+		}
+		seen[cand.FileID] = struct{}{}
+		ids = append(ids, cand.FileID)
+	}
+	limit := c.pageLimit()
+	out := make([]model.FileVersion, 0, len(ids))
+	for start := 0; start < len(ids); start += limit {
+		batch := ids[start:min(start+limit, len(ids))]
+		page, err := reader.FilesByID(ctx, batch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+	}
+	byID := make(map[model.FileID]model.FileVersion, len(out))
+	for _, fv := range out {
+		byID[fv.ID] = fv
+	}
+	for i := range cands {
+		fv, ok := byID[cands[i].FileID]
+		if !ok {
+			continue
+		}
+		cands[i].SizeBytes, cands[i].Status = fv.Size, fv.Status
+		if cands[i].Path == "" {
+			cands[i].Path = fv.Path
+		}
+	}
+	return out, nil
+}
+
+// relationsOnPaths reads the relation kind of every edge the expansion admitted
+// onto a retained route, and reports whether it found all of them.
+//
+// A model.RelationPath stores relation ids only, graph.ImpactResult never
+// returns the relations it walked, and the pinned reader exposes no by-id
+// relation read -- adding one would be a second spelling of EdgesBatch. So the
+// edges are re-read here from the candidate node set, keyset-paged by relation
+// id and bounded by the same context.max_graph_edges the walk ran under, and
+// filtered to the ids the routes actually name.
+//
+// The completeness flag matters: ranking treats an edge it cannot type as
+// inadmissible, so stopping at the edge bound with ids still unfound changes
+// scores. The caller discloses that as an incomplete scope rather than letting
+// two compiles of one generation disagree in silence.
+func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedReader,
+	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
+	wanted := map[model.RelationID]struct{}{}
+	nodes := make([]model.NodeID, 0, len(cands))
+	seenNode := map[model.NodeID]struct{}{}
+	for _, cand := range cands {
+		for _, p := range cand.Paths {
+			for _, rel := range p.Relations {
+				wanted[rel] = struct{}{}
+			}
+		}
+		if cand.NodeID == "" {
+			continue
+		}
+		if _, dup := seenNode[cand.NodeID]; dup {
+			continue
+		}
+		seenNode[cand.NodeID] = struct{}{}
+		nodes = append(nodes, cand.NodeID)
+	}
+	out := make(map[model.RelationID]model.Relation, len(wanted))
+	if len(wanted) == 0 || len(nodes) == 0 {
+		return out, len(wanted) == 0, nil
+	}
+
+	limit := c.pageLimit()
+	budget := c.cfg.Context.MaxGraphEdges
+	if budget <= 0 {
+		budget = model.MaxPageItems
+	}
+	scanned := 0
+	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
+		batch := nodes[start:min(start+limit, len(nodes))]
+		var after model.RelationID
+		for len(out) < len(wanted) {
+			page, err := reader.EdgesBatch(ctx, batch, model.DirectionBoth, scopeRelations, after, limit)
+			if err != nil {
+				return nil, false, err
+			}
+			for _, rel := range page {
+				if _, want := wanted[rel.ID]; want {
+					out[rel.ID] = rel
+				}
+				after = rel.ID
+			}
+			scanned += len(page)
+			if len(page) < limit || scanned >= budget {
+				break
+			}
+		}
+		if scanned >= budget {
+			break
+		}
+	}
+	return out, len(out) == len(wanted), nil
 }
 
 // candidate is the ONE intermediate record that crosses lane boundaries: seed
