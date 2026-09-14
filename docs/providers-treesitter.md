@@ -87,7 +87,25 @@ minted key basis, per node kind:
 | File module | `module` | `file:<path>` | `module:<path>` | yes, whole file | `source_location` |
 | Declaration | function, method, class, interface, struct, enum, field, variable, constant, test, module, namespace | `file:<path>` | qualified name | yes, exact declaration range | `source_location` |
 | Import target | `module` | `provider.ScopeWorkspace` | `import:<lang>:<import path>` | no; qualified name = import path | `structural_key` (same import path from any file mints the same node) |
-| Unresolved callee | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | no | `unresolved`; metadata `{"resolution":"unresolved"}` |
+| Callee reference | function (bare call) or method (qualified call) | `file:<path>` | `call:<name>` or `call:<qualifier>.<name>` | no | `unresolved`; metadata `{"resolution":…,"candidates":…,"callee":…}` |
+
+A callee reference node is minted for every call this file cannot resolve to
+exactly one of its own declarations. Its metadata carries the Section 9.3
+attribute pair and no number that could be read as a confidence:
+
+| `resolution` | `candidates` | When |
+|---|---|---|
+| `ambiguous` | number of candidates (≥ 2) | the callee name is declared more than once in this file (overloads, two methods of the same name); the candidates are also retained as `may_refer_to` edges |
+| `import` | 0 | the qualifier is a name an import of this file introduced (`fmt.Println`, `str.ToUpper`), so the callee comes through that import and is known not to be here |
+| `unresolved` | 0 | nothing in this file declares the name — a builtin, a conversion, a cross-file callee |
+
+`exact` never appears: it requires a compiler binding this provider does not
+have. `same_module` and `unique_name` never appear either: a call that does
+resolve to one declaration of this file names that declaration directly, and
+the `calls` edge to a located declaration in the same file states the
+resolution structurally rather than as an attribute on a node that also
+describes the declaration itself. This provider never resolves a name outside
+the file, so `unique_name` has no meaning here.
 
 Aliases published (so later units and other providers resolve the same
 symbols without rescanning):
@@ -118,6 +136,31 @@ symbols without rescanning):
   declaration without this key will not merge with the semantic provider's
   node for the same function, which is missing coverage, not a silent
   simplification.
+- `("file:"+path, "callsite:"+path+":"+first+"-"+last)` → the callee node of
+  every call site. This is the Section 11.3 call-site join key, computed
+  byte-for-byte identically by the SCIP importer for the reference occurrence
+  at the same bytes, so the reconciler merges the syntactic callee with the
+  compiler-resolved symbol and the `calls` relation acquires a precise target
+  while both evidence rows remain:
+
+  ```
+  scope key  file:<path>
+  native key callsite:<path>:<first byte>-<last byte>
+  ```
+
+  The range is the **callee identifier token's**, one-based and inclusive: a
+  token occupying the half-open UTF-8 byte range `[start,end)` is spelled
+  `start+1` `-` `end`. Byte offsets, never characters and never UTF-16 code
+  units — the SCIP importer converts its own encoding through
+  `internal/source` before it builds the same key. The path is the same
+  root-relative slash path the unit's scope key carries. The identifier range
+  is validated against the pinned bytes like every other offset, so an offset
+  inside a UTF-8 sequence or outside the call is `CTX_PROVIDER_OUTPUT_INVALID`,
+  not a key. A key over `MaxNativeKeyBytes` is omitted rather than truncated
+  and the omission is counted, so the file is `partial`. Only `@call.name`
+  captures produce this alias; a type reference does not, because only a call
+  site is the join SCIP cannot make on its own (no indexer distinguishes a
+  call-site reference from a function-value reference).
 - `("pkg:go:"+dir+":"+package, qualified name)` → Go top-level declarations;
   `("pkg:java:"+package, qualified name)` → Java top-level declarations. These
   are the two languages where a declared package clause makes members visible
@@ -134,8 +177,8 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `exports` | file module → declaration | Go exported identifier, Rust `pub`, Java `public`, JS/TS `export` (including `export { x }` lists), TS `export default` |
 | `imports` | file module → import target | every import/include/use |
 | `calls` | enclosing declaration (or file module) → declaration | a call whose name is declared exactly once in this file, respecting qualification (a `recv.name()` call names methods; a bare call names functions, tests, classes and structs); definitions preferred over prototypes |
-| `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); bounded by `MaxAmbiguousCandidates` |
-| `calls` | enclosing declaration → unresolved callee | a call whose name is not declared in this file, or whose qualifier is a name an import introduced (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`): cross-file, so never guessed |
+| `calls` | enclosing declaration (or file module) → callee reference | a call this file cannot resolve to exactly one of its declarations: ambiguous, import-qualified (`fmt.Println`, `str.ToUpper`, `path.join`, `std::move`) or not declared here. The callee is a provider-local node carrying `resolution`/`candidates`, never a guess |
+| `may_refer_to` | enclosing declaration → each candidate | a call whose name is declared more than once in this file (overloads, shadowing); bounded by `MaxAmbiguousCandidates`, alongside the `calls` edge to the ambiguous callee reference |
 | `references` | enclosing declaration → type declaration | a type reference to a class/struct/interface/enum declared in this file; a type this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 
@@ -255,9 +298,20 @@ worker → parent   Hello{pid, fingerprint, languages}          once, first
 parent → worker   Request{language, path, source_bytes}
 parent → worker   Source<raw bytes>                            exactly source_bytes
 worker → parent   Decl* Import* Ref*                           facts, one record each
+                  Ref{kind, start, end, name_start, name_end, name, scope, qualified?, qualifier?, qualifier_is_import?}
 worker → parent   Done{package, syntax_errors, truncated, rss_bytes}
               or  Error{code, message}                         per-file failure; worker stays healthy
 ```
+
+A `Ref` carries two ranges: `start`/`end` bound the whole reference
+expression (the call expression for a call), and `name_start`/`name_end`
+bound the callee identifier token alone. The alias is built from the second,
+because that is what a SCIP occurrence covers; the enclosing expression's
+range would join nothing. `qualifier` is the receiver as written when it is a
+name within `wire.MaxQualifierBytes` and empty when the receiver is a larger
+expression — a chained `a.b(x).c(y).Scan(&v)` has a receiver hundreds of bytes
+long, which is a callee this file cannot name, not a string to truncate.
+`qualifier_is_import` is decided from the receiver's full text either way.
 
 Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
@@ -349,7 +403,7 @@ language (`ecmascript.scm` is shared by JavaScript, TypeScript and TSX;
 | `@def.<kind>` | a declaration of `<kind>` (function, method, class, interface, struct, enum, field, variable, constant, module, namespace, test); its `@name` (or `@declarator` for C) names it, `@body` marks where the signature ends |
 | `@scope` + `@scope.name` | a non-declaration container that contributes to qualified names and turns functions into methods (Rust `impl`) |
 | `@import` + `@import.path` + `@import.name` | an import statement, its path and the local name it introduces |
-| `@call` + `@call.name` + `@call.qualifier` | a call site |
+| `@call` + `@call.name` + `@call.qualifier` | a call site; `@call.name` is the callee identifier whose byte range becomes the `callsite:` alias, so every language pack must capture it (TSX and C++ inherit theirs from `ecmascript.scm` and `c.scm`) |
 | `@ref.type` | a type reference |
 | `@package` | the package/module clause |
 | `@export` + `@export.name` | an export wrapper or export list entry |
@@ -370,7 +424,9 @@ and attach documentation (adjacent preceding comments; Python docstrings).
 | fact frame | 64 KiB | both sides |
 | declarations / imports / references per file | 20000 / 4000 / 60000 | both sides |
 | evidence per fact | 64 | parent |
-| distinct unresolved callees per file | 2000 | parent; past it the file is `partial` |
+| distinct callee reference nodes per file | 2000 | parent; past it the call is counted, not minted, and the file is `partial` |
+| call qualifier (receiver text) | `wire.MaxQualifierBytes` (512) | worker; a larger receiver expression is reported as an unnamed qualifier, so the key is `call:.<name>` |
+| call-site alias key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | cross-provider declaration key | `MaxNativeKeyBytes` (2048) | parent; past it the key is omitted, not truncated, and the file is `partial` |
 | records per sink hand-off | 1000 | parent |
 | documentation body | 8 KiB | parent |
@@ -406,7 +462,14 @@ carry this inventory; it is reported as a shared change in the Task 8 report.
   byte range selects source containing its name, lines match the bytes, the
   nested declaration is contained by its outer one, the pool never exceeds
   its bound and every worker has exited after `Close`. The test binary is its
-  own worker through `TestMain`.
+  own worker through `TestMain`. `checkCallsites` extends the same loop with
+  the three call-site join invariants: every `callsite:` key's one-based
+  inclusive range selects exactly its callee node's name in the pinned bytes
+  (the Go fixture's non-ASCII `日本語` callee is what separates a byte range
+  from a rune range at both ends), a second independent unit over the same
+  bytes publishes identical keys naming identical identities, and the call to
+  the builtin `len` publishes both its alias and a callee node with
+  `resolution=unresolved`, `candidates=0`.
 - `internal/bench` `TestParserResourcePlateau` (skipped under `-short`): 600
   parses of 64×-repeated fixtures through the real worker path on one
   long-lived worker; worker RSS after warm-up must stay within 8 MiB of its
