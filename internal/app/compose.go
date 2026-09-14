@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -151,6 +152,10 @@ type stack struct {
 	// the repository identity, which is the coordinator's to derive.
 	repo   model.RepositoryID
 	search *search.Service
+	// compiler is the Section 15 context compiler. It is set by openCompiler
+	// rather than openQueries because it needs the graph factory, which is a
+	// Workspace method and therefore does not exist until the workspace does.
+	compiler *contextpkg.Compiler
 
 	// states are the capability rows detection can never publish because the
 	// provider could not be constructed at all. A provider missing from the
@@ -592,6 +597,31 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 	return nil
 }
 
+// openCompiler builds the Section 15 context compiler over the services
+// openQueries composed. graph is Workspace.Query, which opens a bounded engine
+// over ONE explicit generation and returns the release that drops its lease: it
+// satisfies contextpkg.GraphFactory exactly, so the sqlite adjacency adapter is
+// reused rather than spelled a second time here.
+//
+// It is built eagerly at open, like search, so a missing dependency fails the
+// composition instead of every compile, where it would read as a data problem.
+func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
+	c, err := contextpkg.New(contextpkg.Options{
+		Store:  s.store,
+		Repo:   s.repo,
+		Search: s.search,
+		Graph:  graph,
+		Config: s.cfg,
+		Now:    time.Now,
+		Logger: s.logger,
+	})
+	if err != nil {
+		return err
+	}
+	s.compiler = c
+	return nil
+}
+
 // Close releases everything the stack opened, in reverse. Every step runs even
 // when an earlier one failed: a lock left held or a worker left running is a
 // workspace nobody else can index.
@@ -600,8 +630,13 @@ func (s *stack) Close() error {
 		return nil
 	}
 	var errs []error
-	// The search service is released first: it reads through the store, so a
-	// store closed under it would be a reader outliving what it reads.
+	// The context compiler is released first, then the search service: both
+	// read through the store, and the compiler reads through the search
+	// service, so a dependency closed under either would be a reader outliving
+	// what it reads.
+	if s.compiler != nil {
+		errs = append(errs, s.compiler.Close())
+	}
 	if s.search != nil {
 		errs = append(errs, s.search.Close())
 	}
