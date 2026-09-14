@@ -101,6 +101,21 @@ func validateLocatedRange(field string, fileID FileID, r *SourceRange) *Error {
 	return nil
 }
 
+// validateLocatedBytes is validateLocatedRange for a byte interval: storage
+// keeps no line/column context for an evidence row, so a row read back carries
+// a ByteRange where an ingested fact carried a SourceRange. The mixed-range
+// CHECK applies to it unchanged -- an interval is either wholly absent or
+// accompanied by the file it indexes into.
+func validateLocatedBytes(field string, fileID FileID, r *ByteRange) *Error {
+	if r == nil {
+		return nil
+	}
+	if fileID == "" {
+		return invalid("%s is present without %s.file_id; a located range must name its file", field, field)
+	}
+	return r.Validate(field)
+}
+
 // FileStatus is the snapshot_files vocabulary. A deleted entry is a tombstone
 // with no content hash and zero size.
 type FileStatus string

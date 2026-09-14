@@ -442,6 +442,20 @@ type ReferenceOccurrence struct {
 	FileID     FileID       `json:"file_id,omitempty"`
 	Path       string       `json:"path,omitempty"`
 	Range      *SourceRange `json:"range,omitempty"`
+	// Bytes locates a canonical occurrence when Range cannot: evidence is
+	// persisted as a byte interval with no line or column context, so a sealed
+	// occurrence carries Bytes and a nil Range while an overlay answer, which
+	// comes from a language server that speaks positions, carries Range.
+	// Presenting the byte interval AS a line number is the one thing neither
+	// this type nor its renderers may do.
+	Bytes *ByteRange `json:"bytes,omitempty"`
+	// FromName is the qualified name (or the plain name, where the provider
+	// sealed no qualified one) of FromNodeID, hydrated once per page so a
+	// reader can tell two occurrences apart without resolving every id itself.
+	// It is empty when the node is not visible in this generation and for an
+	// overlay row that sealed no canonical edge; consumers then fall back to
+	// the id and never render a blank where a symbol belongs.
+	FromName string `json:"from_name,omitempty"`
 	// SemanticSource labels where this occurrence came from. The zero value and
 	// SemanticCanonical both mean a sealed canonical fact; SemanticLSP marks an
 	// ephemeral overlay answer that has no canonical relation or evidence row,
@@ -498,6 +512,12 @@ func (o ReferenceOccurrence) Validate() error {
 		return err
 	}
 	if err := validateLocatedRange("reference_occurrence.range", o.FileID, o.Range); err != nil {
+		return err
+	}
+	if err := validateLocatedBytes("reference_occurrence.bytes", o.FileID, o.Bytes); err != nil {
+		return err
+	}
+	if err := boundField("reference_occurrence.from_name", o.FromName, MaxQualifiedNameBytes); err != nil {
 		return err
 	}
 	return nil
