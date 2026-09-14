@@ -101,6 +101,7 @@ type Config struct {
 	Index     Index     `toml:"index"`
 	Resources Resources `toml:"resources"`
 	Storage   Storage   `toml:"storage"`
+	Retention Retention `toml:"retention"`
 	Tools     Tools     `toml:"tools"`
 	Providers Providers `toml:"providers"`
 	Context   Context   `toml:"context"`
@@ -180,6 +181,22 @@ type Storage struct {
 	WALHighWaterBytes      int64    `toml:"wal_high_water_bytes"`
 	ClosedSessionRetention Duration `toml:"closed_session_retention"`
 	QueryCursorTTL         Duration `toml:"query_cursor_ttl"`
+}
+
+// Retention configures the process-level collector (internal/retention): the
+// scheduled reclaim of sessions, spools, snapshots and the tool store, and the
+// Section 10.4 blob grace protocol it owns.
+type Retention struct {
+	// BlobGrace is how long a blob that nothing references waits, once it has
+	// been trashed, before the collector rechecks reachability and deletes its
+	// row and its content-addressed object.
+	//
+	// It is the protocol's safety margin, not a tuning knob for throughput: the
+	// window is what protects a reader that pinned a generation in the instant
+	// the manifest naming a blob went away. Shortening it narrows that
+	// protection; lengthening it only delays reclaim. It must be positive --
+	// a zero window would delete an object in the same pass that trashed it.
+	BlobGrace Duration `toml:"blob_grace"`
 }
 
 // Providers groups the four provider families of Section 20.1.
@@ -397,6 +414,9 @@ func Defaults() Config {
 			WALHighWaterBytes:      67108864,
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),
 			QueryCursorTTL:         Duration(15 * time.Minute),
+		},
+		Retention: Retention{
+			BlobGrace: Duration(24 * time.Hour),
 		},
 		Tools: Tools{
 			Offline:       false,

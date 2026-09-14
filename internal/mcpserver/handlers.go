@@ -11,26 +11,24 @@ import (
 
 // handlers carries everything the 23 tool handlers need.
 //
-// It holds the FOUR NARROW FACADE INTERFACES and never *app.Services.
-// *app.Services is a concrete struct and therefore cannot be faked, while
-// app.IndexService, app.ExploreService, app.ContextService and
-// app.DiagnoseService exist for exactly this ("The four narrow interfaces below
+// It holds the THREE NARROW FACADE INTERFACES the 23 tools of Section 19.2
+// actually call, and never *app.Services. *app.Services is a concrete struct
+// and therefore cannot be faked, while app.IndexService, app.ExploreService and
+// app.ContextService exist for exactly this ("The four narrow interfaces below
 // exist for consumers to depend on" — internal/app/services.go) and *Services
-// satisfies all four. That is the seam that lets every lane's test rows run
-// against an in-package fake while the facade bodies are still landing, and it
-// is why internal/cli/mcp.go can hand ws.Services() to all four fields.
+// satisfies them. That is the seam that lets every lane's test rows run against
+// an in-package fake, and it is why internal/cli/mcp.go can hand ws.Services()
+// to each field.
+//
+// app.DiagnoseService is deliberately absent: Section 19.2 lists no doctor tool
+// (toolCount = 23), so a diagnose field here would be a dependency no handler
+// reads. `codectx doctor` is the consumer of that facade method.
 //
 // log writes to STDERR. stdout belongs to the SDK's framing (see doc.go).
 type handlers struct {
 	index   app.IndexService
 	explore app.ExploreService
 	context app.ContextService
-	// diagnose has no Task 19 consumer: Section 19.2 lists no doctor tool, so
-	// Doctor's typed refusal needs no wire surface. It is held here rather than
-	// dropped because New takes the whole facade and a fifth constructor
-	// signature later would be the churn; this is wave-E Q14's existing ledger
-	// entry, not a new gap.
-	diagnose app.DiagnoseService
 
 	// cfg carries the Section 20 bounds. L1's limitMiddleware reads
 	// resources.max_metadata_response_bytes, max_concurrent_queries,

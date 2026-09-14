@@ -105,9 +105,13 @@ type RetentionConfig struct {
 // Report is what one collection pass reclaimed. Every count is what this pass
 // actually removed, so a caller logs progress rather than intent.
 type Report struct {
-	SessionsExpired  int64
-	SessionsPruned   int64
-	SpoolsSwept      int64
+	SessionsExpired int64
+	SessionsPruned  int64
+	// SpoolBytesSwept is BYTES, not a count of files: (*pagination.Spools).Sweep
+	// returns the live spool byte total it reconciled its budget against, and an
+	// operator-facing field named for a count while carrying a byte total is a
+	// misreport. The name states the unit so the number reads as what it is.
+	SpoolBytesSwept  int64
 	ToolsCollected   int
 	BlobsQuarantined int64
 	BlobsTrashed     int64
