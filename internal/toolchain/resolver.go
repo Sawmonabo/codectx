@@ -318,7 +318,16 @@ func (r *Resolver) pinned(name string) (Tool, error) {
 	var runtime Tool
 	if e.Runtime != "" {
 		var err error
-		if runtime, err = r.pinned(e.Runtime); err != nil {
+		// An overridden runtime still has a fully known identity: the override
+		// names the executable and its checksum, so the hosted entry's pinned
+		// fingerprint folds the runtime the user actually supplies rather than
+		// refusing. Only the entry itself has no pinned identity when overridden.
+		if ov, ok := r.overrides[e.Runtime]; ok {
+			runtime, err = resolveOverride(e.Runtime, ov)
+		} else {
+			runtime, err = r.pinned(e.Runtime)
+		}
+		if err != nil {
 			return Tool{}, err
 		}
 	}

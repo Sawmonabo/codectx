@@ -829,14 +829,14 @@ func (e *emitter) emitNodes(ctx context.Context) error {
 	}
 }
 
-// sortedKeys is one fact's key list in the order a keyed put requires:
+// sortedKeys is one fact's stored key list in the order a keyed put requires:
 // ascending and without duplicates. Duplicates are ordinary — two entities of
 // one identity, or two occurrences of one edge, can share a key — and storage
-// refuses a list that holds one.
-// sortedKeys is the key list stored for one fact. There is deliberately no
-// per-fact bound: dropping a key would blind removal detection for that fact,
-// and every key is one of the query's rows, so maxDerivedRows is the only
-// ceiling (51 keys on one relation was the measured peak on this repository).
+// refuses a list that holds one. There is deliberately no per-fact bound:
+// dropping a key would blind removal detection for that fact, and every key is
+// one of the export's rows, so the export's row bounds are the only ceiling —
+// maxStagedRows for a node fact's keys and maxDerivedRows for a relation's
+// (51 keys on one relation was the measured peak on this repository).
 func sortedKeys(keys []string) []string {
 	slices.Sort(keys)
 	return slices.Compact(keys)
