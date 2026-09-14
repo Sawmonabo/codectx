@@ -39,9 +39,11 @@ func (u storeUnit) Seal(ctx context.Context) error { return u.store.SealUnit(ctx
 // RunUnit executes one assigned unit end to end: it runs the provider with a
 // batch sink over out, flushes what the provider emitted, and seals the unit
 // only when the provider reported a succeeded run and the writer's whole-unit
-// validation passed. On any other outcome, including a partial run, a write
-// failure or cancellation, the unit is failed and its output deleted; failed
-// partial output is never attached to a generation.
+// validation passed. On a partial run or a write failure the unit is failed
+// and its output deleted. A build the caller cancelled abandons the unit
+// instead: it is marked failed and its rows are left for storage's collection,
+// so the exit path never waits on a rollback. Failed or abandoned output is
+// never attached to a generation.
 //
 // The provider runs under a child context that the sink cancels when a write
 // fails, so every producer goroutine stops promptly. Cleanup uses a context
@@ -52,7 +54,7 @@ func (u storeUnit) Seal(ctx context.Context) error { return u.store.SealUnit(ctx
 // and Fail must never overlap a write. While the sink is live another
 // acquirer may flush its queued batches into the writer to relieve pool
 // pressure, so the sink is discarded (which waits for any such write and
-// then leaves the pool) before Seal or Fail is called on any path. The
+// then leaves the pool) before Seal, Fail or Abandon is called on any path. The
 // deferred Discard is only the idempotent safety net.
 func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, limits Limits, pool *Pool) (model.ProviderResult, error) {
 	runCtx, cancel := context.WithCancelCause(ctx)
