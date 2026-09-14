@@ -43,9 +43,10 @@ ABI and grammar metadata that the unit fingerprint folds in.
 
 The managed analyzer toolchain of Section 11.7 pins one external analyzer or
 runtime per lock entry (`docs/toolchain.md`). Most are pinned at the upstream
-publisher's own asset URL; `gopls` and the four Node-hosted analyzers have no
-upstream binary and are built at release time and redistributed as assets of
-the `tools-v<n>` release. Either way the payload is **not linked into the
+publisher's own asset URL; `gopls`, the four Node-hosted analyzers, and the
+three platforms of `scip-go` upstream does not build have no upstream binary and
+are built at release time and redistributed as assets of the `tools-v<n>`
+release. Either way the payload is **not linked into the
 binary**: the product downloads the one its lock names, verifies its SHA-256
 and size, and runs it as a separate process. Every payload keeps its upstream
 license file inside the archive; the table below is the inventory the lock also
@@ -56,7 +57,7 @@ the two the bytes come from.
 |---|---|---|---|---|
 | `node` | 22.23.2 | MIT (Node.js core) with the bundled-component licenses in `LICENSE` (ICU under Unicode-DFS-2016, OpenSSL under Apache-2.0, zlib, libuv and others) | upstream | https://nodejs.org/dist/v22.23.2/ |
 | `jdk` (Eclipse Temurin) | 21.0.12.1+1 | GPL-2.0-only WITH Classpath-exception-2.0 | upstream | https://adoptium.net/temurin/releases/?version=21 |
-| `scip-go` | 0.2.7 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-go |
+| `scip-go` | 0.2.7 | Apache-2.0 | upstream (linux amd64/arm64, darwin arm64); redistributed (darwin amd64, windows amd64/arm64) | https://github.com/sourcegraph/scip-go |
 | `scip-typescript` | 0.4.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-typescript |
 | `scip-python` | 0.6.6 | MIT (the package vendors pyright) | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-python |
 | `scip-java` | 0.13.1 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-java |

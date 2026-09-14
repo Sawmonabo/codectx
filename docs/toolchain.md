@@ -19,7 +19,7 @@ release time for all six targets. Installing codectx installs nothing else.
 | Artifact | Produced by | Role |
 |---|---|---|
 | `internal/toolchain/tools.lock.json` | `internal/tools/toollock` | The embedded lock. One entry per tool with its version, license, upstream, runtime and a per-platform `{url, sha256, size, entry, entry_sha256, provenance}`. Data only. |
-| `tools-v<n>` release assets | `internal/tools/toollock` | One deterministic `<tool>-<version>-<os>-<arch>.tar.gz` per platform, for the five tools that have no upstream binary at all. |
+| `tools-v<n>` release assets | `internal/tools/toollock` | One deterministic `<tool>-<version>-<os>-<arch>.tar.gz` per hosted platform, for every tool-and-platform upstream publishes no binary for. |
 | Profiles (`internal/provider/...`) | Product code | The argv, trigger files, budgets, timeouts and env allowlist. A profile names a lock entry; it never names a command found on the host. |
 
 A platform absent from a tool's `platforms` map means the tool is unavailable
@@ -47,12 +47,17 @@ cutting a new lock, and is not a correctness or integrity failure. Where
 upstream publishes no binary at all, there is nothing to depend on and we
 build and host the payload ourselves.
 
+The rule is applied per *platform*, not per tool: a tool whose upstream builds
+some targets and not others is pinned upstream where a binary exists and hosted
+where none does.
+
 | Hosted on `tools-v1` (no upstream binary exists) | Pinned at the upstream URL |
 |---|---|
-| `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `joern`, `jdtls`, `clangd`, `scip-go`, `scip-java`, `scip-clang`, `rust-analyzer` |
+| `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `joern`, `jdtls`, `clangd`, `scip-java`, `scip-clang`, `rust-analyzer` |
 | `scip-typescript`, `scip-python`, `typescript-language-server`, `pyright` — npm packages, prebuilt so the user never runs npm | |
+| `scip-go` — darwin amd64 and both Windows targets only; cross-built | `scip-go` — linux amd64/arm64 and darwin arm64 |
 
-The five hosted payloads are normalized deterministically: entries sorted by
+The hosted payloads are normalized deterministically: entries sorted by
 path, one fixed modification time, uid/gid 0, no owner names, modes collapsed
 to `0644`/`0755`, and a gzip header with no name and no timestamp. Packing the
 same tree twice produces byte-identical bytes, so a regenerated release does
@@ -88,7 +93,7 @@ and a path, which the lock's own validation enforces. The hosts in use are
 |---|---|---|---|---|---|---|
 | `node` | 22.23.2 (Jod LTS) | runtime | — | — | all six | upstream `nodejs.org/dist`, digest from `SHASUMS256.txt` |
 | `jdk` | Temurin 21.0.12.1+1 | runtime | — | — | all six | upstream `adoptium/temurin21-binaries` release, published SHA-256 |
-| `scip-go` | 0.2.7 | indexer | — | go | linux amd64/arm64, darwin arm64 | upstream, sidecar `.sha256` |
+| `scip-go` | 0.2.7 | indexer | — | go | all six | upstream with sidecar `.sha256` on linux amd64/arm64 and darwin arm64; cross-built and hosted on the other three |
 | `scip-typescript` | 0.4.0 | indexer | node | typescript, tsx, javascript | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-python` | 0.6.6 | indexer | node | python | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-java` | 0.13.1 | indexer | jdk | java | all six | upstream launcher jar, sidecar `.sha256` |
@@ -122,10 +127,14 @@ the engine is a backend swap rather than a product change.
   payloads are built with `go install <pkg>@<version>` under `CGO_ENABLED=0`
   and `-trimpath`, outside the product's own module graph, and hosted on the
   tools release.
-- **`scip-go` covers three platforms.** Upstream builds linux amd64/arm64 and
-  darwin arm64. The other three have no upstream binary; Go there is served by
-  `gopls` and by the dependence engine, which is a reduction in precise Go
-  indexing on those platforms and is stated in the lock by omission.
+- **`scip-go` is hybrid within one tool.** Upstream builds linux amd64/arm64
+  and darwin arm64, and those three are pinned at the upstream assets. Upstream
+  publishes nothing for darwin amd64 or either Windows target, so those three
+  are cross-built from the pinned module at release time and hosted, exactly as
+  `gopls` is. Precise Go indexing is therefore available on all six platforms.
+  The module declares itself as `github.com/scip-code/scip-go` while the release
+  assets still live under `github.com/sourcegraph/scip-go`; the project moved
+  owner and both spellings name scip-go 0.2.7.
 - **`rust-analyzer`, `clangd`, `scip-clang`: no upstream digest.** These
   projects publish release assets with no checksum sidecar. The lock pins the
   SHA-256 observed at generation time, which from that point forward is what
@@ -137,8 +146,10 @@ the engine is a backend swap rather than a product change.
   is available on arm64 Windows, which the lock states by omission.
 - **Three upstream assets are single files, not archives.** `rust-analyzer`'s
   unix builds are a bare gzip member, and `scip-clang` and `scip-java` are
-  published unarchived. Extracting those needs a single-file payload shape in
-  the runtime extractor; see the lane A3 report.
+  published unarchived. The runtime writes such a payload as its single entry
+  file, at the payload-relative path the lock already pins for it and with the
+  executable bit set; the pinned entry digest then verifies it exactly as it
+  verifies a member of an archive.
 
 ## Regenerating and verifying
 
@@ -149,13 +160,29 @@ go run ./internal/tools/toollock -tools joern # limit to one tool
 go run ./internal/tools/toollock -no-upload   # produce the hosted payloads without publishing
 ```
 
-`-check` is the release gate for "the lock describes what is actually
-published". It makes no distinction between an upstream URL and one of ours:
-every URL is fetched again and digested. A `tar.gz` or bare gzip payload is
-hashed as it streams; a zip needs its central directory, which lives at the
-end, so it streams past a scratch file that is deleted immediately. No payload
-is ever held in memory, and a digest mismatch is never retried and never
-executed.
+`-check` is the release gate, and it answers two questions rather than one.
+
+First, **the lock describes what is actually published**: every URL is fetched
+again and digested, with no distinction between an upstream URL and one of ours.
+A `tar.gz` or bare gzip payload is hashed as it streams; a zip needs its central
+directory, which lives at the end, so it streams past a scratch file that is
+deleted immediately. No payload is ever held in memory, and a digest mismatch is
+never retried and never executed.
+
+Second, **the runtime can actually install what the lock pins**: every entry
+carrying a payload for the platform the check runs on is then installed through
+`internal/toolchain` itself — its fetcher, its digest verification, its confined
+extractor and its entry hashing — into a scratch store that is removed
+afterwards unless `-keep` is given. A digest check alone cannot see the
+extractor, and a payload the extractor refuses is a tool the product cannot run
+no matter how well its digest matches. One platform per runner is enough: the
+digest half covers the other five and the extractor is platform-independent.
+
+The lock also has to stay inside the runtime's extraction bounds. The generator
+measures what each payload expands to and fails the run — rather than logging a
+number — when a payload exceeds the file count or the expansion budget
+`internal/toolchain` enforces, so that ceiling is met at release time instead of
+on a user's machine.
 
 The generator resumes: each finished platform is recorded, so an interrupted
 run does not repeat work that already succeeded, and a hosted asset that is

@@ -23,7 +23,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -227,8 +226,11 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 			if err := extract(dl, treeDir, pp.Src.Kind, pp.Src.Strip, pp.Src.Dest); err != nil {
 				return entry, err
 			}
-			files, bytes := treeStats(treeDir)
-			logf("%s/%s: extracts to %d files, %d bytes", spec.Name, plat, files, bytes)
+			// An upstream payload is pinned as published, so its expansion must
+			// clear the runtime's bounds before the lock records it.
+			if err := checkTreeBounds(spec.Name, plat, treeDir, size); err != nil {
+				return entry, err
+			}
 			payloadURL, payloadSum, payloadSize = pp.Src.URL, sum, size
 			if !*flagKeep {
 				_ = os.Remove(dl)
@@ -280,6 +282,11 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 			}
 			payloadURL = assetURL(*flagRepo, *flagTag, assetName)
 			logf("%s/%s: packed %s (%d bytes, sha256 %s) in %s", spec.Name, plat, assetName, payloadSize, payloadSum, time.Since(start).Round(time.Second))
+			// A hosted payload's compressed size is only known once it is
+			// packed, so its bounds check happens here rather than at extraction.
+			if err := checkTreeBounds(spec.Name, plat, treeDir, payloadSize); err != nil {
+				return entry, err
+			}
 			switch {
 			case *flagNoUpload:
 			default:
@@ -395,9 +402,7 @@ func resolveEntry(root, pattern string) (string, error) {
 func writeLicenseTable(l Lock, path string) error {
 	var b strings.Builder
 	b.WriteString("| Payload | Version | License | Upstream |\n|---|---|---|---|\n")
-	names := sortedToolNames(l)
-	sort.Strings(names)
-	for _, n := range names {
+	for _, n := range l.Names() {
 		e := l.Tools[n]
 		fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n", e.Name, e.Version, e.License, e.Upstream)
 	}

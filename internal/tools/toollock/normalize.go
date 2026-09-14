@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // epoch is the single modification time every normalized payload entry carries.
@@ -32,25 +34,22 @@ const (
 	maxPayloadBytes = 2 << 30
 )
 
-// confinedRel validates that name, interpreted relative to a payload root, stays
-// inside that root. It is the single confinement rule shared by the extractor
-// (archive member names) and the packer (symlink targets): an absolute path, a
-// rooted Windows path, a path that climbs out with "..", or an empty path is
-// rejected before any byte is written or read.
+// confinedRel normalizes an upstream archive member name and then holds it to
+// the runtime's own rule, toolchain.ConfinedRelPath. Normalizing first is the
+// one deliberate difference: this program reads archives as their publishers
+// wrote them, where a leading "./" or a trailing "/" is ordinary, while the
+// runtime reads only payloads this program has already vetted and rejects both
+// outright. Everything the runtime refuses -- an absolute path, a rooted
+// Windows path, a backslash, a NUL, a path climbing out with ".." -- is refused
+// here too, from the same code, so a payload cannot be packed or measured under
+// a name the product would later throw out.
 func confinedRel(name string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("empty path")
 	}
-	slashed := strings.ReplaceAll(name, `\`, "/")
-	if path.IsAbs(slashed) {
-		return "", fmt.Errorf("absolute path %q", name)
-	}
-	if len(slashed) >= 2 && slashed[1] == ':' {
-		return "", fmt.Errorf("rooted path %q", name)
-	}
-	clean := path.Clean(slashed)
-	if clean == ".." || strings.HasPrefix(clean, "../") || clean == "." || clean == "/" {
-		return "", fmt.Errorf("path escapes payload root: %q", name)
+	clean := path.Clean(strings.TrimSuffix(strings.ReplaceAll(name, `\`, "/"), "/"))
+	if err := toolchain.ConfinedRelPath(clean); err != nil {
+		return "", fmt.Errorf("path %q %s", name, err)
 	}
 	return clean, nil
 }

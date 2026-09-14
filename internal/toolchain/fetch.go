@@ -18,9 +18,10 @@ import (
 )
 
 // This file is the product's entire outbound network surface (Section 21). It
-// fetches only a URL the embedded lock names, or the same path under a
-// configured mirror, and it verifies the declared size and digest before any
-// caller may look at the bytes.
+// fetches only a URL the embedded lock names, or that URL relocated under a
+// configured mirror -- which keeps the original host as the mirror path's first
+// segment -- and it verifies the declared size and digest before any caller may
+// look at the bytes.
 
 const (
 	// maxRedirects is Section 11.7's "at most three redirects".
@@ -38,7 +39,9 @@ const (
 	tlsTimeout  = 30 * time.Second
 )
 
-// assetDelegates names the hosts an asset host may hand a download body to.
+// assetDelegates names the hosts an asset host may hand a download body to. It
+// is keyed by the host the lock names, never by the host actually dialed, so a
+// mirror standing in front of that publisher forwards the same delegation.
 // Section 11.7 allows redirects "to the same host set"; a GitHub release asset
 // is answered by github.com with a 302 to a separate content host, so the set
 // is the lock's host plus the hosts that host is known to delegate to. Observed
@@ -83,11 +86,22 @@ func newFetcher(transport http.RoundTripper, mirror *url.URL, maxBytes int64, ti
 	}
 }
 
+// lockHostKey carries the lock URL's own host down the redirect chain. Under a
+// mirror the first request's host is the mirror's, not the asset publisher's,
+// so keying the delegate set off via[0] would refuse the very delegation a
+// mirror proxying that publisher has to forward. The value is set on the
+// request context, which every redirect request inherits.
+type lockHostKey struct{}
+
+func withLockHost(ctx context.Context, host string) context.Context {
+	return context.WithValue(ctx, lockHostKey{}, host)
+}
+
 // checkRedirect enforces the redirect bound and the host set. via holds the
 // requests already made, so following the Nth redirect arrives with len(via)
-// == N and refusing above maxRedirects follows at most that many. via[0] is the
-// original request, so the permitted host set is derived from the lock's own
-// host and never grows as the chain does.
+// == N and refusing above maxRedirects follows at most that many. The permitted
+// set is the request's own origin host plus the delegates of the host the lock
+// names, and it never grows as the chain does.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > maxRedirects {
 		return errors.New("too many redirects")
@@ -95,11 +109,11 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if req.URL.Scheme != "https" {
 		return errors.New("redirect leaves https")
 	}
-	origin := via[0].URL.Hostname()
-	if req.URL.Hostname() == origin {
+	if req.URL.Hostname() == via[0].URL.Hostname() {
 		return nil
 	}
-	for _, allowed := range assetDelegates[origin] {
+	lockHost, _ := via[0].Context().Value(lockHostKey{}).(string)
+	for _, allowed := range assetDelegates[lockHost] {
 		if req.URL.Hostname() == allowed {
 			return nil
 		}
@@ -107,20 +121,23 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return errors.New("redirect leaves the asset host set")
 }
 
-// target applies the mirror substitution of Section 11.7: the same path under
-// the configured prefix, which is how a private host serves the same payloads.
-func (f *fetcher) target(raw string) (*url.URL, error) {
+// target applies the mirror substitution of Section 11.7: the mirror replaces
+// the scheme and host and keeps the original host as the first path segment, so
+// one mirror serves every upstream and hosted asset without three origin trees
+// colliding in a single namespace. It also reports the lock URL's own host,
+// which is what the redirect policy keys its delegate set off.
+func (f *fetcher) target(raw string) (*url.URL, string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, invalid("tool payload URL is unparsable")
+		return nil, "", invalid("tool payload URL is unparsable")
 	}
 	if f.mirror == nil {
-		return u, nil
+		return u, u.Hostname(), nil
 	}
 	mirrored := *f.mirror
-	mirrored.Path = path.Join(f.mirror.Path, u.Path)
+	mirrored.Path = path.Join(f.mirror.Path, u.Host, u.Path)
 	mirrored.RawQuery = ""
-	return &mirrored, nil
+	return &mirrored, u.Hostname(), nil
 }
 
 // download streams one payload into dst while hashing it, and reports a typed
@@ -131,11 +148,11 @@ func (f *fetcher) download(ctx context.Context, name string, e Entry, p Payload,
 	if p.Size > f.maxBytes {
 		return resourceLimit("tool %q payload is %d bytes, over the %d-byte tools.max_fetch_bytes cap", name, p.Size, f.maxBytes)
 	}
-	target, err := f.target(p.URL)
+	target, lockHost, err := f.target(p.URL)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, f.timeout)
+	ctx, cancel := context.WithTimeout(withLockHost(ctx, lockHost), f.timeout)
 	defer cancel()
 
 	started := time.Now()
@@ -225,7 +242,7 @@ func rewind(dst *os.File) error {
 
 func fetchFailed(name, detail string, retryable bool) *model.Error {
 	return (&model.Error{
-		Code: CodeToolFetchFailed, Retryable: retryable,
+		Code: model.CodeToolFetchFailed, Retryable: retryable,
 		Message:     "the managed tool payload could not be fetched: " + detail,
 		Remediation: "check network access, or set tools.mirror to a reachable host, or tools.offline with a pre-populated store",
 	}).WithDetail("tool", name)
@@ -234,7 +251,7 @@ func fetchFailed(name, detail string, retryable bool) *model.Error {
 // digestMismatch is never retryable: bytes that disagree with the lock are not
 // a transient fault, and Section 11.7 forbids retrying or executing them.
 func digestMismatch(name, format string, args ...any) *model.Error {
-	return toolError(CodeToolDigestMismatch, format, args...).
+	return toolError(model.CodeToolDigestMismatch, format, args...).
 		WithDetail("tool", name).
 		WithRemediation("the payload host is serving different bytes than this build pins; upgrade codectx or point tools.mirror at a correct mirror")
 }

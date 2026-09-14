@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -47,7 +48,7 @@ func LockWorkspace(ctx context.Context, dataDir string, wait time.Duration) (*Wo
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		held, err := tryLock(f)
+		held, err := fslock.TryLock(f)
 		if err != nil {
 			f.Close()
 			return nil, internal("workspace lock: %v", err)
@@ -76,7 +77,7 @@ func (l *WorkspaceLock) Close() error {
 		return nil
 	}
 	l.once.Do(func() {
-		if err := unlock(l.f); err != nil {
+		if err := fslock.Unlock(l.f); err != nil {
 			l.err = internal("workspace unlock: %v", err)
 		}
 		if err := l.f.Close(); err != nil && l.err == nil {
