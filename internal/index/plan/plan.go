@@ -104,6 +104,10 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 // provenance distance Section 13.3 requires it to answer `stale` with. The
 // coordinator attaches it through sqlite.AttachCarried; it is never reported
 // fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry.
+//
+// It is also the row shape Inputs.CarriedPage reads back: a scope the previous
+// generation already carried is the same unit with the distance it had then,
+// which this generation's carry accumulates onto rather than restarting.
 type Carried struct {
 	Unit                 model.UnitID
 	ProviderID, ScopeKey string
@@ -159,21 +163,24 @@ type Inputs struct {
 	// PrevGen is the generation reuse, carry and delta predecessors are read
 	// from; zero means there is none and every unit is built.
 	PrevGen model.GenerationID
-	// PriorCarry reports the distance PrevGen already recorded for a scope, so
-	// a unit carried across several generations accumulates its distance
-	// instead of reporting 1 forever. It is the fold of the paged listing
-	// sqlite.CarriedUnits(ctx, PrevGen, afterProviderID, afterScopeKey, limit)
-	// -- page until a short page arrives -- by Key(providerID, scopeKey).
+	// CarriedPage is one keyset page of PrevGen's stale members, exactly
+	// sqlite.Store.CarriedUnits' shape: page in (provider, scope) order from
+	// the given cursor (two empty strings start from the beginning), at most
+	// limit rows, a short page being the last. Build pages until a short page
+	// arrives and folds the result by Key(providerID, scopeKey), so a unit
+	// carried across several generations accumulates its distance instead of
+	// reporting 1 forever.
 	//
-	// It is the coordinator's fold and not a call Build makes itself: the
-	// coordinator already pages those rows to project the previous
-	// generation's provenance distance into CapabilityState.Details (ruling
-	// Q4), so folding the same listing into Build would read it twice.
-	// A function rather than a map so an unwired coordinator is visibly nil
-	// instead of silently equivalent to "nothing was ever carried": Build
-	// refuses whenever PrevGen is set and this is missing.
-	PriorCarry func(providerID, scopeKey string) (Carried, bool)
-	Config     config.Config
+	// It is the page fetcher and not the folded lookup because completeness is
+	// then structural: a coordinator that called the listing once and folded
+	// one page would satisfy a lookup-shaped field with a partial map, and
+	// every scope past the first page would read as "never carried" -- a unit
+	// stale for ten generations reported stale for one. Build never chooses
+	// the response bound it pages with beyond asking for model.MaxPageItems,
+	// which is the cap the store applies anyway; a nil fetcher is refused
+	// whenever PrevGen is set.
+	CarriedPage func(ctx context.Context, afterProviderID, afterScopeKey string, limit int) ([]Carried, error)
+	Config      config.Config
 }
 
 // Build derives the plan. It reads the snapshot manifest and the previous
@@ -182,14 +189,17 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if in.View == nil || in.Store == nil {
 		return Plan{}, invalid("the planner needs a snapshot view and the store")
 	}
-	if in.PrevGen != 0 && in.PriorCarry == nil {
-		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.PriorCarry from the paged sqlite.CarriedUnits listing")
+	if in.PrevGen != 0 && in.CarriedPage == nil {
+		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.CarriedPage to the paged sqlite.Store.CarriedUnits listing")
 	}
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
 			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
 		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{}}
 	if err := b.classifyProviders(ctx); err != nil {
+		return Plan{}, err
+	}
+	if err := b.foldCarry(ctx); err != nil {
 		return Plan{}, err
 	}
 	if err := b.walk(ctx); err != nil {
@@ -232,6 +242,11 @@ type builder struct {
 	// membership is the whole snapshot. One slice is shared by every such unit
 	// rather than copied per unit; it is never mutated after the walk.
 	allInputs []model.UnitInput
+	// prior is the complete fold of Inputs.CarriedPage by Key, empty when
+	// there is no previous generation. It holds one entry per stale scope of
+	// that generation -- unit-scoped like Plan.Reuse and Plan.Previous, never
+	// file-scoped.
+	prior map[string]Carried
 
 	byProvider map[string][]Unit
 	// overBound records one exemplar path per provider whose scope key does
@@ -302,6 +317,35 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// foldCarry reads the previous generation's carry distances once, before the
+// manifest walk. It pages Inputs.CarriedPage to the end -- a page shorter than
+// the limit is the last, the same keyset loop the snapshot view uses over the
+// manifest -- because a partial fold is indistinguishable from "this scope was
+// never carried": the scopes past the first page would each restart their
+// provenance distance at 1 and report a unit stale for ten generations as
+// stale for one.
+func (b *builder) foldCarry(ctx context.Context) error {
+	if b.in.PrevGen == 0 {
+		return nil
+	}
+	b.prior = map[string]Carried{}
+	afterProviderID, afterScopeKey := "", ""
+	for {
+		page, err := b.in.CarriedPage(ctx, afterProviderID, afterScopeKey, model.MaxPageItems)
+		if err != nil {
+			return err
+		}
+		for _, c := range page {
+			b.prior[Key(c.ProviderID, c.ScopeKey)] = c
+		}
+		if len(page) < model.MaxPageItems {
+			return nil
+		}
+		last := page[len(page)-1]
+		afterProviderID, afterScopeKey = last.ProviderID, last.ScopeKey
+	}
 }
 
 // walk is the one manifest pass that plans every file unit, folds every
@@ -557,7 +601,7 @@ func (b *builder) carry(s *semantic, prev model.UnitID, deferred bool) {
 	}
 	c := Carried{Unit: prev, ProviderID: s.providerID, ScopeKey: s.scopeKey,
 		DistanceGenerations: 1, DistanceFiles: s.changed}
-	if prior, ok := b.in.PriorCarry(s.providerID, s.scopeKey); ok {
+	if prior, ok := b.prior[Key(s.providerID, s.scopeKey)]; ok {
 		// The predecessor was already stale in the previous generation, so its
 		// distance is measured from its own snapshot, not from that one.
 		c.DistanceGenerations += prior.DistanceGenerations

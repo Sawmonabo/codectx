@@ -10,7 +10,6 @@ package plan
 import (
 	"context"
 
-	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -103,31 +102,24 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		for _, u := range dp.Units {
 			// Residual 109: a dependence unit declares its semantic closure and
 			// nothing else -- the files of its own family that it owns, plus
-			// the manifest and lock files it declares (Section 11.6: "the
-			// unit's source file hashes, its manifest and lock files"). Every
-			// file under the root would fold a README, an image and another
+			// the manifest and lock files it owns (Section 11.6: "the unit's
+			// source file hashes, its manifest and lock files"). Every file
+			// under the root would fold a README, an image and another
 			// language's sources into the key of the heaviest unit in the
 			// product, so a documentation edit would reparse it; Section 13.1
-			// forbids exactly that. u.Markers is the closure's manifest half
-			// and is complete, never truncated, so nothing leaves the key
-			// unobserved. The lookup is built once per unit, so the manifest
-			// walk stays O(files x units) rather than O(files x units x
-			// markers).
-			markers := make(map[string]bool, len(u.Markers))
-			for _, m := range u.Markers {
-				markers[m] = true
-			}
+			// forbids exactly that.
+			//
+			// dependence.Unit.OwnsInput is that closure, and it is the same
+			// predicate the provider's own cache key folds, so a unit's
+			// planned identity and its graph cache key cannot drift apart. It
+			// answers for a tombstone as well as a live row, which is what
+			// lets a deleted member set semantic.removed and keep the scope
+			// out of Plan.Carry (Section 13.3). FamilyOf maps both "c" and
+			// "cpp" to one family inside it, so the whole-repository C/C++
+			// unit keeps both languages' sources.
 			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, heavy: true,
 				family: u.Family, bytes: u.Bytes,
-				contains: func(fv model.FileVersion) bool {
-					if !u.Contains(fv.Path) {
-						return false
-					}
-					// FamilyOf maps both "c" and "cpp" to FamilyC, so the
-					// whole-repository C/C++ unit keeps both languages'
-					// sources.
-					return dependence.FamilyOf(lang.Of(fv.Path)) == u.Family || markers[fv.Path]
-				}})
+				contains: func(fv model.FileVersion) bool { return u.OwnsInput(fv.Path) }})
 		}
 		var unplanned map[string]int
 		for f, n := range dp.Unplanned {

@@ -18,13 +18,15 @@ package dependence
 // the Cargo workspace root; a directory of `.rs` files without a `Cargo.toml`
 // produces an empty graph and is therefore not a unit at all.
 //
-// A plan holds one descriptor per project and no repository-sized source list
-// (Section 6): membership is a predicate over the project root and the nested
-// roots it does not own, and file counts and bytes are folded in a streaming
-// pass. The one list a descriptor does hold is its manifest and lock files --
-// the half of the unit's cache key that is not its sources. markersUnder keeps
-// that list complete rather than bounded, and partitions it across the
-// family's units, so one plan holds each marker path at most once.
+// A plan holds one descriptor per project and no repository-sized list at all
+// (Section 6): membership is a predicate over the project root, the nested
+// roots the unit does not own, and its family's source languages, manifest
+// names and lock names (Unit.OwnsInput), and file counts and bytes are folded
+// in a streaming pass. The manifest half of the closure is that predicate and
+// not a stored list of marker paths, so nothing here grows with the number of
+// directories holding a go.sum, and the closure answers for a path the live
+// manifest no longer holds -- a tombstoned lock file is still a member of the
+// unit that owns it, which a list built from live manifest rows cannot say.
 
 import (
 	"context"
@@ -56,10 +58,6 @@ type Unit struct {
 	// same family that this unit does not own. They are never materialized for
 	// this unit, so a nested module is analysed once, by its own unit.
 	Excluded []string
-	// Markers are the manifest and lock files whose content is part of the
-	// unit's semantic closure (Section 11.6), sorted. The list is complete:
-	// see markersUnder for why it is not bounded.
-	Markers []string
 	// Files and Bytes are the unit's own source files and their byte count:
 	// the governor sizes the heap cap from Bytes, and a unit with no files is
 	// never scheduled.
@@ -135,7 +133,6 @@ type Plan struct {
 // each unit's file count and byte total. Nothing repository-sized is retained.
 func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	roots := map[Family]map[string]bool{}
-	markers := map[Family]map[string][]string{}
 	present := map[Family]bool{}
 	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
@@ -153,12 +150,6 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 				}
 				roots[f][dir] = true
 			}
-			if slices.Contains(projectMarkers[f], base) || slices.Contains(closureMarkers[f], base) {
-				if markers[f] == nil {
-					markers[f] = map[string][]string{}
-				}
-				markers[f][dir] = append(markers[f][dir], fv.Path)
-			}
 		}
 		return nil
 	})
@@ -171,7 +162,7 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 		if !present[f] {
 			continue
 		}
-		units, unplanned, err := planFamily(f, roots[f], markers[f])
+		units, unplanned, err := planFamily(f, roots[f])
 		if err != nil {
 			return Plan{}, err
 		}
@@ -193,11 +184,11 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 
 // planFamily turns one family's marker directories into unit descriptors and
 // reports how many projects it had to refuse.
-func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([]Unit, int, error) {
+func planFamily(f Family, roots map[string]bool) ([]Unit, int, error) {
 	if f == FamilyC {
 		// Header resolution spans the tree, so C and C++ are the one family
 		// whose unit is the repository itself.
-		return []Unit{{ScopeKey: ScopeWorkspace, Family: f, Markers: flatten(markers)}}, 0, nil
+		return []Unit{{ScopeKey: ScopeWorkspace, Family: f}}, 0, nil
 	}
 	dirs := make([]string, 0, len(roots))
 	for d := range roots {
@@ -255,7 +246,7 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 	for _, d := range planned {
 		key, _ := scopeKey(f, d)
 		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
-			Excluded: nested(d, planned), Markers: markersUnder(markers, d, nested(d, planned))})
+			Excluded: nested(d, planned)})
 	}
 	if f != FamilyRust && !slices.Contains(planned, "") {
 		// Source of this family outside every project still has facts worth
@@ -275,8 +266,7 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		// closure now that it owns them — fall back to this unit rather than
 		// being analysed by nobody.
 		key, _ := scopeKey(f, "")
-		units = append(units, Unit{ScopeKey: key, Family: f,
-			Excluded: planned, Markers: markersUnder(markers, "", planned)})
+		units = append(units, Unit{ScopeKey: key, Family: f, Excluded: planned})
 	}
 	return units, unplanned, nil
 }
@@ -311,6 +301,31 @@ func (u Unit) Contains(p string) bool {
 		}
 	}
 	return true
+}
+
+// OwnsInput reports whether path is part of this unit's semantic closure
+// (Section 11.6): a source file of its own family that it owns, or a manifest
+// or lock file it owns. It is the manifest half of the cache key (CacheKey)
+// and of the unit's declared inputs, which is exactly "any of these changing
+// invalidates the unit".
+//
+// It is a predicate over the path and not a lookup in a stored list of marker
+// paths, for two reasons. It answers for a tombstone, which a list built from
+// live manifest rows cannot: a lock file the previous generation's unit
+// declared and this snapshot holds as deleted is still a member, so the scope
+// is ineligible for carry (Section 13.3) instead of being carried into a
+// generation where AttachCarried refuses it. And it holds nothing that grows
+// with the repository (Section 6): the C/C++ unit is the whole tree, so a
+// list would hold every Makefile in it.
+func (u Unit) OwnsInput(p string) bool {
+	if !u.Contains(p) {
+		return false
+	}
+	if FamilyOf(lang.Of(p)) == u.Family {
+		return true
+	}
+	base := path.Base(p)
+	return slices.Contains(projectMarkers[u.Family], base) || slices.Contains(closureMarkers[u.Family], base)
 }
 
 // scopeKey is the unit's capability and alias scope. It names the family in
@@ -349,53 +364,3 @@ func nested(d string, dirs []string) []string {
 	}
 	return out
 }
-
-// markersUnder collects the manifest paths a unit owns, sorted and complete.
-//
-// It does not truncate, and it has no count bound. A marker this list drops is
-// a manifest or lock file that leaves the unit's cache key (CacheKey) and the
-// unit's declared inputs, which is exactly "any of these changing invalidates
-// the unit" (Section 11.6) broken in the unsafe direction: the unit is reused
-// across a changed go.sum and serves stale dependence facts as fresh. A count
-// bound cannot fail closed here either, because the natural overflow is an
-// ordinary repository and not a planner defect: the C/C++ unit is the whole
-// tree, so its markers are every Makefile and CMakeLists.txt in it, and a
-// JavaScript monorepo's root unit collects every package.json below it.
-// Refusing those would refuse to index the repository at all.
-//
-// The list is not repository-sized in the sense Section 6 bounds: it holds
-// manifest and lock files only, and markersUnder partitions them across the
-// family's units (a marker under an excluded nested project belongs to that
-// project's unit), so one plan holds each marker path at most once. That is
-// the same reasoning that leaves a planned unit's declared input list
-// unbounded -- a silently short input list is a reuse-safety corruption, not a
-// memory optimization.
-func markersUnder(markers map[string][]string, root string, excluded []string) []string {
-	var out []string
-	dirs := make([]string, 0, len(markers))
-	for d := range markers {
-		dirs = append(dirs, d)
-	}
-	slices.Sort(dirs)
-	for _, d := range dirs {
-		if !within(d, root) {
-			continue
-		}
-		skip := false
-		for _, ex := range excluded {
-			if within(d, ex) {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-		out = append(out, markers[d]...)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// flatten is markersUnder for the whole repository.
-func flatten(markers map[string][]string) []string { return markersUnder(markers, "", nil) }
