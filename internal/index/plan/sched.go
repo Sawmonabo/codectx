@@ -115,6 +115,10 @@ func (s *Scheduler) pump() {
 		if s.admitted > 0 && s.allocation > 0 && s.used+head.bytes > s.allocation {
 			return
 		}
+		// Cleared before the reslice: a popped waiter left in the backing array
+		// stays reachable until append next reallocates, and the product bounds
+		// every queue explicitly rather than by luck.
+		s.queue[0] = nil
 		s.queue = s.queue[1:]
 		s.admitted++
 		s.used += head.bytes
@@ -127,7 +131,11 @@ func (s *Scheduler) pump() {
 func (s *Scheduler) remove(w *waiter) {
 	for i, q := range s.queue {
 		if q == w {
-			s.queue = append(s.queue[:i], s.queue[i+1:]...)
+			// The shift leaves the last slot pointing at the waiter that moved
+			// down; clearing it is what keeps the canceled waiter unreachable.
+			copy(s.queue[i:], s.queue[i+1:])
+			s.queue[len(s.queue)-1] = nil
+			s.queue = s.queue[:len(s.queue)-1]
 			return
 		}
 	}
