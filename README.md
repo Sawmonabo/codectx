@@ -18,7 +18,7 @@ codectx mcp serve --repo .
 ```
 
 If only the bundled structural providers are available the commands still work
-and report their precision; installed SCIP, LSP or Joern tooling enriches the
+and report their precision; installed SCIP, LSP or dependence-engine tooling enriches the
 same graph and query APIs without changing the agent integration.
 
 ## Output contract
