@@ -39,14 +39,20 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 	}
 	// One aggregate call for the counts. Paging Coverage for them would cost
 	// 1250 round trips on a 250k-file session.
-	required, fullyServed, _, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
+	c, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
 	if err != nil {
 		return model.NextContextItem{}, err
 	}
-	// Waived files are deliberately not subtracted and not skipped by the walk:
-	// a waiver never fabricates coverage, so a waived required file is still
-	// unread. Whether it blocks readiness is Task 17's question, not this one.
-	remaining := required - fullyServed
+	// Remaining counts against FullyRead, not the reported Served: this number
+	// is paired with Action, and the walk below stops at the first file that is
+	// not full_served without consulting waivers. Subtracting Served instead
+	// would let a waived-and-fully-read file raise Remaining while the walk
+	// finds nothing unserved, and `context next` would answer action=complete
+	// beside remaining=1. A waiver is still never fabricated coverage -- a
+	// waived and UNREAD file is unread here, is walked like any other, and
+	// raises Remaining -- and whether any waiver blocks readiness remains Task
+	// 17's question, not this one.
+	remaining := c.Required - c.FullyRead
 	if remaining < 0 {
 		remaining = 0
 	}

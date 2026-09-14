@@ -72,7 +72,7 @@ type Sessions interface {
 	// CoverageSummary is the one storage addition of this task (L6): the counts
 	// Status needs in a single round trip instead of paging Coverage. Task 17
 	// consumes the same method and must not define a second one.
-	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	// AcknowledgeFile refuses unless the file is already full_served; it never
 	// creates coverage.
 	AcknowledgeFile(ctx context.Context, session model.SessionID, actor string, file model.FileID) error
@@ -315,7 +315,7 @@ func typedErrf(code, format string, args ...any) *model.Error {
 //	// reproducing both branches of the fileCoverage state switch (union ==
 //	// size, and the separate zero-length confirmed-EOF branch). Task 15 must
 //	// not define it; Task 17 consumes it and must not define a second one.
-//	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+//	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 //
 //	// internal/storage/sqlite/state.go -- Task 17's two appended reads, L6's.
 //	// APPEND ONLY; no existing method was edited.
