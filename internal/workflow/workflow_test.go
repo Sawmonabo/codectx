@@ -321,6 +321,7 @@ func TestWorkflowScenarios(t *testing.T) {
 		}},
 		// L5 rows
 		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
+		{"a waived session seals a capsule carrying the stored waiver reason", capsuleCarriesStoredWaivers},
 		// L6 rows
 		// L7 rows
 		// L8 rows
@@ -885,6 +886,21 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	return out, err
 }
 
+// Waivers answers in file-id order, not insertion order: the store pages its
+// primary key and the capsule's identity is order-sensitive, so an
+// append-ordered answer here would assert a determinism the store never gives.
+func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fs, err := s.lookup(session, actor)
+	if fs == nil {
+		return nil, err
+	}
+	out := append([]model.WaiverRecord(nil), fs.waivers...)
+	sort.Slice(out, func(i, j int) bool { return out[i].FileID < out[j].FileID })
+	return out, err
+}
+
 func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, actor string) (int64, int64, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1038,11 +1054,12 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}); err != nil {
 		t.Fatalf("open consolidate on the fixture session: %v", err)
 	}
-	// The fixture waives one required file, and the frozen Sessions interface
-	// exposes no reader for the stored waiver reasons (see capsuleWaivers), so
-	// this row seals a session with no waiver outstanding. The waiver's own
-	// invariant is L4's row, not this one.
+	// This row seals under a satisfied strict gate, and Capsule.Validate refuses
+	// that beside recorded waivers, so the fixture's waiver is withdrawn whole:
+	// the flag and the record it is derived from. The waived capsule is the row
+	// below; the waiver's own readiness invariant is L4's.
 	h.file(fixtureSession, fileWaived).waived = false
+	h.store.sessions[fixtureSession].waivers = nil
 
 	rec := h.session(fixtureSession)
 	g := gate{ReadComplete: true, Ready: true, Strict: true, ScopeComplete: true}
@@ -1102,5 +1119,34 @@ func fixtureScopeReview(session model.SessionID, actor string, scopeVersion int)
 		ID: model.NewObservationID(req), SessionID: session, ActorID: actor,
 		ScopeVersion: scopeVersion, Kind: model.ObservationScopeReview, Review: review,
 		Note: "scope reviewed", CreatedAt: fixtureNow,
+	}
+}
+
+// capsuleCarriesStoredWaivers seals the fixture session with its waiver intact.
+// The reason lives only in the store's coverage_waivers rows -- Waive's return
+// value echoes the request and FileCoverage carries only a flag -- so a capsule
+// whose Waivers list is empty or reason-less is an artifact that hides an
+// audited exception.
+func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
+	ctx := context.Background()
+	if _, err := h.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the fixture session: %v", err)
+	}
+	// A recorded waiver and a satisfied strict gate is the one combination
+	// Capsule.Validate refuses outright, so this seal is non-strict.
+	c, err := h.svc.buildCapsule(ctx, h.session(fixtureSession),
+		gate{ReadComplete: true, Ready: true, Strict: false, ScopeComplete: true})
+	if err != nil {
+		t.Fatalf("seal a capsule for a waived session: %v", err)
+	}
+	if len(c.Waivers) != 1 {
+		t.Fatalf("the sealed capsule carries %d waivers; the session recorded 1", len(c.Waivers))
+	}
+	if got := c.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
+		t.Fatalf("the capsule carries waiver %s/%q, not the stored %s/%q",
+			got.FileID, got.Reason, fileWaived, "vendored generated code")
 	}
 }
