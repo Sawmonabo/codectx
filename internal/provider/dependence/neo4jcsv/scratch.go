@@ -139,6 +139,20 @@ CREATE TABLE proj(kind TEXT NOT NULL, from_e TEXT NOT NULL, to_e TEXT NOT NULL, 
 CREATE TABLE loc(id TEXT PRIMARY KEY, ok INTEGER NOT NULL, path TEXT NOT NULL DEFAULT '', file_id TEXT NOT NULL DEFAULT '',
 	content_hash TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', range_json TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
 CREATE TABLE ident(ent TEXT PRIMARY KEY, node_id TEXT NOT NULL, fact_json TEXT NOT NULL, alias_json TEXT NOT NULL, key TEXT NOT NULL) WITHOUT ROWID;
+-- ident is keyed on the entity, but emitNodes pages it by node id and picks
+-- the smallest entity of each. Without this index every page is a full table
+-- scan plus a temp sort of the whole table, and the smallest-entity subquery
+-- is a second full scan per surviving row: quadratic in the unit's identity
+-- count, and 85% of a whole import measured on a 64 MB export. With it both
+-- become index seeks.
+CREATE INDEX ident_by_node ON ident(node_id, ent);
+-- members is the (type, field name) -> declaration map memberOf looks a field
+-- access up in. It is materialized once by project() because the join behind
+-- it — TYPE_DECL to its MEMBER children by AST, filtered on an unindexed
+-- m.name — is executed once per field-access write site and was the largest
+-- remaining cost of an import after the index above.
+CREATE TABLE members(type_full_name TEXT NOT NULL, name TEXT NOT NULL, id TEXT NOT NULL,
+	PRIMARY KEY(type_full_name, name)) WITHOUT ROWID;
 CREATE TABLE rels(rel_id TEXT NOT NULL, ev_id TEXT NOT NULL, from_id TEXT NOT NULL, kind TEXT NOT NULL, to_id TEXT NOT NULL,
 	ev_json TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(rel_id, ev_id)) WITHOUT ROWID;
 CREATE TABLE keys(key TEXT PRIMARY KEY, changed INTEGER NOT NULL DEFAULT 1) WITHOUT ROWID;
@@ -352,6 +366,16 @@ func (s *scratch) project(ctx context.Context) error {
 			SELECT 'control_depends_on', ad.target, ac.target, e.dst, '', '` + detailCDG + `', '' FROM edges e
 			JOIN anchors ac ON ac.node = e.src JOIN anchors ad ON ad.node = e.dst
 			WHERE e.label = 'CDG' AND ac.target <> ad.target`,
+		// The field-access map, built in one pass instead of one join per
+		// write site. A type with two members of the same name takes the
+		// smallest id, which is the same choice the per-site query made, so
+		// the map is a function of the export alone.
+		`INSERT OR IGNORE INTO members(type_full_name, name, id)
+			SELECT t.full_name, m.name, MIN(m.id) FROM nodes t
+			JOIN edges a ON a.label = 'AST' AND a.src = t.id
+			JOIN nodes m ON m.id = a.dst AND m.label = 'MEMBER'
+			WHERE t.label = 'TYPE_DECL' AND t.full_name <> '' AND m.name <> ''
+			GROUP BY t.full_name, m.name`,
 	}
 	for _, q := range steps {
 		if err := ctx.Err(); err != nil {

@@ -48,8 +48,8 @@ const keySep = "\x1f"
 // Normalization. The Go frontend appends a package's file-level declarations
 // to a synthetic per-package initializer in a nondeterministic order, so the
 // coordinates of everything that initializer owns shuffle between two parses
-// of identical source (docs/research/11-incremental-joern.md §4.2: 20% of the
-// unit's data-dependence rows). For a fact owned by an initializer the
+// of identical source (the incremental-engine research round, §4.2: 20% of
+// the unit's data-dependence rows). For a fact owned by an initializer the
 // positional component is therefore replaced by a digest of the ordered
 // source text of its endpoints: content, which is stable, instead of
 // position, which is not.

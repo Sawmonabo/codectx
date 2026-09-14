@@ -176,7 +176,14 @@ Every one of these was reproduced against the real engine.
 | definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and the method names. |
 
 The out-of-memory test is applied before the helper-crash test, because an
-out-of-memory stderr carries the `Process exited with code` line too.
+out-of-memory stderr carries the `Process exited with code` line too — but
+only for a run that actually failed. The marker is a substring match over the
+bounded stderr, so a run that exited 0 and left a good graph can carry it from
+an out-of-memory the engine caught and logged, or from a source path or method
+name containing the word. Such a run is not `memory`: it falls through to the
+engine/none decision, which the graph-presence check then resolves. Reading it
+as heap exhaustion would spend the unit's single retry on a full reparse of a
+unit that had already succeeded.
 
 Classification depends on the engine logging at WARN, so the child environment
 pins its log level rather than inheriting whatever the host set.
@@ -199,6 +206,15 @@ and is never used for memory.
    which is exactly what it is for.
 3. Only then is the unit split along the next frontend-native boundary, and
    each part that produces a live export is imported into the same unit.
+   Two parts legitimately describe the same entity — above all the external
+   stub of a callee both of them reference — and storage keys a node fact by
+   (unit, node), so a repeated identity would fail the whole unit and lose
+   every fact of every part. The parts therefore share one dedupe sink for the
+   unit's lifetime: the first part to publish an identity writes it and later
+   repeats are dropped. The seen set is on disk, inside the run directory, so
+   a large unit does not hold hundreds of thousands of identities in memory,
+   and dropping a repeat never breaks the put-order rule, because the identity
+   it names was already written.
 4. Every capability the subdivided unit publishes is `partial`, with the
    failed unit id and the backend failure (`<pass>/<exception>`). Control and
    data dependence survive splitting almost intact; engine `calls` keep under
@@ -235,16 +251,50 @@ carried into the new generation until the fresh one replaces it (Section 13.3).
 
 The engine has no incremental mode, no merge and no per-file export
 (joern#5757), so a refreshed unit is a whole parse and export — unless the
-cache key still matches, in which case nothing runs at all. The **storage**
-step is a delta: facts are keyed by an id-independent semantic key and only
-changed rows are written. Deriving the keys measured 1–5 s per unit against
-17–65 s engine runs, and a one-line edit changes about one fact row in ten
-thousand.
+cache key still matches, in which case nothing runs at all.
+
+What is wired today, exactly. Every import derives an id-independent semantic
+key per fact (the fact label, its owning method's full name, its file, the
+operator it was lowered from, its target name and its ordered byte ranges;
+`<clinit>`-owned facts use a digest of their endpoints' source text instead of
+their coordinates, because the Go frontend shuffles those between two parses
+of identical source). The importer streams that key set to a sorted file,
+diffs a supplied previous set against it in one merge pass, and can publish
+only the relations whose key changed. Deriving the keys measured 1–5 s per
+unit against 17–65 s engine runs, and a one-line edit changes about one fact
+row in ten thousand.
+
+What is **not** wired today. The key set is derived on every import but not
+kept: the provider names no path for it, so it is written beside the staging
+database and removed with it. It is not kept because there is nowhere to keep
+it — a key set belongs to the *stored* unit, and storage has no fact-key
+column. The provider likewise passes no previous key set, so every import is
+a full one and the whole export is published. This is
+deliberate, not an omission: the delta's other half is a storage operation —
+the fresh export is diffed against the **stored** unit and the unchanged rows
+are carried into the new unit — and `UnitWriter` has no carry-over or
+delete-by-key path yet. Suppressing the unchanged relations before storage can
+carry them over would publish a unit holding only the rows that changed, which
+is a unit missing most of its facts. The provider therefore stays honest and
+full until storage can hold up its end; the step is the coordinator's
+(Task 12), and the key algebra is versioned so a stored set built by an older
+algebra can never be mis-diffed against a fresh one.
 
 ## Privacy and cleanup
 
-Materializations, graphs not selected for the cache, and exports are removed
-on every termination path. The child's stdout is discarded and its stderr is
+Materializations, graphs not selected for the cache, exports and the
+importer's staging database are removed on every termination path. All of them
+live under the provider's own private roots — `<data_dir>/dependence/runs/` for
+the per-run directories and `<data_dir>/dependence/scratch/` for the staging
+databases — never under the system temp directory: the staging database holds
+source-derived graph content and was measured at 649 MB for one 64 MB export.
+
+`defer` covers every return and every panic but not a `SIGKILL` or a power
+loss, so the provider sweeps both private roots when it is constructed,
+before any unit runs. A workspace has one cross-process owner, so nothing else
+can hold a run of this provider at that moment and everything found there is
+stale. The scan is bounded, and an entry that cannot be removed is logged and
+skipped rather than failing construction. The child's stdout is discarded and its stderr is
 read only for classification: no raw analyzer output, no source body and no
 inherited environment reaches an ordinary log. Process-tree metrics are
 recorded as their own log fields, separate from the base index's accounting.

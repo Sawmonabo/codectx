@@ -30,7 +30,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -92,8 +94,9 @@ const (
 
 // Options are the inputs of one import beyond the export itself.
 //
-// Language, UnitScopeKey, ProjectRoot, Limits and PreviousKeys are the lane
-// contract. Repository, Unit, Run and Content are not decorative: an Evidence
+// Language, UnitScopeKey, ProjectRoot, UnitRoot, Limits and PreviousKeys
+// describe the export and where it came from. Repository, Unit, Run and
+// Content are not decorative: an Evidence
 // row is invalid without the unit, provider version and origin run, a
 // RelationID cannot be derived without the repository, and a byte range
 // cannot be verified without the pinned bytes. ScratchDir is where the
@@ -110,6 +113,13 @@ type Options struct {
 	// ProjectRoot is the absolute directory the engine parsed. An absolute
 	// FILENAME is accepted only under it.
 	ProjectRoot string
+	// UnitRoot is that same directory as a root-relative snapshot path, "" for
+	// a unit that is the whole repository. The export's paths are relative to
+	// the directory the engine was given, not to the repository, so this is
+	// the prefix that turns one into a snapshot path. Without it every fact of
+	// a unit below the repository root binds to a path the snapshot does not
+	// have, and the unit seals with nothing in it.
+	UnitRoot string
 	// Limits are the sink's per-batch bounds. MaxRecordBytes also bounds one
 	// CSV record before the decoder can allocate it.
 	Limits provider.Limits
@@ -143,6 +153,11 @@ func (o Options) validate() error {
 	}
 	if o.ProjectRoot == "" || !filepath.IsAbs(o.ProjectRoot) {
 		return argumentInvalid("import options carry no absolute project root")
+	}
+	if u := o.UnitRoot; u != "" {
+		if c := path.Clean(u); c != u || path.IsAbs(u) || c == "." || c == ".." || strings.HasPrefix(c, "../") {
+			return argumentInvalid("import options carry a unit root that is not a clean root-relative path")
+		}
 	}
 	if o.Content == nil {
 		return argumentInvalid("import options carry no pinned snapshot view")
