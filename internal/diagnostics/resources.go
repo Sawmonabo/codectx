@@ -20,7 +20,9 @@ import (
 // figures the sampler produced are still true, so the database and write-ahead
 // log sizes are left absent and the call succeeds. The alternative would let an
 // unreadable database suppress the memory reading an operator is diagnosing a
-// memory problem with.
+// memory problem with. The failure is not swallowed either -- an unreadable
+// store is what the Section 22 store-integrity check reports, and this block's
+// job is only to avoid reporting its size as zero.
 func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 	report, err := s.opts.Sampler.Sample(ctx)
 	if err != nil {
