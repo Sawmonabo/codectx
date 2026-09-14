@@ -507,6 +507,56 @@ var scenarios = []scenario{
 	// L2 rows.
 
 	// L3 rows.
+	{
+		// Failure mode: symbol_info's two facade calls straddle a generation
+		// change, so the evidence describes a different snapshot than the
+		// metadata beside it and a model reasons about a symbol using
+		// occurrences that no longer refer to it. The handler threads the
+		// generation the FIRST answer pinned into the second request; nothing
+		// else in the package can catch it being dropped, because passing the
+		// caller's own generation_id through instead compiles and looks right.
+		//
+		// The fake is deliberately asymmetric so the row cannot pass with the
+		// threading removed: the input names no generation, Symbol answers
+		// pinned to 41, and References echoes back whatever generation it was
+		// handed. Threaded => 41; unthreaded => 0.
+		name: "symbol_info evidence is pinned to the generation its metadata came from",
+		facade: func(f *fakeServices) {
+			f.symbolFn = func(_ context.Context, r model.SymbolRequest) (model.Page[model.Node], error) {
+				return model.Page[model.Node]{
+					Meta:  model.QueryMeta{Binding: model.Binding{GenerationID: 41}},
+					Items: []model.Node{{ID: model.NodeID(strings.Repeat("a", 64)), Name: r.Query}},
+				}, nil
+			}
+			f.referencesFn = func(_ context.Context, r model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error) {
+				return model.Page[model.ReferenceOccurrence]{
+					Meta:  model.QueryMeta{Binding: model.Binding{GenerationID: r.GenerationID}},
+					Items: []model.ReferenceOccurrence{},
+				}, nil
+			}
+		},
+		tool: "codectx_symbol_info",
+		args: symbolInfoInput{
+			Query:          "Parse",
+			SemanticSource: model.SemanticCanonical,
+			Page:           model.PageRequest{Limit: 10},
+		},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("symbol_info reported a tool error: %s", firstText(res))
+			}
+			var got result[symbolInfoOutput]
+			decode(t, res, &got)
+			symbolGen := got.Data.Symbol.Meta.Binding.GenerationID
+			evidenceGen := got.Data.Evidence.Meta.Binding.GenerationID
+			if symbolGen != 41 {
+				t.Fatalf("symbol generation_id = %d, want 41", symbolGen)
+			}
+			if evidenceGen != symbolGen {
+				t.Errorf("evidence generation_id = %d, want the symbol's %d", evidenceGen, symbolGen)
+			}
+		},
+	},
 
 	// L4 rows.
 
