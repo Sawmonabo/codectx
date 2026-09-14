@@ -225,11 +225,7 @@ func (e *Engine) nextReferenceCursor(queryHash string, last model.RelationID) (s
 	if e.signer == nil || last == "" {
 		return "", nil
 	}
-	holder, ok := e.adjacency.(LeaseHolder)
-	if !ok {
-		return "", nil
-	}
-	lease := holder.LeaseID()
+	lease := e.leaseID()
 	if lease == "" {
 		return "", nil
 	}
