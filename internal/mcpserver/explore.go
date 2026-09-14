@@ -44,11 +44,10 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, _ em
 // through a tool whose name does not say so.
 func (h *handlers) refreshIndex(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
 	var zero result[model.IndexResult]
-	req := model.IndexRequest{Full: false, Rebuild: false, Watch: false}
-	if err := req.Validate(); err != nil {
-		return nil, zero, toolFailure(h.log, err)
-	}
-	res, err := h.index.Refresh(ctx, req)
+	// The request is not Validate()d here: IndexRequest.Validate rejects only
+	// the full+rebuild combination, and all three fields are fixed false, so the
+	// branch could never fire. Refresh validates the request it is given.
+	res, err := h.index.Refresh(ctx, model.IndexRequest{})
 	if err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}
