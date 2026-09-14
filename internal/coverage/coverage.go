@@ -200,10 +200,7 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 
 // Next names the next required_full file this actor has not fully served, in
 // manifest ordinal order, with its pinned hash, size and resume offset. It is
-// metadata only and never carries source bytes. Owned by L4.
-func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.NextContextItem, error) {
-	return model.NextContextItem{}, notImplemented("coverage.Next")
-}
+// metadata only and never carries source bytes. Implemented in next.go (L4).
 
 // Close ends the session with the Section 17.1 compare-and-swap:
 // AdvanceSession{Target: StateClosed, ExpectedVersion}. It releases the
