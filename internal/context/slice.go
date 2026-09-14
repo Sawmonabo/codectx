@@ -33,8 +33,9 @@ type fileGroup struct {
 
 // groupByFile collects the sorted candidates into file-atomic groups, in the
 // order their highest-ranked member appears. Group sizes sum the measured entry
-// sizes, which over-counts a file selected through several symbols rather than
-// under-counting it: a budget check must never be optimistic.
+// sizes, and measureEntry charges a file's source to its first entry alone, so
+// a group's size is the file's real transport cost: its source once plus every
+// selected entry's own metadata.
 func groupByFile(sorted []candidate, entries []model.ContextEntry) ([]fileGroup, error) {
 	if len(sorted) != len(entries) {
 		return nil, &model.Error{Code: model.CodeInternal,
