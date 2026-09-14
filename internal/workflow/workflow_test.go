@@ -250,6 +250,75 @@ func TestWorkflowScenarios(t *testing.T) {
 			}
 		}},
 		// L4 rows
+		// Failure mode: a gate that folds a waiver into readiness grants false
+		// write readiness -- an orchestrator would start writing files nobody
+		// read. Everything §16.3 asks for is arranged here except the waiver,
+		// so the waiver is the only precondition left unsatisfied and the two
+		// readiness booleans must still be false. SessionStatus.Validate:514
+		// refuses the same combination, so this row also proves the evaluator
+		// never has to be caught by the model.
+		{name: "readiness/a required-file waiver alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			// Finish the partly served file and read the waived one too: a
+			// file may be both waived and later read, and only then is
+			// "everything else satisfied" literally true.
+			h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+
+			h.store.mu.Lock()
+			h.store.sessions[fixtureSession].obs = append(h.store.sessions[fixtureSession].obs,
+				fixtureScopeReview(fixtureSession, fixtureActor, 1))
+			h.store.mu.Unlock()
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+			})
+			if err != nil {
+				t.Fatalf("Status: %v (code %q)", err, code(err))
+			}
+			if !st.ScopeComplete || !st.ReadCompleteForSnapshot || st.Superseded {
+				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v read_complete=%v superseded=%v",
+					st.ScopeComplete, st.ReadCompleteForSnapshot, st.Superseded)
+			}
+			if st.RequiredFiles != 4 || st.FullyServedFiles != 4 || st.WaivedFiles != 1 {
+				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/4/1",
+					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
+		// Failure mode: expiry is lazy, so a lapsed session is still recorded
+		// as verify_open and the store hands back the record beside
+		// CTX_SESSION_EXPIRED -- which status deliberately swallows to stay
+		// honest. SessionStatus.Validate has no expiry clause, so nothing else
+		// in the system would catch a gate that opened on a dead lease. The
+		// other actor's session is used because it carries no waiver, leaving
+		// the expired lease as the only unsatisfied precondition.
+		{name: "readiness/an expired lease alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			h.file(fixtureOther, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureOther, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+			h.store.mu.Lock()
+			h.store.sessions[fixtureOther].obs = append(h.store.sessions[fixtureOther].obs,
+				fixtureScopeReview(fixtureOther, fixtureActorB, 1))
+			h.store.sessions[fixtureOther].rec.ExpiresAt = fixtureNow.Add(-time.Hour)
+			h.store.mu.Unlock()
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureOther, ActorID: fixtureActorB,
+			})
+			if err != nil {
+				t.Fatalf("Status of an expired session must still describe it: %v (code %q)", err, code(err))
+			}
+			if !st.ReadCompleteForSnapshot || st.WaivedFiles != 0 || st.Superseded {
+				t.Fatalf("the non-expiry preconditions are not all satisfied: read_complete=%v waived=%d superseded=%v",
+					st.ReadCompleteForSnapshot, st.WaivedFiles, st.Superseded)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("an expired session lease granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
 		// L5 rows
 		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
 		// L6 rows
@@ -1013,5 +1082,25 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}
 	if !second.CreatedAt.Equal(first.CreatedAt) {
 		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
+}
+
+// --- L4 helpers -------------------------------------------------------------
+
+// fixtureScopeReview is a current, non-blocking attestation for one actor,
+// written straight into the fake by the rows that need the gate's review
+// precondition already satisfied. Record is another lane's surface and these
+// rows are about the gate, not about how an observation is persisted; the
+// attestation itself is built by l3ScopeReview rather than a second builder.
+func fixtureScopeReview(session model.SessionID, actor string, scopeVersion int) model.Observation {
+	review := l3ScopeReview(fixtureID("manifest", "canonical"), scopeVersion, "", nil)
+	req := model.ObservationRequest{
+		SessionID: session, ActorID: actor, ExpectedScope: scopeVersion,
+		Kind: model.ObservationScopeReview, Review: review, Note: "scope reviewed",
+	}
+	return model.Observation{
+		ID: model.NewObservationID(req), SessionID: session, ActorID: actor,
+		ScopeVersion: scopeVersion, Kind: model.ObservationScopeReview, Review: review,
+		Note: "scope reviewed", CreatedAt: fixtureNow,
 	}
 }
