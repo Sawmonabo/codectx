@@ -28,6 +28,19 @@ own evidence detail rather than borrowing the intraprocedural label.
 `reads` and `writes` come from this provider alone: no SCIP indexer sets a
 write role, and syntax cannot resolve the target of an assignment.
 
+Each published capability carries its own state at the unit's scope, and a
+state that is not `fresh` carries the machine-readable particulars of why in
+bounded `details` pairs: `skipped_methods` (the exact count) and
+`skipped_method_names` (a sample, whole names only) on a `partial`
+`data_flows_to`, `subdivided` and `backend_failure` on every capability of a
+subdivided unit. Export rows the importer recognised but does not map are
+reported once, under the `unsupported_labels` pseudo-capability, `unavailable`,
+with a label-to-count map ordered by count and an `untracked_labels` count for
+whatever did not fit. The particulars are never encoded into extra capability
+rows whose *name* is the detail text: that grows a bounded list with the size
+of the repository and claims a capability identity for something that is not a
+capability.
+
 ## The engine
 
 The backend is [Joern](https://github.com/joernio/joern), pinned by the
@@ -107,6 +120,15 @@ One parse handles exactly one language, so one unit is one frontend-native
 project. Scope keys are `pkg:<family>:<root-relative project directory>`,
 with `workspace` for the one family whose unit is the repository.
 
+A project whose scope key would exceed the identity bound is refused by the
+planner, with a warning naming the family and the path length; it is not
+planned and not scheduled. The key is never truncated to fit: two deep
+directories sharing a long prefix would cut to the same key, and every
+capability row, alias scope and cached graph of one project would then be
+attributed to the other. Losing one project's facts openly is the smaller
+harm, and refusing in the planner keeps the decision where the units are
+chosen rather than failing the unit once it has already begun.
+
 | Family | Languages | Project marker | Rule |
 |---|---|---|---|
 | `c` | C, C++ | — | the whole repository, one unit: header resolution spans the tree |
@@ -130,9 +152,11 @@ and dependence edges and alias their cross-package calls by full name; a
 whole-repository parse of a multi-module Go workspace covered 36 files because
 the frontend reads `go.work`'s root module only.
 
-A unit's files are materialized privately, and the nested projects it does not
-own are pruned from that private copy before the engine reads it, so a module
-inside another module is analysed once.
+A unit's files are materialized privately by membership: the copy is made file
+by file and only the files the unit owns are ever written, so a module inside
+another module is analysed once, by its own unit. Nothing is copied and then
+deleted — the nested project's source never enters this unit's private tree at
+all, and the sibling projects cost neither the copy time nor the disk.
 
 ## The cache
 
@@ -202,11 +226,24 @@ Every one of these was reproduced against the real engine.
 
 | Class | Signal | Outcome |
 |---|---|---|
-| `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and, when the tree was sampled, `observed_peak_bytes`. One retry, then fail closed. |
+| `memory` | `OutOfMemoryError` on stderr, non-zero exit, no graph | `CTX_RESOURCE_LIMIT` with `heap_cap_bytes`, `allocation_bytes`, `estimated_bytes` and `observed_peak_bytes`. One retry, then fail closed. |
 | `engine` (pass crash) | `Pass <name> failed in <n> ms` at WARN with the throwable | `CTX_PROVIDER_OUTPUT_INVALID` with `pass` and `exception`. No retry: it reproduces. Siblings are unaffected. |
 | `engine` (zero-exit helper crash) | `Process exited with code <n>` on stderr, **or** an export with no methods for a unit that has source, **or** a clean exit that left no graph | same code. The exit status is a lie in this mode; the empty result is the only honest signal. |
 | `timeout` | the step exceeded the unit deadline | `CTX_PROVIDER_TIMEOUT`. |
-| definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and the method names. |
+| definition-cap skip | paired `<method> has more than <n> definitions` and `Skipping.` WARN lines | **not** a failure: the unit seals and `data_flows_to` is published `partial` with the exact count and a sample of the method names in its `details`. |
+
+Every failure carries `observed_peak_bytes`: the peak of the summed resident
+memory over the whole analyzer tree, sampled every 250 ms while it ran. It is
+the tree sum at one instant, never a sum of per-process high-water marks
+reached at different instants, and it is therefore higher than
+`/usr/bin/time %M`, which reports the largest single process — by tens to
+hundreds of megabytes on this engine, whose orchestrator JVM, frontend and
+helpers are separate processes (`docs/research/10-round3-empirical.md` §1).
+The figure is what the memory governor's estimate is checked against. Where
+the platform cannot observe a running tree — anything but Linux today — the
+detail is absent and a memory failure says so under
+`observed_peak_bytes_unavailable`; it is never published as a zero, which
+would read as an analysis that used no memory.
 
 The out-of-memory test is applied before the helper-crash test, because an
 out-of-memory stderr carries the `Process exited with code` line too — but
@@ -248,8 +285,9 @@ and is never used for memory.
    a large unit does not hold hundreds of thousands of identities in memory,
    and dropping a repeat never breaks the put-order rule, because the identity
    it names was already written.
-4. Every capability the subdivided unit publishes is `partial`, with the
-   failed unit id and the backend failure (`<pass>/<exception>`). Control and
+4. Every capability the subdivided unit publishes is `partial`, carrying the
+   failed unit id under `subdivided` and the backend failure under
+   `backend_failure` (`<pass>/<exception>`) in its `details`. Control and
    data dependence survive splitting almost intact; engine `calls` keep under
    half of their resolved targets, so consumers that need calls should use the
    syntax-plus-SCIP path, which never depended on the engine.
