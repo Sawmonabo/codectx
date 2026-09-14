@@ -57,6 +57,9 @@ type importRec struct {
 
 type refRec struct {
 	span
+	// nameSpan is the callee/type identifier token alone, inside span. The
+	// parent builds the Section 11.3 callsite alias from it.
+	nameSpan  span
 	kind      string
 	name      string
 	qualifier *ts.Node
@@ -218,7 +221,8 @@ func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier
 		e.truncated = true
 		return
 	}
-	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: name[0].Utf8Text(e.src)}
+	r := refRec{span: span{node.StartByte(), node.EndByte()}, kind: kind, name: name[0].Utf8Text(e.src),
+		nameSpan: span{name[0].StartByte(), name[0].EndByte()}}
 	if len(qualifier) > 0 {
 		r.qualifier = &qualifier[0]
 	}
@@ -358,11 +362,18 @@ func (e *extraction) emit(out *emitter) error {
 		if r.kind == "call" && isTestDecl(wireDecls, r.span) {
 			continue // a test declaration is not a call to its framework
 		}
-		w := wire.Ref{Kind: r.kind, Start: uint32(r.start), End: uint32(r.end), Name: r.name, Scope: enclosing(wireDecls, r.span)}
+		w := wire.Ref{Kind: r.kind, Start: uint32(r.start), End: uint32(r.end),
+			NameStart: uint32(r.nameSpan.start), NameEnd: uint32(r.nameSpan.end),
+			Name: r.name, Scope: enclosing(wireDecls, r.span)}
 		if r.qualifier != nil {
-			w.Qualified = true
-			w.Qualifier = r.qualifier.Utf8Text(e.src)
-			w.QualifierIsImport = localNames[w.Qualifier]
+			q := r.qualifier.Utf8Text(e.src)
+			// The import decision is made on the receiver as written; only
+			// the reported copy is bounded, so a call through an import is
+			// still recognized however long the receiver expression is.
+			w.Qualified, w.QualifierIsImport = true, localNames[q]
+			if len(q) <= wire.MaxQualifierBytes {
+				w.Qualifier = q
+			}
 		}
 		if err := out.ref(w); err != nil {
 			return err
