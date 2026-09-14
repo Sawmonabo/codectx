@@ -122,9 +122,9 @@ type Result struct {
 	Full       bool
 	FullReason string
 	// Filtered says the emit this build requested was a filtered one AND that
-	// the filter degenerated into nothing: the predecessor's own state was
-	// supplied to the import, and no unit of that state was retired. Both
-	// conjuncts matter. The dependence applier sets it as
+	// the filter held: the predecessor's own state was supplied to the import,
+	// and no unit of that state was retired, so the import emitted only what
+	// changed. Both conjuncts matter. The dependence applier sets it as
 	// `supplied && Delta.Removed == 0` because only then did the import leave
 	// the unchanged relations, and the facts that name no file, unpublished —
 	// a supplied filter over a state that lost a key re-emits enough that the
