@@ -29,6 +29,14 @@ GOOS=windows go list -deps -f '{{with .Module}}{{.Path}} {{.Version}}{{end}}' ./
 | github.com/tree-sitter/tree-sitter-python | v0.25.0 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-rust | v0.24.2 | MIT (`LICENSE`) | Grammar. |
 | github.com/tree-sitter/tree-sitter-typescript | v0.23.2 | MIT (`LICENSE`) | Grammar (TypeScript and TSX). Grammar authors: Max Brunsfeld, Ayman Nadeem, Maxim Sokolov and tree-sitter contributors. |
+| github.com/modelcontextprotocol/go-sdk | v1.7.0 | Apache-2.0 (`LICENSE`) | The MCP server of Section 19: framing, dispatch and tool registration. The license records an in-progress MIT-to-Apache-2.0 transition, so contributions whose authors have not consented to relicensing stay MIT; both are permissive and neither restricts commercial use. |
+| github.com/google/jsonschema-go | v0.4.3 | MIT (`LICENSE`) | JSON Schema inference and validation for the tool schemas; required by the MCP SDK. Copyright 2025 JSON Schema Go Project Authors. |
+| github.com/segmentio/encoding | v0.5.4 | MIT (`LICENSE`) | JSON codec used by the MCP SDK. Copyright 2019 Segment.io, Inc. |
+| github.com/segmentio/asm | v1.1.3 | MIT (`LICENSE`) | SIMD helpers; required by segmentio/encoding. Copyright 2021 Segment. |
+| github.com/yosida95/uritemplate/v3 | v3.0.2 | BSD-3-Clause (`LICENSE`) | RFC 6570 URI templates; required by the MCP SDK's resource templates. Copyright 2016 Kohei Yoshida. |
+| golang.org/x/oauth2 | v0.35.0 | BSD-3-Clause (`LICENSE`) | Reached through the MCP SDK's module graph. codectx registers no HTTP, auth or remote transport (Section 19.3) and imports only the SDK's `mcp` package, so no OAuth code path is reachable from this binary. Copyright 2009 The Go Authors. |
+| golang.org/x/sync | v0.22.0 | BSD-3-Clause (`LICENSE`) | Concurrency primitives used by the MCP SDK. Copyright 2009 The Go Authors. |
+| golang.org/x/time | v0.15.0 | BSD-3-Clause (`LICENSE`) | Rate limiting used by the MCP SDK. Copyright 2009 The Go Authors. |
 
 The Go standard library and toolchain are covered by the Go project's
 BSD-3-Clause license and are not redistributed as source by this repository.

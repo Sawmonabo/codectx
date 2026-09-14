@@ -156,16 +156,16 @@ func (h *handlers) dependencyPath(ctx context.Context, _ *mcp.CallToolRequest, i
 // three. toolFor parameterizes only the input, so this signature alone fixes the
 // tool's output contract — which is why it stays ImpactResult.
 //
-// The facade change landing with Task 17 INT makes ExploreService.Impact return
-// (model.ImpactResult, error). Until it lands the landed interface still returns
-// Page[model.ImpactEntry], and the only way to bridge that here would be to
-// rebuild an ImpactResult from the page — which would report Packages as absent
-// and both counts as zero, presenting a lossy projection as complete impact.
-// That is the silent capability reduction Section 30.1 forbids, so this stub
-// calls no facade method and reports a typed CTX_INTERNAL instead (ruling A2 of
-// the post-T19-L0 rulings). It compiles unchanged on both sides of INT; see the
-// L3 report for the exact edits INT makes.
-func (h *handlers) impact(_ context.Context, _ *mcp.CallToolRequest, _ model.ImpactRequest) (*mcp.CallToolResult, result[model.ImpactResult], error) {
+// model.ImpactRequest is the In type verbatim, so this is the same shape as
+// every other handler here: validate → one facade call → wrap.
+func (h *handlers) impact(ctx context.Context, _ *mcp.CallToolRequest, in model.ImpactRequest) (*mcp.CallToolResult, result[model.ImpactResult], error) {
 	var zero result[model.ImpactResult]
-	return nil, zero, h.notImplemented("codectx_impact")
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	res, err := h.explore.Impact(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, res), nil
 }
