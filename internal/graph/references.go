@@ -10,12 +10,26 @@ import (
 
 // referenceEndpoint binds a reference continuation to this operation, so
 // pagination.Signer.DecodeCursor rejects a cursor signed for a different
-// endpoint whose sort key means nothing here. It does NOT distinguish two
-// reference queries on the same endpoint: pagination.Cursor.QueryHash is what
-// pins the node and operation, and this engine mints no cursor to put a hash
-// in (see checkReferenceCursor), so a same-generation cursor for a different
-// node would resume at a foreign keyset position once tokens exist.
+// endpoint whose sort key means nothing here. The endpoint alone does not
+// distinguish two reference queries: referenceQueryHash pins the node and the
+// operation, and checkReferenceCursor compares it, so a cursor minted for one
+// symbol can never resume another symbol's walk at a foreign keyset position.
 const referenceEndpoint = "graph.references"
+
+// referenceQueryHashDomain is the Section 9.1 hash domain for the normalized
+// reference query a continuation is bound to.
+const referenceQueryHashDomain = "graph.references.query"
+
+// referenceQueryHash is the normalized query identity of one reference walk.
+// The keyset position a cursor carries is a RelationID in the order produced by
+// THIS node and THIS operation; presenting it to any other reference query is
+// CTX_CURSOR_INVALID rather than a silently repinned answer.
+func referenceQueryHash(node model.NodeID, op model.ReferenceOperation) string {
+	h := model.NewHasher(referenceQueryHashDomain)
+	h.AddString(string(node))
+	h.AddString(string(op))
+	return h.Sum()
+}
 
 // referenceWalk is the direction and relation allowlist one reference
 // operation walks. The mapping is fixed here rather than taken from the
@@ -85,23 +99,15 @@ func referenceWalkFor(op model.ReferenceOperation) (referenceWalk, error) {
 // A canonical relation with no evidence row contributes no occurrence and is
 // not reported, because an occurrence is an evidence row: a reference with no
 // location is not an answerable reference.
-func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error) {
-	// The engine checks only what it must to answer safely. It deliberately
-	// does not re-run model.ReferenceRequest.Validate: that is the request
-	// boundary's job (id spelling, page/generation exclusivity, profile
-	// bounds), and this engine is specified to accept already-resolved ids
-	// from a caller that has already validated them. Re-validating here would
-	// make the engine's contract depend on the wire id format rather than on
-	// the facts it reads.
-	if req.NodeID == "" {
-		return model.Page[model.ReferenceOccurrence]{}, &model.Error{
-			Code: model.CodeArgumentInvalid, Message: "reference query requires a resolved node id"}
-	}
-	if !req.SemanticSource.Valid() {
-		return model.Page[model.ReferenceOccurrence]{}, (&model.Error{
-			Code:    model.CodeArgumentInvalid,
-			Message: "reference semantic source is not a known semantic source"}).
-			WithDetail("semantic_source", string(req.SemanticSource))
+func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (page model.Page[model.ReferenceOccurrence], err error) {
+	defer func() { err = typedContextError(ctx, err) }()
+	// The landed model validator is the request contract -- resolved id
+	// spelling, the operation and semantic-source vocabularies, the profile
+	// bound and the generation/cursor exclusivity of Section 7. The engine runs
+	// it rather than a private subset of it, so a request this engine accepts
+	// is exactly a request the facade accepts.
+	if err := req.Validate(); err != nil {
+		return model.Page[model.ReferenceOccurrence]{}, err
 	}
 	walk, err := referenceWalkFor(req.Operation)
 	if err != nil {
@@ -137,7 +143,8 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (mo
 	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
 	defer cancel()
 
-	after, err := e.resumeReferences(req)
+	queryHash := referenceQueryHash(req.NodeID, req.Operation)
+	after, err := e.resumeReferences(req, queryHash)
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
@@ -150,36 +157,92 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (mo
 		pageLimit = model.MaxPageItems
 	}
 
-	items, more, clipped, err := e.referencePage(ctx, req.NodeID, walk, after, pageLimit)
+	items, last, more, clipped, err := e.referencePage(ctx, req.NodeID, walk, after, pageLimit)
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
 
 	meta := model.QueryMeta{Binding: binding}
-	switch {
-	case clipped:
+	if clipped {
 		// A single relation carried more occurrences than one page may hold.
-		// Reporting it as complete would understate how often the symbol is
-		// used at that one edge.
+		// Those occurrences are unrecoverable once the keyset position moves
+		// past their relation, so this is real truncation even when a
+		// continuation is offered for the relations that follow.
 		meta.Truncated = true
 		meta.TruncationReason = "a relation carries more occurrences than one page holds"
-	case more:
-		// The keyset walk stopped on a relation boundary with relations left.
-		// A continuation token cannot be minted here: pagination.Cursor pins
-		// the generation lease that retains the pinned facts, and the frozen
-		// Adjacency port exposes a Binding but no lease id. Until that is
-		// threaded through, the honest answer is a bounded page that says so.
-		meta.Truncated = true
-		meta.TruncationReason = "more reference occurrences remain beyond this page"
 	}
-	return model.Page[model.ReferenceOccurrence]{Meta: meta, Items: items}, nil
+	if more {
+		// The keyset walk stopped on a relation boundary with relations left.
+		token, err := e.nextReferenceCursor(queryHash, last)
+		if err != nil {
+			return model.Page[model.ReferenceOccurrence]{}, err
+		}
+		meta.NextCursor = token
+		if token == "" && !meta.Truncated {
+			// No signer, or no lease to bind the token to: the remaining
+			// relations cannot be reached, so the page is truncated and says so
+			// rather than presenting a bounded page as the complete set.
+			meta.Truncated = true
+			meta.TruncationReason = "more reference occurrences remain beyond this page"
+		}
+	}
+	page = model.Page[model.ReferenceOccurrence]{Meta: meta, Items: items}
+	if err := page.Validate(); err != nil {
+		return model.Page[model.ReferenceOccurrence]{}, err
+	}
+	for i := range items {
+		if err := items[i].Validate(); err != nil {
+			return model.Page[model.ReferenceOccurrence]{}, err
+		}
+	}
+	return page, nil
+}
+
+// nextReferenceCursor mints the continuation for a page that stopped on a
+// relation boundary with relations left. It returns an empty token, not an
+// error, when this workspace cannot issue one: a continuation is an optional
+// convenience, and an engine built without a signer (or over an Adjacency that
+// holds no retention lease) must still answer the page it did compute.
+//
+// The token carries the pinned generation and analysis key, the normalized
+// query hash and the lease that retains the facts, so it can only be replayed
+// against the same generation, the same symbol and the same operation, and only
+// while that generation is still pinned.
+func (e *Engine) nextReferenceCursor(queryHash string, last model.RelationID) (string, error) {
+	if e.signer == nil || last == "" {
+		return "", nil
+	}
+	holder, ok := e.adjacency.(LeaseHolder)
+	if !ok {
+		return "", nil
+	}
+	lease := holder.LeaseID()
+	if lease == "" {
+		return "", nil
+	}
+	b := e.adjacency.Binding()
+	token, err := e.signer.EncodeCursor(pagination.Cursor{
+		Endpoint:     referenceEndpoint,
+		GenerationID: b.GenerationID,
+		AnalysisKey:  b.AnalysisKey,
+		QueryHash:    queryHash,
+		LastKey:      string(last),
+		LeaseID:      lease,
+		// The cursor expires with the retention lease it names: a token that
+		// outlived the lease would resume over facts nothing is holding.
+		ExpiresAt: e.now().Add(e.limits.CursorTTL),
+	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 // resumeReferences turns a presented cursor into the keyset position to resume
 // from. A cursor without a signer cannot be verified at all, and an unverified
 // continuation is a request to read from a position nothing vouched for, so it
 // is rejected rather than trusted.
-func (e *Engine) resumeReferences(req model.ReferenceRequest) (model.RelationID, error) {
+func (e *Engine) resumeReferences(req model.ReferenceRequest, queryHash string) (model.RelationID, error) {
 	if req.Page.Cursor == "" {
 		return "", nil
 	}
@@ -192,7 +255,7 @@ func (e *Engine) resumeReferences(req model.ReferenceRequest) (model.RelationID,
 	if err != nil {
 		return "", err
 	}
-	if err := e.checkReferenceCursor(c); err != nil {
+	if err := e.checkReferenceCursor(c, queryHash); err != nil {
 		return "", err
 	}
 	if c.SpoolID != "" {
@@ -206,15 +269,22 @@ func (e *Engine) resumeReferences(req model.ReferenceRequest) (model.RelationID,
 	return model.RelationID(c.LastKey), nil
 }
 
-// checkReferenceCursor rejects a verified cursor that belongs to a different
-// pinned generation. The signature proves the token is ours; it does not prove
-// it describes this generation's facts, and resuming a keyset walk against a
-// different generation would page through facts the first page never saw.
-func (e *Engine) checkReferenceCursor(c pagination.Cursor) error {
+// checkReferenceCursor rejects a verified cursor that does not describe THIS
+// query. The signature proves the token is ours; it does not prove it describes
+// this generation's facts or this symbol's keyset order. Resuming against a
+// different generation would page through facts the first page never saw, and
+// resuming against a different node or operation would start at a RelationID
+// that means nothing in the new order -- both silently skip references.
+func (e *Engine) checkReferenceCursor(c pagination.Cursor, queryHash string) error {
 	b := e.adjacency.Binding()
 	if c.GenerationID != b.GenerationID || c.AnalysisKey != b.AnalysisKey {
 		return (&model.Error{Code: model.CodeCursorInvalid,
 			Message: "cursor was issued against a different generation"}).
+			WithDetail("endpoint", referenceEndpoint)
+	}
+	if c.QueryHash != queryHash {
+		return (&model.Error{Code: model.CodeCursorInvalid,
+			Message: "cursor was issued for a different reference query"}).
 			WithDetail("endpoint", referenceEndpoint)
 	}
 	return nil
@@ -227,15 +297,16 @@ func (e *Engine) checkReferenceCursor(c pagination.Cursor) error {
 // beyond the page, and whether one relation's occurrences had to be clipped to
 // the page bound.
 func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk referenceWalk,
-	after model.RelationID, pageLimit int) (items []model.ReferenceOccurrence, more, clipped bool, err error) {
+	after model.RelationID, pageLimit int) (items []model.ReferenceOccurrence, last model.RelationID,
+	more, clipped bool, err error) {
 	seeds := []model.NodeID{node}
 	for {
 		rels, err := e.adjacency.Edges(ctx, seeds, walk.direction, walk.kinds, after, adjacencyBatch)
 		if err != nil {
-			return nil, false, false, err
+			return nil, "", false, false, err
 		}
 		if len(rels) == 0 {
-			return items, false, clipped, nil
+			return items, last, false, clipped, nil
 		}
 		ids := make([]model.RelationID, 0, len(rels))
 		for _, r := range rels {
@@ -250,9 +321,9 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 		// the evidence of nearly every relation in a 256-relation batch and make
 		// this method silently under-report occurrences, which is the one thing
 		// it exists to get right. The storage implementation is bound by this.
-		ev, err := e.adjacency.EvidenceFor(ctx, ids, pageLimit+1)
+		ev, err := e.evidence(ctx, ids, pageLimit+1)
 		if err != nil {
-			return nil, false, false, err
+			return nil, "", false, false, err
 		}
 		for _, r := range rels {
 			occ := ev[r.ID]
@@ -266,40 +337,75 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 			if len(items) > 0 && len(items)+len(occ) > pageLimit {
 				// Stop on the relation boundary: this relation belongs whole
 				// to the next page.
-				return items, true, clipped, nil
+				return items, last, true, clipped, nil
 			}
-			sorted := append([]model.EvidenceID(nil), occ...)
-			sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-			for _, id := range sorted {
+			sorted := append([]model.Evidence(nil), occ...)
+			sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+			for _, row := range sorted {
 				items = append(items, model.ReferenceOccurrence{
 					RelationID: r.ID,
-					EvidenceID: id,
+					EvidenceID: row.ID,
 					Kind:       r.Kind,
 					FromNodeID: r.From,
 					ToNodeID:   r.To,
-					// Precision, FileID, Path and Range live on the evidence
-					// row, and the frozen Adjacency port returns evidence as
-					// ids only. They are left empty rather than invented: a
-					// fabricated precision class would misreport how the fact
-					// was derived. Filling them needs EvidenceFor to return
-					// rows, not ids -- a change to graph.go that this lane does
-					// not own.
+					// Precision, FileID and Range come from the evidence row
+					// itself -- they are what makes the occurrence checkable
+					// against the source, and an empty precision is not a
+					// neutral default but a claim about derivation nobody made
+					// (ReferenceOccurrence.Validate rejects it). Path stays
+					// empty: it is a rendering convenience derived from FileID,
+					// and resolving it would cost one file read per distinct
+					// file on a port that offers no batched file lookup, while
+					// FileID plus Range already locates the occurrence exactly.
+					Precision:      row.Precision,
+					FileID:         row.FileID,
+					Range:          row.Range,
 					SemanticSource: model.SemanticCanonical,
 				})
 			}
-			after = r.ID
+			after, last = r.ID, r.ID
 			if len(items) >= pageLimit || clipped {
 				more, err := e.hasMoreRelations(ctx, seeds, walk, after)
 				if err != nil {
-					return nil, false, false, err
+					return nil, "", false, false, err
 				}
-				return items, more, clipped, nil
+				return items, last, more, clipped, nil
 			}
 		}
 		if len(rels) < adjacencyBatch {
-			return items, false, clipped, nil
+			return items, last, false, clipped, nil
 		}
 	}
+}
+
+// evidence hydrates the evidence backing a page of relations. It prefers the
+// optional EvidenceRowReader seam, which returns whole rows, and falls back to
+// the frozen identity-only Adjacency.EvidenceFor for an Adjacency that does not
+// offer it. limit is the per-relation cap in both cases.
+//
+// The fallback yields rows carrying only an id, which is what a traversal needs
+// but not what a reference occurrence does; References then rejects its own
+// page through ReferenceOccurrence.Validate rather than publishing an
+// occurrence whose precision class is unstated. An Adjacency used for reference
+// queries therefore has to implement the seam, and the app adapter does.
+func (e *Engine) evidence(ctx context.Context, relations []model.RelationID,
+	limit int) (map[model.RelationID][]model.Evidence, error) {
+	if rows, ok := e.adjacency.(EvidenceRowReader); ok {
+		return rows.EvidenceRows(ctx, relations, limit)
+	}
+	ids, err := e.adjacency.EvidenceFor(ctx, relations, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[model.RelationID][]model.Evidence, len(ids))
+	for rel, list := range ids {
+		rows := make([]model.Evidence, 0, len(list))
+		for _, id := range list {
+			rows = append(rows, model.Evidence{ID: id, RelationID: rel})
+		}
+		out[rel] = rows
+	}
+	return out, nil
 }
 
 // hasMoreRelations probes for a single relation past the page's last key, so a

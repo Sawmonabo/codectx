@@ -202,3 +202,65 @@ type expandOptions struct {
 // deliberately. expand reports it as a clean finish, so the visitor owns
 // whatever truncation it recorded before stopping.
 var errStopExpansion = errors.New("expansion stopped by visitor")
+
+// EvidenceRowReader is the OPTIONAL hydration seam an Adjacency may also
+// implement. The frozen Adjacency.EvidenceFor returns evidence IDENTITIES,
+// which is all a traversal needs to call a path evidence-backed; a reference
+// occurrence additionally needs the precision class, the file and the byte
+// range, and all three live on the evidence row rather than on the relation.
+// Without this seam those fields would have to be left empty, and an empty
+// precision is not a neutral default -- ReferenceOccurrence.Validate rejects
+// it, because a fact whose derivation class is unknown cannot be trusted at
+// the precision the caller assumes.
+//
+// It is a separate optional interface rather than a widening of Adjacency so
+// the frozen port stays frozen and a test fake that has no evidence rows keeps
+// compiling; References type-asserts it and falls back to the identity-only
+// read, so the seam's absence costs the occurrence fields and nothing else.
+type EvidenceRowReader interface {
+	// EvidenceRows hydrates the evidence backing a page of relations in one
+	// round trip. limit is the PER-RELATION cap, exactly as on
+	// Adjacency.EvidenceFor.
+	EvidenceRows(ctx context.Context, relations []model.RelationID,
+		limit int) (map[model.RelationID][]model.Evidence, error)
+}
+
+// LeaseHolder is the OPTIONAL seam exposing the retention lease that pins the
+// generation an answer was read from. A continuation token must name that
+// lease: the token is only valid while the facts it will resume over are still
+// retained, so a cursor minted without one would outlive the generation it
+// pins. An Adjacency that does not hold a lease simply offers no continuation.
+type LeaseHolder interface {
+	LeaseID() string
+}
+
+// typedContextError is the ONE place a bare context failure becomes a Section 8
+// code. Every Engine entry point routes its error through it, because a raw
+// context.DeadlineExceeded reaching internal/cli is rendered as the exit-2
+// invalid-argument class -- a query that ran out of time would be reported as a
+// command line the operator typed wrong.
+//
+// An error that already carries a model.Error is returned untouched: the gate's
+// CTX_RESOURCE_LIMIT and every validator rejection are more specific than the
+// context state that accompanies them, and rewriting them here would erase the
+// one detail the operator needs.
+func typedContextError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		// The deadline is the engine's own query timeout, not the caller's:
+		// Options.Limits.QueryTimeout is what the entry points wrap the walk in.
+		return errors.Join(&model.Error{Code: model.CodeQueryDeadline, Retryable: true,
+			Message:     "the query did not finish within the configured query timeout",
+			Remediation: "narrow the request bounds or raise resources.query_timeout"}, err)
+	case errors.Is(err, context.Canceled):
+		return model.Canceled(ctx.Err())
+	}
+	return err
+}

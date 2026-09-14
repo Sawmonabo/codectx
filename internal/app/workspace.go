@@ -2,12 +2,16 @@ package app
 
 import (
 	"context"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/search"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -145,4 +149,119 @@ func (w *Workspace) Close() error {
 		first = err
 	}
 	return first
+}
+
+// maxAmbiguousCandidates bounds the candidate list an ambiguous name is
+// rejected with (ruling Q9). It is an app-internal presentation bound, not a
+// new protocol limit: the answer is the rejection, and a list long enough to
+// flood a terminal would not help the operator disambiguate.
+const maxAmbiguousCandidates = 16
+
+// ResolveNodes turns the `<name-or-id>` arguments of a query command into
+// resolved NodeIDs against one pinned generation.
+//
+// An argument that is already a resolved id is passed through untouched, so an
+// id-taking caller pays for no lookup. A name is resolved through
+// PinnedReader.Nodes -- storage, not search, which is what keeps Section 30.1's
+// "graph accepts resolved IDs and does not depend on search" true of this path
+// as well. Exact `name` is tried first and exact `qualified_name` second, so an
+// unqualified spelling wins where it is unique and a fully qualified spelling
+// still resolves when the short name is not.
+//
+// More than one candidate is CTX_ARGUMENT_INVALID naming at most
+// maxAmbiguousCandidates of them. Picking the first silently is the one thing
+// this must never do: the candidates are different symbols, and answering about
+// the wrong one is a wrong answer the caller cannot detect.
+func (w *Workspace) ResolveNodes(ctx context.Context, gen model.GenerationID, names []string) ([]model.NodeID, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	resolved := make([]model.NodeID, len(names))
+	var reader *sqlite.PinnedReader
+	defer func() {
+		if reader != nil {
+			reader.Close()
+		}
+	}()
+	for i, name := range names {
+		if model.ValidHexID(name) {
+			resolved[i] = model.NodeID(name)
+			continue
+		}
+		if reader == nil {
+			// The generation is pinned once, and only when a name actually
+			// needs looking up, so an all-ids invocation opens no lease.
+			r, err := w.s.store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
+			if err != nil {
+				return nil, err
+			}
+			reader = r
+		}
+		id, err := resolveOneName(ctx, reader, name)
+		if err != nil {
+			return nil, err
+		}
+		resolved[i] = id
+	}
+	return resolved, nil
+}
+
+// resolveOneName resolves a single name against the pinned reader. It asks for
+// one more candidate than it will list, so "exactly the bound" and "more than
+// the bound" are distinguishable and the rejection can say which.
+func resolveOneName(ctx context.Context, reader *sqlite.PinnedReader, name string) (model.NodeID, error) {
+	candidates, err := reader.Nodes(ctx, sqlite.NodeFilter{Name: name}, "", maxAmbiguousCandidates+1)
+	if err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		candidates, err = reader.Nodes(ctx, sqlite.NodeFilter{QualifiedName: name}, "", maxAmbiguousCandidates+1)
+		if err != nil {
+			return "", err
+		}
+	}
+	switch {
+	case len(candidates) == 0:
+		return "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "no node in this generation carries that name"}).
+			WithDetail("name", name).
+			WithRemediation("run `codectx symbol` to find the symbol, or pass its resolved node id")
+	case len(candidates) == 1:
+		return candidates[0].Node.ID, nil
+	}
+	return "", ambiguousName(name, candidates)
+}
+
+// ambiguousName builds the rejection for a name several nodes carry. The
+// candidates ride in the remediation text rather than in the details map
+// because they are what the operator reads to choose one, and each is rendered
+// as its qualified name plus a short id prefix -- enough to tell the candidates
+// apart and to paste back, without printing sixteen 64-character ids.
+func ambiguousName(name string, candidates []sqlite.StoredNode) error {
+	shown := candidates
+	more := false
+	if len(shown) > maxAmbiguousCandidates {
+		shown, more = shown[:maxAmbiguousCandidates], true
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d nodes carry this name", len(shown))
+	if more {
+		fmt.Fprintf(&b, " (showing the first %d)", maxAmbiguousCandidates)
+	}
+	b.WriteString("; pass one of these node ids: ")
+	for i, c := range shown {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		label := c.Node.QualifiedName
+		if label == "" {
+			label = c.Node.Name
+		}
+		fmt.Fprintf(&b, "%s %s…", label, string(c.Node.ID)[:12])
+	}
+	return (&model.Error{Code: model.CodeArgumentInvalid,
+		Message: "this name resolves to more than one node"}).
+		WithDetail("name", name).
+		WithDetail("candidates", strconv.Itoa(len(candidates))).
+		WithRemediation(b.String())
 }

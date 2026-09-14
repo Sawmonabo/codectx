@@ -82,6 +82,10 @@ If only the bundled structural providers are available the commands still work
 and report their precision; SCIP, LSP or dependence-engine analysis enriches the
 same graph and query APIs without changing the agent integration.
 
+`codectx refs`, `callers`, `callees`, `path` and `impact` answer bounded
+structural questions about the indexed generation; `docs/queries.md` has their
+arguments, budgets and the configuration keys they read.
+
 ## Output contract
 
 Every `--json` request emits one envelope on stdout with `schema_version`,

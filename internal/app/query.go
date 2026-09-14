@@ -98,6 +98,33 @@ func (a adjacency) EvidenceFor(ctx context.Context, relations []model.RelationID
 	return ids, nil
 }
 
+// EvidenceRows is graph.EvidenceRowReader: whole evidence rows, so a reference
+// occurrence carries the precision class, file and byte range that make it
+// checkable against the source. EvidenceFor above returns the identities a
+// traversal needs; this returns the rows an occurrence needs, from the same
+// batched read.
+func (a adjacency) EvidenceRows(ctx context.Context, relations []model.RelationID,
+	limit int) (map[model.RelationID][]model.Evidence, error) {
+	stored, err := a.reader.EvidenceBatch(ctx, relations, limit)
+	if err != nil {
+		return nil, err
+	}
+	rows := make(map[model.RelationID][]model.Evidence, len(stored))
+	for rel, list := range stored {
+		out := make([]model.Evidence, 0, len(list))
+		for _, row := range list {
+			out = append(out, row.Evidence)
+		}
+		rows[rel] = out
+	}
+	return rows, nil
+}
+
+// LeaseID is graph.LeaseHolder: the retention lease this reader holds. A
+// continuation token names it so the token cannot outlive the generation whose
+// facts it will resume over.
+func (a adjacency) LeaseID() string { return a.reader.LeaseID() }
+
 func (a adjacency) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	return a.reader.Capabilities(ctx)
 }
