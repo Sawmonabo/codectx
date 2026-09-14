@@ -16,7 +16,7 @@ Task 12) decides which units exist, opens each one in storage with its exact
 inputs and dependencies, and hands the provider a `UnitRequest`; the provider
 produces exactly that unit through the `Sink` and reports a `ProviderResult`.
 
-External tools (SCIP indexers, Joern, language servers) run through
+External tools (SCIP indexers, the dependence engine, language servers) run through
 `internal/process`. There is no second process abstraction and no plugin
 loader: providers are Go packages composed into one `Registry` by
 `internal/app`.

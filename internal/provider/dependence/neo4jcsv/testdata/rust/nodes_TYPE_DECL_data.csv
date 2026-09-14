@@ -1,0 +1,11 @@
+167503724544,TYPE_DECL,,src/lib.rs:w::<global>,METHOD,"pub struct S { pub f: i32, pub arr: [i32; 4] }",1,src/lib.rs,w::S,<empty>,,false,1,S,0,46,1
+167503724545,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,&mut [i32; 4],<empty>,,true,,&mut [i32; 4],,,-1
+167503724546,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,&mut i32,<empty>,,true,,&mut i32,,,-1
+167503724547,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,&mut w::S,<empty>,,true,,&mut w::S,,,-1
+167503724548,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,&w::S,<empty>,,true,,&w::S,,,-1
+167503724549,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,(),<empty>,,true,,(),,,-1
+167503724550,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,"(i32, i32)",<empty>,,true,,"(i32, i32)",,,-1
+167503724551,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,ANY,<empty>,,true,,ANY,,,-1
+167503724552,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,[i32; 4],<empty>,,true,,[i32; 4],,,-1
+167503724553,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,i32,<empty>,,true,,i32,,,-1
+167503724554,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,usize,<empty>,,true,,usize,,,-1

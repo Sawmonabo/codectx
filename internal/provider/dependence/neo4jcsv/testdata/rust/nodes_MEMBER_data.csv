@@ -1,0 +1,2 @@
+98784247808,MEMBER,<empty>,<empty>,pub f: i32,16,,<empty>,1,f,15,25,1,,i32
+98784247809,MEMBER,<empty>,<empty>,pub arr: [i32; 4],28,,<empty>,1,arr,27,44,2,,[i32; 4]

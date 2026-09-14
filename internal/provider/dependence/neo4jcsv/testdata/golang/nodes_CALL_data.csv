@@ -1,0 +1,22 @@
+30064771072,CALL,-1,,,x := 1,7,STATIC_DISPATCH,,12,<operator>.assignment,<operator>.assignment,,,2,,,,int
+30064771073,CALL,-1,,,x += 2,2,STATIC_DISPATCH,,13,<operator>.assignmentPlus,<operator>.assignmentPlus,,,3,,,,int
+30064771074,CALL,-1,,,x++,2,STATIC_DISPATCH,,14,<operator>.postIncrement,<operator>.postIncrement,,,4,,,,ANY
+30064771075,CALL,-1,,,s.F = 3,2,STATIC_DISPATCH,,15,<operator>.assignment,<operator>.assignment,,,5,,,,int
+30064771076,CALL,1,,,s.F,2,STATIC_DISPATCH,,15,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,*w.S.F.<FieldAccess>.<unknown>
+30064771077,CALL,-1,,,s.Arr[i] = 4,2,STATIC_DISPATCH,,16,<operator>.assignment,<operator>.assignment,,,6,,,,int
+30064771078,CALL,1,,,s.Arr[i],2,STATIC_DISPATCH,,16,<operator>.indexAccess,<operator>.indexAccess,,,1,,,,w.S.Arr.<FieldAccess>.<unknown>
+30064771079,CALL,1,,,s.Arr,2,STATIC_DISPATCH,,16,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,*w.S.Arr.<FieldAccess>.<unknown>
+30064771080,CALL,-1,,,*p = 5,2,STATIC_DISPATCH,,17,<operator>.assignment,<operator>.assignment,,,7,,,,int
+30064771081,CALL,1,,,*p,2,STATIC_DISPATCH,,17,<operator>.indirection,<operator>.indirection,,,1,,,,*int
+30064771082,CALL,-1,,,*p += 1,2,STATIC_DISPATCH,,18,<operator>.assignmentPlus,<operator>.assignmentPlus,,,8,,,,int
+30064771083,CALL,1,,,*p,2,STATIC_DISPATCH,,18,<operator>.indirection,<operator>.indirection,,,1,,,,*int
+30064771084,CALL,-1,,,G = x,2,STATIC_DISPATCH,,19,<operator>.assignment,<operator>.assignment,,,9,,,,int
+30064771085,CALL,1,,,G,2,STATIC_DISPATCH,,19,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,int
+30064771086,CALL,-1,,,"a, b := x, x",10,STATIC_DISPATCH,,20,<operator>.assignment,<operator>.assignment,,,12,,,,int
+30064771087,CALL,-1,,,"a, b := x, x",13,STATIC_DISPATCH,,20,<operator>.assignment,<operator>.assignment,,,13,,,,int
+30064771088,CALL,-1,,,"a, b = b, a",2,STATIC_DISPATCH,,21,<operator>.assignment,<operator>.assignment,,,14,,,,int
+30064771089,CALL,-1,,,"s.M[""k""] = 6",2,STATIC_DISPATCH,,22,<operator>.assignment,<operator>.assignment,,,15,,,,int
+30064771090,CALL,1,,,"s.M[""k""]",2,STATIC_DISPATCH,,22,<operator>.indexAccess,<operator>.indexAccess,,,1,,,,w.S.M.<FieldAccess>.<unknown>
+30064771091,CALL,1,,,s.M,2,STATIC_DISPATCH,,22,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,*w.S.M.<FieldAccess>.<unknown>
+30064771092,CALL,-1,,,_ = a,2,STATIC_DISPATCH,,23,<operator>.assignment,<operator>.assignment,,,16,,,,int
+30064771093,CALL,-1,,,_ = b,2,STATIC_DISPATCH,,24,<operator>.assignment,<operator>.assignment,,,17,,,,int

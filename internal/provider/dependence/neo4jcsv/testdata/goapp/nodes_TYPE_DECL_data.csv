@@ -1,0 +1,2 @@
+167503724544,TYPE_DECL,,,,example.com/fix/app,1,/app,example.com/fix/app,<empty>,,false,1,example.com/fix/app,,,1
+167503724545,TYPE_DECL,,,,Counter struct{ N int },6,app/app.go,example.com/fix/app.Counter,<empty>,,false,5,Counter,,,2
