@@ -83,9 +83,16 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			defer ws.Close()
 			ctx, cancel := queryContext(cmd.Context(), timeout)
 			defer cancel()
+			// queryFailure types a bare context failure: the service returns
+			// context.DeadlineExceeded unwrapped from PinGeneration and the
+			// tier reads, and untyped it reaches ExitCode as the exit-2
+			// invalid-argument class, reporting a query that ran out of time
+			// as a command line the operator typed wrong. The workspace open
+			// above is deliberately left alone, for the reason queryContext
+			// gives.
 			result, err := ws.Search().Search(ctx, req)
 			if err != nil {
-				return err
+				return queryFailure(err)
 			}
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {

@@ -17,6 +17,7 @@ import (
 // on the concrete reader: every method below is *sqlite.PinnedReader's, byte
 // for byte, and the assertion under it makes that a build-time fact.
 type exactReader interface {
+	Node(ctx context.Context, id model.NodeID) (sqlite.StoredNode, error)
 	FileByPath(ctx context.Context, path string) (model.FileID, error)
 	File(ctx context.Context, id model.FileID) (model.FileVersion, error)
 	NodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
@@ -135,42 +136,85 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 // pathCandidates is tier 0: the query read as a root-relative path, resolved to
 // a file, then that file's visible nodes in document order. A query that is not
 // a path, or names no visible file, yields no candidates rather than an error —
-// the symbol tiers answer the same query.
-func pathCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, error) {
+// the symbol tiers answer the same query. The second return reports that the
+// file had more KEPT candidates than limit.
+//
+// It pages NodesInFile on its (start_byte, node_id) keyset rather than issuing
+// one bounded read, because storage takes no kind filter (search.go:109) and so
+// applies the bound BEFORE the filter: a single read of limit nodes would
+// answer "0 hits, not truncated" for a file whose matching declarations all sit
+// past node limit. It reads one candidate past the bound to tell a full answer
+// from a truncated one without claiming truncation it has not seen, and returns
+// at most limit.
+func pathCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, bool, error) {
 	normalized, ok := normalizeQueryPath(query)
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 	file, err := r.FileByPath(ctx, normalized)
 	if err != nil {
 		var typed *model.Error
 		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, err
+		return nil, false, err
 	}
-	nodes, err := r.NodesInFile(ctx, file, 0, "", limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]exactHit, 0, len(nodes))
-	for _, n := range nodes {
-		if !matchesKinds(n, kinds) {
-			continue
+	out := make([]exactHit, 0, limit)
+	var afterStart int64
+	var after model.NodeID
+	for len(out) <= limit {
+		// The page size is the caller's bound, which storage clamps to at most
+		// model.MaxPageItems (query.go:283); asking for more would be a bound
+		// this code believes and the database does not, and the loop would
+		// then end on the first page.
+		nodes, err := r.NodesInFile(ctx, file, afterStart, after, limit)
+		if err != nil {
+			return nil, false, err
 		}
-		out = append(out, exactHit{Tier: model.TierExactPath, Path: normalized, Node: n})
+		if len(nodes) == 0 {
+			break
+		}
+		for _, n := range nodes {
+			afterStart, after = nodeStartByte(n), n.Node.ID
+			if !matchesKinds(n.Node.Kind, kinds) {
+				continue
+			}
+			out = append(out, exactHit{Tier: model.TierExactPath, Path: normalized, Node: n})
+			if len(out) > limit {
+				break
+			}
+		}
+		if len(nodes) < limit {
+			// A short page is the end of the file's keyset, so nothing was
+			// dropped and the answer for this tier is complete.
+			break
+		}
 	}
-	return out, nil
+	if len(out) > limit {
+		return out[:limit], true, nil
+	}
+	return out, false, nil
 }
 
-// matchesKinds applies the request's kind filter to a node the storage layer
-// could not filter itself (NodesInFile takes no kinds).
-func matchesKinds(n sqlite.StoredNode, kinds []model.NodeKind) bool {
+// nodeStartByte is the offset NodesInFile pages on. A node with no byte range
+// is legal (schema.sql:178) and storage sorts it at offset zero, so the keyset
+// this walk carries has to agree with that or the walk would loop on it.
+func nodeStartByte(n sqlite.StoredNode) int64 {
+	if n.Bytes == nil {
+		return 0
+	}
+	return int64(n.Bytes.Start)
+}
+
+// matchesKinds applies a kind filter to a node the storage layer could not
+// filter itself (NodesInFile takes no kinds), and to a lexical document's kind,
+// which storage cannot filter inside the MATCH either.
+func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 	if len(kinds) == 0 {
 		return true
 	}
 	for _, k := range kinds {
-		if n.Node.Kind == k {
+		if kind == k {
 			return true
 		}
 	}
@@ -196,8 +240,7 @@ func matchesKinds(n sqlite.StoredNode, kinds []model.NodeKind) bool {
 // those two filters.
 func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, bool, error) {
 	paths := newPathResolver(r)
-	full := false
-	out, err := pathCandidates(ctx, r, query, kinds, limit)
+	out, full, err := pathCandidates(ctx, r, query, kinds, limit)
 	if err != nil {
 		return nil, false, err
 	}
@@ -206,6 +249,14 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		seen[hit.Node.Node.ID] = struct{}{}
 	}
 	for _, tier := range exactTiers {
+		// One row per node: where several units publish the same node fact,
+		// Nodes applies the Section 9.4 read-time precedence order (verified
+		// source binding, then provider id, then unit key) inside the query
+		// itself (storage/sqlite/query.go:138-143). Ruling Q1/Q8 puts that
+		// mechanism in storage and this note where Nodes is consumed: nothing
+		// in this package re-ranks or re-folds provider ids, and a nil-aware
+		// clause would be added here only if a leg showed a nil-valued row
+		// winning.
 		nodes, err := r.Nodes(ctx, nodeFilterFor(tier, query, kinds), "", limit)
 		if err != nil {
 			return nil, false, err
