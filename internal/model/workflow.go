@@ -3,6 +3,7 @@ package model
 import (
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -468,8 +469,15 @@ type SessionStatus struct {
 	RequiredFiles           int64             `json:"required_files"`
 	FullyServedFiles        int64             `json:"fully_served_files"`
 	WaivedFiles             int64             `json:"waived_files"`
-	CreatedAt               time.Time         `json:"created_at"`
-	ExpiresAt               time.Time         `json:"expires_at"`
+	// GuaranteeLimit states what this answer does and does not guarantee. It is
+	// never empty while ReadyForImplementation is true (Section 16.3): readiness
+	// is point-in-time, and a caller that receives a bare true has been told a
+	// snapshot-shaped fact as though it were a standing permission. When the
+	// gate is shut it carries the operator-facing reason instead, so the field
+	// is always the evaluator's own words about the two booleans beside it.
+	GuaranteeLimit string    `json:"guarantee_limit,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 // Validate enforces the status shape and the invariant that strict readiness is
@@ -516,6 +524,12 @@ func (s SessionStatus) Validate() error {
 	}
 	if s.ReadyForImplementation && !s.StrictGateSatisfied {
 		return invalid("session_status reports ready_for_implementation without a satisfied strict gate")
+	}
+	if err := boundField("session_status.guarantee_limit", s.GuaranteeLimit, MaxReasonBytes); err != nil {
+		return err
+	}
+	if s.ReadyForImplementation && strings.TrimSpace(s.GuaranteeLimit) == "" {
+		return invalid("session_status reports ready_for_implementation without stating the point-in-time guarantee limit")
 	}
 	return nil
 }

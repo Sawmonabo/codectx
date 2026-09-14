@@ -191,9 +191,13 @@ func (s *Service) requireConsolidationReady(ctx context.Context, rec sqlite.Sess
 //
 // The two writes are deliberately not one transaction (the store exposes no
 // transaction helper and this package adds none): PutCapsule is write-once on
-// session_id, so a crash between them is retried and never duplicated. The
-// stored capsule's identity is compared with the computed one and a mismatch is
-// reported -- the sealed capsule is never recomputed and overwritten.
+// session_id, so a crash between them is retried and never duplicated.
+//
+// buildCapsule does the whole seal -- hash, write-once PutCapsule and the
+// CTX_VERSION_CONFLICT comparison of the returned CanonicalHash (ruling Q11).
+// This guard therefore calls it and does nothing else with the result: INT
+// removed a second hash-write-compare sequence here, which was idempotent but
+// was a second spelling of the one sealing path.
 func (s *Service) sealCapsule(ctx context.Context, rec sqlite.SessionRecord) error {
 	m, err := s.sessions.Manifest(ctx, rec.ManifestID)
 	if err != nil {
@@ -203,19 +207,6 @@ func (s *Service) sealCapsule(ctx context.Context, rec sqlite.SessionRecord) err
 	if err != nil {
 		return err
 	}
-	capsule, err := s.buildCapsule(ctx, rec, g)
-	if err != nil {
-		return err
-	}
-	capsule.CanonicalHash = canonicalCapsuleHash(capsule)
-
-	stored, err := s.sessions.PutCapsule(ctx, capsule)
-	if err != nil {
-		return err
-	}
-	if stored.CanonicalHash != capsule.CanonicalHash {
-		return typedErrf(model.CodeVersionConflict,
-			"this session already sealed a capsule with a different identity; the session's observations or coverage changed after it was sealed")
-	}
-	return nil
+	_, err = s.buildCapsule(ctx, rec, g)
+	return err
 }

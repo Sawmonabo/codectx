@@ -171,6 +171,11 @@ type stack struct {
 	// coverage.Service promises its callers.
 	viewsMu sync.Mutex
 	views   map[model.SnapshotID]*snapshot.View
+	// snapshots memoises the immutable generation-to-snapshot binding the
+	// workflow validator resolves. It shares viewsMu because it is the same
+	// kind of fact -- a published binding that cannot change -- and is filled
+	// on the same path.
+	snapshots map[model.GenerationID]model.SnapshotID
 	// compiler is the Section 15 context compiler. It is set by openCompiler
 	// rather than openQueries because it needs the graph factory, which is a
 	// Workspace method and therefore does not exist until the workspace does.
@@ -633,6 +638,7 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 // config.Config.
 func (s *stack) openCoverage() error {
 	s.views = make(map[model.SnapshotID]*snapshot.View)
+	s.snapshots = make(map[model.GenerationID]model.SnapshotID)
 	svc, err := coverage.New(coverage.Options{
 		Sessions:   s.store,
 		OpenSource: s.openView,
@@ -651,6 +657,150 @@ func (s *stack) openCoverage() error {
 	}
 	s.coverage = svc
 	return nil
+}
+
+// openWorkflow builds the Section 17 workflow service. It is composed last,
+// from open() rather than from openQueries, because workflow.New requires a
+// Compiler and the compiler itself does not exist until openCompiler has run
+// over the workspace's graph factory: wiring it inside openQueries would fail
+// every composition, including the report composition `codectx context ...`
+// uses.
+//
+// Like the coverage service it is built in both compositions -- the context
+// commands open the workspace for a report -- and it is built eagerly, so a
+// missing dependency or a non-positive bound fails the open rather than every
+// request.
+//
+// The store is passed as the narrow workflow.Sessions interface and the bounds
+// are resolved here, so the service never sees *sqlite.Store's wider surface or
+// config.Config.
+func (s *stack) openWorkflow() error {
+	svc, err := workflow.New(workflow.Options{
+		Sessions: s.store,
+		Compile:  s.compiler,
+		Validate: validatorFunc(s.currentSource),
+		Limits:   workflowLimits(s.cfg),
+		Now:      time.Now,
+		Logger:   s.logger,
+	})
+	if err != nil {
+		return err
+	}
+	s.workflow = svc
+	return nil
+}
+
+// workflowLimits resolves the Section 20.1 bounds the workflow service
+// enforces. It is the only place configuration is turned into those bounds, so
+// the service itself never reads config.Config.
+//
+// MaxObservationReferences has no configuration key: it is the model's own
+// ceiling on one observation's reference list (model.MaxObservationReferences),
+// and an operator-settable second ceiling would be a bound the model already
+// refuses to exceed.
+func workflowLimits(cfg config.Config) workflow.Limits {
+	return workflow.Limits{
+		MaxPageItems:                        cfg.Resources.MaxPageItems,
+		MaxObservationReferences:            model.MaxObservationReferences,
+		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
+		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
+		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,
+	}
+}
+
+// validatorFunc adapts the closure below to workflow.Validator. The interface
+// has one method, so the adapter is the whole implementation; a named struct
+// would add a type without adding a fact.
+type validatorFunc func(ctx context.Context, file model.FileID, hash string) (bool, error)
+
+func (f validatorFunc) Current(ctx context.Context, file model.FileID, hash string) (bool, error) {
+	return f(ctx, file, hash)
+}
+
+// currentSource is the workflow service's Validator: does this pinned file
+// still carry this content hash in the repository's CURRENT source?
+//
+// The question is deliberately asked against the ACTIVE generation's snapshot
+// and not the session's own. A session's pinned hashes were copied out of its
+// own snapshot and a snapshot is immutable, so validating against it would
+// compare a row with itself and answer true for every file forever -- a
+// readiness gate that can never detect stale source, which is the precise
+// failure Section 16.3's precondition 7 exists to catch.
+//
+// It reads the catalog row directly rather than through s.view: *snapshot.View
+// exposes content only by opening or reading bytes, and this needs one indexed
+// metadata row. Store.SnapshotFile is the same Catalog method the view itself
+// calls, so this is not a second path to the pinned manifest.
+//
+// Three answers are "not current" rather than failures, because each is a real
+// state of a live workspace: nothing published yet, the file absent from the
+// current snapshot, and a deletion tombstone.
+//
+// Note what this cannot decide today, so nobody reads more into it than it
+// says. A generation's snapshot is fixed when the generation begins, so while
+// the session's generation IS the active one the snapshot asked here is the
+// session's own and every pinned hash matches by construction; and when it is
+// not the active one, the gate is already shut by supersession. Precondition 7
+// is therefore subsumed by Superseded at present. It is asked separately anyway
+// because the two are different questions -- the readiness contract promises a
+// per-file answer, and the source that would make it decisive is a per-file
+// WORKTREE hash, which this repository does not have yet: coherence is
+// snapshot-level (HEAD plus a dirty flag, internal/index/status.go:88).
+// Ledgered for Task 20; until then the guarantee limit's "pair it with
+// expected-content-hash validation at each write" is what covers the gap.
+func (s *stack) currentSource(ctx context.Context, file model.FileID, hash string) (bool, error) {
+	snap, err := s.activeSnapshot(ctx)
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeNoActiveGeneration {
+			return false, nil
+		}
+		return false, err
+	}
+	fv, err := s.store.SnapshotFile(ctx, snap, file)
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Details["reason"] == sqlite.ReasonNotFound {
+			return false, nil
+		}
+		return false, err
+	}
+	if fv.Status == model.FileDeleted {
+		return false, nil
+	}
+	return fv.ContentHash == hash, nil
+}
+
+// activeSnapshot is the snapshot of the repository's currently published
+// generation.
+//
+// The active generation is re-read on every call -- it is one indexed row and
+// it is exactly the fact that may have moved since the last request, so caching
+// it would cache the answer the gate must not cache. The generation-to-snapshot
+// binding is immutable once published, so that half is memoised beside the
+// views, which is what keeps a per-file validator walk from taking a retention
+// lease per file.
+func (s *stack) activeSnapshot(ctx context.Context) (model.SnapshotID, error) {
+	gen, err := s.store.ActiveGeneration(ctx, s.repo)
+	if err != nil {
+		return "", err
+	}
+	s.viewsMu.Lock()
+	id, ok := s.snapshots[gen]
+	s.viewsMu.Unlock()
+	if ok {
+		return id, nil
+	}
+	pinned, err := s.store.PinGeneration(ctx, s.repo, gen, s.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		return "", err
+	}
+	defer pinned.Close()
+	id = pinned.Binding().SnapshotID
+	s.viewsMu.Lock()
+	s.snapshots[gen] = id
+	s.viewsMu.Unlock()
+	return id, nil
 }
 
 // openCompiler builds the Section 15 context compiler over the services
