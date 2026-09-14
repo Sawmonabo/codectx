@@ -855,6 +855,78 @@ var scenarios = []scenario{
 
 	// L4 rows
 
+	// Next must resume where the confirmed prefix ends and must stay metadata
+	// only. A Next that answers zero sends the actor back over bytes it already
+	// holds and, on a partially served file, can never terminate; a Next that
+	// opens the Source has become a second read endpoint that serves bytes
+	// without issuing a receipt, so coverage would be granted or bypassed
+	// outside ConfirmChunks. The fixture's ordinal 0 is the empty file, whose
+	// natural offset is zero, so the row first serves it and then confirms a
+	// prefix of ordinal 1: the assertion is only meaningful once the answer is
+	// a nonzero offset on the next required file.
+	{name: "Next resumes at the confirmed prefix without opening the source", run: func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		empty, crlf := model.FileID(hexID(0x20)), model.FileID(hexID(0x21))
+		// Built directly rather than through newHarness: New is L3's and is
+		// still a stub, so h.svc is nil. The opener fails the row if Next ever
+		// reaches for source, which is what gives "no bytes" real teeth --
+		// NextContextItem has no bytes or receipt field to assert against.
+		svc := &Service{
+			sessions: h.store,
+			open: func(context.Context, model.SnapshotID) (Source, error) {
+				t.Fatalf("Next opened the source; it is metadata only and must never read bytes")
+				return nil, nil
+			},
+			limits: fixtureLimits(),
+			now:    func() time.Time { return h.now },
+		}
+		// Coverage is only ever created the way production creates it: an
+		// issued chunk whose receipt is confirmed. Kept local to this row so no
+		// other lane's rows depend on it.
+		serve := func(file model.FileID, start, end uint64) {
+			t.Helper()
+			id, err := model.NewRandomID()
+			if err != nil {
+				t.Fatalf("chunk id: %v", err)
+			}
+			chunk := model.IssuedChunk{
+				ID: id, SessionID: sessionA, ActorID: actorA, FileID: file,
+				ContentHash: h.file(file).hash(), Bytes: model.ByteRange{Start: start, End: end},
+				ExpiresAt: h.now.Add(time.Hour),
+			}
+			if err := h.store.IssueChunk(ctx, chunk); err != nil {
+				t.Fatalf("issue chunk: %v", err)
+			}
+			if err := h.store.ConfirmChunks(ctx, sessionA, actorA, []string{id}); err != nil {
+				t.Fatalf("confirm chunk: %v", err)
+			}
+		}
+		// The empty file is fully served only by a confirmed zero-length EOF
+		// chunk; the next required file gets a confirmed 7-byte prefix.
+		serve(empty, 0, 0)
+		serve(crlf, 0, 7)
+
+		item, err := svc.Next(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if item.FileID != crlf {
+			t.Fatalf("next names file %s; the first required file that is not full_served is %s", item.FileID, crlf)
+		}
+		if item.Offset != 7 {
+			t.Fatalf("next resumes at %d; the confirmed prefix ends at 7", item.Offset)
+		}
+		want := h.file(crlf)
+		if item.Action != actionReadSource || item.ContentHash != want.hash() || item.Size != int64(len(want.data)) {
+			t.Fatalf("next answers action %q hash %s size %d; want %q/%s/%d",
+				item.Action, item.ContentHash, item.Size, actionReadSource, want.hash(), len(want.data))
+		}
+		// Four required files, one of them now full_served.
+		if item.Remaining != 3 {
+			t.Fatalf("next reports %d required files remaining; three are not full_served", item.Remaining)
+		}
+	}},
+
 	// L5 rows
 
 	// L6 rows

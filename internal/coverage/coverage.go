@@ -171,10 +171,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 
 // Next names the next required_full file this actor has not fully served, in
 // manifest ordinal order, with its pinned hash, size and resume offset. It is
-// metadata only and never carries source bytes. Owned by L4.
-func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.NextContextItem, error) {
-	return model.NextContextItem{}, notImplemented("coverage.Next")
-}
+// metadata only and never carries source bytes. Implemented in next.go (L4).
 
 // receiptPayload is what a source receipt binds. Every field is checked against
 // the live session before ConfirmChunks runs, so a payload naming another
