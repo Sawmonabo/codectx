@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
+	"github.com/spf13/cobra"
 )
 
 // TestCommandEnvelope protects the machine-stable CLI boundary of Section 18.2:
@@ -63,11 +64,18 @@ func TestCommandEnvelope(t *testing.T) {
 		// which is how a row reaches the composition's own failure classes
 		// without depending on the directory the test happens to run in.
 		missingRepo bool
-		exitCode    int
-		ok          bool
-		command     string
-		errCode     string
-		checkData   func(t *testing.T, data json.RawMessage)
+		// absentWorkspaceArg does the same for the two Section 18.1 commands
+		// that name their repository POSITIONALLY -- `doctor [path]` and
+		// `repo-map [path]` -- and, because the Task 20 integration lane is the
+		// one that registers them in root.go, skips the row until that line
+		// lands rather than letting it pass as an unknown command for the wrong
+		// reason. The skip clears itself the moment the command is registered.
+		absentWorkspaceArg bool
+		exitCode           int
+		ok                 bool
+		command            string
+		errCode            string
+		checkData          func(t *testing.T, data json.RawMessage)
 	}{
 		{name: "version json", args: []string{"version", "--json"}, exitCode: 0, ok: true, command: "version", checkData: checkBuildData(build)},
 		{name: "unknown flag", args: []string{"version", "--bogus", "--json"}, exitCode: 2, ok: false, command: "version", errCode: "CTX_ARGUMENT_INVALID"},
@@ -125,6 +133,35 @@ func TestCommandEnvelope(t *testing.T) {
 		// that is not a workspace, so a check that ran after the open would fail
 		// on the workspace (exit 3) instead of on the flag.
 		{name: "context advance without the version guard", args: []string{"context", "advance", hexID, "consolidate", "--actor", "agent-a", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context advance", errCode: "CTX_ARGUMENT_INVALID"},
+		// T20-L6 rows: `doctor` and `repo-map` are the two Section 18.1
+		// spellings Task 20 adds, and the pair exists to pin the asymmetry
+		// between them, which is a design decision and not an accident of two
+		// commands being written by one lane.
+		//
+		// `doctor` is the command an operator reaches for when their workspace
+		// is broken. If a failed open failed the command, the one tool meant to
+		// diagnose a broken installation would refuse to run on one and report
+		// only what the operator already knew, so the open failure is a FAILING
+		// CHECK inside a completed report: the build identity is still there,
+		// the typed code and remediation are still there, and the diagnosis
+		// succeeded. `repo-map` must do the opposite with the same failure --
+		// an unopenable workspace has no map, and answering with an empty page
+		// would render it as a repository containing no packages at all, which
+		// a model consuming the map reads as fact.
+		//
+		// LANE NOTE (T20-L6): the lane plan's second assertion -- `repo-map
+		// --cursor` on a TAMPERED token reporting CTX_CURSOR_INVALID and exit 8
+		// -- is not reachable from this package at fixture scale. The cursor is
+		// verified in graph/cursor.go's verifyContinuation, behind a pinned
+		// generation, so the open of a directory that is not a workspace fails
+		// first and exit 3 is what the row would actually observe; reaching the
+		// verifier needs a real store with an active generation, which is the
+		// verification lane's argv, not this table's. Handed to VERIFY: `codectx
+		// repo-map --cursor <token with one byte changed> --json` against the
+		// proof store must be CTX_CURSOR_INVALID with exit 8. The exit-8 mapping
+		// itself is already in ExitCode's table and is not re-asserted here.
+		{name: "doctor on a workspace it cannot open", args: []string{"doctor", "--json"}, absentWorkspaceArg: true, exitCode: 0, ok: true, command: "doctor", checkData: checkUnopenableWorkspaceReport},
+		{name: "repo-map on a workspace it cannot open", args: []string{"repo-map", "--json"}, absentWorkspaceArg: true, exitCode: 3, ok: false, command: "repo-map", errCode: "CTX_WORKSPACE_NOT_FOUND"},
 		// L4 rows: the two cases digest Section 6 budgets for this lane are
 		// TestInitRefusesToOverwriteProjectConfig and
 		// TestBrokenStdoutPipeIsNotADefect, at the end of this file. Neither is
@@ -144,6 +181,12 @@ func TestCommandEnvelope(t *testing.T) {
 			}
 			var stdout, stderr bytes.Buffer
 			root := cli.NewRoot(build, &stdout, &stderr)
+			if tc.absentWorkspaceArg {
+				if !hasCommand(root, tc.args[0]) {
+					t.Skipf("`codectx %s` is not registered in root.go yet; the Task 20 integration lane adds it", tc.args[0])
+				}
+				args = append(args, filepath.Join(t.TempDir(), "absent"))
+			}
 			err := cli.Execute(context.Background(), build, root, args)
 
 			if got := cli.ExitCode(err); got != tc.exitCode {
@@ -232,6 +275,68 @@ func isolateUserDirs(t *testing.T, userConfig string) {
 	if err := os.WriteFile(filepath.Join(appDir, "config.toml"), []byte(userConfig), 0o600); err != nil {
 		t.Fatalf("user configuration file: %v", err)
 	}
+}
+
+// hasCommand reports whether the built tree registers a command by name. It
+// reads the tree rather than a build tag or an environment variable so the two
+// rows that depend on a registration this lane does not own go live by
+// themselves as soon as that registration lands.
+func hasCommand(root *cobra.Command, name string) bool {
+	for _, c := range root.Commands() {
+		if c.Name() == name {
+			return true
+		}
+	}
+	return false
+}
+
+// checkUnopenableWorkspaceReport holds `doctor` to the contract that makes it
+// worth registering at all: the workspace that could not be opened is reported
+// as a failing check, with the typed code and a detail that says what happened,
+// inside a report whose own state is fail. A report that came back passing, or
+// with no check at all, would tell an operator their broken installation is
+// healthy -- which is worse than the command not existing.
+func checkUnopenableWorkspaceReport(t *testing.T, raw json.RawMessage) {
+	t.Helper()
+	var data struct {
+		State  string `json:"state"`
+		Checks []struct {
+			Name   string `json:"name"`
+			State  string `json:"state"`
+			Detail string `json:"detail"`
+			Code   string `json:"code"`
+		} `json:"checks"`
+		Build struct {
+			Version string `json:"version"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("data: %v", err)
+	}
+	if model.CheckState(data.State) != model.CheckFail {
+		t.Errorf("report state = %q, want %q", data.State, model.CheckFail)
+	}
+	// The build identity is knowable without a workspace, and it is the first
+	// thing anyone reading a diagnostic report needs.
+	if data.Build.Version == "" {
+		t.Errorf("the report carries no build identity")
+	}
+	if len(data.Checks) == 0 {
+		t.Fatalf("the report carries no check; the open failure has to be reported as one")
+	}
+	for _, c := range data.Checks {
+		if model.CheckState(c.State) != model.CheckFail {
+			continue
+		}
+		if c.Code != string(model.CodeWorkspaceNotFound) {
+			t.Errorf("failing check %q code = %q, want %q", c.Name, c.Code, model.CodeWorkspaceNotFound)
+		}
+		if c.Detail == "" {
+			t.Errorf("failing check %q carries no detail", c.Name)
+		}
+		return
+	}
+	t.Errorf("no check failed although the workspace could not be opened: %+v", data.Checks)
 }
 
 func checkBuildData(build model.BuildInfo) func(*testing.T, json.RawMessage) {
