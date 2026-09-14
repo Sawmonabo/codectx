@@ -38,6 +38,56 @@ func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
 		// L1 rows
+		// Failure mode: a service that picked its own version from a
+		// pre-read record, retried the store's compare-and-swap or
+		// swallowed its conflict would let two clients both believe they
+		// closed the same session -- and the loser would carry a stale
+		// ExpectedVersion it thinks is current. Closing is the transition
+		// with no service guard, so this exercises the version path alone.
+		{name: "two clients closing at the same expected version: exactly one wins", run: func(t *testing.T, h *harness) {
+			expected := h.session(fixtureSession).StateVersion
+			req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+
+			type attempt struct {
+				status model.WorkflowStatus
+				err    error
+			}
+			attempts := make([]attempt, 2)
+			var wg sync.WaitGroup
+			wg.Add(len(attempts))
+			for i := range attempts {
+				go func(i int) {
+					defer wg.Done()
+					status, err := h.svc.Close(context.Background(), req, expected)
+					attempts[i] = attempt{status: status, err: err}
+				}(i)
+			}
+			wg.Wait()
+
+			var won, lost int
+			for _, a := range attempts {
+				switch {
+				case a.err == nil:
+					won++
+					if a.status.State != model.StateClosed {
+						t.Errorf("the winning close reports state %q, want %q", a.status.State, model.StateClosed)
+					}
+					if a.status.StateVersion != expected+1 {
+						t.Errorf("the winning close reports state version %d, want %d", a.status.StateVersion, expected+1)
+					}
+				case code(a.err) == model.CodeVersionConflict:
+					lost++
+				default:
+					t.Errorf("the losing close failed with %q: %v", code(a.err), a.err)
+				}
+			}
+			if won != 1 || lost != 1 {
+				t.Fatalf("%d closes won and %d hit a version conflict; want exactly one of each", won, lost)
+			}
+			if got := h.session(fixtureSession).State; got != model.StateClosed {
+				t.Errorf("the session is in state %q after both closes, want %q", got, model.StateClosed)
+			}
+		}},
 		// L2 rows
 		// L3 rows
 		//
