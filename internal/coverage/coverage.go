@@ -101,18 +101,20 @@ type Source interface {
 
 var _ Source = (*snapshot.View)(nil)
 
+// The store is the production Sessions; the assertion keeps the interface
+// honest against it rather than discovering a drift at composition.
+var _ Sessions = (*sqlite.Store)(nil)
+
 // SourceOpener yields the Source for one pinned snapshot. internal/app owns the
 // *snapshot.View behind it and memoises per SnapshotID, which is what keeps
 // *sqlite.Store, *snapshot.CAS and config.Config out of this package.
-// The store is the production Sessions; the assertion keeps the interface
-// honest against it.
-var _ Sessions = (*sqlite.Store)(nil)
-
 type SourceOpener func(ctx context.Context, snap model.SnapshotID) (Source, error)
 
-// Options composes the service. Every dependency is required: the composition
-// root builds this eagerly when a workspace opens, so a missing one is a wiring
-// defect that must fail there rather than per request.
+// Options composes the service. Sessions, OpenSource, Signer and every Limits
+// bound are required: the composition root builds this eagerly when a workspace
+// opens, so a missing one is a wiring defect that must fail there rather than
+// per request. Leases and Logger are the two exceptions New tolerates -- see
+// New for what a nil one costs.
 type Options struct {
 	Sessions   Sessions
 	OpenSource SourceOpener
@@ -158,10 +160,6 @@ type Service struct {
 	now      func() time.Time
 	log      *slog.Logger
 }
-
-// Next names the next required_full file this actor has not fully served, in
-// manifest ordinal order, with its pinned hash, size and resume offset. It is
-// metadata only and never carries source bytes. Implemented in next.go (L4).
 
 // receiptPayload is what a source receipt binds. Every field is checked against
 // the live session before ConfirmChunks runs, so a payload naming another
@@ -292,14 +290,6 @@ const (
 // caller: Next answers actionComplete instead.
 var errNoSource = errors.New("no unserved required file remains")
 
-// notImplemented is the typed stub every unimplemented body returns. It is
-// CTX_INTERNAL because reaching one is a wiring defect, not user-correctable
-// input, and it is an error rather than a panic so a partially wired build
-// fails honestly instead of crashing the process.
-func notImplemented(op string) *model.Error {
-	return notImplementedf(model.CodeInternal, "%s is not implemented", op)
-}
-
 // notImplementedf builds a typed model.Error without leaking source bytes,
 // receipt tokens or the dependence engine's name into the message.
 func notImplementedf(code, format string, args ...any) *model.Error {
@@ -309,8 +299,9 @@ func notImplementedf(code, format string, args ...any) *model.Error {
 // --- Also frozen by L0; implemented elsewhere -------------------------------
 //
 // These signatures live in files this package does not own. They are recorded
-// here so no fill-in lane has to invent a shared name, and no lane may change
-// one without asking the controller.
+// here as the map of what wires this package to the rest of the process: the
+// composition root, the storage aggregate and the command tree. Changing one of
+// them changes this package's contract with a file it cannot see.
 //
 //	// internal/app/compose.go -- openQueries-style construction. Deliberately
 //	// not a raw Store() accessor, which would leak the whole storage surface.
@@ -318,16 +309,16 @@ func notImplementedf(code, format string, args ...any) *model.Error {
 //
 //	// internal/app/workspace.go -- the SourceOpener closes over the stack's
 //	// store (as snapshot.Catalog) and CAS via snapshot.OpenView, memoised per
-//	// snapshot. Added by INT.
+//	// snapshot.
 //	func (w *Workspace) Coverage() *coverage.Service
 //
-//	// internal/storage/sqlite/state.go -- appended by L6, one aggregate query
+//	// internal/storage/sqlite/state.go -- one appended aggregate query
 //	// reproducing both branches of the fileCoverage state switch (union ==
 //	// size, and the separate zero-length confirmed-EOF branch). Task 15 must
 //	// not define it; Task 17 consumes it and must not define a second one.
 //	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
 //
-//	// internal/cli/context.go -- written by L5 with the Section 18.1 spellings
-//	// context read/acknowledge/status/next/close. INT adds one loop line to
-//	// root.go that registers them.
+//	// internal/cli/context.go -- the Section 18.1 spellings context
+//	// read/acknowledge/status/next/close, registered by one loop line in
+//	// root.go.
 //	func newContextCommands(build model.BuildInfo) []*cobra.Command
