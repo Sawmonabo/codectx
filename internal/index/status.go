@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
@@ -30,7 +31,13 @@ var errWorktreeChanged = errors.New("index: worktree changed")
 
 // Status projects the active generation (Sections 13.2, 13.3). It runs no
 // provider, captures nothing and never publishes: a status call on a busy
-// workspace is a read.
+// workspace is a read, which is why it is the one entry point legal without
+// the workspace indexing lock.
+//
+// The composition-time rows of Options.States are folded into the published
+// completeness and the whole list is brought back inside its bound here, so a
+// capability whose provider could not be constructed is reported even by a
+// generation published before it failed, and the answer still validates.
 func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	gen, err := c.opts.Store.ActiveGeneration(ctx, c.repo)
 	if err != nil {
@@ -50,9 +57,18 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
+	states = composedStates(states, c.opts.States)
+	states, omitted := boundStates(states, c.log)
 	coherence, warnings, err := c.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
+	}
+	if omitted > 0 {
+		// Section 18.2: a truncated report shows what it omitted. A renderer
+		// prints what it is handed, so the count has to be in the result.
+		warnings = append(warnings, "the capability report holds more than its bound of "+
+			strconv.Itoa(model.MaxCapabilityStates)+" rows; "+strconv.Itoa(omitted)+
+			" of the least severe were omitted")
 	}
 	st := model.IndexStatus{Binding: binding, Health: healthOf(states), Coherence: coherence,
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
@@ -97,26 +113,36 @@ func (c *Coordinator) coherence(ctx context.Context, snap model.Snapshot) (model
 	return model.CoherenceSnapshot, nil, nil
 }
 
-// watchState is what the coordinator's own reconciliation loop knows about
-// watch coverage. The filesystem-notification watcher is composed above this
-// package (internal/index/watch, driven by internal/app), so what is reported
-// here is exactly what this loop provides: periodic reconciliation, which is
-// never complete notification coverage, and the time it last succeeded.
+// watchState is what the running watch loops know about watch coverage. When a
+// notification watcher drives the loop, coverage is the watcher's own answer;
+// without one the only coverage is periodic reconciliation, which is never
+// complete notification coverage, and what is reported is exactly that.
 type watchState struct {
 	mu         sync.Mutex
 	active     int
+	source     *watch.Watcher
 	reconciled time.Time
 }
 
-func (w *watchState) enter() {
+// enter records one running watch and the notification source driving it, if
+// any. Concurrent watches over one coordinator are not a supported
+// composition, but the counter makes a second one visible rather than letting
+// the first one's exit report "watch off" while it still runs.
+func (w *watchState) enter(source *watch.Watcher) {
 	w.mu.Lock()
 	w.active++
+	if source != nil {
+		w.source = source
+	}
 	w.mu.Unlock()
 }
 
 func (w *watchState) leave() {
 	w.mu.Lock()
 	w.active--
+	if w.active == 0 {
+		w.source = nil
+	}
 	w.mu.Unlock()
 }
 
@@ -126,20 +152,30 @@ func (w *watchState) reconciledAt(t time.Time) {
 	w.mu.Unlock()
 }
 
-// project fills the Section 13.2 watch fields. WatchComplete is false while
-// the only coverage is this loop: reporting complete coverage for periodic
-// reconciliation would claim notification coverage the product does not have.
+// project fills the Section 13.2 watch fields. With a notification watcher
+// running they are the watcher's own Coverage(); without one WatchComplete is
+// false and the warning says so, because reporting complete coverage for
+// periodic reconciliation would claim notification coverage the product does
+// not have.
 func (w *watchState) project(st *model.IndexStatus) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	st.WatchActive = w.active > 0
-	if !w.reconciled.IsZero() {
-		at := w.reconciled
+	at := w.reconciled
+	if w.source != nil {
+		complete, pending, lastReconciled := w.source.Coverage()
+		st.WatchComplete = complete
+		st.PendingPaths = int64(pending)
+		if lastReconciled.After(at) {
+			at = lastReconciled
+		}
+	}
+	if !at.IsZero() {
 		st.LastReconciledAt = &at
 	}
-	if st.WatchActive {
+	if st.WatchActive && !st.WatchComplete {
 		st.Warnings = append(st.Warnings,
-			"watch coverage is periodic reconciliation only; filesystem notification coverage is reported by the watcher that drives refresh")
+			"watch coverage is incomplete: not every directory the traversal admits carries a filesystem notification watch, so changes under the rest are seen only at the next periodic reconciliation")
 	}
 }
 
@@ -164,6 +200,21 @@ type failureRow struct {
 
 func newCapabilityReport() *capabilityReport {
 	return &capabilityReport{rows: map[string]model.CapabilityState{}, failures: map[string]*failureRow{}}
+}
+
+// newCapabilityReport seeds a report with the composition-time rows of
+// Options.States. A provider that could not be constructed never reaches the
+// registry, so nothing on the indexing path would otherwise report its
+// capabilities at all, and the operator would have to run a second, different
+// command to learn that a capability is unavailable. Seeding here rather than
+// merging above this package is what puts those rows inside the
+// MaxCapabilityStates bound instead of past it.
+func (c *Coordinator) newCapabilityReport() *capabilityReport {
+	r := newCapabilityReport()
+	for _, st := range c.opts.States {
+		r.add(st)
+	}
+	return r
 }
 
 func stateKey(providerID, capability, scope string, state model.CapabilityStateValue) string {
@@ -228,12 +279,22 @@ func (r *capabilityReport) addUnavailable(providerID, capability string) {
 		Details:        map[string]string{"reason": "no_units_planned"}})
 }
 
-// addDeferred publishes the row of a capability whose only work is running in
-// the background (Section 11.6, ruling Q9): it has no member in this
-// generation and no previous unit to carry, so there is nothing to answer from
-// yet. A carried predecessor reports `stale` through addCarried instead, and
-// that row wins because it is recorded first.
+// addDeferred publishes the row of a capability whose work is still running in
+// the background (Section 11.6, ruling Q9): the deferred scope has no member in
+// this generation, so the capability cannot be reported as fresh coverage.
+//
+// A `fresh` row already recorded for one of the provider's other scopes is
+// demoted rather than left to win: it was added while the run was in flight,
+// and keeping it would publish "this capability is fresh" for a capability one
+// of whose scopes has nothing behind it at all -- the over-claim Section 13.3
+// forbids. Any other row (stale, partial, failed) already under-claims and
+// stays.
 func (r *capabilityReport) addDeferred(providerID, capability string) {
+	key := stateKey(providerID, capability, provider.ScopeWorkspace, model.CapabilityFresh)
+	if _, ok := r.rows[key]; ok {
+		delete(r.rows, key)
+		r.order = slices.DeleteFunc(r.order, func(k string) bool { return k == key })
+	}
 	if r.reported(providerID, capability) {
 		return
 	}
@@ -247,9 +308,16 @@ func (r *capabilityReport) addDeferred(providerID, capability string) {
 func (r *capabilityReport) addFailure(providerID, capability, scope, code string) {
 	key := providerID + "\x00" + capability
 	row, ok := r.failures[key]
-	if !ok {
+	switch {
+	case !ok:
 		row = &failureRow{providerID: providerID, capability: capability, scope: scope, code: code}
 		r.failures[key] = row
+	case scope < row.scope:
+		// The exemplar is the lexicographically first scope, never the first
+		// to arrive: the units of one provider are built concurrently, and
+		// details_json folds into the AnalysisKey, so an arrival-ordered
+		// exemplar would key two identical runs differently.
+		row.scope = scope
 	}
 	row.units++
 }
@@ -285,11 +353,11 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 	return false
 }
 
-// finish publishes the bounded list. The per-scope carry rows are collapsed
-// per provider capability before anything is dropped, because a stale
-// capability with an aggregate distance is still an honest stale answer while
-// a truncated list silently loses one.
-func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
+// finish publishes the bounded list and how many rows the bound omitted. The
+// per-scope carry rows are collapsed per provider capability before anything is
+// dropped, because a stale capability with an aggregate distance is still an
+// honest stale answer while a truncated list silently loses one.
+func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, int) {
 	out := make([]model.CapabilityState, 0, len(r.order)+len(r.failures)+len(r.carried))
 	for _, key := range r.order {
 		out = append(out, r.rows[key])
@@ -323,16 +391,86 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 		carried = collapseCarried(carried)
 	}
 	out = append(out, carried...)
+	return boundStates(out, log)
+}
+
+// boundStates brings an assembled capability list inside
+// model.MaxCapabilityStates and reports how many rows it had to omit. It is
+// the one place the bound is applied: the indexing path calls it through
+// finish, and Status calls it after folding in the composition-time rows, so a
+// published list can never exceed the bound its own contract validates against.
+//
+// When rows must go, the degradations stay. The list is first folded to one
+// row per provider capability and state, and only if that is still too long is
+// it ordered by severity -- failed, stale, partial, unavailable, then fresh --
+// and cut from the tail. Truncating the assembly order instead would drop the
+// failures and carries, which are appended last, and keep the fresh rows:
+// Section 13.3 allows a report to under-claim and never to over-claim.
+func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, int) {
 	if len(out) > model.MaxCapabilityStates {
-		// The per-scope rows are folded to one row per provider capability and
-		// state before anything is dropped: an aggregate degradation with a
-		// count is still an honest degradation, a truncated list is not.
 		out = collapseScopes(out)
 	}
-	if len(out) > model.MaxCapabilityStates {
-		log.Warn("the capability report exceeded its bound and was truncated", "component", component,
-			"rows", len(out), "limit", model.MaxCapabilityStates)
-		out = out[:model.MaxCapabilityStates]
+	if len(out) <= model.MaxCapabilityStates {
+		return out, 0
+	}
+	// The order is total, so which rows survive is a function of the set and
+	// not of the order the unit workers happened to report in.
+	slices.SortStableFunc(out, func(a, b model.CapabilityState) int {
+		if r := severityRank(a.State) - severityRank(b.State); r != 0 {
+			return r
+		}
+		if a.ProviderID != b.ProviderID {
+			return compareString(a.ProviderID, b.ProviderID)
+		}
+		if a.Capability != b.Capability {
+			return compareString(a.Capability, b.Capability)
+		}
+		return compareString(string(a.State), string(b.State))
+	})
+	omitted := len(out) - model.MaxCapabilityStates
+	log.Warn("the capability report exceeded its bound and was truncated", "component", component,
+		"rows", len(out), "limit", model.MaxCapabilityStates, "omitted", omitted)
+	return out[:model.MaxCapabilityStates], omitted
+}
+
+// severityRank orders capability states by how much a reader must act on them.
+// A fresh row is the one a truncated report can afford to lose.
+func severityRank(s model.CapabilityStateValue) int {
+	switch s {
+	case model.CapabilityFailed:
+		return 0
+	case model.CapabilityStale:
+		return 1
+	case model.CapabilityPartial:
+		return 2
+	case model.CapabilityUnavailable:
+		return 3
+	case model.CapabilityFresh:
+		return 5
+	}
+	return 4
+}
+
+// composedStates folds the composition-time rows of Options.States into a list
+// read back from a published generation. A generation this build published
+// already holds them, so the fold is keyed by provider capability and the
+// published row wins: one published under an older build, or by a process
+// whose provider did construct, gains the row it is missing rather than
+// growing a duplicate.
+func composedStates(published, composed []model.CapabilityState) []model.CapabilityState {
+	if len(composed) == 0 {
+		return published
+	}
+	have := make(map[string]bool, len(published))
+	for _, s := range published {
+		have[s.ProviderID+"\x00"+s.Capability] = true
+	}
+	out := slices.Clone(published)
+	for _, s := range composed {
+		if have[s.ProviderID+"\x00"+s.Capability] {
+			continue
+		}
+		out = append(out, s)
 	}
 	return out
 }
@@ -340,26 +478,39 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 // collapseScopes folds every per-scope row of one provider capability and
 // state into one workspace-scoped row carrying the scope count and one
 // exemplar scope.
+//
+// The exemplar is the lexicographically first scope of the fold, never the
+// first row to arrive: the rows come from unit workers that run concurrently,
+// and the exemplar is published as a `scope_key` detail, which folds into
+// details_json and therefore into the AnalysisKey. Two identical runs must key
+// identically.
 func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 	var order []string
 	folds := map[string]model.CapabilityState{}
 	counts := map[string]int{}
+	exemplars := map[string]string{}
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + string(c.State)
 		if _, ok := folds[key]; !ok {
 			folded := c
-			if c.Scope != provider.ScopeWorkspace {
-				folded = c.WithDetail("scope_key", model.TruncateDetail(c.Scope))
-				folded.Scope = provider.ScopeWorkspace
-			}
+			folded.Scope = provider.ScopeWorkspace
 			folds[key] = folded
 			order = append(order, key)
+		}
+		if c.Scope != provider.ScopeWorkspace {
+			if e, ok := exemplars[key]; !ok || c.Scope < e {
+				exemplars[key] = c.Scope
+			}
 		}
 		counts[key] += countDetail(c)
 	}
 	out := make([]model.CapabilityState, 0, len(order))
 	for _, key := range order {
-		out = append(out, folds[key].WithDetail("scopes", strconv.Itoa(counts[key])))
+		row := folds[key]
+		if e, ok := exemplars[key]; ok {
+			row = row.WithDetail("scope_key", model.TruncateDetail(e))
+		}
+		out = append(out, row.WithDetail("scopes", strconv.Itoa(counts[key])))
 	}
 	return out
 }

@@ -3,7 +3,6 @@ package index
 import (
 	"context"
 
-	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -16,6 +15,14 @@ import (
 // It runs after activation and never before: collecting while a generation is
 // staging would race the units it is about to attach, and the workspace lock
 // the caller holds is what keeps a second process out of both.
+//
+// Within this process retention must also be taken under Coordinator.run, not
+// only under the cross-process workspace lock. RetainByRef ends in a sweep with
+// no snapshot filter, which deletes every snapshot no generation, lease or
+// session references -- and a foreground indexing run has exactly such a
+// window, between writing its capture and opening the generation that first
+// references it. The indexing path is already inside that lock; the background
+// publication takes it explicitly.
 
 // retain sweeps the store to the configured policy. A retention failure never
 // fails the indexing run that just published: the generation is active, its
@@ -29,8 +36,8 @@ func (c *Coordinator) retain(ctx context.Context) {
 	// a half-swept store is the one state retention must not leave behind.
 	report, err := c.opts.Store.RetainByRef(context.WithoutCancel(ctx), c.repo, policy, c.now())
 	if err != nil {
-		c.log.Warn("retention could not sweep the store", "component", component,
-			"repository_id", string(c.repo), "diagnostic_code", provider.CodeOf(err))
+		logTyped(c.log, "retention could not sweep the store", err,
+			"component", component, "repository_id", string(c.repo))
 		return
 	}
 	c.log.Info("retention swept the store", "component", component, "repository_id", string(c.repo),
