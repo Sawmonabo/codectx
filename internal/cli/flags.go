@@ -44,7 +44,12 @@ func addLimitFlag(cmd *cobra.Command) {
 // not a keyset position in the walk, so it prints no token and offering the
 // flag would advertise a workflow the command refuses.
 func addCursorFlag(cmd *cobra.Command) {
-	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, or was issued for a different query or command")
+	// The refusal list is worded for BOTH families this flag serves. `search`
+	// and `symbol` repin the cursor's own generation, so a newer one cannot
+	// disturb them; the graph commands read the ACTIVE generation and refuse a
+	// cursor that pins a different one (graph/cursor.go:249), which is a
+	// refusal the caller can hit without altering the token.
+	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, was issued for a different query or command, or -- for the graph commands -- names a generation that is no longer the active one")
 }
 
 // pageRequest reads the page flags of a command that declares them. A command
