@@ -161,15 +161,14 @@ type Inputs struct {
 	PrevGen model.GenerationID
 	// PriorCarry reports the distance PrevGen already recorded for a scope, so
 	// a unit carried across several generations accumulates its distance
-	// instead of reporting 1 forever. It is the fold of
-	// sqlite.CarriedUnits(PrevGen) by Key(providerID, scopeKey).
+	// instead of reporting 1 forever. It is the fold of the paged listing
+	// sqlite.CarriedUnits(ctx, PrevGen, afterProviderID, afterScopeKey, limit)
+	// -- page until a short page arrives -- by Key(providerID, scopeKey).
 	//
-	// It is the coordinator's fold and not a call Build makes itself, for two
-	// reasons. The coordinator already lists those rows to project the
-	// previous generation's provenance distance into CapabilityState.Details
-	// (ruling Q4), so folding the same listing into Build would read one
-	// bounded listing twice; and CarriedUnits' response bound then belongs
-	// where the listing is owned rather than being able to fail a whole plan.
+	// It is the coordinator's fold and not a call Build makes itself: the
+	// coordinator already pages those rows to project the previous
+	// generation's provenance distance into CapabilityState.Details (ruling
+	// Q4), so folding the same listing into Build would read it twice.
 	// A function rather than a map so an unwired coordinator is visibly nil
 	// instead of silently equivalent to "nothing was ever carried": Build
 	// refuses whenever PrevGen is set and this is missing.
@@ -184,7 +183,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 		return Plan{}, invalid("the planner needs a snapshot view and the store")
 	}
 	if in.PrevGen != 0 && in.PriorCarry == nil {
-		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.PriorCarry from sqlite.CarriedUnits")
+		return Plan{}, invalid("the planner needs the previous generation's carry distances; wire Inputs.PriorCarry from the paged sqlite.CarriedUnits listing")
 	}
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
