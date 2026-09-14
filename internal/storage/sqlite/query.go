@@ -295,6 +295,72 @@ func pageLimit(limit int) int {
 	return limit
 }
 
+// Containers pages the visible CONTAINER nodes of the pinned generation by
+// keyset on node_id, restricted to kinds. It is the repository map's
+// enumeration: Nodes above demands exactly one of name, qualified name or
+// qualified-name prefix, and a map has no such seed -- it asks for the
+// containers themselves.
+//
+// One row per node, chosen by nodePrecedence inside the grouped subquery
+// exactly as NodesByID does, so the outer LIMIT counts NODES and not facts.
+// That is load-bearing rather than tidiness: node_facts holds one row per
+// (node, unit), and a container published by two units would otherwise make a
+// full page come back short, which the caller reads as the end of the map --
+// a repository silently missing its remaining packages.
+//
+// Visibility is the generation's: memberOf restricts every fact to a unit this
+// generation selected, so a failed or unsealed unit's containers are invisible.
+func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
+	after model.NodeID, limit int) ([]StoredNode, error) {
+	if len(kinds) == 0 {
+		return nil, invalid("container listing needs at least one node kind")
+	}
+	if len(kinds) > model.MaxFilterValues {
+		return nil, invalid("container listing has %d kinds, limit %d", len(kinds), model.MaxFilterValues)
+	}
+	afterRaw, err := optionalBlob("after", string(after))
+	if err != nil {
+		return nil, err
+	}
+	b := newBinder(r.gen)
+	marks := make([]string, len(kinds))
+	for i, k := range kinds {
+		if !k.Valid() {
+			return nil, invalid("container listing kind %q is not a known node kind", k)
+		}
+		marks[i] = b.mark(string(k))
+	}
+	where := "ni.kind IN (" + strings.Join(marks, ",") + ")"
+	if afterRaw != nil {
+		where += " AND nf.node_id > " + b.mark(afterRaw)
+	}
+	limitMark := b.mark(pageLimit(limit))
+	query := `SELECT ` + nodeBatchOuterColumns + ` FROM (
+		SELECT ` + nodeBatchColumns + `, ` + nodePrecedence + ` FROM node_facts nf
+		JOIN units u ON u.id = nf.unit_id
+		JOIN node_ids ni ON ni.id = nf.node_id
+		LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
+		WHERE ` + where + memberOf("nf") + ` GROUP BY nf.node_id
+	) ORDER BY node_id LIMIT ` + limitMark
+	var out []StoredNode
+	err = r.s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, query, b.args...)
+		if err != nil {
+			return wrap("node_facts", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			n, err := scanNode(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, n)
+		}
+		return wrap("node_facts", rows.Err())
+	})
+	return out, err
+}
+
 // Relations pages visible edges touching node in direction, keyset on
 // relation_id. Reverse traversal uses the indexed target column.
 func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, direction model.Direction, kinds []model.RelationKind,

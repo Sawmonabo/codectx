@@ -20,11 +20,14 @@ import (
 // and this package never asks for a block delete of its own.
 
 // defaultGraceWindow is how long a trashed blob waits before its final
-// reachability check. There is no configuration key for it: Section 20.1 has
-// none, and it is not an operator knob but the protocol's safety margin
-// against a reader that pinned a generation just as the manifest naming its
-// blob went away. RetentionConfig.GraceWindow overrides it, which is how a
-// test drives the boundary without sleeping.
+// reachability check: the protocol's safety margin against a reader that
+// pinned a generation just as the manifest naming its blob went away.
+//
+// It is the fallback, not the setting. `retention.blob_grace` is the operator
+// key (default 24h, validated positive) and the composition root passes it as
+// RetentionConfig.GraceWindow; this constant answers a zero window, which is
+// what a collector built without configuration -- a test driving the boundary
+// without sleeping -- hands in.
 const defaultGraceWindow = 24 * time.Hour
 
 // BlobStore is the grace protocol's store surface, declared here beside the

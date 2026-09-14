@@ -29,7 +29,7 @@ import (
 type fakeServices struct {
 	indexFn       func(context.Context, model.IndexRequest) (model.IndexResult, error)
 	refreshFn     func(context.Context, model.IndexRequest) (model.IndexResult, error)
-	indexStatusFn func(context.Context) (model.IndexStatus, error)
+	indexStatusFn func(context.Context, model.StatusRequest) (model.IndexStatus, error)
 
 	overviewFn   func(context.Context, model.OverviewRequest) (model.Page[model.OverviewItem], error)
 	searchFn     func(context.Context, model.SearchRequest) (model.Page[model.SearchHit], error)
@@ -54,15 +54,12 @@ type fakeServices struct {
 	capsuleFn       func(context.Context, model.CapsuleRequest) (model.CapsulePage, error)
 	exportFn        func(context.Context, model.SessionRequest) (model.Capsule, error)
 	closeSessionFn  func(context.Context, model.SessionRequest, int) (model.SessionStatus, error)
-
-	doctorFn func(context.Context, model.DoctorRequest) (model.DoctorReport, error)
 }
 
 var (
-	_ app.IndexService    = (*fakeServices)(nil)
-	_ app.ExploreService  = (*fakeServices)(nil)
-	_ app.ContextService  = (*fakeServices)(nil)
-	_ app.DiagnoseService = (*fakeServices)(nil)
+	_ app.IndexService   = (*fakeServices)(nil)
+	_ app.ExploreService = (*fakeServices)(nil)
+	_ app.ContextService = (*fakeServices)(nil)
 )
 
 // unset is what a nil function field answers with.
@@ -84,11 +81,11 @@ func (f *fakeServices) Refresh(ctx context.Context, r model.IndexRequest) (model
 	return f.refreshFn(ctx, r)
 }
 
-func (f *fakeServices) IndexStatus(ctx context.Context) (model.IndexStatus, error) {
+func (f *fakeServices) IndexStatus(ctx context.Context, r model.StatusRequest) (model.IndexStatus, error) {
 	if f.indexStatusFn == nil {
 		return model.IndexStatus{}, unset("IndexStatus")
 	}
-	return f.indexStatusFn(ctx)
+	return f.indexStatusFn(ctx, r)
 }
 
 func (f *fakeServices) Overview(ctx context.Context, r model.OverviewRequest) (model.Page[model.OverviewItem], error) {
@@ -231,13 +228,6 @@ func (f *fakeServices) CloseSession(ctx context.Context, r model.SessionRequest,
 	return f.closeSessionFn(ctx, r, v)
 }
 
-func (f *fakeServices) Doctor(ctx context.Context, r model.DoctorRequest) (model.DoctorReport, error) {
-	if f.doctorFn == nil {
-		return model.DoctorReport{}, unset("Doctor")
-	}
-	return f.doctorFn(ctx, r)
-}
-
 // ---------------------------------------------------------------------------
 // The in-memory client harness.
 // ---------------------------------------------------------------------------
@@ -252,13 +242,12 @@ const testSchemaVersion = "test-schema-1"
 // file independent of L1's landing.
 func newTestHandlers(f *fakeServices) *handlers {
 	return &handlers{
-		index:    f,
-		explore:  f,
-		context:  f,
-		diagnose: f,
-		cfg:      config.Defaults(),
-		build:    model.BuildInfo{Version: "0.0.0-test", SchemaVersion: testSchemaVersion},
-		log:      slog.New(slog.DiscardHandler),
+		index:   f,
+		explore: f,
+		context: f,
+		cfg:     config.Defaults(),
+		build:   model.BuildInfo{Version: "0.0.0-test", SchemaVersion: testSchemaVersion},
+		log:     slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -271,13 +260,12 @@ func newTestServer(f *fakeServices) *mcp.Server {
 	// nobody ships and no bound could ever be exercised over the transport.
 	h := newTestHandlers(f)
 	s, err := New(Options{
-		Index:    h.index,
-		Explore:  h.explore,
-		Context:  h.context,
-		Diagnose: h.diagnose,
-		Config:   h.cfg,
-		Build:    h.build,
-		Logger:   h.log,
+		Index:   h.index,
+		Explore: h.explore,
+		Context: h.context,
+		Config:  h.cfg,
+		Build:   h.build,
+		Logger:  h.log,
 	})
 	if err != nil {
 		panic(err)
@@ -347,10 +335,10 @@ func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSess
 // wire contract of a tool in a diff that never mentions this package. That is
 // exactly the silent change a snapshot exists to catch.
 //
-// codectx_index_status and codectx_refresh_index take no arguments, so they
+// codectx_refresh_index takes no arguments, so it
 // require none.
 var toolSchemas = map[string][]string{
-	"codectx_index_status":        nil,
+	"codectx_index_status":        {"resources"},
 	"codectx_refresh_index":       nil,
 	"codectx_repo_overview":       {"depth", "page"},
 	"codectx_search":              {"query", "page"},
@@ -528,12 +516,19 @@ var scenarios = []scenario{
 		// this row failing means all 23 are suspect.
 		name: "index_status round-trips the shared envelope",
 		facade: func(f *fakeServices) {
-			f.indexStatusFn = func(context.Context) (model.IndexStatus, error) {
+			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
+				// The request reaches the facade as sent: ruling Q1 makes the
+				// resource block a field of this one answer, and a handler that
+				// dropped the flag would report "not measured" for a block the
+				// caller explicitly asked for.
+				if !r.Resources {
+					return model.IndexStatus{}, unset("IndexStatus: resources was not forwarded")
+				}
 				return model.IndexStatus{FileCount: 7, SourceBytes: 1024, WatchActive: true}, nil
 			}
 		},
 		tool: "codectx_index_status",
-		args: emptyInput{},
+		args: model.StatusRequest{Resources: true},
 		check: func(t *testing.T, res *mcp.CallToolResult) {
 			if res.IsError {
 				t.Fatalf("index_status reported a tool error: %s", firstText(res))
@@ -565,10 +560,10 @@ var scenarios = []scenario{
 		// row pins the SDK's ACTUAL behaviour, observed rather than presumed.
 		name: "a canceled tools/call reports the cancellation, not a result",
 		tool: "codectx_index_status",
-		args: emptyInput{},
+		args: model.StatusRequest{},
 		callCtx: func(_ *testing.T, f *fakeServices) context.Context {
 			ctx, cancel := context.WithCancel(context.Background())
-			f.indexStatusFn = func(handlerCtx context.Context) (model.IndexStatus, error) {
+			f.indexStatusFn = func(handlerCtx context.Context, _ model.StatusRequest) (model.IndexStatus, error) {
 				// The call is abandoned while this handler is the one running,
 				// and the handler waits for the cancellation to reach it, so
 				// neither side of the transport races the other.
@@ -681,10 +676,15 @@ var scenarios = []scenario{
 		name: "repo_overview surfaces a refusing Overview as a tool error",
 		facade: func(f *fakeServices) {
 			f.overviewFn = func(context.Context, model.OverviewRequest) (model.Page[model.OverviewItem], error) {
+				// The producer now exists, so the refusal this row drives is a
+				// real one a live workspace can answer with: no generation has
+				// been published yet. The invariant is unchanged and is not
+				// about which refusal it is -- an empty page must never stand
+				// in for one.
 				return model.Page[model.OverviewItem]{}, &model.Error{
 					Code:        model.CodeNoActiveGeneration,
-					Message:     "repo_overview has no producer in this build",
-					Remediation: "this operation waits on the repository map aggregate",
+					Message:     "this repository has no active generation",
+					Remediation: "run codectx index first",
 				}
 			}
 		},
@@ -698,7 +698,7 @@ var scenarios = []scenario{
 			if !strings.Contains(text, model.CodeNoActiveGeneration) {
 				t.Errorf("tool error text = %q, want the typed code %s", text, model.CodeNoActiveGeneration)
 			}
-			if !strings.Contains(text, "waits on the repository map aggregate") {
+			if !strings.Contains(text, "run codectx index first") {
 				t.Errorf("tool error text = %q, want the facade's remediation", text)
 			}
 		},
