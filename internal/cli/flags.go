@@ -20,8 +20,8 @@ const (
 // addQueryFlags declares the flags every query command shares. --repo reuses
 // the one spelling the rest of the tree already has. cursored says whether this
 // command also declares --cursor: the generation help may only mention a flag
-// the command actually has, so `path` and `impact`, which issue no
-// continuation, are not told about a combination they cannot make.
+// the command actually has, so `path`, which issues no continuation, is not
+// told about a combination it cannot make.
 func addQueryFlags(cmd *cobra.Command, cursored bool) {
 	addRepoFlag(cmd)
 	generation := "answer from this generation instead of the active one (0 pins the active generation"
@@ -39,10 +39,10 @@ func addLimitFlag(cmd *cobra.Command) {
 }
 
 // addCursorFlag declares --cursor, for the commands that actually MINT a
-// continuation token. It is separate from addLimitFlag because `impact` pages
-// its ranked entry list without being resumable: its page boundary is a rank,
-// not a keyset position in the walk, so it prints no token and offering the
-// flag would advertise a workflow the command refuses.
+// continuation token. It is separate from addLimitFlag because a command can
+// bound its page without being resumable: `path` returns its routes under the
+// reason-path cap and prints no token, and offering the flag there would
+// advertise a workflow the command refuses.
 func addCursorFlag(cmd *cobra.Command) {
 	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, or was issued for a different query or command")
 }

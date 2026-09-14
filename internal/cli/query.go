@@ -305,9 +305,10 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd, false)
+	addQueryFlags(cmd, true)
 	addLimitFlag(cmd)
-	addTraversalFlags(cmd, true, false)
+	addCursorFlag(cmd)
+	addTraversalFlags(cmd, true, true)
 	return cmd
 }
 
@@ -601,11 +602,11 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 }
 
 // addTraversalFlags declares the walk budgets. The two switches are separate
-// because the three commands differ on both axes: `path` carries no edge budget
-// at all, and `impact` carries one but spends it in a single walk. A flag with
-// no field behind it would describe a request the command cannot build, and
-// "cumulative across pages" on a command that issues no continuation would
-// describe a workflow it cannot perform.
+// because the commands differ on both axes: `path` carries no edge budget at
+// all and issues no continuation, while `impact` carries one and pages its
+// ranked list. A flag with no field behind it would describe a request the
+// command cannot build, and "cumulative across pages" on a command that issues
+// no continuation would describe a workflow it cannot perform.
 func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
 	cumulative := ""
