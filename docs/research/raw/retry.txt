@@ -1,0 +1,17 @@
+### m32rimm uncapped, --max-num-def 4000 (engine default) LOC=1054551
+tree_peak_sum_kb=18311056 tree_peak_single_kb=18309056 procs_at_peak=2 exit=0
+parse time_wall=86.24 s user=770.84 s largest_rss_kb=18528516 exit=0
+skipped_methods=2 cpg_kb=275092
+### m32rimm uncapped, --max-num-def 40000
+tree_peak_sum_kb=18889204 tree_peak_single_kb=18887204 procs_at_peak=2 exit=0
+parse time_wall=106.17 s user=867.37 s largest_rss_kb=19027568 exit=0
+skipped_methods=0  cpg_kb=275564
+tree_peak_sum_kb=7441972 tree_peak_single_kb=7439972 procs_at_peak=2 exit=0
+export m32-base time_wall=95.30 s largest_rss_kb=7548032 exit=0
+m32-base REACHING_DEF=13811726 CDG=1307034 CALL=44695131 METHOD=231552 csv_kb=4950216
+tree_peak_sum_kb=7222996 tree_peak_single_kb=7220996 procs_at_peak=2 exit=0
+export m32-40k time_wall=96.45 s largest_rss_kb=7219628 exit=0
+m32-40k REACHING_DEF=13953749 CDG=1307034 CALL=44695131 METHOD=231552 csv_kb=4956396
+fisio/fisio/common/test_utils/constants.py:<module> has more than 4000 definitions
+utils/customer/AEP/tenable/test_residual_risk_asset_csv_dump.py:<module> has more than 4000 definitions
+DONE

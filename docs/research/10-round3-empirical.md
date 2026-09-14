@@ -90,8 +90,9 @@ for postgres, 4.95 GB for m32rimm; export needs its own reservation and the CSV 
 ## 4a. The two units that cannot be shrunk (C/C++ and giant Python)
 Postgres and m32rimm are single frontend-native units (C is header-coupled; m32rimm is one
 Python package tree). See the pgcap results appended below for the postgres 4 GB / 2 GB attempts.
-The provider's answer for a unit whose reservation exceeds `unit_memory_ceiling_bytes` is
-`failed: memory` with the observed requirement, never a silent partial graph.
+Under the adopted direction (`00-synthesis.md` §8) these units run whole at the machine-derived
+allocation; on a machine that cannot hold them the answer is `failed: memory` with the observed
+requirement, never a silent partial graph and never a memory-motivated split.
 
 ## 5. Kubernetes (Go, go.work multi-module, staging modules)
 Whole-repo parse at default and 8 GB both covered only 36 files (the frontend reads go.work's
@@ -115,7 +116,7 @@ profile must not set that flag when a `go.work` is present.
 ## 6. Engine failure modes the provider must classify (all observed)
 | Mode | Example | Signal | Provider state |
 |---|---|---|---|
-| Heap exhaustion | m32rimm at 4 GB, redglass at 1 GB | non-zero exit, `OutOfMemoryError` on stderr, no cpg | `failed: memory` (retry once at ceiling) |
+| Heap exhaustion | m32rimm at 4 GB, redglass at 1 GB | non-zero exit, `OutOfMemoryError` on stderr, no cpg | `failed: memory` (retry once at the machine-derived allocation when it exceeds the failed cap) |
 | Deterministic pass crash | kubectl module, r3 client whole | non-zero exit, `Pass … failed` + exception on stderr, no cpg | `failed: engine` with pass name; no retry; siblings unaffected |
 | Helper crash with **zero exit** | tokio (Rust): bundled rust-analyzer panics `should have ExpressionStore::expr_only`, then joern-parse prints "Successfully wrote graph" | exit 0, cpg 16–20 KB, 1 FILE node, stderr contains `Process exited with code 101` | must be detected: FILE count 0 for a non-empty unit, or the `Process exited with code` line → `failed: engine`. Exit code alone is a lie here. |
 | Definition cap exceeded | git 4, postgres 9, both 4, m32 2 methods | `Skipping.` WARN lines | `partial` with `skipped_methods` (retry policy §8) |
@@ -150,7 +151,7 @@ so RSS overhead is frontend-specific, not a fixed ratio: Go/TS/Java ran 0.3–0.
 C 2.6 GB, Python 1.9 GB (redglass 2 GB cap → 3.9 GB RSS). The governor keys the overhead
 allowance per frontend from these measurements (table in §9), and re-learns it from observed peaks.
 A 1.8M-line C repo therefore needs ~6.6 GB for parse and ~2.8 GB for export as a single unit;
-below that it is `failed: memory` with the observed requirement. Whole-repo C is the one unit the
+on a machine with less free memory than that it is `failed: memory` with the observed requirement after the machine-derived retry. Whole-repo C is the one unit the
 planner cannot split today; per-directory C units are possible in principle (each translation
 unit is parsed independently against its include paths, only cross-directory call linking would
 move to the alias join) and are left as the documented follow-up if a real user hits this.
@@ -171,7 +172,7 @@ unresolved when the importing file is parsed without its target, and 16% of call
 entirely (the TypeScript frontend needs the whole `tsconfig` program to type receivers).
 **Ruling: a TypeScript/JavaScript unit is the `tsconfig`/`package.json` project, never a
 subdirectory.** Splitting is only the crash fallback (r3 client), and a fallback unit is
-published `partial` with reason `subdivided` so consumers know call precision dropped.
+published per capability as `partial: subdivided` (control/data dependence near-complete, engine `calls` degraded; consumers use the syntax-plus-SCIP `calls` path) so nobody mistakes it for a full-unit result. Subdivision is never used for memory.
 
 **Python, redglass/packages (7 packages).**
 | | methods (internal) | calls resolved to internal methods | CDG | REACHING_DEF |
@@ -185,7 +186,7 @@ by full name (Section 11.6). The whole-tree run also emitted 2.41M external call
 1.35M for the units: the whole-program type recovery fans calls out to many candidate targets,
 so "more edges" there is lower precision, not more knowledge. **Ruling: Python units are packages
 (directory with `__init__.py`/`pyproject.toml`), exactly as the plan says; m32rimm (1.05M LOC,
-one flat package tree) is the case where the planner must fall back to top-level subpackages.**
+one flat package tree) is run whole at the machine-derived allocation; it completed uncapped at 18.4 GB. Splitting for memory is not done.**
 
 ## 9. Definition-cap retry (`--max-num-def`)
 m32rimm at the default cap skipped 2 methods (`partial`). Both are module bodies of generated
@@ -196,9 +197,26 @@ utils/customer/AEP/tenable/test_residual_risk_asset_csv_dump.py:<module> has mor
 ```
 Retrying with `--max-num-def 40000` under a 6 GB cap ran 100 s and died of OOM at 8.1 GB RSS
 (tree). Data-flow over a 4,000-assignment constant table is quadratic and worthless.
-**Ruling: no automatic retry with a higher limit.** `partial` carries the skipped method names
-(parsed from the WARN lines) so a consumer can see exactly which bodies lack data dependence;
-`--max-num-def` stays at the engine default and is part of the cache key.
+That run was under an artificial 6 GB cap on a unit that needs ~18 GB uncapped, so it is not
+conclusive on its own. The uncapped rerun is recorded in §9a below and decides the policy.
+`partial` carries the skipped method names (parsed from the WARN lines) so a consumer can see
+exactly which bodies lack data dependence; `--max-num-def` stays at the engine default and is
+part of the cache key.
+
+## 9a. Definition cap, uncapped rerun (decides the policy)
+Same 1.05M-line Python tree, no heap cap, machine has 47 GB (`raw/retry.txt`):
+
+| `--max-num-def` | parse wall | CPU | parse tree RSS | skipped methods | REACHING_DEF | CDG | CALL | export |
+|---|---|---|---|---|---|---|---|---|
+| 4000 (engine default) | 86.2 s | 771 s | 18.3 GB | 2 | 13,811,726 | 1,307,034 | 44,695,131 | 95.3 s, 7.4 GB |
+| 40000 | 106.2 s | 867 s | 18.9 GB | 0 | 13,953,749 (+1.0%) | identical | identical | 96.5 s, 7.2 GB |
+
+With real memory available the higher cap costs 23% more parse time and 3% more memory, removes
+every skip, and changes nothing outside the two previously skipped bodies (CDG and CALL counts
+are identical). The earlier "prohibitive" result was purely the artificial 6 GB cap.
+**Ruling: the pinned parse argv uses `--max-num-def 40000` from the start** (no second parse, so no
+doubled cost), the value is part of the cache key, and a body that still exceeds it is published
+`partial` with the skipped method names. No further retry.
 
 ## 10. Per-frontend memory model for the governor (measured)
 | frontend | RSS above heap cap | notes |
@@ -212,8 +230,9 @@ Retrying with `--max-num-def 40000` under a 6 GB cap ran 100 s and died of OOM a
 | export (joern-export) | 0.3–0.8 GB | scales with graph; CSV = 5–10× cpg |
 
 Reservation = heap cap + frontend allowance + helper allowance; the heap cap is chosen from unit
-bytes with headroom (sizing against the smallest passing cap costs time, see spring). Units whose
-reservation exceeds `unit_memory_ceiling_bytes` are `failed: memory` up front, without running.
+bytes with headroom (sizing against the smallest passing cap costs time, see spring). Reservations
+schedule and serialize units; only an explicit user `unit_memory_ceiling_bytes` rejects a unit before
+it runs (ruling in `00-synthesis.md` §8).
 
 ## 11. Cleanup
 After this report was written: clones (kubernetes, git, postgres, spring-framework, tokio,

@@ -26,7 +26,7 @@ All by experiment; details and raw logs in `10-round3-empirical.md`.
 |---|---|
 | Total RAM of the process tree | Sampled every 0.5 s and summed over descendants. Tree exceeds the largest process by 30–130 MB (Go), ~250 MB (Rust helper). Go 239k LOC full pipeline: 1.0 GB tree. |
 | Export memory | Own reservation; capped and lossless (postgres export default 6.5 GB → 2 GB cap 2.8 GB, identical; 1 GB cap fails closed). |
-| Python cap | 506k LOC needs 2 GB heap (3.9 GB RSS); 1.05M LOC single package fails at 4 GB → planner falls back to subpackages, which keep 100% of methods/CDG/dataflow and 79% of internal call resolution. |
+| Python cap | 506k LOC needs 2 GB heap (3.9 GB RSS); 1.05M LOC single package fails at 4 GB but completes uncapped (18.4 GB) → run it whole with the machine-derived allocation; per-package units (100% methods/CDG/dataflow, 79% internal calls) are the natural unit shape, never a memory fallback. |
 | C/C++ scale | git 443k LOC: 2 GB cap 3.3 GB RSS, identical. postgres 1.8M LOC: 4 GB heap (6.6 GB RSS) ok, 2 GB fails closed. Per-frontend RSS allowance: C 2.6 GB, Python 1.9 GB, Go/TS/Java ≤0.5 GB. |
 | Java/Rust/TS caps | spring 1.5M LOC Java: 6 GB cap ok (3.6× slower, near live set). TS 81k LOC: 1 GB cap 1.3 GB RSS. Rust ripgrep 56k LOC: 2 GB cap 1.8 GB RSS, workspace root is one unit. |
 | Per-language callsite join | 100% at exact range on six-language fixtures with the production `.scm` patterns. |
@@ -35,7 +35,7 @@ All by experiment; details and raw logs in `10-round3-empirical.md`.
 | Subdivision parity | TS: CDG/dataflow 99.7–99.9%, resolved calls 46% → never split a tsconfig project. Python per package: 100% methods/CDG/dataflow, 79% resolved calls, cross-package calls alias by full name. |
 | Synthesis contradictions | Fixed: `auto` = background after base activation everywhere. |
 | Generation visibility | §6 below: sealed unit → new generation reusing active units → atomic activation. |
-| Definition-cap retry | Rejected: 10× cap on m32rimm OOMs at 8 GB; skipped bodies are generated constant tables. `partial` lists the skipped method names. |
+| Definition-cap retry | Uncapped rerun: `--max-num-def 40000` costs +23% time, +3% memory, zero skips, +1% dataflow edges, all else identical → pinned argv uses 40000 from the start; residual skips are `partial` with method names, no retry. |
 | New findings | Go frontend ignores go.work (planner walks go.mod); kubectl module crashes deterministically (`failed: engine`); tokio empty graph with exit 0 (helper panic; must be detected). |
 
 ## 1. Why peers feel instant and Joern does not
@@ -131,3 +131,15 @@ real answer exactly at activation.
 See `10-round3-empirical.md` for the tree-summed memory tables (parse and export), per-language
 caps on C, Rust, TypeScript, Java and large Python, the Kubernetes go.work finding, the six-language
 call-site join, the reads/writes lowering algebra, subdivision parity and the definition-cap retry.
+
+## 8. Direction ruling (2026-09-13, user-adopted reviewer directive)
+Joern-backed `dependence` is the MVP backend. No default memory ceiling: estimates schedule and
+serialize work (`max_concurrent_heavy_analyzers = 1` by default, co-schedule only when summed
+reservations fit); only an explicit user limit rejects work up front; one OOM retry at the
+machine-derived allocation, only when it exceeds the failed cap. Subdivision is the last-resort
+recovery from a reproducible engine crash (confirmed by one rerun with the frontend's fixed,
+currently empty, semantics-neutral option allowlist), never for memory, published per capability as
+`partial: subdivided` with failed unit, backend failure and affected capabilities. No lowered
+analysis limits or omitted fact families. Every advertised language (nine languages, six
+frontends; C++ and TSX still to be exercised) runs end to end in Task 22 with real tools. Benchmark
+corpora are pinned by commit in Task 21 as the differential oracle for any future native engine.
