@@ -102,7 +102,7 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 	}
 	report := RetentionReport{RefsRetained: len(kept)}
 
-	unitsBefore, err := s.countUnits(ctx)
+	unitsBefore, err := s.countUnits(ctx, repoRaw)
 	if err != nil {
 		return RetentionReport{}, err
 	}
@@ -142,7 +142,7 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 	if err := s.sweep(ctx, now, nil); err != nil {
 		return RetentionReport{}, err
 	}
-	unitsAfter, err := s.countUnits(ctx)
+	unitsAfter, err := s.countUnits(ctx, repoRaw)
 	if err != nil {
 		return RetentionReport{}, err
 	}
@@ -263,10 +263,17 @@ func (s *Store) sweepCandidates(ctx context.Context, repoRaw []byte, kept map[in
 	return out, nil
 }
 
-func (s *Store) countUnits(ctx context.Context) (int64, error) {
+// countUnits counts the units some generation of repo selects, which is what
+// RetentionReport.UnitsDeleted is about. The store admits several repositories
+// (repositories is a table and generations.repository_id references it) while
+// the collection tail retention brackets is store-wide, so an unscoped count
+// would attribute another repository's collected units to this one.
+func (s *Store) countUnits(ctx context.Context, repoRaw []byte) (int64, error) {
 	var n int64
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		return wrap("units", tx.QueryRowContext(ctx, `SELECT count(*) FROM units`).Scan(&n))
+		return wrap("units", tx.QueryRowContext(ctx, `SELECT count(*) FROM units u WHERE EXISTS (
+			SELECT 1 FROM generation_units gu JOIN generations g ON g.id = gu.generation_id
+			WHERE gu.unit_id = u.id AND g.repository_id = ?)`, repoRaw).Scan(&n))
 	})
 	return n, err
 }

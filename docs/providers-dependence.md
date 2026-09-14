@@ -407,17 +407,47 @@ its previous row dropped by the carry-over — so the sound rule is to
 over-emit. It costs import work and never correctness. Node facts are outside
 this: they are published whole on every run.
 
-What is **not** wired today. The provider passes no previous key set, so every
-import is a full one. The key set is derived on every import and written
-beside the staging database, and the provider names no path to keep it: a key
-set belongs to the *stored* unit, and deciding where a stored unit's delta
-state lives, reading the previous unit's set back and calling storage's
-carry-over are the coordinator's step (Task 12), not the provider's. Storage
-now holds up its end — it records the keys of every fact and carries the
-unchanged rows of a previous unit minus everything named replaced — so what
-remains is the wiring, not a missing mechanism. The key algebra is versioned,
-so a stored set built by an older algebra can never be mis-diffed against a
-fresh one.
+**What ships.** The delta is wired end to end by the coordinator's
+`internal/index/delta` applier, not by the provider: the provider exposes
+`ImportOptions{PreviousKeys, KeysPath}` and reports `Report.Keys`, and the
+applier decides where a stored unit's delta state lives, reads the previous
+unit's set back and calls storage's carry-over.
+
+- **Stored state.** One kind, `"dependence.fact_keys"`: the sorted key set the
+  sealed unit published, written with the unit through
+  `UnitWriter.PutDeltaState` and read back with `Store.DeltaState`. The unit's
+  *declared inputs* are not stored a second time — the applier merge-joins
+  `Store.UnitInputs(previous)` against this unit's own input stream.
+- **The replaced set.** `Replaced.Keys` is the changed keys plus the removed
+  ones, streamed straight out of `KeySet.Diff`. `Replaced.Files` is the merge
+  join above: every file the predecessor declared that this unit does not
+  declare with the same bytes. `Replaced.Scopes` is deliberately empty — nodes
+  and their aliases are emitted whole on every dependence import, so naming the
+  unit's scope would delete the aliases of every identity that survived.
+  `Replaced.IndexLevel` is set exactly when the emit was unfiltered and
+  therefore republished the facts that name no file.
+- **When `PreviousKeys` is supplied, and when it is withheld.** Only when that
+  replaced-file set is empty. Naming an edited path in `Replaced.Files` drops
+  the predecessor's evidence in that path, and a filtered emit never rewrites
+  the relations in it whose keys did not move, so the unit would be missing
+  rows a full build holds; not naming it trips storage's carried-input check.
+  An edit therefore has no sound filtered form, and the applier withholds the
+  previous keys, which makes the import emit every relation — always correct,
+  and it costs import work only.
+
+The consequence is worth stating plainly: **only an addition-only refresh
+inherits rows.** A refresh that changes or removes any declared file does a
+full build's import work and carries nothing, even though its predecessor was
+present and usable. `Result.Filtered` is how a caller tells the two apart —
+`Result.Carried` being all zero is indistinguishable from a predecessor that
+had nothing to give. Measured through the applier against the real engine: an
+edited file inherited nothing and published 14 relations, exactly as the full
+build did, while an added file inherited 14 relations and 29 evidence rows and
+published no relation of its own where the full build published 14 — both
+row-identical to the full build of the same unit identity.
+
+The key algebra is versioned, so a stored set built by an older algebra can
+never be mis-diffed against a fresh one.
 
 ## Privacy and cleanup
 

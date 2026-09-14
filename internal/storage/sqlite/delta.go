@@ -52,13 +52,21 @@ const MaxDeltaStateBytes = 64 << 20
 // Naming the complement rather than the survivors is deliberate: for both
 // wave-A importers the replaced set is a handful of entries against tens of
 // thousands of survivors.
+//
+// All three sets are streams, consumed once, and none is ever materialized
+// here: the replaced set is small for the refreshes that motivate a delta, but
+// a branch switch or a formatting pass names every document of the repository,
+// and Section 6 forbids holding that list in the Go heap. A producer that
+// cannot stream its set has a whole-repository list of its own, which is the
+// same defect one level up.
 type Replaced struct {
 	// Files are the per-path evidence buckets the import replaced or dropped.
-	Files []model.FileID
-	// Scopes are the alias scope keys the import replaced or dropped.
-	Scopes []string
-	// Keys are the producer fact keys the import replaced or dropped. It is
-	// consumed once.
+	// Each must be a valid FileID.
+	Files iter.Seq[model.FileID]
+	// Scopes are the alias scope keys the import replaced or dropped. Each
+	// must be non-empty and within model.MaxScopeKeyBytes.
+	Scopes iter.Seq[string]
+	// Keys are the producer fact keys the import replaced or dropped.
 	// Each key must be a lowercase hex digest (model.ValidHexID); anything
 	// else is refused.
 	Keys iter.Seq[string]
@@ -102,26 +110,13 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 	if err != nil {
 		return CarryOverStats{}, err
 	}
-	files := make([][]byte, 0, len(replaced.Files))
-	for _, f := range replaced.Files {
-		raw, err := idBlob("replaced file_id", string(f))
-		if err != nil {
-			return CarryOverStats{}, err
-		}
-		files = append(files, raw)
-	}
-	for _, scope := range replaced.Scopes {
-		if scope == "" || len(scope) > model.MaxScopeKeyBytes {
-			return CarryOverStats{}, invalid("a replaced scope key is empty or exceeds %d bytes", model.MaxScopeKeyBytes)
-		}
-	}
 	var stats CarryOverStats
 	err = w.s.write(ctx, func(tx *sql.Tx) error {
 		prevRow, err := w.previousUnitRow(ctx, tx, prev, prevKey)
 		if err != nil {
 			return err
 		}
-		keyed, err := w.stageReplaced(ctx, tx, files, replaced.Scopes, replaced.Keys)
+		keyed, err := w.stageReplaced(ctx, tx, replaced)
 		if err != nil {
 			return err
 		}
@@ -185,43 +180,81 @@ var carryTemp = []string{
 	`DELETE FROM cx_carry_keys`,
 }
 
-// stageReplaced materialises the replaced sets and reports how many keys were
-// staged.
-func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, files [][]byte, scopes []string, keys iter.Seq[string]) (int64, error) {
+// stageReplaced drains the three replaced streams into the staging tables and
+// reports how many keys were staged. Each element is validated as it is
+// staged, so nothing is held: the sets are the caller's streams, and the only
+// materialisation is the temp tables, which live in SQLite's own bounded
+// storage and are dropped with the connection.
+func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, replaced Replaced) (int64, error) {
 	for _, q := range carryTemp {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return 0, wrap("carry-over staging", err)
 		}
 	}
-	for _, raw := range files {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cx_carry_files(file_id) VALUES(?)`, raw); err != nil {
-			return 0, wrap("carry-over staging", err)
+	// check returns the bound value, not a bool: cx_carry_files is a BLOB
+	// column and the other two are TEXT, and binding the wrong Go type would
+	// store a value none of the survival predicates can match.
+	stage := func(table string, seq iter.Seq[string], check func(string) (any, error)) error {
+		if seq == nil {
+			return nil
 		}
-	}
-	for _, scope := range scopes {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO cx_carry_scopes(scope_key) VALUES(?)`, scope); err != nil {
-			return 0, wrap("carry-over staging", err)
+		stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO `+table+` VALUES(?)`)
+		if err != nil {
+			return wrap("carry-over staging", err)
 		}
+		defer stmt.Close()
+		var outer error
+		for v := range seq {
+			raw, err := check(v)
+			if err != nil {
+				outer = err
+				break
+			}
+			if _, err := stmt.ExecContext(ctx, raw); err != nil {
+				outer = wrap("carry-over staging", err)
+				break
+			}
+		}
+		return outer
 	}
-	if keys == nil {
-		return 0, nil
+	if err := stage("cx_carry_files(file_id)", stringsOf(replaced.Files), func(f string) (any, error) {
+		return idBlob("replaced file_id", f)
+	}); err != nil {
+		return 0, err
 	}
-	stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO cx_carry_keys(fact_key) VALUES(?)`)
-	if err != nil {
-		return 0, wrap("carry-over staging", err)
+	if err := stage("cx_carry_scopes(scope_key)", replaced.Scopes, func(scope string) (any, error) {
+		if scope == "" || len(scope) > model.MaxScopeKeyBytes {
+			return nil, invalid("a replaced scope key is empty or exceeds %d bytes", model.MaxScopeKeyBytes)
+		}
+		return scope, nil
+	}); err != nil {
+		return 0, err
 	}
-	defer stmt.Close()
 	var n int64
-	for key := range keys {
+	if err := stage("cx_carry_keys(fact_key)", replaced.Keys, func(key string) (any, error) {
 		if !model.ValidHexID(key) {
-			return 0, invalid("a replaced fact key is not a %d-character lowercase hex digest", model.IDHexLen)
-		}
-		if _, err := stmt.ExecContext(ctx, key); err != nil {
-			return 0, wrap("carry-over staging", err)
+			return nil, invalid("a replaced fact key is not a %d-character lowercase hex digest", model.IDHexLen)
 		}
 		n++
+		return key, nil
+	}); err != nil {
+		return 0, err
 	}
 	return n, nil
+}
+
+// stringsOf adapts a FileID stream to the one stageReplaced validates.
+func stringsOf(files iter.Seq[model.FileID]) iter.Seq[string] {
+	if files == nil {
+		return nil
+	}
+	return func(yield func(string) bool) {
+		for f := range files {
+			if !yield(string(f)) {
+				return
+			}
+		}
+	}
 }
 
 // checkCarriedInputs refuses a carry-over that would inherit a fact about a
@@ -582,6 +615,87 @@ func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string) 
 		return nil, err
 	}
 	return payload, nil
+}
+
+// unitInputsPage bounds one page of a UnitInputs scan. The iterator reads a
+// page per read transaction so no cursor is held open across the caller's
+// work, and the page size is the bound Section 6 requires on the traversal.
+const unitInputsPage = 1000
+
+// UnitInputs streams the sealed unit's declared inputs in ascending FileID
+// order — the same order BeginUnit required when they were written — so a
+// caller can merge-join them against a fresh input stream without holding
+// either list. It refuses a unit that is not sealed: a building unit's
+// unit_inputs rows are still arriving, and a delta that diffed against a
+// partial set would name too few replaced buckets and carry a stale fact.
+//
+// The first failure ends the sequence: it is yielded with a zero UnitInput and
+// nothing follows it.
+func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[model.UnitInput, error] {
+	return func(yield func(model.UnitInput, error) bool) {
+		fail := func(err error) { yield(model.UnitInput{}, err) }
+		key, err := idBlob("unit_id", string(unit))
+		if err != nil {
+			fail(err)
+			return
+		}
+		var row int64
+		if err := s.read(ctx, func(tx *sql.Tx) error {
+			var state model.UnitState
+			err := tx.QueryRowContext(ctx, `SELECT id, state FROM units WHERE unit_key = ?`, key).Scan(&row, &state)
+			if isNoRows(err) {
+				return notFound("unit %s does not exist", unit)
+			}
+			if err != nil {
+				return wrap("units", err)
+			}
+			if state != model.UnitSealed {
+				return conflict("unit %s is %s; only a sealed unit's inputs can be read", unit, state)
+			}
+			return nil
+		}); err != nil {
+			fail(err)
+			return
+		}
+		after := make([]byte, 0, 32)
+		page := make([]model.UnitInput, 0, unitInputsPage)
+		for {
+			var last []byte
+			if err := s.read(ctx, func(tx *sql.Tx) error {
+				page = page[:0]
+				last = nil
+				rows, err := tx.QueryContext(ctx, `SELECT file_id, content_hash, executable FROM unit_inputs
+					WHERE unit_id = ?1 AND file_id > ?2 ORDER BY file_id LIMIT ?3`, row, after, unitInputsPage)
+				if err != nil {
+					return wrap("unit_inputs", err)
+				}
+				defer rows.Close()
+				for rows.Next() {
+					var file, hash []byte
+					var executable int
+					if err := rows.Scan(&file, &hash, &executable); err != nil {
+						return wrap("unit_inputs", err)
+					}
+					last = file
+					page = append(page, model.UnitInput{FileID: model.FileID(idHex(file)),
+						ContentHash: idHex(hash), Executable: executable == 1})
+				}
+				return wrap("unit_inputs", rows.Err())
+			}); err != nil {
+				fail(err)
+				return
+			}
+			for _, in := range page {
+				if !yield(in, nil) {
+					return
+				}
+			}
+			if len(page) < unitInputsPage {
+				return
+			}
+			after = last
+		}
+	}
 }
 
 // SelectedUnit reports the unit a generation selects for one provider and

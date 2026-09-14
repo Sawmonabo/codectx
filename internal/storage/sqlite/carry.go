@@ -26,12 +26,6 @@ import (
 // the AnalysisKey (see Activate), so a generation carrying a stale unit is
 // never byte-identical to one that rebuilt it.
 
-// maxCarriedUnits bounds one CarriedUnits listing. Generation membership is
-// planned, not unbounded, but Section 6 requires an explicit finite bound on
-// every response; a generation past this is a planner defect, not a large
-// repository.
-const maxCarriedUnits = model.MaxRecordsPerResult
-
 // Carry is how far behind a carried unit is: the number of generations, and
 // the number of changed files, between the unit's snapshot and the one the
 // generation is being built over. Both surface as the provenance distance on
@@ -100,16 +94,38 @@ type CarriedUnit struct {
 	Carry                Carry
 }
 
-// CarriedUnits lists gen's stale members in provider and scope order. A
-// generation with none returns an empty slice, not an error: carrying nothing
-// is the ordinary case.
-func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID) ([]CarriedUnit, error) {
+// CarriedUnits pages gen's stale members in provider and scope order, keyset
+// on that pair (two empty strings start from the beginning); limit is capped
+// at model.MaxPageItems. A generation with none returns an empty slice, not an
+// error: carrying nothing is the ordinary case.
+//
+// It is a page and not a listing because a caller must not assume it returns
+// everything: a generation may carry more stale units than one response may
+// hold, and refusing that with CTX_RESOURCE_LIMIT would take the capability
+// report down with it. A short page — fewer rows than limit — is the end.
+//
+// The fan-out is real and not hypothetical. The planner (internal/index/plan,
+// which storage must not import) admits up to 513 dependence units per
+// language family that subdivides — 512 nested project units plus the root —
+// across five such families, plus one C/C++ unit: 2566 carriable units in one
+// generation, well past any single page. Page until a short page arrives.
+func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID,
+	afterProviderID, afterScopeKey string, limit int) ([]CarriedUnit, error) {
+	limit = pageLimit(limit)
+	if len(afterProviderID) > model.MaxIdentifierBytes {
+		return nil, invalid("after_provider_id is %d bytes, limit %d", len(afterProviderID), model.MaxIdentifierBytes)
+	}
+	if len(afterScopeKey) > model.MaxScopeKeyBytes {
+		return nil, invalid("after_scope_key is %d bytes, limit %d", len(afterScopeKey), model.MaxScopeKeyBytes)
+	}
 	var out []CarriedUnit
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		out = out[:0]
 		rows, err := tx.QueryContext(ctx, `SELECT lower(hex(u.unit_key)), gu.provider_id, gu.scope_key, gu.distance_generations, gu.distance_files
 			FROM generation_units gu JOIN units u ON u.id = gu.unit_id
-			WHERE gu.generation_id = ? AND gu.carried = 1 ORDER BY gu.provider_id, gu.scope_key LIMIT ?`, int64(gen), maxCarriedUnits+1)
+			WHERE gu.generation_id = ?1 AND gu.carried = 1
+				AND (gu.provider_id > ?2 OR (gu.provider_id = ?2 AND gu.scope_key > ?3))
+			ORDER BY gu.provider_id, gu.scope_key LIMIT ?4`, int64(gen), afterProviderID, afterScopeKey, limit)
 		if err != nil {
 			return wrap("generation_units", err)
 		}
@@ -123,14 +139,7 @@ func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID) ([]Car
 			cu.Unit = model.UnitID(unit)
 			out = append(out, cu)
 		}
-		if err := rows.Err(); err != nil {
-			return wrap("generation_units", err)
-		}
-		if len(out) > maxCarriedUnits {
-			return &model.Error{Code: model.CodeResourceLimit,
-				Message: fmt.Sprintf("generation %d carries more than the %d units one report may list", gen, maxCarriedUnits)}
-		}
-		return nil
+		return wrap("generation_units", rows.Err())
 	})
 	if err != nil {
 		return nil, err
