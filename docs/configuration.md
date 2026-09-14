@@ -230,24 +230,22 @@ directories and network posture are product code, not configuration.
 | `dependence.unit_memory_floor_bytes` | `805306368` | user | Smallest allocation a unit may be sized to. Sizing a unit near its live set costs time rather than memory, so the floor keeps a small unit from being starved into a much slower run. |
 | `dependence.unit_memory_ceiling_bytes` | `0` | user | Largest allocation a unit may be sized to. `0` derives it from the machine: free memory minus the base index footprint minus a safety margin. There is no default memory ceiling, and only a non-zero value here may reject a unit before it runs. |
 
-## `[analyzers.<name>]` — approved analyzer profiles
+## Analyzer profiles are not configurable
 
-**User trust only.** A project file that declares a profile is rejected with
-`CTX_TRUST_REQUIRED`. A profile is a description of a tool that has been
-approved; nothing in the configuration layer runs anything.
+There is no `[analyzers.<name>]` table. An analyzer profile — which binary
+starts, under which runtime, with which argument array, which environment
+variables it may see, its budgets, its timeout and its declared network posture
+— is product code, and the binary is the payload the embedded tool lock pinned
+and the store verified (Section 20.2 — trust is the lock, not an approval).
+There is no approved path to write, no `PATH` lookup and no way for a
+configuration file to change what an analyzer is given.
 
-| Key | Required | Meaning |
-|---|---|---|
-| `executable` | yes | Absolute path. A bare command name is rejected: what `PATH` resolves to is not what was approved. |
-| `version_constraint` | yes | The version the caller must observe before admitting output. |
-| `checksum` | no | Expected lowercase SHA-256 hex of the executable. This is how a writable-repository executable substitution is detected. |
-| `args` | no | Fixed argument array. Only the substitutions `${input_dir}`, `${output_file}`, `${work_dir}` and `${manifest}` may appear; any other `${...}` is rejected rather than passed through literally. |
-| `env_allowlist` | no | Names of environment variables the child may receive. Anything not named is absent from the child environment entirely. It is a fingerprint input: changing it invalidates the units the profile produced. |
-| `work_dir` | yes | Absolute private working directory. |
-| `memory_budget_bytes` | yes | Memory reservation for one run. |
-| `disk_budget_bytes` | yes | Temporary disk reservation for one run. |
-| `network` | yes | `"denied"` or `"allowed"`. See the limitation below. |
-| `timeout` | yes | Deadline for one run. |
+What a user may still say about tools is in `[tools]` and
+`[tools.override.<name>]` above: where the store lives, whether fetching is
+allowed, which mirror to use, and — for one named lock entry at a time — an
+exact replacement binary with its version and checksum. `docs/providers-scip.md`
+and `docs/providers-lsp.md` list the argument arrays and environment allowlists
+each profile actually uses.
 
 There is no shell, so an argument is always a literal argument. There are no
 cloud or AI credential fields in core.
@@ -324,8 +322,14 @@ setting does not invalidate work that did not depend on it:
 | Fingerprint | Covers | Invalidates |
 |---|---|---|
 | **Source policy** | `follow_symlinks`, `include_untracked`, `index_generated`, `index_vendor`, `max_files`, and a digest of this build's built-in vendor and generated classification lists | the snapshot identity |
-| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes`, every `providers.*` selection, and every approved profile's executable, version constraint, checksum, arguments, environment allowlist and network posture | unit identity and the analysis key |
+| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes` and every `providers.*` selection | unit identity and the analysis key |
 | **Context policy** | the whole `[context]` table | manifest identity |
+
+`[tools]` is deliberately **not** in the analysis fingerprint: a store location
+or a mirror is an operational setting, and the identity that matters is the
+payload's own. Each provider folds the fingerprint of the payloads it resolved
+into its own `Descriptor().Version` instead, so replacing an analyzer
+invalidates the units it produced without a store path doing the same.
 
 The exclusion lists are in the source fingerprint because the toggles alone do
 not decide eligibility: `index_vendor = false` means something different in a
@@ -374,14 +378,14 @@ mechanism, and periodic full reconciliation catches timestamp-preserving edits.
 
 ### Clearing the environment is not a network boundary
 
-Every child process runs with exactly the environment its approved profile
-allows and nothing else: the parent's environment is never inherited, so
+Every child process runs with exactly the environment its profile's allowlist
+names and nothing else: the parent's environment is never inherited, so
 credentials held by the codectx process cannot leak into an analyzer. That is a
 disclosure control, and it is all it is.
 
 It does **not** prevent the child from opening a network connection. Neither
-does `network = "denied"` in a profile, which is a declared posture that
-diagnostics report, not an enforced restriction. Proxy variables and
+does a profile's `denied` network posture, which is a value diagnostics report,
+not an enforced restriction. Proxy variables and
 environment flags are not a security boundary. Actually denying an analyzer
 network access requires an OS sandbox, container or namespace — a deployment
 control outside this tool. `codectx doctor --offline` reports both the core
@@ -391,7 +395,9 @@ only monitoring is available.
 Similarly, an argument array is not a sandbox. Compilers, indexers and language
 servers legitimately load plugins, build macros and project configuration, which
 means running one on a repository can execute code from that repository. That is
-why every external analyzer requires an explicitly approved profile.
+why every external analyzer is a payload this build pinned by digest, with an
+argument array and an environment this build fixed, rather than anything a
+repository or a configuration file can influence.
 
 ### Resource budgets are admission, not enforcement
 

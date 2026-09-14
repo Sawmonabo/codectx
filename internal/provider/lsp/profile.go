@@ -1,12 +1,9 @@
 package lsp
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"context"
 	"encoding/json"
 	"errors"
-	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,61 +13,107 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// Definition is what this build knows about one supported language server:
-// its name, the manifest language tags it serves, the argument array that
-// puts it in stdio mode and the workspace markers that suggest a repository
-// is its kind. A Definition authorizes nothing. It becomes runnable only when
-// the user configuration approves an executable under the same name
-// (Section 20.2: enabled="auto" uses an already approved profile and never
-// executes what is found on PATH).
+// Definition is everything this build knows about one supported language
+// server: its name — which is also the name of its entry in the embedded tool
+// lock — the manifest language tags it serves, the argument array that puts it
+// in stdio mode, the parent environment variables it may see, the workspace
+// markers that suggest a repository is its kind, and its bounds.
+//
+// A Definition is a description, not a capability. It becomes runnable only
+// through Resolve, which hands back the payload the lock pinned and the store
+// verified. Nothing here is configurable and nothing is looked up on PATH
+// (Section 20.2).
 type Definition struct {
 	Name string
 	// Languages are the snapshot manifest language tags this server serves.
 	Languages []string
-	// Args is the default argument array. An approved profile's own Args
-	// replace it entirely when present.
+	// Args is the argument array appended to the resolved payload's own argv
+	// prefix. ${input_dir} is the materialization root and ${work_dir} the
+	// server's private working directory; there is no other substitution and
+	// no shell.
 	Args []string
+	// EnvAllowlist names the parent variables the server may see. The child's
+	// environment is exactly these (those the parent actually has) plus the
+	// variables the resolved payload carries, and nothing else.
+	EnvAllowlist []string
 	// RootMarkers are root-relative files whose presence suggests the
 	// repository is this server's kind. Detection reads their metadata through
 	// the confined root and nothing else.
 	RootMarkers []string
+	// MemoryBudgetBytes and DiskBudgetBytes are the runner reservations;
+	// Timeout bounds the server's whole lifetime. The manager's idle TTL
+	// usually stops it long before.
+	MemoryBudgetBytes int64
+	DiskBudgetBytes   int64
+	Timeout           time.Duration
 }
 
-// definitions are the six servers Section 11.5 names. Only gopls has been
-// exercised against a real installation, in an ad-hoc run recorded in the
-// Task 10 report; the others are documented as unverified in
-// docs/providers-lsp.md. The protocol itself is exercised by the fake server.
+// Standard bounds for a language server. A server is an interactive process
+// held open across many requests, so the timeout is a lifetime ceiling rather
+// than a per-request bound (Options.RequestTimeout is that one), and the
+// reservations are what the runner accounts before the child starts.
+const (
+	serverLifetime      = time.Hour
+	serverMemoryBudget  = 4 << 30
+	serverDiskBudget    = 2 << 30
+	serverMemoryLarge   = 8 << 30
+	serverDiskLarge     = 4 << 30
+	workDirName         = "lsp"
+	substitutionInput   = "${input_dir}"
+	substitutionWorkDir = "${work_dir}"
+)
+
+// definitions are the six servers Section 11.5 names. Every one of them was
+// resolved through the real lock and store on this platform before its
+// argument array was pinned; the protocol handshake is exercised against gopls
+// and against the fake server. docs/providers-lsp.md records exactly which.
 var definitions = map[string]Definition{
 	"gopls": {
 		Name: "gopls", Languages: []string{"go"},
-		Args:        []string{"serve"},
-		RootMarkers: []string{"go.mod", "go.work"},
+		Args:              []string{"serve"},
+		EnvAllowlist:      []string{"PATH", "HOME", "GOPATH", "GOCACHE", "GOMODCACHE", "GOFLAGS", "GOPROXY", "GOPRIVATE"},
+		RootMarkers:       []string{"go.mod", "go.work"},
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
 	"rust-analyzer": {
 		Name: "rust-analyzer", Languages: []string{"rust"},
-		RootMarkers: []string{"Cargo.toml"},
+		EnvAllowlist:      []string{"PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME"},
+		RootMarkers:       []string{"Cargo.toml"},
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
 	},
 	"pyright": {
 		Name: "pyright", Languages: []string{"python"},
-		Args:        []string{"--stdio"},
-		RootMarkers: []string{"pyproject.toml", "pyrightconfig.json", "setup.py", "requirements.txt"},
+		Args:              []string{"--stdio"},
+		EnvAllowlist:      []string{"PATH", "HOME"},
+		RootMarkers:       []string{"pyproject.toml", "pyrightconfig.json", "setup.py", "requirements.txt"},
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
 	"typescript-language-server": {
 		Name: "typescript-language-server", Languages: []string{"typescript", "tsx", "javascript"},
-		Args:        []string{"--stdio"},
-		RootMarkers: []string{"tsconfig.json", "jsconfig.json", "package.json"},
+		Args:              []string{"--stdio"},
+		EnvAllowlist:      []string{"PATH", "HOME"},
+		RootMarkers:       []string{"tsconfig.json", "jsconfig.json", "package.json"},
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
 	"clangd": {
 		Name: "clangd", Languages: []string{"c", "cpp"},
-		RootMarkers: []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
+		EnvAllowlist:      []string{"PATH", "HOME"},
+		RootMarkers:       []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
+		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
 	"jdtls": {
 		Name: "jdtls", Languages: []string{"java"},
-		Args:        []string{"-data", "${work_dir}"},
-		RootMarkers: []string{"pom.xml", "build.gradle", "build.gradle.kts"},
+		Args: []string{"-data", substitutionWorkDir},
+		// JAVA_HOME is deliberately absent: the resolved payload carries the
+		// managed JDK's own, and a host value in the allowlist would shadow
+		// the runtime the lock pinned.
+		EnvAllowlist:      []string{"PATH", "HOME"},
+		RootMarkers:       []string{"pom.xml", "build.gradle", "build.gradle.kts"},
+		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
 	},
 }
 
@@ -86,8 +129,8 @@ func Definitions() []Definition {
 
 // Detect reports which of the definition's root markers exist in the
 // workspace. It inspects metadata through the confined root only, runs
-// nothing, and its answer is a hint for choosing among already trusted
-// profiles: a present marker never authorizes execution.
+// nothing, and its answer is a hint for choosing among the supported servers:
+// a present marker never starts anything.
 func (d Definition) Detect(root workspace.Root) []string {
 	var found []string
 	for _, marker := range d.RootMarkers {
@@ -98,40 +141,28 @@ func (d Definition) Detect(root workspace.Root) []string {
 	return found
 }
 
-// Profile is a trusted, runnable server: a Definition joined with the
-// operator's approval from the user configuration. Only Trusted constructs
-// one, so holding a Profile is holding the approval.
+// Profile is a runnable server: a Definition joined with the payload the
+// toolchain resolved for it. Only Resolve constructs one, so holding a Profile
+// is holding a verified payload — the lock pinned its bytes, the store
+// verified them and the resolver hashed its entry at this resolution.
 type Profile struct {
 	Definition
-	// Executable is the approved absolute path.
-	Executable string
-	// VersionConstraint is matched against the version the server reports in
-	// its initialize result; a server that reports none or another version is
-	// shut down as untrusted.
-	VersionConstraint string
-	// Checksum is the expected lowercase SHA-256 of the executable, or empty
-	// to record the observed checksum without checking it.
-	Checksum string
-	// Args is the resolved argument array with substitutions still in place;
-	// the server start applies them from validated private paths.
-	Args []string
-	// EnvAllowlist names the parent variables the server may see.
-	EnvAllowlist []string
-	// WorkDir is the private working directory the server runs in.
-	WorkDir string
-	// MemoryBudgetBytes and DiskBudgetBytes are the runner reservations.
-	MemoryBudgetBytes int64
-	DiskBudgetBytes   int64
-	// Timeout bounds the server's whole lifetime.
-	Timeout time.Duration
+	// Tool is the resolved payload. Its ArgvPrefix is the complete launcher
+	// (the binary itself, or the managed Node or JDK and the pinned entry) and
+	// its Env carries what that launcher needs.
+	Tool toolchain.Tool
 }
 
-// Trusted resolves the named server from the configuration. It is the only
-// constructor of a Profile: the LSP overlay must be enabled, the name must be
-// a supported definition and the user configuration must approve it under
-// [analyzers.<name>]. Each refusal has its own code so a caller can tell
-// "disabled" from "not approved" from "not a language server".
-func Trusted(cfg config.Config, name string) (Profile, error) {
+// Resolve returns the named server's runnable profile. The overlay must be
+// enabled and the name must be one of the six this build supports; everything
+// else about the server — which binary starts, under which runtime, with which
+// arguments and budgets — comes from this build and the embedded tool lock.
+//
+// A payload that cannot be resolved surfaces the toolchain's own CTX_TOOL_*
+// error verbatim: offline, an unsupported platform, a corrupt store or an
+// invalid override are different conditions and a caller must be able to tell
+// them apart.
+func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Config, name string) (Profile, error) {
 	if cfg.Providers.LSP.Enabled == config.Disabled {
 		return Profile{}, unavailable("the lsp overlay is disabled by configuration").WithDetail("profile", name)
 	}
@@ -139,64 +170,47 @@ func Trusted(cfg config.Config, name string) (Profile, error) {
 	if !ok {
 		return Profile{}, invalid("%q is not a supported language server; see docs/providers-lsp.md", truncate(name, 64))
 	}
-	approval, ok := cfg.Analyzers[name]
-	if !ok {
-		return Profile{}, trustRequired("language server %q is not approved in the user configuration", name).WithDetail("profile", name)
+	if resolver == nil {
+		return Profile{}, unavailable("the lsp overlay needs the managed toolchain resolver").WithDetail("profile", name)
 	}
-	if !filepath.IsAbs(approval.Executable) {
-		return Profile{}, trustRequired("language server %q is approved with a non-absolute executable", name).WithDetail("profile", name)
-	}
-	if approval.VersionConstraint == "" {
-		return Profile{}, trustRequired("language server %q is approved without a version constraint", name).WithDetail("profile", name)
-	}
-	// The work directory must be absolute here, not only at the runner: the
-	// server start creates it before the runner ever inspects it, and a
-	// relative path would be created under whatever directory the process
-	// happens to be in.
-	if !filepath.IsAbs(approval.WorkDir) {
-		return Profile{}, trustRequired("language server %q is approved with a non-absolute work directory", name).WithDetail("profile", name)
-	}
-	if approval.Timeout <= 0 || approval.MemoryBudgetBytes <= 0 || approval.DiskBudgetBytes <= 0 {
-		return Profile{}, trustRequired("language server %q is approved without a timeout or budgets", name).WithDetail("profile", name)
-	}
-	args := def.Args
-	if len(approval.Args) > 0 {
-		args = approval.Args
-	}
-	for _, a := range args {
-		if strings.Contains(a, "${output_file}") || strings.Contains(a, "${manifest}") {
-			return Profile{}, invalid("language server %q argument %q uses a substitution that has no value for a language server", name, a)
+	t, err := resolver.Resolve(ctx, name)
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) {
+			return Profile{}, typed.WithDetail("profile", name)
 		}
+		return Profile{}, err
 	}
-	return Profile{
-		Definition:        def,
-		Executable:        approval.Executable,
-		VersionConstraint: approval.VersionConstraint,
-		Checksum:          approval.Checksum,
-		Args:              slices.Clone(args),
-		EnvAllowlist:      slices.Clone(approval.EnvAllowlist),
-		WorkDir:           approval.WorkDir,
-		MemoryBudgetBytes: approval.MemoryBudgetBytes,
-		DiskBudgetBytes:   approval.DiskBudgetBytes,
-		Timeout:           approval.Timeout.Std(),
-	}, nil
+	return Profile{Definition: def, Tool: t}, nil
 }
 
-// argv applies the typed substitutions to the profile's arguments. Only the
-// two the closed set defines for a server are meaningful: ${input_dir} is the
-// materialization root and ${work_dir} the private working directory.
-func (p Profile) argv(inputDir string) []string {
-	out := make([]string, len(p.Args))
-	for i, a := range p.Args {
-		a = strings.ReplaceAll(a, "${input_dir}", inputDir)
-		a = strings.ReplaceAll(a, "${work_dir}", p.WorkDir)
-		out[i] = a
-	}
-	return out
+// workDir is the server's private working directory under the data directory.
+// It belongs to codectx, not to a user's shell, and the server start creates
+// it before the runner ever inspects it.
+func (p Profile) workDir(dataDir string) string {
+	return filepath.Join(dataDir, workDirName, p.Name)
 }
 
-// env builds the child's complete environment from the allowlist. A variable
-// the parent does not have is absent, not empty.
+// argv is the complete argument array after the launcher: the resolved
+// payload's own prefix supplies argv[0] and, for a runtime-hosted payload, the
+// pinned entry, and the definition supplies the rest with its two typed
+// substitutions applied.
+func (p Profile) argv(inputDir, workDir string) (path string, args []string) {
+	prefix := p.Tool.ArgvPrefix
+	args = append([]string(nil), prefix[1:]...)
+	for _, a := range p.Args {
+		a = strings.ReplaceAll(a, substitutionInput, inputDir)
+		a = strings.ReplaceAll(a, substitutionWorkDir, workDir)
+		args = append(args, a)
+	}
+	return prefix[0], args
+}
+
+// env builds the child's complete environment: the allowlisted parent
+// variables the parent actually has, then the variables the resolved payload
+// carries. The payload's come last so a host JAVA_HOME can never shadow the
+// managed JDK the lock pinned. A variable the parent does not have is absent,
+// not empty.
 func (p Profile) env() []string {
 	var out []string
 	for _, name := range p.EnvAllowlist {
@@ -204,63 +218,7 @@ func (p Profile) env() []string {
 			out = append(out, name+"="+v)
 		}
 	}
-	return out
-}
-
-// checksum reads the executable once and returns its SHA-256. When the
-// profile pins one, a mismatch is a trust failure: the file at the approved
-// path is not the file the operator approved.
-func (p Profile) checksum() (string, error) {
-	f, err := os.Open(p.Executable)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", unavailable("language server %q is not installed at %s", p.Name, p.Executable).WithDetail("profile", p.Name)
-		}
-		return "", trustRequired("language server %q cannot be inspected: %v", p.Name, err).WithDetail("profile", p.Name)
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", trustRequired("language server %q cannot be read: %v", p.Name, err).WithDetail("profile", p.Name)
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	if p.Checksum != "" && p.Checksum != sum {
-		return "", trustRequired("language server %q at %s does not match its approved checksum", p.Name, p.Executable).
-			WithDetail("profile", p.Name).WithDetail("observed_checksum", sum)
-	}
-	return sum, nil
-}
-
-// versionMatches reports whether a server-reported version satisfies the
-// constraint. Servers report free-form strings: "v0.23.0", "1.80.0 (abc
-// 2024-01-01)", "clangd version 18.1.3", and gopls a compact JSON blob whose
-// Main.Version holds the tag. The constraint therefore matches when it
-// occurs in the report as a whole version token: preceded by nothing, a
-// non-version character or a "v" prefix, and followed by nothing, a further
-// ".x" component, a "-pre" suffix or a non-version character. "0.23" accepts
-// "v0.23.1" and rejects "10.23" and "0.230".
-func versionMatches(constraint, reported string) bool {
-	c := strings.TrimPrefix(strings.TrimSpace(constraint), "v")
-	if c == "" || reported == "" {
-		return false
-	}
-	isVersionByte := func(b byte) bool {
-		return b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z'
-	}
-	for i := 0; ; {
-		j := strings.Index(reported[i:], c)
-		if j < 0 {
-			return false
-		}
-		start, end := i+j, i+j+len(c)
-		before := start == 0 || !isVersionByte(reported[start-1]) && reported[start-1] != '.' ||
-			reported[start-1] == 'v' && (start == 1 || !isVersionByte(reported[start-2]))
-		after := end == len(reported) || reported[end] == '.' || reported[end] == '-' || !isVersionByte(reported[end])
-		if before && after {
-			return true
-		}
-		i = start + 1
-	}
+	return append(out, p.Tool.Env...)
 }
 
 // serverVersion reduces what a server reports in serverInfo.version to the
@@ -268,6 +226,14 @@ func versionMatches(constraint, reported string) bool {
 // whose top-level Version field holds the tag; other servers report a short
 // string. The label is bounded to model.MaxIdentifierBytes so the overlay
 // binding validates; the full report still feeds the input digest.
+//
+// The report is provenance, never a gate. Nothing compares it against a
+// constraint: the lock's entry digest is what identifies these bytes, and the
+// version a server chooses to print has no fixed relationship to the release
+// it came from — the rust-analyzer release tagged 2026-08-17.4 reports
+// "1.98.0 (88d9e12 2026-08-18)" and the scip-java 0.13.1 payload reports
+// "0.0.0-SNAPSHOT" (both measured here). A constraint written to accept those
+// is a constraint that accepts anything, which is a gate in name only.
 func serverVersion(reported string) string {
 	v := strings.TrimSpace(reported)
 	if strings.HasPrefix(v, "{") {
@@ -285,20 +251,23 @@ func serverVersion(reported string) string {
 }
 
 // inputDigest is the overlay label's input hash: the snapshot's identity and
-// manifest, the profile and how it was started, and the server the handshake
-// revealed. Two overlays with equal digests answered from the same bytes with
-// the same tool; a different digest is a different question.
-func inputDigest(snap model.Snapshot, p Profile, checksum, serverVersion, encoding string) string {
+// manifest, the payload the lock pinned and how it was started, and the server
+// the handshake revealed. Two overlays with equal digests answered from the
+// same bytes with the same tool; a different digest is a different question.
+//
+// The payload fingerprint is what makes a replaced tool a different question:
+// Section 20.2 keeps `[tools]` out of the analysis configuration hash, so a
+// tool change reaches an answer's identity only here and through the
+// providers' own versions.
+func inputDigest(snap model.Snapshot, p Profile, serverVersion, encoding string) string {
 	h := model.NewHasher("lsp-overlay-v1")
 	h.AddString(string(snap.ID))
 	h.AddString(snap.ManifestHash)
 	h.AddString(p.Name)
-	h.AddString(p.Executable)
-	h.AddString(checksum)
+	h.AddString(p.Tool.Fingerprint())
 	h.AddString(serverVersion)
 	h.AddString(encoding)
-	for _, a := range p.Args {
-		h.AddString(a)
-	}
+	args := slices.Clone(p.Args)
+	h.AddString(strings.Join(args, "\x00"))
 	return h.Sum()
 }
