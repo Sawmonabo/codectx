@@ -279,6 +279,137 @@ func TestContextCompilerScenario(t *testing.T) {
 		// L1 SEEDS rows
 		// L2 SCOPE rows
 		// L3 RANK rows
+		{
+			// Guards the Section 15.3 path contribution: the product of
+			// weight(kind) and the per-edge precision multiplier, decayed once
+			// per hop AFTER the first. Silent breakage here does not fail any
+			// compile -- it just ranks a distant entity as if it were adjacent,
+			// so the manifest quietly leads with the wrong files.
+			name: "path contribution multiplies per-edge precision and decays once per hop after the first",
+			run: func(t *testing.T, fx *contextFixture) {
+				rels := map[model.RelationID]model.Relation{
+					"r1": {ID: "r1", Kind: model.RelCalls},
+					"r2": {ID: "r2", Kind: model.RelImplements},
+				}
+				compiler := map[model.RelationID]int64{"r1": precisionMultiplier[model.PrecisionCompiler]}
+				heuristic := map[model.RelationID]int64{"r1": precisionMultiplier[model.PrecisionHeuristic]}
+				twoHop := map[model.RelationID]int64{
+					"r1": precisionMultiplier[model.PrecisionCompiler],
+					"r2": precisionMultiplier[model.PrecisionSyntax],
+				}
+				cases := []struct {
+					name string
+					path model.RelationPath
+					prec map[model.RelationID]int64
+					want int64
+				}{
+					// calls 900_000 * compiler 1_000_000.
+					{"compiler call hop", model.RelationPath{Relations: []model.RelationID{"r1"}}, compiler, 900_000},
+					// calls 900_000 * heuristic 450_000: an unevidenced edge is
+					// ranked as the weakest precision, never as a free one.
+					{"heuristic call hop", model.RelationPath{Relations: []model.RelationID{"r1"}}, heuristic, 405_000},
+					// (900_000) * (implements 940_000 * syntax 720_000) * decay 650_000.
+					{"decayed second hop", model.RelationPath{Relations: []model.RelationID{"r1", "r2"}}, twoHop, 395_928},
+				}
+				for _, tc := range cases {
+					got, kinds, ok, err := scorePath(tc.path, rels, tc.prec)
+					if err != nil || !ok {
+						t.Fatalf("%s: scorePath ok=%v err=%v", tc.name, ok, err)
+					}
+					if got != tc.want {
+						t.Fatalf("%s: contribution = %d micros, want %d", tc.name, got, tc.want)
+					}
+					if len(kinds) != len(tc.path.Relations) {
+						t.Fatalf("%s: reported %d hop kinds, want %d", tc.name, len(kinds), len(tc.path.Relations))
+					}
+				}
+				// A hop this compile did not walk, or one whose kind carries no
+				// Section 15.3 contribution, makes the route inadmissible: scored
+				// as 1.0 it would rank an unexplained route above an explained one.
+				if _, _, ok, err := scorePath(model.RelationPath{Relations: []model.RelationID{"unwalked"}}, rels, compiler); ok || err != nil {
+					t.Fatalf("unwalked edge admitted: ok=%v err=%v", ok, err)
+				}
+				_ = fx
+			},
+		},
+		{
+			// Guards the rest of Section 15.3 through the pinned reader: an edge
+			// with no visible evidence falls back to heuristic precision, each
+			// bounded boost is added at most once, and the tie-break chain is
+			// total. A broken order is invisible here but breaks Task 16, whose
+			// `context next` is an ordinal walk over this order.
+			name: "ranking falls back to heuristic precision and orders by the full tie-break chain",
+			run: func(t *testing.T, fx *contextFixture) {
+				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
+				if err != nil {
+					t.Fatalf("PinGeneration: %v", err)
+				}
+				defer reader.Close()
+
+				impl, caller := fx.File("internal/order/service.go"), fx.File("internal/order/handler.go")
+				edge := model.NewRelationID(fx.Repo, fx.Node("internal/order/handler.go"), model.RelCalls,
+					fx.Node("internal/order/service.go"))
+				// The fixture seals node evidence only, so this edge has no
+				// evidence row and must take the heuristic multiplier.
+				rels := map[model.RelationID]model.Relation{edge: {ID: edge,
+					From: fx.Node("internal/order/handler.go"), Kind: model.RelCalls,
+					To: fx.Node("internal/order/service.go")}}
+
+				cands := []candidate{
+					{FileID: impl.ID, Path: impl.Path, Requirement: model.RequirementFull,
+						Origin: originExplicitSeed, Status: impl.Status},
+					{NodeID: fx.Node("internal/order/handler.go"), FileID: caller.ID, Path: caller.Path,
+						Requirement: model.RequirementRecommended, Origin: originExpansion, Depth: 1,
+						Status: caller.Status, Paths: []model.RelationPath{{Relations: []model.RelationID{edge}}}},
+					{NodeID: "n2", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
+					{NodeID: "n3", Path: "a.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
+					{NodeID: "n1", Path: "b.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
+					{NodeID: "n1", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
+				}
+				ranked, err := (&Compiler{cfg: fx.Cfg}).rank(fx.ctx, reader, cands, rels)
+				if err != nil {
+					t.Fatalf("rank: %v", err)
+				}
+
+				// Seed 1_000_000 + captured change 120_000 + one walked edge of
+				// package centrality 5_000; caller 405_000 + that same 5_000.
+				// The optional candidates sit in the repository root, which this
+				// compile walked no edge in, so they score nothing at all and the
+				// tie-break chain alone decides their order.
+				type want struct {
+					path  string
+					id    model.NodeID
+					score int64
+				}
+				expect := []want{
+					{impl.Path, "", 1_125_000},
+					{caller.Path, fx.Node("internal/order/handler.go"), 410_000},
+					{"a.go", "n3", 0},
+					{"a.go", "n1", 0},
+					{"a.go", "n2", 0},
+					{"b.go", "n1", 0},
+				}
+				if len(ranked) != len(expect) {
+					t.Fatalf("rank returned %d candidates, want %d", len(ranked), len(expect))
+				}
+				for i, w := range expect {
+					got := ranked[i]
+					if got.Path != w.path || got.NodeID != w.id || got.ScoreMicros != w.score {
+						t.Fatalf("rank[%d] = {path %q node %q score %d}, want {path %q node %q score %d}",
+							i, got.Path, got.NodeID, got.ScoreMicros, w.path, w.id, w.score)
+					}
+					if len(got.Reasons) > model.MaxReasonsPerEntry {
+						t.Fatalf("rank[%d] carries %d reasons, over the bound %d", i, len(got.Reasons), model.MaxReasonsPerEntry)
+					}
+				}
+				// One admitted route, one route retained: nothing is hidden in
+				// MorePaths that the entry could have explained.
+				if ranked[1].MorePaths != 0 || len(ranked[1].Paths) != 1 {
+					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 0",
+						len(ranked[1].Paths), ranked[1].MorePaths)
+				}
+			},
+		},
 		// L4 BUDGET rows
 		// L5 MANIFEST rows
 		// INT rows
