@@ -247,6 +247,10 @@ func (e *Engine) resumeImpact(ctx context.Context, token, queryHash string,
 		// whether the walk behind it was complete.
 		return impactAnswer{}, nil, nil, cursorInvalid("continuation state is not readable")
 	}
+	// The ranked tail is in memory, so the spool it came from and the lease the
+	// token carries are consumed: this page spills its own remainder under a
+	// fresh pair. See Engine.releaseConsumed.
+	e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 	return answer, entries, b, nil
 }
 

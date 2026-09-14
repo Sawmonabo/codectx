@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -444,11 +445,19 @@ type fixtureLeases struct {
 
 func newFixtureLeases() *fixtureLeases { return &fixtureLeases{live: map[string]time.Time{}} }
 
-func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease) error {
+func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease, _ string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.live[lease.ID] = lease.ExpiresAt
 	return nil
+}
+
+// liveCount is how many leases are still held. A continuation is used once, so
+// a walk read to exhaustion must end with none of its own.
+func (l *fixtureLeases) liveCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.live)
 }
 
 func (l *fixtureLeases) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
@@ -930,6 +939,71 @@ func TestGraphScenarios(t *testing.T) {
 						t.Fatalf("relation %s appeared %d times across the paged walk, want exactly once",
 							rel.ID, seen[rel.ID])
 					}
+				}
+			},
+		},
+
+		{
+			// A continuation is state, and state that is never reclaimed is a
+			// leak with a 15-minute half-life: every page of every walk in the
+			// process mints a cursor lease and spills a spool, and once the page
+			// after it has been served neither will be read again. Left to their
+			// TTL they pin a generation retention may not collect -- the 118
+			// unreleased leases obligation 6 names. This walks a multi-page
+			// traversal to exhaustion and asks what it left behind: nothing.
+			name: "a walk read to exhaustion releases every continuation it consumed",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spoolDir := t.TempDir()
+				spools, err := pagination.NewSpools(spoolDir, 1<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 400
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+				req := model.GraphRequest{GenerationID: 1,
+					Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+					Page: model.PageRequest{Limit: 120}}
+				pages := 0
+				for {
+					res, err := e.Neighbors(context.Background(), req)
+					if err != nil {
+						t.Fatalf("page %d: %v", pages+1, err)
+					}
+					pages++
+					if res.Meta.NextCursor == "" {
+						break
+					}
+					if pages > 8 {
+						t.Fatalf("paged walk did not terminate after %d pages", pages)
+					}
+					req.GenerationID = 0
+					req.Page = model.PageRequest{Limit: 120, Cursor: res.Meta.NextCursor}
+				}
+				if pages < 2 {
+					t.Fatalf("the walk answered in %d page(s); this row needs a continuation to consume", pages)
+				}
+				if live := store.liveCount(); live != 0 {
+					t.Fatalf("a walk of %d pages left %d live cursor leases, want 0; each holds a generation against retention until its TTL",
+						pages, live)
+				}
+				left, err := os.ReadDir(spoolDir)
+				if err != nil {
+					t.Fatalf("read spool dir: %v", err)
+				}
+				if len(left) != 0 {
+					t.Fatalf("a walk of %d pages left %d spool file(s) behind, want 0", pages, len(left))
 				}
 			},
 		},
