@@ -84,7 +84,6 @@ func (l *Locator) Locate(ctx context.Context) (dependence.Engine, error) {
 		ParseArgv:  append([]string(nil), t.ArgvPrefix...),
 		ExportArgv: export,
 		Env:        append([]string(nil), t.Env...),
-		Name:       t.Name,
 		Version:    t.Version,
 		Digest:     t.Fingerprint(),
 	}
