@@ -3,9 +3,10 @@
 codectx owns every external analyzer it runs and every runtime those analyzers
 need. Nothing is looked up on `PATH`, nothing is installed by the user, and
 nothing executes that the shipped binary did not pin. This document describes
-the pinned set and the provenance behind it (Section 11.7). The runtime
-behaviour — store layout, resolution order, offline refusals, `codectx tools`
-commands — belongs to `internal/toolchain`.
+the pinned set and the provenance behind it, the `codectx tools` commands that
+manage it, and the per-platform matrix that proves it (Section 11.7). Store
+layout, resolution order and offline refusals are implemented in
+`internal/toolchain`, whose package comment is the detailed reference.
 
 **The user needs no toolchain of their own.** Not Go, not Node, not npm, not a
 JDK. Node comes from a pinned nodejs.org distribution and the JDK from a pinned
@@ -150,6 +151,81 @@ the engine is a backend swap rather than a product change.
   file, at the payload-relative path the lock already pins for it and with the
   executable bit set; the pinned entry digest then verifies it exactly as it
   verifies a member of an archive.
+
+## The `codectx tools` commands
+
+Nothing here is a prerequisite. Indexing resolves what a repository needs and
+installs it on demand, so a user who never runs `codectx tools` gets the same
+result. These commands exist for CI, for offline hosts, and for answering "what
+is on this machine and is it still intact".
+
+```bash
+codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
+codectx tools prefetch [--all | NAME...] [--json]      # install ahead of time
+codectx tools verify [--json]                          # rehash every installed entry against the lock
+codectx tools gc [--json]                              # remove versions the current lock does not name
+```
+
+`status` is the cheap report: it checks each entry's publication marker and the
+presence of its executable, and never rehashes, so it stays usable for a store
+holding the 1.8 GB engine. Each entry is reported in one of five states —
+`installed`, `available` (pinned but not fetched yet), `unsupported_platform`
+(the lock carries no payload here, which is honest absence and not a failure),
+`override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
+
+`prefetch` requires either `--all` or explicit names, so a bare invocation
+cannot start a multi-gigabyte download by accident. A name the lock does not
+carry is rejected before anything is fetched. An entry with no payload for this
+platform is skipped rather than failed. Each completed fetch logs one record —
+tool, version, digest, bytes, elapsed — on stderr, and the report of what is now
+installed goes to stdout.
+
+`verify` is the expensive one: it rehashes each installed entry executable
+against the digest the lock pins for it. A store a user edited or a disk damaged
+is reported here rather than discovered inside an analyzer run, and a corrupt
+entry **fails the command** with `CTX_TOOL_CORRUPT` — a check that reports
+damage and exits 0 is a gate that passes silently in CI. A corrupt entry is
+repaired by re-running `prefetch` for it, not by `gc`: `gc` removes versions the
+lock no longer names, and a damaged tree at the pinned version is one the lock
+does name.
+
+`--repo` selects which workspace's resolved configuration is used, because the
+data directory is per workspace by default. Set `tools.cache_dir` in the user
+configuration to give every checkout on the machine one shared store.
+
+Exit codes follow Section 18.2: every `CTX_TOOL_*` failure is exit 5 (a managed
+tool that cannot be resolved is a provider that cannot run), except
+`CTX_TOOL_OVERRIDE_INVALID`, which is exit 3 because it is a configuration error
+the user fixes in their own file.
+
+## The per-platform matrix
+
+`.github/workflows/tools-matrix.yml` is the gate behind "supported". On
+`ubuntu-latest`, `macos-latest` and `windows-latest` it prefetches every payload
+the lock carries for that platform, re-verifies the store, and then runs
+`.github/tools-matrix`, which indexes a nine-language fixture — Go, TypeScript,
+TSX, JavaScript, Python, Java, C, C++ and Rust, every one of them carrying
+non-ASCII identifiers and literals — with the pinned analyzers and parses each
+language family with the pinned graph engine. C++ and TSX are exercised
+explicitly because the research rounds covered only C and TypeScript. A language
+no run covers fails the job, so a payload that silently stopped working cannot
+leave a green matrix behind it.
+
+The matrix does not run on every push: one leg downloads about 2.6 GB. It runs
+when the lock, the toolchain runtime or the matrix itself changes, on demand,
+and weekly — the weekly run is what catches an upstream asset that disappeared
+from its publisher's release while its digest in the lock stayed valid.
+
+Two host programs are assumed on the runner and are not pinned, because the
+analyzers themselves shell out to them: `scip-python` invokes `pip3`/`python3`
+to enumerate the environment it is indexing, and `rust-analyzer` loads the crate
+graph through `cargo`. A missing one is reported as a runner problem rather than
+as a broken payload.
+
+The ordinary CI workflow enforces the other half of Section 11.7: `go list
+-deps` over `./cmd/codectx` fails the build if any package outside
+`internal/toolchain` imports `net/http`. The shipped binary's dependency graph
+is what is checked, not a grep of the source.
 
 ## Regenerating and verifying
 
