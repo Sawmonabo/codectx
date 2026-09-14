@@ -177,9 +177,13 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		c := candidate{
 			NodeID: e.NodeID,
 			FileID: e.FileID,
-			// ImpactEntry.Name is the entry's qualified name, which this
-			// candidate carries as its label until hydrateFiles replaces it
-			// with the file path FileID resolves to.
+			// KNOWN MISMATCH (raised in FX-F18-B's report, ruling pending):
+			// candidate.Path holds a file path everywhere else, but
+			// ImpactEntry.Name is a qualified name, and hydrateFiles only fills
+			// Path when it is empty -- so this value is never corrected to the
+			// path FileID resolves to. Behaviour is unchanged from before the
+			// Path->Name rename; the fix needs context_test.go's fake impact
+			// entries re-based on FileID at the same time.
 			Path:        e.Name,
 			Requirement: boundaryRequirement(e.Kind, e.Depth),
 			Origin:      originExpansion,
