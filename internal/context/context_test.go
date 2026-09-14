@@ -4,6 +4,8 @@ import (
 	stdcontext "context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/search"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -277,6 +282,188 @@ func TestContextCompilerScenario(t *testing.T) {
 
 	rows := []contextScenarioRow{
 		// L1 SEEDS rows
+		{
+			// Guards Section 15.2: the seed steps run in their stated order, so
+			// an identity the caller named can never be outranked by prose or by
+			// a captured change, and an ambiguous name keeps every declaration.
+			// A silent first pick here would hand the caller a confident plan
+			// built on the wrong declaration, with nothing in the manifest
+			// saying a choice was made.
+			name: "seeds resolve in Section 15.2 step order and keep every declaration of an ambiguous name",
+			// The published fixture names every symbol once, so ambiguity has to
+			// be built: this republishes the same snapshot as a second activated
+			// generation in which the caller file also declares Place.
+			setup: func(t *testing.T, fx *contextFixture) {
+				// Units are content-addressed and shared across generations, so a
+				// second declaration of one name needs a second file: this
+				// republishes the snapshot with two files that both declare Place
+				// and activates a generation over them.
+				prior := fx.Gen
+				ambiguous := []string{"internal/order/place_read.go", "internal/order/place_write.go"}
+				versions := make([]model.FileVersion, 0, len(fixtureFiles)+len(ambiguous))
+				var sourceBytes uint64
+				for _, spec := range fixtureFiles {
+					versions = append(versions, fx.File(spec.path))
+					sourceBytes += uint64(len(spec.content))
+				}
+				for _, path := range ambiguous {
+					// Reusing the implementation file's content keeps the blob the
+					// row's CAS already holds while giving each path its own file
+					// identity, so the two declarations are genuinely distinct.
+					body := fixtureFiles[1].content
+					versions = append(versions, fx.putBlob(path, body))
+					sourceBytes += uint64(len(body))
+				}
+				manifest := model.H("codectx.test.manifest", "task-15-ambiguous")
+				policy := model.H("codectx.test.source-policy")
+				snap := model.Snapshot{
+					ID:                 model.NewSnapshotID(fx.Repo, "", policy, manifest),
+					RepositoryID:       fx.Repo,
+					CaptureConsistency: model.CaptureValidated,
+					SourcePolicyHash:   policy,
+					FileCount:          uint64(len(versions)),
+					SourceBytes:        sourceBytes,
+					ManifestHash:       manifest,
+					CreatedAt:          fixtureNow(),
+				}
+				err := fx.Store.PutSnapshot(fx.ctx, snap, func(yield func(model.FileVersion) error) error {
+					for _, fv := range versions {
+						if err := yield(fv); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatalf("PutSnapshot: %v", err)
+				}
+				if fx.Gen, err = fx.Store.BeginGeneration(fx.ctx, fx.Repo, snap.ID,
+					model.H("codectx.test.semantic", "ambiguous"), "main"); err != nil {
+					t.Fatalf("BeginGeneration: %v", err)
+				}
+				run, err := fx.Store.BeginProviderRun(fx.ctx, fx.Gen, fixtureProviderID, fixtureProviderVersion)
+				if err != nil {
+					t.Fatalf("BeginProviderRun: %v", err)
+				}
+				for _, path := range ambiguous {
+					fx.sealUnit(run, fx.File(path), "Place", model.NodeFunction)
+				}
+				if fx.Binding, err = fx.Store.Activate(fx.ctx, fx.Gen, prior, model.HealthFresh, fixtureCapabilities, "norm-v1"); err != nil {
+					t.Fatalf("Activate: %v", err)
+				}
+			},
+			run: func(t *testing.T, fx *contextFixture) {
+				// The shared fixture composes no discovery service, so the row
+				// builds the one it needs: seed resolution is defined in terms of
+				// Search.Resolve and Search.Search, and a fake would be proving a
+				// fake.
+				dir := t.TempDir()
+				cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
+				if err != nil {
+					t.Fatalf("OpenCAS: %v", err)
+				}
+				for _, spec := range fixtureFiles {
+					if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
+						t.Fatalf("CAS.Put(%s): %v", spec.path, err)
+					}
+				}
+				signer, err := pagination.OpenSigner(dir)
+				if err != nil {
+					t.Fatalf("OpenSigner: %v", err)
+				}
+				spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, fx.Store)
+				if err != nil {
+					t.Fatalf("NewSpools: %v", err)
+				}
+				svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
+					Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
+					CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
+				if err != nil {
+					t.Fatalf("search.New: %v", err)
+				}
+				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
+				if err != nil {
+					t.Fatalf("PinGeneration: %v", err)
+				}
+				defer reader.Close()
+				c := &Compiler{store: fx.Store, repo: fx.Repo, search: svc, cfg: fx.Cfg,
+					now: fx.Now, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+
+				// One task mixing an explicit seed, a backticked identifier, a
+				// path token, a free term and a path that names nothing.
+				seeds, err := c.extractSeeds(fx.ctx, reader, fx.Gen, model.ContextRequest{
+					Task:  "Update `Place` so internal/order/handler.go keeps working; check Repository and docs/missing.md",
+					Seeds: []string{"internal/order/ports.go"},
+					Phase: model.PhaseVerify,
+				})
+				if err != nil {
+					t.Fatalf("extractSeeds: %v", err)
+				}
+
+				// The steps append in order, so the origins a compile produces are
+				// non-decreasing. Reordering any two steps breaks this.
+				for i := 1; i < len(seeds.Candidates); i++ {
+					if seeds.Candidates[i].Origin < seeds.Candidates[i-1].Origin {
+						t.Fatalf("seed %d has origin %d after origin %d: extraction ran out of Section 15.2 order",
+							i, seeds.Candidates[i].Origin, seeds.Candidates[i-1].Origin)
+					}
+				}
+				byPath := map[string]candidate{}
+				for _, cnd := range seeds.Candidates {
+					if cnd.NodeID == "" {
+						byPath[cnd.Path] = cnd
+					}
+				}
+				if got := byPath["internal/order/ports.go"].Origin; got != originExplicitSeed {
+					t.Fatalf("the explicit seed carries origin %d, want originExplicitSeed", got)
+				}
+				if got := byPath["internal/order/handler.go"].Origin; got != originPathToken {
+					t.Fatalf("the path token carries origin %d, want originPathToken", got)
+				}
+
+				// Ambiguity is preserved: every declaration the resolver returns
+				// for the backticked name is its own candidate, none is dropped.
+				page, err := svc.Resolve(fx.ctx, model.SymbolRequest{GenerationID: fx.Gen, Query: "Place",
+					Operation: model.SymbolResolve, SemanticSource: model.SemanticCanonical,
+					Page: model.PageRequest{Limit: model.MaxPageItems}})
+				if err != nil {
+					t.Fatalf("Resolve: %v", err)
+				}
+				if len(page.Items) < 2 {
+					t.Fatalf("the fixture resolves %q to %d declarations; the row needs an ambiguous name", "Place", len(page.Items))
+				}
+				declared := map[model.NodeID]bool{}
+				for _, cnd := range seeds.Candidates {
+					if cnd.Origin == originBacktick && cnd.NodeID != "" {
+						declared[cnd.NodeID] = true
+					}
+				}
+				if len(declared) != len(page.Items) {
+					t.Fatalf("the backticked name produced %d seeds for %d declarations: a candidate was silently chosen or dropped",
+						len(declared), len(page.Items))
+				}
+				for _, n := range page.Items {
+					if !declared[n.ID] {
+						t.Fatalf("declaration %s of the ambiguous name is missing from the seeds", n.ID)
+					}
+				}
+
+				// An identity that resolves to nothing is reported with a reason
+				// and leaves the scope incomplete; it is never dropped in silence.
+				if !seeds.Unresolved {
+					t.Fatal("a task naming an absent path left Unresolved false")
+				}
+				var reason string
+				for _, ex := range seeds.Excluded {
+					if ex.Path == "docs/missing.md" {
+						reason = ex.Excluded
+					}
+				}
+				if reason == "" {
+					t.Fatalf("the absent path is not an exclusion with a reason; exclusions were %+v", seeds.Excluded)
+				}
+			},
+		},
 		// L2 SCOPE rows
 		// L3 RANK rows
 		// L4 BUDGET rows
