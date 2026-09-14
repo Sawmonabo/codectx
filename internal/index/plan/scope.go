@@ -10,6 +10,7 @@ package plan
 import (
 	"context"
 
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -100,14 +101,33 @@ func semanticScopes(ctx context.Context, p provider.Provider, det provider.Detec
 		}
 		out := make([]semantic, 0, len(dp.Units))
 		for _, u := range dp.Units {
-			// Residual 109: a dependence unit declares every non-deleted
-			// snapshot file it owns, not only the files of its own language.
-			// Its manifests and lock files are part of the semantic closure
-			// Section 11.6 keys the cached graph on, so a unit that declared
-			// only its sources would be reused across a changed go.sum.
+			// Residual 109: a dependence unit declares its semantic closure and
+			// nothing else -- the files of its own family that it owns, plus
+			// the manifest and lock files it declares (Section 11.6: "the
+			// unit's source file hashes, its manifest and lock files"). Every
+			// file under the root would fold a README, an image and another
+			// language's sources into the key of the heaviest unit in the
+			// product, so a documentation edit would reparse it; Section 13.1
+			// forbids exactly that. u.Markers is the closure's manifest half
+			// and is complete, never truncated, so nothing leaves the key
+			// unobserved. The lookup is built once per unit, so the manifest
+			// walk stays O(files x units) rather than O(files x units x
+			// markers).
+			markers := make(map[string]bool, len(u.Markers))
+			for _, m := range u.Markers {
+				markers[m] = true
+			}
 			out = append(out, semantic{providerID: d.ID, scopeKey: u.ScopeKey, heavy: true,
 				family: u.Family, bytes: u.Bytes,
-				contains: func(fv model.FileVersion) bool { return u.Contains(fv.Path) }})
+				contains: func(fv model.FileVersion) bool {
+					if !u.Contains(fv.Path) {
+						return false
+					}
+					// FamilyOf maps both "c" and "cpp" to FamilyC, so the
+					// whole-repository C/C++ unit keeps both languages'
+					// sources.
+					return dependence.FamilyOf(lang.Of(fv.Path)) == u.Family || markers[fv.Path]
+				}})
 		}
 		var unplanned map[string]int
 		for f, n := range dp.Unplanned {

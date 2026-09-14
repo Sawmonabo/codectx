@@ -37,12 +37,15 @@ const (
 	// unplannedScopeKey counts the files whose unit scope key does not fit
 	// model.MaxScopeKeyBytes, per provider.
 	unplannedScopeKey = "scope_key_over_bound:"
+	// unplannedNoInputs counts the semantic scopes refused because nothing in
+	// the pinned snapshot is a member of them, per provider.
+	unplannedNoInputs = "semantic_scope_without_inputs:"
 	// unplannedProjects counts the dependence projects the provider's own
 	// planner refused as units of their own, per family.
 	unplannedProjects = "dependence_projects_unplanned:"
 	// unplannedDuplicateFileNode counts the manifest units whose file node
 	// duplicates the filesystem unit's node for the same file identity
-	// (controller ruling Q8, Task 7 residual). See the comment at duplicate().
+	// (ruling Q8 as re-ruled, Task 7 residual). See the comment at duplicate().
 	unplannedDuplicateFileNode = "manifest_duplicate_file_node"
 )
 
@@ -100,7 +103,7 @@ func (u Unit) Spec(analysisConfigHash string) (model.UnitSpec, error) {
 // Carried is one previous sealed unit of a refreshing semantic scope, with the
 // provenance distance Section 13.3 requires it to answer `stale` with. The
 // coordinator attaches it through sqlite.AttachCarried; it is never reported
-// fresh. Its scope is never also in Plan.Units -- see Plan.Carry.
+// fresh. Its scope's deferred unit is also in Plan.Units -- see Plan.Carry.
 type Carried struct {
 	Unit                 model.UnitID
 	ProviderID, ScopeKey string
@@ -121,10 +124,12 @@ type Plan struct {
 	// scopes have no entry in Units: there is nothing to run.
 	Reuse map[string]model.UnitID
 	// Carry are the stale predecessors of deferred semantic scopes, to attach
-	// through sqlite.AttachCarried. A scope appears in Carry or in Units,
-	// never in both: generation_units holds one row per
-	// (generation, provider, scope), so a generation that builds a scope's
-	// unit cannot also carry that scope's predecessor.
+	// through sqlite.AttachCarried. A carried scope's *deferred* unit is also
+	// in Units, because it runs later, in its own work generation (Section
+	// 11.6, ruling Q1). The coordinator attaches the carried predecessor into
+	// this generation with sqlite.AttachCarried and must not attach the
+	// deferred unit here: generation_units holds one row per
+	// (generation, provider, scope).
 	Carry []Carried
 	// Previous maps Key(providerID, scopeKey) to the sealed predecessor a
 	// rebuilt semantic unit imports its delta from. A file-invalidated unit has
@@ -141,23 +146,16 @@ type Plan struct {
 
 // Inputs are the planner's read-only dependencies.
 type Inputs struct {
-	View      model.SnapshotView
+	View model.SnapshotView
+	// Selection is what Registry.Select answered. Its Detections carry the two
+	// things the planner needs and a descriptor does not hold: ObservedVersion,
+	// which folds into UnitSpec.ProviderVersion so a unit is keyed by the tool
+	// that actually produced it, and InputPaths, which is what
+	// scip.Provider.Scopes reads. The planner is handed no workspace root and
+	// must not re-run detection anyway: detection touches the live checkout,
+	// and the plan is about the pinned snapshot.
 	Selection provider.Selection
-	// Detections are the detections Registry.Select produced, by provider ID.
-	//
-	// DEVIATION from the lane plan's frozen shape, reported to the controller:
-	// provider.Selection (frozen, internal/provider/registry.go) discards every
-	// Detection, and the planner needs two things only a Detection carries --
-	// ObservedVersion, which folds into UnitSpec.ProviderVersion so a unit is
-	// keyed by the tool that actually produced it, and InputPaths, which is
-	// what scip.Provider.Scopes reads. The planner is handed no workspace root
-	// and must not re-run detection anyway (detection touches the live
-	// checkout; the plan is about the pinned snapshot). The proper fix is a
-	// Detections field on provider.Selection; until it exists the coordinator
-	// must supply this map, and Build refuses rather than planning an active
-	// provider's units from a zero Detection.
-	Detections map[string]provider.Detection
-	Store      *sqlite.Store
+	Store     *sqlite.Store
 	// PrevGen is the generation reuse, carry and delta predecessors are read
 	// from; zero means there is none and every unit is built.
 	PrevGen model.GenerationID
@@ -166,11 +164,15 @@ type Inputs struct {
 	// instead of reporting 1 forever. It is the fold of
 	// sqlite.CarriedUnits(PrevGen) by Key(providerID, scopeKey).
 	//
-	// DEVIATION, reported: the planner does not call CarriedUnits itself
-	// because that call is L1's and does not exist yet; wiring it as a
-	// function makes an unwired coordinator visibly nil rather than silently
-	// equivalent to "nothing was ever carried". Build requires it whenever
-	// PrevGen is set.
+	// It is the coordinator's fold and not a call Build makes itself, for two
+	// reasons. The coordinator already lists those rows to project the
+	// previous generation's provenance distance into CapabilityState.Details
+	// (ruling Q4), so folding the same listing into Build would read one
+	// bounded listing twice; and CarriedUnits' response bound then belongs
+	// where the listing is owned rather than being able to fail a whole plan.
+	// A function rather than a map so an unwired coordinator is visibly nil
+	// instead of silently equivalent to "nothing was ever carried": Build
+	// refuses whenever PrevGen is set and this is missing.
 	PriorCarry func(providerID, scopeKey string) (Carried, bool)
 	Config     config.Config
 }
@@ -187,7 +189,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
 			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
-		byProvider: map[string][]Unit{}, overBound: map[string]string{}}
+		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{}}
 	if err := b.classifyProviders(ctx); err != nil {
 		return Plan{}, err
 	}
@@ -196,6 +198,15 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	}
 	if err := b.emit(ctx); err != nil {
 		return Plan{}, err
+	}
+	// Every output map of one value is normalized empty-to-nil here, in one
+	// place: a caller ranging over the plan cannot then tell an empty map from
+	// a missing one by accident.
+	if len(b.plan.Reuse) == 0 {
+		b.plan.Reuse = nil
+	}
+	if len(b.plan.Previous) == 0 {
+		b.plan.Previous = nil
 	}
 	if len(b.plan.Unplanned) == 0 {
 		b.plan.Unplanned = nil
@@ -227,6 +238,9 @@ type builder struct {
 	// overBound records one exemplar path per provider whose scope key does
 	// not fit, for the degradation row; the count lives in Unplanned.
 	overBound map[string]string
+	// noInputs records one exemplar scope key per provider whose semantic
+	// scope no snapshot file is a member of, for the degradation row.
+	noInputs map[string]string
 	// fsActive records whether the filesystem provider is active. Change
 	// attribution is derived from its per-file unit identity, which is the
 	// only content-exact comparison the planner has.
@@ -249,10 +263,16 @@ func (b *builder) classifyProviders(ctx context.Context) error {
 	b.semantics = map[string][]*semantic{}
 	for _, p := range b.in.Selection.Active {
 		d := p.Descriptor()
-		det, ok := b.in.Detections[d.ID]
+		det, ok := b.in.Selection.Detections[d.ID]
 		if !ok {
-			return invalid("the planner has no detection for active provider " + d.ID +
-				"; wire Inputs.Detections from the detections Registry.Select produced")
+			// Argument validation on an exported API, not a reachable
+			// degradation: Registry.Select fills Detections for exactly the
+			// providers it returns in Active. A caller that hands Build a
+			// hand-built Selection instead must not silently plan an active
+			// provider's units from a zero Detection, which would change every
+			// UnitSpec.ProviderVersion.
+			return invalid("the selection carries no detection for active provider " + d.ID +
+				"; Selection must be the value Registry.Select returned")
 		}
 		version, err := foldVersion(d.Version, det.ObservedVersion)
 		if err != nil {
@@ -425,16 +445,16 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 
 // duplicate counts the file identity that two units publish a node fact for:
 // the filesystem unit's, which carries the file's metadata, and the manifest
-// unit's, which is nil-valued (manifest.unit.fileNode). Controller ruling Q8
-// says the filesystem fact wins and the duplicate is suppressed at plan time.
+// unit's, which is nil-valued (manifest.unit.fileNode).
 //
-// It cannot be: node_facts' conflict clause is ON CONFLICT(unit_id, node_id)
-// DO NOTHING (internal/storage/sqlite/units.go:459), which is per unit, so
-// both rows are written whatever order the units run in, and neither the
-// manifest provider nor storage is this lane's to change. What the plan can do
-// is count it, which is what this does -- the precedence itself has to be
-// applied where the two rows are read, or by Task 7's emitter. Reported to the
-// controller for a re-ruling.
+// Ruling Q8 first put the suppression at plan time. It cannot be there:
+// node_facts' conflict clause is ON CONFLICT(unit_id, node_id) DO NOTHING
+// (internal/storage/sqlite/units.go:459), which is per unit, so both rows are
+// written whatever order the units run in, and no plan-time ordering or
+// dependency suppresses either. Re-ruled: precedence is applied at read time
+// in the query layer (Task 13/14) -- for one node id across the units of the
+// active generation the filesystem provider's row wins over a nil-valued
+// manifest row. The plan counts the duplicate only, which is what this does.
 func (b *builder) duplicate(fv model.FileVersion) {
 	for _, fp := range b.fileProviders {
 		if fp.id == manifest.ID && fp.gate(fv) {
@@ -462,6 +482,21 @@ func (b *builder) emit(ctx context.Context) error {
 				inputs = b.allInputs
 			} else {
 				slices.SortFunc(inputs, func(a, c model.UnitInput) int { return compareID(a.FileID, c.FileID) })
+			}
+			if len(inputs) == 0 {
+				// A unit that declares nothing folds the empty input digest,
+				// which is the same digest whatever the snapshot holds -- an
+				// identity that reuses forever no matter what changed. It is
+				// reachable: a scip `import:` scope whose index file detection
+				// saw in the live checkout is not in the pinned snapshot (the
+				// workspace policy excluded it, or it is over a size bound) is
+				// a member of nothing. Refused and published as a degradation,
+				// never planned with a constant identity.
+				b.plan.Unplanned[unplannedNoInputs+s.providerID]++
+				if _, seen := b.noInputs[s.providerID]; !seen {
+					b.noInputs[s.providerID] = s.scopeKey
+				}
+				continue
 			}
 			u := Unit{ProviderID: s.providerID, ProviderVersion: s.version, ScopeKey: s.scopeKey, Inputs: inputs}
 			if s.heavy {
@@ -496,12 +531,6 @@ func (b *builder) emit(ctx context.Context) error {
 		b.plan.Units = append(b.plan.Units, b.byProvider[p.Descriptor().ID]...)
 	}
 	b.degradations()
-	if len(b.plan.Reuse) == 0 {
-		b.plan.Reuse = nil
-	}
-	if len(b.plan.Previous) == 0 {
-		b.plan.Previous = nil
-	}
 	return nil
 }
 
@@ -539,27 +568,34 @@ func (b *builder) carry(s *semantic, prev model.UnitID, deferred bool) {
 }
 
 // degradations publishes one capability row per affected provider capability
-// for the scope keys the planner refused. One row per (provider, capability)
-// and not one per path: the row count must stay inside
-// model.MaxCapabilityStates whatever the repository holds, and the offending
-// path cannot be the row's scope -- it is by definition longer than
-// model.MaxScopeKeyBytes, which CapabilityState.Validate bounds Scope by.
+// for everything the planner refused. One row per (provider, capability) and
+// not one per path: the row count must stay inside model.MaxCapabilityStates
+// whatever the repository holds, and the offending path cannot be the row's
+// scope -- it is by definition longer than model.MaxScopeKeyBytes, which
+// CapabilityState.Validate bounds Scope by.
 func (b *builder) degradations() {
 	for _, p := range b.in.Selection.Active {
 		d := p.Descriptor()
-		n := b.plan.Unplanned[unplannedScopeKey+d.ID]
-		if n == 0 {
-			continue
+		if n := b.plan.Unplanned[unplannedScopeKey+d.ID]; n > 0 {
+			for _, c := range d.Capabilities {
+				state := b.partial(d, c).WithDetail("files_over_scope_bound", strconv.Itoa(n))
+				state = state.WithDetail("bound", strconv.Itoa(model.MaxScopeKeyBytes))
+				b.plan.States = append(b.plan.States, state.WithDetail("path", model.TruncateDetail(b.overBound[d.ID])))
+			}
 		}
-		for _, c := range d.Capabilities {
-			state := model.CapabilityState{ProviderID: d.ID, Capability: c, Scope: provider.ScopeWorkspace,
-				State: model.CapabilityPartial, DiagnosticCode: model.CodeProviderOutputInvalid}
-			state = state.WithDetail("files_over_scope_bound", strconv.Itoa(n))
-			state = state.WithDetail("bound", strconv.Itoa(model.MaxScopeKeyBytes))
-			state = state.WithDetail("path", model.TruncateDetail(b.overBound[d.ID]))
-			b.plan.States = append(b.plan.States, state)
+		if n := b.plan.Unplanned[unplannedNoInputs+d.ID]; n > 0 {
+			for _, c := range d.Capabilities {
+				state := b.partial(d, c).WithDetail("scopes_without_inputs", strconv.Itoa(n))
+				b.plan.States = append(b.plan.States, state.WithDetail("scope_key", model.TruncateDetail(b.noInputs[d.ID])))
+			}
 		}
 	}
+}
+
+// partial is the empty degradation row every refusal above fills in.
+func (b *builder) partial(d model.ProviderDescriptor, capability string) model.CapabilityState {
+	return model.CapabilityState{ProviderID: d.ID, Capability: capability, Scope: provider.ScopeWorkspace,
+		State: model.CapabilityPartial, DiagnosticCode: model.CodeProviderOutputInvalid}
 }
 
 // previous answers, for one scope, whether the previous generation's sealed
