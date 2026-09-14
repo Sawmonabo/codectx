@@ -1357,6 +1357,78 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Errorf("previous unit is %s/exists=%v (err %v), want sealed", state, exists, err)
 		}
 	})
+
+	t.Run("batched adjacency spans units but stays inside the generation", func(t *testing.T) {
+		// A frontier expansion reads many units in one statement. If the batch
+		// lost its membership predicate, an edge published only by a unit this
+		// generation does not select would be served as a fact of it: the
+		// traversal would report a call the pinned snapshot does not contain,
+		// and every answer derived from it would be wrong with no way to tell.
+		// The same batch must still cross unit boundaries, or the traversal
+		// silently stops at the first unit edge.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a := f.file("pkg/a.go", "package pkg\nfunc F() { G() }\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() { G() }\n")
+		snap1 := f.snapshot("one", a, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture) (model.UnitID, model.NodeID) {
+			w := f.begin(gen, run, ff)
+			from := f.putNode(w, run, ff.path, "F", &ff, "key:node:from:"+ff.path)
+			to := f.putNode(w, run, ff.path, "G", &ff, "key:node:to:"+ff.path)
+			f.putRelation(w, run, from, to, "key:rel:"+ff.path, &ff)
+			if err := f.s.SealUnit(f.ctx, w); err != nil {
+				t.Fatalf("SealUnit(%s): %v", ff.path, err)
+			}
+			return w.UnitID(), from
+		}
+		unitA, fromA := edge(gen1, run1, a)
+		_, fromB := edge(gen1, run1, b)
+		f.activate(gen1, 0)
+
+		// gen2 drops b.go entirely: only unit A is a member, so b.go's edge is
+		// still stored but is not a fact of gen2.
+		snap2 := f.snapshot("two", a)
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.s.AttachUnit(f.ctx, gen2, unitA); err != nil {
+			t.Fatalf("AttachUnit: %v", err)
+		}
+		f.activate(gen2, gen1)
+
+		batch := func(gen model.GenerationID, dir model.Direction) []model.Relation {
+			t.Helper()
+			r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+			if err != nil {
+				t.Fatalf("PinGeneration(%d): %v", gen, err)
+			}
+			defer r.Close()
+			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", model.MaxPageItems)
+			if err != nil {
+				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
+			}
+			return rels
+		}
+		// gen1 selects both units, so one batch over both seed nodes crosses
+		// the unit boundary and returns both edges.
+		if got := batch(gen1, model.DirectionOutgoing); len(got) != 2 {
+			t.Fatalf("gen1 batch returned %d edges, want both units' edges: %+v", len(got), got)
+		}
+		// gen2 selects only unit A. The UNION form must be restricted too, so
+		// both directions are asserted.
+		for _, dir := range []model.Direction{model.DirectionOutgoing, model.DirectionBoth} {
+			got := batch(gen2, dir)
+			if len(got) != 1 || got[0].From != fromA {
+				t.Fatalf("gen2 %s batch = %+v, want only unit A's edge from %s", dir, got, fromA)
+			}
+		}
+	})
 }
 
 // TestActivateCapabilityDetails covers the diagnostic detail map a provider
