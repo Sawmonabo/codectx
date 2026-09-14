@@ -1,0 +1,22 @@
+107374182400,METHOD,example.com/fix/helper,TYPE_DECL,example.com/fix/helper<clinit>,0,0,example.com/fix/helper,example.com/fix/helper<clinit>,<empty>,,false,0,0,example.com/fix/helper<clinit>,,,1,
+107374182401,METHOD,example.com/fix/app,TYPE_DECL,"func Run(c *Counter, flag bool) int {
+	x := 1
+	if flag {
+		x = helper.Scale(x)
+		c.N = x
+	} else {
+		x += 3
+		c.N = x
+	}
+	Total = x
+	return x
+}",1,2,app/app.go,example.com/fix/app.Run,<empty>,,false,9,20,Run,,,1,"example.com/fix/app.Run(*example.com/fix/app.Counter, bool)int"
+107374182402,METHOD,example.com/fix/app,TYPE_DECL,example.com/fix/app.app.go,1,2,app/app.go,app/app.go:example.com/fix/app.app.go,<empty>,,false,1,20,example.com/fix/app.app.go,,,1,
+107374182403,METHOD,example.com/fix/helper,TYPE_DECL,"func Scale(v int) int {
+	return v * Factor
+}",1,2,helper/helper.go,example.com/fix/helper.Scale,<empty>,,false,4,6,Scale,,,1,example.com/fix/helper.Scale(int)int
+107374182404,METHOD,example.com/fix/helper,TYPE_DECL,example.com/fix/helper.helper.go,1,15,helper/helper.go,helper/helper.go:example.com/fix/helper.helper.go,<empty>,,false,1,8,example.com/fix/helper.helper.go,,,1,
+107374182405,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
+107374182406,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.fieldAccess,<empty>,,true,,,<operator>.fieldAccess,,,0,
+107374182407,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignmentPlus,<empty>,,true,,,<operator>.assignmentPlus,,,0,
+107374182408,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.multiplication,<empty>,,true,,,<operator>.multiplication,,,0,

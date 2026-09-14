@@ -1,0 +1,15 @@
+90194313216,LITERAL,2,,,0,5,__builtin.int,1,4,5,2,,__builtin.int
+90194313217,LITERAL,2,,,0,34,__builtin.int,3,48,49,2,,__builtin.int
+90194313218,LITERAL,1,,,0,49,__builtin.int,3,63,64,1,,ANY
+90194313219,LITERAL,2,,,4,52,__builtin.int,3,66,67,2,,ANY
+90194313220,LITERAL,2,,,1,9,__builtin.int,6,104,105,2,,__builtin.int
+90194313221,LITERAL,2,,,2,17,__builtin.int,6,112,113,2,,ANY
+90194313222,LITERAL,2,,,3,11,__builtin.int,7,124,125,2,,__builtin.int
+90194313223,LITERAL,2,,,4,25,__builtin.int,7,138,139,2,,ANY
+90194313224,LITERAL,2,,,0,5,__builtin.int,8,151,162,2,,ANY
+90194313225,LITERAL,2,,,1,5,__builtin.int,8,151,162,2,,ANY
+90194313226,LITERAL,2,,,0,18,__builtin.int,8,164,175,2,,ANY
+90194313227,LITERAL,2,,,1,18,__builtin.int,8,164,175,2,,ANY
+90194313228,LITERAL,2,,,7,13,__builtin.int,9,188,189,2,,__builtin.int
+90194313229,LITERAL,2,,,6,22,__builtin.int,10,211,212,2,,__builtin.int
+90194313230,LITERAL,2,,,"""k""",15,__builtin.str,10,204,206,2,,ANY

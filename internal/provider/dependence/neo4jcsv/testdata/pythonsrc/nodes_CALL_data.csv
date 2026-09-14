@@ -1,0 +1,47 @@
+30064771072,CALL,-1,,,G = 0,1,STATIC_DISPATCH,,1,<operator>.assignment,<operator>.assignment,0,5,1,,,,ANY
+30064771073,CALL,1,,,self.f,25,STATIC_DISPATCH,,3,<operator>.fieldAccess,<operator>.fieldAccess,39,45,1,,,,ANY
+30064771074,CALL,-1,,,self.f = 0,25,STATIC_DISPATCH,,3,<operator>.assignment,<operator>.assignment,39,49,1,,,,ANY
+30064771075,CALL,1,,,[0],48,STATIC_DISPATCH,,3,<operator>.listLiteral,<operator>.listLiteral,62,65,1,,,,ANY
+30064771076,CALL,2,,,[0] * 4,48,STATIC_DISPATCH,,3,<operator>.multiplication,<operator>.multiplication,62,67,2,,,,ANY
+30064771077,CALL,1,,,self.arr,37,STATIC_DISPATCH,,3,<operator>.fieldAccess,<operator>.fieldAccess,51,59,1,,,,ANY
+30064771078,CALL,-1,,,self.arr = [0] * 4,37,STATIC_DISPATCH,,3,<operator>.assignment,<operator>.assignment,51,67,2,,,,ANY
+30064771079,CALL,-1,,,__init__ = def __init__(...),5,STATIC_DISPATCH,,3,<operator>.assignment,<operator>.assignment,19,68,1,,,,ANY
+30064771080,CALL,-1,,,class S<meta>(...).<fakeNew>,18,STATIC_DISPATCH,,3,<operator>.fieldAccess,<operator>.fieldAccess,32,36,0,,,,ANY
+30064771081,CALL,2,,,class S<meta>(...).<fakeNew>(),18,DYNAMIC_DISPATCH,,3,<unknownFullName>,,32,36,2,,,,ANY
+30064771082,CALL,-1,,,__newInstance = class S<meta>(...).<fakeNew>(),18,STATIC_DISPATCH,,3,<operator>.assignment,<operator>.assignment,32,36,1,,,,ANY
+30064771083,CALL,-1,,,__newInstance.__init__,18,STATIC_DISPATCH,,3,<operator>.fieldAccess,<operator>.fieldAccess,32,36,0,,,,ANY
+30064771084,CALL,-1,,,__newInstance.__init__(),18,DYNAMIC_DISPATCH,,3,<unknownFullName>,,32,36,2,,,,ANY
+30064771085,CALL,1,,,,18,STATIC_DISPATCH,,3,<operator>.alloc,<operator>.alloc,32,36,1,,,,ANY
+30064771086,CALL,1,,,__init__(self),5,STATIC_DISPATCH,w.py:<module>.S.__init__,3,w.py:<module>.S.__init__,w.py:<module>.S.__init__,19,68,1,,,,ANY
+30064771087,CALL,-1,,,S = class S<meta>(...),1,STATIC_DISPATCH,,2,<operator>.assignment,<operator>.assignment,6,68,1,,,,ANY
+30064771088,CALL,-1,,,def <body>(...)(),1,DYNAMIC_DISPATCH,w.py:<module>.S.,2,w.py:<module>.S..__init__,,6,68,2,,,,ANY
+30064771089,CALL,-1,,,x = 1,5,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,100,105,2,,,,ANY
+30064771090,CALL,-1,,,x += 2,12,STATIC_DISPATCH,,6,<operator>.assignmentPlus,<operator>.assignmentPlus,107,113,3,,,,ANY
+30064771091,CALL,1,,,s.f,5,STATIC_DISPATCH,,7,<operator>.fieldAccess,<operator>.fieldAccess,118,121,1,,,,ANY
+30064771092,CALL,-1,,,s.f = 3,5,STATIC_DISPATCH,,7,<operator>.assignment,<operator>.assignment,118,125,4,,,,ANY
+30064771093,CALL,1,,,s.arr,14,STATIC_DISPATCH,,7,<operator>.fieldAccess,<operator>.fieldAccess,127,132,1,,,,ANY
+30064771094,CALL,1,,,s.arr[i],14,STATIC_DISPATCH,,7,<operator>.indexAccess,<operator>.indexAccess,127,135,1,,,,ANY
+30064771095,CALL,-1,,,s.arr[i] = 4,14,STATIC_DISPATCH,,7,<operator>.assignment,<operator>.assignment,127,139,5,,,,ANY
+30064771096,CALL,-1,,,G = x,28,STATIC_DISPATCH,,7,<operator>.assignment,<operator>.assignment,141,146,6,,,,ANY
+30064771097,CALL,2,,,"(x, x)",12,STATIC_DISPATCH,,8,<operator>.tupleLiteral,<operator>.tupleLiteral,158,162,2,,,,ANY
+30064771098,CALL,-1,,,"tmp0 = (x, x)",5,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,151,162,1,,,,ANY
+30064771099,CALL,2,,,tmp0[0],5,STATIC_DISPATCH,,8,<operator>.indexAccess,<operator>.indexAccess,151,162,2,,,,ANY
+30064771100,CALL,-1,,,a = tmp0[0],5,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,151,162,2,,,,ANY
+30064771101,CALL,2,,,tmp0[1],5,STATIC_DISPATCH,,8,<operator>.indexAccess,<operator>.indexAccess,151,162,2,,,,ANY
+30064771102,CALL,-1,,,b = tmp0[1],5,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,151,162,3,,,,ANY
+30064771103,CALL,2,,,"(b, a)",25,STATIC_DISPATCH,,8,<operator>.tupleLiteral,<operator>.tupleLiteral,171,175,2,,,,ANY
+30064771104,CALL,-1,,,"tmp1 = (b, a)",18,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,164,175,1,,,,ANY
+30064771105,CALL,2,,,tmp1[0],18,STATIC_DISPATCH,,8,<operator>.indexAccess,<operator>.indexAccess,164,175,2,,,,ANY
+30064771106,CALL,-1,,,a = tmp1[0],18,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,164,175,2,,,,ANY
+30064771107,CALL,2,,,tmp1[1],18,STATIC_DISPATCH,,8,<operator>.indexAccess,<operator>.indexAccess,164,175,2,,,,ANY
+30064771108,CALL,-1,,,b = tmp1[1],18,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,164,175,3,,,,ANY
+30064771109,CALL,-1,,,tmp2 = 7,5,STATIC_DISPATCH,,9,<operator>.assignment,<operator>.assignment,180,189,1,,,,ANY
+30064771110,CALL,-1,,,y = tmp2,5,STATIC_DISPATCH,,9,<operator>.assignment,<operator>.assignment,180,189,2,,,,ANY
+30064771111,CALL,-1,,,x = tmp2,5,STATIC_DISPATCH,,9,<operator>.assignment,<operator>.assignment,180,189,3,,,,ANY
+30064771112,CALL,2,,,{},9,STATIC_DISPATCH,,10,<operator>.dictLiteral,<operator>.dictLiteral,198,200,2,,,,ANY
+30064771113,CALL,-1,,,tmp3 = {},9,STATIC_DISPATCH,,10,<operator>.assignment,<operator>.assignment,198,200,1,,,,ANY
+30064771114,CALL,-1,,,"d = tmp3 = {}
+tmp3",5,STATIC_DISPATCH,,10,<operator>.assignment,<operator>.assignment,194,200,10,,,,ANY
+30064771115,CALL,1,,,"d[""k""]",13,STATIC_DISPATCH,,10,<operator>.indexAccess,<operator>.indexAccess,202,208,1,,,,ANY
+30064771116,CALL,-1,,,"d[""k""] = 6",13,STATIC_DISPATCH,,10,<operator>.assignment,<operator>.assignment,202,212,11,,,,ANY
+30064771117,CALL,-1,,,run = def run(...),1,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,68,213,3,,,,ANY

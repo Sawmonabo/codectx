@@ -1,0 +1,16 @@
+107374182400,METHOD,w.c:<global>,TYPE_DECL,<clinit>,1,31,w.c,S.<clinit>:S(),<empty>,,false,1,1,<clinit>,,,3,
+107374182401,METHOD,w.c:<global>,TYPE_DECL,<global>,1,1,w.c,w.c:<global>,<empty>,,false,1,7,<global>,,,1,
+107374182402,METHOD,w.c:<global>,TYPE_DECL,"void run(struct S *s, int *p, int i) {
+  int x = 1; x += 2; x++; --x;
+  s->f = 3; s->arr[i] = 4; (*p) = 5; *p += 1; g = x;
+  int y = x = 7;
+}",1,1,w.c,run,<empty>,,false,3,7,run,,,1,"void(S*,int*,int)"
+107374182403,METHOD,<includes>:<global>,NAMESPACE_BLOCK,<global>,,,<includes>,<includes>:<global>,<empty>,,false,1,,<global>,,,1,
+107374182404,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.arrayInitializer,<empty>,,true,,,<operator>.arrayInitializer,,,0,
+107374182405,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
+107374182406,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignmentPlus,<empty>,,true,,,<operator>.assignmentPlus,,,0,
+107374182407,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.postIncrement,<empty>,,true,,,<operator>.postIncrement,,,0,
+107374182408,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.preDecrement,<empty>,,true,,,<operator>.preDecrement,,,0,
+107374182409,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indirectFieldAccess,<empty>,,true,,,<operator>.indirectFieldAccess,,,0,
+107374182410,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indirectIndexAccess,<empty>,,true,,,<operator>.indirectIndexAccess,,,0,
+107374182411,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indirection,<empty>,,true,,,<operator>.indirection,,,0,
