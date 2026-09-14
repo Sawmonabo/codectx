@@ -339,67 +339,22 @@ func checkWalk(ctx context.Context, b *budget) error {
 // relation allowlist, reporting the direction it walked and the visited and
 // edge counts it spent.
 func (e *Engine) Neighbors(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, neighborsEndpoint, req.Direction, req.Relations, nil)
+	return e.traverse(ctx, req, neighborsEndpoint, req.Direction, req.Relations)
 }
 
-// Callers expands incoming `calls` edges. It pins both the direction and the
-// relation itself; a request that contradicts either is rejected with
-// CTX_ARGUMENT_INVALID rather than having the field silently ignored.
-func (e *Engine) Callers(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, callersEndpoint, model.DirectionIncoming, []model.RelationKind{model.RelCalls},
-		pinnedCalls(model.DirectionIncoming, "callers"))
-}
-
-// Callees expands outgoing `calls` edges, pinning direction and relation the
-// same way Callers does.
-func (e *Engine) Callees(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, calleesEndpoint, model.DirectionOutgoing, []model.RelationKind{model.RelCalls},
-		pinnedCalls(model.DirectionOutgoing, "callees"))
-}
-
-// pinnedCalls builds the request check for an operation whose direction and
-// relation are fixed by its name. GraphRequest.Validate already rejects an
-// unknown direction, so the only remaining case is a known direction that
-// disagrees with the operation. An empty relation list means "the operation's
-// own relation"; any other list is a caller asking for something the operation
-// cannot answer, and is refused for the same reason the direction is.
-func pinnedCalls(dir model.Direction, op string) func(model.GraphRequest) error {
-	return func(req model.GraphRequest) error {
-		if req.Direction != dir {
-			return (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: "this operation walks one fixed direction"}).
-				WithDetail("operation", op).
-				WithDetail("direction", string(dir))
-		}
-		if len(req.Relations) == 0 {
-			return nil
-		}
-		if len(req.Relations) != 1 || req.Relations[0] != model.RelCalls {
-			return (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: "this operation walks one fixed relation kind"}).
-				WithDetail("operation", op).
-				WithDetail("relation", string(model.RelCalls))
-		}
-		return nil
-	}
-}
-
-// Endpoint names bind a continuation to the operation that issued it, the way
-// referenceEndpoint does: a cursor minted by callees means nothing to callers
-// even at the same generation and seeds, and resumeTraversal rejects it.
-const (
-	neighborsEndpoint = "graph.neighbors"
-	callersEndpoint   = "graph.callers"
-	calleesEndpoint   = "graph.callees"
-)
+// neighborsEndpoint binds a continuation to the operation that issued it, the
+// way referenceEndpoint does: a cursor minted by a traversal means nothing to
+// another endpoint even at the same generation and seeds, and resumeTraversal
+// rejects it.
+const neighborsEndpoint = "graph.neighbors"
 
 // continuationUnavailable rejects a request carrying a traversal cursor.
 // Silently ignoring a cursor would restart the walk from the seeds while the
 // caller believed it was resuming, which would double-spend the cumulative
 // budget the cursor exists to carry, so a typed refusal is the honest answer.
 //
-// Every other operation DOES page: Neighbors, Callers and Callees mint and
-// resume a traversalCursor from a keyset position, and Impact spills its ranked
+// Every other operation DOES page: Neighbors mints and resumes
+// a traversalCursor from a keyset position, and Impact spills its ranked
 // tail into a spool and replays it. PackageDependencies is the one that remains:
 // it aggregates a whole walk into pairs, so it has neither a (owner, relation)
 // stop to resume from nor a ranked list to cut. Its CLI command declares no
@@ -424,23 +379,16 @@ func resolveBound(requested, configured int) int {
 	return requested
 }
 
-// traverse is the shared body of Neighbors, Callers and Callees. dir and kinds
-// are what the operation actually walks; pin, when non-nil, is the operation's
-// own request check, run after the shared validation so it can trust the
-// request's shape.
+// traverse is the body behind Neighbors: dir and kinds are what the request
+// asked to walk, and endpoint is what a continuation minted here is bound to.
 func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint string, dir model.Direction,
-	kinds []model.RelationKind, pin func(model.GraphRequest) error) (res model.GraphResult, err error) {
-	// One deferred mapping covers Neighbors, Callers and Callees: a bare
+	kinds []model.RelationKind) (res model.GraphResult, err error) {
+	// One deferred mapping covers every traversal: a bare
 	// context failure from the adjacency reader becomes the Section 8 code for
 	// the state it is in, and anything already typed is left alone.
 	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
 		return model.GraphResult{}, err
-	}
-	if pin != nil {
-		if err := pin(req); err != nil {
-			return model.GraphResult{}, err
-		}
 	}
 	// The deadline wraps the gate as well as the walk, so waiting for a slot
 	// past the request deadline is the resource limit the caller must see, and

@@ -58,6 +58,11 @@ func runService(cmd *cobra.Command, open opener,
 	// command does not have would reject a correct command line as invalid.
 	var timeout time.Duration
 	if cmd.Flags().Lookup(queryTimeoutFlag) != nil {
+		// durationFlag refuses a negative duration for every duration flag in
+		// the tree, so the value reaching queryContext below is never the
+		// negative that it would otherwise read as "no deadline" -- the
+		// opposite of what the operator asked for. This is the only screen;
+		// a second one here would be the same command line checked twice.
 		if timeout, err = durationFlag(cmd, queryTimeoutFlag); err != nil {
 			return err
 		}
@@ -76,13 +81,3 @@ func runService(cmd *cobra.Command, open opener,
 	// class and report itself as a command line they typed wrong.
 	return queryFailure(fn(ctx, ws, ws.Services()))
 }
-
-// The Section 18.2 omission indicator is frozen here as a NAME ONLY:
-//
-//	func writeOmitted(b *strings.Builder, shown, total int)
-//
-// It is not written by this lane. The renderers that landed clip per cell
-// (tableCell, clip) and drop no rows, so a function created up front would ship
-// with no caller -- the placeholder the Section 30.1 completion gate forbids.
-// The first lane that actually omits rows writes it, under this name; if no
-// lane omits rows, it is never written at all.
