@@ -8,10 +8,13 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// referenceEndpoint binds a reference continuation to this operation. A cursor
-// signed for another endpoint carries a sort key and a query hash that mean
-// nothing here, so pagination.Signer.DecodeCursor rejects it rather than
-// silently repinning the request onto a different query.
+// referenceEndpoint binds a reference continuation to this operation, so
+// pagination.Signer.DecodeCursor rejects a cursor signed for a different
+// endpoint whose sort key means nothing here. It does NOT distinguish two
+// reference queries on the same endpoint: pagination.Cursor.QueryHash is what
+// pins the node and operation, and this engine mints no cursor to put a hash
+// in (see checkReferenceCursor), so a same-generation cursor for a different
+// node would resume at a foreign keyset position once tokens exist.
 const referenceEndpoint = "graph.references"
 
 // referenceWalk is the direction and relation allowlist one reference
@@ -69,7 +72,9 @@ func referenceWalkFor(op model.ReferenceOperation) (referenceWalk, error) {
 // distinct RelationIDs gets the relation count. Pages therefore end on a
 // relation boundary: splitting one relation's occurrences across two pages is
 // exactly what would let a consumer double-count the relation or collapse the
-// occurrences.
+// occurrences. The one exception is a single relation carrying more
+// occurrences than a whole page holds; that page is clipped and reported as
+// truncated, because the alternative is an unbounded page.
 //
 // A request naming the lsp semantic source is answered with an
 // unavailable-capability row and no records. It is never answered canonically:
@@ -190,6 +195,14 @@ func (e *Engine) resumeReferences(req model.ReferenceRequest) (model.RelationID,
 	if err := e.checkReferenceCursor(c); err != nil {
 		return "", err
 	}
+	if c.SpoolID != "" {
+		// A spool-carrying cursor has an empty LastKey, so honouring it would
+		// resume at position zero and silently re-serve page one as if it were
+		// page two. References spools nothing; such a token is not ours to read.
+		return "", (&model.Error{Code: model.CodeCursorInvalid,
+			Message: "cursor carries spooled traversal state this endpoint does not produce"}).
+			WithDetail("endpoint", referenceEndpoint)
+	}
 	return model.RelationID(c.LastKey), nil
 }
 
@@ -231,6 +244,12 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 		// pageLimit+1 per relation distinguishes "exactly a page of
 		// occurrences" from "more than a page", so the clipped flag is never
 		// raised for a relation that happens to fill the page exactly.
+		//
+		// This reads Adjacency.EvidenceFor's limit as a PER-RELATION cap, not a
+		// total row cap across the batch. A total-cap implementation would drop
+		// the evidence of nearly every relation in a 256-relation batch and make
+		// this method silently under-report occurrences, which is the one thing
+		// it exists to get right. The storage implementation is bound by this.
 		ev, err := e.adjacency.EvidenceFor(ctx, ids, pageLimit+1)
 		if err != nil {
 			return nil, false, false, err
@@ -270,7 +289,11 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 			}
 			after = r.ID
 			if len(items) >= pageLimit || clipped {
-				return items, e.hasMoreRelations(ctx, seeds, walk, after), clipped, nil
+				more, err := e.hasMoreRelations(ctx, seeds, walk, after)
+				if err != nil {
+					return nil, false, false, err
+				}
+				return items, more, clipped, nil
 			}
 		}
 		if len(rels) < adjacencyBatch {
@@ -281,9 +304,15 @@ func (e *Engine) referencePage(ctx context.Context, node model.NodeID, walk refe
 
 // hasMoreRelations probes for a single relation past the page's last key, so a
 // page that ends exactly on the bound reports truncation only when something
-// really remains.
+// really remains. The probe runs on the deadline-bounded context after the walk
+// has already spent the budget, so it is the call most likely to fail; a
+// failure is propagated rather than read as "nothing remains", because the
+// latter would publish a bounded page as the complete set of references.
 func (e *Engine) hasMoreRelations(ctx context.Context, seeds []model.NodeID,
-	walk referenceWalk, after model.RelationID) bool {
+	walk referenceWalk, after model.RelationID) (bool, error) {
 	rels, err := e.adjacency.Edges(ctx, seeds, walk.direction, walk.kinds, after, 1)
-	return err == nil && len(rels) > 0
+	if err != nil {
+		return false, err
+	}
+	return len(rels) > 0, nil
 }
