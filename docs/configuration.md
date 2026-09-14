@@ -19,8 +19,13 @@ Three rules apply to every key:
   namespace, so an unrecognized key is always a typo or a setting from a
   different version that this build would otherwise silently ignore.
 - **No zero or negative value means "unlimited."** Every limit is a positive
-  number. The single exception is `index.workers = 0`, which means "choose from
-  the available CPUs and memory reservations" — itself a finite bound.
+  number. Exactly three keys give `0` a documented meaning of its own, and each
+  is still a finite bound: `index.workers = 0` chooses from the available CPUs
+  and memory reservations, `index.max_retained_bytes = 0` leaves retention
+  governed by `index.retain_refs` alone rather than by a byte budget, and
+  `providers.dependence.unit_memory_ceiling_bytes = 0` derives a unit's
+  allocation from the machine. A negative value is rejected everywhere; it is
+  never a third meaning.
 - **A limit may be lowered, never raised past its contract ceiling.**
   Configuration narrows what this build does; it cannot widen what a stored
   column or a bounded response can hold.
@@ -38,8 +43,8 @@ analyzed. A repository may tell codectx to look at less of itself; it may never
 tell codectx to run something, to look outside itself, to relax a safety check,
 or to raise a resource ceiling. Concretely, a project file can never set an
 executable path, an argument array, an environment variable, a shell, a network
-posture, a path root, `workspace.follow_symlinks`, `storage.data_dir`,
-`context.strict_read_gate`, or
+posture, a path root, any `[tools]` key, `workspace.follow_symlinks`,
+`storage.data_dir`, `context.strict_read_gate`, or
 `context.allow_exploratory_waiver_consolidation`.
 
 `enabled = "auto"` for an external analyzer means "use an already approved
@@ -112,7 +117,8 @@ it concludes. All are **user** trust.
 | `watch_pending_bytes` | `2097152` | Reserved bytes for pending watch events. |
 | `watch_debounce` | `"250ms"` | Quiet period before a watch batch is scheduled. |
 | `reconcile_interval` | `"30s"` | Period of full reconciliation, which catches missed and timestamp-preserving changes. |
-| `retain_generations` | `3` | Generations kept: the active one plus two prior. |
+| `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. The minimum is `1`, which retains the active ref alone. |
+| `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
 
@@ -169,6 +175,39 @@ it with user-private permissions when it first opens the database. When the data
 directory does lie inside the workspace, it is excluded from traversal
 unconditionally.
 
+## `[tools]` — the managed analyzer toolchain
+
+All **user** trust, and a project file that sets any key here is rejected with
+`CTX_TRUST_REQUIRED`: this table decides which binaries this build executes.
+
+codectx owns every external analyzer and every runtime one needs. Nothing is
+looked up on `PATH`, nothing is installed by hand, and nothing runs that the
+shipped binary did not pin: each tool's exact version, per-platform URL and
+SHA-256 come from a lock embedded in the binary, and a payload whose digest
+disagrees is never extracted and never executed. None of these keys is required
+for ordinary use.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `offline` | `false` | Make every fetch a typed refusal without opening a socket. A tool already in the store still runs. |
+| `cache_dir` | `""` | Absolute path of the tool store. Empty resolves to `tools/` inside the data directory, created user-private. |
+| `mirror` | `""` | Absolute `http`/`https` URL prefix that replaces the host of every lock asset URL. The paths and the digests stay the lock's, so a mirror relocates bytes and never changes which bytes are accepted. |
+| `max_fetch_bytes` | `2147483648` | Ceiling on one payload download. |
+| `fetch_timeout` | `"10m"` | Deadline for one payload download. |
+
+### `[tools.override.<name>]`
+
+An override is the only way to run a tool the lock did not ship for this
+platform, or to replace one it did. It changes the **binary** and never the
+invocation: argument arrays, environment allowlists, budgets, working
+directories and network posture are product code, not configuration.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `executable` | yes | Absolute path. A bare command name is rejected: what `PATH` resolves to is not what was named. |
+| `version` | yes | The exact version this binary is, not a constraint. It is recorded as the identity of the tool behind the units it produces. |
+| `checksum` | yes | Lowercase hex SHA-256 of `executable`, verified at the start of every run. It is required, not optional: an override names a binary the lock does not describe, so without it the entry would admit whatever happens to sit at that path on the next run. |
+
 ## `[providers.*]` — analysis providers
 
 | Key | Default | Trust | Meaning |
@@ -183,9 +222,11 @@ unconditionally.
 | `lsp.max_servers` | `1` | user | Concurrent language servers. |
 | `lsp.max_outstanding_requests` | `8` | user | In-flight requests per server. |
 | `lsp.idle_ttl` | `"60s"` | user | Idle time before a server is stopped. |
-| `joern.enabled` | `false` | user | `true`, `false` or `"auto"`. |
-| `joern.profile` | `"pinned-default"` | user | Name of the approved profile to use. |
-| `joern.timeout` | `"45m"` | user | Deadline for one deep-analysis run. |
+| `dependence.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. `"auto"` runs dependence units as low-priority background work once the base generation is active; a query that asks for a dependence fact promotes its units and is answered `pending` until they seal. `true` blocks the index on them. The provider never delays base readiness. |
+| `dependence.timeout` | `"45m"` | user | Deadline for one dependence unit. |
+| `dependence.cache_bytes` | `4294967296` | user | Budget for the per-unit parsed-graph cache, which is what makes an unchanged unit cost nothing on refresh. |
+| `dependence.unit_memory_floor_bytes` | `805306368` | user | Smallest allocation a unit may be sized to. Sizing a unit near its live set costs time rather than memory, so the floor keeps a small unit from being starved into a much slower run. |
+| `dependence.unit_memory_ceiling_bytes` | `0` | user | Largest allocation a unit may be sized to. `0` derives it from the machine: free memory minus the base index footprint minus a safety margin. There is no default memory ceiling, and only a non-zero value here may reject a unit before it runs. |
 
 ## `[analyzers.<name>]` — approved analyzer profiles
 
@@ -268,6 +309,9 @@ relationships that must hold:
 - `resources.max_temp_bytes` > `resources.min_free_disk_bytes`.
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes`.
+- `providers.dependence.unit_memory_ceiling_bytes`, when set, is at least
+  `providers.dependence.unit_memory_floor_bytes`. A ceiling under the floor is
+  not a narrow budget; it is a provider that rejects every unit before it runs.
 - All byte arithmetic stays inside 64-bit signed range.
 
 ## Fingerprints
@@ -290,8 +334,9 @@ for the same reason: a profile that gains a variable can resolve different
 dependencies from identical source.
 
 Operational settings — worker counts, batch sizes, cache sizes, idle TTLs, the
-data directory, transport and logging — are in none of them. They change how the
-work is scheduled, never what it concludes.
+data directory, retention, the tool store location and its fetch budgets,
+transport and logging — are in none of them. They change how the work is
+scheduled or where it is kept, never what it concludes.
 
 Raising an admission limit does change the analysis fingerprint. That is
 deliberate: a unit produced under a lower limit is not the same result as one

@@ -58,8 +58,7 @@ func (c Config) AnalysisConfigHash() string {
 	}
 	h.AddString(c.Providers.SCIP.Enabled.String())
 	h.AddString(c.Providers.LSP.Enabled.String())
-	h.AddString(c.Providers.Joern.Enabled.String())
-	h.AddString(c.Providers.Joern.Profile)
+	h.AddString(c.Providers.Dependence.Enabled.String())
 	// An approved profile decides which executable and argument array produced
 	// a unit, so a changed profile must invalidate the units it produced. The
 	// private work directory is excluded: it is an operational location.

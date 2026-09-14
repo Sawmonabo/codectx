@@ -56,7 +56,9 @@ func mustWrite(t *testing.T, path, content string) {
 //   - a project file that grants execution, weakens a safety toggle or raises a
 //     ceiling is a repository escalating its own trust (Section 20.2); and
 //   - a resolved configuration whose related budgets disagree produces
-//     responses that cannot fit their own wire ceiling (Section 20.1).
+//     responses that cannot fit their own wire ceiling (Section 20.1); and
+//   - a tool override without its checksum admits whatever binary happens to
+//     sit at that path on the next run (Section 20.2).
 //
 // The first case also pins the shipped defaults: if they ever stop satisfying
 // their own cross-field validation, every command fails at startup.
@@ -125,6 +127,34 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 		{
 			name:     "zero is not unlimited",
 			user:     "[resources]\nmax_concurrent_queries = 0\n",
+			wantCode: model.CodeConfigInvalid,
+		},
+		{
+			// The toolchain decides which binaries this build executes, so a
+			// repository that could set any of it would choose them.
+			name:     "project sets a tools key",
+			project:  "[tools]\noffline = true\n",
+			wantCode: model.CodeTrustRequired,
+		},
+		{
+			// An override is the one binary the lock does not describe. Without
+			// its checksum nothing about it is verifiable at run start.
+			name:     "a tool override without a checksum is rejected",
+			user:     "[tools.override.scip-go]\nexecutable = \"/opt/codectx/scip-go\"\nversion = \"0.5.0\"\n",
+			wantCode: model.CodeConfigInvalid,
+		},
+		{
+			// Retention is by ref: 0 retained refs would prune the results the
+			// active ref is being served from.
+			name:     "retain_refs 0 is rejected",
+			user:     "[index]\nretain_refs = 0\n",
+			wantCode: model.CodeConfigInvalid,
+		},
+		{
+			// 0 means the machine-derived allocation; a negative value is not a
+			// third meaning, and admitting one would size every unit from it.
+			name:     "a negative dependence memory ceiling is rejected",
+			user:     "[providers.dependence]\nunit_memory_ceiling_bytes = -1\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 	} {
