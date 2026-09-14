@@ -398,13 +398,13 @@ const (
 // caller believed it was resuming, which would double-spend the cumulative
 // budget the cursor exists to carry, so a typed refusal is the honest answer.
 //
-// The traversal operations above DO page: Neighbors, Callers and Callees mint
-// and resume a traversalCursor. This refusal is what remains for the two
-// impact-family operations, whose page boundary is not a keyset position at
-// all: Impact ranks the whole walk and cuts the ranked list, and
-// PackageDependencies aggregates it, so neither has a (owner, relation) stop to
-// resume from. Their CLI commands declare no --cursor flag; the refusal covers
-// the API path, where a caller can still set Page.Cursor.
+// Every other operation DOES page: Neighbors, Callers and Callees mint and
+// resume a traversalCursor from a keyset position, and Impact spills its ranked
+// tail into a spool and replays it. PackageDependencies is the one that remains:
+// it aggregates a whole walk into pairs, so it has neither a (owner, relation)
+// stop to resume from nor a ranked list to cut. Its CLI command declares no
+// --cursor flag; this refusal covers the API path, where a caller can still set
+// Page.Cursor.
 func continuationUnavailable(cursor string) error {
 	if cursor == "" {
 		return nil
