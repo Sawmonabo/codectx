@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -281,6 +283,144 @@ func TestContextCompilerScenario(t *testing.T) {
 	rows := []contextScenarioRow{
 		// L1 SEEDS rows
 		// L2 SCOPE rows
+		{
+			name: "required scope pulls every decision boundary of the seed",
+			// Guards Section 15.2: a plan that omits the caller, the contract,
+			// the test or the configuration of a file it asks an actor to
+			// change is not implementation ready, however well the omitted
+			// entries would have scored.
+			run: func(t *testing.T, fx *contextFixture) {
+				impl := "internal/order/service.go"
+				eng := fx.scopeEngine([]model.Relation{
+					fx.edge("internal/order/handler.go", model.RelCalls, impl),
+					fx.edge(impl, model.RelImplements, "internal/order/ports.go"),
+					fx.edge("internal/order/service_test.go", model.RelTests, impl),
+					fx.edge("config/order.toml", model.RelConfigures, impl),
+					fx.edge("docs/order.md", model.RelDocuments, impl),
+				}, fixtureCapabilities)
+				// The same file reaches scope from two Section 15.2 steps: an
+				// explicit seed that is also a captured change. One entity must
+				// yield one entry -- context_entries is keyed by ordinal, so a
+				// duplicate would persist as a second entry for one node.
+				changed := fx.seedOf(impl)
+				changed.Origin = originChangedFile
+				res, err := expandScope(fx.ctx, eng, fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl), changed}, fixtureCapabilities)
+				if err != nil {
+					t.Fatalf("expandScope: %v", err)
+				}
+				seen := 0
+				for _, c := range res.Candidates {
+					if c.Path == impl {
+						seen++
+					}
+				}
+				if seen != 1 {
+					t.Fatalf("one entity produced %d entries; a manifest may hold only one", seen)
+				}
+				if !res.ScopeComplete {
+					t.Fatalf("a fresh, untruncated expansion reported incomplete scope: %+v", res.Completeness)
+				}
+				for _, want := range []struct {
+					path string
+					req  model.Requirement
+				}{
+					{impl, model.RequirementFull},                             // the seed itself
+					{"internal/order/ports.go", model.RequirementFull},        // contract
+					{"internal/order/service_test.go", model.RequirementFull}, // test
+					{"config/order.toml", model.RequirementFull},              // configuration
+					{"internal/order/handler.go", model.RequirementSymbol},    // caller
+					{"docs/order.md", model.RequirementRecommended},           // documentation
+				} {
+					got, ok := requirementFor(t, res, want.path)
+					if !ok {
+						t.Fatalf("scope dropped the boundary %q", want.path)
+					}
+					if got.Requirement != want.req {
+						t.Fatalf("boundary %q requirement = %q, want %q", want.path, got.Requirement, want.req)
+					}
+				}
+			},
+		},
+		{
+			name: "an unresolved token is discovery but an unresolved explicit seed is an error",
+			// Guards ruling Q7 from both sides: a task token nothing matched
+			// must NOT fail the compile (it yields a discovery answer whose
+			// omission is visible as a reasoned exclusion), while an explicit
+			// seed the caller named and the snapshot does not hold MUST fail
+			// rather than compile a plan quietly built around it.
+			run: func(t *testing.T, fx *contextFixture) {
+				impl := "internal/order/service.go"
+				eng := fx.scopeEngine([]model.Relation{
+					fx.edge("internal/order/handler.go", model.RelCalls, impl),
+				}, fixtureCapabilities)
+				unresolved := candidate{Path: "Ledger", Origin: originLexical,
+					Excluded: "no symbol or path in the pinned snapshot matched"}
+
+				res, err := expandScope(fx.ctx, eng, fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl), unresolved}, fixtureCapabilities)
+				if err != nil {
+					t.Fatalf("an unresolved extracted token must not fail the compile: %v", err)
+				}
+				if res.ScopeComplete {
+					t.Fatal("an unresolved token left the scope reported as complete")
+				}
+				kept, ok := requirementFor(t, res, "Ledger")
+				if !ok || kept.Excluded == "" {
+					t.Fatalf("the unresolved token lost its exclusion: %+v", kept)
+				}
+				if kept.Requirement != "" {
+					t.Fatalf("an unresolved token was marked %q; a discovery answer has no required entry for it", kept.Requirement)
+				}
+
+				unresolved.Origin = originExplicitSeed
+				_, err = expandScope(fx.ctx, eng, fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl), unresolved}, fixtureCapabilities)
+				var typed *model.Error
+				if !errors.As(err, &typed) || typed.Code != model.CodeScopeIncomplete {
+					t.Fatalf("an unresolvable explicit seed returned %v, want %s", err, model.CodeScopeIncomplete)
+				}
+			},
+		},
+		{
+			name: "a truncated or degraded expansion can never report complete scope",
+			// Guards Section 15.2's one-way rule: truncation and a non-fresh
+			// capability are what make an answer partial, and no later pass may
+			// set ScopeComplete back to true. A plan that claims completeness
+			// over a walk that stopped early grants false readiness.
+			run: func(t *testing.T, fx *contextFixture) {
+				impl := "internal/order/service.go"
+				rels := []model.Relation{
+					fx.edge("internal/order/handler.go", model.RelCalls, impl),
+					fx.edge(impl, model.RelImplements, "internal/order/ports.go"),
+					fx.edge("internal/order/service_test.go", model.RelTests, impl),
+				}
+				cfg := fx.Cfg.Context
+				cfg.MaxGraphEdges = 1 // the walk must stop before the last edge
+				res, err := expandScope(fx.ctx, fx.scopeEngine(rels, fixtureCapabilities), fx.Gen, cfg,
+					[]candidate{fx.seedOf(impl)}, fixtureCapabilities)
+				if err != nil {
+					t.Fatalf("expandScope: %v", err)
+				}
+				if res.ScopeComplete {
+					t.Fatal("an edge-budget truncation reported complete scope")
+				}
+
+				stale := []model.CapabilityState{{ProviderID: "treesitter", Capability: "structure",
+					Scope: "workspace", State: model.CapabilityStale}}
+				res, err = expandScope(fx.ctx, fx.scopeEngine(rels, stale), fx.Gen, fx.Cfg.Context,
+					[]candidate{fx.seedOf(impl)}, stale)
+				if err != nil {
+					t.Fatalf("expandScope: %v", err)
+				}
+				if res.ScopeComplete {
+					t.Fatal("a stale capability reported complete scope")
+				}
+				if len(res.Completeness) != 1 || res.Completeness[0].State != model.CapabilityStale {
+					t.Fatalf("the manifest header lost the capability row behind the verdict: %+v", res.Completeness)
+				}
+			},
+		},
 		// L3 RANK rows
 		{
 			// Guards the Section 15.3 path contribution: the product of
@@ -787,4 +927,129 @@ func pathOfEntry(t *testing.T, fx *contextFixture, e model.ContextEntry) string 
 	}
 	t.Fatalf("entry %d names file %q, which the fixture does not publish", e.Ordinal, e.FileID)
 	return ""
+}
+
+// --- Task 15 lane L2 (SCOPE) test support -------------------------------
+//
+// The fixture publishes no relations (the digest fakes the GraphFactory), and
+// the only sqlite-to-graph.Adjacency adapter is unexported in internal/app, so
+// scope rows drive a real graph.Engine over this in-memory adjacency. It is
+// deliberately literal: it answers exactly the edges a row declares, so a row
+// asserting a requirement is asserting scope's rule and not the store's.
+type scopeAdjacency struct {
+	binding   model.Binding
+	nodes     map[model.NodeID]model.Node
+	relations []model.Relation
+	caps      []model.CapabilityState
+}
+
+func (a *scopeAdjacency) Binding() model.Binding { return a.binding }
+
+func (a *scopeAdjacency) Capabilities(stdcontext.Context) ([]model.CapabilityState, error) {
+	return a.caps, nil
+}
+
+// Edges is keyset-ordered by relation id after `after`, exactly as the port
+// documents; an empty kinds slice means every kind.
+func (a *scopeAdjacency) Edges(_ stdcontext.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	want := make(map[model.NodeID]bool, len(nodes))
+	for _, n := range nodes {
+		want[n] = true
+	}
+	allowed := make(map[model.RelationKind]bool, len(kinds))
+	for _, k := range kinds {
+		allowed[k] = true
+	}
+	out := make([]model.Relation, 0, limit)
+	for _, r := range a.relations {
+		if r.ID <= after || (len(kinds) > 0 && !allowed[r.Kind]) {
+			continue
+		}
+		touches := (dir == model.DirectionOutgoing && want[r.From]) ||
+			(dir == model.DirectionIncoming && want[r.To]) ||
+			(dir == model.DirectionBoth && (want[r.From] || want[r.To]))
+		if !touches {
+			continue
+		}
+		if out = append(out, r); len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (a *scopeAdjacency) NodesByID(_ stdcontext.Context, ids []model.NodeID) ([]model.Node, error) {
+	out := make([]model.Node, 0, len(ids))
+	for _, id := range ids {
+		if n, ok := a.nodes[id]; ok {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+// EvidenceFor returns no rows: scope asserts requirements and completeness, and
+// per-edge evidence is lane L3's ranking input, not scope's.
+func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
+	return map[model.RelationID][]model.EvidenceID{}, nil
+}
+
+// scopeEngine builds an engine over the fixture's nodes and the edges a row
+// declares. The limits mirror internal/app's graphLimits, so a row exercises
+// the same bounds production resolves.
+func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.CapabilityState) *graph.Engine {
+	f.t.Helper()
+	adj := &scopeAdjacency{binding: f.Binding, nodes: map[model.NodeID]model.Node{}, relations: rels, caps: caps}
+	for _, spec := range fixtureFiles {
+		fv := f.File(spec.path)
+		id := f.Node(spec.path)
+		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
+			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
+	}
+	sort.Slice(adj.relations, func(i, j int) bool { return adj.relations[i].ID < adj.relations[j].ID })
+	eng, err := graph.New(graph.Options{Adjacency: adj, Limits: graph.Limits{
+		MaxDepth:       f.Cfg.Context.MaxGraphDepth,
+		MaxVisited:     f.Cfg.Context.MaxVisitedNodes,
+		MaxEdges:       f.Cfg.Context.MaxGraphEdges,
+		MaxPageItems:   f.Cfg.Resources.MaxPageItems,
+		MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry,
+		QueryTimeout:   f.Cfg.Resources.QueryTimeout.Std(),
+		CursorTTL:      f.Cfg.Storage.QueryCursorTTL.Std(),
+		FrontierBytes:  f.Cfg.Resources.QueryMemoryBytes,
+		// Deliberately the real clock, not the fixture's frozen one: the engine
+		// derives a context deadline from it, and a frozen instant in the past
+		// would expire every walk before its first edge.
+	}})
+	if err != nil {
+		f.t.Fatalf("graph.New: %v", err)
+	}
+	return eng
+}
+
+// edge declares one fixture relation by the paths it connects.
+func (f *contextFixture) edge(from string, kind model.RelationKind, to string) model.Relation {
+	f.t.Helper()
+	a, b := f.Node(from), f.Node(to)
+	return model.Relation{ID: model.NewRelationID(f.Repo, a, kind, b), From: a, Kind: kind, To: b}
+}
+
+// seedOf is the resolved seed a scope row starts from.
+func (f *contextFixture) seedOf(path string) candidate {
+	f.t.Helper()
+	fv := f.File(path)
+	return candidate{NodeID: f.Node(path), FileID: fv.ID, Path: path,
+		Kind: model.NodeFunction, Origin: originExplicitSeed, Status: fv.Status}
+}
+
+// requirementFor finds the candidate whose path names the artifact at path.
+// Expansion entries report the qualified name, so the match is by prefix.
+func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool) {
+	t.Helper()
+	for _, c := range res.Candidates {
+		if c.Path == path || strings.HasPrefix(c.Path, path+".") {
+			return c, true
+		}
+	}
+	return candidate{}, false
 }
