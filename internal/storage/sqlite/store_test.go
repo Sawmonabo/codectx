@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -650,4 +652,478 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("mismatched database was altered: generations=%d err=%v", remaining, err)
 	}
 	raw.Close()
+}
+
+// Delta import (Section 11.4). The helpers below build a package-scoped unit
+// over two files with the shapes a carry-over has to get right: a fact located
+// in each file, a fact and a relation in the index-level bucket that name no
+// file at all, one relation whose only evidence is in one file, aliases in
+// per-file and workspace scopes, and a lexical document per file.
+
+const deltaScope = "pkg"
+
+// beginScope opens a package-scoped unit over several files under cfg. cfg is
+// the analysis configuration digest, which is the only part of a unit identity
+// a test can vary while holding the inputs fixed, so a delta-built unit and a
+// full re-import of the same snapshot can coexist and be compared.
+func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cfg string, files ...fileFixture) *store.UnitWriter {
+	f.t.Helper()
+	inputs := make([]model.UnitInput, 0, len(files))
+	h := model.NewUnitInputHasher()
+	for _, ff := range files {
+		inputs = append(inputs, model.UnitInput{FileID: ff.id, ContentHash: ff.hash})
+	}
+	slices.SortFunc(inputs, func(a, b model.UnitInput) int { return strings.Compare(string(a.FileID), string(b.FileID)) })
+	for _, in := range inputs {
+		if err := h.Add(in); err != nil {
+			f.t.Fatal(err)
+		}
+	}
+	spec := model.UnitSpec{ProviderID: providerID, ProviderVersion: providerVersion, ScopeKey: deltaScope,
+		InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
+	spec.ID = model.NewUnitID(spec, cfg)
+	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: cfg, OriginRunID: run, SourceBinding: model.SourceBindingVerified}
+	w, err := f.s.BeginUnit(f.ctx, gen, build, func(yield func(model.UnitInput) error) error {
+		for _, in := range inputs {
+			if err := yield(in); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		f.t.Fatalf("BeginUnit(%s): %v", cfg, err)
+	}
+	return w
+}
+
+// putNode publishes one keyed node fact. ff nil places the fact in the unit's
+// index-level bucket: no file, no range, and evidence that names neither.
+func (f *fixture) putNode(w *store.UnitWriter, run model.ProviderRunID, scope, name, key string, ff *fileFixture) model.NodeID {
+	f.t.Helper()
+	fact := f.nodeFact(w, run, scope, name, ff)
+	if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{key}); err != nil {
+		f.t.Fatalf("PutKeyedNodes(%s): %v", name, err)
+	}
+	return fact.Node.ID
+}
+
+func (f *fixture) nodeFact(w *store.UnitWriter, run model.ProviderRunID, scope, name string, ff *fileFixture) model.NodeFact {
+	f.t.Helper()
+	canonical := model.CanonicalNodeKey(scope, name)
+	id := model.NewNodeID(f.repo, model.NodeFunction, canonical)
+	node := model.Node{ID: id, Kind: model.NodeFunction, Language: "go", Name: name, QualifiedName: scope + "." + name}
+	ev := model.Evidence{UnitID: w.UnitID(), ProviderID: providerID, ProviderVersion: providerVersion, OriginRunID: run,
+		NodeID: id, Precision: model.PrecisionSyntax, NativeKey: name}
+	if ff != nil {
+		rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: uint64(len(ff.content)), Line: 1, Column: uint32(len(ff.content))}}
+		node.FileID, node.ContentHash, node.Range = ff.id, ff.hash, rng
+		ev.FileID, ev.ContentHash, ev.Range = ff.id, ff.hash, rng
+	}
+	ev.ID = model.NewEvidenceID(ev)
+	return model.NodeFact{Node: node, CanonicalKey: canonical, Evidence: []model.Evidence{ev}}
+}
+
+// putRelation publishes one keyed relation. ff nil places its only occurrence
+// in the index-level bucket.
+func (f *fixture) putRelation(w *store.UnitWriter, run model.ProviderRunID, from, to model.NodeID, key string, ff *fileFixture) {
+	f.t.Helper()
+	id := model.NewRelationID(f.repo, from, model.RelCalls, to)
+	ev := model.Evidence{UnitID: w.UnitID(), ProviderID: providerID, ProviderVersion: providerVersion, OriginRunID: run,
+		RelationID: id, Precision: model.PrecisionSyntax, NativeKey: key}
+	if ff != nil {
+		ev.FileID, ev.ContentHash = ff.id, ff.hash
+		ev.Range = &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: uint64(len(ff.content)), Line: 1, Column: uint32(len(ff.content))}}
+	}
+	ev.ID = model.NewEvidenceID(ev)
+	rel := model.Relation{ID: id, From: from, Kind: model.RelCalls, To: to}
+	if err := w.PutKeyedRelations(f.ctx, []model.RelationFact{{Relation: rel, Evidence: []model.Evidence{ev}}}, []string{key}); err != nil {
+		f.t.Fatalf("PutKeyedRelations(%s): %v", key, err)
+	}
+}
+
+// fillScope publishes the whole fact set of the package unit over a and b.
+func (f *fixture) fillScope(w *store.UnitWriter, run model.ProviderRunID, a, b fileFixture) {
+	f.t.Helper()
+	f.fillFile(w, run, a)
+	f.fillFile(w, run, b)
+	f.fillIndexLevel(w, run, a)
+}
+
+// fillFile publishes everything bucketed to one path: its node, its alias and
+// its lexical document.
+func (f *fixture) fillFile(w *store.UnitWriter, run model.ProviderRunID, ff fileFixture) model.NodeID {
+	f.t.Helper()
+	id := f.putNode(w, run, ff.path, "F", "key:node:"+ff.path, &ff)
+	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: "file:" + ff.path, NativeKey: "F", NodeID: id}}); err != nil {
+		f.t.Fatalf("PutAliases(%s): %v", ff.path, err)
+	}
+	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{f.searchDoc(ff)}); err != nil {
+		f.t.Fatalf("PutSearchUnits(%s): %v", ff.path, err)
+	}
+	return id
+}
+
+// fillIndexLevel publishes the facts that name no file: an external callee and
+// the edge into it. Its evidence belongs to the unit's single index-level
+// bucket, which a per-path delta never replaces.
+func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a fileFixture) {
+	f.t.Helper()
+	external := f.putNode(w, run, "workspace", "X", "key:node:external", nil)
+	caller := model.NewNodeID(f.repo, model.NodeFunction, model.CanonicalNodeKey(a.path, "F"))
+	f.putRelation(w, run, caller, external, "key:rel:external", nil)
+	if err := w.PutAliases(f.ctx, []model.NativeAlias{{ScopeKey: "workspace", NativeKey: "X", NodeID: external}}); err != nil {
+		f.t.Fatalf("PutAliases(workspace): %v", err)
+	}
+}
+
+// factColumns are the identifying columns of each fact table, with every
+// unit-scoped column excluded: the row's own unit id, the rowid search_units
+// mints on insert and the evidence id, which folds the unit id by construction
+// (Section 9.3) and therefore cannot match across two units describing the
+// same occurrence.
+var factColumns = []struct{ table, cols string }{
+	{"node_facts", "lower(hex(node_id)), language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json, fact_key"},
+	{"relation_facts", "lower(hex(relation_id)), fact_key"},
+	{"native_aliases", "scope_key, native_key, lower(hex(node_id))"},
+	{"search_units", "lower(hex(search_key)), lower(hex(coalesce(node_id, x''))), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
+	{"evidence", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key, detail, content_hash_bound"},
+}
+
+// unitRowID resolves a unit key to the integer row the fact tables reference.
+func unitRowID(t *testing.T, db *sql.DB, id model.UnitID) int64 {
+	t.Helper()
+	raw, _ := model.DecodeID(string(id))
+	var row int64
+	if err := db.QueryRow(`SELECT id FROM units WHERE unit_key = ?`, raw).Scan(&row); err != nil {
+		t.Fatalf("unit row for %s: %v", id, err)
+	}
+	return row
+}
+
+// sameFacts asserts that two units hold exactly the same facts.
+func sameFacts(t *testing.T, db *sql.DB, want, got int64) {
+	t.Helper()
+	for _, tb := range factColumns {
+		for _, dir := range []struct {
+			what string
+			a, b int64
+		}{{"missing from the delta unit", want, got}, {"only in the delta unit", got, want}} {
+			var n int64
+			q := `SELECT count(*) FROM (SELECT ` + tb.cols + ` FROM ` + tb.table + ` WHERE unit_id = ?1
+				EXCEPT SELECT ` + tb.cols + ` FROM ` + tb.table + ` WHERE unit_id = ?2)`
+			if err := db.QueryRow(q, dir.a, dir.b).Scan(&n); err != nil {
+				t.Fatalf("%s: %v", tb.table, err)
+			}
+			if n != 0 {
+				t.Errorf("%s: %d rows %s", tb.table, n, dir.what)
+			}
+		}
+	}
+}
+
+func unitRows(t *testing.T, db *sql.DB, table string, unit int64) int64 {
+	t.Helper()
+	var n int64
+	if err := db.QueryRow(`SELECT count(*) FROM `+table+` WHERE unit_id = ?`, unit).Scan(&n); err != nil {
+		t.Fatalf("%s: %v", table, err)
+	}
+	return n
+}
+
+// TestDeltaImportInvariants covers the three ways a delta import can corrupt a
+// generation while looking like it worked. Each subtest names the silent
+// failure it protects against.
+func TestDeltaImportInvariants(t *testing.T) {
+	t.Run("carried unit is identical to a full re-import", func(t *testing.T) {
+		// A delta that produced anything other than what a full import would
+		// produce makes the index depend on how it was built, not on the
+		// source: two machines refreshing the same tree would answer
+		// differently and neither would be wrong by its own accounting.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a1 := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() { F() }\n")
+		snap1 := f.snapshot("one", a1, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		w1 := f.beginScope(gen1, run1, configHash, a1, b)
+		f.fillScope(w1, run1, a1, b)
+		if err := f.s.SealUnit(f.ctx, w1); err != nil {
+			t.Fatalf("SealUnit: %v", err)
+		}
+		prev := w1.UnitID()
+
+		// a.go is edited; b.go is untouched.
+		a2 := f.file("pkg/a.go", "package pkg\nfunc F() { /* edited */ }\n")
+		snap2 := f.snapshot("two", a2, b)
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run2 := f.run(gen2)
+		wFull := f.beginScope(gen2, run2, "cfg-full", a2, b)
+		f.fillScope(wFull, run2, a2, b)
+		if err := f.s.SealUnit(f.ctx, wFull); err != nil {
+			t.Fatalf("SealUnit(full): %v", err)
+		}
+
+		gen3, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run3 := f.run(gen3)
+		wDelta := f.beginScope(gen3, run3, "cfg-delta", a2, b)
+		f.fillFile(wDelta, run3, a2)
+		f.fillIndexLevel(wDelta, run3, a2)
+		stats, err := wDelta.CarryOver(f.ctx, prev, store.Replaced{
+			Files:  []model.FileID{a2.id},
+			Scopes: []string{"file:" + a2.path},
+			Keys:   slices.Values([]string{"key:node:" + a2.path}),
+		})
+		if err != nil {
+			t.Fatalf("CarryOver: %v", err)
+		}
+		if stats.Nodes != 1 || stats.SearchUnits != 1 || stats.Aliases != 1 {
+			t.Errorf("carried %+v, want b.go's node, alias and document", stats)
+		}
+		if err := f.s.SealUnit(f.ctx, wDelta); err != nil {
+			t.Fatalf("SealUnit(delta): %v", err)
+		}
+
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		sameFacts(t, raw, unitRowID(t, raw, wFull.UnitID()), unitRowID(t, raw, wDelta.UnitID()))
+		// Carried search documents keep the rowids the FTS index was built
+		// against. SealUnit only counts documents, so an index entry pointing
+		// at the wrong row passes every other check and then answers a lexical
+		// query with another document's text. FTS5 with rank 1 compares the
+		// index against its external content table and errors when they
+		// disagree; without the argument it only checks the index internally
+		// and this mismatch passes.
+		if _, err := raw.Exec(`INSERT INTO search_fts(search_fts, rank) VALUES('integrity-check', 1)`); err != nil {
+			t.Fatalf("carried search documents left the FTS index disagreeing with its content: %v", err)
+		}
+	})
+
+	t.Run("a replaced key is never carried", func(t *testing.T) {
+		// A delta that keeps a fact its producer says is gone publishes a
+		// declaration the source no longer contains, and no later refresh
+		// removes it: the row is carried again forever.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
+		snap := f.snapshot("one", a, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		w1 := f.beginScope(gen1, run1, configHash, a, b)
+		f.fillFile(w1, run1, a)
+		f.fillFile(w1, run1, b)
+		gone := f.putNode(w1, run1, "pkg/b.go", "Gone", "key:node:gone", &b)
+		if err := f.s.SealUnit(f.ctx, w1); err != nil {
+			t.Fatalf("SealUnit: %v", err)
+		}
+
+		// The refresh reports key:node:gone removed and re-emits nothing for
+		// it. Nothing else about b.go changed, so its bucket is not replaced:
+		// only the key can keep the fact out.
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run2 := f.run(gen2)
+		w2 := f.beginScope(gen2, run2, "cfg-delta", a, b)
+		if _, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{Keys: slices.Values([]string{"key:node:gone"})}); err != nil {
+			t.Fatalf("CarryOver: %v", err)
+		}
+		if err := f.s.SealUnit(f.ctx, w2); err != nil {
+			t.Fatalf("SealUnit(delta): %v", err)
+		}
+
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		row := unitRowID(t, raw, w2.UnitID())
+		if n := unitRows(t, raw, "node_facts", row); n != 2 {
+			t.Errorf("delta unit has %d node facts, want 2 (the removed key must not be carried)", n)
+		}
+		goneRaw, _ := model.DecodeID(string(gone))
+		var leaked int64
+		if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, goneRaw).Scan(&leaked); err != nil {
+			t.Fatal(err)
+		}
+		if leaked != 0 {
+			t.Errorf("the removed fact leaked into the new unit")
+		}
+		// Its evidence must go with it: evidence is never carried for a fact
+		// the new unit does not hold.
+		if err := raw.QueryRow(`SELECT count(*) FROM evidence WHERE unit_id = ? AND node_id = ?`, row, goneRaw).Scan(&leaked); err != nil {
+			t.Fatal(err)
+		}
+		if leaked != 0 {
+			t.Errorf("the removed fact's evidence leaked into the new unit")
+		}
+	})
+
+	t.Run("a repeated identity under a second key is refused", func(t *testing.T) {
+		// A stored fact row holds one delta key. A producer whose keys are
+		// finer than the identities they resolve to would leave a row keyed by
+		// one of its several keys; a later refresh that removes only that key,
+		// while the others still hold, drops a fact the source still contains
+		// — and nothing re-emits it, because its surviving keys are unchanged.
+		f := newFixture(t, filepath.Join(t.TempDir(), "codectx.db"))
+		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+		snap := f.snapshot("one", a)
+		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run := f.run(gen)
+		w := f.beginScope(gen, run, configHash, a)
+		fact := f.nodeFact(w, run, "pkg/a.go", "F", &a)
+		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:one"}); err != nil {
+			t.Fatalf("PutKeyedNodes: %v", err)
+		}
+		wantCode(t, w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:two"}), model.CodeProviderOutputInvalid)
+		// The same key again is the ordinary repeat a deduplicating sink
+		// produces and must still be accepted.
+		if err := w.PutKeyedNodes(f.ctx, []model.NodeFact{fact}, []string{"key:one"}); err != nil {
+			t.Fatalf("repeat under the same key: %v", err)
+		}
+	})
+
+	t.Run("a failed delta leaves the previous unit intact", func(t *testing.T) {
+		// Carry-over copies rows into the new unit rather than sharing the
+		// previous unit's. If it ever shared them, discarding a failed refresh
+		// would delete facts the still-published generation is serving.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
+		snap := f.snapshot("one", a, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		w1 := f.beginScope(gen1, run1, configHash, a, b)
+		f.fillScope(w1, run1, a, b)
+		if err := f.s.SealUnit(f.ctx, w1); err != nil {
+			t.Fatalf("SealUnit: %v", err)
+		}
+		f.activate(gen1, 0)
+
+		raw, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		prevRow := unitRowID(t, raw, w1.UnitID())
+		before := map[string]int64{}
+		for _, tb := range factColumns {
+			before[tb.table] = unitRows(t, raw, tb.table, prevRow)
+		}
+
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		run2 := f.run(gen2)
+		w2 := f.beginScope(gen2, run2, "cfg-delta", a, b)
+		if _, err := w2.CarryOver(f.ctx, w1.UnitID(), store.Replaced{}); err != nil {
+			t.Fatalf("CarryOver: %v", err)
+		}
+		if err := w2.Fail(f.ctx); err != nil {
+			t.Fatalf("Fail: %v", err)
+		}
+		if state, exists, err := f.s.UnitState(f.ctx, w2.UnitID()); err != nil || exists {
+			t.Errorf("failed delta unit is %s/exists=%v (err %v), want gone", state, exists, err)
+		}
+		for _, tb := range factColumns {
+			if got := unitRows(t, raw, tb.table, prevRow); got != before[tb.table] {
+				t.Errorf("%s: previous unit has %d rows after the failed delta, had %d", tb.table, got, before[tb.table])
+			}
+		}
+		if state, exists, err := f.s.UnitState(f.ctx, w1.UnitID()); err != nil || !exists || state != model.UnitSealed {
+			t.Errorf("previous unit is %s/exists=%v (err %v), want sealed", state, exists, err)
+		}
+	})
+}
+
+// TestActivateCapabilityDetails covers the diagnostic detail map a provider
+// attaches to a non-fresh capability. It protects two silent failures: the
+// details never reaching storage at all, which turns "partial" into a claim
+// with no evidence behind it, and the AnalysisKey depending on the order a
+// publisher happened to add the pairs, which would make two identical
+// generations disagree on their own reproducible fingerprint.
+func TestActivateCapabilityDetails(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codectx.db")
+	f := newFixture(t, dbPath)
+	a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
+	snap := f.snapshot("one", a)
+
+	partial := func(pairs ...string) []model.CapabilityState {
+		c := model.CapabilityState{ProviderID: providerID, Capability: "structure", Scope: "workspace",
+			State: model.CapabilityPartial, DiagnosticCode: "CTX_PROVIDER_PARTIAL"}
+		for i := 0; i < len(pairs); i += 2 {
+			c = c.WithDetail(pairs[i], pairs[i+1])
+		}
+		return []model.CapabilityState{c}
+	}
+
+	publish := func(caps []model.CapabilityState, expected model.GenerationID, reuse model.UnitID) (model.Binding, model.UnitID) {
+		t.Helper()
+		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		unit := reuse
+		if unit == "" {
+			unit = f.unit(gen, f.run(gen), a)
+		} else if err := f.s.AttachUnit(f.ctx, gen, unit); err != nil {
+			t.Fatalf("AttachUnit: %v", err)
+		}
+		b, err := f.s.Activate(f.ctx, gen, expected, model.HealthDegraded, caps, "norm-v1")
+		if err != nil {
+			t.Fatalf("Activate: %v", err)
+		}
+		return b, unit
+	}
+
+	first, unit := publish(partial("skipped_methods", "hover,signature", "unsupported_labels", "7"), 0, "")
+	// The same pairs added in the opposite order are the same report.
+	second, _ := publish(partial("unsupported_labels", "7", "skipped_methods", "hover,signature"), first.GenerationID, unit)
+	if first.AnalysisKey != second.AnalysisKey {
+		t.Errorf("analysis key depends on the order details were added: %s vs %s", first.AnalysisKey, second.AnalysisKey)
+	}
+	// A different detail is a different report, or the fold is decorative.
+	third, _ := publish(partial("skipped_methods", "hover", "unsupported_labels", "7"), second.GenerationID, unit)
+	if third.AnalysisKey == first.AnalysisKey {
+		t.Errorf("analysis key ignores capability details")
+	}
+
+	r, err := f.s.PinGeneration(f.ctx, f.repo, third.GenerationID, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	defer r.Close()
+	got, err := r.Capabilities(f.ctx)
+	if err != nil {
+		t.Fatalf("Capabilities: %v", err)
+	}
+	if len(got) != 1 || got[0].Details["skipped_methods"] != "hover" || got[0].Details["unsupported_labels"] != "7" {
+		t.Errorf("capability details did not round-trip: %+v", got)
+	}
 }
