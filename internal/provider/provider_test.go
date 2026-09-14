@@ -211,10 +211,10 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	if len(sel.Active) != 1 {
 		t.Fatalf("Active = %d providers, want the detected one", len(sel.Active))
 	}
-	if len(sel.Inactive) != len(desc.Capabilities) {
-		t.Fatalf("published states = %+v, want one partial row per declared capability", sel.Inactive)
+	if len(sel.States) != len(desc.Capabilities) {
+		t.Fatalf("published states = %+v, want one partial row per declared capability", sel.States)
 	}
-	for i, got := range sel.Inactive {
+	for i, got := range sel.States {
 		if got.ProviderID != "scip" || got.Capability != desc.Capabilities[i] || got.Scope != provider.ScopeWorkspace ||
 			got.State != model.CapabilityPartial || got.Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
 			t.Fatalf("published state %d = %+v, want a partial workspace row carrying the detection detail", i, got)
@@ -225,8 +225,8 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	}
 	// One map per row: a caller that edits one published state must not rewrite
 	// the others.
-	sel.Inactive[0].Details["rust-analyzer"] = "edited"
-	if sel.Inactive[1].Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
+	sel.States[0].Details["rust-analyzer"] = "edited"
+	if sel.States[1].Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
 		t.Fatal("published states share one details map")
 	}
 	// The other half of the same false-readiness question, in the other
@@ -248,7 +248,7 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pendingSel.Active) != 1 || len(pendingSel.Inactive) != 0 {
-		t.Fatalf("a deferred-only detection published %+v, want no capability row", pendingSel.Inactive)
+	if len(pendingSel.Active) != 1 || len(pendingSel.States) != 0 {
+		t.Fatalf("a deferred-only detection published %+v, want no capability row", pendingSel.States)
 	}
 }

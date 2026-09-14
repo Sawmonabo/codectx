@@ -30,17 +30,22 @@ func (r IndexRequest) Validate() error {
 // parse counts are first-class rather than log-only; Section 12.3 makes the
 // published binding and health the outcome of activation.
 type IndexResult struct {
-	Binding       Binding           `json:"binding"`
-	Health        GenerationHealth  `json:"health"`
-	Status        GenerationStatus  `json:"status"`
-	Completeness  []CapabilityState `json:"completeness"`
-	UnitsReused   int64             `json:"units_reused"`
-	UnitsBuilt    int64             `json:"units_built"`
-	FilesParsed   int64             `json:"files_parsed"`
-	FilesCaptured int64             `json:"files_captured"`
-	Runs          []ProviderResult  `json:"runs"`
-	StartedAt     time.Time         `json:"started_at"`
-	CompletedAt   time.Time         `json:"completed_at"`
+	Binding      Binding           `json:"binding"`
+	Health       GenerationHealth  `json:"health"`
+	Status       GenerationStatus  `json:"status"`
+	Completeness []CapabilityState `json:"completeness"`
+	UnitsReused  int64             `json:"units_reused"`
+	UnitsBuilt   int64             `json:"units_built"`
+	// UnitsCarried counts sealed units of a refreshing semantic scope carried
+	// into this generation as stale with provenance distance (Section 13.3);
+	// UnitsInvalidated counts previously reusable units this run had to rebuild.
+	UnitsCarried     int64            `json:"units_carried"`
+	UnitsInvalidated int64            `json:"units_invalidated"`
+	FilesParsed      int64            `json:"files_parsed"`
+	FilesCaptured    int64            `json:"files_captured"`
+	Runs             []ProviderResult `json:"runs"`
+	StartedAt        time.Time        `json:"started_at"`
+	CompletedAt      time.Time        `json:"completed_at"`
 }
 
 // Validate enforces the result shape.
