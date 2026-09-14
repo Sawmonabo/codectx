@@ -166,9 +166,8 @@ func (s *Service) requireConsolidationReady(ctx context.Context, rec sqlite.Sess
 	if err != nil {
 		return err
 	}
-	// Served excludes waived files (VF3), so a waiver is added back here: a
-	// file that was both read and waived is accounted for, and this guard asks
-	// exactly what it asked before -- is every required file either read or
+	// Served excludes waived files (VF3), so the waiver count is added back
+	// here: this guard asks whether every required file is either read or
 	// explicitly excepted. Comparing the bare Served would refuse consolidation
 	// to every session carrying a waiver, whatever it had read, and would send
 	// the operator back to read files they had already read.

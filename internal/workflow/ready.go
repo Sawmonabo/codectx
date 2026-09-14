@@ -68,18 +68,14 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		ScopeComplete: m.ScopeComplete,
 	}
 	// A waiver is an admission that a required file was NOT read, so it never
-	// counts as served -- not even when bytes were also delivered for it, which
-	// is exactly the case the store's aggregate counts in both columns and
-	// which made a fully waived session report full coverage. Subtracting is
-	// deliberately conservative: a waiver on a file no byte of which was served
-	// is already outside `served`, so this can understate the served count by
-	// that file but can never overstate it, and overstating is the direction
-	// that grants false confidence.
-	e.Served = max(served-waived, 0)
+	// counts as served, and CoverageSummary is where that is decided: the store
+	// excludes a waived file from the served count whether or not bytes were
+	// also delivered for it, so this reports the aggregate unaltered.
+	e.Served = served
 	// Task 16's honest weaker answer, otherwise unchanged: an incomplete
 	// manifest scope disqualifies the session outright even when the counts
 	// agree.
-	e.ReadComplete = m.ScopeComplete && e.Served == required
+	e.ReadComplete = m.ScopeComplete && served == required
 
 	var shut []string
 
