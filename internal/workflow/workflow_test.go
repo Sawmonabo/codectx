@@ -136,6 +136,7 @@ func TestWorkflowScenarios(t *testing.T) {
 		}},
 		// L4 rows
 		// L5 rows
+		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
 		// L6 rows
 		// L7 rows
 		// L8 rows
@@ -831,4 +832,71 @@ func l3ScopeReview(manifestHash string, scopeVersion int, target model.ScopeRevi
 		review.Entries = append(review.Entries, entry)
 	}
 	return review
+}
+
+// --- L5 scenario ------------------------------------------------------------
+
+// capsuleIsDeterministic protects the Section 17.3 identity rule and ruling Q11
+// together, because the same seal answers both: the canonical hash is derived
+// from the capsule's semantics and never from when it was built, and a repeated
+// completion returns the FIRST stored capsule rather than recomputing one and
+// writing over the sealed identity.
+//
+// A silent breakage here is severe in a way a wrong error code is not: two
+// honest completions of one session would disagree about what was sealed, and
+// the durable artifact a later session replays would carry whichever timestamp
+// happened to run last.
+func capsuleIsDeterministic(t *testing.T, h *harness) {
+	ctx := context.Background()
+	if _, err := h.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the fixture session: %v", err)
+	}
+	// The fixture waives one required file, and the frozen Sessions interface
+	// exposes no reader for the stored waiver reasons (see capsuleWaivers), so
+	// this row seals a session with no waiver outstanding. The waiver's own
+	// invariant is L4's row, not this one.
+	h.file(fixtureSession, fileWaived).waived = false
+
+	rec := h.session(fixtureSession)
+	g := gate{ReadComplete: true, Ready: true, Strict: true, ScopeComplete: true}
+
+	first, err := h.svc.buildCapsule(ctx, rec, g)
+	if err != nil {
+		t.Fatalf("seal the first capsule: %v", err)
+	}
+	if !first.CreatedAt.Equal(fixtureNow) {
+		t.Fatalf("the sealed capsule carries %s, not the clock it was sealed under (%s)", first.CreatedAt, fixtureNow)
+	}
+
+	// The preimage itself: the same capsule stamped three days later must hash
+	// to the same identity, or the digest is a function of the wall clock.
+	later := fixtureNow.Add(72 * time.Hour)
+	restamped := first
+	restamped.CreatedAt = later
+	if got := canonicalCapsuleHash(restamped); got != first.CanonicalHash {
+		t.Fatalf("the canonical hash moved with CreatedAt: %s before, %s after", first.CanonicalHash, got)
+	}
+
+	// A second completion under a later clock: the seal must answer with the
+	// stored capsule and its original timestamp, never a freshly built one.
+	svc, err := New(Options{
+		Sessions: h.store, Compile: h.store, Validate: h.store, Limits: h.svc.limits,
+		Now: func() time.Time { return later }, Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("build a second service on a later clock: %v", err)
+	}
+	second, err := svc.buildCapsule(ctx, rec, g)
+	if err != nil {
+		t.Fatalf("seal the capsule a second time: %v", err)
+	}
+	if second.CanonicalHash != first.CanonicalHash {
+		t.Fatalf("a second completion sealed a different identity: %s then %s", first.CanonicalHash, second.CanonicalHash)
+	}
+	if !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
 }
