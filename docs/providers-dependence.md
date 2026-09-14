@@ -118,6 +118,14 @@ Any of these changing invalidates the entry. `providers.dependence.cache_bytes`
 bounds the directory; retention evicts least recently used first, and `0`
 disables caching rather than making it unbounded.
 
+A graph whose parse skipped methods at the definition cap is **not** cached.
+What was skipped exists only on that parse's standard error, and a reused graph
+carries no trace of it, so a cache hit would republish `data_flows_to` as
+`fresh` for a unit whose data dependence is missing whole method bodies. A
+reused graph never publishes a capability fresher than the run that produced
+it; the cost is that such a unit reparses every generation, which the pinned
+definition cap makes rare.
+
 ## Memory
 
 There is **no default memory ceiling**. A reservation orders and serializes

@@ -113,8 +113,6 @@ type Reservation struct {
 	// was applied. A unit whose estimate exceeds its cap is the one that
 	// earns an out-of-memory retry.
 	EstimatedBytes int64
-	// CeilingBytes is the explicit user limit, or zero for machine-derived.
-	CeilingBytes int64
 }
 
 // ParseBytes is the reservation of the parse step and ExportBytes that of the
@@ -176,7 +174,7 @@ func NewGovernor(floorBytes, ceilingBytes int64) Governor {
 // the only value that can reject the unit outright (Reject).
 func (g Governor) Reserve(f Family, sourceBytes int64, m Machine) Reservation {
 	r := Reservation{Family: f, ResidentBytes: residentAboveHeap[f], HelperBytes: helperAllowance[f],
-		CeilingBytes: g.CeilingBytes, AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
+		AllocationBytes: m.Allocation(g.BaseFootprint, g.SafetyMargin)}
 	estimate := sourceBytes * heapPerSourceByte[f]
 	if estimate < g.FloorBytes {
 		estimate = g.FloorBytes
