@@ -415,9 +415,14 @@ func resolveOverride(name string, ov Override) (Tool, error) {
 	if got != ov.Checksum {
 		return Tool{}, overrideInvalid(name, "the configured executable does not hash to the configured checksum")
 	}
-	// ArgvPrefix's "never empty" guarantee holds here by construction: the
-	// validOverride call above refuses an executable that is not an absolute
-	// path, so the single element below is always a real one.
+	// ArgvPrefix's "never empty" guarantee is enforced here as well as in
+	// compose, not merely argued from the validOverride call above: consumers
+	// -- joern.Locate among them -- deleted their own prefix checks on the
+	// strength of that guarantee, so it has to hold in code at every point a
+	// Tool is constructed, including one no input reaches today.
+	if ov.Executable == "" {
+		return Tool{}, internalError("resolved tool %q has no launcher", name)
+	}
 	return Tool{
 		Name: name, Version: ov.Version, Root: filepath.Dir(ov.Executable),
 		Executable: ov.Executable, ArgvPrefix: []string{ov.Executable},

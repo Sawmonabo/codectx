@@ -168,7 +168,8 @@ is on this machine and is it still intact".
 
 ```bash
 codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
-codectx tools prefetch [--all | NAME...] [--json]      # install ahead of time
+codectx tools prefetch [--all | --for-repo PATH | NAME...] [--json]
+                                                       # install ahead of time
 codectx tools verify [--json]                          # rehash every installed entry against the lock
 codectx tools gc [--json]                              # remove versions the current lock does not name
 ```
@@ -180,12 +181,34 @@ holding the 1.8 GB engine. Each entry is reported in one of five states —
 (the lock carries no payload here, which is honest absence and not a failure),
 `override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
 
-`prefetch` requires either `--all` or explicit names, so a bare invocation
-cannot start a multi-gigabyte download by accident. A name the lock does not
-carry is rejected before anything is fetched. An entry with no payload for this
-platform is skipped rather than failed. Each completed fetch logs one record —
-tool, version, digest, bytes, elapsed — on stderr, and the report of what is now
-installed goes to stdout.
+`prefetch` requires one of `--all`, `--for-repo PATH` or explicit names, so a
+bare invocation cannot start a multi-gigabyte download by accident. A name the
+lock does not carry is rejected before anything is fetched. An entry with no
+payload for this platform is skipped rather than failed. Each completed fetch
+logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
+report of what is now installed goes to stdout.
+
+`--for-repo PATH` installs exactly what that repository would ever resolve, which
+on a Go repository is four payloads rather than fourteen. The selection is read
+from the three mappings that already decide it — the SCIP indexers' trigger
+manifests, the language servers' root markers and the dependence families'
+project markers — plus each selected entry's `runtime` from the lock, so the
+command cannot disagree with the planner about what a repository needs and no
+second copy of the mapping exists anywhere in the CLI. Markers are read at the
+repository root, by metadata, through the confined root handle: a present marker
+selects a payload and never starts anything, and nothing below the root is
+walked, so the work is bounded by the number of markers rather than by the size
+of the repository. A root whose manifests select nothing is an argument error
+rather than a silent no-op.
+
+```console
+$ codectx tools prefetch --for-repo .
+NAME     VERSION      STATE      LANGUAGES
+gopls    0.23.0       installed  go
+jdk      21.0.12.1+1  installed
+joern    4.0.627      installed  c, cpp, go, java, javascript, python, rust, tsx, typescript
+scip-go  0.2.7        installed  go
+```
 
 `verify` is the expensive one: it rehashes each installed **entry executable**
 against the digest the lock pins for it — the binary, script or jar the lock
@@ -247,10 +270,18 @@ exactly what the gate exists to catch.
 `.github/workflows/tools-matrix.yml` is the gate behind "supported". On
 `ubuntu-latest`, `macos-latest` and `windows-latest` it prefetches every payload
 the lock carries for that platform, re-verifies the store, and then runs
-`.github/tools-matrix`, which indexes a nine-language fixture — Go, TypeScript,
-TSX, JavaScript, Python, Java, C, C++ and Rust, every one of them carrying
-non-ASCII identifiers and literals — with the pinned analyzers and parses each
-language family with the pinned graph engine. C++ and TSX are exercised
+`.github/tools-matrix --store <the store>`, which indexes a nine-language
+fixture — Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust, every
+one of them carrying non-ASCII identifiers and literals — with the pinned
+analyzers and parses each language family with the pinned graph engine.
+
+Every indexer run issues **the product's own argument array**: the smoke builds
+it with `scip.Argv`, the single source of every indexer invocation this product
+makes, and lays the run out the way the provider does — the index written
+outside the input directory, a private scratch root per run. A matrix that ran a
+different argv would prove that some invocation works on the platform rather
+than that the one the product issues does. The fixture and the assertion that
+each index names the documents it was given are the smoke's own. C++ and TSX are exercised
 explicitly because the research rounds covered only C and TypeScript. A language
 no run covers fails the job, so a payload that silently stopped working cannot
 leave a green matrix behind it.

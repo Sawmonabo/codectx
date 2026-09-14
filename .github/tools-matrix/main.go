@@ -22,11 +22,14 @@
 //     proved here only to the extent that their payloads install and verify.
 //     A real initialize/shutdown handshake belongs to the LSP provider.
 //
-// The argv of each indexer is duplicated from the product's analyzer profiles
-// on purpose: this program is the independent check that the pinned binary
-// works on the platform, and it must keep running when a profile is being
-// rewritten. When the CLI grows `codectx index`, the polyglot fixture below is
-// what that end-to-end step should be pointed at.
+// The argv of each indexer is the product's own: every run below is built by
+// scip.Argv, the single source of every indexer invocation this product
+// issues. A matrix that ran a different argument array would prove that some
+// argv works on the platform rather than that the one the product issues does,
+// which is the only question worth an hour of runner time. The fixture and the
+// document assertions stay this program's own. When the CLI grows
+// `codectx index`, the polyglot fixture below is what that end-to-end step
+// should be pointed at.
 //
 // One trap worth naming: this program lives under a dot directory, so the go
 // command excludes it from ./... -- `go build`, `go vet` and `go mod tidy` all
@@ -61,6 +64,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -75,17 +79,15 @@ const runTimeout = 10 * time.Minute
 
 // check is one analyzer run against one part of the fixture.
 type check struct {
-	// tool is the lock entry name.
-	tool string
+	// kind is the profile whose argv this run issues; its value is also the
+	// lock entry name, which is what lets one constant carry the identity of
+	// the tool and of the invocation at once.
+	kind scip.Kind
 	// languages are the languages this run covers, in the Section 11.7 spelling.
 	languages []string
-	// dir is the fixture subdirectory the tool runs in.
+	// dir is the fixture subdirectory the tool runs in, which is the profile's
+	// input directory.
 	dir string
-	// args builds the argv after the resolved tool's own prefix. root is the
-	// materialized fixture root and dir is the absolute working directory.
-	args func(root, dir string) []string
-	// output is the file the run must produce, relative to dir.
-	output string
 	// documents are the paths the produced index must name. For the engine,
 	// which writes a binary graph rather than an index, this is empty and the
 	// output file's existence and size are the whole check.
@@ -104,47 +106,32 @@ type check struct {
 // rounds exercised only C and TypeScript.
 var indexChecks = []check{
 	{
-		tool: "scip-go", languages: []string{"go"}, dir: "go", output: "index.scip",
+		kind: scip.KindGo, languages: []string{"go"}, dir: "go",
 		documents: []string{"sample.go"}, needs: "go",
-		args: func(_, _ string) []string { return []string{"index", "--output", "index.scip", "./..."} },
 	},
 	{
-		tool: "scip-typescript", languages: []string{"typescript", "tsx", "javascript"},
-		dir: "ts", output: "index.scip",
+		kind: scip.KindTypeScript, languages: []string{"typescript", "tsx", "javascript"}, dir: "ts",
 		documents: []string{"src/sample.ts", "src/sample.tsx", "src/sample.js"},
-		args: func(_, dir string) []string {
-			return []string{"index", "--cwd", dir, "--output", "index.scip", "--no-progress-bar"}
-		},
 	},
 	{
-		tool: "scip-python", languages: []string{"python"}, dir: "py", output: "index.scip",
+		kind: scip.KindPython, languages: []string{"python"}, dir: "py",
 		documents: []string{"sample.py"}, needs: "pip3",
-		args: func(_, dir string) []string {
-			return []string{"index", "--cwd", dir, "--project-name", "polyglot",
-				"--project-version", "0.1.0", "--output", "index.scip"}
-		},
 	},
 	{
-		// The scip-config build tool compiles with the managed JDK's own javac,
-		// so the Java leg needs neither Maven nor Gradle on the runner.
-		tool: "scip-java", languages: []string{"java"}, dir: "java", output: "index.scip",
+		// The Java profile hands scip-java a --scip-config build description
+		// and lets it compile with the managed JDK's own javac, so this leg
+		// needs neither Maven nor Gradle on the runner. materialize writes the
+		// same shape of description the profile generates.
+		kind: scip.KindJava, languages: []string{"java"}, dir: "java",
 		documents: []string{"src/main/java/com/example/Sample.java"},
-		args: func(_, _ string) []string {
-			return []string{"index", "--scip-config", "scip-java.json", "--output", "index.scip"}
-		},
 	},
 	{
-		tool: "scip-clang", languages: []string{"c", "cpp"}, dir: "c", output: "index.scip",
+		kind: scip.KindClang, languages: []string{"c", "cpp"}, dir: "c",
 		documents: []string{"sample.c", "sample.cpp"},
-		args: func(_, _ string) []string {
-			return []string{"--compdb-path", "compile_commands.json",
-				"--index-output-path", "index.scip", "--no-progress-report"}
-		},
 	},
 	{
-		tool: "rust-analyzer", languages: []string{"rust"}, dir: "rust", output: "index.scip",
+		kind: scip.KindRust, languages: []string{"rust"}, dir: "rust",
 		documents: []string{"src/lib.rs"}, needs: "cargo",
-		args: func(_, _ string) []string { return []string{"scip", ".", "--output", "index.scip"} },
 	},
 }
 
@@ -260,7 +247,7 @@ func run(store, work string, keep bool) error {
 // The result is a named return so the deferred timing lands in the value this
 // function actually returns.
 func runIndexCheck(ctx context.Context, res *toolchain.Resolver, root string, c check) (r result) {
-	r = result{name: c.tool, languages: c.languages}
+	r = result{name: string(c.kind), languages: c.languages}
 	started := time.Now()
 	defer func() { r.elapsed = time.Since(started) }()
 
@@ -273,17 +260,32 @@ func runIndexCheck(ctx context.Context, res *toolchain.Resolver, root string, c 
 			return r
 		}
 	}
-	tool, err := res.Resolve(ctx, c.tool)
+	// scip.Kind is also the lock entry name, so one constant names the profile
+	// and the payload.
+	tool, err := res.Resolve(ctx, string(c.kind))
 	if err != nil {
 		r.skipped = unsupportedHere(err)
 		r.detail = "resolve: " + err.Error()
 		return r
 	}
+	// The three paths the profile varies per run. The index is written outside
+	// the input directory and the scratch root is private to this run, exactly
+	// as the provider arranges them, so a tool cannot read its own output back
+	// as an input.
 	dir := filepath.Join(root, c.dir)
-	output := filepath.Join(dir, c.output)
+	output := filepath.Join(root, "out", string(c.kind)+".scip")
+	workDir := filepath.Join(root, "work", string(c.kind))
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		r.detail = "work directory: " + err.Error()
+		return r
+	}
+	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
+		r.detail = "output directory: " + err.Error()
+		return r
+	}
 	_ = os.Remove(output)
 
-	if out, err := runTool(ctx, tool, c.args(root, dir), dir); err != nil {
+	if out, err := runTool(ctx, tool, scip.Argv(c.kind, dir, output, workDir), dir); err != nil {
 		r.detail = err.Error() + tail(out)
 		return r
 	}
@@ -457,6 +459,12 @@ func materialize(root string) error {
 		return err
 	}
 
+	// The same shape the Java profile's writeScipJavaConfig emits: the input
+	// directory is both the source root and the only source directory, and
+	// nothing is resolved from a remote index. The scratch root is not a field
+	// here -- the profile passes it as --targetroot, which scip.Argv builds.
+	// The file lands in the directory this leg passes as inputDir, which is
+	// where --scip-config looks for it.
 	javaDir := slash(root, "java")
 	scipJava := fmt.Sprintf(`{
   "projects": [
@@ -465,12 +473,11 @@ func materialize(root string) error {
       "sourceDirectories": [%q],
       "dependencies": [],
       "classpath": [],
-      "javacOptions": [],
-      "targetroot": %q
+      "javacOptions": []
     }
   ]
 }
-`, javaDir, slash(root, "java", "src", "main", "java"), slash(root, "java", "target", "scip-targetroot"))
+`, javaDir, javaDir)
 	return os.WriteFile(filepath.Join(root, "java", "scip-java.json"), []byte(scipJava), 0o644)
 }
 

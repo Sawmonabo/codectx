@@ -5,20 +5,32 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"sort"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/lsp"
+	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
 const (
-	toolsRepoFlag = "repo"
-	toolsAllFlag  = "all"
+	toolsRepoFlag    = "repo"
+	toolsAllFlag     = "all"
+	toolsForRepoFlag = "for-repo"
 )
+
+// cpgKind is the lock's own word for the tool the dependence provider runs.
+// The selection below asks the inventory which entry that is rather than
+// naming the engine: the engine's name appears in the lock and in the one
+// package that runs it, never on a command surface.
+const cpgKind = "cpg"
 
 // toolEntry is one line of the `tools` report. It mirrors toolchain.Status with
 // explicit wire tags, because the JSON shape of Section 18.1 is a CLI contract
@@ -94,12 +106,13 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 	}
 
 	prefetch := &cobra.Command{
-		Use:   "prefetch [--all | NAME...]",
+		Use:   "prefetch [--all | --for-repo PATH | NAME...]",
 		Short: "Install pinned payloads ahead of time",
 		Long: "Installs the payloads a later run would fetch on demand. Name the " +
-			"tools to install, or pass --all for every entry the lock carries for " +
-			"this platform; one of the two is required, so a bare prefetch never " +
-			"downloads gigabytes by accident.",
+			"tools to install, pass --for-repo to install exactly what one " +
+			"repository's manifests select, or pass --all for every entry the " +
+			"lock carries for this platform; one of the three is required, so a " +
+			"bare prefetch never downloads gigabytes by accident.",
 		Args:          cobra.ArbitraryArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -119,6 +132,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	prefetch.Flags().Bool(toolsAllFlag, false, "install every entry the lock carries for this platform")
+	prefetch.Flags().String(toolsForRepoFlag, "", "install only what this repository's own manifests select")
 
 	verify := &cobra.Command{
 		Use:   "verify",
@@ -229,8 +243,20 @@ func prefetchNames(cmd *cobra.Command, args []string) ([]string, error) {
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
+	forRepo, err := cmd.Flags().GetString(toolsForRepoFlag)
+	if err != nil {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
+	}
 	known := toolchain.Embedded().Names()
 	switch {
+	case all && forRepo != "":
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--all installs every pinned tool, so it cannot be combined with --for-repo"}).
+			WithRemediation("pick one: `--all` for the whole lock, `--for-repo PATH` for what that repository needs")
+	case forRepo != "" && len(args) > 0:
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--for-repo selects the tools from the repository, so it cannot be combined with tool names"}).
+			WithRemediation("run `codectx tools prefetch --for-repo PATH`, or name the tools without --for-repo")
 	case all && len(args) > 0:
 		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
 			Message: "--all installs every pinned tool, so it cannot be combined with tool names"}).
@@ -238,9 +264,11 @@ func prefetchNames(cmd *cobra.Command, args []string) ([]string, error) {
 	case all:
 		// A nil list is every entry the lock carries for this platform.
 		return nil, nil
+	case forRepo != "":
+		return toolsForRepo(forRepo)
 	case len(args) == 0:
 		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
-			Message: "prefetch needs the tools to install: pass --all or name them"}).
+			Message: "prefetch needs the tools to install: pass --all, pass --for-repo PATH, or name them"}).
 			WithRemediation("pinned tools: " + strings.Join(known, ", "))
 	}
 	valid := make(map[string]bool, len(known))
@@ -263,6 +291,95 @@ func prefetchNames(cmd *cobra.Command, args []string) ([]string, error) {
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// toolsForRepo is the lock entries one repository would ever resolve. It reads
+// the three mappings that already decide it -- the SCIP indexers' triggers, the
+// language servers' root markers and the dependence families' project markers
+// -- from the packages that own them, so this command cannot disagree with the
+// planner about what a repository needs. There is deliberately no table here:
+// a second copy of the mapping that decides what gets downloaded is exactly the
+// drift policy.md forbids.
+//
+// Markers are read at the repository root, through the confined handle and by
+// metadata alone, which is the same rule lsp.Definition.Detect applies: a
+// present marker selects a payload, it never starts anything, and nothing below
+// the root is walked, so the answer is bounded by the number of markers rather
+// than by the size of the repository.
+func toolsForRepo(path string) ([]string, error) {
+	root, err := workspace.Discover(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	lock := toolchain.Embedded()
+	selected := make(map[string]bool, len(lock.Tools))
+	present := func(marker string) bool {
+		info, err := root.Lstat(marker)
+		return err == nil && info.Mode().IsRegular()
+	}
+	// A tool is selected by the first of its markers that exists; which one it
+	// was does not change the payload.
+	add := func(name string, markers []string) {
+		for _, marker := range markers {
+			if present(marker) {
+				selected[name] = true
+				return
+			}
+		}
+	}
+	for _, kind := range scip.Kinds {
+		add(string(kind), scip.Triggers(kind))
+	}
+	for _, def := range lsp.Definitions() {
+		add(def.Name, def.RootMarkers)
+	}
+	for _, name := range cpgEntries(lock) {
+		for _, family := range dependence.Families {
+			add(name, dependence.ProjectMarkers(family))
+		}
+	}
+	// The runtimes come from the lock's own `runtime` field rather than from a
+	// second mapping: a Node-hosted indexer cannot run without node, and the
+	// point of prefetching is that nothing is fetched later.
+	for name := range maps.Clone(selected) {
+		entry, ok := lock.Tools[name]
+		if !ok {
+			// Every name above is a lock entry by construction, so a miss is a
+			// build that shipped a profile the lock does not carry.
+			return nil, &model.Error{Code: model.CodeInternal,
+				Message: "a profile names a tool the embedded lock does not carry: " + name}
+		}
+		if entry.Runtime != "" {
+			selected[entry.Runtime] = true
+		}
+	}
+	if len(selected) == 0 {
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "no manifest at that repository's root selects a pinned tool"}).
+			WithRemediation("name the tools to install, or run `codectx tools prefetch --all`")
+	}
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// cpgEntries are the lock entries of the kind the dependence provider runs.
+// Asking the inventory which entry that is keeps the engine's name out of this
+// package: `--for-repo` needs to know that a Go or Java project needs the graph
+// engine, not which engine it is.
+func cpgEntries(lock toolchain.Lock) []string {
+	var out []string
+	for _, name := range lock.Names() {
+		if lock.Tools[name].Kind == cpgKind {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // report converts the toolchain report into the CLI shape, keeping only the
