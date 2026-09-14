@@ -112,6 +112,28 @@ type Policy struct {
 	IncludeUntracked bool
 }
 
+// ExcludeDir reports whether the directory named name at root-relative path rel
+// is excluded by this policy: the built-in vendor and generated classification
+// and the Git ignore hook, in that order. It does not answer the unconditional
+// exclusions (the Git directory and the data directory), which are not
+// policy-negotiable and are applied by the traversal itself, and it does not
+// consider ForceIncludeDir, which asks the different question of whether an
+// excluded directory may still hold a forced path.
+//
+// It is exported because the watcher derives its watch set from the same
+// classification. A second copy of these rules elsewhere would let the set of
+// directories a capture reads and the set a watcher watches drift apart
+// silently, which is a missed change reported as fresh coverage.
+func (p Policy) ExcludeDir(rel, name string) bool {
+	if !p.IndexVendor && vendorDirs[name] {
+		return true
+	}
+	if !p.IndexGenerated && generatedDirs[name] {
+		return true
+	}
+	return p.Ignore != nil && p.Ignore(rel, true)
+}
+
 // Walk streams every eligible file in deterministic order, calling visit once
 // per file. It retains no repository-wide file list: only the entries of the
 // directories on the current path are held at any moment.
@@ -135,10 +157,48 @@ func Walk(ctx context.Context, root Root, policy Policy, visit func(File) error)
 	return w.walkDir(ctx, ".", nil, false)
 }
 
+// WalkDirs streams every directory this traversal would descend into, starting
+// with the root ".", in the same order Walk visits them. No file is inspected:
+// a directory is emitted because the policy admits it, not because it already
+// holds an eligible file, so a directory that is empty today is still emitted.
+//
+// That is the difference the watcher needs. Deriving a watch set from Walk
+// yields only the ancestors of the files that exist at that moment, so the
+// first file to appear in an empty admitted directory produces no notification
+// at all. The set WalkDirs yields is a strict superset of those ancestors --
+// every emitted file was reached by descending through its ancestors, and each
+// of those directories is emitted here -- so it can only widen coverage, never
+// narrow it.
+//
+// An excluded directory that ForceIncludeDir claims may hold a forced path is
+// emitted too, for the same reason Walk descends into it: a tracked file inside
+// an ignored tree is eligible, so its directory must be watched.
+//
+// The traversal is bounded by depth and by the per-directory entry cap, exactly
+// as Walk is; the file budget does not apply because no file is emitted. A
+// caller that needs a bound on the number of directories imposes it by
+// returning an error from visit, which stops the traversal.
+func WalkDirs(ctx context.Context, root Root, policy Policy, visit func(relDir string) error) error {
+	if root.root == nil {
+		return notFound("the workspace is not open")
+	}
+	w := &walker{root: root, policy: policy, visitDir: visit, dataDirRel: dataDirRelative(root.Path, policy.DataDir)}
+	if w.dataDirRel == "." {
+		return resourceLimit("the data directory is the workspace root; no file would be eligible")
+	}
+	if err := visit("."); err != nil {
+		return err
+	}
+	return w.walkDir(ctx, ".", nil, false)
+}
+
 type walker struct {
-	root       Root
-	policy     Policy
-	visit      func(File) error
+	root   Root
+	policy Policy
+	visit  func(File) error
+	// visitDir, when set, makes this a directory-only traversal: every
+	// directory the walk descends into is reported and no file is emitted.
+	visitDir   func(string) error
 	dataDirRel string
 	emitted    int64
 	seen       int
@@ -198,14 +258,24 @@ func (w *walker) visitEntry(ctx context.Context, rel string, e entry, excluded b
 		return nil
 	}
 	if e.isDir {
-		childExcluded := excluded || w.dirExcluded(rel, e.name)
+		childExcluded := excluded || w.policy.ExcludeDir(rel, e.name)
 		if childExcluded && !w.mayForceInside(rel) {
 			// Nothing inside can be forced back in, so the subtree is not read
 			// at all: not listed, not counted against the entry cap, not a
 			// source of errors.
 			return nil
 		}
+		if w.visitDir != nil {
+			if err := w.visitDir(rel); err != nil {
+				return err
+			}
+		}
 		return w.walkDir(ctx, rel, e.info, childExcluded)
+	}
+	if w.visitDir != nil {
+		// A directory-only traversal: files are neither classified nor emitted,
+		// and the file budget is not charged.
+		return nil
 	}
 	if !e.info.Mode().IsRegular() {
 		// Devices, sockets, pipes and unresolved links are not source bytes.
@@ -240,16 +310,6 @@ func (w *walker) visitEntry(ctx context.Context, rel string, e entry, excluded b
 // excluded directory must still be visited.
 func (w *walker) mayForceInside(relDir string) bool {
 	return w.policy.ForceIncludeDir != nil && w.policy.ForceIncludeDir(relDir)
-}
-
-func (w *walker) dirExcluded(rel, name string) bool {
-	if !w.policy.IndexVendor && vendorDirs[name] {
-		return true
-	}
-	if !w.policy.IndexGenerated && generatedDirs[name] {
-		return true
-	}
-	return w.policy.Ignore != nil && w.policy.Ignore(rel, true)
 }
 
 func (w *walker) fileExcluded(rel string) bool {
@@ -294,6 +354,14 @@ func (w *walker) readDir(rel string) ([]entry, error) {
 
 	out := make([]entry, 0, len(names))
 	for _, d := range names {
+		if w.visitDir != nil && d.Type()&fs.ModeSymlink == 0 && !d.IsDir() {
+			// A directory-only traversal does not stat files: the kind the
+			// listing already reported is enough to drop them, and stating
+			// every file of the repository is precisely the cost this
+			// traversal exists to avoid. Only a symlink still needs resolving,
+			// because it may name a directory.
+			continue
+		}
 		childRel := d.Name()
 		if rel != "." {
 			childRel = rel + "/" + d.Name()
