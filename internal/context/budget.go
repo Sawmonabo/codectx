@@ -6,6 +6,7 @@
 package context
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -16,12 +17,16 @@ import (
 // config.Context default. Section 20.2 is explicit that a zero never means
 // unlimited, so nothing downstream sees a zero bound and skips a check.
 // MaxBytes and MaxTokens apply PER SLICE; MaxFiles counts distinct selected
-// files across the whole plan; MaxSlices caps total slices.
+// files across the whole plan; MaxSlices caps total slices; MaxManifestBytes
+// caps the whole stored manifest and comes from configuration alone, since
+// Section 15.4's stored-manifest cap is a deployment bound a request may not
+// raise.
 type resolvedBudget struct {
-	MaxBytes  int64
-	MaxTokens int64
-	MaxFiles  int
-	MaxSlices int
+	MaxBytes         int64
+	MaxTokens        int64
+	MaxFiles         int
+	MaxSlices        int
+	MaxManifestBytes int64
 }
 
 // resolveBudget applies the Section 20.1 [context] defaults to req's zero
@@ -38,6 +43,9 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		// context.max_slices carries no Default prefix but is the same kind of
 		// setting: the value a zero budget.max_slices resolves to.
 		MaxSlices: pick(b.MaxSlices, cfg.MaxSlices),
+		// Not pick64: no budget field offers a stored-manifest cap, so the
+		// configured value is the only one.
+		MaxManifestBytes: cfg.MaxManifestBytes,
 	}
 	for _, f := range []struct {
 		key   string
@@ -47,6 +55,7 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		{"context.default_estimated_tokens", out.MaxTokens},
 		{"context.default_max_files", int64(out.MaxFiles)},
 		{"context.max_slices", int64(out.MaxSlices)},
+		{"context.max_manifest_bytes", out.MaxManifestBytes},
 	} {
 		if f.value <= 0 {
 			return resolvedBudget{}, argumentInvalid("%s resolved to %d; a budget bound must be positive, and zero never means unlimited", f.key, f.value)
@@ -83,15 +92,27 @@ func isRequired(r model.Requirement) bool { return requirementRank(r) <= 1 }
 const sizeIterations = 8
 
 // measureEntry builds the persisted entry for c at ordinal and measures its
-// size. EstimatedBytes is the worst-case wire-encoded source length plus the
-// ACTUALLY MEASURED canonical-JSON length of the entry's own metadata: Section
-// 15.4 puts headers, metadata, delimiters and escaping in the budget, so the
-// overhead is measured through serializedBytes, never assumed. Source bytes are
-// never loaded; model.FileVersion.Size is the only input.
-func measureEntry(c candidate, ordinal int) (model.ContextEntry, error) {
-	wire, err := wireEncodedBytes(c.SizeBytes)
-	if err != nil {
-		return model.ContextEntry{}, err
+// size. EstimatedBytes is the ACTUALLY MEASURED canonical-JSON length of the
+// entry's own metadata — Section 15.4 puts headers, metadata, delimiters and
+// escaping in the budget, so the overhead is measured through serializedBytes,
+// never assumed — plus, on the FIRST entry of each file only, the worst-case
+// wire-encoded length of that file's source.
+//
+// chargeSource is what selects that first entry. A file is transported once
+// however many symbols selected it, so charging its source to every entry
+// would budget, floor and persist a file reached through N symbols at N times
+// its size, and the Section 15.4 floor would name a budget larger than the one
+// the plan actually needs. Summing the entries of a file therefore yields the
+// file's real cost, which is what groupByFile and sliceOrdinals both do.
+//
+// Source bytes are never loaded; model.FileVersion.Size is the only input.
+func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, error) {
+	var wire int64
+	if chargeSource {
+		var err error
+		if wire, err = wireEncodedBytes(c.SizeBytes); err != nil {
+			return model.ContextEntry{}, err
+		}
 	}
 	e := model.ContextEntry{
 		Ordinal:       ordinal,
@@ -208,6 +229,18 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 	// required_full prefix at once; nothing downstream re-sorts.
 	sort.SliceStable(sized, func(i, j int) bool { return sized[i].less(sized[j]) })
 
+	// charged holds, for each selected file, the index of its highest-ranked
+	// entry: the one entry that carries the file's source bytes. Selection
+	// keeps or drops a file's entries together (packPlan works on file-atomic
+	// groups), so this index is still the file's first entry in phase two and
+	// both passes charge the source in the same place.
+	charged := make(map[model.FileID]int, len(sized))
+	for i, c := range sized {
+		if _, seen := charged[c.FileID]; !seen {
+			charged[c.FileID] = i
+		}
+	}
+
 	// Phase one measures every candidate at its position in the FULL order.
 	// Selection only ever removes lower-ranked candidates, so a selected
 	// entry's final ordinal is never larger than this one and its final
@@ -216,7 +249,7 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 	// overfilled.
 	provisional := make([]model.ContextEntry, len(sized))
 	for i, c := range sized {
-		e, err := measureEntry(c, i)
+		e, err := measureEntry(c, i, charged[c.FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
@@ -245,7 +278,7 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 			continue
 		}
 		ordinal := len(out.Entries)
-		e, err := measureEntry(sized[i], ordinal)
+		e, err := measureEntry(sized[i], ordinal, charged[sized[i].FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
@@ -253,6 +286,9 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 		out.Entries = append(out.Entries, e)
 	}
 	if out.Slices, err = sliceOrdinals(groups, packed, final, out.Entries); err != nil {
+		return plan{}, err
+	}
+	if err := checkManifestFits(out.Slices, b); err != nil {
 		return plan{}, err
 	}
 	// Exclusions are appended after the entries are ordered so their ordinals
@@ -344,4 +380,28 @@ func packedSliceCount(groups []fileGroup, maxBytes, maxTokens int64) int {
 		tokens += g.tokens
 	}
 	return slices
+}
+
+// checkManifestFits enforces the Section 15.4 stored-manifest byte cap over the
+// plan the packer actually produced. The per-slice bounds alone do not imply
+// it: MaxSlices slices of MaxBytes each may exceed context.max_manifest_bytes,
+// and only required scope is exempt from being dropped, never from the cap. The
+// totals summed here are the exact ones that persist, so the refusal describes
+// the manifest that would have been stored rather than an estimate of it.
+func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
+	var total int64
+	for _, s := range slices {
+		total += s.EstimatedBytes
+	}
+	if total <= b.MaxManifestBytes {
+		return nil
+	}
+	return (&model.Error{
+		Code:    model.CodeResourceLimit,
+		Message: "the selected context exceeds the stored-manifest byte cap",
+	}).
+		WithDetail("manifest_bytes", fmt.Sprint(total)).
+		WithDetail("cap", "context.max_manifest_bytes").
+		WithDetail("cap_bytes", fmt.Sprint(b.MaxManifestBytes)).
+		WithRemediation("narrow the task or lower the per-request budget; context.max_manifest_bytes is a deployment bound a request cannot raise")
 }
