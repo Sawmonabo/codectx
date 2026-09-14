@@ -114,7 +114,17 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			admitted[id] = true
 		}
 		s.Depth = 0
-		s.Requirement = model.RequirementFull
+		if s.Requirement == "" {
+			// Every Section 15.2 seed producer assigns its own requirement:
+			// full for a named identity, recommended for a lexical hit,
+			// optional for a captured change. Promoting all of them here would
+			// put a merely modified or lexically matched file into the
+			// required_full prefix Task 16 reads as mandatory, which Section
+			// 15.2 and ruling Q7 both forbid. The default stands only for a
+			// seed that carries none, which would otherwise rank below optional
+			// and be droppable.
+			s.Requirement = model.RequirementFull
+		}
 		res.Candidates = append(res.Candidates, s)
 		if s.NodeID != "" && len(start) < model.MaxStartNodes {
 			start = append(start, s.NodeID)
@@ -134,7 +144,8 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		return res, nil
 	case len(start) == 0:
 		// Files resolved but no symbol did, so no boundary can be walked from
-		// them. The files stay required; the scope is not complete.
+		// them. Each seed keeps the requirement its Section 15.2 step assigned;
+		// the scope is not complete.
 		res.ScopeComplete = false
 		res.Completeness = degradedCapabilities(caps, nil)
 		return res, nil
@@ -167,7 +178,6 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			NodeID:      e.NodeID,
 			FileID:      e.FileID,
 			Path:        e.Path,
-			Kind:        e.Kind,
 			Requirement: boundaryRequirement(e.Kind, e.Depth),
 			Origin:      originExpansion,
 			Depth:       e.Depth,
