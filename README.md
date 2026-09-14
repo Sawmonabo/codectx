@@ -4,10 +4,14 @@ Codebase intelligence for software-development agents: a Go CLI and MCP server
 that index a Git repository, keep the exact indexed bytes, and answer bounded
 structural queries.
 
-**Status: pre-release.** Only `codectx version` exists today; the commands below
-land in later tasks and are shown as the target contract.
+**Status: pre-release.** `codectx version` and `codectx tools` exist today; the
+other commands below land in later tasks and are shown as the target contract.
 
 ## Quick start
+
+Install and go. There is no toolchain to set up: codectx owns every analyzer it
+runs and every runtime those analyzers need, so you need no Go, Node, npm, JDK,
+or language server of your own.
 
 ```bash
 go build -trimpath -o ./bin/codectx ./cmd/codectx
@@ -17,8 +21,25 @@ codectx context plan --task "Add retry semantics to PaymentService.Authorize" --
 codectx mcp serve --repo .
 ```
 
+Every external analyzer is pinned by an exact version, a per-platform URL and a
+SHA-256 in a lock the binary embeds. Indexing installs what your repository
+needs, verified against that lock before anything executes, into a user-private
+store outside the repository. Nothing is looked up on `PATH`.
+
+`codectx tools` is the optional lifecycle surface for CI and offline hosts:
+
+```bash
+codectx tools status            # every pinned tool and what the store holds
+codectx tools prefetch --all    # install ahead of time instead of on demand
+codectx tools verify            # rehash the store against the lock
+codectx tools gc                # drop versions this binary no longer pins
+```
+
+`docs/toolchain.md` has the pinned set, the offline and mirror settings, and the
+per-platform matrix that proves each payload runs.
+
 If only the bundled structural providers are available the commands still work
-and report their precision; installed SCIP, LSP or dependence-engine tooling enriches the
+and report their precision; SCIP, LSP or dependence-engine analysis enriches the
 same graph and query APIs without changing the agent integration.
 
 ## Output contract
