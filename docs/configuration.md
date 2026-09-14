@@ -269,6 +269,25 @@ cloud or AI credential fields in core.
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 
+The context compiler binds them as follows. The three `default_*` budgets and
+`max_slices` are what a **zero** field of a request's budget resolves to — zero
+never means unlimited, and a configured default that resolves to zero or less is
+a wiring defect the compile reports rather than an unbounded plan.
+`default_max_bytes` and `default_estimated_tokens` apply **per slice**,
+`default_max_files` counts distinct selected files across the whole plan, and
+`max_slices` caps the total. `max_graph_depth`, `max_visited_nodes` and
+`max_graph_edges` bound the one expansion a compile runs, and a walk that
+reaches any of them reports `scope_complete = false` rather than an exhaustive
+plan. `max_reason_paths_per_entry` caps the explanation routes stored per entry;
+routes beyond it are reported as a count, never enumerated.
+
+The ranking weights themselves are **not** configuration. They are compile-time
+constants labelled by the manifest's `policy_version`, so changing one changes
+that label rather than one workspace's answers. The whole `[context]` table is
+already part of manifest identity through the context policy fingerprint below,
+so a manifest compiled under different bounds is a different manifest rather
+than a silent reuse.
+
 ## `[coverage]` — source reads and receipts
 
 All **user** trust.

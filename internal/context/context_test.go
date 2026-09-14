@@ -2,8 +2,6 @@ package context
 
 import (
 	stdcontext "context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,6 +19,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
+	"github.com/Sawmonabo/codectx/internal/source"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -34,9 +33,12 @@ import (
 // Every fill-in lane shares this builder; a lane that needs one more artifact
 // adds it through its row's setup hook rather than editing the builder.
 type contextFixture struct {
-	t       *testing.T
-	ctx     stdcontext.Context
-	Store   *store.Store
+	t     *testing.T
+	ctx   stdcontext.Context
+	Store *store.Store
+	// DBPath is the database file the store opened, so a row can close the
+	// handle and reopen the SAME facts rather than a second copy of them.
+	DBPath  string
 	Repo    model.RepositoryID
 	Cfg     config.Config
 	Files   map[string]model.FileVersion
@@ -65,7 +67,12 @@ var fixtureFiles = []struct {
 	// (524_288),
 	// so a required entry over it raises CTX_MINIMUM_BUDGET under the default
 	// budget rather than being truncated, split or demoted.
-	{"internal/order/generated.go", "Generated", model.NodeFunction, "package order\n\n// " + strings.Repeat("x", 600_000) + "\n"},
+	// Real lines, not one 600 KB line: sparse line checkpoints can only be
+	// placed where a line begins, so a single-line artifact would leave the
+	// file with one checkpoint at byte 0 however it was indexed. 15 + 600*1000
+	// + 4 = 600_019 bytes either way.
+	{"internal/order/generated.go", "Generated", model.NodeFunction, "package order\n\n" +
+		strings.Repeat("// "+strings.Repeat("x", 996)+"\n", 600) + "//x\n"},
 }
 
 // The fixture's one provider identity. Every unit, run and evidence row in the
@@ -92,13 +99,14 @@ func fixtureNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 func newContextFixture(t *testing.T) *contextFixture {
 	t.Helper()
 	ctx := stdcontext.Background()
-	s, err := store.Open(ctx, filepath.Join(t.TempDir(), "codectx.db"), store.Options{})
+	dbPath := filepath.Join(t.TempDir(), "codectx.db")
+	s, err := store.Open(ctx, dbPath, store.Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 
-	fx := &contextFixture{t: t, ctx: ctx, Store: s, Cfg: config.Defaults(),
+	fx := &contextFixture{t: t, ctx: ctx, Store: s, DBPath: dbPath, Cfg: config.Defaults(),
 		Repo:  model.RepositoryID(model.H("codectx.test.repo", "task-15")),
 		Files: map[string]model.FileVersion{}, Now: fixtureNow}
 	if err := s.EnsureRepository(ctx, fx.Repo, "/repo"); err != nil {
@@ -155,15 +163,24 @@ func newContextFixture(t *testing.T) *contextFixture {
 // the Section 15.3 active-change boost has an input.
 func (f *contextFixture) putBlob(path, content string) model.FileVersion {
 	f.t.Helper()
-	sum := sha256.Sum256([]byte(content))
-	hash := hex.EncodeToString(sum[:])
-	rec := model.BlobRecord{Hash: hash, Size: int64(len(content))}
-	for off := 0; off < len(content); off += model.BlobBlockBytes {
-		end := min(off+model.BlobBlockBytes, len(content))
-		d := sha256.Sum256([]byte(content[off:end]))
-		rec.BlockDigests = append(rec.BlockDigests, hex.EncodeToString(d[:]))
+	// The block digests, the whole-file hash and the SPARSE LINE CHECKPOINTS
+	// all come from the one streaming index the product computes at CAS
+	// insertion time (source.BuildIndex, internal/snapshot/cas.go:185), rather
+	// than from a hand-rolled loop here. A fixture that wrote a single
+	// checkpoint at byte 0 would make any range deep inside a large file a
+	// forward scan from byte zero, which serving refuses with
+	// CTX_RESOURCE_LIMIT -- a defect of the fixture that would read as a defect
+	// of the compiler.
+	idx, err := source.BuildIndex(strings.NewReader(content))
+	if err != nil {
+		f.t.Fatalf("BuildIndex(%s): %v", path, err)
 	}
-	rec.LineCheckpoints = []model.LineCheckpoint{{ByteOffset: 0, LineNumber: 1, LineStartByte: 0}}
+	hash := idx.ContentHash
+	rec := model.BlobRecord{Hash: hash, Size: int64(idx.Size), BlockDigests: idx.Blocks}
+	for _, cp := range idx.Checkpoints {
+		rec.LineCheckpoints = append(rec.LineCheckpoints,
+			model.LineCheckpoint{ByteOffset: cp.Byte, LineNumber: cp.Line, LineStartByte: cp.Byte})
+	}
 	if err := f.Store.PutBlob(f.ctx, rec); err != nil {
 		f.t.Fatalf("PutBlob(%s): %v", path, err)
 	}
@@ -963,9 +980,12 @@ func TestContextCompilerScenario(t *testing.T) {
 			// what comes back out of the four Store.Manifest* read methods.
 			name: "manifest ordinals are the actor's reading order and required_full is a prefix",
 			run: func(t *testing.T, fx *contextFixture) {
-				// The row drives the manifest pass directly: Compile's
-				// orchestration is the integration lane's, and the ordering
-				// contract lives entirely in this pass.
+				// The row drives the budget and manifest passes directly:
+				// Compile's orchestration is the integration lane's, and the
+				// ordering contract lives in these two. Ordinals are assigned
+				// exactly ONCE, by the budget pass's total sort, and the
+				// manifest pass persists them; a second ordering here would
+				// agree with the first only by accident.
 				c := &Compiler{store: fx.Store, repo: fx.Repo, cfg: fx.Cfg, now: fx.Now}
 				req := model.ContextRequest{Task: "make Place idempotent", Phase: model.PhaseVerify}
 				cand := func(path string, want model.Requirement, score int64) candidate {
@@ -974,22 +994,33 @@ func TestContextCompilerScenario(t *testing.T) {
 						ScoreMicros: score, SizeBytes: fv.Size, Status: fv.Status, Reasons: []string{"fixture " + path}}
 				}
 				budget := model.Budget{MaxEstimatedTokens: 100_000, MaxBytes: 1 << 20, MaxFiles: 8, MaxSlices: 4}
-				// Packed in the budget pass's packing order, and within each
-				// group deliberately not in reading order.
-				// docs/order.md deliberately outscores both required_full
-				// entries: requirement rank is the FIRST key of the chain, so
-				// a plan ordered by score alone would put it first and hand the
-				// actor an optional file before the code it must read.
-				packed := [][]candidate{
-					{cand("docs/order.md", model.RequirementOptional, 990_000),
-						cand("internal/order/service.go", model.RequirementFull, 900_000)},
-					{cand("internal/order/handler.go", model.RequirementRecommended, 700_000),
-						cand("internal/order/ports.go", model.RequirementFull, 940_000)},
-				}
+				// Deliberately NOT in reading order, and docs/order.md
+				// deliberately outscores both required_full entries:
+				// requirement rank is the FIRST key of the chain, so a plan
+				// ordered by score alone would put it first and hand the actor
+				// an optional file before the code it must read.
 				dropped := cand("config/order.toml", model.RequirementOptional, 10_000)
 				dropped.Excluded = "below the optional cut for this budget"
-				m, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
-					[]candidate{dropped}, fixtureCapabilities, true)
+				cands := []candidate{
+					cand("docs/order.md", model.RequirementOptional, 990_000),
+					cand("internal/order/service.go", model.RequirementFull, 900_000),
+					cand("internal/order/handler.go", model.RequirementRecommended, 700_000),
+					cand("internal/order/ports.go", model.RequirementFull, 940_000),
+					dropped,
+				}
+				files := make([]model.FileVersion, 0, len(cands))
+				for _, cd := range cands {
+					files = append(files, fx.File(cd.Path))
+				}
+				b, err := resolveBudget(budget, fx.Cfg.Context)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err != nil {
+					t.Fatalf("buildPlan: %v", err)
+				}
+				m, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, true)
 				if err != nil {
 					t.Fatalf("persistManifest: %v", err)
 				}
@@ -1026,9 +1057,14 @@ func TestContextCompilerScenario(t *testing.T) {
 				if err != nil {
 					t.Fatalf("ManifestSlices: %v", err)
 				}
-				if len(slices) != 2 || m.SliceCount != 2 {
-					t.Fatalf("read back %d slices (header says %d), want 2", len(slices), m.SliceCount)
+				if len(slices) != m.SliceCount || len(slices) == 0 {
+					t.Fatalf("read back %d slices, header says %d, want a nonzero agreeing count", len(slices), m.SliceCount)
 				}
+				// Every selected ordinal lands in exactly one slice, and each
+				// slice lists its ordinals ascending: `context next` walks the
+				// ordinals, so an ordinal in two slices would serve the same
+				// bytes twice and one in none would be a silent omission.
+				placed := map[int]int{}
 				for _, sl := range slices {
 					for i, o := range sl.EntryOrdinals {
 						if o < 0 || o >= len(entries) {
@@ -1037,6 +1073,12 @@ func TestContextCompilerScenario(t *testing.T) {
 						if i > 0 && o <= sl.EntryOrdinals[i-1] {
 							t.Fatalf("slice %d lists ordinals %v out of reading order", sl.Index, sl.EntryOrdinals)
 						}
+						placed[o]++
+					}
+				}
+				for o := range entries {
+					if placed[o] != 1 {
+						t.Fatalf("ordinal %d appears in %d slices, want exactly one", o, placed[o])
 					}
 				}
 
@@ -1049,14 +1091,13 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 
 				// Recompiling the same request is a no-op, not a second plan.
-				if again, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
-					[]candidate{dropped}, fixtureCapabilities, true); err != nil || again.CanonicalHash != m.CanonicalHash {
+				if again, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, p,
+					fixtureCapabilities, true); err != nil || again.CanonicalHash != m.CanonicalHash {
 					t.Fatalf("re-persisting the identical plan = %v (hash %s), want the immutable manifest unchanged", err, again.CanonicalHash)
 				}
 				// A different plan under the same identity is the determinism
 				// alarm, never a silent overwrite of what the actor is reading.
-				_, err = c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
-					[]candidate{dropped}, fixtureCapabilities, false)
+				_, err = c.persistManifest(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, false)
 				var typed *model.Error
 				if !errors.As(err, &typed) || typed.Code != model.CodeVersionConflict {
 					t.Fatalf("persisting a different canonical plan under the same id = %v, want %s", err, model.CodeVersionConflict)
@@ -1105,6 +1146,89 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		// INT rows
+		{
+			// A manifest identity that depended on the process, the clock or
+			// the database file would make "repeated compile requests reuse the
+			// immutable manifest" (Section 15.1) a lookup that never hits, and
+			// two actors reading the same generation for the same task would
+			// get two different plans with nothing reporting a difference. The
+			// row compiles end to end, reopens the same database and recompiles
+			// -- which must reuse rather than recompile -- and then compiles the
+			// SAME facts in a second database, where the reuse lookup cannot
+			// hit, so identity has to be re-derived from the pinned facts and
+			// the request alone.
+			name: "a manifest identity is a function of the pinned facts and the request, not of the process, the clock or the database file",
+			run: func(t *testing.T, fx *contextFixture) {
+				req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}
+				// One advancing clock for every compile in the row: CreatedAt
+				// is the only field a recompile may change, so it must be able
+				// to change.
+				tick := 0
+				now := func() time.Time {
+					tick++
+					return fixtureNow().Add(time.Duration(tick) * time.Second)
+				}
+				first, err := intCompiler(t, fx, now).Compile(fx.ctx, req)
+				if err != nil {
+					t.Fatalf("Compile: %v", err)
+				}
+				if first.ID == "" || first.CanonicalHash == "" || first.EntryCount == 0 {
+					t.Fatalf("the first compile produced %+v, want a persisted manifest with entries", first)
+				}
+				if first.Binding.GenerationID != fx.Gen || first.PolicyVersion != compilerPolicyVersion {
+					t.Fatalf("manifest header = %+v, want the pinned generation and the frozen policy version", first)
+				}
+
+				// Close the store and reopen the SAME file: the stored manifest
+				// is immutable, so the second compile must return it unchanged
+				// rather than compile a second plan over it.
+				if err := fx.Store.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := store.Open(fx.ctx, fx.DBPath, store.Options{})
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				t.Cleanup(func() { reopened.Close() })
+				fx.Store = reopened
+				second, err := intCompiler(t, fx, now).Compile(fx.ctx, req)
+				if err != nil {
+					t.Fatalf("recompile after reopen: %v", err)
+				}
+				if second.ID != first.ID || second.CanonicalHash != first.CanonicalHash ||
+					!second.CreatedAt.Equal(first.CreatedAt) {
+					t.Fatalf("recompiling after a reopen returned %s/%s at %s, want the immutable manifest %s/%s at %s",
+						second.ID, second.CanonicalHash, second.CreatedAt,
+						first.ID, first.CanonicalHash, first.CreatedAt)
+				}
+
+				// The same facts in a second database, where nothing is stored
+				// to reuse: the plan is recompiled from scratch and must land
+				// on the same identity and the same canonical projection.
+				other := newContextFixture(t)
+				third, err := intCompiler(t, other, now).Compile(other.ctx, req)
+				if err != nil {
+					t.Fatalf("compile against a second store: %v", err)
+				}
+				if third.ID != first.ID {
+					t.Fatalf("ManifestID = %s in a second store, want %s: identity must not depend on the database file", third.ID, first.ID)
+				}
+				if third.CanonicalHash != first.CanonicalHash {
+					t.Fatalf("CanonicalHash = %s in a second store, want %s: the canonical projection must exclude CreatedAt and the local generation",
+						third.CanonicalHash, first.CanonicalHash)
+				}
+				if third.EntryCount != first.EntryCount || third.SliceCount != first.SliceCount {
+					t.Fatalf("second store compiled %d entries / %d slices, want %d / %d",
+						third.EntryCount, third.SliceCount, first.EntryCount, first.SliceCount)
+				}
+				// CreatedAt is the one field a recompile is allowed to change,
+				// and it is excluded from the canonical hash precisely so that
+				// asserting both at once is possible.
+				if !third.CreatedAt.After(first.CreatedAt) {
+					t.Fatalf("second compile CreatedAt = %s, want a later instant than %s", third.CreatedAt, first.CreatedAt)
+				}
+			},
+		},
 	}
 
 	for _, row := range rows {
@@ -1280,4 +1404,62 @@ func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool
 		}
 	}
 	return candidate{}, false
+}
+
+// intCompiler composes a Compiler over fx the way internal/app does: the real
+// search service for seed resolution and a GraphFactory over the fixture's
+// engine, which the shared builder composes neither of.
+//
+// Two clocks, deliberately. now is the caller's, and the row passes ONE
+// advancing clock to every compiler it builds, because a frozen instant would
+// make two compiles agree on CreatedAt by construction and the row asserts they
+// differ. The engine keeps the real clock (scopeEngine), because it derives a
+// context deadline and the fixture's frozen instant lies in the past, which
+// would expire every walk before its first edge.
+func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compiler {
+	t.Helper()
+	dir := t.TempDir()
+	cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
+	if err != nil {
+		t.Fatalf("OpenCAS: %v", err)
+	}
+	for _, spec := range fixtureFiles {
+		if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
+			t.Fatalf("CAS.Put(%s): %v", spec.path, err)
+		}
+	}
+	signer, err := pagination.OpenSigner(dir)
+	if err != nil {
+		t.Fatalf("OpenSigner: %v", err)
+	}
+	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, fx.Store)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
+		Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
+		CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
+	if err != nil {
+		t.Fatalf("search.New: %v", err)
+	}
+	t.Cleanup(func() { svc.Close() })
+	c, err := New(Options{
+		Store:  fx.Store,
+		Repo:   fx.Repo,
+		Search: svc,
+		Graph: func(ctx stdcontext.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
+			if gen != fx.Gen {
+				t.Fatalf("the graph factory was asked for generation %d, want the pinned %d", gen, fx.Gen)
+			}
+			return fx.scopeEngine(nil, fixtureCapabilities), func() error { return nil }, nil
+		},
+		Config: fx.Cfg,
+		Now:    now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
 }

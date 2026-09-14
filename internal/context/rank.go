@@ -133,16 +133,6 @@ func (c *Compiler) reasonPathLimit() int {
 	return limit
 }
 
-// batchLimit is the configured batch bound every bounded read in this package
-// shares (Section 20.1 resources.max_page_items).
-func (c *Compiler) batchLimit() int {
-	limit := c.cfg.Resources.MaxPageItems
-	if limit <= 0 || limit > model.MaxPageItems {
-		return model.MaxPageItems
-	}
-	return limit
-}
-
 // resolvePrecision maps every relation on every candidate route to its edge
 // precision multiplier in ONE batched resolution pass. Precision lives on
 // Evidence and not on Relation, so there is no per-edge read to loop over here;
@@ -175,7 +165,7 @@ func (c *Compiler) resolvePrecision(ctx context.Context, reader *sqlite.PinnedRe
 		return out, nil
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	batch := c.batchLimit()
+	batch := c.pageLimit()
 	for start := 0; start < len(ids); start += batch {
 		end := min(start+batch, len(ids))
 		rows, err := reader.EvidenceBatch(ctx, ids[start:end], evidencePerRelation)

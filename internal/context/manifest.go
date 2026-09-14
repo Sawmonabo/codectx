@@ -126,176 +126,6 @@ func canonicalManifestHash(b model.Binding, reqHash string, budget model.Budget,
 	return h.Sum()
 }
 
-// contextEntry projects one selected candidate into its stored row.
-//
-// EstimatedBytes is the Section 15.4 worst-case wire size of the selected
-// source PLUS the measured canonical-JSON length of the row's own metadata:
-// headers, reasons, evidence paths, delimiters and escaping are in the budget,
-// so the overhead is measured on the real row rather than assumed. The
-// measurement is taken before the two estimate fields are filled, so it is a
-// function of the metadata alone and cannot depend on its own magnitude.
-func contextEntry(c candidate, ordinal int) (model.ContextEntry, error) {
-	e := model.ContextEntry{
-		Ordinal:       ordinal,
-		NodeID:        c.NodeID,
-		FileID:        c.FileID,
-		Requirement:   c.Requirement,
-		ScoreMicros:   c.ScoreMicros,
-		Reasons:       boundedReasons(c.Reasons),
-		EvidencePaths: boundedPaths(c.Paths),
-	}
-	meta, err := serializedBytes(e)
-	if err != nil {
-		return model.ContextEntry{}, err
-	}
-	wire, err := wireEncodedBytes(c.SizeBytes)
-	if err != nil {
-		return model.ContextEntry{}, err
-	}
-	e.EstimatedBytes = wire + meta
-	if e.EstimatedTokens, err = estimateTokens(e.EstimatedBytes); err != nil {
-		return model.ContextEntry{}, err
-	}
-	return e, nil
-}
-
-// boundedReasons applies the Section 15.3 explanation caps. Truncation is at a
-// byte boundary because the cap is a byte cap; a reason is a bounded English
-// sentence, never a value another layer parses.
-func boundedReasons(reasons []string) []string {
-	if len(reasons) > model.MaxReasonsPerEntry {
-		reasons = reasons[:model.MaxReasonsPerEntry]
-	}
-	out := make([]string, 0, len(reasons))
-	for _, r := range reasons {
-		if len(r) > model.MaxReasonBytes {
-			r = r[:model.MaxReasonBytes]
-		}
-		if r != "" {
-			out = append(out, r)
-		}
-	}
-	return out
-}
-
-// boundedPaths projects the retained evidence routes into stored relation id
-// lists, capped at model.MaxReasonPathsPerEntry routes of MaxRelationsPerPath
-// edges. Section 15.3 reports extra routes as a count (candidate.MorePaths)
-// rather than growing an exponential path list, so nothing beyond the cap is
-// enumerated here.
-func boundedPaths(paths []model.RelationPath) [][]model.RelationID {
-	if len(paths) > model.MaxReasonPathsPerEntry {
-		paths = paths[:model.MaxReasonPathsPerEntry]
-	}
-	var out [][]model.RelationID
-	for _, p := range paths {
-		rels := p.Relations
-		if len(rels) > model.MaxRelationsPerPath {
-			rels = rels[:model.MaxRelationsPerPath]
-		}
-		if len(rels) == 0 {
-			continue
-		}
-		out = append(out, append([]model.RelationID(nil), rels...))
-	}
-	return out
-}
-
-// manifestRows turns the budget pass's packed plan into the persisted shape.
-//
-// packed holds one group of candidates per slice, in packing order. Ordinals
-// are assigned by ONE total sort over every selected candidate using the
-// Section 15.3 tie-break chain, so requirement rank is non-decreasing across
-// the whole manifest and required_full therefore occupies a prefix. That is the
-// contract `context next` walks: ordinals 0..n-1 are the actor's canonical
-// reading order, and slices reference those ordinals rather than duplicating
-// the rows.
-//
-// A candidate that the budget pass packed into two slices (an oversized
-// component split at a file boundary) keeps ONE entry, referenced from both:
-// duplicating it would make the same bytes count twice against MaxFiles and
-// give the actor two ordinals for one file.
-func manifestRows(packed [][]candidate) ([]model.ContextEntry, []model.ContextSlice, error) {
-	flat := make([]candidate, 0)
-	seen := make(map[string]struct{})
-	for _, group := range packed {
-		for _, c := range group {
-			if _, dup := seen[c.entityID()]; dup {
-				continue
-			}
-			seen[c.entityID()] = struct{}{}
-			flat = append(flat, c)
-		}
-	}
-	sort.Slice(flat, func(i, j int) bool { return flat[i].less(flat[j]) })
-
-	entries := make([]model.ContextEntry, 0, len(flat))
-	ordinal := make(map[string]int, len(flat))
-	for i, c := range flat {
-		e, err := contextEntry(c, i)
-		if err != nil {
-			return nil, nil, err
-		}
-		entries = append(entries, e)
-		ordinal[c.entityID()] = i
-	}
-
-	slices := make([]model.ContextSlice, 0, len(packed))
-	for _, group := range packed {
-		sl := model.ContextSlice{Index: len(slices)}
-		for _, c := range group {
-			o, ok := ordinal[c.entityID()]
-			if !ok {
-				// Unreachable: every packed candidate was flattened above.
-				// Reported rather than skipped, because a silently dropped
-				// entry is exactly the hidden omission Section 15.4 forbids.
-				return nil, nil, &model.Error{Code: model.CodeInternal,
-					Message: "a packed context candidate has no manifest ordinal"}
-			}
-			sl.EntryOrdinals = append(sl.EntryOrdinals, o)
-			sl.EstimatedBytes += entries[o].EstimatedBytes
-			sl.EstimatedTokens += entries[o].EstimatedTokens
-		}
-		if len(sl.EntryOrdinals) == 0 {
-			// An empty slice is not a deliverable unit and model.ContextSlice
-			// rejects one; dropping it keeps slice indices dense.
-			continue
-		}
-		sort.Ints(sl.EntryOrdinals)
-		slices = append(slices, sl)
-	}
-	return entries, slices, nil
-}
-
-// exclusionRows records every candidate the compiler did not select, each with
-// a nonempty reason, so an omission is visible rather than silent (Section
-// 15.4). Ordering follows the same total tie-break chain the entries use, so
-// two compiles of one request list exclusions identically.
-//
-// A candidate carrying no reason is a defect in the pass that excluded it: the
-// alternative — inventing a reason here — would hide which pass dropped it.
-func exclusionRows(excluded []candidate) ([]model.ExcludedContextEntry, error) {
-	ordered := append([]candidate(nil), excluded...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].less(ordered[j]) })
-	out := make([]model.ExcludedContextEntry, 0, len(ordered))
-	for i, c := range ordered {
-		if strings.TrimSpace(c.Excluded) == "" {
-			return nil, &model.Error{Code: model.CodeInternal,
-				Message: "an excluded context candidate carries no reason"}
-		}
-		reason := c.Excluded
-		if len(reason) > model.MaxReasonBytes {
-			reason = reason[:model.MaxReasonBytes]
-		}
-		out = append(out, model.ExcludedContextEntry{
-			Ordinal:   i,
-			Reference: model.ContextReference{NodeID: c.NodeID, FileID: c.FileID, Path: c.Path},
-			Reason:    reason,
-		})
-	}
-	return out, nil
-}
-
 // reuseManifest is the Section 15.1 immutable-reuse path: a request whose
 // identity is already stored returns the stored header instead of recompiling.
 //
@@ -319,19 +149,29 @@ func (c *Compiler) reuseManifest(ctx context.Context, id model.ManifestID) (mode
 
 // persistManifest writes the compiled plan and returns the immutable header.
 //
+// p is the budget pass's plan, already in the Section 15.3 tie-break order with
+// ordinals 0..n-1 and required_full as a prefix. Ordinals are assigned exactly
+// once, where the packing decided them: re-deriving the rows here from the
+// packed candidates would be a second ordering that agrees with the first only
+// by accident, and the budget would then have been checked against sizes the
+// manifest does not carry.
+//
 // Persisting is the last step of a compile for a reason: a timeout or
 // cancellation must return an explicit incomplete answer and leave no manifest
 // behind, so nothing here is written incrementally.
 func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req model.ContextRequest,
-	budget model.Budget, packed [][]candidate, excluded []candidate,
-	completeness []model.CapabilityState, scopeComplete bool) (model.ContextManifest, error) {
-	entries, slices, err := manifestRows(packed)
-	if err != nil {
-		return model.ContextManifest{}, err
-	}
-	exclusions, err := exclusionRows(excluded)
-	if err != nil {
-		return model.ContextManifest{}, err
+	budget model.Budget, p plan, completeness []model.CapabilityState,
+	scopeComplete bool) (model.ContextManifest, error) {
+	entries, slices, exclusions := p.Entries, p.Slices, p.Excluded
+	for _, x := range exclusions {
+		// Every omission must be visible. A blank reason would persist as a
+		// row that says an entity was dropped and not why, which is exactly
+		// the silent omission Section 15.4 forbids; the pass that excluded it
+		// is the defect, and inventing a reason here would hide which pass.
+		if strings.TrimSpace(x.Reason) == "" {
+			return model.ContextManifest{}, &model.Error{Code: model.CodeInternal,
+				Message: "an excluded context entry carries no reason"}
+		}
 	}
 	id, reqHash := manifestIdentity(b, req, c.cfg)
 	m := model.ContextManifest{
