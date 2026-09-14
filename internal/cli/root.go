@@ -54,6 +54,10 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	for _, c := range newQueryCommands(build) {
 		root.AddCommand(c)
 	}
+	// The Section 18.1 context commands, built as a set for the same reason.
+	for _, c := range newContextCommands(build) {
+		root.AddCommand(c)
+	}
 	return root
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -106,6 +107,13 @@ func (w *Workspace) DataDir() string { return w.s.dataDir }
 // request, so it needs no workspace lock and answers in a report as it does in
 // an indexing session.
 func (w *Workspace) Search() *search.Service { return w.s.search }
+
+// Coverage answers the Section 16 source-read endpoints over this workspace:
+// it opens actor-scoped sessions over a persisted context manifest, serves
+// snapshot-pinned source in bounded chunks and keeps receipt-confirmed coverage
+// of what was actually delivered. Like Search it pins what it reads per
+// session, so it needs no workspace lock and answers in a report.
+func (w *Workspace) Coverage() *coverage.Service { return w.s.coverage }
 
 // Query pins gen -- zero selects the active generation -- and builds the graph
 // engine bound to it. The returned closer releases the retention lease and must
