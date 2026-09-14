@@ -35,17 +35,22 @@ var graphTools = map[string]bool{
 // forbids.
 type limits struct {
 	// maxParamsBytes caps the RAW tools/call arguments frame, before any
-	// decoding. resources.max_metadata_response_bytes is the response ceiling
-	// and is reused as the request ceiling: a request larger than the largest
-	// answer the server may return cannot produce a serviceable call.
+	// decoding. resources.max_metadata_response_bytes serves as the MCP REQUEST
+	// frame cap: a request larger than the largest answer the server may return
+	// cannot produce a serviceable call.
 	//
 	// The per-text-field bound (resources.max_query_text_bytes) is a different
 	// bound and stays where it belongs, in each request type's Validate().
 	//
-	// This middleware bounds REQUESTS ONLY and applies no response ceiling.
-	// That is deliberate: codectx_read_source is bounded by
-	// resources.max_source_response_bytes (7 MiB) in its own handler, and a
-	// 256 KiB response gate here would refuse every source chunk above it.
+	// This middleware bounds REQUESTS ONLY and applies no response ceiling, per
+	// the wave-F ruling on review finding F1. What bounds an answer instead:
+	// the generic tools are bounded by resources.max_page_items plus the
+	// bounded record fields of each model type, and codectx_read_source -- the
+	// only tool that returns source bytes -- is bounded by
+	// resources.max_source_response_bytes (7 MiB) in its own handler. A
+	// response gate here would have to marshal every answer twice to weigh it,
+	// which is the speculative infrastructure policy.md forbids, and at 256 KiB
+	// it would refuse every source chunk above that.
 	maxParamsBytes int64
 	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency
 	// (index.max_parser_workers): a query gate and an indexing gate are
@@ -188,7 +193,7 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			// won: an answer produced after the caller's budget was spent is not
 			// serviceable, and reporting the bound is more honest than shipping
 			// a result whose freshness the bound no longer covers.
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctx.Err() != nil {
 				return refusal(waitFailed(ctx, "in "+call.Params.Name)), nil
 			}
 			return res, nil

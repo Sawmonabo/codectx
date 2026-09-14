@@ -153,8 +153,9 @@ func (h *handlers) dependencyPath(ctx context.Context, _ *mcp.CallToolRequest, i
 // Out is model.ImpactResult WHOLE: Packages, VisitedCount and EdgeCount are
 // what Section 19.2's "affected scope and required boundaries, with
 // completeness" needs, and re-projecting to a model.Page would silently drop all
-// three. toolFor parameterizes only the input, so this signature alone fixes the
-// tool's output contract — which is why it stays ImpactResult.
+// three. addTool derives the output schema from this signature's Out, so the
+// signature alone fixes the tool's output contract — which is why it stays
+// ImpactResult.
 //
 // model.ImpactRequest is the In type verbatim, so this is the same shape as
 // every other handler here: validate → one facade call → wrap.

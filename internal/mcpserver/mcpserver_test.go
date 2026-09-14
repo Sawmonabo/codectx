@@ -292,9 +292,25 @@ func newTestServer(f *fakeServices) *mcp.Server {
 // clean shutdown at test end.
 func connect(t *testing.T, s *mcp.Server) *mcp.ClientSession {
 	t.Helper()
+	return connectSession(t, s, true)
+}
+
+// connectSession is connect with the shutdown assertion made optional.
+//
+// wantClean is false for exactly one caller: the row that abandons a call
+// mid-flight. That row's client tears the in-memory pipe down while the server
+// is still handling the cancellation it just sent, so whether the server's read
+// side observes a clean EOF or a closed pipe is a transport race, not a
+// property of the server. Asserting there would make the suite flaky; the
+// invariant is asserted on every other session instead.
+func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSession {
+	t.Helper()
 	ctx := t.Context()
 	clientT, serverT := mcp.NewInMemoryTransports()
-	serverSession, err := s.Connect(ctx, serverT, nil)
+	// The server session outlives t.Context(), which is canceled just BEFORE
+	// Cleanup runs: under that context Wait would report the harness teardown
+	// rather than the session shutdown the assertion below is about.
+	serverSession, err := s.Connect(context.WithoutCancel(ctx), serverT, nil)
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
@@ -305,7 +321,14 @@ func connect(t *testing.T, s *mcp.Server) *mcp.ClientSession {
 	}
 	t.Cleanup(func() {
 		_ = cs.Close()
-		_ = serverSession.Wait()
+		// Failure mode: the session stops ending cleanly on client
+		// disconnect -- a handler left running, a transport not drained --
+		// and the server keeps a workspace it no longer serves. Wait returns
+		// the session's own outcome, so discarding it is how a dirty shutdown
+		// goes unnoticed in-package.
+		if err := serverSession.Wait(); err != nil && wantClean {
+			t.Errorf("server session did not shut down cleanly: %v", err)
+		}
 	})
 	return cs
 }
@@ -530,32 +553,7 @@ var scenarios = []scenario{
 	},
 
 	// L1 rows.
-	{
-		// Failure mode: the raw tools/call frame stops being capped before it is
-		// decoded. A post-decode cap has already paid the unmarshal and the
-		// schema walk over attacker-sized input, which is the allocation the
-		// bound exists to prevent; the frame is json.RawMessage at the receiving
-		// middleware precisely so the cap can precede it.
-		//
-		// The payload is BOTH oversized and missing every required field of
-		// codectx_search, so the two orders answer differently: gate first gives
-		// CTX_RESOURCE_LIMIT, gate after decoding gives the SDK's schema
-		// validation error. That difference is what pins the ordering rather
-		// than merely the existence of a cap.
-		name: "oversized tool arguments are refused before decoding",
-		tool: "codectx_search",
-		args: map[string]any{"pad": strings.Repeat("x", 300_000)},
-		check: func(t *testing.T, res *mcp.CallToolResult) {
-			if !res.IsError {
-				t.Fatalf("oversized arguments were accepted: %+v", res.StructuredContent)
-			}
-			text := firstText(res)
-			if !strings.HasPrefix(text, model.CodeResourceLimit+":") {
-				t.Errorf("tool error = %q, want the %s refusal that precedes decoding",
-					text, model.CodeResourceLimit)
-			}
-		},
-	},
+	oversizedArgumentsRow(),
 
 	{
 		// Failure mode: a client that goes away mid-call stops being an
@@ -1080,7 +1078,7 @@ func TestScenarios(t *testing.T) {
 			if sc.facade != nil {
 				sc.facade(f)
 			}
-			cs := connect(t, newTestServer(f))
+			cs := connectSession(t, newTestServer(f), sc.callCtx == nil)
 			ctx := t.Context()
 			if sc.callCtx != nil {
 				ctx = sc.callCtx(t, f)
@@ -1135,4 +1133,51 @@ func firstText(res *mcp.CallToolResult) string {
 		}
 	}
 	return ""
+}
+
+// oversizedArgumentsRow is a constructor rather than a literal so the row can
+// own a call flag that both its facade and its check close over.
+//
+// Failure mode: an oversized tools/call frame stops being refused outright and
+// reaches a handler, so the facade pays a query for input the bound exists to
+// reject. The row asserts the refusal carries CTX_RESOURCE_LIMIT and that
+// ExploreService.Search was never entered.
+//
+// What it deliberately does NOT claim: that the cap precedes the SDK's decode
+// and schema validation. The SDK reports a schema failure as a TOOL error, so a
+// post-decode cap would still win this row -- the ordering cannot be observed
+// from the client. It is a structural guarantee instead, and it is stated where
+// it holds, at the json.RawMessage read in limitMiddleware (limits.go).
+//
+// The "never entered" assertion is defence in depth and is over-determined
+// today: this frame is also schema-invalid, and every SearchRequest field is
+// bounded by Validate, so no oversized frame can reach the facade by another
+// route either. What mutation-proves this row is neutering the cap, which
+// substitutes the SDK's schema error for the CTX_RESOURCE_LIMIT refusal.
+func oversizedArgumentsRow() scenario {
+	var searched bool
+	return scenario{
+		name: "oversized tool arguments are refused with CTX_RESOURCE_LIMIT before any handler runs",
+		facade: func(f *fakeServices) {
+			searched = false
+			f.searchFn = func(context.Context, model.SearchRequest) (model.Page[model.SearchHit], error) {
+				searched = true
+				return model.Page[model.SearchHit]{}, nil
+			}
+		},
+		tool: "codectx_search",
+		args: map[string]any{"pad": strings.Repeat("x", 300_000)},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if !res.IsError {
+				t.Fatalf("oversized arguments were accepted: %+v", res.StructuredContent)
+			}
+			text := firstText(res)
+			if !strings.HasPrefix(text, model.CodeResourceLimit+":") {
+				t.Errorf("tool error = %q, want the %s refusal", text, model.CodeResourceLimit)
+			}
+			if searched {
+				t.Errorf("the facade was entered for a frame the bound refuses")
+			}
+		},
+	}
 }
