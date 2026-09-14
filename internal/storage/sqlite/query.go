@@ -515,6 +515,12 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 					return corrupt("generation %d capability %q/%q has unreadable details", r.gen, c.ProviderID, c.Capability)
 				}
 			}
+			// The write path bounds every capability, but the read path must
+			// not trust the row: a row written by a foreign or older binary
+			// would otherwise hand a caller an unbounded detail map.
+			if err := c.Validate(); err != nil {
+				return corrupt("generation %d capability %q/%q is not a valid capability state: %v", r.gen, c.ProviderID, c.Capability, err)
+			}
 			out = append(out, c)
 		}
 		return wrap("generation_capabilities", rows.Err())
