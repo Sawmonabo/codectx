@@ -9,6 +9,7 @@ import (
 	"math"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -548,7 +549,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	label := "node:" + it.kind
 	keyOwner := e.keyOwner(it.fullName, it.ownerFullName)
 	positional := e.positional(it.fullName, it.ownerFullName, it.rng, it.name, it.signature)
-	key := FactKey(label, keyOwner, it.relPath, "", name, positional)
+	key := FactKey(label, keyOwner, it.relPath, "", name, positional, "")
 	if err := e.sc.exec(ctx, `INSERT INTO ident(ent, node_id, fact_json, alias_json, key) VALUES(?,?,?,?,?)`,
 		it.id, string(node.ID), string(factJSON), string(aliasJSON), key); err != nil {
 		return err
@@ -562,7 +563,8 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		// The key must stay a digest: saveKeys unions relation keys into the
 		// key set and LoadKeySet refuses any line that is not one, so a
 		// composed key here would write a set the next refresh cannot load.
-		altKey := FactKey("rel:may_refer_to", keyOwner, it.relPath, "ambiguous", string(alt), positional)
+		altKey := FactKey("rel:may_refer_to", keyOwner, it.relPath, "ambiguous", string(alt), positional,
+			string(node.ID)+keySep+string(alt))
 		if err := e.stageRelation(ctx, node.ID, model.RelMayReferTo, alt, evFile, evHash, evRange,
 			qualified, detailAssignment, altKey); err != nil {
 			return err
@@ -704,7 +706,7 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 				rng = &r
 			}
 			factKey := FactKey("rel:"+o.kind, o.owner, o.relPath, o.op, o.key.target,
-				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target))
+				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target), o.from+keySep+o.to)
 			if err := e.stageRelation(ctx, model.NodeID(o.from), kind, model.NodeID(o.to), model.FileID(o.fileID),
 				o.hash, rng, o.owner, o.detail, factKey); err != nil {
 				return err
@@ -742,45 +744,118 @@ func (e *emitter) stageRelation(ctx context.Context, from model.NodeID, kind mod
 	return e.sc.staged(ctx)
 }
 
-// emitNodes hands every distinct identity to the sink, smallest ID first. Two
-// entities that resolved to one identity publish one fact, because a unit
-// publishes each node once.
+// emitNodes hands every distinct identity to the sink, smallest entity first.
+// Two entities that resolved to one identity publish one fact, because a unit
+// publishes each node once — and that one fact carries the fact keys of every
+// entity behind it. Storage drops a carried fact when ANY of its keys is
+// replaced (Section 11.4), so a key left off here would strand the row it
+// backs: the next refresh would classify that key as changed, storage would
+// keep the old row because the key it kept the row under is not this fact's,
+// and the unit would hold two descriptions of one identity.
 func (e *emitter) emitNodes(ctx context.Context) error {
-	after := ""
+	var afterNode, afterEnt string
+	var open *model.NodeFact
+	var openNode string
+	var openKeys []string
+	var facts []model.NodeFact
+	var keys [][]string
+	closeGroup := func() {
+		if open == nil {
+			return
+		}
+		facts = append(facts, *open)
+		keys = append(keys, sortedKeys(openKeys))
+		open, openNode, openKeys = nil, "", nil
+	}
+	flush := func() error {
+		closeGroup()
+		if len(facts) == 0 {
+			return nil
+		}
+		if err := e.putNodes(ctx, facts, keys); err != nil {
+			return err
+		}
+		e.nodes += len(facts)
+		facts, keys = nil, nil
+		return nil
+	}
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT i.node_id, i.fact_json FROM ident i
-			WHERE i.node_id > ? AND i.ent = (SELECT MIN(j.ent) FROM ident j WHERE j.node_id = i.node_id)
-			ORDER BY i.node_id LIMIT ?`, after, pageSize)
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT node_id, ent, fact_json, key FROM ident
+			WHERE (node_id, ent) > (?, ?) ORDER BY node_id, ent LIMIT ?`, afterNode, afterEnt, pageSize)
 		if err != nil {
 			return internalErr("import nodes: %v", err)
 		}
-		var facts []model.NodeFact
+		type row struct{ node, ent, raw, key string }
+		var page []row
 		for rows.Next() {
-			var id, raw string
-			if err := rows.Scan(&id, &raw); err != nil {
+			var r row
+			if err := rows.Scan(&r.node, &r.ent, &r.raw, &r.key); err != nil {
 				rows.Close()
 				return internalErr("import nodes: %v", err)
 			}
-			var f model.NodeFact
-			if err := json.Unmarshal([]byte(raw), &f); err != nil {
-				rows.Close()
-				return internalErr("import nodes: %v", err)
-			}
-			facts = append(facts, f)
-			after = id
+			page = append(page, r)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return internalErr("import nodes: %v", err)
 		}
-		if len(facts) == 0 {
-			return nil
+		if len(page) == 0 {
+			return flush()
 		}
-		if err := e.sink.PutNodes(ctx, facts); err != nil {
-			return err
+		for _, r := range page {
+			if open == nil || openNode != r.node {
+				closeGroup()
+				var f model.NodeFact
+				if err := json.Unmarshal([]byte(r.raw), &f); err != nil {
+					return internalErr("import nodes: %v", err)
+				}
+				open, openNode = &f, r.node
+			}
+			if r.key != "" {
+				openKeys = append(openKeys, r.key)
+			}
 		}
-		e.nodes += len(facts)
+		afterNode, afterEnt = page[len(page)-1].node, page[len(page)-1].ent
+		// The identity still open may continue on the next page; everything
+		// before it is complete.
+		if len(facts) >= pageSize {
+			hold, holdNode, holdKeys := open, openNode, openKeys
+			open, openNode, openKeys = nil, "", nil
+			if err := flush(); err != nil {
+				return err
+			}
+			open, openNode, openKeys = hold, holdNode, holdKeys
+		}
 	}
+}
+
+// sortedKeys is one fact's key list in the order a keyed put requires:
+// ascending and without duplicates. Duplicates are ordinary — two entities of
+// one identity, or two occurrences of one edge, can share a key — and storage
+// refuses a list that holds one.
+func sortedKeys(keys []string) []string {
+	slices.Sort(keys)
+	return slices.Compact(keys)
+}
+
+// putNodes hands one batch to the sink with its keys, or without them when the
+// sink cannot carry keys at all. A keyed put to a sink whose destination is
+// not a provider.DeltaSink is refused by the sink rather than silently
+// dropping the keys, so the fallback is on the sink's own interface, not on
+// what its destination turns out to be.
+func (e *emitter) putNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
+	if d, ok := e.sink.(provider.DeltaSink); ok {
+		return d.PutKeyedNodes(ctx, facts, keys)
+	}
+	return e.sink.PutNodes(ctx, facts)
+}
+
+// putRelations is putNodes for relation facts.
+func (e *emitter) putRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error {
+	if d, ok := e.sink.(provider.DeltaSink); ok {
+		return d.PutKeyedRelations(ctx, facts, keys)
+	}
+	return e.sink.PutRelations(ctx, facts)
 }
 
 // emitAliases publishes each distinct (scope, native key, node) once.
@@ -811,33 +886,50 @@ func (e *emitter) emitAliases(ctx context.Context) error {
 }
 
 // emitRelations streams the staged occurrences grouped by relation and hands
-// each canonical edge with its bounded evidence list to the sink. A delta
-// import emits only the occurrences whose fact key the previous run did not
-// publish; the node facts are always emitted, because they are the identities
-// the kept rows still reference.
+// each canonical edge, with its bounded evidence list and the fact keys of
+// every occurrence behind it, to the sink. Node facts are always emitted,
+// because they are the identities the kept rows still reference.
+//
+// A delta import filters whole relations, not occurrences: an edge is emitted
+// if ANY of its occurrences carries a key the previous run did not publish,
+// and it is then emitted entire. Filtering occurrences would publish an edge
+// whose evidence held only the occurrences that moved, so the delta-built
+// unit would differ from the same unit built in full — and storage, which
+// drops a fact when any of its keys is replaced, would have nothing to carry
+// the omitted evidence on.
+//
+// deltaFilter, not this function, decides whether filtering is allowed at all.
 func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 	filter := ""
 	if delta {
-		filter = ` AND EXISTS (SELECT 1 FROM keys k WHERE k.key = rels.key AND k.changed = 1)`
+		filter = ` AND EXISTS (SELECT 1 FROM rels o JOIN keys k ON k.key = o.key
+			WHERE o.rel_id = rels.rel_id AND k.changed = 1)`
 	}
-	query := `SELECT rel_id, ev_id, from_id, kind, to_id, ev_json FROM rels
+	query := `SELECT rel_id, ev_id, from_id, kind, to_id, ev_json, key FROM rels
 		WHERE (rel_id, ev_id) > (?, ?)` + filter + ` ORDER BY rel_id, ev_id LIMIT ?`
 	var afterRel, afterEv string
 	var current *model.RelationFact
+	var currentKeys []string
 	var batch []model.RelationFact
-	flush := func() error {
-		if current != nil {
-			batch = append(batch, *current)
-			current = nil
+	var keys [][]string
+	closeGroup := func() {
+		if current == nil {
+			return
 		}
+		batch = append(batch, *current)
+		keys = append(keys, sortedKeys(currentKeys))
+		current, currentKeys = nil, nil
+	}
+	flush := func() error {
+		closeGroup()
 		if len(batch) == 0 {
 			return nil
 		}
-		if err := e.sink.PutRelations(ctx, batch); err != nil {
+		if err := e.putRelations(ctx, batch, keys); err != nil {
 			return err
 		}
 		e.relations += len(batch)
-		batch = nil
+		batch, keys = nil, nil
 		return nil
 	}
 	for {
@@ -845,11 +937,11 @@ func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 		if err != nil {
 			return internalErr("import relations: %v", err)
 		}
-		type row struct{ rel, ev, from, kind, to, raw string }
+		type row struct{ rel, ev, from, kind, to, raw, key string }
 		var page []row
 		for rows.Next() {
 			var r row
-			if err := rows.Scan(&r.rel, &r.ev, &r.from, &r.kind, &r.to, &r.raw); err != nil {
+			if err := rows.Scan(&r.rel, &r.ev, &r.from, &r.kind, &r.to, &r.raw, &r.key); err != nil {
 				rows.Close()
 				return internalErr("import relations: %v", err)
 			}
@@ -864,11 +956,16 @@ func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 		}
 		for _, r := range page {
 			if current == nil || string(current.Relation.ID) != r.rel {
-				if current != nil {
-					batch = append(batch, *current)
-				}
+				closeGroup()
 				current = &model.RelationFact{Relation: model.Relation{ID: model.RelationID(r.rel),
 					From: model.NodeID(r.from), Kind: model.RelationKind(r.kind), To: model.NodeID(r.to)}}
+			}
+			// The key is collected even for an occurrence past the evidence
+			// bound: the occurrence still backs this edge, and a key left off
+			// would leave storage carrying the previous row when that
+			// occurrence alone changes.
+			if r.key != "" {
+				currentKeys = append(currentKeys, r.key)
 			}
 			if len(current.Evidence) >= model.MaxEvidencePerFact {
 				e.clipped++
@@ -884,12 +981,12 @@ func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 		// The relation still open may continue on the next page; everything
 		// before it is complete.
 		if len(batch) >= pageSize {
-			open := current
-			current = nil
+			open, openKeys := current, currentKeys
+			current, currentKeys = nil, nil
 			if err := flush(); err != nil {
 				return err
 			}
-			current = open
+			current, currentKeys = open, openKeys
 		}
 	}
 }
