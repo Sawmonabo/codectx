@@ -262,10 +262,13 @@ type ContextReference struct {
 	Path   string `json:"path,omitempty"`
 }
 
-// Validate enforces that a reference names something.
+// Validate enforces that a reference names something. A path alone is enough:
+// an unresolved task token recorded as an exclusion (Section 15.2) has no
+// node or file behind it, and the exclusion exists precisely to keep that
+// omission visible.
 func (r ContextReference) Validate() error {
-	if r.NodeID == "" && r.FileID == "" {
-		return invalid("context_reference names neither a node_id nor a file_id")
+	if r.NodeID == "" && r.FileID == "" && r.Path == "" {
+		return invalid("context_reference names neither a node_id, a file_id nor a path")
 	}
 	if err := optionalID("context_reference.node_id", string(r.NodeID)); err != nil {
 		return err
