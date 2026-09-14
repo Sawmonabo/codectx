@@ -9,9 +9,14 @@ other commands below land in later tasks and are shown as the target contract.
 
 ## Quick start
 
-Install and go. There is no toolchain to set up: codectx owns every analyzer it
-runs and every runtime those analyzers need, so you need no Go, Node, npm, JDK,
-or language server of your own.
+Install and go. codectx owns every analyzer it runs and every runtime those
+analyzers need — no Node, no npm, no JDK and no language server of your own.
+
+Precise indexing of Go, Rust and Python additionally uses that language's own
+toolchain (`go`, `cargo`, `python3`/`pip3`) the way any build does, because the
+indexer loads the project model through it. Where one is absent that language
+falls back to the structural and dependence providers, which need nothing on the
+host; no other language depends on anything you install.
 
 ```bash
 go build -trimpath -o ./bin/codectx ./cmd/codectx
@@ -24,13 +29,16 @@ codectx mcp serve --repo .
 Every external analyzer is pinned by an exact version, a per-platform URL and a
 SHA-256 in a lock the binary embeds. Indexing installs what your repository
 needs, verified against that lock before anything executes, into a user-private
-store outside the repository. Nothing is looked up on `PATH`.
+store outside the repository. codectx itself looks nothing up on `PATH`; the
+three host toolchains above are the analyzers' own, and `docs/toolchain.md` lists
+them in one place.
 
 `codectx tools` is the optional lifecycle surface for CI and offline hosts:
 
 ```bash
 codectx tools status            # every pinned tool and what the store holds
 codectx tools prefetch --all    # install ahead of time instead of on demand
+codectx tools prefetch --for-repo .   # only what this repository's manifests select
 codectx tools verify            # rehash the store against the lock
 codectx tools gc                # drop versions this binary no longer pins
 ```
