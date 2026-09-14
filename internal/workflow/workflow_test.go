@@ -38,10 +38,220 @@ func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
 		// L1 rows
+		// Failure mode: a service that picked its own version from a
+		// pre-read record, retried the store's compare-and-swap or
+		// swallowed its conflict would let two clients both believe they
+		// closed the same session -- and the loser would carry a stale
+		// ExpectedVersion it thinks is current. Closing is the transition
+		// with no service guard, so this exercises the version path alone.
+		{name: "two clients closing at the same expected version: exactly one wins", run: func(t *testing.T, h *harness) {
+			expected := h.session(fixtureSession).StateVersion
+			req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+
+			type attempt struct {
+				status model.WorkflowStatus
+				err    error
+			}
+			attempts := make([]attempt, 2)
+			var wg sync.WaitGroup
+			wg.Add(len(attempts))
+			for i := range attempts {
+				go func(i int) {
+					defer wg.Done()
+					status, err := h.svc.Close(context.Background(), req, expected)
+					attempts[i] = attempt{status: status, err: err}
+				}(i)
+			}
+			wg.Wait()
+
+			var won, lost int
+			for _, a := range attempts {
+				switch {
+				case a.err == nil:
+					won++
+					if a.status.State != model.StateClosed {
+						t.Errorf("the winning close reports state %q, want %q", a.status.State, model.StateClosed)
+					}
+					if a.status.StateVersion != expected+1 {
+						t.Errorf("the winning close reports state version %d, want %d", a.status.StateVersion, expected+1)
+					}
+				case code(a.err) == model.CodeVersionConflict:
+					lost++
+				default:
+					t.Errorf("the losing close failed with %q: %v", code(a.err), a.err)
+				}
+			}
+			if won != 1 || lost != 1 {
+				t.Fatalf("%d closes won and %d hit a version conflict; want exactly one of each", won, lost)
+			}
+			if got := h.session(fixtureSession).State; got != model.StateClosed {
+				t.Errorf("the session is in state %q after both closes, want %q", got, model.StateClosed)
+			}
+		}},
 		// L2 rows
+		// An include invalidates the prior scope review by moving the scope
+		// version, never by deleting it, and the coverage the actor already
+		// earned at the same content hash survives the INSERT OR IGNORE
+		// derivation. A service that extended scope without the version bump
+		// would leave a stale review satisfying the gate; one that deleted the
+		// observation or the coverage would destroy the audit record and send
+		// the actor back to re-read bytes it has already confirmed.
+		{"include invalidates the prior scope review while same-hash coverage survives", func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			before := h.session(fixtureSession)
+			servedHash := h.file(fixtureSession, fileFull).hash
+
+			// The review is inserted through the store rather than through
+			// Record: the eight-category and citation rules are L3's guard, and
+			// this row needs only a review the gate would count as current.
+			oreq := model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: before.ScopeVersion,
+				Kind: model.ObservationScopeReview, Note: "scope reviewed at the planned scope",
+				Review: &model.ScopeReview{
+					ManifestHash: fixtureID("manifest", "canonical"), ScopeVersion: before.ScopeVersion,
+				},
+			}
+			review := model.Observation{
+				ID: model.NewObservationID(oreq), SessionID: oreq.SessionID, ActorID: oreq.ActorID,
+				ScopeVersion: oreq.ExpectedScope, Kind: oreq.Kind, Review: oreq.Review,
+				Note: oreq.Note, CreatedAt: fixtureNow,
+			}
+			if err := h.store.PutObservation(ctx, review); err != nil {
+				t.Fatalf("record the scope review the include must invalidate: %v", err)
+			}
+
+			// What the recompile returns: a second immutable manifest on the
+			// session's own binding that pulls one further file into scope.
+			included := model.ManifestID(fixtureID("manifest", "included"))
+			extra := model.FileID(fixtureID("file", "included"))
+			h.store.mu.Lock()
+			m := h.store.manifests[fixtureManifest]
+			m.ID, m.EntryCount, m.CanonicalHash = included, 1, fixtureID("manifest", "included", "canonical")
+			h.store.manifests[included] = m
+			h.store.entries[included] = []model.ContextEntry{{
+				Ordinal: 0, FileID: extra, Requirement: model.RequirementFull,
+				ScoreMicros: 900, EstimatedBytes: 10, EstimatedTokens: 2, Reasons: []string{"seed"},
+			}}
+			h.store.current[extra] = fixtureID("hash", "included")
+			h.store.compiled = m
+			h.store.mu.Unlock()
+
+			_, err := h.svc.Include(ctx, model.IncludeRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+				Seeds: []string{"internal/c/included.go"}, ExpectedVersion: before.StateVersion,
+			})
+			// Include's tail projects the new record through L4's status, which
+			// is still a stub in this lane; its store-visible work is committed
+			// by then, so this row asserts on the store. When L4 lands the error
+			// is nil and every assertion below is unchanged.
+			if err != nil && err.Error() != errUnimplemented("status").Error() {
+				t.Fatalf("include: %v", err)
+			}
+
+			after := h.session(fixtureSession)
+			// The review is untouched at the scope version it was recorded
+			// under -- nothing was deleted or rewritten.
+			prior, err := h.store.Observations(ctx, fixtureSession, fixtureActor,
+				model.ObservationScopeReview, before.ScopeVersion, "", 0)
+			if err != nil {
+				t.Fatalf("read the prior scope review: %v", err)
+			}
+			if len(prior) != 1 || prior[0].ID != review.ID {
+				t.Fatalf("the include did not leave the prior scope review intact: %+v", prior)
+			}
+			// ...and it no longer counts, because no review is current at the
+			// session's new scope version.
+			current, err := h.store.Observations(ctx, fixtureSession, fixtureActor,
+				model.ObservationScopeReview, after.ScopeVersion, "", 0)
+			if err != nil {
+				t.Fatalf("read the current scope review: %v", err)
+			}
+			if len(current) != 0 {
+				t.Fatalf("a scope review still satisfies scope version %d after the include: %+v", after.ScopeVersion, current)
+			}
+			if after.ScopeVersion != before.ScopeVersion+1 {
+				t.Fatalf("scope version is %d after the include; want %d", after.ScopeVersion, before.ScopeVersion+1)
+			}
+			if after.ManifestID != included {
+				t.Fatalf("the session's current manifest is %q; want the recompiled %q", after.ManifestID, included)
+			}
+			// Same-actor same-hash coverage survives, so the include costs the
+			// actor a review and not its confirmed reads.
+			cov, err := h.store.Coverage(ctx, fixtureSession, fixtureActor, "", 0)
+			if err != nil {
+				t.Fatalf("read coverage after the include: %v", err)
+			}
+			var full *model.FileCoverage
+			for i := range cov {
+				if cov[i].FileID == fileFull {
+					full = &cov[i]
+				}
+			}
+			if full == nil {
+				t.Fatalf("the include dropped %q from the session's scope", fileFull)
+			}
+			if full.ContentHash != servedHash || full.State != model.CoverageFullServed {
+				t.Fatalf("coverage of the fully served file is %q/%s after the include; want %q/%s",
+					full.ContentHash, full.State, servedHash, model.CoverageFullServed)
+			}
+			inScope := false
+			for _, c := range cov {
+				if c.FileID == extra {
+					inScope = true
+				}
+			}
+			if !inScope {
+				t.Fatalf("the recompiled manifest's file %q never entered the session's scope", extra)
+			}
+		}},
 		// L3 rows
+		//
+		// A scope review is the one observation that can claim a file was read,
+		// so both rows below are about the same silent failure: a review that is
+		// believed rather than checked against served_ranges would let an actor
+		// attest its way to a satisfied strict gate without reading anything.
+		{"Record/a citation over an unconfirmed interval is refused", func(t *testing.T, h *harness) {
+			partial := h.file(fixtureSession, filePartial)
+			// [30,70) spans the deliberate gap at [40,60): it overlaps two
+			// confirmed intervals and is contained by neither.
+			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCallersConsumers,
+				[]model.ClaimReference{{Source: &model.SourceCitation{
+					FileID: filePartial, ContentHash: partial.hash,
+					Bytes: model.ByteRange{Start: 30, End: 70},
+				}}})
+			_, _, err := h.svc.Record(context.Background(), model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+				Kind: model.ObservationScopeReview, Review: review,
+				Note: "reviewed the callers of the partly served file",
+			})
+			if got := code(err); got != model.CodeCoverageIncomplete {
+				t.Fatalf("Record over an unconfirmed citation: code %q (err %v), want %q",
+					got, err, model.CodeCoverageIncomplete)
+			}
+		}},
+		{"Record/a review claiming a file read without full coverage is refused", func(t *testing.T, h *harness) {
+			partial := h.file(fixtureSession, filePartial)
+			// [0,40) IS confirmed, so the citation guard passes and the refusal
+			// can only come from the file's coverage state: a served interval is
+			// not a read file.
+			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
+				[]model.ClaimReference{{Source: &model.SourceCitation{
+					FileID: filePartial, ContentHash: partial.hash,
+					Bytes: model.ByteRange{Start: 0, End: 40},
+				}}})
+			_, _, err := h.svc.Record(context.Background(), model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+				Kind: model.ObservationScopeReview, Review: review,
+				Note: "attested every file read",
+			})
+			if got := code(err); got != model.CodeCoverageIncomplete {
+				t.Fatalf("Record over a partly served attested file: code %q (err %v), want %q",
+					got, err, model.CodeCoverageIncomplete)
+			}
+		}},
 		// L4 rows
 		// L5 rows
+		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
 		// L6 rows
 		// L7 rows
 		// L8 rows
@@ -712,4 +922,96 @@ func (s *fakeStore) Current(_ context.Context, file model.FileID, hash string) (
 		return false, s.validateErr
 	}
 	return s.current[file] == hash, nil
+}
+
+// --- L3 helpers -------------------------------------------------------------
+
+// l3ScopeReview builds an attestation that answers all eight required
+// categories, so a row exercises the guard it names rather than
+// ScopeReview.Validate's completeness check. Only the target category carries
+// references; every other category is answered with an explicit note, which is
+// what the model requires of a category with no references.
+func l3ScopeReview(manifestHash string, scopeVersion int, target model.ScopeReviewCategory,
+	refs []model.ClaimReference) *model.ScopeReview {
+	categories := []model.ScopeReviewCategory{
+		model.ReviewCompleteFilesRead, model.ReviewCallersConsumers, model.ReviewContractsTypes,
+		model.ReviewStateLifecycle, model.ReviewDependencies, model.ReviewIntegrationPoints,
+		model.ReviewSharedUtilities, model.ReviewRemainingUncertainty,
+	}
+	review := &model.ScopeReview{ManifestHash: manifestHash, ScopeVersion: scopeVersion}
+	for _, c := range categories {
+		entry := model.ScopeReviewEntry{Category: c, Note: "answered for " + string(c)}
+		if c == target {
+			entry.References = refs
+		}
+		review.Entries = append(review.Entries, entry)
+	}
+	return review
+}
+
+// --- L5 scenario ------------------------------------------------------------
+
+// capsuleIsDeterministic protects the Section 17.3 identity rule and ruling Q11
+// together, because the same seal answers both: the canonical hash is derived
+// from the capsule's semantics and never from when it was built, and a repeated
+// completion returns the FIRST stored capsule rather than recomputing one and
+// writing over the sealed identity.
+//
+// A silent breakage here is severe in a way a wrong error code is not: two
+// honest completions of one session would disagree about what was sealed, and
+// the durable artifact a later session replays would carry whichever timestamp
+// happened to run last.
+func capsuleIsDeterministic(t *testing.T, h *harness) {
+	ctx := context.Background()
+	if _, err := h.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the fixture session: %v", err)
+	}
+	// The fixture waives one required file, and the frozen Sessions interface
+	// exposes no reader for the stored waiver reasons (see capsuleWaivers), so
+	// this row seals a session with no waiver outstanding. The waiver's own
+	// invariant is L4's row, not this one.
+	h.file(fixtureSession, fileWaived).waived = false
+
+	rec := h.session(fixtureSession)
+	g := gate{ReadComplete: true, Ready: true, Strict: true, ScopeComplete: true}
+
+	first, err := h.svc.buildCapsule(ctx, rec, g)
+	if err != nil {
+		t.Fatalf("seal the first capsule: %v", err)
+	}
+	if !first.CreatedAt.Equal(fixtureNow) {
+		t.Fatalf("the sealed capsule carries %s, not the clock it was sealed under (%s)", first.CreatedAt, fixtureNow)
+	}
+
+	// The preimage itself: the same capsule stamped three days later must hash
+	// to the same identity, or the digest is a function of the wall clock.
+	later := fixtureNow.Add(72 * time.Hour)
+	restamped := first
+	restamped.CreatedAt = later
+	if got := canonicalCapsuleHash(restamped); got != first.CanonicalHash {
+		t.Fatalf("the canonical hash moved with CreatedAt: %s before, %s after", first.CanonicalHash, got)
+	}
+
+	// A second completion under a later clock: the seal must answer with the
+	// stored capsule and its original timestamp, never a freshly built one.
+	svc, err := New(Options{
+		Sessions: h.store, Compile: h.store, Validate: h.store, Limits: h.svc.limits,
+		Now: func() time.Time { return later }, Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("build a second service on a later clock: %v", err)
+	}
+	second, err := svc.buildCapsule(ctx, rec, g)
+	if err != nil {
+		t.Fatalf("seal the capsule a second time: %v", err)
+	}
+	if second.CanonicalHash != first.CanonicalHash {
+		t.Fatalf("a second completion sealed a different identity: %s then %s", first.CanonicalHash, second.CanonicalHash)
+	}
+	if !second.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
 }
