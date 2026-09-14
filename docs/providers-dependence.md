@@ -135,22 +135,23 @@ One parse handles exactly one language, so one unit is one frontend-native
 project. Scope keys are `pkg:<family>:<root-relative project directory>`,
 with `workspace` for the one family whose unit is the repository.
 
-A project whose scope key would exceed the identity bound is refused by the
-planner, with a warning naming the family and the path length; it is not
-planned and not scheduled. The key is never truncated to fit: two deep
-directories sharing a long prefix would cut to the same key, and every
-capability row, alias scope and cached graph of one project would then be
-attributed to the other. Losing one project's facts openly is the smaller
-harm, and refusing in the planner keeps the decision where the units are
-chosen rather than failing the unit once it has already begun.
+A project whose scope key would exceed the identity bound is refused **a unit
+of its own** by the planner, with a warning naming the family and the path.
+The key is never truncated to fit: two deep directories sharing a long prefix
+would cut to the same key, and every capability row, alias scope and cached
+graph of one project would then be attributed to the other. Refusing in the
+planner keeps the decision where the units are chosen rather than failing the
+unit once it has already begun.
 
-A refused project is never a silent omission. Its directory stays excluded
-from the family's repository-root unit — folding its files in would analyse
-them under a scope key naming a different project — so its source is analysed
-by nobody, and every capability the family publishes is therefore `partial`
-with `CTX_PROVIDER_OUTPUT_INVALID` and an `unplanned_projects` count in its
-`details`. A generation that is missing a subtree says so; it never reports the
-family fresh.
+**Its source is not dropped.** A refused directory is excluded from nothing, so
+its files fall back to the unit that encloses them — the enclosing project, or
+the family's repository-root unit. No file of a family is ever orphaned, and
+the family always has a unit that runs. It is still a degradation: that source
+is analysed at a coarser project boundary than it owns, with the neighbouring
+projects' files around it, and resolution depends on a project's extent. So
+every capability the family publishes is `partial` with
+`CTX_PROVIDER_OUTPUT_INVALID` and an `unplanned_projects` count in its
+`details`. The family is never reported fresh while that is true.
 
 | Family | Languages | Project marker | Rule |
 |---|---|---|---|

@@ -146,9 +146,10 @@ type publication struct {
 	// what this build cannot read.
 	UnknownLabels map[string]int
 	// UnplannedProjects is how many projects of this unit's family the planner
-	// refused for an oversized scope key. Their files belong to no unit at all,
-	// so every capability of the family is degraded: the analysis is missing a
-	// subtree, not a method body.
+	// refused a unit of their own for an oversized scope key. Their files fall
+	// back to the unit enclosing them, so nothing goes unanalysed, but the
+	// analysis ran at a coarser project boundary than the source owns — which
+	// degrades every capability of the family alike, not one pass.
 	UnplannedProjects int
 }
 
@@ -181,8 +182,9 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 				row = row.WithDetail("skipped_method_names", names)
 			}
 		}
-		// A subtree no unit owns degrades every capability of the family
-		// alike: nothing in it was analysed by any pass.
+		// Source analysed under a project boundary that is not its own
+		// degrades every capability of the family alike: a resolution that
+		// depends on the project's extent is affected in every pass.
 		if p.UnplannedProjects > 0 {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
 			row = row.WithDetail("unplanned_projects", strconv.Itoa(p.UnplannedProjects))

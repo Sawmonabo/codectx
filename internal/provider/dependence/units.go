@@ -112,17 +112,21 @@ func FamilyOf(language string) Family {
 }
 
 // Plan is one snapshot's dependence units together with what could not be
-// planned. A refused project is not a silent omission: its files belong to no
-// unit, so the family that owns it cannot be published fresh, and Unplanned is
-// how the provider knows that at publication time.
+// planned as a unit of its own. A refused project is not a silent omission:
+// its files are analysed by the unit enclosing them, at a coarser boundary
+// than they own, so the family that owns it cannot be published fresh, and
+// Unplanned is how the provider knows that at publication time.
 type Plan struct {
 	// Units are the planned units, sorted by scope key.
 	Units []Unit
 	// Unplanned counts, per family, the projects planFamily refused because
-	// their scope key does not fit model.MaxScopeKeyBytes. It is a count and
-	// not the paths: the only paths that can appear here are longer than two
-	// kilobytes each, and a plan never holds a repository-sized list of them
-	// (Section 6). The refusal's locus is on the warning this package logs.
+	// their scope key does not fit model.MaxScopeKeyBytes. Their files are
+	// analysed by the unit that encloses them, so nothing is lost, but at a
+	// coarser boundary than the project owns — which is what the family
+	// publishes partial for. It is a count and not the paths: the only paths
+	// that can appear here are longer than two kilobytes each, and a plan never
+	// holds a repository-sized list of them (Section 6). The refusal's locus is
+	// on the warning this package logs.
 	Unplanned map[Family]int
 }
 
@@ -217,30 +221,41 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 			WithDetail("family", string(f)).WithDetail("projects", itoa(int64(len(dirs)))).
 			WithDetail("limit", "MaxUnitsPerFamily").WithDetail("bound", itoa(MaxUnitsPerFamily))
 	}
-	units := make([]Unit, 0, len(dirs)+1)
+	// A project whose scope key does not fit is refused as a project, not as
+	// source. Refusing here is what keeps the failure in the planner: the unit
+	// would otherwise be admitted and fail at BeginUnit, where the scope key is
+	// already the identity every published row carries.
+	//
+	// Only the projects that survive bound the other units, so a refused
+	// directory is excluded from nothing and its files fall back to the unit
+	// that encloses it — the enclosing project, or the family's
+	// repository-root unit. No file of a family is ever orphaned, which is
+	// also what guarantees the degradation below always has a unit to be
+	// published on. It is still a degradation: that source is analysed at a
+	// coarser project boundary than it owns, with the neighbouring projects'
+	// files around it, so the caller publishes the family partial and the
+	// refusal is counted rather than swallowed. The path is logged truncated
+	// because it is what locates the project for an operator and a whole one
+	// is over two kilobytes.
+	planned := make([]string, 0, len(dirs))
 	unplanned := 0
 	for _, d := range dirs {
-		key, ok := scopeKey(f, d)
-		if !ok {
-			// Refusing here is what keeps the failure in the planner. The unit
-			// would otherwise be admitted and fail at BeginUnit, where the
-			// scope key is already the identity every published row carries.
-			//
-			// The refusal is counted, not swallowed: the caller publishes this
-			// family's capabilities partial, so a subtree that no unit analyses
-			// is never reported as freshly analysed. The path is logged
-			// truncated because it is what locates the project for an operator
-			// and a whole one is over two kilobytes.
+		if _, ok := scopeKey(f, d); !ok {
 			unplanned++
-			slog.Warn("a dependence project is not planned: its scope key exceeds the identity bound",
+			slog.Warn("a dependence project is not planned as its own unit: its scope key exceeds the identity bound",
 				"component", component, "family", string(f), "path", truncate(d, model.MaxIdentifierBytes),
 				"path_bytes", len(d), "bound", model.MaxScopeKeyBytes)
 			continue
 		}
-		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
-			Excluded: nested(d, dirs), Markers: markersUnder(markers, d, nested(d, dirs))})
+		planned = append(planned, d)
 	}
-	if f != FamilyRust && !slices.Contains(dirs, "") {
+	units := make([]Unit, 0, len(planned)+1)
+	for _, d := range planned {
+		key, _ := scopeKey(f, d)
+		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
+			Excluded: nested(d, planned), Markers: markersUnder(markers, d, nested(d, planned))})
+	}
+	if f != FamilyRust && !slices.Contains(planned, "") {
 		// Source of this family outside every project still has facts worth
 		// having; the engine parses a bare directory happily. Rust does not:
 		// without a Cargo.toml its helper produces an empty graph, which would
@@ -252,15 +267,14 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		// choosing between them by sort position, so it is not emitted at all.
 		// The root key is "pkg:<family>:", always within the bound.
 		//
-		// Excluded is every project directory of the family, including one
-		// that was just refused. A refused project keeps its own boundary: its
-		// files are not silently folded into the root unit, where they would
-		// be analysed under a scope key that names a different project and
-		// with a nested project's files pulled in around them. They are
-		// analysed by nobody, and the family says so by publishing partial.
+		// Excluded is every project of the family that is planned as its own
+		// unit, and only those: a refused directory is not excluded here, so
+		// its files — and its manifests, which belong in this unit's semantic
+		// closure now that it owns them — fall back to this unit rather than
+		// being analysed by nobody.
 		key, _ := scopeKey(f, "")
 		units = append(units, Unit{ScopeKey: key, Family: f,
-			Excluded: dirs, Markers: markersUnder(markers, "", dirs)})
+			Excluded: planned, Markers: markersUnder(markers, "", planned)})
 	}
 	return units, unplanned, nil
 }

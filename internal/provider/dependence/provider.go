@@ -249,9 +249,10 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	pub.UnknownLabels = report.UnknownLabels
 	// A project of this family the planner had to refuse has no unit of its
-	// own and is excluded from this one, so its files are analysed by nobody.
-	// Publishing this family fresh while that is true is false readiness, and
-	// the unit that ran is the only place with a capability row to say so.
+	// own: its files were analysed by whichever unit encloses them, under a
+	// scope key that names a different project. Publishing this family fresh
+	// while that is true is false readiness, and the unit that ran is the only
+	// place with a capability row to say so.
 	pub.UnplannedProjects = plan.Unplanned[unit.Family]
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
