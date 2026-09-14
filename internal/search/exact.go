@@ -257,24 +257,50 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		// in this package re-ranks or re-folds provider ids, and a nil-aware
 		// clause would be added here only if a leg showed a nil-valued row
 		// winning.
-		nodes, err := r.Nodes(ctx, nodeFilterFor(tier, query, kinds), "", limit)
-		if err != nil {
-			return nil, false, err
-		}
-		// A tier that filled its bound had more to give. Section 14.3 forbids
-		// dropping those silently, so the caller reports the answer as
-		// truncated instead of serving a confidently short page.
-		full = full || len(nodes) >= limit
-		for _, n := range nodes {
-			if _, duplicate := seen[n.Node.ID]; duplicate || supersededByLowerTier(tier, n, query) {
-				continue
-			}
-			p, err := paths.path(ctx, n.Node.FileID)
+		filter := nodeFilterFor(tier, query, kinds)
+		after, kept := model.NodeID(""), 0
+		// The tier is walked on its keyset, not read once. Nodes applies its
+		// SQL LIMIT to node_facts rows and only then collapses the duplicate
+		// node_id rows the Section 9.4 precedence order leaves behind
+		// (storage/sqlite/query.go:246-263), so a full-bound read routinely
+		// returns fewer nodes than it asked for while the keyset still has
+		// rows: a deduped count can neither end the walk nor decide whether
+		// the tier had more. Only an EMPTY page ends it, and `after` advances
+		// strictly on every non-empty one, so it terminates.
+		for kept < limit {
+			nodes, err := r.Nodes(ctx, filter, after, limit)
 			if err != nil {
 				return nil, false, err
 			}
-			seen[n.Node.ID] = struct{}{}
-			out = append(out, exactHit{Tier: tier, Path: p, Node: n})
+			if len(nodes) == 0 {
+				break
+			}
+			for _, n := range nodes {
+				after = n.Node.ID
+				if _, duplicate := seen[n.Node.ID]; duplicate || supersededByLowerTier(tier, n, query) {
+					continue
+				}
+				p, err := paths.path(ctx, n.Node.FileID)
+				if err != nil {
+					return nil, false, err
+				}
+				seen[n.Node.ID] = struct{}{}
+				out = append(out, exactHit{Tier: tier, Path: p, Node: n})
+				if kept++; kept == limit {
+					break
+				}
+			}
+		}
+		if kept == limit {
+			// A tier that filled its bound had more to give only if the keyset
+			// really does continue past it. Section 14.3 forbids dropping the
+			// rest silently, so one follow-up read -- not a deduped count --
+			// decides whether the caller reports the answer as truncated.
+			more, err := r.Nodes(ctx, filter, after, 1)
+			if err != nil {
+				return nil, false, err
+			}
+			full = full || len(more) > 0
 		}
 	}
 	return out, full, nil

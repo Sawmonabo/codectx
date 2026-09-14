@@ -86,6 +86,12 @@ type Options struct {
 	// continuation would cost O(pages x records) and re-read a growing spool on
 	// every page. Nil disables spilling; an overflowing traversal then truncates.
 	Spools *pagination.Spools
+	// Leases mints the CURSOR-SCOPED retention lease every continuation token
+	// names. It is not the pinned reader's query lease: that one is released
+	// when the request returns, so a token naming it is refused by the spool
+	// store on the very next invocation. Nil means continuations are not
+	// offered, exactly like a nil Signer or Spools.
+	Leases *pagination.Leases
 	Gate   Gate // process-scoped; never per-Engine. Nil means the caller gates elsewhere.
 	// Limits is resolved from config.Context/config.Resources by the caller.
 	// The engine never reads config itself, so a cost or bound can never differ
@@ -115,13 +121,14 @@ type Engine struct {
 	promoter  Promoter
 	signer    *pagination.Signer
 	spools    *pagination.Spools
+	leases    *pagination.Leases
 	gate      Gate
 	limits    Limits
 	now       func() time.Time
 }
 
-// New builds an Engine. Adjacency is required; Promoter, Signer, Spools and
-// Gate are optional as documented on Options, and a nil Now defaults to
+// New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases
+// and Gate are optional as documented on Options, and a nil Now defaults to
 // time.Now. Every Limits field must be positive: a zero bound is resolved to
 // the configured default by the caller before it reaches here, so a zero
 // arriving at New is a wiring defect, not a request asking for "unlimited".
@@ -157,6 +164,7 @@ func New(o Options) (*Engine, error) {
 		promoter:  o.Promoter,
 		signer:    o.Signer,
 		spools:    o.Spools,
+		leases:    o.Leases,
 		gate:      o.Gate,
 		limits:    o.Limits,
 		now:       now,
@@ -216,6 +224,10 @@ type expandOptions struct {
 	// Zero leaves the accumulation unbounded and is only reachable from a test
 	// that builds expandOptions directly.
 	FrontierBytes int64
+	// Resume, when non-nil, is the state a continuation restored: the walk
+	// starts from the spooled frontier at the cursor's depth instead of from
+	// seeds, and skips the rows the issuing page already emitted.
+	Resume *resumeState
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.
@@ -245,15 +257,6 @@ type EvidenceRowReader interface {
 	// Adjacency.EvidenceFor.
 	EvidenceRows(ctx context.Context, relations []model.RelationID,
 		limit int) (map[model.RelationID][]model.Evidence, error)
-}
-
-// LeaseHolder is the OPTIONAL seam exposing the retention lease that pins the
-// generation an answer was read from. A continuation token must name that
-// lease: the token is only valid while the facts it will resume over are still
-// retained, so a cursor minted without one would outlive the generation it
-// pins. An Adjacency that does not hold a lease simply offers no continuation.
-type LeaseHolder interface {
-	LeaseID() string
 }
 
 // typedContextError is the ONE place a bare context failure becomes a Section 8

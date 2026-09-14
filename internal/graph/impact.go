@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -24,9 +25,6 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	if err := req.Validate(); err != nil {
 		return model.ImpactResult{}, err
 	}
-	if err := continuationUnavailable(req.Page.Cursor); err != nil {
-		return model.ImpactResult{}, err
-	}
 	ctx, deadline, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
 		return model.ImpactResult{}, err
@@ -34,12 +32,105 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	defer done()
 
 	kinds := impactAllowlist(req.Relations)
-	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
+	maxDepth := resolveBound(req.MaxDepth, e.limits.MaxDepth)
+	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
+	// The page limit is part of the normalized query a continuation is bound
+	// to, exactly as it is for a traversal: a resumed page that asked for a
+	// different limit would cut the ranked list somewhere the issuing page
+	// never stopped.
+	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth, limit)
+
+	var (
+		answer  impactAnswer
+		entries []model.ImpactEntry
+		b       *budget
+	)
+	if req.Page.Cursor != "" {
+		// Page 2..n replay the ranked tail the first page already computed:
+		// no walk, no hydration, no adjacency read at all, and therefore no
+		// traversal budget spent. The counters below are the first page's,
+		// carried unchanged.
+		answer, entries, b, err = e.resumeImpact(ctx, req.Page.Cursor, queryHash, deadline)
+	} else {
+		answer, entries, b, err = e.walkImpact(ctx, req, kinds, maxDepth, deadline)
+	}
+	if err != nil {
+		return model.ImpactResult{}, err
+	}
+
+	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness}
+	if answer.Truncated {
+		markTruncated(&meta, answer.Reason)
+	}
+	var rest []model.ImpactEntry
+	if len(entries) > limit {
+		entries, rest = entries[:limit], entries[limit:]
+	}
+	if len(rest) > 0 {
+		// A full page is truncation whether or not a continuation can be
+		// offered: an engine with no signer or no spool store still says the
+		// answer goes on, it just cannot hand back the rest of it.
+		markTruncated(&meta, reasonPageFull)
+		if meta.NextCursor, err = e.spoolImpact(ctx, b, queryHash, answer, rest); err != nil {
+			return model.ImpactResult{}, err
+		}
+	}
+	result := model.ImpactResult{
+		Meta:     meta,
+		Entries:  entries,
+		Packages: answer.Packages,
+		// Cumulative spend, the same accounting the traversal operations
+		// report, and the same on every page of one answer: the walk happened
+		// once.
+		VisitedCount: b.visited,
+		EdgeCount:    b.edges,
+	}
+	if err := result.Validate(); err != nil {
+		return model.ImpactResult{}, err
+	}
+	return result, nil
+}
+
+// impactEndpoint binds an impact continuation to the operation that issued it.
+// A cursor minted by impact means nothing to a traversal even at the same
+// generation and seeds, and verifyContinuation rejects it.
+const impactEndpoint = "graph.impact"
+
+// impactAnswer is the answer-level half of one impact answer: the facts that
+// describe the WHOLE ranked list rather than the page being served. A
+// continuation replays its entries from a spool and has nothing of its own to
+// recompute them from, so it carries them forward -- without that, every page
+// after the first would report a complete answer for a walk that was truncated,
+// and would drop the deferred-capability disclosure and the rollup the first
+// page computed.
+//
+// Packages ride as their own spool records: a rollup is bounded only by
+// MaxRecordsPerResult, and a thousand pairs in one record can exceed the
+// spool's per-record byte bound.
+type impactAnswer struct {
+	Truncated    bool                    `json:"t,omitempty"`
+	Reason       string                  `json:"r,omitempty"`
+	Completeness []model.CapabilityState `json:"c,omitempty"`
+	Packages     []model.PackageEdge     `json:"-"`
+}
+
+// walkImpact is page 1: the bounded expansion, the ranking pass, hydration and
+// the rollup. It returns the ENTIRE ranked list, not one page of it, because
+// the caller cuts the page and spills what is left.
+//
+// Evidence is attached to every ranked entry here rather than to the page that
+// is served, so the spilled tail is self-contained and a continuation reads no
+// facts at all. The cost is bounded by the record cap the accumulator already
+// enforces, and it is paid once for the whole answer rather than once per page.
+func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
+	maxDepth int, deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
+	var answer impactAnswer
+	meta := model.QueryMeta{}
 	// The deferred-dependence disclosure happens before the walk: a missing
 	// dependence edge must not read as a genuine absence of impact.
 	pending, err := e.pendingDependence(ctx, kinds)
 	if err != nil {
-		return model.ImpactResult{}, err
+		return answer, nil, nil, err
 	}
 	if len(pending) > 0 {
 		meta.Completeness = pending
@@ -50,16 +141,16 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	acc := newImpactAccumulator(req.Start, b,
 		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
 		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
-	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
+	_, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
-		MaxDepth:      resolveBound(req.MaxDepth, e.limits.MaxDepth),
+		MaxDepth:      maxDepth,
 		Budget:        b,
 		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
 	}, acc.Visit)
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
-		return model.ImpactResult{}, err
+		return answer, nil, nil, err
 	}
 	switch {
 	case acc.reason != "":
@@ -73,34 +164,134 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	entries := acc.Entries(e.limits.MaxReasonPaths)
 	entries, hydrateErr := e.hydrateImpactEntries(ctx, entries)
 	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
-		return model.ImpactResult{}, err
-	}
-	if limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems); len(entries) > limit {
-		entries = entries[:limit]
-		// No NextCursor: this endpoint issues none, so a full page says so
-		// instead of handing back a continuation that cannot be resumed.
-		markTruncated(&meta, reasonPageFull)
+		return answer, nil, nil, err
 	}
 	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
-		return model.ImpactResult{}, err
+		return answer, nil, nil, err
 	}
-
 	packages, rollupErr := e.rollupPackages(ctx, acc.Relations())
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
-		return model.ImpactResult{}, err
+		return answer, nil, nil, err
 	}
-	result := model.ImpactResult{
-		Meta:     meta,
-		Entries:  entries,
-		Packages: packages,
-		// Cumulative spend, the same accounting the traversal operations report.
-		VisitedCount: b.visited,
-		EdgeCount:    b.edges,
+	answer = impactAnswer{Truncated: meta.Truncated, Reason: meta.TruncationReason,
+		Completeness: meta.Completeness, Packages: packages}
+	return answer, entries, b, nil
+}
+
+// resumeImpact replays the ranked tail a previous page spilled. It reads no
+// facts: the spool holds the answer-level record, the hydrated entries and the
+// rollup pairs exactly as the walking page computed them, so a continuation
+// costs one signature check and one spool read.
+func (e *Engine) resumeImpact(ctx context.Context, token, queryHash string,
+	deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
+	var answer impactAnswer
+	c, b, err := e.verifyContinuation(token, impactEndpoint, queryHash, deadline)
+	if err != nil {
+		return answer, nil, nil, err
 	}
-	if err := result.Validate(); err != nil {
-		return model.ImpactResult{}, err
+	if c.SpoolID == "" || e.spools == nil {
+		return answer, nil, nil, cursorInvalid("continuation state has expired or was released")
 	}
-	return result, nil
+	var entries []model.ImpactEntry
+	first := true
+	err = e.spools.Open(ctx, c.spoolCursor(), e.now(), func(record []byte) error {
+		var r spoolRecord
+		if err := json.Unmarshal(record, &r); err != nil {
+			return cursorInvalid("continuation state is not readable")
+		}
+		leading := first
+		first = false
+		switch {
+		case leading != (r.Kind == spoolRecordAnswer):
+			// The answer-level record leads every ranked spool and appears
+			// nowhere else. A spool that does not start with one is not a
+			// ranked page this build can replay faithfully -- serving it would
+			// report a truncated answer as complete.
+			return cursorInvalid("continuation state is not readable")
+		case r.Kind == spoolRecordAnswer:
+			if err := json.Unmarshal(r.Payload, &answer); err != nil {
+				return cursorInvalid("continuation state is not readable")
+			}
+			return nil
+		case r.Kind == spoolRecordEntry:
+			if len(entries) >= model.MaxRecordsPerResult {
+				return impactStateTooLarge()
+			}
+			var entry model.ImpactEntry
+			if err := json.Unmarshal(r.Payload, &entry); err != nil {
+				return cursorInvalid("continuation state is not readable")
+			}
+			entries = append(entries, entry)
+			return nil
+		case r.Kind == spoolRecordPackage:
+			if len(answer.Packages) >= model.MaxRecordsPerResult {
+				return impactStateTooLarge()
+			}
+			var pkg model.PackageEdge
+			if err := json.Unmarshal(r.Payload, &pkg); err != nil {
+				return cursorInvalid("continuation state is not readable")
+			}
+			answer.Packages = append(answer.Packages, pkg)
+			return nil
+		default:
+			// A traversal's own frontier and visited records land here: the two
+			// vocabularies are disjoint, so neither replay serves the other.
+			return cursorInvalid("continuation state is not readable")
+		}
+	})
+	if err != nil {
+		return impactAnswer{}, nil, nil, err
+	}
+	if first {
+		// An empty spool carries no answer-level record, so it cannot say
+		// whether the walk behind it was complete.
+		return impactAnswer{}, nil, nil, cursorInvalid("continuation state is not readable")
+	}
+	return answer, entries, b, nil
+}
+
+// impactStateTooLarge is the typed refusal for a spool holding more records
+// than one result may carry. The bound is the same MaxRecordsPerResult the
+// walking page enforced, so only a corrupt or tampered spool can reach it.
+func impactStateTooLarge() error {
+	return (&model.Error{Code: model.CodeResourceLimit,
+		Message:     "continuation state exceeds the result record bound",
+		Remediation: "restart the query with a narrower scope"}).WithDetail("limit", "max_records_per_result")
+}
+
+// spoolImpact spills the answer-level record, the ranked tail and the rollup
+// into a fresh spool and signs the cursor naming it. It returns an empty token
+// with no error when no continuation can be offered -- no signer, no spool
+// store, or no lease store to retain the generation -- because the caller has
+// already reported the answer as truncated and a missing continuation is the
+// same contract as running out of page items.
+func (e *Engine) spoolImpact(ctx context.Context, b *budget, queryHash string, answer impactAnswer,
+	rest []model.ImpactEntry) (string, error) {
+	records := make([]spoolRecord, 0, len(rest)+len(answer.Packages)+1)
+	leading, err := encodeSpoolRecord(spoolRecordAnswer, answer)
+	if err != nil {
+		return "", err
+	}
+	records = append(records, leading)
+	for _, entry := range rest {
+		r, err := encodeSpoolRecord(spoolRecordEntry, entry)
+		if err != nil {
+			return "", err
+		}
+		records = append(records, r)
+	}
+	for _, pkg := range answer.Packages {
+		r, err := encodeSpoolRecord(spoolRecordPackage, pkg)
+		if err != nil {
+			return "", err
+		}
+		records = append(records, r)
+	}
+	return e.nextTraversalCursor(ctx, b, continuation{
+		Endpoint:  impactEndpoint,
+		QueryHash: queryHash,
+		Records:   records,
+	})
 }
 
 // beginImpactQuery applies the per-request deadline and the process-scoped

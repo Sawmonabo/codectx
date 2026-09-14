@@ -58,15 +58,18 @@ evidence row behind it.
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Maximum distinct nodes the walk may admit. |
-| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. |
+| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. On `callers`, `callees` and `impact` it is cumulative across the pages of one answer. |
 
-**Today only `refs` issues a continuation.** `callers`, `callees` and `impact`
-answer in a single bounded page and report truncation with no `next` token; a
-`--cursor` handed to one of them is refused with `CTX_CURSOR_INVALID` rather
-than silently restarting the walk from its seeds, which would double-spend the
-cumulative budget the cursor exists to carry. `path` is not paged at all: it
-declares neither `--limit` nor `--cursor`, and its `--visited` budget is spent
-by the one search it runs.
+**`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
+`callees` and `impact` print a `next` token when more remains, and resuming one
+carries the budget the earlier pages already spent rather than refilling it.
+`impact` resumes differently from the traversal commands: it ranks the whole
+walk on the first page, serves the first `--limit` entries and keeps the ranked
+tail, so a continuation replays that tail in rank order without walking again
+and spends no further budget. Its `walked` counts and its package rollup are
+therefore the same on every page — they describe the one walk behind the whole
+answer. `path` is not paged at all — it declares neither flag, and its
+`--visited` budget is spent by the one search it runs.
 
 **Zero is not "unlimited".** A zero budget takes the configured default, and a
 positive value may narrow that default but never widen it. The visited and edge

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -118,6 +119,22 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for i := 0; i < fixtureWideCount; i++ {
 		addNode(fmt.Sprintf("n-wide-leaf-%03d", i), model.NodeFunction, fmt.Sprintf("wide%03d", i))
 	}
+	// pkg-wide-a and pkg-wide-b make n-wide's fan-out a CROSS-package one, so a
+	// rollup seeded at n-wide has 261 distinct endpoints and containerPackages
+	// asks containsEdges for a 256-node batch whose containment rows do not fit
+	// in one clamped page. Two packages, never one: an edge whose endpoints
+	// share a container rolls up to nothing, and an edge BETWEEN the two would
+	// give ShortestPath a second route into the leaves.
+	addNode("pkg-wide-a", model.NodePackage, "wide-a")
+	addNode("pkg-wide-b", model.NodePackage, "wide-b")
+	// n-ref is the reference target whose incoming edges outrun one clamped
+	// page. Its sources are fresh nodes rather than the n-wide leaves, so no
+	// existing scenario's neighbourhood gains an edge it did not have.
+	addNode("n-ref", model.NodeFunction, "n-ref")
+	addNode("n-ref-caller", model.NodeFunction, "n-ref-caller")
+	for i := 0; i < fixtureWideCount; i++ {
+		addNode(fmt.Sprintf("n-ref-src-%03d", i), model.NodeFunction, fmt.Sprintf("refsrc%03d", i))
+	}
 
 	// edges are declared in a stable order; RelationIDs are assigned from it so
 	// the keyset order is reproducible from the source alone.
@@ -157,6 +174,17 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		{"n-b", model.RelDataFlowsTo, "n-sink"},
 		{"n-c", model.RelControlDependsOn, "n-sink"},
 	}
+	// bare names, by declaration position, the edges that carry NO evidence
+	// row. Containment legitimately carries none (rollup.go says so), and an
+	// evidence-free relation is the only shape that lets a reference walk
+	// advance its keyset across a whole clamped page without filling the page
+	// -- which is the only way referencePage's empty-page termination is
+	// reached at all.
+	bare := map[int]bool{}
+	addBare := func(e edge) {
+		bare[len(edges)] = true
+		edges = append(edges, e)
+	}
 	for i := 0; i < fixtureLeafCount; i++ {
 		edges = append(edges, edge{"n-hub", model.RelCalls, fmt.Sprintf("n-leaf-%02d", i)})
 	}
@@ -167,6 +195,23 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for i := 0; i < fixtureWideCount; i++ {
 		edges = append(edges, edge{"n-wide", model.RelCalls, fmt.Sprintf("n-wide-leaf-%03d", i)})
 	}
+	// Containment for that neighbourhood, again declared after everything that
+	// existed before it. 261 incoming contains rows over a 256-node batch is
+	// more than one clamped page, which is what makes rollup.go's containsEdges
+	// loop observable at all.
+	addBare(edge{"pkg-wide-a", model.RelContains, "n-wide"})
+	for i := 0; i < fixtureWideCount; i++ {
+		addBare(edge{"pkg-wide-b", model.RelContains, fmt.Sprintf("n-wide-leaf-%03d", i)})
+	}
+	// n-ref's incoming references carry no evidence, so a reference walk reads
+	// them, advances its keyset past them and emits nothing for them...
+	for i := 0; i < fixtureWideCount; i++ {
+		addBare(edge{fmt.Sprintf("n-ref-src-%03d", i), model.RelReferences, "n-ref"})
+	}
+	// ...and this is the one occurrence-bearing relation, declared last so it
+	// sorts beyond the first clamped page. A walk that ended on a short page
+	// never reads it and reports a referenced symbol as unreferenced.
+	edges = append(edges, edge{"n-ref-caller", model.RelCalls, "n-ref"})
 
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
@@ -192,6 +237,12 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		id := fixtureRelationID(i)
 		f.relations = append(f.relations, model.Relation{
 			ID: id, From: fixtureNodeID(e.from), Kind: e.kind, To: fixtureNodeID(e.to)})
+		if bare[i] {
+			// A canonical relation with no evidence row at all. References
+			// contributes no occurrence for it; every other reader still sees
+			// the relation.
+			continue
+		}
 		// One occurrence per edge, except n-a -> n-b, which carries two: the
 		// §9.2 relation-count vs occurrence-count distinction needs a relation
 		// that is one relation and two occurrences.
@@ -341,6 +392,64 @@ func (f *graphFixture) Capabilities(ctx context.Context) ([]model.CapabilityStat
 
 func (f *graphFixture) Binding() model.Binding { return f.binding }
 
+// fixtureLeases is the LeaseStore pagination.Spools consults before it writes
+// or replays a spool, and the store the engine mints its cursor leases in.
+//
+// It tracks liveness for real rather than reporting every lease live, because
+// the whole difference a continuation depends on is WHICH lease its token
+// names: the pinned reader's query lease is released the moment the request
+// returns, and a fake that answered "live" for a released lease could not tell
+// a usable cursor from one the next invocation will refuse. A released or
+// unknown lease is CTX_CURSOR_INVALID with the storage layer's own wording.
+type fixtureLeases struct {
+	mu   sync.Mutex
+	live map[string]time.Time
+}
+
+func newFixtureLeases() *fixtureLeases { return &fixtureLeases{live: map[string]time.Time{}} }
+
+func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.live[lease.ID] = lease.ExpiresAt
+	return nil
+}
+
+func (l *fixtureLeases) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.live[id]; !ok {
+		return fixtureLeaseGone()
+	}
+	l.live[id] = expiresAt
+	return nil
+}
+
+// ReleaseLease is idempotent, as the storage DELETE is: releasing twice is not
+// an error, it just leaves the lease gone.
+func (l *fixtureLeases) ReleaseLease(_ context.Context, id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.live, id)
+	return nil
+}
+
+func (l *fixtureLeases) LeaseExpiry(_ context.Context, id string) (time.Time, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	expires, ok := l.live[id]
+	if !ok {
+		return time.Time{}, fixtureLeaseGone()
+	}
+	return expires, nil
+}
+
+// fixtureLeaseGone is storage's refusal, verbatim (sqlite/lease.go): the
+// message an operator sees when a continuation names a lease nobody holds.
+func fixtureLeaseGone() error {
+	return &model.Error{Code: model.CodeCursorInvalid, Message: "lease has expired or was released"}
+}
+
 // fixtureLimits is the resolved budget every scenario starts from. A case that
 // needs a tighter bound copies it and overrides the one field it is testing,
 // so no case depends on another case's mutation.
@@ -459,6 +568,48 @@ func TestGraphScenarios(t *testing.T) {
 				if len(route.Paths) != 1 {
 					t.Fatalf("paths = %d (truncated %v, reason %q), want the one 1-hop route: a reachable target was reported unreachable",
 						len(route.Paths), route.Meta.Truncated, route.Meta.TruncationReason)
+				}
+			},
+		},
+
+		{
+			// resources.query_memory_bytes is the ONLY bound on how much of one
+			// frontier level is held in memory at once, and both the config and
+			// docs/queries.md promise it exists. A level that keeps accumulating
+			// past it restores the unbounded hub the bound was written to stop,
+			// and -- because the walk then still reports a clean finish -- the
+			// operator is never told the ceiling was crossed. n-wide's fan-out
+			// under a budget that holds only a handful of its rows is the
+			// smallest case that separates "stopped at the ceiling and said so"
+			// from "ignored the ceiling". The complementary half (the whole
+			// fan-out is carried under the 32 MiB default, untruncated) is held
+			// by the storage-clamp row above and is not repeated here.
+			name: "traverse/a level past the frontier byte budget truncates and says so",
+			run: func(t *testing.T, f *graphFixture) {
+				limits := fixtureLimits()
+				// Neither the page bound nor the edge budget may be what cuts
+				// this walk short: the frontier ceiling must be the only one
+				// n-wide's fan-out can reach.
+				limits.MaxPageItems = fixtureWideCount + 1
+				limits.FrontierBytes = 4096
+				e, err := New(Options{Adjacency: f, Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				got, err := e.Callees(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("Callees: %v", err)
+				}
+				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonFrontierBytes {
+					t.Fatalf("truncated=%v reason=%q, want true and %q: the frontier byte ceiling was crossed without disclosure",
+						got.Meta.Truncated, got.Meta.TruncationReason, reasonFrontierBytes)
+				}
+				if len(got.Relations) == 0 || len(got.Relations) >= fixtureWideCount {
+					t.Fatalf("returned %d of %d edges under a %d-byte frontier budget: the budget bounded nothing",
+						len(got.Relations), fixtureWideCount, limits.FrontierBytes)
 				}
 			},
 		},
@@ -593,13 +744,10 @@ func TestGraphScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open signer: %v", err)
 			}
-			e, err := New(Options{Adjacency: f, Signer: signer, Limits: fixtureLimits()})
+			e, err := New(Options{Adjacency: f, Signer: signer,
+				Leases: pagination.NewLeases(newFixtureLeases(), fixtureLimits().CursorTTL), Limits: fixtureLimits()})
 			if err != nil {
 				t.Fatalf("new engine: %v", err)
-			}
-			lease, err := model.NewRandomID()
-			if err != nil {
-				t.Fatalf("lease id: %v", err)
 			}
 			const endpoint = "graph.neighbors"
 			queryHash := traversalQueryHash(model.DirectionOutgoing,
@@ -607,9 +755,10 @@ func TestGraphScenarios(t *testing.T) {
 
 			// Page 1 spent this much of the cumulative budget.
 			const spentVisited, spentEdges = 7, 11
-			token, err := e.nextTraversalCursor(&budget{visited: spentVisited, edges: spentEdges},
-				continuation{Endpoint: endpoint, QueryHash: queryHash, LeaseID: lease,
-					Depth: 1, LastKey: "rel-0003"})
+			token, err := e.nextTraversalCursor(context.Background(),
+				&budget{visited: spentVisited, edges: spentEdges},
+				continuation{Endpoint: endpoint, QueryHash: queryHash,
+					Depth: 1, LastOwner: fixtureNodeID("n-a"), LastKey: "rel-0003"})
 			if err != nil || token == "" {
 				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
 			}
@@ -617,7 +766,7 @@ func TestGraphScenarios(t *testing.T) {
 			// resume that reset it would hand the walk a fresh budget, and one that
 			// accumulated would double it on the second replay.
 			for attempt := 1; attempt <= 2; attempt++ {
-				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash)
+				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash, time.Now().Add(time.Minute))
 				if err != nil {
 					t.Fatalf("resume %d: %v", attempt, err)
 				}
@@ -643,12 +792,272 @@ func TestGraphScenarios(t *testing.T) {
 				flipped = 'B'
 			}
 			tampered := token[:at] + string(flipped) + token[at+1:]
-			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
+			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash, time.Now().Add(time.Minute))
 			var typed *model.Error
 			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
 				t.Fatalf("tampered cursor: err %v; want %s", err, model.CodeCursorInvalid)
 			}
 		}},
+		{
+			// A traversal level is emitted in (owner.Node asc, rel.ID asc) order
+			// across independently keyset-paged node chunks, so a page that stops
+			// mid-level cannot be resumed from a relation id alone. These two
+			// seeds make that concrete: n-wide sorts BELOW n-a as a node id while
+			// its 260 relation ids all sort ABOVE n-a's four, so the level emits
+			// the high ids first. A resume that skipped on the relation id alone
+			// would drop every n-a row as "already seen" -- a silent gap in a
+			// paged neighbourhood, which is the C1 failure wearing a cursor.
+			name: "a resumed traversal page repeats no edge and drops none",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 400
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+				seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+				req := model.GraphRequest{GenerationID: 1, Start: seeds,
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+				// Ground truth: the same walk in one page.
+				whole, err := e.Neighbors(context.Background(), req)
+				if err != nil {
+					t.Fatalf("unpaged walk: %v", err)
+				}
+				if whole.Meta.Truncated {
+					t.Fatalf("ground-truth walk must be complete, got %q", whole.Meta.TruncationReason)
+				}
+
+				// The same walk in pages of 120, which lands the first boundary
+				// inside n-wide's fan-out and the last one past it.
+				req.Page = model.PageRequest{Limit: 120}
+				seen := map[model.RelationID]int{}
+				var order []model.RelationID
+				for page := 1; ; page++ {
+					if page > 8 {
+						t.Fatalf("paged walk did not terminate after %d pages", page-1)
+					}
+					res, err := e.Neighbors(context.Background(), req)
+					if err != nil {
+						t.Fatalf("page %d: %v", page, err)
+					}
+					for _, rel := range res.Relations {
+						seen[rel.ID]++
+						order = append(order, rel.ID)
+					}
+					if res.Meta.NextCursor == "" {
+						break
+					}
+					// A cumulative counter that reset per page would let a walk
+					// spend its whole budget again on every continuation.
+					if res.VisitedCount < int64(len(seen)) {
+						t.Fatalf("page %d: visited %d is below the %d nodes already admitted",
+							page, res.VisitedCount, len(seen))
+					}
+					// A cursor pins its own generation, and the page limit is part
+					// of the normalized query the cursor is bound to, so a
+					// continuation repeats the limit and drops the generation.
+					req.GenerationID = 0
+					req.Page = model.PageRequest{Limit: 120, Cursor: res.Meta.NextCursor}
+				}
+				if len(order) != len(whole.Relations) || len(seen) != len(order) {
+					t.Fatalf("paged walk returned %d relations (%d distinct); the one-page walk returned %d",
+						len(order), len(seen), len(whole.Relations))
+				}
+				for _, rel := range whole.Relations {
+					if seen[rel.ID] != 1 {
+						t.Fatalf("relation %s appeared %d times across the paged walk, want exactly once",
+							rel.ID, seen[rel.ID])
+					}
+				}
+			},
+		},
+
+		{
+			// Impact ranks its WHOLE walk and cuts the ranked list, so its page
+			// boundary is a rank rather than a keyset position. The failure this
+			// protects is a paged impact answer that silently loses the tail of
+			// its own ranking: an entry the walk found, ranked, and then never
+			// served because page 2 had nothing to replay. The n-wide hub gives
+			// a ranked list far longer than the page, and the pages are walked
+			// against an Adjacency that fails EVERY read -- so a continuation
+			// that touched the graph again could not even complete, which is
+			// what makes "no re-walk, no traversal budget spent" an observation
+			// rather than an inference.
+			name: "a paged impact answer replays its ranked tail without walking again",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 8<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				leases := pagination.NewLeases(store, limits.CursorTTL)
+				newEngine := func(a Adjacency) *Engine {
+					e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+						Leases: leases, Limits: limits})
+					if err != nil {
+						t.Fatalf("new engine: %v", err)
+					}
+					return e
+				}
+				seeds := []model.NodeID{fixtureNodeID("n-hub")}
+				const pageLimit = 10
+
+				// Ground truth: the same answer ranked and served in one page.
+				whole, err := newEngine(f).Impact(context.Background(), model.ImpactRequest{
+					Start: seeds, Direction: model.DirectionBoth,
+					Page: model.PageRequest{Limit: model.MaxPageItems}})
+				if err != nil {
+					t.Fatalf("one-page impact: %v", err)
+				}
+				if whole.Meta.TruncationReason == reasonPageFull {
+					t.Fatalf("the ground-truth answer was itself cut at its page; it cannot be the whole ranking")
+				}
+				if len(whole.Entries) <= pageLimit {
+					t.Fatalf("ground truth holds %d entries; the fixture must rank more than one page of %d",
+						len(whole.Entries), pageLimit)
+				}
+
+				// Every page after the first is answered over an Adjacency whose
+				// every read fails. Only the spooled tail can serve them.
+				pages := 0
+				var order []model.NodeID
+				req := model.ImpactRequest{Start: seeds, Direction: model.DirectionBoth,
+					Page: model.PageRequest{Limit: pageLimit}}
+				engine := newEngine(f)
+				for {
+					pages++
+					if pages > 32 {
+						t.Fatalf("paged impact did not terminate after %d pages", pages-1)
+					}
+					res, err := engine.Impact(context.Background(), req)
+					if err != nil {
+						t.Fatalf("page %d: %v", pages, err)
+					}
+					if err := res.Validate(); err != nil {
+						t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
+					}
+					for _, entry := range res.Entries {
+						order = append(order, entry.NodeID)
+					}
+					// The walk happened once: its cumulative counters and its
+					// rollup describe the whole answer and are carried unchanged.
+					if res.VisitedCount != whole.VisitedCount || res.EdgeCount != whole.EdgeCount {
+						t.Fatalf("page %d counted (%d visited, %d edges), want the walk's (%d, %d)",
+							pages, res.VisitedCount, res.EdgeCount, whole.VisitedCount, whole.EdgeCount)
+					}
+					if len(res.Packages) != len(whole.Packages) {
+						t.Fatalf("page %d carried %d rollup pairs, want the answer's %d",
+							pages, len(res.Packages), len(whole.Packages))
+					}
+					if res.Meta.NextCursor == "" {
+						break
+					}
+					req = model.ImpactRequest{Start: seeds, Direction: model.DirectionBoth,
+						Page: model.PageRequest{Limit: pageLimit, Cursor: res.Meta.NextCursor}}
+					engine = newEngine(unreadableAdjacency{f})
+				}
+				if pages < 2 {
+					t.Fatalf("the answer was served in %d page(s); the case needs a page boundary", pages)
+				}
+				// One assertion for three invariants: the union equals the
+				// one-page ground truth, nothing repeats, and the rank order
+				// survives every page boundary.
+				if len(order) != len(whole.Entries) {
+					t.Fatalf("the paged answer served %d entries, the one-page answer %d",
+						len(order), len(whole.Entries))
+				}
+				for i, want := range whole.Entries {
+					if order[i] != want.NodeID {
+						t.Fatalf("entry %d of the paged answer is %s, want %s: the ranked order did not survive paging",
+							i, order[i], want.NodeID)
+					}
+				}
+			},
+		},
+
+		{
+			// The defect this protects is a continuation nobody can use. A
+			// token that names the PINNED READER's query lease is dead on
+			// arrival: that lease is released when the request returns, so the
+			// NEXT invocation presents a cursor whose spool the lease store
+			// refuses -- every `callers --cursor` and `impact --cursor` fails
+			// with "lease has expired or was released" while the page it names
+			// sits on disk. A cursor must own a lease of its own, minted for
+			// the same generation and outliving the reader that answered.
+			name: "a continuation survives the release of the reader's query lease",
+			run: func(t *testing.T, f *graphFixture) {
+				ctx := context.Background()
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 120
+				leases := pagination.NewLeases(store, limits.CursorTTL)
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: leases, Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+
+				// The query lease PinGeneration takes for ONE request. It is
+				// live while page 1 is answered and gone before page 2 is
+				// asked for, exactly as reader.Close() leaves it.
+				b := f.Binding()
+				readerLease, err := leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseQuery)
+				if err != nil {
+					t.Fatalf("reader query lease: %v", err)
+				}
+
+				req := model.GraphRequest{GenerationID: 1,
+					Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+					Page: model.PageRequest{Limit: 120}}
+				page1, err := e.Neighbors(ctx, req)
+				if err != nil {
+					t.Fatalf("page 1: %v", err)
+				}
+				if page1.Meta.NextCursor == "" {
+					t.Fatalf("page 1 offered no continuation; the case needs a page boundary")
+				}
+				if err := store.ReleaseLease(ctx, readerLease.ID); err != nil {
+					t.Fatalf("release the reader's query lease: %v", err)
+				}
+
+				req.GenerationID = 0
+				req.Page = model.PageRequest{Limit: 120, Cursor: page1.Meta.NextCursor}
+				page2, err := e.Neighbors(ctx, req)
+				if err != nil {
+					t.Fatalf("page 2 after the reader's query lease was released: %v", err)
+				}
+				if len(page2.Relations) == 0 {
+					t.Fatalf("page 2 served no edges; the continuation resumed nothing")
+				}
+			},
+		},
 
 		// L7 REFS rows
 		{
@@ -687,6 +1096,113 @@ func TestGraphScenarios(t *testing.T) {
 				}
 			},
 		},
+
+		// FX-C14c-PROOF row
+		{
+			// The last two keyset loops that ask Adjacency.Edges for
+			// adjacencyBatch (256) rows: rollup.go's containsEdges and
+			// references.go's referencePage. The reader clamps every request
+			// down to model.MaxPageItems (200), so "the page came back shorter
+			// than I asked for" is true of EVERY page, and a loop that ends on
+			// it ends after its first one. Both sites are pinned here because
+			// both then answer silently wrong rather than failing: the rollup
+			// loses the containers of every node past row 200 and under-counts
+			// the pair, and the reference walk loses every occurrence past row
+			// 200 and reports a referenced symbol as unreferenced.
+			name: "keyset walks past the storage page clamp read every page",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				roll, err := e.PackageDependencies(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-wide")},
+					Relations: []model.RelationKind{model.RelCalls},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("PackageDependencies: %v", err)
+				}
+				if len(roll.Items) != 1 || roll.Items[0].PairCount != int64(fixtureWideCount) {
+					t.Fatalf("containsEdges: rollup returned %+v, want one wide-a -> wide-b pair over %d edges; a short-page break loses the containers past the first clamped page",
+						roll.Items, fixtureWideCount)
+				}
+				refs, err := e.References(context.Background(), model.ReferenceRequest{
+					NodeID:         fixtureNodeID("n-ref"),
+					Operation:      model.ReferenceReferences,
+					SemanticSource: model.SemanticCanonical,
+				})
+				if err != nil {
+					t.Fatalf("References: %v", err)
+				}
+				if len(refs.Items) != 1 || refs.Items[0].FromNodeID != fixtureNodeID("n-ref-caller") {
+					t.Fatalf("referencePage: references returned %d occurrences (%+v), want the single one from n-ref-caller; it sorts past the first clamped page of evidence-free relations",
+						len(refs.Items), refs.Items)
+				}
+			},
+		},
+
+		{
+			// The gate wait is admitted work like any other, so it must sit
+			// INSIDE the request deadline. If the deadline is installed after
+			// the Acquire -- or not at all -- `codectx refs` behind two busy
+			// graph slots waits forever: no timeout of its own, no cancellation,
+			// no output, and nothing in the answer to tell the operator why. The
+			// failure mode this row protects is that hang, which is why the
+			// load-bearing assertion is elapsed wall clock rather than the error
+			// code. Callers rides along because traverse.go installs the same
+			// deadline above the same Acquire and can regress the same way.
+			name: "a busy gate ends at the query deadline instead of blocking",
+			run: func(t *testing.T, f *graphFixture) {
+				const timeout = 50 * time.Millisecond
+				limits := fixtureLimits()
+				limits.QueryTimeout = timeout
+				e, err := New(Options{Adjacency: f, Limits: limits, Gate: blockingGate{}})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				calls := []struct {
+					name string
+					run  func() error
+				}{
+					{"References", func() error {
+						_, err := e.References(context.Background(), model.ReferenceRequest{
+							NodeID:         fixtureNodeID("n-b"),
+							Operation:      model.ReferenceReferences,
+							SemanticSource: model.SemanticCanonical,
+						})
+						return err
+					}},
+					{"Callers", func() error {
+						_, err := e.Callers(context.Background(), model.GraphRequest{
+							Start:     []model.NodeID{fixtureNodeID("n-b")},
+							Direction: model.DirectionIncoming,
+						})
+						return err
+					}},
+				}
+				for _, c := range calls {
+					done := make(chan error, 1)
+					start := time.Now()
+					go func() { done <- c.run() }()
+					select {
+					case err := <-done:
+						if elapsed := time.Since(start); elapsed > 100*timeout {
+							t.Fatalf("%s returned after %s under a %s query timeout: the gate wait outlives the deadline",
+								c.name, elapsed, timeout)
+						}
+						var typed *model.Error
+						if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+							t.Fatalf("%s behind a busy gate returned %v, want a %s error",
+								c.name, err, model.CodeResourceLimit)
+						}
+					case <-time.After(10 * time.Second):
+						t.Fatalf("%s is still waiting for a gate slot 10s into a %s query timeout: the deadline does not wrap the gate wait",
+							c.name, timeout)
+					}
+				}
+			},
+		},
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
@@ -694,3 +1210,47 @@ func TestGraphScenarios(t *testing.T) {
 		})
 	}
 }
+
+// unreadableAdjacency answers every fact read with a failure while still
+// reporting the binding and the retention lease a continuation is bound to. An
+// answer served over it read nothing from the graph, which is how the impact
+// paging case observes that a continuation replays its spool instead of
+// walking again.
+type unreadableAdjacency struct{ *graphFixture }
+
+func (unreadableAdjacency) Edges(context.Context, []model.NodeID, model.Direction,
+	[]model.RelationKind, model.RelationID, int) ([]model.Relation, error) {
+	return nil, errUnreadableAdjacency
+}
+
+func (unreadableAdjacency) NodesByID(context.Context, []model.NodeID) ([]model.Node, error) {
+	return nil, errUnreadableAdjacency
+}
+
+func (unreadableAdjacency) EvidenceFor(context.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
+	return nil, errUnreadableAdjacency
+}
+
+func (unreadableAdjacency) Capabilities(context.Context) ([]model.CapabilityState, error) {
+	return nil, errUnreadableAdjacency
+}
+
+var errUnreadableAdjacency = errors.New("this adjacency answers no read")
+
+// blockingGate is the process gate with every slot permanently busy: Acquire
+// waits for the caller's deadline and reports it as the same CTX_RESOURCE_LIMIT
+// the shipped graphGate reports (internal/app/query.go). A context carrying no
+// deadline therefore waits here forever, which is exactly the hang an engine
+// entry that acquires outside its deadline would inflict on `codectx refs`.
+// Release is unreachable -- Acquire never returns nil -- and exists only to
+// satisfy the graph.Gate interface.
+type blockingGate struct{}
+
+func (blockingGate) Acquire(ctx context.Context) error {
+	<-ctx.Done()
+	return &model.Error{Code: model.CodeResourceLimit, Retryable: true,
+		Message:     "every graph query slot was busy for the whole request deadline",
+		Remediation: "retry when fewer queries are running, or raise resources.max_concurrent_graph_queries"}
+}
+
+func (blockingGate) Release() {}

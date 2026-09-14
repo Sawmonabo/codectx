@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
 	"time"
@@ -62,9 +63,16 @@ type traversalCursor struct {
 	// SpoolID names the spool written by the page that issued this cursor; it
 	// is empty when the page left no frontier behind (a pure keyset page).
 	SpoolID string `json:"spool_id,omitempty"`
-	// LastKey is the keyset position: the last RelationID the issuing page
-	// admitted. Unlike pagination.Cursor it may accompany a SpoolID.
-	LastKey model.RelationID `json:"last_key,omitempty"`
+	// LastOwner and LastKey are the keyset position: the frontier node that
+	// owned the last row the issuing page admitted, and that row's RelationID.
+	// A level is emitted in the frozen (owner.Node asc, rel.ID asc) order
+	// across independently keyset-paged node chunks, so a relation id ALONE
+	// cannot name a mid-level stop -- the chunk after the stopping one restarts
+	// its own relation-id keyset from the beginning. The pair does name it: a
+	// resumed page re-reads the level and skips every row <= (LastOwner,
+	// LastKey). Unlike pagination.Cursor either may accompany a SpoolID.
+	LastOwner model.NodeID     `json:"last_owner,omitempty"`
+	LastKey   model.RelationID `json:"last_key,omitempty"`
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
@@ -100,8 +108,11 @@ func (c traversalCursor) validate() error {
 	if c.SpoolID != "" && !model.ValidHexID(c.SpoolID) {
 		return cursorInvalid("cursor spool id is malformed")
 	}
-	if len(c.LastKey) > model.MaxIdentifierBytes {
+	if len(c.LastKey) > model.MaxIdentifierBytes || len(c.LastOwner) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor sort key exceeds its bound")
+	}
+	if (c.LastOwner == "") != (c.LastKey == "") {
+		return cursorInvalid("cursor sort key is half-formed")
 	}
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
@@ -162,22 +173,50 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 	return h.Sum()
 }
 
-// spoolRecordFrontier and spoolRecordVisited discriminate the two kinds of
-// record a page spills: the frontier it stopped at, and the nodes it already
-// admitted (which a resumed page must not admit again).
+// The kinds of record a page spills. The first two are a traversal's: the
+// frontier it stopped at, and the nodes it already admitted (which a resumed
+// page must not admit again). The last three are a RANKED page's: impact ranks
+// its whole walk and cuts the ranked list, so its continuation replays the tail
+// it already computed instead of resuming a frontier.
+//
+// The two vocabularies are disjoint and each replay accepts only its own, so a
+// traversal cursor can never be resumed over a ranked spool, or the reverse.
 const (
 	spoolRecordFrontier = "f"
 	spoolRecordVisited  = "v"
+	// spoolRecordAnswer is the LEADING record of a ranked spool: the
+	// answer-level facts every page must report identically.
+	spoolRecordAnswer = "a"
+	// spoolRecordEntry is one ranked impact entry, in rank order.
+	spoolRecordEntry = "e"
+	// spoolRecordPackage is one rollup pair. The pairs are individual records
+	// rather than a field of the answer record because a rollup bounded only
+	// by MaxRecordsPerResult can exceed the spool's per-record byte bound.
+	spoolRecordPackage = "p"
 )
 
 // spoolRecord is one spilled record. The field names are short because the
 // spool byte budget is shared across every live continuation in the process.
+// A traversal record uses the node fields; a ranked record carries its own
+// already-encoded value in Payload, so adding a ranked kind does not widen the
+// struct every traversal record pays for.
 type spoolRecord struct {
-	Kind  string           `json:"k"`
-	Node  model.NodeID     `json:"n"`
-	Depth int              `json:"d,omitempty"`
-	Cost  int64            `json:"c,omitempty"`
-	Via   model.RelationID `json:"v,omitempty"`
+	Kind    string           `json:"k"`
+	Node    model.NodeID     `json:"n,omitempty"`
+	Depth   int              `json:"d,omitempty"`
+	Cost    int64            `json:"c,omitempty"`
+	Via     model.RelationID `json:"v,omitempty"`
+	Payload json.RawMessage  `json:"p,omitempty"`
+}
+
+// encodeSpoolRecord builds one ranked record around its payload.
+func encodeSpoolRecord(kind string, payload any) (spoolRecord, error) {
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return spoolRecord{}, &model.Error{Code: model.CodeInternal,
+			Message: "continuation state encoding: " + err.Error()}
+	}
+	return spoolRecord{Kind: kind, Payload: encoded}, nil
 }
 
 // resumeState is what a continuation restores: the decoded cursor, a budget
@@ -195,14 +234,61 @@ type continuation struct {
 	Endpoint string
 	// QueryHash binds the next cursor to this same normalized query.
 	QueryHash string
-	// LeaseID is the retention lease holding the pinned generation; the cursor
-	// and its spool both live exactly as long as it does.
-	LeaseID string
-	Depth   int
-	LastKey model.RelationID
+	Depth     int
+	LastOwner model.NodeID
+	LastKey   model.RelationID
 	// Frontier is where the walk stopped, and Visited the nodes it admitted.
 	Frontier []frontierState
 	Visited  []model.NodeID
+	// Records is the already-built state of a RANKED page -- the answer-level
+	// record, the ranked tail and the rollup pairs impact spills. A traversal
+	// leaves a frontier instead and sets none of these; a ranked page leaves
+	// records instead and has no frontier. Exactly one of the two is populated,
+	// which is what keeps the two replay vocabularies disjoint.
+	Records []spoolRecord
+}
+
+// verifyContinuation is the half of a resume every paging endpoint shares: it
+// verifies the tag, re-checks the payload's own shape, refuses a token issued
+// for another endpoint, query or generation, and rebuilds the budget.
+//
+// The budget carries the cursor's cumulative counters by ASSIGNMENT: presenting
+// one page's cursor twice restores the same allowance both times -- it neither
+// resets to zero nor accumulates. The deadline is THIS request's, measured by
+// the caller before its gate wait (recomputing it here would let a resumed page
+// outlive the request deadline by however long that wait took), and the engine
+// clock is carried with it because checkWalk compares the two.
+//
+// Only the spool replay differs between endpoints, and each endpoint owns its
+// own: the traversal vocabulary and the ranked vocabulary are disjoint, so
+// neither replay can be fed the other's records.
+func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
+	deadline time.Time) (traversalCursor, *budget, error) {
+	if e.signer == nil {
+		return traversalCursor{}, nil, cursorInvalid("continuations are not available in this workspace")
+	}
+	payload, err := e.signer.Verify(token, pagination.PurposeCursor, e.now())
+	if err != nil {
+		return traversalCursor{}, nil, err
+	}
+	var c traversalCursor
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return traversalCursor{}, nil, cursorInvalid("cursor payload is malformed")
+	}
+	if err := c.validate(); err != nil {
+		return traversalCursor{}, nil, err
+	}
+	if c.Endpoint != endpoint {
+		return traversalCursor{}, nil, cursorInvalid("cursor was issued by a different endpoint")
+	}
+	if c.QueryHash != queryHash {
+		return traversalCursor{}, nil, cursorInvalid("cursor was issued for a different query")
+	}
+	binding := e.adjacency.Binding()
+	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
+		return traversalCursor{}, nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
+	}
+	return c, &budget{visited: c.Visited, edges: c.Edges, deadline: deadline, now: e.now}, nil
 }
 
 // resumeTraversal verifies token for endpoint, binds it to the engine's pinned
@@ -212,41 +298,14 @@ type continuation struct {
 // presenting one page's cursor twice restores the same allowance both times --
 // it neither resets to zero nor accumulates. The deadline is fresh, because
 // Section 3 scopes the query timeout to one request, not to a cursor chain.
-func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash string) (*resumeState, error) {
-	if e.signer == nil {
-		return nil, cursorInvalid("continuations are not available in this workspace")
-	}
-	now := e.now()
-	payload, err := e.signer.Verify(token, pagination.PurposeCursor, now)
+func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash string,
+	deadline time.Time) (*resumeState, error) {
+	c, b, err := e.verifyContinuation(token, endpoint, queryHash, deadline)
 	if err != nil {
 		return nil, err
 	}
-	var c traversalCursor
-	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, cursorInvalid("cursor payload is malformed")
-	}
-	if err := c.validate(); err != nil {
-		return nil, err
-	}
-	if c.Endpoint != endpoint {
-		return nil, cursorInvalid("cursor was issued by a different endpoint")
-	}
-	if c.QueryHash != queryHash {
-		return nil, cursorInvalid("cursor was issued for a different query")
-	}
-	binding := e.adjacency.Binding()
-	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
-		return nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
-	}
-	s := &resumeState{
-		Cursor: c,
-		// now is carried with the deadline: checkWalk compares them, and a
-		// deadline measured on the engine clock against time.Now is the
-		// two-clock defect this budget would otherwise reintroduce.
-		Budget: &budget{visited: c.Visited, edges: c.Edges,
-			deadline: now.Add(e.limits.QueryTimeout), now: e.now},
-		Visited: map[model.NodeID]struct{}{},
-	}
+	now := e.now()
+	s := &resumeState{Cursor: c, Budget: b, Visited: map[model.NodeID]struct{}{}}
 	if c.SpoolID == "" {
 		return s, nil
 	}
@@ -289,39 +348,60 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 // nextTraversalCursor writes a FRESH spool for c's frontier and visited set and
 // signs the continuation for the page after it.
 //
-// It returns an empty token, and no error, whenever the traversal must stop
-// rather than continue: an exhausted cumulative budget, an engine with no
-// signer (continuations are not offered), or a frontier with no spool to spill
-// into. In every one of those cases the caller reports Truncated with no
-// NextCursor, which is the same contract as running out of page items.
-func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) {
-	if e.signer == nil {
+// It returns an empty token, and no error, whenever the answer must stop rather
+// than continue: a walk whose cumulative budget is exhausted, an engine with no
+// signer or lease store (continuations are not offered), or state with no spool
+// to spill into. In every one of those cases the caller reports Truncated with
+// no NextCursor, which is the same contract as running out of page items.
+func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuation) (string, error) {
+	if e.signer == nil || e.leases == nil {
+		// No signer, or no lease store to retain the generation the resumed
+		// page will read: a token minted here would resume over facts nothing
+		// is holding.
 		return "", nil
 	}
-	// This is the ONE place the cumulative caps decide whether a traversal may
+	// This is the ONE place the cumulative caps decide whether a WALK may
 	// continue. A resumed page that arrives already at cap therefore answers
 	// Truncated with no NextCursor without spending the budget a second time.
-	if b.visited >= int64(e.limits.MaxVisited) || b.edges >= int64(e.limits.MaxEdges) {
+	// The test is gated on the continuation actually resuming a walk, which
+	// every traversal mint does (traverse.go mints only with a live frontier),
+	// so traversal behaviour is unchanged. A ranked continuation replays
+	// records the first page already computed and spends no traversal budget at
+	// all; refusing it here would silently drop entries the walk did find.
+	resumesWalk := len(c.Frontier) > 0 || c.LastKey != ""
+	if resumesWalk && (b.visited >= int64(e.limits.MaxVisited) || b.edges >= int64(e.limits.MaxEdges)) {
 		return "", nil
 	}
-	if len(c.Frontier) == 0 && c.LastKey == "" {
-		// Nothing left to resume from: the walk is complete.
+	if !resumesWalk && len(c.Records) == 0 {
+		// Nothing left to resume from: the answer is complete.
 		return "", nil
 	}
-	// A frontier OR an already-admitted visited set has to survive the
-	// response, and both live in the spool; with spilling disabled neither can,
-	// so the walk stops here rather than resuming without them.
-	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0
+	// A frontier, an already-admitted visited set or a ranked tail has to
+	// survive the response, and all three live in the spool; with spilling
+	// disabled none can, so the answer stops here rather than resuming without
+	// them.
+	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0 || len(c.Records) > 0
 	if needsSpool && e.spools == nil {
 		return "", nil
+	}
+	// A NEW cursor-owned retention lease, never the pinned reader's query
+	// lease: that one is released when this request returns, so the very next
+	// invocation's spool read would be refused and the continuation would be
+	// unusable. The lease expires with the cursor, so nothing minted here pins
+	// a generation for longer than the token lives.
+	binding := e.adjacency.Binding()
+	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+	if err != nil {
+		return "", err
 	}
 	next := traversalCursor{
 		Version:      traversalCursorVersion,
 		Endpoint:     c.Endpoint,
-		GenerationID: e.adjacency.Binding().GenerationID,
-		AnalysisKey:  e.adjacency.Binding().AnalysisKey,
+		GenerationID: binding.GenerationID,
+		AnalysisKey:  binding.AnalysisKey,
 		QueryHash:    c.QueryHash,
-		LeaseID:      c.LeaseID,
+		LeaseID:      lease.ID,
+		LastOwner:    c.LastOwner,
 		LastKey:      c.LastKey,
 		Depth:        c.Depth,
 		Visited:      b.visited,
@@ -331,22 +411,44 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 	if needsSpool {
 		id, err := e.spill(next, c)
 		if err != nil {
-			return "", err
+			return "", e.releaseLease(ctx, lease.ID, err)
 		}
 		next.SpoolID = id
 	}
 	if err := next.validate(); err != nil {
-		return "", err
+		return "", e.releaseLease(ctx, lease.ID, err)
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
-		return "", &model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()}
+		return "", e.releaseLease(ctx, lease.ID,
+			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
 	}
-	return e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	if err != nil {
+		return "", e.releaseLease(ctx, lease.ID, err)
+	}
+	return token, nil
 }
 
-// spill writes one fresh spool holding c's frontier and visited set and returns
-// its id. The spool is bound to next's lease, generation, analysis key and
+// releaseLease returns a lease whose cursor never reached the caller and
+// reports cause. The request's own context may already be done, so the release
+// runs on an uncancelled one: leaking the lease would pin a generation against
+// retention for the full cursor TTL for a page nobody can ask for.
+//
+// A release that itself fails is joined onto cause rather than dropped -- the
+// engine has no logger, and a retention lease that will now expire only with
+// its TTL is something the operator is told about. errors.As still finds the
+// typed cause, so the joined error keeps its Section 8 code.
+func (e *Engine) releaseLease(ctx context.Context, id string, cause error) error {
+	if err := e.leases.Release(context.WithoutCancel(ctx), id); err != nil {
+		return errors.Join(cause, &model.Error{Code: model.CodeInternal,
+			Message: "a continuation lease could not be released: " + err.Error()})
+	}
+	return cause
+}
+
+// spill writes one fresh spool holding c's records, frontier and visited set
+// and returns its id. The spool is bound to next's lease, generation, analysis key and
 // query hash, which is what Spools.Open checks before it replays a record.
 func (e *Engine) spill(next traversalCursor, c continuation) (string, error) {
 	sp, err := e.spools.Create(next.spoolCursor())
@@ -359,6 +461,11 @@ func (e *Engine) spill(next traversalCursor, c continuation) (string, error) {
 			return &model.Error{Code: model.CodeInternal, Message: "continuation state encoding: " + err.Error()}
 		}
 		return sp.Append(encoded)
+	}
+	for _, r := range c.Records {
+		if err := appendRecord(r); err != nil {
+			return "", e.releaseSpool(sp, err)
+		}
 	}
 	frontierNodes := make(map[model.NodeID]struct{}, len(c.Frontier))
 	for _, fs := range c.Frontier {
