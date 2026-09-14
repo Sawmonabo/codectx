@@ -162,6 +162,14 @@ func (r PlanRequest) Validate() error {
 // ContextEntry is one ranked selection. At least one of NodeID and FileID is
 // present — the context_entries CHECK is an OR, not an XOR, because a whole
 // file is selected without a node and a symbol is selected within its file.
+//
+// EstimatedBytes is a SHARE of the plan's transport cost, not a self-contained
+// size for this entry: it always counts the entry's own measured metadata, but
+// the wire-encoded source of the file is counted on the file's first entry
+// only, because the file is transported once however many entries select it.
+// Summing the entries of a file (or of a slice) therefore gives that file's or
+// slice's real cost; reading one sibling entry's value as "the bytes needed to
+// serve this entry" does not.
 type ContextEntry struct {
 	Ordinal         int            `json:"ordinal"`
 	NodeID          NodeID         `json:"node_id,omitempty"`

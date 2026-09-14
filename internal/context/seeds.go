@@ -19,9 +19,11 @@ import (
 
 // seedSet is the Section 15.2 result: the candidates the task named, the
 // identities it named that nothing in the pinned snapshot answers, and whether
-// any named identity stayed unresolved. Unresolved is what forces
-// ScopeComplete=false downstream; an empty or wholly ambiguous scope is a
-// discovery answer, never an error (Section 15.2).
+// the seed pass saw everything it would have admitted. Unresolved is what
+// forces ScopeComplete=false downstream — it is set both by a named identity
+// nothing answers and by a discovery step that stopped at one of its own
+// bounds; an empty or wholly ambiguous scope is a discovery answer, never an
+// error (Section 15.2).
 type seedSet struct {
 	Candidates []candidate
 	Excluded   []candidate
@@ -212,13 +214,30 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 	return nil
 }
 
+// maxChangedFileScanPages bounds the Section 15.2 step 6 scan. PinnedReader
+// publishes no status-filtered file read, so the only way to find captured
+// changes is to walk the snapshot's file rows — an O(repository) read on a
+// compile whose working tree holds few changes. This ceiling makes it a
+// bounded one: the walk stops after this many pages and the scope is reported
+// incomplete, which is exactly what a truncated discovery step means. A
+// status-filtered read in internal/storage/sqlite would remove the ceiling;
+// that reader is owned elsewhere and is not added here.
+const maxChangedFileScanPages = 16
+
 // changedFileSeeds is Section 15.2 step 6: the captured working-tree changes,
 // admitted last and at the lowest priority, so an active edit informs the plan
 // without displacing an identity the task named. It pages the pinned manifest
-// by keyset, which is the one file listing source of truth.
+// by keyset, which is the one file listing source of truth, and stops at
+// maxChangedFileScanPages rather than walking an arbitrarily large snapshot.
 func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedReader, seen map[string]bool, out *seedSet) error {
 	var after model.FileID
-	for len(out.Candidates) < model.MaxSeeds {
+	for pages := 0; len(out.Candidates) < model.MaxSeeds; pages++ {
+		if pages == maxChangedFileScanPages {
+			// Files past the ceiling may hold changes this plan never saw, so
+			// the plan is a partial view of the working tree and says so.
+			out.Unresolved = true
+			return nil
+		}
 		files, err := reader.Files(ctx, after, c.pageLimit())
 		if err != nil {
 			return contextErr(ctx, err)
