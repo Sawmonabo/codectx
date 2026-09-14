@@ -146,12 +146,10 @@ func newVersionCommand(build model.BuildInfo) *cobra.Command {
 			if jsonRequested(cmd, args) {
 				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), build))
 			}
-			_, err := fmt.Fprintf(out, "codectx %s (commit %s, %s, schema %s)\n",
+			// The same writeText every other human answer goes through, so a
+			// reader that closed the pipe is typed once, in one place.
+			return writeText(out, "codectx %s (commit %s, %s, schema %s)\n",
 				build.Version, build.Commit, build.Toolchain, build.SchemaVersion)
-			if err != nil {
-				return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
-			}
-			return nil
 		},
 	}
 }

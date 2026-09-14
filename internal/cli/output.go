@@ -58,7 +58,8 @@ func writeEnvelope[T any](w io.Writer, env Envelope[T]) error {
 	return nil
 }
 
-// outputFailure types a failure to write the one envelope of Section 18.2.
+// outputFailure types a failure to write a command's answer -- the one envelope
+// of Section 18.2 on the --json path, the rendered block on the human path.
 //
 // A broken pipe is the reader going away -- `codectx ... | head` is the ordinary
 // case -- which is the operator stopping the work, not a defect in this build.
@@ -74,7 +75,7 @@ func outputFailure(err error) *model.Error {
 			Remediation: "The response was not delivered. Re-run without the pipe, or read it to the end.",
 		}
 	}
-	return &model.Error{Code: model.CodeInternal, Message: "failed to write JSON output: " + err.Error()}
+	return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
 }
 
 // ExitCode maps a command failure to the process exit code table of Section

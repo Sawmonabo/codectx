@@ -425,12 +425,20 @@ func TestInitRefusesToOverwriteProjectConfig(t *testing.T) {
 }
 
 // TestBrokenStdoutPipeIsNotADefect pins the Section 18.2 rule that a broken
-// stdout pipe fails the command. Two failure modes meet here. Swallowing the
+// stdout pipe fails the command in a non-defect exit class, which is exactly
+// what it asserts and no more. Two failure modes meet here. Swallowing the
 // write error would return success for a response nobody received, and the
 // caller's next step -- confirming a source receipt -- would credit bytes that
 // were never delivered; so the command must fail. Reporting it as CTX_INTERNAL
 // would put `codectx ... | head`, an ordinary shell pipeline, into the exit-10
 // defect class and send an operator to file a bug against their own pipe.
+//
+// What this row does NOT cover: the receipt half (`version --json` issues no
+// receipt) and the signal half. The write end here is not fd 1, so the runtime
+// returns EPIPE without ever raising SIGPIPE and main.go's signal.Ignore is not
+// exercised. That 141 -> 7 path is proven against the real binary instead --
+// wave-f-verify-T18.md (b) drove `status --json | head -c 0` and observed exit
+// 7, not 141.
 func TestBrokenStdoutPipeIsNotADefect(t *testing.T) {
 	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
 	isolateUserDirs(t, "")

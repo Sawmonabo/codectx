@@ -611,10 +611,14 @@ func writeToolTable(w io.Writer, data toolReport) error {
 }
 
 // writeText emits human output, failing the command when stdout cannot take it
-// rather than reporting success for something nobody received.
+// rather than reporting success for something nobody received. The failure is
+// typed by outputFailure, the same classifier the --json path uses: a reader
+// that closed the pipe is the operator stopping the work (exit 7), not a defect
+// in this build, and the human path must not put `codectx ... | head` in the
+// exit-10 class the --json path keeps it out of.
 func writeText(w io.Writer, format string, args ...any) error {
 	if _, err := fmt.Fprintf(w, format, args...); err != nil {
-		return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
+		return outputFailure(err)
 	}
 	return nil
 }
