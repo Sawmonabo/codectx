@@ -1,6 +1,6 @@
 //go:build windows
 
-package snapshot
+package fslock
 
 import (
 	"errors"
@@ -9,10 +9,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// tryLock takes an exclusive byte-range lock on the first byte of f without
+// TryLock takes an exclusive byte-range lock on the first byte of f without
 // blocking; Windows has no whole-file flock, and a one-byte range is the
 // conventional equivalent.
-func tryLock(f *os.File) (bool, error) {
+func TryLock(f *os.File) (bool, error) {
 	var ol windows.Overlapped
 	err := windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ol)
 	if err == nil {
@@ -24,11 +24,12 @@ func tryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
-func unlock(f *os.File) error {
+// Unlock releases the lock TryLock took.
+func Unlock(f *os.File) error {
 	var ol windows.Overlapped
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &ol)
 }
 
-// syncDir is a no-op: NTFS journals directory metadata, and Windows offers no
+// SyncDir is a no-op: NTFS journals directory metadata, and Windows offers no
 // directory fsync. This is the documented platform durability difference.
-func syncDir(string) error { return nil }
+func SyncDir(string) error { return nil }

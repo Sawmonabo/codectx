@@ -17,9 +17,10 @@
 // and it is why swapping a pinned analyzer invalidates the units it produced.
 //
 // This is the only package in the product that imports net/http. It fetches
-// only URLs the embedded lock names -- or the same path under a configured
-// mirror -- and `tools.offline` turns every fetch into a typed refusal without
-// opening a socket.
+// only URLs the embedded lock names -- or those URLs relocated under a
+// configured mirror, which replaces the scheme and host and keeps the original
+// host as the first path segment -- and `tools.offline` turns every fetch into a
+// typed refusal without opening a socket.
 //
 // Data-directory layout owned by this package:
 //
@@ -46,34 +47,6 @@ import (
 	"syscall"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-)
-
-// Section 22 error families for the managed toolchain. Section 11.7 names the
-// first five; CTX_TOOL_CORRUPT separates "the payload is the pinned bytes but
-// what is inside them is not usable" from "the bytes are not the pinned bytes",
-// because only the first is ever worth reinstalling. Section 22's own list
-// carries none of them: see the report's shared-helper note, these belong in
-// internal/model with the rest of the families once that file may change.
-const (
-	// CodeToolOffline is a tool that is not installed while tools.offline is
-	// set. No socket was opened.
-	CodeToolOffline = "CTX_TOOL_OFFLINE"
-	// CodeToolUnsupportedPlatform is a lock entry with no payload for the
-	// running platform. It is honest absence, not a failure.
-	CodeToolUnsupportedPlatform = "CTX_TOOL_UNSUPPORTED_PLATFORM"
-	// CodeToolFetchFailed is a transport, status or truncation failure. It is
-	// retryable.
-	CodeToolFetchFailed = "CTX_TOOL_FETCH_FAILED"
-	// CodeToolDigestMismatch is fetched bytes whose size or SHA-256 disagrees
-	// with the lock. It is never retried and never extracted.
-	CodeToolDigestMismatch = "CTX_TOOL_DIGEST_MISMATCH"
-	// CodeToolCorrupt is a payload whose archive is malformed or hostile, or an
-	// installed tree whose entry executable no longer hashes to the lock. A
-	// fresh install is the repair.
-	CodeToolCorrupt = "CTX_TOOL_CORRUPT"
-	// CodeToolOverrideInvalid is a [tools.override.<name>] whose executable is
-	// missing, is not a regular file, or does not hash to the declared checksum.
-	CodeToolOverrideInvalid = "CTX_TOOL_OVERRIDE_INVALID"
 )
 
 const (

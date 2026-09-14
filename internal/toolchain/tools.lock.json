@@ -558,6 +558,14 @@
       "entry": "scip-go",
       "entry_sha256": "",
       "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-go-0.2.7-darwin-amd64.tar.gz",
+          "sha256": "c7545ac6fac6ae37030c1b7d0ca3d86ead19ad32effac7b693d80f3376f63909",
+          "size": 11192740,
+          "entry": "scip-go",
+          "entry_sha256": "5bc9493dc29f906f0430094c4e1b2fdb9b35cae7704f51619e32cc8aa84377c0",
+          "provenance": "built"
+        },
         "darwin_arm64": {
           "url": "https://github.com/sourcegraph/scip-go/releases/download/v0.2.7/scip-go-darwin-arm64.tar.gz",
           "sha256": "f21b505452a8dbb270c18ec66690e583801f9e96cff1d72e84c004b7374ec672",
@@ -584,12 +592,28 @@
           "entry_sha256": "f8564bb80c87da37aee811be43c8f97e20a5857c3f63427f03121fe51125be2c",
           "provenance": "upstream",
           "upstream_digest": "sha256:6b93476c7578c5aeb5acacb41f8234c20130168271adea0db8d8ae63d1355acb"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-go-0.2.7-windows-amd64.tar.gz",
+          "sha256": "27889b68cc2f778c77542c37a25a64cc3884c35bb0f8685e181672aae76eb42b",
+          "size": 11001422,
+          "entry": "scip-go.exe",
+          "entry_sha256": "bc628f0141f4b1d0143fbd97c730bd7e773ab6fd3dd2d63c73c25ed7e295bc9d",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-go-0.2.7-windows-arm64.tar.gz",
+          "sha256": "4c6c8f00bcb8c64690c678d9ce0576b80b12fd6d23a1f604afddacf83e285e0e",
+          "size": 9944231,
+          "entry": "scip-go.exe",
+          "entry_sha256": "cec5137d2f69884ca8d75a5e47a734f4a70ebfc541fdb2ae438dc7fb2b79bddd",
+          "provenance": "built"
         }
       },
       "languages": [
         "go"
       ],
-      "notes": "Upstream publishes linux amd64/arm64 and darwin arm64 only. The other three platforms have no upstream binary and are absent from the map; gopls still serves Go there."
+      "notes": "Upstream publishes linux amd64/arm64 and darwin arm64; the other three are cross-built from the pinned module at release time and hosted, which is the hybrid rule applied per platform rather than per tool."
     },
     "scip-java": {
       "name": "scip-java",

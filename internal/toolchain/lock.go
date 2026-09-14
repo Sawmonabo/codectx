@@ -71,13 +71,18 @@ type Payload struct {
 	Entry  string `json:"entry,omitempty"`
 	// EntrySHA256 is this platform's entry digest.
 	EntrySHA256 string `json:"entry_sha256,omitempty"`
-	// Provenance is "upstream" for a re-hosted upstream artifact and "built"
-	// for one the release generator compiled, which is the honest distinction
-	// for a tool that publishes no binaries of its own.
+	// Provenance says where the payload at URL comes from under the hybrid
+	// hosting rule of Section 11.7: "upstream" is pinned at the publisher's own
+	// asset URL, "built" is compiled at release time and hosted on the
+	// tools-v<n> release because upstream publishes no binary for that
+	// platform. It is a provenance record, not something resolution branches on.
 	Provenance string `json:"provenance,omitempty"`
-	// UpstreamDigest is the "<algo>:<hex>" the upstream publisher declared,
-	// recorded for audit. Nothing at run time verifies against it: the payload
-	// this product fetches is its own re-hosted artifact.
+	// UpstreamDigest is the "<algo>:<hex>" the upstream publisher declared for
+	// this artifact, where one is published at all. The release generator
+	// verifies the downloaded bytes against it before recording them, so it is
+	// an audit trail of that generation-time check. Nothing at run time verifies
+	// against it -- SHA256 above is the run-time trust root, and it is the
+	// digest of exactly the bytes this product accepts.
 	UpstreamDigest string `json:"upstream_digest,omitempty"`
 }
 
@@ -332,7 +337,7 @@ func validEntryPath(name, entry string) error {
 	if len(entry) > model.MaxPathBytes {
 		return invalid("tool %q entry path is longer than %d bytes", name, model.MaxPathBytes)
 	}
-	if err := confinedRelPath(entry); err != nil {
+	if err := ConfinedRelPath(entry); err != nil {
 		return invalid("tool %q entry path %s", name, err)
 	}
 	if entry == completeName {
@@ -341,12 +346,16 @@ func validEntryPath(name, entry string) error {
 	return nil
 }
 
-// confinedRelPath is the single path rule this package applies to anything that
+// ConfinedRelPath is the single path rule the product applies to anything that
 // comes out of a lock or an archive: a normalized, relative, slash-separated
 // path with no NUL, no volume, no "." or ".." component and no trailing slash.
 // It is lexical only; the extractor additionally writes through an os.Root, so
 // a path that passes here still cannot escape at the syscall level.
-func confinedRelPath(p string) error {
+//
+// It is exported for the same reason ParseLock is: the release-time generator
+// in internal/tools/toollock must refuse exactly what the runtime refuses,
+// rather than carry a second rule that can drift from this one.
+func ConfinedRelPath(p string) error {
 	if p == "" {
 		return fmt.Errorf("is empty")
 	}

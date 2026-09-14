@@ -283,9 +283,13 @@ func (c Config) validateTools() error {
 		return configInvalid("tools.cache_dir %q is not an absolute path", c.Tools.CacheDir)
 	}
 	if c.Tools.Mirror != "" {
+		// https only, exactly as the toolchain resolver requires: a payload host
+		// reached in plaintext is not a posture Section 21's one outbound path
+		// accepts, and accepting it here would turn a configuration mistake into
+		// a CTX_ARGUMENT_INVALID from the composition root with no key named.
 		u, err := url.Parse(c.Tools.Mirror)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			return configInvalid("tools.mirror %q is not an absolute http or https URL prefix", c.Tools.Mirror)
+		if err != nil || u.Host == "" || u.Scheme != "https" {
+			return configInvalid("tools.mirror %q is not an absolute https URL prefix", c.Tools.Mirror)
 		}
 	}
 	// Map iteration order is random and the first failure names its tool, so
