@@ -73,13 +73,12 @@ type Sessions interface {
 	// Status needs in a single round trip instead of paging Coverage. Task 17
 	// consumes the same method and must not define a second one.
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
-	// SnapshotFile is the pinned manifest row for one file, read by (snapshot,
-	// file id) on the snapshot_files primary key. Next needs exactly its Path:
-	// the coverage and manifest records carry file identifiers and no path, and
-	// naming a file the operator cannot locate is not an answer. It is an
-	// existing *sqlite.Store reader (snapshot.Catalog declares the same method),
-	// not a method this task adds.
-	SnapshotFile(ctx context.Context, snapshot model.SnapshotID, file model.FileID) (model.FileVersion, error)
+	// FilePath is one pinned file's path, read by (snapshot, file id) on the
+	// snapshot_files primary key. Next needs exactly this: the coverage and
+	// manifest records carry file identifiers and no path, and naming a file the
+	// operator cannot locate is not an answer. The whole pinned row is not asked
+	// for, so nothing here can come to depend on the rest of it.
+	FilePath(ctx context.Context, snapshot model.SnapshotID, file model.FileID) (string, error)
 	// AcknowledgeFile refuses unless the file is already full_served; it never
 	// creates coverage.
 	AcknowledgeFile(ctx context.Context, session model.SessionID, actor string, file model.FileID) error

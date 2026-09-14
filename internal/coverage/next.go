@@ -76,12 +76,20 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 		// and manifest entries carry identifiers alone, and `context next`
 		// names a file the operator has to be able to find. One point read on
 		// the snapshot_files primary key, only on the branch that names a file.
-		fv, err := s.sessions.SnapshotFile(ctx, rec.Binding.SnapshotID, cov.FileID)
+		path, err := s.sessions.FilePath(ctx, rec.Binding.SnapshotID, cov.FileID)
 		if err != nil {
+			// A file the session pinned that the snapshot does not hold is the
+			// same manifest/session disagreement coverageOf reports, and it is
+			// not the caller's argument that is wrong: storage marks a missing
+			// row CTX_ARGUMENT_INVALID, which would blame the request.
+			if notFound(err) {
+				return model.NextContextItem{}, typedErrf(model.CodeScopeIncomplete,
+					"file %s is in this session's scope but not in the pinned snapshot", cov.FileID)
+			}
 			return model.NextContextItem{}, err
 		}
 		item.FileID = cov.FileID
-		item.Path = fv.Path
+		item.Path = path
 		item.ContentHash = cov.ContentHash
 		item.Requirement = cov.Requirement
 		item.Size = cov.Size

@@ -759,101 +759,6 @@ type scenario struct {
 var scenarios = []scenario{
 	// L1 rows
 
-	// A maximum-size chunk read at an offset far from the checkpoint before it.
-	// snapshot.View.Read seeks back to that checkpoint and asks CAS.ReadRange
-	// for [checkpoint, end), and CAS.ReadRange refuses a span over
-	// model.MaxRawChunkBytes, so a read path that sizes the chunk from the
-	// request alone serves a 1 MiB chunk only when the offset happens to sit on
-	// a checkpoint and fails with CTX_RESOURCE_LIMIT everywhere else. Read must
-	// subtract the real prefix, which caps this chunk exactly at the ceiling
-	// measured from the checkpoint rather than from the offset.
-	//
-	// needs FX-D16-A: F1 DELETES the clamp this row asserts. Once View.Read
-	// spans the prefix in successive reads, maxRawForWire keeps the full
-	// 1 MiB and the chunk ends at the file size instead of at
-	// checkpoint+MaxRawChunkBytes, so both the issued-range and the
-	// NextOffset assertions below fail by design. The invariant is retired,
-	// not broken: A's snapshot row proves the replacement. Left green at this
-	// HEAD; the controller adapts or deletes it at merge.
-	{"read/chunk far from a checkpoint is capped from the checkpoint", func(t *testing.T, h *harness) {
-		const (
-			lineBytes = 64
-			lines     = 24576         // 1.5 MiB, so a 1 MiB chunk is not clamped by the file size
-			cpByte    = uint64(65536) // the only checkpoint the offset can seek back to
-			cpLine    = uint32(cpByte/lineBytes + 1)
-			offset    = uint64(700032) // a line start 634_496 bytes past that checkpoint
-		)
-		file := &fixtureFile{
-			id: model.FileID(hexID(0x25)), path: "far.txt",
-			data:        []byte(strings.Repeat(strings.Repeat("x", lineBytes-1)+"\n", lines)),
-			checkpoints: []source.Checkpoint{{Byte: 0, Line: 1}, {Byte: cpByte, Line: cpLine}},
-		}
-		// Recommended, not required_full: the required_full ordinals are a
-		// prefix of the manifest and appending a required file would break it.
-		h.files[file.id] = file
-		h.store.order = append(h.store.order, file.id)
-		h.store.required[file.id] = model.RequirementRecommended
-		h.store.sessions[sessionA].coverage[file.id] = &byteSet{served: make([]bool, len(file.data))}
-
-		// Production limits rather than the fixture's: the checkpoint prefix
-		// only binds when the request is allowed to ask for a whole megabyte.
-		limits := fixtureLimits()
-		limits.ChunkBytes, limits.MaxChunkBytes = 65536, model.MaxRawChunkBytes
-		limits.MaxSourceResponseBytes = 7 << 20
-		svc := &Service{
-			sessions: h.store,
-			open:     func(ctx context.Context, snap model.SnapshotID) (Source, error) { return h.src, nil },
-			signer:   h.sign,
-			limits:   limits,
-			now:      func() time.Time { return h.now },
-		}
-
-		resp, err := svc.Read(context.Background(), model.ReadChunkRequest{
-			SessionID: sessionA, ActorID: actorA, FileID: file.id,
-			Offset: offset, MaxBytes: model.MaxRawChunkBytes,
-		})
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-
-		// The whole point: the span the view is asked for, measured from the
-		// checkpoint and not from the offset, is exactly the read ceiling.
-		wantEnd := cpByte + model.MaxRawChunkBytes
-		issued := make([]*fakeChunk, 0, 1)
-		for _, c := range h.store.chunks {
-			if c.file == file.id {
-				issued = append(issued, c)
-			}
-		}
-		if len(issued) != 1 {
-			t.Fatalf("read issued %d chunks for %s, want exactly 1", len(issued), file.id)
-		}
-		if issued[0].start != offset || issued[0].end != wantEnd {
-			t.Fatalf("issued chunk is [%d,%d), want [%d,%d): the chunk cap did not subtract the %d-byte checkpoint prefix",
-				issued[0].start, issued[0].end, offset, wantEnd, offset-cpByte)
-		}
-		if err == nil {
-			if resp.ByteRange.Start != offset || resp.ByteRange.End != wantEnd {
-				t.Fatalf("response range is [%d,%d), want [%d,%d)", resp.ByteRange.Start, resp.ByteRange.End, offset, wantEnd)
-			}
-			if resp.Encoding != model.EncodingUTF8 || resp.PartialLine {
-				t.Fatalf("response is %s partial=%v, want %s on a line-aligned chunk", resp.Encoding, resp.PartialLine, model.EncodingUTF8)
-			}
-			if resp.Content != string(file.data[offset:wantEnd]) {
-				t.Fatalf("response content is %d bytes and does not match the file", len(resp.Content))
-			}
-			if resp.NextOffset == nil || *resp.NextOffset != wantEnd {
-				t.Fatalf("next offset is %v, want %d", resp.NextOffset, wantEnd)
-			}
-			if resp.LineRange.Start.Line != uint32(offset/lineBytes+1) || resp.LineRange.End.Line != uint32(wantEnd/lineBytes+1) {
-				t.Fatalf("line range is %d..%d, want %d..%d: positions were not derived from the checkpoint",
-					resp.LineRange.Start.Line, resp.LineRange.End.Line, offset/lineBytes+1, wantEnd/lineBytes+1)
-			}
-		}
-		// Issuing grants nothing: only a confirmed receipt does.
-		h.checkCoverage(sessionA, actorA, file.id, 0, model.CoverageUnserved)
-	}},
-
 	// L2 rows
 	{
 		// Protects the receipt codec's two bindings: the purpose discriminator,
@@ -1400,7 +1305,6 @@ var scenarios = []scenario{
 	// zero precisely so resources.query_timeout applies, so an unbounded Read
 	// is a request with no finite bound at all.
 	{"read/a store that blocks is cut off by the query timeout", func(t *testing.T, h *harness) {
-		t.Skip("FX-D16-A pending")
 		limits := fixtureLimits()
 		limits.QueryTimeout = 50 * time.Millisecond
 		svc := &Service{
@@ -1437,7 +1341,6 @@ var scenarios = []scenario{
 	// response carrying only a 64-hex file id names a file the operator
 	// cannot open.
 	{"next/names the path of the file it selects", func(t *testing.T, h *harness) {
-		t.Skip("FX-D16-A pending")
 		item, err := h.svc.Next(context.Background(),
 			model.SessionRequest{SessionID: sessionA, ActorID: actorA})
 		if err != nil {

@@ -485,10 +485,10 @@ func contextMaxBytesValue(cmd *cobra.Command) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if v < 0 || v > model.MaxRawChunkBytes {
+	if v < 0 || v > model.MaxRawChunkBytes || (v > 0 && v < utf8.UTFMax) {
 		return 0, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: fmt.Sprintf("--%s is %d; it must be between 0 and %d, where 0 uses the configured chunk size",
-				contextMaxBytesFlag, v, int64(model.MaxRawChunkBytes))}
+			Message: fmt.Sprintf("--%s is %d; it must be 0 for the configured chunk size, or between %d and %d",
+				contextMaxBytesFlag, v, utf8.UTFMax, int64(model.MaxRawChunkBytes))}
 	}
 	return uint32(v), nil
 }
