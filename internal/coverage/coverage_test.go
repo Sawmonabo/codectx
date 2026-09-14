@@ -1,7 +1,9 @@
 package coverage
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -204,6 +206,13 @@ type fakeStore struct {
 	chunks   map[string]*fakeChunk
 	nextID   int
 
+	// confirmCalls counts ConfirmChunks calls. Storage refuses a foreign
+	// chunk too, so a row that only checks the returned code cannot tell the
+	// service's own session/actor/snapshot cross-check from the store's: the
+	// counter is what distinguishes "refused before storage was asked" from
+	// "the store happened to catch it".
+	confirmCalls int
+
 	// scopeComplete is what the fixture manifest reports. Section 15.3's Q7
 	// compiles an ambiguous or empty scope into a manifest with
 	// ScopeComplete=false, which is the only thing that separates
@@ -370,6 +379,7 @@ func (s *fakeStore) UnconfirmedChunks(ctx context.Context, session model.Session
 // batch on an unknown, expired or foreign chunk. Re-confirming an already
 // confirmed chunk is idempotent and must not add credit twice.
 func (s *fakeStore) ConfirmChunks(ctx context.Context, session model.SessionID, actor string, ids []string) error {
+	s.confirmCalls++
 	fs, err := s.session(session, actor)
 	if err != nil {
 		return err
@@ -455,6 +465,21 @@ func (s *fakeStore) CoverageSummary(ctx context.Context, session model.SessionID
 	return required, fullyServed, waived, err
 }
 
+// FilePath is the bounded path reader FX-D16-A's F4 adds to Sessions so Next
+// can fill NextContextItem.Path. It is written here ahead of that lane because
+// the widened interface is unsatisfiable without it and FX-D16-A does not own
+// this file; until F4 lands nothing in the package calls it.
+func (s *fakeStore) FilePath(ctx context.Context, snapshot model.SnapshotID, id model.FileID) (string, error) {
+	if snapshot != snapshotID {
+		return "", typed(model.CodeScopeIncomplete, "snapshot is not the fixture's")
+	}
+	f, ok := s.files[id]
+	if !ok {
+		return "", typed(model.CodeScopeIncomplete, "file is not in the snapshot")
+	}
+	return f.path, nil
+}
+
 // AcknowledgeFile refuses unless coverage is already full: a client assertion
 // never creates coverage.
 func (s *fakeStore) AcknowledgeFile(ctx context.Context, session model.SessionID, actor string, file model.FileID) error {
@@ -510,6 +535,26 @@ func (s *fakeStore) AdvanceSession(ctx context.Context, req model.AdvanceRequest
 		SessionID: fs.rec.ID, State: fs.rec.State, StateVersion: fs.rec.StateVersion,
 		ScopeVersion: fs.rec.ScopeVersion, ManifestID: fs.rec.ManifestID, Phase: fs.rec.Phase,
 	}, nil
+}
+
+// blockingSessions is a Sessions whose Session call never returns on its own,
+// so only a deadline the service imposes can end the request. It EMBEDS the
+// fake rather than reimplementing it, so it keeps satisfying Sessions however
+// that interface is widened, and overrides the one method Read reaches first.
+type blockingSessions struct{ *fakeStore }
+
+// errStoreNeverReturned is what the blocker answers once its own escape hatch
+// fires. A test that hangs is worse than a test that fails, so the row can name
+// the missing deadline instead of blocking the package's test binary.
+var errStoreNeverReturned = errors.New("the store blocked past the query timeout and the read was never cut off")
+
+func (b blockingSessions) Session(ctx context.Context, id model.SessionID, actor string) (sqlite.SessionRecord, error) {
+	select {
+	case <-ctx.Done():
+		return sqlite.SessionRecord{}, ctx.Err()
+	case <-time.After(5 * time.Second):
+		return sqlite.SessionRecord{}, errStoreNeverReturned
+	}
 }
 
 // --- the fake source --------------------------------------------------------
@@ -670,38 +715,29 @@ func (h *harness) file(id model.FileID) *fixtureFile {
 	return f
 }
 
-// oracle is the independent expectation for one session and file: the byte-set
-// plus the separate EOF bit, recomputed from confirmed chunks alone. A row
-// compares the reported CoverageState against this, never against the service's
-// own bookkeeping.
-func (h *harness) oracle(session model.SessionID, id model.FileID) *byteSet {
-	h.t.Helper()
-	want := &byteSet{served: make([]bool, len(h.file(id).data))}
-	for _, c := range h.store.chunks {
-		if c.confirmed && c.session == session && c.file == id {
-			want.confirm(c.start, c.end)
-		}
-	}
-	return want
-}
-
-// checkOracle asserts the store's reported state for one file equals the
-// oracle's. Failure means credit was granted for bytes no confirmed receipt
-// covers, or withheld for bytes one does.
-func (h *harness) checkOracle(session model.SessionID, actor string, id model.FileID) {
+// checkCoverage asserts the reported coverage of one file against the counts
+// the CALLING ROW states, not against a replay of the fake's own records.
+//
+// The replayed oracle this replaces could not fail for a defect in the code
+// under review: it fed the fake's confirmed chunks back through the same
+// byteSet.confirm the fake had already used to build the state it was being
+// compared with, so a wrong range issued by Read was recorded and replayed
+// identically. Here the expectation comes from the fixture -- the row knows the
+// file's size and which of its bytes a confirmed receipt covered -- so credit
+// granted for bytes no receipt covers, or withheld for bytes one does, fails.
+func (h *harness) checkCoverage(session model.SessionID, actor string, id model.FileID, wantBytes int64, wantState model.CoverageState) {
 	h.t.Helper()
 	got, err := h.store.Coverage(context.Background(), session, actor, "", 0)
 	if err != nil {
 		h.t.Fatalf("coverage: %v", err)
 	}
-	want := h.oracle(session, id)
 	for _, fc := range got {
 		if fc.FileID != id {
 			continue
 		}
-		if fc.State != want.state() || fc.ConfirmedBytes != want.confirmedBytes() {
-			h.t.Fatalf("file %s: store reports %s/%d bytes, oracle says %s/%d bytes",
-				id, fc.State, fc.ConfirmedBytes, want.state(), want.confirmedBytes())
+		if fc.State != wantState || fc.ConfirmedBytes != wantBytes {
+			h.t.Fatalf("file %s: coverage reports %s with %d confirmed bytes, the fixture says %s with %d",
+				id, fc.State, fc.ConfirmedBytes, wantState, wantBytes)
 		}
 		return
 	}
@@ -731,6 +767,14 @@ var scenarios = []scenario{
 	// a checkpoint and fails with CTX_RESOURCE_LIMIT everywhere else. Read must
 	// subtract the real prefix, which caps this chunk exactly at the ceiling
 	// measured from the checkpoint rather than from the offset.
+	//
+	// needs FX-D16-A: F1 DELETES the clamp this row asserts. Once View.Read
+	// spans the prefix in successive reads, maxRawForWire keeps the full
+	// 1 MiB and the chunk ends at the file size instead of at
+	// checkpoint+MaxRawChunkBytes, so both the issued-range and the
+	// NextOffset assertions below fail by design. The invariant is retired,
+	// not broken: A's snapshot row proves the replacement. Left green at this
+	// HEAD; the controller adapts or deletes it at merge.
 	{"read/chunk far from a checkpoint is capped from the checkpoint", func(t *testing.T, h *harness) {
 		const (
 			lineBytes = 64
@@ -807,7 +851,7 @@ var scenarios = []scenario{
 			}
 		}
 		// Issuing grants nothing: only a confirmed receipt does.
-		h.checkOracle(sessionA, actorA, file.id)
+		h.checkCoverage(sessionA, actorA, file.id, 0, model.CoverageUnserved)
 	}},
 
 	// L2 rows
@@ -867,22 +911,16 @@ var scenarios = []scenario{
 				typedErr.Code != model.CodeCursorInvalid {
 				t.Fatalf("cursor-purpose token confirmed as a receipt: %v", err)
 			}
-			if got := h.oracle(sessionA, f.id).confirmedBytes(); got != 0 {
-				t.Fatalf("rejected token credited %d bytes", got)
-			}
+			h.checkCoverage(sessionA, actorA, f.id, 0, model.CoverageUnserved)
 
 			// The real receipt, echoed twice: the first grants exactly the
-			// chunk's bytes and the replay neither fails nor adds more.
+			// chunk's bytes -- the fixture file entire -- and the replay
+			// neither fails nor adds more.
 			for i := 0; i < 2; i++ {
 				if err := svc.confirmReceipts(ctx, rec, []string{token}); err != nil {
 					t.Fatalf("confirm %d: %v", i+1, err)
 				}
-				h.checkOracle(sessionA, actorA, f.id)
-			}
-			set := h.oracle(sessionA, f.id)
-			if set.state() != model.CoverageFullServed || set.confirmedBytes() != int64(len(f.data)) {
-				t.Fatalf("after two confirms: %s with %d of %d bytes",
-					set.state(), set.confirmedBytes(), len(f.data))
+				h.checkCoverage(sessionA, actorA, f.id, int64(len(f.data)), model.CoverageFullServed)
 			}
 		},
 	},
@@ -921,9 +959,12 @@ var scenarios = []scenario{
 		if err := h.store.ConfirmChunks(ctx, sessionA, actorA, ids); err != nil {
 			t.Fatalf("confirm %d chunks: %v", len(ids), err)
 		}
+		// Every required file was issued and confirmed over its whole extent,
+		// so each carries exactly its fixture size in confirmed bytes -- the
+		// empty file zero, credited by its confirmed zero-length EOF chunk.
 		for _, fid := range h.store.order {
 			if h.store.required[fid] == model.RequirementFull {
-				h.checkOracle(sessionA, actorA, fid)
+				h.checkCoverage(sessionA, actorA, fid, int64(len(h.file(fid).data)), model.CoverageFullServed)
 			}
 		}
 
@@ -1067,7 +1108,9 @@ var scenarios = []scenario{
 				"want %q with 1 of 4 -- the confirmed EOF receipt is the empty file's coverage",
 				acked.SessionID, acked.FullyServedFiles, acked.RequiredFiles, sessionA)
 		}
-		h.checkOracle(sessionA, actorA, empty)
+		// The empty file's only possible coverage: zero bytes, full_served on
+		// the strength of the confirmed zero-length EOF receipt alone.
+		h.checkCoverage(sessionA, actorA, empty, 0, model.CoverageFullServed)
 
 		// 3. Status answers the same session, from the same record.
 		page, status, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
@@ -1148,6 +1191,247 @@ var scenarios = []scenario{
 		if item.Action != actionReviewScope || item.FileID != "" {
 			t.Fatalf("next answers %q for file %q over a manifest that resolved nothing; want %q and no file",
 				item.Action, item.FileID, actionReviewScope)
+		}
+	}},
+
+	// FX-D16-B rows
+
+	// Bytes that are not text reach the client through base64 and through
+	// nothing else, so the encoder has to carry exactly the chunk's bytes.
+	// Truncating, padding or re-slicing the body serves wrong source under a
+	// response that still validates and still reports a byte range the client
+	// will credit: silently wrong source, which is the failure class this
+	// package exists to prevent.
+	{"read/invalid UTF-8 comes back as lossless base64", func(t *testing.T, h *harness) {
+		f := h.file(model.FileID(hexID(0x23)))
+		resp, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id,
+		})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if resp.Encoding != model.EncodingBase64 {
+			t.Fatalf("read of %s reports encoding %q; bytes that are not valid UTF-8 must travel as %q",
+				f.path, resp.Encoding, model.EncodingBase64)
+		}
+		got, err := base64.StdEncoding.DecodeString(resp.Content)
+		if err != nil {
+			t.Fatalf("the response body is not decodable base64: %v", err)
+		}
+		if !bytes.Equal(got, f.data) {
+			t.Fatalf("the decoded body is %x over range [%d,%d); %s holds %x",
+				got, resp.ByteRange.Start, resp.ByteRange.End, f.path, f.data)
+		}
+	}},
+
+	// A line longer than the chunk budget must be cut and must SAY it was cut.
+	// A response that drops partial_line tells the client it holds a complete
+	// line, so a client assembling lines corrupts the one it is reading; a
+	// response with no next offset stalls the read loop on a file it can then
+	// never finish.
+	{"read/a line longer than the budget splits and says so", func(t *testing.T, h *harness) {
+		f := h.file(model.FileID(hexID(0x22)))
+		resp, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id,
+		})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !resp.PartialLine {
+			t.Fatalf("read of the %d-byte single line %s covers [%d,%d) and reports partial_line=false; "+
+				"the line was split and the client is not told",
+				len(f.data), f.path, resp.ByteRange.Start, resp.ByteRange.End)
+		}
+		if resp.NextOffset == nil || *resp.NextOffset == 0 || *resp.NextOffset != resp.ByteRange.End {
+			t.Fatalf("read of %s reports next offset %v over [%d,%d); a split must resume at the byte it stopped on",
+				f.path, resp.NextOffset, resp.ByteRange.Start, resp.ByteRange.End)
+		}
+	}},
+
+	// The chunk the client is handed is a slice of a window that starts at the
+	// checkpoint, not at the requested offset, so every chunk after the first
+	// is wrong by the prefix unless that offset is subtracted. Reading a whole
+	// file back in budget-sized steps is the only assertion that sees it: each
+	// individual response validates, reports a plausible range and carries the
+	// right number of bytes. CRLF pairs and a final line with no trailing
+	// newline are the two shapes a boundary rule is most likely to normalise
+	// away, so they are what the fixture holds.
+	{"read/a file reassembles byte for byte across chunk boundaries", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		f := h.file(model.FileID(hexID(0x21)))
+		// Seven bytes: three chunks over the 18-byte fixture, with the second
+		// boundary falling inside a line that ends in CRLF.
+		limits := fixtureLimits()
+		limits.ChunkBytes = 7
+		svc := &Service{
+			sessions: h.store,
+			open:     func(context.Context, model.SnapshotID) (Source, error) { return h.src, nil },
+			signer:   h.sign, limits: limits,
+			now: func() time.Time { return h.now },
+		}
+		var got []byte
+		for offset, reads := uint64(0), 0; ; reads++ {
+			if reads > len(f.data) {
+				t.Fatalf("reading %s in %d-byte chunks made no progress", f.path, limits.ChunkBytes)
+			}
+			resp, err := svc.Read(ctx, model.ReadChunkRequest{
+				SessionID: sessionA, ActorID: actorA, FileID: f.id, Offset: offset,
+			})
+			if err != nil {
+				t.Fatalf("read at %d: %v", offset, err)
+			}
+			if resp.Encoding != model.EncodingUTF8 {
+				t.Fatalf("read of the ASCII file %s at %d reports encoding %q", f.path, offset, resp.Encoding)
+			}
+			got = append(got, resp.Content...)
+			if resp.NextOffset == nil {
+				break
+			}
+			offset = *resp.NextOffset
+		}
+		if !bytes.Equal(got, f.data) {
+			t.Fatalf("%s reassembles to %q; the pinned file holds %q", f.path, got, f.data)
+		}
+	}},
+
+	// A read offset inside a UTF-8 sequence has no honest answer: the bytes
+	// from there are not a decodable prefix of anything, and serving them as
+	// base64 instead would hand the client a chunk it cannot place in the
+	// text. The request is refused so the client re-reads from a boundary.
+	{"read/an offset inside a UTF-8 sequence is refused", func(t *testing.T, h *harness) {
+		f := h.file(model.FileID(hexID(0x24)))
+		// The file opens with "é": byte 1 is its continuation byte, and the
+		// checkpoint before it is byte 0, so the window still starts on a
+		// boundary and the offset is the only thing wrong with the request.
+		var typedErr *model.Error
+		_, err := h.svc.Read(context.Background(), model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id, Offset: 1,
+		})
+		if !errors.As(err, &typedErr) || typedErr.Code != model.CodeArgumentInvalid {
+			t.Fatalf("read of %s at the continuation byte 1 returned %v; want %s",
+				f.path, err, model.CodeArgumentInvalid)
+		}
+	}},
+
+	// A receipt binds one session, one actor and one snapshot, and Section
+	// 16.3 forbids sharing it across any of them. The service cross-checks the
+	// payload against the live session record BEFORE storage is asked, which
+	// is the part a returned error code alone cannot prove: ConfirmChunks
+	// refuses a foreign chunk too, so dropping the cross-check would still
+	// look like a rejection while every receipt in the process became a
+	// storage probe for other actors' chunk ids.
+	{"acknowledge/another session's receipt is refused before storage is asked", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		f := h.file(model.FileID(hexID(0x21)))
+		resp, err := h.svc.Read(ctx, model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id,
+		})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		before := h.store.confirmCalls
+		var typedErr *model.Error
+		if _, err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
+			SessionID: sessionB, ActorID: actorB,
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCursorInvalid {
+			t.Fatalf("session %s / actor %s spent a receipt issued to %s / %s: %v",
+				sessionB, actorB, sessionA, actorA, err)
+		}
+		if h.store.confirmCalls != before {
+			t.Fatalf("the foreign receipt reached ConfirmChunks (%d calls, was %d); "+
+				"the session, actor and snapshot it names are checked against the live record first",
+				h.store.confirmCalls, before)
+		}
+		h.checkCoverage(sessionB, actorB, f.id, 0, model.CoverageUnserved)
+	}},
+
+	// A file acknowledgment asserts a human review of a file that is ALREADY
+	// fully served; it creates no coverage of its own. Skipping the store's
+	// refusal -- or never reaching the store at all -- turns `context
+	// acknowledge --file-review` into a silent no-op that reports success, so
+	// an actor marks a file reviewed having read seven of its bytes.
+	{"acknowledge/a file review is refused while the file is only partly served", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		f := h.file(model.FileID(hexID(0x21)))
+		limits := fixtureLimits()
+		limits.ChunkBytes = 7
+		svc := &Service{
+			sessions: h.store,
+			open:     func(context.Context, model.SnapshotID) (Source, error) { return h.src, nil },
+			signer:   h.sign, limits: limits,
+			now: func() time.Time { return h.now },
+		}
+		resp, err := svc.Read(ctx, model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: f.id,
+		})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if _, err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
+			SessionID: sessionA, ActorID: actorA,
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+		}); err != nil {
+			t.Fatalf("acknowledge the receipt: %v", err)
+		}
+		h.checkCoverage(sessionA, actorA, f.id, 7, model.CoveragePartialServed)
+
+		var typedErr *model.Error
+		if _, err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
+			SessionID: sessionA, ActorID: actorA,
+			Kind: model.AcknowledgeFile, FileID: f.id,
+		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCoverageIncomplete {
+			t.Fatalf("a %q acknowledgment over 7 of the %d bytes of %s returned %v; want %s",
+				model.AcknowledgeFile, len(f.data), f.path, err, model.CodeCoverageIncomplete)
+		}
+	}},
+
+	// needs FX-D16-A: F2 puts context.WithTimeout(ctx, QueryTimeout) atop
+	// Read, as OpenSession and Status already do. Read is the one endpoint
+	// that touches the CAS and the filesystem, and `--timeout` defaults to
+	// zero precisely so resources.query_timeout applies, so an unbounded Read
+	// is a request with no finite bound at all.
+	{"read/a store that blocks is cut off by the query timeout", func(t *testing.T, h *harness) {
+		t.Skip("FX-D16-A pending")
+		limits := fixtureLimits()
+		limits.QueryTimeout = 50 * time.Millisecond
+		svc := &Service{
+			sessions: blockingSessions{h.store},
+			open:     func(context.Context, model.SnapshotID) (Source, error) { return h.src, nil },
+			signer:   h.sign, limits: limits,
+			now: func() time.Time { return h.now },
+		}
+		started := time.Now()
+		_, err := svc.Read(context.Background(), model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: model.FileID(hexID(0x21)),
+		})
+		if err == nil || errors.Is(err, errStoreNeverReturned) {
+			t.Fatalf("read of a blocked store returned %v after %s; the %s query timeout must cut it off",
+				err, time.Since(started), limits.QueryTimeout)
+		}
+		var typedErr *model.Error
+		bounded := errors.Is(err, context.DeadlineExceeded) ||
+			(errors.As(err, &typedErr) && typedErr.Code == model.CodeQueryDeadline)
+		if !bounded {
+			t.Fatalf("read of a blocked store failed with %v after %s; want a deadline, not an unrelated error",
+				err, time.Since(started))
+		}
+	}},
+
+	// needs FX-D16-A: F4 assigns NextContextItem.Path from the widened
+	// Sessions. `context next` names the file the actor must read, and a
+	// response carrying only a 64-hex file id names a file the operator
+	// cannot open.
+	{"next/names the path of the file it selects", func(t *testing.T, h *harness) {
+		t.Skip("FX-D16-A pending")
+		item, err := h.svc.Next(context.Background(),
+			model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if want := h.file(item.FileID); item.Path != want.path {
+			t.Fatalf("next names file %s with path %q; the fixture declares it at %q",
+				item.FileID, item.Path, want.path)
 		}
 	}},
 }
