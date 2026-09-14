@@ -735,6 +735,19 @@ func (f validatorFunc) Current(ctx context.Context, file model.FileID, hash stri
 // Three answers are "not current" rather than failures, because each is a real
 // state of a live workspace: nothing published yet, the file absent from the
 // current snapshot, and a deletion tombstone.
+//
+// Note what this cannot decide today, so nobody reads more into it than it
+// says. A generation's snapshot is fixed when the generation begins, so while
+// the session's generation IS the active one the snapshot asked here is the
+// session's own and every pinned hash matches by construction; and when it is
+// not the active one, the gate is already shut by supersession. Precondition 7
+// is therefore subsumed by Superseded at present. It is asked separately anyway
+// because the two are different questions -- the readiness contract promises a
+// per-file answer, and the source that would make it decisive is a per-file
+// WORKTREE hash, which this repository does not have yet: coherence is
+// snapshot-level (HEAD plus a dirty flag, internal/index/status.go:88).
+// Ledgered for Task 20; until then the guarantee limit's "pair it with
+// expected-content-hash validation at each write" is what covers the gap.
 func (s *stack) currentSource(ctx context.Context, file model.FileID, hash string) (bool, error) {
 	snap, err := s.activeSnapshot(ctx)
 	if err != nil {
