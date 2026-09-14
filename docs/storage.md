@@ -61,6 +61,19 @@ SQLite's own bounded temp table. A stream that fails mid-walk must be reported
 by the applier: it staged fewer entries than the applier named, so the
 applier checks its stream error *before* `CarryOver`'s own return.
 
+A producer's stream may itself read the store — the dependence applier's
+`Files` is a merge join against `Store.UnitInputs` — and `CarryOver` drains all
+three streams inside its own write transaction on the single writer
+connection. Such a stream therefore takes a reader-pool connection
+(`read_connections`, default 2) once per page of its own scan while the write
+transaction stays open. WAL readers never wait on the writer, so it cannot
+deadlock, but a saturated reader pool stalls the carry-over and the open write
+transaction blocks every other writer in the process for the length of the
+walk. A producer whose stream reads the store keeps those reads bounded and
+proportional to the unit it replaces; the nesting is documented on `Replaced`,
+`CarryOver` and `UnitInputs` so a third producer does not discover it by
+measuring a stall.
+
 ### The retention bucket
 
 A fact's retention bucket is the `FileID` on its evidence. Evidence with a

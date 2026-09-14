@@ -59,6 +59,18 @@ const MaxDeltaStateBytes = 64 << 20
 // and Section 6 forbids holding that list in the Go heap. A producer that
 // cannot stream its set has a whole-repository list of its own, which is the
 // same defect one level up.
+//
+// A producer's stream may read the store — the dependence applier's Files is a
+// merge join against Store.UnitInputs — and it is drained from inside
+// CarryOver's write transaction, on the single writer connection. Such a
+// stream takes a connection from the reader pool (read_connections, default 2)
+// once per page of its own scan, and the write transaction stays open across
+// every one of those round-trips. WAL readers never wait on the writer, so
+// this cannot deadlock; it does mean a saturated reader pool stalls the
+// carry-over, and the open write transaction blocks every other writer in the
+// process for as long as the walk lasts. A producer whose stream reads the
+// store must therefore keep those reads bounded and proportional to the unit
+// it is replacing, and must not discover this nesting by measuring a stall.
 type Replaced struct {
 	// Files are the per-path evidence buckets the import replaced or dropped.
 	// Each must be a valid FileID.
@@ -93,6 +105,11 @@ type CarryOverStats struct {
 // minus everything Replaced names. It must run after the provider's own
 // batches and before SealUnit: every insert it issues yields to a row already
 // present, so the fresh import always wins over its predecessor.
+//
+// The whole body runs in one write transaction on the single writer
+// connection, and draining Replaced's three streams happens inside it: a
+// producer stream that reads the store runs nested in this transaction and on
+// another connection (see Replaced).
 //
 // Carrying a row asserts that its source has not changed, so the whole call is
 // refused unless every file the previous unit located facts in, and that
@@ -631,6 +648,11 @@ const unitInputsPage = 1000
 //
 // The first failure ends the sequence: it is yielded with a zero UnitInput and
 // nothing follows it.
+//
+// Each page is one read transaction on the reader pool. The dependence delta
+// applier walks this from inside UnitWriter.CarryOver's write transaction, so
+// those reads are nested inside the writer's and compete for reader
+// connections with the rest of the process; see Replaced.
 func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[model.UnitInput, error] {
 	return func(yield func(model.UnitInput, error) bool) {
 		fail := func(err error) { yield(model.UnitInput{}, err) }

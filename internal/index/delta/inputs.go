@@ -109,7 +109,7 @@ func nextInput(next func() (model.UnitInput, error, bool), last *model.FileID, s
 		return model.UnitInput{}, false, err
 	}
 	if *last != "" && in.FileID <= *last {
-		return model.UnitInput{}, false, invalid(side + " inputs are not in ascending file id order")
+		return model.UnitInput{}, false, invalid("%s inputs are not in ascending file id order", side)
 	}
 	*last = in.FileID
 	return in, true, nil
