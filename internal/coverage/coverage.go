@@ -33,12 +33,6 @@ import (
 // satisfies it; the manifest readers are Task 15's and are consumed read-only,
 // so no method here is defined or redefined by this package except
 // CoverageSummary, which is a coverage aggregate owned by this task.
-//
-// The assertion below is commented out only because CoverageSummary does not
-// exist on *sqlite.Store yet. L6 adds it (append-only in state.go) and
-// uncomments this line; nothing else about the interface may change.
-//
-//	var _ Sessions = (*sqlite.Store)(nil)
 type Sessions interface {
 	// Manifest reads belong to Task 15's MANIFEST lane. Entries persist in
 	// Section 15.3 tie-break order, ordinals 0..n-1 are the canonical reading
@@ -110,6 +104,10 @@ var _ Source = (*snapshot.View)(nil)
 // SourceOpener yields the Source for one pinned snapshot. internal/app owns the
 // *snapshot.View behind it and memoises per SnapshotID, which is what keeps
 // *sqlite.Store, *snapshot.CAS and config.Config out of this package.
+// The store is the production Sessions; the assertion keeps the interface
+// honest against it.
+var _ Sessions = (*sqlite.Store)(nil)
+
 type SourceOpener func(ctx context.Context, snap model.SnapshotID) (Source, error)
 
 // Options composes the service. Every dependency is required: the composition
