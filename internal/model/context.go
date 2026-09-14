@@ -522,3 +522,70 @@ func (i NextContextItem) Validate() error {
 	}
 	return nil
 }
+
+// ContextPage is one bounded page of a session's current manifest, the result
+// type ContextPageRequest has lacked. It mirrors CapsulePage: the header
+// travels with every page and the three projections are paged separately, so a
+// cursor is never ambiguous about which list it advances through.
+type ContextPage struct {
+	Meta       QueryMeta              `json:"meta"`
+	SessionID  SessionID              `json:"session_id"`
+	ManifestID ManifestID             `json:"manifest_id"`
+	View       ContextView            `json:"view"`
+	Entries    []ContextEntry         `json:"entries,omitempty"`
+	Slices     []ContextSlice         `json:"slices,omitempty"`
+	Excluded   []ExcludedContextEntry `json:"excluded,omitempty"`
+}
+
+// Validate enforces the page shape and its per-page item bound. A page carries
+// records for exactly the view it declares: a second populated list would let a
+// reader page past records it never saw.
+func (p ContextPage) Validate() error {
+	if err := p.Meta.Validate(); err != nil {
+		return err
+	}
+	if err := requireID("context_page.session_id", string(p.SessionID)); err != nil {
+		return err
+	}
+	if err := requireID("context_page.manifest_id", string(p.ManifestID)); err != nil {
+		return err
+	}
+	if !p.View.Valid() {
+		return invalid("context_page.view %q is not a known view", truncateForMessage(string(p.View)))
+	}
+	lists := []struct {
+		view  ContextView
+		count int
+	}{
+		{ViewEntries, len(p.Entries)},
+		{ViewSlices, len(p.Slices)},
+		{ViewExcluded, len(p.Excluded)},
+	}
+	items := 0
+	for _, l := range lists {
+		if l.count > 0 && l.view != p.View {
+			return invalid("context_page declares view %q but also carries %d %s records",
+				p.View, l.count, l.view)
+		}
+		items += l.count
+	}
+	if err := boundCount("context_page items", items, MaxPageItems); err != nil {
+		return err
+	}
+	for _, e := range p.Entries {
+		if err := e.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, s := range p.Slices {
+		if err := s.Validate(); err != nil {
+			return err
+		}
+	}
+	for _, e := range p.Excluded {
+		if err := e.Validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
