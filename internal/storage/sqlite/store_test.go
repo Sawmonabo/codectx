@@ -570,6 +570,29 @@ func TestStorePublicationScenario(t *testing.T) {
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
 	}
+	// Phase: lexical statistics are generation-local (Section 14.4). A BM25
+	// score is a function of df and the document facts of the pinned
+	// generation, so the same query against the same binding must yield the
+	// same score while other generations stage, activate and are swept
+	// underneath the reader; readerStable holds gen2 across the publication
+	// and retention sequence below, which republishes "changed" in a.go.
+	readerStable, err := f.s.PinGeneration(ctx, f.repo, gen2, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration(gen2, stable): %v", err)
+	}
+	defer readerStable.Close()
+	dfBefore, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
+	if err != nil {
+		t.Fatalf("DocumentFrequency: %v", err)
+	}
+	hitsBefore, err := readerStable.SearchDocuments(ctx, ids)
+	if err != nil {
+		t.Fatalf("SearchDocuments: %v", err)
+	}
+	if len(dfBefore) != 1 || dfBefore[0] != 1 || len(hitsBefore) != 1 {
+		t.Fatalf("gen2 lexical statistics = df %v over %d documents, want df 1 and the one b.go document containing \"changed\"", dfBefore, len(hitsBefore))
+	}
+
 	if err := reader2.Close(); err != nil {
 		t.Fatalf("reader2.Close: %v", err)
 	}
@@ -626,6 +649,21 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("SealUnit(release): %v", err)
 	}
 	f.activate(genOwn, genCarry)
+	// genOwn's unit indexes b.go a second time under its own config, so the
+	// corpus now holds a second document containing "changed" that gen2 does
+	// not select. Its rowid is the probe the stability leg below uses.
+	ownReader, err := f.s.PinGeneration(ctx, f.repo, genOwn, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration(genOwn): %v", err)
+	}
+	ownIDs, err := ownReader.Match(ctx, `"changed"`, 0, 10)
+	if err != nil || len(ownIDs) != 1 || ownIDs[0] == ids[0] {
+		t.Fatalf("genOwn Match(changed) = %v %v, want its own single document, not gen2's %d", ownIDs, err, ids[0])
+	}
+	// Released at once: a lease here would stop retention sweeping genOwn below.
+	if err := ownReader.Close(); err != nil {
+		t.Fatalf("ownReader.Close: %v", err)
+	}
 
 	// The publication half: over a snapshot whose a.go changed, unitA can no
 	// longer be reused, and carrying it must be admitted at attach AND at
@@ -695,6 +733,24 @@ func TestStorePublicationScenario(t *testing.T) {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
 	}
+	// The other half of the ranking-stability leg: three generations have now
+	// staged and activated over gen2 and two have been swept, and genOwn's
+	// second "changed" document is live. gen2's df and document facts must be
+	// exactly what they were, and genOwn's rowid -- a real document of the
+	// same file, outside this generation -- must be omitted, not hydrated.
+	dfAfter, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
+	if err != nil {
+		t.Fatalf("DocumentFrequency after publication and retention: %v", err)
+	}
+	hitsAfter, err := readerStable.SearchDocuments(ctx, []int64{ids[0], ownIDs[0]})
+	if err != nil {
+		t.Fatalf("SearchDocuments after publication and retention: %v", err)
+	}
+	if len(dfAfter) != 1 || dfAfter[0] != dfBefore[0] || len(hitsAfter) != 1 || hitsAfter[0] != hitsBefore[0] {
+		t.Fatalf("gen2 lexical statistics moved from df %v %+v to df %v %+v while later generations published and were swept; a score is not reproducible within its binding",
+			dfBefore, hitsBefore, dfAfter, hitsAfter)
+	}
+
 	// A limit nothing fits under: every ref but the active one is evicted, and
 	// gen2 is swept only insofar as nothing else holds it — the read session
 	// opened above does, so it stays.
