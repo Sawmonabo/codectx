@@ -42,6 +42,7 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 		return &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	})
 	root.AddCommand(newVersionCommand(build))
+	root.AddCommand(newInitCommand(build))
 	root.AddCommand(newToolsCommand(build))
 	root.AddCommand(newIndexCommand(build))
 	root.AddCommand(newRefreshCommand(build))
@@ -49,6 +50,7 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newWatchCommand(build))
 	root.AddCommand(newSearchCommand(build))
 	root.AddCommand(newSymbolCommand(build))
+	root.AddCommand(newMCPCommand(build))
 	// The Section 18.1 query commands are built as a set so query.go never
 	// edits the command tree it belongs to.
 	for _, c := range newQueryCommands(build) {
@@ -144,12 +146,10 @@ func newVersionCommand(build model.BuildInfo) *cobra.Command {
 			if jsonRequested(cmd, args) {
 				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), build))
 			}
-			_, err := fmt.Fprintf(out, "codectx %s (commit %s, %s, schema %s)\n",
+			// The same writeText every other human answer goes through, so a
+			// reader that closed the pipe is typed once, in one place.
+			return writeText(out, "codectx %s (commit %s, %s, schema %s)\n",
 				build.Version, build.Commit, build.Toolchain, build.SchemaVersion)
-			if err != nil {
-				return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
-			}
-			return nil
 		},
 	}
 }

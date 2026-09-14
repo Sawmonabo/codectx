@@ -17,6 +17,13 @@ const (
 	indexFullFlag    = "full"
 	indexRebuildFlag = "rebuild"
 	indexWatchFlag   = "watch"
+	// indexSCIPIndexFlag names a SCIP index that already exists in the
+	// workspace, and indexSCIPInputsFlag the optional manifest describing what
+	// produced it. Both are root-relative paths inside the snapshot: the
+	// provider reads them through the captured bytes, so an absolute path or
+	// one climbing out of the root is refused rather than followed.
+	indexSCIPIndexFlag  = "scip-index"
+	indexSCIPInputsFlag = "scip-inputs"
 )
 
 // indexLockWait is the bounded wait a building command makes for the
@@ -71,46 +78,59 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			repo, err := repoFlagValue(cmd)
+			// The supplied index and its manifest are inputs of the
+			// composition, not of the run: they reach the SCIP provider when
+			// the workspace is opened, which is why they are resolved here and
+			// carried in OpenOptions rather than in the request. scip.New
+			// validates both -- a path that is absolute or climbs out of the
+			// root, and a manifest with no index to describe, are refused as
+			// argument errors by the open itself, so neither is re-checked.
+			scipIndex, err := stringFlag(cmd, indexSCIPIndexFlag)
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, req.Rebuild)
+			scipInputs, err := stringFlag(cmd, indexSCIPInputsFlag)
 			if err != nil {
 				return err
 			}
-			defer ws.Close()
-			if req.Rebuild {
-				// Section 12.2: the new cache is explicit and the old one is
-				// left whole, so the operator is told where both are and that
-				// the sessions and receipts they recorded stay in the old one.
-				if err := writeText(cmd.ErrOrStderr(),
-					"a new cache was created at %s; the previous cache is untouched and still holds its sessions and receipts. "+
-						"Point storage.data_dir at the new cache, or remove the old one once you no longer need them.\n",
-					ws.DataDir()); err != nil {
-					return err
-				}
-			}
-			result, err := ws.Coordinator().Index(cmd.Context(), req)
-			if err != nil {
-				return err
-			}
-			if req.Watch {
-				// A watch session emits one envelope, at its end. The base
-				// generation is the session's first refresh, not a second
-				// result stream of its own.
-				if err := emitIndexProgress(cmd, args, result); err != nil {
-					return err
-				}
-				return runWatch(cmd, build, args, ws)
-			}
-			return drainIndex(cmd, build, args, ws, result)
+			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait, Rebuild: req.Rebuild,
+				SCIPImport: scipIndex, SCIPManifest: scipInputs}),
+				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+					if req.Rebuild {
+						// Section 12.2: the new cache is explicit and the old
+						// one is left whole, so the operator is told where both
+						// are and that the sessions and receipts they recorded
+						// stay in the old one.
+						if err := writeText(cmd.ErrOrStderr(),
+							"a new cache was created at %s; the previous cache is untouched and still holds its sessions and receipts. "+
+								"Point storage.data_dir at the new cache, or remove the old one once you no longer need them.\n",
+							ws.DataDir()); err != nil {
+							return err
+						}
+					}
+					result, err := svc.Index(ctx, req)
+					if err != nil {
+						return err
+					}
+					if req.Watch {
+						// A watch session emits one envelope, at its end. The
+						// base generation is the session's first refresh, not a
+						// second result stream of its own.
+						if err := emitIndexProgress(cmd, args, result); err != nil {
+							return err
+						}
+						return runWatch(ctx, cmd, build, args, ws)
+					}
+					return drainIndex(cmd, build, args, ws, result)
+				})
 		},
 	}
 	addRepoFlag(cmd)
 	cmd.Flags().Bool(indexFullFlag, false, "rebuild every unit of the existing cache instead of reusing sealed ones")
 	cmd.Flags().Bool(indexRebuildFlag, false, "build into a new cache beside the configured one; the existing database is left untouched")
 	cmd.Flags().Bool(indexWatchFlag, false, "keep running and refresh as the workspace changes")
+	cmd.Flags().String(indexSCIPIndexFlag, "", "root-relative path of a SCIP index already present in the workspace, imported instead of being produced")
+	cmd.Flags().String(indexSCIPInputsFlag, "", "root-relative path of the input-hash manifest describing that index; needs --"+indexSCIPIndexFlag)
 	return cmd
 }
 
@@ -133,20 +153,19 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
-				return err
-			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			result, err := ws.Coordinator().Refresh(cmd.Context(), args)
-			if err != nil {
-				return err
-			}
-			return drainIndex(cmd, build, args, ws, result)
+			// The named paths are read by nobody on purpose: the refresh
+			// re-reads the workspace and compares content hashes either way, so
+			// there is no request field to carry them into and a hint that
+			// changed the answer would be the thing the help text promises it
+			// is not.
+			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+					result, err := svc.Refresh(ctx, model.IndexRequest{})
+					if err != nil {
+						return err
+					}
+					return drainIndex(cmd, build, args, ws, result)
+				})
 		},
 	}
 	addRepoFlag(cmd)
@@ -170,38 +189,35 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
-				return err
-			}
-			ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo)
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			// A provider that could not be constructed publishes no detection
-			// row of its own. Those rows are folded in by the coordinator,
-			// before the capability report's own bound is applied: appending
-			// them here pushed Completeness past model.MaxCapabilityStates, a
-			// list IndexStatus.Validate then rejects.
-			status, err := ws.Coordinator().Status(cmd.Context())
-			if err != nil {
-				return err
-			}
-			// The rows are read from the store, and the whole report path was
-			// composed with fetching refused, so nothing here can install the
-			// tool it is reporting on -- a report that installed what it
-			// reports could only ever say the tool is installed (ledger 159).
-			data := statusReport{Index: status,
-				Tools: report(ws.ToolStore(), ws.Resolver().Status(cmd.Context()), nil)}
-			out := cmd.OutOrStdout()
-			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
-			}
-			if err := writeIndexStatus(out, data.Index); err != nil {
-				return err
-			}
-			return writeToolTable(out, data.Tools)
+			return runService(cmd, openForReport(),
+				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+					// A provider that could not be constructed publishes no
+					// detection row of its own. Those rows are folded in by the
+					// coordinator, before the capability report's own bound is
+					// applied: appending them here pushed Completeness past
+					// model.MaxCapabilityStates, a list IndexStatus.Validate
+					// then rejects.
+					status, err := svc.IndexStatus(ctx)
+					if err != nil {
+						return err
+					}
+					// The rows are read from the store, and the whole report
+					// path was composed with fetching refused, so nothing here
+					// can install the tool it is reporting on -- a report that
+					// installed what it reports could only ever say the tool is
+					// installed (ledger 159). The toolchain is not a service
+					// operation, so this row keeps ws.Resolver()/ws.ToolStore().
+					data := statusReport{Index: status,
+						Tools: report(ws.ToolStore(), ws.Resolver().Status(ctx), nil)}
+					out := cmd.OutOrStdout()
+					if jsonRequested(cmd, args) {
+						return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
+					}
+					if err := writeIndexStatus(out, data.Index); err != nil {
+						return err
+					}
+					return writeToolTable(out, data.Tools)
+				})
 		},
 	}
 	addRepoFlag(cmd)
@@ -229,16 +245,17 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
-				return err
-			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			return runWatch(cmd, build, args, ws)
+			// `watch` is a building command, so it opens through the same
+			// runner and the same building opener `index` and `refresh` use:
+			// one open dance, one Close, and a cancellation typed once. It
+			// declares no --timeout, so no deadline is installed over a session
+			// that is meant to run until it is stopped, and the *Services it is
+			// handed goes unread because streaming is deliberately not a facade
+			// operation (digest 17 Section 4) -- Coordinator is.
+			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+				func(ctx context.Context, ws *app.Workspace, _ *app.Services) error {
+					return runWatch(ctx, cmd, build, args, ws)
+				})
 		},
 	}
 	addRepoFlag(cmd)
@@ -259,10 +276,10 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 // context ends, so `codectx watch | head -1` would keep indexing into a dead
 // pipe for the rest of the session -- which is the symptom (Section 18.2: a
 // broken stdout pipe fails the command and does not confirm delivery).
-func runWatch(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace) error {
+func runWatch(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	machine := jsonRequested(cmd, args)
-	ctx, stop := context.WithCancel(cmd.Context())
+	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	var refreshes int64
 	var writeErr error

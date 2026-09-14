@@ -248,11 +248,10 @@ func (s *Services) References(ctx context.Context, req model.ReferenceRequest) (
 
 // Graph answers bounded callers/callees traversal.
 //
-// It routes to Engine.Neighbors, the one traversal that walks the request's own
-// direction and relation allowlist: GraphRequest carries no operation selector,
-// so `callers` and `callees` are that request with Direction and Relations set,
-// and Engine.Callers/Callees would pin them a second time from a name this
-// signature does not carry.
+// It routes to Engine.Neighbors, the one traversal the engine exposes: it walks
+// the request's own direction and relation allowlist, and GraphRequest carries
+// no operation selector, so `callers` and `callees` are that request with
+// Direction and Relations set rather than two further engine entry points.
 func (s *Services) Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
 	if err := req.Validate(); err != nil {
 		return model.GraphResult{}, err

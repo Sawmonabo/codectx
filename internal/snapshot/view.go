@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"slices"
-	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -200,12 +199,6 @@ func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Ra
 	window, err := v.cas.ReadRange(ctx, rec, r)
 	if err != nil {
 		return Range{}, fv, err
-	}
-	// The offset's own rune boundary is checked here rather than left to the
-	// cursor, which would report it as a property of the window it was handed;
-	// Section 16.2 rejects the served offset, and the message names it.
-	if len(window) > 0 && !utf8.RuneStart(window[0]) {
-		return Range{}, fv, invalid("byte offset %d is inside a UTF-8 sequence", r.Start)
 	}
 	startColumn, err := columnAt(r.Start, lineStart)
 	if err != nil {

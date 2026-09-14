@@ -339,67 +339,22 @@ func checkWalk(ctx context.Context, b *budget) error {
 // relation allowlist, reporting the direction it walked and the visited and
 // edge counts it spent.
 func (e *Engine) Neighbors(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, neighborsEndpoint, req.Direction, req.Relations, nil)
+	return e.traverse(ctx, req, neighborsEndpoint, req.Direction, req.Relations)
 }
 
-// Callers expands incoming `calls` edges. It pins both the direction and the
-// relation itself; a request that contradicts either is rejected with
-// CTX_ARGUMENT_INVALID rather than having the field silently ignored.
-func (e *Engine) Callers(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, callersEndpoint, model.DirectionIncoming, []model.RelationKind{model.RelCalls},
-		pinnedCalls(model.DirectionIncoming, "callers"))
-}
-
-// Callees expands outgoing `calls` edges, pinning direction and relation the
-// same way Callers does.
-func (e *Engine) Callees(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return e.traverse(ctx, req, calleesEndpoint, model.DirectionOutgoing, []model.RelationKind{model.RelCalls},
-		pinnedCalls(model.DirectionOutgoing, "callees"))
-}
-
-// pinnedCalls builds the request check for an operation whose direction and
-// relation are fixed by its name. GraphRequest.Validate already rejects an
-// unknown direction, so the only remaining case is a known direction that
-// disagrees with the operation. An empty relation list means "the operation's
-// own relation"; any other list is a caller asking for something the operation
-// cannot answer, and is refused for the same reason the direction is.
-func pinnedCalls(dir model.Direction, op string) func(model.GraphRequest) error {
-	return func(req model.GraphRequest) error {
-		if req.Direction != dir {
-			return (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: "this operation walks one fixed direction"}).
-				WithDetail("operation", op).
-				WithDetail("direction", string(dir))
-		}
-		if len(req.Relations) == 0 {
-			return nil
-		}
-		if len(req.Relations) != 1 || req.Relations[0] != model.RelCalls {
-			return (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: "this operation walks one fixed relation kind"}).
-				WithDetail("operation", op).
-				WithDetail("relation", string(model.RelCalls))
-		}
-		return nil
-	}
-}
-
-// Endpoint names bind a continuation to the operation that issued it, the way
-// referenceEndpoint does: a cursor minted by callees means nothing to callers
-// even at the same generation and seeds, and resumeTraversal rejects it.
-const (
-	neighborsEndpoint = "graph.neighbors"
-	callersEndpoint   = "graph.callers"
-	calleesEndpoint   = "graph.callees"
-)
+// neighborsEndpoint binds a continuation to the operation that issued it, the
+// way referenceEndpoint does: a cursor minted by a traversal means nothing to
+// another endpoint even at the same generation and seeds, and resumeTraversal
+// rejects it.
+const neighborsEndpoint = "graph.neighbors"
 
 // continuationUnavailable rejects a request carrying a traversal cursor.
 // Silently ignoring a cursor would restart the walk from the seeds while the
 // caller believed it was resuming, which would double-spend the cumulative
 // budget the cursor exists to carry, so a typed refusal is the honest answer.
 //
-// Every other operation DOES page: Neighbors, Callers and Callees mint and
-// resume a traversalCursor from a keyset position, and Impact spills its ranked
+// Every other operation DOES page: Neighbors mints and resumes
+// a traversalCursor from a keyset position, and Impact spills its ranked
 // tail into a spool and replays it. PackageDependencies is the one that remains:
 // it aggregates a whole walk into pairs, so it has neither a (owner, relation)
 // stop to resume from nor a ranked list to cut. Its CLI command declares no
@@ -424,23 +379,16 @@ func resolveBound(requested, configured int) int {
 	return requested
 }
 
-// traverse is the shared body of Neighbors, Callers and Callees. dir and kinds
-// are what the operation actually walks; pin, when non-nil, is the operation's
-// own request check, run after the shared validation so it can trust the
-// request's shape.
+// traverse is the body behind Neighbors: dir and kinds are what the request
+// asked to walk, and endpoint is what a continuation minted here is bound to.
 func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint string, dir model.Direction,
-	kinds []model.RelationKind, pin func(model.GraphRequest) error) (res model.GraphResult, err error) {
-	// One deferred mapping covers Neighbors, Callers and Callees: a bare
+	kinds []model.RelationKind) (res model.GraphResult, err error) {
+	// One deferred mapping covers every traversal: a bare
 	// context failure from the adjacency reader becomes the Section 8 code for
 	// the state it is in, and anything already typed is left alone.
 	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
 		return model.GraphResult{}, err
-	}
-	if pin != nil {
-		if err := pin(req); err != nil {
-			return model.GraphResult{}, err
-		}
 	}
 	// The deadline wraps the gate as well as the walk, so waiting for a slot
 	// past the request deadline is the resource limit the caller must see, and
@@ -464,9 +412,9 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	maxEdges := int64(resolveBound(req.MaxEdges, e.limits.MaxEdges))
 	maxItems := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
 
-	// The deferred-dependence disclosure happens before the walk: a missing
-	// dependence edge must not read as a genuine absence of edges.
-	pending, err := e.pendingDependence(ctx, kinds)
+	// The capability disclosure happens before the walk: a missing dependence
+	// edge must not read as a genuine absence of edges.
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
@@ -548,7 +496,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if reason == "" && b.frontierHit {
 		reason = reasonFrontierBytes
 	}
-	if reason == "" && len(pending) > 0 {
+	if reason == "" && deferred {
 		reason = reasonDependence
 	}
 	// A continuation is offered for exactly one stop: the page filled up while
@@ -579,7 +527,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	result := model.GraphResult{
 		Meta: model.QueryMeta{
 			Binding:          e.adjacency.Binding(),
-			Completeness:     pending,
+			Completeness:     caps,
 			Truncated:        reason != "",
 			TruncationReason: reason,
 			NextCursor:       nextCursor,
@@ -602,13 +550,31 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	return result, nil
 }
 
-// pendingDependence reports the deferred dependence capability rows a request
-// touching a dependence-only relation kind must disclose. It returns the rows
-// unchanged in State and DiagnosticCode, folding a promotion's queue position
-// into Details when a promoter is available; in report mode there is no
-// promoter and the rows are reported without promoting. A failed promotion
-// never fails the query -- the answer is still correct, just still incomplete.
-func (e *Engine) pendingDependence(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, error) {
+// completeness is the ONE capability derivation every graph answer uses. It
+// reads the pinned generation's capability report through the same
+// Adjacency.Capabilities port search reads it through (search.go:210), so the
+// graph family discloses the same rows `search` and `symbol` do rather than
+// reporting no capabilities at all.
+//
+// The deferred-dependence disclosure is folded INTO those rows, not appended to
+// them: a deferred row is one of the generation's own capability rows, enriched
+// here with the promotion's queue position. Appending would publish the row
+// twice and push a full report past model.MaxCapabilityStates, which the
+// answer's own Validate then rejects.
+//
+// deferred reports whether a request touching a dependence-only relation kind
+// found deferred units; that, and never the length of rows, is what makes an
+// answer truncated -- every generation carries capability rows, so a
+// length test would report every answer as incomplete.
+//
+// In report mode there is no promoter and the rows are disclosed without
+// promoting. A failed promotion never fails the query: the answer is still
+// correct, just still incomplete.
+func (e *Engine) completeness(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, bool, error) {
+	rows, err := e.adjacency.Capabilities(ctx)
+	if err != nil {
+		return nil, false, err
+	}
 	wanted := map[model.RelationKind]bool{}
 	for _, k := range kinds {
 		wanted[k] = true
@@ -621,35 +587,34 @@ func (e *Engine) pendingDependence(ctx context.Context, kinds []model.RelationKi
 		}
 	}
 	if !touches {
-		return nil, nil
+		return rows, false, nil
 	}
-	caps, err := e.adjacency.Capabilities(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.CapabilityState
-	for _, c := range caps {
+	deferred := false
+	for i, c := range rows {
 		if c.ProviderID != dependenceProviderID || c.Details["reason"] != reasonUnitsDeferred {
 			continue
 		}
-		row := c
-		if e.promoter != nil {
-			if p, err := e.promoter.Promote(ctx, dependenceProviderID, c.Scope); err == nil {
-				// WithDetail clones the map, truncates the value and refuses to
-				// grow past MaxCapabilityDetails, so folding a queue position in
-				// can neither mutate the reader's row nor build a row that then
-				// fails its own Validate and fails the query it was disclosing.
-				row = row.WithDetail("units", strconv.Itoa(p.Units)).
-					WithDetail("position", strconv.Itoa(p.Position))
-				if p.Estimate > 0 {
-					// An unmeasured duration is reported as unmeasured, never invented.
-					row = row.WithDetail("estimate_ms", strconv.FormatInt(p.Estimate.Milliseconds(), 10))
-				}
-			}
+		deferred = true
+		if e.promoter == nil {
+			continue
 		}
-		rows = append(rows, row)
+		p, err := e.promoter.Promote(ctx, dependenceProviderID, c.Scope)
+		if err != nil {
+			continue
+		}
+		// WithDetail clones the map, truncates the value and refuses to
+		// grow past MaxCapabilityDetails, so folding a queue position in
+		// can neither mutate the reader's row nor build a row that then
+		// fails its own Validate and fails the query it was disclosing.
+		row := c.WithDetail("units", strconv.Itoa(p.Units)).
+			WithDetail("position", strconv.Itoa(p.Position))
+		if p.Estimate > 0 {
+			// An unmeasured duration is reported as unmeasured, never invented.
+			row = row.WithDetail("estimate_ms", strconv.FormatInt(p.Estimate.Milliseconds(), 10))
+		}
+		rows[i] = row
 	}
-	return rows, nil
+	return rows, deferred, nil
 }
 
 const (

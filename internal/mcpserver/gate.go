@@ -1,0 +1,164 @@
+package mcpserver
+
+// L5 GATE owns this file (digest §4 rows 18-23): the review gate and the
+// capsule. Session id and actor id are tool arguments, never wire state.
+
+import (
+	"context"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+// contextAcknowledge answers codectx_context_acknowledge.
+func (h *handlers) contextAcknowledge(ctx context.Context, _ *mcp.CallToolRequest, in model.AcknowledgeRequest) (*mcp.CallToolResult, result[model.SessionStatus], error) {
+	var zero result[model.SessionStatus]
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	status, err := h.context.Acknowledge(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, status), nil
+}
+
+// contextWaive answers codectx_context_waive. The returned SessionStatus must
+// reach the wire unaltered: a waived session still reports
+// ready_for_implementation=false, and flattening that away would defeat the
+// Section 16.3 gate.
+func (h *handlers) contextWaive(ctx context.Context, _ *mcp.CallToolRequest, in model.WaiverRequest) (*mcp.CallToolResult, result[waiveOutput], error) {
+	var zero result[waiveOutput]
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	waiver, status, err := h.context.Waive(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, waiveOutput{Waiver: waiver, Status: status}), nil
+}
+
+// contextRecord answers codectx_context_record.
+func (h *handlers) contextRecord(ctx context.Context, _ *mcp.CallToolRequest, in model.ObservationRequest) (*mcp.CallToolResult, result[recordOutput], error) {
+	var zero result[recordOutput]
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	observation, status, err := h.context.Record(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, recordOutput{Observation: observation, Status: status}), nil
+}
+
+// contextAdvance answers codectx_context_advance, passing ExpectedVersion
+// through verbatim so an optimistic-concurrency conflict is reported, never
+// papered over.
+func (h *handlers) contextAdvance(ctx context.Context, _ *mcp.CallToolRequest, in model.AdvanceRequest) (*mcp.CallToolResult, result[advanceOutput], error) {
+	var zero result[advanceOutput]
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	workflow, status, err := h.context.Advance(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, advanceOutput{Workflow: workflow, Status: status}), nil
+}
+
+// contextCapsule answers codectx_context_capsule. The six model.CapsuleView
+// values route to Capsule's bounded page; view="export" routes to Export and is
+// projected to capsuleExport — CANONICAL METADATA ONLY, never the capsule body,
+// whose 8 MiB bound cannot fit the 256 KiB metadata ceiling.
+//
+// The export route validates a model.SessionRequest rather than the whole
+// CapsuleRequest, because CapsuleRequest.Validate rejects any view outside the
+// six model spellings and "export" is deliberately not one of them: it is a
+// wire-only selector this package adds. Page is not consulted on that route —
+// the projection is a fixed, small field set with nothing to page through — but
+// it is still validated, so no tool input escapes its bound.
+func (h *handlers) contextCapsule(ctx context.Context, _ *mcp.CallToolRequest, in model.CapsuleRequest) (*mcp.CallToolResult, result[capsuleOutput], error) {
+	var zero result[capsuleOutput]
+	if string(in.View) == capsuleViewExport {
+		req := model.SessionRequest{SessionID: in.SessionID, ActorID: in.ActorID}
+		if err := req.Validate(); err != nil {
+			return nil, zero, toolFailure(h.log, err)
+		}
+		// Page is not consulted on this route, but it is still bounded: the
+		// schema marks it required, so a caller sends one, and an out-of-range
+		// limit or an oversized cursor must be refused rather than silently
+		// accepted.
+		if err := in.Page.Validate(); err != nil {
+			return nil, zero, toolFailure(h.log, err)
+		}
+		capsule, err := h.context.Export(ctx, req)
+		if err != nil {
+			return nil, zero, toolFailure(h.log, err)
+		}
+		export := exportOf(capsule)
+		return nil, ok(h, capsuleOutput{Export: &export}), nil
+	}
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.context.Capsule(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, capsuleOutput{Page: &page}), nil
+}
+
+// exportOf projects a sealed capsule onto its canonical export metadata.
+//
+// It copies identity, binding, both hashes, the scope version, the strict-gate
+// flag and the creation time, and reduces every record list to its length. No
+// capsule record crosses this boundary: a capsule may hold up to
+// context.max_capsule_bytes (8 MiB) of facts, observations, coverage and
+// waivers, which cannot be served under the 256 KiB
+// resources.max_metadata_response_bytes ceiling this tool answers within. A
+// caller that wants the records pages them through the six view spellings.
+//
+// The count keys are the Capsule fields' own JSON tags, so a count and the view
+// that pages it cannot drift apart.
+func exportOf(c model.Capsule) capsuleExport {
+	return capsuleExport{
+		SessionID:           c.SessionID,
+		ActorID:             c.ActorID,
+		Binding:             c.Binding,
+		ManifestHash:        c.ManifestHash,
+		CanonicalHash:       c.CanonicalHash,
+		ScopeVersion:        c.ScopeVersion,
+		StrictGateSatisfied: c.StrictGateSatisfied,
+		Counts: map[string]int{
+			"scope":            len(c.Scope),
+			"accepted_facts":   len(c.AcceptedFacts),
+			"rejected_facts":   len(c.RejectedFacts),
+			"contradictions":   len(c.Contradictions),
+			"unresolved":       len(c.Unresolved),
+			"scope_review_ids": len(c.ScopeReviewIDs),
+			"coverage":         len(c.Coverage),
+			"waivers":          len(c.Waivers),
+			"completeness":     len(c.Completeness),
+		},
+		CreatedAt: c.CreatedAt,
+	}
+}
+
+// contextClose answers codectx_context_close. closeInput carries the
+// optimistic-concurrency version beside the session request because
+// CloseSession takes it as a separate argument; the facade rejects a version
+// below 1, so this handler forwards it rather than adding a second guard.
+func (h *handlers) contextClose(ctx context.Context, _ *mcp.CallToolRequest, in closeInput) (*mcp.CallToolResult, result[model.SessionStatus], error) {
+	var zero result[model.SessionStatus]
+	req := model.SessionRequest{SessionID: in.SessionID, ActorID: in.ActorID}
+	if err := req.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	status, err := h.context.CloseSession(ctx, req, in.ExpectedVersion)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, status), nil
+}

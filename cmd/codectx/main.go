@@ -23,6 +23,15 @@ func main() {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
 
+	// A write to fd 1 or 2 that returns EPIPE raises SIGPIPE, whose default
+	// disposition kills the process with status 141 before the write error is
+	// ever returned. Ignoring it turns the broken pipe back into the EPIPE the
+	// output path already types (Section 18.2: a broken stdout pipe fails the
+	// command and confirms no delivery), so `codectx ... | head` exits 7 with a
+	// typed envelope instead of being killed by a signal. It is installed after
+	// the worker dispatch so a re-executed parser worker keeps the default.
+	signal.Ignore(syscall.SIGPIPE)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
 	build := model.CurrentBuildInfo()

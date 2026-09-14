@@ -312,7 +312,7 @@ All **user** trust.
 | Key | Default | Meaning |
 |---|---|---|
 | `transport` | `"stdio"` | The only supported transport in this build. |
-| `watch` | `true` | Keep the index fresh while the MCP server runs. |
+| `watch` | `true` | Keep the index fresh while the MCP server runs. `codectx mcp serve --watch=false` turns it off for one session, and `--watch` turns it on where this key is `false`. |
 
 ## Cross-field validation
 

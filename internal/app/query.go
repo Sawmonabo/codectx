@@ -113,7 +113,14 @@ func (a adjacency) EvidenceRows(ctx context.Context, relations []model.RelationI
 	for rel, list := range stored {
 		out := make([]model.Evidence, 0, len(list))
 		for _, row := range list {
-			out = append(out, row.Evidence)
+			// The byte interval is carried across, not dropped: it is the only
+			// location a sealed occurrence has. StoredEvidence keeps it beside
+			// the fact because the table stores offsets and no line or column,
+			// and an occurrence whose location stopped at the file id cannot be
+			// checked against the source, which is what it exists for.
+			ev := row.Evidence
+			ev.Bytes = row.Bytes
+			out = append(out, ev)
 		}
 		rows[rel] = out
 	}
