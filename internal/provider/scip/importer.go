@@ -32,16 +32,34 @@ const fileNativeKey = "file:"
 //     binding before any fact exists, because the binding decides whether an
 //     occurrence that does not land on the pinned bytes fails the unit
 //     (verified: the index claims to describe these bytes and does not) or
-//     is skipped (unverified: discovery over bytes the index never saw);
+//     is skipped (unverified: discovery over bytes the index never saw). It
+//     also resolves the duplicate-path rule and rejects documents whose path
+//     escapes the project root, both of which must be known before the first
+//     fact of the first document is published;
 //   - pass 1: occurrences and symbols are spooled to the scratch database as
-//     they stream past; when a document ends its position encoding is known,
-//     so its definitions are converted against the pinned bytes, resolved,
-//     published and recorded in the on-disk symbol map;
-//   - pass 2: references are read back from the spool with the symbol map
-//     complete, so a forward or external reference resolves to the same
-//     identity a later definition minted; edges are grouped by relation
-//     identity on disk and published with one evidence row per distinct
-//     occurrence range.
+//     they stream past, each contributing its canonical digest to the
+//     document hash; when a document ends its position encoding is known, so
+//     its definitions are converted against the pinned bytes, resolved and
+//     recorded in the on-disk symbol map, and published unless the document
+//     is unchanged;
+//   - pass 2: references of the changed documents are read back from the
+//     spool with the symbol map complete, so a forward or external reference
+//     resolves to the same identity a later definition minted; edges are
+//     grouped by relation identity on disk and published with one evidence
+//     row per distinct occurrence range.
+//
+// Definitions are converted and resolved for **every** admitted document, not
+// only the changed ones, while facts are published only for changed
+// documents. A definition's canonical key is its file and byte range
+// (internal/reconcile.CanonicalKey), so an unchanged document's definitions
+// must be re-derived here or a reference from a changed document to a symbol
+// defined in an unchanged one would mint a second, unlocated identity instead
+// of naming the stored node — the measured "46 dangling occurrence errors" of
+// an incomplete splice, in the other direction
+// (docs/research/12-incremental-scip-lsp.md Section 3.5). The delta therefore
+// buys the storage, FTS and reconcile cost of the unchanged documents, which
+// is where almost all of the import cost lives; it does not buy their
+// position-conversion cost.
 type importer struct {
 	p        *Provider
 	req      provider.UnitRequest
@@ -54,6 +72,13 @@ type importer struct {
 	// ctx is the run context, carried for the walker's document callback,
 	// which takes none.
 	ctx context.Context
+
+	// previous is the stored unit's document manifest, or nil for a full
+	// import; manifest and delta are this run's result.
+	previous  *DocumentManifest
+	manifest  *DocumentManifest
+	delta     Delta
+	digestSeq int64
 
 	// indexHash is the SHA-256 of the index bytes being imported, which a
 	// supplied manifest must commit to; manifestUsable records whether the
@@ -69,6 +94,8 @@ type importer struct {
 	indexBytes uint64
 
 	skippedDocs, skippedOccurrences, truncatedEdges int64
+	outsideRoot, duplicatePaths, skippedAliases     int64
+	assumedEncoding                                 int64
 	partialCode                                     string
 }
 
@@ -97,6 +124,9 @@ type docRow struct {
 
 // run imports one index. open is called once per pass.
 func (im *importer) run(ctx context.Context, open opener) error {
+	if err := im.openDelta(ctx); err != nil {
+		return err
+	}
 	if im.profile == nil && im.p.manifestPath != "" {
 		if err := im.loadManifest(ctx); err != nil {
 			return err
@@ -125,7 +155,22 @@ func (im *importer) run(ctx context.Context, open opener) error {
 	if err := im.passRelationships(ctx); err != nil {
 		return err
 	}
-	return im.emitEdges(ctx)
+	if err := im.emitEdges(ctx); err != nil {
+		return err
+	}
+	// The fresh manifest is written from the documents this import admitted,
+	// and the delta the run reports is read back out of it by Diff, so the
+	// counts a caller sees and the classification a later refresh recomputes
+	// from the stored manifests come from one implementation.
+	m, err := im.writeManifest(ctx)
+	if err != nil {
+		return err
+	}
+	im.manifest = m
+	if im.delta, err = m.Diff(im.previous, nil); err != nil {
+		return err
+	}
+	return nil
 }
 
 // scanBinding streams the index once, reading only paths and text, and
@@ -141,6 +186,10 @@ func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceB
 	w := &walker{limits: im.p.limits, onGrow: im.reserve,
 		onMetadata: func(m metadata) error { meta = m; return nil },
 		onDocument: func(d document) error {
+			admitted, err := im.seeDocument(ctx, d)
+			if err != nil || !admitted {
+				return err
+			}
 			fv, ok, err := im.lookup(ctx, d.path)
 			if err != nil || !ok {
 				return err
@@ -335,6 +384,9 @@ func (im *importer) passDefinitions(ctx context.Context, open opener) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
 			}
+			if err := im.addDigest(ctx, doc, occurrenceDigest(o)); err != nil {
+				return err
+			}
 			r := pad(o.rng)
 			var e [4]any
 			if o.hasEnclosing {
@@ -348,8 +400,15 @@ func (im *importer) passDefinitions(ctx context.Context, open opener) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
 			}
+			if err := im.addDigest(ctx, doc, symbolDigest(s)); err != nil {
+				return err
+			}
 			return im.recordSymbol(ctx, doc, s)
 		},
+		// Index.external_symbols is an Index field, not a Document field
+		// (scip.proto). It is index-level state: it belongs to no path, it
+		// contributes to no document hash, and a refresh always re-imports it
+		// rather than sharing it per document.
 		onExternal: func(s symbolInfo, n int64) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
@@ -405,30 +464,54 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 	return nil
 }
 
-// endDocument binds a finished document to its snapshot file and publishes
-// its definitions. A document the snapshot does not hold, or whose encoding
-// the indexer left unspecified, or whose file exceeds the source bound, is
-// skipped and counted: nothing is guessed about it.
+// endDocument binds a finished document to its snapshot file, classifies it
+// against the stored manifest and resolves its definitions. A document the
+// snapshot does not hold, or whose encoding the indexer left unspecified, or
+// whose file exceeds the source bound, is skipped and counted: nothing is
+// guessed about it, and it stays out of the fresh manifest, so a later refresh
+// treats it as new rather than inheriting rows nothing stands behind.
+//
+// Definitions are always resolved; they are published only when the document
+// is changed. See the type comment for why the unchanged ones cannot simply be
+// walked past.
 func (im *importer) endDocument(d document) error {
 	ctx := im.ctx
+	admitted, err := im.admits(ctx, d)
+	if err != nil {
+		return err
+	}
+	if !admitted {
+		// Rejected by the project-root rule or superseded by a later
+		// document with the same path; both were counted in the pre-pass.
+		return im.dropSpool(ctx, d.index)
+	}
 	fv, ok, err := im.lookup(ctx, d.path)
 	if err != nil {
 		return err
 	}
+	encoding := im.resolveEncoding(d.encoding)
 	switch {
 	case !ok:
 		im.skippedDocs++
-		return nil
-	case columnEncoding(d.encoding) == "":
+		return im.dropSpool(ctx, d.index)
+	case columnEncoding(encoding) == "":
 		im.skippedDocs++
 		im.degrade(model.CodeProviderOutputInvalid)
-		return nil
+		return im.dropSpool(ctx, d.index)
 	case fv.Size > im.p.limits.MaxSourceFileBytes:
 		im.skippedDocs++
 		im.degrade(model.CodeResourceLimit)
-		return nil
+		return im.dropSpool(ctx, d.index)
 	}
-	row := docRow{idx: d.index, path: d.path, language: d.language, encoding: d.encoding, file: fv}
+	row := docRow{idx: d.index, path: d.path, language: d.language, encoding: encoding, file: fv}
+	hash, err := im.documentHash(ctx, row)
+	if err != nil {
+		return err
+	}
+	publish, err := im.classify(ctx, row, hash)
+	if err != nil {
+		return err
+	}
 	if err := im.sc.exec(ctx, `INSERT INTO docs(idx, path, lang, enc, file_id, content_hash, size) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		row.idx, row.path, row.language, row.encoding, string(fv.ID), fv.ContentHash, fv.Size); err != nil {
 		return err
@@ -437,7 +520,7 @@ func (im *importer) endDocument(d document) error {
 	if err != nil {
 		return err
 	}
-	return im.sc.each(ctx, `SELECT seq, symbol, roles, r0, r1, r2, r3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
+	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, r0, r1, r2, r3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
 		[]any{row.idx, roleDefinition}, func(scan func(...any) error) error {
 			var seq int64
 			var symbolText string
@@ -454,8 +537,26 @@ func (im *importer) endDocument(d document) error {
 			if e[0] != nil && e[1] != nil && e[2] != nil && e[3] != nil {
 				enclosing = &[4]int32{*e[0], *e[1], *e[2], *e[3]}
 			}
-			return im.defineSymbol(ctx, ds, symbolText, r, enclosing)
-		})
+			return im.defineSymbol(ctx, ds, symbolText, r, enclosing, publish)
+		}); err != nil {
+		return err
+	}
+	if publish {
+		return nil
+	}
+	// An unchanged document emits no reference, so its occurrences are not
+	// read again.
+	return im.dropSpool(ctx, row.idx)
+}
+
+// dropSpool discards the spooled records of a document no later pass reads.
+// The spool bound counts bytes ever spooled, not bytes live, so this bounds
+// the scratch file rather than refunding the charge.
+func (im *importer) dropSpool(ctx context.Context, doc int64) error {
+	if err := im.sc.exec(ctx, `DELETE FROM occ WHERE doc = ?`, doc); err != nil {
+		return err
+	}
+	return im.sc.exec(ctx, `DELETE FROM dochash WHERE doc = ?`, doc)
 }
 
 // degrade records the first reason the unit's capabilities are partial. An
@@ -478,6 +579,57 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 		return source.UTF32
 	}
 	return ""
+}
+
+// toolPositionEncoding is the measured column encoding of each indexer the
+// product ships, used only when a Document leaves `position_encoding`
+// unspecified.
+//
+// This is a named fact about named tools, not a guess about an unknown index.
+// Measured on this machine against a fixture whose line carries a 4-byte and a
+// 2-byte rune before an identifier, decoding every occurrence range under all
+// three encodings:
+//
+//	scip-go 0.2.7          position_encoding absent   columns are UTF-8
+//	scip-clang 0.4.0       position_encoding absent   columns are UTF-8
+//	rust-analyzer 1.98.0   position_encoding = UTF8   columns are UTF-8
+//	scip-typescript 0.4.0  position_encoding absent   columns are UTF-16
+//	scip-java              position_encoding absent   columns are UTF-16
+//	scip-python 0.6.6      position_encoding absent   columns are UTF-16
+//
+// scip-python is UTF-16 rather than the UTF-32 scip.proto suggests for Python
+// indexers, because it is a TypeScript program (a pyright fork), which is why
+// the table is measured and not read off the proto's advice.
+//
+// `Metadata.text_document_encoding` is deliberately not consulted. All six
+// indexers set it to UTF8 — including the three whose columns are UTF-16 —
+// because it describes the encoding of the source files on disk and scip.proto
+// says so; reading it as a position encoding would convert every UTF-16 column
+// as a byte offset and attribute compiler facts to the wrong bytes.
+//
+// A document of any other tool that does not declare its encoding stays
+// skipped: Section 9.3 forbids guessing one.
+func toolPositionEncoding(toolName string) int32 {
+	switch toolName {
+	case "scip-go", "scip-clang", "rust-analyzer":
+		return encodingUTF8
+	case "scip-typescript", "scip-java", "scip-python":
+		return encodingUTF16
+	}
+	return encodingUnspecified
+}
+
+// resolveEncoding is the encoding a document's ranges are converted in: the
+// document's own declaration, else the tool's measured encoding.
+func (im *importer) resolveEncoding(declared int32) int32 {
+	if columnEncoding(declared) != "" {
+		return declared
+	}
+	enc := toolPositionEncoding(im.meta.toolName)
+	if enc != encodingUnspecified {
+		im.assumedEncoding++
+	}
+	return enc
 }
 
 // loadSource reads one document's exact pinned bytes through the snapshot
@@ -525,10 +677,13 @@ func (im *importer) badRange(ds *docSource, msg string) error {
 		WithDetail("path", ds.doc.path)
 }
 
-// defineSymbol publishes one definition occurrence: the node, its scoped
-// alias, any may_refer_to alternatives, its containment extent for pass 2
-// and its entry in the symbol map.
-func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText string, r [4]int32, enclosing *[4]int32) error {
+// defineSymbol resolves one definition occurrence and records its identity,
+// its containment extent for pass 2 and its entry in the symbol map. When the
+// document is changed it also publishes the node, its scoped alias and any
+// may_refer_to alternatives; when the document is unchanged the storage writer
+// keeps the rows the previous run wrote, so publishing them again would
+// duplicate facts that were never invalidated.
+func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText string, r [4]int32, enclosing *[4]int32, publish bool) error {
 	sym, err := parseSymbol(symbolText)
 	if err != nil {
 		return err
@@ -567,16 +722,18 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 		return err
 	}
 	loc := location{file: ds.doc.file, rng: rng}
-	if err := im.putNode(ctx, res, sym.raw, "definition", loc, false); err != nil {
-		return err
-	}
-	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
-		return err
-	}
-	im.records++
-	for _, other := range res.Ambiguous {
-		if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to"); err != nil {
+	if publish {
+		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false); err != nil {
 			return err
+		}
+		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
+			return err
+		}
+		im.records++
+		for _, other := range res.Ambiguous {
+			if err := im.addEdge(ctx, res.Node.ID, model.RelMayReferTo, other, loc, sym.raw, "may_refer_to"); err != nil {
+				return err
+			}
 		}
 	}
 	if err := im.sc.exec(ctx, `INSERT OR IGNORE INTO defs(doc, start, end, node) VALUES(?, ?, ?, ?)`,
@@ -596,6 +753,15 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 // putNode publishes a resolved node with one evidence row at loc. Node
 // metadata carries the binding when it is unverified and marks an entity
 // that has no definition in this index as external.
+//
+// An external entity has no definition in this index, so it has no source
+// location and its evidence carries none: Section 9.3 requires an absent range
+// rather than a stand-in, and a referencing occurrence is a property of the
+// reference edge, which keeps it. Pinning the node's evidence to whichever
+// document happened to reference it first would also make an index-level fact
+// belong to one path's rows, and a refresh that changed a different document
+// would then publish a second evidence row for the same node on every pass
+// until the bound of Section 11.1 was reached.
 func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey, detail string, loc location, external bool) error {
 	node := res.Node
 	meta := map[string]any{}
@@ -604,6 +770,7 @@ func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey
 	}
 	if external {
 		meta["scip_external"] = true
+		loc = location{}
 	}
 	if len(meta) > 0 {
 		raw, err := json.Marshal(meta)
@@ -644,13 +811,16 @@ func (im *importer) addEdge(ctx context.Context, from model.NodeID, kind model.R
 }
 
 // passReferences is pass 2 over the spooled occurrences: every non-definition
-// occurrence becomes one occurrence of an edge from its innermost enclosing
-// definition (or the document's file node) to the referenced symbol's node.
+// occurrence of a changed document becomes one occurrence of an edge from its
+// innermost enclosing definition (or the document's file node) to the
+// referenced symbol's node. An unchanged document is skipped whole: its edges,
+// evidence and aliases are the rows the storage writer retains.
 func (im *importer) passReferences(ctx context.Context) error {
 	var after int64 = -1
 	for {
 		var page []docRow
-		err := im.sc.each(ctx, `SELECT idx, path, lang, enc, file_id, content_hash, size FROM docs WHERE idx > ? ORDER BY idx LIMIT 256`, []any{after},
+		err := im.sc.each(ctx, `SELECT d.idx, d.path, d.lang, d.enc, d.file_id, d.content_hash, d.size FROM docs d
+			JOIN docdelta x ON x.doc = d.idx AND x.publish = 1 WHERE d.idx > ? ORDER BY d.idx LIMIT 256`, []any{after},
 			func(scan func(...any) error) error {
 				var d docRow
 				var id, hash string
@@ -709,6 +879,9 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
+			if err := im.putCallsiteAlias(ctx, d.path, rng, to); err != nil {
+				return err
+			}
 			kind, detail := model.RelReferences, "reference"
 			switch {
 			case roles&roleImport != 0:
@@ -720,6 +893,26 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			}
 			return im.addEdge(ctx, from, kind, to, loc, sym.raw, detail)
 		})
+}
+
+// putCallsiteAlias publishes the Section 11.3 call-site alias for one
+// reference occurrence: the compiler-resolved symbol, keyed by the byte range
+// the reference occupies in this file version, in the file's alias scope. The
+// tree-sitter provider publishes the same key on the syntactic callee of every
+// call site it finds, so the reconciler merges the two identities wherever the
+// ranges are equal and the `calls` relation gains a precise target. See
+// callsite.go for the key.
+func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.SourceRange, to model.NodeID) error {
+	scopeKey, nativeKey, ok := callsiteAlias(p, rng)
+	if !ok {
+		im.skippedAliases++
+		return nil
+	}
+	if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: scopeKey, NativeKey: nativeKey, NodeID: to}}); err != nil {
+		return err
+	}
+	im.records++
+	return nil
 }
 
 // targetNode returns the node a referenced symbol resolves to: the node its
@@ -827,7 +1020,12 @@ func (im *importer) passRelationships(ctx context.Context) error {
 	var ds *docSource
 	for {
 		rows = rows[:0]
+		// A relationship's evidence is the source symbol's own definition, so
+		// the row belongs to the document that defines it; a relationship of a
+		// symbol defined in an unchanged document is one of the rows the
+		// storage writer retains and is not republished here.
 		err := im.sc.each(ctx, `SELECT r.key, r.target, r.flags, s.node, s.def_doc, s.def_start, s.def_end FROM rel r JOIN sym s ON s.key = r.key
+			JOIN docdelta x ON x.doc = s.def_doc AND x.publish = 1
 			WHERE s.node <> '' AND s.def_doc >= 0 AND (s.def_doc > ? OR (s.def_doc = ? AND r.key || char(0) || r.target > ?))
 			ORDER BY s.def_doc, r.key, r.target LIMIT 256`, []any{afterDoc, afterDoc, after},
 			func(scan func(...any) error) error {
@@ -976,4 +1174,17 @@ func (im *importer) result() model.ProviderResult {
 		r.Capabilities = append(r.Capabilities, model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode})
 	}
 	return r
+}
+
+// report is the full account of the run: the provider result plus the
+// per-document delta and every document and occurrence the import did not
+// admit. RecordsEmitted counts only what reached the sink, so an unchanged
+// document contributes nothing to it.
+func (im *importer) report() Report {
+	return Report{
+		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
+		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
+		SkippedOccurrences: im.skippedOccurrences, SkippedCallsiteAliases: im.skippedAliases,
+		TruncatedEdgeOccurrences: im.truncatedEdges, AssumedPositionEncoding: im.assumedEncoding,
+	}
 }
