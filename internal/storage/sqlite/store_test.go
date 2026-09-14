@@ -306,7 +306,11 @@ func TestStorePublicationScenario(t *testing.T) {
 	// build its unit, and confirm the pinned reader never sees the new node
 	// while the active pointer still resolves to gen1.
 	b2 := f.file("pkg/b.go", "package pkg\nfunc B() { changed() }\n")
-	snap2 := f.snapshot("two", a, b2)
+	// empty.go carries no bytes at all. It is in the snapshot, and later in a
+	// manifest, so the coverage phase below can prove that a zero-byte required
+	// file is not fully served by virtue of having nothing to read.
+	empty := f.file("pkg/empty.go", "")
+	snap2 := f.snapshot("two", a, b2, empty)
 	reader1, err := f.s.PinGeneration(ctx, f.repo, 0, time.Minute)
 	if err != nil {
 		t.Fatalf("PinGeneration: %v", err)
@@ -479,8 +483,8 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("FTS/database integrity after FTS-aware deletion: %v", err)
 	}
 	afterGC := f.stats()
-	if afterGC.Snapshots != 1 || afterGC.Files != 2 {
-		t.Fatalf("after collecting gen1: %d snapshots %d files, want 1 snapshot and 2 files (c.go collected)", afterGC.Snapshots, afterGC.Files)
+	if afterGC.Snapshots != 1 || afterGC.Files != 3 {
+		t.Fatalf("after collecting gen1: %d snapshots %d files, want 1 snapshot and 3 files (c.go collected, snap2's a.go/b.go/empty.go retained)", afterGC.Snapshots, afterGC.Files)
 	}
 	reader2, err := f.s.PinGeneration(ctx, f.repo, 0, time.Minute)
 	if err != nil {
@@ -520,8 +524,12 @@ func TestStorePublicationScenario(t *testing.T) {
 		RequestHash: model.H("req"), PolicyVersion: "p1", CanonicalHash: model.H("canon"), EntryCount: 1, SliceCount: 1,
 		Budget: model.Budget{MaxEstimatedTokens: 1000, MaxBytes: 4096, MaxFiles: 10, MaxSlices: 2}, Completeness: fixtureCaps, ScopeComplete: true,
 		EstimateMethod: "test-estimator", CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
-	entries := []model.ContextEntry{{Ordinal: 0, FileID: b2.id, Requirement: model.RequirementFull, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10, Reasons: []string{"seed"}}}
-	slices := []model.ContextSlice{{Index: 0, EntryOrdinals: []int{0}, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10}}
+	manifest.EntryCount = 2
+	entries := []model.ContextEntry{
+		{Ordinal: 0, FileID: b2.id, Requirement: model.RequirementFull, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10, Reasons: []string{"seed"}},
+		{Ordinal: 1, FileID: empty.id, Requirement: model.RequirementFull, EstimatedBytes: 0, EstimatedTokens: 0, Reasons: []string{"seed"}},
+	}
+	slices := []model.ContextSlice{{Index: 0, EntryOrdinals: []int{0, 1}, EstimatedBytes: int64(len(b2.content)), EstimatedTokens: 10}}
 	wrongKey := manifest
 	wrongKey.Binding.AnalysisKey = model.AnalysisKey(model.H("not", "this"))
 	if err := f.s.PutManifest(ctx, wrongKey, []byte(`{"task":"t"}`), entries, slices, nil); err == nil {
@@ -560,6 +568,87 @@ func TestStorePublicationScenario(t *testing.T) {
 	}
 	if err := f.s.IssueChunk(ctx, fresh); err != nil {
 		t.Fatalf("IssueChunk(current snapshot): %v", err)
+	}
+	// Phase: the coverage summary Status reads instead of paging every file.
+	// The silent failure it protects against is a summary that disagrees with
+	// Coverage's own state switch and so reports a session read-complete when
+	// it is not. The sharp case is the empty required file: it has no bytes, so
+	// no served range can ever exist for it, and a summary that derived
+	// "served == size" arithmetically would count it fully served the instant
+	// the session opened. It counts only once its zero-length EOF chunk is
+	// confirmed.
+	summary := func(step string) (int64, int64, int64) {
+		t.Helper()
+		required, served, waived, err := f.s.CoverageSummary(ctx, open.ID, actorID)
+		if err != nil {
+			t.Fatalf("CoverageSummary(%s): %v", step, err)
+		}
+		return required, served, waived
+	}
+	eof := model.IssuedChunk{ID: model.H("chunk", "eof"), SessionID: open.ID, ActorID: actorID, FileID: empty.id, ContentHash: empty.hash,
+		Bytes: model.ByteRange{Start: 0, End: 0}, ExpiresAt: time.Now().Add(time.Minute).UTC()}
+	if err := f.s.IssueChunk(ctx, eof); err != nil {
+		t.Fatalf("IssueChunk(zero-length EOF chunk over an empty file): %v", err)
+	}
+	if required, served, waived := summary("issued but unconfirmed"); required != 2 || served != 0 || waived != 0 {
+		t.Fatalf("summary with the EOF chunk issued but unconfirmed = %d required %d served %d waived, want 2/0/0; an unconfirmed chunk is not coverage", required, served, waived)
+	}
+	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{eof.ID}); err != nil {
+		t.Fatalf("ConfirmChunks(EOF): %v", err)
+	}
+	if required, served, waived := summary("EOF confirmed"); required != 2 || served != 1 || waived != 0 {
+		t.Fatalf("summary after confirming the EOF chunk = %d required %d served %d waived, want 2/1/0; an empty file is fully served only on a confirmed zero-length receipt", required, served, waived)
+	}
+	// The other branch of the same switch: a nonempty file counts only when the
+	// merged served union is exactly its size, so the partial prefix [0,8) must
+	// not count and the adjacent remainder must complete it.
+	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{fresh.ID}); err != nil {
+		t.Fatalf("ConfirmChunks(prefix): %v", err)
+	}
+	if required, served, waived := summary("partial prefix"); required != 2 || served != 1 || waived != 0 {
+		t.Fatalf("summary with only [0,8) of b.go confirmed = %d required %d served %d waived, want 2/1/0; a partial union is not full coverage", required, served, waived)
+	}
+	rest := fresh
+	rest.ID = model.H("chunk", "3")
+	rest.Bytes = model.ByteRange{Start: 8, End: uint64(len(b2.content))}
+	if err := f.s.IssueChunk(ctx, rest); err != nil {
+		t.Fatalf("IssueChunk(remainder): %v", err)
+	}
+	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{rest.ID}); err != nil {
+		t.Fatalf("ConfirmChunks(remainder): %v", err)
+	}
+	if required, served, waived := summary("union complete"); required != 2 || served != 2 || waived != 0 {
+		t.Fatalf("summary after the served union reaches b.go's size = %d required %d served %d waived, want 2/2/0", required, served, waived)
+	}
+	// The summary reimplements Coverage's state switch in SQL so Status costs
+	// one round trip; the two answering differently is the duplicate
+	// implementation Section 30.1 forbids, so assert agreement rather than only
+	// the absolute counts.
+	page, err := f.s.Coverage(ctx, open.ID, actorID, "", 10)
+	if err != nil {
+		t.Fatalf("Coverage: %v", err)
+	}
+	var paged int64
+	for _, fc := range page {
+		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed {
+			paged++
+		}
+	}
+	if _, served, _ := summary("agreement"); paged != served {
+		t.Fatalf("CoverageSummary says %d required files are fully served; paging Coverage says %d", served, paged)
+	}
+	// A waiver is audited beside coverage, never as coverage: it raises the
+	// waived count and leaves the served count alone (Section 17.3).
+	if _, err := f.s.Waive(ctx, model.WaiverRequest{SessionID: open.ID, ActorID: actorID, FileID: empty.id, Reason: "generated file reviewed out of band"}); err != nil {
+		t.Fatalf("Waive: %v", err)
+	}
+	if required, served, waived := summary("waived"); required != 2 || served != 2 || waived != 1 {
+		t.Fatalf("summary after waiving a required file = %d required %d served %d waived, want 2/2/1", required, served, waived)
+	}
+	if _, _, _, err := f.s.CoverageSummary(ctx, open.ID, "someone-else"); err == nil {
+		t.Fatal("CoverageSummary answered for another actor; coverage is never shared across actors")
+	} else {
+		wantCode(t, err, model.CodeActorMismatch)
 	}
 	// A capsule is the consolidate phase's completion record; a sweep session
 	// has nothing to consolidate yet.
