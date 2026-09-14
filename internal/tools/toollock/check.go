@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // runCheck re-downloads every payload the lock names and confirms that the
@@ -39,11 +41,8 @@ func runCheck(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := lock.validate(); err != nil {
-		return fmt.Errorf("lock is invalid before any download: %w", err)
-	}
 	var checked, bytesRead int64
-	for _, name := range sortedToolNames(lock) {
+	for _, name := range lock.Names() {
 		if filtered && !only[name] {
 			continue
 		}
@@ -64,6 +63,66 @@ func runCheck(ctx context.Context) error {
 		}
 	}
 	logf("verified %d payloads, %d bytes", checked, bytesRead)
+	return runtimeInstallCheck(ctx, lock, only, filtered)
+}
+
+// runtimeInstallCheck installs every entry the running platform carries through
+// internal/toolchain itself -- its fetcher, its digest verification, its
+// confined extractor and its entry hashing -- and fails the run on the first
+// refusal.
+//
+// The digest half above answers only "the lock describes what is published".
+// It answered that for three tools whose payloads the product could not install
+// at all, because they are single files rather than archives and this program's
+// own reader accepted shapes the extractor did not. A release gate that cannot
+// see the runtime's extractor is not the gate Section 11.7's "Verification"
+// paragraph asks for, so the runtime is what decides here. One platform per
+// runner is enough: the other five are covered by the digest half, and the
+// extractor is platform-independent.
+func runtimeInstallCheck(ctx context.Context, lock Lock, only map[string]bool, filtered bool) error {
+	store, err := filepath.Abs(filepath.Join(*flagWork, "runtime-store"))
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(store); err != nil {
+		return err
+	}
+	if !*flagKeep {
+		// The installed trees are several gigabytes and prove nothing once the
+		// run has passed.
+		defer func() { _ = os.RemoveAll(store) }()
+	}
+	if err := os.MkdirAll(store, dirMode); err != nil {
+		return err
+	}
+	r, err := toolchain.NewFromLock(lock, toolchain.Options{
+		DataDir:       store,
+		MaxFetchBytes: maxDownloadBytes,
+		FetchTimeout:  30 * time.Minute,
+	})
+	if err != nil {
+		return err
+	}
+	plat := toolchain.Current().Key()
+	var installed int
+	for _, name := range lock.Names() {
+		if filtered && !only[name] {
+			continue
+		}
+		if _, ok := lock.Tools[name].Platforms[plat]; !ok {
+			logf("skip %s: the lock carries no payload for %s", name, plat)
+			continue
+		}
+		start := time.Now()
+		tool, err := r.Resolve(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%s/%s: the runtime cannot install this payload: %w", name, plat, err)
+		}
+		installed++
+		logf("installed %s/%s argv=%v entry_sha256=%s in %s",
+			name, plat, tool.ArgvPrefix, tool.EntryChecksum, time.Since(start).Round(time.Second))
+	}
+	logf("installed %d payloads on %s through the runtime resolver", installed, plat)
 	return nil
 }
 

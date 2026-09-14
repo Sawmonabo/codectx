@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -46,7 +47,7 @@ func (m *Materialization) Close() error {
 			m.err = ioError("materialization cleanup", err)
 		}
 		if m.owner != nil {
-			unlock(m.owner)
+			fslock.Unlock(m.owner)
 			m.owner.Close()
 			if err := os.Remove(m.owner.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) && m.err == nil {
 				m.err = ioError("materialization cleanup", err)
@@ -81,7 +82,7 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 	if err != nil {
 		return nil, ioError("materialization lock", err)
 	}
-	if held, err := tryLock(owner); err != nil || !held {
+	if held, err := fslock.TryLock(owner); err != nil || !held {
 		owner.Close()
 		os.Remove(owner.Name())
 		if err == nil {
@@ -172,7 +173,7 @@ func sweepMaterializations(dir string) error {
 			errs = append(errs, ioError("materialization sweep", err))
 			continue
 		}
-		held, err := tryLock(f)
+		held, err := fslock.TryLock(f)
 		if err != nil || !held {
 			// Locked: its owner is alive.
 			f.Close()
@@ -184,7 +185,7 @@ func sweepMaterializations(dir string) error {
 		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
-		unlock(f)
+		fslock.Unlock(f)
 		f.Close()
 		if err := os.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, ioError("materialization sweep", err))

@@ -47,10 +47,12 @@ posture, a path root, any `[tools]` key, `workspace.follow_symlinks`,
 `storage.data_dir`, `context.strict_read_gate`, or
 `context.allow_exploratory_waiver_consolidation`.
 
-`enabled = "auto"` for an external analyzer means "use an already approved
-profile if one is available." It never means "run whatever is on `PATH`."
-Detecting a tool by running it with `--version` or `--help` is still execution
-and still requires an approved profile.
+`enabled = "auto"` for an external analyzer means "run every managed profile
+whose trigger evidence the snapshot holds." It never means "run whatever is on
+`PATH`": a managed profile names an entry in the embedded tool lock, so the
+analyzer it starts is a payload the shipped binary pinned and verified, never a
+command found on the host. Detecting a tool by running it with `--version` or
+`--help` is still execution, and it is execution of that pinned payload.
 
 ## `[workspace]` — source eligibility
 
@@ -191,7 +193,7 @@ for ordinary use.
 |---|---|---|
 | `offline` | `false` | Make every fetch a typed refusal without opening a socket. A tool already in the store still runs. |
 | `cache_dir` | `""` | Absolute path of the tool store. Empty resolves to `tools/` inside the data directory, created user-private. |
-| `mirror` | `""` | Absolute `http`/`https` URL prefix that replaces the host of every lock asset URL. The paths and the digests stay the lock's, so a mirror relocates bytes and never changes which bytes are accepted. |
+| `mirror` | `""` | Absolute `https` URL prefix serving every lock asset. It replaces the scheme and host and keeps the original host as the first path segment — `https://nodejs.org/dist/v22.23.2/node.tar.gz` becomes `<mirror>/nodejs.org/dist/v22.23.2/node.tar.gz` — so one mirror serves every publisher the lock names without their paths colliding. The digests stay the lock's, so a mirror relocates bytes and never changes which bytes are accepted. Plaintext `http` is rejected. A mirror answers `200` directly or redirects only within the upstream host's own set; a redirect to a host of the mirror's own is refused. |
 | `max_fetch_bytes` | `2147483648` | Ceiling on one payload download. |
 | `fetch_timeout` | `"10m"` | Deadline for one payload download. |
 
@@ -204,7 +206,7 @@ directories and network posture are product code, not configuration.
 
 | Key | Required | Meaning |
 |---|---|---|
-| `executable` | yes | Absolute path. A bare command name is rejected: what `PATH` resolves to is not what was named. |
+| `executable` | yes | Absolute path of a directly executable launcher. A bare command name is rejected: what `PATH` resolves to is not what was named. It must be a file the operating system can start on its own — not a `.jar` and not a `.js` entry point, even where the pinned tool is one: an override replaces the binary and never the invocation, so no managed runtime is composed around it and nothing supplies a `java -jar` or a `node` prefix. Overriding `scip-java`, `jdtls`, `scip-typescript`, `scip-python`, `typescript-language-server` or `pyright` therefore means naming a wrapper script, not the jar or the script the lock names. |
 | `version` | yes | The exact version this binary is, not a constraint. It is recorded as the identity of the tool behind the units it produces. |
 | `checksum` | yes | Lowercase hex SHA-256 of `executable`, verified at the start of every run. It is required, not optional: an override names a binary the lock does not describe, so without it the entry would admit whatever happens to sit at that path on the next run. |
 

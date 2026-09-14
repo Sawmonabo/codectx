@@ -77,7 +77,12 @@ const (
 	joernVersion  = "4.0.627"
 	goplsVersion  = "v0.23.0"
 	scipGoVersion = "v0.2.7"
-	tsVersion     = "5.9.3"
+	// scipGoPkg is the module's own declared path. The repository moved under a
+	// new owner and the release assets still live at the old one, so the URL a
+	// payload is pinned at and the package a payload is built from spell the
+	// project differently; both are scip-go v0.2.7.
+	scipGoPkg = "github.com/scip-code/scip-go/cmd/scip-go@" + scipGoVersion
+	tsVersion = "5.9.3"
 )
 
 var npmBuilds = map[string]npmBuild{
@@ -247,11 +252,14 @@ func catalog() []toolSpec {
 			Name: "scip-go", Version: "0.2.7", Kind: "indexer",
 			License: "Apache-2.0", Upstream: "https://github.com/sourcegraph/scip-go",
 			Entry: "scip-go", Languages: []string{"go"},
-			Notes: "Upstream publishes linux amd64/arm64 and darwin arm64 only. The other three platforms have no upstream binary and are absent from the map; gopls still serves Go there.",
+			Notes: "Upstream publishes linux amd64/arm64 and darwin arm64; the other three are cross-built from the pinned module at release time and hosted, which is the hybrid rule applied per platform rather than per tool.",
 			Platforms: map[string]platformPayload{
-				"linux_amd64":  {Entry: "scip-go", Src: scipGo("scip-go-linux-amd64.tar.gz")},
-				"linux_arm64":  {Entry: "scip-go", Src: scipGo("scip-go-linux-arm64.tar.gz")},
-				"darwin_arm64": {Entry: "scip-go", Src: scipGo("scip-go-darwin-arm64.tar.gz")},
+				"linux_amd64":   {Entry: "scip-go", Src: scipGo("scip-go-linux-amd64.tar.gz")},
+				"linux_arm64":   {Entry: "scip-go", Src: scipGo("scip-go-linux-arm64.tar.gz")},
+				"darwin_arm64":  {Entry: "scip-go", Src: scipGo("scip-go-darwin-arm64.tar.gz")},
+				"darwin_amd64":  {Entry: "scip-go", Build: &build{Kind: "go", Pkg: scipGoPkg}},
+				"windows_amd64": {Entry: "scip-go.exe", Build: &build{Kind: "go", Pkg: scipGoPkg}},
+				"windows_arm64": {Entry: "scip-go.exe", Build: &build{Kind: "go", Pkg: scipGoPkg}},
 			},
 		},
 		{

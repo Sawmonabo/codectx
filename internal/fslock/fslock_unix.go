@@ -1,6 +1,6 @@
 //go:build !windows
 
-package snapshot
+package fslock
 
 import (
 	"errors"
@@ -8,9 +8,9 @@ import (
 	"syscall"
 )
 
-// tryLock takes an exclusive advisory lock on f without blocking. It reports
+// TryLock takes an exclusive advisory lock on f without blocking. It reports
 // false when another descriptor holds it.
-func tryLock(f *os.File) (bool, error) {
+func TryLock(f *os.File) (bool, error) {
 	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err == nil {
 		return true, nil
@@ -21,15 +21,16 @@ func tryLock(f *os.File) (bool, error) {
 	return false, err
 }
 
-func unlock(f *os.File) error {
+// Unlock releases the lock TryLock took.
+func Unlock(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 }
 
-// syncDir makes a directory entry durable after a publication. POSIX requires
+// SyncDir makes a directory entry durable after a publication. POSIX requires
 // an fsync on the directory for a new name to survive a crash; a filesystem
 // that does not support it reports EINVAL or ENOTSUP, which is not a failure
 // of the publication itself.
-func syncDir(path string) error {
+func SyncDir(path string) error {
 	d, err := os.Open(path)
 	if err != nil {
 		return err

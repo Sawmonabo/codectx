@@ -278,9 +278,11 @@ type Tools struct {
 	// the toolchain owner creates user-private; this package resolves neither,
 	// exactly as it leaves Storage.DataDir's subdirectories alone.
 	CacheDir string `toml:"cache_dir"`
-	// Mirror replaces the host of every lock asset URL. The paths and the
-	// digests stay the lock's, so a mirror can relocate bytes but never change
-	// which bytes are accepted.
+	// Mirror is an absolute https prefix that replaces the scheme and host of
+	// every lock asset URL, keeping the original host as the first path segment
+	// so one mirror serves every publisher the lock names. The digests stay the
+	// lock's, so a mirror can relocate bytes but never change which bytes are
+	// accepted.
 	Mirror string `toml:"mirror"`
 	// MaxFetchBytes and FetchTimeout bound one payload download.
 	MaxFetchBytes int64    `toml:"max_fetch_bytes"`
