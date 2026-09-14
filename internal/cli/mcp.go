@@ -93,7 +93,7 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 					return err
 				}
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
 			if err != nil {
 				return err
 			}
