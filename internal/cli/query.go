@@ -640,6 +640,11 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 // pair as a precise symbol-level call.
 func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	if len(edges) == 0 {
+		// Silence here read as "this renderer emitted nothing". The rollup is
+		// built from containment edges, and a generation whose providers sealed
+		// none has no packages to aggregate -- which is an answer about the
+		// generation, not a missing section of the report.
+		b.WriteString("packages    none (no containment edges in this generation)\n")
 		return
 	}
 	fmt.Fprintf(b, "packages    %d aggregated %s (pair counts, not individual calls)\n",
