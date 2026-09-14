@@ -408,30 +408,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				// builds the one it needs: seed resolution is defined in terms of
 				// Search.Resolve and Search.Search, and a fake would be proving a
 				// fake.
-				dir := t.TempDir()
-				cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
-				if err != nil {
-					t.Fatalf("OpenCAS: %v", err)
-				}
-				for _, spec := range fixtureFiles {
-					if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
-						t.Fatalf("CAS.Put(%s): %v", spec.path, err)
-					}
-				}
-				signer, err := pagination.OpenSigner(dir)
-				if err != nil {
-					t.Fatalf("OpenSigner: %v", err)
-				}
-				spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, fx.Store)
-				if err != nil {
-					t.Fatalf("NewSpools: %v", err)
-				}
-				svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
-					Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
-					CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
-				if err != nil {
-					t.Fatalf("search.New: %v", err)
-				}
+				svc := searchService(t, fx)
 				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
 				if err != nil {
 					t.Fatalf("PinGeneration: %v", err)
@@ -840,9 +817,6 @@ func TestContextCompilerScenario(t *testing.T) {
 						t.Errorf("entry %d estimated_bytes = %d, want %d (wire %d + measured metadata %d)",
 							e.Ordinal, e.EstimatedBytes, want, wire, len(raw))
 					}
-					if e.EstimatedBytes <= wire {
-						t.Errorf("entry %d counted no metadata: estimated_bytes %d <= wire %d", e.Ordinal, e.EstimatedBytes, wire)
-					}
 					tokens, err := model.EstimateTokensUTF8Bytes(e.EstimatedBytes)
 					if err != nil {
 						t.Fatalf("EstimateTokensUTF8Bytes: %v", err)
@@ -850,6 +824,121 @@ func TestContextCompilerScenario(t *testing.T) {
 					if e.EstimatedTokens != tokens {
 						t.Errorf("entry %d estimated_tokens = %d, want %d", e.Ordinal, e.EstimatedTokens, tokens)
 					}
+				}
+			},
+		},
+		{
+			// Guards Section 15.4's "necessary floor": a file is transported
+			// ONCE however many symbols selected it, so charging its source to
+			// every entry over it budgets, floors and persists the file at a
+			// multiple of its real cost. The damage is not cosmetic — a plan
+			// that fits is refused with CTX_MINIMUM_BUDGET naming a budget
+			// larger than it needs, and a caller raising the budget to that
+			// floor is following a number that was never the requirement.
+			name: "a file selected through several symbols is charged its source once",
+			run: func(t *testing.T, fx *contextFixture) {
+				const path = "internal/order/ports.go"
+				cands, files := budgetRowInput(fx, []string{path}, model.RequirementFull)
+				// A second symbol of the SAME file: the port's method. Two
+				// entries, one transported file.
+				second := cands[0]
+				second.NodeID = model.NewNodeID(fx.Repo, model.NodeFunction, model.CanonicalNodeKey(path, "Save"))
+				second.ScoreMicros = cands[0].ScoreMicros - 1
+				cands = append(cands, second)
+				wire, err := wireEncodedBytes(fx.File(path).Size)
+				if err != nil {
+					t.Fatalf("wireEncodedBytes: %v", err)
+				}
+				// The file costs 676 bytes charged once and 760 charged per
+				// entry, so this cap admits exactly one of the two rules. The
+				// guard below fails the row rather than letting it go vacuous
+				// if the entry metadata ever changes size.
+				const sliceCap = 700
+				b, err := resolveBudget(model.Budget{MaxBytes: sliceCap}, fx.Cfg.Context)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err != nil {
+					t.Fatalf("a required file reached through two symbols did not fit a budget that holds it: %v", err)
+				}
+				if len(p.Entries) != 2 || len(p.Slices) != 1 {
+					t.Fatalf("plan holds %d entries in %d slices, want both symbols in one slice", len(p.Entries), len(p.Slices))
+				}
+				// The first entry of the file carries the source; its sibling
+				// carries its own measured metadata and nothing else.
+				raw0, err := json.Marshal(p.Entries[0])
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				if want := wire + int64(len(raw0)); p.Entries[0].EstimatedBytes != want {
+					t.Errorf("entry 0 estimated_bytes = %d, want %d (wire %d + measured metadata %d)",
+						p.Entries[0].EstimatedBytes, want, wire, len(raw0))
+				}
+				raw1, err := json.Marshal(p.Entries[1])
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				if want := int64(len(raw1)); p.Entries[1].EstimatedBytes != want {
+					t.Errorf("entry 1 estimated_bytes = %d, want %d (metadata alone: the file's %d wire bytes are already charged to entry 0)",
+						p.Entries[1].EstimatedBytes, want, wire)
+				}
+				total := p.Entries[0].EstimatedBytes + p.Entries[1].EstimatedBytes
+				if p.Slices[0].EstimatedBytes != total {
+					t.Errorf("slice 0 holds %d bytes, want the %d its entries report; the packer and the store must agree",
+						p.Slices[0].EstimatedBytes, total)
+				}
+				if total+wire <= b.MaxBytes {
+					t.Fatalf("the cap %d no longer discriminates between per-file and per-entry charging (per-file %d, per-entry %d)",
+						b.MaxBytes, total, total+wire)
+				}
+			},
+		},
+		{
+			// Guards the Section 15.4 stored-manifest cap, which the per-slice
+			// bounds do not imply: MaxSlices slices of MaxBytes each can be a
+			// manifest far larger than context.max_manifest_bytes. Without the
+			// check a compile silently persists a manifest above the
+			// deployment's own bound, and required scope is exempt from being
+			// dropped, never from the cap.
+			name: "a plan over the stored-manifest byte cap is refused rather than persisted",
+			run: func(t *testing.T, fx *contextFixture) {
+				paths := []string{"internal/order/ports.go", "internal/order/service.go"}
+				cands, files := budgetRowInput(fx, paths, model.RequirementFull)
+				cfg := fx.Cfg.Context
+				// Small enough that the two required files exceed it together,
+				// while every per-slice bound stays at its default.
+				cfg.MaxManifestBytes = 400
+				b, err := resolveBudget(model.Budget{}, cfg)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err == nil {
+					var total int64
+					for _, s := range p.Slices {
+						total += s.EstimatedBytes
+					}
+					t.Fatalf("a %d-byte manifest was accepted under a %d-byte cap", total, b.MaxManifestBytes)
+				}
+				var got *model.Error
+				if !errors.As(err, &got) || got.Code != model.CodeResourceLimit {
+					t.Fatalf("buildPlan error = %v, want code %s", err, model.CodeResourceLimit)
+				}
+				if got.Details["cap"] != "context.max_manifest_bytes" {
+					t.Errorf("error names cap %q, want the configuration key that caused it", got.Details["cap"])
+				}
+				bytes, err := strconv.ParseInt(got.Details["manifest_bytes"], 10, 64)
+				if err != nil {
+					t.Fatalf("manifest_bytes = %q, want the measured total: %v", got.Details["manifest_bytes"], err)
+				}
+				if bytes <= b.MaxManifestBytes {
+					t.Errorf("manifest_bytes = %d, which does not exceed the cap %d the refusal cites", bytes, b.MaxManifestBytes)
+				}
+				// The refusal must be the manifest cap, not a per-slice bound
+				// reached first, or the row would prove the wrong check.
+				if bytes > b.MaxBytes {
+					t.Errorf("the plan's %d bytes also exceed the per-slice budget %d; the row no longer isolates the manifest cap", bytes, b.MaxBytes)
 				}
 			},
 		},
@@ -1406,17 +1495,11 @@ func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool
 	return candidate{}, false
 }
 
-// intCompiler composes a Compiler over fx the way internal/app does: the real
-// search service for seed resolution and a GraphFactory over the fixture's
-// engine, which the shared builder composes neither of.
-//
-// Two clocks, deliberately. now is the caller's, and the row passes ONE
-// advancing clock to every compiler it builds, because a frozen instant would
-// make two compiles agree on CreatedAt by construction and the row asserts they
-// differ. The engine keeps the real clock (scopeEngine), because it derives a
-// context deadline and the fixture's frozen instant lies in the past, which
-// would expire every walk before its first edge.
-func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compiler {
+// searchService composes the real search.Service over fx's snapshot: its CAS
+// content, signer and spools. Seed resolution is defined in terms of
+// Search.Resolve and Search.Search, so a row that faked them would be proving
+// the fake; every row that needs discovery shares this composition.
+func searchService(t *testing.T, fx *contextFixture) *search.Service {
 	t.Helper()
 	dir := t.TempDir()
 	cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
@@ -1443,6 +1526,22 @@ func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compil
 		t.Fatalf("search.New: %v", err)
 	}
 	t.Cleanup(func() { svc.Close() })
+	return svc
+}
+
+// intCompiler composes a Compiler over fx the way internal/app does: the real
+// search service for seed resolution and a GraphFactory over the fixture's
+// engine, which the shared builder composes neither of.
+//
+// Two clocks, deliberately. now is the caller's, and the row passes ONE
+// advancing clock to every compiler it builds, because a frozen instant would
+// make two compiles agree on CreatedAt by construction and the row asserts they
+// differ. The engine keeps the real clock (scopeEngine), because it derives a
+// context deadline and the fixture's frozen instant lies in the past, which
+// would expire every walk before its first edge.
+func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compiler {
+	t.Helper()
+	svc := searchService(t, fx)
 	c, err := New(Options{
 		Store:  fx.Store,
 		Repo:   fx.Repo,
