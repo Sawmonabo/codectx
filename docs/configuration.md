@@ -134,14 +134,14 @@ All **user** trust.
 | `max_concurrent_queries` | `4` | Concurrent queries. |
 | `max_concurrent_graph_queries` | `2` | Concurrent graph queries; must not exceed `max_concurrent_queries`. |
 | `max_concurrent_heavy_analyzers` | `1` | Concurrent heavy analyzer runs. |
-| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. |
+| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
-| `query_timeout` | `"10s"` | Deadline for one query. |
+| `query_timeout` | `"10s"` | Deadline for one query. `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page; exceeding it is `CTX_QUERY_DEADLINE`, an explicit incomplete answer, never a persisted complete one. `--timeout` on those commands narrows it further and never widens it. |
 | `max_query_text_bytes` | `8192` | Largest query text. |
-| `max_query_terms` | `32` | Most terms in one query. |
-| `max_page_items` | `200` | Largest page. |
+| `max_query_terms` | `32` | Most terms in one query. Query text is tokenized with the index's own tokenizer, and a quoted phrase counts as one term. |
+| `max_page_items` | `200` | Largest page, and the bound `--limit` is clamped to. It is also the per-tier candidate bound of `codectx search`: a tier that fills it makes the answer report `truncated` with a reason rather than silently serving a short page. |
 | `max_provider_record_bytes` | `4194304` | Largest single provider record; must fit `index.batch_bytes`. |
 
 ## `[storage]` — SQLite and the data directory
@@ -157,7 +157,7 @@ All **user** trust.
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
-| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease. |
+| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. |
 
 ### The data directory
 

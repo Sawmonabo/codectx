@@ -4,8 +4,10 @@ Codebase intelligence for software-development agents: a Go CLI and MCP server
 that index a Git repository, keep the exact indexed bytes, and answer bounded
 structural queries.
 
-**Status: pre-release.** `codectx version` and `codectx tools` exist today; the
-other commands below land in later tasks and are shown as the target contract.
+**Status: pre-release.** `codectx version`, `codectx tools`, `codectx index`,
+`codectx refresh`, `codectx status`, `codectx watch`, `codectx search` and
+`codectx symbol` exist today; the other commands below land in later tasks and
+are shown as the target contract.
 
 ## Quick start
 
@@ -45,6 +47,36 @@ codectx tools gc                # drop versions this binary no longer pins
 
 `docs/toolchain.md` has the pinned set, the offline and mirror settings, and the
 per-platform matrix that proves each payload runs.
+
+## Discovery
+
+`codectx search` and `codectx symbol` answer over exactly one generation of the
+index, pinned for the whole request:
+
+```bash
+codectx search "retry backoff" --repo .            # ranked hits across every tier
+codectx search Authorize --kind method --limit 20  # filter by node kind
+codectx search Authorize --language go             # filter by language
+codectx symbol PaymentService.Authorize --repo .   # every candidate for a name
+```
+
+`search` runs five retrieval tiers -- exact path, exact qualified name,
+qualified-name prefix, exact name, and generation-local BM25 lexical retrieval
+-- and ranks them by tier first, then by an integer score, so the same query
+over the same generation always returns the same page. Hits carry the matched
+entity, its path and its source range, never source bodies.
+
+`symbol` resolves a name, qualified name or canonical node ID to every node
+that matches. An ambiguous name returns all the candidates rather than silently
+picking the first.
+
+Both take `--repo`, `--generation`, `--limit`, `--cursor`, `--timeout` and
+`--json`; `search` additionally takes repeatable `--kind` and `--language`. A
+page prints a continuation token as `next`: pass it back with
+`--cursor` to read the following page from the generation the first page was
+read from, which is why `--cursor` and `--generation` cannot be combined. A
+tampered, expired or foreign token is refused with `CTX_CURSOR_INVALID`
+(exit 8) rather than answered from a different question.
 
 If only the bundled structural providers are available the commands still work
 and report their precision; SCIP, LSP or dependence-engine analysis enriches the
