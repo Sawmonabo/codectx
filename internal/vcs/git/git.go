@@ -283,6 +283,41 @@ func (g *Git) Head(ctx context.Context, root string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
+// SymbolicRef returns the short branch name HEAD points at, or "" when HEAD is
+// detached or root is not a Git repository.
+//
+// The empty result is deliberately not interpreted here. Retention keys on the
+// ref a generation was built from (Section 12.4), and the caller decides what
+// a workspace with no branch is called: a detached HEAD is named by its HEAD
+// object id (two detached commits are two refs, each retained once) and a
+// non-Git workspace by the fixed sentinel "(none)". Mapping either inside this
+// package would put a storage policy in the Git driver and would also hide
+// which of the two cases occurred.
+//
+// --quiet makes "HEAD is not a symbolic ref" exit 1 with no diagnostic, which
+// is the detached case. A missing repository is Git's own fatal exit 128, and
+// only that message is read as "not a repository": any other failure — an
+// unreadable or damaged repository, a timeout — is returned as the typed error
+// it is, rather than collapsing into the same "" a caller would take for a
+// plain directory.
+func (g *Git) SymbolicRef(ctx context.Context, root string) (string, error) {
+	var out bytes.Buffer
+	result, stderr, err := g.runStderr(ctx, root, nil, &out, model.MaxPathBytes, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil {
+		if result.TimedOut || result.Canceled {
+			return "", err
+		}
+		if result.ExitCode == 1 {
+			return "", nil
+		}
+		if result.ExitCode == 128 && strings.Contains(stderr, "not a git repository") {
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
 // ListIndex streams every index entry (`git ls-files -z -s -t`) to visit. The
 // output is parsed as it arrives; no repository-sized list is built here. The
 // tag column distinguishes skip-worktree (sparse) entries from checked-out
@@ -513,8 +548,19 @@ func (g *Git) run(ctx context.Context, root string, sink io.Writer, maxStdout in
 // process.Spec.Env replaces the child environment wholesale, so the copy
 // carries everything the child may see; g.env itself is never appended to.
 func (g *Git) runEnv(ctx context.Context, root string, extraEnv []string, sink io.Writer, maxStdout int64, args ...string) (process.Result, error) {
+	result, _, err := g.runStderr(ctx, root, extraEnv, sink, maxStdout, args...)
+	return result, err
+}
+
+// runStderr is runEnv with Git's own first diagnostic line returned alongside
+// the result, for the one caller that must tell two documented exit conditions
+// apart rather than only report them. The excerpt is the same sanitized,
+// bounded text the error message carries, and LC_ALL=C is fixed for every run,
+// so the wording it is matched against does not depend on the operator's
+// locale.
+func (g *Git) runStderr(ctx context.Context, root string, extraEnv []string, sink io.Writer, maxStdout int64, args ...string) (process.Result, string, error) {
 	if !filepath.IsAbs(root) {
-		return process.Result{}, internal("git working directory must be absolute")
+		return process.Result{}, "", internal("git working directory must be absolute")
 	}
 	var stderr bytes.Buffer
 	argv := append(append([]string(nil), safeConfig...), args...)
@@ -541,9 +587,9 @@ func (g *Git) runEnv(ctx context.Context, root string, extraEnv []string, sink i
 			// first diagnostic line, sanitized, says why.
 			typed.Message = "git " + args[0] + " failed: " + excerpt(stderr.Bytes())
 		}
-		return result, err
+		return result, excerpt(stderr.Bytes()), err
 	}
-	return result, nil
+	return result, excerpt(stderr.Bytes()), nil
 }
 
 // excerpt returns the first line of Git's diagnostic with control characters
