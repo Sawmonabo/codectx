@@ -202,7 +202,6 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			NodeID:      hit.NodeID,
 			FileID:      hit.FileID,
 			Path:        hit.Path,
-			Kind:        hit.Kind,
 			Requirement: model.RequirementRecommended,
 			Origin:      originLexical,
 			Reasons:     []string{boundReason(fmt.Sprintf("the task text matches %q lexically", hit.Path))},
@@ -330,7 +329,6 @@ func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 	c := candidate{
 		NodeID:      n.ID,
 		FileID:      n.FileID,
-		Kind:        n.Kind,
 		Requirement: model.RequirementFull,
 		Origin:      origin,
 		Reasons:     []string{boundReason(reason)},
