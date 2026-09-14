@@ -46,7 +46,62 @@ func NewLocator(resolver *toolchain.Resolver) (*Locator, error) {
 	return &Locator{resolver: resolver}, nil
 }
 
-var _ dependence.EngineLocator = (*Locator)(nil)
+// LocateInstalled describes the engine without installing anything. It is the
+// construction-time half of the locator: the payload is reported only when the
+// store already holds it in a verified state, and a payload the lock pins but
+// the store does not hold is reported as absent rather than fetched.
+//
+// This is what keeps Section 11.6's guarantee that the provider never delays
+// base readiness. Resolving the payload here fetched roughly two gigabytes
+// inside every OpenWorkspace, in every repository, before the snapshot was even
+// captured and whether or not the planner would emit a dependence unit at all.
+// The first unit that actually needs the engine pays that cost instead, at unit
+// time, under the scheduler's reservation gate -- the same shape
+// internal/provider/scip uses for a deferred indexer kind.
+//
+// The second result is "the store holds it". false with a nil error is honest
+// absence, and the Engine returned then carries the payload's *pinned*
+// identity: the version the lock names and the fingerprint the payload will
+// have once it is installed. Section 11.6 folds Digest and RuntimeDigest into
+// the graph cache key and the provider descriptor's version, so a unit sealed
+// after the payload landed during this process must key exactly as one sealed
+// by a process that started with it already installed. PinnedFingerprint is
+// computed from the lock alone and is that same string, which is what makes the
+// two indistinguishable.
+//
+// Every other condition -- an unsupported platform, a corrupt store entry, an
+// invalid override, a resolver the user configured offline -- stays a typed
+// error, because none of them is repaired by running a unit later.
+func (l *Locator) LocateInstalled(ctx context.Context) (dependence.Engine, bool, error) {
+	t, installed, err := l.resolver.ResolveInstalled(ctx, lockName)
+	if err != nil {
+		return dependence.Engine{}, false, err
+	}
+	if installed {
+		e, err := l.describe(ctx, t)
+		if err != nil {
+			return dependence.Engine{}, false, err
+		}
+		return e, true, nil
+	}
+	digest, err := l.resolver.PinnedFingerprint(lockName)
+	if err != nil {
+		return dependence.Engine{}, false, err
+	}
+	// The version comes from the same embedded lock the resolver was built
+	// over: it is the one field of the identity that PinnedFingerprint folds
+	// but does not return, and reading it here costs no store access. It
+	// reaches `status` and the ledger through Detection.ObservedVersion, so an
+	// uninstalled payload reports the release it will run rather than nothing.
+	e := dependence.Engine{Version: toolchain.Embedded().Tools[lockName].Version, Digest: digest}
+	// A runtime whose identity cannot be pinned is not fatal for the same
+	// reason Locate's runtime resolution is not: the engine runs either way and
+	// the closure then records no runtime, which is honest rather than wrong.
+	if rt, err := l.resolver.PinnedFingerprint(runtimeLockName); err == nil {
+		e.RuntimeDigest = rt
+	}
+	return e, false, nil
+}
 
 // Locate installs and verifies the pinned payload and describes how to start
 // its two tools.
@@ -75,6 +130,13 @@ func (l *Locator) Locate(ctx context.Context) (dependence.Engine, error) {
 	if err != nil {
 		return dependence.Engine{}, err
 	}
+	return l.describe(ctx, t)
+}
+
+// describe turns one resolved payload into the neutral engine description.
+// Locate and LocateInstalled share it so an installed payload is described
+// identically whichever of the two observed it.
+func (l *Locator) describe(ctx context.Context, t toolchain.Tool) (dependence.Engine, error) {
 	export, err := exportArgv(t)
 	if err != nil {
 		return dependence.Engine{}, err
