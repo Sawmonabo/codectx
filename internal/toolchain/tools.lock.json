@@ -1,0 +1,860 @@
+{
+  "lock_version": 1,
+  "tools": {
+    "clangd": {
+      "name": "clangd",
+      "version": "22.1.6",
+      "kind": "server",
+      "license": "Apache-2.0 WITH LLVM-exception",
+      "upstream": "https://github.com/clangd/clangd",
+      "runtime": "",
+      "entry": "clangd_22.1.6/bin/clangd",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-mac-22.1.6.zip",
+          "sha256": "631aef462556cbd74e0ebaae1778a38d1997d0ba3371652ca54f82652a179e7d",
+          "size": 98113276,
+          "entry": "clangd_22.1.6/bin/clangd",
+          "entry_sha256": "cc2af2be80d293457527e124c0d346c565d4811ae7d0fc9ac019c4dc86050d18",
+          "provenance": "upstream"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-linux-22.1.6.zip",
+          "sha256": "a9c77443af2e447ed467e84771848d3a6ac1c56f84bcfcde717e66318de77cfa",
+          "size": 114790601,
+          "entry": "clangd_22.1.6/bin/clangd",
+          "entry_sha256": "610888fd300f157a234a8534dfb54c87fabb62a94c5acee575be3d40e52395b9",
+          "provenance": "upstream"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/clangd/clangd/releases/download/22.1.6/clangd-windows-22.1.6.zip",
+          "sha256": "ce54f16e0b4fd76d450eeda9664420b195360b73febcfe40e661108fa57f2ce1",
+          "size": 28198778,
+          "entry": "clangd_22.1.6/bin/clangd.exe",
+          "entry_sha256": "bb4eee3a389a1a417fa4d5397215edbca881b0c55f065d49f34927cfb2094e95",
+          "provenance": "upstream"
+        }
+      },
+      "languages": [
+        "c",
+        "cpp"
+      ],
+      "notes": "Upstream publishes x86_64 linux, macOS and Windows builds only; no digest sidecar."
+    },
+    "gopls": {
+      "name": "gopls",
+      "version": "0.23.0",
+      "kind": "server",
+      "license": "BSD-3-Clause",
+      "upstream": "https://pkg.go.dev/golang.org/x/tools/gopls",
+      "runtime": "",
+      "entry": "gopls",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-darwin-amd64.tar.gz",
+          "sha256": "2e0c9029ce27fa6193f29bc380ff6376af04e9600b080abd334ac8fade6936a3",
+          "size": 23219683,
+          "entry": "gopls",
+          "entry_sha256": "6c913a7da696eecdb03b7bd42f6c6ce3798de83210bc4804994212e786d4979d",
+          "provenance": "built"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-darwin-arm64.tar.gz",
+          "sha256": "b30b058476ec021e67d3bf57f43597e6fa19a52f6ee840d01aa693841953fb07",
+          "size": 21674581,
+          "entry": "gopls",
+          "entry_sha256": "4b1321eac82f622d3b5deac2a2f0b3aebc26faaeb7f7b4a3c046c50d4f9642fa",
+          "provenance": "built"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-linux-amd64.tar.gz",
+          "sha256": "ed3755d8ca2942660b7c00f44c8e7125c6d6dd669e48918270ea3acc472538f2",
+          "size": 22576028,
+          "entry": "gopls",
+          "entry_sha256": "5b26bb129164ab0abfc590a0a0645f4103436196ac68043ea251843a613e39d3",
+          "provenance": "built"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-linux-arm64.tar.gz",
+          "sha256": "88d769deb09c79140d53fd6481dcc3bd4f3644a167f24381b309542fc08c86c9",
+          "size": 20582837,
+          "entry": "gopls",
+          "entry_sha256": "46e5603ee58544797b2e48eed862ce5b2b66793d04aaaa08fd240cbd7669daa6",
+          "provenance": "built"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-windows-amd64.tar.gz",
+          "sha256": "70474a660836fd3ba3c6c728486dbf8c745d9b313434551dd382e50210e91987",
+          "size": 22828150,
+          "entry": "gopls.exe",
+          "entry_sha256": "c78a5c3469ded3e7d31463b3f04d9930160a5ef06923ba4fa21919b3b88456c0",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/gopls-0.23.0-windows-arm64.tar.gz",
+          "sha256": "8eef61db50c6fd141bb99fc410f7906a4ef7229363000971f5766b04cfe4d82b",
+          "size": 20695369,
+          "entry": "gopls.exe",
+          "entry_sha256": "1f14b095639193a992ba145df222ce43bfa28c815e6f1a494deac14f492a05d8",
+          "provenance": "built"
+        }
+      },
+      "languages": [
+        "go"
+      ],
+      "notes": "No upstream binaries exist; every platform is cross-built from the pinned module at release time."
+    },
+    "jdk": {
+      "name": "jdk",
+      "version": "21.0.12.1+1",
+      "kind": "runtime",
+      "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+      "upstream": "https://adoptium.net/temurin/releases/?version=21",
+      "runtime": "",
+      "entry": "jdk-21.0.12.1+1/bin/java",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_mac_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "44db0f08196daf19a47f90d13388b0c943b67663cb537f998fe29e836fa842ce",
+          "size": 194316575,
+          "entry": "jdk-21.0.12.1+1/Contents/Home/bin/java",
+          "entry_sha256": "f9af056b260f2084f9a8090e1ee0a0ebe57ab0282821e9ea190725134d282851",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:44db0f08196daf19a47f90d13388b0c943b67663cb537f998fe29e836fa842ce"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_aarch64_mac_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "3623232f33a9c3baadf304480b2535f9a3cba8a58d42ecbb438ba267315d9998",
+          "size": 200073404,
+          "entry": "jdk-21.0.12.1+1/Contents/Home/bin/java",
+          "entry_sha256": "9be1d0a740ff6502df1a762145e62860f5de4b7e17658d9cb9498da3acf9d16c",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:3623232f33a9c3baadf304480b2535f9a3cba8a58d42ecbb438ba267315d9998"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_linux_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94",
+          "size": 207473347,
+          "entry": "jdk-21.0.12.1+1/bin/java",
+          "entry_sha256": "2a207f5e7d075afa01d97f8048389a64432a44c4a5af0f5e77d6e286ec5f401d",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:ce79869e1307ed8ee1e2baa86a412b1eb5b75d10a01006d788a6f968bcfaee94"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_aarch64_linux_hotspot_21.0.12.1_1.tar.gz",
+          "sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223",
+          "size": 205641175,
+          "entry": "jdk-21.0.12.1+1/bin/java",
+          "entry_sha256": "95daec8bce7db9605dd12f77c0c16690fa015b5fadec8d5dc984e9f2aee046f4",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_x64_windows_hotspot_21.0.12.1_1.zip",
+          "sha256": "f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e",
+          "size": 205073461,
+          "entry": "jdk-21.0.12.1+1/bin/java.exe",
+          "entry_sha256": "82051fdab26319d77d20cc0065045d05ec00b3e3d05f44935d7c06b96b621d55",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:f9d6e191ab098c0d416e7d588a24420a8621cd2f4720dab2459b8b7b2d2d8b4e"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.12.1%2B1/OpenJDK21U-jdk_aarch64_windows_hotspot_21.0.12.1_1.zip",
+          "sha256": "ccf2e51f527d542a70ba5794a600d3aac04b4e967950e227834c7566cb1bec7b",
+          "size": 192680862,
+          "entry": "jdk-21.0.12.1+1/bin/java.exe",
+          "entry_sha256": "df4f0a01d3c9f1dd4201b51f102eb97f5dafe686a1907cfd766fa34ef85f0b55",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:ccf2e51f527d542a70ba5794a600d3aac04b4e967950e227834c7566cb1bec7b"
+        }
+      },
+      "notes": "Eclipse Temurin 21 LTS JDK; runtime for scip-java, jdtls and the dependence engine."
+    },
+    "jdtls": {
+      "name": "jdtls",
+      "version": "1.61.0",
+      "kind": "server",
+      "license": "EPL-2.0",
+      "upstream": "https://download.eclipse.org/jdtls/milestones/1.61.0/",
+      "runtime": "jdk",
+      "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+      "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        },
+        "darwin_arm64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        },
+        "linux_amd64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        },
+        "linux_arm64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        },
+        "windows_amd64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        },
+        "windows_arm64": {
+          "url": "https://download.eclipse.org/jdtls/milestones/1.61.0/jdt-language-server-1.61.0-202609031315.tar.gz",
+          "sha256": "338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64",
+          "size": 51037522,
+          "entry": "plugins/org.eclipse.equinox.launcher_1.8.0.v20260804-1928.jar",
+          "entry_sha256": "9b3b1da60813ac5fa09dd5c198f1884be7076d0a5daec54faa3f351a787e34b7",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:338e7e73d61836651ba2453919a0d34fa763eb4e7c03342092309bffb8934c64"
+        }
+      },
+      "languages": [
+        "java"
+      ],
+      "notes": "One platform-independent tarball carrying config_linux, config_mac and config_win; launched as `java -jar <equinox launcher>`."
+    },
+    "joern": {
+      "name": "joern",
+      "version": "4.0.627",
+      "kind": "cpg",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/joernio/joern",
+      "runtime": "jdk",
+      "entry": "joern-cli/joern-parse",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-x86_64.zip",
+          "sha256": "05619b23e6442cc88a18b51351444e8a68de9008dd32169113a38939042a510a",
+          "size": 1788168970,
+          "entry": "joern-cli/joern-parse",
+          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:82529f1e1c15f28986646d079b4799c1c0b5d205548ecb6ec75d3a83bb964454897ca2874521a3f23a1b785e6c15acd4ee865c69e870c267e0dabbf268fc2fc0"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-arm64.zip",
+          "sha256": "307aa0fab71f585780bdce5234af2cd4fe1c98ee411184d9b3f75ed04613b7b5",
+          "size": 1782363428,
+          "entry": "joern-cli/joern-parse",
+          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:d955cceef62db4d9d3dcbab81cc98c3f6cf4bceb71bcf6805e46adc6e986f83a0dc4ba985880353ed51348b462d44b09ea5d32e94514822bdf4134a323502c7b"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-x86_64.zip",
+          "sha256": "964655bdffeea5564eb4ed37f58b640c42226b43aae792aeca5f0e02796e120f",
+          "size": 1858298613,
+          "entry": "joern-cli/joern-parse",
+          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:9d82111631f6fc62a0280e20e40c84adb6875df295d1d50fa78a7b2913d00c1c83cfb7018911c45f1f203892185339633627745f8aaede02a2101b0e4d47bf3b"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-arm64.zip",
+          "sha256": "6b181cba5be8da6bd22131eb4616da2a0eb36941ffe6b03981c5f54ab2fea198",
+          "size": 1855668243,
+          "entry": "joern-cli/joern-parse",
+          "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:89a19b09e444b70266cbfb2cf12aab1b034c63c2d45217b2e3bbcc1d153906dc50a3649aeafec2eb67551865c29e30d6931d0489567bd8355ac606b10baced2c"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-x86_64.zip",
+          "sha256": "ef15bdf9d5980e131573d9327cda3b02c9fbdfad6e6d9af2ec232233cb07cc60",
+          "size": 1809069240,
+          "entry": "joern-cli/joern-parse.bat",
+          "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:4b158b39756669bdd1e8dc886f4107cdb50a63fb4c0ab8a705e5f305b51168cce0e0f2b8707ec73a554a4b5a25789425284d871ebb8d9fbfe8b986d190a84f04"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-arm64.zip",
+          "sha256": "b89ed4a68b594ba66ee520081132f1fc5af9bee329c6eae5b265a2c67b6634c4",
+          "size": 1803909501,
+          "entry": "joern-cli/joern-parse.bat",
+          "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
+          "provenance": "upstream",
+          "upstream_digest": "sha512:2c95805da89d9156ca12dd864d7cdfbdb3ab3ebec42e66086dd9eebfaa26aa9e5529f2333c8c67408070b3d11fa2b7e967627559732704e57736c45704506b22"
+        }
+      },
+      "languages": [
+        "go",
+        "typescript",
+        "tsx",
+        "javascript",
+        "python",
+        "java",
+        "c",
+        "cpp",
+        "rust"
+      ],
+      "notes": "Backend of the `dependence` provider. The sibling `joern-export` lives beside the entry in the same payload root."
+    },
+    "node": {
+      "name": "node",
+      "version": "22.23.2",
+      "kind": "runtime",
+      "license": "MIT AND ICU AND OpenSSL AND others (Node.js LICENSE)",
+      "upstream": "https://nodejs.org/dist/v22.23.2/",
+      "runtime": "",
+      "entry": "node-v22.23.2-linux-x64/bin/node",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-darwin-x64.tar.gz",
+          "sha256": "58e99022c2ff89395576cc7fd4d98cea24bb68081475d5f88b801ee8729fb026",
+          "size": 51246936,
+          "entry": "node-v22.23.2-darwin-x64/bin/node",
+          "entry_sha256": "0b4f059915f3bf3c6cbb02422f4a529bfb21cbbec2d29851c9a5d833f78a04f6",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:58e99022c2ff89395576cc7fd4d98cea24bb68081475d5f88b801ee8729fb026"
+        },
+        "darwin_arm64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-darwin-arm64.tar.gz",
+          "sha256": "61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6",
+          "size": 50068815,
+          "entry": "node-v22.23.2-darwin-arm64/bin/node",
+          "entry_sha256": "18e387c90ab8a8400183e8bdd396376e1e875b91b4c874b894dcade7b35bf572",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6"
+        },
+        "linux_amd64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.gz",
+          "sha256": "b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a",
+          "size": 56851233,
+          "entry": "node-v22.23.2-linux-x64/bin/node",
+          "entry_sha256": "3517c2df0b2f8cd7f422b4b8450ef81c6889f08eb03e281d6de9079b15e6a327",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a"
+        },
+        "linux_arm64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-arm64.tar.gz",
+          "sha256": "013b59cfd2819703a6f4a14ab891fc46fc2a4e3f5bcd92de3fb4929b43e35b30",
+          "size": 56749972,
+          "entry": "node-v22.23.2-linux-arm64/bin/node",
+          "entry_sha256": "1a638b0fe2b68da0489276aca95526c5122fc61ba54d6a2d0d00c1c92ab7b876",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:013b59cfd2819703a6f4a14ab891fc46fc2a4e3f5bcd92de3fb4929b43e35b30"
+        },
+        "windows_amd64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip",
+          "sha256": "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97",
+          "size": 35683585,
+          "entry": "node-v22.23.2-win-x64/node.exe",
+          "entry_sha256": "0d0f5e39f9f3d9587bc19f73eab3c2c9c4903fd02d6dbf9c853dd81b3d95fad4",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97"
+        },
+        "windows_arm64": {
+          "url": "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-arm64.zip",
+          "sha256": "fec025a6da31757e3b6af84c5a1628e9d38442ca99a2161091d78f2fcfa35ef3",
+          "size": 31418167,
+          "entry": "node-v22.23.2-win-arm64/node.exe",
+          "entry_sha256": "97cce5301a815d2dce07ac5bfd1e6039eae88185ec1d10ae4f8cb712f1732878",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:fec025a6da31757e3b6af84c5a1628e9d38442ca99a2161091d78f2fcfa35ef3"
+        }
+      },
+      "notes": "Node.js 22 LTS (Jod); runtime for the node-hosted indexers and servers."
+    },
+    "pyright": {
+      "name": "pyright",
+      "version": "1.1.414",
+      "kind": "server",
+      "license": "MIT",
+      "upstream": "https://www.npmjs.com/package/pyright",
+      "runtime": "node",
+      "entry": "node_modules/pyright/langserver.index.js",
+      "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-darwin-amd64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-darwin-arm64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-linux-amd64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-linux-arm64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-windows-amd64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-windows-arm64.tar.gz",
+          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
+          "size": 4140229,
+          "entry": "node_modules/pyright/langserver.index.js",
+          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
+          "provenance": "built"
+        }
+      },
+      "languages": [
+        "python"
+      ]
+    },
+    "rust-analyzer": {
+      "name": "rust-analyzer",
+      "version": "2026-08-17.4",
+      "kind": "indexer",
+      "license": "MIT OR Apache-2.0",
+      "upstream": "https://github.com/rust-lang/rust-analyzer",
+      "runtime": "",
+      "entry": "rust-analyzer-x86_64-unknown-linux-gnu",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-apple-darwin.gz",
+          "sha256": "134a7d305991de776864e43d1e6c291f60fa2888d4b9b7749864c562c5dc28b7",
+          "size": 14550902,
+          "entry": "rust-analyzer-x86_64-apple-darwin",
+          "entry_sha256": "7533fcf2770418d52c49f67d1267f2053bc90f19bad590f98da143913da4eba8",
+          "provenance": "upstream"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-apple-darwin.gz",
+          "sha256": "ece932daf2f077be87bf745d2eb0a62cbc550f4b1e2e31ca76dfafdd0cc599b3",
+          "size": 13829387,
+          "entry": "rust-analyzer-aarch64-apple-darwin",
+          "entry_sha256": "5142e0d6d0a48bc8ba0638125eaa68296defba7d32628362175eff967d12e145",
+          "provenance": "upstream"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-unknown-linux-gnu.gz",
+          "sha256": "a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901",
+          "size": 14834607,
+          "entry": "rust-analyzer-x86_64-unknown-linux-gnu",
+          "entry_sha256": "947d363b7bb74bfc07ec7b30e189b30426a7f7f100f81667f8a1c275a8e95722",
+          "provenance": "upstream"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-unknown-linux-gnu.gz",
+          "sha256": "941ad31c4256eec3c8457257b0fcfb696d2b4f80c0e5a996f7375a92130c2447",
+          "size": 14284102,
+          "entry": "rust-analyzer-aarch64-unknown-linux-gnu",
+          "entry_sha256": "9af7a48919c41e899ca30bcec333341caeb351ecc1a93ff43a5851cf38ae50f0",
+          "provenance": "upstream"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-pc-windows-msvc.zip",
+          "sha256": "3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2",
+          "size": 17452536,
+          "entry": "rust-analyzer.exe",
+          "entry_sha256": "3e1ca08e0468c9054cab61ec6d693bf04cdcfd5608f5940e824bb0d09adb32a3",
+          "provenance": "upstream"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-pc-windows-msvc.zip",
+          "sha256": "604562665e30aed593ec87397bfa157b4601e2d72f3a01bb8b32776302c179f2",
+          "size": 15618764,
+          "entry": "rust-analyzer.exe",
+          "entry_sha256": "805f54b18d28df26824c78b1061686144fb78a6d5120c8a4c7480b7731deb77a",
+          "provenance": "upstream"
+        }
+      },
+      "languages": [
+        "rust"
+      ],
+      "notes": "Also the Rust language server. Upstream publishes no digest sidecar for these assets."
+    },
+    "scip-clang": {
+      "name": "scip-clang",
+      "version": "0.4.0",
+      "kind": "indexer",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/sourcegraph/scip-clang",
+      "runtime": "",
+      "entry": "scip-clang-x86_64-linux",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_arm64": {
+          "url": "https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-arm64-darwin",
+          "sha256": "ff042fbc8a029f09f4b69fc7692e290e21c52923593207ee52d4e7439473ec64",
+          "size": 71043408,
+          "entry": "scip-clang-arm64-darwin",
+          "entry_sha256": "ff042fbc8a029f09f4b69fc7692e290e21c52923593207ee52d4e7439473ec64",
+          "provenance": "upstream"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-x86_64-linux",
+          "sha256": "06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784",
+          "size": 149130216,
+          "entry": "scip-clang-x86_64-linux",
+          "entry_sha256": "06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784",
+          "provenance": "upstream"
+        }
+      },
+      "languages": [
+        "c",
+        "cpp"
+      ],
+      "notes": "Upstream publishes linux x86_64 and darwin arm64 only; Windows and the other two use clangd for precise C/C++."
+    },
+    "scip-go": {
+      "name": "scip-go",
+      "version": "0.2.7",
+      "kind": "indexer",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/sourcegraph/scip-go",
+      "runtime": "",
+      "entry": "scip-go",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_arm64": {
+          "url": "https://github.com/sourcegraph/scip-go/releases/download/v0.2.7/scip-go-darwin-arm64.tar.gz",
+          "sha256": "f21b505452a8dbb270c18ec66690e583801f9e96cff1d72e84c004b7374ec672",
+          "size": 4970987,
+          "entry": "scip-go",
+          "entry_sha256": "dedb659aa95faa2bd45c4dd1f0dddba0e6277545a6cdbe9078a76ce38ea37cb3",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:f21b505452a8dbb270c18ec66690e583801f9e96cff1d72e84c004b7374ec672"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/sourcegraph/scip-go/releases/download/v0.2.7/scip-go-linux-amd64.tar.gz",
+          "sha256": "5bfe39016ca04f5b3b1cce41d1b63ea120a7d7e93b55407bfb17a6b02d18135a",
+          "size": 5315957,
+          "entry": "scip-go",
+          "entry_sha256": "fed9c4825132c13e8f4337da097536e3f6dfd90cb12c9f92691a97e59b73d1c3",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:5bfe39016ca04f5b3b1cce41d1b63ea120a7d7e93b55407bfb17a6b02d18135a"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/sourcegraph/scip-go/releases/download/v0.2.7/scip-go-linux-arm64.tar.gz",
+          "sha256": "6b93476c7578c5aeb5acacb41f8234c20130168271adea0db8d8ae63d1355acb",
+          "size": 4788503,
+          "entry": "scip-go",
+          "entry_sha256": "f8564bb80c87da37aee811be43c8f97e20a5857c3f63427f03121fe51125be2c",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:6b93476c7578c5aeb5acacb41f8234c20130168271adea0db8d8ae63d1355acb"
+        }
+      },
+      "languages": [
+        "go"
+      ],
+      "notes": "Upstream publishes linux amd64/arm64 and darwin arm64 only. The other three platforms have no upstream binary and are absent from the map; gopls still serves Go there."
+    },
+    "scip-java": {
+      "name": "scip-java",
+      "version": "0.13.1",
+      "kind": "indexer",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/sourcegraph/scip-java",
+      "runtime": "jdk",
+      "entry": "scip-java-v0.13.1",
+      "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/sourcegraph/scip-java/releases/download/v0.13.1/scip-java-v0.13.1",
+          "sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "size": 86321571,
+          "entry": "scip-java-v0.13.1",
+          "entry_sha256": "a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:a694cae143c32c5b6226362fb4bd268a8d13d3cd9b482819b3b0029a9a97b8fe"
+        }
+      },
+      "languages": [
+        "java"
+      ],
+      "notes": "One platform-independent launcher jar, published as a single unarchived file; the upstream sh preamble is tolerated by `java -jar`, so Windows is covered under the managed JDK."
+    },
+    "scip-python": {
+      "name": "scip-python",
+      "version": "0.6.6",
+      "kind": "indexer",
+      "license": "MIT",
+      "upstream": "https://www.npmjs.com/package/@sourcegraph/scip-python",
+      "runtime": "node",
+      "entry": "node_modules/@sourcegraph/scip-python/index.js",
+      "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-darwin-amd64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-darwin-arm64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-linux-amd64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-linux-arm64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-windows-amd64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-python-0.6.6-windows-arm64.tar.gz",
+          "sha256": "146f68f0e950538d7c6cb7eba750b84aaca17196468dc7bf904b50ccbc9ac9da",
+          "size": 6473265,
+          "entry": "node_modules/@sourcegraph/scip-python/index.js",
+          "entry_sha256": "ce60dd39157c8f52d8f9de8f060743e1135b697c52253de65521a19b84e19d2a",
+          "provenance": "built"
+        }
+      },
+      "languages": [
+        "python"
+      ],
+      "notes": "MIT, not Apache-2.0 like the other scip-* indexers: the package vendors pyright."
+    },
+    "scip-typescript": {
+      "name": "scip-typescript",
+      "version": "0.4.0",
+      "kind": "indexer",
+      "license": "Apache-2.0",
+      "upstream": "https://www.npmjs.com/package/@sourcegraph/scip-typescript",
+      "runtime": "node",
+      "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+      "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-darwin-amd64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-darwin-arm64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-linux-amd64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-linux-arm64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-windows-amd64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/scip-typescript-0.4.0-windows-arm64.tar.gz",
+          "sha256": "07a08665c1e6586b4b9f3233816c026b3f847e68b9234fb2779a5c512ebdc8fb",
+          "size": 4837127,
+          "entry": "node_modules/@sourcegraph/scip-typescript/dist/src/main.js",
+          "entry_sha256": "22104bf4323e7667ff0d6f38606937c467af2d6e1fda171203c2065d9b757979",
+          "provenance": "built"
+        }
+      },
+      "languages": [
+        "typescript",
+        "tsx",
+        "javascript"
+      ]
+    },
+    "typescript-language-server": {
+      "name": "typescript-language-server",
+      "version": "6.0.0",
+      "kind": "server",
+      "license": "Apache-2.0 (server) AND Apache-2.0 (TypeScript 5.9.3)",
+      "upstream": "https://www.npmjs.com/package/typescript-language-server",
+      "runtime": "node",
+      "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+      "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-darwin-amd64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-darwin-arm64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-linux-amd64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-linux-arm64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-windows-amd64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/typescript-language-server-6.0.0-windows-arm64.tar.gz",
+          "sha256": "713faedaaa63440d28eea6a18fec25c0417e458a81a7bd82ae85271df8ce4023",
+          "size": 5144609,
+          "entry": "node_modules/typescript-language-server/lib/cli.mjs",
+          "entry_sha256": "146b113929fd41f12fbe7342ba493adce2bf82a07cdc791d0b9678a17572bc46",
+          "provenance": "built"
+        }
+      },
+      "languages": [
+        "typescript",
+        "tsx",
+        "javascript"
+      ],
+      "notes": "Pinned with TypeScript 5.9.3: the server drives `tsserver.js`, which the 7.x package no longer ships."
+    }
+  }
+}
