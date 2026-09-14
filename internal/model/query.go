@@ -730,7 +730,7 @@ func (r PathResult) Validate() error {
 type ImpactEntry struct {
 	NodeID      NodeID         `json:"node_id"`
 	FileID      FileID         `json:"file_id,omitempty"`
-	Path        string         `json:"path,omitempty"`
+	Name        string         `json:"name,omitempty"`
 	Kind        NodeKind       `json:"kind"`
 	Direction   Direction      `json:"direction"`
 	Depth       int            `json:"depth"`
@@ -747,7 +747,7 @@ func (e ImpactEntry) Validate() error {
 	if err := optionalID("impact_entry.file_id", string(e.FileID)); err != nil {
 		return err
 	}
-	if err := boundField("impact_entry.path", e.Path, MaxPathBytes); err != nil {
+	if err := boundField("impact_entry.name", e.Name, MaxQualifiedNameBytes); err != nil {
 		return err
 	}
 	if !e.Kind.Valid() {
