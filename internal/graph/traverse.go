@@ -272,12 +272,17 @@ func pinnedCalls(dir model.Direction, op string) func(model.GraphRequest) error 
 	}
 }
 
-// continuationUnavailable rejects a request carrying a traversal cursor. This
-// package cannot yet decode one, and silently ignoring a cursor would restart
-// the walk from the seeds while the caller believed it was resuming -- which
-// would double-spend the cumulative budget the cursor exists to carry. A typed
-// refusal is the honest answer until the continuation lands; replacing this one
-// function with real cursor decoding is the whole change.
+// continuationUnavailable rejects a request carrying a traversal cursor.
+// Silently ignoring a cursor would restart the walk from the seeds while the
+// caller believed it was resuming, which would double-spend the cumulative
+// budget the cursor exists to carry, so a typed refusal is the honest answer.
+//
+// The traversal cursor CODEC exists (cursor.go: traversalCursor,
+// resumeTraversal, nextTraversalCursor, and the spool spill it writes), but no
+// operation issues or consumes one yet: the walks below expand from their seeds
+// in a single page. Offering the continuation is the work of threading
+// resumeTraversal into this function and nextTraversalCursor into the result,
+// and is deliberately not done here.
 func continuationUnavailable(cursor string) error {
 	if cursor == "" {
 		return nil
@@ -302,7 +307,11 @@ func resolveBound(requested, configured int) int {
 // own request check, run after the shared validation so it can trust the
 // request's shape.
 func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model.Direction,
-	kinds []model.RelationKind, pin func(model.GraphRequest) error) (model.GraphResult, error) {
+	kinds []model.RelationKind, pin func(model.GraphRequest) error) (res model.GraphResult, err error) {
+	// One deferred mapping covers Neighbors, Callers and Callees: a bare
+	// context failure from the adjacency reader becomes the Section 8 code for
+	// the state it is in, and anything already typed is left alone.
+	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
 		return model.GraphResult{}, err
 	}
@@ -314,6 +323,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 	if err := continuationUnavailable(req.Page.Cursor); err != nil {
 		return model.GraphResult{}, err
 	}
+	// The deadline wraps the gate as well as the walk, so waiting for a slot
+	// past the request deadline is the resource limit the caller must see, and
+	// every adjacency round trip below runs under Section 3's per-request
+	// deadline rather than only being checked between expansion steps.
+	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
+	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {
 			return model.GraphResult{}, err
