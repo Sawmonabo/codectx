@@ -87,7 +87,7 @@ type located struct {
 }
 
 func (e *emitter) locateFile(ctx context.Context, filename string) error {
-	rel := normalizePath(filename, e.opts.ProjectRoot)
+	rel := normalizePath(filename, e.opts.ProjectRoot, e.opts.UnitRoot)
 	fv, data, found, err := e.openSource(ctx, rel)
 	if err != nil {
 		return err
@@ -227,7 +227,7 @@ func (e *emitter) openSource(ctx context.Context, rel string) (fv model.FileVers
 // normalizePath turns an engine FILENAME into a slash-separated root-relative
 // path, or "" when it cannot be one. A synthetic name the frontend invents
 // for a package or an include set is not a path and never matches a file.
-func normalizePath(filename, root string) string {
+func normalizePath(filename, root, unitRoot string) string {
 	if filename == "" || strings.HasPrefix(filename, "<") {
 		return ""
 	}
@@ -242,6 +242,13 @@ func normalizePath(filename, root string) string {
 	p = path.Clean(filepath.ToSlash(p))
 	if p == "." || p == ".." || strings.HasPrefix(p, "../") || strings.HasPrefix(p, "/") {
 		return ""
+	}
+	// The export's paths are relative to the directory the engine parsed, so a
+	// unit below the repository root carries its own root as the prefix. The
+	// result is still checked against the pinned snapshot, which is what
+	// refuses a path the repository does not have.
+	if unitRoot != "" {
+		p = path.Join(unitRoot, p)
 	}
 	return p
 }

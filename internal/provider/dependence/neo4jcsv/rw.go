@@ -288,23 +288,26 @@ func (e *emitter) resolveTarget(ctx context.Context, a argument, depth int) (str
 
 // memberOf finds the declaration of a named field on a type. The base
 // expression's TYPE_FULL_NAME carries pointer and reference decoration the
-// TYPE_DECL does not, so it is stripped before the join.
+// TYPE_DECL does not, so it is stripped before the lookup.
+//
+// The lookup is a single primary-key read of the members map project()
+// materialized. It used to be a three-table join executed once per
+// field-access write site, over an unindexed m.name.
 func (e *emitter) memberOf(ctx context.Context, typeFullName, field string) (string, error) {
 	t := strings.Trim(strings.TrimPrefix(typeFullName, "&mut "), "*& ")
 	if t == "" || t == "ANY" || field == "" {
 		return "", nil
 	}
-	var id sql.NullString
-	err := e.sc.db.QueryRowContext(ctx, `SELECT MIN(m.id) FROM nodes t JOIN edges a ON a.label = 'AST' AND a.src = t.id
-		JOIN nodes m ON m.id = a.dst AND m.label = 'MEMBER'
-		WHERE t.label = 'TYPE_DECL' AND t.full_name = ? AND m.name = ?`, t, field).Scan(&id)
+	var id string
+	err := e.sc.db.QueryRowContext(ctx,
+		`SELECT id FROM members WHERE type_full_name = ? AND name = ?`, t, field).Scan(&id)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
 	if err != nil {
 		return "", internalErr("import reads/writes: %v", err)
 	}
-	return id.String, nil
+	return id, nil
 }
 
 // boundIdentifiers collects every identifier in one operator call's operand

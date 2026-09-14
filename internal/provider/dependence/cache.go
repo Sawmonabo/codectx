@@ -14,6 +14,7 @@ package dependence
 // a different analysis with the same name.
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"io/fs"
@@ -176,9 +177,13 @@ func (c *Cache) evict(keep string) {
 	if total <= c.budget {
 		return
 	}
+	// cmp.Compare, not int(a.modTime-b.modTime): the difference of two
+	// nanosecond timestamps overflows a 32-bit int, which would make the LRU
+	// order arbitrary on a 32-bit build and let eviction drop the most
+	// recently used graph.
 	slices.SortFunc(entries, func(a, b entry) int {
 		if a.modTime != b.modTime {
-			return int(a.modTime - b.modTime)
+			return cmp.Compare(a.modTime, b.modTime)
 		}
 		return strings.Compare(a.path, b.path)
 	})

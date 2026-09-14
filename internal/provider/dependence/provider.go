@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -97,12 +99,20 @@ type Provider struct {
 	engine   Engine
 }
 
-// New binds the engine backend and the export importer. The engine is
-// resolved by the backend before this point, so the descriptor version is
+// New binds the engine backend to the production export importer. The engine
+// is resolved by the backend before this point, so the descriptor version is
 // fixed for the process: a graph produced under one payload digest is never
 // confused with one produced under another, and an engine replaced under a
 // running process is not silently adopted.
-func New(backend Backend, importer Importer, opts Options) (*Provider, error) {
+func New(backend Backend, opts Options) (*Provider, error) {
+	return NewWithImporter(backend, defaultImporter{}, opts)
+}
+
+// NewWithImporter is New with the importer supplied. It exists for the tests
+// that drive the provider's failure paths without an engine: the fake backend
+// they need writes an export no real reader can import, so the two have to be
+// replaced together.
+func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provider, error) {
 	if backend == nil || importer == nil {
 		return nil, invalid("the dependence provider needs an engine backend and an export importer")
 	}
@@ -125,6 +135,7 @@ func New(backend Backend, importer Importer, opts Options) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
+	sweepPrivate(opts.DataDir)
 	return &Provider{backend: backend, importer: importer, opts: opts,
 		gov: NewGovernor(opts.UnitMemoryFloorBytes, opts.UnitMemoryCeilingBytes), cache: cache, engine: e}, nil
 }
@@ -232,13 +243,20 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
+	// BytesProcessed is the export bytes the import actually read, which is
+	// what this run processed and what the importer measured. The unit's
+	// source bytes are a different figure and are logged as source_bytes
+	// below; reporting them here would be a number no step of this run read.
 	result := model.ProviderResult{RunID: req.Run, State: model.RunSucceeded,
 		RecordsEmitted: uint64(report.Nodes + report.Relations + report.Aliases),
-		BytesProcessed: uint64(max(unit.Bytes, 0)),
+		BytesProcessed: report.BytesRead,
 		Capabilities:   pub.capabilities(unit.ScopeKey)}
 	slog.Info("dependence unit imported", "component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
 		"scope", unit.ScopeKey, "family", string(unit.Family), "source_files", unit.Files, "source_bytes", unit.Bytes,
 		"nodes", report.Nodes, "relations", report.Relations, "aliases", report.Aliases,
+		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
+		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
+		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes)
@@ -273,11 +291,57 @@ func (p *Provider) openRun(req provider.UnitRequest) (*runDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	root := filepath.Join(p.opts.DataDir, "dependence", "runs", "run-"+id[:16])
+	root := filepath.Join(runsRoot(p.opts.DataDir), "run-"+id[:16])
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, internalErr("the dependence run directory could not be created: " + err.Error())
 	}
 	return &runDir{root: root}, nil
+}
+
+// runsRoot and scratchRoot are the provider's two private working roots under
+// the data directory: one directory per run, and the staging databases the
+// importer creates. Both are swept at construction (sweepPrivate).
+func runsRoot(dataDir string) string    { return filepath.Join(dataDir, "dependence", "runs") }
+func scratchRoot(dataDir string) string { return filepath.Join(dataDir, "dependence", "scratch") }
+
+// maxSweptEntries bounds the startup sweep's directory scan, so a corrupted or
+// hand-filled private root can never turn provider construction into an
+// unbounded walk (Section 6: an explicit finite bound on every traversal).
+const maxSweptEntries = 4096
+
+// sweepPrivate removes everything left under the provider's private working
+// roots. defer covers every return and every panic but not SIGKILL or power
+// loss, and a killed unit leaves a materialization, a graph, an export and a
+// staging database behind — hundreds of megabytes for one unit. Nothing else
+// in the product knows these paths, so the sweep belongs here.
+//
+// Sweeping unconditionally at construction is safe because a workspace has one
+// cross-process owner (Section 6): no other process holds a run of this
+// provider while this one is being built, and no unit of this process has
+// started. A failure to remove an entry is logged and skipped rather than
+// failing construction: leftover disk is a defect, but refusing to index
+// because of it is worse.
+func sweepPrivate(dataDir string) {
+	if dataDir == "" {
+		return
+	}
+	for _, root := range []string{runsRoot(dataDir), scratchRoot(dataDir)} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		if len(entries) > maxSweptEntries {
+			entries = entries[:maxSweptEntries]
+		}
+		for _, e := range entries {
+			path := filepath.Join(root, e.Name())
+			if err := os.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				slog.Error("a stale dependence working directory was not removed", "component", component, "error", err)
+				continue
+			}
+			slog.Info("a stale dependence working directory was swept", "component", component, "name", e.Name())
+		}
+	}
 }
 
 func (r *runDir) path(name string) string { return filepath.Join(r.root, name) }
@@ -322,7 +386,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
-	report, err := p.importExport(ctx, req, unit, run.path("export"), sink)
+	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -466,12 +530,42 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 	return out, nil
 }
 
-// importExport streams one export into the sink. PreviousKeys is nil today, so
-// every import is a full one; the delta is wired when the importer's on-disk
-// key set has an owner (see docs/providers-dependence.md).
-func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, unit Unit, dir string, sink provider.Sink) (ImportReport, error) {
+// importExport streams one export into the sink.
+//
+// Every field the importer validates is filled from the request: an evidence
+// row is invalid without the unit, its provider version and the origin run, a
+// relation id cannot be derived without the repository, and a byte range
+// cannot be verified without the pinned snapshot bytes. ProjectRoot is the
+// absolute directory the engine parsed, because that is what the export's
+// absolute FILENAME values are admitted against, and unitRoot is that same
+// directory as a snapshot path: the export's relative paths are relative to
+// what the engine was given, so a unit below the repository root — a nested
+// module, or one part of a subdivided unit — needs its own root prefixed back
+// on, or every fact it publishes binds to a path the snapshot does not have
+// and the unit seals with nothing in it. ScratchDir keeps the staging database,
+// which holds source-derived graph content and was measured at 649 MB for a
+// 64 MB export, inside the provider's private data directory instead of the
+// system temp directory.
+//
+// Language is the source language recorded on the export's fileless nodes
+// only; a located node takes its language from the snapshot file. The family
+// is coarser than the language there (C++ nodes are tagged c, TypeScript and
+// TSX nodes javascript), which is accurate for every located fact and
+// approximate for the fileless remainder.
+//
+// PreviousKeys is deliberately absent: see the delta ruling in
+// docs/providers-dependence.md §Refresh and delta.
+func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, unit Unit,
+	source, unitRoot, dir string, sink provider.Sink) (ImportReport, error) {
+
+	scratch := scratchRoot(p.opts.DataDir)
+	if err := os.MkdirAll(scratch, 0o700); err != nil {
+		return ImportReport{}, internalErr("the dependence import scratch directory could not be created: " + err.Error())
+	}
 	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, ImportOptions{
-		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: unit.Root, Limits: p.opts.Limits})
+		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
+		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
+		Content: req.Content, ScratchDir: scratch})
 	if err != nil {
 		return ImportReport{}, err
 	}
@@ -497,6 +591,24 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
 		"children", len(children))
+	// Two parts of one subdivided unit legitimately describe the same entity —
+	// above all the external stub of a callee both parts reference — and
+	// storage keys a node fact by (unit, node) with no conflict clause, so the
+	// second row fails the whole unit and every fact of every part is lost.
+	// Subdivision is the only recovery from a reproducible crash, so it must
+	// survive a repeated identity. One dedupe sink for the unit's lifetime,
+	// with its seen set on disk, is what makes the parts one unit; dropping a
+	// repeat never weakens the put-order rule, because the identity it names
+	// was written by the part that published it first.
+	dedupeDir := run.path("dedupe")
+	if err := os.MkdirAll(dedupeDir, 0o700); err != nil {
+		return ImportReport{}, internalErr("the dependence dedupe directory could not be created: " + err.Error())
+	}
+	dedupe, err := neo4jcsv.NewDedupeSink(sink, dedupeDir)
+	if err != nil {
+		return ImportReport{}, err
+	}
+	defer dedupe.Close()
 	var total ImportReport
 	var admitted int
 	for i, child := range children {
@@ -521,7 +633,8 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		if exp.Class != FailureNone || !exp.Live {
 			continue
 		}
-		report, err := p.importExport(ctx, req, unit, dir, sink)
+		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
+			path.Join(unit.Root, child), dir, dedupe)
 		if err != nil {
 			return ImportReport{}, err
 		}
@@ -562,7 +675,16 @@ func childProjects(source string, unit Unit) ([]string, error) {
 	return out, nil
 }
 
-// merge accumulates the counts of one subdivided unit's parts.
+// merge accumulates the counts of one subdivided unit's parts. Every counter
+// the importer reports is summed: a figure that carried only the last part's
+// value would understate what the unit dropped, could not locate or refused,
+// which is exactly what those counters exist to make non-silent.
+//
+// Keys is deliberately not merged. A key set is one file on disk and the
+// unit's set is the union of its parts', which cannot be formed by addition;
+// a subdivided unit therefore reports the absent set, and the next refresh of
+// it is a full import. Inventing one part's set as the unit's would mis-diff
+// the whole unit at the next refresh.
 func merge(a, b ImportReport) ImportReport {
 	a.Nodes += b.Nodes
 	a.Relations += b.Relations
@@ -571,6 +693,14 @@ func merge(a, b ImportReport) ImportReport {
 	a.Changed += b.Changed
 	a.Unchanged += b.Unchanged
 	a.Removed += b.Removed
+	a.DroppedMethods += b.DroppedMethods
+	a.UnlocatedFacts += b.UnlocatedFacts
+	a.UnresolvedWrites += b.UnresolvedWrites
+	a.ClippedEvidence += b.ClippedEvidence
+	a.UnknownRows += b.UnknownRows
+	a.IgnoredFiles += b.IgnoredFiles
+	a.BytesRead += b.BytesRead
+	a.Keys = KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
 			a.UnknownLabels = map[string]int{}

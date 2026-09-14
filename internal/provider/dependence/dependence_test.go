@@ -86,7 +86,9 @@ func (b *fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (d
 
 // fakeImporter emits one method node per unit so a succeeded run actually puts
 // a fact through the sink, which is what makes "a failed export admits no
-// facts" a statement about storage rather than about a no-op.
+// facts" a statement about storage rather than about a no-op. It stands in for
+// the production importer only here, where the export is the fake backend's
+// stub rather than a real one; dependence.New binds the real reader.
 type fakeImporter struct{ report dependence.ImportReport }
 
 func (f fakeImporter) Import(ctx context.Context, dir string, res provider.Resolver,
@@ -137,7 +139,9 @@ func newProvider(t *testing.T, b *fakeBackend) provider.Provider {
 // test can run two units against the same graph cache.
 func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provider {
 	t.Helper()
-	p, err := dependence.New(b, fakeImporter{}, dependence.Options{DataDir: dataDir,
+	// NewWithImporter, not New: the fake backend writes an export no real
+	// reader can import, so the fault injection has to replace both.
+	p, err := dependence.NewWithImporter(b, fakeImporter{}, dependence.Options{DataDir: dataDir,
 		Timeout: 2 * time.Minute, CacheBytes: 1 << 20, Limits: providertest.Limits})
 	if err != nil {
 		t.Fatal(err)
