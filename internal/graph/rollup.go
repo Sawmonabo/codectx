@@ -18,16 +18,11 @@ import (
 // consumer can see that "app depends on lib" rests on nine edges without ever
 // being told which function called which.
 func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest) (model.Page[model.PackageEdge], error) {
-	// As in Impact: the request shape is validated at the boundary that built it;
-	// the engine enforces the seed it cannot work without and its own bounds.
-	if len(req.Start) == 0 {
-		return model.Page[model.PackageEdge]{}, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "package dependencies requires at least one start node"}
+	if err := req.Validate(); err != nil {
+		return model.Page[model.PackageEdge]{}, err
 	}
-	if req.Page.Cursor != "" {
-		return model.Page[model.PackageEdge]{}, (&model.Error{Code: model.CodeCursorInvalid,
-			Message: "package dependencies does not offer continuations"}).
-			WithDetail("endpoint", "package_dependencies")
+	if err := continuationUnavailable(req.Page.Cursor); err != nil {
+		return model.Page[model.PackageEdge]{}, err
 	}
 	ctx, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
@@ -40,18 +35,19 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		kinds = DefaultRelations()
 	}
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
-	pending, err := e.impactPendingRows(ctx, kinds)
+	pending, err := e.pendingDependence(ctx, kinds)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
 	if len(pending) > 0 {
 		meta.Completeness = pending
-		meta.Truncated = true
-		meta.TruncationReason = pendingTruncationReason
+		markTruncated(&meta, reasonDependence)
 	}
 
-	b := e.impactBudget(ctx, req.MaxVisited, req.MaxEdges)
-	acc := newImpactAccumulator(req.Start)
+	b := &budget{deadline: e.now().Add(e.limits.QueryTimeout)}
+	acc := newImpactAccumulator(req.Start, b,
+		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
+		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
 	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction: req.Direction,
 		Kinds:     kinds,
@@ -62,20 +58,28 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	if b.visited <= 0 || b.edges <= 0 {
-		markTruncated(&meta, "the traversal budget was exhausted before the rollup was complete")
+	if acc.reason != "" {
+		markTruncated(&meta, acc.reason)
 	}
 
 	items, rollupErr := e.rollupPackages(ctx, acc.Relations())
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
-	if len(items) > limit {
+	if limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems); len(items) > limit {
 		items = items[:limit]
-		markTruncated(&meta, "more package pairs than one page can carry")
+		markTruncated(&meta, reasonPageFull)
 	}
-	return model.Page[model.PackageEdge]{Meta: meta, Items: items}, nil
+	page := model.Page[model.PackageEdge]{Meta: meta, Items: items}
+	if err := page.Validate(); err != nil {
+		return model.Page[model.PackageEdge]{}, err
+	}
+	for _, item := range items {
+		if err := item.Validate(); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+	}
+	return page, nil
 }
 
 // rollupPackages aggregates symbol-level relations into distinct package pairs.

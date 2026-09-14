@@ -19,20 +19,11 @@ import (
 // already resolved, every bound arrives in Limits, and every fact arrives
 // through Adjacency.
 func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error) {
-	// The request shape -- id format, known kinds, known direction, bounded seed
-	// count -- is validated by model.ImpactRequest.Validate at the boundary that
-	// built it. The engine re-checks only what it alone owns: it must have
-	// something to expand from, and every bound it applies comes from Limits.
-	if len(req.Start) == 0 {
-		return model.ImpactResult{}, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "impact requires at least one start node"}
+	if err := req.Validate(); err != nil {
+		return model.ImpactResult{}, err
 	}
-	// Continuations are not offered for impact in this wave: a cursor this
-	// endpoint never issued is rejected rather than silently ignored, which
-	// would answer page 1 while the caller believes it asked for page 2.
-	if req.Page.Cursor != "" {
-		return model.ImpactResult{}, (&model.Error{Code: model.CodeCursorInvalid,
-			Message: "impact does not offer continuations"}).WithDetail("endpoint", "impact")
+	if err := continuationUnavailable(req.Page.Cursor); err != nil {
+		return model.ImpactResult{}, err
 	}
 	ctx, done, err := beginImpactQuery(ctx, e)
 	if err != nil {
@@ -42,21 +33,21 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.Imp
 
 	kinds := impactAllowlist(req.Relations)
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
-	pending, err := e.impactPendingRows(ctx, kinds)
+	// The deferred-dependence disclosure happens before the walk: a missing
+	// dependence edge must not read as a genuine absence of impact.
+	pending, err := e.pendingDependence(ctx, kinds)
 	if err != nil {
 		return model.ImpactResult{}, err
 	}
 	if len(pending) > 0 {
-		// Copied unchanged in State/DiagnosticCode: a deferred dependence build
-		// makes this answer non-exhaustive, and claiming otherwise would present
-		// missing facts as an absence of impact.
 		meta.Completeness = pending
-		meta.Truncated = true
-		meta.TruncationReason = pendingTruncationReason
+		markTruncated(&meta, reasonDependence)
 	}
 
-	b := e.impactBudget(ctx, req.MaxVisited, req.MaxEdges)
-	acc := newImpactAccumulator(req.Start)
+	b := &budget{deadline: e.now().Add(e.limits.QueryTimeout)}
+	acc := newImpactAccumulator(req.Start, b,
+		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
+		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
 	walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction: req.Direction,
 		Kinds:     kinds,
@@ -67,25 +58,20 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.Imp
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 		return model.ImpactResult{}, err
 	}
-	if b.visited <= 0 || b.edges <= 0 {
-		markTruncated(&meta, "the traversal budget was exhausted before impact was complete")
+	if acc.reason != "" {
+		markTruncated(&meta, acc.reason)
 	}
 
 	entries := acc.Entries(e.limits.MaxReasonPaths)
-	if len(entries) > model.MaxRecordsPerResult {
-		entries = entries[:model.MaxRecordsPerResult]
-		markTruncated(&meta, "more affected entities than one result can carry")
-	}
 	entries, hydrateErr := e.hydrateImpactEntries(ctx, entries)
 	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
 		return model.ImpactResult{}, err
 	}
-	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
-	if len(entries) > limit {
+	if limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems); len(entries) > limit {
 		entries = entries[:limit]
-		// No NextCursor: this endpoint issues none, so a truncated page says so
+		// No NextCursor: this endpoint issues none, so a full page says so
 		// instead of handing back a continuation that cannot be resumed.
-		markTruncated(&meta, "more affected entities than one page can carry")
+		markTruncated(&meta, reasonPageFull)
 	}
 	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
 		return model.ImpactResult{}, err
@@ -95,19 +81,19 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.Imp
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.ImpactResult{}, err
 	}
-	return model.ImpactResult{
-		Meta:         meta,
-		Entries:      entries,
-		Packages:     packages,
-		VisitedCount: acc.VisitedCount(),
-		EdgeCount:    acc.EdgeCount(),
-	}, nil
+	result := model.ImpactResult{
+		Meta:     meta,
+		Entries:  entries,
+		Packages: packages,
+		// Cumulative spend, the same accounting the traversal operations report.
+		VisitedCount: b.visited,
+		EdgeCount:    b.edges,
+	}
+	if err := result.Validate(); err != nil {
+		return model.ImpactResult{}, err
+	}
+	return result, nil
 }
-
-// pendingTruncationReason is the wording Section 11.6 requires when a
-// dependence-backed capability is still building. It names the product concept,
-// never the engine behind it.
-const pendingTruncationReason = "dependence units are still building"
 
 // beginImpactQuery applies the per-request deadline and the process-scoped
 // concurrency gate to one impact-family operation. The gate is acquired under
@@ -143,96 +129,6 @@ func impactAllowlist(requested []model.RelationKind) []model.RelationKind {
 	return append([]model.RelationKind(nil), requested...)
 }
 
-// resolveBound applies the "zero means the configured default" rule and clamps
-// a caller-supplied bound to the configured one: a request can ask for less
-// work than the deployment allows, never for more.
-func resolveBound(requested, configured int) int {
-	if requested <= 0 || requested > configured {
-		return configured
-	}
-	return requested
-}
-
-// impactBudget builds the cumulative work allowance for one walk. budget's
-// visited and edges fields are the REMAINING allowance, not a running count:
-// the caps have no other home (expandOptions carries only MaxDepth), so the
-// walk spends them down and a zero remainder is the signal that a hard bound
-// stopped the answer short.
-func (e *Engine) impactBudget(ctx context.Context, maxVisited, maxEdges int) *budget {
-	b := &budget{
-		visited: int64(resolveBound(maxVisited, e.limits.MaxVisited)),
-		edges:   int64(resolveBound(maxEdges, e.limits.MaxEdges)),
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		b.deadline = deadline
-	} else {
-		b.deadline = e.now().Add(e.limits.QueryTimeout)
-	}
-	return b
-}
-
-// impactPendingRows discloses a still-building dependence capability. It runs
-// only when the allowlist actually touches a dependence-only kind: `calls` has a
-// non-engine path, so a deferred dependence build does not make a calls answer
-// incomplete and must not be reported as if it did.
-//
-// A promoter raises the priority of the deferred work and folds its queue
-// position into the row's details. A failed promotion never fails the query --
-// the answer is still correct, merely still incomplete -- and report-mode
-// workspaces have no promoter at all.
-func (e *Engine) impactPendingRows(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, error) {
-	if !touchesDependenceOnly(kinds) {
-		return nil, nil
-	}
-	caps, err := e.adjacency.Capabilities(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var rows []model.CapabilityState
-	for _, c := range caps {
-		if c.ProviderID != dependenceProviderID || c.Details["reason"] != deferredReason {
-			continue
-		}
-		if e.promoter != nil {
-			if p, perr := e.promoter.Promote(ctx, c.ProviderID, c.Scope); perr == nil {
-				c = c.WithDetail("units", fmt.Sprintf("%d", p.Units)).
-					WithDetail("position", fmt.Sprintf("%d", p.Position))
-				if p.Estimate > 0 {
-					// An unmeasured estimate is reported as unmeasured rather
-					// than as zero, which would read as "ready now".
-					c = c.WithDetail("estimate_ms", fmt.Sprintf("%d", p.Estimate.Milliseconds()))
-				}
-			}
-		}
-		rows = append(rows, c)
-	}
-	return rows, nil
-}
-
-// dependenceProviderID and deferredReason are the landed spellings of the
-// deferred capability row (internal/index/status.go addDeferred). They are
-// matched, never re-invented, so the graph answer discloses exactly the row the
-// indexer published. Neither names the analysis engine.
-const (
-	dependenceProviderID = "dependence"
-	deferredReason       = "units_deferred"
-)
-
-// touchesDependenceOnly reports whether an allowlist contains a kind only the
-// dependence provider can produce.
-func touchesDependenceOnly(kinds []model.RelationKind) bool {
-	only := make(map[model.RelationKind]bool, 4)
-	for _, k := range DependenceOnly() {
-		only[k] = true
-	}
-	for _, k := range kinds {
-		if only[k] {
-			return true
-		}
-	}
-	return false
-}
-
 // impactPhaseError separates the three ways any phase of an impact answer can
 // end. A deadline is truncation with whatever is visible, never an error and
 // never "nothing is affected" -- which is why it wraps hydration, evidence and
@@ -241,12 +137,19 @@ func touchesDependenceOnly(kinds []model.RelationKind) bool {
 // away the truncated answer the walk just produced. A cancellation is the
 // caller's own stop; anything else is a real failure. errStopExpansion is the
 // visitor's own bounded stop and is not a failure at all.
+//
+// Both spellings of each condition are handled: the raw context error from a
+// phase that only checks ctx, and the typed CTX_QUERY_DEADLINE / CTX_CANCELED
+// the walk raises through checkWalk.
 func impactPhaseError(ctx context.Context, err error, meta *model.QueryMeta) error {
-	switch {
-	case err == nil, errors.Is(err, errStopExpansion):
+	if err == nil || errors.Is(err, errStopExpansion) {
 		return nil
-	case errors.Is(err, context.DeadlineExceeded):
-		markTruncated(meta, "the query deadline expired before impact was complete")
+	}
+	var typed *model.Error
+	switch {
+	case errors.Is(err, context.DeadlineExceeded),
+		errors.As(err, &typed) && typed.Code == model.CodeQueryDeadline:
+		markTruncated(meta, reasonDeadline)
 		return nil
 	case errors.Is(err, context.Canceled):
 		return model.Canceled(ctx.Err())
@@ -254,6 +157,11 @@ func impactPhaseError(ctx context.Context, err error, meta *model.QueryMeta) err
 		return err
 	}
 }
+
+// reasonDeadline is the truncation reason for an answer the query deadline cut
+// short. It names the bound, like every other truncation reason, so a caller
+// can tell a slow query from a budget that was too small.
+const reasonDeadline = "query deadline reached"
 
 // markTruncated records the first reason an answer fell short. The first reason
 // wins because it is the bound that actually stopped the work; overwriting it
@@ -284,19 +192,35 @@ type impactNode struct {
 // what keeps a cycle (a -> b -> c -> a) from producing two entries for the same
 // symbol -- while every later edge that reaches an already-admitted node still
 // contributes its reason.
+//
+// It is also where MaxVisited and MaxEdges are enforced: expand deliberately
+// does not know those caps, because only the caller can compare the cumulative,
+// cursor-carried spend in budget against the bounds the request resolved.
 type impactAccumulator struct {
-	seeds   []model.NodeID
-	isSeed  map[model.NodeID]bool
-	byNode  map[model.NodeID]*impactNode
-	order   []model.NodeID
-	edges   []model.Relation
-	edgeCnt int64
+	seeds      []model.NodeID
+	isSeed     map[model.NodeID]bool
+	byNode     map[model.NodeID]*impactNode
+	order      []model.NodeID
+	edges      []model.Relation
+	budget     *budget
+	maxVisited int64
+	maxEdges   int64
+	reason     string
 }
 
-func newImpactAccumulator(start []model.NodeID) *impactAccumulator {
+// reasonRecordCap is the truncation reason for an impact answer that found more
+// affected entities than one result may carry. It is distinct from the page
+// limit: the page bounds what this response returns, this bounds what the
+// ranking pass is allowed to hold at all.
+const reasonRecordCap = "affected entity record limit reached"
+
+func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges int64) *impactAccumulator {
 	a := &impactAccumulator{
-		isSeed: make(map[model.NodeID]bool, len(start)),
-		byNode: map[model.NodeID]*impactNode{},
+		isSeed:     make(map[model.NodeID]bool, len(start)),
+		byNode:     map[model.NodeID]*impactNode{},
+		budget:     b,
+		maxVisited: maxVisited,
+		maxEdges:   maxEdges,
 	}
 	for _, s := range start {
 		if a.isSeed[s] {
@@ -315,25 +239,38 @@ func newImpactAccumulator(start []model.NodeID) *impactAccumulator {
 func (a *impactAccumulator) Seeds() []model.NodeID { return a.seeds }
 
 // Visit is the expand visitor: one call per admitted edge, in frontier order.
+// state is the FRONTIER node the edge left from, so the node this edge affects
+// is the other end of it, one hop deeper and one edge cost further away.
 func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error {
-	a.edgeCnt++
+	switch {
+	case a.budget.edges >= a.maxEdges:
+		a.reason = reasonEdgeBudget
+		return errStopExpansion
+	case a.budget.visited >= a.maxVisited:
+		a.reason = reasonVisitedBudget
+		return errStopExpansion
+	case len(a.order) >= model.MaxRecordsPerResult:
+		a.reason = reasonRecordCap
+		return errStopExpansion
+	}
 	a.edges = append(a.edges, rel)
-	if a.isSeed[state.Node] {
+	reached := otherEndpoint(state.Node, rel)
+	if a.isSeed[reached] {
 		// A seed is the thing being changed, not something the change affects.
 		return nil
 	}
 	direction := impactEdgeDirection(state.Node, rel)
-	reason := impactReason(rel.Kind, direction, state.Depth)
-	entry, ok := a.byNode[state.Node]
+	depth := state.Depth + 1
+	reason := impactReason(rel.Kind, direction, depth)
+	entry, ok := a.byNode[reached]
 	if !ok {
 		entry = &impactNode{
-			id: state.Node, depth: state.Depth, cost: state.Cost,
-			direction: direction, via: rel.ID,
-			parent: otherEndpoint(state.Node, rel),
-			seen:   map[string]bool{},
+			id: reached, depth: depth, cost: state.Cost + Cost(rel.Kind),
+			direction: direction, via: rel.ID, parent: state.Node,
+			seen: map[string]bool{},
 		}
-		a.byNode[state.Node] = entry
-		a.order = append(a.order, state.Node)
+		a.byNode[reached] = entry
+		a.order = append(a.order, reached)
 	}
 	if direction == model.DirectionIncoming {
 		// A node reachable both ways under DirectionBoth is reported as
@@ -349,21 +286,21 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 	return nil
 }
 
-// impactEdgeDirection is the Section 14.3 discriminator. The walk admitted
-// state.Node through rel, so which end of rel it landed on says which way we
-// walked: landing on the source means something upstream points at the seed and
-// may need modification (incoming); landing on the target means the seed points
-// at it and it may need reading (outgoing). A self-edge lands on both and is
-// reported as incoming, the stronger of the two claims.
-func impactEdgeDirection(node model.NodeID, rel model.Relation) model.Direction {
-	if rel.From == node {
-		return model.DirectionIncoming
+// impactEdgeDirection is the Section 14.3 discriminator, read off the frontier
+// node the edge left from: an edge leaving that node lands on something the
+// seed depends on, which may need reading (outgoing); an edge arriving at it
+// comes from something that depends on the seed and may need modification
+// (incoming). A self-edge leaves and arrives at once and is reported as
+// outgoing, then upgraded to incoming by the visitor.
+func impactEdgeDirection(owner model.NodeID, rel model.Relation) model.Direction {
+	if rel.From == owner {
+		return model.DirectionOutgoing
 	}
-	return model.DirectionOutgoing
+	return model.DirectionIncoming
 }
 
-// otherEndpoint is the node an edge was traversed from, given the node it
-// reached.
+// otherEndpoint is the node an edge reaches, given the frontier node it left
+// from.
 func otherEndpoint(node model.NodeID, rel model.Relation) model.NodeID {
 	if rel.From == node {
 		return rel.To
@@ -380,11 +317,6 @@ func impactReason(kind model.RelationKind, dir model.Direction, depth int) strin
 	}
 	return fmt.Sprintf("this symbol %s it (outgoing, depth %d)", kind, depth)
 }
-
-func (a *impactAccumulator) EdgeCount() int64 { return a.edgeCnt }
-
-// VisitedCount counts the seeds plus every node the walk admitted.
-func (a *impactAccumulator) VisitedCount() int64 { return int64(len(a.seeds) + len(a.byNode)) }
 
 // Relations returns every admitted edge, for the package rollup that rides on
 // the same walk.

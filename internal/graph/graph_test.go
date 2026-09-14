@@ -388,32 +388,17 @@ func TestGraphScenarios(t *testing.T) {
 			// an unexplained ranking a caller cannot act on -- and a cyclic graph
 			// (n-a -> n-b -> n-c -> n-a) that admits a node twice would double the
 			// same symbol and inflate its apparent impact. It also holds the
-			// deferred-dependence disclosure, which no real index can produce
-			// (a completed run drains the deferred queue), so this fixture is its
+			// deferred-dependence disclosure, which no completed real index can
+			// produce (the run drains the deferred queue), so this fixture is its
 			// only proof.
 			name: "impact entries are explained, directed and deduplicated across a cycle",
 			run: func(t *testing.T, f *graphFixture) {
-				// expand is lane L1's; against L0's typed stub the walk admits
-				// nothing, so this row waits for traverse.go rather than passing
-				// vacuously. It runs in full the moment that lane lands.
-				// The probe passes inert but VALID options: a zero expandOptions
-				// has a nil Budget, which the real body may dereference before it
-				// notices there are no seeds.
-				probe := expandOptions{
-					Direction: model.DirectionOutgoing, MaxDepth: 1, BatchSize: adjacencyBatch,
-					Budget: &budget{visited: 1, edges: 1, deadline: time.Now().Add(time.Minute)},
-				}
-				if typed, ok := expand(context.Background(), f, nil, probe,
-					func(frontierState, model.Relation) error { return nil }).(*model.Error); ok &&
-					typed.Code == model.CodeInternal && typed.Details["operation"] == "expand" {
-					t.Skip("expand is still lane L1's stub; this row runs once traverse.go lands")
-				}
 				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
 				res, err := engine.Impact(context.Background(), model.ImpactRequest{
-					Start:     []model.NodeID{"n-a"},
+					Start:     []model.NodeID{fixtureNodeID("n-a")},
 					Direction: model.DirectionOutgoing,
 				})
 				if err != nil {
@@ -428,7 +413,7 @@ func TestGraphScenarios(t *testing.T) {
 						t.Errorf("node %q appears twice; the cycle admitted it more than once", entry.NodeID)
 					}
 					seen[entry.NodeID] = true
-					if entry.NodeID == "n-a" {
+					if entry.NodeID == fixtureNodeID("n-a") {
 						t.Error("the seed n-a is reported as affected by its own change")
 					}
 					if len(entry.Reasons) == 0 {
@@ -439,10 +424,8 @@ func TestGraphScenarios(t *testing.T) {
 							entry.NodeID, entry.Direction)
 					}
 					// Every reason must end in the direction and the depth of the
-					// edge that contributed it; a reason that names neither is an
-					// unexplained ranking. Checked by suffix rather than with a
-					// new import, because an import line in this shared file is a
-					// merge conflict with every other lane.
+					// edge that contributed it; a reason naming neither is an
+					// unexplained ranking.
 					for _, reason := range entry.Reasons {
 						named := false
 						for depth := 0; depth <= fixtureLimits().MaxDepth; depth++ {
@@ -456,15 +439,15 @@ func TestGraphScenarios(t *testing.T) {
 						}
 					}
 				}
-				if !seen["n-c"] {
+				if !seen[fixtureNodeID("n-c")] {
 					t.Error("n-c is missing; it is reachable only through the cycle")
 				}
 				// The default impact allowlist includes reads and writes, so the
 				// deferred dependence row must be disclosed unchanged and the
 				// answer must not claim to be exhaustive.
-				if !res.Meta.Truncated || res.Meta.TruncationReason != pendingTruncationReason {
+				if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDependence {
 					t.Errorf("meta = (%v, %q), want truncated with %q",
-						res.Meta.Truncated, res.Meta.TruncationReason, pendingTruncationReason)
+						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
 				}
 				if len(res.Meta.Completeness) != 1 {
 					t.Fatalf("completeness rows = %d, want the one deferred dependence row", len(res.Meta.Completeness))
