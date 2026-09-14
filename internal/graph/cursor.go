@@ -304,8 +304,11 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 		// Nothing left to resume from: the walk is complete.
 		return "", nil
 	}
-	if len(c.Frontier) > 0 && e.spools == nil {
-		// Spilling is disabled, so the frontier cannot survive the response.
+	// A frontier OR an already-admitted visited set has to survive the
+	// response, and both live in the spool; with spilling disabled neither can,
+	// so the walk stops here rather than resuming without them.
+	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0
+	if needsSpool && e.spools == nil {
 		return "", nil
 	}
 	next := traversalCursor{
@@ -321,7 +324,7 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 		Edges:        b.edges,
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
-	if len(c.Frontier) > 0 || len(c.Visited) > 0 {
+	if needsSpool {
 		id, err := e.spill(next, c)
 		if err != nil {
 			return "", err
