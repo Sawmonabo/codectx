@@ -58,6 +58,10 @@ const maxScoreMicros = seedContribution + maxBoostMicros
 // Candidate Status must already be hydrated for the active-change boost to see
 // a captured change; the compile hydrates file metadata once and the budget
 // pass reuses it.
+//
+// It is not idempotent: it narrows each candidate's Paths to the routes it
+// retained, so a second call over the same slice would resolve precision for
+// only that subset and re-score against it. Rank once per compile.
 func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands []candidate,
 	relations map[model.RelationID]model.Relation) ([]candidate, error) {
 	if reader == nil {
@@ -376,7 +380,7 @@ func boostsFor(cand candidate, routed routeScore,
 		total += boostActiveChange
 		reasons = append(reasons, fmt.Sprintf("the working tree has a captured change (%s)", cand.Status))
 	}
-	if associatedTestOrContract(cand, routed) {
+	if associatedTestOrContract(routed) {
 		total += boostAssociatedTest
 		reasons = append(reasons, "an admitted route reaches it as a test or contract of the scope")
 	}
@@ -405,15 +409,17 @@ func isCapturedChange(s model.FileStatus) bool {
 }
 
 // associatedTestOrContract reports whether the candidate is an associated test
-// or contract of the scope: an admitted route arriving over a tests, implements,
-// overrides or extends edge, or a test node the expansion reached.
-func associatedTestOrContract(cand candidate, routed routeScore) bool {
+// or contract of the scope: an admitted route arrives over a tests, implements,
+// overrides or extends edge. The trigger is the edge and never the node kind,
+// so a file merely named like a test cannot claim the boost without a sealed
+// relation saying it tests something in scope.
+func associatedTestOrContract(routed routeScore) bool {
 	for _, k := range []model.RelationKind{model.RelTests, model.RelImplements, model.RelOverrides, model.RelExtends} {
 		if _, ok := routed.kinds[k]; ok {
 			return true
 		}
 	}
-	return cand.Kind == model.NodeTest && len(routed.admittedEdges) > 0
+	return false
 }
 
 // packageOf is the walk-local package key: the directory holding the
