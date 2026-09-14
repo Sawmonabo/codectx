@@ -181,7 +181,8 @@ func matchesKinds(n sqlite.StoredNode, kinds []model.NodeKind) bool {
 // returns their candidates in tier order, each already carrying its path. A
 // node that matches more than one tier appears once, at its most specific tier.
 // limit bounds each tier, so the result holds at most 4*limit candidates; the
-// caller's heap and dedup own the global bound.
+// caller's heap and dedup own the global bound. The second return reports that
+// some tier filled that bound, which the caller turns into QueryMeta.Truncated.
 //
 // Every candidate scores 0 (digest §4, Q6): tier rank, not score, separates the
 // exact tiers, and a candidate that also matched lexically keeps that score when
@@ -193,11 +194,12 @@ func matchesKinds(n sqlite.StoredNode, kinds []model.NodeKind) bool {
 // one, and this package's digest does not say what a Paths entry means (the only
 // precedent, model.FileSelection.Paths, is an exact file list). The caller owns
 // those two filters.
-func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, error) {
+func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, bool, error) {
 	paths := newPathResolver(r)
+	full := false
 	out, err := pathCandidates(ctx, r, query, kinds, limit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	seen := make(map[model.NodeID]struct{}, len(out))
 	for _, hit := range out {
@@ -206,19 +208,23 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 	for _, tier := range exactTiers {
 		nodes, err := r.Nodes(ctx, nodeFilterFor(tier, query, kinds), "", limit)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
+		// A tier that filled its bound had more to give. Section 14.3 forbids
+		// dropping those silently, so the caller reports the answer as
+		// truncated instead of serving a confidently short page.
+		full = full || len(nodes) >= limit
 		for _, n := range nodes {
 			if _, duplicate := seen[n.Node.ID]; duplicate || supersededByLowerTier(tier, n, query) {
 				continue
 			}
 			p, err := paths.path(ctx, n.Node.FileID)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			seen[n.Node.ID] = struct{}{}
 			out = append(out, exactHit{Tier: tier, Path: p, Node: n})
 		}
 	}
-	return out, nil
+	return out, full, nil
 }

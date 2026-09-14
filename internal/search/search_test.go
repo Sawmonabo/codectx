@@ -2,9 +2,7 @@ package search
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"math"
 	"path/filepath"
@@ -95,18 +93,25 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("EnsureRepository: %v", err)
 	}
 
+	// The bodies live in a real content store: SearchHit.Range is hydrated
+	// from the CAS through source.Cursor, so a fixture that only recorded blob
+	// metadata would prove a nil Range rather than a served source position.
+	cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
+	if err != nil {
+		t.Fatalf("OpenCAS: %v", err)
+	}
 	hashes := make(map[string]string, len(fixtureDocs))
 	files := make([]model.FileVersion, 0, len(fixtureDocs))
 	for _, d := range fixtureDocs {
-		sum := sha256.Sum256([]byte(d.body))
-		hash := hex.EncodeToString(sum[:])
+		rec, err := cas.Put(ctx, strings.NewReader(d.body))
+		if err != nil {
+			t.Fatalf("CAS.Put(%s): %v", d.path, err)
+		}
+		hash := rec.Hash
 		hashes[d.path] = hash
 		id := model.NewFileID(f.repo, d.path)
 		f.files[d.path] = id
 		f.nodes[d.path] = model.NewNodeID(f.repo, model.NodeFunction, model.CanonicalNodeKey(d.path, d.name))
-		rec := model.BlobRecord{Hash: hash, Size: int64(len(d.body)),
-			BlockDigests:    []string{hash},
-			LineCheckpoints: []model.LineCheckpoint{{ByteOffset: 0, LineNumber: 1, LineStartByte: 0}}}
 		if err := st.PutBlob(ctx, rec); err != nil {
 			t.Fatalf("PutBlob(%s): %v", d.path, err)
 		}
@@ -165,7 +170,7 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("NewSpools: %v", err)
 	}
-	f.opts = Options{Store: st, Repo: f.repo, Signer: signer, Spools: spools,
+	f.opts = Options{Store: st, Repo: f.repo, Signer: signer, Spools: spools, Content: cas,
 		Resources: config.Defaults().Resources, CursorTTL: pagination.DefaultCursorTTL,
 		Now: func() time.Time { return time.Now().UTC() }}
 	return f
@@ -594,7 +599,7 @@ func legCursorRejections(t *testing.T, f *fixture) {
 // page at all; one that parsed loosely would resume at the wrong tier.
 func legResolveKeyset(t *testing.T, f *fixture) {
 	node := f.nodes["pkg/alpha.go"]
-	key := resolveKey(model.TierQualifiedNamePrefix, node)
+	key := resolveKey(model.TierQualifiedNamePrefix, string(node))
 	if len(key) > 1024 {
 		t.Fatalf("the keyset key is %d bytes, over the Cursor.LastKey bound", len(key))
 	}
@@ -602,7 +607,7 @@ func legResolveKeyset(t *testing.T, f *fixture) {
 	if err != nil {
 		t.Fatalf("parseResolveKey: %v", err)
 	}
-	if rank != model.TierQualifiedNamePrefix.Rank() || got != node {
+	if rank != model.TierQualifiedNamePrefix.Rank() || got != string(node) {
 		t.Fatalf("round trip = (%d, %q), want (%d, %q)", rank, got, model.TierQualifiedNamePrefix.Rank(), node)
 	}
 	c := newCursor(endpointSymbol, f.binding, model.H("lease", "2"), symbolQueryHash(model.SymbolRequest{Query: "Handle"}), time.Now().Add(time.Minute))
@@ -853,10 +858,14 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 		t.Error("the served hit carries no source range")
 	}
 	for i, hit := range page.Items {
-		if hit.Tier == model.TierLexicalFTS {
-			continue
-		}
-		if hit.ScoreMicros != 0 {
+		// Digest §4 zeroes the exact and prefix tiers "unless the document
+		// also matched lexically, keeping that score", which is exactly what
+		// the top hit here does: its node's two lexical documents fold into
+		// the exact candidate. The exemption is read off the hit's own
+		// reasons, with the production spelling, so it can only apply to a
+		// hit the lexical tier really contributed to.
+		lexical := hit.Tier == model.TierLexicalFTS || slices.Contains(hit.Reasons, reasonFor(model.TierLexicalFTS))
+		if !lexical && hit.ScoreMicros != 0 {
 			t.Errorf("hit %d is tier %q with ScoreMicros = %d, want 0", i, hit.Tier, hit.ScoreMicros)
 		}
 		if i > 0 && page.Items[i-1].Tier.Rank() > hit.Tier.Rank() {

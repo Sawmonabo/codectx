@@ -178,11 +178,11 @@ func (c *collector) truncation() (bool, string) { return c.truncated, c.reason }
 // and never scans a file from byte zero.
 const maxRangeWindowBytes = source.CheckpointBytes
 
-// fileReader, blobReader and contentReader are the three narrow reads range
+// fileReader, blobReader and ContentReader are the three narrow reads range
 // hydration needs. They are interfaces, not the concrete *sqlite.PinnedReader,
-// *sqlite.Store and *snapshot.CAS, because the frozen Options of digest §2
-// carries no CAS: the integration lane supplies the CAS it already opens (see
-// the report) and this package stays free of a snapshot import.
+// *sqlite.Store and *snapshot.CAS, so this package stays free of a snapshot
+// import; ContentReader is exported because Options.Content is how the
+// composition root hands the service the CAS it already opens.
 type fileReader interface {
 	File(ctx context.Context, id model.FileID) (model.FileVersion, error)
 }
@@ -191,7 +191,9 @@ type blobReader interface {
 	Blob(ctx context.Context, hash string) (model.BlobRecord, error)
 }
 
-type contentReader interface {
+// ContentReader reads one bounded byte window out of the content-addressed
+// store. *snapshot.CAS satisfies it.
+type ContentReader interface {
 	ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error)
 }
 
@@ -202,14 +204,14 @@ type contentReader interface {
 type hydrator struct {
 	files   fileReader
 	blobs   blobReader
-	content contentReader
+	content ContentReader
 	// blobOf caches one BlobRecord per file for the life of one page: the
 	// hits of a page cluster in a handful of files, and re-reading the same
 	// blob row per hit would be the dominant cost of hydration.
 	blobOf map[model.FileID]model.BlobRecord
 }
 
-func newHydrator(files fileReader, blobs blobReader, content contentReader) *hydrator {
+func newHydrator(files fileReader, blobs blobReader, content ContentReader) *hydrator {
 	return &hydrator{files: files, blobs: blobs, content: content, blobOf: make(map[model.FileID]model.BlobRecord)}
 }
 
