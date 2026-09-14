@@ -123,7 +123,12 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			"only: the refresh always re-reads the workspace and compares content " +
 			"hashes, so the answer comes from the captured bytes, never from a hint, " +
 			"a modification time or a Git status alone. Use --repo to point the " +
-			"command at a repository other than the current directory.",
+			"command at a repository other than the current directory.\n\n" +
+			"Work an optional provider defers past this refresh's generation keeps " +
+			"running after that generation is active, and each batch that seals is " +
+			"published as a further generation before the command exits. Interrupting " +
+			"it keeps everything already published and reports how much is still " +
+			"queued; set providers.dependence.enabled = false to plan none of it.",
 		Args:          cobra.ArbitraryArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -141,7 +146,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return emitIndexResult(cmd, build, args, result)
+			return drainIndex(cmd, build, args, ws, result)
 		},
 	}
 	addRepoFlag(cmd)
@@ -155,8 +160,10 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 		Short: "Report the active generation, its coverage and the managed toolchain",
 		Long: "Reports what the workspace actually holds: the active snapshot and " +
 			"generation, per-capability freshness, whether the generation is still " +
-			"coherent with the worktree, watch coverage, and what the managed " +
-			"toolchain has installed. Nothing is fetched and nothing is written to " +
+			"coherent with the worktree, the watch coverage of this process's own " +
+			"watch loops, and what the managed toolchain has installed. A watch " +
+			"session in another process is not visible here: a separate `codectx " +
+			"watch` reports as off. Nothing is fetched and nothing is written to " +
 			"produce this report, and it takes no workspace lock, so it answers " +
 			"while another process is indexing or watching.",
 		Args:          cobra.NoArgs,
@@ -212,8 +219,10 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			"anything was notified. A burst larger than index.watch_pending_paths or " +
 			"index.watch_pending_bytes collapses to one full reconciliation rather " +
 			"than a partial list of paths, and a host that cannot notify falls back " +
-			"to the periodic pass alone; `codectx status` reports which of the two is " +
-			"covering the workspace. Work an optional provider deferred keeps " +
+			"to the periodic pass alone. Which of the two is covering the workspace " +
+			"is reported by a status call made inside this process; a separate " +
+			"`codectx status` process cannot see this session's coverage and always " +
+			"reports the watch as off. Work an optional provider deferred keeps " +
 			"publishing for the whole session, and the workspace lock is held " +
 			"throughout: one writer, never two.",
 		Args:          cobra.NoArgs,
@@ -286,20 +295,25 @@ func runWatch(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.
 	return writeText(out, "watch stopped after %d %s\n", refreshes, plural(int(refreshes), "refresh", "refreshes"))
 }
 
-// drainIndex publishes the base generation and then runs the deferred queue to
-// empty, which is what makes providers.dependence.enabled = "auto" its
-// documented self in a one-shot run (Section 11.6, ruling Q9).
+// drainIndex publishes the generation a one-shot command has just produced and
+// then runs the deferred queue to empty, which is what makes
+// providers.dependence.enabled = "auto" its documented self in a one-shot run
+// (Section 11.6, ruling Q9). Both one-shot building commands end here --
+// `codectx index` with the generation its Index call activated and `codectx
+// refresh` with the one its Refresh call activated -- because the lifetime that
+// makes the abandonment possible is the same in both: the process exits as soon
+// as that generation is active.
 //
-// Without this the coordinator is closed the moment the base generation
-// activates, and every unit the base generation deferred is abandoned unbuilt
-// and unreported: the shipped default silently produced no dependence fact at
-// all. There is no new flag, because "do not plan that work" already has a
-// spelling: providers.dependence.enabled = false.
+// Without this the coordinator is closed the moment that generation activates,
+// and every unit it deferred is abandoned unbuilt and unreported: the shipped
+// default silently produced no dependence fact at all. There is no new flag,
+// because "do not plan that work" already has a spelling:
+// providers.dependence.enabled = false.
 //
 // Section 18.2's one envelope still holds across the whole run: a --json
-// invocation reports the base generation and each publication on stderr and
+// invocation reports that first generation and each publication on stderr and
 // emits its single envelope, carrying the last generation published, at the
-// end. An interruption is not a failure here -- the base generation is active
+// end. An interruption is not a failure here -- the first generation is active
 // and every published generation stands -- so the command succeeds and says in
 // a warning how much work is still queued.
 func drainIndex(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace, base model.IndexResult) error {
@@ -399,15 +413,6 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 		return false, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
 	return v, nil
-}
-
-// emitIndexResult renders one completed run under the single-envelope rule. It
-// is the whole of a command that publishes exactly one generation.
-func emitIndexResult(cmd *cobra.Command, build model.BuildInfo, args []string, result model.IndexResult) error {
-	if jsonRequested(cmd, args) {
-		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, commandName(cmd), result))
-	}
-	return emitIndexProgress(cmd, args, result)
 }
 
 // emitIndexProgress renders one completed run as progress rather than as the

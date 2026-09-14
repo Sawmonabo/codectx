@@ -122,8 +122,13 @@ func New(o Options) (*Watcher, error) {
 	if o.Root.Path == "" {
 		return nil, invalid("the watcher needs an opened workspace root")
 	}
+	// The watch set is directories, so index.max_files never bounds it -- but a
+	// zero-valued Policy is a caller that never built one, and watching a tree
+	// with none of the capture's exclusions applied is what this refuses.
+	// MaxFiles is the field that is never legitimately zero in a real policy,
+	// so it is the one the check reads.
 	if o.Policy.MaxFiles <= 0 {
-		return nil, invalid("the watcher needs the traversal file budget; zero would mean unlimited")
+		return nil, invalid("the watcher needs the capture's traversal policy, not a zero value")
 	}
 	for _, b := range []struct {
 		name  string
@@ -170,14 +175,26 @@ func New(o Options) (*Watcher, error) {
 //
 // complete is not a promise that no event can be missed. It says that every
 // directory the traversal admits carries a watch -- whether or not it holds an
-// eligible file -- and that none was refused. What it cannot cover is a
-// directory that appears between two rescans: its own creation is an event, so
-// it joins the batch that closes the current debounce window and the rescan at
-// that window's end places its watch, but a file written inside it before that
-// rescan produces no event of its own. It is not lost, because the batch
-// carrying the directory reaches the coordinator only after the rescan and a
-// batch is a hint to re-capture rather than a list of what differs. The
-// reconcile interval remains the bound for the changes notification cannot
+// eligible file -- and that none was refused. Two windows it does not cover:
+//
+// The first is a directory that appears between two rescans: its own creation
+// is an event, so it joins the batch that closes the current debounce window
+// and the rescan at that window's end places its watch, but a file written
+// inside it before that rescan produces no event of its own. It is not lost,
+// because the batch carrying the directory reaches the coordinator only after
+// the rescan and a batch is a hint to re-capture rather than a list of what
+// differs.
+//
+// The second is the traversal policy itself, which every rescan re-applies but
+// none re-derives. The caller builds it once, when the workspace is opened, and
+// its Git ignore predicate is a snapshot of the ignored roots taken at that
+// moment. A .gitignore edited mid-session therefore does not move the watch
+// set: a tree it newly un-ignores stays unwatched while coverage still reports
+// complete, and a tree it newly ignores keeps its watches. Each generation's
+// own traversal recomputes the set, so the index is right either way, and the
+// changes are seen at the next reconciliation rather than on notification.
+//
+// The reconcile interval remains the bound for the changes notification cannot
 // describe at all: a queue overflow, a refused watch, an unavailable backend --
 // which is what lastReconciled is for, and why a reconciliation batch is a full
 // one.
@@ -417,7 +434,8 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // reconciliation tick discovers up to index.reconcile_interval later.
 //
 // The excluded trees stay unwatched, which is what keeps that affordable: with
-// the capture's Git hooks in place an ignored build directory is pruned by the
+// the capture's Git ignore predicate in place an ignored build directory is
+// pruned by the
 // same predicate that keeps it out of the snapshot, so an `npm install` under
 // an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
@@ -439,6 +457,14 @@ func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map
 		want[dir] = true
 		return nil
 	})
+	// A cancelled traversal is the session ending, not a workspace that cannot
+	// be read: the operator pressed Ctrl-C, or Run's own context was cancelled
+	// by the coordinator. Warning about it, placing watches the process is
+	// about to drop, and recording incomplete coverage for a watcher with no
+	// future would all be noise about a shutdown.
+	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		return
+	}
 	// A traversal that stops part way still yields the directories it reached.
 	// Placing those watches and reporting coverage incomplete is strictly
 	// better than placing none: one unreadable directory -- a scratch tree
