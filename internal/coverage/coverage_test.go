@@ -721,6 +721,61 @@ var scenarios = []scenario{
 
 	// L3 rows
 
+	// Strict readiness is a stronger claim than full coverage and Task 16 never
+	// makes it. The failure mode this guards is a status that folds
+	// "every required file is served" into ready_for_implementation: Section
+	// 16.3 additionally requires the verify phase, complete resolved scope, a
+	// current-scope actor review, no blocking unresolved dependency and current
+	// source validation, none of which this task evaluates. The row first
+	// proves the premise -- every required_full file really is full_served --
+	// so it cannot pass vacuously.
+	{name: "status/full coverage still grants no strict readiness", run: func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		var ids []string
+		for i, fid := range h.store.order {
+			if h.store.required[fid] != model.RequirementFull {
+				continue
+			}
+			f := h.file(fid)
+			id := hexID(byte(0x50 + i))
+			// The empty file's chunk is the zero-length EOF chunk, which is the
+			// only thing that can ever grant it full coverage.
+			chunk := model.IssuedChunk{
+				ID: id, SessionID: sessionA, ActorID: actorA, FileID: fid, ContentHash: f.hash(),
+				Bytes:     model.ByteRange{Start: 0, End: uint64(len(f.data))},
+				ExpiresAt: h.now.Add(time.Hour),
+			}
+			if err := h.store.IssueChunk(ctx, chunk); err != nil {
+				t.Fatalf("issue chunk for %s: %v", f.path, err)
+			}
+			ids = append(ids, id)
+		}
+		if err := h.store.ConfirmChunks(ctx, sessionA, actorA, ids); err != nil {
+			t.Fatalf("confirm %d chunks: %v", len(ids), err)
+		}
+		for _, fid := range h.store.order {
+			if h.store.required[fid] == model.RequirementFull {
+				h.checkOracle(sessionA, actorA, fid)
+			}
+		}
+
+		_, status, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA}, model.PageRequest{})
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if status.RequiredFiles != int64(len(ids)) || status.FullyServedFiles != status.RequiredFiles {
+			t.Fatalf("premise failed: %d of %d required files are fully served, want all %d",
+				status.FullyServedFiles, status.RequiredFiles, len(ids))
+		}
+		if !status.ReadCompleteForSnapshot {
+			t.Fatalf("premise failed: read_complete_for_snapshot is false with every required file served")
+		}
+		if status.ReadyForImplementation || status.StrictGateSatisfied {
+			t.Fatalf("full coverage granted strict readiness: ready_for_implementation=%v strict_gate_satisfied=%v",
+				status.ReadyForImplementation, status.StrictGateSatisfied)
+		}
+	}},
+
 	// L4 rows
 
 	// L5 rows

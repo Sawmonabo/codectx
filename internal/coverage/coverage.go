@@ -161,19 +161,6 @@ type Service struct {
 	log      *slog.Logger
 }
 
-// New validates the options and builds the service.
-func New(o Options) (*Service, error) {
-	return nil, notImplemented("coverage.New")
-}
-
-// OpenSession compiles nothing: it opens an actor-specific session over a
-// manifest Task 15 has already persisted, acquires the model.LeaseSession
-// retention lease that stops an expired session from resurrecting deleted
-// source, and reports the resulting status. Owned by L3.
-func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (model.SessionStatus, error) {
-	return model.SessionStatus{}, notImplemented("coverage.OpenSession")
-}
-
 // Read serves one bounded, lossless chunk of pinned source and issues its
 // receipt. Order is the invariant: gate the actor, check the unconfirmed cap,
 // size the chunk with maxRawForWire, read through Source, plan the boundary
@@ -192,24 +179,11 @@ func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest)
 	return model.SessionStatus{}, notImplemented("coverage.Acknowledge")
 }
 
-// Status reports this actor's coverage for this session: one page of per-file
-// records keyed on file_id plus the honest session status. Owned by L3.
-func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], model.SessionStatus, error) {
-	return model.Page[model.FileCoverage]{}, model.SessionStatus{}, notImplemented("coverage.Status")
-}
-
 // Next names the next required_full file this actor has not fully served, in
 // manifest ordinal order, with its pinned hash, size and resume offset. It is
 // metadata only and never carries source bytes. Owned by L4.
 func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.NextContextItem, error) {
 	return model.NextContextItem{}, notImplemented("coverage.Next")
-}
-
-// Close ends the session with the Section 17.1 compare-and-swap:
-// AdvanceSession{Target: StateClosed, ExpectedVersion}. It releases the
-// retention lease. Owned by L3.
-func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedVersion int) (model.SessionStatus, error) {
-	return model.SessionStatus{}, notImplemented("coverage.Close")
 }
 
 // receiptPayload is what a source receipt binds. Every field is checked against
@@ -343,16 +317,6 @@ func maxRawForWire(requested uint32, offset, checkpointPrefix uint64, l Limits) 
 		raw = 0
 	}
 	return uint32(raw), nil
-}
-
-// status is the one place a model.SessionStatus is built from a session record.
-// It spends exactly one CoverageSummary call for the counts -- paging Coverage
-// for them would cost 1250 round trips on a 250k-file session -- and it leaves
-// ReadyForImplementation and StrictGateSatisfied false, because Section 16.3's
-// extra preconditions are Task 17 surface and a half-built readiness evaluator
-// is a duplicate implementation. Owned by L3; called by L1, L4 and L5.
-func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.SessionStatus, error) {
-	return model.SessionStatus{}, notImplemented("coverage.status")
 }
 
 // The model.NextContextItem.Action vocabulary. internal/model/context.go
