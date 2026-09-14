@@ -58,9 +58,9 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 			"workspace that cannot be opened is itself reported as a failing check, so this " +
 			"command answers on exactly the installations it exists to diagnose.\n\n" +
 			"--deep additionally runs the expensive integrity and parser smoke checks; no " +
-			"full database scan happens without it. --offline reports the effective offline " +
-			"policy and whether a real operating-system level restriction on analyzer " +
-			"execution is in force, which is a stronger statement than the flag itself.",
+			"full database scan happens without it. --offline asks for the offline-policy " +
+			"checks, and what the report says is what those checks found -- the flag itself " +
+			"asserts nothing about this installation.",
 		Args:          cobra.MaximumNArgs(1),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -69,7 +69,7 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool(doctorOfflineFlag, false,
-		"report the effective offline policy and whether an operating-system level analyzer restriction is active")
+		"include the offline-policy checks in the report")
 	cmd.Flags().Bool(doctorDeepFlag, false,
 		"also run the expensive integrity and parser smoke checks, which an ordinary run never does")
 	return cmd
@@ -174,7 +174,7 @@ func writeDoctorReport(w io.Writer, r model.DoctorReport) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "build       %s (commit %s, %s, schema %s)\n",
 		r.Build.Version, r.Build.Commit, r.Build.Toolchain, r.Build.SchemaVersion)
-	fmt.Fprintf(&b, "state       %s\nchecks      %s\noffline     %s\nchecked     %s\n\n",
+	fmt.Fprintf(&b, "state       %s\nmode        %s\noffline     %s\nchecked     %s\n\n",
 		r.State, deepLabel(r.Deep), offlineLabel(r.Offline), r.CheckedAt.Format(time.RFC3339))
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "CHECK\tSTATE\tCODE\tDETAIL")
@@ -213,21 +213,26 @@ func checkSummary(counts map[model.CheckState]int) string {
 	return strings.Join(parts, ", ")
 }
 
+// deepLabel names the depth the report was produced at. It is a value, not a
+// hint: a field an operator reads as data must not carry an instruction, which
+// is why the suggestion to pass --deep lives in the command's help text.
 func deepLabel(deep bool) string {
 	if deep {
-		return "deep, including the integrity and parser smoke checks"
+		return "deep"
 	}
-	return "ordinary; --deep also runs the integrity and parser smoke checks"
+	return "ordinary"
 }
 
-// offlineLabel words the policy the report resolved, not the flag that asked
-// about it. What an actual operating-system level restriction on analyzer
-// execution looks like is a check of its own in the list above -- Section 21 is
-// explicit that a cleared proxy variable is not a boundary -- so this line
-// reports the policy and points at that check rather than standing in for it.
+// offlineLabel says whether the offline-policy checks were asked for, and no
+// more. It deliberately claims nothing about an operating-system level
+// restriction on analyzer execution: Section 21 requires that to be reported,
+// but it is a CHECK, produced behind the facade, and a renderer that asserted
+// it from a boolean would be reporting the flag as the boundary -- precisely
+// the substitution Section 21 forbids. See hand-off 4 in the lane report: no
+// lane currently owns that check.
 func offlineLabel(offline bool) string {
 	if offline {
-		return "reported; see the checks above for whether a restriction is enforced by the operating system"
+		return "policy checks requested"
 	}
-	return "not reported; pass --" + doctorOfflineFlag + " to include the offline policy checks"
+	return "policy checks not requested"
 }

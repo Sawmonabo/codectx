@@ -117,11 +117,11 @@ func repoTarget(cmd *cobra.Command, args []string) (string, error) {
 func writeOverviewTable(b *strings.Builder, items []model.OverviewItem) {
 	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "DEPTH\tKIND\tPATH\tNAME\tLANGUAGE\tFILES\tSYMBOLS\tBYTES")
-	var files, symbols, bytes int64
+	var files, symbols, sourceBytes int64
 	for _, item := range items {
 		files += item.FileCount
 		symbols += item.SymbolCount
-		bytes += item.SourceBytes
+		sourceBytes += item.SourceBytes
 		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n", item.Depth, tableCell(string(item.Kind)),
 			tableCell(item.Path), tableCell(item.Name), tableCell(languageCell(item.Language)),
 			item.FileCount, item.SymbolCount, item.SourceBytes)
@@ -132,7 +132,7 @@ func writeOverviewTable(b *strings.Builder, items []model.OverviewItem) {
 	fmt.Fprintf(b, "\n%d %s on this page: %d %s, %d %s, %d bytes\n",
 		len(items), plural(len(items), "container", "containers"),
 		files, plural(int(files), "file", "files"),
-		symbols, plural(int(symbols), "symbol", "symbols"), bytes)
+		symbols, plural(int(symbols), "symbol", "symbols"), sourceBytes)
 }
 
 // languageCell renders a container that carries no language. A repository or a
