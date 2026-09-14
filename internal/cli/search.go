@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -60,7 +59,7 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			if req.Languages, err = stringsFlag(cmd, searchLanguageFlag); err != nil {
 				return err
 			}
-			page, generation, timeout, err := queryFlagValues(cmd)
+			page, generation, err := queryFlagValues(cmd)
 			if err != nil {
 				return err
 			}
@@ -72,33 +71,21 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
+			// One call path: the facade's Search. runService owns the open, the
+			// close, the --timeout deadline and the typing of a bare context
+			// failure, so nothing here repeats them.
+			var result model.Page[model.SearchHit]
+			if err := runService(cmd, openForReport(),
+				func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
+					var err error
+					result, err = svc.Search(ctx, req)
+					return err
+				}); err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo)
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			ctx, cancel := queryContext(cmd.Context(), timeout)
-			defer cancel()
-			// queryFailure types a bare context failure: the service returns
-			// context.DeadlineExceeded unwrapped from PinGeneration and the
-			// tier reads, and untyped it reaches ExitCode as the exit-2
-			// invalid-argument class, reporting a query that ran out of time
-			// as a command line the operator typed wrong. The workspace open
-			// above is deliberately left alone, for the reason queryContext
-			// gives.
-			result, err := ws.Search().Search(ctx, req)
-			if err != nil {
-				return queryFailure(err)
-			}
-			out := cmd.OutOrStdout()
-			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), result))
-			}
-			return writeSearchTable(out, result)
+			return emitQuery(cmd, build, args, result, result.Meta, func(b *strings.Builder) {
+				writeSearchTable(b, result.Items)
+			})
 		},
 	}
 	addQueryFlags(cmd, true)
@@ -109,32 +96,27 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 	return cmd
 }
 
-// queryFlagValues reads the shared flags. The request's own Validate bounds the
-// limit, the cursor and the generation, so nothing is re-checked here; the
-// timeout is the exception, because it is a process-side deadline that never
-// reaches a request field and so has no validator of its own.
-func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID, time.Duration, error) {
+// queryFlagValues reads the request-shaped flags the two Section 18.1 query
+// commands share. The request's own Validate bounds the limit, the cursor and
+// the generation, so nothing is re-checked here.
+//
+// --timeout is not read here at all: runService applies it, and durationFlag
+// refuses a negative one for every duration flag in the tree, so a second read
+// here would be the same command line checked twice.
+func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID, error) {
 	limit, err := intFlag(cmd, queryLimitFlag)
 	if err != nil {
-		return model.PageRequest{}, 0, 0, err
+		return model.PageRequest{}, 0, err
 	}
 	cursor, err := stringFlag(cmd, queryCursorFlag)
 	if err != nil {
-		return model.PageRequest{}, 0, 0, err
+		return model.PageRequest{}, 0, err
 	}
 	generation, err := int64Flag(cmd, queryGenerationFlag)
 	if err != nil {
-		return model.PageRequest{}, 0, 0, err
+		return model.PageRequest{}, 0, err
 	}
-	timeout, err := durationFlag(cmd, queryTimeoutFlag)
-	if err != nil {
-		return model.PageRequest{}, 0, 0, err
-	}
-	if timeout < 0 {
-		return model.PageRequest{}, 0, 0, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: fmt.Sprintf("--%s is %s; it must not be negative, and 0 uses the configured query timeout", queryTimeoutFlag, timeout)}
-	}
-	return model.PageRequest{Limit: limit, Cursor: cursor}, model.GenerationID(generation), timeout, nil
+	return model.PageRequest{Limit: limit, Cursor: cursor}, model.GenerationID(generation), nil
 }
 
 // queryContext applies an operator-supplied deadline to the service call alone.
@@ -148,16 +130,17 @@ func queryContext(ctx context.Context, timeout time.Duration) (context.Context, 
 	return context.WithTimeout(ctx, timeout)
 }
 
-// writeSearchTable renders the human page: the hits, then the page's own
-// metadata. The continuation token and the truncation reason are carried in
-// QueryMeta, which --json emits whole; a table that printed only the rows would
-// silently drop both, leaving the operator with a short answer and no way to
-// tell it was short or to ask for the rest.
-func writeSearchTable(w io.Writer, page model.Page[model.SearchHit]) error {
-	var b strings.Builder
-	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+// writeSearchTable renders the hits a page admitted, in the order the service
+// ranked them: the tier orders the groups and the integer score orders the hits
+// within one, so re-sorting here would show an order the --json consumer never
+// sees. Every hit the page carries is printed -- the page is already bounded by
+// the request's limit, and the continuation token, the truncation reason and
+// the capability notes are rendered around this block by emitQuery, so the
+// operator is never handed a short answer with nothing saying it was short.
+func writeSearchTable(b *strings.Builder, hits []model.SearchHit) {
+	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "TIER\tSCORE\tOCC\tKIND\tLINE\tPATH\tNAME\tREASON")
-	for _, hit := range page.Items {
+	for _, hit := range hits {
 		name := hit.QualifiedName
 		if name == "" {
 			name = hit.Name
@@ -167,26 +150,17 @@ func writeSearchTable(w io.Writer, page model.Page[model.SearchHit]) error {
 			tableCell(string(hit.Kind)), rangeLine(hit.Range), tableCell(hit.Path),
 			tableCell(name), reasonCell(hit.Reasons))
 	}
-	if err := flushTable(tw); err != nil {
-		return err
-	}
-	fmt.Fprintf(&b, "\n%d %s\n", len(page.Items), plural(len(page.Items), "hit", "hits"))
-	writeQueryMeta(&b, page.Meta)
-	return writeText(w, "%s", b.String())
+	flushTableInto(tw)
+	fmt.Fprintf(b, "\n%d %s\n", len(hits), plural(len(hits), "hit", "hits"))
 }
 
-// writeQueryMeta renders the parts of a page's metadata a human table would
-// otherwise lose: the generation the answer was read from, the continuation
-// token, and the truncation the service reported.
-func writeQueryMeta(b *strings.Builder, meta model.QueryMeta) {
-	fmt.Fprintf(b, "generation  %d\n", meta.Binding.GenerationID)
-	writeCapabilities(b, meta.Completeness)
-	if meta.Truncated {
-		fmt.Fprintf(b, "warning     result truncated: %s\n", tableCell(meta.TruncationReason))
-	}
-	if meta.NextCursor != "" {
-		fmt.Fprintf(b, "next        --cursor %s\n", meta.NextCursor)
-	}
+// flushTableInto flushes a table whose sink is a strings.Builder, which is what
+// every renderResult block emitQuery calls gets. The error is dropped
+// deliberately: Builder.Write never returns one, so returning it would put an
+// unreachable branch in each caller. A table written to a file or a pipe -- the
+// envelope on stdout, for one -- must not use this.
+func flushTableInto(tw *tabwriter.Writer) {
+	_ = tw.Flush()
 }
 
 // reasonCell renders a hit's bounded explanation. The exact and prefix tiers
@@ -237,13 +211,6 @@ func tableCell(s string) string {
 		width++
 	}
 	return b.String()
-}
-
-func flushTable(tw *tabwriter.Writer) error {
-	if err := tw.Flush(); err != nil {
-		return &model.Error{Code: model.CodeInternal, Message: "failed to render output: " + err.Error()}
-	}
-	return nil
 }
 
 func int64Flag(cmd *cobra.Command, name string) (int64, error) {

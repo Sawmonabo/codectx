@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/app"
-	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/spf13/cobra"
 )
@@ -92,26 +91,25 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, ws *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
-				req := model.ReferenceRequest{
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				// Names are resolved against the same generation the answer
+				// will pin, so a name and an id name the same node in one
+				// invocation. An argument that is already an id passes through.
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				// Both semantic sources are one facade call: References routes
+				// canonical to the sealed index and lsp to the overlay, so the
+				// command chooses evidence, never a call path.
+				result, err = svc.References(ctx, model.ReferenceRequest{
 					GenerationID:   gen,
 					NodeID:         nodes[0],
 					Operation:      operation,
 					SemanticSource: source,
 					Profile:        profile,
 					Page:           page,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				// Ruling Q13 leaves the canonical route on the engine Task 14
-				// built, byte for byte; ruling Q14 makes this command the
-				// consumer that drives References for the overlay source.
-				if source == model.SemanticLSP {
-					result, err = ws.Services().References(ctx, req)
-				} else {
-					result, err = engine.References(ctx, req)
-				}
+				})
 				return err
 			}); err != nil {
 				return err
@@ -202,19 +200,20 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				return err
 			}
 			var result model.GraphResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				// Direction and the `calls` allowlist are pinned here, by the
+				// command, so the single bounded traversal the facade exposes
+				// answers both spellings; a second operation selector would be
+				// the same contract pinned in two places.
 				req, err := graphRequest(cmd, nodes, direction, []model.RelationKind{model.RelCalls})
 				if err != nil {
 					return err
 				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				if direction == model.DirectionIncoming {
-					result, err = engine.Callers(ctx, req)
-				} else {
-					result, err = engine.Callees(ctx, req)
-				}
+				result, err = svc.Graph(ctx, req)
 				return err
 			}); err != nil {
 				return err
@@ -269,18 +268,18 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.PathResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
-				req := model.PathRequest{
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				result, err = svc.Path(ctx, model.PathRequest{
 					GenerationID: gen,
 					From:         nodes[0],
 					To:           nodes[1],
 					MaxDepth:     depth,
 					MaxVisited:   visited,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				result, err = engine.ShortestPath(ctx, req)
+				})
 				return err
 			}); err != nil {
 				return err
@@ -327,12 +326,19 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
 				base, err := graphRequest(cmd, nodes, model.DirectionBoth, nil)
 				if err != nil {
 					return err
 				}
-				req := model.ImpactRequest{
+				// Impact returns the whole model.ImpactResult, not a page of
+				// entries: the package rollup and the visited/edge accounting
+				// this command renders have no home in model.Page.
+				result, err = svc.Impact(ctx, model.ImpactRequest{
 					GenerationID: base.GenerationID,
 					Start:        base.Start,
 					Direction:    base.Direction,
@@ -340,11 +346,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 					MaxVisited:   base.MaxVisited,
 					MaxEdges:     base.MaxEdges,
 					Page:         base.Page,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				result, err = engine.Impact(ctx, req)
+				})
 				return err
 			}); err != nil {
 				return err
@@ -365,8 +367,8 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 }
 
 // checkNodeArgs screens the positional arguments before any database is opened.
-// It cannot resolve a name -- that needs the pinned generation runQuery opens --
-// but it can reject an argument that is neither a resolved id nor a name worth
+// It cannot resolve a name -- that needs the pinned generation the service
+// call opens -- but it can reject an argument that is neither a resolved id nor a name worth
 // looking up, so an obviously wrong command line never pays for a workspace.
 func checkNodeArgs(args []string) error {
 	for _, arg := range args {
@@ -419,59 +421,6 @@ func graphRequest(cmd *cobra.Command, nodes []model.NodeID, direction model.Dire
 	}, nil
 }
 
-// runQuery opens the workspace in report mode, builds the engine for the pinned
-// generation and runs one query against it. The lease the engine holds is
-// released on every path, including cancellation, and a release failure never
-// masks the failure the query itself reported.
-//
-// The workspace is handed to the callback beside the engine so `refs` can take
-// the overlay route through ws.Services() without opening a second workspace.
-// That route still pays for the engine this function built: the seeds have to
-// be resolved against the pinned generation either way, and one composition
-// that sometimes builds a lease it does not read is cheaper to keep honest than
-// two open paths.
-func runQuery(cmd *cobra.Command, gen model.GenerationID, args []string,
-	fn func(context.Context, *app.Workspace, *graph.Engine, []model.NodeID) error) (err error) {
-	repo, err := repoFlagValue(cmd)
-	if err != nil {
-		return err
-	}
-	timeout, err := durationFlag(cmd, queryTimeoutFlag)
-	if err != nil {
-		return err
-	}
-	ctx := cmd.Context()
-	if timeout > 0 {
-		// Zero leaves the engine's own configured query deadline in charge; a
-		// zero deadline set here would expire before the query started.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	ws, err := app.OpenWorkspaceForReport(ctx, repo)
-	if err != nil {
-		return queryFailure(err)
-	}
-	defer ws.Close()
-	// Names are resolved before the engine is built, against the same
-	// generation the engine will pin. An argument that is already an id is
-	// passed straight through, so an id-only invocation opens no extra lease.
-	nodes, err := ws.ResolveNodes(ctx, gen, args)
-	if err != nil {
-		return queryFailure(err)
-	}
-	engine, release, err := ws.Query(ctx, gen)
-	if err != nil {
-		return queryFailure(err)
-	}
-	defer func() {
-		if cerr := release(); cerr != nil && err == nil {
-			err = queryFailure(cerr)
-		}
-	}()
-	return queryFailure(fn(ctx, ws, engine, nodes))
-}
-
 // queryFailure maps a bare context failure onto the Section 22 vocabulary. The
 // --timeout deadline is this command's own, so nothing below it can type the
 // expiry; left untyped it would reach ExitCode as the exit-2 invalid-argument
@@ -490,8 +439,11 @@ func queryFailure(err error) error {
 		return &model.Error{Code: model.CodeQueryDeadline,
 			Message: "the query did not finish within --" + queryTimeoutFlag}
 	case errors.Is(err, context.Canceled):
+		// Deliberately neutral: runService carries every command that reaches
+		// the facade, including `index --watch`, whose cancellation is a
+		// stopped session rather than an abandoned query.
 		return &model.Error{Code: model.CodeCanceled,
-			Message: "the query was canceled before it completed"}
+			Message: "the command was canceled before it completed"}
 	}
 	return err
 }
@@ -595,16 +547,73 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 	fmt.Fprintf(b, "occurrences %d in %d distinct %s\n", len(items), len(distinct),
 		plural(len(distinct), "relation", "relations"))
 	for _, o := range items {
+		// Every row carries the three things that tell one occurrence from
+		// another and lead the operator to it: which end of the edge is not the
+		// node being asked about, where the site is, and the evidence identity.
+		// Without them a node called twelve times from one file renders as
+		// twelve identical lines, which is an answer the operator cannot act on.
+		//
 		// References deliberately never sets Path -- resolving it would cost one
 		// file read per distinct file on a port with no batched file lookup --
-		// so the location is rendered from what the occurrence actually carries:
-		// the file id and the byte range that locate it exactly.
+		// so the location is the file id, refined by whichever interval the
+		// occurrence carries. A sealed occurrence carries a byte interval and
+		// is printed `@start-end`, because the evidence table stores offsets
+		// and no line or column; deriving a line from an offset needs the file
+		// itself, and printing a made-up one would be worse than printing the
+		// offsets. Only an overlay row, whose language server speaks positions,
+		// can be refined to :line:column.
 		location := string(o.FileID)
-		if o.Range != nil {
-			location = fmt.Sprintf("%s:%d:%d", o.FileID, o.Range.Start.Line, o.Range.Start.Column)
+		if o.Path != "" {
+			// The overlay is the only producer that sets Path, and it is text
+			// an external language server chose, so it goes through the same
+			// cell sanitizer the other human tables use: clip only bounds
+			// width, and a path carrying a newline would forge a table row.
+			location = tableCell(o.Path)
 		}
-		fmt.Fprintf(b, "  %-18s %-10s %s\n", clip(string(o.Kind), 18), clip(string(o.Precision), 10), clip(location, 100))
+		switch {
+		case o.Range != nil:
+			location = fmt.Sprintf("%s:%d:%d", location, o.Range.Start.Line, o.Range.Start.Column)
+		case o.Bytes != nil:
+			location = fmt.Sprintf("%s@%d-%d", location, o.Bytes.Start, o.Bytes.End)
+		}
+		fmt.Fprintf(b, "  %-18s %-16s %s at %s  evidence %s\n", clip(string(o.Kind), 18),
+			clip(string(o.Precision), 16), occurrenceOrigin(o), clip(location, 100), occurrenceEvidence(o))
 	}
+}
+
+// occurrenceOrigin names the end of the edge the caller did not ask about: the
+// referencing node for a reference or an implementation, the referenced type
+// for a type definition. The qualified name leads, because that is what tells
+// the operator which symbol this is, and the full node id follows it rather
+// than being replaced by it: the id is what they feed straight back to `refs`
+// or `symbol`, and a clipped or absent id would name nothing they can ask
+// about. A node this generation publishes no fact for keeps the id alone. An
+// overlay row that sealed no canonical edge has no id and says so rather than
+// printing an empty column that reads as a node whose id is unknown.
+func occurrenceOrigin(o model.ReferenceOccurrence) string {
+	switch {
+	case o.FromNodeID != "" && o.FromName != "":
+		// The name is provider-supplied text, so it goes through the same cell
+		// sanitizer the other human tables use: a name carrying a newline
+		// would forge a table row.
+		return "from " + tableCell(o.FromName) + " " + string(o.FromNodeID)
+	case o.FromNodeID != "":
+		return "from " + string(o.FromNodeID)
+	case o.ToNodeID != "":
+		return "to   " + string(o.ToNodeID)
+	default:
+		return "from (overlay row; no canonical node)"
+	}
+}
+
+// occurrenceEvidence is the identity that separates two occurrences of the same
+// relation in the same file. It is clipped: it is an identity to compare
+// against the --json answer, not an argument any command takes.
+func occurrenceEvidence(o model.ReferenceOccurrence) string {
+	if o.EvidenceID == "" {
+		return "(none sealed)"
+	}
+	return clip(string(o.EvidenceID), 16)
 }
 
 // writePaths renders the routes a path query found, cheapest first, with the
@@ -633,12 +642,10 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	}
 	fmt.Fprintf(b, "entries     %d\n", len(entries))
 	for _, e := range entries {
-		// ImpactEntry.Path carries the entry's QUALIFIED NAME: model.Node has no
-		// file path, and the hydration fills this field from QualifiedName. The
-		// column is labelled for what it holds, so a reader does not take it
-		// for a file path sitting next to a FileID.
+		// ImpactEntry.Name is the entry's qualified name (model.Node has no file
+		// path); the column is labelled for what it holds.
 		fmt.Fprintf(b, "  %s  %-9s depth %d  score %d  name %s\n", e.NodeID, e.Direction, e.Depth,
-			e.ScoreMicros, clip(e.Path, 70))
+			e.ScoreMicros, clip(e.Name, 70))
 		for _, reason := range e.Reasons {
 			fmt.Fprintf(b, "    %s\n", clip(reason, 100))
 		}
@@ -650,6 +657,11 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 // pair as a precise symbol-level call.
 func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	if len(edges) == 0 {
+		// Silence here read as "this renderer emitted nothing". The rollup is
+		// built from containment edges, and a generation whose providers sealed
+		// none has no packages to aggregate -- which is an answer about the
+		// generation, not a missing section of the report.
+		b.WriteString("packages    none (no containment edges in this generation)\n")
 		return
 	}
 	fmt.Fprintf(b, "packages    %d aggregated %s (pair counts, not individual calls)\n",

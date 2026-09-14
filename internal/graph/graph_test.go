@@ -216,7 +216,10 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
 	// fixture that carried ids alone could not tell a hydrated occurrence from
-	// an unhydrated one.
+	// an unhydrated one. The interval is a ByteRange with a nil Range, which is
+	// exactly what a row read back from storage carries -- the evidence table
+	// stores start_byte/end_byte and no line or column -- so a hydration path
+	// that dropped it could not pass here either.
 	evidenceRow := func(rel model.RelationID, i, n int) model.Evidence {
 		return model.Evidence{
 			ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-%d", i, n))),
@@ -227,10 +230,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 			RelationID:      rel,
 			Precision:       model.PrecisionSyntax,
 			FileID:          model.FileID(fixtureID("file-1")),
-			Range: &model.SourceRange{
-				Start: model.Position{Byte: uint64(i) * 16, Line: uint32(i) + 1, Column: 0},
-				End:   model.Position{Byte: uint64(i)*16 + 8, Line: uint32(i) + 1, Column: 8},
-			},
+			Bytes:           &model.ByteRange{Start: uint64(i) * 16, End: uint64(i)*16 + 8},
 		}
 	}
 	for i, e := range edges {
@@ -253,9 +253,18 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	}
 	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
 
-	// A deferred dependence row, as PinnedReader.Capabilities returns it. An
-	// answer that traverses a dependence-only kind must disclose this.
+	// The generation's capability report, as PinnedReader.Capabilities returns
+	// it: one ordinary fresh row, and one deferred dependence row. An answer
+	// that traverses a dependence-only kind must disclose the deferred row, and
+	// EVERY answer must carry the report itself -- a graph answer that dropped
+	// it would report "no capabilities" on a generation whose search answers
+	// report them from the same reader.
 	f.caps = []model.CapabilityState{{
+		ProviderID: "canonical",
+		Capability: "relations",
+		Scope:      "workspace",
+		State:      model.CapabilityFresh,
+	}, {
 		ProviderID:     "dependence",
 		Capability:     "data_flows_to",
 		Scope:          "workspace",
@@ -542,12 +551,13 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("New: %v", err)
 				}
 				wide := fixtureNodeID("n-wide")
-				got, err := e.Callees(context.Background(), model.GraphRequest{
+				got, err := e.Neighbors(context.Background(), model.GraphRequest{
 					Start:     []model.NodeID{wide},
 					Direction: model.DirectionOutgoing,
+					Relations: []model.RelationKind{model.RelCalls},
 				})
 				if err != nil {
-					t.Fatalf("Callees: %v", err)
+					t.Fatalf("Neighbors: %v", err)
 				}
 				if len(got.Relations) != fixtureWideCount || got.EdgeCount != int64(fixtureWideCount) {
 					t.Fatalf("returned %d relations (edge_count %d) for a %d-edge hub: the keyset walk stopped on its first page",
@@ -596,12 +606,13 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
-				got, err := e.Callees(context.Background(), model.GraphRequest{
+				got, err := e.Neighbors(context.Background(), model.GraphRequest{
 					Start:     []model.NodeID{fixtureNodeID("n-wide")},
 					Direction: model.DirectionOutgoing,
+					Relations: []model.RelationKind{model.RelCalls},
 				})
 				if err != nil {
-					t.Fatalf("Callees: %v", err)
+					t.Fatalf("Neighbors: %v", err)
 				}
 				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonFrontierBytes {
 					t.Fatalf("truncated=%v reason=%q, want true and %q: the frontier byte ceiling was crossed without disclosure",
@@ -727,10 +738,22 @@ func TestGraphScenarios(t *testing.T) {
 					t.Errorf("meta = (%v, %q), want truncated with %q",
 						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
 				}
-				if len(res.Meta.Completeness) != 1 {
-					t.Fatalf("completeness rows = %d, want the one deferred dependence row", len(res.Meta.Completeness))
+				// The answer carries the generation's whole capability report,
+				// with the deferred row disclosed once inside it: dropping the
+				// report leaves the caller unable to tell a complete answer from
+				// a degraded one, and publishing the deferred row a second time
+				// alongside it both misreports and grows a full report past
+				// model.MaxCapabilityStates.
+				if len(res.Meta.Completeness) != len(f.caps) {
+					t.Fatalf("completeness rows = %d, want the generation's %d capability rows",
+						len(res.Meta.Completeness), len(f.caps))
 				}
-				row := res.Meta.Completeness[0]
+				var row model.CapabilityState
+				for _, c := range res.Meta.Completeness {
+					if c.ProviderID == "dependence" {
+						row = c
+					}
+				}
 				if row.State != model.CapabilityUnavailable || row.DiagnosticCode != model.CodeProviderUnavailable ||
 					row.Details["reason"] != "units_deferred" {
 					t.Errorf("deferred row = %+v, want it copied unchanged from the capability report", row)
@@ -1139,6 +1162,15 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("referencePage: references returned %d occurrences (%+v), want the single one from n-ref-caller; it sorts past the first clamped page of evidence-free relations",
 						len(refs.Items), refs.Items)
 				}
+				// The occurrence must also be locatable and attributable: the
+				// stored byte interval has to survive hydration, and the
+				// from-node's qualified name has to be filled from the page's
+				// one batched node read. Without either, every occurrence of a
+				// symbol renders as the same anonymous row.
+				if got := refs.Items[0]; got.Bytes == nil || got.FromName != "n-ref-caller" {
+					t.Fatalf("occurrence %+v: want the stored byte interval carried through and from_name %q",
+						got, "n-ref-caller")
+				}
 			},
 		},
 
@@ -1150,7 +1182,7 @@ func TestGraphScenarios(t *testing.T) {
 			// no output, and nothing in the answer to tell the operator why. The
 			// failure mode this row protects is that hang, which is why the
 			// load-bearing assertion is elapsed wall clock rather than the error
-			// code. Callers rides along because traverse.go installs the same
+			// code. Neighbors rides along because traverse.go installs the same
 			// deadline above the same Acquire and can regress the same way.
 			name: "a busy gate ends at the query deadline instead of blocking",
 			run: func(t *testing.T, f *graphFixture) {
@@ -1173,10 +1205,11 @@ func TestGraphScenarios(t *testing.T) {
 						})
 						return err
 					}},
-					{"Callers", func() error {
-						_, err := e.Callers(context.Background(), model.GraphRequest{
+					{"Neighbors", func() error {
+						_, err := e.Neighbors(context.Background(), model.GraphRequest{
 							Start:     []model.NodeID{fixtureNodeID("n-b")},
 							Direction: model.DirectionIncoming,
+							Relations: []model.RelationKind{model.RelCalls},
 						})
 						return err
 					}},

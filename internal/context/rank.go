@@ -238,6 +238,7 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 		contribution int64
 	}
 	admitted := make([]scored, 0, len(cand.Paths))
+	dropped := int64(0)
 	for _, p := range cand.Paths {
 		contribution, kinds, ok, err := scorePath(p, relations, precision)
 		if err != nil {
@@ -255,16 +256,20 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 		out.admittedEdges = append(out.admittedEdges, p.Relations...)
 		// A route longer than the stored bound still scores and still counts,
 		// but it cannot be retained: a truncated explanation path would claim a
-		// route the manifest does not actually hold.
-		if len(p.Relations) <= model.MaxRelationsPerPath {
-			admitted = append(admitted, scored{path: p, contribution: contribution})
+		// route the manifest does not actually hold. It is counted as dropped
+		// here, because MorePaths below is otherwise only the tail of what WAS
+		// retainable and would understate the routes that exist.
+		if len(p.Relations) > model.MaxRelationsPerPath {
+			dropped++
+			continue
 		}
+		admitted = append(admitted, scored{path: p, contribution: contribution})
 	}
 	if len(admitted) == 0 {
 		// Every admissible route was too long to store. MorePaths still
 		// discloses that routes exist, so a bounded explanation never reads as
 		// an unexplained selection.
-		out.morePaths = int64(countAdmitted(cand, relations, precision))
+		out.morePaths = dropped
 		return out, nil
 	}
 	sort.SliceStable(admitted, func(i, j int) bool {
@@ -281,22 +286,9 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 	for _, s := range admitted[:keep] {
 		out.paths = append(out.paths, s.path)
 	}
-	out.morePaths = int64(len(admitted) - keep)
+	out.morePaths = dropped + int64(len(admitted)-keep)
 	out.reasons = append(out.reasons, routeReason(cand, admitted[0].path, relations, out.best))
 	return out, nil
-}
-
-// countAdmitted reports how many routes were admissible when none could be
-// retained, so MorePaths still discloses that routes exist.
-func countAdmitted(cand candidate, relations map[model.RelationID]model.Relation,
-	precision map[model.RelationID]int64) int {
-	n := 0
-	for _, p := range cand.Paths {
-		if _, _, ok, err := scorePath(p, relations, precision); ok && err == nil {
-			n++
-		}
-	}
-	return n
 }
 
 // scorePath is the Section 15.3 path contribution: the product over the route's
@@ -408,11 +400,15 @@ func boostsFor(cand candidate, routed routeScore,
 	return total, reasons
 }
 
-// isCapturedChange reports the Section 15.3 active-change statuses.
+// isCapturedChange reports the Section 15.3 active-change statuses. They are
+// the Section 15.2 step 6 admission set, read from the one changedStatuses
+// definition rather than re-spelled here: a second list would let the boost and
+// the seed step disagree about what a captured change is.
 func isCapturedChange(s model.FileStatus) bool {
-	switch s {
-	case model.FileModified, model.FileAdded, model.FileUntracked:
-		return true
+	for _, changed := range changedStatuses {
+		if s == changed {
+			return true
+		}
 	}
 	return false
 }

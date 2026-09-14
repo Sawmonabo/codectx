@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -26,16 +26,34 @@ type Workspace struct {
 	coord *index.Coordinator
 }
 
-// OpenWorkspace composes the workspace for a run that will index. wait is how
-// long it waits for the workspace lock before reporting CTX_WORKSPACE_BUSY;
-// wait <= 0 tries once. rebuild opens an explicitly requested new cache beside
-// the configured one and leaves the existing database untouched (Section 12.2).
+// OpenOptions are the caller-supplied inputs of an indexing open. They are one
+// exported struct because the CLI now resolves four independent flags into
+// them -- the lock wait, `--rebuild`, and the `--scip-index`/`--scip-inputs`
+// pair -- and four positional parameters that must agree read worse than one
+// value that carries the agreement.
+type OpenOptions struct {
+	// Wait is how long the open waits for the workspace lock before reporting
+	// CTX_WORKSPACE_BUSY; Wait <= 0 tries once.
+	Wait time.Duration
+	// Rebuild opens an explicitly requested new cache beside the configured
+	// one and leaves the existing database untouched (Section 12.2).
+	Rebuild bool
+	// SCIPImport is the root-relative path of a supplied SCIP index inside the
+	// snapshot, and SCIPManifest the root-relative path of the optional
+	// input-hash manifest that describes it. Both are passed to the SCIP
+	// provider as they are: scip.New validates them and rejects a manifest
+	// with no index to describe, so neither is re-checked on the way here.
+	SCIPImport, SCIPManifest string
+}
+
+// OpenWorkspace composes the workspace for a run that will index.
 //
 // A payload an admitted unit needs is installed on demand, by the unit
 // (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
 // at unit time, not a missing capability and not a cost this call pays.
-func OpenWorkspace(ctx context.Context, repo string, wait time.Duration, rebuild bool) (*Workspace, error) {
-	return open(ctx, repo, openOptions{mode: modeIndex, wait: wait, rebuild: rebuild})
+func OpenWorkspace(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeIndex, wait: o.Wait, rebuild: o.Rebuild,
+		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
 }
 
 // OpenWorkspaceForReport composes the workspace for a read-only report. It
@@ -110,11 +128,12 @@ func (w *Workspace) ToolStore() string { return w.s.toolDir }
 // thing a caller cannot derive from the configuration alone.
 func (w *Workspace) DataDir() string { return w.s.dataDir }
 
-// Search answers the discovery endpoints over this workspace: exact symbol and
-// path lookup, and generation-local lexical retrieval. It pins a generation per
-// request, so it needs no workspace lock and answers in a report as it does in
-// an indexing session.
-func (w *Workspace) Search() *search.Service { return w.s.search }
+// Config is the configuration this workspace actually opened with, by value:
+// the resolved file plus whatever the open itself settled, which is why
+// Storage.DataDir here is the cache that was opened rather than the configured
+// one. A caller that needs the configuration of an open workspace reads it
+// here instead of loading the files a second time and risking a second answer.
+func (w *Workspace) Config() config.Config { return w.s.cfg }
 
 // Query pins gen -- zero selects the active generation -- and builds the graph
 // engine bound to it. The returned closer releases the reader's QUERY lease and

@@ -175,9 +175,15 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 
 	for _, e := range impact.Entries {
 		c := candidate{
-			NodeID:      e.NodeID,
-			FileID:      e.FileID,
-			Path:        e.Path,
+			NodeID: e.NodeID,
+			FileID: e.FileID,
+			// Path is deliberately left empty: candidate.Path is a FILE PATH
+			// everywhere else, and ImpactEntry.Name is a qualified name.
+			// Writing the name here made hydrateFiles (compiler.go) skip the
+			// entry -- it fills Path only when it is empty -- so the file path
+			// the FileID resolves to never reached the candidate, and
+			// rank.go's packageOf() bucketed qualified names instead of
+			// directories.
 			Requirement: boundaryRequirement(e.Kind, e.Depth),
 			Origin:      originExpansion,
 			Depth:       e.Depth,

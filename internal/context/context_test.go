@@ -555,12 +555,23 @@ func TestContextCompilerScenario(t *testing.T) {
 					{"internal/order/handler.go", model.RequirementSymbol},    // caller
 					{"docs/order.md", model.RequirementRecommended},           // documentation
 				} {
-					got, ok := requirementFor(t, res, want.path)
+					got, ok := requirementFor(t, fx, res, want.path)
 					if !ok {
 						t.Fatalf("scope dropped the boundary %q", want.path)
 					}
 					if got.Requirement != want.req {
 						t.Fatalf("boundary %q requirement = %q, want %q", want.path, got.Requirement, want.req)
+					}
+				}
+				// candidate.Path is a FILE PATH. An expansion entry has none of
+				// its own -- ImpactEntry.Name is a qualified name -- so it must
+				// arrive empty for hydrateFiles to fill from the FileID.
+				// A name written here is never corrected (hydration fills Path
+				// only when empty) and reaches the stored manifest reference,
+				// and so its canonical hash, as a path naming no file.
+				for _, c := range res.Candidates {
+					if c.Origin == originExpansion && c.Path != "" {
+						t.Fatalf("expansion entry carries path %q of its own; hydration can no longer fill the real one", c.Path)
 					}
 				}
 			},
@@ -588,7 +599,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				if res.ScopeComplete {
 					t.Fatal("an unresolved token left the scope reported as complete")
 				}
-				kept, ok := requirementFor(t, res, "Ledger")
+				kept, ok := requirementFor(t, fx, res, "Ledger")
 				if !ok || kept.Excluded == "" {
 					t.Fatalf("the unresolved token lost its exclusion: %+v", kept)
 				}
@@ -679,7 +690,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					{"internal/order/handler.go", model.RequirementRecommended},
 					{"internal/order/service.go", model.RequirementOptional},
 				} {
-					got, ok := requirementFor(t, res, want.path)
+					got, ok := requirementFor(t, fx, res, want.path)
 					if !ok {
 						t.Fatalf("scope dropped the seed %q", want.path)
 					}
@@ -787,6 +798,11 @@ func TestContextCompilerScenario(t *testing.T) {
 						Status: caller.Status, Paths: []model.RelationPath{
 							{Relations: []model.RelationID{edge}},
 							{Relations: []model.RelationID{second}},
+							// A third admissible route, too long to store. It
+							// reuses the same two relation ids, so it adds no
+							// distinct edge to the package centrality and
+							// changes no score -- only the count MorePaths owes.
+							{Relations: longRoute(edge, second)},
 						}},
 					{NodeID: "n2", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
 					{NodeID: "n3", Path: "a.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
@@ -838,17 +854,19 @@ func TestContextCompilerScenario(t *testing.T) {
 						t.Fatalf("rank[%d] carries %d reasons, over the bound %d", i, len(got.Reasons), model.MaxReasonsPerEntry)
 					}
 				}
-				// Two admitted routes, one retained: the route the manifest
-				// cannot enumerate must still be disclosed. model.ContextEntry
-				// has no other channel for the count, so a bounded reason
-				// carrying it is what keeps the entry from reading as an
-				// unexplained selection.
-				if ranked[1].MorePaths != 1 || len(ranked[1].Paths) != 1 {
-					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 1",
+				// Three admitted routes, one retained: the two the manifest
+				// cannot enumerate must BOTH be disclosed -- the weaker short
+				// route AND the route dropped for exceeding
+				// model.MaxRelationsPerPath. Counting only the retainable tail
+				// would understate the routes that exist, which is the one
+				// channel model.ContextEntry has for them, and a bounded
+				// explanation would then read as an unexplained selection.
+				if ranked[1].MorePaths != 2 || len(ranked[1].Paths) != 1 {
+					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 2",
 						len(ranked[1].Paths), ranked[1].MorePaths)
 				}
-				if !slices.Contains(ranked[1].Reasons, "1 further route(s) reach this entity and are not enumerated") {
-					t.Fatalf("the unenumerated route was never disclosed: %q", ranked[1].Reasons)
+				if !slices.Contains(ranked[1].Reasons, "2 further route(s) reach this entity and are not enumerated") {
+					t.Fatalf("the unenumerated routes were never disclosed: %q", ranked[1].Reasons)
 				}
 			},
 		},
@@ -1560,12 +1578,15 @@ func (f *contextFixture) seedOf(path string) candidate {
 		Requirement: model.RequirementFull, Origin: originExplicitSeed, Status: fv.Status}
 }
 
-// requirementFor finds the candidate whose path names the artifact at path.
-// Expansion entries report the qualified name, so the match is by prefix.
-func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool) {
+// requirementFor finds the candidate for the artifact at path. Expansion
+// entries carry no path of their own -- scope.go leaves candidate.Path for the
+// compiler's file hydration to fill -- so the match is by FileID, and falls back
+// to the path only for a discovery candidate that resolved to no file at all.
+func requirementFor(t *testing.T, fx *contextFixture, res scopeResult, path string) (candidate, bool) {
 	t.Helper()
+	id := fx.Files[path].ID
 	for _, c := range res.Candidates {
-		if c.Path == path || strings.HasPrefix(c.Path, path+".") {
+		if (id != "" && c.FileID == id) || (c.Path != "" && c.Path == path) {
 			return c, true
 		}
 	}
@@ -1597,7 +1618,8 @@ func searchService(t *testing.T, fx *contextFixture) *search.Service {
 		t.Fatalf("NewSpools: %v", err)
 	}
 	svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
-		Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
+		Spools: spools, Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
+		Content: cas, Resources: fx.Cfg.Resources,
 		CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
 	if err != nil {
 		t.Fatalf("search.New: %v", err)
@@ -1638,4 +1660,15 @@ func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compil
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// longRoute builds a route one hop past model.MaxRelationsPerPath out of the
+// ids it is given, so a row can exercise the "admissible but too long to store"
+// branch of scoreRoutes without adding a distinct edge to package centrality.
+func longRoute(ids ...model.RelationID) []model.RelationID {
+	out := make([]model.RelationID, 0, model.MaxRelationsPerPath+1)
+	for i := 0; i <= model.MaxRelationsPerPath; i++ {
+		out = append(out, ids[i%len(ids)])
+	}
+	return out
 }

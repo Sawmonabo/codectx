@@ -36,12 +36,12 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		kinds = DefaultRelations()
 	}
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
-	pending, err := e.pendingDependence(ctx, kinds)
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	if len(pending) > 0 {
-		meta.Completeness = pending
+	meta.Completeness = caps
+	if deferred {
 		markTruncated(&meta, reasonDependence)
 	}
 
@@ -282,11 +282,16 @@ func packageLabel(n model.Node) string {
 // clipPath bounds a reported path to MaxPathBytes on a rune boundary. Over-long
 // input would otherwise fail the result contract and turn a complete answer into
 // an error; clipping mid-rune would emit invalid UTF-8 in JSON.
-func clipPath(s string) string {
-	if len(s) <= model.MaxPathBytes {
+func clipPath(s string) string { return clipTo(s, model.MaxPathBytes) }
+
+// clipTo bounds s to max bytes on a rune boundary. It is the one clipper behind
+// clipPath and the qualified-name clip an impact entry reports, so a reported
+// identifier can never fail its own field bound.
+func clipTo(s string, max int) string {
+	if len(s) <= max {
 		return s
 	}
-	cut := model.MaxPathBytes
+	cut := max
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}

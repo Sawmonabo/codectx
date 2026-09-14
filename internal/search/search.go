@@ -27,10 +27,15 @@ import (
 // capability reduction rather than a shortcut, so the field was added here
 // rather than the promise dropped there.
 type Options struct {
-	Store     *sqlite.Store
-	Repo      model.RepositoryID
-	Signer    *pagination.Signer
-	Spools    *pagination.Spools
+	Store  *sqlite.Store
+	Repo   model.RepositoryID
+	Signer *pagination.Signer
+	Spools *pagination.Spools
+	// Leases mints the cursor-scoped retention lease a continuation names. It
+	// is the app stack's one pagination.Leases over the same store, passed in
+	// rather than built here so search and graph cannot drift into two wrappers
+	// with two TTLs.
+	Leases    *pagination.Leases
 	Content   ContentReader
 	Resources config.Resources
 	CursorTTL time.Duration
@@ -70,6 +75,8 @@ func New(o Options) (*Service, error) {
 		return nil, optionErr("a cursor signer")
 	case o.Spools == nil:
 		return nil, optionErr("a spool store")
+	case o.Leases == nil:
+		return nil, optionErr("a cursor lease minter")
 	case o.Content == nil:
 		return nil, optionErr("a content reader for source positions")
 	}
@@ -97,7 +104,7 @@ func New(o Options) (*Service, error) {
 		repo:    o.Repo,
 		signer:  o.Signer,
 		spools:  o.Spools,
-		leases:  pagination.NewLeases(o.Store, ttl),
+		leases:  o.Leases,
 		content: o.Content,
 		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
 		maxPage: o.Resources.MaxPageItems,

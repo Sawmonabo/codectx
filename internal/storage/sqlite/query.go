@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -479,6 +480,56 @@ func (r *PinnedReader) Files(ctx context.Context, after model.FileID, limit int)
 
 const fileQuery = `SELECT sf.file_id, f.path, sf.status, sf.size_bytes, sf.content_hash, sf.git_object_id, sf.language, sf.executable
 	FROM generations g JOIN snapshot_files sf ON sf.snapshot_id = g.snapshot_id JOIN files f ON f.id = sf.file_id WHERE g.id = ?1`
+
+// ChangedFiles is Files with one predicate: only the snapshot rows whose status
+// is one of statuses are returned, keyset-paged by file id exactly as Files is.
+// It exists so a caller that wants the captured working-tree changes of a
+// 250,000-file workspace does not have to read every file row to find them; the
+// status column is part of the snapshot_files row the same query already scans,
+// so this is a filter, not a second file listing.
+//
+// An empty statuses is a caller asking for nothing and is answered with nothing,
+// never with every row: a status filter that silently becomes "no filter" would
+// turn the bounded read this exists to provide back into the full scan.
+func (r *PinnedReader) ChangedFiles(ctx context.Context, after model.FileID,
+	statuses []model.FileStatus, limit int) ([]model.FileVersion, error) {
+	if len(statuses) == 0 {
+		return nil, nil
+	}
+	limit = pageLimit(limit)
+	afterRaw, err := optionalBlob("after", string(after))
+	if err != nil {
+		return nil, err
+	}
+	if afterRaw == nil {
+		afterRaw = []byte{}
+	}
+	args := []any{r.gen, afterRaw, limit}
+	placeholders := make([]string, 0, len(statuses))
+	for _, st := range statuses {
+		args = append(args, string(st))
+		placeholders = append(placeholders, "?"+strconv.Itoa(len(args)))
+	}
+	query := fileQuery + ` AND sf.file_id > ?2 AND sf.status IN (` + strings.Join(placeholders, ",") +
+		`) ORDER BY sf.file_id LIMIT ?3`
+	var out []model.FileVersion
+	err = r.s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return wrap("snapshot_files", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			fv, err := scanFile(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, fv)
+		}
+		return wrap("snapshot_files", rows.Err())
+	})
+	return out, err
+}
 
 func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 	var fv model.FileVersion

@@ -126,14 +126,14 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	maxDepth int, deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
 	var answer impactAnswer
 	meta := model.QueryMeta{}
-	// The deferred-dependence disclosure happens before the walk: a missing
-	// dependence edge must not read as a genuine absence of impact.
-	pending, err := e.pendingDependence(ctx, kinds)
+	// The capability disclosure happens before the walk: a missing dependence
+	// edge must not read as a genuine absence of impact.
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return answer, nil, nil, err
 	}
-	if len(pending) > 0 {
-		meta.Completeness = pending
+	meta.Completeness = caps
+	if deferred {
 		markTruncated(&meta, reasonDependence)
 	}
 
@@ -528,7 +528,7 @@ func (a *impactAccumulator) Relations() []model.Relation { return a.edges }
 // Entries ranks the affected entities. ScoreMicros is integer arithmetic over
 // the frozen cost table -- 1_000_000 / (1 + cost) -- so a cheaper, more direct
 // route always outranks a longer one and no float ever enters the ordering.
-// The order is (ScoreMicros desc, Depth asc, Path asc, NodeID asc); Path is
+// The order is (ScoreMicros desc, Depth asc, Name asc, NodeID asc); Name is
 // filled during hydration, so ties settle on NodeID here and stay stable.
 //
 // reasonPaths is context.max_reason_paths_per_entry. The accumulator records
@@ -617,10 +617,10 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		}
 		entry.Kind = n.Kind
 		entry.FileID = n.FileID
-		entry.Path = clipPath(n.QualifiedName)
+		entry.Name = clipTo(n.QualifiedName, model.MaxQualifiedNameBytes)
 		out = append(out, entry)
 	}
-	// Path participates in the tie-break, so it is applied once it is known.
+	// Name participates in the tie-break, so it is applied once it is known.
 	sort.SliceStable(out, func(i, j int) bool {
 		x, y := out[i], out[j]
 		if x.ScoreMicros != y.ScoreMicros {
@@ -629,8 +629,8 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		if x.Depth != y.Depth {
 			return x.Depth < y.Depth
 		}
-		if x.Path != y.Path {
-			return x.Path < y.Path
+		if x.Name != y.Name {
+			return x.Name < y.Name
 		}
 		return x.NodeID < y.NodeID
 	})

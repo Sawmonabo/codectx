@@ -144,22 +144,39 @@ func (s *stack) overlayLimit(requested int) int {
 // named outside the pinned snapshot -- a standard library, a dependency cache
 // -- which were neither followed nor opened, so they are reported as a partial
 // capability rather than silently dropped.
-func overlayMeta(binding model.Binding, overlay model.OverlayBinding, capability, profile string, truncated bool, excluded int) model.QueryMeta {
+//
+// An EMPTY page is disclosed too, and answered is what says so. A language
+// server that cannot analyse the workspace at all -- its own toolchain missing
+// from PATH is the ordinary case -- answers every request with zero results and
+// no protocol error, which is byte-identical to a workspace where the symbol
+// genuinely does not exist. This route cannot tell those apart, so it says
+// exactly that: an `unavailable` row carrying the reason, which reaches a --json
+// consumer as completeness and a human reader as a warning (queryWarnings
+// promotes unavailable and failed rows, and prints their `reason` detail). The
+// alternative -- ok:true, items:[], completeness:null -- reports an overlay that
+// analysed nothing as a confident empty answer.
+func overlayMeta(binding model.Binding, overlay model.OverlayBinding, capability, profile string, truncated bool, excluded, answered int) model.QueryMeta {
 	meta := model.QueryMeta{Binding: binding, Overlay: &overlay}
 	if truncated {
 		meta.Truncated = true
 		meta.TruncationReason = "the language server returned more results than the page bound"
 	}
-	if excluded > 0 {
-		meta.Completeness = []model.CapabilityState{
-			model.CapabilityState{
-				ProviderID: overlayProviderID(profile),
-				Capability: capability,
-				Scope:      provider.ScopeWorkspace,
-				State:      model.CapabilityPartial,
-			}.WithDetail("semantic_source", string(model.SemanticLSP)).
-				WithDetail("excluded_locations", strconv.Itoa(excluded)),
-		}
+	state := model.CapabilityState{
+		ProviderID: overlayProviderID(profile),
+		Capability: capability,
+		Scope:      provider.ScopeWorkspace,
+	}.WithDetail("semantic_source", string(model.SemanticLSP))
+	switch {
+	case excluded > 0:
+		// Partial rather than unavailable even when every located answer was
+		// excluded: the server did analyse the workspace and named those
+		// locations, they simply sit outside the pinned snapshot.
+		state.State = model.CapabilityPartial
+		meta.Completeness = []model.CapabilityState{state.WithDetail("excluded_locations", strconv.Itoa(excluded))}
+	case answered == 0:
+		state.State = model.CapabilityUnavailable
+		meta.Completeness = []model.CapabilityState{state.WithDetail("reason",
+			"the language server returned no results for this request; this route cannot tell an absent symbol from a workspace the server could not analyse")}
 	}
 	return meta
 }
@@ -223,7 +240,7 @@ func (s *stack) overlaySymbols(ctx context.Context, req model.SymbolRequest) (mo
 			Message: "symbol operation " + strconv.Quote(string(req.Operation)) + " has no language server overlay route"}
 	}
 	page := model.Page[model.Node]{
-		Meta:  overlayMeta(route.binding, route.overlay.Binding(), string(req.Operation), req.Profile, truncated, excluded),
+		Meta:  overlayMeta(route.binding, route.overlay.Binding(), string(req.Operation), req.Profile, truncated, excluded, len(nodes)),
 		Items: nodes,
 	}
 	if err := page.Validate(); err != nil {
@@ -362,9 +379,10 @@ func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceReques
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
+	occurrences := overlayOccurrences(req.Operation, req.NodeID, res.Items)
 	page := model.Page[model.ReferenceOccurrence]{
-		Meta:  overlayMeta(route.binding, route.overlay.Binding(), string(req.Operation), req.Profile, res.Truncated, res.Excluded),
-		Items: overlayOccurrences(req.Operation, req.NodeID, res.Items),
+		Meta:  overlayMeta(route.binding, route.overlay.Binding(), string(req.Operation), req.Profile, res.Truncated, res.Excluded, len(occurrences)),
+		Items: occurrences,
 	}
 	if err := page.Validate(); err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err

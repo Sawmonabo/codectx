@@ -171,7 +171,7 @@ func New(o Options) (*Engine, error) {
 	}, nil
 }
 
-// Neighbors, Callers and Callees live in traverse.go.
+// Neighbors lives in traverse.go.
 
 // References is implemented in references.go (lane L7).
 
