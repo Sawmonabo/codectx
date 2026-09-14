@@ -547,16 +547,58 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 	fmt.Fprintf(b, "occurrences %d in %d distinct %s\n", len(items), len(distinct),
 		plural(len(distinct), "relation", "relations"))
 	for _, o := range items {
+		// Every row carries the three things that tell one occurrence from
+		// another and lead the operator to it: which end of the edge is not the
+		// node being asked about, where the site is, and the evidence identity.
+		// Without them a node called twelve times from one file renders as
+		// twelve identical lines, which is an answer the operator cannot act on.
+		//
 		// References deliberately never sets Path -- resolving it would cost one
 		// file read per distinct file on a port with no batched file lookup --
-		// so the location is rendered from what the occurrence actually carries:
-		// the file id and the byte range that locate it exactly.
+		// so the location is the file id, refined to :line:column when the
+		// occurrence carries a range (the language server overlay's rows do).
 		location := string(o.FileID)
-		if o.Range != nil {
-			location = fmt.Sprintf("%s:%d:%d", o.FileID, o.Range.Start.Line, o.Range.Start.Column)
+		if o.Path != "" {
+			// The overlay is the only producer that sets Path, and it is text
+			// an external language server chose, so it goes through the same
+			// cell sanitizer the other human tables use: clip only bounds
+			// width, and a path carrying a newline would forge a table row.
+			location = tableCell(o.Path)
 		}
-		fmt.Fprintf(b, "  %-18s %-10s %s\n", clip(string(o.Kind), 18), clip(string(o.Precision), 10), clip(location, 100))
+		if o.Range != nil {
+			location = fmt.Sprintf("%s:%d:%d", location, o.Range.Start.Line, o.Range.Start.Column)
+		}
+		fmt.Fprintf(b, "  %-18s %-16s %s at %s  evidence %s\n", clip(string(o.Kind), 18),
+			clip(string(o.Precision), 16), occurrenceOrigin(o), clip(location, 100), occurrenceEvidence(o))
 	}
+}
+
+// occurrenceOrigin names the end of the edge the caller did not ask about: the
+// referencing node for a reference or an implementation, the referenced type
+// for a type definition. It is printed as a full node id because that is what
+// the operator feeds straight back to `refs` or `symbol` to see where the site
+// is; a clipped id would name nothing they can ask about. An overlay row that
+// sealed no canonical edge has no such id and says so rather than printing an
+// empty column that reads as a node whose id is unknown.
+func occurrenceOrigin(o model.ReferenceOccurrence) string {
+	switch {
+	case o.FromNodeID != "":
+		return "from " + string(o.FromNodeID)
+	case o.ToNodeID != "":
+		return "to   " + string(o.ToNodeID)
+	default:
+		return "from (overlay row; no canonical node)"
+	}
+}
+
+// occurrenceEvidence is the identity that separates two occurrences of the same
+// relation in the same file. It is clipped: it is an identity to compare
+// against the --json answer, not an argument any command takes.
+func occurrenceEvidence(o model.ReferenceOccurrence) string {
+	if o.EvidenceID == "" {
+		return "(none sealed)"
+	}
+	return clip(string(o.EvidenceID), 16)
 }
 
 // writePaths renders the routes a path query found, cheapest first, with the
@@ -600,6 +642,11 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 // pair as a precise symbol-level call.
 func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	if len(edges) == 0 {
+		// Silence here read as "this renderer emitted nothing". The rollup is
+		// built from containment edges, and a generation whose providers sealed
+		// none has no packages to aggregate -- which is an answer about the
+		// generation, not a missing section of the report.
+		b.WriteString("packages    none (no containment edges in this generation)\n")
 		return
 	}
 	fmt.Fprintf(b, "packages    %d aggregated %s (pair counts, not individual calls)\n",
