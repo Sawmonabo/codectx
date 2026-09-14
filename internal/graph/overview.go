@@ -109,6 +109,10 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	}
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
+	// The deferred flag is discarded deliberately: it reports that a
+	// DEPENDENCE-only kind was asked for while its units are still building,
+	// and containment is a canonical kind no provider defers. The capability
+	// rows themselves still ride on every answer.
 	caps, _, err := e.completeness(ctx, []model.RelationKind{model.RelContains})
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
@@ -127,6 +131,13 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
+	// Unlike Neighbors and PackageDependencies, a failed containment read is
+	// NOT turned into a truncated answer here (impactPhaseError's
+	// deadline-to-reasonDeadline path). Those endpoints report the edges they
+	// did read; this one reports COUNTS, and a container whose children were
+	// never read renders as SymbolCount 0 -- a wrong measurement rather than a
+	// missing one, which is the one thing Section 23 forbids above all. A map
+	// that could not be counted refuses instead.
 	held, err := e.containerContents(ctx, ids, b, &meta)
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
