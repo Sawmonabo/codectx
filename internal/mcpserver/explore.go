@@ -3,10 +3,8 @@ package mcpserver
 // L2 EXPLORE owns this file: the index and discovery handlers (digest §4 rows
 // 1-5 and 7). Handlers are thin — Validate() then ONE facade call then ok().
 // Ranking, paging, cursor codecs and truncation belong to internal/search;
-// re-deriving any of them here would be a duplicate implementation.
-//
-// indexStatus below is L0's worked example and is already complete; the other
-// five are L2's to fill in, replacing the notImplemented body and this note.
+// re-deriving any of them here would be a duplicate implementation. Nothing in
+// this package touches a store or an analysis engine.
 
 import (
 	"context"
@@ -30,39 +28,99 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, _ em
 	return nil, ok(h, st), nil
 }
 
-// refreshIndex answers codectx_refresh_index. L2: map refreshInput onto
-// model.IndexRequest with Watch FORCED FALSE — a tool never starts a watcher —
-// and route to IndexService.Refresh (or Index when full/rebuild is asked for).
-func (h *handlers) refreshIndex(_ context.Context, _ *mcp.CallToolRequest, _ refreshInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
+// refreshIndex answers codectx_refresh_index.
+//
+// Watch is forced false: a tool never starts a watcher. The watcher is the
+// serve process's single decision, made once from mcp.watch, and refreshInput
+// carries no watch field precisely so a client cannot ask for one here.
+//
+// The route is IndexService.Refresh and only Refresh (digest §4 row 2).
+// Refresh refuses full/rebuild with a remediated CTX_ARGUMENT_INVALID naming
+// `index --full`/`index --rebuild`, and that refusal is surfaced honestly
+// rather than rerouted to IndexService.Index: Section 19.2 lists no
+// codectx_index tool, so calling Index from here would make a build-a-new-
+// generation operation — one that, for rebuild, creates a new cache — reachable
+// through a tool whose name does not say so.
+func (h *handlers) refreshIndex(ctx context.Context, _ *mcp.CallToolRequest, in refreshInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
 	var zero result[model.IndexResult]
-	return nil, zero, h.notImplemented("codectx_refresh_index")
+	req := model.IndexRequest{Full: in.Full, Rebuild: in.Rebuild, Watch: false}
+	if err := req.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	res, err := h.index.Refresh(ctx, req)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, res), nil
 }
 
-// repoOverview answers codectx_repo_overview. L2: Overview is a TYPED REFUSAL
-// this wave (its producer is Task 20's). Surface that *model.Error honestly
-// through toolFailure as a tool error; returning an empty page or an empty item
-// list instead is a silent capability reduction and a Critical defect.
-func (h *handlers) repoOverview(_ context.Context, _ *mcp.CallToolRequest, _ model.OverviewRequest) (*mcp.CallToolResult, result[model.Page[model.OverviewItem]], error) {
+// repoOverview answers codectx_repo_overview.
+//
+// Overview is a TYPED REFUSAL this wave — its producer is Task 20's — so the
+// only correct thing this handler does with that *model.Error is hand it to
+// toolFailure, which is what every handler here already does with a facade
+// error. There is deliberately NO special case: returning an empty page, an
+// empty item list or a success envelope with no data would be the silent
+// capability reduction Section 30.1 forbids, because a model told "no results"
+// cannot tell that apart from "this repository has no packages".
+func (h *handlers) repoOverview(ctx context.Context, _ *mcp.CallToolRequest, in model.OverviewRequest) (*mcp.CallToolResult, result[model.Page[model.OverviewItem]], error) {
 	var zero result[model.Page[model.OverviewItem]]
-	return nil, zero, h.notImplemented("codectx_repo_overview")
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.explore.Overview(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, page), nil
 }
 
-// search answers codectx_search.
-func (h *handlers) search(_ context.Context, _ *mcp.CallToolRequest, _ model.SearchRequest) (*mcp.CallToolResult, result[model.Page[model.SearchHit]], error) {
+// search answers codectx_search. Validate() is not replaced by the SDK's schema
+// validation: required-ness in the inferred schema comes only from the absence
+// of omitempty, so the query's byte bound and the cursor/generation
+// exactly-one-of rule are still checked here.
+func (h *handlers) search(ctx context.Context, _ *mcp.CallToolRequest, in model.SearchRequest) (*mcp.CallToolResult, result[model.Page[model.SearchHit]], error) {
 	var zero result[model.Page[model.SearchHit]]
-	return nil, zero, h.notImplemented("codectx_search")
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.explore.Search(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, page), nil
 }
 
-// findSymbol answers codectx_find_symbol. L2: pass SemanticSource and Profile
-// through untouched so the LSP overlay route stays reachable, and label the
-// answer with the overlay binding the facade puts in QueryMeta. No source bytes.
-func (h *handlers) findSymbol(_ context.Context, _ *mcp.CallToolRequest, _ model.SymbolRequest) (*mcp.CallToolResult, result[model.Page[model.Node]], error) {
+// findSymbol answers codectx_find_symbol. SemanticSource and Profile are passed
+// through UNTOUCHED, which is what keeps the LSP overlay route of Section 11.6
+// reachable through the same typed facade as the canonical path; rewriting
+// either here would silently answer a live-source question with index facts.
+// The overlay label the facade puts in QueryMeta.Overlay is likewise returned
+// verbatim, so an ephemeral dirty-worktree answer stays distinguishable from a
+// sealed fact. model.Node carries no file content: only codectx_read_source
+// returns source bytes.
+func (h *handlers) findSymbol(ctx context.Context, _ *mcp.CallToolRequest, in model.SymbolRequest) (*mcp.CallToolResult, result[model.Page[model.Node]], error) {
 	var zero result[model.Page[model.Node]]
-	return nil, zero, h.notImplemented("codectx_find_symbol")
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.explore.Symbol(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, page), nil
 }
 
-// references answers codectx_references.
-func (h *handlers) references(_ context.Context, _ *mcp.CallToolRequest, _ model.ReferenceRequest) (*mcp.CallToolResult, result[model.Page[model.ReferenceOccurrence]], error) {
+// references answers codectx_references. Like findSymbol it passes
+// SemanticSource and Profile through untouched.
+func (h *handlers) references(ctx context.Context, _ *mcp.CallToolRequest, in model.ReferenceRequest) (*mcp.CallToolResult, result[model.Page[model.ReferenceOccurrence]], error) {
 	var zero result[model.Page[model.ReferenceOccurrence]]
-	return nil, zero, h.notImplemented("codectx_references")
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	page, err := h.explore.References(ctx, in)
+	if err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	return nil, ok(h, page), nil
 }

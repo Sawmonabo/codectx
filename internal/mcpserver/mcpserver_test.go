@@ -505,6 +505,114 @@ var scenarios = []scenario{
 	// L1 rows.
 
 	// L2 rows.
+	{
+		// Failure mode: an LSP overlay answer reaches the model looking like a
+		// sealed canonical fact. Two ways that happens, both guarded here: the
+		// handler rewrites semantic_source/profile on the way in, so the facade
+		// silently answers a live-source question with index facts and the LSP
+		// route becomes unreachable; or the handler rebuilds the page and drops
+		// QueryMeta.Overlay, so the ephemeral dirty-worktree label of Section
+		// 11.6 / 19.3 is lost in serialization. Also asserts the answer carries
+		// no source bytes: only codectx_read_source may return those.
+		name: "find_symbol labels an lsp answer and returns no source bytes",
+		facade: func(f *fakeServices) {
+			f.symbolFn = func(_ context.Context, r model.SymbolRequest) (model.Page[model.Node], error) {
+				if r.SemanticSource != model.SemanticLSP || r.Profile != "gopls" {
+					return model.Page[model.Node]{}, &model.Error{
+						Code:    model.CodeArgumentInvalid,
+						Message: "handler altered the semantic route: " + string(r.SemanticSource) + "/" + r.Profile,
+					}
+				}
+				return model.Page[model.Node]{
+					Meta: model.QueryMeta{Overlay: &model.OverlayBinding{
+						ProviderID:      "gopls",
+						ProviderVersion: "1.2.3",
+						InputDigest:     "d1",
+					}},
+					Items: []model.Node{{
+						Kind:   model.NodeFunction,
+						Name:   "Serve",
+						FileID: "f1",
+						Range: &model.SourceRange{
+							Start: model.Position{Byte: 0, Line: 1, Column: 1},
+							End:   model.Position{Byte: 10, Line: 2, Column: 1},
+						},
+						SemanticSource: model.SemanticLSP,
+					}},
+				}, nil
+			}
+		},
+		tool: "codectx_find_symbol",
+		args: model.SymbolRequest{
+			Query:          "Serve",
+			Operation:      model.SymbolResolve,
+			SemanticSource: model.SemanticLSP,
+			Profile:        "gopls",
+			Page:           model.PageRequest{Limit: 10},
+		},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("find_symbol reported a tool error: %s", firstText(res))
+			}
+			var got result[model.Page[model.Node]]
+			decode(t, res, &got)
+			if got.Data.Meta.Overlay == nil {
+				t.Fatalf("meta.overlay is nil; an lsp answer reached the client unlabelled")
+			}
+			if got.Data.Meta.Overlay.ProviderID != "gopls" || got.Data.Meta.Overlay.ProviderVersion != "1.2.3" {
+				t.Errorf("meta.overlay = %+v, want the facade's label verbatim", *got.Data.Meta.Overlay)
+			}
+			if len(got.Data.Items) != 1 || got.Data.Items[0].SemanticSource != model.SemanticLSP {
+				t.Errorf("items = %+v, want one node labelled lsp", got.Data.Items)
+			}
+			// model.Node carries no body today; this keeps it that way by
+			// failing the moment a source-bearing field (ReadChunkResponse's
+			// "content") appears on this tool's wire answer.
+			raw, err := json.Marshal(res.StructuredContent)
+			if err != nil {
+				t.Fatalf("marshal structured content: %v", err)
+			}
+			if strings.Contains(string(raw), `"content"`) {
+				t.Errorf("find_symbol answer carries source bytes: %s", raw)
+			}
+		},
+	},
+	{
+		// Failure mode: a not-yet-implemented producer is laundered into "no
+		// results". Overview has no producer this wave and refuses with a typed
+		// *model.Error; a handler that swallowed it and returned an empty page
+		// would leave the model unable to tell "this repository has no
+		// packages" from "this capability does not exist yet" — the silent
+		// capability reduction Section 30.1 forbids. The fixture code is
+		// deliberately NOT CTX_INTERNAL, so a handler that dropped the typed
+		// error and returned an untyped one (which toolFailure reduces to
+		// CTX_INTERNAL) fails this row too. Asserted on IsError + text: SDK
+		// v1.7.0 leaves StructuredContent empty on the error path.
+		name: "repo_overview surfaces a refusing Overview as a tool error",
+		facade: func(f *fakeServices) {
+			f.overviewFn = func(context.Context, model.OverviewRequest) (model.Page[model.OverviewItem], error) {
+				return model.Page[model.OverviewItem]{}, &model.Error{
+					Code:        model.CodeNoActiveGeneration,
+					Message:     "repo_overview has no producer in this build",
+					Remediation: "this operation waits on the repository map aggregate",
+				}
+			}
+		},
+		tool: "codectx_repo_overview",
+		args: model.OverviewRequest{Depth: 1, Page: model.PageRequest{Limit: 10}},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if !res.IsError {
+				t.Fatalf("repo_overview returned a success envelope for a refusing facade: %#v", res.StructuredContent)
+			}
+			text := firstText(res)
+			if !strings.Contains(text, model.CodeNoActiveGeneration) {
+				t.Errorf("tool error text = %q, want the typed code %s", text, model.CodeNoActiveGeneration)
+			}
+			if !strings.Contains(text, "waits on the repository map aggregate") {
+				t.Errorf("tool error text = %q, want the facade's remediation", text)
+			}
+		},
+	},
 
 	// L3 rows.
 	{
