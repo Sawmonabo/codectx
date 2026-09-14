@@ -31,19 +31,20 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, _ em
 // refreshIndex answers codectx_refresh_index.
 //
 // Watch is forced false: a tool never starts a watcher. The watcher is the
-// serve process's single decision, made once from mcp.watch, and refreshInput
-// carries no watch field precisely so a client cannot ask for one here.
+// serve process's single decision, made once from mcp.watch, and the tool takes
+// emptyInput precisely so a client cannot ask for one here.
 //
-// The route is IndexService.Refresh and only Refresh (digest §4 row 2).
-// Refresh refuses full/rebuild with a remediated CTX_ARGUMENT_INVALID naming
-// `index --full`/`index --rebuild`, and that refusal is surfaced honestly
-// rather than rerouted to IndexService.Index: Section 19.2 lists no
-// codectx_index tool, so calling Index from here would make a build-a-new-
+// The route is IndexService.Refresh and only Refresh (digest §4 row 2), which
+// takes no arguments at all: Refresh refuses full and rebuild with a remediated
+// CTX_ARGUMENT_INVALID naming `index --full`/`index --rebuild`, so a `full` or
+// `rebuild` argument here could only ever yield that refusal — a dead input
+// surface. Section 19.2 lists no codectx_index tool, so rerouting either to
+// IndexService.Index is not the alternative: that would make a build-a-new-
 // generation operation — one that, for rebuild, creates a new cache — reachable
 // through a tool whose name does not say so.
-func (h *handlers) refreshIndex(ctx context.Context, _ *mcp.CallToolRequest, in refreshInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
+func (h *handlers) refreshIndex(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
 	var zero result[model.IndexResult]
-	req := model.IndexRequest{Full: in.Full, Rebuild: in.Rebuild, Watch: false}
+	req := model.IndexRequest{Full: false, Rebuild: false, Watch: false}
 	if err := req.Validate(); err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}

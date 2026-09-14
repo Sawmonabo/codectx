@@ -58,16 +58,6 @@ type handlers struct {
 //	internal/cli/mcp.go  — INT: newMCPCommand(build model.BuildInfo) *cobra.Command
 //	                            for `codectx mcp serve --repo PATH [--watch]`
 //
-// notImplemented is what every stub returns until its lane lands. It is a
-// typed CTX_INTERNAL, never a panic: a half-built server must still answer the
-// protocol rather than kill the process and the session with it.
-func (h *handlers) notImplemented(tool string) error {
-	return toolFailure(h.log, &model.Error{
-		Code:    model.CodeInternal,
-		Message: "tool " + tool + " is not implemented in this build",
-	})
-}
-
 // --- Local composite types --------------------------------------------------
 //
 // Every other tool's In is the landed model request type VERBATIM: they already
@@ -79,14 +69,6 @@ func (h *handlers) notImplemented(tool string) error {
 // emptyInput is the argument type of a tool that takes none. The SDK infers
 // `{"type":"object"}` from it, which is what the protocol requires.
 type emptyInput struct{}
-
-// refreshInput deliberately has NO watch field: a tool never starts a watcher.
-// The handler maps this onto model.IndexRequest with Watch forced false; the
-// watcher is the serve process's decision, made once from mcp.watch.
-type refreshInput struct {
-	Full    bool `json:"full"`
-	Rebuild bool `json:"rebuild"`
-}
 
 // symbolInfoInput drives the composed Symbol+References answer of tool 6. It
 // names no operation: symbol_info fixes resolve and references, which is what
