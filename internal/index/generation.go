@@ -194,6 +194,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		return model.IndexResult{}, err
 	}
 	g.c.retain(ctx)
+	g.c.collect(ctx)
 	// Deferred work is enqueued only after the base generation is published:
 	// Section 11.6 is explicit that nothing dependence-shaped runs before base
 	// readiness, and ruling Q9 makes the background tick run it even when no

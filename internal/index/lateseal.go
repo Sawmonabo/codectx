@@ -604,6 +604,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	// same lock the indexing runs hold rather than collecting one of them.
 	c.run.Lock()
 	c.retain(ctx)
+	c.collect(ctx)
 	c.run.Unlock()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,

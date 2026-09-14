@@ -517,6 +517,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, err
 		}
 	}
+	if err = s.openCollector(ctx, o.mode == modeIndex); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -715,7 +718,26 @@ func (s *stack) openDiagnostics() error {
 		return err
 	}
 	s.diagnose = svc
+	return nil
+}
 
+// openCollector builds the process-level collector and, on a run that holds the
+// workspace lock, runs the one startup-recovery pass.
+//
+// It is built in openStack rather than beside the reporter in openQueries
+// because the coordinator is what schedules it: index.New is handed this
+// collector, and the coordinator is constructed from the stack the moment
+// openStack returns. A collector composed after the coordinator could only be
+// attached by a setter, and a coordinator that spends part of its life with a
+// nil scheduler is the dead consumer this obligation exists to remove.
+//
+// LOCK ORDER (retention/retention.go states it once): the caller holds the
+// cross-process workspace lock AND this process's indexing mutex. Here the
+// first is `recovering`, which is true only in the indexing composition, and
+// the second is trivially held: no coordinator exists yet, so nothing in this
+// process can be indexing. A report takes no workspace lock and therefore runs
+// no pass -- it only carries the collector so the coordinator it builds can.
+func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 	// The tool resolver is handed over as the collector's ToolCollector
 	// directly, not wrapped in a GC-only adapter: the data-directory reclaim
 	// discovers the name -> digest oracle by asserting retention.ToolPins on
@@ -723,7 +745,7 @@ func (s *stack) openDiagnostics() error {
 	// leave that pass warning and skipping on every run.
 	collector, err := retention.New(retention.Options{
 		Config: retention.RetentionConfig{
-			DataDir:                dataDir,
+			DataDir:                s.dataDir,
 			ClosedSessionRetention: s.cfg.Storage.ClosedSessionRetention.Std(),
 			GraceWindow:            s.cfg.Retention.BlobGrace.Std(),
 			BatchLimit:             collectorBatchLimit,
@@ -740,6 +762,33 @@ func (s *stack) openDiagnostics() error {
 		return err
 	}
 	s.collector = collector
+	if !recovering {
+		return nil
+	}
+	// The startup pass is the caller pagination.Spools.Sweep, ExpireSessions,
+	// PruneSessions, snapshot.Sweep and Resolver.GC were documented to expect
+	// and never had. Like retention after an activation it never fails the
+	// command that opened the workspace: the state it reclaims is by definition
+	// state nothing references, and the only consequence of a failed pass is
+	// disk the next pass reclaims. It is logged with its typed code so it
+	// cannot be silent.
+	report, err := collector.Collect(context.WithoutCancel(ctx))
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) {
+			s.logger.Warn("the startup collection pass did not finish", "component", "app",
+				"diagnostic_code", typed.Code, "diagnostic", typed.Message)
+		} else {
+			s.logger.Warn("the startup collection pass did not finish", "component", "app",
+				"diagnostic", err.Error())
+		}
+		return nil
+	}
+	s.logger.Info("startup collection pass finished", "component", "app",
+		"sessions_expired", report.SessionsExpired, "sessions_pruned", report.SessionsPruned,
+		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
+		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
+		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored)
 	return nil
 }
 
