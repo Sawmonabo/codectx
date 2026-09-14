@@ -53,10 +53,11 @@ const (
 	fieldRelationshipIsTypeDefinition = 4
 	fieldRelationshipIsDefinition     = 5
 
-	roleDefinition  = 0x1
-	roleImport      = 0x2
-	roleWriteAccess = 0x4
-	roleReadAccess  = 0x8
+	// Only the definition and import roles are read. The read and write
+	// access roles exist in the format but are not mapped: `reads` and
+	// `writes` belong to the dependence provider (Section 11.6).
+	roleDefinition = 0x1
+	roleImport     = 0x2
 
 	encodingUnspecified = 0
 	encodingUTF8        = 1
