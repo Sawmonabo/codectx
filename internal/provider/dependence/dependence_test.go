@@ -3,6 +3,8 @@ package dependence_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,12 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // repo is one Go module with a nested module. It exercises the two planning
@@ -401,6 +405,101 @@ func TestPlanUnits(t *testing.T) {
 		t.Errorf("outer module folded %d files and %d bytes; the governor sizes the heap cap from these",
 			plan[0].Files, plan[0].Bytes)
 	}
+
+	// A unit's cache key and its planned identity are its semantic closure and
+	// nothing else (Section 11.6). Failure mode on the wide side: a
+	// documentation edit invalidates the heaviest unit in the product, which is
+	// a full engine parse and export. Failure mode on the narrow side, which is
+	// the one that corrupts answers: a source file or a lock file leaves the
+	// key, so the unit is reused across a change it never saw and serves stale
+	// dependence facts as fresh.
+	base := dependenceUnitID(t, repo)
+	if got := dependenceUnitID(t, edited(repo, "docs/overview.md", "# overview, revised\n")); got != base {
+		t.Error("editing a documentation file changed the dependence unit's identity; every README edit would reparse the module")
+	}
+	if got := dependenceUnitID(t, edited(repo, "app.go", "package app\n\nfunc Run(x int) int { return x }\n")); got == base {
+		t.Error("editing the module's own source did not change its identity; the unit would be reused across a source change")
+	}
+	if got := dependenceUnitID(t, edited(repo, "go.sum", "example.com/dep v1.2.3 h1:abc=\n")); got == base {
+		t.Error("editing the module's lock file did not change its identity; the unit would be reused across a dependency change")
+	}
+
+	// The same closure, on the marker half, under a repository that owns more
+	// lock files than any fixed bound would allow. Failure mode: a truncated
+	// marker list silently drops a go.sum from the closure, so the unit is
+	// reused across a dependency change with nothing recording that it was.
+	vendored := map[string]string{"go.mod": repo["go.mod"], "app.go": repo["app.go"]}
+	for i := 0; i < 70; i++ {
+		vendored[fmt.Sprintf("vendored/m%02d/go.sum", i)] = fmt.Sprintf("example.com/m%02d v1.0.0 h1:x=\n", i)
+	}
+	vp, err := dependence.PlanUnits(context.Background(), providertest.New(t, vendored).View)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vp.Units) != 1 || vp.Units[0].ScopeKey != rootScope {
+		t.Fatalf("plan = %v, want one %s unit", vp.Units, rootScope)
+	}
+	if !slices.Contains(vp.Units[0].Markers, "vendored/m69/go.sum") {
+		t.Errorf("the unit declares %d of the 71 manifest and lock files it owns; a dropped lock file leaves the cache key",
+			len(vp.Units[0].Markers))
+	}
+}
+
+// planStub is the dependence provider as the planner sees it. The planner
+// dispatches on descriptor identity and asks a dependence provider nothing
+// else -- the scopes come from dependence.PlanUnits over the snapshot -- so
+// the closure rows above need no engine.
+type planStub struct{}
+
+func (planStub) Descriptor() model.ProviderDescriptor {
+	return model.ProviderDescriptor{ID: dependence.ProviderID, Version: "planstub",
+		Capabilities: dependence.Capabilities, InvalidationScope: model.InvalidationPackage}
+}
+
+func (planStub) Detect(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+	return provider.Detection{}, errors.New("the planner never detects")
+}
+
+func (planStub) IndexUnit(context.Context, provider.UnitRequest, provider.Sink) (model.ProviderResult, error) {
+	return model.ProviderResult{}, errors.New("the planner never runs a unit")
+}
+
+// dependenceUnitID plans files through the real planner and folds the identity
+// of the root module's unit, which is what reuse compares byte for byte. Two
+// harnesses over the same content mint the same identities (providertest fixes
+// the repository id for exactly this comparison), so a difference here is a
+// difference in the closure and nothing else.
+func dependenceUnitID(t *testing.T, files map[string]string) model.UnitID {
+	t.Helper()
+	h := providertest.New(t, files)
+	cfg := config.Defaults()
+	p, err := plan.Build(context.Background(), plan.Inputs{View: h.View, Store: h.Store, Config: cfg,
+		Selection: provider.Selection{Active: []provider.Provider{planStub{}},
+			Detections: map[string]provider.Detection{dependence.ProviderID: {Available: true,
+				Capabilities: dependence.Capabilities}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range p.Units {
+		if u.ScopeKey != rootScope {
+			continue
+		}
+		spec, err := u.Spec(cfg.AnalysisConfigHash())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return spec.ID
+	}
+	t.Fatalf("the planner planned no %s unit", rootScope)
+	return ""
+}
+
+// edited is files with one path's content replaced. It copies, because the
+// fixture map is shared with every other row in this file.
+func edited(files map[string]string, path, content string) map[string]string {
+	out := maps.Clone(files)
+	out[path] = content
+	return out
 }
 
 // TestGovernorRetriesOnceAndOnlyHigher protects the memory ruling: there is no

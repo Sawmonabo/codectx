@@ -18,10 +18,13 @@ package dependence
 // the Cargo workspace root; a directory of `.rs` files without a `Cargo.toml`
 // produces an empty graph and is therefore not a unit at all.
 //
-// A plan holds one descriptor per project, never a repository-sized file list
+// A plan holds one descriptor per project and no repository-sized source list
 // (Section 6): membership is a predicate over the project root and the nested
 // roots it does not own, and file counts and bytes are folded in a streaming
-// pass.
+// pass. The one list a descriptor does hold is its manifest and lock files --
+// the half of the unit's cache key that is not its sources. markersUnder keeps
+// that list complete rather than bounded, and partitions it across the
+// family's units, so one plan holds each marker path at most once.
 
 import (
 	"context"
@@ -40,10 +43,6 @@ import (
 // which facts the analysis can resolve.
 const MaxUnitsPerFamily = 512
 
-// maxMarkersPerUnit bounds the manifest and lock paths one unit folds into its
-// cache key.
-const maxMarkersPerUnit = 64
-
 // Unit is one planned frontend-native project.
 type Unit struct {
 	// ScopeKey is `pkg:<family>:<root>` for a project unit and `workspace` for
@@ -58,7 +57,8 @@ type Unit struct {
 	// this unit, so a nested module is analysed once, by its own unit.
 	Excluded []string
 	// Markers are the manifest and lock files whose content is part of the
-	// unit's semantic closure (Section 11.6), sorted.
+	// unit's semantic closure (Section 11.6), sorted. The list is complete:
+	// see markersUnder for why it is not bounded.
 	Markers []string
 	// Files and Bytes are the unit's own source files and their byte count:
 	// the governor sizes the heap cap from Bytes, and a unit with no files is
@@ -350,7 +350,26 @@ func nested(d string, dirs []string) []string {
 	return out
 }
 
-// markersUnder collects the manifest paths a unit owns, bounded and sorted.
+// markersUnder collects the manifest paths a unit owns, sorted and complete.
+//
+// It does not truncate, and it has no count bound. A marker this list drops is
+// a manifest or lock file that leaves the unit's cache key (CacheKey) and the
+// unit's declared inputs, which is exactly "any of these changing invalidates
+// the unit" (Section 11.6) broken in the unsafe direction: the unit is reused
+// across a changed go.sum and serves stale dependence facts as fresh. A count
+// bound cannot fail closed here either, because the natural overflow is an
+// ordinary repository and not a planner defect: the C/C++ unit is the whole
+// tree, so its markers are every Makefile and CMakeLists.txt in it, and a
+// JavaScript monorepo's root unit collects every package.json below it.
+// Refusing those would refuse to index the repository at all.
+//
+// The list is not repository-sized in the sense Section 6 bounds: it holds
+// manifest and lock files only, and markersUnder partitions them across the
+// family's units (a marker under an excluded nested project belongs to that
+// project's unit), so one plan holds each marker path at most once. That is
+// the same reasoning that leaves a planned unit's declared input list
+// unbounded -- a silently short input list is a reuse-safety corruption, not a
+// memory optimization.
 func markersUnder(markers map[string][]string, root string, excluded []string) []string {
 	var out []string
 	dirs := make([]string, 0, len(markers))
@@ -375,9 +394,6 @@ func markersUnder(markers map[string][]string, root string, excluded []string) [
 		out = append(out, markers[d]...)
 	}
 	slices.Sort(out)
-	if len(out) > maxMarkersPerUnit {
-		out = out[:maxMarkersPerUnit]
-	}
 	return out
 }
 
