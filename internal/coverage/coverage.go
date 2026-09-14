@@ -86,6 +86,27 @@ type Sessions interface {
 	// StateClosed, ExpectedVersion: n}. There is no CloseSession and no edge out
 	// of complete, so closing a completed session is CTX_VERSION_CONFLICT.
 	AdvanceSession(ctx context.Context, req model.AdvanceRequest) (model.WorkflowStatus, error)
+
+	// L6 restores: the two Task 17 additions below are frozen here by L0 but
+	// stay commented until L6 appends them to *sqlite.Store in the same commit.
+	// The store is wired into this interface at compose.go:633, so declaring a
+	// method the concrete store does not have yet would break the composition
+	// for every other lane, not merely this file's own assertion. L6 uncomments
+	// these two lines, adds the matching fake methods in coverage_test.go and
+	// consumes them from Next.
+	//
+	// RangeConfirmed answers containment over served_ranges in SQL and returns a
+	// bounded boolean, never an interval list: Next uses it to resume at the
+	// first uncovered byte rather than merging intervals in Go.
+	//
+	//	RangeConfirmed(ctx context.Context, session model.SessionID, actor string, file model.FileID,
+	//	        hash string, r model.ByteRange) (bool, error)
+	//
+	// SessionFilePaths is the bounded batch form of FilePath, so a page of Next
+	// items resolves its paths in one join instead of one query per file.
+	//
+	//	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+	//	        ids []model.FileID) (map[model.FileID]string, error)
 }
 
 // Source is the per-snapshot verified read surface. *snapshot.View satisfies
@@ -308,6 +329,14 @@ func typedErrf(code, format string, args ...any) *model.Error {
 //	// size, and the separate zero-length confirmed-EOF branch). Task 15 must
 //	// not define it; Task 17 consumes it and must not define a second one.
 //	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+//
+//	// internal/storage/sqlite/state.go -- Task 17's two appended reads, L6's.
+//	// APPEND ONLY; no existing method is edited. They land in the same commit
+//	// that uncomments the two Sessions declarations above.
+//	func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
+//	        file model.FileID, hash string, r model.ByteRange) (bool, error)
+//	func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+//	        ids []model.FileID) (map[model.FileID]string, error)
 //
 //	// internal/cli/context.go -- the Section 18.1 spellings context
 //	// read/acknowledge/status/next/close, registered by one loop line in

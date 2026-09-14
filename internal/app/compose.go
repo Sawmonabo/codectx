@@ -704,6 +704,22 @@ func coverageLimits(cfg config.Config) coverage.Limits {
 // catalog, the CAS and an immutable header -- so there is nothing to release
 // and the map is dropped with the stack.
 func (s *stack) openView(ctx context.Context, id model.SnapshotID) (coverage.Source, error) {
+	v, err := s.view(ctx, id)
+	if err != nil {
+		// The concrete pointer is dropped explicitly rather than returned into
+		// the interface: a nil *snapshot.View in a non-nil coverage.Source is a
+		// value every caller's `if src != nil` would wave through.
+		return nil, err
+	}
+	return v, nil
+}
+
+// view is the memoised view itself, in its concrete type. openView narrows it
+// to coverage.Source for the coverage service; the LSP overlay route needs the
+// same view as a model.SnapshotView, which *snapshot.View satisfies and
+// coverage.Source does not, so the memoisation lives here and is not spelled a
+// second time beside it.
+func (s *stack) view(ctx context.Context, id model.SnapshotID) (*snapshot.View, error) {
 	s.viewsMu.Lock()
 	defer s.viewsMu.Unlock()
 	if v, ok := s.views[id]; ok {
