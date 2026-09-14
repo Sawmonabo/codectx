@@ -44,8 +44,11 @@ constants of this build; `${input_dir}` is the materialization root and
 `<data_dir>/lsp/<server>/<payload identity>/`, which the overlay creates before
 the server starts. The last component is the digest half of the resolved
 payload's `Tool.Fingerprint()`: what the directory holds is derived from the
-payload and is never rewritten, so a new payload gets a new directory and the
-old one becomes garbage the data-directory sweep removes. (The digest rather
+payload and is never rewritten, so a new payload gets a new directory. The
+previous one is **left in place** — nothing reclaims anything under
+`<data_dir>/lsp` today — so a machine keeps one tree per payload version it has
+been pinned to, which is the cost of never rewriting a configuration underneath
+a running server. (The digest rather
 than the rendered fingerprint because this is a path component, and the
 rendered form carries the version verbatim — an override's version is whatever
 the user typed.)
@@ -327,8 +330,8 @@ does not have to rediscover it.
   data directory and it accumulates state there across runs. Approving
   `jdtls` means approving that write. A payload upgrade re-creates that
   workspace index, because the work directory is per payload identity; that is
-  the safe direction, and the previous payload's tree is left for the
-  data-directory sweep rather than rewritten under a running server. No snapshot byte and no repository file
+  the safe direction, and the previous payload's tree is left on disk rather
+  than rewritten under a running server — nothing reclaims it yet. No snapshot byte and no repository file
   is ever written: the materialization is read-only input and the checkout is
   never touched.
 - **Unexpected-exit detection is delayed** by twice the grace, as described

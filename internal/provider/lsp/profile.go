@@ -239,8 +239,12 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 // payload booted against the previous one's configuration fails at startup with
 // no way back except deleting the directory by hand. The workspace index under
 // -data is derived from it too, and re-creating that after an upgrade is the
-// safe direction. The stale sibling becomes garbage the data-directory sweep
-// removes.
+// safe direction. The previous payload's directory is left in place: nothing
+// under <data_dir>/lsp is reclaimed today (the only data-directory sweeps are
+// snapshot's over its materializations and dependence's over its own private
+// tree), so a machine keeps one tree per jdtls version it has been pinned to.
+// That bound is the cost of not rewriting a configuration underneath a running
+// server, and reclaiming it belongs to whoever owns data-directory retention.
 //
 // The identity is the payload fingerprint rather than the version, because the
 // version is not by itself an identity: an override carries the version its
