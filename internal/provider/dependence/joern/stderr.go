@@ -94,9 +94,17 @@ func classify(res process.Result) dependence.Outcome {
 		}
 	}
 	switch {
-	case oom:
+	case oom && res.ExitCode != 0:
 		// Heap exhaustion is the one class that may be retried, so it is
-		// decided before any other signal the same stderr carries.
+		// decided before any other signal the same stderr carries — but only
+		// for a run that actually failed. The marker is a substring of the
+		// bounded stderr, so a run that exited 0 and left a good graph can
+		// carry it from an out-of-memory the engine caught and logged, or from
+		// a source path or method name that contains the word. Classifying
+		// that as memory would spend the unit's single retry on a full parse
+		// of a unit that already succeeded. A zero-exit run falls through to
+		// the engine/none decision below, which parse()'s graph-presence check
+		// then resolves.
 		out.Class = dependence.FailureMemory
 	case out.Pass != "", helperCrash, res.ExitCode != 0:
 		out.Class = dependence.FailureEngine
