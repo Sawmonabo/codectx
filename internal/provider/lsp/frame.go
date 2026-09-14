@@ -173,6 +173,12 @@ func trustRequired(format string, args ...any) *model.Error {
 		WithRemediation("Construct the profile with lsp.Resolve, which starts only the payload the embedded tool lock pins.")
 }
 
+// internalError is a product defect: a pinned definition that cannot be started
+// as written. It is never a condition a user can correct.
+func internalError(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
+}
+
 func invalid(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
 }

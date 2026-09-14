@@ -100,10 +100,57 @@ const utilGo = "package main\n" +
 //   - a server-initiated workspace/applyEdit is refused (repository safety);
 //   - shutdown/exit leaves no process and no materialization (resource leak);
 //   - a crashed server releases the pending call and the overlay reports
-//     failure (resource leak, false readiness).
+//     failure (resource leak, false readiness);
+//   - a server that reports no serverInfo still opens, bound to the version of
+//     the payload the lock pinned (false readiness: pyright and
+//     typescript-language-server both answer initialize with no serverInfo, and
+//     an empty ProviderVersion fails OverlayBinding.Validate, which made the
+//     overlay permanently unavailable for four of the nine languages).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
+	}
+	t.Run("no serverInfo", runSilentServerScenario)
+}
+
+func runSilentServerScenario(t *testing.T) {
+	h := providertest.New(t, map[string]string{"main.go": mainGo, "util.go": utilGo})
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODECTX_LSP_FAKE", "1")
+	t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+	t.Setenv("CODECTX_LSP_FAKE_NO_SERVERINFO", "1")
+	// The pinned version differs from the one the fake would have reported, so
+	// the assertion below cannot pass by coincidence.
+	const pinned = "9.9.9"
+	resolver := offlineResolver(t, map[string]toolchain.Override{
+		"gopls": {Executable: exe, Version: pinned, Checksum: fileDigest(t, exe)},
+	})
+	ctx := context.Background()
+	profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
+		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	ov, err := mgr.Open(ctx, h.View, profile)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer ov.Close()
+	if got := ov.Binding(); got.ProviderVersion != pinned || got.Validate() != nil {
+		t.Fatalf("binding = %+v (%v), want provider_version %q", got, got.Validate(), pinned)
 	}
 }
 

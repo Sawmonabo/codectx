@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +35,12 @@ type Definition struct {
 	// server's private working directory; there is no other substitution and
 	// no shell.
 	Args []string
+	// RuntimeArgs are arguments of the runtime that hosts the payload, placed
+	// between the runtime executable and the payload itself. A JVM option
+	// after `-jar` is an application argument, not a JVM option, so a payload
+	// the managed JDK hosts has no other way to ask for one. It is meaningful
+	// only for a runtime-hosted payload, which Resolve enforces.
+	RuntimeArgs []string
 	// EnvAllowlist names the parent variables the server may see. The child's
 	// environment is exactly these (those the parent actually has) plus the
 	// variables the resolved payload carries, and nothing else.
@@ -57,12 +62,16 @@ type Definition struct {
 // than a per-request bound (Options.RequestTimeout is that one), and the
 // reservations are what the runner accounts before the child starts.
 const (
-	serverLifetime      = time.Hour
-	serverMemoryBudget  = 4 << 30
-	serverDiskBudget    = 2 << 30
-	serverMemoryLarge   = 8 << 30
-	serverDiskLarge     = 4 << 30
-	workDirName         = "lsp"
+	serverLifetime     = time.Hour
+	serverMemoryBudget = 4 << 30
+	serverDiskBudget   = 2 << 30
+	serverMemoryLarge  = 8 << 30
+	serverDiskLarge    = 4 << 30
+	workDirName        = "lsp"
+	// serverJDTLS is the one payload with a platform configuration directory to
+	// seed and runtime arguments to pass; both are named by this constant
+	// rather than by a repeated string literal.
+	serverJDTLS         = "jdtls"
 	substitutionInput   = "${input_dir}"
 	substitutionWorkDir = "${work_dir}"
 )
@@ -105,9 +114,33 @@ var definitions = map[string]Definition{
 		RootMarkers:       []string{"compile_commands.json", "compile_flags.txt", ".clangd", "CMakeLists.txt"},
 		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
-	"jdtls": {
-		Name: "jdtls", Languages: []string{"java"},
-		Args: []string{"-data", substitutionWorkDir},
+	serverJDTLS: {
+		Name: serverJDTLS, Languages: []string{"java"},
+		// The Equinox launcher needs its application identity and its module
+		// openings as JVM options, before -jar. jdt.ls reflects into java.base
+		// and the upstream launcher passes the same set; the configuration
+		// directory's config.ini repeats the three eclipse.* properties, which
+		// is why the launcher bootstraps even without them (measured), but a
+		// payload that stopped carrying them would then fail silently.
+		RuntimeArgs: []string{
+			"-Declipse.application=org.eclipse.jdt.ls.core.id1",
+			"-Dosgi.bundles.defaultStartLevel=4",
+			"-Declipse.product=org.eclipse.jdt.ls.core.product",
+			"--add-modules=ALL-SYSTEM",
+			"--add-opens", "java.base/java.util=ALL-UNNAMED",
+			"--add-opens", "java.base/java.lang=ALL-UNNAMED",
+		},
+		// Equinox *writes* into its configuration directory -- OSGi caches, a p2
+		// data area, its own error log -- so it is a private copy under the work
+		// directory, seeded from the payload once (see seedPlatformConfig).
+		// Pointed at the payload's own config_<platform>, three failed starts
+		// left four new paths inside a published, digest-identified store
+		// version that `codectx tools verify` cannot see, because verify
+		// rehashes the pinned entry and not the payload tree.
+		Args: []string{
+			"-configuration", substitutionWorkDir + "/config",
+			"-data", substitutionWorkDir + "/data",
+		},
 		// JAVA_HOME is deliberately absent: the resolved payload carries the
 		// managed JDK's own, and a host value in the allowlist would shadow
 		// the runtime the lock pinned.
@@ -181,6 +214,14 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 		}
 		return Profile{}, err
 	}
+	// RuntimeArgs only mean anything when a runtime hosts the payload, which is
+	// exactly when the resolved prefix carries more than the executable. A
+	// definition that sets them for a directly executable payload would pass
+	// them to the payload as its own arguments; that is a product defect, not a
+	// condition a user can correct.
+	if len(def.RuntimeArgs) > 0 && len(t.ArgvPrefix) < 2 {
+		return Profile{}, internalError("language server %q declares runtime arguments but its payload is not runtime-hosted", name)
+	}
 	return Profile{Definition: def, Tool: t}, nil
 }
 
@@ -197,7 +238,8 @@ func (p Profile) workDir(dataDir string) string {
 // substitutions applied.
 func (p Profile) argv(inputDir, workDir string) (path string, args []string) {
 	prefix := p.Tool.ArgvPrefix
-	args = append([]string(nil), prefix[1:]...)
+	// RuntimeArgs precede the payload the runtime hosts, never follow it.
+	args = append(append([]string(nil), p.RuntimeArgs...), prefix[1:]...)
 	for _, a := range p.Args {
 		a = strings.ReplaceAll(a, substitutionInput, inputDir)
 		a = strings.ReplaceAll(a, substitutionWorkDir, workDir)
@@ -234,7 +276,9 @@ func (p Profile) env() []string {
 // "1.98.0 (88d9e12 2026-08-18)" and the scip-java 0.13.1 payload reports
 // "0.0.0-SNAPSHOT" (both measured here). A constraint written to accept those
 // is a constraint that accepts anything, which is a gate in name only.
-func serverVersion(reported string) string {
+// A server that reports nothing falls back to pinned, the version of the
+// payload the lock pinned, which is never empty for a resolved tool.
+func serverVersion(reported, pinned string) string {
 	v := strings.TrimSpace(reported)
 	if strings.HasPrefix(v, "{") {
 		var build struct {
@@ -243,6 +287,9 @@ func serverVersion(reported string) string {
 		if json.Unmarshal([]byte(v), &build) == nil && build.Version != "" {
 			v = build.Version
 		}
+	}
+	if v == "" {
+		v = pinned
 	}
 	if len(v) > model.MaxIdentifierBytes {
 		v = v[:model.MaxIdentifierBytes]
@@ -267,7 +314,7 @@ func inputDigest(snap model.Snapshot, p Profile, serverVersion, encoding string)
 	h.AddString(p.Tool.Fingerprint())
 	h.AddString(serverVersion)
 	h.AddString(encoding)
-	args := slices.Clone(p.Args)
-	h.AddString(strings.Join(args, "\x00"))
+	h.AddString(strings.Join(p.Args, "\x00"))
+	h.AddString(strings.Join(p.RuntimeArgs, "\x00"))
 	return h.Sum()
 }
