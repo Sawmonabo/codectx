@@ -253,9 +253,18 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	}
 	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
 
-	// A deferred dependence row, as PinnedReader.Capabilities returns it. An
-	// answer that traverses a dependence-only kind must disclose this.
+	// The generation's capability report, as PinnedReader.Capabilities returns
+	// it: one ordinary fresh row, and one deferred dependence row. An answer
+	// that traverses a dependence-only kind must disclose the deferred row, and
+	// EVERY answer must carry the report itself -- a graph answer that dropped
+	// it would report "no capabilities" on a generation whose search answers
+	// report them from the same reader.
 	f.caps = []model.CapabilityState{{
+		ProviderID: "canonical",
+		Capability: "relations",
+		Scope:      "workspace",
+		State:      model.CapabilityFresh,
+	}, {
 		ProviderID:     "dependence",
 		Capability:     "data_flows_to",
 		Scope:          "workspace",
@@ -729,10 +738,22 @@ func TestGraphScenarios(t *testing.T) {
 					t.Errorf("meta = (%v, %q), want truncated with %q",
 						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
 				}
-				if len(res.Meta.Completeness) != 1 {
-					t.Fatalf("completeness rows = %d, want the one deferred dependence row", len(res.Meta.Completeness))
+				// The answer carries the generation's whole capability report,
+				// with the deferred row disclosed once inside it: dropping the
+				// report leaves the caller unable to tell a complete answer from
+				// a degraded one, and publishing the deferred row a second time
+				// alongside it both misreports and grows a full report past
+				// model.MaxCapabilityStates.
+				if len(res.Meta.Completeness) != len(f.caps) {
+					t.Fatalf("completeness rows = %d, want the generation's %d capability rows",
+						len(res.Meta.Completeness), len(f.caps))
 				}
-				row := res.Meta.Completeness[0]
+				var row model.CapabilityState
+				for _, c := range res.Meta.Completeness {
+					if c.ProviderID == "dependence" {
+						row = c
+					}
+				}
 				if row.State != model.CapabilityUnavailable || row.DiagnosticCode != model.CodeProviderUnavailable ||
 					row.Details["reason"] != "units_deferred" {
 					t.Errorf("deferred row = %+v, want it copied unchanged from the capability report", row)

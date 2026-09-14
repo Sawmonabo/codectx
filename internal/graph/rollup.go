@@ -36,12 +36,12 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		kinds = DefaultRelations()
 	}
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
-	pending, err := e.pendingDependence(ctx, kinds)
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	if len(pending) > 0 {
-		meta.Completeness = pending
+	meta.Completeness = caps
+	if deferred {
 		markTruncated(&meta, reasonDependence)
 	}
 
