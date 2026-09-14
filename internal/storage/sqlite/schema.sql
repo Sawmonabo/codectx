@@ -152,7 +152,6 @@ CREATE TABLE node_facts (
     start_byte INTEGER,
     end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    fact_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
@@ -170,9 +169,25 @@ CREATE TABLE relation_ids (
 CREATE TABLE relation_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     relation_id BLOB NOT NULL REFERENCES relation_ids(id),
-    fact_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
+-- fact_keys carries the producer's own id-independent delta keys for one fact
+-- (Section 11.4). A fact is backed by every key that produced it, not by one:
+-- a canonical edge is published once but is derived from N occurrences, each
+-- with its own key, and a refresh re-emits the whole fact when any of them
+-- changes. A carry-over therefore keeps a fact unless ANY of its keys is
+-- replaced, which is the same condition the producer re-emits on, so the fresh
+-- and carried sets partition exactly. A fact with no row here carries no key
+-- and can only be replaced by its retention bucket.
+CREATE TABLE fact_keys (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    node_id BLOB,
+    relation_id BLOB,
+    fact_key TEXT NOT NULL,
+    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
+    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
+    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
+);
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -395,6 +410,9 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
+CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
+CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
+CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
 CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
