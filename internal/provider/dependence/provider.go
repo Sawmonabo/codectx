@@ -15,7 +15,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -620,26 +619,14 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
 		"children", len(children))
-	// Two parts of one subdivided unit legitimately describe the same entity —
-	// above all the external stub of a callee both parts reference. Storage
-	// keys a node fact by (unit, node) and now admits a repeat of that key
-	// (`ON CONFLICT(unit_id, node_id) DO NOTHING`), so a repeated identity no
-	// longer fails the unit. What the clause does not do is compare the two
-	// rows: a second row with different stored columns is dropped silently,
-	// which is a divergence storage must refuse rather than absorb. Until that
-	// refusal lands, one dedupe sink for the unit's lifetime, with its seen
-	// set on disk, keeps the parts one unit and keeps the drop in this
-	// package, where the put-order rule holds: the identity a dropped repeat
-	// names was written by the part that published it first.
-	dedupeDir := run.path("dedupe")
-	if err := os.MkdirAll(dedupeDir, 0o700); err != nil {
-		return ImportReport{}, internalErr("the dependence dedupe directory could not be created: " + err.Error())
-	}
-	dedupe, err := neo4jcsv.NewDedupeSink(sink, dedupeDir)
-	if err != nil {
-		return ImportReport{}, err
-	}
-	defer dedupe.Close()
+	// Every part imports into the one sink storage opened for the unit. Two
+	// parts legitimately describe the same entity — above all the external
+	// stub of a callee both parts reference — and storage now admits a
+	// repeated node identity whose stored columns are identical and refuses
+	// one whose columns diverge (CTX_PROVIDER_OUTPUT_INVALID). The repeat is
+	// therefore neither dropped here nor absorbed there: identical repeats
+	// cost nothing and a divergence, which would mean the parts disagree
+	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
 	for i, child := range children {
@@ -665,7 +652,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			continue
 		}
 		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
-			path.Join(unit.Root, child), dir, dedupe)
+			path.Join(unit.Root, child), dir, sink)
 		if err != nil {
 			return ImportReport{}, err
 		}
