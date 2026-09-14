@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/app"
-	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/spf13/cobra"
 )
@@ -92,26 +91,25 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, ws *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
-				req := model.ReferenceRequest{
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				// Names are resolved against the same generation the answer
+				// will pin, so a name and an id name the same node in one
+				// invocation. An argument that is already an id passes through.
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				// Both semantic sources are one facade call: References routes
+				// canonical to the sealed index and lsp to the overlay, so the
+				// command chooses evidence, never a call path.
+				result, err = svc.References(ctx, model.ReferenceRequest{
 					GenerationID:   gen,
 					NodeID:         nodes[0],
 					Operation:      operation,
 					SemanticSource: source,
 					Profile:        profile,
 					Page:           page,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				// Ruling Q13 leaves the canonical route on the engine Task 14
-				// built, byte for byte; ruling Q14 makes this command the
-				// consumer that drives References for the overlay source.
-				if source == model.SemanticLSP {
-					result, err = ws.Services().References(ctx, req)
-				} else {
-					result, err = engine.References(ctx, req)
-				}
+				})
 				return err
 			}); err != nil {
 				return err
@@ -202,19 +200,20 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				return err
 			}
 			var result model.GraphResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				// Direction and the `calls` allowlist are pinned here, by the
+				// command, so the single bounded traversal the facade exposes
+				// answers both spellings; a second operation selector would be
+				// the same contract pinned in two places.
 				req, err := graphRequest(cmd, nodes, direction, []model.RelationKind{model.RelCalls})
 				if err != nil {
 					return err
 				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				if direction == model.DirectionIncoming {
-					result, err = engine.Callers(ctx, req)
-				} else {
-					result, err = engine.Callees(ctx, req)
-				}
+				result, err = svc.Graph(ctx, req)
 				return err
 			}); err != nil {
 				return err
@@ -269,18 +268,18 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.PathResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
-				req := model.PathRequest{
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
+				result, err = svc.Path(ctx, model.PathRequest{
 					GenerationID: gen,
 					From:         nodes[0],
 					To:           nodes[1],
 					MaxDepth:     depth,
 					MaxVisited:   visited,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				result, err = engine.ShortestPath(ctx, req)
+				})
 				return err
 			}); err != nil {
 				return err
@@ -327,12 +326,19 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+				nodes, err := ws.ResolveNodes(ctx, gen, args)
+				if err != nil {
+					return err
+				}
 				base, err := graphRequest(cmd, nodes, model.DirectionBoth, nil)
 				if err != nil {
 					return err
 				}
-				req := model.ImpactRequest{
+				// Impact returns the whole model.ImpactResult, not a page of
+				// entries: the package rollup and the visited/edge accounting
+				// this command renders have no home in model.Page.
+				result, err = svc.Impact(ctx, model.ImpactRequest{
 					GenerationID: base.GenerationID,
 					Start:        base.Start,
 					Direction:    base.Direction,
@@ -340,11 +346,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 					MaxVisited:   base.MaxVisited,
 					MaxEdges:     base.MaxEdges,
 					Page:         base.Page,
-				}
-				if err := req.Validate(); err != nil {
-					return err
-				}
-				result, err = engine.Impact(ctx, req)
+				})
 				return err
 			}); err != nil {
 				return err
@@ -365,8 +367,8 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 }
 
 // checkNodeArgs screens the positional arguments before any database is opened.
-// It cannot resolve a name -- that needs the pinned generation runQuery opens --
-// but it can reject an argument that is neither a resolved id nor a name worth
+// It cannot resolve a name -- that needs the pinned generation the service
+// call opens -- but it can reject an argument that is neither a resolved id nor a name worth
 // looking up, so an obviously wrong command line never pays for a workspace.
 func checkNodeArgs(args []string) error {
 	for _, arg := range args {
@@ -417,59 +419,6 @@ func graphRequest(cmd *cobra.Command, nodes []model.NodeID, direction model.Dire
 		MaxEdges:     edges,
 		Page:         page,
 	}, nil
-}
-
-// runQuery opens the workspace in report mode, builds the engine for the pinned
-// generation and runs one query against it. The lease the engine holds is
-// released on every path, including cancellation, and a release failure never
-// masks the failure the query itself reported.
-//
-// The workspace is handed to the callback beside the engine so `refs` can take
-// the overlay route through ws.Services() without opening a second workspace.
-// That route still pays for the engine this function built: the seeds have to
-// be resolved against the pinned generation either way, and one composition
-// that sometimes builds a lease it does not read is cheaper to keep honest than
-// two open paths.
-func runQuery(cmd *cobra.Command, gen model.GenerationID, args []string,
-	fn func(context.Context, *app.Workspace, *graph.Engine, []model.NodeID) error) (err error) {
-	repo, err := repoFlagValue(cmd)
-	if err != nil {
-		return err
-	}
-	timeout, err := durationFlag(cmd, queryTimeoutFlag)
-	if err != nil {
-		return err
-	}
-	ctx := cmd.Context()
-	if timeout > 0 {
-		// Zero leaves the engine's own configured query deadline in charge; a
-		// zero deadline set here would expire before the query started.
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	ws, err := app.OpenWorkspaceForReport(ctx, repo)
-	if err != nil {
-		return queryFailure(err)
-	}
-	defer ws.Close()
-	// Names are resolved before the engine is built, against the same
-	// generation the engine will pin. An argument that is already an id is
-	// passed straight through, so an id-only invocation opens no extra lease.
-	nodes, err := ws.ResolveNodes(ctx, gen, args)
-	if err != nil {
-		return queryFailure(err)
-	}
-	engine, release, err := ws.Query(ctx, gen)
-	if err != nil {
-		return queryFailure(err)
-	}
-	defer func() {
-		if cerr := release(); cerr != nil && err == nil {
-			err = queryFailure(cerr)
-		}
-	}()
-	return queryFailure(fn(ctx, ws, engine, nodes))
 }
 
 // queryFailure maps a bare context failure onto the Section 22 vocabulary. The
