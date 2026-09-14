@@ -296,6 +296,7 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
 		RequestTimeout:         cfg.Providers.LSP.RequestTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
+		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
 	}); err != nil {
 		return nil, err
 	}

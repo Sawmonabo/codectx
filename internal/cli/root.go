@@ -42,6 +42,10 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	})
 	root.AddCommand(newVersionCommand(build))
 	root.AddCommand(newToolsCommand(build))
+	root.AddCommand(newIndexCommand(build))
+	root.AddCommand(newRefreshCommand(build))
+	root.AddCommand(newStatusCommand(build))
+	root.AddCommand(newWatchCommand(build))
 	return root
 }
 
