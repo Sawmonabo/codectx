@@ -27,9 +27,9 @@ import (
 )
 
 // Sessions is the only storage surface this package may use. *sqlite.Store
-// satisfies it. Every method here already landed in Task 5 or Task 16 except
-// the two marked NEW, which L6 appends to the store; no method is redefined,
-// re-spelled or wrapped by this package.
+// satisfies it. Every method here already landed in Task 5, Task 12 or Task 16
+// except the three marked NEW, which L6 and L6b append to the store; no method
+// is redefined, re-spelled or wrapped by this package.
 type Sessions interface {
 	// Session checks exact actor identity and rejects a wrong actor, an
 	// expired session and a closed session -- but it skips the actor check
@@ -89,6 +89,14 @@ type Sessions interface {
 	// FileCoverage carries only the Waived flag, so this is the only source of
 	// the stored reasons a sealed capsule must carry. NEW -- L6b.
 	Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error)
+	// ActiveGeneration is the repository's currently published generation. It
+	// is Task 12's existing read (internal/storage/sqlite/units.go), widened
+	// onto this interface rather than reinvented: supersession is "a newer
+	// generation is active than the one this session pinned", and deriving it
+	// from per-file content hashes instead -- as this service did before INT --
+	// reported Superseded false for the exact case Section 16.3 names, a newer
+	// generation active with the pinned files untouched.
+	ActiveGeneration(ctx context.Context, repo model.RepositoryID) (model.GenerationID, error)
 }
 
 // The store is the production Sessions; the assertion keeps the interface
@@ -221,13 +229,6 @@ func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
-// errUnimplemented is the placeholder body of every declaration L0 froze and a
-// fill-in lane owns. It is a typed CTX_INTERNAL rather than a panic so a lane
-// that lands before its siblings cannot crash the process it is wired into.
-func errUnimplemented(op string) error {
-	return typedErrf(model.CodeInternal, "workflow: %s is not implemented", op)
-}
-
 // --- shared unexported surface: names frozen by L0, bodies owned by a lane ---
 
 // gate is one readiness evaluation. It is the single value Advance, Status and
@@ -238,6 +239,10 @@ type gate struct {
 	// strict implementation readiness; Strict is the strict gate itself, which
 	// is false whenever any waiver exists.
 	ReadComplete, Ready, Strict, ScopeComplete bool
+	// Superseded reports that a newer generation is active than the one this
+	// session pinned. It rides on the gate rather than beside it because Ready
+	// is defined in terms of it and every gate reader must see the same answer.
+	Superseded bool
 	// Required, Served and Waived come from one CoverageSummary call.
 	Required, Served, Waived int64
 	// Blocking names the unresolved observations that hold the gate shut.
@@ -257,22 +262,16 @@ const canonicalCapsuleDomain = "codectx.capsule.canonical.v1"
 // state that produces it. Owned by L5.
 var errNotConsolidating = errors.New("capsule is produced only while consolidate is open")
 
-// --- Also frozen by L0; implemented in files this package does not own -------
+// --- what wires this package to the rest of the system ----------------------
 //
-// These signatures are recorded here as the map of what wires Task 17 together.
-// Changing one of them is a controller question, not a lane decision.
+// Sessions above is satisfied by *sqlite.Store. The three methods Task 17 added
+// to it live in internal/storage/sqlite/state.go (RangeConfirmed,
+// SessionFilePaths, Waivers) and are append-only there.
 //
-//	// internal/storage/sqlite/state.go -- L6 owns; APPEND ONLY, no existing method is edited
-//	func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
-//	        file model.FileID, hash string, r model.ByteRange) (bool, error)
-//	func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
-//	        ids []model.FileID) (map[model.FileID]string, error)
-//
-//	// internal/app/compose.go + workspace.go -- INT owns
-//	func (s *stack) openWorkflow() error            // openQueries-style; workflow.New(...) onto the stack
-//
-//	// internal/app/overlay.go -- L8 owns (new file)
-//	func (s *stack) overlaySymbols(ctx context.Context, req model.SymbolRequest) (model.Page[model.Node], error)
-//	func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
-//
-//	// internal/cli/context.go -- L9 owns; newContextCommands already exists and INT adds no root.go line
+// internal/app composes the service: (*stack).openWorkflow builds it after the
+// context compiler exists, resolves Limits from configuration and supplies the
+// Validator, which asks the repository's ACTIVE generation's snapshot whether a
+// pinned content hash is still current -- asking the session's own immutable
+// snapshot would compare a row with itself. internal/app/services.go is the
+// facade every product adapter drives this package through; nothing else calls
+// it directly.
