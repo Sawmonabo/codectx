@@ -3,7 +3,6 @@ package search
 import (
 	"context"
 	"errors"
-	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -64,15 +63,6 @@ const maxRankedHits = 10 * model.MaxPageItems
 // the answer says it is incomplete and why.
 var truncationRankedSetFull = "the ranked candidate set reached its bound of " +
 	strconv.Itoa(maxRankedHits) + " distinct results; narrow the query or add a filter"
-
-// quantizeScore is the digest §4 quantization. It is the ONLY place a BM25
-// float becomes a ranking value; everything downstream compares the int64.
-func quantizeScore(score float64) int64 {
-	if math.IsNaN(score) {
-		return 0
-	}
-	return int64(math.Round(score * 1e6))
-}
 
 // scored is a ranked candidate with the bounded ranking reasons that survive
 // deduplication. Reasons live beside ranked rather than inside it because the

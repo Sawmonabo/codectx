@@ -350,8 +350,10 @@ func legQuantization(t *testing.T, _ *fixture) {
 			t.Errorf("quantizeScore(%v) = %d, want %d", c.score, got, c.want)
 		}
 	}
-	if got := quantizeScore(math.NaN()); got != 0 {
-		t.Errorf("quantizeScore(NaN) = %d, want 0: a NaN must not become a huge ranking value", got)
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		if got := quantizeScore(bad); got != 0 {
+			t.Errorf("quantizeScore(%v) = %d, want 0: a non-finite score must not become an arbitrary ranking value", bad, got)
+		}
 	}
 }
 
