@@ -98,6 +98,38 @@ where the workspace is composed, and handed to it.
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
 | `resources.query_memory_bytes` | Ceiling on the edges one frontier level of a traversal may hold at once. A level that reaches it stops reading, and the answer is truncated with `frontier memory budget exhausted` rather than accumulating a hub without a bound. |
-| `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. |
+| `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
+
+## Context compilation reads the same facts
+
+The context compiler (Section 15) is not a command — it ships as a library the
+workspace exposes, and Task 16's coverage session is its consumer — but it
+queries through this same engine and the same pinned generation, so the keys
+above bind identically for it. It pins ONE generation for a whole compile and
+passes that explicit generation into every seed lookup, expansion and batch, so
+an activation part way through can never split one manifest across two
+generations.
+
+It reads these further keys:
+
+| Key | Effect there |
+|---|---|
+| `context.default_estimated_tokens` | The per-slice token budget a zero `budget.max_estimated_tokens` resolves to. |
+| `context.default_max_bytes` | The per-slice byte budget a zero `budget.max_bytes` resolves to. |
+| `context.default_max_files` | The distinct selected files a zero `budget.max_files` resolves to, across the whole plan. |
+| `context.max_slices` | The slice count a zero `budget.max_slices` resolves to. |
+
+A zero budget field means "use the configured default", never "unlimited", and a
+configured default that resolves to zero or less is rejected rather than
+disabling the bound. A budget that cannot hold the required scope is
+`CTX_MINIMUM_BUDGET` carrying the floor (`min_bytes`, `min_estimated_tokens`,
+`min_slices`, `min_files`, `missing`): required files are never demoted, split
+into misleading independently complete slices, or dropped to fit.
+
+`resources.max_page_items` bounds every batch the compile issues — seed
+resolution, file hydration, the edge read behind per-edge precision and the
+evidence batch — and `resources.query_timeout` is the deadline around the whole
+compile. A deadline or a cancellation returns an explicit incomplete answer
+(`CTX_QUERY_DEADLINE` / `CTX_CANCELED`) and persists no manifest.
 
 See [Configuration](configuration.md) for the full tables.

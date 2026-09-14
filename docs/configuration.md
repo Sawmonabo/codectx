@@ -157,7 +157,7 @@ All **user** trust.
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
-| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. |
+| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |
 
 ### The data directory
 
@@ -269,6 +269,25 @@ cloud or AI credential fields in core.
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 
+The context compiler binds them as follows. The three `default_*` budgets and
+`max_slices` are what a **zero** field of a request's budget resolves to — zero
+never means unlimited, and a configured default that resolves to zero or less is
+a wiring defect the compile reports rather than an unbounded plan.
+`default_max_bytes` and `default_estimated_tokens` apply **per slice**,
+`default_max_files` counts distinct selected files across the whole plan, and
+`max_slices` caps the total. `max_graph_depth`, `max_visited_nodes` and
+`max_graph_edges` bound the one expansion a compile runs, and a walk that
+reaches any of them reports `scope_complete = false` rather than an exhaustive
+plan. `max_reason_paths_per_entry` caps the explanation routes stored per entry;
+routes beyond it are reported as a count, never enumerated.
+
+The ranking weights themselves are **not** configuration. They are compile-time
+constants labelled by the manifest's `policy_version`, so changing one changes
+that label rather than one workspace's answers. The whole `[context]` table is
+already part of manifest identity through the context policy fingerprint below,
+so a manifest compiled under different bounds is a different manifest rather
+than a silent reuse.
+
 ## `[coverage]` — source reads and receipts
 
 All **user** trust.
@@ -280,6 +299,11 @@ All **user** trust.
 | `session_ttl` | `"24h"` | Lifetime of a coverage session. |
 | `max_receipts_per_confirmation` | `16` | Receipts per confirmation batch. |
 | `max_unconfirmed_chunks_per_session` | `64` | Issued but unconfirmed chunks per session. |
+
+There is no receipt lifetime of its own: a source receipt lives as long as
+`storage.query_cursor_ttl`, which the `[storage]` table above describes. A
+session that reads for longer than that must acknowledge as it goes, because an
+expired receipt cannot be confirmed and its bytes earn no coverage.
 
 ## `[mcp]` — server transport
 

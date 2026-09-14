@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -74,7 +75,15 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		s.Close()
 		return nil, err
 	}
-	return &Workspace{s: s, coord: coord}, nil
+	w := &Workspace{s: s, coord: coord}
+	// The compiler is composed last because its graph factory is w.Query, so
+	// it cannot exist before the workspace it queries through.
+	if err := s.openCompiler(w.Query); err != nil {
+		coord.Close()
+		s.Close()
+		return nil, err
+	}
+	return w, nil
 }
 
 // Coordinator is the index coordinator over this workspace.
@@ -98,6 +107,13 @@ func (w *Workspace) DataDir() string { return w.s.dataDir }
 // request, so it needs no workspace lock and answers in a report as it does in
 // an indexing session.
 func (w *Workspace) Search() *search.Service { return w.s.search }
+
+// Coverage answers the Section 16 source-read endpoints over this workspace:
+// it opens actor-scoped sessions over a persisted context manifest, serves
+// snapshot-pinned source in bounded chunks and keeps receipt-confirmed coverage
+// of what was actually delivered. Like Search it pins what it reads per
+// session, so it needs no workspace lock and answers in a report.
+func (w *Workspace) Coverage() *coverage.Service { return w.s.coverage }
 
 // Query pins gen -- zero selects the active generation -- and builds the graph
 // engine bound to it. The returned closer releases the reader's QUERY lease and
@@ -138,6 +154,18 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 		return nil, nil, err
 	}
 	return engine, reader.Close, nil
+}
+
+// Compile compiles one immutable context manifest over this workspace
+// (Section 15). It is the single entry point to the context compiler: the
+// compiler pins its own generation per request, so this needs no workspace lock
+// and answers in a report as it does in an indexing session.
+//
+// The manifest it returns is the header; the entries, slices and exclusions are
+// read back through the store's manifest pages, which is the surface the
+// coverage session of Task 16 walks.
+func (w *Workspace) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
+	return w.s.compiler.Compile(ctx, req)
 }
 
 // Close releases the coordinator and then everything below it, in reverse.

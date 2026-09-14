@@ -196,6 +196,9 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 	f := newFixture(t, true)
 	crlf := []byte("one\r\ntwo\r\n")
 	longLine := append(append(bytes.Repeat([]byte("x"), 200000), '\n'), []byte("line two\n")...)
+	// A minified bundle: 1.5 MB with no line break anywhere, so the only line
+	// checkpoint the index records is the one at byte zero.
+	minified := bytes.Repeat([]byte("ab"), 750000)
 	f.write(".gitattributes", []byte("*.txt text eol=crlf\n"), 0o644)
 	f.write(".gitignore", []byte("*.log\n"), 0o644)
 	f.write("a.txt", crlf, 0o644)
@@ -205,6 +208,7 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 	f.write("dup2.dat", []byte("same\n"), 0o644)
 	f.write("empty.dat", nil, 0o644)
 	f.write("long.dat", longLine, 0o644)
+	f.write("minified.dat", minified, 0o644)
 	f.write("run.sh", []byte("#!/bin/sh\n"), 0o755)
 	f.write("vendor/lib.go", []byte("package lib\n"), 0o644)
 	f.gitCmd("add", "-A")
@@ -299,6 +303,24 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 	}
 	if rng.Start != (model.Position{Byte: 199990, Line: 1, Column: 199990}) || rng.End != (model.Position{Byte: 200010, Line: 3, Column: 0}) {
 		t.Fatalf("Read(long) positions = %+v/%+v; want line 1 col 199990 to line 3 col 0", rng.Start, rng.End)
+	}
+
+	// Serving past the first mebibyte of a file with no line break: the nearest
+	// checkpoint is byte zero, so the bytes between it and the offset cannot be
+	// read in one CAS span. Breaking this makes every byte of a minified bundle
+	// past 1 MiB unreadable, and a required_full file that can never be served
+	// can never reach full_served.
+	mini := files["minified.dat"]
+	rng, _, err = view.Read(f.ctx, mini.ID, model.ByteRange{Start: 1_100_000, End: 1_200_000})
+	if err != nil {
+		t.Fatalf("Read(minified, [1100000,1200000)): %v", err)
+	}
+	if !bytes.Equal(rng.Bytes, minified[1_100_000:1_200_000]) {
+		t.Fatalf("Read(minified) returned %d bytes that are not the stored ones", len(rng.Bytes))
+	}
+	if rng.Start != (model.Position{Byte: 1_100_000, Line: 1, Column: 1_100_000}) ||
+		rng.End != (model.Position{Byte: 1_200_000, Line: 1, Column: 1_200_000}) {
+		t.Fatalf("Read(minified) positions = %+v/%+v; want line 1, columns 1100000 and 1200000", rng.Start, rng.End)
 	}
 
 	// A corrupt block is detected by the range read that touches it and by a

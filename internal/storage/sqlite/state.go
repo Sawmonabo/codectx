@@ -20,6 +20,12 @@ import (
 // in the manifest's generation and every file must be in its snapshot.
 // Storing the same manifest ID again with the same canonical hash is a no-op;
 // a different hash under the same ID is CTX_VERSION_CONFLICT.
+//
+// Entries must arrive in the Section 15.3 reading order: ordinals 0..n-1, with
+// requirement rank non-decreasing (so required_full is a prefix) and score
+// descending within a rank. The workflow walks those ordinals directly, so an
+// order this method accepted and never checked would be a defect visible only
+// one task later.
 func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, requestJSON []byte,
 	entries []model.ContextEntry, slices []model.ContextSlice, excluded []model.ExcludedContextEntry) error {
 	if err := m.Validate(); err != nil {
@@ -37,6 +43,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 	if len(entries) != m.EntryCount || len(slices) != m.SliceCount {
 		return invalid("manifest header counts (%d entries, %d slices) disagree with the rows supplied (%d, %d)", m.EntryCount, m.SliceCount, len(entries), len(slices))
 	}
+	prevRank, prevScore := -1, int64(0)
 	for i, e := range entries {
 		if err := e.Validate(); err != nil {
 			return err
@@ -44,6 +51,22 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		if e.Ordinal != i {
 			return invalid("manifest entries must be ordered 0..n-1; entry %d has ordinal %d", i, e.Ordinal)
 		}
+		// Ordinals are the actor's canonical reading order (Section 15.3), and
+		// `context next` walks them without re-sorting. Storage enforces the
+		// two keys of that order it can see — requirement rank, then score
+		// descending within a rank — so a compiler that persisted a different
+		// order fails here rather than silently handing the actor a plan whose
+		// required_full entries are not the prefix the workflow assumes.
+		rank := requirementRank(e.Requirement)
+		switch {
+		case rank < prevRank:
+			return invalid("manifest entries must be in requirement order; entry %d is %s after %s",
+				i, e.Requirement, entries[i-1].Requirement)
+		case rank == prevRank && e.ScoreMicros > prevScore:
+			return invalid("manifest entries must be in descending score order within a requirement; entry %d scores %d after %d",
+				i, e.ScoreMicros, prevScore)
+		}
+		prevRank, prevScore = rank, e.ScoreMicros
 	}
 	for i, sl := range slices {
 		if err := sl.Validate(); err != nil {
@@ -185,6 +208,23 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		}
 		return nil
 	})
+}
+
+// requirementRank orders the first key of the Section 15.3 reading order:
+// required_full 0 ... optional 3. model.Requirement.Valid has already rejected
+// anything else by the time PutManifest calls this, so there is no silent
+// fall-through rank.
+func requirementRank(r model.Requirement) int {
+	switch r {
+	case model.RequirementFull:
+		return 0
+	case model.RequirementSymbol:
+		return 1
+	case model.RequirementRecommended:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // manifestHeader is the strict typed shape of context_manifests.completeness_json:
@@ -1097,4 +1137,47 @@ func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time
 		return wrap("read_sessions", err)
 	})
 	return n, err
+}
+
+// coverageSummarySQL counts a session's required_full scope in one aggregate
+// pass, reproducing both branches of fileCoverage's state switch inside SQL: a
+// nonempty file is full_served when its disjoint served union is exactly its
+// size, and an empty file only once a zero-length EOF chunk is confirmed (a
+// zero-length row is unstorable in served_ranges, which CHECKs end > start).
+// Keeping the switch here is what lets Status answer a 250k-file session with
+// one round trip instead of paging Coverage; the two must stay in step.
+const coverageSummarySQL = `SELECT count(*),
+	coalesce(sum(CASE WHEN (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
+		OR (sf.size_bytes > 0 AND (SELECT coalesce(sum(r.end_byte - r.start_byte), 0) FROM served_ranges r WHERE r.session_id = s.session_id AND r.file_id = s.file_id AND r.content_hash = s.content_hash) = sf.size_bytes)
+		THEN 1 ELSE 0 END), 0),
+	coalesce(sum(CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END), 0)
+	FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+	WHERE s.session_id = ? AND s.requirement = ?`
+
+// CoverageSummary counts, for one actor's session, the required_full files in
+// scope, how many of them are full_served at their pinned hashes, and how many
+// carry a waiver. A waiver is counted, never treated as coverage: a required
+// file that is waived and unread raises waived without raising fullyServed, so
+// read completeness stays fullyServed == required (Section 16.1) and strict
+// readiness, which no waiver ever grants, remains a separate question
+// (Section 17.3). Like Coverage and Session it reports honestly beside
+// CTX_SESSION_EXPIRED rather than pretending the session has no scope.
+func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error) {
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			// session returns a bare *model.Error, never a joined one, so this
+			// is the same unwrap Session (:504) and Coverage (:776) already do.
+			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
+				return err
+			}
+		}
+		sessionRaw, _ := model.DecodeID(string(rec.ID))
+		return wrap("session_files", tx.QueryRowContext(ctx, coverageSummarySQL, sessionRaw, string(model.RequirementFull)).
+			Scan(&required, &fullyServed, &waived))
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return required, fullyServed, waived, nil
 }
