@@ -123,7 +123,9 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 		return nil, err
 	}
 	e := backend.Engine()
-	if e.Digest == "" || len(e.ParseArgv) == 0 || len(e.ExportArgv) == 0 {
+	// The argv is the backend's concern: a lazily resolved backend has none
+	// until its first unit runs and re-checks both before it executes anything.
+	if e.Digest == "" {
 		return nil, &model.Error{Code: model.CodeProviderUnavailable,
 			Message: "the dependence backend resolved no analysis payload"}
 	}

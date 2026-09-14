@@ -49,13 +49,6 @@ type Engine struct {
 	RuntimeDigest string
 }
 
-// EngineLocator resolves the engine payload. The controller wires
-// internal/toolchain's resolver behind it at composition; this package never
-// fetches, verifies or executes anything itself.
-type EngineLocator interface {
-	Locate(ctx context.Context) (Engine, error)
-}
-
 // Backend is the engine adapter the provider drives. It is the only place the
 // engine's vocabulary exists: it builds the pinned argv, places the heap cap
 // in the child environment, runs both steps through the shared process runner
