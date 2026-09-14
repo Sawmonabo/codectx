@@ -196,6 +196,34 @@ func SearchUnitBytes(u model.SearchUnit) int64 {
 	return recordOverhead + int64(len(u.ID)+len(u.NodeID)+len(u.FileID)+len(u.Path)+len(u.Kind)+len(u.Name)+len(u.QualifiedName)+len(u.Signature)+len(u.Body))
 }
 
+// DeltaSink is the optional extension of Sink for a provider that imports
+// incrementally (Section 11.4). Its destination records, alongside each fact,
+// the producer's own id-independent key — the key the provider's next run
+// classifies as changed, unchanged or removed. Storage needs it because a
+// removed fact cannot be named any other way: a fact identity is derived from
+// the resolved entities, which an edit changes, and a cross-file edge can
+// disappear while every file holding its evidence is untouched.
+//
+// keys is either empty, meaning the batch carries no keys, or parallel to
+// facts. A batch keys every fact or none.
+//
+// A destination that does not implement DeltaSink cannot serve a keyed batch;
+// the sink refuses it rather than dropping the keys, because a unit written
+// without them silently cannot be delta-refreshed.
+type DeltaSink interface {
+	Sink
+	PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys []string) error
+	PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys []string) error
+}
+
+// keyed pairs one queued fact with the producer's delta key, empty when the
+// producer supplied none. Facts are queued keyed so a batch sorts, flushes and
+// is accounted for exactly once whether or not the provider is incremental.
+type keyed[T any] struct {
+	fact T
+	key  string
+}
+
 // batch is one bounded, typed accumulation awaiting persistence.
 type batch[T any] struct {
 	items []T
@@ -220,8 +248,8 @@ type BatchSink struct {
 	cancel context.CancelCauseFunc
 
 	mu        sync.Mutex
-	nodes     batch[model.NodeFact]
-	relations batch[model.RelationFact]
+	nodes     batch[keyed[model.NodeFact]]
+	relations batch[keyed[model.RelationFact]]
 	aliases   batch[model.NativeAlias]
 	search    batch[model.SearchUnit]
 	failed    error
@@ -287,8 +315,17 @@ func (s *BatchSink) Reserve(ctx context.Context, n int64) (release func(), err e
 // written so the transaction shape is a function of content, not of the
 // order workers finished.
 func (s *BatchSink) PutNodes(ctx context.Context, facts []model.NodeFact) error {
-	for _, f := range facts {
-		if err := put(s, ctx, &s.nodes, f, NodeFactBytes(f)); err != nil {
+	return s.PutKeyedNodes(ctx, facts, nil)
+}
+
+// PutKeyedNodes accepts node facts with the producer's delta keys.
+func (s *BatchSink) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys []string) error {
+	if err := checkKeys(len(facts), keys); err != nil {
+		return err
+	}
+	for i, f := range facts {
+		k := keyAt(keys, i)
+		if err := put(s, ctx, &s.nodes, keyed[model.NodeFact]{fact: f, key: k}, NodeFactBytes(f)+int64(len(k))); err != nil {
 			return err
 		}
 	}
@@ -297,12 +334,64 @@ func (s *BatchSink) PutNodes(ctx context.Context, facts []model.NodeFact) error 
 
 // PutRelations accepts relation facts.
 func (s *BatchSink) PutRelations(ctx context.Context, facts []model.RelationFact) error {
-	for _, f := range facts {
-		if err := put(s, ctx, &s.relations, f, RelationFactBytes(f)); err != nil {
+	return s.PutKeyedRelations(ctx, facts, nil)
+}
+
+// PutKeyedRelations accepts relation facts with the producer's delta keys.
+func (s *BatchSink) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys []string) error {
+	if err := checkKeys(len(facts), keys); err != nil {
+		return err
+	}
+	for i, f := range facts {
+		k := keyAt(keys, i)
+		if err := put(s, ctx, &s.relations, keyed[model.RelationFact]{fact: f, key: k}, RelationFactBytes(f)+int64(len(k))); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// checkKeys enforces that a keyed batch keys every fact. A partly keyed batch
+// would leave rows a later refresh could neither replace nor remove.
+func checkKeys(facts int, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if len(keys) != facts {
+		return invalid(fmt.Sprintf("a keyed batch carries %d keys for %d facts", len(keys), facts))
+	}
+	for _, k := range keys {
+		if k == "" {
+			return invalid("a keyed batch keys every fact or none; one key is empty")
+		}
+	}
+	return nil
+}
+
+func keyAt(keys []string, i int) string {
+	if i < len(keys) {
+		return keys[i]
+	}
+	return ""
+}
+
+// unkey splits a sorted batch into the parallel slices the destination takes.
+// keys is nil when the batch carried none, so an unkeyed batch reaches a plain
+// Sink unchanged.
+func unkey[T any](list []keyed[T]) ([]T, []string) {
+	facts := make([]T, len(list))
+	keys := make([]string, len(list))
+	any := false
+	for i, item := range list {
+		facts[i], keys[i] = item.fact, item.key
+		if item.key != "" {
+			any = true
+		}
+	}
+	if !any {
+		return facts, nil
+	}
+	return facts, keys
 }
 
 // PutAliases accepts native aliases.
@@ -411,8 +500,8 @@ func (s *BatchSink) Discard() {
 // dropLocked empties every batch and returns the bytes they held.
 func (s *BatchSink) dropLocked() int64 {
 	freed := s.pendingLocked()
-	s.nodes = batch[model.NodeFact]{}
-	s.relations = batch[model.RelationFact]{}
+	s.nodes = batch[keyed[model.NodeFact]]{}
+	s.relations = batch[keyed[model.RelationFact]]{}
 	s.aliases = batch[model.NativeAlias]{}
 	s.search = batch[model.SearchUnit]{}
 	return freed
@@ -464,7 +553,7 @@ func (s *BatchSink) flushAllLocked(ctx context.Context) error {
 // remaining batches are dropped and released too, the failure is latched and
 // every producer is cancelled with it.
 func flush[T any](s *BatchSink, ctx context.Context, b *batch[T]) error {
-	if _, isNodes := any(b).(*batch[model.NodeFact]); !isNodes && len(s.nodes.items) > 0 {
+	if _, isNodes := any(b).(*batch[keyed[model.NodeFact]]); !isNodes && len(s.nodes.items) > 0 {
 		if err := flush(s, ctx, &s.nodes); err != nil {
 			return err
 		}
@@ -497,12 +586,28 @@ func (s *BatchSink) failLocked(err error) {
 // write sorts one batch by its stable key and hands it to the destination.
 func (s *BatchSink) write(ctx context.Context, items any) error {
 	switch list := items.(type) {
-	case []model.NodeFact:
-		slices.SortFunc(list, func(a, b model.NodeFact) int { return cmp.Compare(a.Node.ID, b.Node.ID) })
-		return s.dst.PutNodes(ctx, list)
-	case []model.RelationFact:
-		slices.SortFunc(list, func(a, b model.RelationFact) int { return cmp.Compare(a.Relation.ID, b.Relation.ID) })
-		return s.dst.PutRelations(ctx, list)
+	case []keyed[model.NodeFact]:
+		slices.SortFunc(list, func(a, b keyed[model.NodeFact]) int { return cmp.Compare(a.fact.Node.ID, b.fact.Node.ID) })
+		facts, keys := unkey(list)
+		if keys == nil {
+			return s.dst.PutNodes(ctx, facts)
+		}
+		dst, ok := s.dst.(DeltaSink)
+		if !ok {
+			return keyless()
+		}
+		return dst.PutKeyedNodes(ctx, facts, keys)
+	case []keyed[model.RelationFact]:
+		slices.SortFunc(list, func(a, b keyed[model.RelationFact]) int { return cmp.Compare(a.fact.Relation.ID, b.fact.Relation.ID) })
+		facts, keys := unkey(list)
+		if keys == nil {
+			return s.dst.PutRelations(ctx, facts)
+		}
+		dst, ok := s.dst.(DeltaSink)
+		if !ok {
+			return keyless()
+		}
+		return dst.PutKeyedRelations(ctx, facts, keys)
 	case []model.NativeAlias:
 		slices.SortFunc(list, func(a, b model.NativeAlias) int {
 			return cmp.Or(cmp.Compare(a.ScopeKey, b.ScopeKey), cmp.Compare(a.NativeKey, b.NativeKey), cmp.Compare(a.NodeID, b.NodeID))
@@ -513,6 +618,14 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 		return s.dst.PutSearchUnits(ctx, list)
 	}
 	return &model.Error{Code: model.CodeInternal, Message: "batch sink received an unknown record type"}
+}
+
+// keyless is the refusal to write a keyed batch to a destination that cannot
+// record keys. Dropping them would seal a unit that looks complete and cannot
+// be delta-refreshed.
+func keyless() error {
+	return &model.Error{Code: model.CodeInternal,
+		Message: "the sink destination does not record provider fact keys; a keyed batch cannot be persisted"}
 }
 
 // overLimit is the typed single-record refusal: Details name the limit broken
