@@ -209,7 +209,7 @@ func unescapeName(s string) string {
 // one to its SCIP package descriptor (manager, name, version).
 func (sym symbol) scopeKey(path string) string {
 	if sym.local {
-		return "file:" + path
+		return fileScope(path)
 	}
 	return "pkg:" + sym.manager + " " + sym.name + " " + sym.version
 }
