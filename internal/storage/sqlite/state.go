@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -1146,24 +1148,60 @@ func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time
 // zero-length row is unstorable in served_ranges, which CHECKs end > start).
 // Keeping the switch here is what lets Status answer a 250k-file session with
 // one round trip instead of paging Coverage; the two must stay in step.
+//
+// The switch is written ONCE, in a derived table, and every column is derived
+// from it: full_read is the switch itself, waived is the waiver existence test,
+// and the served column is literally "full_read AND NOT waived". Pasting the
+// switch twice -- once bare, once with the waiver clause -- would be the second
+// implementation Section 30.1 forbids, and an earlier revision that spliced the
+// waiver clause into the front of the switch bound it to the empty-file branch
+// alone (AND binds tighter than OR), so a waived NONEMPTY file still counted as
+// served. Deriving the columns is what makes that class of mistake unwriteable.
+//
+// The two counts answer two different questions and callers need both. Read
+// completeness asks whether every required file was fully read, waived or not
+// (Section 17.1): a waiver excuses a file from being read, it does not unread
+// one that was. The reported fully_served_files instead answers what the
+// operator is told was covered, and a waiver is an admission that a required
+// file was not read -- so a file that was both waived and delivered must not
+// appear there, or a fully waived session reports full coverage, the claim the
+// waiver exists to deny.
 const coverageSummarySQL = `SELECT count(*),
-	coalesce(sum(CASE WHEN (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
+	coalesce(sum(full_read), 0),
+	coalesce(sum(CASE WHEN full_read = 1 AND waived = 0 THEN 1 ELSE 0 END), 0),
+	coalesce(sum(waived), 0)
+	FROM (SELECT CASE WHEN (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
 		OR (sf.size_bytes > 0 AND (SELECT coalesce(sum(r.end_byte - r.start_byte), 0) FROM served_ranges r WHERE r.session_id = s.session_id AND r.file_id = s.file_id AND r.content_hash = s.content_hash) = sf.size_bytes)
-		THEN 1 ELSE 0 END), 0),
-	coalesce(sum(CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END), 0)
-	FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
-	WHERE s.session_id = ? AND s.requirement = ?`
+		THEN 1 ELSE 0 END AS full_read,
+		CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END AS waived
+		FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+		WHERE s.session_id = ? AND s.requirement = ?)`
 
-// CoverageSummary counts, for one actor's session, the required_full files in
-// scope, how many of them are full_served at their pinned hashes, and how many
-// carry a waiver. A waiver is counted, never treated as coverage: a required
-// file that is waived and unread raises waived without raising fullyServed, so
-// read completeness stays fullyServed == required (Section 16.1) and strict
-// readiness, which no waiver ever grants, remains a separate question
-// (Section 17.3). Like Coverage and Session it reports honestly beside
-// CTX_SESSION_EXPIRED rather than pretending the session has no scope.
-func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error) {
-	err = s.read(ctx, func(tx *sql.Tx) error {
+// CoverageCounts is the one coverage aggregate's whole answer, for one actor's
+// session, over the required_full files in scope. It is a struct rather than
+// four positional int64s because Served and FullyRead differ only by the waiver
+// clause: a transposed pair would read as a plausible count and silently answer
+// a different question.
+//
+// FullyRead is read completeness (Section 17.1) -- every required file fully
+// confirmed at its pinned hash, whether or not it also carries a waiver. Served
+// is the reported fully_served_files: fully confirmed AND not waived. Waived is
+// the waiver count, audited beside coverage and never as coverage, so strict
+// readiness -- which no waiver ever grants -- stays a separate question
+// (Section 17.3).
+type CoverageCounts struct {
+	Required  int64
+	FullyRead int64
+	Served    int64
+	Waived    int64
+}
+
+// CoverageSummary answers CoverageCounts in a single round trip. Like Coverage
+// and Session it reports honestly beside CTX_SESSION_EXPIRED rather than
+// pretending the session has no scope.
+func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (CoverageCounts, error) {
+	var c CoverageCounts
+	err := s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
 			// session returns a bare *model.Error, never a joined one, so this
@@ -1174,10 +1212,220 @@ func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, ac
 		}
 		sessionRaw, _ := model.DecodeID(string(rec.ID))
 		return wrap("session_files", tx.QueryRowContext(ctx, coverageSummarySQL, sessionRaw, string(model.RequirementFull)).
-			Scan(&required, &fullyServed, &waived))
+			Scan(&c.Required, &c.FullyRead, &c.Served, &c.Waived))
 	})
 	if err != nil {
-		return 0, 0, 0, err
+		return CoverageCounts{}, err
 	}
-	return required, fullyServed, waived, nil
+	return c, nil
 }
+
+// rangeConfirmedSQL asks one containment question of served_ranges: is there a
+// single stored interval that already covers [start,end) whole?
+//
+// One row is the whole test because mergeServedRange keeps the stored set
+// minimal -- disjoint intervals with overlap *and* adjacency coalesced -- and
+// it is the only writer of this table. Two rows can therefore never be joined
+// into a covering interval, so containment is a point search on the primary
+// key (session_id, file_id, content_hash, start_byte, end_byte) and no
+// interval list is ever assembled, here or in Go. If that minimality invariant
+// were ever broken the answer degrades to false, which refuses a citation
+// rather than confirming coverage nobody has: the safe direction.
+//
+// The test is containment, not overlap. An interval that spans a gap between
+// two confirmed ranges touches both and is covered by neither.
+const rangeConfirmedSQL = `SELECT EXISTS (SELECT 1 FROM served_ranges r
+	WHERE r.session_id = ?1 AND r.file_id = ?2 AND r.content_hash = ?3
+	  AND r.start_byte <= ?4 AND r.end_byte >= ?5)`
+
+// RangeConfirmed reports whether [r.Start,r.End) of one pinned file is already
+// fully confirmed served to this actor, at this content hash (Sections 16.2,
+// 17.2). It is the check no landed method answers: a scope review may cite
+// source intervals, and a citation over bytes the actor never confirmed would
+// let a note mark a file read without coverage.
+//
+// It returns a bounded boolean and never an interval list. A file outside this
+// session's pinned scope, or one at a hash this session never pinned, is simply
+// not confirmed -- (false, nil) -- because a citation over it is a claim to
+// refuse, not a storage failure. Unlike the reporting reads it does not swallow
+// CTX_SESSION_EXPIRED: it exists to gate a write, and an expired session
+// confirms nothing.
+func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
+	file model.FileID, hash string, r model.ByteRange) (bool, error) {
+	// ValidateNonEmpty matches the served_ranges CHECK(end_byte > start_byte):
+	// the empty interval is unstorable, so asking whether it was served is a
+	// malformed question rather than a false answer.
+	if err := r.ValidateNonEmpty("byte_range"); err != nil {
+		return false, err
+	}
+	fileRaw, err := idBlob("file_id", string(file))
+	if err != nil {
+		return false, err
+	}
+	hashRaw, err := idBlob("content_hash", hash)
+	if err != nil {
+		return false, err
+	}
+	var confirmed bool
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			return err
+		}
+		sessionRaw, _ := model.DecodeID(string(rec.ID))
+		return wrap("served_ranges", tx.QueryRowContext(ctx, rangeConfirmedSQL,
+			sessionRaw, fileRaw, hashRaw, int64(r.Start), int64(r.End)).Scan(&confirmed))
+	})
+	if err != nil {
+		return false, err
+	}
+	return confirmed, nil
+}
+
+// SessionFilePaths resolves a bounded batch of file identifiers to the paths
+// they carry in this session's pinned snapshot. Coverage rows and manifest
+// entries carry identifiers and no path, and naming a file the operator cannot
+// locate is not an answer.
+//
+// It is scoped by session_files, not by the snapshot alone: only files this
+// session pinned are named, so a batch can never be used to enumerate paths
+// outside the actor's scope. An identifier that is not in the pinned scope, or
+// whose pinned hash is no longer in the snapshot, is absent from the map; the
+// caller decides what its own absence means. Like Coverage and CoverageSummary
+// it answers honestly beside CTX_SESSION_EXPIRED rather than pretending the
+// session has no scope.
+func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+	ids []model.FileID) (map[model.FileID]string, error) {
+	if len(ids) > model.MaxPageItems {
+		return nil, &model.Error{Code: model.CodeResourceLimit,
+			Message: fmt.Sprintf("a path batch of %d files exceeds the %d-item page bound", len(ids), model.MaxPageItems)}
+	}
+	out := make(map[model.FileID]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	args := make([]any, 1, len(ids)+1)
+	placeholders := make([]string, 0, len(ids))
+	for _, id := range ids {
+		raw, err := idBlob("file_id", string(id))
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, raw)
+		placeholders = append(placeholders, "?")
+	}
+	query := `SELECT s.file_id, f.path
+		FROM session_files s
+		JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+		JOIN files f ON f.id = s.file_id
+		WHERE s.session_id = ? AND s.file_id IN (` + strings.Join(placeholders, ", ") + `)`
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			// Digest Section 11: errors.As, never a type assertion, so a
+			// joined error is unwrapped rather than silently taking the
+			// not-expired branch.
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeSessionExpired {
+				return err
+			}
+		}
+		args[0], _ = model.DecodeID(string(rec.ID))
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return wrap("session_files", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var file []byte
+			var path string
+			if err := rows.Scan(&file, &path); err != nil {
+				return wrap("session_files", err)
+			}
+			out[model.FileID(idHex(file))] = path
+		}
+		return wrap("session_files", rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Waivers reads this session's recorded coverage exceptions, in file-id order.
+// Waive is a writer whose returned record echoes the request's reason, and
+// FileCoverage carries only the Waived flag, so this is the only reader of the
+// stored reasons -- the text a sealed capsule has to carry to be an honest
+// durable artifact (Section 17.3).
+//
+// coverage_waivers is append-only and has no actor column: the exception is a
+// property of the session, so ActorID comes from the resolved session record
+// exactly as Waive sets it. The page loop runs inside one read transaction, so
+// every page is read from the same snapshot and the assembled list is the set
+// one consistent read would have returned. Like Coverage and CoverageSummary it
+// answers honestly beside CTX_SESSION_EXPIRED: a capsule is sealed from what the
+// session recorded, and an expired session still recorded it.
+//
+// The keyset is file_id alone, the key Coverage pages session_files on. Both
+// tables are keyed (session_id, file_id, content_hash), so both carry the same
+// latent boundary if one session ever pinned one file at two content hashes;
+// nothing in the writer path produces that today, and answering it differently
+// here would be the only place in the package that does.
+func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+	var out []model.WaiverRecord
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			// Digest Section 11: errors.As, never a type assertion, so a
+			// joined error is unwrapped rather than silently taking the
+			// not-expired branch.
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeSessionExpired {
+				return err
+			}
+		}
+		sessionRaw, _ := model.DecodeID(string(rec.ID))
+		after := []byte{}
+		for {
+			rows, err := tx.QueryContext(ctx, waiversSQL, sessionRaw, after, model.MaxPageItems)
+			if err != nil {
+				return wrap("coverage_waivers", err)
+			}
+			n := 0
+			for rows.Next() {
+				var file, hash []byte
+				var created string
+				w := model.WaiverRecord{SessionID: rec.ID, ActorID: rec.ActorID}
+				if err := rows.Scan(&file, &hash, &w.Reason, &created); err != nil {
+					rows.Close()
+					return wrap("coverage_waivers", err)
+				}
+				if w.CreatedAt, err = parseTime(created); err != nil {
+					rows.Close()
+					return wrap("coverage_waivers", err)
+				}
+				w.FileID, w.ContentHash = model.FileID(idHex(file)), idHex(hash)
+				out = append(out, w)
+				after, n = file, n+1
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return wrap("coverage_waivers", err)
+			}
+			rows.Close()
+			if n < model.MaxPageItems {
+				return nil
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// waiversSQL pages coverage_waivers by keyset on its primary key prefix
+// (session_id, file_id), so the ORDER BY is the WITHOUT ROWID table's own key
+// order and costs no sort.
+const waiversSQL = `SELECT file_id, content_hash, reason, created_at FROM coverage_waivers
+	WHERE session_id = ? AND file_id > ? ORDER BY file_id LIMIT ?`
