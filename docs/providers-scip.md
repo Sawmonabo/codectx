@@ -26,12 +26,22 @@ coordinator exists.
 - `Detect` inspects declared inputs only through the confined root: the
   import path, and the trigger manifests of each profile (`go.mod`;
   `package.json`/`tsconfig.json`; `pom.xml`/`build.gradle`/`build.gradle.kts`)
-  together with the profile executable's existence. It never runs a tool.
-  Nothing usable is `CTX_PROVIDER_UNAVAILABLE`.
-- `Scopes(detection)` lists the unit scope keys to plan. A profile whose
-  executable is not installed plans no unit, and `runProfile` refuses with
-  `CTX_PROVIDER_UNAVAILABLE` before anything is materialized, so a missing
-  tool never costs a snapshot materialization or a failed unit.
+  together with the profile payload's state. It never runs a tool.
+  Nothing usable is `CTX_PROVIDER_UNAVAILABLE`. When at least one language is
+  indexable the detection is available, and `Detection.Details` still names
+  every other triggered language and why it is not: the toolchain's own
+  `CTX_TOOL_*` code for a payload this machine cannot supply, and
+  `CTX_TOOL_NOT_INSTALLED` for one the first run will fetch. Without that a
+  repository with `go.mod` and `Cargo.toml` on a machine with no usable
+  `rust-analyzer` would be reported available, plan `scip-go` only, and say
+  nothing anywhere about Rust.
+- `Scopes(detection)` lists the unit scope keys to plan. A profile this
+  machine cannot supply at all — no payload for this platform, a corrupt store
+  entry, an invalid override — plans no unit, so a missing tool never costs a
+  snapshot materialization or a failed unit. A profile whose payload the lock
+  *does* pin for this platform but the store has not installed yet **is**
+  planned: `scip.New` installs nothing, and the first unit that needs the
+  payload fetches it (see "Payload resolution" below).
 - `Verify(ctx, view, scopeKey)` decides `UnitBuild.SourceBinding` before the
   unit is opened. `IndexUnit` repeats the check and reports it in its
   capability states, so a unit opened as verified whose index is not is
@@ -377,6 +387,27 @@ held at a time, so a unit retains up to `MaxSourceFileBytes` (5 MiB) outside
 the pool's accounting, on top of the pool's own budget. That buffer is sized
 by the pinned snapshot file, whose size is checked before the read.
 
+## Payload resolution
+
+`scip.New` **installs nothing**. It asks the toolchain what the store already
+holds (`toolchain.ResolveInstalled`, which is `Resolve` with the fetch
+refused), and sorts the six kinds into three states: ready, deferred (pinned
+for this platform, not installed) and unavailable (a typed `CTX_TOOL_*`
+reason). Resolving with a fetch here installed every language's indexer on a
+machine that had not run `codectx tools prefetch`, before any detection had
+happened and before any unit existed — 24.8 s of fetching at construction,
+against 50 µs and zero files written now.
+
+A deferred payload is fetched by the first unit that runs it, at the one moment
+the repository is known to contain the language; a fetch that fails fails that
+unit with the toolchain's typed code. `Descriptor().Version` still folds only
+the payloads the process actually holds, because `Descriptor()` takes no
+context and has to be a deterministic function of the process — so a deferred
+kind contributes the same fixed empty slot an unresolvable one does, and a unit
+built before its payload was installed keys differently from one built after.
+That is correct (the facts really were produced by a different tool set) and it
+happens once.
+
 ## Profiles
 
 A profile is one of the six managed indexers. It is **product code, not
@@ -392,18 +423,36 @@ of its own language; the exact argv, the environment allowlist and the sealed
 result of each run are in the lane B1 report. The six profiles and the argument
 arrays this build pins, after the payload's own launcher prefix:
 
-| Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture |
-|---|---|---|---|---|
-| `scip-go` | `go.mod`, `go.work` | `index --output <output>` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | allowed |
-| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar` | `HOME` | denied |
-| `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied |
-| `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --output <output>` | `PATH HOME MAVEN_OPTS GRADLE_USER_HOME` | allowed |
-| `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed |
-| `scip-clang` | `compile_commands.json`, `compile_flags.txt` | `--compdb-path=<input>/compile_commands.json --index-output-path=<output>` | `PATH HOME` | denied |
+| Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture | Host toolchain it needs |
+|---|---|---|---|---|---|
+| `scip-go` | `go.mod`, `go.work` | `index --output <output>` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | allowed | `go` |
+| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar` | `HOME` | denied | none (managed Node) |
+| `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied | `python3`, `pip3` |
+| `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --scip-config <input>/scip-java.json --targetroot <work>/scip-java-targetroot --output <output>` | `PATH HOME` | denied | none (managed JDK) |
+| `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo` |
+| `scip-clang` | `compile_commands.json`, `compile_flags.txt` | `--compdb-path=<input>/compile_commands.json --index-output-path=<output>` | `PATH HOME` | denied | none (carries its own Clang); needs the compilation database the project's build produced |
+
+**The host-toolchain column is not optional.** Three of the six load the
+project's model through that language's own toolchain, the way any build does,
+and cannot do otherwise: `scip-go` drives go/packages, `scip-python` reads the
+project's installed distributions through the interpreter and pip, and
+`rust-analyzer` loads `cargo metadata`. Where the toolchain is absent, that
+language has no precise index — the profile exits non-zero and the unit fails
+with `CTX_PROVIDER_UNAVAILABLE` — and the structural and dependence providers
+still cover it. `scip-java` used to belong to that list, through Maven or
+Gradle; it no longer does (see below).
 
 `<input>` is the private materialization root, which is also the child's
-working directory; `<output>` is a file under the run directory, outside the
-materialization. The launcher prefix comes from the lock: a self-contained
+working directory; `<output>` and `<work>` are under the run directory, outside
+the materialization.
+
+**A profile's private copy is the whole workspace, deliberately.** The
+materialization is not narrowed to the files a unit "owns": a precise indexer
+resolves symbols through the project's own dependency context — the module
+graph, the package manifests, the installed distributions, the headers — and
+the unit's scope is the workspace, so a narrower copy would produce an index
+that describes less than the unit claims. The call site says so explicitly
+rather than leaving it to an omitted selection. The launcher prefix comes from the lock: a self-contained
 binary runs as itself, a Node-hosted indexer runs as `<managed node> <entry>`,
 and `scip-java`'s launcher runs with `JAVA_HOME` pointing at the managed JDK.
 The child's environment is exactly the allowlisted variables the parent has
@@ -415,6 +464,22 @@ argv array only (ruling R9-3: no shell anywhere). The run is bounded by the
 smaller of the profile's own timeout and `providers.scip.timeout`, by the
 profile's memory and disk reservations, and by 1 MiB of captured output per
 stream.
+
+**`scip-java` compiles the snapshot itself.** Its default mode drives the
+project's own Maven or Gradle build, found on the host `PATH`, which resolves
+dependencies from a remote index: on a machine with neither, the profile exited
+1 and produced nothing (measured). The profile instead writes a `scip-java.json`
+into the private materialization — naming the materialization root as both the
+source root and the only source directory, with empty `classpath` and
+`dependencies` — and passes `--scip-config`, which makes the indexer compile the
+sources with the managed JDK's own `javac`. The Java profile therefore needs no
+host build tool and resolves nothing remotely, which is why its posture is
+`denied` and why `MAVEN_OPTS`/`GRADLE_USER_HOME` are not in its allowlist.
+Measured on `linux/amd64` with `PATH=/usr/bin:/bin` (no Maven, no Gradle): the
+unit seals with all three capabilities fresh. A repository's own
+`scip-java.json` is replaced in the copy: the invocation is product code, not a
+configuration surface. `--targetroot` keeps the indexer's own intermediate
+output inside the run directory rather than in the materialization.
 
 **Two pinned arguments exist because of a measured failure, not a preference.**
 `scip-python` is given `--project-version` because, left to itself, it asks git
