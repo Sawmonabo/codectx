@@ -170,7 +170,7 @@ func unavailable(format string, args ...any) *model.Error {
 
 func trustRequired(format string, args ...any) *model.Error {
 	return (&model.Error{Code: model.CodeTrustRequired, Message: fmt.Sprintf(format, args...)}).
-		WithRemediation("Approve the language server under [analyzers.<name>] in the user configuration with an absolute executable path and a version constraint.")
+		WithRemediation("Construct the profile with lsp.Resolve, which starts only the payload the embedded tool lock pins.")
 }
 
 func invalid(format string, args ...any) *model.Error {

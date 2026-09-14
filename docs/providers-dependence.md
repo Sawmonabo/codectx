@@ -59,6 +59,39 @@ and `joern --version` drops into the interactive console, so the engine's
 name, version and payload digest come from the lock entry that installed it
 and travel on `Detection.ObservedVersion` and the descriptor version.
 
+### How the payload is resolved
+
+The engine is one entry of the embedded tool lock, installed and verified by
+`internal/toolchain`. The backend never looks on `PATH`, never probes and never
+fetches anything itself: it is handed an `Engine` by a locator, and the
+production locator is the toolchain resolver behind that interface.
+
+* **Parse argv** is the resolved payload's own launcher prefix. The pinned
+  entry is a launcher script that finds its JVM through `JAVA_HOME`, which the
+  resolved payload carries in its environment and which points at the **managed
+  JDK the lock pins** — no host Java is used or needed.
+* **Export argv** is the same prefix with the entry's base name substituted,
+  so it keeps the platform's extension (`.bat` on Windows). The export tool is
+  not the lock's pinned entry, so the resolver does not re-hash it at every
+  resolution: it is covered by the payload digest checked at install. The
+  locator therefore checks it for presence, regularity and the executable bit
+  and refuses with `CTX_TOOL_CORRUPT` otherwise, so a payload damaged after
+  installation is a typed refusal rather than an exec failure in the middle of
+  a unit.
+* **Digest** is the payload's `Tool.Fingerprint()` — the tool name, version,
+  pinned payload digest and the executables observed at this resolution. It is
+  used rather than the bare payload digest because it is never empty: a
+  `[tools.override.<name>]` has no pinned payload digest at all, and an empty
+  digest makes the backend refuse the engine as incomplete. **RuntimeDigest**
+  is the managed JDK's fingerprint, which Section 11.6 folds into the unit's
+  semantic closure — the same engine on a different runtime is not the same
+  analysis.
+* A resolution that fails surfaces the toolchain's own code
+  (`CTX_TOOL_OFFLINE`, `CTX_TOOL_UNSUPPORTED_PLATFORM`, `CTX_TOOL_CORRUPT`,
+  `CTX_TOOL_OVERRIDE_INVALID`, `CTX_TOOL_FETCH_FAILED`,
+  `CTX_TOOL_DIGEST_MISMATCH`), so "not installed" and "not available on this
+  platform" are different answers.
+
 ### Digest-to-release map
 
 | Payload digest | Release |

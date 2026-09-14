@@ -2,7 +2,7 @@
 
 `internal/provider/lsp` is the Section 11.5 query overlay: on-demand
 definition, references, implementations, type definition, document and
-workspace symbols and call hierarchy, answered by an approved local language
+workspace symbols and call hierarchy, answered by a pinned local language
 server running against a **private materialization of the pinned snapshot**.
 It is not a `provider.Provider`. It writes nothing to storage, mints no
 identities and emits no facts through a sink; every answer is ephemeral,
@@ -13,64 +13,77 @@ canonical generations never change.
 
 ## What runs, and why it is allowed to
 
-A `Definition` is what this build knows about a supported server: name,
-manifest language tags, the stdio argument array and root markers.
-`Definitions()` lists the six of Section 11.5. A definition **authorizes
-nothing**. `Definition.Detect(root)` reports which root markers exist, reading
-metadata through the confined `workspace.Root` only; it is a hint for choosing
-among trusted profiles and never a reason to execute.
+A `Definition` is what this build knows about a supported server: name — which
+is also the name of its entry in the embedded tool lock — manifest language
+tags, the stdio argument array, the environment allowlist, the budgets and the
+root markers. `Definitions()` lists the six of Section 11.5. A definition
+**authorizes nothing**. `Definition.Detect(root)` reports which root markers
+exist, reading metadata through the confined `workspace.Root` only; it is a
+hint for choosing among the supported servers and never a reason to execute.
 
-A `Profile` is runnable, and `Trusted(cfg, name)` is its only constructor:
+A `Profile` is runnable, and `Resolve(ctx, resolver, cfg, name)` is its only
+constructor:
 
 | Condition | Result |
 |---|---|
 | `providers.lsp.enabled = false` | `CTX_PROVIDER_UNAVAILABLE` |
 | `name` is not one of the six definitions | `CTX_ARGUMENT_INVALID` |
-| no `[analyzers.<name>]` in the **user** configuration | `CTX_TRUST_REQUIRED` |
-| approval's `executable` is not an absolute path | `CTX_TRUST_REQUIRED` |
-| approval has no `version_constraint` | `CTX_TRUST_REQUIRED` |
-| approval's `work_dir` is not an absolute path | `CTX_TRUST_REQUIRED` |
-| approval lacks a timeout or a memory or disk budget | `CTX_TRUST_REQUIRED` |
-| args use `${output_file}` or `${manifest}` | `CTX_ARGUMENT_INVALID` |
+| no toolchain resolver | `CTX_PROVIDER_UNAVAILABLE` |
+| the payload is not installed and `tools.offline` is set | `CTX_TOOL_OFFLINE` |
+| the lock carries no payload for this platform | `CTX_TOOL_UNSUPPORTED_PLATFORM` |
+| the store's payload does not match the lock | `CTX_TOOL_CORRUPT` |
+| a `[tools.override.<name>]` does not verify | `CTX_TOOL_OVERRIDE_INVALID` |
+| the fetch failed or the bytes disagree | `CTX_TOOL_FETCH_FAILED`, `CTX_TOOL_DIGEST_MISMATCH` |
 
-`enabled = "auto"` therefore means "use an already approved profile"; nothing
-found on `PATH` is ever started (Section 20.2). The approval's `args` replace
-the definition's default argv entirely when present; `${input_dir}` is the
-materialization root and `${work_dir}` the private working directory. The
-child environment is exactly the approval's `env_allowlist` resolved from the
-parent, nothing else; a server that needs `HOME`, `PATH` or a toolchain
-variable needs it listed. `work_dir` must be absolute because the overlay
-creates it before the server starts: a relative one would be created under
-whatever directory the process happens to be in. It is a real working
-directory, not a scratch path — `jdtls` is started with `-data ${work_dir}`
-and writes its workspace state there by design; the materialization is the
-server's read-only input and is never its data directory.
+`enabled = "auto"` therefore means "start the pinned payload for this
+language"; nothing found on `PATH` is ever started and there is no
+`[analyzers.<name>]` approval to write (Section 20.2 — trust is the lock). The
+argument array, the environment allowlist, the budgets and the lifetime are
+constants of this build; `${input_dir}` is the materialization root and
+`${work_dir}` the server's private working directory under
+`<data_dir>/lsp/<server>/`, which the overlay creates before the server starts.
+It is a real working directory, not a scratch path — `jdtls` is started with
+`-data ${work_dir}` and writes its workspace state there by design; the
+materialization is the server's read-only input and is never its data
+directory. The child's environment is exactly the allowlisted variables the
+parent has plus the variables the payload needs, and the payload's come last so
+a host `JAVA_HOME` can never shadow the managed JDK.
 
-| Definition | Languages | Default argv | Root markers |
-|---|---|---|---|
-| `gopls` | go | `serve` | `go.mod`, `go.work` |
-| `rust-analyzer` | rust | | `Cargo.toml` |
-| `pyright` | python | `--stdio` | `pyproject.toml`, `pyrightconfig.json`, `setup.py`, `requirements.txt` |
-| `typescript-language-server` | typescript, tsx, javascript | `--stdio` | `tsconfig.json`, `jsconfig.json`, `package.json` |
-| `clangd` | c, cpp | | `compile_commands.json`, `compile_flags.txt`, `.clangd`, `CMakeLists.txt` |
-| `jdtls` | java | `-data ${work_dir}` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
+| Definition | Languages | Arguments after the launcher | Environment allowlist | Root markers |
+|---|---|---|---|---|
+| `gopls` | go | `serve` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | `go.mod`, `go.work` |
+| `rust-analyzer` | rust | | `PATH HOME CARGO_HOME RUSTUP_HOME` | `Cargo.toml` |
+| `pyright` | python | `--stdio` | `PATH HOME` | `pyproject.toml`, `pyrightconfig.json`, `setup.py`, `requirements.txt` |
+| `typescript-language-server` | typescript, tsx, javascript | `--stdio` | `PATH HOME` | `tsconfig.json`, `jsconfig.json`, `package.json` |
+| `clangd` | c, cpp | | `PATH HOME` | `compile_commands.json`, `compile_flags.txt`, `.clangd`, `CMakeLists.txt` |
+| `jdtls` | java | `-data ${work_dir}` | `PATH HOME` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
 
-**Verification status.** `gopls` v0.23.0 was exercised end to end in an ad-hoc
-run on the development machine (recorded in the Task 10 report: definition,
-references, document and workspace symbols, call hierarchy, standard-library
-locations excluded, idle stop). The other five profiles are implemented from
-their documented stdio invocations and are **unverified against a real
-tool**; `pyright`'s executable is the `pyright-langserver` script, and
-`jdtls` launcher scripts vary by distribution. Approving one is the
-operator's statement that the pinned executable behaves as an LSP server.
+The launcher itself comes from the lock: `gopls`, `clangd` and `rust-analyzer`
+run as themselves; `pyright` and `typescript-language-server` run as
+`<managed node> <pinned entry>`; `jdtls` runs as
+`<managed jdk>/bin/java -jar <pinned launcher jar>` with `JAVA_HOME` set.
 
-At start the executable is checksummed (compared when the approval pins a
-`checksum`, always recorded in the input digest) and the version the server
-reports in `serverInfo.version` is matched against `version_constraint` as a
-version token: `0.23` accepts `v0.23.1` and gopls's JSON build description
-containing `"Version":"v0.23.0"`, and rejects `10.23`. A server that reports
-no version, or another one, is shut down: `CTX_TRUST_REQUIRED`. Detection by
-`--version` is execution and is not performed.
+**Verification status.** All six payloads were resolved through the real lock
+and store on `linux/amd64` and their composed argv recorded (lane B1 report);
+`gopls` 0.23.0 additionally completed the initialize handshake, negotiated its
+position encoding, published a validated overlay binding and answered a
+definition query against the pinned bytes. The protocol itself — out-of-order
+replies, all three position encodings, cancellation, hostile URIs,
+unadvertised methods, a server-initiated edit, shutdown and crash — is
+exercised in full against the fake server. The other five servers' **handshakes**
+have not been run here.
+
+At start nothing is re-hashed: `internal/toolchain` hashed the payload's entry
+at resolution, and `Tool.Fingerprint()` — which commits to the pinned payload
+digest and to the executables observed at that resolution — is folded into the
+overlay's input digest, so a replaced payload is a different answer. The
+version the server reports in `serverInfo.version` is recorded as provenance in
+`OverlayBinding.ProviderVersion` and in the input digest, and is **not** matched
+against a constraint: the lock's digest is what identifies the bytes, and a
+server's printed version has no fixed relationship to the release it came from
+(the `rust-analyzer` release tagged `2026-08-17.4` reports
+`1.98.0 (88d9e12 2026-08-18)`). A constraint written to accept that accepts
+anything. Detection by `--version` is execution and is not performed.
 
 ## Process and stream wiring
 
@@ -90,7 +103,7 @@ Bounds, all finite:
 | in-flight requests per server | `providers.lsp.max_outstanding_requests` | callers wait for a slot under their context |
 | one request | `providers.lsp.request_timeout` | `$/cancelRequest` sent, `CTX_PROVIDER_TIMEOUT` |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
-| server lifetime | the approval's `timeout` | the runner terminates the tree |
+| server lifetime | the definition's own `Timeout` (1 h) | the runner terminates the tree |
 | materialized bytes, cached pinned bytes, bytes sent, bytes received | `Options.MaxOverlayBytes` (default 512 MiB) | materialization refused; cache evicts LRU; the server is failed |
 | one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
 | one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable — a request reports it to its caller, an answer to a server-initiated request is dropped and the writer goroutine continues |
@@ -178,7 +191,7 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 
 ```go
 mgr, _ := lsp.New(lsp.Options{Runner: runner, DataDir: dataDir, MaxServers: cfg.Providers.LSP.MaxServers, ...})
-profile, err := lsp.Trusted(cfg, "gopls")          // CTX_TRUST_REQUIRED without approval
+profile, err := lsp.Resolve(ctx, resolver, cfg, "gopls")     // CTX_TOOL_* when the payload does not resolve
 ov, err := mgr.Open(ctx, view, profile)            // starts lazily, shares a running server
 defer ov.Close()                                   // last close starts the idle TTL
 
