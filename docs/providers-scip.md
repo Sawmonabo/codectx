@@ -30,8 +30,11 @@ coordinator exists.
   Nothing usable is `CTX_PROVIDER_UNAVAILABLE`. When at least one language is
   indexable the detection is available, and `Detection.Details` still names
   every other triggered language and why it is not: the toolchain's own
-  `CTX_TOOL_*` code for a payload this machine cannot supply, and
-  `CTX_TOOL_NOT_INSTALLED` for one the first run will fetch. Without that a
+  `CTX_TOOL_*` code for a payload this machine cannot supply, and the marker
+  `deferred` for one the first run will fetch. The two are spelled differently
+  on purpose — a `CTX_` value is a refusal and the coordinator publishes a
+  `partial` capability row for it, while `deferred` is pending work that will
+  be indexed at full precision and publishes nothing. Without the details a
   repository with `go.mod` and `Cargo.toml` on a machine with no usable
   `rust-analyzer` would be reported available, plan `scip-go` only, and say
   nothing anywhere about Rust.
@@ -400,13 +403,19 @@ against 50 µs and zero files written now.
 
 A deferred payload is fetched by the first unit that runs it, at the one moment
 the repository is known to contain the language; a fetch that fails fails that
-unit with the toolchain's typed code. `Descriptor().Version` still folds only
-the payloads the process actually holds, because `Descriptor()` takes no
-context and has to be a deterministic function of the process — so a deferred
-kind contributes the same fixed empty slot an unresolvable one does, and a unit
-built before its payload was installed keys differently from one built after.
-That is correct (the facts really were produced by a different tool set) and it
-happens once.
+unit with the toolchain's typed code.
+
+`Descriptor().Version` is fixed at construction — `Descriptor()` takes no
+context and has to be a deterministic function of the process — and folds the
+identity of every kind that can produce facts: the resolved fingerprint of a
+payload the store holds, and `toolchain.Resolver.PinnedFingerprint` for a
+deferred one, which computes the same fingerprint from the lock alone. The two
+are the same string for the same payload, so a unit sealed by the run that
+fetched the payload keys identically to every unit after it. Folding an empty
+slot for a deferred kind instead would key the first run on a cold machine
+under a provider version that names no tool at all, and the next process would
+re-index everything that run produced. Only a kind this machine cannot supply
+at all contributes an empty slot, and it plans no unit and produces no facts.
 
 ## Profiles
 
@@ -480,6 +489,16 @@ unit seals with all three capabilities fresh. A repository's own
 `scip-java.json` is replaced in the copy: the invocation is product code, not a
 configuration surface. `--targetroot` keeps the indexer's own intermediate
 output inside the run directory rather than in the materialization.
+
+A materialization that holds **no** `.java` file is refused before the indexer
+starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a remediation naming the
+source-free case. This is the aggregator POM of a multi-module repository —
+`pom.xml` triggers the profile, the root carries no source of its own — and
+without the check `javac` refuses, the indexer exits 1, and the run fails as
+`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured):
+a process failure with no stderr and no remediation. The refusal is the same
+typed one the other profiles produce for an index that describes no admitted
+document, raised before a JVM is started rather than after.
 
 **Two pinned arguments exist because of a measured failure, not a preference.**
 `scip-python` is given `--project-version` because, left to itself, it asks git

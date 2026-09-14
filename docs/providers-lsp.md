@@ -40,8 +40,18 @@ language"; nothing found on `PATH` is ever started and there is no
 `[analyzers.<name>]` approval to write (Section 20.2 — trust is the lock). The
 argument array, the environment allowlist, the budgets and the lifetime are
 constants of this build; `${input_dir}` is the materialization root and
-`${work_dir}` the server's private working directory under
-`<data_dir>/lsp/<server>/`, which the overlay creates before the server starts.
+`${work_dir}` the server's private working directory
+`<data_dir>/lsp/<server>/<payload identity>/`, which the overlay creates before
+the server starts. The last component is the digest half of the resolved
+payload's `Tool.Fingerprint()`: what the directory holds is derived from the
+payload and is never rewritten, so a new payload gets a new directory. The
+previous one is **left in place** — nothing reclaims anything under
+`<data_dir>/lsp` today — so a machine keeps one tree per payload version it has
+been pinned to, which is the cost of never rewriting a configuration underneath
+a running server. (The digest rather
+than the rendered fingerprint because this is a path component, and the
+rendered form carries the version verbatim — an override's version is whatever
+the user typed.)
 It is a real working directory, not a scratch path — `jdtls` is started with
 `-data ${work_dir}/data` **and** `-configuration ${work_dir}/config`, and
 writes its workspace state and its whole Equinox configuration there; the
@@ -79,7 +89,13 @@ not runtime-hosted is a product defect and `Resolve` refuses it with
 `CTX_INTERNAL`. The second is the configuration directory: Equinox **writes**
 into whatever `-configuration` names, so `${work_dir}/config` is a private copy
 seeded once from the payload's own `config_linux`/`config_mac`/`config_win`
-(`config_linux_arm`/`config_mac_arm` on arm64). Pointed at the payload's own,
+(`config_linux_arm`/`config_mac_arm` on arm64). Seeded once is safe only
+because `${work_dir}` is per payload identity: the configuration names bundle
+jars by exact version, so a directory shared across payloads would boot a
+re-pinned `jdtls` against the previous payload's bundle list — reproduced, the
+server dies at startup writing `An error has occurred. See the log file` to
+stdout, and nothing in the product ever rewrites the directory. A new payload
+seeds a new one. Pointed at the payload's own,
 three starts left four new paths inside the store's published,
 digest-identified version directory while `codectx tools verify` still reported
 `14 installed`, exit 0 — verify rehashes the pinned entry, not the payload
@@ -312,7 +328,10 @@ does not have to rediscover it.
 - **`jdtls` writes into `work_dir` by design.** Its default argv is
   `-data ${work_dir}`, so the private working directory is also its workspace
   data directory and it accumulates state there across runs. Approving
-  `jdtls` means approving that write. No snapshot byte and no repository file
+  `jdtls` means approving that write. A payload upgrade re-creates that
+  workspace index, because the work directory is per payload identity; that is
+  the safe direction, and the previous payload's tree is left on disk rather
+  than rewritten under a running server — nothing reclaims it yet. No snapshot byte and no repository file
   is ever written: the materialization is read-only input and the checkout is
   never touched.
 - **Unexpected-exit detection is delayed** by twice the grace, as described

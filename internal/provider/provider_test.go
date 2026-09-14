@@ -229,4 +229,26 @@ func TestSelectPublishesDetectionDetails(t *testing.T) {
 	if sel.Inactive[1].Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
 		t.Fatal("published states share one details map")
 	}
+	// The other half of the same false-readiness question, in the other
+	// direction: a detail that is not a refusal must publish nothing. A pinned
+	// payload the first unit fetches and then indexes at full precision is such
+	// a detail, and it is on every SCIP kind on a cold store -- published as
+	// `partial`, the only surface carrying capability state reports every first
+	// run of the product as degraded, and a real refusal beside it becomes
+	// indistinguishable from routine.
+	pending := providertest.Func{Desc: desc, DetectFn: func(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+		return provider.Detection{Available: true, Capabilities: desc.Capabilities}.
+			WithDetail("scip-go", "deferred"), nil
+	}}
+	pendingReg, err := provider.NewRegistry(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSel, err := pendingReg.Select(context.Background(), h.Root, h.Policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingSel.Active) != 1 || len(pendingSel.Inactive) != 0 {
+		t.Fatalf("a deferred-only detection published %+v, want no capability row", pendingSel.Inactive)
+	}
 }
