@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"syscall"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -43,13 +44,37 @@ func failureEnvelope(schemaVersion, command string, err *model.Error) Envelope[a
 	}
 }
 
-// writeEnvelope emits one envelope. A write failure (a closed stdout pipe, for
-// example) fails the command rather than being reported as success.
+// writeEnvelope emits one envelope. A write failure fails the command rather
+// than being reported as success: Section 18.2 requires that a broken stdout
+// pipe fail the command, because the only thing standing between "bytes we
+// handed to the kernel" and "bytes a client received" is this error. A run that
+// swallowed it would return success for a response nobody read, and the
+// operator's next step -- confirming a source receipt for chunks that were
+// never delivered -- would credit a read that did not happen (Section 16.2).
 func writeEnvelope[T any](w io.Writer, env Envelope[T]) error {
 	if err := json.NewEncoder(w).Encode(env); err != nil {
-		return &model.Error{Code: model.CodeInternal, Message: "failed to write JSON output: " + err.Error()}
+		return outputFailure(err)
 	}
 	return nil
+}
+
+// outputFailure types a failure to write the one envelope of Section 18.2.
+//
+// A broken pipe is the reader going away -- `codectx ... | head` is the ordinary
+// case -- which is the operator stopping the work, not a defect in this build.
+// It belongs to the exit-7 "explicit incomplete work" class alongside
+// cancellation, and reaching CodeInternal/exit 10 there would report a routine
+// shell pipeline as a bug to file. Anything else genuinely is this build
+// failing to produce its own output, which is exit 10.
+func outputFailure(err error) *model.Error {
+	if errors.Is(err, syscall.EPIPE) {
+		return &model.Error{
+			Code:        model.CodeCanceled,
+			Message:     "output stopped: the reader closed the pipe before the response was written",
+			Remediation: "The response was not delivered. Re-run without the pipe, or read it to the end.",
+		}
+	}
+	return &model.Error{Code: model.CodeInternal, Message: "failed to write JSON output: " + err.Error()}
 }
 
 // ExitCode maps a command failure to the process exit code table of Section
