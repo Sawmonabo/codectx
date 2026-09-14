@@ -352,6 +352,33 @@ func (f *graphFixture) NodesByID(ctx context.Context, ids []model.NodeID) ([]mod
 	return out, nil
 }
 
+// Containers is the optional graph.ContainerReader seam: the visible container
+// nodes of kinds, keyset-ordered by NodeID after `after`, clamped exactly as
+// the shipped reader clamps a page. The fixture implements it because the app
+// adapter must, and because a repository map has no seed to hang off -- an
+// Adjacency without it can list no container at all.
+func (f *graphFixture) Containers(ctx context.Context, kinds []model.NodeKind,
+	after model.NodeID, limit int) ([]model.Node, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	want := make(map[model.NodeKind]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	var out []model.Node
+	for _, n := range f.nodes {
+		if want[n.Kind] && n.ID > after {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if l := fixtureEdgePageLimit(limit); len(out) > l {
+		out = out[:l]
+	}
+	return out, nil
+}
+
 // EvidenceFor hydrates the evidence IDENTITIES backing a page of relations in
 // one call -- the frozen Adjacency port, which is all a traversal needs.
 func (f *graphFixture) EvidenceFor(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.EvidenceID, error) {
@@ -1232,6 +1259,108 @@ func TestGraphScenarios(t *testing.T) {
 					case <-time.After(10 * time.Second):
 						t.Fatalf("%s is still waiting for a gate slot 10s into a %s query timeout: the deadline does not wrap the gate wait",
 							c.name, timeout)
+					}
+				}
+			},
+		},
+
+		// T20-L5 OVERVIEW rows
+		{
+			// Protects the silent-omission failure mode: the repository map's
+			// per-container aggregates are read through a keyset loop over
+			// containment edges, and a loop that stops at the first clamped
+			// page -- or at a flat page ceiling -- reports a package with 260
+			// members as a package with 200. A repo-map that omits members is
+			// not read as incomplete; it is read as the repository's shape.
+			name: "overview/a container past the storage page clamp is rolled up completely",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				got, err := e.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID})
+				if err != nil {
+					t.Fatalf("Overview: %v", err)
+				}
+				if err := got.Validate(); err != nil {
+					t.Fatalf("result does not satisfy its own contract: %v", err)
+				}
+				if got.Meta.Truncated {
+					t.Fatalf("a map the fixture fits inside every bound reports truncated: %q",
+						got.Meta.TruncationReason)
+				}
+				byID := map[model.NodeID]model.OverviewItem{}
+				for _, item := range got.Items {
+					byID[item.NodeID] = item
+				}
+				wide, ok := byID[fixtureNodeID("pkg-wide-b")]
+				if !ok {
+					t.Fatalf("pkg-wide-b is absent from a map of %d containers", len(got.Items))
+				}
+				if wide.SymbolCount != fixtureWideCount {
+					t.Fatalf("pkg-wide-b holds %d symbols, want %d: the containment read stopped early",
+						wide.SymbolCount, fixtureWideCount)
+				}
+				app, ok := byID[fixtureNodeID("pkg-app")]
+				if !ok {
+					t.Fatalf("pkg-app is absent from the map")
+				}
+				// pkg-app contains n-a, n-b, n-hub and n-p and imports pkg-lib:
+				// an aggregate that counted the import would report structure
+				// the container does not hold.
+				if app.SymbolCount != 4 || app.FileCount != 0 {
+					t.Fatalf("pkg-app holds %d symbols and %d files, want 4 and 0",
+						app.SymbolCount, app.FileCount)
+				}
+			},
+		},
+		{
+			// Protects the straddled-generation failure mode: every page of one
+			// map must be bound to the generation page 1 pinned, and page 2 must
+			// start where the cursor said and nowhere else. A continuation that
+			// re-pinned, or that restarted the keyset, would splice two
+			// repositories into one map without saying so.
+			name: "overview/page 2 keeps page 1's generation and starts at its keyset",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				limits := fixtureLimits()
+				e, err := New(Options{Adjacency: f, Signer: signer,
+					Leases: pagination.NewLeases(newFixtureLeases(), limits.CursorTTL), Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				const perPage = 2
+				first, err := e.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID,
+					Page:         model.PageRequest{Limit: perPage}})
+				if err != nil {
+					t.Fatalf("page 1: %v", err)
+				}
+				if len(first.Items) != perPage || first.Meta.NextCursor == "" {
+					t.Fatalf("page 1 returned %d items and cursor %q, want %d items and a continuation",
+						len(first.Items), first.Meta.NextCursor, perPage)
+				}
+				second, err := e.Overview(context.Background(), model.OverviewRequest{
+					Page: model.PageRequest{Limit: perPage, Cursor: first.Meta.NextCursor}})
+				if err != nil {
+					t.Fatalf("page 2: %v", err)
+				}
+				if err := second.Validate(); err != nil {
+					t.Fatalf("page 2 does not satisfy its own contract: %v", err)
+				}
+				if second.Meta.Binding != first.Meta.Binding {
+					t.Fatalf("page 2 is bound to %+v, page 1 to %+v: the map straddles a generation change",
+						second.Meta.Binding, first.Meta.Binding)
+				}
+				last := first.Items[len(first.Items)-1].NodeID
+				for _, item := range second.Items {
+					if item.NodeID <= last {
+						t.Fatalf("page 2 lists %s at or before page 1's last container %s: the keyset restarted",
+							item.NodeID, last)
 					}
 				}
 			},
