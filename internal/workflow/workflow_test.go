@@ -122,18 +122,35 @@ func TestWorkflowScenarios(t *testing.T) {
 		// The waiver route is the one exception and it is user-gated: with
 		// context.allow_exploratory_waiver_consolidation off, a recorded waiver
 		// must NOT buy the transition, or the flag protects nothing.
+		//
+		// The shortfall here is ENTIRELY waived, which is the sharp case: a
+		// guard that adds the waiver count back into the served total never
+		// trips at all on this fixture, so the flag-gated branch becomes
+		// unreachable and ruling Q12's default-false control is bypassed in
+		// silence. The third arm is the other half of the same split -- a
+		// waived file that was also READ leaves nothing short, so it needs no
+		// flag -- and together they pin the guard to read completeness
+		// (Section 17.1) rather than to the reported served column.
 		{name: "advance/consolidating short of coverage needs the waiver flag", run: func(t *testing.T, h *harness) {
 			ctx := context.Background()
+			// The fixture is one fully served file, one partly served, one
+			// waived with no bytes at all and one empty. Finishing the partly
+			// served file leaves the waived-and-unread file as the only thing
+			// short, and a current-scope review is put on record so this row
+			// can only fail on the coverage guard, never on a missing review.
+			h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.store.mu.Lock()
+			fs := h.store.sessions[fixtureSession]
+			fs.obs = append(fs.obs, fixtureScopeReview(fixtureSession, fixtureActor, 1))
+			h.store.mu.Unlock()
+
 			req := model.AdvanceRequest{
 				SessionID: fixtureSession, ActorID: fixtureActor,
 				Target: model.StateConsolidateOpen, ExpectedVersion: 1,
 			}
-			// The fixture is one fully served file, one partly served, one
-			// waived and one empty: two of four required files short, and the
-			// waiver is recorded from the start.
 			_, _, err := h.svc.Advance(ctx, req)
 			if got := code(err); got != model.CodeCoverageIncomplete {
-				t.Fatalf("Advance to consolidate_open short of coverage: code %q (err %v), want %q",
+				t.Fatalf("Advance to consolidate_open over a waived and unread required file, flag off: code %q (err %v), want %q",
 					got, err, model.CodeCoverageIncomplete)
 			}
 			if got := h.session(fixtureSession).State; got != model.StateVerifyOpen {
@@ -149,6 +166,25 @@ func TestWorkflowScenarios(t *testing.T) {
 			}
 			if got := h.session(fixtureSession).State; got != model.StateConsolidateOpen {
 				t.Fatalf("the permitted transition left the session at %q", got)
+			}
+
+			// Now read the waived file too and rewind the same session to
+			// verify_open. Nothing is short any more -- a waiver excuses a file
+			// from being read, it does not unread one that was -- so the flag
+			// is not needed and the base service must consolidate. A guard that
+			// compared the reported served column would refuse here and send
+			// the operator back to read bytes they had already confirmed.
+			h.store.mu.Lock()
+			fs.files[fileWaived].served = []model.ByteRange{{Start: 0, End: 50}}
+			fs.rec.Phase, fs.rec.State = model.PhaseVerify, model.StateVerifyOpen
+			req.ExpectedVersion = fs.rec.StateVersion
+			h.store.mu.Unlock()
+
+			if _, _, err := h.svc.Advance(ctx, req); err != nil {
+				t.Fatalf("Advance with every required file read, one of them also waived, flag off: %v (code %q)", err, code(err))
+			}
+			if got := h.session(fixtureSession).State; got != model.StateConsolidateOpen {
+				t.Fatalf("a fully read session with a waiver was left at %q", got)
 			}
 		}},
 		// L2 rows
@@ -343,16 +379,21 @@ func TestWorkflowScenarios(t *testing.T) {
 				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v superseded=%v",
 					st.ScopeComplete, st.Superseded)
 			}
-			// A waived file never counts as served even though this one was
-			// also read (VF3): reporting 4 of 4 served beside a waiver read as
-			// full coverage, which is the claim a waiver exists to deny. So
-			// the served count is 3 and read completeness is false with it.
+			// The waived file was also read, and the two counts must part
+			// company on exactly that: fully_served_files drops it (VF3 --
+			// reporting 4 of 4 served beside a waiver reads as full coverage,
+			// the claim a waiver exists to deny) while read completeness keeps
+			// it, because a waiver excuses a file from being read and does not
+			// unread one that was. Neither answer is readiness: the waiver is
+			// still the precondition that shuts the gate below, which is what
+			// stops the honest read_complete here from becoming false write
+			// authorization.
 			if st.RequiredFiles != 4 || st.FullyServedFiles != 3 || st.WaivedFiles != 1 {
 				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/3/1",
 					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
 			}
-			if st.ReadCompleteForSnapshot {
-				t.Fatal("read_complete_for_snapshot is true beside a required-file waiver; a waived file is not a read file")
+			if !st.ReadCompleteForSnapshot {
+				t.Fatal("read_complete_for_snapshot is false although every required file was fully read; a waiver does not unread a file that was read")
 			}
 			if st.StrictGateSatisfied || st.ReadyForImplementation {
 				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",
@@ -1060,27 +1101,32 @@ func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor st
 	return out, err
 }
 
-func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, actor string) (int64, int64, int64, error) {
+func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
-		return 0, 0, 0, err
+		return sqlite.CoverageCounts{}, err
 	}
-	var required, served, waived int64
+	var c sqlite.CoverageCounts
 	for _, f := range fs.files {
-		required++
-		// The real aggregate excludes a waived file from the served count
-		// whatever its bytes say (coverageSummarySQL); the fake must answer the
-		// same or these rows test a store that does not exist.
-		if f.state() == model.CoverageFullServed && !f.waived {
-			served++
+		c.Required++
+		// The real aggregate derives both columns from one state switch: a
+		// file is fully read on its bytes alone, and the reported served
+		// column is that AND not waived (coverageSummarySQL). The fake must
+		// split them the same way or these rows test a store that does not
+		// exist.
+		if f.state() == model.CoverageFullServed {
+			c.FullyRead++
+			if !f.waived {
+				c.Served++
+			}
 		}
 		if f.waived {
-			waived++
+			c.Waived++
 		}
 	}
-	return required, served, waived, err
+	return c, err
 }
 
 // ActiveGeneration is the store's active_generations read. An unpublished

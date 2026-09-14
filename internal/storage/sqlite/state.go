@@ -1149,30 +1149,59 @@ func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time
 // Keeping the switch here is what lets Status answer a 250k-file session with
 // one round trip instead of paging Coverage; the two must stay in step.
 //
-// A waived file is excluded from the served count whatever its bytes say. A
-// waiver is an admission that a required file was not read, so a file that was
-// both waived and delivered counted in BOTH columns and a fully waived session
-// reported full coverage -- the claim the waiver exists to deny. The exclusion
-// is here, in the one aggregate, so the answer is the same for every caller
-// rather than an arithmetic correction each of them applies differently.
+// The switch is written ONCE, in a derived table, and every column is derived
+// from it: full_read is the switch itself, waived is the waiver existence test,
+// and the served column is literally "full_read AND NOT waived". Pasting the
+// switch twice -- once bare, once with the waiver clause -- would be the second
+// implementation Section 30.1 forbids, and an earlier revision that spliced the
+// waiver clause into the front of the switch bound it to the empty-file branch
+// alone (AND binds tighter than OR), so a waived NONEMPTY file still counted as
+// served. Deriving the columns is what makes that class of mistake unwriteable.
+//
+// The two counts answer two different questions and callers need both. Read
+// completeness asks whether every required file was fully read, waived or not
+// (Section 17.1): a waiver excuses a file from being read, it does not unread
+// one that was. The reported fully_served_files instead answers what the
+// operator is told was covered, and a waiver is an admission that a required
+// file was not read -- so a file that was both waived and delivered must not
+// appear there, or a fully waived session reports full coverage, the claim the
+// waiver exists to deny.
 const coverageSummarySQL = `SELECT count(*),
-	coalesce(sum(CASE WHEN NOT EXISTS (SELECT 1 FROM coverage_waivers w2 WHERE w2.session_id = s.session_id AND w2.file_id = s.file_id AND w2.content_hash = s.content_hash) AND (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
+	coalesce(sum(full_read), 0),
+	coalesce(sum(CASE WHEN full_read = 1 AND waived = 0 THEN 1 ELSE 0 END), 0),
+	coalesce(sum(waived), 0)
+	FROM (SELECT CASE WHEN (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
 		OR (sf.size_bytes > 0 AND (SELECT coalesce(sum(r.end_byte - r.start_byte), 0) FROM served_ranges r WHERE r.session_id = s.session_id AND r.file_id = s.file_id AND r.content_hash = s.content_hash) = sf.size_bytes)
-		THEN 1 ELSE 0 END), 0),
-	coalesce(sum(CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END), 0)
-	FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
-	WHERE s.session_id = ? AND s.requirement = ?`
+		THEN 1 ELSE 0 END AS full_read,
+		CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END AS waived
+		FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+		WHERE s.session_id = ? AND s.requirement = ?)`
 
-// CoverageSummary counts, for one actor's session, the required_full files in
-// scope, how many of them are full_served at their pinned hashes, and how many
-// carry a waiver. A waiver is counted, never treated as coverage: a required
-// file that is waived and unread raises waived without raising fullyServed, so
-// read completeness stays fullyServed == required (Section 16.1) and strict
-// readiness, which no waiver ever grants, remains a separate question
-// (Section 17.3). Like Coverage and Session it reports honestly beside
-// CTX_SESSION_EXPIRED rather than pretending the session has no scope.
-func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error) {
-	err = s.read(ctx, func(tx *sql.Tx) error {
+// CoverageCounts is the one coverage aggregate's whole answer, for one actor's
+// session, over the required_full files in scope. It is a struct rather than
+// four positional int64s because Served and FullyRead differ only by the waiver
+// clause: a transposed pair would read as a plausible count and silently answer
+// a different question.
+//
+// FullyRead is read completeness (Section 17.1) -- every required file fully
+// confirmed at its pinned hash, whether or not it also carries a waiver. Served
+// is the reported fully_served_files: fully confirmed AND not waived. Waived is
+// the waiver count, audited beside coverage and never as coverage, so strict
+// readiness -- which no waiver ever grants -- stays a separate question
+// (Section 17.3).
+type CoverageCounts struct {
+	Required  int64
+	FullyRead int64
+	Served    int64
+	Waived    int64
+}
+
+// CoverageSummary answers CoverageCounts in a single round trip. Like Coverage
+// and Session it reports honestly beside CTX_SESSION_EXPIRED rather than
+// pretending the session has no scope.
+func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (CoverageCounts, error) {
+	var c CoverageCounts
+	err := s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
 			// session returns a bare *model.Error, never a joined one, so this
@@ -1183,12 +1212,12 @@ func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, ac
 		}
 		sessionRaw, _ := model.DecodeID(string(rec.ID))
 		return wrap("session_files", tx.QueryRowContext(ctx, coverageSummarySQL, sessionRaw, string(model.RequirementFull)).
-			Scan(&required, &fullyServed, &waived))
+			Scan(&c.Required, &c.FullyRead, &c.Served, &c.Waived))
 	})
 	if err != nil {
-		return 0, 0, 0, err
+		return CoverageCounts{}, err
 	}
-	return required, fullyServed, waived, nil
+	return c, nil
 }
 
 // rangeConfirmedSQL asks one containment question of served_ranges: is there a
