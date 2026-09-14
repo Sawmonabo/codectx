@@ -1138,3 +1138,46 @@ func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time
 	})
 	return n, err
 }
+
+// coverageSummarySQL counts a session's required_full scope in one aggregate
+// pass, reproducing both branches of fileCoverage's state switch inside SQL: a
+// nonempty file is full_served when its disjoint served union is exactly its
+// size, and an empty file only once a zero-length EOF chunk is confirmed (a
+// zero-length row is unstorable in served_ranges, which CHECKs end > start).
+// Keeping the switch here is what lets Status answer a 250k-file session with
+// one round trip instead of paging Coverage; the two must stay in step.
+const coverageSummarySQL = `SELECT count(*),
+	coalesce(sum(CASE WHEN (sf.size_bytes = 0 AND (SELECT count(*) FROM issued_chunks ic WHERE ic.session_id = s.session_id AND ic.file_id = s.file_id AND ic.content_hash = s.content_hash AND ic.confirmed_at IS NOT NULL AND ic.start_byte = ic.end_byte) > 0)
+		OR (sf.size_bytes > 0 AND (SELECT coalesce(sum(r.end_byte - r.start_byte), 0) FROM served_ranges r WHERE r.session_id = s.session_id AND r.file_id = s.file_id AND r.content_hash = s.content_hash) = sf.size_bytes)
+		THEN 1 ELSE 0 END), 0),
+	coalesce(sum(CASE WHEN EXISTS (SELECT 1 FROM coverage_waivers w WHERE w.session_id = s.session_id AND w.file_id = s.file_id AND w.content_hash = s.content_hash) THEN 1 ELSE 0 END), 0)
+	FROM session_files s JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+	WHERE s.session_id = ? AND s.requirement = ?`
+
+// CoverageSummary counts, for one actor's session, the required_full files in
+// scope, how many of them are full_served at their pinned hashes, and how many
+// carry a waiver. A waiver is counted, never treated as coverage: a required
+// file that is waived and unread raises waived without raising fullyServed, so
+// read completeness stays fullyServed == required (Section 16.1) and strict
+// readiness, which no waiver ever grants, remains a separate question
+// (Section 17.3). Like Coverage and Session it reports honestly beside
+// CTX_SESSION_EXPIRED rather than pretending the session has no scope.
+func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error) {
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			// session returns a bare *model.Error, never a joined one, so this
+			// is the same unwrap Session (:504) and Coverage (:776) already do.
+			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
+				return err
+			}
+		}
+		sessionRaw, _ := model.DecodeID(string(rec.ID))
+		return wrap("session_files", tx.QueryRowContext(ctx, coverageSummarySQL, sessionRaw, string(model.RequirementFull)).
+			Scan(&required, &fullyServed, &waived))
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return required, fullyServed, waived, nil
+}
