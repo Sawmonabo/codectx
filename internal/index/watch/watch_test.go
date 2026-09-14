@@ -62,30 +62,36 @@ func TestWatchOverflowCollapsesToFullReconciliation(t *testing.T) {
 		})
 	}()
 
-	// The watch is placed by Run; write until a batch arrives so the test does
-	// not race the first Add.
+	// The watch is placed by Run; write until the overflow batch arrives so the
+	// test does not race the first Add.
+	//
+	// A non-overflow batch is a legal intermediate result and must not fail the
+	// test. arm() fixes the debounce window from the first event rather than
+	// sliding it, so whenever the burst is slower than the window -- which is
+	// what CPU contention under a full-suite run does -- the window closes with
+	// fewer than MaxPaths paths and the watcher correctly emits what it holds.
+	// The invariant under test is that a burst past the bound *does* collapse,
+	// not that the first batch is the one that collapses.
 	var got watch.Batch
 	deadline := time.After(20 * time.Second)
-	for i := 0; got.Reason == "" && !got.Overflow && len(got.Paths) == 0; {
+	writes := 0
+	for !got.Overflow {
 		for n := 0; n < 4*maxPaths; n++ {
-			name := filepath.Join(dir, "f"+string(rune('a'+i%26))+string(rune('a'+n%26))+".go")
+			name := filepath.Join(dir, "f"+string(rune('a'+writes%26))+string(rune('a'+n%26))+".go")
 			if err := os.WriteFile(name, []byte("package p\n"), 0o600); err != nil {
 				t.Fatalf("write %d: %v", n, err)
 			}
-			i++
+			writes++
 		}
 		select {
 		case got = <-batches:
 		case <-time.After(250 * time.Millisecond):
 		case <-deadline:
-			t.Fatal("no batch was emitted after writing well past index.watch_pending_paths")
+			t.Fatalf("%d writes past a bound of %d never collapsed to a full reconciliation",
+				writes, maxPaths)
 		}
 	}
 
-	if !got.Overflow {
-		t.Fatalf("batch of %d paths is not an overflow; %d writes past a bound of %d must collapse to a full reconciliation",
-			len(got.Paths), 4*maxPaths, maxPaths)
-	}
 	if len(got.Paths) != 0 {
 		t.Errorf("an overflow batch carries %d paths; a collapsed batch makes no claim about individual paths and must carry none",
 			len(got.Paths))

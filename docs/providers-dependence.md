@@ -91,8 +91,25 @@ entry's *name* stays in the lock: `ObservedVersion` renders
 
 The engine is one entry of the embedded tool lock, installed and verified by
 `internal/toolchain`. The backend never looks on `PATH`, never probes and never
-fetches anything itself: it is handed an `Engine` by a locator, and the
-production locator is the toolchain resolver behind that interface.
+fetches anything itself: it is handed an `Engine` by the locator, which is the
+toolchain resolver in production.
+
+**Nothing is installed when the workspace is opened.** Construction resolves the
+payload only if the store already holds it (`Resolver.ResolveInstalled`). A
+payload the lock pins but the store does not hold is reported as absent, and the
+backend keeps the payload's *pinned* identity — `Resolver.PinnedFingerprint`,
+computed from the lock alone — so the descriptor version and the Section 11.6
+cache key are the same string whether the payload landed before the process
+started or during it. The first `Parse` or `Export` resolves the command lines,
+and that is what installs the payload: the first unit that actually needs the
+engine pays the fetch, at unit time, under the scheduler's reservation gate.
+Resolving at construction instead made every `codectx index`, `refresh` and
+`watch` download roughly two gigabytes before the snapshot was even captured,
+in every repository, whether or not the planner would emit a dependence unit —
+which is exactly the delay to base readiness Section 11.6 forbids. The
+resolution is memoized with its error, so a payload that cannot be installed is
+attempted once rather than once per language family, and the resolved digest is
+re-checked against the identity construction already published.
 
 * **Parse argv** is the resolved payload's own launcher prefix. The pinned
   entry is a launcher script that finds its JVM through `JAVA_HOME`, which the
