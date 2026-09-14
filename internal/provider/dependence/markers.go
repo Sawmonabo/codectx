@@ -12,3 +12,12 @@ import "slices"
 // able to reach into it. A family this provider does not analyse has no
 // markers and returns nil.
 func ProjectMarkers(f Family) []string { return slices.Clone(projectMarkers[f]) }
+
+// ClosureMarkers are the build and lock files that belong to a family's
+// semantic closure without defining a project root. The C/C++ family has only
+// these: its unit is the repository itself, so a root declaring a C or C++
+// build (CMakeLists.txt, Makefile, compile_commands.json) declares the family
+// without declaring a project, and `--for-repo` reads them here so the
+// standard out-of-source layout selects the engine. Same copy rule as
+// ProjectMarkers.
+func ClosureMarkers(f Family) []string { return slices.Clone(closureMarkers[f]) }

@@ -38,7 +38,7 @@ them in one place.
 ```bash
 codectx tools status            # every pinned tool and what the store holds
 codectx tools prefetch --all    # install ahead of time instead of on demand
-codectx tools prefetch --for-repo .   # only what this repository's manifests select
+codectx tools prefetch --for-repo .   # only what this repository's root selects
 codectx tools verify            # rehash the store against the lock
 codectx tools gc                # drop versions this binary no longer pins
 ```
