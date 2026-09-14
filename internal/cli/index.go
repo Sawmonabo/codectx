@@ -119,7 +119,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 						if err := emitIndexProgress(cmd, args, result); err != nil {
 							return err
 						}
-						return runWatch(cmd, build, args, ws)
+						return runWatch(ctx, cmd, build, args, ws)
 					}
 					return drainIndex(cmd, build, args, ws, result)
 				})
@@ -245,16 +245,17 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
-				return err
-			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			return runWatch(cmd, build, args, ws)
+			// `watch` is a building command, so it opens through the same
+			// runner and the same building opener `index` and `refresh` use:
+			// one open dance, one Close, and a cancellation typed once. It
+			// declares no --timeout, so no deadline is installed over a session
+			// that is meant to run until it is stopped, and the *Services it is
+			// handed goes unread because streaming is deliberately not a facade
+			// operation (digest 17 Section 4) -- Coordinator is.
+			return runService(cmd, openForBuild(app.OpenOptions{Wait: indexLockWait}),
+				func(ctx context.Context, ws *app.Workspace, _ *app.Services) error {
+					return runWatch(ctx, cmd, build, args, ws)
+				})
 		},
 	}
 	addRepoFlag(cmd)
@@ -275,10 +276,10 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 // context ends, so `codectx watch | head -1` would keep indexing into a dead
 // pipe for the rest of the session -- which is the symptom (Section 18.2: a
 // broken stdout pipe fails the command and does not confirm delivery).
-func runWatch(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace) error {
+func runWatch(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	machine := jsonRequested(cmd, args)
-	ctx, stop := context.WithCancel(cmd.Context())
+	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	var refreshes int64
 	var writeErr error
