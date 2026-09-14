@@ -309,7 +309,9 @@ func TestCanonicalFixture(t *testing.T) {
 		t.Fatal("local 0 of two documents merged into one identity")
 	}
 	wantRange(t, xa, files["pkg/a.go"], "x", 0)
-	got.edge(t, foo.Node.ID, model.RelReads, xa.Node.ID)
+	// A ReadAccess occurrence is a `references` edge: `reads`/`writes` are the
+	// dependence provider's facts and this provider never publishes them.
+	got.edge(t, foo.Node.ID, model.RelReferences, xa.Node.ID)
 
 	// Import and implementation relationships.
 	fileA := got.byNativeKey(t, "file:pkg/a.go", a.ID)
@@ -481,44 +483,74 @@ func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth i
 	}
 }
 
-// TestCallsiteAliasJoin protects the Section 11.3 call-site join on the two
-// coordinate systems that can break it.
+// TestCallsiteAliasJoin protects the Section 11.3 call-site join and the
+// per-tool position-encoding fallback that feeds it.
 //
 // Failure modes: a UTF-16 column converted as a byte offset (scip-typescript,
 // scip-java and scip-python all emit UTF-16 columns) keys the alias on bytes
 // that are not the callee identifier, so the tree-sitter call site and the
 // compiler-resolved symbol never merge and every precise call target is
 // silently lost; a definition occurrence keyed as a call site would alias a
-// declaration to a call range and merge two different entities.
+// declaration to a call range and merge two different entities; and a
+// position encoding assumed from an unmeasured tool or version converts to a
+// valid, in-range, rune-aligned and **wrong** extent, which nothing
+// downstream can detect because it never errors — compiler-precision facts
+// bound to source bytes that are not the symbol.
+//
+// Every case runs the same hand-encoded index over the committed UTF-16
+// TypeScript document: a reference occurrence to Baz at UTF-16 columns
+// [25,28) of line 0, which follows a surrogate pair, so a byte reading of
+// those columns selects "n B" instead of "Baz". The canonical fixture's own
+// b.ts occurrences are all on ASCII-only lines, which cannot separate the two
+// readings. The document leaves `position_encoding` unspecified, which is how
+// every real scip-typescript, scip-java and scip-python index arrives
+// (measured: none of the three sets the field).
 func TestCallsiteAliasJoin(t *testing.T) {
-	files := fixture(t)
-	// One hand-encoded index over the committed UTF-16 TypeScript document:
-	// a reference occurrence to Baz at UTF-16 columns [25,28) of line 0, which
-	// follows a surrogate pair, so a byte reading of those columns lands four
-	// bytes early. The canonical fixture's own b.ts occurrences are all on
-	// ASCII-only lines, which cannot separate the two readings.
-	//
-	// The document leaves `position_encoding` unspecified and the index names
-	// scip-typescript, which is how every real scip-typescript, scip-java and
-	// scip-python index arrives (measured: none of the three sets the field),
-	// so this also covers the measured per-tool encoding of
-	// toolPositionEncoding. Reading those indexes as UTF-8 would put every
-	// occurrence of every non-ASCII line on the wrong bytes.
-	ref := occurrenceRecord(symBaz, 0, 0, 25, 28)
-	def := occurrenceRecord(symBaz, 1, 0, 25, 28)
-	files["utf16.scip"] = string(miniIndex("scip-typescript", documentRecord("web/b.ts", "typescript", 0, def, ref)))
-	inputs := append([]string{"utf16.scip"}, sourcePaths...)
-	p := newProvider(t, "utf16.scip")
-	h := providertest.New(t, files)
-	got, _ := importDelta(t, h, p, scip.ImportScope("utf16.scip"), inputs, nil)
+	cases := []struct {
+		name          string
+		tool, version string
+		admit         bool
+	}{
+		// The measured pair: the columns are read as UTF-16 and the join works.
+		{name: "measured tool and version", tool: "scip-typescript", version: "0.4.0", admit: true},
+		// A tool whose measured encoding is UTF-8 over UTF-16 columns. The
+		// conversion succeeds and selects "n B": the wrong-source case the
+		// self-check exists for.
+		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7"},
+		// The right tool at a version nothing was measured against.
+		{name: "unmeasured version", tool: "scip-typescript", version: "9.9.9"},
+		// A tool with no measured encoding at all.
+		{name: "unmeasured tool", tool: "scip-fixture", version: "0.1.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := fixture(t)
+			ref := occurrenceRecord(symBaz, 0, 0, 25, 28)
+			def := occurrenceRecord(symBaz, 1, 0, 25, 28)
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, def, ref)))
+			inputs := append([]string{"utf16.scip"}, sourcePaths...)
+			p := newProvider(t, "utf16.scip")
+			h := providertest.New(t, files)
+			got, rep := importDelta(t, h, p, scip.ImportScope("utf16.scip"), inputs, nil)
 
-	b := h.File(t, "web/b.ts")
-	baz := got.byNativeKey(t, symBaz, b.ID)
-	wantCallsiteAlias(t, got, "web/b.ts", files["web/b.ts"], "Baz", 0, baz.Node.ID)
-	// The definition occurrence at the same range publishes the symbol alias,
-	// never a second call-site alias for its own declaration.
-	if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
-		t.Fatalf("%d call-site aliases over one reference and one definition, want exactly 1: %v", n, aliasKeys(got))
+			if !tc.admit {
+				// Nothing is published and the document is counted skipped:
+				// an unproved encoding never becomes a fact.
+				if rep.Skipped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
+					t.Fatalf("index of %s %s: skipped=%d, %d nodes, %d relations, %d aliases %v; want the document skipped and nothing published",
+						tc.tool, tc.version, rep.Skipped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
+				}
+				return
+			}
+			b := h.File(t, "web/b.ts")
+			baz := got.byNativeKey(t, symBaz, b.ID)
+			wantCallsiteAlias(t, got, "web/b.ts", files["web/b.ts"], "Baz", 0, baz.Node.ID)
+			// The definition occurrence at the same range publishes the symbol
+			// alias, never a second call-site alias for its own declaration.
+			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
+				t.Fatalf("%d call-site aliases over one reference and one definition, want exactly 1: %v", n, aliasKeys(got))
+			}
+		})
 	}
 }
 
@@ -590,7 +622,7 @@ func TestDeltaImport(t *testing.T) {
 	// A stored path the fresh index no longer describes is removed, and a
 	// document whose path escapes the project root is never admitted at all
 	// (scip-go emits 18 such `go test` mains for this repository).
-	files["small.scip"] = string(miniIndex("scip-fixture",
+	files["small.scip"] = string(miniIndex("scip-fixture", "0.1.0",
 		documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8)),
 		documentRecord("../../outside/x.go", "go", 1, occurrenceRecord(symBar, 1, 0, 0, 1))))
 	smallInputs := append([]string{"small.scip"}, sourcePaths...)
@@ -607,8 +639,8 @@ func TestDeltaImport(t *testing.T) {
 // miniIndex, documentRecord and occurrenceRecord hand-encode a SCIP index for
 // a case the canonical fixture cannot express. Only the fields this provider
 // reads are written; the wire form is the one scip.proto defines.
-func miniIndex(tool string, docs ...[]byte) []byte {
-	meta := appendBytes(nil, 2, appendBytes(appendBytes(nil, 1, []byte(tool)), 2, []byte("0.1.0")))
+func miniIndex(tool, version string, docs ...[]byte) []byte {
+	meta := appendBytes(nil, 2, appendBytes(appendBytes(nil, 1, []byte(tool)), 2, []byte(version)))
 	out := appendBytes(nil, 1, meta)
 	for _, d := range docs {
 		out = appendBytes(out, 2, d)

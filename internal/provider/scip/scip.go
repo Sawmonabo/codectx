@@ -39,25 +39,32 @@ import (
 // ID and Version identify the provider. Version is part of every unit key:
 // bump it when the mapping of SCIP records to facts changes.
 //
-// Version 2 is the Section 11.3/11.4 mapping: every reference occurrence
+// Version 3 is the Section 11.3/11.4 mapping: every reference occurrence
 // publishes a call-site alias, an external entity's evidence carries no
-// location, and a document that does not declare its position encoding is
-// converted in the measured encoding of the tool that wrote the index. The
-// bump is what makes the old units unreachable. A unit sealed by version 1
-// over unchanged inputs has the same scope key and the same input hash, so
-// without it `UnitID` would be identical and the stale unit eligible for
-// reuse — and a workspace indexed by version 1 with scip-typescript,
-// scip-java, scip-python, scip-go or scip-clang holds a sealed unit of *zero*
-// facts, because those five leave `position_encoding` unspecified and version
-// 1 skipped every such document. `documentHashDomain` moves with this
-// constant for the same reason.
+// location, a read or write occurrence is a `references` edge because
+// `reads`/`writes` are the dependence provider's facts (Section 11.6), and a
+// document that does not declare its position encoding is converted in the
+// measured encoding of the tool **build** that wrote the index and only after
+// that encoding is proved against the pinned bytes.
+//
+// Each bump is what makes the units of the version before it unreachable. A
+// unit sealed by an older version over unchanged inputs has the same scope key
+// and the same input hash, so without it `UnitID` would be identical and the
+// stale unit eligible for reuse. Version 1 sealed *zero* facts for
+// scip-typescript, scip-java, scip-python, scip-go and scip-clang, because
+// those five leave `position_encoding` unspecified and version 1 skipped every
+// such document; version 2 sealed `reads`/`writes` edges this provider does
+// not own, and facts converted under an encoding assumed from a tool name
+// alone, which lands a fraction of them on source bytes that are not the
+// symbol. Neither may be reused. `documentHashDomain` changes only when what
+// the document hash covers changes, which forces a bump here in turn.
 const (
 	ID      = "scip"
-	Version = "2"
+	Version = "3"
 )
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
-// aliases; references covers reference, import, read and write occurrences;
+// aliases; references covers reference and import occurrences;
 // implementations covers SCIP relationships.
 const (
 	CapabilityDefinitions     = "precise_definitions"

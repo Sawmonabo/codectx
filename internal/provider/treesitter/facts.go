@@ -62,6 +62,7 @@ type builder struct {
 	cur      *source.Cursor
 	ex       *extraction
 	scope    string
+	modKey   string
 	fileRng  *model.SourceRange
 	decls    []declFact
 	byName   map[string][]int
@@ -99,7 +100,23 @@ func outputInvalid(msg string) *model.Error {
 // returns the facts in put order: every node before any relation, alias or
 // search document that references it.
 func (b *builder) build() error {
-	b.scope = ScopePrefix + b.fv.Path
+	b.scope, b.modKey = ScopePrefix+b.fv.Path, "module:"+b.fv.Path
+	// The file's two path-derived keys are bounded here, once, before any
+	// identity is claimed. A snapshot path may be model.MaxPathBytes long while
+	// a scope key stops at model.MaxScopeKeyBytes and a native key at
+	// model.MaxNativeKeyBytes, so a legal path overflows the file's alias scope
+	// and its module node's native key. Neither is truncated — a truncated key
+	// is a different, possibly colliding identity claim — and neither may be
+	// published over its bound, which model.NodeCandidate.Validate and
+	// model.NativeAlias.Validate reject with CTX_ARGUMENT_INVALID, failing the
+	// whole unit for one file nothing can name. Without a module node there is
+	// no container for a declaration and no scope for an alias, so the file
+	// publishes nothing and reports its structural coverage partial /
+	// CTX_COVERAGE_INCOMPLETE, exactly as an over-long declaration key does.
+	if len(b.scope) > model.MaxScopeKeyBytes || len(b.modKey) > model.MaxNativeKeyBytes {
+		b.dropped++
+		return nil
+	}
 	b.rels = map[model.RelationID]*model.RelationFact{}
 	b.nodeAt = map[model.NodeID]int{}
 	b.byName = map[string][]int{}
@@ -196,7 +213,7 @@ func (b *builder) validateDecls() error {
 // declaration is defined by and the subject of imports and exports.
 func (b *builder) resolveModule() error {
 	res, err := b.resolve(model.NodeCandidate{
-		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: "module:" + b.fv.Path,
+		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.modKey,
 		Kind: model.NodeModule, Language: b.lang.Name, Name: path.Base(b.fv.Path), QualifiedName: b.fv.Path,
 		FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: b.fileRng,
 	})
@@ -208,8 +225,8 @@ func (b *builder) resolveModule() error {
 	if b.ex.done.Package != "" {
 		meta["package"] = bound(b.ex.done.Package, model.MaxNameBytes)
 	}
-	b.putNode(res, b.fileRng, "module:"+b.fv.Path, meta)
-	b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: "module:" + b.fv.Path, NodeID: res.Node.ID})
+	b.putNode(res, b.fileRng, b.modKey, meta)
+	b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: b.modKey, NodeID: res.Node.ID})
 	return nil
 }
 
@@ -264,8 +281,19 @@ func (b *builder) resolveDecls() error {
 			// claiming structural coverage it does not have.
 			b.dropped++
 		}
-		if pkg := b.packageScope(); pkg != "" && d.Parent < 0 {
-			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		if d.Parent < 0 {
+			pkg, over := b.packageScope()
+			switch {
+			case pkg != "":
+				b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
+			case over:
+				// The package alias scope did not fit and was omitted rather
+				// than truncated, for the same reason declKey omits an
+				// over-long key. This declaration will not merge with the one
+				// another file of the same package publishes, so the file's
+				// structural coverage is genuinely incomplete and says so.
+				b.dropped++
+			}
 		}
 		b.search = append(b.search, b.searchUnit(d))
 	}
@@ -283,9 +311,10 @@ func (b *builder) resolveDecls() error {
 // the declaration's final byte lies on, not the half-open end position's.
 // Nothing is normalized: the identifier is the token the source spells, the
 // path is the same root-relative slash path the unit's scope key carries.
-// Joern's exported METHOD key is byte-for-byte this string, so publishing it
-// as an alias is what merges the two providers' identities for one function
-// instead of leaving two correct but unrelated nodes.
+// The `dependence` provider, whose exported declaration key is byte-for-byte
+// this string, publishes the same alias, which is what merges the two
+// providers' identities for one function instead of leaving two correct but
+// unrelated nodes.
 //
 // A key over MaxNativeKeyBytes is omitted rather than truncated: a truncated
 // key would be a different, possibly colliding identity claim. The
@@ -311,18 +340,29 @@ func (b *builder) declKey(d *declFact) string {
 // packageScope is the language's package-level alias scope for top-level
 // declarations, when the language has a declared package clause whose
 // members are visible across files without an import: Go and Java.
-func (b *builder) packageScope() string {
+//
+// The Go spelling carries the file's directory, which a legal path can make
+// longer than model.MaxScopeKeyBytes on its own. An over-long scope is
+// reported over=true so the caller drops and counts that one alias, rather
+// than publishing a key model.NativeAlias.Validate rejects — which would fail
+// the whole unit — or a truncated one, which would be a colliding scope.
+func (b *builder) packageScope() (scope string, over bool) {
 	pkg := b.ex.done.Package
 	if pkg == "" || len(pkg) > model.MaxNameBytes {
-		return ""
+		return "", false
 	}
 	switch b.lang.Name {
 	case "go":
-		return "pkg:go:" + path.Dir(b.fv.Path) + ":" + pkg
+		scope = "pkg:go:" + path.Dir(b.fv.Path) + ":" + pkg
 	case "java":
-		return "pkg:java:" + pkg
+		scope = "pkg:java:" + pkg
+	default:
+		return "", false
 	}
-	return ""
+	if len(scope) > model.MaxScopeKeyBytes {
+		return "", true
+	}
+	return scope, false
 }
 
 // imports publishes one module node per import target (a structural
@@ -337,9 +377,19 @@ func (b *builder) imports() error {
 		if err != nil {
 			return err
 		}
+		// An import path is bounded by MaxQualifiedNameBytes, which equals
+		// MaxNativeKeyBytes, so the prefix can push the import target's key
+		// over its bound. It is dropped and counted like every other key that
+		// does not fit: the import edge is lost, never truncated into a
+		// different identity and never allowed to fail the unit.
+		key := "import:" + b.lang.Name + ":" + imp.Path
+		if len(key) > model.MaxNativeKeyBytes {
+			b.dropped++
+			continue
+		}
 		name := lastPathSegment(imp.Path)
 		res, err := b.resolve(model.NodeCandidate{
-			ProviderID: lang.ProviderID, ScopeKey: provider.ScopeWorkspace, NativeKey: "import:" + b.lang.Name + ":" + imp.Path,
+			ProviderID: lang.ProviderID, ScopeKey: provider.ScopeWorkspace, NativeKey: key,
 			Kind: model.NodeModule, Language: b.lang.Name, Name: name, QualifiedName: imp.Path,
 		})
 		if err != nil {

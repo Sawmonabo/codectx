@@ -466,10 +466,12 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 
 // endDocument binds a finished document to its snapshot file, classifies it
 // against the stored manifest and resolves its definitions. A document the
-// snapshot does not hold, or whose encoding the indexer left unspecified, or
-// whose file exceeds the source bound, is skipped and counted: nothing is
-// guessed about it, and it stays out of the fresh manifest, so a later refresh
-// treats it as new rather than inheriting rows nothing stands behind.
+// snapshot does not hold, or whose encoding the indexer left unspecified and
+// the per-tool table cannot supply, or whose supplied encoding does not hold
+// against the pinned bytes (encodingHolds), or whose file exceeds the source
+// bound, is skipped and counted: nothing is guessed about it, and it stays out
+// of the fresh manifest, so a later refresh treats it as new rather than
+// inheriting rows nothing stands behind.
 //
 // Definitions are always resolved; they are published only when the document
 // is changed. See the type comment for why the unchanged ones cannot simply be
@@ -489,7 +491,7 @@ func (im *importer) endDocument(d document) error {
 	if err != nil {
 		return err
 	}
-	encoding := im.resolveEncoding(d.encoding)
+	encoding, assumed := im.resolveEncoding(d.encoding)
 	switch {
 	case !ok:
 		im.skippedDocs++
@@ -504,6 +506,29 @@ func (im *importer) endDocument(d document) error {
 		return im.dropSpool(ctx, d.index)
 	}
 	row := docRow{idx: d.index, path: d.path, language: d.language, encoding: encoding, file: fv}
+	// The pinned bytes are read before the document is classified, because an
+	// encoding taken from the per-tool table is a claim about these bytes that
+	// has to hold before the document may contribute a hash, a manifest row or
+	// a fact. A document whose guess does not hold is skipped and counted like
+	// one whose encoding was never stated: it stays out of the fresh manifest,
+	// so a later refresh treats it as new rather than inheriting rows nothing
+	// stands behind.
+	ds, err := im.loadSource(ctx, row)
+	if err != nil {
+		return err
+	}
+	if assumed {
+		holds, err := im.encodingHolds(ctx, ds)
+		if err != nil {
+			return err
+		}
+		if !holds {
+			im.skippedDocs++
+			im.degrade(model.CodeProviderOutputInvalid)
+			return im.dropSpool(ctx, d.index)
+		}
+		im.assumedEncoding++
+	}
 	hash, err := im.documentHash(ctx, row)
 	if err != nil {
 		return err
@@ -514,10 +539,6 @@ func (im *importer) endDocument(d document) error {
 	}
 	if err := im.sc.exec(ctx, `INSERT INTO docs(idx, path, lang, enc, file_id, content_hash, size) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		row.idx, row.path, row.language, row.encoding, string(fv.ID), fv.ContentHash, fv.Size); err != nil {
-		return err
-	}
-	ds, err := im.loadSource(ctx, row)
-	if err != nil {
 		return err
 	}
 	if err := im.sc.each(ctx, `SELECT seq, symbol, roles, r0, r1, r2, r3, e0, e1, e2, e3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq`,
@@ -581,25 +602,35 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 	return ""
 }
 
-// toolPositionEncoding is the measured column encoding of each indexer the
-// product ships, used only when a Document leaves `position_encoding`
+// toolPositionEncoding is the measured column encoding of each indexer build
+// the product ships, used only when a Document leaves `position_encoding`
 // unspecified.
 //
-// This is a named fact about named tools, not a guess about an unknown index.
-// Measured on this machine against a fixture whose line carries a 4-byte and a
+// The key is the **pair** `Metadata.tool_info.{name, version}`, never the name
+// alone. A name-keyed table is an assertion about every build a tool will ever
+// have, and a wrong encoding does not announce itself: converting a UTF-16
+// column as a byte offset yields a valid, in-range, rune-aligned and wrong
+// extent for most occurrences, so the facts are published at compiler
+// precision against bytes that are not the symbol. Each pair below was
+// measured on this machine against a fixture whose line carries a 4-byte and a
 // 2-byte rune before an identifier, decoding every occurrence range under all
 // three encodings:
 //
 //	scip-go 0.2.7          position_encoding absent   columns are UTF-8
 //	scip-clang 0.4.0       position_encoding absent   columns are UTF-8
-//	rust-analyzer 1.98.0   position_encoding = UTF8   columns are UTF-8
 //	scip-typescript 0.4.0  position_encoding absent   columns are UTF-16
-//	scip-java              position_encoding absent   columns are UTF-16
 //	scip-python 0.6.6      position_encoding absent   columns are UTF-16
+//	scip-java 0.0.0        position_encoding absent   columns are UTF-16
+//	                       (the only build measured reports "0.0.0-SNAPSHOT")
 //
 // scip-python is UTF-16 rather than the UTF-32 scip.proto suggests for Python
 // indexers, because it is a TypeScript program (a pyright fork), which is why
 // the table is measured and not read off the proto's advice.
+//
+// rust-analyzer is deliberately absent: measured at 1.98.0 it declares
+// `position_encoding = UTF8` on every document, so it never reaches this
+// table; a build that stopped declaring it would be an unmeasured pair and
+// stay skipped, which is the right outcome and not a row to write in advance.
 //
 // `Metadata.text_document_encoding` is deliberately not consulted. All six
 // indexers set it to UTF8 — including the three whose columns are UTF-16 —
@@ -607,29 +638,103 @@ func columnEncoding(enc int32) source.ColumnEncoding {
 // says so; reading it as a position encoding would convert every UTF-16 column
 // as a byte offset and attribute compiler facts to the wrong bytes.
 //
-// A document of any other tool that does not declare its encoding stays
-// skipped: Section 9.3 forbids guessing one.
-func toolPositionEncoding(toolName string) int32 {
+// Any other pair returns encodingUnspecified and its documents stay skipped:
+// Section 9.3 forbids guessing one. Versions are compared with the profile
+// checker's own comparator, so a leading "v" and a build or pre-release suffix
+// (`0.0.0-SNAPSHOT`) do not defeat the match; a version that is not a dotted
+// number is not a measured pair either and is skipped rather than raised.
+func toolPositionEncoding(toolName, toolVersion string) int32 {
+	var enc int32
+	var measured string
 	switch toolName {
-	case "scip-go", "scip-clang", "rust-analyzer":
-		return encodingUTF8
-	case "scip-typescript", "scip-java", "scip-python":
-		return encodingUTF16
+	case "scip-go":
+		enc, measured = encodingUTF8, "=0.2.7"
+	case "scip-clang":
+		enc, measured = encodingUTF8, "=0.4.0"
+	case "scip-typescript":
+		enc, measured = encodingUTF16, "=0.4.0"
+	case "scip-python":
+		enc, measured = encodingUTF16, "=0.6.6"
+	case "scip-java":
+		enc, measured = encodingUTF16, "=0.0.0"
+	default:
+		return encodingUnspecified
 	}
-	return encodingUnspecified
+	if ok, err := satisfies(toolVersion, measured); err != nil || !ok {
+		return encodingUnspecified
+	}
+	return enc
 }
 
 // resolveEncoding is the encoding a document's ranges are converted in: the
-// document's own declaration, else the tool's measured encoding.
-func (im *importer) resolveEncoding(declared int32) int32 {
+// document's own declaration, else the measured encoding of the tool build
+// that wrote the index. assumed says the second case applies, so the caller
+// must prove the guess against the pinned bytes before it admits a fact.
+func (im *importer) resolveEncoding(declared int32) (enc int32, assumed bool) {
 	if columnEncoding(declared) != "" {
-		return declared
+		return declared, false
 	}
-	enc := toolPositionEncoding(im.meta.toolName)
-	if enc != encodingUnspecified {
-		im.assumedEncoding++
-	}
-	return enc
+	enc = toolPositionEncoding(im.meta.toolName, im.meta.toolVersion)
+	return enc, enc != encodingUnspecified
+}
+
+// maxEncodingProbes bounds the definition occurrences encodingHolds reads
+// looking for one it can check. A document whose first maxEncodingProbes
+// definitions all name something the source does not spell literally is
+// skipped, exactly as one with no definition at all is: an unchecked guess is
+// never admitted.
+const maxEncodingProbes = 256
+
+// encodingHolds proves an assumed position encoding against the document's
+// pinned bytes, once, before any of its occurrences is admitted.
+//
+// A wrong encoding does not fail on its own. Reading a UTF-16 column as a byte
+// offset lands inside a UTF-8 sequence only by luck; far more often it selects
+// a valid, in-range, rune-aligned extent a few bytes off the identifier, which
+// rangeOf accepts and which is then published at PrecisionCompiler against
+// source that is not the symbol — the wrong-bytes class nothing downstream can
+// detect. So the guess is checked the only way the index itself allows: the
+// first definition occurrence whose symbol names an identifier the source
+// spells literally (symbol.probeName) must select exactly that identifier.
+//
+// On a line with a non-ASCII rune before the token the readings disagree and a
+// wrong guess is caught; on an ASCII-only line every reading converts to the
+// same bytes, so there is nothing to catch and the check passes on the truth.
+func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, error) {
+	var checked, holds bool
+	err := im.sc.each(ctx, `SELECT symbol, r0, r1, r2, r3 FROM occ WHERE doc = ? AND (roles & ?) <> 0 ORDER BY seq LIMIT ?`,
+		[]any{ds.doc.idx, roleDefinition, maxEncodingProbes}, func(scan func(...any) error) error {
+			var symbolText string
+			var r [4]int32
+			if err := scan(&symbolText, &r[0], &r[1], &r[2], &r[3]); err != nil {
+				return internal("scip scratch read: " + err.Error())
+			}
+			if checked || symbolText == "" {
+				return nil
+			}
+			sym, err := parseSymbol(symbolText)
+			if err != nil {
+				return err
+			}
+			name, ok := sym.probeName()
+			if !ok {
+				return nil
+			}
+			// This occurrence decides the document: a symbol that names an
+			// identifier and does not land on it is the failure being looked
+			// for, so a later occurrence is not tried instead.
+			checked = true
+			if r[0] < 0 || r[1] < 0 || r[2] < 0 || r[3] < 0 {
+				return nil
+			}
+			rng, cerr := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
+			if cerr != nil || rng.End.Byte > uint64(len(ds.data)) || rng.Start.Byte > rng.End.Byte {
+				return nil
+			}
+			holds = string(ds.data[rng.Start.Byte:rng.End.Byte]) == name
+			return nil
+		})
+	return holds, err
 }
 
 // loadSource reads one document's exact pinned bytes through the snapshot
@@ -882,14 +987,16 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err := im.putCallsiteAlias(ctx, d.path, rng, to); err != nil {
 				return err
 			}
+			// The read and write occurrence roles are deliberately not
+			// mapped: `reads` and `writes` are the dependence provider's
+			// facts (Section 11.6), derived from the graph's assignment
+			// operators, and two providers publishing one relation kind from
+			// different precisions is the parallel implementation policy.md
+			// forbids. Every non-definition, non-import occurrence is a
+			// `references` edge here.
 			kind, detail := model.RelReferences, "reference"
-			switch {
-			case roles&roleImport != 0:
+			if roles&roleImport != 0 {
 				kind, detail = model.RelImports, "import"
-			case roles&roleWriteAccess != 0:
-				kind, detail = model.RelWrites, "write"
-			case roles&roleReadAccess != 0:
-				kind, detail = model.RelReads, "read"
 			}
 			return im.addEdge(ctx, from, kind, to, loc, sym.raw, detail)
 		})
