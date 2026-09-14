@@ -241,6 +241,22 @@ func (s IndexStatus) Validate() error {
 	return nil
 }
 
+// StatusRequest selects what `status` and `codectx_index_status` report.
+// Section 23 names status as the surface for resource accounting, and the
+// report is optional because an ordinary status must stay cheap: Resources is
+// false by default, and IndexStatus.Resources is nil unless it is set.
+//
+// Ruling Q1 makes this the request of
+// IndexService.IndexStatus(ctx, model.StatusRequest); `codectx status
+// --resources` and the MCP tool's input are its readers. INT re-points the
+// facade, the CLI and the MCP schema onto it.
+type StatusRequest struct {
+	Resources bool `json:"resources"`
+}
+
+// Validate accepts any value; the single flag is independent.
+func (r StatusRequest) Validate() error { return nil }
+
 // DoctorRequest selects the diagnostic depth of Section 18.1. Deep is explicit
 // because Section 22 reserves expensive integrity and parser smoke checks for
 // it; no full database scan happens on an ordinary command.
