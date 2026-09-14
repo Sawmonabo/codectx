@@ -19,12 +19,8 @@ import (
 // here because it already has one spelling, declared by addRepoFlag, and a
 // second would be two contracts for one question.
 const (
-	queryGenerationFlag = "generation"
-	queryLimitFlag      = "limit"
-	queryCursorFlag     = "cursor"
-	queryTimeoutFlag    = "timeout"
-	searchKindFlag      = "kind"
-	searchLanguageFlag  = "language"
+	searchKindFlag     = "kind"
+	searchLanguageFlag = "language"
 )
 
 // tableCellWidth bounds one human-table column. The values are indexed from the
@@ -99,22 +95,10 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addQueryFlags(cmd)
+	addPageFlags(cmd)
 	cmd.Flags().StringArray(searchKindFlag, nil, "keep only hits of this node kind; repeat the flag for more than one")
 	cmd.Flags().StringArray(searchLanguageFlag, nil, "keep only hits in this language; repeat the flag for more than one")
 	return cmd
-}
-
-// addQueryFlags declares the flags both Section 18.1 query commands take.
-func addQueryFlags(cmd *cobra.Command) {
-	addRepoFlag(cmd)
-	cmd.Flags().Int64(queryGenerationFlag, 0,
-		"generation to read; 0 reads the active generation, and a cursor already pins its own")
-	cmd.Flags().Int(queryLimitFlag, 0,
-		fmt.Sprintf("most results in one page; 0 uses the endpoint default and %d is the ceiling", model.MaxPageItems))
-	cmd.Flags().String(queryCursorFlag, "",
-		"continuation token from an earlier page; it pins that page's generation, so --generation is refused with it")
-	cmd.Flags().Duration(queryTimeoutFlag, 0,
-		"deadline for this query; 0 uses the configured resources.query_timeout")
 }
 
 // queryFlagValues reads the shared flags. The request's own Validate bounds the
@@ -254,14 +238,6 @@ func flushTable(tw *tabwriter.Writer) error {
 	return nil
 }
 
-func intFlag(cmd *cobra.Command, name string) (int, error) {
-	v, err := cmd.Flags().GetInt(name)
-	if err != nil {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return v, nil
-}
-
 func int64Flag(cmd *cobra.Command, name string) (int64, error) {
 	v, err := cmd.Flags().GetInt64(name)
 	if err != nil {
@@ -270,26 +246,10 @@ func int64Flag(cmd *cobra.Command, name string) (int64, error) {
 	return v, nil
 }
 
-func stringFlag(cmd *cobra.Command, name string) (string, error) {
-	v, err := cmd.Flags().GetString(name)
-	if err != nil {
-		return "", &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return v, nil
-}
-
 func stringsFlag(cmd *cobra.Command, name string) ([]string, error) {
 	v, err := cmd.Flags().GetStringArray(name)
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return v, nil
-}
-
-func durationFlag(cmd *cobra.Command, name string) (time.Duration, error) {
-	v, err := cmd.Flags().GetDuration(name)
-	if err != nil {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
 	return v, nil
 }

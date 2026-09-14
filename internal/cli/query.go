@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -19,13 +18,9 @@ import (
 // flags there would be help text that describes a request the command cannot
 // build.
 const (
-	queryDepthFlag      = "depth"
-	queryLimitFlag      = "limit"
-	queryCursorFlag     = "cursor"
-	queryGenerationFlag = "generation"
-	queryTimeoutFlag    = "timeout"
-	queryVisitedFlag    = "visited"
-	queryEdgesFlag      = "edges"
+	queryDepthFlag   = "depth"
+	queryVisitedFlag = "visited"
+	queryEdgesFlag   = "edges"
 )
 
 // zeroBoundHelp is the one sentence every budget flag ends with. A zero here is
@@ -577,21 +572,6 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	}
 }
 
-// addQueryFlags declares the flags every query command shares. --repo reuses
-// the one spelling the rest of the tree already has.
-func addQueryFlags(cmd *cobra.Command) {
-	addRepoFlag(cmd)
-	cmd.Flags().Int64(queryGenerationFlag, 0, "answer from this generation instead of the active one (0 pins the active generation; not combinable with --cursor)")
-	cmd.Flags().Duration(queryTimeoutFlag, 0, "give up after this much wall clock"+zeroBoundHelp)
-}
-
-// addPageFlags declares the page flags, for the commands whose request has a
-// page. `path` has none: its routes are bounded by the reason-path cap.
-func addPageFlags(cmd *cobra.Command) {
-	cmd.Flags().Int(queryLimitFlag, 0, "items in one page"+zeroBoundHelp)
-	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on that answer's generation")
-}
-
 // addTraversalFlags declares the walk budgets. withEdges is false for `path`,
 // whose request carries no edge budget: a flag with no field behind it would be
 // help text describing a request the command cannot build.
@@ -601,54 +581,6 @@ func addTraversalFlags(cmd *cobra.Command, withEdges bool) {
 	if withEdges {
 		cmd.Flags().Int(queryEdgesFlag, 0, "maximum distinct relations the walk may admit, cumulative across pages"+zeroBoundHelp)
 	}
-}
-
-// pageRequest reads the page flags of a command that declares them.
-func pageRequest(cmd *cobra.Command) (model.PageRequest, error) {
-	limit, err := intFlag(cmd, queryLimitFlag)
-	if err != nil {
-		return model.PageRequest{}, err
-	}
-	cursor, err := stringFlag(cmd, queryCursorFlag)
-	if err != nil {
-		return model.PageRequest{}, err
-	}
-	return model.PageRequest{Limit: limit, Cursor: cursor}, nil
-}
-
-func generationFlag(cmd *cobra.Command) (model.GenerationID, error) {
-	v, err := cmd.Flags().GetInt64(queryGenerationFlag)
-	if err != nil {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return model.GenerationID(v), nil
-}
-
-func intFlag(cmd *cobra.Command, name string) (int, error) {
-	v, err := cmd.Flags().GetInt(name)
-	if err != nil {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return v, nil
-}
-
-func stringFlag(cmd *cobra.Command, name string) (string, error) {
-	v, err := cmd.Flags().GetString(name)
-	if err != nil {
-		return "", &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	return v, nil
-}
-
-func durationFlag(cmd *cobra.Command, name string) (time.Duration, error) {
-	v, err := cmd.Flags().GetDuration(name)
-	if err != nil {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
-	}
-	if v < 0 {
-		return 0, &model.Error{Code: model.CodeArgumentInvalid, Message: "--" + name + " must not be negative"}
-	}
-	return v, nil
 }
 
 // clip bounds one display cell. It never shortens an identifier a caller has to
