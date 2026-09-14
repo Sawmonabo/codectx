@@ -39,6 +39,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -46,7 +47,6 @@ import (
 	tslang "github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
-	"github.com/Sawmonabo/codectx/internal/toolchain"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -76,9 +76,9 @@ const domainRepository = "repository-identity-v1"
 // throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
 const maxWorkers = 8
 
-// Options are the coordinator's dependencies. Every field except Resolver,
-// Logger and Now is required; the workspace lock is the caller's and is never
-// closed here.
+// Options are the coordinator's dependencies. Every field except Lock,
+// Watcher, States, Logger and Now is required; the workspace lock is the
+// caller's and is never closed here.
 type Options struct {
 	Root     workspace.Root
 	Config   config.Config
@@ -86,15 +86,29 @@ type Options struct {
 	Registry *provider.Registry
 	CAS      *snapshot.CAS
 	Git      *git.Git
-	Lock     *snapshot.WorkspaceLock
-	Pool     *provider.Pool
-	// Resolver is carried for the status path's non-fetching installed-tool
-	// projection, which is composed above this package; nothing on the
-	// indexing path resolves tools, because providers are handed their own
-	// resolved binaries at construction.
-	Resolver *toolchain.Resolver
-	Logger   *slog.Logger
-	Now      func() time.Time
+	// Lock may be nil for a report-only coordinator: Status is legal without
+	// it, because Section 12.3 makes the active generation immutable once
+	// published and a report only reads it. Index, Refresh, Watch, Promote
+	// and Drain refuse with a typed CTX_ARGUMENT_INVALID: they capture, build
+	// and publish, and Section 13.2 gives that to exactly one cross-process
+	// owner.
+	Lock *snapshot.WorkspaceLock
+	Pool *provider.Pool
+	// Watcher, when non-nil, is the notification source Watch drives: its
+	// debounced batches become refreshes and its Coverage() is what status
+	// reports. nil keeps the periodic-only behaviour, whose coverage is
+	// reported incomplete because that is what it is.
+	Watcher *watch.Watcher
+	// States are the composition-time capability rows of providers that could
+	// not be constructed at all -- an absent analyzer payload, a profile that
+	// did not resolve. They are folded into every capability report
+	// (IndexResult.Completeness, IndexStatus.Completeness) before the
+	// MaxCapabilityStates bound is applied, so a degradation the operator must
+	// see is never the row that truncation drops and never pushes the
+	// published list past its own contract.
+	States []model.CapabilityState
+	Logger *slog.Logger
+	Now    func() time.Time
 }
 
 // Pending is the typed answer a query gets for a capability whose dependence
@@ -151,8 +165,6 @@ func New(o Options) (*Coordinator, error) {
 		return nil, invalid("the coordinator needs an opened workspace root")
 	case o.Store == nil || o.CAS == nil || o.Registry == nil || o.Pool == nil:
 		return nil, invalid("the coordinator needs a store, a CAS, a provider registry and a sink pool")
-	case o.Lock == nil:
-		return nil, invalid("the coordinator needs the workspace lock its caller holds")
 	case !filepath.IsAbs(o.Config.Storage.DataDir):
 		return nil, invalid("the coordinator needs an absolute data directory")
 	case o.Root.HasGit && o.Git == nil:
@@ -224,6 +236,18 @@ func workerCount(configured int) int {
 	return max(1, min(runtime.NumCPU(), maxWorkers))
 }
 
+// writable refuses an entry point that captures, builds or publishes when the
+// coordinator was opened without the cross-process workspace lock. A
+// report-only coordinator is a legal composition (Section 13.2 gives indexing
+// to one owner, and a report is not indexing), so the refusal belongs at each
+// building method rather than in New, where it would also forbid Status.
+func (c *Coordinator) writable() error {
+	if c.opts.Lock == nil {
+		return invalid("this coordinator was opened without the workspace indexing lock")
+	}
+	return nil
+}
+
 // Close stops the background deferred work. It does not release the workspace
 // lock, the store or the providers: those belong to the composition root,
 // which closes them in reverse after this returns.
@@ -240,6 +264,9 @@ func (c *Coordinator) Close() error {
 // deleted the store it was handed would be destroying state its caller still
 // owns.
 func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
+	if err := c.writable(); err != nil {
+		return model.IndexResult{}, err
+	}
 	if err := req.Validate(); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -253,6 +280,9 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 // notification that named the wrong file, or named none at all, changes what
 // this run costs and never what it concludes (Section 13.2).
 func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexResult, error) {
+	if err := c.writable(); err != nil {
+		return model.IndexResult{}, err
+	}
 	// The hint is recorded and deliberately not acted on: narrowing the
 	// capture to it is exactly the mistake Section 13.2 names, because a
 	// notification can miss a timestamp-preserving write and Git status alone
@@ -264,24 +294,33 @@ func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexR
 	return c.index(ctx, model.IndexRequest{})
 }
 
-// Watch runs the coordinator's own bounded reconciliation loop: every
-// reconcile_interval it refreshes and hands the result to emit, until ctx
-// ends. It is the periodic half of Section 13.2 and needs no notification
-// support from the operating system, which is exactly what makes it the
-// fallback when watch coverage is incomplete.
+// Watch reconciles this workspace until ctx ends, handing every published
+// result to emit (Section 13.2).
 //
-// The filesystem-notification half is composed by the caller: the watcher
-// (internal/index/watch) hands its debounced, overflow-collapsing batches to
-// Refresh, whose path list is a hint. Keeping the two apart is what lets the
-// notification source be absent, degraded or replaced without the coordinator
-// knowing: source and hash truth beat a notification either way.
+// With Options.Watcher set it is the notification half: the watcher's
+// debounced, overflow-collapsing batches become refreshes, the watcher's own
+// reconcile interval is the periodic fallback, and Coverage() is what status
+// reports. A batch's path list is a hint and nothing more -- Refresh
+// re-captures and compares content hashes -- so an overflow batch, which
+// carries no paths, costs a full capture and never a dropped change.
+//
+// Without a watcher it is the periodic half alone: every reconcile_interval it
+// refreshes. That needs no notification support from the operating system,
+// which is exactly what makes it the fallback, and its coverage is reported
+// incomplete because periodic reconciliation is not notification coverage.
 func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) error {
+	if err := c.writable(); err != nil {
+		return err
+	}
 	interval := c.opts.Config.Index.ReconcileInterval.Std()
 	if interval <= 0 {
 		return invalid("watch needs a positive reconcile interval")
 	}
-	c.watch.enter()
+	c.watch.enter(c.opts.Watcher)
 	defer c.watch.leave()
+	if c.opts.Watcher != nil {
+		return c.watchNotified(ctx, emit)
+	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -290,23 +329,51 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 			return nil
 		case <-t.C:
 		}
-		res, err := c.Refresh(ctx, nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			// A failed reconciliation is not the end of the watch: the prior
-			// generation is still published and the next tick tries again.
-			// Nothing here carries source or native keys.
-			c.log.Warn("periodic reconciliation failed", "component", component,
-				"repository_id", string(c.repo), "error", provider.CodeOf(err))
-			continue
-		}
-		c.watch.reconciledAt(c.now())
-		if emit != nil {
-			emit(res)
+		if _, ok := c.reconcile(ctx, nil, emit); !ok && ctx.Err() != nil {
+			return nil
 		}
 	}
+}
+
+// watchNotified drives the notification watcher. Batches are delivered
+// synchronously, so events that arrive during a refresh accumulate into the
+// next batch rather than starting a second one.
+func (c *Coordinator) watchNotified(ctx context.Context, emit func(model.IndexResult)) error {
+	err := c.opts.Watcher.Run(ctx, func(b watch.Batch) error {
+		// An overflow batch is a full-reconciliation request: its Paths are
+		// empty by construction and the hint is dropped entirely.
+		var paths []string
+		if !b.Overflow {
+			paths = b.Paths
+		}
+		if _, ok := c.reconcile(ctx, paths, emit); !ok && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	})
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+// reconcile runs one watch-driven refresh. A failed reconciliation is not the
+// end of the watch: the prior generation is still published and the next batch
+// or tick tries again.
+func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(model.IndexResult)) (model.IndexResult, bool) {
+	res, err := c.Refresh(ctx, paths)
+	if err != nil {
+		if ctx.Err() == nil {
+			logTyped(c.log, "periodic reconciliation failed", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+		return model.IndexResult{}, false
+	}
+	c.watch.reconciledAt(c.now())
+	if emit != nil {
+		emit(res)
+	}
+	return res, true
 }
 
 // ref is the ref this generation is built from (ruling Q3): the branch when
@@ -386,6 +453,23 @@ func (c *Coordinator) activeGeneration(ctx context.Context) (model.GenerationID,
 		return 0, err
 	}
 	return gen, nil
+}
+
+// logTyped logs a failure with its typed diagnostic beside its code. The code
+// alone does not distinguish, say, a pinned generation that is gone from a
+// capability row that failed validation, and these lines are the only record
+// of a background failure an operator ever sees. model.Error.Message and
+// Remediation are product-authored text: they carry no source bytes, no
+// secrets, no environment and no raw analyzer output, which is what Section
+// 20.1 keeps out of ordinary logs.
+func logTyped(log *slog.Logger, msg string, err error, args ...any) {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		log.Warn(msg, append(args, "diagnostic_code", typed.Code, "diagnostic", typed.Message,
+			"remediation", typed.Remediation)...)
+		return
+	}
+	log.Warn(msg, append(args, "diagnostic_code", provider.CodeOf(err))...)
 }
 
 func invalid(msg string) error { return &model.Error{Code: model.CodeArgumentInvalid, Message: msg} }

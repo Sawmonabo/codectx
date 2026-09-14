@@ -55,7 +55,12 @@ func (b *build) run(ctx context.Context) (Result, error) {
 		runErr = errors.Join(runErr, err)
 	}
 	if runErr != nil {
-		return Result{}, runErr
+		// The failed run is carried out with the error: the coordinator
+		// publishes a provider-run row from Result.Result, and a zero value
+		// here would leave an operator with a failed capability and no record
+		// of the run that produced it.
+		b.res.Result = result
+		return b.res, runErr
 	}
 	b.res.Unit = b.req.Build.Spec.ID
 	b.res.Result = result
