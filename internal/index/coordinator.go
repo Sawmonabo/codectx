@@ -248,6 +248,12 @@ func (c *Coordinator) writable() error {
 	return nil
 }
 
+// Repository is the identity this coordinator derived for the workspace root.
+// It is the key every generation, lease and pinned read is scoped by, and it is
+// exposed rather than re-derived by callers so the derivation has exactly one
+// spelling in the process.
+func (c *Coordinator) Repository() model.RepositoryID { return c.repo }
+
 // Close stops the background deferred work. It does not release the workspace
 // lock, the store or the providers: those belong to the composition root,
 // which closes them in reverse after this returns.
