@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 	"github.com/spf13/cobra"
 )
 
@@ -179,7 +181,7 @@ func newContextReadCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var resp model.ReadChunkResponse
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				resp, err = svc.Read(ctx, req)
 				return err
@@ -254,7 +256,7 @@ func newContextAcknowledgeCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var status model.SessionStatus
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				status, err = svc.Acknowledge(ctx, req)
 				return err
@@ -338,7 +340,7 @@ func newContextStatusCommand(build model.BuildInfo) *cobra.Command {
 				files  model.Page[model.FileCoverage]
 				status model.SessionStatus
 			)
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				files, status, err = svc.SessionStatus(ctx, req, page)
 				return err
@@ -391,7 +393,7 @@ func newContextNextCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var item model.NextContextItem
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				item, err = svc.Next(ctx, req)
 				return err
@@ -430,7 +432,7 @@ func newContextCloseCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var status model.SessionStatus
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				status, err = svc.CloseSession(ctx, req, expected)
 				return err
@@ -530,40 +532,6 @@ func contextMaxBytesValue(cmd *cobra.Command) (uint32, error) {
 				contextMaxBytesFlag, v, utf8.UTFMax, int64(model.MaxRawChunkBytes))}
 	}
 	return uint32(v), nil
-}
-
-// runContext opens the workspace in report mode and runs one session operation
-// against the application facade. It takes app.ContextService rather than the
-// concrete *app.Services so this file depends on the narrow contract Section
-// 19.2 froze -- the same one the MCP server consumes -- and so no command here
-// can reach a live engine, view or store. The --timeout deadline covers the
-// service call alone, for the reason queryContext gives: a slow workspace open
-// is not an operation that ran out of time.
-func runContext(cmd *cobra.Command, fn func(context.Context, app.ContextService) error) error {
-	repo, err := repoFlagValue(cmd)
-	if err != nil {
-		return err
-	}
-	timeout, err := durationFlag(cmd, queryTimeoutFlag)
-	if err != nil {
-		return err
-	}
-	ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo)
-	if err != nil {
-		return err
-	}
-	defer ws.Close()
-	// The facade is a cheap view over services the composition built when the
-	// workspace opened, so a workspace that opened has one; there is no
-	// per-command wiring check to make here. It is never cached across
-	// commands: this one dies with the deferred Close above.
-	var svc app.ContextService = ws.Services()
-	ctx, cancel := queryContext(cmd.Context(), timeout)
-	defer cancel()
-	// queryFailure types a bare context failure: left untyped, a deadline the
-	// operator set with --timeout would reach ExitCode as the invalid-argument
-	// class and report itself as a command line they typed wrong.
-	return queryFailure(fn(ctx, svc))
 }
 
 // emitContext writes the one answer for the commands whose result carries no
@@ -736,7 +704,7 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 				result model.PlanResult
 				status model.SessionStatus
 			)
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				result, status, err = svc.Plan(ctx, req)
 				return err
@@ -839,7 +807,7 @@ func newContextEntriesCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ContextPage
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				result, err = svc.Entries(ctx, req)
 				return err
@@ -904,7 +872,7 @@ func newContextIncludeCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var status model.SessionStatus
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				status, err = svc.Include(ctx, req)
 				return err
@@ -962,7 +930,7 @@ func newContextWaiveCommand(build model.BuildInfo) *cobra.Command {
 				record model.WaiverRecord
 				status model.SessionStatus
 			)
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				record, status, err = svc.Waive(ctx, req)
 				return err
@@ -1036,7 +1004,7 @@ func newContextRecordCommand(build model.BuildInfo) *cobra.Command {
 				record model.Observation
 				status model.SessionStatus
 			)
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				record, status, err = svc.Record(ctx, req)
 				return err
@@ -1287,7 +1255,7 @@ func newContextAdvanceCommand(build model.BuildInfo) *cobra.Command {
 				workflow model.WorkflowStatus
 				status   model.SessionStatus
 			)
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				workflow, status, err = svc.Advance(ctx, req)
 				return err
@@ -1373,7 +1341,7 @@ func newContextCapsuleCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.CapsulePage
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				result, err = svc.Capsule(ctx, req)
 				return err
@@ -1403,6 +1371,9 @@ func newContextExportCommand(build model.BuildInfo) *cobra.Command {
 			"durable record a later session replays, and silently replacing a file -- a source file " +
 			"above all -- would destroy work on the strength of a mistyped path. Choose another path, " +
 			"or remove the existing file deliberately.\n\n" +
+			"It also refuses any path inside the repository. codectx writes nothing into the tree it " +
+			"indexes, so a capsule belongs beside the repository rather than in it -- a new file in " +
+			"the working tree would be indexed as source, committed by accident, or both.\n\n" +
 			"Use \"codectx context capsule\" to read the capsule a page at a time without writing it.",
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
@@ -1423,13 +1394,18 @@ func newContextExportCommand(build model.BuildInfo) *cobra.Command {
 			// Screened before the workspace is opened, so a mistyped path that
 			// names an existing file -- a source file above all -- is reported
 			// without first assembling a capsule that will be thrown away.
-			// O_EXCL below is still what actually refuses: it is the only check
-			// that cannot lose a race with another writer.
+			// O_EXCL below is still what actually refuses an existing file: it
+			// is the only check that cannot lose a race with another writer.
+			// The repository screen has no O_EXCL equivalent, because the path
+			// it refuses is precisely one that does not exist yet.
+			if err := screenCapsuleOutput(cmd, output); err != nil {
+				return err
+			}
 			if _, err := os.Lstat(output); err == nil {
 				return errOutputExists()
 			}
 			var capsule model.Capsule
-			if err := runContext(cmd, func(ctx context.Context, svc app.ContextService) error {
+			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
 				capsule, err = svc.Export(ctx, req)
 				return err
@@ -1448,7 +1424,7 @@ func newContextExportCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addContextFlags(cmd)
-	cmd.Flags().String(contextOutputFlag, "", "required: the file to write the capsule to; an existing file is never overwritten")
+	cmd.Flags().String(contextOutputFlag, "", "required: the file to write the capsule to, outside the repository; an existing file is never overwritten")
 	return cmd
 }
 
@@ -1512,6 +1488,87 @@ func writeCapsuleFile(path string, capsule model.Capsule) (int64, error) {
 	_ = os.Remove(path)
 	return 0, &model.Error{Code: model.CodeInternal,
 		Message: "failed to write the capsule file: " + clip(reason.Error(), model.MaxDetailBytes)}
+}
+
+// screenCapsuleOutput refuses a --output path that lands inside the repository
+// this command is about. A capsule is a record *about* the repository, never a
+// file in it: Section 6 is explicit that codectx writes no file into the tree
+// it indexes, and a capsule dropped into the working tree would be picked up as
+// source by the next index, or committed by accident, or both. O_EXCL cannot
+// stand in for this check -- the path it would refuse is one that already
+// exists, and the path refused here is one that does not.
+//
+// The repository is discovered exactly as the workspace open discovers it
+// (workspace.Discover), so the root refused here is the root that would be
+// indexed rather than a second answer to the same question.
+func screenCapsuleOutput(cmd *cobra.Command, output string) error {
+	repo, err := repoFlagValue(cmd)
+	if err != nil {
+		return err
+	}
+	root, err := workspace.Discover(repo)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	abs, err := filepath.Abs(output)
+	if err != nil {
+		return &model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("--%s cannot be resolved to an absolute path: %s",
+				contextOutputFlag, clip(err.Error(), model.MaxDetailBytes))}
+	}
+	// The comparison is between resolved directories rather than the strings
+	// the operator typed: a parent directory that is a symlink into the
+	// repository names a path inside it that no lexical prefix test would see.
+	// Only the parent is resolved, because the file itself must not exist yet.
+	if underDir(resolvedDir(filepath.Dir(abs)), resolvedDir(root.Path)) {
+		return errOutputInsideRepository()
+	}
+	return nil
+}
+
+// resolvedDir is dir with its symlinks resolved. A directory that does not
+// exist yet cannot be resolved, so the deepest ancestor that does exist is
+// resolved and the remaining lexical segments are re-attached to it. Resolving
+// only whole existing paths would be worse than useless here: it would leave
+// one side of the caller's comparison resolved and the other lexical whenever
+// the output's parent has still to be created, which is exactly the case the
+// caller screens, and a repository reached through a symlinked ancestor would
+// then pass the test it must fail.
+func resolvedDir(dir string) string {
+	existing, missing := dir, []string(nil)
+	for {
+		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
+			return filepath.Join(append([]string{resolved}, missing...)...)
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			// The filesystem root itself did not resolve: nothing below it can
+			// be put in resolved form, so both sides stay lexical.
+			return dir
+		}
+		missing = append([]string{filepath.Base(existing)}, missing...)
+		existing = parent
+	}
+}
+
+// underDir reports whether dir is root itself or lies beneath it.
+func underDir(dir, root string) bool {
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		// Different volumes on Windows: nothing beneath the root can be named
+		// relative to it, so the path is outside it.
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// errOutputInsideRepository names the refusal without naming the root: an
+// absolute private path has no place in an error a machine consumer stores.
+func errOutputInsideRepository() error {
+	return &model.Error{Code: model.CodeArgumentInvalid,
+		Message:     "--" + contextOutputFlag + " names a path inside the repository; export never writes into the tree it indexes",
+		Remediation: "write the capsule outside the repository, then attach or copy it wherever the record belongs"}
 }
 
 // errOutputExists is the one refusal both the pre-open screen and O_EXCL
