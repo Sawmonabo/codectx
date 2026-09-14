@@ -433,18 +433,33 @@ unit's set back and calls storage's carry-over.
   rows a full build holds; not naming it trips storage's carried-input check.
   An edit therefore has no sound filtered form, and the applier withholds the
   previous keys, which makes the import emit every relation — always correct,
-  and it costs import work only.
+  and it costs import work only. The two questions are answered by two
+  independent walks of the coordinator's `Request.Inputs`, so the applier holds
+  them against each other: a filtered emit chosen because the first walk saw
+  nothing replaced, while carry-over's walk names a replaced file, is a
+  `Request.Inputs` that is not re-iterable, and the unit is refused rather than
+  sealed missing the rows that file's bucket held.
 
 The consequence is worth stating plainly: **only an addition-only refresh
 inherits rows.** A refresh that changes or removes any declared file does a
 full build's import work and carries nothing, even though its predecessor was
 present and usable. `Result.Filtered` is how a caller tells the two apart —
 `Result.Carried` being all zero is indistinguishable from a predecessor that
-had nothing to give. Measured through the applier against the real engine: an
-edited file inherited nothing and published 14 relations, exactly as the full
-build did, while an added file inherited 14 relations and 29 evidence rows and
-published no relation of its own where the full build published 14 — both
-row-identical to the full build of the same unit identity.
+had nothing to give.
+
+Measured through the applier against the real engine, over one named fixture:
+`internal/provider/dependence/neo4jcsv/testdata/src/gofix` (the `pkg:go:` unit,
+`go.mod` + `app/app.go` + `helper/helper.go`, 38 fact keys) as the predecessor,
+refreshed after adding one file, `extra/extra.go`, declaring `func Note() int {
+return 7 }`. The refresh kept its filter and inherited **14 relations and 29
+evidence rows**; its own import published 11 nodes, 17 aliases and **0
+relations**, and the unit it sealed — 11 node facts, 14 relation facts, 40 fact
+keys, 40 evidence rows, 17 aliases — is row-identical to a full build of the
+same unit identity, whose import published those same 14 relations itself. The
+zero is a property of *that added file*, which declares no call, not of
+addition-only refreshes in general: an added file that called something would
+publish its own relations and inherit the rest. What generalises is the
+row-identity, and that nothing was re-imported for the untouched files.
 
 The key algebra is versioned, so a stored set built by an older algebra can
 never be mis-diffed against a fresh one.

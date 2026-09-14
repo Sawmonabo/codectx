@@ -141,6 +141,10 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			// relations, and the facts that name no file, unpublished.
 			b.res.Filtered = supplied && d.Removed == 0
 			var filesErr error
+			// replacedSeen counts what the walk below actually produced, so
+			// the two walks of req.Inputs can be held against each other: see
+			// the refusal after CarryOver returns.
+			var replacedSeen int
 			replaced := sqlite.Replaced{
 				// The replaced files are streamed from the same merge join
 				// the emptiness check above ran, walked a second time rather
@@ -149,6 +153,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 				// list.
 				Files: func(yield func(model.FileID) bool) {
 					filesErr = replacedInputs(ctx, a.store, req.Previous, req.Inputs, func(f model.FileID) error {
+						replacedSeen++
 						if !yield(f) {
 							return errStopInputs
 						}
@@ -199,6 +204,27 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 			}
 			if diffErr != nil {
 				return diffErr
+			}
+			// The decisive disagreement between the two walks of req.Inputs.
+			// The filtered emit above was chosen because walk 2 found no
+			// declared input replaced; this walk named some anyway. That
+			// orientation is the corrupting one: Replaced.Files drops the
+			// predecessor's evidence in a path the filtered emit never
+			// republishes, so the unit would seal missing rows a full build
+			// holds, under a capability that says fresh. Nothing downstream
+			// can see it — the changed file IS named, so checkCarriedInputs
+			// is satisfied, and dependence node facts are republished whole,
+			// so SealUnit finds no dangling endpoint. Refusing here fails the
+			// unit, and RunUnit's failure path deletes its rows.
+			//
+			// The opposite disagreement needs no check: if walk 2 saw a
+			// replacement and this walk did not, the emit was unfiltered and
+			// republished everything.
+			if b.res.Filtered && replacedSeen != 0 {
+				return invalid("this unit's input stream is not re-iterable: the filtered "+
+					"emit was chosen because no declared input was replaced, but carry-over "+
+					"named %d replaced file(s); Request.Inputs must yield the same inputs "+
+					"on every walk", replacedSeen)
 			}
 			if err != nil {
 				return err
