@@ -465,19 +465,66 @@ func (s *fakeStore) CoverageSummary(ctx context.Context, session model.SessionID
 	return required, fullyServed, waived, err
 }
 
-// FilePath is the bounded path reader FX-D16-A's F4 adds to Sessions so Next
-// can fill NextContextItem.Path. It is written here ahead of that lane because
-// the widened interface is unsatisfiable without it and FX-D16-A does not own
-// this file; until F4 lands nothing in the package calls it.
-func (s *fakeStore) FilePath(ctx context.Context, snapshot model.SnapshotID, id model.FileID) (string, error) {
-	if snapshot != snapshotID {
-		return "", typed(model.CodeScopeIncomplete, "snapshot is not the fixture's")
+// contains answers containment over the one representation of served bytes, so
+// the fake can never claim coverage the oracle does not hold. An interval that
+// spans a gap between two confirmed ranges is not contained.
+func (b *byteSet) contains(r model.ByteRange) bool {
+	if r.End > uint64(len(b.served)) {
+		return false
 	}
-	f, ok := s.files[id]
-	if !ok {
-		return "", typed(model.CodeScopeIncomplete, "file is not in the snapshot")
+	for i := r.Start; i < r.End; i++ {
+		if !b.served[i] {
+			return false
+		}
 	}
-	return f.path, nil
+	return true
+}
+
+// RangeConfirmed is the bounded containment test L6 adds to Sessions so Next
+// can resume at the first byte this actor has not confirmed. Like the real
+// method it refuses the empty interval, answers false rather than failing for a
+// file outside the pinned scope or at another hash, and does not swallow
+// CTX_SESSION_EXPIRED: it gates a write.
+func (s *fakeStore) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
+	file model.FileID, hash string, r model.ByteRange) (bool, error) {
+	if err := r.ValidateNonEmpty("byte_range"); err != nil {
+		return false, err
+	}
+	fs, err := s.session(session, actor)
+	if err != nil {
+		return false, err
+	}
+	set := fs.coverage[file]
+	f, ok := s.files[file]
+	if set == nil || !ok || f.hash() != hash {
+		return false, nil
+	}
+	return set.contains(r), nil
+}
+
+// SessionFilePaths is the bounded batch path reader L6 adds to Sessions so Next
+// can fill NextContextItem.Path. Like the real method it is scoped by the
+// session's own files -- an identifier outside the pinned scope is absent from
+// the map, never named -- and it reports beside CTX_SESSION_EXPIRED.
+func (s *fakeStore) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+	ids []model.FileID) (map[model.FileID]string, error) {
+	fs, err := s.session(session, actor)
+	if fs == nil {
+		return nil, err
+	}
+	if len(ids) > model.MaxPageItems {
+		return nil, typed(model.CodeResourceLimit, "a path batch of %d files exceeds the page bound", len(ids))
+	}
+	out := make(map[model.FileID]string, len(ids))
+	for _, id := range ids {
+		if fs.coverage[id] == nil {
+			continue
+		}
+		if f, ok := s.files[id]; ok {
+			out[id] = f.path
+		}
+	}
+	return out, err
 }
 
 // AcknowledgeFile refuses unless coverage is already full: a client assertion
@@ -877,16 +924,20 @@ var scenarios = []scenario{
 
 	// L4 rows
 
-	// Next must resume where the confirmed prefix ends and must stay metadata
-	// only. A Next that answers zero sends the actor back over bytes it already
-	// holds and, on a partially served file, can never terminate; a Next that
-	// opens the Source has become a second read endpoint that serves bytes
-	// without issuing a receipt, so coverage would be granted or bypassed
-	// outside ConfirmChunks. The fixture's ordinal 0 is the empty file, whose
-	// natural offset is zero, so the row first serves it and then confirms a
-	// prefix of ordinal 1: the assertion is only meaningful once the answer is
-	// a nonzero offset on the next required file.
-	{name: "Next resumes at the confirmed prefix without opening the source", run: func(t *testing.T, h *harness) {
+	// Next must resume at the first byte this actor has not confirmed and must
+	// stay metadata only. A Next that answers zero sends the actor back over
+	// bytes it already holds and, on a partially served file, can never
+	// terminate; a Next that answers the size of the served union skips a hole
+	// the actor never read, so the file can never reach full coverage and the
+	// gate stays shut on bytes nobody will be asked for again; a Next that opens
+	// the Source has become a second read endpoint that serves bytes without
+	// issuing a receipt, so coverage would be granted or bypassed outside
+	// ConfirmChunks. The fixture's ordinal 0 is the empty file, whose natural
+	// offset is zero, so the row first serves it and then confirms a prefix of
+	// ordinal 1: the assertion is only meaningful once the answer is a nonzero
+	// offset on the next required file. L6 extends it with the out-of-order
+	// confirmation that separates the prefix end from the union size.
+	{name: "Next resumes at the first unconfirmed byte without opening the source", run: func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		empty, crlf := model.FileID(hexID(0x20)), model.FileID(hexID(0x21))
 		// Built directly rather than through newHarness so the opener can fail
@@ -939,13 +990,27 @@ var scenarios = []scenario{
 			t.Fatalf("next resumes at %d; the confirmed prefix ends at 7", item.Offset)
 		}
 		want := h.file(crlf)
-		if item.Action != actionReadSource || item.ContentHash != want.hash() || item.Size != int64(len(want.data)) {
-			t.Fatalf("next answers action %q hash %s size %d; want %q/%s/%d",
-				item.Action, item.ContentHash, item.Size, actionReadSource, want.hash(), len(want.data))
+		if item.Action != actionReadSource || item.ContentHash != want.hash() || item.Size != int64(len(want.data)) || item.Path != want.path {
+			t.Fatalf("next answers action %q hash %s size %d path %q; want %q/%s/%d/%q",
+				item.Action, item.ContentHash, item.Size, item.Path, actionReadSource, want.hash(), len(want.data), want.path)
 		}
 		// Four required files, one of them now full_served.
 		if item.Remaining != 3 {
 			t.Fatalf("next reports %d required files remaining; three are not full_served", item.Remaining)
+		}
+		// L6: a client that confirms out of order leaves a hole. [0,7) and
+		// [10,14) is eleven confirmed bytes whose prefix still ends at 7, so the
+		// union size and the resume point part company here. Answering 11 would
+		// hand back a file the actor has a hole in and never ask for bytes 7..10
+		// again.
+		serve(crlf, 10, 14)
+		item, err = svc.Next(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next after the out-of-order confirmation: %v", err)
+		}
+		if item.FileID != crlf || item.Offset != 7 {
+			t.Fatalf("next resumes file %s at %d; the confirmed prefix of %s still ends at 7 with [7,10) unread",
+				item.FileID, item.Offset, crlf)
 		}
 	}},
 
