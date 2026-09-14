@@ -22,6 +22,14 @@ type MaterializeOptions struct {
 	// MaxBytes bounds the total content copied; exceeding it is a typed
 	// resource limit and nothing is left behind.
 	MaxBytes int64
+	// Include, when set, decides membership file by file: only versions it
+	// accepts are copied, and the ones it rejects cost neither a byte of the
+	// MaxBytes budget nor an inode. It is the selector for a subset whose
+	// shape is a predicate rather than a list, which model.FileSelection.Paths
+	// cannot express: that list is bounded at MaxFilterValues entries, far
+	// below the file count of one analysis unit. A nil Include copies every
+	// nondeleted file the selection yields.
+	Include func(model.FileVersion) bool
 }
 
 // Materialization is a private tree of copied snapshot files for an external
@@ -57,9 +65,9 @@ func (m *Materialization) Close() error {
 	return m.err
 }
 
-// Materialize copies the selected nondeleted files of view into a fresh
-// private directory under opts.Dir, preserving the executable bit and the
-// root-relative layout. Every byte passes through the view's verified reader.
+// Materialize copies the selected nondeleted files of view that opts.Include
+// accepts into a fresh private directory under opts.Dir, preserving the
+// executable bit and the root-relative layout. Every byte passes through the view's verified reader.
 // Writes go through an os.Root over the new directory, so a manifest path can
 // neither escape it nor follow a link out of it. The tree is removed on any
 // failure or cancellation; on success the caller owns it until Close.
@@ -95,13 +103,13 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 		m.Close()
 		return nil, ioError("materialization root", err)
 	}
-	if err := m.fill(ctx, view, sel, opts.MaxBytes); err != nil {
+	if err := m.fill(ctx, view, sel, opts); err != nil {
 		return nil, errors.Join(err, m.Close())
 	}
 	return m, nil
 }
 
-func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel model.FileSelection, maxBytes int64) error {
+func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel model.FileSelection, opts MaterializeOptions) error {
 	root, err := os.OpenRoot(m.root)
 	if err != nil {
 		return ioError("materialization root", err)
@@ -115,8 +123,11 @@ func (m *Materialization) fill(ctx context.Context, view model.SnapshotView, sel
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
-		if total += fv.Size; total > maxBytes {
-			return resourceLimit("materialization exceeds its %d-byte bound", maxBytes)
+		if opts.Include != nil && !opts.Include(fv) {
+			return nil
+		}
+		if total += fv.Size; total > opts.MaxBytes {
+			return resourceLimit("materialization exceeds its %d-byte bound", opts.MaxBytes)
 		}
 		if strings.HasPrefix(fv.Path, "/") || path.Clean(fv.Path) != fv.Path {
 			return &model.Error{Code: model.CodePathEscape, Message: "manifest path is not a normalized root-relative path"}

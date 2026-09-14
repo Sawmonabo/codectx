@@ -29,7 +29,7 @@ const (
 	// classification or pinned argument arrays change. The descriptor version
 	// is this plus the engine payload digest, so a unit built by one engine
 	// release is never reused for another.
-	adapterVersion = "1"
+	adapterVersion = "2"
 	// ScopeWorkspace is the scope of the C/C++ unit, the one unit that is the
 	// whole repository.
 	ScopeWorkspace = provider.ScopeWorkspace
@@ -357,13 +357,19 @@ func (r *runDir) close(req provider.UnitRequest) {
 func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	run *runDir, sink provider.Sink) (publication, ImportReport, error) {
 
+	// Membership is decided file by file, by the unit itself: only the files
+	// this unit owns are ever written. Copying the whole snapshot and deleting
+	// the nested projects afterwards spent the time and the disk of every
+	// sibling project, and left another unit's source inside this unit's
+	// private tree for as long as the pruning took.
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
-		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes})
+		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
+			Include: func(fv model.FileVersion) bool { return unit.Contains(fv.Path) }})
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
 	defer mat.Close()
-	source, err := pruneToUnit(mat.Root(), unit)
+	source, err := unitSource(mat.Root(), unit)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -480,7 +486,8 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
 		"family", string(unit.Family), "exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
-		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes, "tree_peak_bytes", out.PeakBytes)
+		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
+		"tree_peak_bytes", peakForLog(out))
 	if out.Class == FailureNone {
 		if info, err := os.Stat(graph); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 			// A zero exit with no graph is the helper crash the orchestrator
@@ -712,24 +719,13 @@ func merge(a, b ImportReport) ImportReport {
 	return a
 }
 
-// pruneToUnit narrows a whole-snapshot materialization to exactly one unit's
-// files: the nested projects it does not own are removed from the private
-// copy, so a module inside another module is analysed once, by its own unit.
-// The returned directory is what the engine reads.
-//
-// The materialization is whole because snapshot.Materialize selects by an
-// explicit path list bounded at 64 entries, which cannot carry a unit's files;
-// the report records the shared-helper change that would let it copy only the
-// unit's own files.
-func pruneToUnit(root string, unit Unit) (string, error) {
-	for _, ex := range unit.Excluded {
-		if ex == "" || strings.Contains(ex, "..") {
-			return "", invalid("a dependence unit excludes a directory that is not root-relative")
-		}
-		if err := os.RemoveAll(filepath.Join(root, filepath.FromSlash(ex))); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", internalErr("a nested project could not be pruned from the unit materialization: " + err.Error())
-		}
-	}
+// unitSource is the directory of a unit's materialization that the engine
+// reads. The materialization already holds only this unit's files, so the only
+// thing left to establish is that the project directory is actually there: an
+// absent one would otherwise be handed to the engine as a missing path or, for
+// the repository root, as an empty tree that parses to an empty graph
+// indistinguishable from a crashed frontend helper.
+func unitSource(root string, unit Unit) (string, error) {
 	dir := root
 	if unit.Root != "" {
 		dir = filepath.Join(root, filepath.FromSlash(unit.Root))
