@@ -308,16 +308,13 @@ and is never used for memory.
    each part that produces a live export is imported into the same unit.
    Two parts legitimately describe the same entity — above all the external
    stub of a callee both of them reference. Storage keys a node fact by
-   (unit, node) and admits a repeat of that key without failing the unit, but
-   it does not compare the two rows, so a second row whose stored columns
-   differ would be dropped with nothing said. The parts therefore share one
-   dedupe sink for the unit's lifetime, which keeps the drop in the provider,
-   where the identity is known to have been published by an earlier part of the
-   same unit: the first part to publish an identity writes it and later repeats
-   are dropped. The seen set is on disk, inside the run directory, so a large
-   unit does not hold hundreds of thousands of identities in memory, and
-   dropping a repeat never breaks the put-order rule, because the identity it
-   names was already written.
+   (unit, node); it admits a repeat of that key whose stored columns are
+   identical and refuses one whose columns diverge with
+   `CTX_PROVIDER_OUTPUT_INVALID`. Nothing in the provider drops or rewrites a
+   repeat: what the import publishes for one identity is a function of that
+   identity alone, so the parts' repeats are identical and cost nothing, and a
+   divergence — the parts disagreeing about one entity — fails the unit where
+   it can be seen instead of being absorbed into a silently truncated one.
 4. Every capability the subdivided unit publishes is `partial`, carrying the
    failed unit id under `subdivided` and the backend failure under
    `backend_failure` (`<pass>/<exception>`) in its `details`. Control and
@@ -368,21 +365,40 @@ only the relations whose key changed. Deriving the keys measured 1–5 s per
 unit against 17–65 s engine runs, and a one-line edit changes about one fact
 row in ten thousand.
 
-What is **not** wired today. The key set is derived on every import but not
-kept: the provider names no path for it, so it is written beside the staging
-database and removed with it. It is not kept because there is nowhere to keep
-it — a key set belongs to the *stored* unit, and storage has no fact-key
-column. The provider likewise passes no previous key set, so every import is
-a full one and the whole export is published. This is
-deliberate, not an omission: the delta's other half is a storage operation —
-the fresh export is diffed against the **stored** unit and the unchanged rows
-are carried into the new unit — and `UnitWriter` has no carry-over or
-delete-by-key path yet. Suppressing the unchanged relations before storage can
-carry them over would publish a unit holding only the rows that changed, which
-is a unit missing most of its facts. The provider therefore stays honest and
-full until storage can hold up its end; the step is the coordinator's
-(Task 12), and the key algebra is versioned so a stored set built by an older
-algebra can never be mis-diffed against a fresh one.
+Every fact reaches storage with its keys. A published fact carries *every*
+key behind it, not one: a node identity two entities resolved to carries both
+entities' keys, and a canonical edge carries the key of each of its
+occurrences, including the occurrences past the evidence bound. Storage drops
+a carried fact when **any** of its keys is replaced, so a key left off would
+strand the row it backs — the next refresh would classify that key as changed,
+storage would keep the old row under a key the fresh fact never names, and the
+unit would hold two descriptions of one identity. The list is sorted and
+deduplicated because storage refuses an unsorted one, and there is no bound on
+its length beyond the record-byte accounting every fact is already charged
+under, which fails closed with `CTX_RESOURCE_LIMIT`.
+
+A delta import filters whole relations, never occurrences: an edge is
+republished if any of its occurrences carries a changed key, and it is then
+republished entire, so a delta-built unit is row-identical to the same unit
+built in full. And an import whose previous key set *lost* a key republishes
+every relation. A removed key is a digest that cannot be mapped back to the
+edge it backed, and that edge may still exist — delete one of two identical
+calls and the edge keeps an unchanged key, gains no changed one, and has had
+its previous row dropped by the carry-over — so the sound rule is to
+over-emit. It costs import work and never correctness. Node facts are outside
+this: they are published whole on every run.
+
+What is **not** wired today. The provider passes no previous key set, so every
+import is a full one. The key set is derived on every import and written
+beside the staging database, and the provider names no path to keep it: a key
+set belongs to the *stored* unit, and deciding where a stored unit's delta
+state lives, reading the previous unit's set back and calling storage's
+carry-over are the coordinator's step (Task 12), not the provider's. Storage
+now holds up its end — it records the keys of every fact and carries the
+unchanged rows of a previous unit minus everything named replaced — so what
+remains is the wiring, not a missing mechanism. The key algebra is versioned,
+so a stored set built by an older algebra can never be mis-diffed against a
+fresh one.
 
 ## Privacy and cleanup
 

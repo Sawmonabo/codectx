@@ -367,14 +367,17 @@ func TestImportConformsUnderPerPutFlush(t *testing.T) {
 	providertest.Conform(t, p, files, "pkg:fixture", paths)
 }
 
-// TestDedupeSinkAdmitsASubdividedUnit protects the subdivision path. A
+// TestSubdividedUnitAdmitsRepeatedIdentities protects the subdivision path. A
 // subdivided unit runs the engine per part and imports every part's export
-// into the one sink opened for the unit, and two parts legitimately describe
-// the same identity (above all the external stub of a shared callee). Storage
-// keys a node fact by (unit, node) with no conflict clause, so the second part
-// republishing that identity fails the whole unit and every fact in it is
-// lost. DedupeSink is the only thing between that and a lost unit.
-func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
+// into the one sink storage opened for the unit, and two parts legitimately
+// describe the same identity — above all the external stub of a callee both
+// parts reference. Storage admits a repeated node identity whose stored
+// columns are identical and refuses one whose columns diverge, so nothing
+// between the import and storage may drop or rewrite the repeat; what the
+// import publishes for one identity must be a function of that identity
+// alone. Silent breakage here loses a whole unit's facts on the one path that
+// exists to rescue them.
+func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	files, paths := readSource(t, filepath.Join("testdata", "src", "gofix"))
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
@@ -391,17 +394,12 @@ func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
 	p := providertest.Func{
 		Desc: descriptor(),
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-			dedupe, err := neo4jcsv.NewDedupeSink(recorder{Sink: sink, c: &c}, t.TempDir())
-			if err != nil {
-				return model.ProviderResult{}, err
-			}
-			defer dedupe.Close()
 			for i := range part {
 				nodes, aliases := nodesSoFar(), c.aliasN
 				o := neo4jcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
 					Limits: providertest.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit,
 					Run: req.Run, Content: req.Content, ScratchDir: t.TempDir()}
-				if _, err := neo4jcsv.Import(ctx, export, req.Resolver, dedupe, o); err != nil {
+				if _, err := neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o); err != nil {
 					return model.ProviderResult{}, err
 				}
 				part[i].nodes, part[i].aliases = nodesSoFar()-nodes, c.aliasN-aliases
@@ -417,9 +415,10 @@ func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
 	if part[0].nodes == 0 || part[0].aliases == 0 {
 		t.Fatalf("the first part published %d node facts and %d aliases; the fixture must publish both", part[0].nodes, part[0].aliases)
 	}
-	if part[1].nodes != 0 || part[1].aliases != 0 {
-		t.Fatalf("the second part re-published %d node facts and %d aliases; storage would reject them and fail the unit",
-			part[1].nodes, part[1].aliases)
+	if part[1].nodes != part[0].nodes || part[1].aliases != part[0].aliases {
+		t.Fatalf("the second part published %d node facts and %d aliases against the first part's %d and %d; "+
+			"the repeats must be identical, or storage refuses them and the unit is lost",
+			part[1].nodes, part[1].aliases, part[0].nodes, part[0].aliases)
 	}
 }
 
