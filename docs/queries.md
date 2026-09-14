@@ -55,19 +55,21 @@ evidence row behind it.
 | `--generation` | all | Answer from this generation instead of the active one. Not combinable with `--cursor`. |
 | `--timeout` | all | Deadline for this invocation. Zero leaves the configured query deadline in charge. |
 | `--limit` | all but `path` | Items in one page. |
-| `--cursor` | all but `path` and `impact` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Maximum distinct nodes the walk may admit. |
-| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. On `callers` and `callees` it is cumulative across the pages of one traversal. |
+| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. On `callers`, `callees` and `impact` it is cumulative across the pages of one answer. |
 
-**`impact` and `path` issue no continuation.** `search`, `symbol`, `refs`,
-`callers` and `callees` print a `next` token when more remains, and resuming
-one carries the budget the earlier pages already spent rather than refilling it.
-`impact` pages its ranked entry list with `--limit` but declares no `--cursor`:
-its page boundary is a rank over the whole walk, not a position in it, so there
-is nothing to resume from and a full page is reported as truncated. `path` is
-not paged at all — it declares neither flag, and its `--visited` budget is spent
-by the one search it runs.
+**`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
+`callees` and `impact` print a `next` token when more remains, and resuming one
+carries the budget the earlier pages already spent rather than refilling it.
+`impact` resumes differently from the traversal commands: it ranks the whole
+walk on the first page, serves the first `--limit` entries and keeps the ranked
+tail, so a continuation replays that tail in rank order without walking again
+and spends no further budget. Its `walked` counts and its package rollup are
+therefore the same on every page — they describe the one walk behind the whole
+answer. `path` is not paged at all — it declares neither flag, and its
+`--visited` budget is spent by the one search it runs.
 
 **Zero is not "unlimited".** A zero budget takes the configured default, and a
 positive value may narrow that default but never widen it. The visited and edge
