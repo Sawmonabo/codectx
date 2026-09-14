@@ -62,9 +62,16 @@ type traversalCursor struct {
 	// SpoolID names the spool written by the page that issued this cursor; it
 	// is empty when the page left no frontier behind (a pure keyset page).
 	SpoolID string `json:"spool_id,omitempty"`
-	// LastKey is the keyset position: the last RelationID the issuing page
-	// admitted. Unlike pagination.Cursor it may accompany a SpoolID.
-	LastKey model.RelationID `json:"last_key,omitempty"`
+	// LastOwner and LastKey are the keyset position: the frontier node that
+	// owned the last row the issuing page admitted, and that row's RelationID.
+	// A level is emitted in the frozen (owner.Node asc, rel.ID asc) order
+	// across independently keyset-paged node chunks, so a relation id ALONE
+	// cannot name a mid-level stop -- the chunk after the stopping one restarts
+	// its own relation-id keyset from the beginning. The pair does name it: a
+	// resumed page re-reads the level and skips every row <= (LastOwner,
+	// LastKey). Unlike pagination.Cursor either may accompany a SpoolID.
+	LastOwner model.NodeID     `json:"last_owner,omitempty"`
+	LastKey   model.RelationID `json:"last_key,omitempty"`
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
@@ -100,8 +107,11 @@ func (c traversalCursor) validate() error {
 	if c.SpoolID != "" && !model.ValidHexID(c.SpoolID) {
 		return cursorInvalid("cursor spool id is malformed")
 	}
-	if len(c.LastKey) > model.MaxIdentifierBytes {
+	if len(c.LastKey) > model.MaxIdentifierBytes || len(c.LastOwner) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor sort key exceeds its bound")
+	}
+	if (c.LastOwner == "") != (c.LastKey == "") {
+		return cursorInvalid("cursor sort key is half-formed")
 	}
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
@@ -197,9 +207,10 @@ type continuation struct {
 	QueryHash string
 	// LeaseID is the retention lease holding the pinned generation; the cursor
 	// and its spool both live exactly as long as it does.
-	LeaseID string
-	Depth   int
-	LastKey model.RelationID
+	LeaseID   string
+	Depth     int
+	LastOwner model.NodeID
+	LastKey   model.RelationID
 	// Frontier is where the walk stopped, and Visited the nodes it admitted.
 	Frontier []frontierState
 	Visited  []model.NodeID
@@ -212,7 +223,8 @@ type continuation struct {
 // presenting one page's cursor twice restores the same allowance both times --
 // it neither resets to zero nor accumulates. The deadline is fresh, because
 // Section 3 scopes the query timeout to one request, not to a cursor chain.
-func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash string) (*resumeState, error) {
+func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash string,
+	deadline time.Time) (*resumeState, error) {
 	if e.signer == nil {
 		return nil, cursorInvalid("continuations are not available in this workspace")
 	}
@@ -243,8 +255,10 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		// now is carried with the deadline: checkWalk compares them, and a
 		// deadline measured on the engine clock against time.Now is the
 		// two-clock defect this budget would otherwise reintroduce.
-		Budget: &budget{visited: c.Visited, edges: c.Edges,
-			deadline: now.Add(e.limits.QueryTimeout), now: e.now},
+		// deadline is THIS request's, measured by the caller before its gate
+		// wait; recomputing it here would let a resumed page outlive the
+		// request deadline by however long that wait took.
+		Budget:  &budget{visited: c.Visited, edges: c.Edges, deadline: deadline, now: e.now},
 		Visited: map[model.NodeID]struct{}{},
 	}
 	if c.SpoolID == "" {
@@ -295,7 +309,9 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 // into. In every one of those cases the caller reports Truncated with no
 // NextCursor, which is the same contract as running out of page items.
 func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) {
-	if e.signer == nil {
+	if e.signer == nil || c.LeaseID == "" {
+		// No signer, or an Adjacency holding no retention lease: a token that
+		// outlived the lease would resume over facts nothing is retaining.
 		return "", nil
 	}
 	// This is the ONE place the cumulative caps decide whether a traversal may
@@ -322,6 +338,7 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 		AnalysisKey:  e.adjacency.Binding().AnalysisKey,
 		QueryHash:    c.QueryHash,
 		LeaseID:      c.LeaseID,
+		LastOwner:    c.LastOwner,
 		LastKey:      c.LastKey,
 		Depth:        c.Depth,
 		Visited:      b.visited,
