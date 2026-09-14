@@ -51,7 +51,9 @@ var _ dependence.EngineLocator = (*Locator)(nil)
 // Locate installs and verifies the pinned payload and describes how to start
 // its two tools.
 //
-// Both argv arrays are complete launcher prefixes. The pinned payload's entry
+// Both argv arrays are complete launcher prefixes; internal/toolchain
+// guarantees that a resolved tool's ArgvPrefix is never empty, so this does not
+// re-check it. The pinned payload's entry
 // is a launcher script that finds the managed JDK through JAVA_HOME, which the
 // resolved tool already carries in its environment, so the parse argv is the
 // resolver's own prefix unchanged. The export tool is not the lock's entry and
@@ -73,9 +75,6 @@ func (l *Locator) Locate(ctx context.Context) (dependence.Engine, error) {
 	if err != nil {
 		return dependence.Engine{}, err
 	}
-	if len(t.ArgvPrefix) == 0 {
-		return dependence.Engine{}, corrupt("the analysis engine payload has no launcher")
-	}
 	export, err := exportArgv(t)
 	if err != nil {
 		return dependence.Engine{}, err
@@ -84,7 +83,6 @@ func (l *Locator) Locate(ctx context.Context) (dependence.Engine, error) {
 		ParseArgv:  append([]string(nil), t.ArgvPrefix...),
 		ExportArgv: export,
 		Env:        append([]string(nil), t.Env...),
-		Name:       t.Name,
 		Version:    t.Version,
 		Digest:     t.Fingerprint(),
 	}
@@ -107,6 +105,14 @@ func exportArgv(t toolchain.Tool) ([]string, error) {
 	last := len(argv) - 1
 	dir, base := filepath.Split(argv[last])
 	if !strings.HasPrefix(base, parseEntry) {
+		// For the pinned payload this cannot happen. For a user override it is
+		// a real constraint on the file the user named, so the refusal has to
+		// point at their configuration rather than at the store.
+		if t.Source == toolchain.SourceOverride {
+			return nil, &model.Error{Code: model.CodeToolOverrideInvalid,
+				Message:     "the analysis engine override must be the payload's own parse launcher, whose name the export tool beside it is derived from",
+				Remediation: "point the override at the engine payload's parse launcher; see docs/configuration.md"}
+		}
 		return nil, corrupt("the analysis engine payload does not carry the expected launcher name")
 	}
 	path := filepath.Join(dir, exportEntry+strings.TrimPrefix(base, parseEntry))
@@ -121,8 +127,13 @@ func exportArgv(t toolchain.Tool) ([]string, error) {
 	return argv, nil
 }
 
+// corrupt is a payload failure raised on the dependence provider's own run
+// path. It carries no `tool` detail: model.Error.Details is rendered verbatim
+// in the CLI's failure envelope, and the lock entry's name on an indexing
+// diagnostic is exactly the surface Section 11.6 keeps the engine's name off.
+// The remediation already sends the operator to `codectx tools verify`, which
+// is the inventory surface where the name belongs.
 func corrupt(msg string) *model.Error {
-	return (&model.Error{Code: model.CodeToolCorrupt, Message: msg,
-		Remediation: "run `codectx tools verify` and re-install the payload"}).
-		WithDetail("tool", lockName)
+	return &model.Error{Code: model.CodeToolCorrupt, Message: msg,
+		Remediation: "run `codectx tools verify` and re-install the payload"}
 }
