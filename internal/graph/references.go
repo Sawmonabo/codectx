@@ -175,7 +175,16 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
 
-	meta := model.QueryMeta{Binding: binding}
+	// The same capability disclosure every other graph answer carries, from the
+	// same helper, so `refs` reports the generation's capabilities rather than
+	// none. The deferred-dependence flag is discarded deliberately: a reference
+	// operation walks references, calls or implements (referenceWalkFor), none
+	// of which is a dependence-only kind, so there is nothing for it to report.
+	caps, _, err := e.completeness(ctx, walk.kinds)
+	if err != nil {
+		return model.Page[model.ReferenceOccurrence]{}, err
+	}
+	meta := model.QueryMeta{Binding: binding, Completeness: caps}
 	if clipped {
 		// A single relation carried more occurrences than one page may hold.
 		// Those occurrences are unrecoverable once the keyset position moves

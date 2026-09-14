@@ -126,14 +126,14 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	maxDepth int, deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
 	var answer impactAnswer
 	meta := model.QueryMeta{}
-	// The deferred-dependence disclosure happens before the walk: a missing
-	// dependence edge must not read as a genuine absence of impact.
-	pending, err := e.pendingDependence(ctx, kinds)
+	// The capability disclosure happens before the walk: a missing dependence
+	// edge must not read as a genuine absence of impact.
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return answer, nil, nil, err
 	}
-	if len(pending) > 0 {
-		meta.Completeness = pending
+	meta.Completeness = caps
+	if deferred {
 		markTruncated(&meta, reasonDependence)
 	}
 

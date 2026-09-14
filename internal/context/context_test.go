@@ -555,12 +555,23 @@ func TestContextCompilerScenario(t *testing.T) {
 					{"internal/order/handler.go", model.RequirementSymbol},    // caller
 					{"docs/order.md", model.RequirementRecommended},           // documentation
 				} {
-					got, ok := requirementFor(t, res, want.path)
+					got, ok := requirementFor(t, fx, res, want.path)
 					if !ok {
 						t.Fatalf("scope dropped the boundary %q", want.path)
 					}
 					if got.Requirement != want.req {
 						t.Fatalf("boundary %q requirement = %q, want %q", want.path, got.Requirement, want.req)
+					}
+				}
+				// candidate.Path is a FILE PATH. An expansion entry has none of
+				// its own -- ImpactEntry.Name is a qualified name -- so it must
+				// arrive empty for hydrateFiles to fill from the FileID.
+				// A name written here is never corrected (hydration fills Path
+				// only when empty) and reaches the stored manifest reference,
+				// and so its canonical hash, as a path naming no file.
+				for _, c := range res.Candidates {
+					if c.Origin == originExpansion && c.Path != "" {
+						t.Fatalf("expansion entry carries path %q of its own; hydration can no longer fill the real one", c.Path)
 					}
 				}
 			},
@@ -588,7 +599,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				if res.ScopeComplete {
 					t.Fatal("an unresolved token left the scope reported as complete")
 				}
-				kept, ok := requirementFor(t, res, "Ledger")
+				kept, ok := requirementFor(t, fx, res, "Ledger")
 				if !ok || kept.Excluded == "" {
 					t.Fatalf("the unresolved token lost its exclusion: %+v", kept)
 				}
@@ -679,7 +690,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					{"internal/order/handler.go", model.RequirementRecommended},
 					{"internal/order/service.go", model.RequirementOptional},
 				} {
-					got, ok := requirementFor(t, res, want.path)
+					got, ok := requirementFor(t, fx, res, want.path)
 					if !ok {
 						t.Fatalf("scope dropped the seed %q", want.path)
 					}
@@ -1567,12 +1578,15 @@ func (f *contextFixture) seedOf(path string) candidate {
 		Requirement: model.RequirementFull, Origin: originExplicitSeed, Status: fv.Status}
 }
 
-// requirementFor finds the candidate whose path names the artifact at path.
-// Expansion entries report the qualified name, so the match is by prefix.
-func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool) {
+// requirementFor finds the candidate for the artifact at path. Expansion
+// entries carry no path of their own -- scope.go leaves candidate.Path for the
+// compiler's file hydration to fill -- so the match is by FileID, and falls back
+// to the path only for a discovery candidate that resolved to no file at all.
+func requirementFor(t *testing.T, fx *contextFixture, res scopeResult, path string) (candidate, bool) {
 	t.Helper()
+	id := fx.Files[path].ID
 	for _, c := range res.Candidates {
-		if c.Path == path || strings.HasPrefix(c.Path, path+".") {
+		if (id != "" && c.FileID == id) || (c.Path != "" && c.Path == path) {
 			return c, true
 		}
 	}
