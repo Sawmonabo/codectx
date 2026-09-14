@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 
@@ -22,62 +23,62 @@ import (
 // scopes V1 to tools.
 func register(s *mcp.Server, h *handlers) {
 	// --- L2: index and discovery ---------------------------------------
-	mcp.AddTool(s, toolFor[emptyInput]("codectx_index_status", "Index status",
-		"Active generation, health, coherence and capability completeness."), h.indexStatus)
-	mcp.AddTool(s, toolFor[emptyInput]("codectx_refresh_index", "Refresh index",
-		"Build an incremental generation over the current workspace."), h.refreshIndex)
-	mcp.AddTool(s, toolFor[model.OverviewRequest]("codectx_repo_overview", "Repository overview",
-		"Bounded repository, package, module and language map."), h.repoOverview)
-	mcp.AddTool(s, toolFor[model.SearchRequest]("codectx_search", "Search",
-		"Ranked lexical, path and symbol retrieval over one generation."), h.search)
-	mcp.AddTool(s, toolFor[model.SymbolRequest]("codectx_find_symbol", "Find symbol",
-		"Resolve a symbol through the canonical index or the LSP overlay."), h.findSymbol)
+	addTool(s, "codectx_index_status", "Index status",
+		"Active generation, health, coherence and capability completeness.", h.indexStatus)
+	addTool(s, "codectx_refresh_index", "Refresh index",
+		"Build an incremental generation over the current workspace.", h.refreshIndex)
+	addTool(s, "codectx_repo_overview", "Repository overview",
+		"Bounded repository, package, module and language map.", h.repoOverview)
+	addTool(s, "codectx_search", "Search",
+		"Ranked lexical, path and symbol retrieval over one generation.", h.search)
+	addTool(s, "codectx_find_symbol", "Find symbol",
+		"Resolve a symbol through the canonical index or the LSP overlay.", h.findSymbol)
 
 	// --- L3: symbol composition ----------------------------------------
-	mcp.AddTool(s, toolFor[symbolInfoInput]("codectx_symbol_info", "Symbol info",
-		"Symbol metadata with reference evidence pinned to one generation."), h.symbolInfo)
+	addTool(s, "codectx_symbol_info", "Symbol info",
+		"Symbol metadata with reference evidence pinned to one generation.", h.symbolInfo)
 
 	// --- L2: references -------------------------------------------------
-	mcp.AddTool(s, toolFor[model.ReferenceRequest]("codectx_references", "References",
-		"Reference, implementation or type-definition occurrences of a node."), h.references)
+	addTool(s, "codectx_references", "References",
+		"Reference, implementation or type-definition occurrences of a node.", h.references)
 
 	// --- L3: traversal ---------------------------------------------------
-	mcp.AddTool(s, toolFor[graphInput]("codectx_callers", "Callers",
-		"Bounded inbound call neighborhood of one or more nodes."), h.callers)
-	mcp.AddTool(s, toolFor[graphInput]("codectx_callees", "Callees",
-		"Bounded outbound call neighborhood of one or more nodes."), h.callees)
-	mcp.AddTool(s, toolFor[model.PathRequest]("codectx_dependency_path", "Dependency path",
-		"Bounded shortest dependency path between two resolved nodes."), h.dependencyPath)
-	mcp.AddTool(s, toolFor[model.ImpactRequest]("codectx_impact", "Impact",
-		"Affected scope and required package boundaries, with completeness."), h.impact)
+	addTool(s, "codectx_callers", "Callers",
+		"Bounded inbound call neighborhood of one or more nodes.", h.callers)
+	addTool(s, "codectx_callees", "Callees",
+		"Bounded outbound call neighborhood of one or more nodes.", h.callees)
+	addTool(s, "codectx_dependency_path", "Dependency path",
+		"Bounded shortest dependency path between two resolved nodes.", h.dependencyPath)
+	addTool(s, "codectx_impact", "Impact",
+		"Affected scope and required package boundaries, with completeness.", h.impact)
 
 	// --- L4: session lifecycle -------------------------------------------
-	mcp.AddTool(s, toolFor[model.PlanRequest]("codectx_context_plan", "Plan context",
-		"Open a read session and return its manifest beside its status."), h.contextPlan)
-	mcp.AddTool(s, toolFor[statusInput]("codectx_context_status", "Context status",
-		"Paged per-file coverage beside the session's gate status."), h.contextStatus)
-	mcp.AddTool(s, toolFor[model.SessionRequest]("codectx_context_next", "Next context item",
-		"The next required read action. Metadata only; no source bytes."), h.contextNext)
-	mcp.AddTool(s, toolFor[model.ContextPageRequest]("codectx_context_entries", "Context entries",
-		"One paged projection of a session's current manifest."), h.contextEntries)
-	mcp.AddTool(s, toolFor[model.IncludeRequest]("codectx_context_include", "Include seeds",
-		"Widen a session's scope with additional seeds."), h.contextInclude)
-	mcp.AddTool(s, toolFor[model.ReadChunkRequest]("codectx_read_source", "Read source",
-		"The only tool that returns source bytes: one bounded chunk with a receipt."), h.readSource)
+	addTool(s, "codectx_context_plan", "Plan context",
+		"Open a read session and return its manifest beside its status.", h.contextPlan)
+	addTool(s, "codectx_context_status", "Context status",
+		"Paged per-file coverage beside the session's gate status.", h.contextStatus)
+	addTool(s, "codectx_context_next", "Next context item",
+		"The next required read action. Metadata only; no source bytes.", h.contextNext)
+	addTool(s, "codectx_context_entries", "Context entries",
+		"One paged projection of a session's current manifest.", h.contextEntries)
+	addTool(s, "codectx_context_include", "Include seeds",
+		"Widen a session's scope with additional seeds.", h.contextInclude)
+	addTool(s, "codectx_read_source", "Read source",
+		"The only tool that returns source bytes: one bounded chunk with a receipt.", h.readSource)
 
 	// --- L5: review gate and capsule --------------------------------------
-	mcp.AddTool(s, toolFor[model.AcknowledgeRequest]("codectx_context_acknowledge", "Acknowledge",
-		"Confirm issued read receipts or a fully read file."), h.contextAcknowledge)
-	mcp.AddTool(s, toolFor[model.WaiverRequest]("codectx_context_waive", "Waive file",
-		"Record a reasoned waiver for a required file."), h.contextWaive)
-	mcp.AddTool(s, toolFor[model.ObservationRequest]("codectx_context_record", "Record observation",
-		"Record an accepted fact, rejection, contradiction or scope review."), h.contextRecord)
-	mcp.AddTool(s, toolFor[model.AdvanceRequest]("codectx_context_advance", "Advance workflow",
-		"Move the session to a target workflow state under its version."), h.contextAdvance)
-	mcp.AddTool(s, toolFor[model.CapsuleRequest]("codectx_context_capsule", "Context capsule",
-		`One bounded capsule view, or view="export" for canonical export metadata.`), h.contextCapsule)
-	mcp.AddTool(s, toolFor[closeInput]("codectx_context_close", "Close session",
-		"Close a session under its expected state version."), h.contextClose)
+	addTool(s, "codectx_context_acknowledge", "Acknowledge",
+		"Confirm issued read receipts or a fully read file.", h.contextAcknowledge)
+	addTool(s, "codectx_context_waive", "Waive file",
+		"Record a reasoned waiver for a required file.", h.contextWaive)
+	addTool(s, "codectx_context_record", "Record observation",
+		"Record an accepted fact, rejection, contradiction or scope review.", h.contextRecord)
+	addTool(s, "codectx_context_advance", "Advance workflow",
+		"Move the session to a target workflow state under its version.", h.contextAdvance)
+	addTool(s, "codectx_context_capsule", "Context capsule",
+		`One bounded capsule view, or view="export" for canonical export metadata.`, h.contextCapsule)
+	addTool(s, "codectx_context_close", "Close session",
+		"Close a session under its expected state version.", h.contextClose)
 }
 
 // toolCount is the Section 19.2 surface size. Section 19.2 lists 23 tools; the
@@ -85,14 +86,25 @@ func register(s *mcp.Server, h *handlers) {
 // which is why DiagnoseService keeps no Task 19 consumer.
 const toolCount = 23
 
-// toolFor builds one tool's metadata with the preset input schema below.
-func toolFor[In any](name, title, description string) *mcp.Tool {
-	return &mcp.Tool{
-		Name:        name,
-		Title:       title,
-		Description: description,
-		InputSchema: inputSchema[In](name),
-	}
+// addTool registers one tool with BOTH of its schemas preset from the handler's
+// own request and answer types.
+//
+// In and Out are inferred from the handler value, never written at the call
+// site: an explicitly named input type could drift from the handler's actual
+// parameter type and preset a schema for a struct the tool does not decode.
+// Presetting both halves is also what closes the output-schema defect the
+// outputSchemas table below describes -- the SDK infers an output schema
+// whenever one is absent, and its inference of json.RawMessage does not match
+// what that field marshals to.
+func addTool[In, Out any](s *mcp.Server, name, title, description string,
+	h mcp.ToolHandlerFor[In, Out]) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         name,
+		Title:        title,
+		Description:  description,
+		InputSchema:  schemaFor[In](name, "input", enumSchemas),
+		OutputSchema: schemaFor[Out](name, "output", outputSchemas),
+	}, h)
 }
 
 // enumSchemas is the ONE enum table, and it is keyed by Go type rather than by
@@ -160,18 +172,45 @@ func stringEnum(values ...string) *jsonschema.Schema {
 	return &jsonschema.Schema{Type: "string", Enum: enum}
 }
 
-// inputSchema presets a tool's input schema, which the SDK honors as-is;
-// inference only fills a nil one.
+// outputSchemas is the OUTPUT side of the same one-table mechanism: the same
+// jsonschema.ForOptions.TypeSchemas hook, keyed by reflect.Type, applied to the
+// answer envelope instead of the request. It is a separate table, not a second
+// mechanism, because enumSchemas must NOT reach an output -- the reason is
+// spelled out above: output structs legitimately carry zero-valued enum fields
+// that an enum list without "" would reject.
+//
+// What it corrects: json.RawMessage is []byte, which jsonschema-go infers as
+// ["null","array"], while the value marshals as whatever JSON it holds -- an
+// object for model.Node.Metadata (model/facts.go). Every non-empty answer
+// carrying such a node therefore failed the SDK's output validation and came
+// back to the client as a JSON-RPC PROTOCOL error instead of a result, with no
+// Section 22 code to read (codectx_find_symbol, codectx_symbol_info,
+// codectx_callers, codectx_callees and codectx_dependency_path all return
+// nodes). internal/model's wire shape is correct and is exercised by the CLI,
+// so the correction belongs here.
+//
+// Keying by type rather than by property path is what makes this one entry
+// sufficient: it covers json.RawMessage wherever it occurs in any tool's answer,
+// at any depth, today and for any field a later type adds. The schema is the
+// empty (always-true) one, which is the honest description of a field whose
+// contents are deliberately unconstrained JSON.
+var outputSchemas = map[reflect.Type]*jsonschema.Schema{
+	reflect.TypeFor[json.RawMessage](): {},
+}
+
+// schemaFor presets one half of a tool's schema, which the SDK honors as-is;
+// inference only fills a nil one. presets selects which of the two type tables
+// above applies; half names the side for the panic message.
 //
 // It panics rather than returning an error because a schema that cannot be
 // inferred is a build-time defect in this package, not a runtime condition: the
 // tool would be unusable and the process must not come up pretending otherwise.
 // register() is exercised by the schema snapshot, so the panic surfaces in
 // `go test`, never in a serving process.
-func inputSchema[In any](tool string) *jsonschema.Schema {
-	s, err := jsonschema.For[In](&jsonschema.ForOptions{TypeSchemas: enumSchemas})
+func schemaFor[T any](tool, half string, presets map[reflect.Type]*jsonschema.Schema) *jsonschema.Schema {
+	s, err := jsonschema.For[T](&jsonschema.ForOptions{TypeSchemas: presets})
 	if err != nil {
-		panic(fmt.Sprintf("mcpserver: input schema for tool %q: %v", tool, err))
+		panic(fmt.Sprintf("mcpserver: %s schema for tool %q: %v", half, tool, err))
 	}
 	return s
 }
