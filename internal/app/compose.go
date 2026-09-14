@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/coverage"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -147,10 +149,19 @@ type stack struct {
 	// gate is the process-scoped max_concurrent_graph_queries semaphore. One
 	// graph engine is built per request, so the bound cannot live on the engine.
 	gate *graphGate
-	// repo and search are set by openQueries once the coordinator has resolved
-	// the repository identity, which is the coordinator's to derive.
-	repo   model.RepositoryID
-	search *search.Service
+	// repo, search and coverage are set by openQueries once the coordinator has
+	// resolved the repository identity, which is the coordinator's to derive.
+	repo     model.RepositoryID
+	search   *search.Service
+	coverage *coverage.Service
+
+	// views memoises the per-snapshot read view the coverage service opens
+	// through its SourceOpener. A view is pinned to one immutable snapshot, so
+	// one per snapshot is correct for the life of the workspace; the mutex is
+	// what makes the opener safe to call from concurrent requests, which
+	// coverage.Service promises its callers.
+	viewsMu sync.Mutex
+	views   map[model.SnapshotID]*snapshot.View
 
 	// states are the capability rows detection can never publish because the
 	// provider could not be constructed at all. A provider missing from the
@@ -589,7 +600,86 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		return err
 	}
 	s.search = svc
+	return s.openCoverage()
+}
+
+// openCoverage builds the Section 16 coverage service. It is called from
+// openQueries rather than openStack for the same reason the search service is:
+// nothing below the coordinator can name the repository, and the session store
+// the service reads is scoped by it.
+//
+// The service is built in both compositions, because `codectx context ...`
+// opens the workspace for a report (it reads pinned source and writes only
+// session rows, so it needs no workspace lock); building it only for an
+// indexing run would leave every one of those commands with no service.
+//
+// The store is passed as the narrow coverage.Sessions interface and the CAS
+// never leaves this file: the service sees the frozen interfaces and a Limits
+// resolved here, never *sqlite.Store's wider surface, *snapshot.CAS or
+// config.Config.
+func (s *stack) openCoverage() error {
+	s.views = make(map[model.SnapshotID]*snapshot.View)
+	svc, err := coverage.New(coverage.Options{
+		Sessions:   s.store,
+		OpenSource: s.openView,
+		Signer:     s.signer,
+		// The session lease must expire with the session it retains, so this is
+		// its own Leases at coverage.session_ttl -- the search service's is at
+		// storage.query_cursor_ttl and sharing it would release the pinned
+		// snapshot out from under a session that is still open.
+		Leases: pagination.NewLeases(s.store, s.cfg.Coverage.SessionTTL.Std()),
+		Limits: coverageLimits(s.cfg),
+		Now:    time.Now,
+		Logger: s.logger,
+	})
+	if err != nil {
+		return err
+	}
+	s.coverage = svc
 	return nil
+}
+
+// coverageLimits resolves the Section 20.1 bounds the coverage service enforces.
+// It is the only place configuration is turned into those bounds, so the service
+// itself never reads config.Config.
+//
+// ReceiptTTL has no key of its own: a receipt is a signed token handed back for
+// one continuation exactly as a cursor is, so it expires on
+// storage.query_cursor_ttl, the key that already bounds this workspace's signed
+// tokens. Giving it a second key would let an operator set two lifetimes for one
+// kind of token.
+func coverageLimits(cfg config.Config) coverage.Limits {
+	return coverage.Limits{
+		ChunkBytes:                     cfg.Coverage.ChunkBytes,
+		MaxChunkBytes:                  cfg.Coverage.MaxChunkBytes,
+		MaxSourceResponseBytes:         cfg.Resources.MaxSourceResponseBytes,
+		MaxMetadataResponseBytes:       cfg.Resources.MaxMetadataResponseBytes,
+		MaxReceiptsPerConfirmation:     cfg.Coverage.MaxReceiptsPerConfirmation,
+		MaxUnconfirmedChunksPerSession: cfg.Coverage.MaxUnconfirmedChunksPerSession,
+		MaxPageItems:                   cfg.Resources.MaxPageItems,
+		SessionTTL:                     cfg.Coverage.SessionTTL.Std(),
+		QueryTimeout:                   cfg.Resources.QueryTimeout.Std(),
+		ReceiptTTL:                     cfg.Storage.QueryCursorTTL.Std(),
+	}
+}
+
+// openView is the coverage service's SourceOpener: the per-snapshot verified
+// read surface, memoised so a session that reads a hundred chunks opens one
+// view rather than a hundred. A *snapshot.View holds no handle -- it is the
+// catalog, the CAS and an immutable header -- so there is nothing to release
+// and the map is dropped with the stack.
+func (s *stack) openView(ctx context.Context, id model.SnapshotID) (coverage.Source, error) {
+	s.viewsMu.Lock()
+	defer s.viewsMu.Unlock()
+	if v, ok := s.views[id]; ok {
+		return v, nil
+	}
+	v, err := snapshot.OpenView(ctx, s.store, s.cas, id)
+	if err != nil {
+		return nil, err
+	}
+	s.views[id] = v
+	return v, nil
 }
 
 // Close releases everything the stack opened, in reverse. Every step runs even
