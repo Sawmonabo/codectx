@@ -100,9 +100,14 @@ func (w *Workspace) DataDir() string { return w.s.dataDir }
 func (w *Workspace) Search() *search.Service { return w.s.search }
 
 // Query pins gen -- zero selects the active generation -- and builds the graph
-// engine bound to it. The returned closer releases the retention lease and must
-// be called once, whatever the query returns; the engine must not be used after
-// it.
+// engine bound to it. The returned closer releases the reader's QUERY lease and
+// must be called once, whatever the query returns; the engine must not be used
+// after it.
+//
+// A continuation token never names that lease. The engine is given the stack's
+// lease store and mints a cursor-scoped lease per token, because the query
+// lease is gone the moment this request returns and the next CLI invocation
+// would find the spool it names already released.
 //
 // The engine is built per request, which is why the concurrency gate it is
 // given is the stack's process-scoped one. The coordinator is passed as the
@@ -123,6 +128,7 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 		Promoter:  promote,
 		Signer:    w.s.signer,
 		Spools:    w.s.spools,
+		Leases:    w.s.leases,
 		Gate:      w.s.gate,
 		Limits:    graphLimits(w.s.cfg),
 		Now:       time.Now,

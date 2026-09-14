@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -391,23 +392,62 @@ func (f *graphFixture) Capabilities(ctx context.Context) ([]model.CapabilityStat
 
 func (f *graphFixture) Binding() model.Binding { return f.binding }
 
-// LeaseID makes the fixture a LeaseHolder: a continuation token names the
-// retention lease holding its generation, and an Adjacency without one offers
-// no continuation at all, so a paging case could not run against a fake that
-// held no lease.
-func (f *graphFixture) LeaseID() string { return fixtureID("lease-1") }
-
 // fixtureLeases is the LeaseStore pagination.Spools consults before it writes
-// or replays a spool. Storage owns the real retention_leases rows; the graph
-// engine only needs a live lease to exist, so the fake reports every lease as
-// live for the fixture window.
-type fixtureLeases struct{}
+// or replays a spool, and the store the engine mints its cursor leases in.
+//
+// It tracks liveness for real rather than reporting every lease live, because
+// the whole difference a continuation depends on is WHICH lease its token
+// names: the pinned reader's query lease is released the moment the request
+// returns, and a fake that answered "live" for a released lease could not tell
+// a usable cursor from one the next invocation will refuse. A released or
+// unknown lease is CTX_CURSOR_INVALID with the storage layer's own wording.
+type fixtureLeases struct {
+	mu   sync.Mutex
+	live map[string]time.Time
+}
 
-func (fixtureLeases) AcquireLease(context.Context, model.Lease) error     { return nil }
-func (fixtureLeases) RenewLease(context.Context, string, time.Time) error { return nil }
-func (fixtureLeases) ReleaseLease(context.Context, string) error          { return nil }
-func (fixtureLeases) LeaseExpiry(context.Context, string) (time.Time, error) {
-	return time.Now().Add(time.Hour), nil
+func newFixtureLeases() *fixtureLeases { return &fixtureLeases{live: map[string]time.Time{}} }
+
+func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.live[lease.ID] = lease.ExpiresAt
+	return nil
+}
+
+func (l *fixtureLeases) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.live[id]; !ok {
+		return fixtureLeaseGone()
+	}
+	l.live[id] = expiresAt
+	return nil
+}
+
+// ReleaseLease is idempotent, as the storage DELETE is: releasing twice is not
+// an error, it just leaves the lease gone.
+func (l *fixtureLeases) ReleaseLease(_ context.Context, id string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.live, id)
+	return nil
+}
+
+func (l *fixtureLeases) LeaseExpiry(_ context.Context, id string) (time.Time, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	expires, ok := l.live[id]
+	if !ok {
+		return time.Time{}, fixtureLeaseGone()
+	}
+	return expires, nil
+}
+
+// fixtureLeaseGone is storage's refusal, verbatim (sqlite/lease.go): the
+// message an operator sees when a continuation names a lease nobody holds.
+func fixtureLeaseGone() error {
+	return &model.Error{Code: model.CodeCursorInvalid, Message: "lease has expired or was released"}
 }
 
 // fixtureLimits is the resolved budget every scenario starts from. A case that
@@ -662,13 +702,10 @@ func TestGraphScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open signer: %v", err)
 			}
-			e, err := New(Options{Adjacency: f, Signer: signer, Limits: fixtureLimits()})
+			e, err := New(Options{Adjacency: f, Signer: signer,
+				Leases: pagination.NewLeases(newFixtureLeases(), fixtureLimits().CursorTTL), Limits: fixtureLimits()})
 			if err != nil {
 				t.Fatalf("new engine: %v", err)
-			}
-			lease, err := model.NewRandomID()
-			if err != nil {
-				t.Fatalf("lease id: %v", err)
 			}
 			const endpoint = "graph.neighbors"
 			queryHash := traversalQueryHash(model.DirectionOutgoing,
@@ -676,8 +713,9 @@ func TestGraphScenarios(t *testing.T) {
 
 			// Page 1 spent this much of the cumulative budget.
 			const spentVisited, spentEdges = 7, 11
-			token, err := e.nextTraversalCursor(&budget{visited: spentVisited, edges: spentEdges},
-				continuation{Endpoint: endpoint, QueryHash: queryHash, LeaseID: lease,
+			token, err := e.nextTraversalCursor(context.Background(),
+				&budget{visited: spentVisited, edges: spentEdges},
+				continuation{Endpoint: endpoint, QueryHash: queryHash,
 					Depth: 1, LastOwner: fixtureNodeID("n-a"), LastKey: "rel-0003"})
 			if err != nil || token == "" {
 				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
@@ -733,14 +771,16 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("open signer: %v", err)
 				}
-				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, fixtureLeases{})
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
 				if err != nil {
 					t.Fatalf("new spools: %v", err)
 				}
 				limits := fixtureLimits()
 				limits.MaxDepth = 2
 				limits.MaxPageItems = 400
-				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools, Limits: limits})
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 				if err != nil {
 					t.Fatalf("new engine: %v", err)
 				}
@@ -819,13 +859,16 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("open signer: %v", err)
 				}
-				spools, err := pagination.NewSpools(t.TempDir(), 8<<20, fixtureLeases{})
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 8<<20, store)
 				if err != nil {
 					t.Fatalf("new spools: %v", err)
 				}
 				limits := fixtureLimits()
+				leases := pagination.NewLeases(store, limits.CursorTTL)
 				newEngine := func(a Adjacency) *Engine {
-					e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools, Limits: limits})
+					e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+						Leases: leases, Limits: limits})
 					if err != nil {
 						t.Fatalf("new engine: %v", err)
 					}
@@ -903,6 +946,73 @@ func TestGraphScenarios(t *testing.T) {
 						t.Fatalf("entry %d of the paged answer is %s, want %s: the ranked order did not survive paging",
 							i, order[i], want.NodeID)
 					}
+				}
+			},
+		},
+
+		{
+			// The defect this protects is a continuation nobody can use. A
+			// token that names the PINNED READER's query lease is dead on
+			// arrival: that lease is released when the request returns, so the
+			// NEXT invocation presents a cursor whose spool the lease store
+			// refuses -- every `callers --cursor` and `impact --cursor` fails
+			// with "lease has expired or was released" while the page it names
+			// sits on disk. A cursor must own a lease of its own, minted for
+			// the same generation and outliving the reader that answered.
+			name: "a continuation survives the release of the reader's query lease",
+			run: func(t *testing.T, f *graphFixture) {
+				ctx := context.Background()
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 120
+				leases := pagination.NewLeases(store, limits.CursorTTL)
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: leases, Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+
+				// The query lease PinGeneration takes for ONE request. It is
+				// live while page 1 is answered and gone before page 2 is
+				// asked for, exactly as reader.Close() leaves it.
+				b := f.Binding()
+				readerLease, err := leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseQuery)
+				if err != nil {
+					t.Fatalf("reader query lease: %v", err)
+				}
+
+				req := model.GraphRequest{GenerationID: 1,
+					Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+					Page: model.PageRequest{Limit: 120}}
+				page1, err := e.Neighbors(ctx, req)
+				if err != nil {
+					t.Fatalf("page 1: %v", err)
+				}
+				if page1.Meta.NextCursor == "" {
+					t.Fatalf("page 1 offered no continuation; the case needs a page boundary")
+				}
+				if err := store.ReleaseLease(ctx, readerLease.ID); err != nil {
+					t.Fatalf("release the reader's query lease: %v", err)
+				}
+
+				req.GenerationID = 0
+				req.Page = model.PageRequest{Limit: 120, Cursor: page1.Meta.NextCursor}
+				page2, err := e.Neighbors(ctx, req)
+				if err != nil {
+					t.Fatalf("page 2 after the reader's query lease was released: %v", err)
+				}
+				if len(page2.Relations) == 0 {
+					t.Fatalf("page 2 served no edges; the continuation resumed nothing")
 				}
 			},
 		},
