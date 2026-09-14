@@ -314,7 +314,8 @@ func newContextStatusCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addContextFlags(cmd)
-	addPageFlags(cmd)
+	addLimitFlag(cmd)
+	addCursorFlag(cmd)
 	return cmd
 }
 
