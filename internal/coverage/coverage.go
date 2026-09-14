@@ -72,13 +72,7 @@ type Sessions interface {
 	// CoverageSummary is the one storage addition of this task (L6): the counts
 	// Status needs in a single round trip instead of paging Coverage. Task 17
 	// consumes the same method and must not define a second one.
-	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
-	// FilePath is one pinned file's path, read by (snapshot, file id) on the
-	// snapshot_files primary key. Next needs exactly this: the coverage and
-	// manifest records carry file identifiers and no path, and naming a file the
-	// operator cannot locate is not an answer. The whole pinned row is not asked
-	// for, so nothing here can come to depend on the rest of it.
-	FilePath(ctx context.Context, snapshot model.SnapshotID, file model.FileID) (string, error)
+	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	// AcknowledgeFile refuses unless the file is already full_served; it never
 	// creates coverage.
 	AcknowledgeFile(ctx context.Context, session model.SessionID, actor string, file model.FileID) error
@@ -86,6 +80,20 @@ type Sessions interface {
 	// StateClosed, ExpectedVersion: n}. There is no CloseSession and no edge out
 	// of complete, so closing a completed session is CTX_VERSION_CONFLICT.
 	AdvanceSession(ctx context.Context, req model.AdvanceRequest) (model.WorkflowStatus, error)
+
+	// RangeConfirmed answers containment over served_ranges in SQL and returns a
+	// bounded boolean, never an interval list: Next resumes at the first byte
+	// this actor has not confirmed rather than merging intervals in Go.
+	RangeConfirmed(ctx context.Context, session model.SessionID, actor string, file model.FileID,
+		hash string, r model.ByteRange) (bool, error)
+	// SessionFilePaths resolves a bounded batch of pinned file ids to their
+	// paths, scoped by the session's own files. Next needs exactly this: the
+	// coverage and manifest records carry file identifiers and no path, and
+	// naming a file the operator cannot locate is not an answer. The whole
+	// pinned row is not asked for, so nothing here can come to depend on the
+	// rest of it, and no batch can name a file outside the actor's scope.
+	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+		ids []model.FileID) (map[model.FileID]string, error)
 }
 
 // Source is the per-snapshot verified read surface. *snapshot.View satisfies
@@ -307,7 +315,14 @@ func typedErrf(code, format string, args ...any) *model.Error {
 //	// reproducing both branches of the fileCoverage state switch (union ==
 //	// size, and the separate zero-length confirmed-EOF branch). Task 15 must
 //	// not define it; Task 17 consumes it and must not define a second one.
-//	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+//	func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
+//
+//	// internal/storage/sqlite/state.go -- Task 17's two appended reads, L6's.
+//	// APPEND ONLY; no existing method was edited.
+//	func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
+//	        file model.FileID, hash string, r model.ByteRange) (bool, error)
+//	func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+//	        ids []model.FileID) (map[model.FileID]string, error)
 //
 //	// internal/cli/context.go -- the Section 18.1 spellings context
 //	// read/acknowledge/status/next/close, registered by one loop line in
