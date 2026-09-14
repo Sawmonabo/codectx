@@ -1,8 +1,8 @@
 package cli
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"strings"
 	"text/tabwriter"
 
@@ -45,7 +45,7 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			page, generation, timeout, err := queryFlagValues(cmd)
+			page, generation, err := queryFlagValues(cmd)
 			if err != nil {
 				return err
 			}
@@ -83,39 +83,23 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			repo, err := repoFlagValue(cmd)
-			if err != nil {
-				return err
-			}
-			ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo)
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
-			ctx, cancel := queryContext(cmd.Context(), timeout)
-			defer cancel()
-			// Ruling Q13 keeps the canonical query commands on the path they
-			// already have -- Task 18 re-points them at the facade -- so the
-			// default route is byte-for-byte the one Task 13 built. Only the
-			// overlay route goes through Services(), which is the consumer
-			// ruling Q14 says drives Symbol for the LSP source.
-			//
-			// Typed for the reason `search` gives: a query deadline must not
-			// reach the operator as an invalid command line.
+			// One call path for both semantic sources: the facade switches on
+			// the request's SemanticSource, so the canonical route and the
+			// overlay route are one command reaching one operation. runService
+			// owns the open, the close, the --timeout deadline and the typing
+			// of a bare context failure.
 			var result model.Page[model.Node]
-			if source == model.SemanticLSP {
-				result, err = ws.Services().Symbol(ctx, req)
-			} else {
-				result, err = ws.Search().Resolve(ctx, req)
+			if err := runService(cmd, openForReport(),
+				func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
+					var err error
+					result, err = svc.Symbol(ctx, req)
+					return err
+				}); err != nil {
+				return err
 			}
-			if err != nil {
-				return queryFailure(err)
-			}
-			out := cmd.OutOrStdout()
-			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), result))
-			}
-			return writeSymbolTable(out, result)
+			return emitQuery(cmd, build, args, result, result.Meta, func(b *strings.Builder) {
+				writeSymbolTable(b, result.Items)
+			})
 		},
 	}
 	addQueryFlags(cmd, true)
@@ -245,26 +229,23 @@ func symbolOperationValue(cmd *cobra.Command) (model.SymbolOperation, error) {
 	return op, nil
 }
 
-// writeSymbolTable renders the human page. The candidate columns are the ones
-// that separate an ambiguous name's candidates from one another -- which node,
-// in which file, at which line -- and the page metadata follows for the reason
-// writeSearchTable gives.
-func writeSymbolTable(w io.Writer, page model.Page[model.Node]) error {
-	var b strings.Builder
-	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+// writeSymbolTable renders the candidates a page admitted, in the order the
+// service returned them -- an ambiguous name's candidates are ranked by the
+// resolver, and a renderer that re-ordered them would disagree with the --json
+// consumer about which candidate came first. Every candidate on the page is
+// printed; the binding, the continuation token and the capability notes are
+// rendered around this block by emitQuery.
+func writeSymbolTable(b *strings.Builder, nodes []model.Node) {
+	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "NODE\tKIND\tLANGUAGE\tFILE\tLINE\tNAME\tQUALIFIED NAME")
-	for _, node := range page.Items {
+	for _, node := range nodes {
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			shortID(string(node.ID)), tableCell(string(node.Kind)), tableCell(node.Language),
 			shortID(string(node.FileID)), rangeLine(node.Range),
 			tableCell(node.Name), tableCell(node.QualifiedName))
 	}
-	if err := flushTable(tw); err != nil {
-		return err
-	}
-	fmt.Fprintf(&b, "\n%d %s\n", len(page.Items), plural(len(page.Items), "candidate", "candidates"))
-	writeQueryMeta(&b, page.Meta)
-	return writeText(w, "%s", b.String())
+	flushTableInto(tw)
+	fmt.Fprintf(b, "\n%d %s\n", len(nodes), plural(len(nodes), "candidate", "candidates"))
 }
 
 // shortID renders a canonical identifier's prefix. An absent identifier -- an
