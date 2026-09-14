@@ -214,31 +214,26 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 	return nil
 }
 
-// maxChangedFileScanPages bounds the Section 15.2 step 6 scan. PinnedReader
-// publishes no status-filtered file read, so the only way to find captured
-// changes is to walk the snapshot's file rows — an O(repository) read on a
-// compile whose working tree holds few changes. This ceiling makes it a
-// bounded one: the walk stops after this many pages and the scope is reported
-// incomplete, which is exactly what a truncated discovery step means. A
-// status-filtered read in internal/storage/sqlite would remove the ceiling;
-// that reader is owned elsewhere and is not added here.
-const maxChangedFileScanPages = 16
-
 // changedFileSeeds is Section 15.2 step 6: the captured working-tree changes,
 // admitted last and at the lowest priority, so an active edit informs the plan
-// without displacing an identity the task named. It pages the pinned manifest
-// by keyset, which is the one file listing source of truth, and stops at
-// maxChangedFileScanPages rather than walking an arbitrarily large snapshot.
+// without displacing an identity the task named.
+//
+// It reads changed rows only, through PinnedReader.ChangedFiles, rather than
+// paging every file row of the snapshot and discarding the unchanged ones. That
+// is what bounds it: a page holds only admissible rows, so the loop stops after
+// at most model.MaxSeeds/pageLimit + 1 reads whatever the workspace's file
+// count is. The page ceiling this used to carry bounded the scan by declaring a
+// 250,000-file workspace's scope unresolvable, which a supported workspace must
+// never be.
 func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedReader, seen map[string]bool, out *seedSet) error {
 	var after model.FileID
-	for pages := 0; len(out.Candidates) < model.MaxSeeds; pages++ {
-		if pages == maxChangedFileScanPages {
-			// Files past the ceiling may hold changes this plan never saw, so
-			// the plan is a partial view of the working tree and says so.
-			out.Unresolved = true
-			return nil
-		}
-		files, err := reader.Files(ctx, after, c.pageLimit())
+	// Compiler.pageLimit only ever yields a value in (0, model.MaxPageItems],
+	// which is exactly the window sqlite.pageLimit passes through unchanged, so
+	// a page shorter than this limit is genuinely the last page and not a
+	// clamped read that still has rows behind it.
+	limit := c.pageLimit()
+	for len(out.Candidates) < model.MaxSeeds {
+		files, err := reader.ChangedFiles(ctx, after, changedStatuses, limit)
 		if err != nil {
 			return contextErr(ctx, err)
 		}
@@ -247,10 +242,11 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 		}
 		for _, fv := range files {
 			after = fv.ID
-			if !changedStatus(fv.Status) {
-				continue
-			}
 			if len(out.Candidates) >= model.MaxSeeds {
+				// Changed files remain that this plan never saw, exactly like a
+				// discovery step stopped at any other of its own bounds, so the
+				// scope is reported incomplete rather than silently partial.
+				out.Unresolved = true
 				return nil
 			}
 			add(out, seen, candidate{
@@ -263,7 +259,16 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 				Reasons:     []string{boundReason(fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status))},
 			})
 		}
+		if len(files) < limit {
+			// A short page is the end of the keyset walk; asking for the page
+			// after it would cost one more read that can only come back empty.
+			return nil
+		}
 	}
+	// The loop condition failed on entry or after a full page: seeds filled up
+	// before every captured change was admitted, and the unseen ones make this
+	// a partial view of the working tree.
+	out.Unresolved = true
 	return nil
 }
 
@@ -496,12 +501,11 @@ func normalizeSeedPath(tok string) string {
 	return p
 }
 
-// changedStatus reports whether a captured file is an active working-tree
-// change, which is the Section 15.2 step 6 admission test and the Section 15.3
-// active-change boost input.
-func changedStatus(s model.FileStatus) bool {
-	return s == model.FileModified || s == model.FileAdded || s == model.FileUntracked
-}
+// changedStatuses is the ONE definition of "an active working-tree change": the
+// Section 15.2 step 6 admission set. It is passed to PinnedReader.ChangedFiles
+// rather than re-spelled as a SQL predicate there, so the status set cannot
+// drift between the reader and the step that consumes it.
+var changedStatuses = []model.FileStatus{model.FileModified, model.FileAdded, model.FileUntracked}
 
 // boundReason clips one reason to model.MaxReasonBytes, which every stored
 // entry and exclusion is validated against.

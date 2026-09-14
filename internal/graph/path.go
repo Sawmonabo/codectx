@@ -62,14 +62,15 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	res = model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
 	// The same disclosure the traversal entries make, from the same place: a
 	// second implementation here would be a second shape for one contract --
-	// pendingDependence returns the deferred rows alone, copied unchanged in
-	// State and DiagnosticCode, with a promotion's queue position folded in.
-	completeness, err := e.pendingDependence(ctx, kinds)
+	// completeness returns the generation's capability rows with the deferred
+	// dependence ones enriched in place, and the bound flag, never the row
+	// count, is what truncates the answer.
+	caps, deferred, err := e.completeness(ctx, kinds)
 	if err != nil {
 		return model.PathResult{}, err
 	}
-	res.Meta.Completeness = completeness
-	if len(completeness) > 0 {
+	res.Meta.Completeness = caps
+	if deferred {
 		pathTruncate(&res.Meta, pathReasonDeferred)
 	}
 
