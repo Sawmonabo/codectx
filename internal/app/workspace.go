@@ -32,8 +32,9 @@ func OpenWorkspace(ctx context.Context, repo string, wait time.Duration, rebuild
 }
 
 // OpenWorkspaceForReport composes the workspace for a read-only report. It
-// takes no workspace lock, writes nothing and installs nothing, so a report
-// answers while another process indexes or watches.
+// takes no workspace lock, mutates no generation and installs nothing -- it
+// creates only the cache's own directories -- so a report answers while
+// another process indexes or watches.
 func OpenWorkspaceForReport(ctx context.Context, repo string) (*Workspace, error) {
 	return open(ctx, repo, openOptions{mode: modeReport})
 }
