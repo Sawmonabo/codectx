@@ -1,9 +1,11 @@
-# Graph queries — `refs`, `callers`, `callees`, `path`, `impact`
+# Graph queries — `refs`, `callers`, `callees`, `path`, `impact`, and the `repo-map`
 
-These five commands answer bounded structural questions about one pinned
-generation. They read; none of them takes the workspace lock, so they answer
-while another process is indexing or watching. Every one of them produces an
-answer that either is exhaustive or says, in the same breath, that it is not.
+The five graph commands answer bounded structural questions about one pinned
+generation; `repo-map`, documented at the end, reads the same pinned generation
+through the same paging machinery. They read; none of them takes the workspace
+lock, so they answer while another process is indexing or watching. Every one of
+them produces an answer that either is exhaustive or says, in the same breath,
+that it is not.
 
 Each command accepts `--json`, which emits exactly one envelope on stdout and
 nothing else. The human rendering carries the same binding, the same capability
@@ -133,3 +135,34 @@ compile. A deadline or a cancellation returns an explicit incomplete answer
 (`CTX_QUERY_DEADLINE` / `CTX_CANCELED`) and persists no manifest.
 
 See [Configuration](configuration.md) for the full tables.
+
+## The repository map — `repo-map`
+
+`codectx repo-map [path]` is not a graph walk, but it reads the same pinned
+generation through the same paging machinery, so it is documented here rather
+than twice.
+
+```sh
+codectx repo-map .            --depth 2
+codectx repo-map --repo . --limit 100 --json
+```
+
+It reports the **containers** of the pinned generation — repository, modules,
+packages and directories — with the file, symbol and byte totals aggregated
+under each one. Nothing is materialized whole: the answer is a bounded page of
+container metadata, and a repository larger than one page is continued through
+the token the answer prints rather than truncated.
+
+`--depth` bounds how far down the container tree the map goes, counted from the
+repository root; zero leaves the configured bound in charge, as it does on every
+flag in the table above. `--repo`, `--generation`, `--limit`, `--cursor`,
+`--timeout` and `--json` mean exactly what they mean for the five commands
+above.
+
+The repository is named either as a positional path — the Section 18.1 spelling
+— or with `--repo`. Naming it both ways is **refused** rather than resolved to
+one of them: either precedence silently ignores something the operator typed.
+
+A workspace that cannot be opened fails the command. It is not answered with an
+empty page, because an empty map and an unopenable workspace are different
+facts and rendering one as the other is the single thing a map must never say.
