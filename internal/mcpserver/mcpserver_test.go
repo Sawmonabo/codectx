@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -357,14 +358,22 @@ var toolEnums = map[string]map[string][]string{
 		"view": {"accepted_facts", "rejected_facts", "contradictions", "unresolved",
 			"coverage", "waivers", "export"},
 	},
+	// A NESTED enum: model.Phase occurs only inside PlanRequest.Context, one
+	// level down. It is the sole coverage of the recursion, which every enum
+	// type would silently lose if the preset only reached top-level fields.
+	"codectx_context_plan": {
+		"context.phase": {"sweep", "verify", "consolidate"},
+	},
 }
 
-// schemaShape is the decoded form of a listed tool's input schema.
+// schemaShape is the decoded form of a listed tool's input schema. It is
+// recursive because the enum table must reach nested objects too: model.Phase
+// occurs ONLY at depth 1 (PlanRequest.Context.Phase), which is a different path
+// through jsonschema-go's reflection than a top-level field.
 type schemaShape struct {
-	Required   []string `json:"required"`
-	Properties map[string]struct {
-		Enum []string `json:"enum"`
-	} `json:"properties"`
+	Required   []string                `json:"required"`
+	Properties map[string]*schemaShape `json:"properties"`
+	Enum       []string                `json:"enum"`
 }
 
 func TestToolSchemaSnapshot(t *testing.T) {
@@ -408,13 +417,26 @@ func TestToolSchemaSnapshot(t *testing.T) {
 		}
 	}
 	for name, fields := range toolEnums {
-		for field, want := range fields {
-			got := seen[name].Properties[field].Enum
+		for path, want := range fields {
+			got := enumAt(seen[name], path)
 			if !equalStrings(got, want) {
-				t.Errorf("tool %q field %q enum = %v, want %v", name, field, got, want)
+				t.Errorf("tool %q field %q enum = %v, want %v", name, path, got, want)
 			}
 		}
 	}
+}
+
+// enumAt walks a dotted property path and returns the enum it finds, or nil.
+func enumAt(shape schemaShape, path string) []string {
+	cur := &shape
+	for _, field := range strings.Split(path, ".") {
+		next := cur.Properties[field]
+		if next == nil {
+			return nil
+		}
+		cur = next
+	}
+	return cur.Enum
 }
 
 func equalStrings(got, want []string) bool {
