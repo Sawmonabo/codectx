@@ -38,8 +38,102 @@ func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
 		// L1 rows
+		// Failure mode: a service that picked its own version from a
+		// pre-read record, retried the store's compare-and-swap or
+		// swallowed its conflict would let two clients both believe they
+		// closed the same session -- and the loser would carry a stale
+		// ExpectedVersion it thinks is current. Closing is the transition
+		// with no service guard, so this exercises the version path alone.
+		{name: "two clients closing at the same expected version: exactly one wins", run: func(t *testing.T, h *harness) {
+			expected := h.session(fixtureSession).StateVersion
+			req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+
+			type attempt struct {
+				status model.WorkflowStatus
+				err    error
+			}
+			attempts := make([]attempt, 2)
+			var wg sync.WaitGroup
+			wg.Add(len(attempts))
+			for i := range attempts {
+				go func(i int) {
+					defer wg.Done()
+					status, err := h.svc.Close(context.Background(), req, expected)
+					attempts[i] = attempt{status: status, err: err}
+				}(i)
+			}
+			wg.Wait()
+
+			var won, lost int
+			for _, a := range attempts {
+				switch {
+				case a.err == nil:
+					won++
+					if a.status.State != model.StateClosed {
+						t.Errorf("the winning close reports state %q, want %q", a.status.State, model.StateClosed)
+					}
+					if a.status.StateVersion != expected+1 {
+						t.Errorf("the winning close reports state version %d, want %d", a.status.StateVersion, expected+1)
+					}
+				case code(a.err) == model.CodeVersionConflict:
+					lost++
+				default:
+					t.Errorf("the losing close failed with %q: %v", code(a.err), a.err)
+				}
+			}
+			if won != 1 || lost != 1 {
+				t.Fatalf("%d closes won and %d hit a version conflict; want exactly one of each", won, lost)
+			}
+			if got := h.session(fixtureSession).State; got != model.StateClosed {
+				t.Errorf("the session is in state %q after both closes, want %q", got, model.StateClosed)
+			}
+		}},
 		// L2 rows
 		// L3 rows
+		//
+		// A scope review is the one observation that can claim a file was read,
+		// so both rows below are about the same silent failure: a review that is
+		// believed rather than checked against served_ranges would let an actor
+		// attest its way to a satisfied strict gate without reading anything.
+		{"Record/a citation over an unconfirmed interval is refused", func(t *testing.T, h *harness) {
+			partial := h.file(fixtureSession, filePartial)
+			// [30,70) spans the deliberate gap at [40,60): it overlaps two
+			// confirmed intervals and is contained by neither.
+			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCallersConsumers,
+				[]model.ClaimReference{{Source: &model.SourceCitation{
+					FileID: filePartial, ContentHash: partial.hash,
+					Bytes: model.ByteRange{Start: 30, End: 70},
+				}}})
+			_, _, err := h.svc.Record(context.Background(), model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+				Kind: model.ObservationScopeReview, Review: review,
+				Note: "reviewed the callers of the partly served file",
+			})
+			if got := code(err); got != model.CodeCoverageIncomplete {
+				t.Fatalf("Record over an unconfirmed citation: code %q (err %v), want %q",
+					got, err, model.CodeCoverageIncomplete)
+			}
+		}},
+		{"Record/a review claiming a file read without full coverage is refused", func(t *testing.T, h *harness) {
+			partial := h.file(fixtureSession, filePartial)
+			// [0,40) IS confirmed, so the citation guard passes and the refusal
+			// can only come from the file's coverage state: a served interval is
+			// not a read file.
+			review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
+				[]model.ClaimReference{{Source: &model.SourceCitation{
+					FileID: filePartial, ContentHash: partial.hash,
+					Bytes: model.ByteRange{Start: 0, End: 40},
+				}}})
+			_, _, err := h.svc.Record(context.Background(), model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+				Kind: model.ObservationScopeReview, Review: review,
+				Note: "attested every file read",
+			})
+			if got := code(err); got != model.CodeCoverageIncomplete {
+				t.Fatalf("Record over a partly served attested file: code %q (err %v), want %q",
+					got, err, model.CodeCoverageIncomplete)
+			}
+		}},
 		// L4 rows
 		// L5 rows
 		// L6 rows
@@ -712,4 +806,29 @@ func (s *fakeStore) Current(_ context.Context, file model.FileID, hash string) (
 		return false, s.validateErr
 	}
 	return s.current[file] == hash, nil
+}
+
+// --- L3 helpers -------------------------------------------------------------
+
+// l3ScopeReview builds an attestation that answers all eight required
+// categories, so a row exercises the guard it names rather than
+// ScopeReview.Validate's completeness check. Only the target category carries
+// references; every other category is answered with an explicit note, which is
+// what the model requires of a category with no references.
+func l3ScopeReview(manifestHash string, scopeVersion int, target model.ScopeReviewCategory,
+	refs []model.ClaimReference) *model.ScopeReview {
+	categories := []model.ScopeReviewCategory{
+		model.ReviewCompleteFilesRead, model.ReviewCallersConsumers, model.ReviewContractsTypes,
+		model.ReviewStateLifecycle, model.ReviewDependencies, model.ReviewIntegrationPoints,
+		model.ReviewSharedUtilities, model.ReviewRemainingUncertainty,
+	}
+	review := &model.ScopeReview{ManifestHash: manifestHash, ScopeVersion: scopeVersion}
+	for _, c := range categories {
+		entry := model.ScopeReviewEntry{Category: c, Note: "answered for " + string(c)}
+		if c == target {
+			entry.References = refs
+		}
+		review.Entries = append(review.Entries, entry)
+	}
+	return review
 }

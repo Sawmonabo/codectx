@@ -609,6 +609,43 @@ func TestStorePublicationScenario(t *testing.T) {
 	if required, served, waived := summary("partial prefix"); required != 2 || served != 1 || waived != 0 {
 		t.Fatalf("summary with only [0,8) of b.go confirmed = %d required %d served %d waived, want 2/1/0; a partial union is not full coverage", required, served, waived)
 	}
+	// Phase: containment over the served ranges (Section 17.2). A scope review
+	// may cite source intervals, and a citation over bytes the actor never
+	// confirmed would let a note mark a file read without coverage, so the test
+	// must be containment and not overlap. The sharp case is the interval that
+	// spans a gap between two confirmed ranges: it touches both and is covered
+	// by neither. Confirming [12,16) beside the prefix [0,8) makes that gap.
+	confirmed := func(start, end uint64) bool {
+		t.Helper()
+		ok, err := f.s.RangeConfirmed(ctx, open.ID, actorID, b2.id, b2.hash, model.ByteRange{Start: start, End: end})
+		if err != nil {
+			t.Fatalf("RangeConfirmed([%d,%d)): %v", start, end, err)
+		}
+		return ok
+	}
+	island := fresh
+	island.ID = model.H("chunk", "island")
+	island.Bytes = model.ByteRange{Start: 12, End: 16}
+	if err := f.s.IssueChunk(ctx, island); err != nil {
+		t.Fatalf("IssueChunk(island): %v", err)
+	}
+	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{island.ID}); err != nil {
+		t.Fatalf("ConfirmChunks(island): %v", err)
+	}
+	if !confirmed(0, 8) || !confirmed(4, 8) || !confirmed(12, 16) {
+		t.Fatal("RangeConfirmed denied an interval inside a confirmed range; containment must hold for a sub-interval too")
+	}
+	if confirmed(0, 16) {
+		t.Fatal("RangeConfirmed confirmed [0,16) while [8,12) was never served; the test is containment, not overlap")
+	}
+	if confirmed(0, 36) {
+		t.Fatal("RangeConfirmed confirmed an interval running past the confirmed ranges")
+	}
+	// A file outside the pinned scope is not confirmed and is not an error: a
+	// citation over it is a claim to refuse, not a storage failure.
+	if ok, err := f.s.RangeConfirmed(ctx, open.ID, actorID, a.id, a.hash, model.ByteRange{Start: 0, End: 1}); err != nil || ok {
+		t.Fatalf("RangeConfirmed(file outside the session scope) = %v %v, want false and no error", ok, err)
+	}
 	rest := fresh
 	rest.ID = model.H("chunk", "3")
 	rest.Bytes = model.ByteRange{Start: 8, End: uint64(len(b2.content))}
@@ -638,6 +675,27 @@ func TestStorePublicationScenario(t *testing.T) {
 	if _, served, _ := summary("agreement"); paged != served {
 		t.Fatalf("CoverageSummary says %d required files are fully served; paging Coverage says %d", served, paged)
 	}
+	// Once the union closes the gap the same interval is confirmed: the answer
+	// tracks the stored ranges rather than the order they arrived in.
+	if !confirmed(0, 16) {
+		t.Fatal("RangeConfirmed still denied [0,16) after the remainder closed the gap")
+	}
+	// Phase: naming the files of a session. The batch reader is scoped by
+	// session_files, not by the snapshot: a.go is in the same pinned snapshot
+	// but not in this session's scope, and a reader that named it would let a
+	// batch enumerate paths outside the actor's scope.
+	paths, err := f.s.SessionFilePaths(ctx, open.ID, actorID, []model.FileID{b2.id, empty.id, a.id})
+	if err != nil {
+		t.Fatalf("SessionFilePaths: %v", err)
+	}
+	if paths[b2.id] != b2.path || paths[empty.id] != empty.path {
+		t.Fatalf("SessionFilePaths named %q and %q for the session's own files; want %q and %q",
+			paths[b2.id], paths[empty.id], b2.path, empty.path)
+	}
+	if _, named := paths[a.id]; named || len(paths) != 2 {
+		t.Fatalf("SessionFilePaths returned %d paths including a file outside the session's scope: %v", len(paths), paths)
+	}
+
 	// A waiver is audited beside coverage, never as coverage: it raises the
 	// waived count and leaves the served count alone (Section 17.3).
 	if _, err := f.s.Waive(ctx, model.WaiverRequest{SessionID: open.ID, ActorID: actorID, FileID: empty.id, Reason: "generated file reviewed out of band"}); err != nil {
