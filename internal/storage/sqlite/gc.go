@@ -209,3 +209,158 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 	}
 	return nil
 }
+
+// --- Section 10.4 blob grace protocol ---------------------------------------
+//
+// A retained CAS object is never deleted the moment it stops being referenced.
+// It is demoted to 'quarantined' and stamped with the time of the demotion,
+// rechecked and demoted to 'trash', and deleted only once the grace window has
+// passed AND a further reachability check made inside the deleting transaction
+// still finds nothing referencing it. Every phase restores a blob that became
+// referenced again rather than advancing it, so a capture or a session that
+// reappears between two phases wins over the collector.
+//
+// The caller (internal/retention) holds the workspace lock and this process's
+// indexing mutex, so no capture is publishing while these run.
+
+// blobUnreferenced is the one reachability predicate, shared by all three
+// phases so they cannot drift apart. Exactly two tables reference blobs(hash)
+// as data: snapshot_files (a manifest row naming the content) and unit_inputs
+// (what a unit was built from). The other two references, blob_blocks and
+// line_checkpoints, are the blob's own rows and cascade with it. Sessions are
+// deliberately absent and are still covered: session_files carries a foreign
+// key onto snapshot_files(snapshot_id, file_id, content_hash), so a blob an
+// open session holds necessarily still has a snapshot_files row naming it.
+const blobUnreferenced = `NOT EXISTS (SELECT 1 FROM snapshot_files sf WHERE sf.content_hash = blobs.hash)
+	AND NOT EXISTS (SELECT 1 FROM unit_inputs ui WHERE ui.content_hash = blobs.hash)`
+
+// restoreBlob is the one statement that returns a demoted blob to 'ready'.
+// Clearing trashed_at is not optional: the schema's CHECK forbids a 'ready'
+// row carrying a grace timestamp, and a stale one would measure the next
+// grace window from the wrong instant. Both restore paths use it -- PutBlob
+// when capture republishes the object, and the two collector phases below when
+// a reference reappears -- so neither can forget. The caller appends the WHERE
+// clause; the first bound parameter is the ready state.
+const restoreBlob = `UPDATE blobs SET state = ?, trashed_at = NULL `
+
+// blobBatch bounds one phase to a finite number of rows (Section 6). A pass
+// that cannot finish drains over the next scheduled collection.
+func blobBatch(limit int) int {
+	if limit < 1 || limit > gcBatchUnits {
+		return gcBatchUnits
+	}
+	return limit
+}
+
+// QuarantineBlobs demotes up to limit retained blobs that nothing references
+// any more, stamping each with now, and reports how many it demoted. Nothing
+// is deleted here: quarantine only starts the clock.
+func (s *Store) QuarantineBlobs(ctx context.Context, now time.Time, limit int) (int64, error) {
+	var demoted int64
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE blobs SET state = ?, trashed_at = ?
+			WHERE hash IN (SELECT hash FROM blobs WHERE state = ? AND `+blobUnreferenced+` LIMIT ?)`,
+			string(model.BlobQuarantined), formatTime(now), string(model.BlobReady), blobBatch(limit))
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		demoted, err = res.RowsAffected()
+		return wrap("blobs", err)
+	})
+	return demoted, err
+}
+
+// TrashBlobs is the second phase: a quarantined blob that is referenced again
+// is restored to 'ready', and one that is still unreferenced moves to 'trash'.
+// It takes no clock, because trashed_at marks the demotion out of 'ready' and
+// must not be rewritten here: restamping it would restart the grace window on
+// every pass and nothing would ever be collected.
+func (s *Store) TrashBlobs(ctx context.Context, limit int) (trashed, restored int64, err error) {
+	batch := blobBatch(limit)
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, restoreBlob+`WHERE hash IN (SELECT hash FROM blobs
+			WHERE state = ? AND NOT (`+blobUnreferenced+`) LIMIT ?)`,
+			string(model.BlobReady), string(model.BlobQuarantined), batch)
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		if restored, err = res.RowsAffected(); err != nil {
+			return wrap("blobs", err)
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE blobs SET state = ?
+			WHERE hash IN (SELECT hash FROM blobs WHERE state = ? AND `+blobUnreferenced+` LIMIT ?)`,
+			string(model.BlobTrash), string(model.BlobQuarantined), batch)
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		trashed, err = res.RowsAffected()
+		return wrap("blobs", err)
+	})
+	return trashed, restored, err
+}
+
+// CollectBlobs is the final phase: a trashed blob referenced again is restored,
+// and one trashed at or before deadline that the recheck in this same
+// transaction still finds unreferenced has its row deleted. The hashes of the
+// deleted rows are returned so the caller removes their CAS objects -- the
+// database row goes first, because a published object with no row is an orphan
+// the next capture simply republishes over, while a row with no object reads
+// as present and fails only on the first ReadRange.
+func (s *Store) CollectBlobs(ctx context.Context, deadline time.Time, limit int) (deleted []string, restored int64, err error) {
+	batch := blobBatch(limit)
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, restoreBlob+`WHERE hash IN (SELECT hash FROM blobs
+			WHERE state = ? AND NOT (`+blobUnreferenced+`) LIMIT ?)`,
+			string(model.BlobReady), string(model.BlobTrash), batch)
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		if restored, err = res.RowsAffected(); err != nil {
+			return wrap("blobs", err)
+		}
+		// The selection repeats the reachability predicate rather than trusting
+		// the restore above to have emptied the referenced set: the restore is
+		// bounded to one batch, so with more referenced trash rows than the
+		// batch allows, some are still 'trash' here and this predicate is the
+		// one that keeps them. It is also the check that runs in the same
+		// transaction as the delete, which is what makes the deletion safe
+		// rather than merely well-ordered.
+		rows, err := tx.QueryContext(ctx, `SELECT hash FROM blobs WHERE state = ?
+			AND trashed_at IS NOT NULL AND trashed_at <= ? AND `+blobUnreferenced+` LIMIT ?`,
+			string(model.BlobTrash), formatTime(deadline), batch)
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		hashes := make([][]byte, 0, batch)
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				rows.Close()
+				return wrap("blobs", err)
+			}
+			hashes = append(hashes, raw)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return wrap("blobs", err)
+		}
+		for _, raw := range hashes {
+			// Deleting the blobs row is what removes blob_blocks and
+			// line_checkpoints, through their ON DELETE CASCADE. They are
+			// never deleted on their own, and no phase above touches them:
+			// PutBlob's restore path flips a demoted row back to 'ready' and
+			// keeps its existing blocks and checkpoints, so blocks dropped
+			// ahead of the row would leave a blob that reads as present and
+			// fails on the first ReadRange.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM blobs WHERE hash = ?`, raw); err != nil {
+				return wrap("blobs", err)
+			}
+			deleted = append(deleted, idHex(raw))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return deleted, restored, nil
+}

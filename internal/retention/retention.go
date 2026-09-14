@@ -76,6 +76,12 @@ type Options struct {
 	Spools   SpoolSweeper
 	Snapshot SnapshotSweeper
 	Tools    ToolCollector
+	// Blobs and Objects are the two halves of the Section 10.4 grace protocol:
+	// the store phases that demote, restore and delete a blob row, and the CAS
+	// that holds the published object the last phase removes. Both are declared
+	// in grace.go beside the implementation that drives them.
+	Blobs   BlobStore
+	Objects ObjectStore
 	// Now is the clock. A test supplies a fixed one so the grace window and
 	// every expiry boundary are deterministic.
 	Now func() time.Time
@@ -126,6 +132,10 @@ func New(opts Options) (*Collector, error) {
 		return nil, missingDependency("snapshot sweeper")
 	case opts.Tools == nil:
 		return nil, missingDependency("tool collector")
+	case opts.Blobs == nil:
+		return nil, missingDependency("blob store")
+	case opts.Objects == nil:
+		return nil, missingDependency("object store")
 	case opts.Config.DataDir == "":
 		return nil, missingDependency("data directory")
 	}

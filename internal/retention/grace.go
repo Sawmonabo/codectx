@@ -1,21 +1,112 @@
 package retention
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
+)
 
-// grace is the Section 10.4 blob protocol, owned by L3a: an unreferenced blob
-// is quarantined, then trashed under a recheck of leases and reachability, and
-// deleted -- row, blocks, line checkpoints and the CAS object on disk -- only
-// after the grace window and a second reachability check. A blob that becomes
-// referenced again before the final deletion is restored, not deleted.
+// The Section 10.4 blob grace protocol, the one thing this package owns rather
+// than schedules. An unreferenced blob is quarantined, then trashed under a
+// recheck of reachability, and deleted -- row, blocks, line checkpoints and
+// the CAS object on disk -- only after the grace window and a further
+// reachability check made inside the deleting transaction. A blob that becomes
+// referenced again at any point is restored, not deleted.
 //
-// Binding invariant from storage/sqlite/source.go:57-64: blob_blocks and
+// Binding invariant from storage/sqlite/source.go: blob_blocks and
 // line_checkpoints must not be dropped before the blobs row, because PutBlob's
-// restore path flips state and keeps them.
+// restore path flips a demoted row's state and keeps them. The store honours it
+// by deleting nothing but the blobs row and letting the foreign keys cascade,
+// and this package never asks for a block delete of its own.
+
+// defaultGraceWindow is how long a trashed blob waits before its final
+// reachability check. There is no configuration key for it: Section 20.1 has
+// none, and it is not an operator knob but the protocol's safety margin
+// against a reader that pinned a generation just as the manifest naming its
+// blob went away. RetentionConfig.GraceWindow overrides it, which is how a
+// test drives the boundary without sleeping.
+const defaultGraceWindow = 24 * time.Hour
+
+// BlobStore is the grace protocol's store surface, declared here beside the
+// implementation that drives it because these methods were designed with it
+// (storage/sqlite/gc.go). Each is one bounded phase, and each restores rather
+// than advances a blob whose reference reappeared.
+type BlobStore interface {
+	// QuarantineBlobs demotes up to limit 'ready' blobs that nothing
+	// references, stamping each with now, and reports how many.
+	QuarantineBlobs(ctx context.Context, now time.Time, limit int) (int64, error)
+	// TrashBlobs rechecks quarantined blobs: still unreferenced moves to
+	// 'trash', referenced again is restored to 'ready'. It takes no clock,
+	// because the grace window is measured from the quarantine stamp and
+	// rewriting that stamp would restart the window on every pass.
+	TrashBlobs(ctx context.Context, limit int) (trashed, restored int64, err error)
+	// CollectBlobs deletes up to limit blobs trashed at or before deadline
+	// that a recheck in the deleting transaction still finds unreferenced,
+	// returning their hashes so their CAS objects can go; a trashed blob
+	// referenced again is restored instead.
+	CollectBlobs(ctx context.Context, deadline time.Time, limit int) (deleted []string, restored int64, err error)
+}
+
+// ObjectStore removes a published CAS object by content hash. internal/snapshot
+// owns the only derivation of an object's path (CAS.path, unexported), so this
+// package must not rebuild <data>/cas/<hh>/<hash> itself -- that is the
+// duplicate implementation the charter above forbids.
 //
-// The store methods this needs do not exist at this commit: L3a owns
-// storage/sqlite/gc.go and source.go and declares its narrow store interface
-// here beside its implementation, so L0 does not freeze a signature for
-// behaviour that has not been designed yet.
-func (c *Collector) grace(_ context.Context, report Report) (Report, error) {
-	return report, notImplemented("blob grace protocol", "L3a")
+// Named INT seam: internal/snapshot needs `func (c *CAS) Remove(hash string)
+// error` reusing c.path, and internal/app hands the CAS in as Options.Objects.
+type ObjectStore interface {
+	Remove(hash string) error
+}
+
+// grace runs one pass of the three phases in order and adds what it reclaimed
+// to report. The phases are deliberately one pass each rather than a loop to
+// exhaustion: a blob quarantined by this pass is trashed by the next one and
+// deleted by the one after the grace window, so the protocol's delay is real
+// and one collection can never run unbounded.
+//
+// The caller holds both locks named in the package comment; grace takes none.
+func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
+	now := c.opts.Now()
+	limit := c.opts.Config.BatchLimit
+	window := c.opts.Config.GraceWindow
+	if window <= 0 {
+		window = defaultGraceWindow
+	}
+
+	// Every count is added only after its phase reported success: a phase is
+	// one transaction, and a commit that fails returns the number of rows the
+	// statement matched for work that then rolled back. Report is what the
+	// pass actually reclaimed, so a failed phase contributes nothing while the
+	// phases that did commit keep their counts.
+	quarantined, err := c.opts.Blobs.QuarantineBlobs(ctx, now, limit)
+	if err != nil {
+		return report, err
+	}
+	report.BlobsQuarantined += quarantined
+
+	trashed, restored, err := c.opts.Blobs.TrashBlobs(ctx, limit)
+	if err != nil {
+		return report, err
+	}
+	report.BlobsTrashed += trashed
+	report.BlobsRestored += restored
+
+	deleted, restored, err := c.opts.Blobs.CollectBlobs(ctx, now.Add(-window), limit)
+	if err != nil {
+		return report, err
+	}
+	report.BlobsRestored += restored
+	report.BlobsDeleted += int64(len(deleted))
+
+	// The rows are already gone, so every object here is unreachable through
+	// the store. An object that cannot be removed is reported with the rest
+	// rather than retried or hidden: it is a leftover file, not lost source,
+	// and the next capture of the same content republishes over it.
+	var errs []error
+	for _, hash := range deleted {
+		if err := c.opts.Objects.Remove(hash); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return report, errors.Join(errs...)
 }
