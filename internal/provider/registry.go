@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -117,13 +118,16 @@ func (r *Registry) Lookup(id string) (Provider, bool) {
 }
 
 // Selection is the outcome of detection over one workspace. Active holds the
-// providers that will run, in dependency order. Inactive holds one capability
-// row per declared capability of every provider that will not run, at
-// ScopeWorkspace: `unavailable` for a disabled or absent optional provider,
-// `failed` for an enabled provider that could not be detected. The two are
-// kept apart because a disabled optional tool must not make a healthy base
-// generation falsely fail, while an enabled requested capability that fails
-// makes the generation degraded (Sections 11.1, 13.3).
+// providers that will run, in dependency order. Inactive holds every capability
+// row detection publishes, at ScopeWorkspace and one per declared capability:
+// `unavailable` for a disabled or absent optional provider, `failed` for an
+// enabled provider that could not be detected, and `partial` for a provider
+// that *will* run but whose detection named something inside it that cannot
+// (Detection.Details). The categories are kept apart because a disabled
+// optional tool must not make a healthy base generation falsely fail, while an
+// enabled requested capability that fails makes the generation degraded
+// (Sections 11.1, 13.3); a partial row is the middle case -- the provider runs,
+// and the coordinator publishes the reasons the rest of it will not.
 type Selection struct {
 	Active   []Provider
 	Inactive []model.CapabilityState
@@ -150,7 +154,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		if enablement != nil {
 			mode = enablement(id)
 		}
-		state, code := detect(ctx, p, d, mode, root, policy, active, inactive)
+		state, code, details := detect(ctx, p, d, mode, root, policy, active, inactive)
 		if err := ctx.Err(); err != nil {
 			// A stopped selection is not a list of failed providers.
 			return Selection{}, model.Canceled(err)
@@ -158,6 +162,22 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		if state == "" {
 			active[id] = true
 			sel.Active = append(sel.Active, p)
+			// A provider can be available as a whole and degraded in a part --
+			// one of six SCIP indexers missing, say. Those reasons live only in
+			// Detection.Details, which nothing else publishes, so without this
+			// row a partly working provider is indistinguishable from a healthy
+			// one at the only surface that carries capability state.
+			if len(details) == 0 {
+				continue
+			}
+			for _, c := range d.Capabilities {
+				sel.Inactive = append(sel.Inactive, model.CapabilityState{ProviderID: id, Capability: c,
+					Scope: ScopeWorkspace, State: model.CapabilityPartial, DiagnosticCode: code,
+					// One map per row: every other detail map in the tree is
+					// copy-on-write, and sharing one would let a later edit of
+					// any row rewrite its siblings.
+					Details: maps.Clone(details)})
+			}
 			continue
 		}
 		if d.Required {
@@ -181,11 +201,13 @@ type inactiveProvider struct {
 }
 
 // detect decides one provider. An empty state means active; otherwise the
-// state and diagnostic code the inactive capability rows carry.
+// state the inactive capability rows carry. The diagnostic code and details are
+// the detection's own either way: an active provider can still name the parts
+// of itself that are unavailable.
 func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode config.Enablement, root workspace.Root, policy workspace.Policy,
-	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string) {
+	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string, map[string]string) {
 	if mode == config.Disabled {
-		return model.CapabilityUnavailable, model.CodeProviderUnavailable
+		return model.CapabilityUnavailable, model.CodeProviderUnavailable, nil
 	}
 	for _, dep := range d.DependsOn {
 		if active[dep] {
@@ -195,22 +217,25 @@ func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode co
 		// provider waiting on a disabled tool is absent for that reason, one
 		// waiting on a failed enabled tool has failed for the same reason.
 		why := inactive[dep]
-		return why.state, why.code
+		return why.state, why.code, nil
 	}
 	det, err := p.Detect(ctx, root, policy)
 	if err == nil {
 		err = det.Validate(d)
 	}
 	if err != nil {
-		return model.CapabilityFailed, CodeOf(err)
+		return model.CapabilityFailed, CodeOf(err), nil
 	}
 	if det.Available {
-		return "", ""
+		return "", det.DiagnosticCode, det.Details
 	}
+	// The details belong to the available case alone: an inactive provider's
+	// whole reason is its diagnostic code, and Select publishes no partial row
+	// for it to carry them.
 	if mode == config.Auto {
-		return model.CapabilityUnavailable, det.DiagnosticCode
+		return model.CapabilityUnavailable, det.DiagnosticCode, nil
 	}
-	return model.CapabilityFailed, det.DiagnosticCode
+	return model.CapabilityFailed, det.DiagnosticCode, nil
 }
 
 // CodeOf extracts the Section 22 code an error carries for a diagnostic
