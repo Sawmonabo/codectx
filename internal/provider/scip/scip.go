@@ -340,8 +340,9 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 		if triggered {
 			det.Available = true
 			if slices.Contains(p.deferred, k) {
-				// The operator is told what the first run will fetch, before it
-				// spends the bytes.
+				// The kind is recorded as pending rather than as a refusal:
+				// Select publishes a degraded capability row for a CTX_ value and
+				// nothing for this one, which is why the spelling differs.
 				det = det.WithDetail(string(k), markerDeferred)
 			}
 		}

@@ -216,10 +216,14 @@ answer for two of the three providers but not the third:
   signals: a project marker of one of the other families at the root
   (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
   `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `Cargo.toml`), a C or C++ build file at the root (`CMakeLists.txt`,
-  `compile_commands.json`, `Makefile` — the family's closure markers, which
-  also cover the out-of-source layout with sources under `src/`), or a source
-  file of any of the families lying at the root itself.
+  `Cargo.toml`), a C or C++ build declaration at the root (`CMakeLists.txt` or
+  `compile_commands.json`, which also cover the out-of-source layout with
+  sources under `src/`; a bare `Makefile` does not count, since it is common at
+  roots of every language), or a source file of any of the families lying at
+  the root itself. This over-selects in one direction only: a root carrying
+  `CMakeLists.txt` or a project marker with no source of that family anywhere
+  in the tree still prefetches the engine, because the planner gates on sources
+  while this command reads only the root.
 
   One root shape is therefore still under-served and fetches the graph engine
   and its JDK at index time after a `--for-repo` prefetch reported success: a

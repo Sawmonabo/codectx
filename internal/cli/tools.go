@@ -413,12 +413,19 @@ func rootDeclaresDependenceProject(present func(string) bool) bool {
 		}
 	}
 	// The C/C++ family declares no project marker at all; its build files are
-	// closure markers, and a root carrying one (the out-of-source CMake layout
-	// keeps every source under src/) declares the family just as surely. Only
-	// that family's closure markers are admitted here: go.sum or yarn.lock
-	// alone must not select the engine when the project marker beside them
-	// already decides it.
+	// closure markers, and a root carrying a C/C++ build declaration (the
+	// out-of-source CMake layout keeps every source under src/) declares the
+	// family. Only the two that declare a C/C++ build are admitted: a Makefile
+	// is ubiquitous in Go, Python and Rust roots and would fetch the engine for
+	// a repository that never resolves it; go.sum or yarn.lock alone must not
+	// select the engine when the project marker beside them already decides it.
+	// A CMakeLists.txt at a root with no C/C++ source anywhere still selects
+	// the engine -- the planner gates on sources, this command on the root --
+	// and docs/toolchain.md says so.
 	for _, marker := range dependence.ClosureMarkers(dependence.FamilyC) {
+		if marker == "Makefile" {
+			continue
+		}
 		if present(marker) {
 			return true
 		}

@@ -339,9 +339,11 @@ const markerDeferred = "deferred"
 //
 // A deferred kind whose pinned identity cannot even be named joins bad. That is
 // unreachable as the lock stands -- every Kind is a lock entry, a platform with
-// no payload is already a typed refusal from ResolveInstalled, and an override
-// resolves without a store and so is never deferred -- and planning a unit
-// whose facts could not be keyed is the one outcome that must not be possible.
+// no payload is already a typed refusal from ResolveInstalled, an overridden
+// kind resolves without a store and so is never deferred, and an overridden
+// runtime folds the override's own identity into the pinned fingerprint -- and
+// planning a unit whose facts could not be keyed is the one outcome that must
+// not be possible.
 //
 // All four results are deterministic in Kinds order.
 func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profile, deferred []Kind, identities map[Kind]string, bad []unresolved) {
