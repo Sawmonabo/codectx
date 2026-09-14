@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -229,7 +230,7 @@ func (s *Service) coverageFor(ctx context.Context, session model.SessionID, acto
 func previousFileID(id model.FileID) model.FileID {
 	digits := []byte(id)
 	for i := len(digits) - 1; i >= 0; i-- {
-		d := indexHex(digits[i])
+		d := strings.IndexByte(hexDigits, digits[i])
 		switch {
 		case d < 0:
 			return ""
@@ -241,13 +242,4 @@ func previousFileID(id model.FileID) model.FileID {
 		}
 	}
 	return ""
-}
-
-func indexHex(c byte) int {
-	for i := 0; i < len(hexDigits); i++ {
-		if hexDigits[i] == c {
-			return i
-		}
-	}
-	return -1
 }
