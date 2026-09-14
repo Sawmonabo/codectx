@@ -509,6 +509,152 @@ var scenarios = []scenario{
 	// L3 rows.
 
 	// L4 rows.
+	//
+	// Both rows are wrapped in a func literal so the row's fixtures and its
+	// actor-aware facade live in one scope: the first row needs the SAME facade
+	// for two sessions, and package-level helpers would collide with the other
+	// lanes appending at their own markers.
+	func() scenario {
+		const (
+			session  = model.SessionID("a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1")
+			file     = model.FileID("b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2")
+			owner    = "actor-alpha"
+			receipt  = "receipt-token-for-actor-alpha"
+			source   = "package model // SENTINEL SOURCE BYTES"
+			intruder = "actor-beta"
+		)
+		// read models the coverage service: it issues bytes and a receipt to the
+		// session's owning actor and refuses anyone else with the Section 22 code.
+		read := func(_ context.Context, r model.ReadChunkRequest) (model.ReadChunkResponse, error) {
+			if r.ActorID != owner {
+				return model.ReadChunkResponse{}, &model.Error{
+					Code:        model.CodeActorMismatch,
+					Message:     "this session belongs to another actor",
+					Remediation: "plan a session for this actor",
+				}
+			}
+			return model.ReadChunkResponse{
+				FileID:    r.FileID,
+				ByteRange: model.ByteRange{End: uint64(len(source))},
+				Encoding:  model.EncodingUTF8,
+				Content:   source,
+				Receipt:   receipt,
+			}, nil
+		}
+		return scenario{
+			// Failure mode: actor isolation is lost at the wire. Either the receipt
+			// that proves bytes were issued does not survive the envelope, which
+			// makes coverage unprovable and every acknowledgement a guess, or a
+			// second actor's refusal arrives as something other than a tool error:
+			// a CTX_ACTOR_MISMATCH raised as a PROTOCOL error aborts the call with
+			// no code the model can read, and a refusal that still carried an
+			// envelope would hand a foreign actor the session's source bytes.
+			name:   "read_source echoes the receipt and denies a second actor",
+			facade: func(f *fakeServices) { f.readFn = read },
+			tool:   "codectx_read_source",
+			args: model.ReadChunkRequest{
+				SessionID: session,
+				ActorID:   owner,
+				FileID:    file,
+				MaxBytes:  4096,
+			},
+			check: func(t *testing.T, res *mcp.CallToolResult) {
+				if res.IsError {
+					t.Fatalf("the owning actor's read reported a tool error: %s", firstText(res))
+				}
+				var got result[model.ReadChunkResponse]
+				decode(t, res, &got)
+				if got.Data.Receipt != receipt {
+					t.Errorf("receipt = %q, want the issued receipt %q echoed verbatim", got.Data.Receipt, receipt)
+				}
+				if got.Data.Content != source {
+					t.Errorf("content = %q, want the issued chunk %q", got.Data.Content, source)
+				}
+
+				// The same facade, a second actor, replaying the receipt it just saw.
+				second := connect(t, newTestServer(&fakeServices{readFn: read}))
+				denied, err := second.CallTool(t.Context(), &mcp.CallToolParams{
+					Name: "codectx_read_source",
+					Arguments: model.ReadChunkRequest{
+						SessionID:       session,
+						ActorID:         intruder,
+						FileID:          file,
+						MaxBytes:        4096,
+						ConfirmReceipts: []string{receipt},
+					},
+				})
+				if err != nil {
+					t.Fatalf("the second actor's read raised a protocol error, want a tool error: %v", err)
+				}
+				if !denied.IsError {
+					t.Fatalf("the second actor's read succeeded; want a tool error")
+				}
+				text := firstText(denied)
+				if !strings.Contains(text, model.CodeActorMismatch) {
+					t.Errorf("denial text = %q, want it to carry %s", text, model.CodeActorMismatch)
+				}
+				if strings.Contains(text, source) {
+					t.Errorf("the denial leaked source bytes: %q", text)
+				}
+				if denied.StructuredContent != nil {
+					t.Errorf("the denial carried structured content %#v, want none", denied.StructuredContent)
+				}
+			},
+		}
+	}(),
+	func() scenario {
+		const (
+			session = model.SessionID("c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3")
+			file    = model.FileID("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4")
+			source  = "func Secret() {} // SENTINEL SOURCE BYTES"
+		)
+		return scenario{
+			// Failure mode: codectx_context_next starts carrying source bytes.
+			// Section 19.2 marks it metadata only and codectx_read_source is the one
+			// tool that may return a body, because every issued byte must travel
+			// with a receipt coverage can later require. A next answer that smuggles
+			// content — in the item, in a warning, anywhere in the envelope — serves
+			// source outside the receipt path and silently voids the coverage gate.
+			//
+			// readFn is set so the sentinel is genuinely reachable from this
+			// handler's facade; without it the assertion could not fail and would
+			// prove nothing.
+			name: "context_next returns metadata only, no source bytes",
+			facade: func(f *fakeServices) {
+				f.readFn = func(_ context.Context, r model.ReadChunkRequest) (model.ReadChunkResponse, error) {
+					return model.ReadChunkResponse{FileID: r.FileID, Encoding: model.EncodingUTF8, Content: source, Receipt: "receipt"}, nil
+				}
+				f.nextFn = func(context.Context, model.SessionRequest) (model.NextContextItem, error) {
+					return model.NextContextItem{
+						Action:    "read",
+						FileID:    file,
+						Path:      "internal/model/context.go",
+						Size:      int64(len(source)),
+						Remaining: 3,
+					}, nil
+				}
+			},
+			tool: "codectx_context_next",
+			args: model.SessionRequest{SessionID: session, ActorID: "actor-alpha"},
+			check: func(t *testing.T, res *mcp.CallToolResult) {
+				if res.IsError {
+					t.Fatalf("context_next reported a tool error: %s", firstText(res))
+				}
+				var got result[model.NextContextItem]
+				decode(t, res, &got)
+				if got.Data.Path != "internal/model/context.go" || got.Data.Size != int64(len(source)) {
+					t.Errorf("data = %+v, want the facade's metadata verbatim", got.Data)
+				}
+				raw, err := json.Marshal(res.StructuredContent)
+				if err != nil {
+					t.Fatalf("re-marshal structured content: %v", err)
+				}
+				if strings.Contains(string(raw), source) {
+					t.Fatalf("context_next carried source bytes: %s", raw)
+				}
+			},
+		}
+	}(),
 
 	// L5 rows.
 }
