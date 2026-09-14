@@ -45,11 +45,18 @@ type deferredUnit struct {
 type lateSealer struct {
 	c *Coordinator
 
-	// tickMu serializes the ticks themselves. The background loop and a
-	// caller's Drain both run them, and two ticks at once would each open a
-	// work generation and each publish, so one would lose the activation
+	// tick1 admits one tick at a time. The background loop and a caller's
+	// Drain both run them, and two ticks at once would each open a work
+	// generation and each publish, so one would lose the activation
 	// compare-and-swap and throw its batch away.
-	tickMu sync.Mutex
+	//
+	// It is a one-slot channel rather than a mutex because the admission has
+	// to be abandonable: a Drain whose context is cancelled while the
+	// background loop owns a batch must return then, not when the batch ends,
+	// and sync.Mutex.Lock has no way to hear the cancellation. A batch is
+	// minutes of engine work, so the difference is an interruptible command
+	// and an uninterruptible one.
+	tick1 chan struct{}
 
 	mu    sync.Mutex
 	queue []deferredUnit
@@ -69,12 +76,37 @@ type lateSealer struct {
 	// estimate is unknown and Pending reports no estimate at all.
 	estimate time.Duration
 	samples  int64
-	// progress is the callback of the Drain in flight, if any. It is held here
-	// rather than passed down a tick because the background loop and Drain
-	// share one queue: whichever of them runs a batch, the caller that is
-	// waiting for the queue to empty is the one that must hear about the
-	// publication.
-	progress func(model.IndexResult)
+	// published holds the results of the publications no Drain has delivered
+	// yet. A tick records its publication here and never calls the caller's
+	// callback itself: the tick may be the background loop's goroutine, and
+	// Drain's contract is that progress is invoked from the draining
+	// goroutine alone and never after Drain has returned -- which is what
+	// lets the caller read what the callback wrote without a mutex.
+	//
+	// It is appended to whether or not a Drain is registered, so a batch that
+	// publishes in the window between an activation and the Drain that
+	// follows it is still reported rather than silently superseding the
+	// result the caller ends up announcing. Only the most recent
+	// maxBufferedPublications are kept, because a long-lived watch publishes
+	// batch after batch with no drain to consume them and an unbounded
+	// recollection of results nobody reads is a leak; the bound cannot lose a
+	// publication a Drain wanted, since it delivers after every tick and the
+	// pre-registration window holds at most one.
+	published []model.IndexResult
+	// draining is set for the life of a Drain. It is the re-entrancy guard,
+	// and it is a field of its own rather than "a progress callback is
+	// registered" because the nil callback Drain documents as legal would
+	// otherwise be neither refused nor protected.
+	draining bool
+	// publishing is set while a tick is inside its publication. Between the
+	// last unit finishing and the publication returning nothing is queued and
+	// nothing is running, and a caller that reads that as "nothing is
+	// pending" would close the coordinator on top of a completed batch and
+	// cancel it away. Only the answers about what closing would abandon
+	// (Coordinator.Pending, close) count it: the drain loop and the
+	// background loop use it to decide whether to run a tick, and a tick is
+	// not what an in-flight publication needs.
+	publishing bool
 
 	wake    chan struct{}
 	ctx     context.Context
@@ -83,9 +115,53 @@ type lateSealer struct {
 	started bool
 }
 
+// maxBufferedPublications bounds the undelivered publication results the
+// sealer remembers. It is a product-owned structural bound: a drain delivers
+// after every tick, so only a watch with no drain at all can reach it, and
+// what such a process would do with a hundred stale results is nothing.
+const maxBufferedPublications = 32
+
 func newLateSealer(c *Coordinator) *lateSealer {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &lateSealer{c: c, wake: make(chan struct{}, 1), ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	return &lateSealer{c: c, tick1: make(chan struct{}, 1), wake: make(chan struct{}, 1),
+		ctx: ctx, cancel: cancel, done: make(chan struct{})}
+}
+
+// acquire takes the tick slot, giving up when ctx is cancelled. release
+// returns it; every acquire that returned nil must be released.
+func (l *lateSealer) acquire(ctx context.Context) error {
+	// The context is examined first, so a cancelled caller never wins a free
+	// slot on the select's coin toss and starts a batch it is about to abandon.
+	if err := ctx.Err(); err != nil {
+		return model.Canceled(err)
+	}
+	select {
+	case l.tick1 <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return model.Canceled(ctx.Err())
+	}
+}
+
+func (l *lateSealer) release() { <-l.tick1 }
+
+// record remembers one publication for the drain goroutine to deliver.
+func (l *lateSealer) record(res model.IndexResult) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.published = append(l.published, res)
+	if n := len(l.published); n > maxBufferedPublications {
+		l.published = append(l.published[:0], l.published[n-maxBufferedPublications:]...)
+	}
+}
+
+// take removes everything recorded so far, for the drain goroutine to deliver.
+func (l *lateSealer) take() []model.IndexResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := l.published
+	l.published = nil
+	return out
 }
 
 // enqueue replaces the background queue with this generation's deferred units.
@@ -125,6 +201,13 @@ func (l *lateSealer) close() {
 	l.mu.Lock()
 	started, pending := l.started, len(l.queue)
 	if l.running != nil {
+		pending++
+	}
+	if l.publishing {
+		// A batch that has sealed its units and is publishing them is about
+		// to be cancelled by l.cancel below, and its units are then members
+		// of nothing but the aborted work generation. That is exactly the
+		// loss this warning exists to name, so it is counted here too.
 		pending++
 	}
 	l.mu.Unlock()
@@ -196,6 +279,12 @@ func (l *lateSealer) finished() {
 
 // pending is what the queue holds now: the unit in flight plus everything
 // behind it, and the snapshot, selection and ref the tick works over.
+//
+// It is the question "is there a tick to run", so the publication window is
+// deliberately not counted: a publication in flight needs no tick, and adding
+// it here would have the background loop open and abort an empty work
+// generation for every batch a Drain publishes. What closing the coordinator
+// would abandon is the other question, and Coordinator.Pending answers it.
 func (l *lateSealer) pending() (int, model.SnapshotID, provider.Selection, string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -222,13 +311,23 @@ type sealedUnit struct {
 	unit                 model.UnitID
 }
 
-// tick runs one batch in a work generation and publishes what sealed. A Drain
-// waiting on the queue hears about the publication whether this tick is its
-// own or the background loop's.
+// tick takes the tick slot and runs one batch, abandoning the attempt if ctx
+// is cancelled before the slot is free.
 func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 	sel provider.Selection, ref string) error {
-	l.tickMu.Lock()
-	defer l.tickMu.Unlock()
+	if err := l.acquire(ctx); err != nil {
+		return err
+	}
+	defer l.release()
+	return l.tickHeld(ctx, snap, sel, ref)
+}
+
+// tickHeld runs one batch in a work generation and publishes what sealed. The
+// caller holds the tick slot. The publication is recorded for a Drain to
+// deliver, never announced from here: this may be the background loop's
+// goroutine.
+func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
+	sel provider.Selection, ref string) error {
 	c := l.c
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
@@ -288,7 +387,9 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 		abort()
 		return nil
 	}
+	l.setPublishing(true)
 	res, published, err := l.publish(ctx, snap, sel, ref, sealed)
+	l.setPublishing(false)
 	abort()
 	if err != nil {
 		// The sealed units are members of nothing but the work generation this
@@ -300,14 +401,17 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 		return err
 	}
 	if published {
-		l.mu.Lock()
-		progress := l.progress
-		l.mu.Unlock()
-		if progress != nil {
-			progress(res)
-		}
+		l.record(res)
 	}
 	return nil
+}
+
+// setPublishing marks the publication window, which is pending work that is
+// neither queued nor running.
+func (l *lateSealer) setPublishing(on bool) {
+	l.mu.Lock()
+	l.publishing = on
+	l.mu.Unlock()
 }
 
 // runOne builds one deferred unit in the work generation, under the heavy
@@ -543,16 +647,27 @@ func (l *lateSealer) attach(ctx context.Context, g *generation, replacing map[st
 	return nil
 }
 
-// Pending reports the deferred units queued or running right now (Section
-// 11.6): what a caller that is about to close the coordinator would abandon,
-// and what Drain would run. Position is zero because this is an answer about
-// the whole queue rather than about one promoted scope.
+// Pending reports the deferred work outstanding right now (Section 11.6):
+// what a caller that is about to close the coordinator would abandon, and what
+// Drain would run. Position is zero because this is an answer about the whole
+// queue rather than about one promoted scope.
+//
+// A batch that has finished building and is publishing counts as one unit:
+// closing the coordinator cancels that publication and its units are collected
+// with the work generation, so a caller that read zero here would report a
+// clean one-shot run over work it had just thrown away. It is counted as one
+// rather than as the batch's size because the batch is published as a whole,
+// and what the operator is told to do about it -- run `codectx watch` -- is
+// the same either way.
 func (c *Coordinator) Pending() Pending {
 	l := c.late
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	units := len(l.queue)
 	if l.running != nil {
+		units++
+	}
+	if l.publishing {
 		units++
 	}
 	if units == 0 {
@@ -568,39 +683,66 @@ func (c *Coordinator) Pending() Pending {
 // It is how a one-shot command honours ruling Q9 -- under the shipped
 // `providers.dependence.enabled = "auto"` the deferred units must run whether
 // or not a query ever asks, and a process that closed the coordinator the
-// moment its base generation activated would run none of them. Cancelling
-// returns as soon as the tick in flight ends: the base generation and every
-// batch already published stay exactly as they are, and what is still queued is
-// reported by Pending.
+// moment its base generation activated would run none of them.
+//
+// Cancelling returns at once, including while the background loop owns the
+// batch: the wait for the tick slot is abandoned rather than served, because
+// the batch it is waiting for is minutes of engine work and an operator's
+// interrupt that is answered in minutes is an interrupt that was ignored. The
+// base generation and every batch already published stay exactly as they are,
+// and what is still outstanding is reported by Pending.
+//
+// progress is called from this goroutine only, and never after Drain has
+// returned: the caller may therefore write from it and read what it wrote once
+// Drain is done, with no lock. Every publication recorded since the last
+// delivery is handed over after each tick and once more before Drain returns
+// on any path, so a batch the background loop published outside a tick of this
+// Drain's is reported too.
+//
+// The queue is tested for emptiness with the tick slot held, which is the only
+// state in which "nothing is queued and nothing is running" is true of the
+// whole sealer: outside it the answer can be the gap between a batch's last
+// unit and its publication, and a caller that closed the coordinator there
+// would cancel a completed batch away.
 func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult)) error {
 	if err := c.writable(); err != nil {
 		return err
 	}
 	l := c.late
 	l.mu.Lock()
-	if l.progress != nil {
+	if l.draining {
 		l.mu.Unlock()
 		return invalid("the deferred queue is already being drained")
 	}
-	l.progress = progress
+	l.draining = true
 	l.mu.Unlock()
 	defer func() {
 		l.mu.Lock()
-		l.progress = nil
+		l.draining = false
 		l.mu.Unlock()
 	}()
+	deliver := func() {
+		for _, res := range l.take() {
+			if progress != nil {
+				progress(res)
+			}
+		}
+	}
 	for {
-		if err := ctx.Err(); err != nil {
-			return model.Canceled(err)
+		if err := l.acquire(ctx); err != nil {
+			deliver()
+			return err
 		}
 		units, snap, sel, ref := l.pending()
 		if units == 0 {
+			l.release()
+			deliver()
 			return nil
 		}
-		// tickMu is what makes this a wait rather than a race: if the
-		// background loop is already running this batch, tick blocks until it
-		// finishes and the publication reaches progress from there.
-		if err := l.tick(ctx, snap, sel, ref); err != nil {
+		err := l.tickHeld(ctx, snap, sel, ref)
+		l.release()
+		deliver()
+		if err != nil {
 			return err
 		}
 	}

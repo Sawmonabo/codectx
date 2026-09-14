@@ -538,6 +538,48 @@ func TestIncrementalScenario(t *testing.T) {
 		f.remove("index.scip")
 	})
 
+	t.Run("an optional provider's failure rows key on the exemplar scope, not on arrival order", func(t *testing.T) {
+		// The units of one provider capability are built concurrently, and
+		// the published row's scope_key AND diagnostic_code both fold into
+		// details_json/diagnostic_code, which fold into the AnalysisKey. Two
+		// identical runs whose failures merely arrived in a different order
+		// must therefore publish the identical row; an arrival-ordered
+		// exemplar keys them apart and breaks reuse for every consumer.
+		failures := []struct{ scope, code string }{
+			{"pkg:go:", model.CodeProviderTimeout},
+			{"pkg:java:", model.CodeProviderOutputInvalid},
+		}
+		report := func(order []int) model.CapabilityState {
+			r := newCapabilityReport()
+			for _, i := range order {
+				r.addFailure(scip.ID, "references", failures[i].scope, failures[i].code)
+			}
+			states, _ := r.finish(f.c.log)
+			for _, st := range states {
+				if st.ProviderID == scip.ID {
+					return st
+				}
+			}
+			t.Fatal("the failure fold published no row")
+			return model.CapabilityState{}
+		}
+		forward, reverse := report([]int{0, 1}), report([]int{1, 0})
+		if forward.DiagnosticCode != reverse.DiagnosticCode {
+			t.Fatalf("the published diagnostic code depends on arrival order: %q then %q",
+				forward.DiagnosticCode, reverse.DiagnosticCode)
+		}
+		if forward.Details["scope_key"] != reverse.Details["scope_key"] {
+			t.Fatalf("the published scope key depends on arrival order: %q then %q",
+				forward.Details["scope_key"], reverse.Details["scope_key"])
+		}
+		// The code must be the chosen scope's own: a row naming one scope and
+		// another scope's reason is arrival-ordered again, and misreports.
+		if forward.Details["scope_key"] != failures[0].scope || forward.DiagnosticCode != failures[0].code {
+			t.Fatalf("the exemplar row is scope %q code %q, want the lexicographically first scope %q and its code %q",
+				forward.Details["scope_key"], forward.DiagnosticCode, failures[0].scope, failures[0].code)
+		}
+	})
+
 	t.Run("a required provider's unit failure publishes nothing", func(t *testing.T) {
 		before, err := f.store.ActiveGeneration(ctx, f.c.repo)
 		if err != nil {
