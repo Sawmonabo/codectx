@@ -1307,11 +1307,14 @@ var analyzedTables = [...]string{"node_facts", "generation_units"}
 // one. Generations published before this landed keep the old plan until the
 // next activation rewrites the statistics.
 func (s *Store) refreshStatistics(ctx context.Context) {
-	// analysis_limit is SQLite's bounded-scan mode: each index is sampled
-	// rather than walked end to end, which is what makes this affordable
-	// inside an activation. The stats it writes are approximate and that is
-	// enough -- the plan only has to prefer an indexed range over a full scan.
-	if _, err := s.writer.ExecContext(ctx, `PRAGMA analysis_limit=1000`); err != nil {
+	// analysis_limit bounds each index scan instead of walking it end to end,
+	// which is what makes this affordable inside an activation; the statistics
+	// it writes are approximate, and approximate is all the planner needs to
+	// prefer an indexed range over a filtered scan. The value is measured, not
+	// chosen: on the 66,307-node proof store the plan flips to idx_nodes_qname
+	// at 10,000 and not at 1,000, so it is set an order of magnitude above the
+	// point where it starts working.
+	if _, err := s.writer.ExecContext(ctx, `PRAGMA analysis_limit=10000`); err != nil {
 		slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
 			"component", "storage", "error", err.Error())
 		return
