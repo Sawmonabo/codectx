@@ -120,11 +120,6 @@ func (a adjacency) EvidenceRows(ctx context.Context, relations []model.RelationI
 	return rows, nil
 }
 
-// LeaseID is graph.LeaseHolder: the retention lease this reader holds. A
-// continuation token names it so the token cannot outlive the generation whose
-// facts it will resume over.
-func (a adjacency) LeaseID() string { return a.reader.LeaseID() }
-
 func (a adjacency) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	return a.reader.Capabilities(ctx)
 }
