@@ -22,7 +22,6 @@ import (
 	"errors"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -81,12 +80,15 @@ type Batch struct {
 type Options struct {
 	// Root is the opened workspace. The watcher only reads through it.
 	Root workspace.Root
-	// Policy is the traversal policy the watch set is derived from. Its Git
-	// hooks (Ignore, ForceInclude, ForceIncludeDir), when supplied, decide
-	// which directories are watched and which events are kept; with nil hooks
-	// every directory the built-in exclusions admit is watched, which is wider
-	// than a capture's eligible set and therefore safe -- an extra path in a
-	// batch costs a hash comparison, a missing one costs correctness.
+	// Policy is the traversal policy the watch set is derived from: every
+	// directory it admits is watched. Its Git hooks (Ignore, ForceInclude,
+	// ForceIncludeDir), when supplied, decide which directories are watched and
+	// which events are kept, so the watched tree is the tree a capture reads.
+	// With nil hooks only the built-in vendor and generated exclusions apply,
+	// which watches more than a capture would admit: safe for correctness -- an
+	// extra path in a batch costs a hash comparison, a missing one costs a
+	// change -- but it puts watches on ignored build trees, so a caller with a
+	// Git owner available is expected to supply the hooks.
 	Policy workspace.Policy
 	// Debounce is index.watch_debounce and Reconcile is
 	// index.reconcile_interval.
@@ -167,11 +169,18 @@ func New(o Options) (*Watcher, error) {
 // the watch set was last re-derived from the filesystem.
 //
 // complete is not a promise that no event can be missed. It says that every
-// directory the traversal admits carries a watch and none was refused. A
-// directory that holds no eligible file when the watch set is derived is not
-// watched until the next reconciliation, so the reconcile interval bounds the
-// window in which its first eligible file goes unnoticed -- which is what
-// lastReconciled is for, and why a reconciliation batch is a full one.
+// directory the traversal admits carries a watch -- whether or not it holds an
+// eligible file -- and that none was refused. What it cannot cover is a
+// directory that appears between two rescans: its own creation is an event, so
+// it joins the batch that closes the current debounce window and the rescan at
+// that window's end places its watch, but a file written inside it before that
+// rescan produces no event of its own. It is not lost, because the batch
+// carrying the directory reaches the coordinator only after the rescan and a
+// batch is a hint to re-capture rather than a list of what differs. The
+// reconcile interval remains the bound for the changes notification cannot
+// describe at all: a queue overflow, a refused watch, an unavailable backend --
+// which is what lastReconciled is for, and why a reconciliation batch is a full
+// one.
 func (w *Watcher) Coverage() (complete bool, pending int, lastReconciled time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -400,30 +409,34 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // rescan re-derives the watch set from the traversal policy and reconciles the
 // held watches with it.
 //
-// The set is the directories that hold, or lie above, a file the policy admits
-// -- derived by running the one traversal the product owns rather than by
-// re-implementing its exclusion rules here. That has a consequence worth
-// naming: a directory currently holding no admitted file is not watched, and
-// its first admitted file is noticed at the next reconciliation rather than
-// immediately. The alternative, watching every directory, would put a watch on
-// the excluded trees too, so an `npm install` under a `node_modules` the
-// operator excluded from indexing would overflow the queue and trigger a full
+// The set is every directory the policy admits -- derived by running the one
+// traversal the product owns (workspace.WalkDirs) rather than by
+// re-implementing its exclusion rules here. Admitted, not populated: a
+// directory holding no eligible file today still carries a watch, so the first
+// file to appear in it is a notification rather than something the next
+// reconciliation tick discovers up to index.reconcile_interval later.
+//
+// The excluded trees stay unwatched, which is what keeps that affordable: with
+// the capture's Git hooks in place an ignored build directory is pruned by the
+// same predicate that keeps it out of the snapshot, so an `npm install` under
+// an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
 func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map[string]bool) {
 	want := make(map[string]bool, len(watched)+16)
+	// The root is wanted even when the traversal cannot start: a workspace
+	// whose root is watched and whose coverage is reported incomplete is
+	// strictly better than one with no watch at all.
 	want["."] = true
 	overLimit := false
-	err := workspace.Walk(ctx, w.opts.Root, w.opts.Policy, func(f workspace.File) error {
-		for dir := path.Dir(f.Path); dir != "." && dir != "/"; dir = path.Dir(dir) {
-			if want[dir] {
-				break
-			}
-			if len(want) >= maxWatchedDirs {
-				overLimit = true
-				return errWatchSetFull
-			}
-			want[dir] = true
+	err := workspace.WalkDirs(ctx, w.opts.Root, w.opts.Policy, func(dir string) error {
+		if want[dir] {
+			return nil
 		}
+		if len(want) >= maxWatchedDirs {
+			overLimit = true
+			return errWatchSetFull
+		}
+		want[dir] = true
 		return nil
 	})
 	// A traversal that stops part way still yields the directories it reached.
