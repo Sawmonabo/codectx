@@ -444,25 +444,30 @@ func (s *fakeStore) Coverage(ctx context.Context, session model.SessionID, actor
 }
 
 // CoverageSummary is the single-round-trip aggregate L6 adds to the real store.
-func (s *fakeStore) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (int64, int64, int64, error) {
+func (s *fakeStore) CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error) {
 	fs, err := s.session(session, actor)
 	if fs == nil {
-		return 0, 0, 0, err
+		return sqlite.CoverageCounts{}, err
 	}
-	var required, fullyServed, waived int64
+	var c sqlite.CoverageCounts
 	for fid := range fs.coverage {
 		if s.required[fid] != model.RequirementFull {
 			continue
 		}
-		required++
+		c.Required++
+		// FullyRead is the bytes alone; the reported Served column is that AND
+		// not waived, exactly as coverageSummarySQL derives the two.
 		if s.fileCoverage(fs, fid).State == model.CoverageFullServed {
-			fullyServed++
+			c.FullyRead++
+			if !fs.waived[fid] {
+				c.Served++
+			}
 		}
 		if fs.waived[fid] {
-			waived++
+			c.Waived++
 		}
 	}
-	return required, fullyServed, waived, err
+	return c, err
 }
 
 // contains answers containment over the one representation of served bytes, so
@@ -939,6 +944,24 @@ var scenarios = []scenario{
 		// Four required files, one of them now full_served.
 		if item.Remaining != 3 {
 			t.Fatalf("next reports %d required files remaining; three are not full_served", item.Remaining)
+		}
+		// Remaining is paired with Action, and the walk above stops at the
+		// first file that is not full_served without consulting waivers. So
+		// waiving the file that was already read must not raise Remaining:
+		// counting against the reported served column instead would let this
+		// answer remaining=4 while the walk still names crlf, and on the last
+		// file it would answer action=complete beside remaining=1.
+		// fakeSession.waived is the fake's waiver knob and this is its only
+		// writer: the coverage service records no waiver itself (Waive is
+		// workflow's), so a row that needs one arranges it in the store.
+		h.store.sessions[sessionA].waived = map[model.FileID]bool{empty: true}
+		item, err = svc.Next(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next after waiving a fully served file: %v", err)
+		}
+		if item.FileID != crlf || item.Remaining != 3 {
+			t.Fatalf("next answers file %s with %d remaining after a fully read file was waived; want %s with 3 -- a waiver does not unread a file that was read",
+				item.FileID, item.Remaining, crlf)
 		}
 		// L6: a client that confirms out of order leaves a hole. [0,7) and
 		// [10,14) is eleven confirmed bytes whose prefix still ends at 7, so the
