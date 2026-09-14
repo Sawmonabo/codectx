@@ -418,6 +418,12 @@ func TestIncrementalScenario(t *testing.T) {
 		// An overflow batch names no paths at all: it means "reconcile
 		// everything". The change must still be found, because the capture and
 		// the content hashes are the truth and the hint never was.
+		//
+		// Refresh ignores the hint by construction today, so this leg executes
+		// the same code as the leg above: it is a forward guard, not live
+		// coverage. It fails the day someone narrows the capture to the hint,
+		// which is exactly when an overflow would start dropping the changes it
+		// collapsed.
 		res, err := f.c.Refresh(ctx, nil)
 		if err != nil {
 			t.Fatalf("refresh: %v", err)
@@ -457,6 +463,45 @@ func TestIncrementalScenario(t *testing.T) {
 		stop()
 		if err := <-done; err != nil {
 			t.Fatalf("watch: %v", err)
+		}
+	})
+
+	t.Run("a deferred publication outlives the activation that intervened while its units built", func(t *testing.T) {
+		// Failure mode: the background tick reads the active generation when
+		// it starts and the publication pins that id minutes later. An
+		// ordinary reconciliation in between supersedes it and retention
+		// deletes it, so the pin fails and the whole batch of sealed units is
+		// thrown away and collected -- under the shipped
+		// `providers.dependence.enabled = "auto"` default, every time.
+		gen, err := f.store.ActiveGeneration(ctx, f.c.repo)
+		if err != nil {
+			t.Fatalf("ActiveGeneration: %v", err)
+		}
+		pinned, err := f.store.PinGeneration(ctx, f.c.repo, gen, statusLeaseTTL)
+		if err != nil {
+			t.Fatalf("PinGeneration: %v", err)
+		}
+		snap := pinned.Binding().SnapshotID
+		pinned.Close()
+		sel, err := f.c.opts.Registry.Select(ctx, f.c.opts.Root, f.c.policy, f.c.enablement)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		// The reconciliation the tick does not see. It activates over gen and
+		// retention collects it, exactly as the 30 s default interval does
+		// while a dependence unit runs.
+		if _, err := f.c.Refresh(ctx, nil); err != nil {
+			t.Fatalf("refresh: %v", err)
+		}
+		if _, err := f.store.PinGeneration(ctx, f.c.repo, gen, statusLeaseTTL); err == nil {
+			t.Fatal("the superseded generation still exists; this leg is not exercising the race")
+		}
+		// A publication with nothing to replace still pins and plans, which is
+		// the whole of the path that failed: it must reach "nothing to
+		// publish" over the generation that superseded gen, not
+		// CTX_ARGUMENT_INVALID over the one that is gone.
+		if _, _, err = f.c.late.publish(ctx, snap, sel, refNone, nil); err != nil {
+			t.Fatalf("the deferred publication pinned a stale generation: %v", err)
 		}
 	})
 
@@ -705,7 +750,8 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan: plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}}}
 	g.coverage()
-	for _, s := range g.caps.finish(f.c.log) {
+	published, _ := g.caps.finish(f.c.log)
+	for _, s := range published {
 		if s.ProviderID != d.ID {
 			continue
 		}
@@ -722,7 +768,8 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		plan:   plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
 	g.coverage()
-	for _, s := range g.caps.finish(f.c.log) {
+	published, _ = g.caps.finish(f.c.log)
+	for _, s := range published {
 		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
 			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
 				s.ProviderID, s.Capability, s.State)
@@ -733,8 +780,10 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// what has not started answers "nothing pending" for as long as the unit
 	// runs, which is the whole window a query needs the answer in.
 	l := f.c.late
+	l.mu.Lock()
 	l.running = &deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "running"}}
 	l.queue = append(l.queue, deferredUnit{unit: plan.Unit{ProviderID: d.ID, ScopeKey: "queued"}})
+	l.mu.Unlock()
 	p, err := f.c.Promote(ctx, d.ID, "running")
 	if err != nil {
 		t.Fatalf("Promote: %v", err)

@@ -78,7 +78,7 @@ type generation struct {
 
 // attempt captures, plans, builds and publishes exactly once.
 func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
-	g := &generation{c: c, req: req, started: c.now(), caps: newCapabilityReport()}
+	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
 	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -104,8 +104,8 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 		// staging holds units no later run can complete, and startup recovery
 		// would have to clean it up instead.
 		if abortErr := c.opts.Store.Abort(context.WithoutCancel(ctx), gen); abortErr != nil {
-			c.log.Warn("the failed staging generation could not be aborted", "component", component,
-				"generation_id", int64(gen), "error", provider.CodeOf(abortErr))
+			logTyped(c.log, "the failed staging generation could not be aborted", abortErr,
+				"component", component, "generation_id", int64(gen))
 		}
 		return model.IndexResult{}, err
 	}
@@ -142,7 +142,15 @@ func (g *generation) capture(ctx context.Context) error {
 // key is the same bytes by construction (see build).
 func (g *generation) planUnits(ctx context.Context) error {
 	c := g.c
-	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, c.policy, c.enablement)
+	// Detection walks the workspace itself, so it is given the same Git
+	// exclusion the capture applies. The configured policy alone has no ignore
+	// hook at all, which had detection proposing scopes over every ignored
+	// tree in the checkout -- source the generation can never contain.
+	policy, err := snapshot.TraversalPolicy(ctx, c.policy, c.opts.Root, c.opts.Git)
+	if err != nil {
+		return err
+	}
+	sel, err := c.opts.Registry.Select(ctx, c.opts.Root, policy, c.enablement)
 	if err != nil {
 		return err
 	}
@@ -179,7 +187,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		return model.IndexResult{}, err
 	}
 	g.coverage()
-	states := g.caps.finish(g.c.log)
+	states, _ := g.caps.finish(g.c.log)
 	health := healthOf(states)
 	binding, err := g.c.opts.Store.Activate(ctx, g.gen, g.prev, health, states, NormalizationVersion)
 	if err != nil {
@@ -391,6 +399,10 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 		// would fail as "run is not running".
 		out, err := applier.Apply(ctx, req)
 		if err != nil {
+			// out.Result carries the run the applier actually opened, so the
+			// failure still publishes a provider-run row; without it the
+			// operator sees that a capability failed and nothing about the run
+			// that failed.
 			return outcome{result: out.Result}, err
 		}
 		return outcome{result: annotate(out), parsed: parsedBy(applier, u, out),
