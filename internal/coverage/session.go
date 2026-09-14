@@ -229,11 +229,6 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 	if err != nil && !(expiredSession(err) && rec.ID != "") {
 		return emptyPage, err
 	}
-	if rec.ID == "" {
-		return emptyPage, typedErrf(model.CodeInternal,
-			"coverage status was asked to page a session that was never loaded")
-	}
-
 	limit := s.statusLimit(page.Limit)
 	after, err := s.resumeStatus(page.Cursor, rec)
 	if err != nil {
@@ -384,15 +379,6 @@ func statusQueryHash(rec sqlite.SessionRecord) string {
 func expiredSession(err error) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == model.CodeSessionExpired
-}
-
-// notFound reports the storage contract for a lookup that matched no row:
-// CTX_ARGUMENT_INVALID carrying sqlite.ReasonNotFound, which distinguishes a
-// missing row from a malformed argument under the same code.
-func notFound(err error) bool {
-	var typed *model.Error
-	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid &&
-		typed.Details["reason"] == sqlite.ReasonNotFound
 }
 
 // cursorInvalid is the one rejection a bad continuation gets. Section 16.3 has
