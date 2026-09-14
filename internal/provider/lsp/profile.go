@@ -231,8 +231,26 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 // workDir is the server's private working directory under the data directory.
 // It belongs to codectx, not to a user's shell, and the server start creates
 // it before the runner ever inspects it.
+//
+// The last component is the resolved payload's identity, so a payload change
+// gets a new directory. What lives here is derived from the payload and is not
+// rewritten once written: jdtls's Equinox configuration is seeded from the
+// payload's own config tree and names bundle jars by exact version, so a new
+// payload booted against the previous one's configuration fails at startup with
+// no way back except deleting the directory by hand. The workspace index under
+// -data is derived from it too, and re-creating that after an upgrade is the
+// safe direction. The stale sibling becomes garbage the data-directory sweep
+// removes.
+//
+// The identity is the payload fingerprint rather than the version, because the
+// version is not by itself an identity: an override carries the version its
+// user typed, a re-pinned payload may keep its upstream version string, and the
+// fingerprint folds the bytes as well. It is the fingerprint's digest half
+// (Tool.FingerprintDigest) because this is a path component: the rendered
+// fingerprint embeds that same user-supplied version verbatim, and a version of
+// ".." would name the data directory's parent.
 func (p Profile) workDir(dataDir string) string {
-	return filepath.Join(dataDir, workDirName, p.Name)
+	return filepath.Join(dataDir, workDirName, p.Name, p.Tool.FingerprintDigest())
 }
 
 // argv is the complete argument array after the launcher: the resolved
