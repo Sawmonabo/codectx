@@ -88,11 +88,6 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeTrustRequired,
 		},
 		{
-			name:     "project authorizes an executable",
-			project:  "[analyzers.scip]\nexecutable = \"/usr/bin/scip\"\n",
-			wantCode: model.CodeTrustRequired,
-		},
-		{
 			name:     "project disables the strict read gate",
 			project:  "[context]\nstrict_read_gate = false\n",
 			wantCode: model.CodeTrustRequired,
@@ -113,16 +108,6 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			// that capped a large repository at an unrelated number.
 			name: "a large file budget is a budget, not a capsule ceiling",
 			user: "[workspace]\nmax_files = 2000000\n",
-		},
-		{
-			// There is no shell, so "}" in an argv element is a literal.
-			name: "a literal brace in an analyzer argument is not a substitution",
-			user: "[analyzers.demo]\nexecutable = \"/usr/local/bin/demo\"\nversion_constraint = \">=1.0\"\nwork_dir = \"/tmp/demo\"\nmemory_budget_bytes = 1048576\ndisk_budget_bytes = 1048576\ntimeout = \"30s\"\nnetwork = \"denied\"\nargs = [\"--opt={a}\", \"${input_dir}\"]\n",
-		},
-		{
-			name:     "an unknown substitution is rejected",
-			user:     "[analyzers.demo]\nexecutable = \"/usr/local/bin/demo\"\nversion_constraint = \">=1.0\"\nwork_dir = \"/tmp/demo\"\nmemory_budget_bytes = 1048576\ndisk_budget_bytes = 1048576\ntimeout = \"30s\"\nnetwork = \"denied\"\nargs = [\"${output_dr}\"]\n",
-			wantCode: model.CodeConfigInvalid,
 		},
 		{
 			name:     "zero is not unlimited",
@@ -222,15 +207,5 @@ func TestFingerprintsCoverEligibilityInputs(t *testing.T) {
 	)
 	if cfg.SourcePolicyHash() == bare {
 		t.Error("SourcePolicyHash covers only the configured toggles; the built-in exclusion lists are not an input")
-	}
-
-	// An analyzer's environment allowlist changes what the analyzer can
-	// resolve, so two profiles differing only in it are not interchangeable.
-	withHome := cfg
-	withHome.Analyzers = map[string]Analyzer{"demo": {Name: "demo", EnvAllowlist: []string{"HOME"}}}
-	withPath := cfg
-	withPath.Analyzers = map[string]Analyzer{"demo": {Name: "demo", EnvAllowlist: []string{"HOME", "PATH"}}}
-	if withHome.AnalysisConfigHash() == withPath.AnalysisConfigHash() {
-		t.Error("AnalysisConfigHash ignores analyzers.*.env_allowlist")
 	}
 }

@@ -10,7 +10,6 @@ package config
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"time"
 
@@ -107,29 +106,6 @@ type Config struct {
 	Context   Context   `toml:"context"`
 	Coverage  Coverage  `toml:"coverage"`
 	MCP       MCP       `toml:"mcp"`
-	// Analyzers is the `[analyzers.<name>]` table of approved profiles. It is
-	// user-configuration-only; a project file that declares one is rejected as
-	// a trust escalation. Iterate it through SortedAnalyzers so diagnostics and
-	// fingerprints have a deterministic order.
-	Analyzers map[string]Analyzer `toml:"analyzers"`
-}
-
-// SortedAnalyzers returns the approved profiles ordered by name, with each
-// profile's Name filled in. Map iteration order is random, so every consumer
-// that reports or hashes profiles uses this instead.
-func (c Config) SortedAnalyzers() []Analyzer {
-	names := make([]string, 0, len(c.Analyzers))
-	for name := range c.Analyzers {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out := make([]Analyzer, 0, len(names))
-	for _, name := range names {
-		a := c.Analyzers[name]
-		a.Name = name
-		out = append(out, a)
-	}
-	return out
 }
 
 // Workspace is the source-eligibility policy. Every field here feeds
@@ -344,68 +320,6 @@ type Coverage struct {
 type MCP struct {
 	Transport string `toml:"transport"`
 	Watch     bool   `toml:"watch"`
-}
-
-// NetworkPolicy is an analyzer profile's declared network posture. `denied` is
-// a policy statement and an input to the diagnostics that report whether an
-// actual OS-level restriction is active; on its own it is not a network
-// boundary (Section 21).
-type NetworkPolicy string
-
-const (
-	NetworkDenied  NetworkPolicy = "denied"
-	NetworkAllowed NetworkPolicy = "allowed"
-)
-
-// Valid reports whether p is a known wire spelling.
-func (p NetworkPolicy) Valid() bool { return p == NetworkDenied || p == NetworkAllowed }
-
-// Analyzer is one approved analyzer profile (Section 20.2). It exists only in
-// the user configuration: a project file that declares one is an escalation.
-//
-// The profile is a description, not a capability: this package validates its
-// shape, and the provider that owns the tool resolves, checksums and runs it
-// through internal/process.
-type Analyzer struct {
-	// Name is the profile's table key, filled in by Load.
-	Name string `toml:"-"`
-	// Executable is an absolute path. Section 20.2 forbids PATH lookup, so a
-	// bare command name is rejected rather than resolved.
-	Executable string `toml:"executable"`
-	// VersionConstraint is the exact version or range the caller must observe
-	// before admitting output from this tool.
-	VersionConstraint string `toml:"version_constraint"`
-	// Checksum is the expected lowercase SHA-256 hex of the executable, which
-	// is how writable-repository executable substitution is detected.
-	Checksum string `toml:"checksum"`
-	// Args is a fixed argument array. Placeholders are the typed substitutions
-	// named by AnalyzerSubstitutions; no other template syntax is accepted and
-	// there is no shell, so a value can never become a shell fragment.
-	Args []string `toml:"args"`
-	// EnvAllowlist names the environment variables the child may inherit. Any
-	// variable not named here is absent from the child environment entirely.
-	EnvAllowlist []string `toml:"env_allowlist"`
-	// WorkDir is the absolute private working directory for this analyzer.
-	WorkDir string `toml:"work_dir"`
-	// MemoryBudgetBytes and DiskBudgetBytes are the reservations the runner
-	// accounts before the child starts.
-	MemoryBudgetBytes int64 `toml:"memory_budget_bytes"`
-	DiskBudgetBytes   int64 `toml:"disk_budget_bytes"`
-	// Network is the declared posture, not an enforced sandbox.
-	Network NetworkPolicy `toml:"network"`
-	Timeout Duration      `toml:"timeout"`
-}
-
-// AnalyzerSubstitutions is the closed set of typed placeholders an approved
-// profile's argument array may contain. Substitution values are supplied by the
-// provider at run time from validated private paths; an unknown placeholder is
-// a configuration error rather than a literal argument, because a silently
-// literal "${input_dir}" would make the tool read the wrong tree.
-var AnalyzerSubstitutions = map[string]bool{
-	"input_dir":   true,
-	"output_file": true,
-	"work_dir":    true,
-	"manifest":    true,
 }
 
 // TraversalPolicy is the traversal policy this configuration describes. The Git

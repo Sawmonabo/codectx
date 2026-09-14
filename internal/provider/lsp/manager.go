@@ -10,11 +10,12 @@
 // disappears without corrupting anything when the server stops. Canonical
 // facts, generations and units are never read or written here.
 //
-// Trust comes from configuration alone. A Definition names a supported
-// server; only a Profile constructed by Trusted from an [analyzers.<name>]
-// approval can be started, and detection of a repository's kind never
-// authorizes execution. Servers run through the shared internal/process
-// runner with no shell, an allowlisted environment and bounded streams.
+// Trust comes from the embedded tool lock. A Definition names a supported
+// server; only a Profile constructed by Resolve, which hands back the payload
+// the lock pinned and internal/toolchain verified, can be started, and
+// detection of a repository's kind never authorizes execution. Servers run
+// through the shared internal/process runner with no shell, an allowlisted
+// environment and bounded streams.
 package lsp
 
 import (
@@ -156,15 +157,15 @@ func New(opts Options) (*Manager, error) {
 
 // Open returns an overlay over view answered by profile, starting the server
 // lazily on first use and sharing a running one afterwards. The profile must
-// come from Trusted. When every server slot is taken by a server nobody is
+// come from Resolve. When every server slot is taken by a server nobody is
 // using, the idle one is stopped to make room; when all are in use, the
 // answer is CTX_RESOURCE_LIMIT rather than a queue.
 func (m *Manager) Open(ctx context.Context, view model.SnapshotView, profile Profile) (*Overlay, error) {
 	if view == nil {
 		return nil, invalid("an overlay needs a snapshot view")
 	}
-	if profile.Executable == "" || profile.Name == "" {
-		return nil, trustRequired("the profile was not constructed by lsp.Trusted; an unapproved server is never started")
+	if len(profile.Tool.ArgvPrefix) == 0 || profile.Name == "" {
+		return nil, trustRequired("the profile was not constructed by lsp.Resolve; a server the tool lock did not pin is never started")
 	}
 	key := serverKey{snapshot: view.Header().ID, profile: profile.Name}
 	// Two attempts: the second covers a shared server that failed or began
