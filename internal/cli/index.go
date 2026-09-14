@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/app"
@@ -24,6 +25,12 @@ const (
 	// one climbing out of the root is refused rather than followed.
 	indexSCIPIndexFlag  = "scip-index"
 	indexSCIPInputsFlag = "scip-inputs"
+	// statusResourcesFlag asks `status` for the Section 23 accounting block.
+	// It is opt-in because an ordinary status must stay cheap: sampling a
+	// process tree and measuring the store costs more than reporting what the
+	// coordinator already knows, and every `status` paying for it would make
+	// the cheapest report in the tree one of the most expensive.
+	statusResourcesFlag = "resources"
 )
 
 // indexLockWait is the bounded wait a building command makes for the
@@ -184,13 +191,38 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			"session in another process is not visible here: a separate `codectx " +
 			"watch` reports as off. Nothing is fetched and nothing is written to " +
 			"produce this report, and it takes no workspace lock, so it answers " +
-			"while another process is indexing or watching.",
+			"while another process is indexing or watching.\n\n" +
+			"--resources adds the Section 23 accounting block: parent and worker memory, " +
+			"the query, cache and queue reservations, live subprocesses and pending events, " +
+			"database, WAL, temporary and content bytes, and unit reuse and parse counts. " +
+			"It is not reported by default because measuring it costs more than the rest of " +
+			"this report put together. A metric this host cannot measure is reported as " +
+			"unavailable, never as zero.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resources, err := boolFlag(cmd, statusResourcesFlag)
+			if err != nil {
+				return err
+			}
+			// Ruling Q1 makes the resource block a request field rather than a
+			// second call: one report, one moment. The request is built and
+			// screened here, where the command line is.
+			req := model.StatusRequest{Resources: resources}
+			if err := req.Validate(); err != nil {
+				return err
+			}
 			return runService(cmd, openForReport(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+					// HAND-OFF TO INT (ruling Q1). The facade still takes no
+					// request in this tree, so the call below is the one the
+					// integration lane replaces, verbatim:
+					//     status, err := svc.IndexStatus(ctx, req)
+					// Until it lands, IndexStatus.Resources stays nil and the
+					// block renders nothing -- absent, which is exactly what
+					// "not measured" looks like everywhere else in this report.
+					//
 					// A provider that could not be constructed publishes no
 					// detection row of its own. Those rows are folded in by the
 					// coordinator, before the capability report's own bound is
@@ -221,6 +253,8 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addRepoFlag(cmd)
+	cmd.Flags().Bool(statusResourcesFlag, false,
+		"also report the Section 23 resource accounting block, which an ordinary status does not measure")
 	return cmd
 }
 
@@ -480,8 +514,65 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	for _, warning := range s.Warnings {
 		fmt.Fprintf(&b, "warning     %s\n", warning)
 	}
+	// Absent unless --resources asked for it, which is the same thing the
+	// --json consumer sees: the field is omitted rather than rendered empty.
+	if s.Resources != nil {
+		writeResources(&b, *s.Resources)
+	}
 	b.WriteString("\n")
 	return writeText(w, "%s", b.String())
+}
+
+// metricUnavailable is how an unmeasured metric renders. Section 22 requires an
+// unavailable metric be recorded as unavailable and never as zero, and every
+// field of model.ResourceReport is a pointer for exactly that reason: nil means
+// this host or this platform did not measure it, while 0 is a real measurement
+// of zero. Printing a nil as 0 would report a process using no memory, which is
+// the one reading an operator would act on and the one that is never true.
+const metricUnavailable = "unavailable"
+
+// writeResources renders the Section 23 accounting block. Every field of the
+// report is listed, present or not: a row that disappeared when its metric did
+// would leave the operator unable to tell "this build does not report that" from
+// "this host cannot measure it".
+func writeResources(b *strings.Builder, r model.ResourceReport) {
+	b.WriteString("\nresources\n")
+	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
+	for _, row := range []struct{ label, value string }{
+		{"parent rss", byteMetric(r.ParentRSSBytes)},
+		{"peak parent rss", byteMetric(r.PeakParentRSSBytes)},
+		{"base worker rss", byteMetric(r.BaseWorkerRSSBytes)},
+		{"go managed", byteMetric(r.GoManagedBytes)},
+		{"native worker", byteMetric(r.NativeWorkerBytes)},
+		{"query reservation", byteMetric(r.QueryReservationBytes)},
+		{"cache reservation", byteMetric(r.CacheReservationBytes)},
+		{"queue reservation", byteMetric(r.QueueReservationBytes)},
+		{"database", byteMetric(r.DatabaseBytes)},
+		{"wal", byteMetric(r.WALBytes)},
+		{"temp", byteMetric(r.TempBytes)},
+		{"content store", byteMetric(r.CASBytes)},
+		{"live subprocesses", countMetric(r.LiveSubprocesses)},
+		{"pending events", countMetric(r.PendingEvents)},
+		{"units reused", countMetric(r.UnitsReused)},
+		{"units parsed", countMetric(r.UnitsParsed)},
+	} {
+		fmt.Fprintf(tw, "  %s\t%s\n", row.label, row.value)
+	}
+	flushTableInto(tw)
+}
+
+func byteMetric(v *uint64) string {
+	if v == nil {
+		return metricUnavailable
+	}
+	return fmt.Sprintf("%d bytes", *v)
+}
+
+func countMetric(v *int64) string {
+	if v == nil {
+		return metricUnavailable
+	}
+	return fmt.Sprintf("%d", *v)
 }
 
 // writeCapabilities renders per-capability freshness. A capability with no row
