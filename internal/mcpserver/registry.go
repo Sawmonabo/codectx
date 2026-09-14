@@ -24,7 +24,7 @@ import (
 func register(s *mcp.Server, h *handlers) {
 	// --- L2: index and discovery ---------------------------------------
 	addTool(s, "codectx_index_status", "Index status",
-		"Active generation, health, coherence and capability completeness.", h.indexStatus)
+		"Active generation, health, coherence and capability completeness. Set resources=true for the accounting block.", h.indexStatus)
 	addTool(s, "codectx_refresh_index", "Refresh index",
 		"Build an incremental generation over the current workspace.", h.refreshIndex)
 	addTool(s, "codectx_repo_overview", "Repository overview",
@@ -83,7 +83,7 @@ func register(s *mcp.Server, h *handlers) {
 
 // toolCount is the Section 19.2 surface size. Section 19.2 lists 23 tools; the
 // "24" of wave-E Q16 is an off-by-one and is ledgered. There is no doctor tool,
-// which is why DiagnoseService keeps no Task 19 consumer.
+// which is why this package takes no app.DiagnoseService at all.
 const toolCount = 23
 
 // addTool registers one tool with BOTH of its schemas preset from the handler's

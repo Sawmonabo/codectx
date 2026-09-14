@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -70,7 +71,7 @@ var (
 type IndexService interface {
 	Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error)
 	Refresh(ctx context.Context, req model.IndexRequest) (model.IndexResult, error)
-	IndexStatus(ctx context.Context) (model.IndexStatus, error)
+	IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error)
 }
 
 // ExploreService answers the read-only discovery and traversal endpoints.
@@ -152,30 +153,67 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 	return res, nil
 }
 
-// IndexStatus reports the active generation and its capability completeness.
-func (s *Services) IndexStatus(ctx context.Context) (model.IndexStatus, error) {
+// IndexStatus reports the active generation and its capability completeness,
+// and -- only when the request asks for it -- the Section 23 resource block.
+//
+// The block is a request field rather than a second call (ruling Q1) so one
+// answer describes one moment: a caller that asked status and then resources
+// would be reading two instants and reporting them as one. It stays off by
+// default because sampling the host walks the content-addressed store and the
+// temporary directories, and an ordinary status must stay cheap.
+//
+// A failure to sample is the request's failure, not a quieter status: the
+// caller asked for resources, so answering without them would report a
+// measurement as absent when it was refused. Absence inside the block still
+// means "not measurable on this host", which is the sampler's own contract.
+func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error) {
+	if err := req.Validate(); err != nil {
+		return model.IndexStatus{}, err
+	}
 	st, err := s.w.coord.Status(ctx)
 	if err != nil {
 		return model.IndexStatus{}, s.fail("index status", err)
 	}
+	if !req.Resources {
+		return st, nil
+	}
+	svc, err := s.diagnostics()
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	report, err := svc.Resources(ctx)
+	if err != nil {
+		return model.IndexStatus{}, s.fail("index status", err)
+	}
+	st.Resources = &report
 	return st, nil
 }
 
 // --- ExploreService ---------------------------------------------------------
 
-// Overview reports the repository's top-level structure.
+// Overview reports the repository's top-level structure: one bounded,
+// generation-pinned page of container nodes, each carrying what it directly
+// holds.
 //
-// It has no producer to route to: the bounded package/module/language map of
-// model.OverviewItem needs per-container file, symbol and byte aggregates that
-// no landed service computes, and ruling Q8 forbids Task 17 adding a second
-// aggregate to get them. The request is still validated, so a malformed one is
-// refused as an argument error rather than as a defect, and the answer is an
-// explicit typed refusal naming the owner. See deviation D1 in the lane report.
+// It routes through withEngine like every other traversal endpoint, because the
+// map is read from the same pinned generation and under the same lease
+// discipline: the engine's container enumeration is only meaningful inside the
+// binding withEngine pins, and releasing that lease on every path is what keeps
+// a repository map from retaining a generation after the page is printed.
 func (s *Services) Overview(ctx context.Context, req model.OverviewRequest) (model.Page[model.OverviewItem], error) {
 	if err := req.Validate(); err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
-	return model.Page[model.OverviewItem]{}, notProduced("repo_overview", "the repository map aggregate")
+	var page model.Page[model.OverviewItem]
+	err := s.withEngine(ctx, req.GenerationID, func(e *graph.Engine) error {
+		var err error
+		page, err = e.Overview(ctx, req)
+		return err
+	})
+	if err != nil {
+		return model.Page[model.OverviewItem]{}, s.fail("repo overview", err)
+	}
+	return page, nil
 }
 
 // Search answers generation-local lexical retrieval and exact lookup.
@@ -553,20 +591,41 @@ func (s *Services) CloseSession(ctx context.Context, req model.SessionRequest, e
 
 // --- DiagnoseService --------------------------------------------------------
 
-// Doctor reports this installation's health.
+// Doctor reports this installation's health: the Section 22 check list, run
+// against this workspace.
 //
-// Like Overview it has no producer to route to: Section 22's checks live in
-// internal/diagnostics, which Task 22 builds, and assembling a DoctorReport
-// here would be that package written twice. The request is validated and the
-// answer is an explicit typed refusal naming the owner. See deviation D1.
+// The report is returned as internal/diagnostics produced it. A failing check
+// is not an error -- a doctor that refused to answer because something it
+// checks is broken would be useless precisely when it is needed -- so only a
+// failure to PRODUCE the list at all reaches the caller as an error.
 func (s *Services) Doctor(ctx context.Context, req model.DoctorRequest) (model.DoctorReport, error) {
 	if err := req.Validate(); err != nil {
 		return model.DoctorReport{}, err
 	}
-	return model.DoctorReport{}, notProduced("doctor", "the diagnostics reporter")
+	svc, err := s.diagnostics()
+	if err != nil {
+		return model.DoctorReport{}, err
+	}
+	report, err := svc.Doctor(ctx, req)
+	if err != nil {
+		return model.DoctorReport{}, s.fail("doctor", err)
+	}
+	return report, nil
 }
 
 // --- shared routing helpers -------------------------------------------------
+
+// diagnostics returns the composed Section 22/23 reporter, for the same reason
+// and with the same shape as workflow below: open() builds it eagerly, so the
+// nil branch is unreachable through a workspace this package opened, and a
+// refusal that names the wiring gap beats a panic in a product adapter.
+func (s *Services) diagnostics() (*diagnostics.Service, error) {
+	if s.w.s.diagnose == nil {
+		return nil, &model.Error{Code: model.CodeInternal,
+			Message: "app: this workspace composed no diagnostics service"}
+	}
+	return s.w.s.diagnose, nil
+}
 
 // workflow returns the composed workflow service. open() builds it eagerly and
 // fails the composition if it cannot, so the nil branch is unreachable through
@@ -626,16 +685,6 @@ func (s *Services) fail(op string, err error) error {
 		"component", "app", "operation", op, "error", err.Error())
 	return &model.Error{Code: model.CodeInternal,
 		Message: "app: " + op + " failed unexpectedly"}
-}
-
-// notProduced is the answer of a facade method whose producer is another task's
-// to build. It is a CTX_INTERNAL because Section 22 adds no code for it and the
-// caller cannot correct it, and it names the missing producer so an operator
-// reading the message learns what is absent rather than that something broke.
-func notProduced(op, producer string) error {
-	return &model.Error{Code: model.CodeInternal,
-		Message:     "app: " + op + " has no producer in this build",
-		Remediation: "this operation waits on " + producer}
 }
 
 // unknownSource refuses a semantic source this facade cannot route. The request

@@ -105,10 +105,10 @@ func (c *Collector) sweep(ctx context.Context) (Report, error) {
 	errs = append(errs, err)
 
 	// (*Spools).Sweep returns the live byte total it reconciled the budget
-	// against, not a count of files removed. Report.SpoolsSwept therefore
-	// carries bytes; the rename is the reporting fix named for INT.
+	// against, not a count of files removed, which is why the field it lands in
+	// is named for bytes.
 	liveSpoolBytes, err := c.opts.Spools.Sweep(ctx, now)
-	report.SpoolsSwept = liveSpoolBytes
+	report.SpoolBytesSwept = liveSpoolBytes
 	errs = append(errs, err)
 
 	errs = append(errs, c.opts.Snapshot.SweepSnapshots(c.opts.Config.DataDir))

@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/coverage"
+	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -28,6 +29,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -64,10 +66,24 @@ const spoolBudgetDivisor = 8
 // the provider's own default restated here so one number sizes both sides
 // rather than a budget guessing at a default it cannot see.
 //
-// It is known to over-reserve by roughly seven times against measured worker
-// resident memory (ledger 113); re-pinning it is Task 20's measurement, and
-// over-reserving is the safe direction for an admission bound.
+// Task 20 measured it on this host, with the real worker subprocess and all
+// pinned grammars loaded: one worker peaks at 38.9 MiB over ordinary repository
+// files and grows linearly at about 30.5 MiB per MiB of source, reaching
+// 191.5 MiB at `workspace.max_parse_file_bytes = 5 MiB`. Ledger 113's "roughly
+// seven times over-reserved" reproduces exactly -- but only for ordinary files.
+// Re-pinning to the ~37 MiB that measurement suggests would let a worker exceed
+// its own admission reservation five-fold on a single legal file, so the pin
+// stays at 256 MiB, which leaves about a third of headroom over the parse
+// ceiling. The measurement, not the round number, is the reason.
 const parserWorkerReservationBytes int64 = 256 << 20
+
+// collectorBatchLimit bounds every phase of one retention pass. It restates
+// internal/storage/sqlite's own collection batch (gcBatchUnits, unexported
+// there) so both halves of a pass agree about how much work one transaction is,
+// and it is stated explicitly rather than left at zero: retention.New accepts a
+// zero, and a zero limit would make every phase collect nothing, forever, while
+// reporting success.
+const collectorBatchLimit = 200
 
 // sharedRunnerHeadroom is how many children beyond the heavy-analyzer budget
 // the shared runner admits: Git plumbing and a SCIP indexer run alongside a
@@ -170,6 +186,17 @@ type stack struct {
 	// workflow is the Section 17 guard, review and capsule service the facade
 	// routes every session mutation through. INT wires it.
 	workflow *workflow.Service
+
+	// runners are every process runner this stack owns, held only so the
+	// resource sampler can count their live children. Nothing else reads them:
+	// each component keeps its own runner.
+	runners []diagnostics.ProcessCounter
+	// diagnose produces the Section 22 check list and the Section 23 resource
+	// block; collector is the process-level reclaim pass and the Section 10.4
+	// blob grace protocol. Both are set by openDiagnostics, which needs the
+	// repository identity, so both are built from openQueries.
+	diagnose  *diagnostics.Service
+	collector *retention.Collector
 
 	// views memoises the per-snapshot read view the coverage service opens
 	// through its SourceOpener. A view is pinned to one immutable snapshot, so
@@ -320,12 +347,27 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 
 	// The analyzer runners are budgeted from what their children reserve, not
 	// from resources.base_memory_budget_bytes: that setting budgets this
-	// process's own footprint. Using it here refused every language server and
-	// every graph-engine run at admission, before the process existed, because
-	// one server reserves several times the whole base budget (measured on this
-	// repository; the lane report carries the output).
+	// process's own footprint. Using it as a runner budget refused every
+	// language server and every graph-engine run at admission, before the
+	// process existed, because one server reserves several times the whole base
+	// budget (measured on this repository; the lane report carries the output).
+	//
+	// It is read here instead as what it actually is, and this is its first
+	// runtime reader: the machine-derived allocation subtracts THIS process's
+	// footprint from available memory before handing the rest to children, and
+	// resources.base_memory_budget_bytes is the configured size of exactly that
+	// footprint. Passing the constant instead would budget children against a
+	// figure the operator cannot change while validation goes on checking their
+	// reservations against the one they can.
+	baseFootprint := cfg.Resources.BaseMemoryBudgetBytes
+	if baseFootprint <= 0 {
+		// Validation refuses a non-positive value, so this guards a Config
+		// built in code rather than loaded. A zero footprint would hand the
+		// whole machine to children.
+		baseFootprint = dependence.DefaultBaseFootprintBytes
+	}
 	childMemory := dependence.ObserveMachine().Allocation(
-		dependence.DefaultBaseFootprintBytes, dependence.DefaultSafetyMarginBytes)
+		baseFootprint, dependence.DefaultSafetyMarginBytes)
 	if childMemory <= 0 {
 		childMemory = unobservedChildMemoryBudget
 	}
@@ -363,6 +405,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
+
+	// The three runners are the only live-subprocess counters in this process,
+	// so the resource report sums all three: naming one would describe part of
+	// the process budget as the whole of it.
+	s.runners = []diagnostics.ProcessCounter{shared, parsers, servers}
 
 	if root.HasGit {
 		// A Git workspace is never captured without its membership and ignore
@@ -629,7 +676,71 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		return err
 	}
 	s.search = svc
-	return s.openCoverage()
+	if err := s.openCoverage(); err != nil {
+		return err
+	}
+	return s.openDiagnostics()
+}
+
+// openDiagnostics composes the Section 22/23 reporter and the process-level
+// collector. It is called from openQueries for the same reason the search and
+// coverage services are: the doctor's active-pointer check names the repository,
+// and only the coordinator derives that identity.
+//
+// Both are built in BOTH compositions. `codectx doctor` and `codectx status
+// --resources` open the workspace for a report, so building the reporter only
+// for an indexing run would leave every diagnostic command with no producer --
+// the exact failure Task 20 exists to remove.
+//
+// Every dependency crosses as a narrow interface: neither package sees
+// *sqlite.Store, *toolchain.Resolver, *snapshot.CAS or config.Config's whole
+// tree, which is what their doc.go rules require and what lets their rows run
+// against fakes.
+func (s *stack) openDiagnostics() error {
+	dataDir := s.dataDir
+	svc, err := diagnostics.New(diagnostics.Options{
+		Config: s.cfg,
+		// The binary's own identity, read from the same source `codectx
+		// version` reads. Threading it down from the command line would be a
+		// second spelling of a fact this process can always answer for itself.
+		Build:     model.CurrentBuildInfo(),
+		Repo:      s.repo,
+		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
+		Store:     storeReader{Store: s.store},
+		Toolchain: toolchainReporter{r: s.resolver},
+		Workspace: workspaceProber{},
+		Now:       time.Now,
+	})
+	if err != nil {
+		return err
+	}
+	s.diagnose = svc
+
+	// The tool resolver is handed over as the collector's ToolCollector
+	// directly, not wrapped in a GC-only adapter: the data-directory reclaim
+	// discovers the name -> digest oracle by asserting retention.ToolPins on
+	// this same dependency, and an adapter would hide PinnedFingerprints and
+	// leave that pass warning and skipping on every run.
+	collector, err := retention.New(retention.Options{
+		Config: retention.RetentionConfig{
+			DataDir:                dataDir,
+			ClosedSessionRetention: s.cfg.Storage.ClosedSessionRetention.Std(),
+			GraceWindow:            s.cfg.Retention.BlobGrace.Std(),
+			BatchLimit:             collectorBatchLimit,
+		},
+		Sessions: s.store,
+		Spools:   s.spools,
+		Snapshot: snapshotSweeper{},
+		Tools:    s.resolver,
+		Blobs:    s.store,
+		Objects:  s.cas,
+		Now:      time.Now,
+	})
+	if err != nil {
+		return err
+	}
+	s.collector = collector
+	return nil
 }
 
 // openCoverage builds the Section 16 coverage service. It is called from

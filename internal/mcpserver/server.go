@@ -28,16 +28,16 @@ const serverInstructions = `codectx serves one workspace over stdio. Open a cont
 
 const serverDescription = "Bounded, generation-pinned code context and review-gate tools for one workspace."
 
-// Options is everything mcpserver.New needs. The four facade fields are the
+// Options is everything mcpserver.New needs. The three facade fields are the
 // NARROW INTERFACES of internal/app, never *app.Services: *Services is a
-// concrete struct and cannot be faked, and it satisfies all four, so
+// concrete struct and cannot be faked, and it satisfies all three, so
 // internal/cli/mcp.go hands ws.Services() to each field while tests hand an
-// in-package fake.
+// in-package fake. There is no Diagnose field: Section 19.2 registers no doctor
+// tool, so the server would hold a service no handler could call.
 type Options struct {
-	Index    app.IndexService
-	Explore  app.ExploreService
-	Context  app.ContextService
-	Diagnose app.DiagnoseService
+	Index   app.IndexService
+	Explore app.ExploreService
+	Context app.ContextService
 
 	// Config supplies the Section 20 bounds limitMiddleware and readSource
 	// enforce. A zero value is not accepted: see New.
@@ -71,10 +71,10 @@ type Server struct {
 // 19.3 scopes V1 to tools — and sets no KeepAlive, which the SDK documents as
 // unavailable for protocol versions >= 2026-07-28.
 func New(opts Options) (*Server, error) {
-	if opts.Index == nil || opts.Explore == nil || opts.Context == nil || opts.Diagnose == nil {
+	if opts.Index == nil || opts.Explore == nil || opts.Context == nil {
 		return nil, &model.Error{
 			Code:    model.CodeArgumentInvalid,
-			Message: "mcpserver.New requires all four facade services",
+			Message: "mcpserver.New requires all three facade services",
 		}
 	}
 	logger := opts.Logger
@@ -83,13 +83,12 @@ func New(opts Options) (*Server, error) {
 	}
 
 	s := &Server{h: &handlers{
-		index:    opts.Index,
-		explore:  opts.Explore,
-		context:  opts.Context,
-		diagnose: opts.Diagnose,
-		cfg:      opts.Config,
-		build:    opts.Build,
-		log:      logger,
+		index:   opts.Index,
+		explore: opts.Explore,
+		context: opts.Context,
+		cfg:     opts.Config,
+		build:   opts.Build,
+		log:     logger,
 	}}
 	// The bounds are resolved from the handlers' own cfg, not from a second
 	// copy on Server: the gate and the handlers it gates can then never

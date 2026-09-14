@@ -115,13 +115,12 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
 			svc := ws.Services()
 			server, err := mcpserver.New(mcpserver.Options{
-				Index:    svc,
-				Explore:  svc,
-				Context:  svc,
-				Diagnose: svc,
-				Config:   cfg,
-				Build:    build,
-				Logger:   log,
+				Index:   svc,
+				Explore: svc,
+				Context: svc,
+				Config:  cfg,
+				Build:   build,
+				Logger:  log,
 			})
 			if err != nil {
 				return err
