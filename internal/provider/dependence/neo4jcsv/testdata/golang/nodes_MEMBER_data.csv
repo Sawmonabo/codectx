@@ -1,0 +1,4 @@
+98784247808,MEMBER,w,TYPE_DECL,G,5,,<empty>,9,G,,,1,,int
+98784247809,MEMBER,<empty>,<empty>,F,6,,<empty>,4,F,,,2,,int
+98784247810,MEMBER,<empty>,<empty>,Arr,6,,<empty>,5,Arr,,,3,,[]int
+98784247811,MEMBER,<empty>,<empty>,M,6,,<empty>,6,M,,,4,,ANY

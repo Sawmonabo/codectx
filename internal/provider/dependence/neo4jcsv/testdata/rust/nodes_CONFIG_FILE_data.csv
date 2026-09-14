@@ -1,0 +1,7 @@
+42949672960,CONFIG_FILE,"[package]
+name = ""w""
+version = ""0.1.0""
+edition = ""2021""
+[lib]
+path = ""src/lib.rs""
+",Cargo.toml

@@ -1,0 +1,15 @@
+68719476736,IDENTIFIER,1,,,Factor,5,,8,helper,,,1,,example.com/fix/helper
+68719476737,IDENTIFIER,1,,,x,2,,10,x,,,1,,int
+68719476738,IDENTIFIER,-1,,,flag,5,,11,flag,,,1,,bool
+68719476739,IDENTIFIER,1,,,x,3,,12,x,,,1,,int
+68719476740,IDENTIFIER,1,,,x,20,,12,x,,,1,,int
+68719476741,IDENTIFIER,1,,,c,3,,13,c,,,1,,*example.com/fix/app.Counter
+68719476742,IDENTIFIER,2,,,x,9,,13,x,,,2,,int
+68719476743,IDENTIFIER,1,,,x,3,,15,x,,,1,,int
+68719476744,IDENTIFIER,1,,,c,3,,16,c,,,1,,*example.com/fix/app.Counter
+68719476745,IDENTIFIER,2,,,x,9,,16,x,,,2,,int
+68719476746,IDENTIFIER,1,,,Total,2,,18,app,,,1,,example.com/fix/app
+68719476747,IDENTIFIER,2,,,x,10,,18,x,,,2,,int
+68719476748,IDENTIFIER,1,,,x,9,,19,x,,,1,,int
+68719476749,IDENTIFIER,1,,,v,9,,5,v,,,1,,int
+68719476750,IDENTIFIER,1,,,Factor,13,,5,helper,,,1,,example.com/fix/helper

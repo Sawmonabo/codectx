@@ -1,0 +1,16 @@
+107374182400,METHOD,<empty>,<empty>,"function run(s, i) {
+  let x = 1; x += 2; x++; --x;
+  s.f = 3; s.arr[i] = 4; g = x;
+  let [a, b] = [x, x]; [a, b] = [b, a]; ({f: a} = s);
+  let y = x = 7; s?.g; g ??= 1;
+}",0,1,w.js,w.js::program:run,<empty>,,false,2,7,run,,,1,
+107374182401,METHOD,w.js::program,TYPE_DECL,:program,0,0,w.js,w.js::program,<empty>,,false,1,8,:program,,,1,
+107374182402,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
+107374182403,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignmentPlus,<empty>,,true,,,<operator>.assignmentPlus,,,0,
+107374182404,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.postIncrement,<empty>,,true,,,<operator>.postIncrement,,,0,
+107374182405,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.preIncrement,<empty>,,true,,,<operator>.preIncrement,,,0,
+107374182406,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.fieldAccess,<empty>,,true,,,<operator>.fieldAccess,,,0,
+107374182407,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indexAccess,<empty>,,true,,,<operator>.indexAccess,,,0,
+107374182408,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,__ecma.Array.factory,<empty>,,true,,,__ecma.Array.factory,,,0,
+107374182409,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.notNullAssert,<empty>,,true,,,<operator>.notNullAssert,,,0,
+107374182410,METHOD,<speculatedMethods>,NAMESPACE_BLOCK,<empty>,,,<empty>,__ecma.Array:,<empty>,,true,,,__ecma.Array:,,,0,

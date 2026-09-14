@@ -1,0 +1,10 @@
+167503724544,TYPE_DECL,,<empty>,<empty>,<empty>,1,N/A,ANY,<empty>,,false,1,ANY,1,1,0
+167503724545,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.S<meta>,<empty>,ANY,false,2,S<meta>,6,68,1
+167503724546,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.S,<empty>,,false,2,S,6,68,2
+167503724547,TYPE_DECL,,<empty>,<empty>,<empty>,5,w.py,w.py:<module>.S.__init__,<empty>,ANY,false,3,__init__,19,68,2
+167503724548,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.S.<body>,<empty>,ANY,false,2,<body>,6,68,2
+167503724549,TYPE_DECL,,<empty>,<empty>,<empty>,18,w.py,w.py:<module>.S.<metaClassCallHandler>,<empty>,ANY,false,3,<metaClassCallHandler>,32,36,2
+167503724550,TYPE_DECL,,<empty>,<empty>,<empty>,18,w.py,w.py:<module>.S.<fakeNew>,<empty>,ANY,false,3,<fakeNew>,32,36,4
+167503724551,TYPE_DECL,,<empty>,<empty>,<empty>,5,w.py,w.py:<module>.S.__init__<metaClassAdapter>,<empty>,ANY,false,3,__init__<metaClassAdapter>,19,68,8
+167503724552,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>.run,<empty>,ANY,false,4,run,68,213,4
+167503724553,TYPE_DECL,,<empty>,<empty>,<empty>,1,w.py,w.py:<module>,<empty>,ANY,false,1,<module>,0,213,2
