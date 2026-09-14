@@ -1,0 +1,37 @@
+30064771072,CALL,-1,,,(*self).f = f,16,STATIC_DISPATCH,,1,<operator>.assignment,<operator>.assignment,15,25,1,,,,ANY
+30064771073,CALL,1,,,(*self).f,16,STATIC_DISPATCH,,1,<operator>.fieldAccess,<operator>.fieldAccess,15,25,1,,,,i32
+30064771074,CALL,1,,,*self,16,STATIC_DISPATCH,,1,<operator>.indirection,<operator>.indirection,15,25,1,,,,w::S
+30064771075,CALL,-1,,,(*self).arr = arr,28,STATIC_DISPATCH,,1,<operator>.assignment,<operator>.assignment,27,44,2,,,,ANY
+30064771076,CALL,1,,,(*self).arr,28,STATIC_DISPATCH,,1,<operator>.fieldAccess,<operator>.fieldAccess,27,44,1,,,,[i32; 4]
+30064771077,CALL,1,,,*self,28,STATIC_DISPATCH,,1,<operator>.indirection,<operator>.indirection,27,44,1,,,,w::S
+30064771078,CALL,-1,,,static mut G: i32 = 0;,12,STATIC_DISPATCH,,2,<operator>.assignment,<operator>.assignment,58,59,3,,,,ANY
+30064771079,CALL,-1,,,let mut x = 1;,13,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,129,130,2,,,,ANY
+30064771080,CALL,-1,,,x += 2,20,STATIC_DISPATCH,,4,<operator>.assignmentPlus,<operator>.assignmentPlus,136,142,3,,,,()
+30064771081,CALL,1,,,&x,20,STATIC_DISPATCH,,4,<operator>.addressOf,<operator>.addressOf,136,137,1,,,,&mut i32
+30064771082,CALL,-1,,,x -= 1,28,STATIC_DISPATCH,,4,<operator>.assignmentMinus,<operator>.assignmentMinus,144,150,4,,,,()
+30064771083,CALL,1,,,&x,28,STATIC_DISPATCH,,4,<operator>.addressOf,<operator>.addressOf,144,145,1,,,,&mut i32
+30064771084,CALL,-1,,,s.f = 3,5,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,156,163,5,,,,()
+30064771085,CALL,1,,,s.f,5,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,156,159,1,,,,i32
+30064771086,CALL,1,,,*s,5,STATIC_DISPATCH,,5,<operator>.indirection,<operator>.indirection,156,157,1,,,,w::S
+30064771087,CALL,-1,,,s.arr[i] = 4,14,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,165,177,6,,,,()
+30064771088,CALL,1,,,s.arr[i],14,STATIC_DISPATCH,,5,<operator>.indexAccess,<operator>.indexAccess,165,173,1,,,,i32
+30064771089,CALL,1,,,&s.arr,14,STATIC_DISPATCH,,5,<operator>.addressOf,<operator>.addressOf,165,170,1,,,,&mut [i32; 4]
+30064771090,CALL,1,,,s.arr,14,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,165,170,1,,,,[i32; 4]
+30064771091,CALL,1,,,*s,14,STATIC_DISPATCH,,5,<operator>.indirection,<operator>.indirection,165,166,1,,,,w::S
+30064771092,CALL,-1,,,*p = 5,28,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,179,185,7,,,,()
+30064771093,CALL,1,,,*p,28,STATIC_DISPATCH,,5,<operator>.indirection,<operator>.indirection,179,181,1,,,,i32
+30064771094,CALL,-1,,,*p += 1,36,STATIC_DISPATCH,,5,<operator>.assignmentPlus,<operator>.assignmentPlus,187,194,8,,,,()
+30064771095,CALL,1,,,&*p,36,STATIC_DISPATCH,,5,<operator>.addressOf,<operator>.addressOf,187,189,1,,,,&mut i32
+30064771096,CALL,1,,,*p,36,STATIC_DISPATCH,,5,<operator>.indirection,<operator>.indirection,187,189,1,,,,i32
+30064771097,CALL,-1,,,G = x,54,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,205,210,1,,,,()
+30064771098,CALL,-1,,,"<tmp>0 = (x, x)",5,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,218,246,13,,,,ANY
+30064771099,CALL,2,,,"(x, x)",26,STATIC_DISPATCH,,6,<operator>.tupleLiteral,<operator>.tupleLiteral,239,245,2,,,,"(i32, i32)"
+30064771100,CALL,-1,,,a = <tmp>0.0,14,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,227,228,14,,,,ANY
+30064771101,CALL,2,,,<tmp>0.0,10,STATIC_DISPATCH,,6,<operator>.fieldAccess,<operator>.fieldAccess,223,228,2,,,,i32
+30064771102,CALL,-1,,,b = <tmp>0.1,21,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,234,235,15,,,,ANY
+30064771103,CALL,2,,,<tmp>0.1,17,STATIC_DISPATCH,,6,<operator>.fieldAccess,<operator>.fieldAccess,230,235,2,,,,i32
+30064771104,CALL,-1,,,"(a, b) = (b, a)",34,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,247,262,16,,,,()
+30064771105,CALL,1,,,"(a, b)",34,STATIC_DISPATCH,,6,<operator>.tupleLiteral,<operator>.tupleLiteral,247,253,1,,,,"(i32, i32)"
+30064771106,CALL,2,,,"(b, a)",43,STATIC_DISPATCH,,6,<operator>.tupleLiteral,<operator>.tupleLiteral,256,262,2,,,,"(i32, i32)"
+30064771107,CALL,-1,,,"<tmp>1 = (a, b)",5,STATIC_DISPATCH,,7,<operator>.assignment,<operator>.assignment,268,283,18,,,,ANY
+30064771108,CALL,2,,,"(a, b)",13,STATIC_DISPATCH,,7,<operator>.tupleLiteral,<operator>.tupleLiteral,276,282,2,,,,"(i32, i32)"

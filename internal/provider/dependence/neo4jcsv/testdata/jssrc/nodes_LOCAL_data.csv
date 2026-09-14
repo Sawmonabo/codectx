@@ -1,0 +1,18 @@
+94489280512,LOCAL,,run,0,,<empty>,2,run,,,0,,w.js::program:run
+94489280513,LOCAL,,x,6,,<empty>,3,x,,,0,__ecma.Number,__ecma.Number
+94489280514,LOCAL,,"[a, b]",6,,<empty>,5,"[a, b]",,,0,ANY,ANY
+94489280515,LOCAL,,_tmp_0,15,,<empty>,5,_tmp_0,,,0,,__ecma.Array
+94489280516,LOCAL,,_tmp_1,6,,<empty>,5,_tmp_1,,,0,,__ecma.Array
+94489280517,LOCAL,,a,7,__ecma.Number;__ecma.Array:<indexAccess>;_tmp_4:f:<returnValue>:<member>(f),<empty>,5,a,,,0,,__ecma.Number
+94489280518,LOCAL,,b,10,__ecma.Number;__ecma.Array:<indexAccess>,<empty>,5,b,,,0,,__ecma.Number
+94489280519,LOCAL,,_tmp_2,32,,<empty>,5,_tmp_2,,,0,,__ecma.Array
+94489280520,LOCAL,,_tmp_3,23,,<empty>,5,_tmp_3,,,0,,__ecma.Array
+94489280521,LOCAL,,a,24,__ecma.Number;__ecma.Array:<indexAccess>;_tmp_4:f:<returnValue>:<member>(f),<empty>,5,a,,,0,,__ecma.Number
+94489280522,LOCAL,,b,10,__ecma.Number;__ecma.Array:<indexAccess>,<empty>,5,b,,,0,,__ecma.Number
+94489280523,LOCAL,,_tmp_4,41,,<empty>,5,_tmp_4,,,0,,ANY
+94489280524,LOCAL,,a,7,__ecma.Number;__ecma.Array:<indexAccess>;_tmp_4:f:<returnValue>:<member>(f),<empty>,5,a,,,0,,__ecma.Number
+94489280525,LOCAL,,y,6,,<empty>,6,y,,,0,__ecma.Number,__ecma.Number
+94489280526,LOCAL,,g,4,,<empty>,1,g,,,0,__ecma.Number,__ecma.Number
+94489280527,LOCAL,w.js::program:run:g,g,25,,<empty>,4,g,,,0,,__ecma.Number
+94489280528,LOCAL,,_tmp_2,32,,<empty>,5,_tmp_2,,,0,,__ecma.Array
+94489280529,LOCAL,,_tmp_0,15,,<empty>,5,_tmp_0,,,0,,__ecma.Array
