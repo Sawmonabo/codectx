@@ -49,9 +49,12 @@ func newMCPCommand(build model.BuildInfo) *cobra.Command {
 // concurrent use over one workspace (services.go, Task 19 Q2), which is what
 // lets the bounded set of concurrent tool calls share this single instance.
 //
-// stdout belongs to the SDK's framing from the moment the server starts: every
-// diagnostic this command emits goes to stderr, and a startup failure is
-// reported before a single protocol byte is written.
+// stdout belongs to the SDK's framing for this whole invocation: every
+// diagnostic AND every refusal this command emits goes to stderr, including the
+// --json failure envelope for a pre-server rejection such as a busy workspace.
+// Section 18.2's envelope is written to the root command's output stream, so
+// RunE redirects that stream to stderr rather than letting a machine-readable
+// refusal land on the channel the protocol owns.
 func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -67,6 +70,15 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// stdout is the protocol's for the rest of this process. Execute
+			// writes the Section 18.2 failure envelope to the ROOT command's
+			// output stream, not this one, so the redirect has to be on the
+			// root: a --json rejection here -- a bad --repo, a workspace
+			// another writer holds -- otherwise emits a JSON object on the
+			// channel the SDK is about to frame. It is set before the first
+			// thing that can fail so every refusal on this path is covered.
+			cmd.Root().SetOut(cmd.ErrOrStderr())
+
 			repo, err := repoFlagValue(cmd)
 			if err != nil {
 				return err
