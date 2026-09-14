@@ -86,6 +86,34 @@ func TestCommandEnvelope(t *testing.T) {
 		// on the flags, and the service's own rejection of the same request
 		// cannot stand in for the command's.
 		{name: "context acknowledge naming both acknowledgment kinds", args: []string{"context", "acknowledge", hexID, hexID, "--actor", "agent-a", "--receipt", "tok", "--file-review", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context acknowledge", errCode: "CTX_ARGUMENT_INVALID"},
+		// Section 11.6 forbids answering a semantic_source=lsp request from
+		// canonical facts, and Section 11.5 keeps the choice of language server
+		// out of the product's hands: a root marker is a hint, not a choice. So
+		// `--semantic-source lsp` with no `--profile` names no server at all,
+		// and the only two things the command could do instead of refusing are
+		// both defects -- guess a server, or fall through to canonical and
+		// return a page the caller would read as "the overlay found nothing".
+		//
+		// The refusal has to land before the workspace is opened, which is what
+		// the missing repository pins: a check that ran after the open would
+		// fail on the workspace and prove nothing about the selector. It is the
+		// exit-2 argument class rather than the provider class for the reason
+		// prefetchNames gives (tools.go): a name the caller did not supply is
+		// their input, not a provider that could not run.
+		//
+		// LANE NOTE (L10): the sibling assertion -- a RESOLVABLE-looking
+		// profile whose payload cannot be resolved surfacing the toolchain's
+		// CTX_TOOL_* verbatim -- is not reachable from this package in this
+		// build. Every CTX_TOOL_* originates in toolchain.Resolver.Resolve
+		// inside lsp.Resolve, which is reached only through the facade's
+		// overlay route (L7/L8), and building a second resolution here would be
+		// the duplicate path the facade exists to prevent. Proving it needs a
+		// real workspace and belongs to the integration/verification lane:
+		// `codectx symbol NAME --semantic-source lsp --profile gopls` under a
+		// user config carrying `[tools]\noffline = true` must exit 5 with
+		// CTX_TOOL_OFFLINE. What this row does pin is that the command never
+		// reaches an empty page on the lsp route.
+		{name: "symbol on the lsp overlay without a profile", args: []string{"symbol", "writeSymbolTable", "--semantic-source", "lsp", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "symbol", errCode: "CTX_ARGUMENT_INVALID"},
 	}
 
 	for _, tc := range tests {
