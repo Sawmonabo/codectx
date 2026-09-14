@@ -19,9 +19,12 @@ import (
 // each part and imports each export into the one sink storage opened for the
 // unit, and two parts legitimately describe the same entity — above all the
 // external stub of a callee both parts reference. Storage keys a node fact by
-// (unit, node) and rejects the second row, which would fail the whole unit,
-// so the caller wraps its sink in one DedupeSink for the unit's lifetime and
-// passes it to every Import.
+// (unit, node) and admits a repeat of that key without failing the unit, but
+// it does not compare the two rows: the second row's differing columns are
+// dropped with nothing said. This sink drops the repeat here instead, where
+// the identity is known to have been published by an earlier part of the same
+// unit, so the caller wraps its sink in one DedupeSink for the unit's
+// lifetime and passes it to every Import.
 //
 // The seen set is on disk, not in the Go heap: a large unit publishes
 // hundreds of thousands of identities. Dropping a duplicate never weakens the

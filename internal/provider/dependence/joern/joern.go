@@ -12,7 +12,9 @@
 //	joern-export <graph> --repr=all --format=neo4jcsv --out <export>
 //
 // Both were run against Joern 4.0.627 on all six frontends before they were
-// pinned; the runs are recorded in the lane report. `--repr=pdg|cdg|ddg` is
+// pinned; the runs are recorded in the lane report. The engine is not
+// run-to-run deterministic, so those runs establish that each frontend parses
+// and exports, not that two runs of one are equal. `--repr=pdg|cdg|ddg` is
 // not implemented for CSV or GraphML in this release, and the single `all`
 // export already carries every edge family the provider imports.
 package joern
@@ -47,9 +49,11 @@ var frontend = map[dependence.Family]string{
 // maxNumDef is the per-method definition cap the pinned parse always passes.
 // Measured on a 1.05M-line Python tree against the engine default of 4000
 // (docs/research/10-round3-empirical.md Section 9a): 23% more parse time, 3%
-// more memory, every skipped method removed, and every other fact count
-// identical. It is part of the cache key and there is no second parse at a
-// higher limit.
+// more memory, every skipped method removed, and no change to any other fact
+// count beyond the engine's own run-to-run variance (Section 9a's CDG and CALL
+// counts were equal; the variance band is recorded in
+// docs/providers-dependence.md). It is part of the cache key and there is no
+// second parse at a higher limit.
 const maxNumDef = "40000"
 
 // Output bounds. The child's stdout is the engine's banner and is discarded;

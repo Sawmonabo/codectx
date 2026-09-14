@@ -145,12 +145,22 @@ type publication struct {
 	// did not map. They are published as unavailable rows so a consumer sees
 	// what this build cannot read.
 	UnknownLabels map[string]int
+	// UnplannedProjects is how many projects of this unit's family the planner
+	// refused for an oversized scope key. Their files belong to no unit at all,
+	// so every capability of the family is degraded: the analysis is missing a
+	// subtree, not a method body.
+	UnplannedProjects int
 }
 
 // capabilities renders the publication as the result's capability list: the
 // five published capabilities at the unit's scope, each carrying the bounded
 // details of why it is not fresh, plus one unavailable row when the importer
 // met labels it does not map.
+//
+// The details are a fixed, small set of keys — a count of skipped methods and
+// their names, the subdivided unit and its backend failure, the count of
+// projects the planner could not admit — so a row's detail map is bounded by
+// this code rather than by the repository.
 //
 // The particulars travel in CapabilityState.Details. They are not encoded into
 // extra capability rows whose name is the detail text: a row per skipped method
@@ -170,6 +180,12 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			if names := p.skippedNames(); names != "" {
 				row = row.WithDetail("skipped_method_names", names)
 			}
+		}
+		// A subtree no unit owns degrades every capability of the family
+		// alike: nothing in it was analysed by any pass.
+		if p.UnplannedProjects > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
+			row = row.WithDetail("unplanned_projects", strconv.Itoa(p.UnplannedProjects))
 		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
@@ -257,6 +273,16 @@ func truncate(s string, max int) string {
 
 // utf8Start reports whether b begins a UTF-8 sequence.
 func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
+
+// observedPeak is the analyzer tree's sampled peak, or zero when the platform
+// does not sample it. Zero means unobserved, never "the tree used nothing", so
+// every consumer of the figure must treat it as absent rather than as small.
+func observedPeak(o Outcome) int64 {
+	if o.PeakUnsampled {
+		return 0
+	}
+	return o.PeakBytes
+}
 
 // peakForLog renders the sampled tree peak for a log line: the figure, or the
 // word that says it was never observed. A log that printed 0 for an unsampled

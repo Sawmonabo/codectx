@@ -28,9 +28,12 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 )
 
-// Engine identifies the resolved analysis payload. Name, Version and Digest
-// are provenance: they reach `status`, `doctor` and the ledger through
+// Engine identifies the resolved analysis payload. Version and Digest are the
+// provenance that reaches `status`, `doctor` and the ledger, through
 // Detection.ObservedVersion and the descriptor version, and nowhere else.
+// Name is the lock entry the payload was installed as; it is inventory
+// vocabulary and reaches no product surface, so nothing outside the backend
+// package that resolves it reads it.
 // ParseArgv and ExportArgv are complete argv prefixes (a launcher plus its
 // arguments, for example a managed JDK and `-jar`), so a runtime-dependent
 // payload needs no second concept here.

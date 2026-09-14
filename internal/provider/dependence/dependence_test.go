@@ -48,7 +48,9 @@ type fakeBackend struct {
 
 func (b *fakeBackend) Engine() dependence.Engine {
 	return dependence.Engine{ParseArgv: []string{"/opt/engine/parse"}, ExportArgv: []string{"/opt/engine/export"},
-		Name: "engine", Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
+		// A payload name no rendered product string may contain. The real
+		// locator fills this from the tool lock entry.
+		Name: "cpg-engine-payload", Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
 }
 
 func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
@@ -155,6 +157,23 @@ func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provid
 // so unchanged facts could never be reused across snapshots.
 func TestSucceededUnitConforms(t *testing.T) {
 	providertest.Conform(t, newProvider(t, &fakeBackend{}), repo, rootScope, []string{"app.go", "go.mod"})
+
+	// Detection is a product surface: `status`, `doctor` and the ledger render
+	// ObservedVersion verbatim. Failure mode: the engine's payload name is
+	// composed into it from the resolved payload with no string literal at the
+	// site, so a name leak ships past every source-level check while the
+	// provenance a reader actually needs — version and payload digest — is
+	// unchanged. Only the rendered string can catch it.
+	b := &fakeBackend{}
+	h := providertest.New(t, repo)
+	det, err := newProvider(t, b).Detect(context.Background(), h.Root, h.Policy)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if want := "engine " + b.Engine().Version + " " + b.Engine().Digest; det.ObservedVersion != want {
+		t.Errorf("ObservedVersion = %q, want %q: the payload name is never rendered on a product surface",
+			det.ObservedVersion, want)
+	}
 }
 
 // TestFailedUnitAdmitsNoFacts is Task 11 Step 1's process-fault case. Failure
@@ -357,10 +376,11 @@ func TestCleanGraphIsReused(t *testing.T) {
 // holds.
 func TestPlanUnits(t *testing.T) {
 	h := providertest.New(t, repo)
-	plan, err := dependence.PlanUnits(context.Background(), h.View)
+	p, err := dependence.PlanUnits(context.Background(), h.View)
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := p.Units
 	var keys []string
 	for _, u := range plan {
 		keys = append(keys, u.ScopeKey)
@@ -397,15 +417,22 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if small.Bytes() <= small.HeapCapBytes {
 		t.Error("the reservation is not above its heap cap; a cap is not a memory cap")
 	}
-	if g.RetryCap(small) <= small.HeapCapBytes {
+	if g.RetryCap(small, 0) <= small.HeapCapBytes {
 		t.Error("a unit far below the allocation has no retry available")
+	}
+	// The observed peak is the tree's, on the attempt that just failed. A tree
+	// that already reached what the machine can allocate has nowhere to grow,
+	// whatever its heap cap was, so the retry the plan allows would be a
+	// second full parse for the same failure.
+	if got := g.RetryCap(small, small.AllocationBytes); got != 0 {
+		t.Errorf("retry cap = %d, want none: the failed attempt already peaked at the whole allocation", got)
 	}
 
 	huge := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
 	if huge.HeapCapBytes != huge.AllocationBytes {
 		t.Errorf("cap %d is not bounded by the machine-derived allocation %d", huge.HeapCapBytes, huge.AllocationBytes)
 	}
-	if got := g.RetryCap(huge); got != 0 {
+	if got := g.RetryCap(huge, 0); got != 0 {
 		t.Errorf("retry cap = %d, want none: the first attempt already had the whole allocation", got)
 	}
 
