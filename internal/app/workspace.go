@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -128,11 +128,12 @@ func (w *Workspace) ToolStore() string { return w.s.toolDir }
 // thing a caller cannot derive from the configuration alone.
 func (w *Workspace) DataDir() string { return w.s.dataDir }
 
-// Search answers the discovery endpoints over this workspace: exact symbol and
-// path lookup, and generation-local lexical retrieval. It pins a generation per
-// request, so it needs no workspace lock and answers in a report as it does in
-// an indexing session.
-func (w *Workspace) Search() *search.Service { return w.s.search }
+// Config is the configuration this workspace actually opened with, by value:
+// the resolved file plus whatever the open itself settled, which is why
+// Storage.DataDir here is the cache that was opened rather than the configured
+// one. A caller that needs the configuration of an open workspace reads it
+// here instead of loading the files a second time and risking a second answer.
+func (w *Workspace) Config() config.Config { return w.s.cfg }
 
 // Query pins gen -- zero selects the active generation -- and builds the graph
 // engine bound to it. The returned closer releases the reader's QUERY lease and
