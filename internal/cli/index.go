@@ -215,21 +215,13 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return runService(cmd, openForReport(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
-					// HAND-OFF TO INT (ruling Q1). The facade still takes no
-					// request in this tree, so the call below is the one the
-					// integration lane replaces, verbatim:
-					//     status, err := svc.IndexStatus(ctx, req)
-					// Until it lands, IndexStatus.Resources stays nil and the
-					// block renders nothing -- absent, which is exactly what
-					// "not measured" looks like everywhere else in this report.
-					//
 					// A provider that could not be constructed publishes no
 					// detection row of its own. Those rows are folded in by the
 					// coordinator, before the capability report's own bound is
 					// applied: appending them here pushed Completeness past
 					// model.MaxCapabilityStates, a list IndexStatus.Validate
 					// then rejects.
-					status, err := svc.IndexStatus(ctx)
+					status, err := svc.IndexStatus(ctx, req)
 					if err != nil {
 						return err
 					}

@@ -18,10 +18,17 @@ import (
 // to end, so that jsonschema reflection over a model type, the shared envelope
 // and the in-memory transport are all proven before a fill-in lane starts.
 //
-// IndexStatus takes no request, so there is nothing to Validate().
-func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexStatus], error) {
+// The input is model.StatusRequest (ruling Q1), the same request `codectx
+// status --resources` builds: the Section 23 accounting block is a field on the
+// answer, and a model that could not ask for it would have to guess at this
+// installation's resource state or go without. It defaults to false, so a
+// client that sends no arguments still gets the cheap status it always got.
+func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, in model.StatusRequest) (*mcp.CallToolResult, result[model.IndexStatus], error) {
 	var zero result[model.IndexStatus]
-	st, err := h.index.IndexStatus(ctx)
+	if err := in.Validate(); err != nil {
+		return nil, zero, toolFailure(h.log, err)
+	}
+	st, err := h.index.IndexStatus(ctx, in)
 	if err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}

@@ -106,6 +106,15 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 		// the cumulative edge budget rides along, so paging the whole map
 		// cannot cost more adjacency reads than one walk of it.
 		after, b = c.LastOwner, resumed
+		// The continuation is consumed here, at the point its state is in
+		// memory, exactly as resumeTraversal consumes a pure keyset one: this
+		// endpoint mints a lease per page and spills no spool, so holding the
+		// replayed lease until the cursor TTL would pin a generation against
+		// retention for state nothing will read again -- one lease per page of
+		// every walk of the map. Presenting the same token twice is therefore
+		// CTX_CURSOR_INVALID rather than a replayed page, the same deliberate
+		// trade every other continuation makes.
+		e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 	}
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
