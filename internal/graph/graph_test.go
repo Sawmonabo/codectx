@@ -333,6 +333,42 @@ func TestGraphScenarios(t *testing.T) {
 		}},
 
 		// L7 REFS rows
+		{
+			// Section 9.2: a relation and an occurrence are different counts. The
+			// fixture's n-a -calls-> n-b edge is ONE sealed relation backed by TWO
+			// evidence rows. Collapsing the two occurrences into one item would
+			// under-report how often the symbol is used; emitting the relation
+			// twice as two relations would over-report how many edges reach it.
+			// Both are silent wrong answers a caller cannot detect.
+			name: "references keeps relation count and occurrence count distinct",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				page, err := e.References(context.Background(), model.ReferenceRequest{
+					NodeID:         "n-b",
+					Operation:      model.ReferenceReferences,
+					SemanticSource: model.SemanticCanonical,
+				})
+				if err != nil {
+					t.Fatalf("References: %v", err)
+				}
+				relations := map[model.RelationID]int{}
+				occurrences := map[model.EvidenceID]bool{}
+				for _, o := range page.Items {
+					relations[o.RelationID]++
+					occurrences[o.EvidenceID] = true
+				}
+				if len(relations) != 1 || len(occurrences) != 2 || len(page.Items) != 2 {
+					t.Fatalf("want 1 relation and 2 distinct occurrences, got %d relations, %d occurrences in %d items: %+v",
+						len(relations), len(occurrences), len(page.Items), page.Items)
+				}
+				if page.Meta.Truncated {
+					t.Fatalf("a complete two-occurrence answer must not be truncated: %q", page.Meta.TruncationReason)
+				}
+			},
+		},
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
