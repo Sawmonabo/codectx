@@ -486,6 +486,15 @@ func expiredSession(err error) bool {
 	return errors.As(err, &typed) && typed.Code == model.CodeSessionExpired
 }
 
+// notFound reports the storage contract for a lookup that matched no row:
+// CTX_ARGUMENT_INVALID carrying sqlite.ReasonNotFound, which distinguishes a
+// missing row from a malformed argument under the same code.
+func notFound(err error) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid &&
+		typed.Details["reason"] == sqlite.ReasonNotFound
+}
+
 // cursorInvalid is the one rejection a bad continuation gets. Section 16.3 has
 // no CTX_CURSOR_* family per endpoint, and the token is never echoed back.
 func cursorInvalid(message string) *model.Error {
