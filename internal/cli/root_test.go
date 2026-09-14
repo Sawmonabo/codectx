@@ -41,6 +41,12 @@ import (
 // binary's own name, which is what distinguishes `codectx tools status` from
 // `codectx status`: the two carry different data shapes under one label
 // otherwise.
+// hexID is a well-formed resolved id. The context commands screen their
+// positional arguments before anything else, so a malformed one would be
+// rejected for the wrong reason and prove nothing about the flags. INT:
+// uncomment with the row that uses it.
+// const hexID = "00000000000000000000000000000000000000000000000000000000000000ab"
+
 func TestCommandEnvelope(t *testing.T) {
 	build := model.BuildInfo{
 		Version:       "1.2.3",
@@ -69,6 +75,20 @@ func TestCommandEnvelope(t *testing.T) {
 		{name: "tools status on an empty store", args: []string{"tools", "status", "--json"}, exitCode: 0, ok: true, command: "tools status", checkData: checkEmptyStoreReport},
 		{name: "tools prefetch while offline", args: []string{"tools", "prefetch", "--all", "--json"}, userConfig: "[tools]\noffline = true\n", exitCode: 5, ok: false, command: "tools prefetch", errCode: "CTX_TOOL_OFFLINE"},
 		{name: "status on a path that is not a workspace", args: []string{"status", "--json"}, missingRepo: true, exitCode: 3, ok: false, command: "status", errCode: "CTX_WORKSPACE_NOT_FOUND"},
+		// `context acknowledge` carries two assertions that Section 16.3 keeps
+		// apart: --receipt confirms that bytes were delivered, --file-review
+		// asserts that a fully served file was reviewed. A command line naming
+		// both has to be resolved by guessing which one the operator meant, and
+		// either guess writes a claim nobody made -- credit for bytes that may
+		// never have arrived, or a review of a file that may not be covered. The
+		// rejection also has to happen before a workspace is opened, which is
+		// what this row pins: the row names no repository, so a check that ran
+		// after the open would fail on the workspace instead of on the flags.
+		// INT: uncomment this row together with the root.go registration line.
+		// The row is green with that line in place and mutation-proved in
+		// T16-L5-report.md; without it the tree routes `context` nowhere, so the
+		// envelope reports the root command instead of the rejection.
+		// {name: "context acknowledge naming both acknowledgment kinds", args: []string{"context", "acknowledge", hexID, hexID, "--actor", "agent-a", "--receipt", "tok", "--file-review", "--json"}, exitCode: 2, ok: false, command: "context acknowledge", errCode: "CTX_ARGUMENT_INVALID"},
 	}
 
 	for _, tc := range tests {
