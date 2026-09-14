@@ -14,6 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -24,6 +25,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
+	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -41,7 +43,17 @@ const databaseName = "codectx.db"
 const (
 	workersDirName = "workers"
 	workDirName    = "work"
+	spoolsDirName  = "spools"
 )
+
+// spoolBudgetDivisor is what the shared temporary-file budget is divided by to
+// size the query spools. resources.max_temp_bytes is not a per-consumer budget:
+// the same key is already the whole disk budget of both process runners
+// (compose.go, the shared and parser runners below), so handing the spools the
+// undivided key would let three independent consumers each believe they own it.
+// A query's spools are the smallest of the three claims -- one bounded page of
+// ranked records per live cursor -- so they take the smallest share.
+const spoolBudgetDivisor = 8
 
 // parserWorkerReservationBytes is what one tree-sitter worker is admitted
 // against, and therefore what the parser runner's budget is sized from. It is
@@ -125,6 +137,20 @@ type stack struct {
 	ts       *treesitter.Provider
 	watcher  *watch.Watcher
 	logger   *slog.Logger
+
+	// signer signs the pagination cursors every paged query hands back, and
+	// spools hold the ranked pages a keyset cursor cannot re-derive. Both are
+	// process-wide and are built once here because the search service and every
+	// graph engine share them.
+	signer *pagination.Signer
+	spools *pagination.Spools
+	// gate is the process-scoped max_concurrent_graph_queries semaphore. One
+	// graph engine is built per request, so the bound cannot live on the engine.
+	gate *graphGate
+	// repo and search are set by openQueries once the coordinator has resolved
+	// the repository identity, which is the coordinator's to derive.
+	repo   model.RepositoryID
+	search *search.Service
 
 	// states are the capability rows detection can never publish because the
 	// provider could not be constructed at all. A provider missing from the
@@ -240,6 +266,20 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
 		return nil, err
 	}
+
+	// The cursor key and the query spools are workspace-private state under the
+	// cache this run actually opened, so a rebuild cache signs with its own key
+	// and a cursor issued against the old cache is refused rather than decoded
+	// against a generation that is not there. The store is the lease store: a
+	// spool lives exactly as long as the retention lease its cursor carries.
+	if s.signer, err = pagination.OpenSigner(s.dataDir); err != nil {
+		return nil, err
+	}
+	if s.spools, err = pagination.NewSpools(filepath.Join(s.dataDir, workDirName, spoolsDirName),
+		cfg.Resources.MaxTempBytes/spoolBudgetDivisor, s.store); err != nil {
+		return nil, err
+	}
+	s.gate = newGraphGate(cfg.Resources.MaxConcurrentGraphQueries)
 
 	// The analyzer runners are budgeted from what their children reserve, not
 	// from resources.base_memory_budget_bytes: that setting budgets this
@@ -527,6 +567,30 @@ func (s *stack) dependenceAbsent(state model.CapabilityStateValue, code string, 
 	}
 }
 
+// openQueries builds the query services that need the repository identity,
+// which only the coordinator derives. It is called by open once the coordinator
+// exists rather than from openStack, because the alternative -- re-deriving the
+// identity here -- would be a second spelling of it that silently drifts the
+// day the first one changes.
+func (s *stack) openQueries(repo model.RepositoryID) error {
+	s.repo = repo
+	svc, err := search.New(search.Options{
+		Store:     s.store,
+		Repo:      repo,
+		Signer:    s.signer,
+		Spools:    s.spools,
+		Resources: s.cfg.Resources,
+		CursorTTL: s.cfg.Storage.QueryCursorTTL.Std(),
+		Now:       time.Now,
+		Logger:    s.logger,
+	})
+	if err != nil {
+		return err
+	}
+	s.search = svc
+	return nil
+}
+
 // Close releases everything the stack opened, in reverse. Every step runs even
 // when an earlier one failed: a lock left held or a worker left running is a
 // workspace nobody else can index.
@@ -535,6 +599,11 @@ func (s *stack) Close() error {
 		return nil
 	}
 	var errs []error
+	// The search service is released first: it reads through the store, so a
+	// store closed under it would be a reader outliving what it reads.
+	if s.search != nil {
+		errs = append(errs, s.search.Close())
+	}
 	if s.lsp != nil {
 		errs = append(errs, s.lsp.Close())
 	}
