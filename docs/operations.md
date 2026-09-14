@@ -1,0 +1,216 @@
+# Operations
+
+How to check that a codectx workspace is healthy, what to do when it is not, and
+what the tool reclaims on its own. Configuration keys named here are documented
+in [configuration](configuration.md); the security reasoning behind the controls
+is in [the threat model](threat-model.md).
+
+## The first command to run
+
+```
+codectx doctor          # human summary
+codectx doctor --json   # one machine-stable envelope
+codectx doctor --deep   # adds the expensive integrity and parser smoke checks
+codectx doctor --offline
+```
+
+`doctor` returns a **bounded list of checks**. Each check carries a name, a
+state, a human detail, a machine reason code and a remediation string, and the
+report carries the build identity, the flags it ran under and an overall state.
+
+| State | Meaning |
+|---|---|
+| `pass` | Checked, and healthy. |
+| `warn` | Checked, degraded, still serving. Act before it becomes `fail`. |
+| `fail` | Checked, and this workspace cannot serve correctly until it is fixed. |
+| `unavailable` | **Not checked here.** The check or metric could not be measured on this platform or in this mode. It is never reported as a passing check and never as a zero measurement. |
+
+`doctor` is cheap by default: no version, status or search command performs a
+full database scan. The expensive integrity and parser smoke checks run only
+when you ask for them with `--deep`.
+
+### What is checked
+
+- **Build and toolchain pins** — the build identity and the pinned versions this
+  binary was built against.
+- **Workspace and data-directory permissions** — that the data directory exists,
+  is user-private and is writable.
+- **Free space** — measured against `resources.min_free_disk_bytes`.
+- **Database schema, full-text index and write-ahead log** — including WAL size
+  against `storage.wal_high_water_bytes`.
+- **The active generation pointer** — whether this repository has one at all.
+- **Recent capture and freshness** — how stale the active generation is.
+- **Sampled content-store blocks** — a bounded sample of stored source blocks is
+  re-verified against its recorded hash. `--deep` widens this.
+- **Bundled grammar availability.**
+- **Managed toolchain status, one check per lock entry** — identified by the
+  entry name the lock records. The dependence backend is reported as
+  `engine <version> <digest>`; no third-party product name is printed.
+- **Orphan temporary state** — staging directories, materializations and spools
+  that no live owner references.
+- **Session and lease retention** — live and expired sessions, and the retention
+  leases that keep a generation collectable or not.
+
+`--offline` reports core policy and whether an OS-level analyzer restriction is
+actually active on this host, in addition to refusing every fetch.
+
+> The exact check names are produced by the diagnostics service and are stable
+> per build; treat the reason code, not the name, as the thing to match on.
+
+## Recovery: what each code means and what to do
+
+| Code | What happened | What to do |
+|---|---|---|
+| `CTX_WORKSPACE_NOT_FOUND` | No workspace was discovered from this directory upward. | Run `codectx init` at the repository root, or run from inside the repository. |
+| `CTX_CONFIG_INVALID` | A configuration key is unknown, malformed or violates a cross-key rule. | The detail names the key. Fix it in the layer that set it; there is no extension namespace, so an unknown key is always a typo or a setting from another version. |
+| `CTX_TRUST_REQUIRED` | A project file set a key only the user configuration may set, or raised a limit it may only lower. | Move the setting to your user configuration, or lower it. |
+| `CTX_SCHEMA_MISMATCH` | The database on disk was written by a different schema. **This fails closed on purpose**; there is no migration layer. | Remove the workspace's data directory and re-index. Nothing in it is a source of truth: the repository is. |
+| `CTX_STORAGE_CORRUPT` | An integrity check failed. | Run `codectx doctor --deep` for the detail, then remove the data directory and re-index. |
+| `CTX_SOURCE_INTEGRITY` | A stored source block did not match its recorded hash. | Same as above: re-index. Do not keep serving from the store — retained bytes are what every answer cites. |
+| `CTX_NO_ACTIVE_GENERATION` | The workspace is initialized but nothing has been published yet, or the last run failed before publication. | Run `codectx index`. A failed or unsealed unit is invisible by design, so a partial run leaves no half-visible state to clean up. |
+| `CTX_WORKSPACE_BUSY` | Another process holds the workspace lock, or a live lease or retained session still references what was asked for. | **Retryable.** Wait and retry. The workspace lock is an advisory OS file lock, so it is released by the kernel if its holder dies — there is no stale lock file to remove by hand. |
+| `CTX_DISK_FULL` | Free space is below `resources.min_free_disk_bytes`, or a temporary budget was exhausted. | See "Disk pressure" below. |
+| `CTX_RESOURCE_LIMIT` / `CTX_MINIMUM_BUDGET` | A bounded operation hit its ceiling, or the configured budgets cannot satisfy the minimum this build needs. | Narrow the request, or raise the relevant `[resources]` key. `CTX_MINIMUM_BUDGET` means the configuration itself does not hold together. |
+| `CTX_PROVIDER_UNAVAILABLE` | A provider is not usable — not installed, unsupported platform, or refused as too old. | The detail names the provider and the reason. Either install or enable it, or disable it; the index is still published without it, with that capability reported degraded. |
+| `CTX_PROVIDER_TIMEOUT` / `CTX_PROVIDER_OUTPUT_INVALID` | An analyzer exceeded its bound, or produced output that failed validation. | Retry once; if it repeats, disable that provider and report it. Raw analyzer output is not in the ordinary log by design — request the private debug artifact if you need it. |
+| `CTX_TOOL_OFFLINE` | A managed tool is missing and `tools.offline` is set. | Run `codectx tools prefetch` with fetching enabled, or install the tool and point an override at it. |
+| `CTX_TOOL_DIGEST_MISMATCH` / `CTX_TOOL_CORRUPT` | A payload did not match the lock, or an installed tool failed verification. | Run `codectx tools gc` then `codectx tools verify`. A digest mismatch is never retried as if it were a network fault. |
+| `CTX_TOOL_FETCH_FAILED` | The fetch itself failed. | **Retryable.** Check connectivity and proxy settings; note that proxy variables are honored but are not a security control. |
+| `CTX_TOOL_UNSUPPORTED_PLATFORM` / `CTX_TOOL_OVERRIDE_INVALID` | The lock names no payload for this platform, or an override does not verify. | Supply a verified override, or accept the capability as unavailable. |
+| `CTX_SESSION_EXPIRED` / `CTX_SESSION_SUPERSEDED` / `CTX_ACTOR_MISMATCH` | A context session is past its deadline, was replaced, or is being used by a different actor. | Open a new session. Receipts are never shared between sessions. |
+| `CTX_CURSOR_INVALID` | A continuation token or a source receipt was malformed, tampered with, or older than `storage.query_cursor_ttl`. | Re-run the query from the first page. |
+| `CTX_INTERNAL` | A composition or producer defect. | Report it with the command you ran. It is not an operator-fixable state. |
+
+## Retention, collection and the grace window
+
+Nothing is deleted implicitly by a query. Reclamation happens in one **collection
+pass**, run on the startup-recovery path and after a generation is activated.
+The caller holds both the cross-process workspace lock and this process's
+indexing mutex for the whole pass, so a second process cannot publish into the
+window a sweep is examining. Every pass is batch-bounded: what does not finish
+in one pass finishes in the next.
+
+A pass does these things, in this order:
+
+1. **Sessions.** Live sessions past their deadline are expired; closed sessions
+   older than `storage.closed_session_retention` are pruned.
+2. **Pagination spools.** Spool files whose lease has expired or whose
+   continuation was consumed are removed.
+3. **Snapshot staging and content-store temporaries.** Crash leftovers under the
+   data directory are removed. A published content object is never touched here.
+4. **Tool store.** Staging directories no install owns, and installed versions
+   the lock no longer names, are collected. A tool whose lock is held by a
+   running install is skipped, not waited on.
+5. **Generations and units.** Retention is **by ref**, governed by
+   `index.retain_refs` and `index.max_retained_bytes`. A generation is refused
+   collection while a live lease or a retained session references it — that
+   refusal is the retryable `CTX_WORKSPACE_BUSY`, not a silent skip.
+6. **Source blobs — the grace protocol.** See below.
+
+### The blob grace protocol
+
+Source bytes are the one thing this tool must never lose while something can
+still cite them, so they are not deleted in the pass that finds them
+unreferenced. A blob moves through states instead:
+
+`ready` → `quarantined` → `trash` → *(grace window elapses)* → **rechecked** →
+deleted.
+
+A blob found unreferenced is quarantined, then trashed with the time it was
+trashed. Only after the grace window has elapsed is reachability checked **a
+second time**, and only a blob still unreferenced at that second check is
+deleted. Anything that references the blob again in the meantime restores it to
+`ready` in place, and the grace timestamp is cleared with it. Deletion order is
+fixed: the block and line-checkpoint rows are removed only after the blob row
+itself, never before, so a crash mid-delete can never leave a blob that claims
+bytes it no longer has.
+
+The grace window is a bounded duration the collector is configured with. It
+trades disk against the cost of losing bytes an in-flight answer still cites;
+shortening it reclaims sooner and narrows that safety margin.
+
+### What is *not* collected automatically
+
+- A language server's per-profile working directory under `<data_dir>/lsp/`
+  survives a profile change. Remove it by hand if a profile's footprint matters.
+- Files an analyzer child leaves outside its own run directory. On Windows a
+  non-console child never receives the graceful stop signal (see
+  [the threat model](threat-model.md)), so it never gets the chance to clean up
+  after itself; the pass above reclaims the run directory regardless.
+
+## Disk pressure
+
+Free space is checked against `resources.min_free_disk_bytes` (default
+`1073741824`). Below it, indexing pauses and writes return a typed
+`CTX_DISK_FULL` rather than a partial store. **Disk pressure never evicts the
+source an open session is reading** — degrading an answer is not an acceptable
+way to free space.
+
+Temporary bytes across materializations and spools are separately capped by
+`resources.max_temp_bytes`, which must exceed `resources.min_free_disk_bytes`.
+
+In order, when you are short on space:
+
+1. `codectx doctor` — the free-space and orphan-temporary checks say whether the
+   space is being consumed by the store or by leftovers.
+2. `codectx tools gc` — reclaims tool-store staging and versions the lock no
+   longer names.
+3. Lower `index.retain_refs`, or set `index.max_retained_bytes`, and let the
+   next collection pass evict least-recently-used refs. The active ref is never
+   evicted.
+4. Wait out the grace window, or re-run after it elapses: trashed blobs are not
+   reclaimed before their second reachability check.
+
+## Rebuilding a workspace
+
+There is no migration layer and no repair tool, because there is nothing in the
+data directory that the repository cannot produce again. A rebuild is always
+safe and is the correct answer to `CTX_SCHEMA_MISMATCH`, `CTX_STORAGE_CORRUPT`
+and `CTX_SOURCE_INTEGRITY`:
+
+1. Stop anything holding the workspace — a `codectx watch` or an MCP server.
+2. Remove the workspace's data directory — `storage.data_dir`, whose empty
+   default resolves to a user-private per-workspace directory documented in
+   [configuration](configuration.md).
+3. `codectx init`, then `codectx index`.
+4. `codectx doctor --deep` to confirm.
+
+Open sessions, cursors and receipts do not survive a rebuild. That is correct:
+they cite a generation that no longer exists.
+
+## Unavailable metrics and unsupported platforms
+
+`codectx status --resources` reports the resource accounting block. **A metric
+that cannot be measured is absent, never zero.** The two surfaces express that
+differently, and both are load-bearing:
+
+- In the resource block, an unmeasured field is a **null pointer, omitted from
+  the JSON entirely**. A field that *is* present with the value `0` is a real
+  measurement of zero.
+- In `doctor`, an unmeasured check has `state: "unavailable"`. It is not `pass`
+  and it is not `fail`.
+
+If you see `0` where you expected a figure, it is a measurement of zero — file
+it as a bug rather than assuming the platform does not support it.
+
+The columns below describe the **platform capability each metric family depends
+on**, not a per-build inventory. A family whose reader is absent — because the
+platform has none, or because the measurement is not wired in this build —
+reports `unavailable`. It never reports `0`.
+
+| Metric family | linux | darwin | windows | Why |
+|---|---|---|---|---|
+| Parent process RSS, current and peak | measured | measured | measured | Read from the OS process interface. |
+| Go-managed bytes | measured | measured | measured | Reported by the Go runtime. |
+| **Process-tree peak, sampled concurrently** | **measured** | **`unavailable`** | **`unavailable`** | Sampling walks the live process group's per-process memory while the tree runs. Only the Linux build has that reader; on every other platform the runner sets its tree-unsampled flag and the figure is omitted rather than under-reported as the parent's alone. |
+| **Native worker and per-engine memory** | **measured** | **`unavailable`** | **`unavailable`** | Same reader as the tree peak: a worker's memory is a member of the sampled tree. |
+| Live subprocesses | platform-independent | platform-independent | platform-independent | Counted in-process by the runner as children start and are reaped, never sampled from the OS, so no platform lacks a reader for it. |
+| Database, WAL, temporary and content-store bytes | measured | measured | measured | Filesystem sizes. |
+| Free disk bytes | measured, else `unavailable` | measured, else `unavailable` | measured, else `unavailable` | Reported by the OS for the data directory's filesystem. A filesystem that refuses to answer yields `unavailable`, not `0`. |
+| Unit reuse and parse counts | measured | measured | measured | Counted during the run. |
+| Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
+| Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |
+
+The practical consequence on macOS and Windows: an analyzer's memory is bounded
+by admission control and by the runner's own limits, and its *observed* peak is
+reported as unavailable. Use the Linux build when you need the measurement.
