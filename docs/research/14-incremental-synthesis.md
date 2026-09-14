@@ -39,9 +39,10 @@ Measured price of the unit re-run for one edited file: 240k-line Go module 16–
    index, reject documents outside project root), engine by id-independent fact key (normalize Go
    `<clinit>` nondeterminism). Cost: ~1–5 s of keying, against 17–65 s engine runs. Collapses the
    storage/FTS/reconcile cost to ~0.01–2% of today's.
-2. **Unit retention decoupled from generation retention (Task 12/20, §12.4, §20).** Byte-budgeted
-   cache of sealed units so A→B→A branch switches reuse A's SCIP and dependence units instead of
-   re-running them.
+2. **Retention by distinct ref, not by snapshot count (Task 12/20, §12.4, §20).** Keep the results of
+   the last `retain_refs` branches/commits the user indexed (default 8) so A→B→C→A reuses A's units.
+   No default size limit; `max_retained_bytes` is user-set only (same posture as memory). User ruling
+   2026-09-13: a forced size cap was rejected.
 3. **Carried-over stale units with a labelled distance (§13.3, Task 12).** During the 20–60 s
    refresh, dependence answers stay available and marked `stale` (generation distance) instead of
    `pending`. Honesty rules already exist in the capability vocabulary.
