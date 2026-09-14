@@ -11,6 +11,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 type archiveKind string
@@ -237,6 +239,26 @@ func copyInto(src, dst string, mode fs.FileMode) error {
 		return err
 	}
 	return writeStream(dst, in, mode)
+}
+
+// checkTreeBounds holds one realized payload to the bounds the runtime
+// extractor will apply to it. Measuring and only logging would leave a payload
+// that outgrew a bound to be discovered at install time on a user's machine,
+// as a CTX_RESOURCE_LIMIT nobody can act on; here it is a release-time failure
+// with the two numbers in the message. The bounds come from internal/toolchain
+// itself, so raising one there raises it here in the same change.
+func checkTreeBounds(tool, plat, root string, compressedSize int64) error {
+	files, bytes := treeStats(root)
+	logf("%s/%s: extracts to %d files, %d bytes", tool, plat, files, bytes)
+	if files > toolchain.MaxPayloadFiles {
+		return fmt.Errorf("%s/%s: the payload holds %d files, over the runtime extractor's %d-entry bound",
+			tool, plat, files, toolchain.MaxPayloadFiles)
+	}
+	if bound := toolchain.MaxExpandedBytes(compressedSize); bytes > bound {
+		return fmt.Errorf("%s/%s: the payload expands to %d bytes, over the runtime extractor's %d-byte bound for a %d-byte payload",
+			tool, plat, bytes, bound, compressedSize)
+	}
+	return nil
 }
 
 // treeStats reports what an extracted payload costs, so a release can be

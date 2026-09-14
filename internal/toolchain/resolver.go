@@ -93,7 +93,9 @@ type Options struct {
 	DataDir string
 	// Offline turns every fetch into a typed refusal without opening a socket.
 	Offline bool
-	// Mirror optionally replaces the lock asset host, serving the same paths.
+	// Mirror optionally replaces the scheme and host of every lock asset URL,
+	// keeping the original host as the first path segment so one mirror serves
+	// every publisher the lock names. It must be an absolute https URL.
 	Mirror string
 	// MaxFetchBytes caps one payload.
 	MaxFetchBytes int64
@@ -141,7 +143,15 @@ type Resolver struct {
 }
 
 // New builds a resolver over the embedded lock.
-func New(opts Options) (*Resolver, error) { return newResolver(Embedded(), opts, nil) }
+func New(opts Options) (*Resolver, error) { return NewFromLock(Embedded(), opts) }
+
+// NewFromLock builds a resolver over a lock the caller parsed with ParseLock.
+// It exists for the release gate in internal/tools/toollock, which has to
+// install payloads through this package from the lock file it is checking
+// rather than from whichever lock happened to be compiled into the running
+// binary: those are the same document only by coincidence of build order, and a
+// gate that verifies the wrong one is not a gate. Product code calls New.
+func NewFromLock(lock Lock, opts Options) (*Resolver, error) { return newResolver(lock, opts, nil) }
 
 // newResolver is New with the lock and the HTTP transport injected. The tests
 // use it to serve a synthetic lock from httptest and to prove that an offline
@@ -304,7 +314,7 @@ func (r *Resolver) inspect(name string, e Entry, p Payload, rehash bool) (string
 	hash, err := hashEntry(name, dir, e.entryPath(p), e.entryDigest(p))
 	if err != nil {
 		var typed *model.Error
-		if errors.As(err, &typed) && typed.Code == CodeToolCorrupt {
+		if errors.As(err, &typed) && typed.Code == model.CodeToolCorrupt {
 			return "", StateCorrupt, typed.Message, nil
 		}
 		return "", "", "", err
@@ -353,7 +363,14 @@ func javaEnv(runtime Tool) []string {
 
 // resolveOverride verifies a user-configured executable on every run start, as
 // Section 20.2 requires. An override replaces the binary and never the
-// invocation: it is run directly, with no managed runtime composed around it.
+// invocation: it is run directly, with no managed runtime composed around it,
+// including for an entry whose pinned payload is a jar or a Node script. That
+// makes an override of such a tool a directly executable launcher rather than
+// the jar or the script itself, which is the constraint docs/configuration.md
+// states on the surface a user actually reads. Composing the managed runtime
+// around an override instead would put a binary the lock never described behind
+// a runtime the lock pinned, and the override contract is that the user owns
+// what starts.
 func resolveOverride(name string, ov Override) (Tool, error) {
 	if err := validOverride(name, ov); err != nil {
 		return Tool{}, err
@@ -466,7 +483,7 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 		}
 		_, err := r.Resolve(ctx, name)
 		var typed *model.Error
-		if errors.As(err, &typed) && typed.Code == CodeToolUnsupportedPlatform {
+		if errors.As(err, &typed) && typed.Code == model.CodeToolUnsupportedPlatform {
 			continue
 		}
 		errs = append(errs, err)
@@ -480,21 +497,21 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 func (r *Resolver) GC(ctx context.Context) (int, error) { return r.store.gc(ctx, r.lock) }
 
 func offline(name string) *model.Error {
-	return (&model.Error{Code: CodeToolOffline,
+	return (&model.Error{Code: model.CodeToolOffline,
 		Message:     "the managed tool is not installed in a verified state and tools.offline forbids fetching it",
 		Remediation: "run `codectx tools prefetch` with network access, use the offline bundle, or clear tools.offline"}).
 		WithDetail("tool", name)
 }
 
 func unsupported(name string, p Platform) *model.Error {
-	return (&model.Error{Code: CodeToolUnsupportedPlatform,
+	return (&model.Error{Code: model.CodeToolUnsupportedPlatform,
 		Message:     "the managed tool has no pinned payload for this platform",
 		Remediation: "this language runs at the precision its available providers give on " + p.Key()}).
 		WithDetail("tool", name).WithDetail("platform", p.Key())
 }
 
 func overrideInvalid(name, detail string) *model.Error {
-	return (&model.Error{Code: CodeToolOverrideInvalid,
+	return (&model.Error{Code: model.CodeToolOverrideInvalid,
 		Message:     "the configured tool override is not usable: " + detail,
 		Remediation: "correct [tools.override." + name + "] in the user configuration, or remove it to use the pinned payload"}).
 		WithDetail("tool", name)

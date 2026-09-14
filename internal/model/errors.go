@@ -39,6 +39,26 @@ const (
 	CodeDiskFull                = "CTX_DISK_FULL"
 	CodeStorageCorrupt          = "CTX_STORAGE_CORRUPT"
 
+	// The managed-toolchain family of Section 11.7. CodeToolOffline is a tool
+	// that is not installed while tools.offline is set, refused without opening
+	// a socket. CodeToolUnsupportedPlatform is a lock entry with no payload for
+	// the running platform: honest absence, not a failure.
+	// CodeToolFetchFailed is a transport, status or truncation failure and is
+	// retryable. CodeToolDigestMismatch is fetched bytes whose size or SHA-256
+	// disagrees with the lock; it is never retried and never extracted.
+	// CodeToolCorrupt is the pinned bytes being unusable rather than wrong -- a
+	// malformed or hostile archive, or an installed tree whose entry executable
+	// no longer hashes to the lock -- so a fresh install is the repair, which is
+	// why it is a separate family from the digest mismatch.
+	// CodeToolOverrideInvalid is a [tools.override.<name>] whose executable is
+	// missing, is not a regular file, or does not hash to the declared checksum.
+	CodeToolOffline             = "CTX_TOOL_OFFLINE"
+	CodeToolUnsupportedPlatform = "CTX_TOOL_UNSUPPORTED_PLATFORM"
+	CodeToolFetchFailed         = "CTX_TOOL_FETCH_FAILED"
+	CodeToolDigestMismatch      = "CTX_TOOL_DIGEST_MISMATCH"
+	CodeToolCorrupt             = "CTX_TOOL_CORRUPT"
+	CodeToolOverrideInvalid     = "CTX_TOOL_OVERRIDE_INVALID"
+
 	// CodeArgumentInvalid covers an invalid command, argument, input shape or
 	// flag combination. Section 22 lists the families it "includes" and none of
 	// them names the exit-2 class, so this code names it. Every Validate method

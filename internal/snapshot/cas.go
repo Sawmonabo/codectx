@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
@@ -122,7 +123,7 @@ func (c *CAS) put(ctx context.Context, r io.Reader, want string) (model.BlobReco
 	// The temporary name is gone after a rename and redundant after a link;
 	// either way nothing else references it.
 	os.Remove(tmp.Name())
-	if err := syncDir(filepath.Dir(final)); err != nil {
+	if err := fslock.SyncDir(filepath.Dir(final)); err != nil {
 		return model.BlobRecord{}, ioError("CAS directory sync", err)
 	}
 	return rec, nil

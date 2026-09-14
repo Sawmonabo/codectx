@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -87,7 +88,7 @@ func (s *store) acquire(ctx context.Context, name string, wait time.Duration) (*
 	}
 	deadline := time.Now().Add(wait)
 	for {
-		held, err := tryLock(f)
+		held, err := fslock.TryLock(f)
 		if err != nil {
 			f.Close()
 			return nil, internalError("tool install lock: %v", bareCause(err))
@@ -119,7 +120,7 @@ func (l *toolLock) release() error {
 		return nil
 	}
 	l.once.Do(func() {
-		if err := unlock(l.f); err != nil {
+		if err := fslock.Unlock(l.f); err != nil {
 			l.err = internalError("tool install unlock: %v", bareCause(err))
 		}
 		if err := l.f.Close(); err != nil && l.err == nil {
@@ -156,7 +157,7 @@ func (s *store) install(ctx context.Context, f *fetcher, name string, e Entry, p
 	if err := os.Mkdir(tree, storeDirPerm); err != nil {
 		return ioError("tool payload staging tree", err)
 	}
-	if err := extract(ctx, name, archive, tree, p.Size); err != nil {
+	if err := extract(ctx, name, archive, tree, e.entryPath(p), p.Size); err != nil {
 		return err
 	}
 	// The archive is dead weight once unpacked, and a large payload is unpacked
@@ -171,7 +172,7 @@ func (s *store) install(ctx context.Context, f *fetcher, name string, e Entry, p
 	if _, err := hashEntry(name, tree, e.entryPath(p), e.entryDigest(p)); err != nil {
 		return err
 	}
-	if err := syncDir(tree); err != nil {
+	if err := fslock.SyncDir(tree); err != nil {
 		return ioError("tool payload directory sync", err)
 	}
 	return s.publish(name, e.Version, tree, p.SHA256)
@@ -192,7 +193,7 @@ func (s *store) publish(name, version, tree, digest string) error {
 	if err := os.Rename(tree, final); err != nil {
 		return ioError("tool store publish", err)
 	}
-	if err := syncDir(filepath.Dir(final)); err != nil {
+	if err := fslock.SyncDir(filepath.Dir(final)); err != nil {
 		return ioError("tool store directory sync", err)
 	}
 	// The marker is written last and through a rename of its own, so a crash
@@ -205,7 +206,7 @@ func (s *store) publish(name, version, tree, digest string) error {
 	if err := os.Rename(tmp, filepath.Join(final, completeName)); err != nil {
 		return ioError("tool publication marker", err)
 	}
-	if err := syncDir(final); err != nil {
+	if err := fslock.SyncDir(final); err != nil {
 		return ioError("tool store directory sync", err)
 	}
 	return nil

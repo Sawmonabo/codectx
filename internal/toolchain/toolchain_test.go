@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,21 @@ func tarball(t *testing.T, entries ...archiveEntry) []byte {
 	return buf.Bytes()
 }
 
+// gzipped wraps body in a bare gzip member: the single-file payload shape three
+// pinned upstreams publish, which is a gzip stream that is not a tar.
+func gzipped(t *testing.T, body string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(body)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // goodPayload is the two-file tarball the brief calls for: one executable entry
 // and one data file.
 func goodPayload(t *testing.T) []byte {
@@ -104,11 +120,11 @@ func entryDigest(t *testing.T, archive []byte, name string) string {
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return strings.Repeat("0", 64)
-		}
 		if err != nil {
-			t.Fatalf("tar: %v", err)
+			// EOF, or a gzip stream that is not a tar at all: either way the
+			// fixture carries no such member, and a payload that never reaches
+			// its entry check only needs a well-formed digest in the lock.
+			return strings.Repeat("0", 64)
 		}
 		if hdr.Name != name {
 			continue
@@ -233,10 +249,75 @@ func stagingEmpty(t *testing.T, dataDir string) {
 
 // TestPayloadDisagreeingWithTheLockIsNeverInstalled protects the trust root:
 // bytes whose size or SHA-256 differ from the lock must never be extracted,
-// executed, or left in the store. Silent breakage would let one bad response
-// from an asset host become a tool the product runs forever.
+// executed, or left in the store, and the request that fetched them must be the
+// one the lock identifies. Silent breakage would let one bad response from an
+// asset host become a tool the product runs forever.
+//
+// The mirror and redirect rows carry the second half of that. A mirror serves
+// three publishers at once, so a substitution that dropped the original host
+// would flatten three origin trees into one namespace and let one publisher's
+// path answer for another's -- the digest would still be checked, but against
+// bytes fetched from somewhere the lock never named. The redirect rows pin the
+// delegate set to the host the lock names rather than the host actually dialed,
+// which is what keeps a mirror from silently widening the host set.
 func TestPayloadDisagreeingWithTheLockIsNeverInstalled(t *testing.T) {
 	payload := goodPayload(t)
+	t.Run("a mirrored URL still identifies its upstream host", func(t *testing.T) {
+		for _, tc := range []struct{ mirror, raw, want, wantHost string }{
+			{"", "https://github.com/o/r/releases/download/t/a.tar.gz",
+				"https://github.com/o/r/releases/download/t/a.tar.gz", "github.com"},
+			{"https://mirror.invalid/ctx", "https://nodejs.org/dist/v1/node.tar.gz",
+				"https://mirror.invalid/ctx/nodejs.org/dist/v1/node.tar.gz", "nodejs.org"},
+			{"https://mirror.invalid/ctx", "https://download.eclipse.org/jdtls/m/j.tar.gz",
+				"https://mirror.invalid/ctx/download.eclipse.org/jdtls/m/j.tar.gz", "download.eclipse.org"},
+			{"https://mirror.invalid", "https://github.com/o/r/releases/download/t/a.tar.gz",
+				"https://mirror.invalid/github.com/o/r/releases/download/t/a.tar.gz", "github.com"},
+		} {
+			var mirror *url.URL
+			if tc.mirror != "" {
+				var err error
+				if mirror, err = url.Parse(tc.mirror); err != nil {
+					t.Fatalf("mirror %q: %v", tc.mirror, err)
+				}
+			}
+			got, host, err := newFetcher(nil, mirror, 1<<30, time.Second, nil).target(tc.raw)
+			if err != nil {
+				t.Fatalf("target(%q): %v", tc.raw, err)
+			}
+			if got.String() != tc.want || host != tc.wantHost {
+				t.Fatalf("mirror %q: target(%q) = %q/%q, want %q/%q",
+					tc.mirror, tc.raw, got, host, tc.want, tc.wantHost)
+			}
+		}
+	})
+	t.Run("a redirect may only reach the lock host's own delegates", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, from, to, lockHost string
+			refused                  bool
+		}{
+			{"same host", "https://github.com/a", "https://github.com/b", "github.com", false},
+			{"github delegate", "https://github.com/a", "https://release-assets.githubusercontent.com/b", "github.com", false},
+			{"github delegate behind a mirror", "https://mirror.invalid/ctx/github.com/a",
+				"https://release-assets.githubusercontent.com/b", "github.com", false},
+			{"the mirror's own host is not a delegate", "https://mirror.invalid/ctx/nodejs.org/a",
+				"https://cdn.mirror.invalid/b", "nodejs.org", true},
+			{"a delegate of a host the lock did not name", "https://mirror.invalid/ctx/nodejs.org/a",
+				"https://release-assets.githubusercontent.com/b", "nodejs.org", true},
+			{"leaving https", "https://github.com/a", "http://github.com/b", "github.com", true},
+		} {
+			via, err := http.NewRequestWithContext(withLockHost(t.Context(), tc.lockHost), http.MethodGet, tc.from, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			next, err := http.NewRequestWithContext(via.Context(), http.MethodGet, tc.to, nil)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if got := checkRedirect(next, []*http.Request{via}) != nil; got != tc.refused {
+				t.Fatalf("%s: refused = %v, want %v", tc.name, got, tc.refused)
+			}
+		}
+	})
 	for _, tc := range []struct {
 		name   string
 		mangle func(*Payload)
@@ -251,8 +332,8 @@ func TestPayloadDisagreeingWithTheLockIsNeverInstalled(t *testing.T) {
 			r := f.resolver(t, false, nil)
 
 			_, err := r.Resolve(t.Context(), testTool)
-			if got := codeOf(t, err); got != CodeToolDigestMismatch {
-				t.Fatalf("code = %q, want %q (err %v)", got, CodeToolDigestMismatch, err)
+			if got := codeOf(t, err); got != model.CodeToolDigestMismatch {
+				t.Fatalf("code = %q, want %q (err %v)", got, model.CodeToolDigestMismatch, err)
 			}
 			requireAbsent(t, f.versionDir(), "the store version directory")
 			stagingEmpty(t, f.dataDir)
@@ -276,29 +357,41 @@ func TestHostileArchiveIsRejectedBeforeAnyByteEscapes(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		entries []archiveEntry
-		code    string
+		// served overrides the tarball built from entries, for a payload shape
+		// that is not an archive at all.
+		served []byte
+		code   string
 	}{
-		{"absolute path", []archiveEntry{{name: canary, body: "x"}}, CodeToolCorrupt},
-		{"parent traversal", []archiveEntry{{name: "../canary", body: "x"}}, CodeToolCorrupt},
-		{"unnormalized traversal", []archiveEntry{{name: "bin/../../canary", body: "x"}}, CodeToolCorrupt},
+		{"absolute path", []archiveEntry{{name: canary, body: "x"}}, nil, model.CodeToolCorrupt},
+		{"parent traversal", []archiveEntry{{name: "../canary", body: "x"}}, nil, model.CodeToolCorrupt},
+		{"unnormalized traversal", []archiveEntry{{name: "bin/../../canary", body: "x"}}, nil, model.CodeToolCorrupt},
 		{"symlink leaving the payload", []archiveEntry{
 			{name: "escape", typ: tar.TypeSymlink, link: "../../canary"},
-		}, CodeToolCorrupt},
+		}, nil, model.CodeToolCorrupt},
 		{"absolute symlink", []archiveEntry{
 			{name: "escape", typ: tar.TypeSymlink, link: canary},
-		}, CodeToolCorrupt},
+		}, nil, model.CodeToolCorrupt},
 		{"hard link", []archiveEntry{
 			{name: testEntry, body: "ok", mode: 0o755},
 			{name: "alias", typ: tar.TypeLink, link: testEntry},
-		}, CodeToolCorrupt},
-		{"device node", []archiveEntry{{name: "dev", typ: tar.TypeChar}}, CodeToolCorrupt},
-		{"forged publication marker", []archiveEntry{{name: completeName, body: "x"}}, CodeToolCorrupt},
-		{"expands past its bound", []archiveEntry{{name: "big", body: bomb}}, model.CodeResourceLimit},
+		}, nil, model.CodeToolCorrupt},
+		{"device node", []archiveEntry{{name: "dev", typ: tar.TypeChar}}, nil, model.CodeToolCorrupt},
+		{"forged publication marker", []archiveEntry{{name: completeName, body: "x"}}, nil, model.CodeToolCorrupt},
+		{"expands past its bound", []archiveEntry{{name: "big", body: bomb}}, nil, model.CodeResourceLimit},
+		// A lone gzip member carries no trustworthy decompressed length, so its
+		// byte budget is charged while the bytes move rather than up front. That
+		// is a second implementation of the bound the row above covers, and the
+		// shape three pinned upstreams actually publish.
+		{"a single-gzip payload expands past its bound", nil, gzipped(t, bomb), model.CodeResourceLimit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			// The lock pins the hostile bytes honestly, so the digest gate
 			// passes and the extractor is what has to refuse them.
-			f := newFixture(t, tarball(t, tc.entries...))
+			served := tc.served
+			if served == nil {
+				served = tarball(t, tc.entries...)
+			}
+			f := newFixture(t, served)
 			r := f.resolver(t, false, nil)
 
 			_, err := r.Resolve(t.Context(), testTool)
@@ -341,8 +434,8 @@ func TestOfflineRefusesWithoutDialing(t *testing.T) {
 			r := f.resolver(t, true, trap)
 
 			_, err := r.Resolve(t.Context(), testTool)
-			if got := codeOf(t, err); got != CodeToolOffline {
-				t.Fatalf("code = %q, want %q (err %v)", got, CodeToolOffline, err)
+			if got := codeOf(t, err); got != model.CodeToolOffline {
+				t.Fatalf("code = %q, want %q (err %v)", got, model.CodeToolOffline, err)
 			}
 			if f.hits.Load() != 0 {
 				t.Fatalf("an offline resolution reached the asset host %d times", f.hits.Load())
@@ -356,6 +449,14 @@ func TestOfflineRefusesWithoutDialing(t *testing.T) {
 // publication marker and the entry re-hash at every resolution, a half-finished
 // install or an edited binary would be executed as if the lock had approved it.
 func TestUnpublishedOrAlteredStoreIsInvisibleAndRepaired(t *testing.T) {
+	// The committed lock is this binary's trust root and Embedded panics on one
+	// that will not parse or validate, by design. Every case below injects a
+	// synthetic lock, so without this line the real file is read by no test at
+	// all and a field the generator adds would surface as an init-time panic in
+	// production rather than as a failure here.
+	if embedded := Embedded(); embedded.LockVersion != lockVersion || len(embedded.Tools) == 0 {
+		t.Fatalf("the embedded lock is version %d with %d tools", embedded.LockVersion, len(embedded.Tools))
+	}
 	payload := goodPayload(t)
 	for _, tc := range []struct {
 		name   string
