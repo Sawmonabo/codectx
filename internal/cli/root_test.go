@@ -27,6 +27,15 @@ import (
 // yet. `tools prefetch` under tools.offline must fail with CTX_TOOL_OFFLINE and
 // exit 5, because that family reaching the default branch of ExitCode would
 // report a refusal the user configured as an internal defect (exit 10).
+//
+// The `status` row protects the same boundary for the commands the index
+// coordinator answers. Those commands open a workspace, a database, a tool
+// store and several analyzer processes, and every one of those failures has to
+// reach the operator as one typed envelope in its own exit class. An untyped
+// error from any step in that composition falls into ExitCode's default
+// branches -- exit 2 ("you typed it wrong") or exit 10 ("this is a defect") --
+// and a machine consumer would then retry a workspace that does not exist, or
+// file a bug against a path the user mistyped.
 func TestCommandEnvelope(t *testing.T) {
 	build := model.BuildInfo{
 		Version:       "1.2.3",
@@ -39,25 +48,34 @@ func TestCommandEnvelope(t *testing.T) {
 		name       string
 		args       []string
 		userConfig string
-		exitCode   int
-		ok         bool
-		command    string
-		errCode    string
-		checkData  func(t *testing.T, data json.RawMessage)
+		// missingRepo points the command at a path that is not a workspace,
+		// which is how a row reaches the composition's own failure classes
+		// without depending on the directory the test happens to run in.
+		missingRepo bool
+		exitCode    int
+		ok          bool
+		command     string
+		errCode     string
+		checkData   func(t *testing.T, data json.RawMessage)
 	}{
 		{name: "version json", args: []string{"version", "--json"}, exitCode: 0, ok: true, command: "version", checkData: checkBuildData(build)},
 		{name: "unknown flag", args: []string{"version", "--bogus", "--json"}, exitCode: 2, ok: false, command: "version", errCode: "CTX_ARGUMENT_INVALID"},
 		{name: "unknown command", args: []string{"bogus", "--json"}, exitCode: 2, ok: false, command: "codectx", errCode: "CTX_ARGUMENT_INVALID"},
 		{name: "tools status on an empty store", args: []string{"tools", "status", "--json"}, exitCode: 0, ok: true, command: "status", checkData: checkEmptyStoreReport},
 		{name: "tools prefetch while offline", args: []string{"tools", "prefetch", "--all", "--json"}, userConfig: "[tools]\noffline = true\n", exitCode: 5, ok: false, command: "prefetch", errCode: "CTX_TOOL_OFFLINE"},
+		{name: "status on a path that is not a workspace", args: []string{"status", "--json"}, missingRepo: true, exitCode: 3, ok: false, command: "status", errCode: "CTX_WORKSPACE_NOT_FOUND"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateUserDirs(t, tc.userConfig)
+			args := tc.args
+			if tc.missingRepo {
+				args = append([]string{"--repo", filepath.Join(t.TempDir(), "absent")}, args...)
+			}
 			var stdout, stderr bytes.Buffer
 			root := cli.NewRoot(build, &stdout, &stderr)
-			err := cli.Execute(context.Background(), build, root, tc.args)
+			err := cli.Execute(context.Background(), build, root, args)
 
 			if got := cli.ExitCode(err); got != tc.exitCode {
 				t.Fatalf("exit code = %d, want %d (err: %v)", got, tc.exitCode, err)
