@@ -186,13 +186,7 @@ func (e *Engine) Callees(ctx context.Context, req model.GraphRequest) (model.Gra
 	return model.GraphResult{}, notImplemented("callees")
 }
 
-// References answers a canonical reference query, preserving the Section 9.2
-// distinction between relation count and occurrence count. A request naming the
-// lsp semantic source is answered with an unavailable-capability row and no
-// records, never with a silently substituted canonical answer.
-func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error) {
-	return model.Page[model.ReferenceOccurrence]{}, notImplemented("references")
-}
+// References is implemented in references.go (lane L7).
 
 // ShortestPath runs a nonnegative integer-cost Dijkstra over the request's
 // relation allowlist. An exhausted depth, visited budget or deadline is
