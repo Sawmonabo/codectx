@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -451,4 +452,42 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if capped.Reject(capped.Reserve(dependence.FamilyC, 1<<30, plenty), rootScope) == nil {
 		t.Error("an explicit ceiling did not reject a unit that does not fit it")
 	}
+
+	// Admission is the other half of the same ruling: a reservation orders and
+	// serializes heavy work, and two heavy analyzers run together only when
+	// their reservations sum inside the machine-derived allocation. Failure
+	// mode: admission grants two heavy analyzers whose summed reservations
+	// exceed the allocation, so an indexing run OOM-kills the machine.
+	//
+	// maxHeavy is 2 here on purpose: at the default of 1 the count alone would
+	// serialize the second unit and the memory gate would never be exercised.
+	sched := plan.NewScheduler(2, plenty)
+	heavy := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
+	if 2*heavy.Bytes() <= heavy.AllocationBytes {
+		t.Fatalf("two %d-byte reservations fit the %d-byte allocation; this row no longer proves the gate",
+			heavy.Bytes(), heavy.AllocationBytes)
+	}
+	release, err := sched.Admit(context.Background(), heavy)
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	blocked, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := sched.Admit(blocked, heavy); err == nil {
+		t.Error("admission granted a second heavy analyzer whose reservation does not fit beside the first")
+	}
+	// The first slot back is what lets the queue move: a reservation never
+	// refuses work, it only orders it.
+	release()
+	release() // releasing twice must not free a slot that was never taken
+	second, err := sched.Admit(context.Background(), heavy)
+	if err != nil {
+		t.Fatalf("Admit after release: %v", err)
+	}
+	stillBlocked, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel2()
+	if _, err := sched.Admit(stillBlocked, heavy); err == nil {
+		t.Error("releasing one admission twice freed a slot that was never taken")
+	}
+	second()
 }
