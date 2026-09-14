@@ -71,8 +71,8 @@ func TraversalPolicy(ctx context.Context, base workspace.Policy, root workspace.
 		if errors.As(err, &typed) && typed.Code == model.CodeResourceLimit {
 			// The logger is the package default because this function's
 			// signature is the one every traversing component shares and
-			// none of them has a logger to give it; Builder resolves its own
-			// the same way when none is configured.
+			// none of them has a logger to give it; the composition root
+			// installs the process logger as that default.
 			slog.Default().Warn("this worktree has more ignored roots than the traversal policy holds; the ignored trees are walked rather than excluded",
 				"component", "snapshot", "max_ignored_roots", maxIgnoredRoots)
 			return base, nil

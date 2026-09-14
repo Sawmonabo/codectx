@@ -435,8 +435,8 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 //
 // The excluded trees stay unwatched, which is what keeps that affordable: with
 // the capture's Git ignore predicate in place an ignored build directory is
-// pruned by the
-// same predicate that keeps it out of the snapshot, so an `npm install` under
+// pruned by the same predicate that keeps it out of the snapshot, so an
+// `npm install` under
 // an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
 func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map[string]bool) {

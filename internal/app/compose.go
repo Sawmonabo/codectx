@@ -176,6 +176,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// inside the workspace must be excluded as the configured one is.
 	st := &stack{root: root, cfg: cfg, dataDir: cfg.Storage.DataDir,
 		logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))}
+	// Components whose shared signatures carry no logger (the traversal
+	// policy, for one) log through the package default; make it this one so
+	// every line the process emits is formatted the same way.
+	slog.SetDefault(st.logger)
 	s = st
 	// Every later step opens something; from here a failure must release what
 	// has been opened so far, in reverse. The deferred close names the local
