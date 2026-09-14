@@ -218,14 +218,15 @@ var _ provider.Provider = (*Provider)(nil)
 // `codectx tools prefetch`, before any detection had happened and before any
 // unit existed (measured: 24.8 s of fetching at construction).
 //
-// What does not become lazy is the descriptor's version. It folds the payloads
-// this process actually holds (see Descriptor) and is fixed here, because
-// Descriptor() takes no context and must be a deterministic function of the
-// process: a version that changed as payloads appeared would key two units of
-// the same run differently. A deferred kind therefore contributes the same
-// fixed empty slot an unresolvable one does, and a unit built before the
-// payload was installed keys differently from one built after -- correctly,
-// since the facts really were produced by a different tool set, and only once.
+// What does not become lazy is the descriptor's version. It is fixed here,
+// because Descriptor() takes no context and must be a deterministic function of
+// the process: a version that changed as payloads appeared would key two units
+// of the same run differently. It folds the identity of every kind that can
+// produce facts -- the resolved fingerprint of a payload the store holds and
+// the lock's pinned fingerprint of a deferred one, which are the same string
+// for the same payload -- so a unit built before the payload was installed
+// keys identically to one built after. Only a kind this machine cannot supply
+// at all contributes an empty slot, and it produces no facts to key.
 //
 // A payload that cannot be resolved at all is not an error. It is recorded
 // with the toolchain's own CTX_TOOL_* code and reported as honest absence, so
@@ -256,16 +257,17 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	}
 	var profs []Profile
 	var deferred []Kind
+	var identities map[Kind]string
 	var missing []unresolved
 	if o.Resolver != nil {
-		profs, deferred, missing = resolveProfiles(ctx, o.Resolver)
+		profs, deferred, identities, missing = resolveProfiles(ctx, o.Resolver)
 	}
-	// A build that resolved no payload carries no tools digest: an import-only
-	// provider runs no indexer, so a digest over six empty slots would key its
-	// units by tools it never had.
+	// A build with no payload identity at all carries no tools digest: an
+	// import-only provider runs no indexer, so a digest over six empty slots
+	// would key its units by tools it never had.
 	version := Version
-	if len(profs) > 0 {
-		version = Version + "/" + toolsFingerprint(profs)
+	if len(identities) > 0 {
+		version = Version + "/" + toolsFingerprint(identities)
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
 		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout,
@@ -340,7 +342,7 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 			if slices.Contains(p.deferred, k) {
 				// The operator is told what the first run will fetch, before it
 				// spends the bytes.
-				det = det.WithDetail(string(k), codeToolNotInstalled)
+				det = det.WithDetail(string(k), markerDeferred)
 			}
 		}
 	}
@@ -361,7 +363,7 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 	// at model.MaxIdentifierBytes, and a concatenation would be truncated there
 	// -- silently dropping whichever payloads sort last, so replacing one of them
 	// would change nothing the coordinator folds into UnitSpec.ProviderVersion.
-	if len(p.profiles) > 0 {
+	if p.version != Version {
 		det.ObservedVersion = p.version
 	}
 	if !det.Available {

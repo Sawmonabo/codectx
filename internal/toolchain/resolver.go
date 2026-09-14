@@ -72,8 +72,18 @@ const fingerprintDomain = "tool-fingerprint-v1"
 // It excludes paths and every operational value, so two machines that resolved
 // the same pinned tool produce the same fingerprint.
 func (t Tool) Fingerprint() string {
-	return t.Name + "@" + t.Version + "+" +
-		model.H(fingerprintDomain, string(t.Source), t.Name, t.Version, t.PayloadDigest, t.EntryChecksum, t.Checksum)
+	return t.Name + "@" + t.Version + "+" + t.FingerprintDigest()
+}
+
+// FingerprintDigest is the digest half of Fingerprint: the same identity, in a
+// fixed-length lowercase hex form that is safe to use as a filename. The
+// rendered fingerprint carries the version verbatim, and an override's version
+// is whatever the user typed -- `..`, or a string with a separator in it --
+// so a consumer that names a directory after a tool's identity uses this half
+// rather than the whole. internal/provider/lsp is that consumer: a server's
+// private work directory is per payload identity, not per name.
+func (t Tool) FingerprintDigest() string {
+	return model.H(fingerprintDomain, string(t.Source), t.Name, t.Version, t.PayloadDigest, t.EntryChecksum, t.Checksum)
 }
 
 // Override is a user-configured replacement for a lock entry. It mirrors
@@ -255,6 +265,64 @@ func (r *Resolver) Resolve(ctx context.Context, name string) (Tool, error) {
 		return Tool{}, err
 	}
 	return compose(name, e, p, dir, entryHash, runtime)
+}
+
+// PinnedFingerprint is Tool.Fingerprint() for the payload the lock pins,
+// computed from the lock alone: no store is read, nothing is fetched and no
+// filesystem path is touched. It is the identity the tool will have once its
+// payload is installed, because every field the fingerprint folds is pinned --
+// the source is managed, the version and the payload digest are the lock's, and
+// the entry digest is what a resolution verifies the installed entry against
+// before it accepts it.
+//
+// It exists for a consumer that keys facts by tool identity and plans work for
+// a payload that is pinned but not yet in the store: internal/provider/scip
+// defers such a kind, and a unit it seals must carry the same provider version
+// whether the payload landed before the process started or during it.
+//
+// A tool the user has overridden has no pinned identity -- its version and its
+// bytes are the user's -- and this refuses one. That is unreachable from the
+// deferral path it serves: an override resolves without touching the store, so
+// it is either usable now or a typed refusal now, never deferred.
+func (r *Resolver) PinnedFingerprint(name string) (string, error) {
+	t, err := r.pinned(name)
+	if err != nil {
+		return "", err
+	}
+	return t.Fingerprint(), nil
+}
+
+// pinned builds the identity half of a resolved Tool from lock data. It runs
+// compose, rather than reproducing its four launcher shapes, because the shape
+// decides which executable's digest becomes Tool.Checksum -- the entry's for a
+// tool that runs as itself, the runtime's for a Node or jar payload -- and a
+// second copy of that branch is a copy that can disagree with the one
+// resolution uses.
+//
+// The Tool it returns is meaningful in its identity fields only: composed
+// against an empty payload directory, its Root, Executable, ArgvPrefix and Env
+// are relative or derived from relative paths and nothing may run it. It stays
+// unexported for that reason, and PinnedFingerprint returns only the string.
+func (r *Resolver) pinned(name string) (Tool, error) {
+	e, ok := r.lock.Tools[name]
+	if !ok {
+		return Tool{}, internalError("no lock entry is named %q", name)
+	}
+	if _, ok := r.overrides[name]; ok {
+		return Tool{}, internalError("tool %q is replaced by a user override, whose identity the lock does not pin", name)
+	}
+	p, ok := e.Platforms[r.platform.Key()]
+	if !ok {
+		return Tool{}, unsupported(name, r.platform)
+	}
+	var runtime Tool
+	if e.Runtime != "" {
+		var err error
+		if runtime, err = r.pinned(e.Runtime); err != nil {
+			return Tool{}, err
+		}
+	}
+	return compose(name, e, p, "", e.entryDigest(p), runtime)
 }
 
 // ensure returns the installed payload directory and the entry digest observed

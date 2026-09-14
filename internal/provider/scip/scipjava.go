@@ -2,8 +2,10 @@ package scip
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -35,6 +37,44 @@ type scipJavaProject struct {
 	Dependencies      []string `json:"dependencies"`
 	Classpath         []string `json:"classpath"`
 	JavacOptions      []string `json:"javacOptions"`
+}
+
+// requireJavaSources refuses a Java run whose materialization holds no `.java`
+// file at all, before the indexer is started.
+//
+// A root pom.xml with no compilable source is not exotic: it is every
+// aggregator POM of a multi-module repository, and a root manifest is exactly
+// what triggers this profile. javac refuses, scip-java exits 1, and the run
+// fails as `CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1`
+// (measured) -- a process failure with no stderr and no remediation, for a
+// condition this provider can name precisely and the other five profiles
+// already do name: the Go path reports the same empty index as
+// CTX_PROVIDER_OUTPUT_INVALID. The refusal is the same typed one, raised
+// before a JVM is started rather than after.
+//
+// The walk stops at the first match and is bounded by the materialization,
+// which MaxMaterializeBytes already bounds.
+func requireJavaSources(matRoot string) error {
+	found := false
+	err := filepath.WalkDir(matRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(path, ".java") {
+			found = true
+			return fs.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return internal("scip java source scan: " + err.Error())
+	}
+	if found {
+		return nil
+	}
+	return &model.Error{Code: model.CodeProviderOutputInvalid,
+		Message:     "the snapshot declares a Java project but holds no .java source for the indexer to describe",
+		Remediation: "an aggregator pom.xml whose modules hold the sources needs no index of its own; if sources were expected here, restore them and re-run"}
 }
 
 // writeScipJavaConfig writes the Java profile's build description into the

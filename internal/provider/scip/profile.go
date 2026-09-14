@@ -307,14 +307,15 @@ type unresolved struct {
 	err  error
 }
 
-// codeToolNotInstalled labels a kind whose payload this platform pins but the
-// store does not hold yet: the first unit that needs it fetches it. It is a
-// detail value, not a Section 22 error code -- no failure has happened, so
-// there is nothing to raise -- and it is spelled like one because it sits in
-// the same detail map beside the toolchain's real CTX_TOOL_* codes, where an
-// operator reads "run prefetch" from one and "this platform has no payload"
-// from another.
-const codeToolNotInstalled = "CTX_TOOL_NOT_INSTALLED"
+// markerDeferred labels a kind whose payload this platform pins but the store
+// does not hold yet: the first unit that needs it fetches it and indexes the
+// language at full precision. It is deliberately not spelled like a Section 22
+// code. It shares a detail map with the toolchain's real CTX_TOOL_* refusals,
+// and the one consumer of that map -- provider.Registry.Select -- publishes a
+// degraded capability row for a refusal. A pending payload is not degradation,
+// so it must be distinguishable by value: anything CTX_-prefixed in these
+// details means "this part of the provider cannot run", and this does not.
+const markerDeferred = "deferred"
 
 // resolveProfiles sorts every kind into the three states construction can
 // observe, without installing anything.
@@ -329,8 +330,22 @@ const codeToolNotInstalled = "CTX_TOOL_NOT_INSTALLED"
 // platform, a corrupt store entry, an invalid override -- which Section 11.7
 // makes honest absence with the toolchain's own typed reason.
 //
-// All three are deterministic in Kinds order.
-func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profile, deferred []Kind, bad []unresolved) {
+// identities is the payload identity of every kind that will produce facts,
+// ready and deferred alike: the resolved fingerprint for one the store holds
+// and the lock's pinned fingerprint for one it does not. They are the same
+// string for the same payload, which is what makes Descriptor().Version
+// independent of whether the payload happened to be installed when the process
+// started (see toolsFingerprint).
+//
+// A deferred kind whose pinned identity cannot even be named joins bad. That is
+// unreachable as the lock stands -- every Kind is a lock entry, a platform with
+// no payload is already a typed refusal from ResolveInstalled, and an override
+// resolves without a store and so is never deferred -- and planning a unit
+// whose facts could not be keyed is the one outcome that must not be possible.
+//
+// All four results are deterministic in Kinds order.
+func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profile, deferred []Kind, identities map[Kind]string, bad []unresolved) {
+	identities = make(map[Kind]string, len(Kinds))
 	for _, k := range Kinds {
 		t, installed, err := r.ResolveInstalled(ctx, string(k))
 		switch {
@@ -338,11 +353,18 @@ func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profil
 			bad = append(bad, unresolved{kind: k, code: codeOf(err), err: err})
 		case installed:
 			ready = append(ready, Profile{Kind: k, Tool: t})
+			identities[k] = t.Fingerprint()
 		default:
+			pinned, err := r.PinnedFingerprint(string(k))
+			if err != nil {
+				bad = append(bad, unresolved{kind: k, code: codeOf(err), err: err})
+				continue
+			}
 			deferred = append(deferred, k)
+			identities[k] = pinned
 		}
 	}
-	return ready, deferred, bad
+	return ready, deferred, identities, bad
 }
 
 // codeOf is the typed code of a resolution failure, or CTX_PROVIDER_UNAVAILABLE
@@ -392,6 +414,10 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindJava:
+		// Refused before the JVM starts, not diagnosed from its exit status.
+		if err := requireJavaSources(mat.Root()); err != nil {
+			return "", "", p.profileError(prof, "", err)
+		}
 		if err := writeScipJavaConfig(mat.Root()); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
@@ -552,28 +578,30 @@ func checkTool(prof Profile, m metadata) error {
 // canonical hash in the tree.
 const fingerprintDomain = "scip-provider-tools-v1"
 
-// toolsFingerprint is the digest of every resolved payload, in Kinds order. It
-// is what Descriptor().Version folds in so that replacing an indexer
-// invalidates the units it produced: Section 20.2 keeps `[tools]` out of
-// AnalysisConfigHash, so the tool identity has to reach the unit key through
-// the provider's own version.
+// toolsFingerprint is the digest of the payload identity of every kind that can
+// produce facts, in Kinds order. It is what Descriptor().Version folds in so
+// that replacing an indexer invalidates the units it produced: Section 20.2
+// keeps `[tools]` out of AnalysisConfigHash, so the tool identity has to reach
+// the unit key through the provider's own version.
 //
-// A kind whose payload did not resolve contributes one fixed empty slot, never
-// the reason it is missing. Two machines that resolved the same pinned payloads
-// must key their units identically, and why some other language's indexer is
-// absent -- offline here, an empty store there -- is not part of what produced
-// these facts. Folding the reason would give a `profile:scip-go` unit two
-// different UnitIDs for one identical scip-go payload. The typed reason belongs
-// to Detection.DiagnosticCode, which carries it.
-func toolsFingerprint(profiles []Profile) string {
+// A deferred kind contributes the identity the lock pins for it, which is the
+// identity the payload has once the unit that needs it has fetched it. The
+// facts really are produced by the pinned indexer, so they are keyed by it,
+// and a first run on a cold machine keys its units exactly as every later run
+// does -- without which the fetching run's whole output is re-indexed by the
+// next process.
+//
+// A kind whose payload this machine cannot supply at all contributes one fixed
+// empty slot, never the reason it is missing. It plans no unit and produces no
+// facts, and two machines that hold the same pinned payloads must key their
+// units identically -- why some other language's indexer is absent (offline
+// here, an unsupported platform there) is not part of what produced these
+// facts. The typed reason belongs to Detection.Details, which carries it.
+func toolsFingerprint(identities map[Kind]string) string {
 	h := model.NewHasher(fingerprintDomain)
-	byKind := make(map[Kind]string, len(Kinds))
-	for _, p := range profiles {
-		byKind[p.Kind] = p.Tool.Fingerprint()
-	}
 	for _, k := range Kinds {
 		h.AddString(string(k))
-		h.AddString(byKind[k])
+		h.AddString(identities[k])
 	}
 	return h.Sum()
 }
