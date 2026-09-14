@@ -570,6 +570,29 @@ func TestStorePublicationScenario(t *testing.T) {
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
 	}
+	// Phase: lexical statistics are generation-local (Section 14.4). A BM25
+	// score is a function of df and the document facts of the pinned
+	// generation, so the same query against the same binding must yield the
+	// same score while other generations stage, activate and are swept
+	// underneath the reader; readerStable holds gen2 across the publication
+	// and retention sequence below, which republishes "changed" in a.go.
+	readerStable, err := f.s.PinGeneration(ctx, f.repo, gen2, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration(gen2, stable): %v", err)
+	}
+	defer readerStable.Close()
+	dfBefore, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
+	if err != nil {
+		t.Fatalf("DocumentFrequency: %v", err)
+	}
+	hitsBefore, err := readerStable.SearchDocuments(ctx, ids)
+	if err != nil {
+		t.Fatalf("SearchDocuments: %v", err)
+	}
+	if len(dfBefore) != 1 || dfBefore[0] != 1 || len(hitsBefore) != 1 {
+		t.Fatalf("gen2 lexical statistics = df %v over %d documents, want df 1 and the one b.go document containing \"changed\"", dfBefore, len(hitsBefore))
+	}
+
 	if err := reader2.Close(); err != nil {
 		t.Fatalf("reader2.Close: %v", err)
 	}
@@ -626,6 +649,21 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("SealUnit(release): %v", err)
 	}
 	f.activate(genOwn, genCarry)
+	// genOwn's unit indexes b.go a second time under its own config, so the
+	// corpus now holds a second document containing "changed" that gen2 does
+	// not select. Its rowid is the probe the stability leg below uses.
+	ownReader, err := f.s.PinGeneration(ctx, f.repo, genOwn, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration(genOwn): %v", err)
+	}
+	ownIDs, err := ownReader.Match(ctx, `"changed"`, 0, 10)
+	if err != nil || len(ownIDs) != 1 || ownIDs[0] == ids[0] {
+		t.Fatalf("genOwn Match(changed) = %v %v, want its own single document, not gen2's %d", ownIDs, err, ids[0])
+	}
+	// Released at once: a lease here would stop retention sweeping genOwn below.
+	if err := ownReader.Close(); err != nil {
+		t.Fatalf("ownReader.Close: %v", err)
+	}
 
 	// The publication half: over a snapshot whose a.go changed, unitA can no
 	// longer be reused, and carrying it must be admitted at attach AND at
@@ -695,6 +733,24 @@ func TestStorePublicationScenario(t *testing.T) {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
 	}
+	// The other half of the ranking-stability leg: three generations have now
+	// staged and activated over gen2 and two have been swept, and genOwn's
+	// second "changed" document is live. gen2's df and document facts must be
+	// exactly what they were, and genOwn's rowid -- a real document of the
+	// same file, outside this generation -- must be omitted, not hydrated.
+	dfAfter, err := readerStable.DocumentFrequency(ctx, []string{"changed"})
+	if err != nil {
+		t.Fatalf("DocumentFrequency after publication and retention: %v", err)
+	}
+	hitsAfter, err := readerStable.SearchDocuments(ctx, []int64{ids[0], ownIDs[0]})
+	if err != nil {
+		t.Fatalf("SearchDocuments after publication and retention: %v", err)
+	}
+	if len(dfAfter) != 1 || dfAfter[0] != dfBefore[0] || len(hitsAfter) != 1 || hitsAfter[0] != hitsBefore[0] {
+		t.Fatalf("gen2 lexical statistics moved from df %v %+v to df %v %+v while later generations published and were swept; a score is not reproducible within its binding",
+			dfBefore, hitsBefore, dfAfter, hitsAfter)
+	}
+
 	// A limit nothing fits under: every ref but the active one is evicted, and
 	// gen2 is swept only insofar as nothing else holds it — the read session
 	// opened above does, so it stays.
@@ -1355,6 +1411,78 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 		if state, exists, err := f.s.UnitState(f.ctx, w1.UnitID()); err != nil || !exists || state != model.UnitSealed {
 			t.Errorf("previous unit is %s/exists=%v (err %v), want sealed", state, exists, err)
+		}
+	})
+
+	t.Run("batched adjacency spans units but stays inside the generation", func(t *testing.T) {
+		// A frontier expansion reads many units in one statement. If the batch
+		// lost its membership predicate, an edge published only by a unit this
+		// generation does not select would be served as a fact of it: the
+		// traversal would report a call the pinned snapshot does not contain,
+		// and every answer derived from it would be wrong with no way to tell.
+		// The same batch must still cross unit boundaries, or the traversal
+		// silently stops at the first unit edge.
+		dbPath := filepath.Join(t.TempDir(), "codectx.db")
+		f := newFixture(t, dbPath)
+		a := f.file("pkg/a.go", "package pkg\nfunc F() { G() }\n")
+		b := f.file("pkg/b.go", "package pkg\nfunc F() { G() }\n")
+		snap1 := f.snapshot("one", a, b)
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		run1 := f.run(gen1)
+		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture) (model.UnitID, model.NodeID) {
+			w := f.begin(gen, run, ff)
+			from := f.putNode(w, run, ff.path, "F", &ff, "key:node:from:"+ff.path)
+			to := f.putNode(w, run, ff.path, "G", &ff, "key:node:to:"+ff.path)
+			f.putRelation(w, run, from, to, "key:rel:"+ff.path, &ff)
+			if err := f.s.SealUnit(f.ctx, w); err != nil {
+				t.Fatalf("SealUnit(%s): %v", ff.path, err)
+			}
+			return w.UnitID(), from
+		}
+		unitA, fromA := edge(gen1, run1, a)
+		_, fromB := edge(gen1, run1, b)
+		f.activate(gen1, 0)
+
+		// gen2 drops b.go entirely: only unit A is a member, so b.go's edge is
+		// still stored but is not a fact of gen2.
+		snap2 := f.snapshot("two", a)
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.s.AttachUnit(f.ctx, gen2, unitA); err != nil {
+			t.Fatalf("AttachUnit: %v", err)
+		}
+		f.activate(gen2, gen1)
+
+		batch := func(gen model.GenerationID, dir model.Direction) []model.Relation {
+			t.Helper()
+			r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+			if err != nil {
+				t.Fatalf("PinGeneration(%d): %v", gen, err)
+			}
+			defer r.Close()
+			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", model.MaxPageItems)
+			if err != nil {
+				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
+			}
+			return rels
+		}
+		// gen1 selects both units, so one batch over both seed nodes crosses
+		// the unit boundary and returns both edges.
+		if got := batch(gen1, model.DirectionOutgoing); len(got) != 2 {
+			t.Fatalf("gen1 batch returned %d edges, want both units' edges: %+v", len(got), got)
+		}
+		// gen2 selects only unit A. The UNION form must be restricted too, so
+		// both directions are asserted.
+		for _, dir := range []model.Direction{model.DirectionOutgoing, model.DirectionBoth} {
+			got := batch(gen2, dir)
+			if len(got) != 1 || got[0].From != fromA {
+				t.Fatalf("gen2 %s batch = %+v, want only unit A's edge from %s", dir, got, fromA)
+			}
 		}
 	})
 }

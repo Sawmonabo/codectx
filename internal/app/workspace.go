@@ -4,7 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -62,6 +65,11 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		s.Close()
 		return nil, err
 	}
+	if err := s.openQueries(coord.Repository()); err != nil {
+		coord.Close()
+		s.Close()
+		return nil, err
+	}
 	return &Workspace{s: s, coord: coord}, nil
 }
 
@@ -80,6 +88,47 @@ func (w *Workspace) ToolStore() string { return w.s.toolDir }
 // data directory, or the sibling `index --rebuild` created, which is the one
 // thing a caller cannot derive from the configuration alone.
 func (w *Workspace) DataDir() string { return w.s.dataDir }
+
+// Search answers the discovery endpoints over this workspace: exact symbol and
+// path lookup, and generation-local lexical retrieval. It pins a generation per
+// request, so it needs no workspace lock and answers in a report as it does in
+// an indexing session.
+func (w *Workspace) Search() *search.Service { return w.s.search }
+
+// Query pins gen -- zero selects the active generation -- and builds the graph
+// engine bound to it. The returned closer releases the retention lease and must
+// be called once, whatever the query returns; the engine must not be used after
+// it.
+//
+// The engine is built per request, which is why the concurrency gate it is
+// given is the stack's process-scoped one. The coordinator is passed as the
+// promoter only when this workspace holds the indexing lock: Coordinator.Promote
+// requires it, so a report promotes nothing and reports the deferred capability
+// rows instead (Section 11.6).
+func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
+	reader, err := w.s.store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		return nil, nil, err
+	}
+	var promote graph.Promoter
+	if w.s.lock != nil {
+		promote = promoter{coord: w.coord}
+	}
+	engine, err := graph.New(graph.Options{
+		Adjacency: adjacency{reader: reader},
+		Promoter:  promote,
+		Signer:    w.s.signer,
+		Spools:    w.s.spools,
+		Gate:      w.s.gate,
+		Limits:    graphLimits(w.s.cfg),
+		Now:       time.Now,
+	})
+	if err != nil {
+		reader.Close()
+		return nil, nil, err
+	}
+	return engine, reader.Close, nil
+}
 
 // Close releases the coordinator and then everything below it, in reverse.
 // Both halves run even when the first fails: the workspace lock must be

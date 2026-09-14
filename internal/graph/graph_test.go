@@ -2,12 +2,16 @@ package graph
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // This is the whole test budget for the graph engine: one shared in-memory
@@ -33,6 +37,19 @@ import (
 //
 // newGraphFixture has no caller until the fill-in lanes land their rows; that
 // is expected for the skeleton commit and is not dead code.
+
+// fixtureID maps a readable fixture name to the 64-lowercase-hex id every
+// model validator requires. The graph below is written in readable names so it
+// stays legible, and every id that crosses a validated boundary is derived
+// here: a fixture that used the readable name directly would be rejected by
+// Validate before any engine logic ran.
+func fixtureID(name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return hex.EncodeToString(sum[:])
+}
+
+// fixtureNodeID is fixtureID for node names; a test names its seeds with it.
+func fixtureNodeID(name string) model.NodeID { return model.NodeID(fixtureID(name)) }
 
 // fixtureLeafCount is the hub's fan-out. It is larger than any per-page bound a
 // test sets, so a truncation case has something real to truncate.
@@ -60,36 +77,37 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		nodes:    map[model.NodeID]model.Node{},
 		evidence: map[model.RelationID][]model.EvidenceID{},
 		binding: model.Binding{
-			RepositoryID: "repo-1",
-			SnapshotID:   "snap-1",
+			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
+			SnapshotID:   model.SnapshotID(fixtureID("snap-1")),
 			GenerationID: 1,
-			AnalysisKey:  "akey-1",
+			AnalysisKey:  model.AnalysisKey(fixtureID("akey-1")),
 		},
 	}
 
-	addNode := func(id model.NodeID, kind model.NodeKind, name string) {
+	addNode := func(name string, kind model.NodeKind, label string) {
+		id := fixtureNodeID(name)
 		f.nodes[id] = model.Node{
-			ID: id, Kind: kind, Name: name, QualifiedName: name,
+			ID: id, Kind: kind, Name: label, QualifiedName: label,
 			Language: "go", SemanticSource: model.SemanticCanonical,
 		}
 	}
 	addNode("pkg-app", model.NodePackage, "app")
 	addNode("pkg-lib", model.NodePackage, "lib")
-	for _, id := range []model.NodeID{"n-a", "n-b", "n-c", "n-hub", "n-p", "n-q", "n-z"} {
-		addNode(id, model.NodeFunction, string(id))
+	for _, name := range []string{"n-a", "n-b", "n-c", "n-hub", "n-p", "n-q", "n-z"} {
+		addNode(name, model.NodeFunction, name)
 	}
 	addNode("n-var", model.NodeVariable, "n-var")
 	addNode("n-sink", model.NodeFunction, "n-sink")
 	for i := 0; i < fixtureLeafCount; i++ {
-		addNode(model.NodeID(fmt.Sprintf("n-leaf-%02d", i)), model.NodeFunction, fmt.Sprintf("leaf%02d", i))
+		addNode(fmt.Sprintf("n-leaf-%02d", i), model.NodeFunction, fmt.Sprintf("leaf%02d", i))
 	}
 
 	// edges are declared in a stable order; RelationIDs are assigned from it so
 	// the keyset order is reproducible from the source alone.
 	type edge struct {
-		from model.NodeID
+		from string
 		kind model.RelationKind
-		to   model.NodeID
+		to   string
 	}
 	edges := []edge{
 		// containment: pkg-app owns the entry points, pkg-lib the targets, so a
@@ -123,20 +141,23 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		{"n-c", model.RelControlDependsOn, "n-sink"},
 	}
 	for i := 0; i < fixtureLeafCount; i++ {
-		edges = append(edges, edge{"n-hub", model.RelCalls, model.NodeID(fmt.Sprintf("n-leaf-%02d", i))})
+		edges = append(edges, edge{"n-hub", model.RelCalls, fmt.Sprintf("n-leaf-%02d", i)})
 	}
 	// n-a calls the hub, so the fan-out is reachable from the same seed as the cycle.
 	edges = append(edges, edge{"n-a", model.RelCalls, "n-hub"})
 
 	for i, e := range edges {
-		id := model.RelationID(fmt.Sprintf("rel-%04d", i))
-		f.relations = append(f.relations, model.Relation{ID: id, From: e.from, Kind: e.kind, To: e.to})
+		// Zero-padded hex counters keep the keyset order identical to the
+		// declaration order above, so the order is still readable from source.
+		id := model.RelationID(fmt.Sprintf("%064x", i))
+		f.relations = append(f.relations, model.Relation{
+			ID: id, From: fixtureNodeID(e.from), Kind: e.kind, To: fixtureNodeID(e.to)})
 		// One occurrence per edge, except n-a -> n-b, which carries two: the
 		// §9.2 relation-count vs occurrence-count distinction needs a relation
 		// that is one relation and two occurrences.
-		f.evidence[id] = []model.EvidenceID{model.EvidenceID(fmt.Sprintf("ev-%04d-0", i))}
+		f.evidence[id] = []model.EvidenceID{model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-0", i)))}
 		if e.from == "n-a" && e.to == "n-b" && e.kind == model.RelCalls {
-			f.evidence[id] = append(f.evidence[id], model.EvidenceID(fmt.Sprintf("ev-%04d-1", i)))
+			f.evidence[id] = append(f.evidence[id], model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-1", i))))
 		}
 	}
 	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
@@ -270,8 +291,95 @@ type graphScenario struct {
 func TestGraphScenarios(t *testing.T) {
 	scenarios := []graphScenario{
 		// L1 TRAVERSE rows
+		{
+			// Protects the silent-drop failure mode: a hub whose fan-out exceeds
+			// the edge budget must stop AT the budget, say so, and return every
+			// edge it counted. A walk that kept going and dropped the overflow --
+			// or that stopped without setting Truncated -- would present a
+			// partial neighbourhood as the whole one. It also pins the batching:
+			// 40 out-edges cost far fewer Edges round trips than one per node.
+			name: "traverse/hub at max edges truncates without dropping",
+			run: func(t *testing.T, f *graphFixture) {
+				const maxEdges = 10
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				got, err := e.Neighbors(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-hub")},
+					Relations: []model.RelationKind{model.RelCalls},
+					Direction: model.DirectionOutgoing,
+					MaxEdges:  maxEdges,
+				})
+				if err != nil {
+					t.Fatalf("Neighbors: %v", err)
+				}
+				if err := got.Validate(); err != nil {
+					t.Fatalf("result does not satisfy its own contract: %v", err)
+				}
+				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonEdgeBudget {
+					t.Fatalf("truncated=%v reason=%q, want true and %q",
+						got.Meta.Truncated, got.Meta.TruncationReason, reasonEdgeBudget)
+				}
+				if got.EdgeCount != maxEdges {
+					t.Fatalf("edge_count = %d, want %d", got.EdgeCount, maxEdges)
+				}
+				if int64(len(got.Relations)) != got.EdgeCount {
+					t.Fatalf("returned %d relations but counted %d: edges were dropped silently",
+						len(got.Relations), got.EdgeCount)
+				}
+				if got.Direction != model.DirectionOutgoing {
+					t.Fatalf("direction = %q, want %q", got.Direction, model.DirectionOutgoing)
+				}
+				if f.EdgeCalls >= fixtureLeafCount {
+					t.Fatalf("%d Edges round trips for a %d-edge hub: the frontier was not batched",
+						f.EdgeCalls, fixtureLeafCount)
+				}
+			},
+		},
 
 		// L2 PATH rows
+		{
+			// The two n-a -> n-z routes cost exactly the same (calls is 1 per
+			// hop), so nothing about the facts orders them: the ONLY thing that
+			// fixes the answer is the frozen tie-break -- cost ascending, then
+			// the RelationID sequence compared lexicographically. If map
+			// iteration order or heap-insertion order leaked into the walk,
+			// two identical queries over identical facts would answer
+			// differently, which is precisely the determinism Section 15.1
+			// canonical context identity rests on. The query is run 100 times
+			// because a map-order defect surfaces across runs, not within one.
+			name: "path/equal_cost_routes_keep_the_frozen_order",
+			run: func(t *testing.T, f *graphFixture) {
+				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				want := [][]model.RelationID{
+					{"rel-0013", "rel-0014"}, // n-a -> n-p -> n-z
+					{"rel-0015", "rel-0016"}, // n-a -> n-q -> n-z
+				}
+				for run := 0; run < 100; run++ {
+					got, err := engine.ShortestPath(context.Background(), model.PathRequest{
+						From: "n-a", To: "n-z", Relations: []model.RelationKind{model.RelCalls},
+					})
+					if err != nil {
+						t.Fatalf("run %d: ShortestPath: %v", run, err)
+					}
+					if len(got.Paths) != len(want) {
+						t.Fatalf("run %d: got %d paths, want %d: %+v", run, len(got.Paths), len(want), got.Paths)
+					}
+					for i, w := range want {
+						if fmt.Sprint(got.Paths[i].Relations) != fmt.Sprint(w) {
+							t.Fatalf("run %d: path %d relations = %v, want %v", run, i, got.Paths[i].Relations, w)
+						}
+						if got.Paths[i].CostUnits != 2 {
+							t.Fatalf("run %d: path %d cost_units = %d, want 2", run, i, got.Paths[i].CostUnits)
+						}
+					}
+				}
+			},
+		},
 
 		// L3 IMPACT rows
 		{
@@ -370,8 +478,97 @@ func TestGraphScenarios(t *testing.T) {
 		},
 
 		// L5 CURSOR rows
+		{name: "resumed page keeps the cumulative budget, neither reset nor doubled", run: func(t *testing.T, f *graphFixture) {
+			signer, err := pagination.OpenSigner(t.TempDir())
+			if err != nil {
+				t.Fatalf("open signer: %v", err)
+			}
+			e, err := New(Options{Adjacency: f, Signer: signer, Limits: fixtureLimits()})
+			if err != nil {
+				t.Fatalf("new engine: %v", err)
+			}
+			lease, err := model.NewRandomID()
+			if err != nil {
+				t.Fatalf("lease id: %v", err)
+			}
+			const endpoint = "graph.neighbors"
+			queryHash := traversalQueryHash(model.DirectionOutgoing,
+				[]model.RelationKind{model.RelCalls}, []model.NodeID{"n-a"}, 3, 200)
+
+			// Page 1 spent this much of the cumulative budget.
+			const spentVisited, spentEdges = 7, 11
+			token, err := e.nextTraversalCursor(&budget{visited: spentVisited, edges: spentEdges},
+				continuation{Endpoint: endpoint, QueryHash: queryHash, LeaseID: lease,
+					Depth: 1, LastKey: "rel-0003"})
+			if err != nil || token == "" {
+				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
+			}
+			// Replaying page 1's cursor restores the SAME allowance every time: a
+			// resume that reset it would hand the walk a fresh budget, and one that
+			// accumulated would double it on the second replay.
+			for attempt := 1; attempt <= 2; attempt++ {
+				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash)
+				if err != nil {
+					t.Fatalf("resume %d: %v", attempt, err)
+				}
+				if got.Budget.visited != spentVisited || got.Budget.edges != spentEdges {
+					t.Fatalf("resume %d: budget = visited %d, edges %d; want %d and %d",
+						attempt, got.Budget.visited, got.Budget.edges, spentVisited, spentEdges)
+				}
+				if got.Cursor.LastKey != "rel-0003" || got.Cursor.Depth != 1 {
+					t.Fatalf("resume %d: keyset position = %q at depth %d; want rel-0003 at depth 1",
+						attempt, got.Cursor.LastKey, got.Cursor.Depth)
+				}
+			}
+			// A tampered token is never honoured with a budget of its own choosing.
+			tampered := token[:len(token)-1] + "A"
+			if tampered == token {
+				tampered = token[:len(token)-1] + "B"
+			}
+			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
+				t.Fatalf("tampered cursor: err %v; want %s", err, model.CodeCursorInvalid)
+			}
+		}},
 
 		// L7 REFS rows
+		{
+			// Section 9.2: a relation and an occurrence are different counts. The
+			// fixture's n-a -calls-> n-b edge is ONE sealed relation backed by TWO
+			// evidence rows. Collapsing the two occurrences into one item would
+			// under-report how often the symbol is used; emitting the relation
+			// twice as two relations would over-report how many edges reach it.
+			// Both are silent wrong answers a caller cannot detect.
+			name: "references keeps relation count and occurrence count distinct",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				page, err := e.References(context.Background(), model.ReferenceRequest{
+					NodeID:         fixtureNodeID("n-b"),
+					Operation:      model.ReferenceReferences,
+					SemanticSource: model.SemanticCanonical,
+				})
+				if err != nil {
+					t.Fatalf("References: %v", err)
+				}
+				relations := map[model.RelationID]int{}
+				occurrences := map[model.EvidenceID]bool{}
+				for _, o := range page.Items {
+					relations[o.RelationID]++
+					occurrences[o.EvidenceID] = true
+				}
+				if len(relations) != 1 || len(occurrences) != 2 || len(page.Items) != 2 {
+					t.Fatalf("want 1 relation and 2 distinct occurrences, got %d relations, %d occurrences in %d items: %+v",
+						len(relations), len(occurrences), len(page.Items), page.Items)
+				}
+				if page.Meta.Truncated {
+					t.Fatalf("a complete two-occurrence answer must not be truncated: %q", page.Meta.TruncationReason)
+				}
+			},
+		},
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {

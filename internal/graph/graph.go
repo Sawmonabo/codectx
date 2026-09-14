@@ -166,41 +166,9 @@ func notImplemented(op string) error {
 		Message: "graph operation is not implemented"}).WithDetail("operation", op)
 }
 
-// Neighbors expands the request's seeds in the request's own direction over its
-// relation allowlist, reporting the direction it walked and the visited and
-// edge counts it spent.
-func (e *Engine) Neighbors(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return model.GraphResult{}, notImplemented("neighbors")
-}
+// Neighbors, Callers and Callees live in traverse.go.
 
-// Callers expands incoming `calls` edges. It pins both the direction and the
-// relation itself; a request whose Direction contradicts that is rejected with
-// CTX_ARGUMENT_INVALID rather than having the field silently ignored.
-func (e *Engine) Callers(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return model.GraphResult{}, notImplemented("callers")
-}
-
-// Callees expands outgoing `calls` edges, pinning direction and relation the
-// same way Callers does.
-func (e *Engine) Callees(ctx context.Context, req model.GraphRequest) (model.GraphResult, error) {
-	return model.GraphResult{}, notImplemented("callees")
-}
-
-// References answers a canonical reference query, preserving the Section 9.2
-// distinction between relation count and occurrence count. A request naming the
-// lsp semantic source is answered with an unavailable-capability row and no
-// records, never with a silently substituted canonical answer.
-func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error) {
-	return model.Page[model.ReferenceOccurrence]{}, notImplemented("references")
-}
-
-// ShortestPath runs a nonnegative integer-cost Dijkstra over the request's
-// relation allowlist. An exhausted depth, visited budget or deadline is
-// reported as truncation together with the paths found so far -- never as "no
-// path exists", which is reserved for a genuinely unreachable target.
-func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model.PathResult, error) {
-	return model.PathResult{}, notImplemented("shortest_path")
-}
+// References is implemented in references.go (lane L7).
 
 // frontierState is one admitted node's position in a walk: how far it sits from
 // the nearest seed, what it cost to reach, and the edge that reached it.
@@ -228,12 +196,9 @@ type expandOptions struct {
 	BatchSize int
 }
 
-// expand is the ONE batched BFS. L1 owns its body in traverse.go; L0 ships a stub so L3 compiles
-// and codes against this exact signature in parallel. visit is called once per admitted edge in
-// the frozen (depth asc, NodeID asc) order and may return errStopExpansion to end the walk.
-func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) error {
-	return notImplemented("expand")
-}
+// expand, the ONE batched BFS every operation walks with, lives in traverse.go.
 
+// errStopExpansion is the sentinel an expand visitor returns to end the walk
+// deliberately. expand reports it as a clean finish, so the visitor owns
+// whatever truncation it recorded before stopping.
 var errStopExpansion = errors.New("expansion stopped by visitor")
