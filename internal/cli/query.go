@@ -439,8 +439,11 @@ func queryFailure(err error) error {
 		return &model.Error{Code: model.CodeQueryDeadline,
 			Message: "the query did not finish within --" + queryTimeoutFlag}
 	case errors.Is(err, context.Canceled):
+		// Deliberately neutral: runService carries every command that reaches
+		// the facade, including `index --watch`, whose cancellation is a
+		// stopped session rather than an abandoned query.
 		return &model.Error{Code: model.CodeCanceled,
-			Message: "the query was canceled before it completed"}
+			Message: "the command was canceled before it completed"}
 	}
 	return err
 }

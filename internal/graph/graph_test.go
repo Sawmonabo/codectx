@@ -542,12 +542,13 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("New: %v", err)
 				}
 				wide := fixtureNodeID("n-wide")
-				got, err := e.Callees(context.Background(), model.GraphRequest{
+				got, err := e.Neighbors(context.Background(), model.GraphRequest{
 					Start:     []model.NodeID{wide},
 					Direction: model.DirectionOutgoing,
+					Relations: []model.RelationKind{model.RelCalls},
 				})
 				if err != nil {
-					t.Fatalf("Callees: %v", err)
+					t.Fatalf("Neighbors: %v", err)
 				}
 				if len(got.Relations) != fixtureWideCount || got.EdgeCount != int64(fixtureWideCount) {
 					t.Fatalf("returned %d relations (edge_count %d) for a %d-edge hub: the keyset walk stopped on its first page",
@@ -596,12 +597,13 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
-				got, err := e.Callees(context.Background(), model.GraphRequest{
+				got, err := e.Neighbors(context.Background(), model.GraphRequest{
 					Start:     []model.NodeID{fixtureNodeID("n-wide")},
 					Direction: model.DirectionOutgoing,
+					Relations: []model.RelationKind{model.RelCalls},
 				})
 				if err != nil {
-					t.Fatalf("Callees: %v", err)
+					t.Fatalf("Neighbors: %v", err)
 				}
 				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonFrontierBytes {
 					t.Fatalf("truncated=%v reason=%q, want true and %q: the frontier byte ceiling was crossed without disclosure",
@@ -1150,7 +1152,7 @@ func TestGraphScenarios(t *testing.T) {
 			// no output, and nothing in the answer to tell the operator why. The
 			// failure mode this row protects is that hang, which is why the
 			// load-bearing assertion is elapsed wall clock rather than the error
-			// code. Callers rides along because traverse.go installs the same
+			// code. Neighbors rides along because traverse.go installs the same
 			// deadline above the same Acquire and can regress the same way.
 			name: "a busy gate ends at the query deadline instead of blocking",
 			run: func(t *testing.T, f *graphFixture) {
@@ -1173,10 +1175,11 @@ func TestGraphScenarios(t *testing.T) {
 						})
 						return err
 					}},
-					{"Callers", func() error {
-						_, err := e.Callers(context.Background(), model.GraphRequest{
+					{"Neighbors", func() error {
+						_, err := e.Neighbors(context.Background(), model.GraphRequest{
 							Start:     []model.NodeID{fixtureNodeID("n-b")},
 							Direction: model.DirectionIncoming,
+							Relations: []model.RelationKind{model.RelCalls},
 						})
 						return err
 					}},

@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Sawmonabo/codectx/internal/app"
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/mcpserver"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -72,16 +71,21 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Configuration is resolved BEFORE the workspace is opened: it
-			// decides whether this session watches, and a rejection that first
-			// took the workspace lock has already made the workspace busy for a
-			// session it will not run. mcp.transport is not re-checked here --
-			// config validation already rejects anything but stdio, and a
-			// second check would be a branch nothing can reach.
-			cfg, err := config.Load(repo)
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
 			if err != nil {
 				return err
 			}
+			defer ws.Close()
+
+			// The configuration is the one the open already resolved. Loading
+			// the files a second time here would be a second answer to one
+			// question, and it would buy nothing: the open loads configuration
+			// before it takes the workspace lock, so a rejected configuration
+			// still fails without ever making the workspace busy.
+			// mcp.transport is not re-checked -- config validation already
+			// rejects anything but stdio, and a second check would be a branch
+			// nothing can reach.
+			cfg := ws.Config()
 			// mcp.watch is the default and --watch is the override. The flag is
 			// declared false and resolved by Changed() rather than defaulted to
 			// the configured value, because a cobra default is baked into
@@ -93,11 +97,6 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 					return err
 				}
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
-			if err != nil {
-				return err
-			}
-			defer ws.Close()
 
 			// The logger is the process's one diagnostic channel and it is
 			// bound to stderr: a byte of ours on stdout corrupts the framing.

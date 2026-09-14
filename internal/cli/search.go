@@ -100,12 +100,9 @@ func newSearchCommand(build model.BuildInfo) *cobra.Command {
 // commands share. The request's own Validate bounds the limit, the cursor and
 // the generation, so nothing is re-checked here.
 //
-// --timeout is read but not returned: applying it is runService's job, and it
-// reaches no request field. It is screened here because it is screened nowhere
-// else -- runService's queryContext reads any non-positive duration as "no
-// deadline", so a negative one would otherwise be accepted in silence as the
-// opposite of what the operator asked for -- and because screening it before
-// the open is what keeps a rejected command line from paying for a workspace.
+// --timeout is not read here at all: runService applies it, and durationFlag
+// refuses a negative one for every duration flag in the tree, so a second read
+// here would be the same command line checked twice.
 func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID, error) {
 	limit, err := intFlag(cmd, queryLimitFlag)
 	if err != nil {
@@ -118,14 +115,6 @@ func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID,
 	generation, err := int64Flag(cmd, queryGenerationFlag)
 	if err != nil {
 		return model.PageRequest{}, 0, err
-	}
-	timeout, err := durationFlag(cmd, queryTimeoutFlag)
-	if err != nil {
-		return model.PageRequest{}, 0, err
-	}
-	if timeout < 0 {
-		return model.PageRequest{}, 0, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: fmt.Sprintf("--%s is %s; it must not be negative, and 0 uses the configured query timeout", queryTimeoutFlag, timeout)}
 	}
 	return model.PageRequest{Limit: limit, Cursor: cursor}, model.GenerationID(generation), nil
 }
