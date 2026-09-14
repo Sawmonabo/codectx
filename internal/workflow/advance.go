@@ -166,13 +166,25 @@ func (s *Service) requireConsolidationReady(ctx context.Context, rec sqlite.Sess
 	if err != nil {
 		return err
 	}
-	if g.Served < g.Required {
+	// FullyRead, not Served: Section 17.1's coverage completeness asks whether
+	// every required file was fully read, waived or not, and Served is the
+	// reported column that deliberately drops a waived file. A session whose
+	// waived files were all read is complete and needs no flag, so comparing
+	// Served would send the operator back to read files they had already read.
+	//
+	// Adding the waiver count back instead -- g.Served+g.Waived -- is the
+	// mirror-image mistake and the worse one: a waived and UNREAD required file
+	// contributes to that sum, so a session whose entire shortfall is waived
+	// never trips the guard, the branch below is never reached, and the
+	// default-false user flag ruling Q12 puts in front of the exploratory route
+	// is bypassed. The shortfall is a read fact; the flag gates the exception.
+	if g.FullyRead < g.Required {
 		if g.Waived > 0 && s.limits.AllowExploratoryWaiverConsolidation {
 			return nil
 		}
 		return typedErrf(model.CodeCoverageIncomplete,
 			"%d of %d required files are fully read for this actor; read the rest, or waive them and enable context.allow_exploratory_waiver_consolidation",
-			g.Served, g.Required)
+			g.FullyRead, g.Required)
 	}
 	review, err := s.currentReview(ctx, rec, m.CanonicalHash)
 	if err != nil {

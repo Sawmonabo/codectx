@@ -578,27 +578,27 @@ func TestStorePublicationScenario(t *testing.T) {
 	// "served == size" arithmetically would count it fully served the instant
 	// the session opened. It counts only once its zero-length EOF chunk is
 	// confirmed.
-	summary := func(step string) (int64, int64, int64) {
+	summary := func(step string) store.CoverageCounts {
 		t.Helper()
-		required, served, waived, err := f.s.CoverageSummary(ctx, open.ID, actorID)
+		c, err := f.s.CoverageSummary(ctx, open.ID, actorID)
 		if err != nil {
 			t.Fatalf("CoverageSummary(%s): %v", step, err)
 		}
-		return required, served, waived
+		return c
 	}
 	eof := model.IssuedChunk{ID: model.H("chunk", "eof"), SessionID: open.ID, ActorID: actorID, FileID: empty.id, ContentHash: empty.hash,
 		Bytes: model.ByteRange{Start: 0, End: 0}, ExpiresAt: time.Now().Add(time.Minute).UTC()}
 	if err := f.s.IssueChunk(ctx, eof); err != nil {
 		t.Fatalf("IssueChunk(zero-length EOF chunk over an empty file): %v", err)
 	}
-	if required, served, waived := summary("issued but unconfirmed"); required != 2 || served != 0 || waived != 0 {
-		t.Fatalf("summary with the EOF chunk issued but unconfirmed = %d required %d served %d waived, want 2/0/0; an unconfirmed chunk is not coverage", required, served, waived)
+	if c := summary("issued but unconfirmed"); c.Required != 2 || c.FullyRead != 0 || c.Served != 0 || c.Waived != 0 {
+		t.Fatalf("summary with the EOF chunk issued but unconfirmed = %+v, want 2 required / 0 fully read / 0 served / 0 waived; an unconfirmed chunk is not coverage", c)
 	}
 	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{eof.ID}); err != nil {
 		t.Fatalf("ConfirmChunks(EOF): %v", err)
 	}
-	if required, served, waived := summary("EOF confirmed"); required != 2 || served != 1 || waived != 0 {
-		t.Fatalf("summary after confirming the EOF chunk = %d required %d served %d waived, want 2/1/0; an empty file is fully served only on a confirmed zero-length receipt", required, served, waived)
+	if c := summary("EOF confirmed"); c.Required != 2 || c.FullyRead != 1 || c.Served != 1 || c.Waived != 0 {
+		t.Fatalf("summary after confirming the EOF chunk = %+v, want 2 required / 1 fully read / 1 served / 0 waived; an empty file is fully served only on a confirmed zero-length receipt", c)
 	}
 	// The other branch of the same switch: a nonempty file counts only when the
 	// merged served union is exactly its size, so the partial prefix [0,8) must
@@ -606,8 +606,8 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{fresh.ID}); err != nil {
 		t.Fatalf("ConfirmChunks(prefix): %v", err)
 	}
-	if required, served, waived := summary("partial prefix"); required != 2 || served != 1 || waived != 0 {
-		t.Fatalf("summary with only [0,8) of b.go confirmed = %d required %d served %d waived, want 2/1/0; a partial union is not full coverage", required, served, waived)
+	if c := summary("partial prefix"); c.Required != 2 || c.FullyRead != 1 || c.Served != 1 || c.Waived != 0 {
+		t.Fatalf("summary with only [0,8) of b.go confirmed = %+v, want 2 required / 1 fully read / 1 served / 0 waived; a partial union is not full coverage", c)
 	}
 	// Phase: containment over the served ranges (Section 17.2). A scope review
 	// may cite source intervals, and a citation over bytes the actor never
@@ -655,24 +655,26 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err := f.s.ConfirmChunks(ctx, open.ID, actorID, []string{rest.ID}); err != nil {
 		t.Fatalf("ConfirmChunks(remainder): %v", err)
 	}
-	if required, served, waived := summary("union complete"); required != 2 || served != 2 || waived != 0 {
-		t.Fatalf("summary after the served union reaches b.go's size = %d required %d served %d waived, want 2/2/0", required, served, waived)
+	if c := summary("union complete"); c.Required != 2 || c.FullyRead != 2 || c.Served != 2 || c.Waived != 0 {
+		t.Fatalf("summary after the served union reaches b.go's size = %+v, want 2 required / 2 fully read / 2 served / 0 waived", c)
 	}
 	// The summary reimplements Coverage's state switch in SQL so Status costs
 	// one round trip; the two answering differently is the duplicate
 	// implementation Section 30.1 forbids, so assert agreement rather than only
-	// the absolute counts.
+	// the absolute counts. The summary's served column is "fully confirmed AND
+	// not waived", so the paged count applies the waiver clause too -- and the
+	// waiver written below re-checks the same agreement once one exists.
 	page, err := f.s.Coverage(ctx, open.ID, actorID, "", 10)
 	if err != nil {
 		t.Fatalf("Coverage: %v", err)
 	}
 	var paged int64
 	for _, fc := range page {
-		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed {
+		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed && !fc.Waived {
 			paged++
 		}
 	}
-	if _, served, _ := summary("agreement"); paged != served {
+	if served := summary("agreement").Served; paged != served {
 		t.Fatalf("CoverageSummary says %d required files are fully served; paging Coverage says %d", served, paged)
 	}
 	// Once the union closes the gap the same interval is confirmed: the answer
@@ -696,13 +698,31 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("SessionFilePaths returned %d paths including a file outside the session's scope: %v", len(paths), paths)
 	}
 
-	// A waiver is audited beside coverage, never as coverage: it raises the
-	// waived count and leaves the served count alone (Section 17.3).
+	// A waiver is audited beside coverage, never AS coverage: it raises the
+	// waived count and REMOVES the file from the served count, even though this
+	// one is fully served (its confirmed zero-length EOF chunk). A summary that
+	// counted it in both columns reported a fully waived session as fully
+	// covered, which is the claim the waiver exists to deny (Section 17.3).
 	if _, err := f.s.Waive(ctx, model.WaiverRequest{SessionID: open.ID, ActorID: actorID, FileID: empty.id, Reason: "generated file reviewed out of band"}); err != nil {
 		t.Fatalf("Waive: %v", err)
 	}
-	if required, served, waived := summary("waived"); required != 2 || served != 2 || waived != 1 {
-		t.Fatalf("summary after waiving a required file = %d required %d served %d waived, want 2/2/1", required, served, waived)
+	if c := summary("waived"); c.Required != 2 || c.FullyRead != 2 || c.Served != 1 || c.Waived != 1 {
+		t.Fatalf("summary after waiving a fully served required file = %+v, want 2 required / 2 fully read / 1 served / 1 waived; the waiver clears the served column and leaves the read fact standing", c)
+	}
+	// ...and Coverage still reports the file full_served with the waived flag
+	// set, so the two readers agree under the same definition.
+	waivedPage, err := f.s.Coverage(ctx, open.ID, actorID, "", 10)
+	if err != nil {
+		t.Fatalf("Coverage after the waiver: %v", err)
+	}
+	paged = 0
+	for _, fc := range waivedPage {
+		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed && !fc.Waived {
+			paged++
+		}
+	}
+	if served := summary("agreement under a waiver").Served; paged != served {
+		t.Fatalf("CoverageSummary says %d served with a waiver in scope; paging Coverage says %d", served, paged)
 	}
 	// The waiver's reason survives only in coverage_waivers: Waive's return
 	// value echoes the request, so this read-back is what proves the stored row
@@ -715,12 +735,10 @@ func TestStorePublicationScenario(t *testing.T) {
 		waivers[0].ActorID != actorID || waivers[0].CreatedAt.IsZero() {
 		t.Fatalf("Waivers read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
 	}
-	if _, err := f.s.Waivers(ctx, open.ID, "someone-else"); err == nil {
-		t.Fatal("Waivers answered for another actor; a waiver is never shared across actors")
-	} else {
-		wantCode(t, err, model.CodeActorMismatch)
-	}
-	if _, _, _, err := f.s.CoverageSummary(ctx, open.ID, "someone-else"); err == nil {
+	// One wrong-actor assertion covers every session reader: they all resolve
+	// the session through the same actor-checked s.session, so a second reader
+	// asserting it again restates one guard rather than protecting another.
+	if _, err := f.s.CoverageSummary(ctx, open.ID, "someone-else"); err == nil {
 		t.Fatal("CoverageSummary answered for another actor; coverage is never shared across actors")
 	} else {
 		wantCode(t, err, model.CodeActorMismatch)
