@@ -190,6 +190,13 @@ func (s *Service) buildCapsule(ctx context.Context, rec sqlite.SessionRecord, g 
 // capsuleScope collects the scoped node ids from the pinned manifest, sorted and
 // deduplicated so two builds of the same session produce one ordering. Manifest
 // entries that name no node (a file pulled in whole) contribute nothing.
+//
+// Scope is the PINNED MANIFEST's scope and Coverage is the SESSION's union, and
+// after an Include the two deliberately differ: a recompiled manifest covers the
+// included seeds only, while session_files accumulates across every include
+// (Store.IncludeManifest inserts, never replaces). So a sealed capsule can list
+// coverage for a file whose nodes are absent from Scope; that is the accepted
+// reading of Section 17.3, not a drift between two spellings of one set.
 func (s *Service) capsuleScope(ctx context.Context, rec sqlite.SessionRecord) ([]model.NodeID, error) {
 	seen := make(map[model.NodeID]bool)
 	var out []model.NodeID
@@ -245,8 +252,21 @@ func (s *Service) capsuleCoverage(ctx context.Context, rec sqlite.SessionRecord)
 // durable artifact, so the reasons come from the store's own append-only
 // coverage_waivers rows -- never from the Waive request that echoed them -- and
 // arrive in the store's file-id order, which is the capsule's canonical order.
+//
+// Store.Waivers pages internally and returns the whole list, so the bound is
+// applied on consumption: a waiver exists per required file at most, the same
+// population capsuleCoverage caps, and a capsule too large to carry is the
+// CTX_RESOURCE_LIMIT refusal every other projection here already answers rather
+// than an unbounded response Section 6 forbids.
 func (s *Service) capsuleWaivers(ctx context.Context, rec sqlite.SessionRecord) ([]model.WaiverRecord, error) {
-	return s.sessions.Waivers(ctx, rec.ID, rec.ActorID)
+	out, err := s.sessions.Waivers(ctx, rec.ID, rec.ActorID)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > model.MaxCoverageFilesPerCapsule {
+		return nil, capsuleTooLarge("waivers", model.MaxCoverageFilesPerCapsule)
+	}
+	return out, nil
 }
 
 // capsuleFacts projects one fact-bearing observation kind. Section 17.3 records

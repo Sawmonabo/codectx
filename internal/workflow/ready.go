@@ -38,18 +38,13 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest) (model.S
 	return s.status(ctx, rec)
 }
 
-// readiness evaluates the full Section 16.3 precondition set exactly once per
-// request: one CoverageSummary call, the manifest's ScopeComplete, the verify
-// phase, the active generation, a current-scope review, a blocking-unresolved
-// scan, waived == 0 and per-request Validator revalidation of every cited
-// source. When the gate is open the result carries the point-in-time guarantee
-// limit (ruling Q10): a silent true is a defect. Owned by L4; INT moved
-// Superseded onto the gate itself.
-func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (gate, error) {
-	return s.evaluate(ctx, rec, m)
-}
-
-// evaluate is the single place the Section 16.3 preconditions are decided.
+// readiness is the single place the Section 16.3 precondition set is decided,
+// exactly once per request: one CoverageSummary call, the manifest's
+// ScopeComplete, the verify phase, the active generation, a current-scope
+// review, a blocking-unresolved scan, waived == 0 and per-request Validator
+// revalidation of every cited source. When the gate is open the result carries
+// the point-in-time guarantee limit (ruling Q10): a silent true is a defect.
+// Owned by L4; INT moved Superseded onto the gate itself.
 //
 // The order is deliberate. The counts, the manifest's own scope answer, the
 // phase and state, the waiver count and the current-source walk are all
@@ -58,7 +53,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 // is asked for last and only when every other precondition already holds: it is
 // a pure predicate with nothing to report but pass or fail, so querying storage
 // for it while the gate is already shut buys the operator nothing.
-func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (gate, error) {
+func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (gate, error) {
 	// Precondition 3's inputs, in one call. Paging Coverage for counts would
 	// cost a round trip per page on a large session, which is exactly why
 	// CoverageSummary exists; this package defines no second aggregate.
@@ -69,14 +64,22 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 
 	e := gate{
 		Required:      required,
-		Served:        served,
 		Waived:        waived,
 		ScopeComplete: m.ScopeComplete,
 	}
-	// Task 16's honest weaker answer, unchanged: a waiver is counted and
-	// reported but never folded in, and an incomplete manifest scope
-	// disqualifies the session outright even when the counts agree.
-	e.ReadComplete = m.ScopeComplete && served == required
+	// A waiver is an admission that a required file was NOT read, so it never
+	// counts as served -- not even when bytes were also delivered for it, which
+	// is exactly the case the store's aggregate counts in both columns and
+	// which made a fully waived session report full coverage. Subtracting is
+	// deliberately conservative: a waiver on a file no byte of which was served
+	// is already outside `served`, so this can understate the served count by
+	// that file but can never overstate it, and overstating is the direction
+	// that grants false confidence.
+	e.Served = max(served-waived, 0)
+	// Task 16's honest weaker answer, otherwise unchanged: an incomplete
+	// manifest scope disqualifies the session outright even when the counts
+	// agree.
+	e.ReadComplete = m.ScopeComplete && e.Served == required
 
 	var shut []string
 
@@ -279,7 +282,7 @@ func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.S
 	if err != nil {
 		return model.SessionStatus{}, err
 	}
-	e, err := s.evaluate(ctx, rec, m)
+	e, err := s.readiness(ctx, rec, m)
 	if err != nil {
 		return model.SessionStatus{}, err
 	}
