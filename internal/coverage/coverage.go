@@ -97,7 +97,15 @@ type Sessions interface {
 // that retains the slice must copy it first.
 type Source interface {
 	Read(ctx context.Context, id model.FileID, r model.ByteRange) (snapshot.Range, model.FileVersion, error)
+	// Checkpoint reports where Read will actually begin: the byte of the nearest
+	// stored line checkpoint at or before offset. maxRawForWire needs the prefix
+	// offset - Checkpoint(offset) before it can choose a raw size, and the prefix
+	// cannot be assumed from the checkpoint spacing -- a checkpoint starts a
+	// line, so on a minified file the nearest one may be byte zero.
+	Checkpoint(ctx context.Context, id model.FileID, offset uint64) (uint64, error)
 }
+
+var _ Source = (*snapshot.View)(nil)
 
 // SourceOpener yields the Source for one pinned snapshot. internal/app owns the
 // *snapshot.View behind it and memoises per SnapshotID, which is what keeps
@@ -265,8 +273,9 @@ const sourceEnvelopeBytes = 4096
 //     [checkpoint, end), and CAS.ReadRange rejects a span over
 //     model.MaxRawChunkBytes. Checkpoint spacing is 64 KiB, so a maximum-size
 //     chunk that does not start on a checkpoint fails unless the prefix is
-//     subtracted here. checkpointPrefix is offset minus the byte of the nearest
-//     checkpoint at or before offset;
+//     subtracted here. checkpointPrefix is offset minus Source.Checkpoint at
+//     that offset; it is never assumed from the checkpoint spacing, which
+//     bounds nothing on a file without line breaks;
 //   - the wire budget: the worst-case base64 encoding 4*((raw+2)/3) plus
 //     sourceEnvelopeBytes must fit Limits.MaxSourceResponseBytes. With
 //     budget = MaxSourceResponseBytes - sourceEnvelopeBytes and k = budget/4

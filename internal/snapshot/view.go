@@ -200,6 +200,32 @@ func (v *View) Read(ctx context.Context, id model.FileID, r model.ByteRange) (Ra
 	return Range{Bytes: window[r.Start-cp.Byte:], Start: start, End: end}, fv, nil
 }
 
+// Checkpoint reports the byte offset of the nearest stored line checkpoint at
+// or before offset, which is where Read will actually begin reading.
+//
+// It exists because Read's cost is not the interval the caller asked for: it
+// seeks back to that checkpoint and asks CAS.ReadRange for [checkpoint, end),
+// and CAS.ReadRange refuses a span over model.MaxRawChunkBytes. A caller that
+// sizes a maximum-length chunk without knowing the prefix therefore fails
+// intermittently, on exactly the files where the prefix is largest. The prefix
+// cannot be bounded by the checkpoint spacing alone -- a checkpoint starts a
+// line, so on a minified file with no line breaks the nearest one may be byte
+// zero -- so the chunk cap has to ask for the real offset rather than assume
+// one. offset - Checkpoint(offset) is that prefix.
+//
+// An offset equal to the size is valid: an EOF read is a legal zero-length
+// chunk and still has a checkpoint before it.
+func (v *View) Checkpoint(ctx context.Context, id model.FileID, offset uint64) (uint64, error) {
+	_, rec, err := v.file(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if offset > uint64(rec.Size) {
+		return 0, invalid("byte offset %d is past the %d-byte file", offset, rec.Size)
+	}
+	return indexOf(rec).CheckpointFor(offset).Byte, nil
+}
+
 // RepairSource is the only fallback a read may ever use, and only through
 // Repair: the repository whose recorded Git object IDs may reconstruct a
 // missing blob.
