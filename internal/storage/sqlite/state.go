@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1285,9 +1286,11 @@ func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, a
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
-			// session returns a bare *model.Error, never a joined one, the same
-			// unwrap Session (:504) and CoverageSummary (:1169) already do.
-			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
+			// Digest Section 11: errors.As, never a type assertion, so a
+			// joined error is unwrapped rather than silently taking the
+			// not-expired branch.
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeSessionExpired {
 				return err
 			}
 		}
@@ -1337,9 +1340,11 @@ func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor stri
 	err := s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
-			// session returns a bare *model.Error, never a joined one, the same
-			// unwrap Session (:504) and Coverage (:776) already do.
-			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
+			// Digest Section 11: errors.As, never a type assertion, so a
+			// joined error is unwrapped rather than silently taking the
+			// not-expired branch.
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeSessionExpired {
 				return err
 			}
 		}

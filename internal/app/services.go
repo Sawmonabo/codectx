@@ -726,6 +726,13 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 			page.Meta.Truncated, page.Meta.TruncationReason = true, why
 		}
 	}
+	// The page's own invariants -- a bounded QueryMeta and records for exactly
+	// the view it declares -- are checked before it leaves the facade, so a
+	// widened view or a mis-assembled projection fails here rather than
+	// reaching a caller as a well-formed lie.
+	if err := page.Validate(); err != nil {
+		return model.ContextPage{}, s.fail("context entries", err)
+	}
 	return page, nil
 }
 
