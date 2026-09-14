@@ -47,6 +47,13 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRefreshCommand(build))
 	root.AddCommand(newStatusCommand(build))
 	root.AddCommand(newWatchCommand(build))
+	root.AddCommand(newSearchCommand(build))
+	root.AddCommand(newSymbolCommand(build))
+	// The Section 18.1 query commands are built as a set so query.go never
+	// edits the command tree it belongs to.
+	for _, c := range newQueryCommands(build) {
+		root.AddCommand(c)
+	}
 	return root
 }
 
@@ -75,6 +82,13 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 		return typed
 	}
 	fmt.Fprintln(root.ErrOrStderr(), "Error:", typed.Message)
+	if typed.Remediation != "" {
+		// The remediation is where a rejection puts what the operator has to act
+		// on -- the candidate ids of an ambiguous name, the key to raise. On the
+		// --json path it rides in the envelope; without this line the text path
+		// is the only consumer that is told less.
+		fmt.Fprintln(root.ErrOrStderr(), " ", typed.Remediation)
+	}
 	return typed
 }
 
