@@ -425,24 +425,51 @@ func TestPlanUnits(t *testing.T) {
 	}
 
 	// The same closure, on the marker half, under a repository that owns more
-	// lock files than any fixed bound would allow. Failure mode: a truncated
-	// marker list silently drops a go.sum from the closure, so the unit is
-	// reused across a dependency change with nothing recording that it was.
+	// lock files than any fixed bound would allow. Failure mode: a lock file
+	// silently dropped from the closure, so the unit is reused across a
+	// dependency change with nothing recording that it was.
 	vendored := map[string]string{"go.mod": repo["go.mod"], "app.go": repo["app.go"]}
 	for i := 0; i < 70; i++ {
 		vendored[fmt.Sprintf("vendored/m%02d/go.sum", i)] = fmt.Sprintf("example.com/m%02d v1.0.0 h1:x=\n", i)
 	}
-	vp, err := dependence.PlanUnits(context.Background(), providertest.New(t, vendored).View)
+	vh := providertest.New(t, vendored)
+	// A lock file the previous generation's unit declared and this snapshot
+	// holds as a tombstone. Failure mode, and the reason membership is a
+	// predicate rather than a list built from the live manifest: a deleted
+	// member the unit does not recognise leaves the scope eligible for carry
+	// (Section 13.3), so the planner emits a carry that AttachCarried refuses
+	// because one of the unit's inputs no longer exists in the snapshot.
+	const tombstone = "vendored/m70/go.sum"
+	view := withTombstone{SnapshotView: vh.View,
+		row: model.FileVersion{ID: model.NewFileID(vh.Repo, tombstone), Path: tombstone, Status: model.FileDeleted}}
+	vp, err := dependence.PlanUnits(context.Background(), view)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(vp.Units) != 1 || vp.Units[0].ScopeKey != rootScope {
 		t.Fatalf("plan = %v, want one %s unit", vp.Units, rootScope)
 	}
-	if !slices.Contains(vp.Units[0].Markers, "vendored/m69/go.sum") {
-		t.Errorf("the unit declares %d of the 71 manifest and lock files it owns; a dropped lock file leaves the cache key",
-			len(vp.Units[0].Markers))
+	if !vp.Units[0].OwnsInput("vendored/m69/go.sum") {
+		t.Error("the unit does not own one of the 71 manifest and lock files under its root; a lock file outside the closure leaves the cache key")
 	}
+	if !vp.Units[0].OwnsInput(tombstone) {
+		t.Errorf("the unit does not own %s, a lock file the snapshot holds as a tombstone; the scope stays carry-eligible after a member is deleted", tombstone)
+	}
+}
+
+// withTombstone is a snapshot view with one deleted manifest row appended.
+// providertest retains live files only, and a tombstone is precisely the row
+// the planner must still resolve to a member.
+type withTombstone struct {
+	model.SnapshotView
+	row model.FileVersion
+}
+
+func (v withTombstone) EachFile(ctx context.Context, sel model.FileSelection, fn func(model.FileVersion) error) error {
+	if err := v.SnapshotView.EachFile(ctx, sel, fn); err != nil {
+		return err
+	}
+	return fn(v.row)
 }
 
 // planStub is the dependence provider as the planner sees it. The planner
