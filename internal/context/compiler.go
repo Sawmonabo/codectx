@@ -353,13 +353,11 @@ type candidate struct {
 	NodeID      model.NodeID
 	FileID      model.FileID
 	Path        string // normalized, root-relative
-	Kind        model.NodeKind
 	Requirement model.Requirement
 	Origin      originKind // which Section 15.2 step produced it
 	Depth       int        // 0 for a seed
 	StartByte   int64
 	ScoreMicros int64
-	Boosts      int64
 	SizeBytes   int64 // model.FileVersion.Size; 0 until sized
 	Status      model.FileStatus
 	Reasons     []string             // <= model.MaxReasonsPerEntry, each <= MaxReasonBytes
