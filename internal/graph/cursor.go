@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"strconv"
 	"time"
@@ -233,9 +234,6 @@ type continuation struct {
 	Endpoint string
 	// QueryHash binds the next cursor to this same normalized query.
 	QueryHash string
-	// LeaseID is the retention lease holding the pinned generation; the cursor
-	// and its spool both live exactly as long as it does.
-	LeaseID   string
 	Depth     int
 	LastOwner model.NodeID
 	LastKey   model.RelationID
@@ -352,12 +350,14 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 //
 // It returns an empty token, and no error, whenever the answer must stop rather
 // than continue: a walk whose cumulative budget is exhausted, an engine with no
-// signer (continuations are not offered), or state with no spool to spill into. In every one of those cases the caller reports Truncated with no
-// NextCursor, which is the same contract as running out of page items.
-func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) {
-	if e.signer == nil || c.LeaseID == "" {
-		// No signer, or an Adjacency holding no retention lease: a token that
-		// outlived the lease would resume over facts nothing is retaining.
+// signer or lease store (continuations are not offered), or state with no spool
+// to spill into. In every one of those cases the caller reports Truncated with
+// no NextCursor, which is the same contract as running out of page items.
+func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuation) (string, error) {
+	if e.signer == nil || e.leases == nil {
+		// No signer, or no lease store to retain the generation the resumed
+		// page will read: a token minted here would resume over facts nothing
+		// is holding.
 		return "", nil
 	}
 	// This is the ONE place the cumulative caps decide whether a WALK may
@@ -384,13 +384,23 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 	if needsSpool && e.spools == nil {
 		return "", nil
 	}
+	// A NEW cursor-owned retention lease, never the pinned reader's query
+	// lease: that one is released when this request returns, so the very next
+	// invocation's spool read would be refused and the continuation would be
+	// unusable. The lease expires with the cursor, so nothing minted here pins
+	// a generation for longer than the token lives.
+	binding := e.adjacency.Binding()
+	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+	if err != nil {
+		return "", err
+	}
 	next := traversalCursor{
 		Version:      traversalCursorVersion,
 		Endpoint:     c.Endpoint,
-		GenerationID: e.adjacency.Binding().GenerationID,
-		AnalysisKey:  e.adjacency.Binding().AnalysisKey,
+		GenerationID: binding.GenerationID,
+		AnalysisKey:  binding.AnalysisKey,
 		QueryHash:    c.QueryHash,
-		LeaseID:      c.LeaseID,
+		LeaseID:      lease.ID,
 		LastOwner:    c.LastOwner,
 		LastKey:      c.LastKey,
 		Depth:        c.Depth,
@@ -401,18 +411,40 @@ func (e *Engine) nextTraversalCursor(b *budget, c continuation) (string, error) 
 	if needsSpool {
 		id, err := e.spill(next, c)
 		if err != nil {
-			return "", err
+			return "", e.releaseLease(ctx, lease.ID, err)
 		}
 		next.SpoolID = id
 	}
 	if err := next.validate(); err != nil {
-		return "", err
+		return "", e.releaseLease(ctx, lease.ID, err)
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
-		return "", &model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()}
+		return "", e.releaseLease(ctx, lease.ID,
+			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
 	}
-	return e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	if err != nil {
+		return "", e.releaseLease(ctx, lease.ID, err)
+	}
+	return token, nil
+}
+
+// releaseLease returns a lease whose cursor never reached the caller and
+// reports cause. The request's own context may already be done, so the release
+// runs on an uncancelled one: leaking the lease would pin a generation against
+// retention for the full cursor TTL for a page nobody can ask for.
+//
+// A release that itself fails is joined onto cause rather than dropped -- the
+// engine has no logger, and a retention lease that will now expire only with
+// its TTL is something the operator is told about. errors.As still finds the
+// typed cause, so the joined error keeps its Section 8 code.
+func (e *Engine) releaseLease(ctx context.Context, id string, cause error) error {
+	if err := e.leases.Release(context.WithoutCancel(ctx), id); err != nil {
+		return errors.Join(cause, &model.Error{Code: model.CodeInternal,
+			Message: "a continuation lease could not be released: " + err.Error()})
+	}
+	return cause
 }
 
 // spill writes one fresh spool holding c's records, frontier and visited set

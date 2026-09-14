@@ -186,13 +186,13 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	}
 	if more {
 		// The keyset walk stopped on a relation boundary with relations left.
-		token, err := e.nextReferenceCursor(queryHash, last)
+		token, err := e.nextReferenceCursor(ctx, queryHash, last)
 		if err != nil {
 			return model.Page[model.ReferenceOccurrence]{}, err
 		}
 		meta.NextCursor = token
 		if token == "" && !meta.Truncated {
-			// No signer, or no lease to bind the token to: the remaining
+			// No signer, or no lease store to bind the token to: the remaining
 			// relations cannot be reached, so the page is truncated and says so
 			// rather than presenting a bounded page as the complete set.
 			meta.Truncated = true
@@ -214,35 +214,38 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 // nextReferenceCursor mints the continuation for a page that stopped on a
 // relation boundary with relations left. It returns an empty token, not an
 // error, when this workspace cannot issue one: a continuation is an optional
-// convenience, and an engine built without a signer (or over an Adjacency that
-// holds no retention lease) must still answer the page it did compute.
+// convenience, and an engine built without a signer or a lease store must still
+// answer the page it did compute.
 //
 // The token carries the pinned generation and analysis key, the normalized
 // query hash and the lease that retains the facts, so it can only be replayed
 // against the same generation, the same symbol and the same operation, and only
-// while that generation is still pinned.
-func (e *Engine) nextReferenceCursor(queryHash string, last model.RelationID) (string, error) {
-	if e.signer == nil || last == "" {
-		return "", nil
-	}
-	lease := e.leaseID()
-	if lease == "" {
+// while that generation is still pinned. That lease is minted HERE and owned by
+// the cursor: the pinned reader's query lease is released when this request
+// returns, so a token naming it would be refused by the next invocation.
+func (e *Engine) nextReferenceCursor(ctx context.Context, queryHash string,
+	last model.RelationID) (string, error) {
+	if e.signer == nil || e.leases == nil || last == "" {
 		return "", nil
 	}
 	b := e.adjacency.Binding()
+	lease, err := e.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
+	if err != nil {
+		return "", err
+	}
 	token, err := e.signer.EncodeCursor(pagination.Cursor{
 		Endpoint:     referenceEndpoint,
 		GenerationID: b.GenerationID,
 		AnalysisKey:  b.AnalysisKey,
 		QueryHash:    queryHash,
 		LastKey:      string(last),
-		LeaseID:      lease,
+		LeaseID:      lease.ID,
 		// The cursor expires with the retention lease it names: a token that
 		// outlived the lease would resume over facts nothing is holding.
 		ExpiresAt: e.now().Add(e.limits.CursorTTL),
 	})
 	if err != nil {
-		return "", err
+		return "", e.releaseLease(ctx, lease.ID, err)
 	}
 	return token, nil
 }

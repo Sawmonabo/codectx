@@ -71,7 +71,7 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		// offered: an engine with no signer or no spool store still says the
 		// answer goes on, it just cannot hand back the rest of it.
 		markTruncated(&meta, reasonPageFull)
-		if meta.NextCursor, err = e.spoolImpact(b, queryHash, answer, rest); err != nil {
+		if meta.NextCursor, err = e.spoolImpact(ctx, b, queryHash, answer, rest); err != nil {
 			return model.ImpactResult{}, err
 		}
 	}
@@ -262,10 +262,10 @@ func impactStateTooLarge() error {
 // spoolImpact spills the answer-level record, the ranked tail and the rollup
 // into a fresh spool and signs the cursor naming it. It returns an empty token
 // with no error when no continuation can be offered -- no signer, no spool
-// store, or an Adjacency holding no retention lease -- because the caller has
+// store, or no lease store to retain the generation -- because the caller has
 // already reported the answer as truncated and a missing continuation is the
 // same contract as running out of page items.
-func (e *Engine) spoolImpact(b *budget, queryHash string, answer impactAnswer,
+func (e *Engine) spoolImpact(ctx context.Context, b *budget, queryHash string, answer impactAnswer,
 	rest []model.ImpactEntry) (string, error) {
 	records := make([]spoolRecord, 0, len(rest)+len(answer.Packages)+1)
 	leading, err := encodeSpoolRecord(spoolRecordAnswer, answer)
@@ -287,10 +287,9 @@ func (e *Engine) spoolImpact(b *budget, queryHash string, answer impactAnswer,
 		}
 		records = append(records, r)
 	}
-	return e.nextTraversalCursor(b, continuation{
+	return e.nextTraversalCursor(ctx, b, continuation{
 		Endpoint:  impactEndpoint,
 		QueryHash: queryHash,
-		LeaseID:   e.leaseID(),
 		Records:   records,
 	})
 }

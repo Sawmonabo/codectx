@@ -144,6 +144,10 @@ type stack struct {
 	// graph engine share them.
 	signer *pagination.Signer
 	spools *pagination.Spools
+	// leases mints the cursor-scoped retention leases graph continuations
+	// name. It is built once per stack rather than per request so every cursor
+	// in the process retains its generation for the same configured window.
+	leases *pagination.Leases
 	// gate is the process-scoped max_concurrent_graph_queries semaphore. One
 	// graph engine is built per request, so the bound cannot live on the engine.
 	gate *graphGate
@@ -279,6 +283,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		cfg.Resources.MaxTempBytes/spoolBudgetDivisor, s.store); err != nil {
 		return nil, err
 	}
+	s.leases = pagination.NewLeases(s.store, cfg.Storage.QueryCursorTTL.Std())
 	s.gate = newGraphGate(cfg.Resources.MaxConcurrentGraphQueries)
 
 	// The analyzer runners are budgeted from what their children reserve, not

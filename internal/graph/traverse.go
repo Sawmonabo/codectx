@@ -563,10 +563,9 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			visited = append(visited, id)
 		}
 		sort.Slice(visited, func(i, j int) bool { return visited[i] < visited[j] })
-		nextCursor, err = e.nextTraversalCursor(b, continuation{
+		nextCursor, err = e.nextTraversalCursor(ctx, b, continuation{
 			Endpoint:  endpoint,
 			QueryHash: queryHash,
-			LeaseID:   e.leaseID(),
 			Depth:     state.Depth,
 			LastOwner: lastOwner,
 			LastKey:   lastKey,
