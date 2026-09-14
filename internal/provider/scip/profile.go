@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -89,8 +90,14 @@ type kindSpec struct {
 // kindSpecs are the six profiles. Budgets and timeouts are the measured
 // figures of docs/research/08-scip-empirical-six-indexers.md widened for a
 // real repository: the one-file fixtures run in seconds, and the two profiles
-// that drive a build tool (scip-java through Maven or Gradle, rust-analyzer
-// through cargo) are the ones that need both the time and the room.
+// that drive a compiler over the whole project (scip-java through the managed
+// JDK's javac, rust-analyzer through cargo) need both the time and the room.
+//
+// Four of the six load the project model through the host's own language
+// toolchain and cannot do otherwise: scip-go needs `go`, rust-analyzer needs
+// `cargo`, scip-python needs `python3`/`pip3`, and scip-clang needs the
+// compilation database the project's build produced. scip-java does not:
+// see KindJava. docs/providers-scip.md tables this per profile.
 var kindSpecs = map[Kind]kindSpec{
 	// scip-go drives the host `go` toolchain through go/packages, so `go` must
 	// be reachable and its caches must be addressable; without PATH it exits 1
@@ -146,18 +153,28 @@ var kindSpecs = map[Kind]kindSpec{
 		diskBudgetBytes:   2 << 30,
 		timeout:           30 * time.Minute,
 	},
-	// scip-java drives the project's own build (Maven or Gradle), which it
-	// finds on PATH and which resolves dependencies from a remote index. The
-	// managed JDK reaches it as JAVA_HOME from the resolved tool, so JAVA_HOME
-	// is deliberately not in this allowlist: a host value would shadow the
-	// pinned runtime.
+	// scip-java compiles the snapshot itself, with the managed JDK's own
+	// javac, against the build description writeScipJavaConfig generates in the
+	// materialization. Its other mode -- driving the project's own Maven or
+	// Gradle build, found on PATH -- is what the profile deliberately does not
+	// use: it makes precise Java indexing depend on a host build tool codectx
+	// does not own and on a remote dependency index. With --scip-config the
+	// profile resolves nothing remotely, so its posture is denied and
+	// MAVEN_OPTS and GRADLE_USER_HOME are not in the allowlist.
+	//
+	// The managed JDK reaches the child as JAVA_HOME from the resolved tool, so
+	// JAVA_HOME is deliberately not in this allowlist either: a host value
+	// would shadow the pinned runtime.
 	KindJava: {
 		triggers: []string{"pom.xml", "build.gradle", "build.gradle.kts"},
 		args: func(a argPaths) []string {
-			return []string{"index", "--output", a.OutputFile}
+			return []string{"index",
+				"--scip-config", filepath.Join(a.InputDir, scipJavaConfigName),
+				"--targetroot", filepath.Join(a.WorkDir, scipJavaTargetRootName),
+				"--output", a.OutputFile}
 		},
-		env:               []string{"PATH", "HOME", "MAVEN_OPTS", "GRADLE_USER_HOME"},
-		network:           NetworkAllowed,
+		env:               []string{"PATH", "HOME"},
+		network:           NetworkDenied,
 		memoryBudgetBytes: 4 << 30,
 		diskBudgetBytes:   4 << 30,
 		timeout:           45 * time.Minute,
@@ -222,8 +239,37 @@ func (p Profile) Name() string { return string(p.Kind) }
 // spec is the build's fixed description of this kind.
 func (p Profile) spec() kindSpec { return kindSpecs[p.Kind] }
 
+// Triggers are the manifests whose presence makes a workspace a candidate for
+// one kind. It is the single source of the trigger mapping: `tools prefetch
+// --for-repo` and the planner read it without resolving a payload, so the
+// command that exists to install a payload does not have to install one first,
+// and no second copy of the mapping can drift from this one.
+//
+// The result is a copy of package state; a kind this build does not know has
+// no triggers and returns nil.
+func Triggers(k Kind) []string { return slices.Clone(kindSpecs[k].triggers) }
+
+// Argv is the argument array one kind is run with, after the resolved
+// payload's own launcher prefix. It is the single source of every indexer
+// invocation this product issues: the provider's own run path builds its
+// arguments here, and so does the per-platform tools matrix, whose whole
+// purpose is to prove that the invocation the product issues works on that
+// platform. A matrix that ran a different argument array would answer a
+// different question (see docs/toolchain.md).
+//
+// inputDir is the directory the indexer reads, which is also the child's
+// working directory; outputFile is where the index must be written; workDir is
+// the run's private scratch root. A kind this build does not know returns nil.
+func Argv(k Kind, inputDir, outputFile, workDir string) []string {
+	spec, ok := kindSpecs[k]
+	if !ok {
+		return nil
+	}
+	return spec.args(argPaths{InputDir: inputDir, OutputFile: outputFile, WorkDir: workDir})
+}
+
 // Triggers are the manifests whose presence makes a workspace a candidate.
-func (p Profile) Triggers() []string { return kindSpecs[p.Kind].triggers }
+func (p Profile) Triggers() []string { return Triggers(p.Kind) }
 
 // Network is the declared posture of this profile.
 func (p Profile) Network() NetworkPosture { return kindSpecs[p.Kind].network }
@@ -233,7 +279,7 @@ func (p Profile) Network() NetworkPosture { return kindSpecs[p.Kind].network }
 // entry script, and the kind supplies the rest.
 func (p Profile) argv(a argPaths) (path string, args []string) {
 	prefix := p.Tool.ArgvPrefix
-	args = append(append([]string(nil), prefix[1:]...), kindSpecs[p.Kind].args(a)...)
+	args = append(append([]string(nil), prefix[1:]...), Argv(p.Kind, a.InputDir, a.OutputFile, a.WorkDir)...)
 	return prefix[0], args
 }
 
@@ -261,22 +307,42 @@ type unresolved struct {
 	err  error
 }
 
-// resolveProfiles resolves every kind through the toolchain. A kind that
-// cannot be resolved is not an error: it is a language this machine cannot
-// index precisely, which Section 11.7 makes honest absence with a typed
-// reason. The result is deterministic in Kinds order.
-func resolveProfiles(ctx context.Context, r *toolchain.Resolver) ([]Profile, []unresolved) {
-	var ok []Profile
-	var bad []unresolved
+// codeToolNotInstalled labels a kind whose payload this platform pins but the
+// store does not hold yet: the first unit that needs it fetches it. It is a
+// detail value, not a Section 22 error code -- no failure has happened, so
+// there is nothing to raise -- and it is spelled like one because it sits in
+// the same detail map beside the toolchain's real CTX_TOOL_* codes, where an
+// operator reads "run prefetch" from one and "this platform has no payload"
+// from another.
+const codeToolNotInstalled = "CTX_TOOL_NOT_INSTALLED"
+
+// resolveProfiles sorts every kind into the three states construction can
+// observe, without installing anything.
+//
+// ready is a payload the store already holds, verified at this resolution.
+// deferred is a payload this platform pins that the store does not hold: the
+// language is still indexable, and the first unit that needs it fetches it
+// (see Provider.profileFor). Constructing a provider must not install half a
+// gigabyte of indexers for languages the repository does not contain, which is
+// what resolving with a fetch here did.
+// bad is a kind this machine cannot index precisely at all -- an unsupported
+// platform, a corrupt store entry, an invalid override -- which Section 11.7
+// makes honest absence with the toolchain's own typed reason.
+//
+// All three are deterministic in Kinds order.
+func resolveProfiles(ctx context.Context, r *toolchain.Resolver) (ready []Profile, deferred []Kind, bad []unresolved) {
 	for _, k := range Kinds {
-		t, err := r.Resolve(ctx, string(k))
-		if err != nil {
+		t, installed, err := r.ResolveInstalled(ctx, string(k))
+		switch {
+		case err != nil:
 			bad = append(bad, unresolved{kind: k, code: codeOf(err), err: err})
-			continue
+		case installed:
+			ready = append(ready, Profile{Kind: k, Tool: t})
+		default:
+			deferred = append(deferred, k)
 		}
-		ok = append(ok, Profile{Kind: k, Tool: t})
 	}
-	return ok, bad
+	return ready, deferred, bad
 }
 
 // codeOf is the typed code of a resolution failure, or CTX_PROVIDER_UNAVAILABLE
@@ -308,13 +374,25 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if p.runner == nil {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"})
 	}
+	// The whole snapshot is the deliberate selection, not an omitted Include
+	// (snapshot.MaterializeOptions.Include exists and is not used here on
+	// purpose). A precise indexer resolves a symbol through the project's own
+	// dependency context -- the module graph, the package manifests, the
+	// installed distributions, the headers -- and the unit's scope is the
+	// workspace, so a copy narrowed to some subset of files would produce an
+	// index that describes less than the unit claims. See docs/providers-scip.md.
 	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes})
 	if err != nil {
 		return "", "", p.profileError(prof, "", err)
 	}
 	defer mat.Close()
-	if prof.Kind == KindClang {
+	switch prof.Kind {
+	case KindClang:
 		if err := normalizeCompileCommands(mat.Root(), p.limits.MaxManifestBytes); err != nil {
+			return "", "", p.profileError(prof, "", err)
+		}
+	case KindJava:
+		if err := writeScipJavaConfig(mat.Root()); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	}

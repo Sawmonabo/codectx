@@ -43,7 +43,8 @@ constants of this build; `${input_dir}` is the materialization root and
 `${work_dir}` the server's private working directory under
 `<data_dir>/lsp/<server>/`, which the overlay creates before the server starts.
 It is a real working directory, not a scratch path — `jdtls` is started with
-`-data ${work_dir}` and writes its workspace state there by design; the
+`-data ${work_dir}/data` **and** `-configuration ${work_dir}/config`, and
+writes its workspace state and its whole Equinox configuration there; the
 materialization is the server's read-only input and is never its data
 directory. The child's environment is exactly the allowlisted variables the
 parent has plus the variables the payload needs, and the payload's come last so
@@ -56,22 +57,70 @@ a host `JAVA_HOME` can never shadow the managed JDK.
 | `pyright` | python | `--stdio` | `PATH HOME` | `pyproject.toml`, `pyrightconfig.json`, `setup.py`, `requirements.txt` |
 | `typescript-language-server` | typescript, tsx, javascript | `--stdio` | `PATH HOME` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | `clangd` | c, cpp | | `PATH HOME` | `compile_commands.json`, `compile_flags.txt`, `.clangd`, `CMakeLists.txt` |
-| `jdtls` | java | `-data ${work_dir}` | `PATH HOME` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
+| `jdtls` | java | `-configuration ${work_dir}/config -data ${work_dir}/data` | `PATH HOME` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
 
 The launcher itself comes from the lock: `gopls`, `clangd` and `rust-analyzer`
 run as themselves; `pyright` and `typescript-language-server` run as
 `<managed node> <pinned entry>`; `jdtls` runs as
 `<managed jdk>/bin/java -jar <pinned launcher jar>` with `JAVA_HOME` set.
 
-**Verification status.** All six payloads were resolved through the real lock
-and store on `linux/amd64` and their composed argv recorded (lane B1 report);
-`gopls` 0.23.0 additionally completed the initialize handshake, negotiated its
-position encoding, published a validated overlay binding and answered a
-definition query against the pinned bytes. The protocol itself — out-of-order
-replies, all three position encodings, cancellation, hostile URIs,
-unadvertised methods, a server-initiated edit, shutdown and crash — is
-exercised in full against the fake server. The other five servers' **handshakes**
-have not been run here.
+**`jdtls` needs two things the table above cannot express, and both are
+required for it to start at all.** The first is `Definition.RuntimeArgs`:
+arguments of the *runtime*, placed between the managed JDK and `-jar`, because
+a JVM option after `-jar` is an application argument and the Equinox launcher
+would never boot. They are the application identity Eclipse expects
+(`-Declipse.application=org.eclipse.jdt.ls.core.id1`,
+`-Dosgi.bundles.defaultStartLevel=4`,
+`-Declipse.product=org.eclipse.jdt.ls.core.product`) and the module openings
+jdt.ls reflects through (`--add-modules=ALL-SYSTEM`, `--add-opens
+java.base/java.util=ALL-UNNAMED`, `--add-opens
+java.base/java.lang=ALL-UNNAMED`). Setting them on a *pinned* payload that is
+not runtime-hosted is a product defect and `Resolve` refuses it with
+`CTX_INTERNAL`. The second is the configuration directory: Equinox **writes**
+into whatever `-configuration` names, so `${work_dir}/config` is a private copy
+seeded once from the payload's own `config_linux`/`config_mac`/`config_win`
+(`config_linux_arm`/`config_mac_arm` on arm64). Pointed at the payload's own,
+three starts left four new paths inside the store's published,
+digest-identified version directory while `codectx tools verify` still reported
+`14 installed`, exit 0 — verify rehashes the pinned entry, not the payload
+tree.
+
+Both specials belong to the pinned payload alone. A `[tools.override.jdtls]`
+is run directly, with no managed runtime composed around it and no payload tree
+to seed from, so the runtime arguments are dropped from its argv (which changes
+`input_digest`, correctly: a different invocation is a different question) and
+no configuration is copied. An override replaces the binary and never the
+invocation; a wrapper script that needs JVM options passes its own.
+
+**Verification status.** All six servers were run through `lsp.Resolve` +
+`Manager.Open` on `linux/amd64` against a fixture of their own language, over
+the real lock and store, and each completed initialize, published an overlay
+binding that validates, advertised its capabilities and shut down cleanly:
+
+| Server | Reported version | Bound `ProviderVersion` | Capabilities |
+|---|---|---|---|
+| `gopls` | `v0.23.0` | `v0.23.0` | all seven |
+| `rust-analyzer` | `0.3.3016-standalone` | same | all seven |
+| `clangd` | `clangd version 22.1.6 …` | same | all seven |
+| `pyright` | **none** | `1.1.414` (pinned) | all but implementations |
+| `typescript-language-server` | **none** | `6.0.0` (pinned) | all seven |
+| `jdtls` | `1.61.0-SNAPSHOT` | same | all seven |
+
+`pyright` and `typescript-language-server` answer `initialize` with no
+`serverInfo` object at all (measured, both through the product and with a raw
+`initialize` outside it). `OverlayBinding.Validate` requires a non-empty
+`ProviderVersion`, so the overlay used to fail for python, typescript, tsx and
+javascript with `CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
+The label now falls back to the version of the payload the lock pinned, which
+is never empty and is the honest identity of a server that declines to name
+itself; the **reported** string keeps feeding the input digest unchanged, so a
+payload that starts reporting a version later is still a different question.
+The jdtls version directory in the store is byte-identical before and after a
+start, and `codectx tools verify` exits 0 over it. The protocol itself —
+out-of-order replies, all three position encodings, cancellation, hostile URIs,
+unadvertised methods, a server-initiated edit, a server that reports no
+`serverInfo`, shutdown and crash — is exercised in full against the fake
+server.
 
 At start nothing is re-hashed: `internal/toolchain` hashed the payload's entry
 at resolution, and `Tool.Fingerprint()` — which commits to the pinned payload
