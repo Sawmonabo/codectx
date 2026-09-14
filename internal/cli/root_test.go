@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/cli"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -124,7 +125,14 @@ func TestCommandEnvelope(t *testing.T) {
 		// that is not a workspace, so a check that ran after the open would fail
 		// on the workspace (exit 3) instead of on the flag.
 		{name: "context advance without the version guard", args: []string{"context", "advance", hexID, "consolidate", "--actor", "agent-a", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context advance", errCode: "CTX_ARGUMENT_INVALID"},
-		// L4 rows
+		// L4 rows: the two cases digest Section 6 budgets for this lane are
+		// TestInitRefusesToOverwriteProjectConfig and
+		// TestBrokenStdoutPipeIsNotADefect, at the end of this file. Neither is
+		// expressible in this table: it writes to a bytes.Buffer and then asserts
+		// that stdout parses as exactly one envelope, which a broken pipe makes
+		// impossible by construction, and it has no way to name a per-case
+		// temporary directory as a positional argument. Contorting the harness
+		// for two cases would cost every other row its clarity.
 	}
 
 	for _, tc := range tests {
@@ -346,5 +354,113 @@ func TestExitCodeClasses(t *testing.T) {
 				t.Fatalf("ExitCode(%v) = %d, want %d", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestInitRefusesToOverwriteProjectConfig protects the only ordinary command
+// that writes project configuration. The failure mode is destruction: `init`
+// re-run in a repository that already carries a tuned .codectx.toml must not
+// replace it, because nothing in this build can recover the settings and the
+// file is the repository's own declaration of what may be indexed. The run also
+// has to leave a file config.Load accepts -- a generated file carrying a key
+// the loader rejects would fail every later command in that checkout, which is
+// a broken installation reported as a healthy one.
+func TestInitRefusesToOverwriteProjectConfig(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	isolateUserDirs(t, "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.ProjectConfigName)
+
+	run := func(args ...string) error {
+		var stdout, stderr bytes.Buffer
+		root := cli.NewRoot(build, &stdout, &stderr)
+		err := cli.Execute(context.Background(), build, root, args)
+		if stderr.Len() != 0 {
+			t.Errorf("stderr = %q, want empty", stderr.String())
+		}
+		return err
+	}
+
+	if err := run("init", dir, "--json"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	generated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("generated file: %v", err)
+	}
+	if _, err := config.Load(dir); err != nil {
+		t.Fatalf("the generated %s is not loadable: %v", config.ProjectConfigName, err)
+	}
+
+	tuned := string(generated) + "\n[workspace]\nmax_files = 17\n"
+	if err := os.WriteFile(path, []byte(tuned), 0o644); err != nil {
+		t.Fatalf("tuned file: %v", err)
+	}
+	err = run("init", dir, "--json")
+	if got := cli.ExitCode(err); got != 2 {
+		t.Fatalf("exit code = %d, want 2 (err: %v)", got, err)
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeArgumentInvalid {
+		t.Fatalf("error = %v, want CTX_ARGUMENT_INVALID", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file after the refusal: %v", err)
+	}
+	if string(after) != tuned {
+		t.Fatalf("the refused run changed the file:\n%s", string(after))
+	}
+
+	if err := run("init", dir, "--force", "--json"); err != nil {
+		t.Fatalf("init --force: %v", err)
+	}
+	forced, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("file after --force: %v", err)
+	}
+	if string(forced) != string(generated) {
+		t.Fatalf("--force did not replace the file")
+	}
+}
+
+// TestBrokenStdoutPipeIsNotADefect pins the Section 18.2 rule that a broken
+// stdout pipe fails the command. Two failure modes meet here. Swallowing the
+// write error would return success for a response nobody received, and the
+// caller's next step -- confirming a source receipt -- would credit bytes that
+// were never delivered; so the command must fail. Reporting it as CTX_INTERNAL
+// would put `codectx ... | head`, an ordinary shell pipeline, into the exit-10
+// defect class and send an operator to file a bug against their own pipe.
+func TestBrokenStdoutPipeIsNotADefect(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	isolateUserDirs(t, "")
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer writer.Close()
+	// The reader goes away before anything is written, which is what `| head -c 0`
+	// does. The write end is a real file descriptor, so the write returns EPIPE
+	// rather than the in-process io.ErrClosedPipe.
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	root := cli.NewRoot(build, writer, &stderr)
+	err = cli.Execute(context.Background(), build, root, []string{"version", "--json"})
+	if err == nil {
+		t.Fatal("the command succeeded although its response was never delivered")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("error = %v, want a typed error", err)
+	}
+	if typed.Code == model.CodeInternal {
+		t.Errorf("error.code = %s; a closed reader is not a defect in this build", typed.Code)
+	}
+	if got := cli.ExitCode(err); got != 7 {
+		t.Fatalf("exit code = %d, want 7 (err: %v)", got, err)
 	}
 }
