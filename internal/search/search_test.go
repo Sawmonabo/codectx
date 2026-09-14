@@ -170,7 +170,8 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("NewSpools: %v", err)
 	}
-	f.opts = Options{Store: st, Repo: f.repo, Signer: signer, Spools: spools, Content: cas,
+	f.opts = Options{Store: st, Repo: f.repo, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(st, pagination.DefaultCursorTTL), Content: cas,
 		Resources: config.Defaults().Resources, CursorTTL: pagination.DefaultCursorTTL,
 		Now: func() time.Time { return time.Now().UTC() }}
 	return f
