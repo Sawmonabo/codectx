@@ -27,9 +27,9 @@ import (
 )
 
 // Sessions is the only storage surface this package may use. *sqlite.Store
-// satisfies it. Every method here already landed in Task 5 or Task 16 except
-// the two marked NEW, which L6 appends to the store; no method is redefined,
-// re-spelled or wrapped by this package.
+// satisfies it. Every method here already landed in Task 5, Task 12 or Task 16
+// except the three marked NEW, which L6 and L6b append to the store; no method
+// is redefined, re-spelled or wrapped by this package.
 type Sessions interface {
 	// Session checks exact actor identity and rejects a wrong actor, an
 	// expired session and a closed session -- but it skips the actor check
@@ -89,6 +89,14 @@ type Sessions interface {
 	// FileCoverage carries only the Waived flag, so this is the only source of
 	// the stored reasons a sealed capsule must carry. NEW -- L6b.
 	Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error)
+	// ActiveGeneration is the repository's currently published generation. It
+	// is Task 12's existing read (internal/storage/sqlite/units.go), widened
+	// onto this interface rather than reinvented: supersession is "a newer
+	// generation is active than the one this session pinned", and deriving it
+	// from per-file content hashes instead -- as this service did before INT --
+	// reported Superseded false for the exact case Section 16.3 names, a newer
+	// generation active with the pinned files untouched.
+	ActiveGeneration(ctx context.Context, repo model.RepositoryID) (model.GenerationID, error)
 }
 
 // The store is the production Sessions; the assertion keeps the interface
@@ -238,6 +246,10 @@ type gate struct {
 	// strict implementation readiness; Strict is the strict gate itself, which
 	// is false whenever any waiver exists.
 	ReadComplete, Ready, Strict, ScopeComplete bool
+	// Superseded reports that a newer generation is active than the one this
+	// session pinned. It rides on the gate rather than beside it because Ready
+	// is defined in terms of it and every gate reader must see the same answer.
+	Superseded bool
 	// Required, Served and Waived come from one CoverageSummary call.
 	Required, Served, Waived int64
 	// Blocking names the unresolved observations that hold the gate shut.

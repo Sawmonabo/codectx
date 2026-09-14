@@ -32,6 +32,19 @@ import (
 // Lifetime: a *Services is created per *Workspace and is valid only for that
 // workspace's lifetime. The CLI opens and closes a report workspace per
 // command, so a *Services must never be cached across commands.
+//
+// Concurrency (Task 19, Q2): a *Services is safe for concurrent use by multiple
+// goroutines over one workspace, which is what lets an MCP server answer
+// several tool calls against a single open workspace. It holds one pointer and
+// no mutable state of its own, and every service it routes to is either
+// immutable after composition (search, context compiler, workflow -- all of
+// whose fields are read-only after New) or explicitly synchronised: the stack's
+// memoised views and generation bindings are guarded by viewsMu, the graph
+// engine is built per request behind the process-scoped concurrency gate, and
+// the store is a *sql.DB, which is itself concurrency-safe. There is no lazy
+// initialisation anywhere behind this facade -- every service is composed
+// eagerly in open() -- so no request can be the one that builds a field another
+// request is reading.
 type Services struct {
 	w *Workspace
 }
@@ -71,7 +84,7 @@ type ExploreService interface {
 	References(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
 	Graph(ctx context.Context, req model.GraphRequest) (model.GraphResult, error)
 	Path(ctx context.Context, req model.PathRequest) (model.PathResult, error)
-	Impact(ctx context.Context, req model.ImpactRequest) (model.Page[model.ImpactEntry], error)
+	Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error)
 }
 
 // ContextService is the Section 16/17 session lifecycle end to end: plan, read
@@ -275,14 +288,17 @@ func (s *Services) Path(ctx context.Context, req model.PathRequest) (model.PathR
 
 // Impact answers bounded impact analysis.
 //
-// The engine answers a model.ImpactResult and the frozen facade returns a page,
-// so the ranked entries and their metadata are projected onto it. The package
-// rollup and the visited/edge accounting the result also carries have no home
-// in model.Page; a caller that needs them asks Graph for the rollup. See
-// deviation D3 in the lane report.
-func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.Page[model.ImpactEntry], error) {
+// It returns the engine's whole model.ImpactResult rather than a page of its
+// entries. L0 froze this method as model.Page[model.ImpactEntry]; INT changed
+// it (wave-e ruling "Rulings on L7 FACADE deviations", D3) because the result
+// also carries the per-package rollup and the visited/edge accounting that
+// `codectx impact` already prints, and model.Page has no home for either. A
+// facade that silently dropped them would make the facade path a downgrade from
+// the command it is meant to replace. This is the only Task 17 change to a
+// frozen facade signature.
+func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error) {
 	if err := req.Validate(); err != nil {
-		return model.Page[model.ImpactEntry]{}, err
+		return model.ImpactResult{}, err
 	}
 	var res model.ImpactResult
 	err := s.withEngine(ctx, req.GenerationID, func(e *graph.Engine) error {
@@ -291,9 +307,9 @@ func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.P
 		return err
 	})
 	if err != nil {
-		return model.Page[model.ImpactEntry]{}, s.fail("impact", err)
+		return model.ImpactResult{}, s.fail("impact", err)
 	}
-	return model.Page[model.ImpactEntry]{Meta: res.Meta, Items: res.Entries}, nil
+	return res, nil
 }
 
 // --- ContextService ---------------------------------------------------------
@@ -523,10 +539,12 @@ func (s *Services) Doctor(ctx context.Context, req model.DoctorRequest) (model.D
 
 // --- shared routing helpers -------------------------------------------------
 
-// workflow returns the composed workflow service. The field is wired by the
-// integration lane; until it is, every method that needs it answers a typed
-// defect rather than dereferencing nil, because a panic in a product adapter is
-// strictly worse than a refusal that names the wiring gap.
+// workflow returns the composed workflow service. open() builds it eagerly and
+// fails the composition if it cannot, so the nil branch is unreachable through
+// a workspace this package opened; it is kept because *Services is reachable
+// from any *Workspace value a test or a future composition constructs, and a
+// panic in a product adapter is strictly worse than a refusal that names the
+// wiring gap.
 func (s *Services) workflow() (*workflow.Service, error) {
 	if s.w.s.workflow == nil {
 		return nil, &model.Error{Code: model.CodeInternal,
