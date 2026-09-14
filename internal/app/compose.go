@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -69,19 +70,36 @@ const sharedRunnerHeadroom = 2
 // refused, which is the Section 23.3 admission discipline.
 const unobservedChildMemoryBudget int64 = 8 << 30
 
-// openMode selects what the composition may install while it is built.
+// openMode selects what the composition takes and what it may write.
 type openMode uint8
 
 const (
-	// modeIndex composes for a run that will index: a payload a unit needs is
-	// installed on demand (Section 11.7).
+	// modeIndex composes for a run that will index: it takes the cross-process
+	// workspace lock for the whole session and runs startup recovery under it.
 	modeIndex openMode = iota
-	// modeReport composes for a read-only report. Nothing is fetched: a
-	// `status` that downloads an analyzer to say whether it is present has
-	// already made the answer untrue, and on a slow link it turns a status
-	// call into a multi-gigabyte transfer (ledger 159).
+	// modeReport composes for a read-only report. It takes no lock and writes
+	// nothing, so `codectx status` answers while a `watch` session holds the
+	// workspace instead of being refused for a lock it does not need: Section
+	// 12.3 makes the active generation immutable once published, and a report
+	// reads only that (ledger 159 keeps the same path from installing
+	// anything, which the providers now honour by construction).
 	modeReport
 )
+
+// openOptions are the composition's variable inputs. They are one struct
+// because two of them -- the report mode and the rebuild cache -- both change
+// what openStack opens, and two positional parameters that must agree read
+// worse than one value that carries the agreement.
+type openOptions struct {
+	mode openMode
+	// wait is how long modeIndex waits for the workspace lock. modeReport
+	// takes no lock and ignores it.
+	wait time.Duration
+	// rebuild opens a sibling cache instead of the configured one, which is
+	// what `index --rebuild` means in Section 12.2: an explicitly requested new
+	// cache, with the existing database left exactly as it was.
+	rebuild bool
+}
 
 // stack is everything a workspace owns below the coordinator. It exists apart
 // from Workspace so the composition -- configuration, directories, the lock,
@@ -101,6 +119,7 @@ type stack struct {
 	toolDir  string
 	lsp      *lsp.Manager
 	ts       *treesitter.Provider
+	watcher  *watch.Watcher
 	logger   *slog.Logger
 
 	// states are the capability rows detection can never publish because the
@@ -116,7 +135,7 @@ type stack struct {
 // directories exist before anything opens a file inside them; the cross-process
 // lock is taken before the database, so startup recovery runs as the single
 // owner (Sections 12.3, 13.2).
-func openStack(ctx context.Context, repo string, wait time.Duration, mode openMode) (s *stack, err error) {
+func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err error) {
 	// os.Executable is resolved once, here, and a failure is fatal: every
 	// later reader of this path would otherwise silently fall back to argv[0],
 	// which a caller controls (ledger 113, 126).
@@ -138,13 +157,27 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 	if err != nil {
 		return nil, err
 	}
-	s = &stack{root: root, cfg: cfg, dataDir: cfg.Storage.DataDir,
+	// The tool store is derived from the configured data directory and must
+	// stay there whatever cache this run writes: a rebuild that moved it would
+	// re-fetch every managed payload, which for the analysis engine alone is
+	// roughly two gigabytes for a flag that is about the database.
+	toolCfg := cfg
+	if o.rebuild {
+		cfg.Storage.DataDir = rebuildDir(cfg.Storage.DataDir, time.Now())
+	}
+	// cfg.Storage.DataDir is the effective cache from here on, including in
+	// Config.TraversalPolicy, which excludes it from the walk: a rebuild cache
+	// inside the workspace must be excluded as the configured one is.
+	st := &stack{root: root, cfg: cfg, dataDir: cfg.Storage.DataDir,
 		logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))}
+	s = st
 	// Every later step opens something; from here a failure must release what
-	// has been opened so far, in reverse.
+	// has been opened so far, in reverse. The deferred close names the local
+	// rather than the named result, because every error path below returns
+	// `nil, err` and would otherwise disarm its own cleanup.
 	defer func() {
 		if err != nil {
-			s.Close()
+			st.Close()
 			s = nil
 		}
 	}()
@@ -158,8 +191,16 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 		}
 	}
 
-	if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, wait); err != nil {
-		return nil, err
+	// Section 13.2's single cross-process owner governs indexing. A report
+	// publishes nothing, so it takes no lock: the writer lock on this path made
+	// `codectx status` permanently refused while a `watch` session ran, with a
+	// remediation ("wait for the running process to finish") that a watch never
+	// satisfies. internal/index refuses its building entry points when Lock is
+	// nil, so the absence is enforced there rather than trusted here.
+	if o.mode == modeIndex {
+		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, o.wait); err != nil {
+			return nil, err
+		}
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
 		BusyTimeout:       cfg.Storage.BusyTimeout.Std(),
@@ -175,9 +216,16 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 	}
 	// Recovery runs under the lock and before anything reads a generation, so
 	// a staging generation an earlier crash abandoned is failed and collected
-	// rather than inherited.
-	if err = s.store.Recover(ctx, time.Now()); err != nil {
-		return nil, err
+	// rather than inherited. It is a write -- Abort on every staging generation
+	// and then a sweep -- so a report, which holds no lock, must not run it:
+	// doing so would abort the staging generation of a concurrently running
+	// index. Skipping it costs a report nothing, because Store.Recover never
+	// touches the active pointer and Coordinator.Status reads only the active
+	// generation.
+	if o.mode == modeIndex {
+		if err = s.store.Recover(ctx, time.Now()); err != nil {
+			return nil, err
+		}
 	}
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
 		return nil, err
@@ -242,7 +290,7 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 		}
 	}
 
-	if s.resolver, s.toolDir, err = openResolver(cfg, os.Stderr, false); err != nil {
+	if s.resolver, s.toolDir, err = openResolver(toolCfg, os.Stderr); err != nil {
 		return nil, err
 	}
 
@@ -280,7 +328,7 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 	}
 
 	providers := []provider.Provider{fs, mf, s.ts, sp}
-	if dp := s.openDependence(ctx, shared, mode); dp != nil {
+	if dp := s.openDependence(ctx, shared); dp != nil {
 		providers = append(providers, dp)
 	}
 	if s.registry, err = provider.NewRegistry(providers...); err != nil {
@@ -300,7 +348,45 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 	}); err != nil {
 		return nil, err
 	}
+	// The filesystem watcher is the notification half of Section 13.2. It is
+	// built only for a run that may index: a report never watches, and a
+	// watcher a report constructed would place inotify watches over the whole
+	// workspace to answer a question that reads one row.
+	//
+	// The policy is the capture's own, not bare Config.TraversalPolicy(): the
+	// Git ignore and force-include hooks decide which directories are watched,
+	// and without them the watch set and the periodic rescan cover every
+	// gitignored build tree the snapshot can never contain.
+	if o.mode == modeIndex {
+		policy, perr := snapshot.TraversalPolicy(ctx, cfg.TraversalPolicy(), root, s.git)
+		if perr != nil {
+			return nil, perr
+		}
+		if s.watcher, err = watch.New(watch.Options{
+			Root:      root,
+			Policy:    policy,
+			Debounce:  cfg.Index.WatchDebounce.Std(),
+			Reconcile: cfg.Index.ReconcileInterval.Std(),
+			MaxPaths:  cfg.Index.WatchPendingPaths,
+			MaxBytes:  cfg.Index.WatchPendingBytes,
+			Logger:    s.logger,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
+}
+
+// rebuildDir is the sibling cache `index --rebuild` opens. Section 12.2 makes
+// the flag an explicitly requested new cache, not a migration and not a
+// deletion: the configured directory and the database inside it are left
+// exactly as they were, and the new cache is named beside it so an operator can
+// see both and remove the one they no longer want.
+//
+// The instant is a parameter so the name is a function of the run rather than
+// of a clock read somewhere inside the composition.
+func rebuildDir(dataDir string, now time.Time) string {
+	return dataDir + "-rebuild-" + now.UTC().Format("20060102T150405Z")
 }
 
 // openDependence builds the dependence provider, or reports its absence.
@@ -312,26 +398,18 @@ func openStack(ctx context.Context, repo string, wait time.Duration, mode openMo
 // becomes a capability row the coordinator publishes, which is the difference
 // between "this capability is unavailable, here is why" and a capability the
 // report never mentions.
-func (s *stack) openDependence(ctx context.Context, runner *process.Runner, mode openMode) provider.Provider {
+func (s *stack) openDependence(ctx context.Context, runner *process.Runner) provider.Provider {
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
 		s.dependenceAbsent(model.CapabilityUnavailable, "", nil)
 		return nil
 	}
-	// This is the one construction in the whole composition that can fetch: the
-	// locator resolves the analysis payload here rather than at unit time, so a
-	// read-only report -- and only the locator inside it -- resolves through a
-	// resolver with fetching refused. Everything else already installs nothing
-	// at construction, and handing them an offline resolver would change what
-	// they report about payloads they merely inspect.
-	resolver := s.resolver
-	if mode == modeReport {
-		var rerr error
-		if resolver, _, rerr = openResolver(s.cfg, os.Stderr, true); rerr != nil {
-			s.dependenceAbsent(model.CapabilityUnavailable, model.CodeProviderUnavailable, rerr)
-			return nil
-		}
-	}
-	locator, err := joern.NewLocator(resolver)
+	// Nothing here installs anything any more: the locator reports the pinned
+	// identity of a payload the store does not hold and the first unit that
+	// needs the engine resolves it. The report path therefore needs no second,
+	// force-offline resolver -- which was itself a defect, because it reported
+	// a merely-uninstalled payload as CTX_TOOL_OFFLINE and told an operator to
+	// turn off an offline mode they had never enabled.
+	locator, err := joern.NewLocator(s.resolver)
 	if err == nil {
 		var backend *joern.Backend
 		if backend, err = joern.New(ctx, locator, runner); err == nil {
@@ -411,9 +489,11 @@ func (s *stack) Close() error {
 }
 
 // openResolver builds one managed-toolchain resolver over a resolved
-// configuration. forceOffline refuses every fetch without opening a socket,
-// which is what a read-only report composes with.
-func openResolver(cfg config.Config, stderr io.Writer, forceOffline bool) (*toolchain.Resolver, string, error) {
+// configuration. There is exactly one resolver per composition: `tools.offline`
+// is the only thing that refuses a fetch, because a second resolver that
+// refused them regardless reported a payload that is merely not installed as a
+// payload the operator's own offline setting withheld.
+func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace and the store under it is <data_dir>/tools,
 	// while tools.cache_dir names the store itself -- which is how one store is
@@ -426,7 +506,7 @@ func openResolver(cfg config.Config, stderr io.Writer, forceOffline bool) (*tool
 	res, err := toolchain.New(toolchain.Options{
 		DataDir:       cfg.Storage.DataDir,
 		StoreDir:      cfg.Tools.CacheDir,
-		Offline:       cfg.Tools.Offline || forceOffline,
+		Offline:       cfg.Tools.Offline,
 		Mirror:        cfg.Tools.Mirror,
 		MaxFetchBytes: cfg.Tools.MaxFetchBytes,
 		FetchTimeout:  cfg.Tools.FetchTimeout.Std(),

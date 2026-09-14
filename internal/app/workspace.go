@@ -4,19 +4,16 @@ import (
 	"context"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index"
-	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/provider/lsp"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
-	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // Workspace is one opened workspace: the composed stack plus the index
-// coordinator over it. It is the single cross-process owner of Section 13.2 --
-// the workspace lock is held for its whole lifetime -- so exactly one of
-// `index`, `refresh`, `watch` and the MCP server builds at a time and a second
-// caller is told the workspace is busy rather than becoming a second writer.
+// coordinator over it. Opened for indexing it is the single cross-process owner
+// of Section 13.2 -- the workspace lock is held for its whole lifetime -- so
+// exactly one of `index`, `refresh`, `watch` and the MCP server builds at a
+// time and a second caller is told the workspace is busy rather than becoming a
+// second writer. Opened for a report it holds no lock and can build nothing.
 type Workspace struct {
 	s     *stack
 	coord *index.Coordinator
@@ -24,25 +21,25 @@ type Workspace struct {
 
 // OpenWorkspace composes the workspace for a run that will index. wait is how
 // long it waits for the workspace lock before reporting CTX_WORKSPACE_BUSY;
-// wait <= 0 tries once.
+// wait <= 0 tries once. rebuild opens an explicitly requested new cache beside
+// the configured one and leaves the existing database untouched (Section 12.2).
 //
-// A payload an admitted unit needs is installed on demand here (Section 11.7):
-// this is the indexing path, and an analyzer that is pinned but not yet
-// downloaded is a fetch, not a missing capability.
-func OpenWorkspace(ctx context.Context, repo string, wait time.Duration) (*Workspace, error) {
-	return open(ctx, repo, wait, modeIndex)
+// A payload an admitted unit needs is installed on demand, by the unit
+// (Section 11.7): an analyzer that is pinned but not yet downloaded is a fetch
+// at unit time, not a missing capability and not a cost this call pays.
+func OpenWorkspace(ctx context.Context, repo string, wait time.Duration, rebuild bool) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeIndex, wait: wait, rebuild: rebuild})
 }
 
-// OpenWorkspaceForReport composes the workspace for a read-only report and
-// installs nothing while doing it (ledger 159). `status` must be able to say
-// that an analyzer is not installed; a status path that installs it first can
-// only ever report the answer it created.
-func OpenWorkspaceForReport(ctx context.Context, repo string, wait time.Duration) (*Workspace, error) {
-	return open(ctx, repo, wait, modeReport)
+// OpenWorkspaceForReport composes the workspace for a read-only report. It
+// takes no workspace lock, writes nothing and installs nothing, so a report
+// answers while another process indexes or watches.
+func OpenWorkspaceForReport(ctx context.Context, repo string) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeReport})
 }
 
-func open(ctx context.Context, repo string, wait time.Duration, mode openMode) (*Workspace, error) {
-	s, err := openStack(ctx, repo, wait, mode)
+func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
+	s, err := openStack(ctx, repo, o)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +52,8 @@ func open(ctx context.Context, repo string, wait time.Duration, mode openMode) (
 		Git:      s.git,
 		Lock:     s.lock,
 		Pool:     s.pool,
-		Resolver: s.resolver,
+		Watcher:  s.watcher,
+		States:   s.states,
 		Logger:   s.logger,
 		Now:      time.Now,
 	})
@@ -77,22 +75,10 @@ func (w *Workspace) Resolver() *toolchain.Resolver { return w.s.resolver }
 // ToolStore is the absolute path of the tool store the resolver reads.
 func (w *Workspace) ToolStore() string { return w.s.toolDir }
 
-// LSP is the working-tree overlay manager (Section 11.5). It is not a registry
-// provider: no overlay fact is ever written to a generation, so it is answered
-// at query time and lives beside the coordinator rather than inside it.
-func (w *Workspace) LSP() *lsp.Manager { return w.s.lsp }
-
-// Root is the confined workspace root and Config the resolved configuration.
-func (w *Workspace) Root() workspace.Root { return w.s.root }
-
-// Config is the resolved configuration this workspace was composed from.
-func (w *Workspace) Config() config.Config { return w.s.cfg }
-
-// States are the capability rows for providers that could not be constructed
-// at all, which detection therefore never sees. A reader that publishes
-// completeness must fold these in, or an optional provider whose payload is
-// absent disappears from the report instead of being reported unavailable.
-func (w *Workspace) States() []model.CapabilityState { return w.s.states }
+// DataDir is the cache this workspace actually opened. It is the configured
+// data directory, or the sibling `index --rebuild` created, which is the one
+// thing a caller cannot derive from the configuration alone.
+func (w *Workspace) DataDir() string { return w.s.dataDir }
 
 // Close releases the coordinator and then everything below it, in reverse.
 // Both halves run even when the first fails: the workspace lock must be

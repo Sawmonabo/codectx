@@ -21,13 +21,16 @@ type Envelope[T any] struct {
 	Error         *model.Error `json:"error"`
 }
 
-func successEnvelope[T any](schemaVersion, command string, data T) Envelope[T] {
+// successEnvelope builds the success shape. Warnings are the bounded,
+// product-authored notes about work the command did not complete; the field is
+// always an array, never null, so a consumer never has to distinguish the two.
+func successEnvelope[T any](schemaVersion, command string, data T, warnings ...string) Envelope[T] {
 	return Envelope[T]{
 		SchemaVersion: schemaVersion,
 		Command:       command,
 		OK:            true,
 		Data:          data,
-		Warnings:      []string{},
+		Warnings:      append([]string{}, warnings...),
 	}
 }
 

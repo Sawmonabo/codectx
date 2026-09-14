@@ -31,8 +31,8 @@ const (
 )
 
 // Locator resolves the engine payload through the managed toolchain. It is the
-// implementation of dependence.EngineLocator the composition root wires in:
-// the neutral package never learns which entry of the lock this is.
+// one type that knows which entry of the lock the engine is; the neutral
+// dependence package never learns it.
 type Locator struct {
 	resolver *toolchain.Resolver
 }

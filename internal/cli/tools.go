@@ -181,7 +181,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			data := toolsGCReport{Store: store, Removed: removed}
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), data))
+				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
 			}
 			return writeText(out, "store     %s\nremoved   %d superseded tool %s\n",
 				data.Store, data.Removed, plural(data.Removed, "version", "versions"))
@@ -574,7 +574,7 @@ func emitToolReport(cmd *cobra.Command, build model.BuildInfo, args []string, da
 		if failure != nil {
 			return failure
 		}
-		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, cmd.Name(), data))
+		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, commandName(cmd), data))
 	}
 	if err := writeToolTable(cmd.OutOrStdout(), data); err != nil {
 		return err
