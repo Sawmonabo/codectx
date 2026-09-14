@@ -91,8 +91,25 @@ entry's *name* stays in the lock: `ObservedVersion` renders
 
 The engine is one entry of the embedded tool lock, installed and verified by
 `internal/toolchain`. The backend never looks on `PATH`, never probes and never
-fetches anything itself: it is handed an `Engine` by a locator, and the
-production locator is the toolchain resolver behind that interface.
+fetches anything itself: it is handed an `Engine` by the locator, which is the
+toolchain resolver in production.
+
+**Nothing is installed when the workspace is opened.** Construction resolves the
+payload only if the store already holds it (`Resolver.ResolveInstalled`). A
+payload the lock pins but the store does not hold is reported as absent, and the
+backend keeps the payload's *pinned* identity — `Resolver.PinnedFingerprint`,
+computed from the lock alone — so the descriptor version and the Section 11.6
+cache key are the same string whether the payload landed before the process
+started or during it. The first `Parse` or `Export` resolves the command lines,
+and that is what installs the payload: the first unit that actually needs the
+engine pays the fetch, at unit time, under the scheduler's reservation gate.
+Resolving at construction instead made every `codectx index`, `refresh` and
+`watch` download roughly two gigabytes before the snapshot was even captured,
+in every repository, whether or not the planner would emit a dependence unit —
+which is exactly the delay to base readiness Section 11.6 forbids. The
+resolution is memoized with its error, so a payload that cannot be installed is
+attempted once rather than once per language family, and the resolved digest is
+re-checked against the identity construction already published.
 
 * **Parse argv** is the resolved payload's own launcher prefix. The pinned
   entry is a launcher script that finds its JVM through `JAVA_HOME`, which the
@@ -407,17 +424,62 @@ its previous row dropped by the carry-over — so the sound rule is to
 over-emit. It costs import work and never correctness. Node facts are outside
 this: they are published whole on every run.
 
-What is **not** wired today. The provider passes no previous key set, so every
-import is a full one. The key set is derived on every import and written
-beside the staging database, and the provider names no path to keep it: a key
-set belongs to the *stored* unit, and deciding where a stored unit's delta
-state lives, reading the previous unit's set back and calling storage's
-carry-over are the coordinator's step (Task 12), not the provider's. Storage
-now holds up its end — it records the keys of every fact and carries the
-unchanged rows of a previous unit minus everything named replaced — so what
-remains is the wiring, not a missing mechanism. The key algebra is versioned,
-so a stored set built by an older algebra can never be mis-diffed against a
-fresh one.
+**What ships.** The delta is wired end to end by the coordinator's
+`internal/index/delta` applier, not by the provider: the provider exposes
+`ImportOptions{PreviousKeys, KeysPath}` and reports `Report.Keys`, and the
+applier decides where a stored unit's delta state lives, reads the previous
+unit's set back and calls storage's carry-over.
+
+- **Stored state.** One kind, `"dependence.fact_keys"`: the sorted key set the
+  sealed unit published, written with the unit through
+  `UnitWriter.PutDeltaState` and read back with `Store.DeltaState`. The unit's
+  *declared inputs* are not stored a second time — the applier merge-joins
+  `Store.UnitInputs(previous)` against this unit's own input stream.
+- **The replaced set.** `Replaced.Keys` is the changed keys plus the removed
+  ones, streamed straight out of `KeySet.Diff`. `Replaced.Files` is the merge
+  join above: every file the predecessor declared that this unit does not
+  declare with the same bytes. `Replaced.Scopes` is deliberately empty — nodes
+  and their aliases are emitted whole on every dependence import, so naming the
+  unit's scope would delete the aliases of every identity that survived.
+  `Replaced.IndexLevel` is set exactly when the emit was unfiltered and
+  therefore republished the facts that name no file.
+- **When `PreviousKeys` is supplied, and when it is withheld.** Only when that
+  replaced-file set is empty. Naming an edited path in `Replaced.Files` drops
+  the predecessor's evidence in that path, and a filtered emit never rewrites
+  the relations in it whose keys did not move, so the unit would be missing
+  rows a full build holds; not naming it trips storage's carried-input check.
+  An edit therefore has no sound filtered form, and the applier withholds the
+  previous keys, which makes the import emit every relation — always correct,
+  and it costs import work only. The two questions are answered by two
+  independent walks of the coordinator's `Request.Inputs`, so the applier holds
+  them against each other: a filtered emit chosen because the first walk saw
+  nothing replaced, while carry-over's walk names a replaced file, is a
+  `Request.Inputs` that is not re-iterable, and the unit is refused rather than
+  sealed missing the rows that file's bucket held.
+
+The consequence is worth stating plainly: **only an addition-only refresh
+inherits rows.** A refresh that changes or removes any declared file does a
+full build's import work and carries nothing, even though its predecessor was
+present and usable. `Result.Filtered` is how a caller tells the two apart —
+`Result.Carried` being all zero is indistinguishable from a predecessor that
+had nothing to give.
+
+Measured through the applier against the real engine, over one named fixture:
+`internal/provider/dependence/neo4jcsv/testdata/src/gofix` (the `pkg:go:` unit,
+`go.mod` + `app/app.go` + `helper/helper.go`, 38 fact keys) as the predecessor,
+refreshed after adding one file, `extra/extra.go`, declaring `func Note() int {
+return 7 }`. The refresh kept its filter and inherited **14 relations and 29
+evidence rows**; its own import published 11 nodes, 17 aliases and **0
+relations**, and the unit it sealed — 11 node facts, 14 relation facts, 40 fact
+keys, 40 evidence rows, 17 aliases — is row-identical to a full build of the
+same unit identity, whose import published those same 14 relations itself. The
+zero is a property of *that added file*, which declares no call, not of
+addition-only refreshes in general: an added file that called something would
+publish its own relations and inherit the rest. What generalises is the
+row-identity, and that nothing was re-imported for the untouched files.
+
+The key algebra is versioned, so a stored set built by an older algebra can
+never be mis-diffed against a fresh one.
 
 ## Privacy and cleanup
 

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/spf13/cobra"
@@ -42,6 +43,10 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	})
 	root.AddCommand(newVersionCommand(build))
 	root.AddCommand(newToolsCommand(build))
+	root.AddCommand(newIndexCommand(build))
+	root.AddCommand(newRefreshCommand(build))
+	root.AddCommand(newStatusCommand(build))
+	root.AddCommand(newWatchCommand(build))
 	return root
 }
 
@@ -64,13 +69,27 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 		typed = &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	}
 	if jsonRequested(cmd, args) {
-		if writeErr := writeEnvelope(root.OutOrStdout(), failureEnvelope(build.SchemaVersion, cmd.Name(), typed)); writeErr != nil {
+		if writeErr := writeEnvelope(root.OutOrStdout(), failureEnvelope(build.SchemaVersion, commandName(cmd), typed)); writeErr != nil {
 			return writeErr
 		}
 		return typed
 	}
 	fmt.Fprintln(root.ErrOrStderr(), "Error:", typed.Message)
 	return typed
+}
+
+// commandName is the envelope's `command` field: the command path with the
+// root binary's own name removed, so `codectx tools status` is "tools status"
+// and `codectx status` is "status". Both used to report "status" for two
+// different data shapes, which left a consumer unable to tell which report it
+// was decoding. The root itself keeps its own name: an argument the tree could
+// not route to any command belongs to the binary.
+func commandName(cmd *cobra.Command) string {
+	path, root := cmd.CommandPath(), cmd.Root().Name()
+	if path == root {
+		return root
+	}
+	return strings.TrimPrefix(path, root+" ")
 }
 
 // jsonRequested reports whether machine-readable output was asked for. The
@@ -105,7 +124,7 @@ func newVersionCommand(build model.BuildInfo) *cobra.Command {
 			// the same four fields.
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), build))
+				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), build))
 			}
 			_, err := fmt.Fprintf(out, "codectx %s (commit %s, %s, schema %s)\n",
 				build.Version, build.Commit, build.Toolchain, build.SchemaVersion)

@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -122,7 +123,9 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 		return nil, err
 	}
 	e := backend.Engine()
-	if e.Digest == "" || len(e.ParseArgv) == 0 || len(e.ExportArgv) == 0 {
+	// The argv is the backend's concern: a lazily resolved backend has none
+	// until its first unit runs and re-checks both before it executes anything.
+	if e.Digest == "" {
 		return nil, &model.Error{Code: model.CodeProviderUnavailable,
 			Message: "the dependence backend resolved no analysis payload"}
 	}
@@ -218,33 +221,72 @@ func detectInputs(ctx context.Context, root workspace.Root, policy workspace.Pol
 	return inputs, languages, nil
 }
 
-// IndexUnit produces exactly the assigned unit: plan the snapshot, find the
+// ImportOptions carry what the provider.Provider interface has no room for:
+// the delta state of the unit being refreshed, and where this run's own state
+// is to be written. The coordinator's delta applier owns both; the provider
+// fills every other field of the export reader's options itself.
+type ImportOptions struct {
+	// PreviousKeys is the fact key set the sealed unit this run refreshes
+	// published. The zero value is the absent set and means a full import:
+	// every relation is published and nothing of a predecessor is carried.
+	PreviousKeys neo4jcsv.KeySet
+	// KeysPath is the absolute path this run's fresh key set is written to,
+	// so the caller can store it with the unit it describes. Empty writes it
+	// beside the import's staging database, which is deleted with it — which
+	// is what IndexUnit, the full-import form, wants.
+	KeysPath string
+}
+
+// Report is one import: the provider result the coordinator records, the fresh
+// fact key set it stores as this unit's delta state, and the delta that key
+// set has against ImportOptions.PreviousKeys.
+//
+// Keys is the absent set when this run cannot describe the whole unit with one
+// set — a subdivided unit, whose parts each ran in full — and the next refresh
+// of such a unit is a full import.
+type Report struct {
+	Result model.ProviderResult
+	Keys   neo4jcsv.KeySet
+	Delta  neo4jcsv.Delta
+}
+
+// IndexUnit is the full-import form of Import, which is what the
+// provider.Provider interface can express. A coordinator that holds the unit's
+// previous fact key set calls Import instead.
+func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	rep, err := p.Import(ctx, req, sink, ImportOptions{})
+	return rep.Result, err
+}
+
+// Import produces exactly the assigned unit: plan the snapshot, find the
 // unit the coordinator named, reserve, reuse or build the graph, export,
 // validate, import, and remove every private artifact on every path. A failure
 // returns a typed error and no facts; provider.RunUnit then deletes whatever
 // reached storage, so an engine crash can never leave half a graph queryable.
-func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink provider.Sink,
+	opts ImportOptions) (Report, error) {
+
 	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
 	defer cancel()
 
 	unit, plan, err := p.unitFor(ctx, req)
 	if err != nil {
-		return model.ProviderResult{}, err
+		return Report{}, err
 	}
 	res := p.gov.Reserve(unit.Family, unit.Bytes, ObserveMachine())
 	if err := p.gov.Reject(res, unit.ScopeKey); err != nil {
-		return model.ProviderResult{}, err
+		return Report{}, err
 	}
 
 	run, err := p.openRun(req)
 	if err != nil {
-		return model.ProviderResult{}, err
+		return Report{}, err
 	}
 	defer run.close(req)
 
-	pub, report, err := p.build(ctx, req, unit, res, run, sink)
+	pub, report, err := p.build(ctx, req, unit, res, run, sink, opts)
 	if err != nil {
-		return model.ProviderResult{}, err
+		return Report{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
 	// A project of this family the planner had to refuse has no unit of its
@@ -270,8 +312,11 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"unplanned_projects", pub.UnplannedProjects,
-		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes)
-	return result, nil
+		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
+		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
+		"keys_removed", report.Removed)
+	return Report{Result: result, Keys: report.Keys,
+		Delta: neo4jcsv.Delta{Changed: report.Changed, Unchanged: report.Unchanged, Removed: report.Removed}}, nil
 }
 
 // unitFor re-derives the plan from the pinned snapshot and returns the unit
@@ -369,7 +414,7 @@ func (r *runDir) close(req provider.UnitRequest) {
 
 // build runs the whole analysis for one unit and returns what it must publish.
 func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, sink provider.Sink) (publication, ImportReport, error) {
+	run *runDir, sink provider.Sink, opts ImportOptions) (publication, ImportReport, error) {
 
 	// Membership is decided file by file, by the unit itself: only the files
 	// this unit owns are ever written. Copying the whole snapshot and deleting
@@ -406,7 +451,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
-	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink)
+	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -581,19 +626,22 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 // TSX nodes javascript), which is accurate for every located fact and
 // approximate for the fileless remainder.
 //
-// PreviousKeys is deliberately absent: see the delta ruling in
-// docs/providers-dependence.md §Refresh and delta.
+// PreviousKeys and KeysPath come from the coordinator's delta applier
+// (docs/providers-dependence.md §Refresh and delta). A run handed the previous
+// unit's key set publishes only the relations whose key changed; a run handed
+// none publishes every one.
 func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, unit Unit,
-	source, unitRoot, dir string, sink provider.Sink) (ImportReport, error) {
+	source, unitRoot, dir string, sink provider.Sink, opts ImportOptions) (ImportReport, error) {
 
 	scratch := scratchRoot(p.opts.DataDir)
 	if err := os.MkdirAll(scratch, 0o700); err != nil {
 		return ImportReport{}, internalErr("the dependence import scratch directory could not be created: " + err.Error())
 	}
-	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, ImportOptions{
+	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
-		Content: req.Content, ScratchDir: scratch})
+		Content: req.Content, ScratchDir: scratch,
+		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		return ImportReport{}, err
 	}
@@ -651,8 +699,13 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		if exp.Class != FailureNone || !exp.Live {
 			continue
 		}
+		// No delta options: a part's key set is a subset of the unit's, so
+		// diffing one against the whole unit's previous set would report
+		// every other part's keys removed and carry nothing. Every part
+		// imports in full and merge reports the absent set, which makes the
+		// next refresh of a subdivided unit a full import.
 		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
-			path.Join(unit.Root, child), dir, sink)
+			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
 			return ImportReport{}, err
 		}
@@ -718,7 +771,7 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
-	a.Keys = KeySet{}
+	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
 			a.UnknownLabels = map[string]int{}

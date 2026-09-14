@@ -49,13 +49,6 @@ type Engine struct {
 	RuntimeDigest string
 }
 
-// EngineLocator resolves the engine payload. The controller wires
-// internal/toolchain's resolver behind it at composition; this package never
-// fetches, verifies or executes anything itself.
-type EngineLocator interface {
-	Locate(ctx context.Context) (Engine, error)
-}
-
 // Backend is the engine adapter the provider drives. It is the only place the
 // engine's vocabulary exists: it builds the pinned argv, places the heap cap
 // in the child environment, runs both steps through the shared process runner
@@ -180,38 +173,40 @@ var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyP
 // The import contract is the export reader's own, not a mirror of it. A
 // mirror drifts: the declared one carried five of the ten option fields the
 // reader requires and six of its thirteen report fields, so no adapter built
-// from it could satisfy the reader's own validation. These are aliases, so
-// there is exactly one definition of an import's inputs and results and
-// Importer is satisfiable by the reader as written.
+// from it could satisfy the reader's own validation. ImportReport is an alias, so
+// there is exactly one definition of an import's results and Importer is
+// satisfiable by the reader as written; Importer's own options parameter
+// names neo4jcsv.Options for the same reason.
 //
 // The export format is not the engine. The engine's dialect lives behind
 // Backend; neo4jcsv reads the bulk-import CSV the export step writes and
 // names nothing of the engine, which is why this package may depend on it.
-type (
-	// KeySet is the fact-key set one import publishes and the next consumes
-	// for a delta; the zero value is the absent set and requests a full
-	// import.
-	KeySet = neo4jcsv.KeySet
-	// ImportOptions are the inputs of one import beyond the export itself.
-	ImportOptions = neo4jcsv.Options
-	// ImportReport is what one import published and what it refused.
-	ImportReport = neo4jcsv.Report
-)
+//
+// The fact key set has no alias of its own: the delta API this package
+// exposes (ImportOptions.PreviousKeys, Report.Keys) names neo4jcsv.KeySet
+// directly, and a second spelling one function away from it is the drift this
+// comment warns about.
+
+// ImportReport is what one import published and what it refused.
+type ImportReport = neo4jcsv.Report
 
 // Importer streams one export into the sink. It is an interface so a test can
 // drive the provider's failure paths without an engine; the production
 // binding is defaultImporter, which New uses.
 type Importer interface {
-	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts ImportOptions) (ImportReport, error)
+	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error)
 }
 
-// defaultImporter is the production importer: the export reader itself. With
-// the aliases above the adaptation is the identity, which is the point — a
-// translating adapter is where the two field lists would drift apart again.
+// defaultImporter is the production importer: the export reader itself. The
+// adaptation is the identity, which is the point — a translating adapter is
+// where the two field lists would drift apart again. The export reader's own
+// option struct is named here rather than aliased, because ImportOptions is
+// the coordinator-facing pair (PreviousKeys, KeysPath) the provider fills the
+// rest of.
 type defaultImporter struct{}
 
 func (defaultImporter) Import(ctx context.Context, exportDir string, res provider.Resolver,
-	sink provider.Sink, opts ImportOptions) (ImportReport, error) {
+	sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error) {
 	return neo4jcsv.Import(ctx, exportDir, res, sink, opts)
 }
 

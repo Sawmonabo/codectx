@@ -151,6 +151,17 @@ func (f *fixture) begin(gen model.GenerationID, run model.ProviderRunID, ff file
 func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, deps ...model.UnitID) model.UnitID {
 	f.t.Helper()
 	w := f.begin(gen, run, ff, deps...)
+	f.fill(w, run, ff)
+	if err := f.s.SealUnit(f.ctx, w); err != nil {
+		f.t.Fatalf("SealUnit(%s): %v", ff.path, err)
+	}
+	return w.UnitID()
+}
+
+// fill writes one node fact, its alias and its search document into a building
+// unit over ff.
+func (f *fixture) fill(w *store.UnitWriter, run model.ProviderRunID, ff fileFixture) {
+	f.t.Helper()
 	key := model.CanonicalNodeKey(ff.path, "F")
 	nodeID := model.NewNodeID(f.repo, model.NodeFunction, key)
 	rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: uint64(len(ff.content)), Line: 1, Column: uint32(len(ff.content))}}
@@ -176,10 +187,6 @@ func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileF
 	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{f.searchDoc(ff)}); err != nil {
 		f.t.Fatalf("PutSearchUnits: %v", err)
 	}
-	if err := f.s.SealUnit(f.ctx, w); err != nil {
-		f.t.Fatalf("SealUnit(%s): %v", ff.path, err)
-	}
-	return w.UnitID()
 }
 
 func (f *fixture) nodeID(ff fileFixture) model.NodeID {
@@ -264,7 +271,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	snap1 := f.snapshot("one", a, b1, c)
 
 	// Generation 1: build both units and publish.
-	gen1, err := f.s.BeginGeneration(ctx, f.repo, snap1.ID, model.H("semantic"))
+	gen1, err := f.s.BeginGeneration(ctx, f.repo, snap1.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatalf("BeginGeneration: %v", err)
 	}
@@ -304,7 +311,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PinGeneration: %v", err)
 	}
-	gen2, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"))
+	gen2, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatalf("BeginGeneration(2): %v", err)
 	}
@@ -352,7 +359,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// Phase: failed activation rolls back. A dependency that is not a member
 	// makes validation fail after the status update was issued; both the
 	// pointer and the status must be untouched afterwards.
-	gen3, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"))
+	gen3, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatalf("BeginGeneration(3): %v", err)
 	}
@@ -567,21 +574,185 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("reader2.Close: %v", err)
 	}
 
+	// Phase: stale carry and its identity (Section 13.3). A semantic unit
+	// still rebuilding after an edit is carried into the new generation so its
+	// capability can answer `stale` with a distance instead of `pending`. The
+	// failure mode guarded here is the one that makes a stale answer
+	// indistinguishable from a fresh one: either the carried unit cannot be
+	// published at all, or it publishes under an AnalysisKey identical to a
+	// fresh generation's.
+	//
+	// The identity half is proved over snap2 with gen2's own membership: the
+	// same two unit keys, the same capabilities, the same snapshot and the
+	// same normalization and semantic hashes, with exactly one member marked
+	// carried. Nothing else can move the key, so a key equal to gen2's would
+	// mean the carried marker and the distance never reached the fold. A
+	// genuinely stale unit would have a different unit key and the two keys
+	// would differ for the old reason, proving nothing.
+	genCarry, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "feature")
+	if err != nil {
+		t.Fatalf("BeginGeneration(carry): %v", err)
+	}
+	if err := f.s.AttachUnit(ctx, genCarry, unitA); err != nil {
+		t.Fatalf("AttachUnit(unitA) into the carry generation: %v", err)
+	}
+	if err := f.s.AttachCarried(ctx, genCarry, unitB2, store.Carry{DistanceGenerations: 2, DistanceFiles: 1}); err != nil {
+		t.Fatalf("AttachCarried(unitB2): %v", err)
+	}
+	bindCarry := f.activate(genCarry, gen2)
+	if bindCarry.AnalysisKey == bind2.AnalysisKey {
+		t.Fatal("a generation carrying a stale unit has the same analysis key as the fresh generation with the same membership; a stale answer is indistinguishable from a fresh one")
+	}
+	carried, err := f.s.CarriedUnits(ctx, genCarry, "", "", 0)
+	if err != nil {
+		t.Fatalf("CarriedUnits: %v", err)
+	}
+	if len(carried) != 1 || carried[0].Unit != unitB2 || carried[0].Carry != (store.Carry{DistanceGenerations: 2, DistanceFiles: 1}) {
+		t.Fatalf("CarriedUnits = %+v, want only unitB2 with its recorded distance", carried)
+	}
+
+	// A ref of its own, holding a unit no other generation selects. Every
+	// generation so far selects exactly the same two units, so deleting any of
+	// them frees nothing and retention has nothing it could report as
+	// reclaimable; this is the generation that makes that figure measurable.
+	genOwn, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "release")
+	if err != nil {
+		t.Fatalf("BeginGeneration(release): %v", err)
+	}
+	runOwn := f.run(genOwn)
+	wOwn := f.beginScope(genOwn, runOwn, "cfg-release", b2)
+	f.fillFile(wOwn, runOwn, b2)
+	if err := f.s.SealUnit(ctx, wOwn); err != nil {
+		t.Fatalf("SealUnit(release): %v", err)
+	}
+	f.activate(genOwn, genCarry)
+
+	// The publication half: over a snapshot whose a.go changed, unitA can no
+	// longer be reused, and carrying it must be admitted at attach AND at
+	// activation, where the membership input check runs again.
+	a2 := f.file("pkg/a.go", "package pkg\nfunc A() { changed() }\n")
+	snap3 := f.snapshot("three", a2, b2)
+	genStale, err := f.s.BeginGeneration(ctx, f.repo, snap3.ID, model.H("semantic"), "topic")
+	if err != nil {
+		t.Fatalf("BeginGeneration(stale): %v", err)
+	}
+	if err := f.s.AttachUnit(ctx, genStale, unitA); err == nil {
+		t.Fatal("AttachUnit reused a unit whose input bytes changed")
+	} else {
+		wantCode(t, err, model.CodeSnapshotChanged)
+	}
+	if err := f.s.AttachCarried(ctx, genStale, unitA, store.Carry{DistanceGenerations: 1, DistanceFiles: 1}); err != nil {
+		t.Fatalf("AttachCarried(stale unitA): %v", err)
+	}
+	if err := f.s.AttachUnit(ctx, genStale, unitB2); err != nil {
+		t.Fatalf("AttachUnit(unitB2): %v", err)
+	}
+	bindStale := f.activate(genStale, genOwn)
+	if bindStale.AnalysisKey == bindCarry.AnalysisKey {
+		t.Fatal("two generations over different snapshots share an analysis key")
+	}
+
+	// A unit whose inputs no longer exist is not carried: answering from it
+	// would describe source the snapshot does not have.
+	snap4 := f.snapshot("four", b2)
+	genGone, err := f.s.BeginGeneration(ctx, f.repo, snap4.ID, model.H("semantic"), "topic")
+	if err != nil {
+		t.Fatalf("BeginGeneration(deleted input): %v", err)
+	}
+	if err := f.s.AttachCarried(ctx, genGone, unitA, store.Carry{DistanceGenerations: 1}); err == nil {
+		t.Fatal("AttachCarried carried a unit whose input file is gone from the snapshot")
+	} else {
+		wantCode(t, err, model.CodeSnapshotChanged)
+	}
+	if err := f.s.Abort(ctx, genGone); err != nil {
+		t.Fatalf("Abort(deleted input): %v", err)
+	}
+
+	// Phase: retention by distinct ref (Section 12.4). Four refs have been
+	// indexed — "main" (gen2), "feature" (genCarry), "release" (genOwn) and
+	// "topic" (genStale, active) — so retention keeps each ref's most recent
+	// generation and sweeps what no retained ref keeps. A byte limit then
+	// evicts the least recently used refs first. The failure mode is
+	// unambiguous: evicting the published generation leaves the workspace
+	// serving nothing, and sweeping a generation a retained session still
+	// holds destroys the source a coverage receipt was issued against.
+	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4}, time.Now())
+	if err != nil {
+		t.Fatalf("RetainByRef: %v", err)
+	}
+	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
+		t.Fatalf("RetainByRef(4 refs) = %+v, want every ref retained and the two failed generations swept", r1)
+	}
+	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
+	// stricter limit could free, so `status` can warn before a disk fills. A
+	// silent zero here is a warning that never fires.
+	if r1.BytesReclaimable <= 0 {
+		t.Fatalf("RetainByRef(%+v) reported no reclaimable bytes although two non-active "+
+			"generations are retained; ruling Q10 measures it even when unlimited", r1)
+	}
+	for _, gen := range []model.GenerationID{gen2, genCarry, genOwn, genStale} {
+		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {
+			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
+		}
+	}
+	// A limit nothing fits under: every ref but the active one is evicted, and
+	// gen2 is swept only insofar as nothing else holds it — the read session
+	// opened above does, so it stays.
+	r2, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4, MaxRetainedBytes: 1}, time.Now())
+	if err != nil {
+		t.Fatalf("RetainByRef(byte limit): %v", err)
+	}
+	if r2.RefsRetained != 1 || r2.GenerationsSwept != 2 {
+		t.Fatalf("RetainByRef(byte limit) = %+v, want only the active ref retained and the two collectable generations swept", r2)
+	}
+	for _, gen := range []model.GenerationID{genCarry, genOwn} {
+		if _, err := f.s.GenerationStatus(ctx, gen); err == nil {
+			t.Fatalf("an evicted ref's generation %d survived the byte limit", gen)
+		}
+	}
+	if _, err := f.s.GenerationStatus(ctx, gen2); err != nil {
+		t.Fatalf("retention swept a generation a retained session still holds: %v", err)
+	}
+	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != genStale {
+		t.Fatalf("active generation after retention = %d, want the published %d; retention must never evict the active generation", got, genStale)
+	}
+	reader3, err := f.s.PinGeneration(ctx, f.repo, 0, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration after retention: %v", err)
+	}
+	if _, err := reader3.Node(ctx, f.nodeID(b2)); err != nil {
+		t.Fatalf("the retained active generation no longer serves its facts: %v", err)
+	}
+	if err := reader3.Close(); err != nil {
+		t.Fatalf("reader3.Close: %v", err)
+	}
+
 	// Phase: recovery. A generation left staging with a half-built unit is
 	// failed by Recover, its unsealed output deleted and its collected
 	// leftovers swept exactly as DeleteGeneration's tail would; the active
 	// pointer is untouched. A second Recover is a no-op.
-	gen4, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"))
+	gen4, err := f.s.BeginGeneration(ctx, f.repo, snap3.ID, model.H("semantic"), "topic")
 	if err != nil {
 		t.Fatalf("BeginGeneration(4): %v", err)
 	}
 	run4 := f.run(gen4)
 	// A dependency changes the unit key, so this is a new unit over b.go
 	// rather than a rebuild of the sealed one.
-	f.begin(gen4, run4, b2, unitA)
+	baseline := f.stats()
+	// A build the caller cancelled abandons its unit rather than unwinding it:
+	// the cascading delete is unbounded work the operator is waiting on, so
+	// the rows survive the cancel and Recover is what must reclaim them.
+	w4 := f.begin(gen4, run4, b2, unitA)
+	f.fill(w4, run4, b2)
+	if err := w4.Abandon(ctx); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+	if abandoned := f.stats(); abandoned.NodeFacts != baseline.NodeFacts+1 || abandoned.Evidence != baseline.Evidence+1 || abandoned.SearchUnits != baseline.SearchUnits+1 {
+		t.Fatalf("Abandon deleted the cancelled unit's rows (%+v, from %+v); the cancel path must defer that work to collection", abandoned, baseline)
+	}
 	// An expired lease is exactly the kind of leftover only the collection
 	// tail removes; Recover must run that tail, not just fail the generation.
-	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: gen2, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
+	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: genStale, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
 	if err := f.s.AcquireLease(ctx, expired); err != nil {
 		t.Fatalf("AcquireLease: %v", err)
 	}
@@ -592,12 +763,15 @@ func TestStorePublicationScenario(t *testing.T) {
 	if st, _ := f.s.GenerationStatus(ctx, gen4); st != model.GenerationFailed {
 		t.Fatalf("gen4 status after Recover = %s, want failed", st)
 	}
-	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != gen2 {
+	if got, _ := f.s.ActiveGeneration(ctx, f.repo); got != genStale {
 		t.Fatalf("Recover moved the active pointer to %d", got)
 	}
 	afterRecover := f.stats()
 	if afterRecover.Units != beforeRecover.Units-1 {
 		t.Fatalf("Recover left %d units, want the building unit deleted from %d", afterRecover.Units, beforeRecover.Units)
+	}
+	if afterRecover.NodeFacts != baseline.NodeFacts || afterRecover.Evidence != baseline.Evidence || afterRecover.SearchUnits != baseline.SearchUnits {
+		t.Fatalf("Recover left the abandoned unit's rows behind (%+v, want the pre-build %+v)", afterRecover, baseline)
 	}
 	if afterRecover.Leases != beforeRecover.Leases-1 {
 		t.Fatalf("Recover left %d leases, want the expired lease swept from %d", afterRecover.Leases, beforeRecover.Leases)
@@ -859,7 +1033,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		a1 := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		b := f.file("pkg/b.go", "package pkg\nfunc F() { F() }\n")
 		snap1 := f.snapshot("one", a1, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"))
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -874,7 +1048,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		// a.go is edited; b.go is untouched.
 		a2 := f.file("pkg/a.go", "package pkg\nfunc F() { /* edited */ }\n")
 		snap2 := f.snapshot("two", a2, b)
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"))
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -885,7 +1059,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(full): %v", err)
 		}
 
-		gen3, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"))
+		gen3, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -894,8 +1068,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		f.fillFile(wDelta, run3, a2)
 		f.fillIndexLevel(wDelta, run3, a2)
 		stats, err := wDelta.CarryOver(f.ctx, prev, store.Replaced{
-			Files:  []model.FileID{a2.id},
-			Scopes: []string{"file:" + a2.path},
+			Files:  slices.Values([]model.FileID{a2.id}),
+			Scopes: slices.Values([]string{"file:" + a2.path}),
 			Keys:   slices.Values(keyList("key:node:" + a2.path)),
 		})
 		if err != nil {
@@ -935,7 +1109,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
 		snap := f.snapshot("one", a, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -951,7 +1125,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		// The refresh reports key:node:gone removed and re-emits nothing for
 		// it. Nothing else about b.go changed, so its bucket is not replaced:
 		// only the key can keep the fact out.
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1004,7 +1178,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		f := newFixture(t, dbPath)
 		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		snap := f.snapshot("one", a)
-		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1064,7 +1238,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
 		snap := f.snapshot("one", a, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1080,7 +1254,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 
 		// One of Partly's two keys is replaced and none of Stable's. No bucket
 		// is replaced, so only the keys decide.
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1136,7 +1310,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		a := f.file("pkg/a.go", "package pkg\nfunc F() {}\n")
 		b := f.file("pkg/b.go", "package pkg\nfunc F() {}\n")
 		snap := f.snapshot("one", a, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1159,7 +1333,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			before[tb.table] = unitRows(t, raw, tb.table, prevRow)
 		}
 
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1208,7 +1382,7 @@ func TestActivateCapabilityDetails(t *testing.T) {
 
 	publish := func(caps []model.CapabilityState, expected model.GenerationID, reuse model.UnitID) (model.Binding, model.UnitID) {
 		t.Helper()
-		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"))
+		gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 		if err != nil {
 			t.Fatal(err)
 		}

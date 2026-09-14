@@ -36,6 +36,34 @@ The copy is also strictly cheaper than the re-import it replaces: nothing is
 decoded, resolved, validated against the snapshot or re-tokenized —
 `search_units.token_count` is copied, not recomputed.
 
+## Discarding a unit: two costs, two paths
+
+`UnitWriter.Fail` unwinds a building unit synchronously: the FTS delete, every
+fact table, and then the identity sweeps that ask, per candidate node, whether
+anything still references it. That is proportional to the unit's output, not to
+the failure, and for a large unit it is seconds to minutes of work that cannot
+be cancelled (it runs under `context.WithoutCancel` so a stop cannot leave a
+half-discarded unit).
+
+A build the caller cancelled therefore takes `UnitWriter.Abandon` instead: one
+`UPDATE` marking the unit `failed`. The rows stay, and stay invisible — every
+read joins `generation_units`, and an abandoned unit is a member of no
+generation — until `collectUnreachableUnits` removes them from the next
+`Store.Recover` or a retention sweep. A non-cancel failure keeps the cascading
+`Fail`: nobody is waiting on the process, and the store is left minimal.
+
+`collectUnreachableUnits` decides "nothing is still writing this" from the
+origin run's status rather than the unit's state, because a unit is only ever
+written while its origin run is running. That also covers the unit a process
+killed mid-build, whose generation may already be gone (`provider_runs.
+generation_id` is `ON DELETE SET NULL`), which the generation-scoped `Abort`
+query cannot see.
+
+The identity sweep is indexed on both sides it interrogates
+(`idx_alias_node`, `idx_context_entries_node`); without them each candidate
+node costs a full scan of `native_aliases`, which is quadratic in the unit
+being deleted.
+
 ## The two granularities
 
 Two wave-A importers produce deltas at two different granularities, and
@@ -44,12 +72,35 @@ Two wave-A importers produce deltas at two different granularities, and
 | Producer | Delta unit | What the applier names |
 |---|---|---|
 | `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
-| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is Task 12's. |
+| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is `internal/index/delta` — shipped. |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
 survivors. For both importers that is a handful of entries against tens of
-thousands: a one-file edit of this repository replaces 1 of 154 SCIP documents,
+thousands: a one-file edit of this repository replaces 1 of 174 SCIP documents,
 and an unchanged engine export replaces 0 of 77,701 fact keys.
+
+All three sets are `iter.Seq` streams, consumed once and never materialized.
+The replaced set is small for the refreshes that motivate a delta, but a branch
+switch, a regenerated code tree or a first refresh after a formatting pass
+leaves *no* document unchanged, and the set is then every document in the
+repository — which Section 6 forbids holding in the Go heap. `stageReplaced`
+validates each element as it stages it, so the only materialization is
+SQLite's own bounded temp table. A stream that fails mid-walk must be reported
+by the applier: it staged fewer entries than the applier named, so the
+applier checks its stream error *before* `CarryOver`'s own return.
+
+A producer's stream may itself read the store — the dependence applier's
+`Files` is a merge join against `Store.UnitInputs` — and `CarryOver` drains all
+three streams inside its own write transaction on the single writer
+connection. Such a stream therefore takes a reader-pool connection
+(`read_connections`, default 2) once per page of its own scan while the write
+transaction stays open. WAL readers never wait on the writer, so it cannot
+deadlock, but a saturated reader pool stalls the carry-over and the open write
+transaction blocks every other writer in the process for the length of the
+walk. A producer whose stream reads the store keeps those reads bounded and
+proportional to the unit it replaces; the nesting is documented on `Replaced`,
+`CarryOver` and `UnitInputs` so a third producer does not discover it by
+measuring a stall.
 
 ### The retention bucket
 
@@ -173,6 +224,17 @@ whose facts were collected. `Store.DeltaState` reads it back;
 `Store.SelectedUnit` finds the predecessor — the unit the previous generation
 selected for the same provider and scope.
 
+What a unit *declared* is not delta state and is never stored twice:
+`Store.UnitInputs(ctx, unit)` streams a sealed unit's `unit_inputs` rows as an
+`iter.Seq2[model.UnitInput, error]` in ascending `FileID` order — the order
+`BeginUnit` required when they were written — so an applier can merge-join the
+predecessor's declared files against the fresh ones without holding either
+list. It refuses a unit that is not sealed: a building unit's rows are still
+arriving, and a delta diffed against a partial set would name too few replaced
+buckets and carry a stale fact. The dependence applier uses it to compute
+`Replaced.Files`; the manifest of the same rows it used to store beside the
+unit was deleted with it.
+
 ## Applier sketch
 
 ```go
@@ -186,15 +248,32 @@ w, _ := store.BeginUnit(ctx, gen, build, inputs)
 rep, _ := p.Import(ctx, req, sink, scip.ImportOptions{Previous: previous})
 sink.Flush(ctx)
 
-var replaced sqlite.Replaced
-rep.Manifest.Diff(previous, func(c scip.Change) error {
-    if c.Class != scip.ClassUnchanged {
-        replaced.Files = append(replaced.Files, model.NewFileID(repo, c.Path))
-        replaced.Scopes = append(replaced.Scopes, "file:"+c.Path)
-    }
-    return nil
-})
-_, _ = w.CarryOver(ctx, prev, replaced)
+// Diff is re-runnable, so the delta is measured once and each replaced set is
+// streamed by a walk of its own; nothing is collected.
+d, _ := rep.Manifest.Diff(previous, nil)
+var filesErr, scopesErr error
+replaced := sqlite.Replaced{
+    Files: func(yield func(model.FileID) bool) {
+        filesErr = changedDocuments(rep.Manifest, previous, func(path string) error {
+            if !yield(model.NewFileID(repo, path)) {
+                return errStopDocs
+            }
+            return nil
+        })
+    },
+    Scopes: func(yield func(string) bool) {
+        scopesErr = changedDocuments(rep.Manifest, previous, func(path string) error {
+            if !yield("file:" + path) {
+                return errStopDocs
+            }
+            return nil
+        })
+    },
+}
+stats, err := w.CarryOver(ctx, prev, replaced)
+// The stream errors first: a stream that failed mid-walk staged fewer entries
+// than the applier named.
+_, _, _, _ = stats, filesErr, scopesErr, err
 
 fresh := filepath.Join(workDir, "manifest")
 rep.Manifest.Save(fresh)
@@ -205,7 +284,7 @@ rep.Manifest.Close()
 ```
 
 This is the sequence the lane's real-tool proof runs (scip-go 0.2.7 over two
-copies of this repository, one file edited): `changed=1`, `unchanged=159`, and
+copies of this repository, one file edited): `changed=1`, `unchanged=173`, and
 the delta-built unit is row-identical to a full re-import across every fact
 table.
 

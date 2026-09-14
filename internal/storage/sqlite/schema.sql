@@ -59,10 +59,18 @@ CREATE TABLE snapshot_files (
     CHECK((status = 'deleted' AND content_hash IS NULL AND size_bytes = 0)
        OR (status <> 'deleted' AND content_hash IS NOT NULL))
 ) WITHOUT ROWID;
+-- generations.ref is the ref the generation was built from (Section 12.4):
+-- retention keeps the last retain_refs DISTINCT refs the user actually
+-- indexed, not the last N generations, which is what makes A -> B -> C -> A
+-- find A's units still on disk. The value is the caller's: a branch name, the
+-- HEAD object id when HEAD is detached, or the fixed sentinel '(none)' for a
+-- workspace that is not a Git repository. Storage never interprets it, only
+-- groups by it.
 CREATE TABLE generations (
     id INTEGER PRIMARY KEY,
     repository_id BLOB NOT NULL REFERENCES repositories(id),
     snapshot_id BLOB NOT NULL,
+    ref TEXT NOT NULL CHECK(length(ref) > 0),
     analysis_key BLOB CHECK(analysis_key IS NULL OR length(analysis_key) = 32),
     semantic_config_hash TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('staging','active','superseded','failed')),
@@ -115,14 +123,27 @@ CREATE TABLE unit_dependencies (
     PRIMARY KEY(unit_id, dependency_id),
     CHECK(unit_id <> dependency_id)
 ) WITHOUT ROWID;
+-- carried marks the Section 13.3 stale-with-distance member: the scope's
+-- previous sealed unit, kept in the generation while its fresh rebuild is
+-- still running. Such a unit's inputs differ from the generation's snapshot by
+-- definition, so AttachCarried admits it where AttachUnit refuses, and the two
+-- distance columns record how far behind it is (generations, and changed files
+-- between its snapshot and this one). All three columns are folded into the
+-- membership digest, and therefore into the AnalysisKey: without them a
+-- generation carrying a stale unit would be byte-identical to one that rebuilt
+-- it, and a stale answer would be indistinguishable from a fresh one.
 CREATE TABLE generation_units (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL,
     scope_key TEXT NOT NULL,
     unit_id INTEGER NOT NULL,
+    carried INTEGER NOT NULL CHECK(carried IN (0,1)),
+    distance_generations INTEGER NOT NULL CHECK(distance_generations >= 0),
+    distance_files INTEGER NOT NULL CHECK(distance_files >= 0),
     PRIMARY KEY(generation_id, provider_id, scope_key),
     UNIQUE(generation_id, unit_id),
-    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key)
+    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key),
+    CHECK(carried = 1 OR (distance_generations = 0 AND distance_files = 0))
 ) WITHOUT ROWID;
 CREATE TABLE generation_capabilities (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
@@ -400,6 +421,9 @@ CREATE TABLE retention_leases (
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
+-- Retention ranks a repository's refs by the most recent generation each was
+-- activated for, then sweeps everything below the retain_refs cut.
+CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at);
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
@@ -417,6 +441,12 @@ CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
+-- The identity sweep in unit deletion asks, per candidate node, whether any
+-- alias still points at it. Without this index that question is a full scan of
+-- native_aliases per node, which is quadratic in the size of the unit being
+-- deleted; the same holds for a manifest entry's node.
+CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
+CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);

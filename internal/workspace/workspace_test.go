@@ -38,6 +38,11 @@ func safeTree(t *testing.T) (Root, string) {
 	} {
 		mustWrite(t, filepath.Join(root, filepath.FromSlash(rel)), rel)
 	}
+	// An empty directory: ReadDir reports io.EOF for it, which once aborted
+	// the whole walk (and every snapshot capture) as CTX_PATH_ESCAPE.
+	if err := os.MkdirAll(filepath.Join(root, "empty"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlinks are unavailable in this environment: %v", err)
 	}
@@ -191,4 +196,48 @@ func collect(t *testing.T, root Root, policy Policy) []string {
 		t.Fatalf("Walk: %v", err)
 	}
 	return got
+}
+
+// TestWalkDirsAdmitsEmptyDirectoriesAndPrunesExcluded protects the watch set's
+// derivation, which is the only consumer of WalkDirs. Two failure modes are
+// life-or-death for freshness, and both are silent:
+//
+//   - an admitted directory that holds no file yet must still be emitted, or
+//     no watch is placed on it and the first file written there is invisible
+//     to notification while the index keeps reporting complete coverage;
+//   - an excluded directory must not be emitted unless the policy claims a
+//     forced path lives inside it, or an ignored build tree is watched and one
+//     `npm install` overflows the queue into a full reconciliation of a tree
+//     that is not indexed at all.
+func TestWalkDirsAdmitsEmptyDirectoriesAndPrunesExcluded(t *testing.T) {
+	root, _ := safeTree(t)
+	policy := testPolicy(root)
+
+	// "empty" holds no file at all and must still be admitted; ".git", the
+	// data directory and "vendor" must not be.
+	assertWalkDirs(t, root, policy, []string{".", "a", "empty", "sub", "sub/dir"})
+
+	// A forced path inside an excluded tree makes that tree's directories
+	// watchable again, exactly as Walk descends into them.
+	policy.ForceIncludeDir = func(relDir string) bool { return relDir == "vendor" }
+	assertWalkDirs(t, root, policy, []string{".", "a", "empty", "sub", "sub/dir", "vendor"})
+}
+
+func assertWalkDirs(t *testing.T, root Root, policy Policy, want []string) {
+	t.Helper()
+	var got []string
+	if err := WalkDirs(context.Background(), root, policy, func(dir string) error {
+		got = append(got, dir)
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkDirs: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("WalkDirs yielded %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("WalkDirs yielded %v, want %v", got, want)
+		}
+	}
 }
