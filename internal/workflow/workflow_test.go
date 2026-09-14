@@ -140,11 +140,12 @@ func TestWorkflowScenarios(t *testing.T) {
 				SessionID: fixtureSession, ActorID: fixtureActor,
 				Seeds: []string{"internal/c/included.go"}, ExpectedVersion: before.StateVersion,
 			})
-			// Include's tail projects the new record through L4's status, which
-			// is still a stub in this lane; its store-visible work is committed
-			// by then, so this row asserts on the store. When L4 lands the error
-			// is nil and every assertion below is unchanged.
-			if err != nil && err.Error() != errUnimplemented("status").Error() {
+			// Include's tail projects the new record through status, which is
+			// real since L4 landed: the include must now succeed outright. The
+			// assertions below still read the store, because what this row
+			// protects is the store-visible effect of the include and not the
+			// projection.
+			if err != nil {
 				t.Fatalf("include: %v", err)
 			}
 
@@ -250,11 +251,99 @@ func TestWorkflowScenarios(t *testing.T) {
 			}
 		}},
 		// L4 rows
+		// Failure mode: a gate that folds a waiver into readiness grants false
+		// write readiness -- an orchestrator would start writing files nobody
+		// read. Everything §16.3 asks for is arranged here except the waiver,
+		// so the waiver is the only precondition left unsatisfied and the two
+		// readiness booleans must still be false. SessionStatus.Validate:514
+		// refuses the same combination, so this row also proves the evaluator
+		// never has to be caught by the model.
+		{name: "readiness/a required-file waiver alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			// Finish the partly served file and read the waived one too: a
+			// file may be both waived and later read, and only then is
+			// "everything else satisfied" literally true.
+			h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+
+			h.store.mu.Lock()
+			h.store.sessions[fixtureSession].obs = append(h.store.sessions[fixtureSession].obs,
+				fixtureScopeReview(fixtureSession, fixtureActor, 1))
+			h.store.mu.Unlock()
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+			})
+			if err != nil {
+				t.Fatalf("Status: %v (code %q)", err, code(err))
+			}
+			if !st.ScopeComplete || !st.ReadCompleteForSnapshot || st.Superseded {
+				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v read_complete=%v superseded=%v",
+					st.ScopeComplete, st.ReadCompleteForSnapshot, st.Superseded)
+			}
+			if st.RequiredFiles != 4 || st.FullyServedFiles != 4 || st.WaivedFiles != 1 {
+				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/4/1",
+					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
+		// Failure mode: expiry is lazy, so a lapsed session is still recorded
+		// as verify_open and the store hands back the record beside
+		// CTX_SESSION_EXPIRED -- which status deliberately swallows to stay
+		// honest. SessionStatus.Validate has no expiry clause, so nothing else
+		// in the system would catch a gate that opened on a dead lease. The
+		// other actor's session is used because it carries no waiver, leaving
+		// the expired lease as the only unsatisfied precondition.
+		{name: "readiness/an expired lease alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			h.file(fixtureOther, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureOther, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+			h.store.mu.Lock()
+			h.store.sessions[fixtureOther].obs = append(h.store.sessions[fixtureOther].obs,
+				fixtureScopeReview(fixtureOther, fixtureActorB, 1))
+			h.store.sessions[fixtureOther].rec.ExpiresAt = fixtureNow.Add(-time.Hour)
+			h.store.mu.Unlock()
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureOther, ActorID: fixtureActorB,
+			})
+			if err != nil {
+				t.Fatalf("Status of an expired session must still describe it: %v (code %q)", err, code(err))
+			}
+			if !st.ReadCompleteForSnapshot || st.WaivedFiles != 0 || st.Superseded {
+				t.Fatalf("the non-expiry preconditions are not all satisfied: read_complete=%v waived=%d superseded=%v",
+					st.ReadCompleteForSnapshot, st.WaivedFiles, st.Superseded)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("an expired session lease granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
+		// Failure mode: supersession derived from per-file content hashes
+		// answers false for the exact case Section 16.3 names -- a newer
+		// generation published with every pinned file untouched -- and the gate
+		// then grants write readiness over an index the session never saw.
+		// Nothing about the files changes here; only the active generation
+		// moves, so this row fails the moment Superseded goes back to being a
+		// function of Validator.Current.
+		{name: "readiness/a newer active generation supersedes a session whose files are untouched", run: supersededByNewerGeneration},
 		// L5 rows
 		{"capsule identity excludes timestamps and a second completion returns the sealed capsule", capsuleIsDeterministic},
+		{"a waived session seals a capsule carrying the stored waiver reason", capsuleCarriesStoredWaivers},
 		// L6 rows
 		// L7 rows
 		// L8 rows
+		// INT rows
+		// Failure mode: every lane proved its own operation against a fake and
+		// a stub sibling. This drives one session through the whole service --
+		// review, status, consolidate, seal, both capsule read paths and close
+		// -- so a seam that only shows up when the real neighbour is on the
+		// other side of it (an observation id the service computes differently
+		// from the caller, a readiness projection that disagrees with the gate
+		// the seal used, two capsule readers that disagree about the sealed
+		// identity) fails here rather than in a product adapter.
+		{name: "the session lifecycle end to end: record, gate, seal, read back, close", run: sessionLifecycle},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -368,6 +457,10 @@ type fakeStore struct {
 	// right now. Changing one under a session is how a lane proves the gate is
 	// revalidated per request rather than cached.
 	current map[model.FileID]string
+	// active is the published generation per repository, the store's
+	// active_generations row. Moving it past a session's pinned generation is
+	// how a row proves supersession.
+	active map[model.RepositoryID]model.GenerationID
 	// compileErr and validateErr let a lane drive the failure paths without a
 	// second fake.
 	compileErr, validateErr error
@@ -387,11 +480,11 @@ var (
 // fakeStore.current, fixtureOther -- is deliberately caller-less until rows land
 // under the markers above. It is not dead code awaiting deletion.
 //
-// Two things a lane will look for and will not find here. Superseded has no
-// source in the frozen Sessions -- no method yields the active generation -- so
-// L4 derives it from Validator.Current: a required file whose pinned hash is no
-// longer current means the session reads a superseded snapshot. The knob is
-// h.store.current[fileFull] = "<another hash>". And the capsule size bound is
+// Two knobs worth naming. Supersession is a generation fact: INT widened
+// Sessions with the store's ActiveGeneration, so the knob is
+// h.store.active[<repo>] = <newer generation>, and it is deliberately
+// independent of h.store.current[fileFull] = "<another hash>", which drives
+// precondition 7's per-file revalidation. And the capsule size bound is
 // the service's, not the fake's: L5 checks Limits.MaxCapsuleBytes before the
 // write, so the "capsule over max_capsule_bytes fails explicitly" row drives the
 // service and never reaches PutCapsule.
@@ -500,6 +593,7 @@ func newFakeStore() *fakeStore {
 		entries:   map[model.ManifestID][]model.ContextEntry{},
 		compiled:  manifest,
 		current:   map[model.FileID]string{},
+		active:    map[model.RepositoryID]model.GenerationID{binding.RepositoryID: binding.GenerationID},
 	}
 	for i, f := range files {
 		s.entries[fixtureManifest] = append(s.entries[fixtureManifest], model.ContextEntry{
@@ -816,6 +910,21 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	return out, err
 }
 
+// Waivers answers in file-id order, not insertion order: the store pages its
+// primary key and the capsule's identity is order-sensitive, so an
+// append-ordered answer here would assert a determinism the store never gives.
+func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fs, err := s.lookup(session, actor)
+	if fs == nil {
+		return nil, err
+	}
+	out := append([]model.WaiverRecord(nil), fs.waivers...)
+	sort.Slice(out, func(i, j int) bool { return out[i].FileID < out[j].FileID })
+	return out, err
+}
+
 func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, actor string) (int64, int64, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -834,6 +943,19 @@ func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, 
 		}
 	}
 	return required, served, waived, err
+}
+
+// ActiveGeneration is the store's active_generations read. An unpublished
+// repository is CTX_NO_ACTIVE_GENERATION, exactly as the store answers it.
+func (s *fakeStore) ActiveGeneration(_ context.Context, repo model.RepositoryID) (model.GenerationID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gen, ok := s.active[repo]
+	if !ok {
+		return 0, &model.Error{Code: model.CodeNoActiveGeneration,
+			Message: "no generation has been published for this repository"}
+	}
+	return gen, nil
 }
 
 func (s *fakeStore) Manifest(_ context.Context, id model.ManifestID) (model.ContextManifest, error) {
@@ -969,11 +1091,12 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}); err != nil {
 		t.Fatalf("open consolidate on the fixture session: %v", err)
 	}
-	// The fixture waives one required file, and the frozen Sessions interface
-	// exposes no reader for the stored waiver reasons (see capsuleWaivers), so
-	// this row seals a session with no waiver outstanding. The waiver's own
-	// invariant is L4's row, not this one.
+	// This row seals under a satisfied strict gate, and Capsule.Validate refuses
+	// that beside recorded waivers, so the fixture's waiver is withdrawn whole:
+	// the flag and the record it is derived from. The waived capsule is the row
+	// below; the waiver's own readiness invariant is L4's.
 	h.file(fixtureSession, fileWaived).waived = false
+	h.store.sessions[fixtureSession].waivers = nil
 
 	rec := h.session(fixtureSession)
 	g := gate{ReadComplete: true, Ready: true, Strict: true, ScopeComplete: true}
@@ -1013,5 +1136,221 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}
 	if !second.CreatedAt.Equal(first.CreatedAt) {
 		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
+}
+
+// --- L4 helpers -------------------------------------------------------------
+
+// fixtureScopeReview is a current, non-blocking attestation for one actor,
+// written straight into the fake by the rows that need the gate's review
+// precondition already satisfied. Record is another lane's surface and these
+// rows are about the gate, not about how an observation is persisted; the
+// attestation itself is built by l3ScopeReview rather than a second builder.
+func fixtureScopeReview(session model.SessionID, actor string, scopeVersion int) model.Observation {
+	review := l3ScopeReview(fixtureID("manifest", "canonical"), scopeVersion, "", nil)
+	req := model.ObservationRequest{
+		SessionID: session, ActorID: actor, ExpectedScope: scopeVersion,
+		Kind: model.ObservationScopeReview, Review: review, Note: "scope reviewed",
+	}
+	return model.Observation{
+		ID: model.NewObservationID(req), SessionID: session, ActorID: actor,
+		ScopeVersion: scopeVersion, Kind: model.ObservationScopeReview, Review: review,
+		Note: "scope reviewed", CreatedAt: fixtureNow,
+	}
+}
+
+// capsuleCarriesStoredWaivers seals the fixture session with its waiver intact.
+// The reason lives only in the store's coverage_waivers rows -- Waive's return
+// value echoes the request and FileCoverage carries only a flag -- so a capsule
+// whose Waivers list is empty or reason-less is an artifact that hides an
+// audited exception.
+func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
+	ctx := context.Background()
+	if _, err := h.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the fixture session: %v", err)
+	}
+	// A recorded waiver and a satisfied strict gate is the one combination
+	// Capsule.Validate refuses outright, so this seal is non-strict.
+	c, err := h.svc.buildCapsule(ctx, h.session(fixtureSession),
+		gate{ReadComplete: true, Ready: true, Strict: false, ScopeComplete: true})
+	if err != nil {
+		t.Fatalf("seal a capsule for a waived session: %v", err)
+	}
+	if len(c.Waivers) != 1 {
+		t.Fatalf("the sealed capsule carries %d waivers; the session recorded 1", len(c.Waivers))
+	}
+	if got := c.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
+		t.Fatalf("the capsule carries waiver %s/%q, not the stored %s/%q",
+			got.FileID, got.Reason, fileWaived, "vendored generated code")
+	}
+}
+
+// --- INT scenarios ----------------------------------------------------------
+
+// supersededByNewerGeneration arranges every Section 16.3 precondition and then
+// publishes a newer generation without touching one byte of pinned source.
+//
+// The mutation this protects against is the one the service actually had before
+// integration: Superseded derived from Validator.Current. Under that derivation
+// this row's session reports Superseded false and ReadyForImplementation true,
+// because no file moved -- which is exactly the false write permission the flag
+// exists to withhold.
+func supersededByNewerGeneration(t *testing.T, h *harness) {
+	// Everything except supersession: both partly-read files finished, the
+	// waiver withdrawn, a current-scope review recorded.
+	h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+	h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+	h.store.mu.Lock()
+	h.store.sessions[fixtureSession].files[fileWaived].waived = false
+	h.store.sessions[fixtureSession].waivers = nil
+	h.store.sessions[fixtureSession].obs = append(h.store.sessions[fixtureSession].obs,
+		fixtureScopeReview(fixtureSession, fixtureActor, 1))
+	repo := h.store.sessions[fixtureSession].rec.Binding.RepositoryID
+	pinned := h.store.sessions[fixtureSession].rec.Binding.GenerationID
+	h.store.mu.Unlock()
+
+	req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+	before, err := h.svc.Status(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Status before the new generation: %v (code %q)", err, code(err))
+	}
+	if before.Superseded || !before.ReadyForImplementation || !before.StrictGateSatisfied {
+		t.Fatalf("the session is not ready before the new generation: superseded=%v ready=%v strict=%v reason=%q",
+			before.Superseded, before.ReadyForImplementation, before.StrictGateSatisfied, before.GuaranteeLimit)
+	}
+	if before.GuaranteeLimit == "" {
+		t.Fatal("an open gate reported no point-in-time guarantee limit")
+	}
+
+	// The only mutation: a newer generation is published. No file is touched,
+	// so h.store.current is left exactly as it was.
+	h.store.mu.Lock()
+	h.store.active[repo] = pinned + 1
+	h.store.mu.Unlock()
+
+	after, err := h.svc.Status(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Status after the new generation: %v (code %q)", err, code(err))
+	}
+	if !after.Superseded {
+		t.Fatal("a newer active generation did not supersede the session")
+	}
+	if after.ReadyForImplementation {
+		t.Fatal("a superseded session reported ready_for_implementation")
+	}
+	// Read completeness is a statement about the historical snapshot and must
+	// survive supersession; conflating the two is the other half of this bug.
+	if !after.ReadCompleteForSnapshot {
+		t.Fatal("supersession destroyed read completeness for the session's own snapshot")
+	}
+	if after.GuaranteeLimit == "" {
+		t.Fatal("a shut gate said nothing about why it is shut")
+	}
+}
+
+// sessionLifecycle drives one session through the whole workflow service with
+// every lane's real implementation behind it: Record -> Status -> Advance to
+// consolidate -> seal on Advance to complete -> both capsule read paths ->
+// Close.
+//
+// The coverage half of Section 16 (plan, read, acknowledge) is coverage.Service's
+// and is not reachable from this package's fake, so the read side is arranged as
+// the fixture state those operations would have produced -- confirmed ranges on
+// every required file. What this row proves is the workflow seam, which is the
+// only seam Task 17 owns.
+func sessionLifecycle(t *testing.T, h *harness) {
+	ctx := context.Background()
+
+	// The read side, as coverage.Read/Acknowledge would have left it.
+	h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+	h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+	h.store.mu.Lock()
+	h.store.sessions[fixtureSession].files[fileWaived].waived = false
+	h.store.sessions[fixtureSession].waivers = nil
+	h.store.mu.Unlock()
+
+	// Record: the observation id is content-derived, so the caller can compute
+	// it from its own request before the write. A service that stored anything
+	// else would break idempotency on retry without any error being raised.
+	full := h.file(fixtureSession, fileFull)
+	review := l3ScopeReview(fixtureID("manifest", "canonical"), 1, model.ReviewCompleteFilesRead,
+		[]model.ClaimReference{{Source: &model.SourceCitation{
+			FileID: fileFull, ContentHash: full.hash,
+			Bytes: model.ByteRange{Start: 0, End: 100},
+		}}})
+	obsReq := model.ObservationRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+		Kind: model.ObservationScopeReview, Review: review, Note: "reviewed the pinned scope",
+	}
+	obs, st, err := h.svc.Record(ctx, obsReq)
+	if err != nil {
+		t.Fatalf("Record: %v (code %q)", err, code(err))
+	}
+	if obs.ID != model.NewObservationID(obsReq) {
+		t.Fatalf("Record stored observation %q; the request's own identity is %q", obs.ID, model.NewObservationID(obsReq))
+	}
+
+	// The status Record returns and the status Status returns are the same
+	// evaluation, and both must be honest about an open gate.
+	if !st.ReadyForImplementation || !st.StrictGateSatisfied || st.Superseded {
+		t.Fatalf("Record's status is not ready: ready=%v strict=%v superseded=%v reason=%q",
+			st.ReadyForImplementation, st.StrictGateSatisfied, st.Superseded, st.GuaranteeLimit)
+	}
+	if st.GuaranteeLimit == "" {
+		t.Fatal("an open gate was reported with nothing said about what it guarantees")
+	}
+
+	// Consolidate, then complete. Complete is the transition that seals, so a
+	// capsule exists only if the guard ran.
+	toConsolidate, _, err := h.svc.Advance(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: st.StateVersion,
+	})
+	if err != nil {
+		t.Fatalf("Advance to consolidate_open: %v (code %q)", err, code(err))
+	}
+	toComplete, completed, err := h.svc.Advance(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateComplete, ExpectedVersion: toConsolidate.StateVersion,
+	})
+	if err != nil {
+		t.Fatalf("Advance to complete: %v (code %q)", err, code(err))
+	}
+	if completed.State != model.StateComplete {
+		t.Fatalf("the completed session reports state %q", completed.State)
+	}
+
+	// Two independent read paths onto one sealed identity. Export returns the
+	// whole record; Capsule projects one view of it. They read the same stored
+	// row through different code, and a projection that rebuilt or re-hashed
+	// anything would disagree here.
+	exported, err := h.svc.Export(ctx, model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor})
+	if err != nil {
+		t.Fatalf("Export: %v (code %q)", err, code(err))
+	}
+	page, err := h.svc.Capsule(ctx, model.CapsuleRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor, View: model.CapsuleViewCoverage,
+	})
+	if err != nil {
+		t.Fatalf("Capsule: %v (code %q)", err, code(err))
+	}
+	if page.CanonicalHash != exported.CanonicalHash {
+		t.Fatalf("the paged capsule reports identity %q and the export reports %q",
+			page.CanonicalHash, exported.CanonicalHash)
+	}
+	if !exported.StrictGateSatisfied {
+		t.Fatal("the capsule sealed under an open strict gate records it as unsatisfied")
+	}
+
+	// Close from complete: there is no edge out of complete, so the store's
+	// transition table refuses it and the service surfaces that refusal rather
+	// than inventing a closed session.
+	if _, err := h.svc.Close(ctx, model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor},
+		toComplete.StateVersion); code(err) != model.CodeVersionConflict {
+		t.Fatalf("Close of a completed session: code %q (err %v), want %q",
+			code(err), err, model.CodeVersionConflict)
 	}
 }

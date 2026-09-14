@@ -118,7 +118,7 @@ func (s *Service) buildCapsule(ctx context.Context, rec sqlite.SessionRecord, g 
 	if err != nil {
 		return model.Capsule{}, err
 	}
-	waivers, err := s.capsuleWaivers(rec, coverage)
+	waivers, err := s.capsuleWaivers(ctx, rec)
 	if err != nil {
 		return model.Capsule{}, err
 	}
@@ -240,29 +240,13 @@ func (s *Service) capsuleCoverage(ctx context.Context, rec sqlite.SessionRecord)
 	return out, nil
 }
 
-// capsuleWaivers reports the recorded exceptions.
-//
-// KNOWN GAP, reported to the controller: model.WaiverRecord requires a non-blank
-// Reason (model/coverage.go:310) and the frozen Sessions interface exposes no
-// waiver reader -- Waive is a writer whose returned record echoes the request's
-// reason rather than the stored row, and FileCoverage carries only the Waived
-// flag. A capsule that listed no waivers while its coverage shows waived files
-// would be a dishonest durable artifact, and inventing a reason is worse, so a
-// waived session refuses to seal until a reader lands.
-func (s *Service) capsuleWaivers(rec sqlite.SessionRecord, coverage []model.FileCoverage) ([]model.WaiverRecord, error) {
-	waived := 0
-	for _, f := range coverage {
-		if f.Waived {
-			waived++
-		}
-	}
-	if waived == 0 {
-		return nil, nil
-	}
-	return nil, typedErrf(model.CodeInternal,
-		"this session records %d waived files and no stored waiver reader is wired, so a complete capsule cannot be sealed", waived).
-		WithDetail("session_state", string(rec.State)).
-		WithRemediation("seal this session once the waiver reader is available; the coverage record already names the waived files")
+// capsuleWaivers reads the session's recorded exceptions. A capsule that
+// listed no waivers while its coverage shows waived files would be a dishonest
+// durable artifact, so the reasons come from the store's own append-only
+// coverage_waivers rows -- never from the Waive request that echoed them -- and
+// arrive in the store's file-id order, which is the capsule's canonical order.
+func (s *Service) capsuleWaivers(ctx context.Context, rec sqlite.SessionRecord) ([]model.WaiverRecord, error) {
+	return s.sessions.Waivers(ctx, rec.ID, rec.ActorID)
 }
 
 // capsuleFacts projects one fact-bearing observation kind. Section 17.3 records
