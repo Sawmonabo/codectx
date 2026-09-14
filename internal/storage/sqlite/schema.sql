@@ -131,6 +131,7 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE node_ids (
@@ -151,6 +152,7 @@ CREATE TABLE node_facts (
     start_byte INTEGER,
     end_byte INTEGER,
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    fact_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
@@ -168,6 +170,7 @@ CREATE TABLE relation_ids (
 CREATE TABLE relation_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     relation_id BLOB NOT NULL REFERENCES relation_ids(id),
+    fact_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
 CREATE TABLE evidence (
@@ -181,14 +184,22 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
+    content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL)),
+    CHECK(content_hash_bound = 0 OR file_id IS NOT NULL),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 );
+CREATE TABLE unit_delta_state (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY(unit_id, kind)
+) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key TEXT NOT NULL,
@@ -384,6 +395,7 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
+CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
