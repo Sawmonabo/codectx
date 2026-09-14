@@ -1418,6 +1418,12 @@ CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
+-- The identity sweep in unit deletion asks, per candidate node, whether any
+-- alias still points at it. Without this index that question is a full scan of
+-- native_aliases per node, which is quadratic in the size of the unit being
+-- deleted; the same holds for a manifest entry's node.
+CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
+CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
