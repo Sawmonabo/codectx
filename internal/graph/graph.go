@@ -202,22 +202,6 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model
 	return model.PathResult{}, notImplemented("shortest_path")
 }
 
-// Impact ranks the entities a change to the seeds may affect. Every entry
-// carries the direction that made it affected -- incoming means it may need
-// modification, outgoing that it may need reading -- and at least one
-// evidence-backed reason naming the relation kind in product vocabulary.
-func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error) {
-	return model.ImpactResult{}, notImplemented("impact")
-}
-
-// PackageDependencies rolls symbol-level edges up to their package or module
-// container nodes and reports distinct (from-package, to-package) pairs with
-// their evidence counts. A rollup pair is never presented as a precise symbol
-// call.
-func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest) (model.Page[model.PackageEdge], error) {
-	return model.Page[model.PackageEdge]{}, notImplemented("package_dependencies")
-}
-
 // frontierState is one admitted node's position in a walk: how far it sits from
 // the nearest seed, what it cost to reach, and the edge that reached it.
 type frontierState struct {
