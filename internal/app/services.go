@@ -631,6 +631,13 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 	if err != nil && !(rec.ID != "" && expiredSession(err)) {
 		return model.ContextPage{}, s.fail("context entries", err)
 	}
+	// The manifest is read for the capability states it was compiled against:
+	// a projection that omitted them would tell an operator less about the
+	// generation behind this scope than `context status` already does.
+	manifest, err := st.store.Manifest(ctx, rec.ManifestID)
+	if err != nil {
+		return model.ContextPage{}, s.fail("context entries", err)
+	}
 	after, err := s.resumeEntries(req, rec)
 	if err != nil {
 		return model.ContextPage{}, s.fail("context entries", err)
@@ -639,7 +646,7 @@ func (s *Services) Entries(ctx context.Context, req model.ContextPageRequest) (m
 	// guess from a full page, and it is dropped before the page is built.
 	limit := entriesLimit(st.cfg.Resources.MaxPageItems, req.Page.Limit)
 	page := model.ContextPage{
-		Meta:       model.QueryMeta{Binding: rec.Binding},
+		Meta:       model.QueryMeta{Binding: rec.Binding, Completeness: manifest.Completeness},
 		SessionID:  rec.ID,
 		ManifestID: rec.ManifestID,
 		View:       req.View,
@@ -731,9 +738,14 @@ func entriesQueryHash(rec sqlite.SessionRecord, view model.ContextView) string {
 // cursor is a claim about which page this is, so one naming another generation,
 // another projection or a spool this endpoint never writes is refused; honoring
 // it would silently re-serve or skip manifest records.
+//
+// The no-cursor answer is -1, not 0. Manifest ordinals and slice indexes run
+// 0..n-1 and every store page is `WHERE ordinal > ?`, so a 0 sentinel would
+// silently drop the first record of every first page. An integer keyset has no
+// free out-of-band value the way coverage's file-id keyset has the empty string.
 func (s *Services) resumeEntries(req model.ContextPageRequest, rec sqlite.SessionRecord) (int, error) {
 	if req.Page.Cursor == "" {
-		return 0, nil
+		return -1, nil
 	}
 	c, err := s.w.s.signer.DecodeCursor(req.Page.Cursor, entriesEndpoint, time.Now())
 	if err != nil {
@@ -748,6 +760,8 @@ func (s *Services) resumeEntries(req model.ContextPageRequest, rec sqlite.Sessio
 	if c.SpoolID != "" {
 		return 0, cursorInvalid("cursor carries spooled traversal state this endpoint does not produce")
 	}
+	// A cursor's key is the last ordinal served, so 0 is legitimate here even
+	// though it is not a legitimate sentinel above.
 	after, err := strconv.Atoi(c.LastKey)
 	if err != nil || after < 0 {
 		return 0, cursorInvalid("cursor sort key is not a manifest ordinal")
