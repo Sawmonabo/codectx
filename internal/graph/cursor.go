@@ -239,8 +239,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		return nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
 	}
 	s := &resumeState{
-		Cursor:  c,
-		Budget:  &budget{visited: c.Visited, edges: c.Edges, deadline: now.Add(e.limits.QueryTimeout)},
+		Cursor: c,
+		// now is carried with the deadline: checkWalk compares them, and a
+		// deadline measured on the engine clock against time.Now is the
+		// two-clock defect this budget would otherwise reintroduce.
+		Budget: &budget{visited: c.Visited, edges: c.Edges,
+			deadline: now.Add(e.limits.QueryTimeout), now: e.now},
 		Visited: map[model.NodeID]struct{}{},
 	}
 	if c.SpoolID == "" {

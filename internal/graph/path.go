@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"sort"
-	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -61,12 +60,16 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	}
 
 	res = model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
-	completeness, deferred, err := e.pathCompleteness(ctx, kinds)
+	// The same disclosure the traversal entries make, from the same place: a
+	// second implementation here would be a second shape for one contract --
+	// pendingDependence returns the deferred rows alone, copied unchanged in
+	// State and DiagnosticCode, with a promotion's queue position folded in.
+	completeness, err := e.pendingDependence(ctx, kinds)
 	if err != nil {
 		return model.PathResult{}, err
 	}
 	res.Meta.Completeness = completeness
-	if deferred {
+	if len(completeness) > 0 {
 		pathTruncate(&res.Meta, pathReasonDeferred)
 	}
 
@@ -161,55 +164,6 @@ func pathTruncate(m *model.QueryMeta, reason string) {
 	}
 	m.Truncated = true
 	m.TruncationReason = reason
-}
-
-// pathCompleteness reports the pinned generation's capability states and says
-// whether a dependence-only kind this request walks is still building. A
-// deferred row is copied through unchanged in State and DiagnosticCode: there
-// is no pending capability value and inventing one would touch shared model and
-// every renderer. When a promoter is available the queue position is folded into
-// the row's details; a failed promotion never fails the query.
-func (e *Engine) pathCompleteness(ctx context.Context, kinds []model.RelationKind) ([]model.CapabilityState, bool, error) {
-	rows, err := e.adjacency.Capabilities(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	wanted := map[model.RelationKind]bool{}
-	for _, k := range kinds {
-		wanted[k] = true
-	}
-	var touches bool
-	for _, k := range DependenceOnly() {
-		if wanted[k] {
-			touches = true
-			break
-		}
-	}
-	var deferred bool
-	for i := range rows {
-		if rows[i].ProviderID != "dependence" || rows[i].Details["reason"] != "units_deferred" {
-			continue
-		}
-		if !touches {
-			continue
-		}
-		deferred = true
-		if e.promoter == nil {
-			continue
-		}
-		pending, err := e.promoter.Promote(ctx, rows[i].ProviderID, rows[i].Scope)
-		if err != nil {
-			continue
-		}
-		rows[i] = rows[i].
-			WithDetail("units", strconv.Itoa(pending.Units)).
-			WithDetail("position", strconv.Itoa(pending.Position))
-		if pending.Estimate > 0 {
-			// An unmeasured duration is reported as unmeasured, never invented.
-			rows[i] = rows[i].WithDetail("estimate_ms", strconv.FormatInt(pending.Estimate.Milliseconds(), 10))
-		}
-	}
-	return rows, deferred, nil
 }
 
 // hydratePaths attaches the evidence backing each route. Evidence is fetched for
@@ -409,7 +363,11 @@ func (w *pathWalk) expandBatch(ctx context.Context, nodes []model.NodeID) error 
 			w.edges[r.From] = append(w.edges[r.From], r)
 			w.relax(r)
 		}
-		if len(rels) < adjacencyBatch {
+		// Only an empty page ends the keyset walk: the reader clamps the
+		// requested limit down to model.MaxPageItems, so a short page is the
+		// normal case rather than the end of the edges. `after` advanced on
+		// every row above, so the next page starts past the last one read.
+		if len(rels) == 0 {
 			break
 		}
 	}
