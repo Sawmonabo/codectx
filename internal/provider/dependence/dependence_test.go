@@ -130,7 +130,14 @@ func (c carrier) IndexUnit(ctx context.Context, req provider.UnitRequest, sink p
 
 func newProvider(t *testing.T, b *fakeBackend) provider.Provider {
 	t.Helper()
-	p, err := dependence.New(b, fakeImporter{}, dependence.Options{DataDir: t.TempDir(),
+	return newProviderIn(t, b, t.TempDir())
+}
+
+// newProviderIn builds a provider over a caller-chosen data directory, so a
+// test can run two units against the same graph cache.
+func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provider {
+	t.Helper()
+	p, err := dependence.New(b, fakeImporter{}, dependence.Options{DataDir: dataDir,
 		Timeout: 2 * time.Minute, CacheBytes: 1 << 20, Limits: providertest.Limits})
 	if err != nil {
 		t.Fatal(err)
@@ -235,10 +242,12 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 // and reported fresh, is a silent correctness loss — a consumer would read
 // "no data flow here" as an analysed absence rather than an unanalysed one.
 func TestSkippedMethodsPublishPartial(t *testing.T) {
-	b := &fakeBackend{parse: dependence.Outcome{SkippedCount: 2,
-		SkippedMethods: []string{"app.go:<module>.Run", "app.go:<module>.Helper"}}}
+	dataDir := t.TempDir()
+	skips := dependence.Outcome{SkippedCount: 2,
+		SkippedMethods: []string{"app.go:<module>.Run", "app.go:<module>.Helper"}}
+	b := &fakeBackend{parse: skips}
 	h := providertest.New(t, repo)
-	result, unit, err := h.Run(t, newProvider(t, b), rootScope, []string{"app.go", "go.mod"})
+	result, unit, err := h.Run(t, newProviderIn(t, b, dataDir), rootScope, []string{"app.go", "go.mod"})
 	if err != nil {
 		t.Fatalf("the unit failed: %v", err)
 	}
@@ -271,6 +280,55 @@ func TestSkippedMethodsPublishPartial(t *testing.T) {
 		if _, ok := states["skipped_method:"+name]; !ok {
 			t.Errorf("the result does not name the skipped method %q", name)
 		}
+	}
+
+	// The same unit again, against the same graph cache. What was skipped
+	// exists only on the parse's stderr, so a reused graph carries no trace of
+	// it: reusing one here would republish data_flows_to as fresh and silently
+	// upgrade an unanalysed absence into an analysed one. This is the path the
+	// first run cannot reach, and the one a cache exists to take.
+	again := &fakeBackend{parse: skips}
+	h2 := providertest.New(t, repo)
+	second, _, err := h2.Run(t, newProviderIn(t, again, dataDir), rootScope, []string{"app.go", "go.mod"})
+	if err != nil {
+		t.Fatalf("the second unit failed: %v", err)
+	}
+	if again.parses == 0 {
+		t.Error("the second run reused a cached graph for a unit that skipped methods")
+	}
+	states = map[string]model.CapabilityStateValue{}
+	for _, c := range second.Capabilities {
+		states[c.Capability] = c.State
+	}
+	if states[dependence.CapabilityDataFlowsTo] != model.CapabilityPartial {
+		t.Errorf("data_flows_to on reuse = %q, want partial", states[dependence.CapabilityDataFlowsTo])
+	}
+	if states["skipped_methods:2"] != model.CapabilityPartial {
+		t.Error("the reused result does not publish the exact skipped-method count")
+	}
+}
+
+// TestCleanGraphIsReused is the other half of the cache contract, and the
+// reason the reuse assertion above is not vacuous. Failure mode: a cache that
+// never hits would make every "partial survives reuse" assertion pass while
+// the expensive parse it exists to avoid runs every generation anyway.
+func TestCleanGraphIsReused(t *testing.T) {
+	dataDir := t.TempDir()
+	first := &fakeBackend{}
+	h := providertest.New(t, repo)
+	if _, _, err := h.Run(t, newProviderIn(t, first, dataDir), rootScope, []string{"app.go", "go.mod"}); err != nil {
+		t.Fatalf("the first unit failed: %v", err)
+	}
+	if first.parses != 1 {
+		t.Fatalf("parses = %d, want 1 on a cold cache", first.parses)
+	}
+	again := &fakeBackend{}
+	h2 := providertest.New(t, repo)
+	if _, _, err := h2.Run(t, newProviderIn(t, again, dataDir), rootScope, []string{"app.go", "go.mod"}); err != nil {
+		t.Fatalf("the second unit failed: %v", err)
+	}
+	if again.parses != 0 {
+		t.Errorf("parses = %d, want 0: the same source and the same pinned argv must reuse the graph", again.parses)
 	}
 }
 

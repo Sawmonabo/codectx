@@ -200,12 +200,16 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		units = append(units, Unit{ScopeKey: scopeKey(f, d), Family: f, Root: d,
 			Excluded: nested(d, dirs), Markers: markersUnder(markers, d, nested(d, dirs))})
 	}
-	if f != FamilyRust {
+	if f != FamilyRust && !slices.Contains(dirs, "") {
 		// Source of this family outside every project still has facts worth
 		// having; the engine parses a bare directory happily. Rust does not:
 		// without a Cargo.toml its helper produces an empty graph, which would
 		// be indistinguishable from a crashed helper, so loose Rust files are
 		// left unanalysed rather than published as an empty unit.
+		//
+		// A project rooted at the repository root already owns this scope key.
+		// Emitting a second unit under the same key would leave unitFor
+		// choosing between them by sort position, so it is not emitted at all.
 		units = append(units, Unit{ScopeKey: scopeKey(f, ""), Family: f,
 			Excluded: dirs, Markers: markersUnder(markers, "", dirs)})
 	}

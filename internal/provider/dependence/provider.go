@@ -149,7 +149,12 @@ func (p *Provider) Descriptor() model.ProviderDescriptor {
 // payload, which is where the lock recorded them.
 //
 // Detection reads only the repository's project markers, stops at the bound,
-// and never walks the tree into memory.
+// and never walks the tree into memory: it accumulates at most
+// provider.MaxDetectionInputs paths and one boolean, whatever the repository's
+// size. It traverses where the filesystem and treesitter providers answer from
+// a constant because neither question it must answer — which projects exist,
+// and whether any analysable source exists at all — can be answered without
+// looking.
 func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy workspace.Policy) (provider.Detection, error) {
 	inputs, languages, err := detectInputs(ctx, root, policy)
 	if err != nil {
@@ -229,7 +234,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	pub.UnknownLabels = report.UnknownLabels
 	result := model.ProviderResult{RunID: req.Run, State: model.RunSucceeded,
 		RecordsEmitted: uint64(report.Nodes + report.Relations + report.Aliases),
-		BytesProcessed: uint64(max(report.Changed+report.Unchanged, 0)),
+		BytesProcessed: uint64(max(unit.Bytes, 0)),
 		Capabilities:   pub.capabilities(unit.ScopeKey)}
 	slog.Info("dependence unit imported", "component", component, "unit", string(req.Unit.ID), "run", string(req.Run),
 		"scope", unit.ScopeKey, "family", string(unit.Family), "source_files", unit.Files, "source_bytes", unit.Bytes,
@@ -381,7 +386,14 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 		}
 		outcome = confirm
 	}
-	if p.cache.Put(key, graph) {
+	if outcome.SkippedCount == 0 && p.cache.Put(key, graph) {
+		// A graph whose parse skipped methods is deliberately not cached. What
+		// was skipped is only on the parse's stderr, and a cache hit replays
+		// the graph without it — so a reused entry would publish data_flows_to
+		// as fresh for a unit whose data dependence is missing whole method
+		// bodies. Not caching it costs a reparse for units that skip at all,
+		// which the pinned definition cap makes rare (docs/research/
+		// 10-round3-empirical.md Section 9a); caching it would cost the truth.
 		return p.cache.path(key), outcome, nil
 	}
 	return graph, outcome, nil
