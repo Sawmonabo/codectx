@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -23,11 +25,6 @@ const (
 // here ever becomes a second writer.
 const indexLockWait = 10 * time.Second
 
-// statusLockWait is zero on purpose. A report must not queue behind a build:
-// telling the operator the workspace is busy is an answer, blocking a status
-// call for ten seconds behind someone else's index is not.
-const statusLockWait = 0
-
 // statusReport is the data payload of `status`: the coordinator's own index
 // status, and the managed-toolchain rows the same report renders, which is
 // what Task 22 Step 3 owes `status` beside `doctor`. They travel in one
@@ -47,7 +44,12 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 		Long: "Captures an exact snapshot of the workspace, runs the providers whose " +
 			"units are not reusable, and publishes the result as one new generation " +
 			"after it validates. Unchanged units are reused rather than rebuilt, so a " +
-			"second run over an unchanged tree parses nothing.",
+			"second run over an unchanged tree parses nothing.\n\n" +
+			"Work an optional provider defers past the base generation keeps running " +
+			"after that generation is active, and each batch that seals is published " +
+			"as a further generation before the command exits. Interrupting it keeps " +
+			"everything already published and reports how much is still queued; set " +
+			"providers.dependence.enabled = false to plan none of it.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -69,31 +71,45 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			ws, err := openWorkspace(cmd, indexLockWait)
+			repo, err := repoFlagValue(cmd)
+			if err != nil {
+				return err
+			}
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, req.Rebuild)
 			if err != nil {
 				return err
 			}
 			defer ws.Close()
-			if req.Watch {
-				result, err := ws.Coordinator().Index(cmd.Context(), req)
-				if err != nil {
+			if req.Rebuild {
+				// Section 12.2: the new cache is explicit and the old one is
+				// left whole, so the operator is told where both are and that
+				// the sessions and receipts they recorded stay in the old one.
+				if err := writeText(cmd.ErrOrStderr(),
+					"a new cache was created at %s; the previous cache is untouched and still holds its sessions and receipts. "+
+						"Point storage.data_dir at the new cache, or remove the old one once you no longer need them.\n",
+					ws.DataDir()); err != nil {
 					return err
 				}
-				if err := emitIndexResult(cmd, build, args, result); err != nil {
-					return err
-				}
-				return runWatch(cmd, build, args, ws)
 			}
 			result, err := ws.Coordinator().Index(cmd.Context(), req)
 			if err != nil {
 				return err
 			}
-			return emitIndexResult(cmd, build, args, result)
+			if req.Watch {
+				// A watch session emits one envelope, at its end. The base
+				// generation is the session's first refresh, not a second
+				// result stream of its own.
+				if err := emitIndexProgress(cmd, args, result); err != nil {
+					return err
+				}
+				return runWatch(cmd, build, args, ws)
+			}
+			return drainIndex(cmd, build, args, ws, result)
 		},
 	}
 	addRepoFlag(cmd)
 	cmd.Flags().Bool(indexFullFlag, false, "rebuild every unit of the existing cache instead of reusing sealed ones")
-	cmd.Flags().Bool(indexRebuildFlag, false, "create a new cache; the existing database is left untouched")
+	cmd.Flags().Bool(indexRebuildFlag, false, "build into a new cache beside the configured one; the existing database is left untouched")
 	cmd.Flags().Bool(indexWatchFlag, false, "keep running and refresh as the workspace changes")
 	return cmd
 }
@@ -103,15 +119,20 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "refresh [paths...]",
 		Short: "Refresh the active generation, optionally only for the named paths",
-		Long: "Refreshes the index incrementally. Named paths narrow the work to the " +
-			"units those files belong to; with no paths the whole workspace is " +
-			"reconciled. Either way the answer comes from the captured bytes, never " +
-			"from a modification time or a Git status alone.",
+		Long: "Refreshes the index incrementally. Named paths are notification hints " +
+			"only: the refresh always re-reads the workspace and compares content " +
+			"hashes, so the answer comes from the captured bytes, never from a hint, " +
+			"a modification time or a Git status alone. Use --repo to point the " +
+			"command at a repository other than the current directory.",
 		Args:          cobra.ArbitraryArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ws, err := openWorkspace(cmd, indexLockWait)
+			repo, err := repoFlagValue(cmd)
+			if err != nil {
+				return err
+			}
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
 			if err != nil {
 				return err
 			}
@@ -135,7 +156,9 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 		Long: "Reports what the workspace actually holds: the active snapshot and " +
 			"generation, per-capability freshness, whether the generation is still " +
 			"coherent with the worktree, watch coverage, and what the managed " +
-			"toolchain has installed. Nothing is fetched to produce this report.",
+			"toolchain has installed. Nothing is fetched and nothing is written to " +
+			"produce this report, and it takes no workspace lock, so it answers " +
+			"while another process is indexing or watching.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -144,19 +167,20 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo, statusLockWait)
+			ws, err := app.OpenWorkspaceForReport(cmd.Context(), repo)
 			if err != nil {
 				return err
 			}
 			defer ws.Close()
+			// A provider that could not be constructed publishes no detection
+			// row of its own. Those rows are folded in by the coordinator,
+			// before the capability report's own bound is applied: appending
+			// them here pushed Completeness past model.MaxCapabilityStates, a
+			// list IndexStatus.Validate then rejects.
 			status, err := ws.Coordinator().Status(cmd.Context())
 			if err != nil {
 				return err
 			}
-			// A provider that could not be constructed publishes no detection
-			// row of its own; without these the report would simply not mention
-			// a capability the operator asked for, which reads as "fine".
-			status.Completeness = append(status.Completeness, ws.States()...)
 			// The rows are read from the store, and the whole report path was
 			// composed with fetching refused, so nothing here can install the
 			// tool it is reporting on -- a report that installed what it
@@ -165,7 +189,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 				Tools: report(ws.ToolStore(), ws.Resolver().Status(cmd.Context()), nil)}
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {
-				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), data))
+				return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
 			}
 			if err := writeIndexStatus(out, data.Index); err != nil {
 				return err
@@ -183,15 +207,24 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 		Use:   "watch",
 		Short: "Refresh the index as the workspace changes",
 		Long: "Watches the workspace and refreshes the index as it changes, coalescing " +
-			"events over a debounce window and reconciling against the filesystem " +
-			"periodically. A burst larger than the pending bounds collapses to one " +
-			"full reconciliation rather than a partial list of paths, and the " +
-			"workspace lock is held for the whole session: one writer, never two.",
+			"filesystem notifications over index.watch_debounce and reconciling " +
+			"against the filesystem every index.reconcile_interval whether or not " +
+			"anything was notified. A burst larger than index.watch_pending_paths or " +
+			"index.watch_pending_bytes collapses to one full reconciliation rather " +
+			"than a partial list of paths, and a host that cannot notify falls back " +
+			"to the periodic pass alone; `codectx status` reports which of the two is " +
+			"covering the workspace. Work an optional provider deferred keeps " +
+			"publishing for the whole session, and the workspace lock is held " +
+			"throughout: one writer, never two.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ws, err := openWorkspace(cmd, indexLockWait)
+			repo, err := repoFlagValue(cmd)
+			if err != nil {
+				return err
+			}
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
 			if err != nil {
 				return err
 			}
@@ -210,39 +243,139 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 // single envelope when the watch ends -- which, for a session the operator
 // interrupts, is the typed cancellation. Human output is progressive, because
 // a human watching a terminal is the one consumer a stream is for.
+//
+// Every progressive write goes through writeText, and a failed one stops the
+// watch from inside the callback. Watch's callback cannot report an error, and
+// returning one after Watch returns is not enough: Watch only returns when the
+// context ends, so `codectx watch | head -1` would keep indexing into a dead
+// pipe for the rest of the session -- which is the symptom (Section 18.2: a
+// broken stdout pipe fails the command and does not confirm delivery).
 func runWatch(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace) error {
 	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
 	machine := jsonRequested(cmd, args)
+	ctx, stop := context.WithCancel(cmd.Context())
+	defer stop()
 	var refreshes int64
-	err := ws.Coordinator().Watch(cmd.Context(), func(result model.IndexResult) {
+	var writeErr error
+	err := ws.Coordinator().Watch(ctx, func(result model.IndexResult) {
 		refreshes++
-		if machine {
-			fmt.Fprintf(errOut, "refreshed generation=%d health=%s reused=%d built=%d carried=%d invalidated=%d\n",
-				result.Binding.GenerationID, result.Health,
-				result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+		if writeErr != nil {
 			return
 		}
-		fmt.Fprintf(out, "%s  generation %d  %s  reused %d  built %d  carried %d  invalidated %d\n",
-			result.CompletedAt.Format(time.RFC3339), result.Binding.GenerationID, result.Health,
-			result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+		w, line := out, humanRefreshLine(result)
+		if machine {
+			w, line = errOut, machineRefreshLine("refreshed", result)
+		}
+		if err := writeText(w, "%s", line); err != nil {
+			writeErr = err
+			stop()
+		}
 	})
+	// The write failure is the real cause; the cancellation it triggered is
+	// only how the loop was stopped, so it must not mask it.
+	if writeErr != nil {
+		return writeErr
+	}
 	if err != nil {
 		return err
 	}
 	if machine {
-		return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(),
+		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd),
 			map[string]int64{"refreshes": refreshes}))
 	}
 	return writeText(out, "watch stopped after %d %s\n", refreshes, plural(int(refreshes), "refresh", "refreshes"))
 }
 
-// openWorkspace opens the workspace a building command was pointed at.
-func openWorkspace(cmd *cobra.Command, wait time.Duration) (*app.Workspace, error) {
-	repo, err := repoFlagValue(cmd)
-	if err != nil {
-		return nil, err
+// drainIndex publishes the base generation and then runs the deferred queue to
+// empty, which is what makes providers.dependence.enabled = "auto" its
+// documented self in a one-shot run (Section 11.6, ruling Q9).
+//
+// Without this the coordinator is closed the moment the base generation
+// activates, and every unit the base generation deferred is abandoned unbuilt
+// and unreported: the shipped default silently produced no dependence fact at
+// all. There is no new flag, because "do not plan that work" already has a
+// spelling: providers.dependence.enabled = false.
+//
+// Section 18.2's one envelope still holds across the whole run: a --json
+// invocation reports the base generation and each publication on stderr and
+// emits its single envelope, carrying the last generation published, at the
+// end. An interruption is not a failure here -- the base generation is active
+// and every published generation stands -- so the command succeeds and says in
+// a warning how much work is still queued.
+func drainIndex(cmd *cobra.Command, build model.BuildInfo, args []string, ws *app.Workspace, base model.IndexResult) error {
+	out, errOut := cmd.OutOrStdout(), cmd.ErrOrStderr()
+	machine := jsonRequested(cmd, args)
+	if err := emitIndexProgress(cmd, args, base); err != nil {
+		return err
 	}
-	return app.OpenWorkspace(cmd.Context(), repo, wait)
+	ctx, stop := context.WithCancel(cmd.Context())
+	defer stop()
+	latest := base
+	var writeErr error
+	drainErr := ws.Coordinator().Drain(ctx, func(result model.IndexResult) {
+		latest = result
+		if writeErr != nil {
+			return
+		}
+		w, line := out, humanRefreshLine(result)
+		if machine {
+			w, line = errOut, machineRefreshLine("published", result)
+		}
+		if err := writeText(w, "%s", line); err != nil {
+			writeErr = err
+			stop()
+		}
+	})
+	if writeErr != nil {
+		return writeErr
+	}
+	var warnings []string
+	if pending := ws.Coordinator().Pending(); pending.Units > 0 {
+		warnings = append(warnings, fmt.Sprintf("%d deferred %s not built; run `codectx watch` to finish them",
+			pending.Units, plural(pending.Units, "unit is", "units are")))
+	} else if drainErr != nil && !isCanceled(drainErr) {
+		warnings = append(warnings, "the deferred queue stopped early: "+diagnostic(drainErr))
+	}
+	if machine {
+		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), latest, warnings...))
+	}
+	for _, warning := range warnings {
+		if err := writeText(out, "warning     %s\n", warning); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isCanceled reports whether an error is the operator stopping the work, which
+// on the drain path is an expected end and not a defect.
+func isCanceled(err error) bool {
+	var typed *model.Error
+	return errors.Is(err, context.Canceled) || (errors.As(err, &typed) && typed.Code == model.CodeCanceled)
+}
+
+// diagnostic is the product-authored text of a typed failure. Section 20.1
+// keeps source bodies, secrets, environment and raw analyzer output out of
+// ordinary output; a model.Error message is none of those, and a bare code
+// cannot tell an operator what happened.
+func diagnostic(err error) string {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return typed.Code + ": " + typed.Message
+	}
+	return err.Error()
+}
+
+func humanRefreshLine(result model.IndexResult) string {
+	return fmt.Sprintf("%s  generation %d  %s  reused %d  built %d  carried %d  invalidated %d\n",
+		result.CompletedAt.Format(time.RFC3339), result.Binding.GenerationID, result.Health,
+		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
+}
+
+func machineRefreshLine(event string, result model.IndexResult) string {
+	return fmt.Sprintf("%s generation=%d health=%s reused=%d built=%d carried=%d invalidated=%d\n",
+		event, result.Binding.GenerationID, result.Health,
+		result.UnitsReused, result.UnitsBuilt, result.UnitsCarried, result.UnitsInvalidated)
 }
 
 // addRepoFlag declares `--repo` on one command. The flag name is the one
@@ -268,11 +401,21 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 	return v, nil
 }
 
-// emitIndexResult renders one completed run under the single-envelope rule.
+// emitIndexResult renders one completed run under the single-envelope rule. It
+// is the whole of a command that publishes exactly one generation.
 func emitIndexResult(cmd *cobra.Command, build model.BuildInfo, args []string, result model.IndexResult) error {
-	out := cmd.OutOrStdout()
 	if jsonRequested(cmd, args) {
-		return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), result))
+		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, commandName(cmd), result))
+	}
+	return emitIndexProgress(cmd, args, result)
+}
+
+// emitIndexProgress renders one completed run as progress rather than as the
+// result: human output on stdout, and for a --json consumer one log line on
+// stderr, because the envelope that run belongs to has not been written yet.
+func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResult) error {
+	if jsonRequested(cmd, args) {
+		return writeText(cmd.ErrOrStderr(), "%s", machineRefreshLine("indexed", result))
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "generation  %d\nsnapshot    %s\nhealth      %s (%s)\n",
@@ -282,7 +425,7 @@ func emitIndexResult(cmd *cobra.Command, build model.BuildInfo, args []string, r
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeCapabilities(&b, result.Completeness)
-	return writeText(out, "%s", b.String())
+	return writeText(cmd.OutOrStdout(), "%s", b.String())
 }
 
 // writeIndexStatus renders the human status block. Every value is one the

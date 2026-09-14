@@ -15,14 +15,13 @@ import (
 // over it, returning the resolver and the store path it reads. Logs go to
 // stderr (Section 18.2), never to the result stream a --json consumer reads.
 //
-// The resolver is the fetching one: a `tools prefetch` exists to install, and
-// the read-only reports call res.Status, which installs nothing of its own. A
-// composition that must not fetch at all builds its resolver through
-// openResolver instead.
+// The resolver fetches only what `tools.offline` allows: a `tools prefetch`
+// exists to install, and the read-only reports call res.Status, which installs
+// nothing of its own.
 func OpenToolchain(repo string, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	cfg, err := config.Load(repo)
 	if err != nil {
 		return nil, "", err
 	}
-	return openResolver(cfg, stderr, false)
+	return openResolver(cfg, stderr)
 }
