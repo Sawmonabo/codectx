@@ -678,7 +678,7 @@ func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
 	// provider and scope, so the successor cannot be sealed beside the unit it
 	// carries over from. (L1 widens BeginGeneration with a ref parameter; this
 	// call site is listed in the lane report.)
-	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"))
+	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"), "refs/heads/providertest")
 	if err != nil {
 		t.Fatalf("BeginGeneration: %v", err)
 	}

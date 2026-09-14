@@ -1040,6 +1040,7 @@ CREATE TABLE generations (
     id INTEGER PRIMARY KEY,
     repository_id BLOB NOT NULL REFERENCES repositories(id),
     snapshot_id BLOB NOT NULL,
+    ref TEXT NOT NULL CHECK(length(ref) > 0),
     analysis_key BLOB CHECK(analysis_key IS NULL OR length(analysis_key) = 32),
     semantic_config_hash TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('staging','active','superseded','failed')),
@@ -1097,9 +1098,13 @@ CREATE TABLE generation_units (
     provider_id TEXT NOT NULL,
     scope_key TEXT NOT NULL,
     unit_id INTEGER NOT NULL,
+    carried INTEGER NOT NULL CHECK(carried IN (0,1)),
+    distance_generations INTEGER NOT NULL CHECK(distance_generations >= 0),
+    distance_files INTEGER NOT NULL CHECK(distance_files >= 0),
     PRIMARY KEY(generation_id, provider_id, scope_key),
     UNIQUE(generation_id, unit_id),
-    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key)
+    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key),
+    CHECK(carried = 1 OR (distance_generations = 0 AND distance_files = 0))
 ) WITHOUT ROWID;
 CREATE TABLE generation_capabilities (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
@@ -1108,6 +1113,7 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE node_ids (
@@ -1351,6 +1357,7 @@ CREATE TABLE retention_leases (
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
+CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at);
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
