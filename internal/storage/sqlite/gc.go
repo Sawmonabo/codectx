@@ -107,11 +107,23 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 	})
 }
 
-// collectUnreachableUnits deletes, in bounded batches, every non-building unit
-// that no generation selects and no remaining unit depends on. Each pass
-// removes leaves only, so dependencies are deleted after their dependents.
+// collectUnreachableUnits deletes, in bounded batches, every unit that no
+// generation selects, no remaining unit depends on, and nothing is still
+// writing. Each pass removes leaves only, so dependencies are deleted after
+// their dependents.
+//
+// "Nothing is still writing" is the origin run's status, not the unit's state:
+// a unit is only written while its origin run is running (BeginUnit refuses
+// any other run), so a unit left `building` by a run that has already reached
+// a terminal state was abandoned — by a cancelled build that marked it failed
+// and deferred its rows to here, or by a process that died mid-build. The
+// generation such a run belonged to may be gone by then (provider_runs.
+// generation_id is ON DELETE SET NULL), which is exactly the case Abort's
+// generation-scoped query can no longer see, and the orphan-run sweep cannot
+// clear while the unit still references the run.
 func (s *Store) collectUnreachableUnits(ctx context.Context) error {
-	return s.collectUnits(ctx, `SELECT u.id FROM units u WHERE u.state <> 'building'
+	return s.collectUnits(ctx, `SELECT u.id FROM units u JOIN provider_runs pr ON pr.id = u.origin_run_id
+		WHERE (u.state <> 'building' OR pr.status <> 'running')
 		AND NOT EXISTS (SELECT 1 FROM generation_units gu WHERE gu.unit_id = u.id)
 		AND NOT EXISTS (SELECT 1 FROM unit_dependencies ud WHERE ud.dependency_id = u.id) LIMIT ?2`, 0)
 }

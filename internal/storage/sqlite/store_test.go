@@ -151,6 +151,17 @@ func (f *fixture) begin(gen model.GenerationID, run model.ProviderRunID, ff file
 func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, deps ...model.UnitID) model.UnitID {
 	f.t.Helper()
 	w := f.begin(gen, run, ff, deps...)
+	f.fill(w, run, ff)
+	if err := f.s.SealUnit(f.ctx, w); err != nil {
+		f.t.Fatalf("SealUnit(%s): %v", ff.path, err)
+	}
+	return w.UnitID()
+}
+
+// fill writes one node fact, its alias and its search document into a building
+// unit over ff.
+func (f *fixture) fill(w *store.UnitWriter, run model.ProviderRunID, ff fileFixture) {
+	f.t.Helper()
 	key := model.CanonicalNodeKey(ff.path, "F")
 	nodeID := model.NewNodeID(f.repo, model.NodeFunction, key)
 	rng := &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: uint64(len(ff.content)), Line: 1, Column: uint32(len(ff.content))}}
@@ -176,10 +187,6 @@ func (f *fixture) unit(gen model.GenerationID, run model.ProviderRunID, ff fileF
 	if err := w.PutSearchUnits(f.ctx, []model.SearchUnit{f.searchDoc(ff)}); err != nil {
 		f.t.Fatalf("PutSearchUnits: %v", err)
 	}
-	if err := f.s.SealUnit(f.ctx, w); err != nil {
-		f.t.Fatalf("SealUnit(%s): %v", ff.path, err)
-	}
-	return w.UnitID()
 }
 
 func (f *fixture) nodeID(ff fileFixture) model.NodeID {
@@ -731,7 +738,18 @@ func TestStorePublicationScenario(t *testing.T) {
 	run4 := f.run(gen4)
 	// A dependency changes the unit key, so this is a new unit over b.go
 	// rather than a rebuild of the sealed one.
-	f.begin(gen4, run4, b2, unitA)
+	baseline := f.stats()
+	// A build the caller cancelled abandons its unit rather than unwinding it:
+	// the cascading delete is unbounded work the operator is waiting on, so
+	// the rows survive the cancel and Recover is what must reclaim them.
+	w4 := f.begin(gen4, run4, b2, unitA)
+	f.fill(w4, run4, b2)
+	if err := w4.Abandon(ctx); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+	if abandoned := f.stats(); abandoned.NodeFacts != baseline.NodeFacts+1 || abandoned.Evidence != baseline.Evidence+1 || abandoned.SearchUnits != baseline.SearchUnits+1 {
+		t.Fatalf("Abandon deleted the cancelled unit's rows (%+v, from %+v); the cancel path must defer that work to collection", abandoned, baseline)
+	}
 	// An expired lease is exactly the kind of leftover only the collection
 	// tail removes; Recover must run that tail, not just fail the generation.
 	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: genStale, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
@@ -751,6 +769,9 @@ func TestStorePublicationScenario(t *testing.T) {
 	afterRecover := f.stats()
 	if afterRecover.Units != beforeRecover.Units-1 {
 		t.Fatalf("Recover left %d units, want the building unit deleted from %d", afterRecover.Units, beforeRecover.Units)
+	}
+	if afterRecover.NodeFacts != baseline.NodeFacts || afterRecover.Evidence != baseline.Evidence || afterRecover.SearchUnits != baseline.SearchUnits {
+		t.Fatalf("Recover left the abandoned unit's rows behind (%+v, want the pre-build %+v)", afterRecover, baseline)
 	}
 	if afterRecover.Leases != beforeRecover.Leases-1 {
 		t.Fatalf("Recover left %d leases, want the expired lease swept from %d", afterRecover.Leases, beforeRecover.Leases)
