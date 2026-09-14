@@ -41,6 +41,71 @@ func TestWorkflowScenarios(t *testing.T) {
 		// L2 rows
 		// L3 rows
 		// L4 rows
+		// Failure mode: a gate that folds a waiver into readiness grants false
+		// write readiness -- an orchestrator would start writing files nobody
+		// read. Everything §16.3 asks for is arranged here except the waiver,
+		// so the waiver is the only precondition left unsatisfied and the two
+		// readiness booleans must still be false. SessionStatus.Validate:514
+		// refuses the same combination, so this row also proves the evaluator
+		// never has to be caught by the model.
+		{name: "readiness/a required-file waiver alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			// Finish the partly served file and read the waived one too: a
+			// file may be both waived and later read, and only then is
+			// "everything else satisfied" literally true.
+			h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+
+			// A current, non-blocking scope review answering all eight
+			// categories, written straight into the fake because Record is
+			// another lane's surface and this row is about the gate, not about
+			// how an observation is persisted.
+			review := model.ScopeReview{
+				ManifestHash: fixtureID("manifest", "canonical"),
+				ScopeVersion: 1,
+			}
+			for _, c := range []model.ScopeReviewCategory{
+				model.ReviewCompleteFilesRead, model.ReviewCallersConsumers,
+				model.ReviewContractsTypes, model.ReviewStateLifecycle,
+				model.ReviewDependencies, model.ReviewIntegrationPoints,
+				model.ReviewSharedUtilities, model.ReviewRemainingUncertainty,
+			} {
+				review.Entries = append(review.Entries, model.ScopeReviewEntry{
+					Category: c, Note: "read and accounted for in the fixture scope",
+				})
+			}
+			if err := review.Validate(); err != nil {
+				t.Fatalf("the fixture scope review is malformed: %v", err)
+			}
+			obsReq := model.ObservationRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor, ExpectedScope: 1,
+				Kind: model.ObservationScopeReview, Review: &review, Note: "scope reviewed",
+			}
+			fs := h.store.sessions[fixtureSession]
+			fs.obs = append(fs.obs, model.Observation{
+				ID: model.NewObservationID(obsReq), SessionID: fixtureSession, ActorID: fixtureActor,
+				ScopeVersion: 1, Kind: model.ObservationScopeReview, Review: &review,
+				Note: "scope reviewed", CreatedAt: fixtureNow,
+			})
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+			})
+			if err != nil {
+				t.Fatalf("Status: %v (code %q)", err, code(err))
+			}
+			if !st.ScopeComplete || !st.ReadCompleteForSnapshot || st.Superseded {
+				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v read_complete=%v superseded=%v",
+					st.ScopeComplete, st.ReadCompleteForSnapshot, st.Superseded)
+			}
+			if st.RequiredFiles != 4 || st.FullyServedFiles != 4 || st.WaivedFiles != 1 {
+				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/4/1",
+					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
 		// L5 rows
 		// L6 rows
 		// L7 rows
