@@ -35,11 +35,13 @@ type Definition struct {
 	// server's private working directory; there is no other substitution and
 	// no shell.
 	Args []string
-	// RuntimeArgs are arguments of the runtime that hosts the payload, placed
-	// between the runtime executable and the payload itself. A JVM option
-	// after `-jar` is an application argument, not a JVM option, so a payload
-	// the managed JDK hosts has no other way to ask for one. It is meaningful
-	// only for a runtime-hosted payload, which Resolve enforces.
+	// RuntimeArgs are arguments of the runtime that hosts the *pinned* payload,
+	// placed between the runtime executable and the payload itself. A JVM
+	// option after `-jar` is an application argument, not a JVM option, so a
+	// payload the managed JDK hosts has no other way to ask for one. They
+	// belong to the managed launch only: an override replaces the binary and
+	// never the invocation, so no runtime is composed around it and there is
+	// nothing for them to configure (see Profile.runtimeArgs).
 	RuntimeArgs []string
 	// EnvAllowlist names the parent variables the server may see. The child's
 	// environment is exactly these (those the parent actually has) plus the
@@ -214,12 +216,13 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 		}
 		return Profile{}, err
 	}
-	// RuntimeArgs only mean anything when a runtime hosts the payload, which is
-	// exactly when the resolved prefix carries more than the executable. A
-	// definition that sets them for a directly executable payload would pass
-	// them to the payload as its own arguments; that is a product defect, not a
-	// condition a user can correct.
-	if len(def.RuntimeArgs) > 0 && len(t.ArgvPrefix) < 2 {
+	// RuntimeArgs only mean anything when a runtime hosts the payload, which for
+	// a managed payload is exactly when the resolved prefix carries more than
+	// the executable. A pinned definition that sets them for a directly
+	// executable payload could not start as written; that is a product defect,
+	// not a condition a user can correct. An override is exempt: it is always a
+	// bare executable by construction, and runtimeArgs drops them for it.
+	if len(def.RuntimeArgs) > 0 && t.Source == toolchain.SourceManaged && len(t.ArgvPrefix) < 2 {
 		return Profile{}, internalError("language server %q declares runtime arguments but its payload is not runtime-hosted", name)
 	}
 	return Profile{Definition: def, Tool: t}, nil
@@ -239,13 +242,25 @@ func (p Profile) workDir(dataDir string) string {
 func (p Profile) argv(inputDir, workDir string) (path string, args []string) {
 	prefix := p.Tool.ArgvPrefix
 	// RuntimeArgs precede the payload the runtime hosts, never follow it.
-	args = append(append([]string(nil), p.RuntimeArgs...), prefix[1:]...)
+	args = append(append([]string(nil), p.runtimeArgs()...), prefix[1:]...)
 	for _, a := range p.Args {
 		a = strings.ReplaceAll(a, substitutionInput, inputDir)
 		a = strings.ReplaceAll(a, substitutionWorkDir, workDir)
 		args = append(args, a)
 	}
 	return prefix[0], args
+}
+
+// runtimeArgs are the runtime arguments this launch actually uses: the
+// definition's for the managed payload, none for a user override. An override
+// is run directly, with no managed runtime composed around it, so a JVM option
+// would reach it as one of its own arguments. It is a method rather than a
+// field read so argv and inputDigest cannot disagree about what was passed.
+func (p Profile) runtimeArgs() []string {
+	if p.Tool.Source != toolchain.SourceManaged {
+		return nil
+	}
+	return p.RuntimeArgs
 }
 
 // env builds the child's complete environment: the allowlisted parent
@@ -315,6 +330,6 @@ func inputDigest(snap model.Snapshot, p Profile, serverVersion, encoding string)
 	h.AddString(serverVersion)
 	h.AddString(encoding)
 	h.AddString(strings.Join(p.Args, "\x00"))
-	h.AddString(strings.Join(p.RuntimeArgs, "\x00"))
+	h.AddString(strings.Join(p.runtimeArgs(), "\x00"))
 	return h.Sum()
 }
