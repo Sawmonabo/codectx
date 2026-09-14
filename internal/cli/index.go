@@ -75,7 +75,7 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, req.Rebuild)
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait, Rebuild: req.Rebuild})
 			if err != nil {
 				return err
 			}
@@ -137,7 +137,7 @@ func newRefreshCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
 			if err != nil {
 				return err
 			}
@@ -233,7 +233,7 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, indexLockWait, false)
+			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
 			if err != nil {
 				return err
 			}

@@ -124,6 +124,7 @@ func TestCommandEnvelope(t *testing.T) {
 		// that is not a workspace, so a check that ran after the open would fail
 		// on the workspace (exit 3) instead of on the flag.
 		{name: "context advance without the version guard", args: []string{"context", "advance", hexID, "consolidate", "--actor", "agent-a", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context advance", errCode: "CTX_ARGUMENT_INVALID"},
+		// L4 rows
 	}
 
 	for _, tc := range tests {
