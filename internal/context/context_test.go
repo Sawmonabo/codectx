@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -666,6 +667,56 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "a lexical or changed-file seed never enters the required_full prefix",
+			// Guards Section 15.2 and ruling Q7: only a named identity is
+			// required in full. Promoting a merely lexical hit or a captured
+			// change makes it mandatory full reading for Task 16's coverage
+			// gate -- a required entry is never demoted or dropped later -- and
+			// reorders the manifest, because Requirement is the first Section
+			// 15.3 tie-break key. Nothing fails when this breaks; the actor is
+			// simply told to read whole files the task never named.
+			run: func(t *testing.T, fx *contextFixture) {
+				lexical := fx.seedOf("internal/order/handler.go")
+				lexical.NodeID, lexical.Origin = "", originLexical
+				lexical.Requirement = model.RequirementRecommended
+				changed := fx.seedOf("internal/order/service.go")
+				changed.NodeID, changed.Origin = "", originChangedFile
+				changed.Requirement = model.RequirementOptional
+
+				// No seed resolves a symbol, so no boundary can be walked: this
+				// is the discovery answer of ruling Q7, not an implementation
+				// plan, and it must hold no required entry at all.
+				res, err := expandScope(fx.ctx, fx.scopeEngine(nil, fixtureCapabilities), fx.Gen,
+					fx.Cfg.Context, []candidate{lexical, changed}, fixtureCapabilities)
+				if err != nil {
+					t.Fatalf("expandScope: %v", err)
+				}
+				if res.ScopeComplete {
+					t.Fatal("a scope that resolved no boundary reported complete scope")
+				}
+				for _, want := range []struct {
+					path string
+					req  model.Requirement
+				}{
+					{"internal/order/handler.go", model.RequirementRecommended},
+					{"internal/order/service.go", model.RequirementOptional},
+				} {
+					got, ok := requirementFor(t, res, want.path)
+					if !ok {
+						t.Fatalf("scope dropped the seed %q", want.path)
+					}
+					if got.Requirement != want.req {
+						t.Fatalf("seed %q requirement = %q, want %q", want.path, got.Requirement, want.req)
+					}
+				}
+				for _, c := range res.Candidates {
+					if c.Requirement == model.RequirementFull {
+						t.Fatalf("%q entered the required_full prefix on a discovery answer", c.Path)
+					}
+				}
+			},
+		},
 		// L3 RANK rows
 		{
 			// Guards the Section 15.3 path contribution: the product of
@@ -739,28 +790,48 @@ func TestContextCompilerScenario(t *testing.T) {
 					fx.Node("internal/order/service.go"))
 				// The fixture seals node evidence only, so this edge has no
 				// evidence row and must take the heuristic multiplier.
-				rels := map[model.RelationID]model.Relation{edge: {ID: edge,
-					From: fx.Node("internal/order/handler.go"), Kind: model.RelCalls,
-					To: fx.Node("internal/order/service.go")}}
+				second := model.NewRelationID(fx.Repo, fx.Node("internal/order/handler.go"), model.RelImports,
+					fx.Node("internal/order/service.go"))
+				rels := map[model.RelationID]model.Relation{
+					edge: {ID: edge, From: fx.Node("internal/order/handler.go"), Kind: model.RelCalls,
+						To: fx.Node("internal/order/service.go")},
+					// A weaker second route to the same entity: it cannot raise
+					// the maximum, and with one retained path it is the route
+					// MorePaths must disclose.
+					second: {ID: second, From: fx.Node("internal/order/handler.go"), Kind: model.RelImports,
+						To: fx.Node("internal/order/service.go")},
+				}
 
 				cands := []candidate{
 					{FileID: impl.ID, Path: impl.Path, Requirement: model.RequirementFull,
 						Origin: originExplicitSeed, Status: impl.Status},
 					{NodeID: fx.Node("internal/order/handler.go"), FileID: caller.ID, Path: caller.Path,
 						Requirement: model.RequirementRecommended, Origin: originExpansion, Depth: 1,
-						Status: caller.Status, Paths: []model.RelationPath{{Relations: []model.RelationID{edge}}}},
+						Status: caller.Status, Paths: []model.RelationPath{
+							{Relations: []model.RelationID{edge}},
+							{Relations: []model.RelationID{second}},
+						}},
 					{NodeID: "n2", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
 					{NodeID: "n3", Path: "a.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
 					{NodeID: "n1", Path: "b.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
 					{NodeID: "n1", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
 				}
-				ranked, err := (&Compiler{cfg: fx.Cfg}).rank(fx.ctx, reader, cands, rels)
+				// One retained path, so the second admitted route can only be
+				// disclosed as a count.
+				cfg := fx.Cfg
+				cfg.Context.MaxReasonPathsPerEntry = 1
+				ranked, err := (&Compiler{cfg: cfg}).rank(fx.ctx, reader, cands, rels)
 				if err != nil {
 					t.Fatalf("rank: %v", err)
 				}
+				// rank scores but does not order: buildPlan rewrites Path and
+				// sorts, so the tie-break chain is asserted over the same total
+				// order the plan applies.
+				sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].less(ranked[j]) })
 
-				// Seed 1_000_000 + captured change 120_000 + one walked edge of
-				// package centrality 5_000; caller 405_000 + that same 5_000.
+				// Seed 1_000_000 + captured change 120_000 + two walked edges of
+				// package centrality 10_000; caller 405_000 (the stronger call
+				// route, never a sum over both) + that same 10_000.
 				// The optional candidates sit in the repository root, which this
 				// compile walked no edge in, so they score nothing at all and the
 				// tie-break chain alone decides their order.
@@ -770,8 +841,8 @@ func TestContextCompilerScenario(t *testing.T) {
 					score int64
 				}
 				expect := []want{
-					{impl.Path, "", 1_125_000},
-					{caller.Path, fx.Node("internal/order/handler.go"), 410_000},
+					{impl.Path, "", 1_130_000},
+					{caller.Path, fx.Node("internal/order/handler.go"), 415_000},
 					{"a.go", "n3", 0},
 					{"a.go", "n1", 0},
 					{"a.go", "n2", 0},
@@ -790,11 +861,17 @@ func TestContextCompilerScenario(t *testing.T) {
 						t.Fatalf("rank[%d] carries %d reasons, over the bound %d", i, len(got.Reasons), model.MaxReasonsPerEntry)
 					}
 				}
-				// One admitted route, one route retained: nothing is hidden in
-				// MorePaths that the entry could have explained.
-				if ranked[1].MorePaths != 0 || len(ranked[1].Paths) != 1 {
-					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 0",
+				// Two admitted routes, one retained: the route the manifest
+				// cannot enumerate must still be disclosed. model.ContextEntry
+				// has no other channel for the count, so a bounded reason
+				// carrying it is what keeps the entry from reading as an
+				// unexplained selection.
+				if ranked[1].MorePaths != 1 || len(ranked[1].Paths) != 1 {
+					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 1",
 						len(ranked[1].Paths), ranked[1].MorePaths)
+				}
+				if !slices.Contains(ranked[1].Reasons, "1 further route(s) reach this entity and are not enumerated") {
+					t.Fatalf("the unenumerated route was never disclosed: %q", ranked[1].Reasons)
 				}
 			},
 		},
@@ -1391,7 +1468,7 @@ func (f *contextFixture) seedOf(path string) candidate {
 	f.t.Helper()
 	fv := f.File(path)
 	return candidate{NodeID: f.Node(path), FileID: fv.ID, Path: path,
-		Kind: model.NodeFunction, Origin: originExplicitSeed, Status: fv.Status}
+		Requirement: model.RequirementFull, Origin: originExplicitSeed, Status: fv.Status}
 }
 
 // requirementFor finds the candidate whose path names the artifact at path.
