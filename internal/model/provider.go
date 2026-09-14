@@ -295,7 +295,7 @@ func (c CapabilityState) WithDetail(key, value string) CapabilityState {
 	}
 	details := make(map[string]string, len(c.Details)+1)
 	maps.Copy(details, c.Details)
-	details[key] = truncateUTF8(value, MaxDetailBytes)
+	details[key] = TruncateDetail(value)
 	c.Details = details
 	return c
 }

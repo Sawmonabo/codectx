@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // serverState is the lifecycle of one language server process.
@@ -135,6 +136,16 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		mat.Close()
 		return nil, unavailable("language server %q work directory cannot be created: %v", p.Name, err)
 	}
+	if p.Name == serverJDTLS && p.Tool.Source == toolchain.SourceManaged {
+		// The one payload that needs a private copy of something out of the
+		// store before it can start; see seedPlatformConfig. An override has no
+		// store payload to seed from -- it replaces the binary and owns its own
+		// launch -- so the copy is the managed payload's alone.
+		if err := seedPlatformConfig(p.Tool.Root, workDir); err != nil {
+			mat.Close()
+			return nil, err
+		}
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.runCancel = cancel
 	path, args := p.argv(mat.Root(), workDir)
@@ -236,6 +247,14 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 		return outputInvalid("the language server chose position encoding %q, which this client did not offer", truncate(wire, 32))
 	}
 	s.enc = enc
+	// A server that declines to name itself is still identified by the payload
+	// the lock pinned: pyright and typescript-language-server both answer
+	// initialize with no serverInfo at all (measured), and an empty
+	// ProviderVersion fails OverlayBinding.Validate, which made the overlay
+	// permanently unavailable for python, typescript, tsx and javascript with
+	// an error in the argument class. The *reported* string keeps feeding
+	// inputDigest unchanged, so a payload that starts reporting a version later
+	// is still a different question.
 	version := ""
 	if result.ServerInfo != nil {
 		version = result.ServerInfo.Version
@@ -253,7 +272,7 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	s.sync = opensDocuments(c.TextDocumentSync)
 	s.binding = model.OverlayBinding{
 		ProviderID:      "lsp:" + s.profile.Name,
-		ProviderVersion: serverVersion(version),
+		ProviderVersion: serverVersion(version, s.profile.Tool.Version),
 		InputDigest:     inputDigest(snap, s.profile, version, wire),
 	}
 	if err := s.binding.Validate(); err != nil {
