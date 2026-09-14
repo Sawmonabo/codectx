@@ -382,6 +382,83 @@ func TestGraphScenarios(t *testing.T) {
 		},
 
 		// L3 IMPACT rows
+		{
+			// Protects the Section 14.3 entry contract: an impact answer whose
+			// entries carry no reason, or no incoming/outgoing discriminator, is
+			// an unexplained ranking a caller cannot act on -- and a cyclic graph
+			// (n-a -> n-b -> n-c -> n-a) that admits a node twice would double the
+			// same symbol and inflate its apparent impact. It also holds the
+			// deferred-dependence disclosure, which no completed real index can
+			// produce (the run drains the deferred queue), so this fixture is its
+			// only proof.
+			name: "impact entries are explained, directed and deduplicated across a cycle",
+			run: func(t *testing.T, f *graphFixture) {
+				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				res, err := engine.Impact(context.Background(), model.ImpactRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-a")},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("Impact: %v", err)
+				}
+				if len(res.Entries) == 0 {
+					t.Fatal("Impact returned no entries; the fixture reaches n-b, n-c and the hub from n-a")
+				}
+				seen := map[model.NodeID]bool{}
+				for _, entry := range res.Entries {
+					if seen[entry.NodeID] {
+						t.Errorf("node %q appears twice; the cycle admitted it more than once", entry.NodeID)
+					}
+					seen[entry.NodeID] = true
+					if entry.NodeID == fixtureNodeID("n-a") {
+						t.Error("the seed n-a is reported as affected by its own change")
+					}
+					if len(entry.Reasons) == 0 {
+						t.Errorf("entry %q carries no reason", entry.NodeID)
+					}
+					if entry.Direction != model.DirectionOutgoing {
+						t.Errorf("entry %q direction = %q, want the outgoing discriminator",
+							entry.NodeID, entry.Direction)
+					}
+					// Every reason must end in the direction and the depth of the
+					// edge that contributed it; a reason naming neither is an
+					// unexplained ranking.
+					for _, reason := range entry.Reasons {
+						named := false
+						for depth := 0; depth <= fixtureLimits().MaxDepth; depth++ {
+							want := fmt.Sprintf("(outgoing, depth %d)", depth)
+							if len(reason) >= len(want) && reason[len(reason)-len(want):] == want {
+								named = true
+							}
+						}
+						if !named {
+							t.Errorf("entry %q reason %q names no direction and depth", entry.NodeID, reason)
+						}
+					}
+				}
+				if !seen[fixtureNodeID("n-c")] {
+					t.Error("n-c is missing; it is reachable only through the cycle")
+				}
+				// The default impact allowlist includes reads and writes, so the
+				// deferred dependence row must be disclosed unchanged and the
+				// answer must not claim to be exhaustive.
+				if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDependence {
+					t.Errorf("meta = (%v, %q), want truncated with %q",
+						res.Meta.Truncated, res.Meta.TruncationReason, reasonDependence)
+				}
+				if len(res.Meta.Completeness) != 1 {
+					t.Fatalf("completeness rows = %d, want the one deferred dependence row", len(res.Meta.Completeness))
+				}
+				row := res.Meta.Completeness[0]
+				if row.State != model.CapabilityUnavailable || row.DiagnosticCode != model.CodeProviderUnavailable ||
+					row.Details["reason"] != "units_deferred" {
+					t.Errorf("deferred row = %+v, want it copied unchanged from the capability report", row)
+				}
+			},
+		},
 
 		// L5 CURSOR rows
 		{name: "resumed page keeps the cumulative budget, neither reset nor doubled", run: func(t *testing.T, f *graphFixture) {
