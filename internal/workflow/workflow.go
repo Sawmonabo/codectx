@@ -229,13 +229,6 @@ func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
-// errUnimplemented is the placeholder body of every declaration L0 froze and a
-// fill-in lane owns. It is a typed CTX_INTERNAL rather than a panic so a lane
-// that lands before its siblings cannot crash the process it is wired into.
-func errUnimplemented(op string) error {
-	return typedErrf(model.CodeInternal, "workflow: %s is not implemented", op)
-}
-
 // --- shared unexported surface: names frozen by L0, bodies owned by a lane ---
 
 // gate is one readiness evaluation. It is the single value Advance, Status and
@@ -269,22 +262,16 @@ const canonicalCapsuleDomain = "codectx.capsule.canonical.v1"
 // state that produces it. Owned by L5.
 var errNotConsolidating = errors.New("capsule is produced only while consolidate is open")
 
-// --- Also frozen by L0; implemented in files this package does not own -------
+// --- what wires this package to the rest of the system ----------------------
 //
-// These signatures are recorded here as the map of what wires Task 17 together.
-// Changing one of them is a controller question, not a lane decision.
+// Sessions above is satisfied by *sqlite.Store. The three methods Task 17 added
+// to it live in internal/storage/sqlite/state.go (RangeConfirmed,
+// SessionFilePaths, Waivers) and are append-only there.
 //
-//	// internal/storage/sqlite/state.go -- L6 owns; APPEND ONLY, no existing method is edited
-//	func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
-//	        file model.FileID, hash string, r model.ByteRange) (bool, error)
-//	func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
-//	        ids []model.FileID) (map[model.FileID]string, error)
-//
-//	// internal/app/compose.go + workspace.go -- INT owns
-//	func (s *stack) openWorkflow() error            // openQueries-style; workflow.New(...) onto the stack
-//
-//	// internal/app/overlay.go -- L8 owns (new file)
-//	func (s *stack) overlaySymbols(ctx context.Context, req model.SymbolRequest) (model.Page[model.Node], error)
-//	func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
-//
-//	// internal/cli/context.go -- L9 owns; newContextCommands already exists and INT adds no root.go line
+// internal/app composes the service: (*stack).openWorkflow builds it after the
+// context compiler exists, resolves Limits from configuration and supplies the
+// Validator, which asks the repository's ACTIVE generation's snapshot whether a
+// pinned content hash is still current -- asking the session's own immutable
+// snapshot would compare a row with itself. internal/app/services.go is the
+// facade every product adapter drives this package through; nothing else calls
+// it directly.
