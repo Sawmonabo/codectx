@@ -44,7 +44,7 @@ Two wave-A importers produce deltas at two different granularities, and
 | Producer | Delta unit | What the applier names |
 |---|---|---|
 | `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
-| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — **planned (Task 12)**: the storage side below is shipped, but no `neo4jcsv` path calls `PutKeyedNodes`/`PutKeyedRelations` yet, so its units store no keys and only their retention buckets can replace them. The adoption is its own lane |
+| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — shipped: `emitNodes`/`emitRelations` hand every key behind each fact to `PutKeyedNodes`/`PutKeyedRelations` (`fact_keys` holds one row per key), and `KeySet.Diff` yields the replaced set; the applier that passes it to `CarryOver` is Task 12's. |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
 survivors. For both importers that is a handful of entries against tens of
