@@ -244,7 +244,7 @@ func ambiguousName(name string, candidates []sqlite.StoredNode) error {
 		shown, more = shown[:maxAmbiguousCandidates], true
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d nodes carry this name", len(shown))
+	fmt.Fprintf(&b, "%d nodes carry this name", len(candidates))
 	if more {
 		fmt.Fprintf(&b, " (showing the first %d)", maxAmbiguousCandidates)
 	}

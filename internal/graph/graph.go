@@ -78,7 +78,9 @@ type Options struct {
 	// Signer is nil when continuations are not offered; a request that asks to
 	// page without one is answered as truncated with no NextCursor.
 	Signer *pagination.Signer
-	// Spools holds traversal state that overflows Limits.FrontierBytes. The
+	// Spools holds the frontier and visited set a continuation resumes from.
+	// It is NOT an overflow area for Limits.FrontierBytes: a level that reaches
+	// that ceiling stops reading and the answer says so. The
 	// frozen strategy is ONE FRESH SPOOL PER PAGE: pagination.Spools.Open
 	// replays every record from the start and cannot seek, so a replay-and-skip
 	// continuation would cost O(pages x records) and re-read a growing spool on
@@ -99,7 +101,10 @@ type Options struct {
 type Limits struct {
 	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
 	QueryTimeout, CursorTTL                                      time.Duration
-	FrontierBytes                                                int64
+	// FrontierBytes caps the edges one frontier level may hold at once,
+	// estimated by edgeRowBytes. A level that reaches it stops reading and the
+	// answer is truncated with reasonFrontierBytes.
+	FrontierBytes int64
 }
 
 // Engine answers graph queries against one pinned generation. One Engine is
@@ -158,14 +163,6 @@ func New(o Options) (*Engine, error) {
 	}, nil
 }
 
-// notImplemented is the typed stub every operation returns until its owning
-// lane lands its body. It is CTX_INTERNAL because reaching it is a defect in
-// this package, never a caller error.
-func notImplemented(op string) error {
-	return (&model.Error{Code: model.CodeInternal,
-		Message: "graph operation is not implemented"}).WithDetail("operation", op)
-}
-
 // Neighbors, Callers and Callees live in traverse.go.
 
 // References is implemented in references.go (lane L7).
@@ -185,6 +182,24 @@ type frontierState struct {
 type budget struct {
 	visited, edges int64
 	deadline       time.Time
+	// now is the engine clock the deadline was measured on. A budget whose
+	// deadline comes from e.now() must be compared against e.now(): mixing in
+	// time.Now would make a test clock's deadline either unreachable or
+	// already past. Nil means time.Now, for a budget built without a clock.
+	now func() time.Time
+	// frontierHit records that levelEdges stopped accumulating because the
+	// frontier byte budget was spent. The walk itself is a clean finish; the
+	// caller turns this into the truncation reason, because only it owns the
+	// answer's meta.
+	frontierHit bool
+}
+
+// clock is the budget's own clock, defaulting to time.Now.
+func (b *budget) clock() time.Time {
+	if b.now == nil {
+		return time.Now()
+	}
+	return b.now()
 }
 
 // expandOptions configures one batched walk.
@@ -194,6 +209,13 @@ type expandOptions struct {
 	MaxDepth  int
 	Budget    *budget
 	BatchSize int
+	// FrontierBytes is Limits.FrontierBytes: the ceiling on the edges one
+	// frontier level may hold in memory at once. A level that reaches it stops
+	// reading and the walk is reported as truncated for that reason, rather
+	// than accumulating a whole hub's fan-out with no bound in front of it.
+	// Zero leaves the accumulation unbounded and is only reachable from a test
+	// that builds expandOptions directly.
+	FrontierBytes int64
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

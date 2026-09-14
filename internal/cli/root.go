@@ -82,6 +82,13 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 		return typed
 	}
 	fmt.Fprintln(root.ErrOrStderr(), "Error:", typed.Message)
+	if typed.Remediation != "" {
+		// The remediation is where a rejection puts what the operator has to act
+		// on -- the candidate ids of an ambiguous name, the key to raise. On the
+		// --json path it rides in the envelope; without this line the text path
+		// is the only consumer that is told less.
+		fmt.Fprintln(root.ErrOrStderr(), " ", typed.Remediation)
+	}
 	return typed
 }
 

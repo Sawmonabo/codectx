@@ -18,8 +18,8 @@ name**.
 A name is resolved against the pinned generation: the exact `name` first, the
 exact `qualified_name` second. A name that no node carries, and a name that
 several nodes carry, are both `CTX_ARGUMENT_INVALID`; the ambiguous case names
-up to sixteen candidate ids in its remediation (visible in the `--json`
-envelope) so the caller can pick one. Nothing is ever resolved to the first
+up to sixteen candidate ids in its remediation, printed under the error on the
+text path and carried in the `--json` envelope, so the caller can pick one. Nothing is ever resolved to the first
 candidate silently — the candidates are different symbols, and answering about
 the wrong one is a wrong answer the caller cannot detect.
 
@@ -56,15 +56,17 @@ evidence row behind it.
 | `--timeout` | all | Deadline for this invocation. Zero leaves the configured query deadline in charge. |
 | `--limit` | all but `path` | Items in one page. |
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Maximum distinct nodes the walk may admit. |
+| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. |
 
 **Today only `refs` issues a continuation.** `callers`, `callees` and `impact`
 answer in a single bounded page and report truncation with no `next` token; a
 `--cursor` handed to one of them is refused with `CTX_CURSOR_INVALID` rather
 than silently restarting the walk from its seeds, which would double-spend the
-cumulative budget the cursor exists to carry.
-| `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Maximum distinct nodes the walk may admit. |
-| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. |
+cumulative budget the cursor exists to carry. `path` is not paged at all: it
+declares neither `--limit` nor `--cursor`, and its `--visited` budget is spent
+by the one search it runs.
 
 **Zero is not "unlimited".** A zero budget takes the configured default, and a
 positive value may narrow that default but never widen it. The visited and edge
@@ -88,11 +90,11 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_depth` | Default and ceiling for `--depth`. |
 | `context.max_visited_nodes` | Default and ceiling for `--visited`. |
 | `context.max_graph_edges` | Default and ceiling for `--edges`. |
-| `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns, and reason paths per `impact` entry. |
+| `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | Frontier and visited-set budget before a traversal spills to a spool. |
+| `resources.query_memory_bytes` | Ceiling on the edges one frontier level of a traversal may hold at once. A level that reaches it stops reading, and the answer is truncated with `frontier memory budget exhausted` rather than accumulating a hub without a bound. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. |
 
 See [Configuration](configuration.md) for the full tables.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sort"
 	"strconv"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -19,7 +18,23 @@ const (
 	reasonVisitedBudget = "visited node budget exhausted"
 	reasonPageFull      = "page item limit reached"
 	reasonDependence    = "dependence units are still building"
+	reasonFrontierBytes = "frontier memory budget exhausted"
 )
+
+// edgeRowOverheadBytes is the fixed per-row cost of holding one edge of a
+// frontier level in memory: the edgeRow struct, its model.Relation, the string
+// headers inside both, and the map entry that records the relation as
+// collected. It is a deliberately conservative ESTIMATE rather than a
+// measurement -- Limits.FrontierBytes is a ceiling on memory, and an estimate
+// that reads low would let the ceiling be crossed before the walk noticed.
+const edgeRowOverheadBytes = 256
+
+// edgeRowBytes estimates what one edgeRow costs, adding the identifiers it
+// actually carries to the fixed overhead.
+func edgeRowBytes(r edgeRow) int64 {
+	return edgeRowOverheadBytes + int64(len(r.owner.Node)+len(r.owner.Via)+
+		len(r.rel.ID)+len(r.rel.From)+len(r.rel.To)+len(r.rel.Kind)+len(r.neighbor))
+}
 
 // expand is the ONE batched BFS. visit is called once per admitted edge in the
 // frozen (depth asc, NodeID asc) order and may return errStopExpansion to end
@@ -88,6 +103,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		if err != nil {
 			return err
 		}
+		// A level that spent the frontier budget is still emitted -- the edges
+		// it did read are facts -- but the walk stops after it rather than
+		// expanding a level it knows is incomplete.
 
 		var next []frontierState
 		for _, row := range rows {
@@ -111,6 +129,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 				Via:   row.rel.ID,
 			})
 		}
+		if o.Budget.frontierHit {
+			return nil
+		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
 	}
@@ -132,8 +153,12 @@ type edgeRow struct {
 // never with the frontier itself.
 func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level map[model.NodeID]frontierState,
 	o expandOptions, batch int, admittedRel map[model.RelationID]bool) ([]edgeRow, error) {
-	var rows []edgeRow
+	var (
+		rows  []edgeRow
+		spent int64
+	)
 	collected := map[model.RelationID]bool{}
+chunks:
 	for start := 0; start < len(nodes); start += batch {
 		end := start + batch
 		if end > len(nodes) {
@@ -160,12 +185,28 @@ func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level ma
 					// to an arbitrary node would invent a path.
 					continue
 				}
+				row := edgeRow{owner: owner, rel: rel, neighbor: neighbor}
+				if o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
+					// The level does not fit in the configured frontier budget.
+					// Stopping here and disclosing it is the honest answer; the
+					// alternative is accumulating an unbounded hub in memory
+					// under a bound the configuration says exists.
+					o.Budget.frontierHit = true
+					break chunks
+				}
+				spent += edgeRowBytes(row)
 				collected[rel.ID] = true
-				rows = append(rows, edgeRow{owner: owner, rel: rel, neighbor: neighbor})
+				rows = append(rows, row)
 			}
-			if len(page) < batch {
+			if len(page) == 0 {
 				break
 			}
+			// A short page is NOT exhaustion: Adjacency.Edges promises "at
+			// most limit rows", and the shipped reader clamps any limit above
+			// model.MaxPageItems down to it, so a full frontier chunk returns
+			// fewer rows than asked for on every page. Only an EMPTY page ends
+			// the keyset walk; the advance below is what makes the next one
+			// reachable.
 			after = page[len(page)-1].ID
 		}
 	}
@@ -217,7 +258,7 @@ func checkWalk(ctx context.Context, b *budget) error {
 		}
 		return &model.Error{Code: model.CodeQueryDeadline, Message: "graph traversal exceeded its deadline"}
 	}
-	if !b.deadline.IsZero() && !time.Now().Before(b.deadline) {
+	if !b.deadline.IsZero() && !b.clock().Before(b.deadline) {
 		return &model.Error{Code: model.CodeQueryDeadline, Message: "graph traversal exceeded its deadline"}
 	}
 	return nil
@@ -327,7 +368,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 	// past the request deadline is the resource limit the caller must see, and
 	// every adjacency round trip below runs under Section 3's per-request
 	// deadline rather than only being checked between expansion steps.
-	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
+	deadline := e.now().Add(e.limits.QueryTimeout)
+	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {
@@ -351,7 +393,10 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 		return model.GraphResult{}, err
 	}
 
-	b := &budget{deadline: e.now().Add(e.limits.QueryTimeout)}
+	// The walk's deadline is the SAME instant the context carries, taken before
+	// the gate wait: a deadline recomputed after it would outlive the request's
+	// own by however long the wait took.
+	b := &budget{deadline: deadline, now: e.now}
 	var (
 		relations  []model.Relation
 		walkReason string
@@ -378,11 +423,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 		return nil
 	}
 	if err := expand(ctx, e.adjacency, req.Start, expandOptions{
-		Direction: dir,
-		Kinds:     kinds,
-		MaxDepth:  maxDepth,
-		Budget:    b,
-		BatchSize: adjacencyBatch,
+		Direction:     dir,
+		Kinds:         kinds,
+		MaxDepth:      maxDepth,
+		Budget:        b,
+		BatchSize:     adjacencyBatch,
+		FrontierBytes: e.limits.FrontierBytes,
 	}, visit); err != nil {
 		return model.GraphResult{}, err
 	}
@@ -398,6 +444,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, dir model
 	}
 
 	reason := walkReason
+	// A level cut short by the frontier budget is truncation the caller must
+	// see; the visitor's own reason is more specific, so it wins when both hold.
+	if reason == "" && b.frontierHit {
+		reason = reasonFrontierBytes
+	}
 	if reason == "" && len(pending) > 0 {
 		reason = reasonDependence
 	}
