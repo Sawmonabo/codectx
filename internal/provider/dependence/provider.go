@@ -769,7 +769,7 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
-	a.Keys = KeySet{}
+	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
 			a.UnknownLabels = map[string]int{}
