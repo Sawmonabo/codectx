@@ -114,6 +114,16 @@ func TestCommandEnvelope(t *testing.T) {
 		// CTX_TOOL_OFFLINE. What this row does pin is that the command never
 		// reaches an empty page on the lsp route.
 		{name: "symbol on the lsp overlay without a profile", args: []string{"symbol", "writeSymbolTable", "--semantic-source", "lsp", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "symbol", errCode: "CTX_ARGUMENT_INVALID"},
+		// `context advance` is the guarded transition of Section 17.1, and the
+		// guard is the version the caller presents. An omitted --expected-version
+		// arrives as zero, which is not "the configured default" the budget flags
+		// of this package use but a version no session can ever have: accepting
+		// it would turn a compare-and-swap into an unconditional write, which is
+		// exactly the lost update the guard exists to prevent. The rejection also
+		// has to happen before a workspace is opened -- this row points at a path
+		// that is not a workspace, so a check that ran after the open would fail
+		// on the workspace (exit 3) instead of on the flag.
+		{name: "context advance without the version guard", args: []string{"context", "advance", hexID, "consolidate", "--actor", "agent-a", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context advance", errCode: "CTX_ARGUMENT_INVALID"},
 	}
 
 	for _, tc := range tests {
@@ -311,6 +321,18 @@ func TestExitCodeClasses(t *testing.T) {
 			name: "cancellation on its own",
 			err:  &model.Error{Code: model.CodeCanceled, Message: "canceled"},
 			want: 7,
+		},
+		{
+			// The gate `context advance` consults is the Section 16.3 read gate:
+			// advancing to consolidate is refused while required files are not
+			// fully served to this actor. That refusal is CTX_COVERAGE_INCOMPLETE,
+			// and it belongs to the exit-6 "policy/read/scope/freshness gate not
+			// ready" class, NOT to exit 1 or to the exit-2 class a bare untyped
+			// error falls into: an agent that read "you typed the command wrong"
+			// there would retry the flags instead of reading the files it owes.
+			name: "the read gate refusing a transition is not a command-line error",
+			err:  &model.Error{Code: model.CodeCoverageIncomplete, Message: "required files are not fully served"},
+			want: 6,
 		},
 		{
 			name: "an unrecognized code is a defect, not a guess",
