@@ -354,7 +354,10 @@ func newContextStatusCommand(build model.BuildInfo) *cobra.Command {
 			// QueryMeta would print a generation and snapshot nobody reported.
 			data := contextStatus{Session: status, Files: files}
 			return emitQuery(cmd, build, args, data, files.Meta, func(b *strings.Builder) {
-				writeSessionStatus(b, status)
+				// The body only: emitQuery's header already printed this
+				// answer's generation and snapshot, and the session pins the
+				// same two (SessionStatus.Binding is the page's binding).
+				writeSessionBody(b, status)
 				writeCoverageTable(b, files.Items)
 			})
 		},
@@ -582,9 +585,19 @@ func writeChunkHeader(b *strings.Builder, resp model.ReadChunkResponse) {
 // collapsing them into one "ready" line is exactly the dishonest summary
 // Section 16.3 forbids.
 func writeSessionStatus(b *strings.Builder, st model.SessionStatus) {
-	fmt.Fprintf(b, "session     %s\nactor       %s\n", st.SessionID, st.ActorID)
-	fmt.Fprintf(b, "generation  %d\nsnapshot    %s\nmanifest    %s\n",
-		st.Binding.GenerationID, st.Binding.SnapshotID, st.ManifestID)
+	// The session's own binding, for the seven commands that render outside
+	// emitQuery and would otherwise report no generation at all.
+	fmt.Fprintf(b, "generation  %d\nsnapshot    %s\n", st.Binding.GenerationID, st.Binding.SnapshotID)
+	writeSessionBody(b, st)
+}
+
+// writeSessionBody is writeSessionStatus without the binding header, for the
+// one caller -- `context status` -- whose answer carries a real model.QueryMeta
+// and therefore already printed the generation and snapshot through emitQuery's
+// shared header. Printing them again from the session block told the operator
+// the same two facts twice.
+func writeSessionBody(b *strings.Builder, st model.SessionStatus) {
+	fmt.Fprintf(b, "session     %s\nactor       %s\nmanifest    %s\n", st.SessionID, st.ActorID, st.ManifestID)
 	fmt.Fprintf(b, "state       %s in phase %s (state version %d, scope version %d)\n",
 		st.State, st.Phase, st.StateVersion, st.ScopeVersion)
 	fmt.Fprintf(b, "files       %d required, %d fully served, %d waived\n",
