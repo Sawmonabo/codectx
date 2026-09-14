@@ -2,7 +2,10 @@ package snapshot
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -11,9 +14,16 @@ import (
 // a product-owned structural bound, not a configuration knob: the set is the
 // outermost ignored paths of a worktree, which is small on any real repository
 // (this one has six), and the bound exists so a pathological tree is refused
-// rather than held. A repository past it is a typed resource limit, never a
-// truncated exclusion set -- a truncated one would silently admit the ignored
-// trees it dropped.
+// rather than held.
+//
+// `git ls-files --others --ignored --directory` collapses only *wholly*
+// untracked ignored directories, so a directory holding a tracked file lists
+// its ignored untracked files one by one -- the ordinary shape of a checkout
+// with `*.o`, `*.class` or `*.pyc` next to tracked sources. A repository past
+// the bound therefore exists, and what TraversalPolicy does about it is
+// degrade: the exclusion is an optimisation and refusing to index at all is
+// not a proportionate answer to losing one. The set is never truncated, which
+// would silently admit some ignored trees and hide the loss.
 const maxIgnoredRoots = 65536
 
 // TraversalPolicy is the walk policy every component that traverses this
@@ -30,6 +40,14 @@ const maxIgnoredRoots = 65536
 // The exclusion is derived from `git ls-files --others --ignored --directory`,
 // which lists only untracked paths, so a tracked file always wins over an
 // ignore match (Section 10.2) without this having to ask what is tracked.
+//
+// It is an optimisation, not a correctness requirement: the capture applies
+// its own, narrower rule regardless, so a caller that gets the base policy
+// back walks the ignored trees, pays for them and proposes scopes the capture
+// will not hold -- which costs work and coverage, and does not make the index
+// wrong. Refusing to open the workspace does make it wrong, so a repository
+// with more ignored roots than the bound degrades to the base policy with a
+// warning instead of failing every command that traverses it.
 //
 // It is deliberately a *bounded* approximation of what a capture applies.
 // Builder's own passes replace Ignore, ForceInclude and ForceIncludeDir with
@@ -49,6 +67,16 @@ func TraversalPolicy(ctx context.Context, base workspace.Policy, root workspace.
 		return nil
 	})
 	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeResourceLimit {
+			// The logger is the package default because this function's
+			// signature is the one every traversing component shares and
+			// none of them has a logger to give it; Builder resolves its own
+			// the same way when none is configured.
+			slog.Default().Warn("this worktree has more ignored roots than the traversal policy holds; the ignored trees are walked rather than excluded",
+				"component", "snapshot", "max_ignored_roots", maxIgnoredRoots)
+			return base, nil
+		}
 		return workspace.Policy{}, err
 	}
 	if len(ignored) == 0 {

@@ -315,9 +315,12 @@ func (r *capabilityReport) addFailure(providerID, capability, scope, code string
 	case scope < row.scope:
 		// The exemplar is the lexicographically first scope, never the first
 		// to arrive: the units of one provider are built concurrently, and
-		// details_json folds into the AnalysisKey, so an arrival-ordered
-		// exemplar would key two identical runs differently.
-		row.scope = scope
+		// both details_json and diagnostic_code fold into the AnalysisKey, so
+		// an arrival-ordered exemplar would key two identical runs
+		// differently. The code travels with the scope it belongs to -- a
+		// published row naming one scope's key and another scope's failure
+		// reason is arrival-ordered again, in a shape that also misreports.
+		row.scope, row.code = scope, code
 	}
 	row.units++
 }
@@ -484,35 +487,59 @@ func composedStates(published, composed []model.CapabilityState) []model.Capabil
 // and the exemplar is published as a `scope_key` detail, which folds into
 // details_json and therefore into the AnalysisKey. Two identical runs must key
 // identically.
+//
+// The whole exemplar row is what is published, not just its scope. Its
+// diagnostic code and its other details are the chosen scope's, so the fold
+// describes one scope truthfully instead of pairing one scope's key with
+// whichever row happened to arrive first; diagnostic_code folds into the
+// AnalysisKey as well, so an arrival-ordered one is the same determinism
+// defect the scope exemplar exists to prevent. Rows that are all
+// workspace-scoped have no scope to choose between and are ordered by their
+// code, which is likewise arrival-independent.
 func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 	var order []string
 	folds := map[string]model.CapabilityState{}
 	counts := map[string]int{}
-	exemplars := map[string]string{}
+	scoped := map[string]bool{}
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + string(c.State)
-		if _, ok := folds[key]; !ok {
-			folded := c
-			folded.Scope = provider.ScopeWorkspace
-			folds[key] = folded
+		best, ok := folds[key]
+		if !ok {
 			order = append(order, key)
 		}
-		if c.Scope != provider.ScopeWorkspace {
-			if e, ok := exemplars[key]; !ok || c.Scope < e {
-				exemplars[key] = c.Scope
-			}
+		if !ok || betterExemplar(c, best, scoped[key]) {
+			folds[key] = c
+			scoped[key] = c.Scope != provider.ScopeWorkspace
 		}
 		counts[key] += countDetail(c)
 	}
 	out := make([]model.CapabilityState, 0, len(order))
 	for _, key := range order {
 		row := folds[key]
-		if e, ok := exemplars[key]; ok {
-			row = row.WithDetail("scope_key", model.TruncateDetail(e))
+		exemplar := row.Scope
+		row.Scope = provider.ScopeWorkspace
+		if scoped[key] {
+			row = row.WithDetail("scope_key", model.TruncateDetail(exemplar))
 		}
 		out = append(out, row.WithDetail("scopes", strconv.Itoa(counts[key])))
 	}
 	return out
+}
+
+// betterExemplar answers whether candidate should replace the exemplar chosen
+// so far, whose scope is a real one when haveScoped is set. A real scope always
+// beats the workspace scope, which names no scope at all; between two real ones
+// and between two workspace ones the order is lexicographic, on the scope first
+// and on the diagnostic code when the scopes are equal.
+func betterExemplar(candidate, best model.CapabilityState, haveScoped bool) bool {
+	scoped := candidate.Scope != provider.ScopeWorkspace
+	if scoped != haveScoped {
+		return scoped
+	}
+	if candidate.Scope != best.Scope {
+		return candidate.Scope < best.Scope
+	}
+	return candidate.DiagnosticCode < best.DiagnosticCode
 }
 
 // collapseCarried folds every carried scope of one provider capability into
