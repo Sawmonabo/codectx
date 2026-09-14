@@ -77,11 +77,16 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		CAS:      s.cas,
 		Git:      s.git,
 		Lock:     s.lock,
-		Pool:     s.pool,
-		Watcher:  s.watcher,
-		States:   s.states,
-		Logger:   s.logger,
-		Now:      time.Now,
+		// The collector is composed at the end of openStack precisely so it can
+		// be handed over here: the coordinator's post-activation path is the
+		// only place in this process that holds both the cross-process
+		// workspace lock and the indexing mutex a collection pass requires.
+		Collector: s.collector,
+		Pool:      s.pool,
+		Watcher:   s.watcher,
+		States:    s.states,
+		Logger:    s.logger,
+		Now:       time.Now,
 	})
 	if err != nil {
 		s.Close()

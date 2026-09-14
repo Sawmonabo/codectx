@@ -93,7 +93,12 @@ type Options struct {
 	// and publish, and Section 13.2 gives that to exactly one cross-process
 	// owner.
 	Lock *snapshot.WorkspaceLock
-	Pool *provider.Pool
+	// Collector is the process-level reclaim pass, scheduled from the same
+	// post-activation points as retention-by-ref because that is the one moment
+	// this process holds both locks the pass requires. It may be nil; see the
+	// Collector interface in retention.go.
+	Collector Collector
+	Pool      *provider.Pool
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
