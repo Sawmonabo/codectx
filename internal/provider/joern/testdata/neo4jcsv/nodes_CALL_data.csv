@@ -1,6 +1,0 @@
-10,CALL,helper,helper(),main.helper,18,7
-11,CALL,<operator>.assignment,x := helper(),<operator>.assignment,18,2
-12,CALL,check,check(x),main.check,19,5
-13,CALL,sink,sink(x),main.sink,20,3
-14,CALL,Println,fmt.Println(v),fmt.Println,14,2
-15,CALL,ghost,ghost(),main.ghost,21,1
