@@ -276,13 +276,20 @@ func TestWorkflowScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Status: %v (code %q)", err, code(err))
 			}
-			if !st.ScopeComplete || !st.ReadCompleteForSnapshot || st.Superseded {
-				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v read_complete=%v superseded=%v",
-					st.ScopeComplete, st.ReadCompleteForSnapshot, st.Superseded)
+			if !st.ScopeComplete || st.Superseded {
+				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v superseded=%v",
+					st.ScopeComplete, st.Superseded)
 			}
-			if st.RequiredFiles != 4 || st.FullyServedFiles != 4 || st.WaivedFiles != 1 {
-				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/4/1",
+			// A waived file never counts as served even though this one was
+			// also read (VF3): reporting 4 of 4 served beside a waiver read as
+			// full coverage, which is the claim a waiver exists to deny. So
+			// the served count is 3 and read completeness is false with it.
+			if st.RequiredFiles != 4 || st.FullyServedFiles != 3 || st.WaivedFiles != 1 {
+				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/3/1",
 					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
+			}
+			if st.ReadCompleteForSnapshot {
+				t.Fatal("read_complete_for_snapshot is true beside a required-file waiver; a waived file is not a read file")
 			}
 			if st.StrictGateSatisfied || st.ReadyForImplementation {
 				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",

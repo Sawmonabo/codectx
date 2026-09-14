@@ -329,11 +329,33 @@ func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanR
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
-	status, err := s.w.s.coverage.OpenSession(ctx, req, manifest.ID)
+	id, err := s.w.s.coverage.OpenSession(ctx, req, manifest.ID)
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
-	return model.PlanResult{Manifest: manifest, SessionID: status.SessionID, ActorID: status.ActorID}, status, nil
+	// The gate-aware status is the workflow evaluator's and nobody else's
+	// (ruling VF1), so the freshly opened session is described by the same
+	// readiness answer every later call reports. The extra read is a session
+	// read, not a second aggregate: Section 16.3 is still decided by one
+	// CoverageSummary call inside that evaluator.
+	status, err := s.sessionStatus(ctx, model.SessionRequest{SessionID: id, ActorID: req.ActorID})
+	if err != nil {
+		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
+	}
+	return model.PlanResult{Manifest: manifest, SessionID: id, ActorID: req.ActorID}, status, nil
+}
+
+// sessionStatus is the facade's one route to a model.SessionStatus: the
+// workflow readiness evaluator. Every endpoint that answers a status composes
+// this rather than building one, so ready_for_implementation,
+// strict_gate_satisfied and the guarantee limit mean the same thing on all of
+// them (ruling VF1).
+func (s *Services) sessionStatus(ctx context.Context, req model.SessionRequest) (model.SessionStatus, error) {
+	wf, err := s.workflow()
+	if err != nil {
+		return model.SessionStatus{}, err
+	}
+	return wf.Status(ctx, req)
 }
 
 // SessionStatus reports one page of per-file coverage beside the honest session
@@ -345,7 +367,11 @@ func (s *Services) SessionStatus(ctx context.Context, req model.SessionRequest, 
 	if err := page.Validate(); err != nil {
 		return model.Page[model.FileCoverage]{}, model.SessionStatus{}, err
 	}
-	files, status, err := s.w.s.coverage.Status(ctx, req, page)
+	files, err := s.w.s.coverage.Status(ctx, req, page)
+	if err != nil {
+		return model.Page[model.FileCoverage]{}, model.SessionStatus{}, s.fail("context status", err)
+	}
+	status, err := s.sessionStatus(ctx, req)
 	if err != nil {
 		return model.Page[model.FileCoverage]{}, model.SessionStatus{}, s.fail("context status", err)
 	}
@@ -400,7 +426,12 @@ func (s *Services) Acknowledge(ctx context.Context, req model.AcknowledgeRequest
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
-	status, err := s.w.s.coverage.Acknowledge(ctx, req)
+	if err := s.w.s.coverage.Acknowledge(ctx, req); err != nil {
+		return model.SessionStatus{}, s.fail("context acknowledge", err)
+	}
+	// Read after the confirmation, so the status reports the coverage this call
+	// just granted rather than the state before it.
+	status, err := s.sessionStatus(ctx, model.SessionRequest{SessionID: req.SessionID, ActorID: req.ActorID})
 	if err != nil {
 		return model.SessionStatus{}, s.fail("context acknowledge", err)
 	}
@@ -492,10 +523,9 @@ func (s *Services) Export(ctx context.Context, req model.SessionRequest) (model.
 // It spends two calls on purpose. The transition is the workflow service's,
 // which owns the Section 17.1 guards and answers a model.WorkflowStatus; the
 // frozen facade answers a model.SessionStatus, which only the readiness
-// evaluator builds. Routing the close through coverage.Service.Close instead
-// would give the right type in one call and a second closing path, which the
-// no-drift rule forbids; changing the frozen workflow.Close signature is not a
-// fill-in lane's to do, so it is reported (deviation D2) rather than done.
+// evaluator builds (deviation D2, accepted). There is no second closing path to
+// take instead: ruling VF1 removed coverage.Service.Close along with the
+// duplicate status aggregate that was its only reason to exist.
 //
 // A Status that fails after a successful Close loses the report, not the close:
 // the transition is already committed and the caller's next status shows it.
