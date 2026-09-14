@@ -42,12 +42,14 @@ const evidencePerRelation = 8
 // arithmetic defect presented as a ranking.
 const maxScoreMicros = seedContribution + maxBoostMicros
 
-// rank scores every candidate in place and returns them in the total Section
-// 15.3 order. It resolves per-edge precision for the whole candidate set in one
-// batched pass, scores each admitted route in fixed point, keeps the maximum
-// route (never a sum over routes, which is how a cycle inflates a score),
-// reports the routes it did not enumerate as MorePaths, and adds each bounded
-// boost at most once.
+// rank scores every candidate in place and returns the same slice. It does NOT
+// order it: buildPlan rewrites each candidate's Path from the file version and
+// then sorts with the same total Section 15.3 order, so an order established
+// here would be sorted on a path key that budgeting replaces. It resolves
+// per-edge precision for the whole candidate set in one batched pass, scores
+// each admitted route in fixed point, keeps the maximum route (never a sum over
+// routes, which is how a cycle inflates a score), discloses the routes it did
+// not enumerate as a bounded reason, and adds each bounded boost at most once.
 //
 // relations carries every relation on an admitted path, keyed by id: a
 // RelationPath stores relation ids only and the pinned reader exposes no
@@ -104,7 +106,6 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 			base = routed[i].best
 		}
 		boosts, reasons := boostsFor(cands[i], routed[i], centrality)
-		cands[i].Boosts = boosts
 		score := base + boosts
 		if score > maxScoreMicros {
 			score = maxScoreMicros
@@ -113,13 +114,31 @@ func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands 
 			score = 0
 		}
 		cands[i].ScoreMicros = score
-		for _, reason := range append(routed[i].reasons, reasons...) {
+		// The routes that were not enumerated are disclosed BEFORE the boost
+		// reasons: appendReason drops silently at MaxReasonsPerEntry, and a
+		// bounded explanation that lost this line reads as an unexplained
+		// selection -- the one thing MorePaths exists to prevent.
+		for _, reason := range append(morePathsReason(cands[i].MorePaths), routed[i].reasons...) {
+			cands[i].Reasons = appendReason(cands[i].Reasons, reason)
+		}
+		for _, reason := range reasons {
 			cands[i].Reasons = appendReason(cands[i].Reasons, reason)
 		}
 	}
 
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].less(cands[j]) })
 	return cands, nil
+}
+
+// morePathsReason is the bounded disclosure of routes the manifest admitted but
+// could not enumerate (Section 15.3: "report additional-path counts rather than
+// growing an exponential path list"). model.ContextEntry carries reasons and
+// evidence paths and nothing else, so a reason is the only channel the count
+// has; without it the retained paths would read as the whole story.
+func morePathsReason(more int64) []string {
+	if more <= 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("%d further route(s) reach this entity and are not enumerated", more)}
 }
 
 // reasonPathLimit is the configured cap on stored explanation paths per entry,
