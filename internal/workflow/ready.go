@@ -111,6 +111,16 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 		shut = append(shut, "the session is not in an open verify or consolidate state")
 	}
 
+	// Precondition 1, second half -- the session lease is still live. Expiry is
+	// lazy: the store closes nothing until something reads, so a lapsed session
+	// still carries State: verify_open, and the CTX_SESSION_EXPIRED that comes
+	// back beside the record is deliberately swallowed here so status stays
+	// honest. Nothing above would notice, and SessionStatus.Validate has no
+	// expiry clause, so without this an expired lease would open the gate.
+	if !rec.ExpiresAt.IsZero() && !rec.ExpiresAt.After(s.now()) {
+		shut = append(shut, "the session lease has expired")
+	}
+
 	// Precondition 2 -- resolved and complete scope. Task 15 compiles an
 	// ambiguous or empty scope into a manifest with ScopeComplete=false and no
 	// required_full entries, so this is what stops a session that resolved
