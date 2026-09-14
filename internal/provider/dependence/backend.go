@@ -192,8 +192,6 @@ type (
 	// for a delta; the zero value is the absent set and requests a full
 	// import.
 	KeySet = neo4jcsv.KeySet
-	// ImportOptions are the inputs of one import beyond the export itself.
-	ImportOptions = neo4jcsv.Options
 	// ImportReport is what one import published and what it refused.
 	ImportReport = neo4jcsv.Report
 )
@@ -202,16 +200,19 @@ type (
 // drive the provider's failure paths without an engine; the production
 // binding is defaultImporter, which New uses.
 type Importer interface {
-	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts ImportOptions) (ImportReport, error)
+	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error)
 }
 
-// defaultImporter is the production importer: the export reader itself. With
-// the aliases above the adaptation is the identity, which is the point — a
-// translating adapter is where the two field lists would drift apart again.
+// defaultImporter is the production importer: the export reader itself. The
+// adaptation is the identity, which is the point — a translating adapter is
+// where the two field lists would drift apart again. The export reader's own
+// option struct is named here rather than aliased, because ImportOptions is
+// the coordinator-facing pair (PreviousKeys, KeysPath) the provider fills the
+// rest of.
 type defaultImporter struct{}
 
 func (defaultImporter) Import(ctx context.Context, exportDir string, res provider.Resolver,
-	sink provider.Sink, opts ImportOptions) (ImportReport, error) {
+	sink provider.Sink, opts neo4jcsv.Options) (ImportReport, error) {
 	return neo4jcsv.Import(ctx, exportDir, res, sink, opts)
 }
 
