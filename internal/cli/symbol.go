@@ -68,9 +68,11 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			defer ws.Close()
 			ctx, cancel := queryContext(cmd.Context(), timeout)
 			defer cancel()
+			// Typed for the reason `search` gives: a query deadline must not
+			// reach the operator as an invalid command line.
 			result, err := ws.Search().Resolve(ctx, req)
 			if err != nil {
-				return err
+				return queryFailure(err)
 			}
 			out := cmd.OutOrStdout()
 			if jsonRequested(cmd, args) {

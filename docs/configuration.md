@@ -141,7 +141,7 @@ All **user** trust.
 | `query_timeout` | `"10s"` | Deadline for one query. `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page; exceeding it is `CTX_QUERY_DEADLINE`, an explicit incomplete answer, never a persisted complete one. `--timeout` on those commands narrows it further and never widens it. |
 | `max_query_text_bytes` | `8192` | Largest query text. |
 | `max_query_terms` | `32` | Most terms in one query. Query text is tokenized with the index's own tokenizer, and a quoted phrase counts as one term. |
-| `max_page_items` | `200` | Largest page, and the bound `--limit` is clamped to. It is also the per-tier candidate bound of `codectx search`: a tier that fills it makes the answer report `truncated` with a reason rather than silently serving a short page. |
+| `max_page_items` | `200` | Largest page, and the bound `--limit` is clamped to, for `codectx search` and `codectx symbol` as well as the graph commands: lowering it lowers the pages they serve. The candidate bound each retrieval tier of `codectx search` is read to stays the `200` ceiling, so narrowing the page never narrows what was ranked; a tier that fills that bound makes the answer report `truncated` with a reason rather than silently serving a short page, and every continuation of that answer repeats the same `truncated` flag and reason. |
 | `max_provider_record_bytes` | `4194304` | Largest single provider record; must fit `index.batch_bytes`. |
 
 ## `[storage]` — SQLite and the data directory

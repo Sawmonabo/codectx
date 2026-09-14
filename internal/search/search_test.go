@@ -648,14 +648,18 @@ func legSpooledPage(t *testing.T, f *fixture) {
 		{FileID: f.files["pkg/beta.go"], Path: "pkg/beta.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS,
 			Name: "HandleRequest", ScoreMicros: 1_000_000, OccurrenceCount: 1},
 	}
-	id, err := spoolHits(f.opts.Spools, c, want)
+	// The answer-level metadata the first page computed travels with the
+	// remainder: a continuation reads its hits from the spool and has nothing
+	// of its own to recompute truncation from.
+	answer := spoolMeta{Truncated: true, TruncationReason: truncationExactTierFull}
+	id, err := spoolHits(f.opts.Spools, c, answer, want)
 	if err != nil {
 		t.Fatalf("spoolHits: %v", err)
 	}
 	if !model.ValidHexID(id) {
 		t.Fatalf("spool id %q is not a well-formed id", id)
 	}
-	if got, err := spoolHits(f.opts.Spools, c, nil); err != nil || got != "" {
+	if got, err := spoolHits(f.opts.Spools, c, answer, nil); err != nil || got != "" {
 		t.Fatalf("spoolHits(nothing left) = (%q, %v), want (\"\", nil)", got, err)
 	}
 
@@ -664,18 +668,22 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if err := next.Validate(); err != nil {
 		t.Fatalf("a spooled cursor does not validate: %v", err)
 	}
-	got, err := readSpool(f.ctx, f.opts.Spools, next, now)
+	meta, got, err := readSpool(f.ctx, f.opts.Spools, next, now)
 	if err != nil {
 		t.Fatalf("readSpool: %v", err)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("readSpool replayed %+v, want %+v", got, want)
 	}
+	if !meta.Truncated || meta.TruncationReason != truncationExactTierFull {
+		t.Fatalf("readSpool replayed truncation (%t, %q), want the first page's (true, %q)",
+			meta.Truncated, meta.TruncationReason, truncationExactTierFull)
+	}
 
 	// A spool bound to another query is not this cursor's continuation.
 	foreign := next
 	foreign.QueryHash = searchQueryHash(model.SearchRequest{Query: "other"})
-	_, err = readSpool(f.ctx, f.opts.Spools, foreign, now)
+	_, _, err = readSpool(f.ctx, f.opts.Spools, foreign, now)
 	assertCode(t, "foreign spool", err, model.CodeCursorInvalid)
 
 	// Releasing the lease ends the continuation rather than serving a page
@@ -683,7 +691,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if err := leases.Release(f.ctx, lease.ID); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	_, err = readSpool(f.ctx, f.opts.Spools, next, now)
+	_, _, err = readSpool(f.ctx, f.opts.Spools, next, now)
 	assertCode(t, "released lease", err, model.CodeCursorInvalid)
 }
 
@@ -856,6 +864,39 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 	}
 	if top.Range == nil {
 		t.Error("the served hit carries no source range")
+	}
+	// The BM25F constants themselves. Section 9 requires exact int64
+	// ScoreMicros, not orderings: with only an ordering assertion, bm25K1,
+	// bm25B and every columnWeight entry can be changed to any other value and
+	// the suite stays green, so the scoring formula would be unprotected. Two
+	// scores are pinned because they load different parts of it: the top hit
+	// folds a name-column match into an exact-tier candidate, and the second
+	// is a pure body/qualified-name lexical hit. Recompute these deliberately
+	// -- a changed value here is a changed ranking for every caller.
+	//
+	// The other half of Section 9's ranking claim, that a lower-scoring exact
+	// hit still outranks a higher-scoring lexical one, is legLessChain's
+	// (:327); asserting it again here would be a duplicate.
+	const (
+		wantTopMicros     int64 = 2_197_205
+		wantLexicalMicros int64 = 554_547
+	)
+	if top.ScoreMicros != wantTopMicros {
+		t.Errorf("the alpha hit scores %d, want the BM25F value %d", top.ScoreMicros, wantTopMicros)
+	}
+	lexicalHit := false
+	for _, hit := range page.Items {
+		if hit.NodeID != f.nodes["pkg/beta.go"] {
+			continue
+		}
+		lexicalHit = true
+		if hit.Tier != model.TierLexicalFTS || hit.ScoreMicros != wantLexicalMicros {
+			t.Errorf("the beta hit is tier %q at %d, want %q at the BM25F value %d",
+				hit.Tier, hit.ScoreMicros, model.TierLexicalFTS, wantLexicalMicros)
+		}
+	}
+	if !lexicalHit {
+		t.Error("the query returned no lexical hit to score")
 	}
 	for i, hit := range page.Items {
 		// Digest §4 zeroes the exact and prefix tiers "unless the document
