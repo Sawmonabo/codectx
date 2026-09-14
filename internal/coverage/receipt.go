@@ -49,10 +49,10 @@ func (p receiptPayload) check() string {
 // bound, so this never re-checks it.
 func (s *Service) encodeReceipt(p receiptPayload, expires time.Time) (string, error) {
 	if why := p.check(); why != "" {
-		return "", notImplementedf(model.CodeInternal, "receipt payload is incomplete: %s", why)
+		return "", typedErrf(model.CodeInternal, "receipt payload is incomplete: %s", why)
 	}
 	if expires.IsZero() {
-		return "", notImplementedf(model.CodeInternal, "receipt payload has no expiry")
+		return "", typedErrf(model.CodeInternal, "receipt payload has no expiry")
 	}
 	// Truncating to the second matches the signer's header, which stores unix
 	// seconds: an untruncated expiry would round down and expire the token
@@ -60,7 +60,7 @@ func (s *Service) encodeReceipt(p receiptPayload, expires time.Time) (string, er
 	expires = expires.UTC().Truncate(time.Second)
 	payload, err := json.Marshal(p)
 	if err != nil {
-		return "", notImplementedf(model.CodeInternal, "receipt encoding: %s", err.Error())
+		return "", typedErrf(model.CodeInternal, "receipt encoding: %s", err.Error())
 	}
 	return s.signer.Sign(pagination.PurposeReceipt, payload, expires)
 }
@@ -78,10 +78,10 @@ func (s *Service) decodeReceipt(token string, now time.Time) (receiptPayload, er
 	}
 	var p receiptPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
-		return receiptPayload{}, notImplementedf(model.CodeCursorInvalid, "receipt payload is malformed")
+		return receiptPayload{}, typedErrf(model.CodeCursorInvalid, "receipt payload is malformed")
 	}
 	if why := p.check(); why != "" {
-		return receiptPayload{}, notImplementedf(model.CodeCursorInvalid, "receipt payload is malformed: %s", why)
+		return receiptPayload{}, typedErrf(model.CodeCursorInvalid, "receipt payload is malformed: %s", why)
 	}
 	return p, nil
 }
@@ -110,7 +110,7 @@ func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord,
 		batch = model.MaxReceiptsPerConfirmation
 	}
 	if len(tokens) > batch {
-		return notImplementedf(model.CodeResourceLimit,
+		return typedErrf(model.CodeResourceLimit,
 			"a confirmation carries at most %d receipts, got %d", batch, len(tokens))
 	}
 
@@ -130,7 +130,7 @@ func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord,
 		// rejections carry CTX_CURSOR_INVALID; reporting an actor mismatch
 		// separately would tell the caller that another actor's token exists.
 		if p.SessionID != rec.ID || p.ActorID != rec.ActorID || p.SnapshotID != rec.Binding.SnapshotID {
-			return notImplementedf(model.CodeCursorInvalid, "receipt was not issued for this session")
+			return typedErrf(model.CodeCursorInvalid, "receipt was not issued for this session")
 		}
 		ids = append(ids, p.ChunkID)
 	}
@@ -153,6 +153,10 @@ func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest)
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	defer cancel()
+
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
 		return model.SessionStatus{}, err
