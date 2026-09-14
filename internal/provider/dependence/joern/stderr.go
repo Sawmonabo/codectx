@@ -59,7 +59,8 @@ const maxScanTokenBytes = 1 << 20
 // acts on. A timeout wins over everything, because a terminated tree's stderr
 // says whatever it happened to have flushed.
 func classify(res process.Result) dependence.Outcome {
-	out := dependence.Outcome{ExitCode: res.ExitCode, Duration: res.Duration, StderrBytes: res.StderrBytes}
+	out := dependence.Outcome{ExitCode: res.ExitCode, Duration: res.Duration, StderrBytes: res.StderrBytes,
+		PeakBytes: res.PeakTreeBytes, PeakUnsampled: res.TreeUnsampled}
 	if res.TimedOut {
 		out.Class = dependence.FailureTimeout
 		return out

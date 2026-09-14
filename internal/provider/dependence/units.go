@@ -25,6 +25,7 @@ package dependence
 
 import (
 	"context"
+	"log/slog"
 	"path"
 	"slices"
 	"strings"
@@ -53,9 +54,8 @@ type Unit struct {
 	// repository root.
 	Root string
 	// Excluded are the root-relative directories of nested projects of the
-	// same family that this unit does not own. They are pruned from the
-	// private materialization before the engine reads it, so a nested module
-	// is analysed once, by its own unit.
+	// same family that this unit does not own. They are never materialized for
+	// this unit, so a nested module is analysed once, by its own unit.
 	Excluded []string
 	// Markers are the manifest and lock files whose content is part of the
 	// unit's semantic closure (Section 11.6), sorted.
@@ -197,7 +197,16 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 	}
 	units := make([]Unit, 0, len(dirs)+1)
 	for _, d := range dirs {
-		units = append(units, Unit{ScopeKey: scopeKey(f, d), Family: f, Root: d,
+		key, ok := scopeKey(f, d)
+		if !ok {
+			// Refusing here is what keeps the failure in the planner. The unit
+			// would otherwise be admitted and fail at BeginUnit, where the
+			// scope key is already the identity every published row carries.
+			slog.Warn("a dependence project is not planned: its scope key exceeds the identity bound",
+				"component", component, "family", string(f), "path_bytes", len(d), "bound", model.MaxScopeKeyBytes)
+			continue
+		}
+		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
 			Excluded: nested(d, dirs), Markers: markersUnder(markers, d, nested(d, dirs))})
 	}
 	if f != FamilyRust && !slices.Contains(dirs, "") {
@@ -210,7 +219,9 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		// A project rooted at the repository root already owns this scope key.
 		// Emitting a second unit under the same key would leave unitFor
 		// choosing between them by sort position, so it is not emitted at all.
-		units = append(units, Unit{ScopeKey: scopeKey(f, ""), Family: f,
+		// The root key is "pkg:<family>:", always within the bound.
+		key, _ := scopeKey(f, "")
+		units = append(units, Unit{ScopeKey: key, Family: f,
 			Excluded: dirs, Markers: markersUnder(markers, "", dirs)})
 	}
 	return units, nil
@@ -250,8 +261,19 @@ func (u Unit) Contains(p string) bool {
 
 // scopeKey is the unit's capability and alias scope. It names the family in
 // the product's own vocabulary, never the engine's frontend name.
-func scopeKey(f Family, root string) string {
-	return truncate("pkg:"+string(f)+":"+root, model.MaxScopeKeyBytes)
+//
+// A key that does not fit model.MaxScopeKeyBytes is refused, not truncated.
+// Truncation is a colliding identity claim: two deep project directories with
+// a long common prefix would cut to the same key, and every capability row,
+// alias scope and cache entry of one would then be attributed to the other.
+// The planner drops such a project instead, which loses one project's facts
+// openly rather than mixing two projects' facts silently.
+func scopeKey(f Family, root string) (string, bool) {
+	key := "pkg:" + string(f) + ":" + root
+	if len(key) > model.MaxScopeKeyBytes {
+		return "", false
+	}
+	return key, true
 }
 
 // within reports whether p lies at or under the root-relative directory dir;
