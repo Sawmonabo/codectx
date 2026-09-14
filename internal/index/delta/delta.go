@@ -28,6 +28,7 @@ package delta
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -49,9 +50,21 @@ type Request struct {
 	Previous   model.UnitID // zero: full build
 	Build      model.UnitBuild
 	// Inputs yields the unit's declared inputs in ascending FileID order. It
-	// must be re-iterable: storage streams it to open the unit, and the
-	// dependence applier walks it again to merge-join it against the
-	// predecessor's stored inputs rather than keeping the file list.
+	// must be re-iterable — every walk must yield the same inputs: storage
+	// streams it to open the unit, and the dependence applier walks it again
+	// (twice) to merge-join it against the predecessor's stored inputs rather
+	// than keeping the file list.
+	//
+	// The contract as a whole is not enforceable — the fresh stream is never
+	// fully drained on the later walks, so no fold over it could be compared
+	// — but a drifting stream is not simply trusted either. Storage folds
+	// model.NewUnitInputHasher over walk 1 and refuses a mismatch against
+	// Build.Spec.InputHash, and the dependence applier refuses the one
+	// disagreement between the later walks that would corrupt the unit: a
+	// filtered emit chosen because walk 2 saw nothing replaced, while walk 3
+	// names a replaced file whose bucket that emit never republishes (see
+	// dependence.go). What is left unchecked is drift that costs import work
+	// rather than rows.
 	Inputs  func(yield func(model.UnitInput) error) error
 	Unit    provider.UnitRequest
 	WorkDir string
@@ -108,8 +121,23 @@ type Result struct {
 	// unusable predecessor invalidated a previous unit.
 	Full       bool
 	FullReason string
-	// Filtered says the provider's import ran against the predecessor's own
-	// state and therefore emitted only what changed. A delta whose
+	// Filtered says the emit this build requested was a filtered one AND that
+	// the filter degenerated into nothing: the predecessor's own state was
+	// supplied to the import, and no unit of that state was retired. Both
+	// conjuncts matter. The dependence applier sets it as
+	// `supplied && Delta.Removed == 0` because only then did the import leave
+	// the unchanged relations, and the facts that name no file, unpublished —
+	// a supplied filter over a state that lost a key re-emits enough that the
+	// unit is not a filtered one in the sense the replaced set is built on.
+	//
+	// It is a property of what the build passed and measured, never of what
+	// the provider did with it: an importer that accepted the previous state
+	// and re-emitted everything anyway would still land here, and nothing
+	// checks it. The SCIP applier sets it from the request alone, before its
+	// import runs. That is deliberate — the replaced-set decisions keyed on
+	// it (Replaced.IndexLevel, and the dependence applier's re-iterability
+	// refusal) must be sound against what this build chose, not against a
+	// report from the producer they are guarding. A delta whose
 	// Filtered is false re-imported everything and inherited nothing, even
 	// though the predecessor was present and usable — for the dependence
 	// applier that is every refresh that changed or removed a declared file.
@@ -152,8 +180,8 @@ func writeState(dir, name string, payload []byte) (string, error) {
 	return p, nil
 }
 
-func invalid(msg string) *model.Error {
-	return &model.Error{Code: model.CodeArgumentInvalid, Message: msg}
+func invalid(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
 }
 
 func internal(msg string) *model.Error {
