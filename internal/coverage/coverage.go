@@ -184,14 +184,6 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 	return model.ReadChunkResponse{}, notImplemented("coverage.Read")
 }
 
-// Acknowledge confirms echoed receipts or records a full-file client
-// assertion. The two kinds are not interchangeable: a receipt confirms
-// delivered bytes, a file acknowledgment requires full coverage first and never
-// creates it. Owned by L2.
-func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest) (model.SessionStatus, error) {
-	return model.SessionStatus{}, notImplemented("coverage.Acknowledge")
-}
-
 // Status reports this actor's coverage for this session: one page of per-file
 // records keyed on file_id plus the honest session status. Owned by L3.
 func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], model.SessionStatus, error) {
@@ -223,32 +215,6 @@ type receiptPayload struct {
 	ContentHash string
 	Start, End  uint64
 	ChunkID     string
-}
-
-// encodeReceipt signs a payload with pagination.PurposeReceipt. It adds no
-// method to Signer: Section 16.3's rule that cursor tokens and source receipts
-// are never accepted interchangeably is already enforced by the purpose
-// discriminator. The encoded payload must fit
-// model.MaxTokenBytes*3/4 minus the signer's own framing. Owned by L2.
-func (s *Service) encodeReceipt(p receiptPayload, expires time.Time) (string, error) {
-	return "", notImplemented("coverage.encodeReceipt")
-}
-
-// decodeReceipt verifies a token with pagination.PurposeReceipt, never
-// PurposeCursor. A tampered, expired or wrong-purpose token is
-// CTX_CURSOR_INVALID; there is no CTX_RECEIPT_* family and the token is never
-// echoed in the error. Owned by L2.
-func (s *Service) decodeReceipt(token string, now time.Time) (receiptPayload, error) {
-	return receiptPayload{}, notImplemented("coverage.decodeReceipt")
-}
-
-// confirmReceipts is the single confirmation path shared by Acknowledge with
-// kind "receipt" and by Read's ConfirmReceipts echo: decode each token, check
-// every payload field against rec, then make exactly one ConfirmChunks call
-// with the raw chunk ids. Interval merging and the union test belong to that
-// call and are never reproduced here. Owned by L2.
-func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord, tokens []string) error {
-	return notImplemented("coverage.confirmReceipts")
 }
 
 // sourceEnvelopeBytes is the headroom reserved for everything in a read
