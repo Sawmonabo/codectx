@@ -59,31 +59,6 @@ func (c Config) AnalysisConfigHash() string {
 	h.AddString(c.Providers.SCIP.Enabled.String())
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
-	// An approved profile decides which executable and argument array produced
-	// a unit, so a changed profile must invalidate the units it produced. The
-	// private work directory is excluded: it is an operational location.
-	profiles := c.SortedAnalyzers()
-	h.AddString(quoteInt(int64(len(profiles))))
-	for _, a := range profiles {
-		h.AddString(a.Name)
-		h.AddString(a.Executable)
-		h.AddString(a.VersionConstraint)
-		h.AddString(a.Checksum)
-		h.AddString(quoteInt(int64(len(a.Args))))
-		for _, arg := range a.Args {
-			h.AddString(arg)
-		}
-		h.AddString(string(a.Network))
-		// The environment an analyzer may see is an input to what it produces:
-		// a profile that gains a variable can resolve different dependencies
-		// from the same source and must not reuse the earlier units.
-		env := append([]string(nil), a.EnvAllowlist...)
-		sort.Strings(env)
-		h.AddString(quoteInt(int64(len(env))))
-		for _, name := range env {
-			h.AddString(name)
-		}
-	}
 	return h.Sum()
 }
 
