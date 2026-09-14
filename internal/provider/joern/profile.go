@@ -109,20 +109,15 @@ func PinnedDefault() Profile {
 	}
 }
 
-// ProfileFromConfig builds the profile the configuration selects:
-// providers.joern.profile names the built-in argument set, and the
-// `joern-parse` and `joern-export` analyzer entries supply the approved
-// executables, checksums, version constraints, budgets, timeouts, the shared
-// work directory and the environment allowlist. An analyzer entry with its
-// own args is refused: the argv is product-owned for the pinned profile, and
-// a profile this build does not know is unsupported rather than guessed.
+// ProfileFromConfig builds the built-in profile: the argument arrays are
+// product-owned, and the `joern-parse` and `joern-export` analyzer entries
+// supply the approved executables, checksums, version constraints, budgets,
+// timeouts, the shared work directory and the environment allowlist. An
+// analyzer entry with its own args is refused: the argv belongs to this
+// package, never to configuration.
 func ProfileFromConfig(cfg config.Config) (Profile, error) {
-	if cfg.Providers.Joern.Profile != ProfileName {
-		return Profile{}, configInvalid("providers.joern.profile %q is not a profile this build supports; the only pinned profile is %q",
-			cfg.Providers.Joern.Profile, ProfileName)
-	}
 	p := PinnedDefault()
-	p.Timeout = cfg.Providers.Joern.Timeout.Std()
+	p.Timeout = cfg.Providers.Dependence.Timeout.Std()
 	tools := []struct {
 		name string
 		dst  *Tool
