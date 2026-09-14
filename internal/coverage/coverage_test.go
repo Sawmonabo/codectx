@@ -1298,6 +1298,14 @@ var scenarios = []scenario{
 	// from there are not a decodable prefix of anything, and serving them as
 	// base64 instead would hand the client a chunk it cannot place in the
 	// text. The request is refused so the client re-reads from a boundary.
+	//
+	// Where the teeth are: the rejection itself is Task 4's, raised twice in
+	// internal/source (PlanChunk's window[0] guard and Cursor.PositionAt's),
+	// and no mutation of internal/coverage makes this row red -- deleting
+	// either source guard alone leaves the other one catching it. What the row
+	// pins here is that Read PROPAGATES the refusal rather than rounding the
+	// offset down to a boundary or falling back to base64, which is the shape
+	// a future "be lenient about offsets" change would take.
 	{"read/an offset inside a UTF-8 sequence is refused", func(t *testing.T, h *harness) {
 		f := h.file(model.FileID(hexID(0x24)))
 		// The file opens with "é": byte 1 is its continuation byte, and the
@@ -1409,9 +1417,15 @@ var scenarios = []scenario{
 			t.Fatalf("read of a blocked store returned %v after %s; the %s query timeout must cut it off",
 				err, time.Since(started), limits.QueryTimeout)
 		}
+		// The invariant is "bounded, not hung", and the escape hatch above is
+		// what enforces it exactly. This only keeps the row from passing on an
+		// unrelated failure, so it admits every spelling the deadline may
+		// reach a caller in: FX-D16-A may return ctx.Err() raw, as the landed
+		// timeout sites do, or wrap it in a typed error.
 		var typedErr *model.Error
-		bounded := errors.Is(err, context.DeadlineExceeded) ||
-			(errors.As(err, &typedErr) && typedErr.Code == model.CodeQueryDeadline)
+		bounded := errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+			(errors.As(err, &typedErr) && (typedErr.Code == model.CodeQueryDeadline ||
+				typedErr.Code == model.CodeCanceled || typedErr.Code == model.CodeResourceLimit))
 		if !bounded {
 			t.Fatalf("read of a blocked store failed with %v after %s; want a deadline, not an unrelated error",
 				err, time.Since(started))
