@@ -40,32 +40,13 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest) (model.S
 
 // readiness evaluates the full Section 16.3 precondition set exactly once per
 // request: one CoverageSummary call, the manifest's ScopeComplete, the verify
-// phase, a current-scope review, a blocking-unresolved scan, waived == 0 and
-// per-request Validator revalidation of every cited source. When the gate is
-// open the result carries the point-in-time guarantee limit (ruling Q10): a
-// silent true is a defect. Owned by L4.
-//
-// This is the gate Advance and buildCapsule read; Status reads the wider
-// evaluation, because the frozen gate carries no Superseded field.
+// phase, the active generation, a current-scope review, a blocking-unresolved
+// scan, waived == 0 and per-request Validator revalidation of every cited
+// source. When the gate is open the result carries the point-in-time guarantee
+// limit (ruling Q10): a silent true is a defect. Owned by L4; INT moved
+// Superseded onto the gate itself.
 func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (gate, error) {
-	e, err := s.evaluate(ctx, rec, m)
-	return e.gate, err
-}
-
-// evaluation is one readiness evaluation plus the one SessionStatus field the
-// frozen gate cannot carry. Superseded has no source on the Sessions surface --
-// no method there reports the active generation -- so it is derived here from
-// Validator.Current: a required file whose pinned content hash is no longer the
-// current one means this session is reading a superseded snapshot. That is also
-// precondition 7, so the two share a single walk rather than validating twice.
-//
-// gate is frozen in workflow.go with four booleans against SessionStatus' five,
-// and a fill-in lane does not change a frozen type; this local wrapper keeps
-// Superseded honest without a second Validator pass. Recorded in the L4 report
-// as the one field the frozen gate should probably carry.
-type evaluation struct {
-	gate
-	Superseded bool
+	return s.evaluate(ctx, rec, m)
 }
 
 // evaluate is the single place the Section 16.3 preconditions are decided.
@@ -77,21 +58,21 @@ type evaluation struct {
 // is asked for last and only when every other precondition already holds: it is
 // a pure predicate with nothing to report but pass or fail, so querying storage
 // for it while the gate is already shut buys the operator nothing.
-func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (evaluation, error) {
+func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m model.ContextManifest) (gate, error) {
 	// Precondition 3's inputs, in one call. Paging Coverage for counts would
 	// cost a round trip per page on a large session, which is exactly why
 	// CoverageSummary exists; this package defines no second aggregate.
 	required, served, waived, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
 	if err != nil && !expiredSession(err) {
-		return evaluation{}, err
+		return gate{}, err
 	}
 
-	e := evaluation{gate: gate{
+	e := gate{
 		Required:      required,
 		Served:        served,
 		Waived:        waived,
 		ScopeComplete: m.ScopeComplete,
-	}}
+	}
 	// Task 16's honest weaker answer, unchanged: a waiver is counted and
 	// reported but never folded in, and an incomplete manifest scope
 	// disqualifies the session outright even when the counts agree.
@@ -142,13 +123,28 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 		shut = append(shut, "the session carries a required-file waiver")
 	}
 
+	// Supersession is a generation fact, not a file fact: a newer generation
+	// being active is exactly what Section 16.3 means by superseded, and it is
+	// true even when every pinned file is byte-identical. It is evaluated
+	// unconditionally because it is a reported SessionStatus field.
+	superseded, err := s.superseded(ctx, rec)
+	if err != nil {
+		return gate{}, err
+	}
+	e.Superseded = superseded
+	if superseded {
+		shut = append(shut, "a newer generation has been published since this session pinned its scope")
+	}
+
 	// Precondition 7 -- current-source validation, per request, immediately
-	// before answering. The same walk answers Superseded.
+	// before answering. This is the per-file question and is deliberately not
+	// the same one as supersession: a file may have moved under a session whose
+	// generation is still active (the snapshot was re-taken), and a generation
+	// may have been republished with every pinned file untouched.
 	current, err := s.sourcesCurrent(ctx, rec, required)
 	if err != nil {
-		return evaluation{}, err
+		return gate{}, err
 	}
-	e.Superseded = !current
 	if !current {
 		shut = append(shut, "a required file's pinned content hash is no longer current")
 	}
@@ -160,7 +156,7 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 	blocking, err := s.sessions.Observations(ctx, rec.ID, rec.ActorID, model.ObservationUnresolved,
 		rec.ScopeVersion, "", s.limits.MaxPageItems)
 	if err != nil && !expiredSession(err) {
-		return evaluation{}, err
+		return gate{}, err
 	}
 	for _, o := range blocking {
 		e.Blocking = append(e.Blocking, o.ID)
@@ -179,7 +175,7 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 	// and invalidates the old review, which stays for audit.
 	review, err := s.currentReview(ctx, rec, m.CanonicalHash)
 	if err != nil {
-		return evaluation{}, err
+		return gate{}, err
 	}
 	if review == nil || review.Review == nil {
 		e.Reason = "no scope review covers this manifest at the current scope version"
@@ -192,16 +188,38 @@ func (s *Service) evaluate(ctx context.Context, rec sqlite.SessionRecord, m mode
 		}
 	}
 
-	// All seven hold. Superseded is false here by construction -- it is the
-	// negation of precondition 7 -- so ReadyForImplementation and
-	// StrictGateSatisfied agree, and both carry the guarantee limit rather than
-	// a silent true.
+	// All seven hold, and the gate is shut above whenever the session is
+	// superseded, so Ready and Strict agree here. They are still computed
+	// separately: Strict is the strict gate Section 17.3 stamps into a capsule,
+	// Ready is write permission, and a future precondition that shuts one
+	// without the other must not be able to land silently.
 	e.Strict = true
 	e.Ready = e.Strict && !e.Superseded
 	e.Reason = guaranteeLimit
 	s.log.Warn("strict readiness gate is open",
 		"session_id", string(rec.ID), "scope_version", rec.ScopeVersion, "guarantee", guaranteeLimit)
 	return e, nil
+}
+
+// superseded reports whether a newer generation is active for this
+// repository than the one the session pinned. It is one indexed row read on
+// active_generations; the store owns that read (Task 12) and this package adds
+// no second spelling of it.
+//
+// CTX_NO_ACTIVE_GENERATION is an answer, not a failure: if nothing is published
+// the generation this session pinned is certainly not the active one, and
+// reporting the session as current would be the false positive this exists to
+// prevent.
+func (s *Service) superseded(ctx context.Context, rec sqlite.SessionRecord) (bool, error) {
+	active, err := s.sessions.ActiveGeneration(ctx, rec.Binding.RepositoryID)
+	if err != nil {
+		var typed *model.Error
+		if errors.As(err, &typed) && typed.Code == model.CodeNoActiveGeneration {
+			return true, nil
+		}
+		return false, err
+	}
+	return active != rec.Binding.GenerationID, nil
 }
 
 // sourcesCurrent revalidates every required_full file's pinned content hash
@@ -246,10 +264,12 @@ func (s *Service) sourcesCurrent(ctx context.Context, rec sqlite.SessionRecord, 
 	}
 }
 
-// status projects one readiness evaluation onto all nineteen SessionStatus
-// fields, Superseded included. SessionStatus.Validate refuses the dishonest
-// combinations, so a wrong evaluator fails loudly rather than silently.
-// Owned by L4.
+// status projects one readiness evaluation onto all twenty SessionStatus
+// fields, Superseded and GuaranteeLimit included. SessionStatus.Validate
+// refuses the dishonest combinations -- readiness beside a waiver, readiness
+// without the strict gate, readiness with nothing said about what it
+// guarantees -- so a wrong evaluator fails loudly rather than silently.
+// Owned by L4; GuaranteeLimit added by INT.
 func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.SessionStatus, error) {
 	if rec.ID == "" {
 		return model.SessionStatus{}, typedErrf(model.CodeInternal,
@@ -284,8 +304,14 @@ func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.S
 		RequiredFiles:           e.Required,
 		FullyServedFiles:        e.Served,
 		WaivedFiles:             e.Waived,
-		CreatedAt:               rec.CreatedAt,
-		ExpiresAt:               rec.ExpiresAt,
+		// The gate's own words: the point-in-time guarantee limit when it is
+		// open (ruling Q10) and the operator-facing reason when it is shut.
+		// Bounded by construction -- every contributing string is authored in
+		// this file and their join is well under model.MaxReasonBytes -- and
+		// SessionStatus.Validate enforces the bound rather than trusting that.
+		GuaranteeLimit: e.Reason,
+		CreatedAt:      rec.CreatedAt,
+		ExpiresAt:      rec.ExpiresAt,
 	}
 	if err := status.Validate(); err != nil {
 		return model.SessionStatus{}, err
