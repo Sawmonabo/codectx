@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -1180,4 +1181,134 @@ func (s *Store) CoverageSummary(ctx context.Context, session model.SessionID, ac
 		return 0, 0, 0, err
 	}
 	return required, fullyServed, waived, nil
+}
+
+// rangeConfirmedSQL asks one containment question of served_ranges: is there a
+// single stored interval that already covers [start,end) whole?
+//
+// One row is the whole test because mergeServedRange keeps the stored set
+// minimal -- disjoint intervals with overlap *and* adjacency coalesced -- and
+// it is the only writer of this table. Two rows can therefore never be joined
+// into a covering interval, so containment is a point search on the primary
+// key (session_id, file_id, content_hash, start_byte, end_byte) and no
+// interval list is ever assembled, here or in Go. If that minimality invariant
+// were ever broken the answer degrades to false, which refuses a citation
+// rather than confirming coverage nobody has: the safe direction.
+//
+// The test is containment, not overlap. An interval that spans a gap between
+// two confirmed ranges touches both and is covered by neither.
+const rangeConfirmedSQL = `SELECT EXISTS (SELECT 1 FROM served_ranges r
+	WHERE r.session_id = ?1 AND r.file_id = ?2 AND r.content_hash = ?3
+	  AND r.start_byte <= ?4 AND r.end_byte >= ?5)`
+
+// RangeConfirmed reports whether [r.Start,r.End) of one pinned file is already
+// fully confirmed served to this actor, at this content hash (Sections 16.2,
+// 17.2). It is the check no landed method answers: a scope review may cite
+// source intervals, and a citation over bytes the actor never confirmed would
+// let a note mark a file read without coverage.
+//
+// It returns a bounded boolean and never an interval list. A file outside this
+// session's pinned scope, or one at a hash this session never pinned, is simply
+// not confirmed -- (false, nil) -- because a citation over it is a claim to
+// refuse, not a storage failure. Unlike the reporting reads it does not swallow
+// CTX_SESSION_EXPIRED: it exists to gate a write, and an expired session
+// confirms nothing.
+func (s *Store) RangeConfirmed(ctx context.Context, session model.SessionID, actor string,
+	file model.FileID, hash string, r model.ByteRange) (bool, error) {
+	// ValidateNonEmpty matches the served_ranges CHECK(end_byte > start_byte):
+	// the empty interval is unstorable, so asking whether it was served is a
+	// malformed question rather than a false answer.
+	if err := r.ValidateNonEmpty("byte_range"); err != nil {
+		return false, err
+	}
+	fileRaw, err := idBlob("file_id", string(file))
+	if err != nil {
+		return false, err
+	}
+	hashRaw, err := idBlob("content_hash", hash)
+	if err != nil {
+		return false, err
+	}
+	var confirmed bool
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			return err
+		}
+		sessionRaw, _ := model.DecodeID(string(rec.ID))
+		return wrap("served_ranges", tx.QueryRowContext(ctx, rangeConfirmedSQL,
+			sessionRaw, fileRaw, hashRaw, int64(r.Start), int64(r.End)).Scan(&confirmed))
+	})
+	if err != nil {
+		return false, err
+	}
+	return confirmed, nil
+}
+
+// SessionFilePaths resolves a bounded batch of file identifiers to the paths
+// they carry in this session's pinned snapshot. Coverage rows and manifest
+// entries carry identifiers and no path, and naming a file the operator cannot
+// locate is not an answer.
+//
+// It is scoped by session_files, not by the snapshot alone: only files this
+// session pinned are named, so a batch can never be used to enumerate paths
+// outside the actor's scope. An identifier that is not in the pinned scope, or
+// whose pinned hash is no longer in the snapshot, is absent from the map; the
+// caller decides what its own absence means. Like Coverage and CoverageSummary
+// it answers honestly beside CTX_SESSION_EXPIRED rather than pretending the
+// session has no scope.
+func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
+	ids []model.FileID) (map[model.FileID]string, error) {
+	if len(ids) > model.MaxPageItems {
+		return nil, &model.Error{Code: model.CodeResourceLimit,
+			Message: fmt.Sprintf("a path batch of %d files exceeds the %d-item page bound", len(ids), model.MaxPageItems)}
+	}
+	out := make(map[model.FileID]string, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	args := make([]any, 1, len(ids)+1)
+	placeholders := make([]string, 0, len(ids))
+	for _, id := range ids {
+		raw, err := idBlob("file_id", string(id))
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, raw)
+		placeholders = append(placeholders, "?")
+	}
+	query := `SELECT s.file_id, f.path
+		FROM session_files s
+		JOIN snapshot_files sf ON sf.snapshot_id = s.snapshot_id AND sf.file_id = s.file_id AND sf.content_hash = s.content_hash
+		JOIN files f ON f.id = s.file_id
+		WHERE s.session_id = ? AND s.file_id IN (` + strings.Join(placeholders, ", ") + `)`
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		rec, err := s.session(ctx, tx, session, actor, time.Now())
+		if err != nil {
+			// session returns a bare *model.Error, never a joined one, the same
+			// unwrap Session (:504) and CoverageSummary (:1169) already do.
+			if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeSessionExpired {
+				return err
+			}
+		}
+		args[0], _ = model.DecodeID(string(rec.ID))
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return wrap("session_files", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var file []byte
+			var path string
+			if err := rows.Scan(&file, &path); err != nil {
+				return wrap("session_files", err)
+			}
+			out[model.FileID(idHex(file))] = path
+		}
+		return wrap("session_files", rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
