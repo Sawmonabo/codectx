@@ -14,7 +14,7 @@ import (
 // first component of every key, so a change to the algebra makes every stored
 // key differ from every fresh key and the next refresh rewrites the unit
 // instead of silently mis-diffing against keys built by another algebra.
-const keyAlgebraVersion = "1"
+const keyAlgebraVersion = "2"
 
 // keySetMagic is the first line of a key-set file.
 const keySetMagic = "codectx-dependence-keyset v1"
@@ -44,6 +44,21 @@ const keySep = "\x1f"
 //	target              the syntactic name of the fact's target, or ""
 //	positional          the fact's ordered byte ranges, "start-end" joined
 //	                    with "|", in the order (from, to, occurrence)
+//	endpoints           for a relation, the published identities of its two
+//	                    endpoints joined with the separator; "" for a node
+//
+// Endpoints. A relation's published identity is derived from its endpoints,
+// and a located declaration's identity is derived from its declaration range,
+// so editing a callee moves every call edge into it to a new identity while
+// the components above — the site's own file, owner, target name and byte
+// range — do not move at all. Without the endpoints the same key would name
+// two different facts across a refresh, the previous row would be carried
+// under a key the fresh run still publishes, and the unit would hold an edge
+// whose endpoint no longer exists (storage refuses to seal it). A node fact
+// takes no endpoints component: its identity already tracks through file and
+// positional, and folding an identity minted from a declaration range into a
+// node key would reintroduce the initializer nondeterminism the positional
+// rule below exists to defeat.
 //
 // Normalization. The Go frontend appends a package's file-level declarations
 // to a synthetic per-package initializer in a nondeterministic order, so the
@@ -53,9 +68,9 @@ const keySep = "\x1f"
 // positional component is therefore replaced by a digest of the ordered
 // source text of its endpoints: content, which is stable, instead of
 // position, which is not.
-func FactKey(label, owner, file, operator, target, positional string) string {
+func FactKey(label, owner, file, operator, target, positional, endpoints string) string {
 	h := sha256.New()
-	for i, part := range [...]string{keyAlgebraVersion, label, owner, file, operator, target, positional} {
+	for i, part := range [...]string{keyAlgebraVersion, label, owner, file, operator, target, positional, endpoints} {
 		if i > 0 {
 			io.WriteString(h, keySep)
 		}
