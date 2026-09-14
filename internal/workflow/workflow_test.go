@@ -88,6 +88,69 @@ func TestWorkflowScenarios(t *testing.T) {
 				t.Errorf("the session is in state %q after both closes, want %q", got, model.StateClosed)
 			}
 		}},
+		// Failure mode: sweep_open -> verify_open with a manifest that resolved
+		// nothing. The store's transition table allows the edge, so without this
+		// service guard a session whose scope compiled to zero entries enters a
+		// verify phase it can never complete -- there is nothing to read, so
+		// read completeness is vacuously unreachable and the operator is told to
+		// read files that do not exist.
+		{name: "advance/a manifest that resolved no seed cannot enter verify", run: func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			h.store.mu.Lock()
+			rec := h.store.sessions[fixtureSession]
+			rec.rec.Phase, rec.rec.State = model.PhaseSweep, model.StateSweepOpen
+			m := h.store.manifests[fixtureManifest]
+			m.EntryCount = 0
+			h.store.manifests[fixtureManifest] = m
+			h.store.mu.Unlock()
+
+			_, _, err := h.svc.Advance(ctx, model.AdvanceRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+				Target: model.StateVerifyOpen, ExpectedVersion: 1,
+			})
+			if got := code(err); got != model.CodeScopeIncomplete {
+				t.Fatalf("Advance to verify_open over an empty manifest: code %q (err %v), want %q",
+					got, err, model.CodeScopeIncomplete)
+			}
+			if got := h.session(fixtureSession).State; got != model.StateSweepOpen {
+				t.Fatalf("the refused transition still moved the session to %q", got)
+			}
+		}},
+		// Failure mode: verify_open -> consolidate_open while required files are
+		// unread. The store does not count coverage, so without this guard a
+		// session consolidates -- and seals a capsule -- over files nobody read.
+		// The waiver route is the one exception and it is user-gated: with
+		// context.allow_exploratory_waiver_consolidation off, a recorded waiver
+		// must NOT buy the transition, or the flag protects nothing.
+		{name: "advance/consolidating short of coverage needs the waiver flag", run: func(t *testing.T, h *harness) {
+			ctx := context.Background()
+			req := model.AdvanceRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+				Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+			}
+			// The fixture is one fully served file, one partly served, one
+			// waived and one empty: two of four required files short, and the
+			// waiver is recorded from the start.
+			_, _, err := h.svc.Advance(ctx, req)
+			if got := code(err); got != model.CodeCoverageIncomplete {
+				t.Fatalf("Advance to consolidate_open short of coverage: code %q (err %v), want %q",
+					got, err, model.CodeCoverageIncomplete)
+			}
+			if got := h.session(fixtureSession).State; got != model.StateVerifyOpen {
+				t.Fatalf("the refused transition still moved the session to %q", got)
+			}
+
+			// The same session, the same shortfall, the flag on: the recorded
+			// waiver is now the exploratory route ruling Q12 allows, and the
+			// readiness gate -- not this guard -- is what keeps it honest.
+			waiverSvc := h.serviceWithWaiverConsolidation(t)
+			if _, _, err := waiverSvc.Advance(ctx, req); err != nil {
+				t.Fatalf("Advance under allow_exploratory_waiver_consolidation: %v (code %q)", err, code(err))
+			}
+			if got := h.session(fixtureSession).State; got != model.StateConsolidateOpen {
+				t.Fatalf("the permitted transition left the session at %q", got)
+			}
+		}},
 		// L2 rows
 		// An include invalidates the prior scope review by moving the scope
 		// version, never by deleting it, and the coverage the actor already
@@ -276,16 +339,62 @@ func TestWorkflowScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Status: %v (code %q)", err, code(err))
 			}
-			if !st.ScopeComplete || !st.ReadCompleteForSnapshot || st.Superseded {
-				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v read_complete=%v superseded=%v",
-					st.ScopeComplete, st.ReadCompleteForSnapshot, st.Superseded)
+			if !st.ScopeComplete || st.Superseded {
+				t.Fatalf("the non-waiver preconditions are not all satisfied: scope_complete=%v superseded=%v",
+					st.ScopeComplete, st.Superseded)
 			}
-			if st.RequiredFiles != 4 || st.FullyServedFiles != 4 || st.WaivedFiles != 1 {
-				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/4/1",
+			// A waived file never counts as served even though this one was
+			// also read (VF3): reporting 4 of 4 served beside a waiver read as
+			// full coverage, which is the claim a waiver exists to deny. So
+			// the served count is 3 and read completeness is false with it.
+			if st.RequiredFiles != 4 || st.FullyServedFiles != 3 || st.WaivedFiles != 1 {
+				t.Fatalf("counts are required=%d served=%d waived=%d, want 4/3/1",
 					st.RequiredFiles, st.FullyServedFiles, st.WaivedFiles)
+			}
+			if st.ReadCompleteForSnapshot {
+				t.Fatal("read_complete_for_snapshot is true beside a required-file waiver; a waived file is not a read file")
 			}
 			if st.StrictGateSatisfied || st.ReadyForImplementation {
 				t.Fatalf("a waived required file granted strict readiness: strict=%v ready=%v",
+					st.StrictGateSatisfied, st.ReadyForImplementation)
+			}
+		}},
+		// Failure mode: precondition 5's second half. A scope review that
+		// records blocking uncertainty is an actor saying "I could not settle
+		// this"; a gate that counted it as a review present would open on the
+		// actor's own stated doubt, which is precisely the false write
+		// authorization Section 16.3 exists to refuse. Everything else is
+		// arranged to hold, so the blocking entry is the only thing shutting it.
+		{name: "readiness/a blocking scope review entry alone shuts the strict gate", run: func(t *testing.T, h *harness) {
+			h.file(fixtureSession, filePartial).served = []model.ByteRange{{Start: 0, End: 100}}
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+
+			h.store.mu.Lock()
+			// No waiver, so precondition 6 and the served count both hold.
+			fs := h.store.sessions[fixtureSession]
+			fs.files[fileWaived].waived = false
+			fs.waivers = nil
+			blocking := fixtureScopeReview(fixtureSession, fixtureActor, 1)
+			for i := range blocking.Review.Entries {
+				if blocking.Review.Entries[i].Category == model.ReviewRemainingUncertainty {
+					blocking.Review.Entries[i].Blocking = true
+				}
+			}
+			fs.obs = append(fs.obs, blocking)
+			h.store.mu.Unlock()
+
+			st, err := h.svc.Status(context.Background(), model.SessionRequest{
+				SessionID: fixtureSession, ActorID: fixtureActor,
+			})
+			if err != nil {
+				t.Fatalf("Status: %v (code %q)", err, code(err))
+			}
+			if !st.ReadCompleteForSnapshot || st.WaivedFiles != 0 || st.Superseded {
+				t.Fatalf("the non-review preconditions are not all satisfied: read_complete=%v waived=%d superseded=%v",
+					st.ReadCompleteForSnapshot, st.WaivedFiles, st.Superseded)
+			}
+			if st.StrictGateSatisfied || st.ReadyForImplementation {
+				t.Fatalf("a blocking scope review entry granted strict readiness: strict=%v ready=%v",
 					st.StrictGateSatisfied, st.ReadyForImplementation)
 			}
 		}},
@@ -514,6 +623,32 @@ func newHarness(t *testing.T) *harness {
 		t.Fatalf("build the workflow service: %v", err)
 	}
 	return &harness{t: t, store: store, svc: svc}
+}
+
+// serviceWithWaiverConsolidation is the same fake store behind a service whose
+// user-level context.allow_exploratory_waiver_consolidation is on. The flag is
+// a Limits field read at guard time, so the only way to exercise both sides of
+// ruling Q12 against one fixture is a second service over the same store.
+func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
+	t.Helper()
+	svc, err := New(Options{
+		Sessions: h.store,
+		Compile:  h.store,
+		Validate: h.store,
+		Limits: Limits{
+			MaxPageItems:                        model.MaxPageItems,
+			MaxObservationReferences:            model.MaxObservationReferences,
+			MaxCapsuleBytes:                     8 << 20,
+			QueryTimeout:                        10 * time.Second,
+			AllowExploratoryWaiverConsolidation: true,
+		},
+		Now:    func() time.Time { return fixtureNow },
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("build the workflow service with the waiver flag: %v", err)
+	}
+	return svc
 }
 
 // session is the fixture session record, for a row that needs to call an
@@ -935,7 +1070,10 @@ func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, 
 	var required, served, waived int64
 	for _, f := range fs.files {
 		required++
-		if f.state() == model.CoverageFullServed {
+		// The real aggregate excludes a waived file from the served count
+		// whatever its bytes say (coverageSummarySQL); the fake must answer the
+		// same or these rows test a store that does not exist.
+		if f.state() == model.CoverageFullServed && !f.waived {
 			served++
 		}
 		if f.waived {

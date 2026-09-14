@@ -864,64 +864,6 @@ var scenarios = []scenario{
 
 	// L3 rows
 
-	// Strict readiness is a stronger claim than full coverage and Task 16 never
-	// makes it. The failure mode this guards is a status that folds
-	// "every required file is served" into ready_for_implementation: Section
-	// 16.3 additionally requires the verify phase, complete resolved scope, a
-	// current-scope actor review, no blocking unresolved dependency and current
-	// source validation, none of which this task evaluates. The row first
-	// proves the premise -- every required_full file really is full_served --
-	// so it cannot pass vacuously.
-	{name: "status/full coverage still grants no strict readiness", run: func(t *testing.T, h *harness) {
-		ctx := context.Background()
-		var ids []string
-		for i, fid := range h.store.order {
-			if h.store.required[fid] != model.RequirementFull {
-				continue
-			}
-			f := h.file(fid)
-			id := hexID(byte(0x50 + i))
-			// The empty file's chunk is the zero-length EOF chunk, which is the
-			// only thing that can ever grant it full coverage.
-			chunk := model.IssuedChunk{
-				ID: id, SessionID: sessionA, ActorID: actorA, FileID: fid, ContentHash: f.hash(),
-				Bytes:     model.ByteRange{Start: 0, End: uint64(len(f.data))},
-				ExpiresAt: h.now.Add(time.Hour),
-			}
-			if err := h.store.IssueChunk(ctx, chunk); err != nil {
-				t.Fatalf("issue chunk for %s: %v", f.path, err)
-			}
-			ids = append(ids, id)
-		}
-		if err := h.store.ConfirmChunks(ctx, sessionA, actorA, ids); err != nil {
-			t.Fatalf("confirm %d chunks: %v", len(ids), err)
-		}
-		// Every required file was issued and confirmed over its whole extent,
-		// so each carries exactly its fixture size in confirmed bytes -- the
-		// empty file zero, credited by its confirmed zero-length EOF chunk.
-		for _, fid := range h.store.order {
-			if h.store.required[fid] == model.RequirementFull {
-				h.checkCoverage(sessionA, actorA, fid, int64(len(h.file(fid).data)), model.CoverageFullServed)
-			}
-		}
-
-		_, status, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA}, model.PageRequest{})
-		if err != nil {
-			t.Fatalf("status: %v", err)
-		}
-		if status.RequiredFiles != int64(len(ids)) || status.FullyServedFiles != status.RequiredFiles {
-			t.Fatalf("premise failed: %d of %d required files are fully served, want all %d",
-				status.FullyServedFiles, status.RequiredFiles, len(ids))
-		}
-		if !status.ReadCompleteForSnapshot {
-			t.Fatalf("premise failed: read_complete_for_snapshot is false with every required file served")
-		}
-		if status.ReadyForImplementation || status.StrictGateSatisfied {
-			t.Fatalf("full coverage granted strict readiness: ready_for_implementation=%v strict_gate_satisfied=%v",
-				status.ReadyForImplementation, status.StrictGateSatisfied)
-		}
-	}},
-
 	// L4 rows
 
 	// Next must resume at the first byte this actor has not confirmed and must
@@ -1049,41 +991,35 @@ var scenarios = []scenario{
 				"an issued chunk is not coverage until it is confirmed", resp.Coverage, resp.Receipt)
 		}
 
-		// 2. Acknowledge it. The returned status is L3's, built from the record
-		// the confirmation just changed.
-		acked, err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
+		// 2. Acknowledge it. It reports no status of its own (ruling VF1); what
+		// it changes is the stored coverage, which is what this asserts.
+		if err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
 			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
-		})
-		if err != nil {
+		}); err != nil {
 			t.Fatalf("acknowledge: %v", err)
-		}
-		if acked.SessionID != sessionA || acked.RequiredFiles != 4 || acked.FullyServedFiles != 1 {
-			t.Fatalf("acknowledge reports session %q with %d of %d required files served; "+
-				"want %q with 1 of 4 -- the confirmed EOF receipt is the empty file's coverage",
-				acked.SessionID, acked.FullyServedFiles, acked.RequiredFiles, sessionA)
 		}
 		// The empty file's only possible coverage: zero bytes, full_served on
 		// the strength of the confirmed zero-length EOF receipt alone.
 		h.checkCoverage(sessionA, actorA, empty, 0, model.CoverageFullServed)
 
-		// 3. Status answers the same session, from the same record.
-		page, status, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
+		// 3. The status page reports the coverage that confirmation granted,
+		// over this session's whole required scope.
+		page, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
 			model.PageRequest{})
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
-		if status.SessionID != acked.SessionID || status.ActorID != acked.ActorID ||
-			status.Binding != acked.Binding || status.ManifestID != acked.ManifestID ||
-			status.Phase != acked.Phase || status.State != acked.State ||
-			status.StateVersion != acked.StateVersion ||
-			status.RequiredFiles != acked.RequiredFiles ||
-			status.FullyServedFiles != acked.FullyServedFiles {
-			t.Fatalf("status describes %+v; acknowledge described %+v -- two endpoints "+
-				"reporting one session must not disagree", status, acked)
+		var served int
+		for _, item := range page.Items {
+			if item.Requirement == model.RequirementFull && item.State == model.CoverageFullServed {
+				served++
+			}
 		}
-		if len(page.Items) == 0 {
-			t.Fatalf("status returned no coverage records for a session with four required files")
+		if len(page.Items) == 0 || served != 1 {
+			t.Fatalf("the status page carries %d records of which %d are fully served; "+
+				"want a populated page with exactly the empty file served",
+				len(page.Items), served)
 		}
 
 		// 4. Next advances past the file the confirmation covered.
@@ -1097,32 +1033,6 @@ var scenarios = []scenario{
 				item.FileID, item.Action, item.Offset, item.Remaining, crlf, actionReadSource)
 		}
 
-		// 5. Close is the compare-and-swap of ruling Q5 against the version
-		// Status just reported, not a CloseSession of its own: a stale version
-		// must lose rather than close a session that moved under the caller.
-		var typedErr *model.Error
-		if _, err := h.svc.Close(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
-			status.StateVersion+1); !errors.As(err, &typedErr) || typedErr.Code != model.CodeVersionConflict {
-			t.Fatalf("close at the wrong state version reports %v; want %s",
-				err, model.CodeVersionConflict)
-		}
-		closed, err := h.svc.Close(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
-			status.StateVersion)
-		if err != nil {
-			t.Fatalf("close: %v", err)
-		}
-		if closed.State != model.StateClosed || closed.StateVersion != status.StateVersion+1 {
-			t.Fatalf("close leaves the session %s at version %d; want %s at %d",
-				closed.State, closed.StateVersion, model.StateClosed, status.StateVersion+1)
-		}
-		// Partial coverage never earns readiness, and neither does closing.
-		for _, st := range []model.SessionStatus{acked, status, closed} {
-			if st.ReadCompleteForSnapshot || st.ReadyForImplementation || st.StrictGateSatisfied {
-				t.Fatalf("a session with 1 of 4 required files served reports read_complete=%t "+
-					"ready_for_implementation=%t strict_gate_satisfied=%t; Task 16 grants none of them",
-					st.ReadCompleteForSnapshot, st.ReadyForImplementation, st.StrictGateSatisfied)
-			}
-		}
 	}},
 
 	// An incomplete manifest scope is not a completed read. Ruling Q7 compiles
@@ -1294,7 +1204,7 @@ var scenarios = []scenario{
 		}
 		before := h.store.confirmCalls
 		var typedErr *model.Error
-		if _, err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
+		if err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionB, ActorID: actorB,
 			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
 		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCursorInvalid {
@@ -1331,7 +1241,7 @@ var scenarios = []scenario{
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		if _, err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
+		if err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
 			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
 		}); err != nil {
@@ -1340,7 +1250,7 @@ var scenarios = []scenario{
 		h.checkCoverage(sessionA, actorA, f.id, 7, model.CoveragePartialServed)
 
 		var typedErr *model.Error
-		if _, err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
+		if err := svc.Acknowledge(ctx, model.AcknowledgeRequest{
 			SessionID: sessionA, ActorID: actorA,
 			Kind: model.AcknowledgeFile, FileID: f.id,
 		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCoverageIncomplete {

@@ -105,11 +105,21 @@ func (s *stack) openOverlay(ctx context.Context, gen model.GenerationID, profile
 	return &overlayRoute{reader: reader, overlay: overlay, binding: binding, limit: s.overlayLimit(page.Limit)}, nil
 }
 
-// close releases the server handle and then the generation pin. Both run even
-// when the first fails: a lease left held outlives the command that took it.
-func (r *overlayRoute) close() {
-	r.overlay.Close()
-	r.reader.Close()
+// closeOverlay releases the server handle and then the generation pin. Both run
+// even when the first fails: a lease left held outlives the command that took
+// it. Neither failure can be returned -- the caller is already answering -- so
+// each is logged at Warn, because PinnedReader.Close is what releases the
+// retention lease and a silent failure there is a generation pinned against
+// retention with nothing to say so.
+func (s *stack) closeOverlay(r *overlayRoute) {
+	if err := r.overlay.Close(); err != nil {
+		s.logger.Warn("a language server overlay handle could not be closed",
+			"component", "app", "error", err.Error())
+	}
+	if err := r.reader.Close(); err != nil {
+		s.logger.Warn("a pinned generation reader could not be released",
+			"component", "app", "error", err.Error())
+	}
 }
 
 // overlayLimit clamps the caller's page bound to this workspace's
@@ -175,7 +185,7 @@ func (s *stack) overlaySymbols(ctx context.Context, req model.SymbolRequest) (mo
 	if err != nil {
 		return model.Page[model.Node]{}, err
 	}
-	defer route.close()
+	defer s.closeOverlay(route)
 
 	var (
 		nodes     []model.Node
@@ -283,7 +293,10 @@ func overlayContainer(container string) json.RawMessage {
 }
 
 // overlayDefinitionNodes turns definition locations into overlay nodes. A
-// location carries no name and no kind, so the queried name is carried through
+// definition result is a bare lsp.Location: the protocol's textDocument/
+// definition response carries a range and nothing else, so the overlay has no
+// SymbolKind to derive a node kind from here (unlike the symbol routes, which
+// map the kind the server sent). The queried name is therefore carried through
 // and the kind is model.NodeVariable -- the same honest fallback the protocol
 // mapping uses for a symbol whose kind is not a declaration kind this client
 // knows: a named entity, never a fabricated declaration kind.
@@ -320,7 +333,7 @@ func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceReques
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
-	defer route.close()
+	defer s.closeOverlay(route)
 
 	stored, err := route.reader.Node(ctx, req.NodeID)
 	if err != nil {

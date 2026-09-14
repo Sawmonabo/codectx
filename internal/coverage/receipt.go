@@ -149,9 +149,14 @@ func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord,
 // branch touches session state the request's actor does not own. An expired or
 // closed session fails here: only the reporting paths carry on beside
 // CTX_SESSION_EXPIRED, and a confirmation is a mutation.
-func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest) (model.SessionStatus, error) {
+//
+// It reports no status of its own (ruling VF1): the facade reads the gate-aware
+// model.SessionStatus from workflow.Service.Status after this returns, so what
+// the caller sees is the coverage this call just granted, judged by the one
+// readiness evaluator.
+func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest) error {
 	if err := req.Validate(); err != nil {
-		return model.SessionStatus{}, err
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
@@ -159,19 +164,12 @@ func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest)
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
-		return model.SessionStatus{}, err
+		return err
 	}
 	// Validate admits exactly the two kinds, so there is no third branch to
 	// write and no unreachable default to leave behind.
 	if req.Kind == model.AcknowledgeReceipt {
-		err = s.confirmReceipts(ctx, rec, req.Receipts)
-	} else {
-		err = s.sessions.AcknowledgeFile(ctx, req.SessionID, req.ActorID, req.FileID)
+		return s.confirmReceipts(ctx, rec, req.Receipts)
 	}
-	if err != nil {
-		return model.SessionStatus{}, err
-	}
-	// The status is read after the confirmation, so it reports the coverage this
-	// call just granted rather than the state before it.
-	return s.status(ctx, rec)
+	return s.sessions.AcknowledgeFile(ctx, req.SessionID, req.ActorID, req.FileID)
 }
