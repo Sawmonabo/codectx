@@ -15,6 +15,10 @@ import (
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
+// A qualifier the worker is allowed to send must fit the name bound the
+// parent publishes it under; this does not compile if the two ever diverge.
+const _ uint = model.MaxNameBytes - wire.MaxQualifierBytes
+
 // Fact bounds beyond the model's. A doc body is kept well under the per-record
 // cap so a declaration's search document never approaches it; evidence per
 // fact is the model bound, and occurrences past it are counted, not stored.
@@ -22,12 +26,14 @@ const (
 	maxDocBytes    = 8 << 10
 	capabilityName = "structure"
 	searchDomain   = "treesitter-search-v1"
-	// maxUnresolvedCallees bounds the distinct cross-file callees one file may
-	// mint a placeholder for. A generated or minified file can hold tens of
-	// thousands of distinct unresolved names, each of which would be a node, a
-	// relation and evidence; past the bound the call is counted and the file's
-	// structural coverage is reported partial instead.
-	maxUnresolvedCallees = 2000
+	// maxCalleeReferences bounds the distinct callee reference nodes one file
+	// may mint: the callees no single declaration of this file can be. A
+	// generated or minified file can hold tens of thousands of distinct such
+	// names, each of which would be a node, a relation and evidence; past the
+	// bound the call is counted and the file's structural coverage is reported
+	// partial instead. The call-site aliases a file publishes are bounded with
+	// it and by wire.MaxRefsPerFile, which bounds its references outright.
+	maxCalleeReferences = 2000
 	// maxPutRecords bounds one hand-off to the sink, so a unit's facts stream
 	// through it in bounded slices rather than one slice the size of the whole
 	// file's output. provider.Sink does not expose the sink's Limits, so this
@@ -56,6 +62,7 @@ type builder struct {
 	cur      *source.Cursor
 	ex       *extraction
 	scope    string
+	modKey   string
 	fileRng  *model.SourceRange
 	decls    []declFact
 	byName   map[string][]int
@@ -68,8 +75,8 @@ type builder struct {
 	search   []model.SearchUnit
 	// dropped counts what this file's bounds kept out of the facts:
 	// occurrences past the per-fact evidence bound, calls past the
-	// unresolved-callee bound and declaration keys over MaxNativeKeyBytes.
-	// Any of it makes the file's coverage partial.
+	// callee-reference bound, and declaration or call-site keys over
+	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
 	dropped int
 }
 
@@ -93,7 +100,23 @@ func outputInvalid(msg string) *model.Error {
 // returns the facts in put order: every node before any relation, alias or
 // search document that references it.
 func (b *builder) build() error {
-	b.scope = ScopePrefix + b.fv.Path
+	b.scope, b.modKey = ScopePrefix+b.fv.Path, "module:"+b.fv.Path
+	// The file's two path-derived keys are bounded here, once, before any
+	// identity is claimed. A snapshot path may be model.MaxPathBytes long while
+	// a scope key stops at model.MaxScopeKeyBytes and a native key at
+	// model.MaxNativeKeyBytes, so a legal path overflows the file's alias scope
+	// and its module node's native key. Neither is truncated — a truncated key
+	// is a different, possibly colliding identity claim — and neither may be
+	// published over its bound, which model.NodeCandidate.Validate and
+	// model.NativeAlias.Validate reject with CTX_ARGUMENT_INVALID, failing the
+	// whole unit for one file nothing can name. Without a module node there is
+	// no container for a declaration and no scope for an alias, so the file
+	// publishes nothing and reports its structural coverage partial /
+	// CTX_COVERAGE_INCOMPLETE, exactly as an over-long declaration key does.
+	if len(b.scope) > model.MaxScopeKeyBytes || len(b.modKey) > model.MaxNativeKeyBytes {
+		b.dropped++
+		return nil
+	}
 	b.rels = map[model.RelationID]*model.RelationFact{}
 	b.nodeAt = map[model.NodeID]int{}
 	b.byName = map[string][]int{}
@@ -190,7 +213,7 @@ func (b *builder) validateDecls() error {
 // declaration is defined by and the subject of imports and exports.
 func (b *builder) resolveModule() error {
 	res, err := b.resolve(model.NodeCandidate{
-		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: "module:" + b.fv.Path,
+		ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.modKey,
 		Kind: model.NodeModule, Language: b.lang.Name, Name: path.Base(b.fv.Path), QualifiedName: b.fv.Path,
 		FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: b.fileRng,
 	})
@@ -202,8 +225,8 @@ func (b *builder) resolveModule() error {
 	if b.ex.done.Package != "" {
 		meta["package"] = bound(b.ex.done.Package, model.MaxNameBytes)
 	}
-	b.putNode(res, b.fileRng, "module:"+b.fv.Path, meta)
-	b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: "module:" + b.fv.Path, NodeID: res.Node.ID})
+	b.putNode(res, b.fileRng, b.modKey, meta)
+	b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: b.modKey, NodeID: res.Node.ID})
 	return nil
 }
 
@@ -258,8 +281,19 @@ func (b *builder) resolveDecls() error {
 			// claiming structural coverage it does not have.
 			b.dropped++
 		}
-		if pkg := b.packageScope(); pkg != "" && d.Parent < 0 {
-			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		if d.Parent < 0 {
+			pkg, over := b.packageScope()
+			switch {
+			case pkg != "":
+				b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
+			case over:
+				// The package alias scope did not fit and was omitted rather
+				// than truncated, for the same reason declKey omits an
+				// over-long key. This declaration will not merge with the one
+				// another file of the same package publishes, so the file's
+				// structural coverage is genuinely incomplete and says so.
+				b.dropped++
+			}
 		}
 		b.search = append(b.search, b.searchUnit(d))
 	}
@@ -277,9 +311,10 @@ func (b *builder) resolveDecls() error {
 // the declaration's final byte lies on, not the half-open end position's.
 // Nothing is normalized: the identifier is the token the source spells, the
 // path is the same root-relative slash path the unit's scope key carries.
-// Joern's exported METHOD key is byte-for-byte this string, so publishing it
-// as an alias is what merges the two providers' identities for one function
-// instead of leaving two correct but unrelated nodes.
+// The `dependence` provider, whose exported declaration key is byte-for-byte
+// this string, publishes the same alias, which is what merges the two
+// providers' identities for one function instead of leaving two correct but
+// unrelated nodes.
 //
 // A key over MaxNativeKeyBytes is omitted rather than truncated: a truncated
 // key would be a different, possibly colliding identity claim. The
@@ -305,18 +340,29 @@ func (b *builder) declKey(d *declFact) string {
 // packageScope is the language's package-level alias scope for top-level
 // declarations, when the language has a declared package clause whose
 // members are visible across files without an import: Go and Java.
-func (b *builder) packageScope() string {
+//
+// The Go spelling carries the file's directory, which a legal path can make
+// longer than model.MaxScopeKeyBytes on its own. An over-long scope is
+// reported over=true so the caller drops and counts that one alias, rather
+// than publishing a key model.NativeAlias.Validate rejects — which would fail
+// the whole unit — or a truncated one, which would be a colliding scope.
+func (b *builder) packageScope() (scope string, over bool) {
 	pkg := b.ex.done.Package
 	if pkg == "" || len(pkg) > model.MaxNameBytes {
-		return ""
+		return "", false
 	}
 	switch b.lang.Name {
 	case "go":
-		return "pkg:go:" + path.Dir(b.fv.Path) + ":" + pkg
+		scope = "pkg:go:" + path.Dir(b.fv.Path) + ":" + pkg
 	case "java":
-		return "pkg:java:" + pkg
+		scope = "pkg:java:" + pkg
+	default:
+		return "", false
 	}
-	return ""
+	if len(scope) > model.MaxScopeKeyBytes {
+		return "", true
+	}
+	return scope, false
 }
 
 // imports publishes one module node per import target (a structural
@@ -331,9 +377,19 @@ func (b *builder) imports() error {
 		if err != nil {
 			return err
 		}
+		// An import path is bounded by MaxQualifiedNameBytes, which equals
+		// MaxNativeKeyBytes, so the prefix can push the import target's key
+		// over its bound. It is dropped and counted like every other key that
+		// does not fit: the import edge is lost, never truncated into a
+		// different identity and never allowed to fail the unit.
+		key := "import:" + b.lang.Name + ":" + imp.Path
+		if len(key) > model.MaxNativeKeyBytes {
+			b.dropped++
+			continue
+		}
 		name := lastPathSegment(imp.Path)
 		res, err := b.resolve(model.NodeCandidate{
-			ProviderID: lang.ProviderID, ScopeKey: provider.ScopeWorkspace, NativeKey: "import:" + b.lang.Name + ":" + imp.Path,
+			ProviderID: lang.ProviderID, ScopeKey: provider.ScopeWorkspace, NativeKey: key,
 			Kind: model.NodeModule, Language: b.lang.Name, Name: name, QualifiedName: imp.Path,
 		})
 		if err != nil {
@@ -346,24 +402,50 @@ func (b *builder) imports() error {
 }
 
 // refs publishes call sites and type references. Resolution is file-local
-// (Section 11.1 precision syntax): a name declared once in this file is the
-// target; a name declared several times is retained as may_refer_to edges; a
-// name declared nowhere in this file, or qualified by an imported name, is an
-// honest unresolved placeholder, never a guess at another file's symbol.
+// (Section 11.1 precision syntax): a call to a name declared exactly once in
+// this file names that declaration; every other call names a provider-local
+// callee reference node carrying the Section 9.3 resolution and candidates
+// attributes, never a guess at another file's symbol, and a name declared
+// several times here is additionally retained as may_refer_to edges.
+//
+// Every call site also publishes the Section 11.3 call-site alias on its
+// callee node, so the SCIP importer's alias for the reference occurrence at
+// the same bytes joins the syntactic callee to the compiler-resolved symbol
+// and the calls relation acquires a precise target.
 func (b *builder) refs() error {
-	unresolved := map[string]model.Resolution{}
+	callees := map[string]model.Resolution{}
 	for _, r := range b.ex.refs {
 		if r.Kind != "call" && r.Kind != "type" {
 			return outputInvalid("reference kind " + bound(r.Kind, 32) + " is unknown")
 		}
-		if r.Name == "" || len(r.Name) > model.MaxNameBytes || !utf8.ValidString(r.Name) || len(r.Qualifier) > model.MaxNameBytes {
+		if r.Name == "" || len(r.Name) > model.MaxNameBytes || !utf8.ValidString(r.Name) {
 			return outputInvalid("reference name is empty, over its bound or not UTF-8")
+		}
+		// The two are checked apart because they fail for different reasons
+		// and a single message cost a lane a debugging round: a name is a
+		// token the grammar captured, a qualifier is a receiver expression
+		// the worker is required to bound before it sends it.
+		if len(r.Qualifier) > wire.MaxQualifierBytes || !utf8.ValidString(r.Qualifier) {
+			return outputInvalid("reference qualifier is over its bound or not UTF-8")
 		}
 		if r.Scope < -1 || r.Scope >= len(b.decls) {
 			return outputInvalid("reference names a scope that is not a declaration")
 		}
 		rng, err := b.rangeOf(r.Start, r.End)
 		if err != nil {
+			return err
+		}
+		// The identifier range is validated against the pinned bytes like
+		// every other offset — rangeOf is what rejects an offset inside a
+		// UTF-8 sequence or past the manifest size — and must name a
+		// non-empty token inside the reference it belongs to, because the
+		// callsite alias is built from it and a range that is not the
+		// callee token joins the wrong SCIP occurrence, or none.
+		if r.NameEnd <= r.NameStart || r.NameStart < r.Start || r.NameEnd > r.End {
+			return outputInvalid("reference identifier range [" + strconv.Itoa(int(r.NameStart)) + "," + strconv.Itoa(int(r.NameEnd)) +
+				") is empty or lies outside the reference")
+		}
+		if _, err := b.rangeOf(r.NameStart, r.NameEnd); err != nil {
 			return err
 		}
 		from := b.module.Node.ID
@@ -379,22 +461,36 @@ func (b *builder) refs() error {
 			}
 			continue
 		}
-		switch {
-		case len(targets) == 1:
-			b.putRelation(from, model.RelCalls, b.decls[targets[0]].res.Node.ID, rng, r.Name, "")
-		case len(targets) > 1:
-			for _, t := range targets[:min(len(targets), model.MaxAmbiguousCandidates)] {
-				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
-			}
-		default:
+		var callee model.NodeID
+		if len(targets) == 1 {
+			// The one declaration of this file the name can mean. The callee
+			// node is that declaration, and the calls edge to a located
+			// declaration of this same file states that resolution
+			// structurally rather than as an attribute on a node that also
+			// describes the declaration itself.
+			callee = b.decls[targets[0]].res.Node.ID
+			b.putRelation(from, model.RelCalls, callee, rng, r.Name, "")
+		} else {
+			// Nothing in this file is the single callee: the name is declared
+			// several times here, is qualified by an imported name, or is not
+			// declared here at all.
+			//
+			// A bare call keys its callee reference by the callee name, a
+			// qualified one by receiver and name; the two never collide
+			// because a callee name is a single identifier and a qualified
+			// key always carries the separating dot. A receiver the worker
+			// could not name within its bound leaves the qualifier empty, so
+			// the key is "call:." + name: a method of that name on a receiver
+			// this file does not name, which is what it is.
 			key := "call:" + r.Name
 			kind := model.NodeFunction
 			if r.Qualified {
 				key, kind = "call:"+r.Qualifier+"."+r.Name, model.NodeMethod
 			}
-			res, ok := unresolved[key]
+			resolution, candidates := calleeResolution(r, targets)
+			res, ok := callees[key]
 			if !ok {
-				if len(unresolved) >= maxUnresolvedCallees {
+				if len(callees) >= maxCalleeReferences {
 					// Past the bound the call is counted, not minted: a file
 					// with more distinct cross-file callees than this is
 					// reported partial rather than allowed to publish an
@@ -406,15 +502,76 @@ func (b *builder) refs() error {
 					Kind: kind, Language: b.lang.Name, Name: r.Name}); err != nil {
 					return err
 				}
-				unresolved[key] = res
-				b.putNode(res, rng, key, map[string]any{"resolution": "unresolved", "callee": r.Name})
+				callees[key] = res
+				b.putNode(res, rng, key, map[string]any{"resolution": resolution, "candidates": candidates, "callee": r.Name})
 			} else {
 				b.addEvidence(res.Node.ID, rng, key)
 			}
-			b.putRelation(from, model.RelCalls, res.Node.ID, rng, key, "unresolved")
+			callee = res.Node.ID
+			b.putRelation(from, model.RelCalls, callee, rng, key, resolution)
+			for _, t := range targets[:min(len(targets), model.MaxAmbiguousCandidates)] {
+				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
+			}
+		}
+		if key := b.callsiteKey(r.NameStart, r.NameEnd); key != "" {
+			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: callee})
+		} else {
+			// The key did not fit and was omitted rather than truncated: a
+			// truncated key is a different, possibly colliding identity
+			// claim. Without it this call site does not join the SCIP
+			// occurrence at the same bytes, so the file's structural
+			// coverage is genuinely incomplete and reports partial.
+			b.dropped++
 		}
 	}
 	return nil
+}
+
+// calleeResolution is the Section 9.3 attribute pair for a call whose callee
+// is not one declaration of this file: which basis resolved it and how many
+// equally supported candidates were considered.
+//
+// Only three of the six enum values can be produced by a file-local
+// syntactic pass. `exact` needs a compiler binding, which this provider does
+// not have; `same_module` describes the resolved case above, which carries
+// its resolution structurally as an edge to a located declaration of this
+// file rather than as an attribute; `unique_name` would mean resolving a
+// name across a scope wider than this file, which this provider never does.
+func calleeResolution(r wire.Ref, targets []int) (string, int) {
+	switch {
+	case len(targets) > 1:
+		return "ambiguous", len(targets)
+	case r.QualifierIsImport:
+		// The qualifier is a name an import of this file introduced, so the
+		// callee is known to come through that import and is known not to be
+		// in this file: the basis is the import, with no in-file candidate.
+		return "import", 0
+	default:
+		return "unresolved", 0
+	}
+}
+
+// callsiteKey is the Section 11.3 call-site join key, the one string this
+// provider and the SCIP importer both compute for the same call site:
+//
+//	scope  "file:" + path
+//	key    "callsite:" + path + ":" + <first byte> + "-" + <last byte>
+//
+// The byte range is the callee identifier's, one-based and inclusive, so a
+// callee token occupying the half-open UTF-8 byte range [start,end) is
+// spelled start+1 "-" end. Byte offsets, never characters or UTF-16 code
+// units: the SCIP importer converts its own encoding through internal/source
+// before it builds the same key. The path is the snapshot manifest's
+// root-relative slash path, the same one this unit's scope key carries.
+//
+// A key over MaxNativeKeyBytes is omitted rather than truncated, exactly as
+// declKey is, and the omission is counted by the caller.
+func (b *builder) callsiteKey(start, end uint32) string {
+	key := "callsite:" + b.fv.Path + ":" + strconv.FormatUint(uint64(start)+1, 10) + "-" + strconv.FormatUint(uint64(end), 10)
+	if len(key) > model.MaxNativeKeyBytes {
+		return ""
+	}
+	return key
 }
 
 // targets are the declarations in this file a reference can name. A

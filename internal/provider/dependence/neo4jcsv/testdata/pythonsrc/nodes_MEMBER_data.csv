@@ -1,0 +1,7 @@
+98784247808,MEMBER,<empty>,<empty>,f,25,,<empty>,3,f,39,45,1,,__builtin.int
+98784247809,MEMBER,<empty>,<empty>,arr,37,,<empty>,3,arr,51,59,2,,ANY
+98784247810,MEMBER,<empty>,<empty>,<fakeNew>,,w.py:<module>.S.<fakeNew>,<empty>,,<fakeNew>,,,5,,ANY
+98784247811,MEMBER,<empty>,<empty>,__init__,5,w.py:<module>.S.__init__,<empty>,3,__init__,19,68,6,,ANY
+98784247812,MEMBER,<empty>,<empty>,__init__,5,w.py:<module>.S.__init__<metaClassAdapter>,<empty>,3,__init__,19,68,9,,ANY
+98784247813,MEMBER,<empty>,<empty>,G,1,,<empty>,1,G,,,1,,__builtin.int
+98784247814,MEMBER,<empty>,<empty>,S,1,,<empty>,2,S,,,2,,w.py:<module>.S

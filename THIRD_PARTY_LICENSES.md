@@ -38,3 +38,50 @@ Go modules (each module carries the grammar's `parser.c`); the query packs under
 `internal/provider/treesitter/lang/queries/` are codectx's own and are covered
 by this repository's license. See `docs/providers-treesitter.md` for the pinned
 ABI and grammar metadata that the unit fingerprint folds in.
+
+## Pinned analyzer payloads
+
+The managed analyzer toolchain of Section 11.7 pins one external analyzer or
+runtime per lock entry (`docs/toolchain.md`). Most are pinned at the upstream
+publisher's own asset URL; `gopls`, the four Node-hosted analyzers, and the
+three platforms of `scip-go` upstream does not build have no upstream binary and
+are built at release time and redistributed as assets of the `tools-v<n>`
+release. Either way the payload is **not linked into the
+binary**: the product downloads the one its lock names, verifies its SHA-256
+and size, and runs it as a separate process. Every payload keeps its upstream
+license file inside the archive; the table below is the inventory the lock also
+records in each entry's `license` field, and the `Hosting` column says which of
+the two the bytes come from.
+
+| Payload | Version | License | Hosting | Upstream |
+|---|---|---|---|---|
+| `node` | 22.23.2 | MIT (Node.js core) with the bundled-component licenses in `LICENSE` (ICU under Unicode-DFS-2016, OpenSSL under Apache-2.0, zlib, libuv and others) | upstream | https://nodejs.org/dist/v22.23.2/ |
+| `jdk` (Eclipse Temurin) | 21.0.12.1+1 | GPL-2.0-only WITH Classpath-exception-2.0 | upstream | https://adoptium.net/temurin/releases/?version=21 |
+| `scip-go` | 0.2.7 | Apache-2.0 | upstream (linux amd64/arm64, darwin arm64); redistributed (darwin amd64, windows amd64/arm64) | https://github.com/sourcegraph/scip-go |
+| `scip-typescript` | 0.4.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-typescript |
+| `scip-python` | 0.6.6 | MIT (the package vendors pyright) | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-python |
+| `scip-java` | 0.13.1 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-java |
+| `rust-analyzer` | 2026-08-17.4 | MIT OR Apache-2.0 | upstream | https://github.com/rust-lang/rust-analyzer |
+| `scip-clang` | 0.4.0 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-clang |
+| `gopls` | 0.23.0 | BSD-3-Clause (the Go project) | redistributed | https://pkg.go.dev/golang.org/x/tools/gopls |
+| `typescript-language-server` | 6.0.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/typescript-language-server |
+| `typescript` (shipped inside the `typescript-language-server` payload) | 5.9.3 | Apache-2.0 | redistributed | https://www.npmjs.com/package/typescript |
+| `pyright` | 1.1.414 | MIT | redistributed | https://www.npmjs.com/package/pyright |
+| `clangd` | 22.1.6 | Apache-2.0 WITH LLVM-exception | upstream | https://github.com/clangd/clangd |
+| `jdtls` (Eclipse JDT Language Server) | 1.61.0 | EPL-2.0 | upstream | https://download.eclipse.org/jdtls/milestones/1.61.0/ |
+| `joern` (backend of the `dependence` provider) | 4.0.627 | Apache-2.0 | upstream | https://github.com/joernio/joern |
+
+The npm payloads are produced with `npm ci --omit=dev --omit=optional
+--ignore-scripts`, so each carries its resolved production dependency tree and
+those packages' own licenses under `node_modules/`. None is copyleft beyond the
+weak-copyleft entries named above (`jdk` under the Classpath Exception and
+`jdtls` under EPL-2.0), and neither imposes an obligation on a program that
+merely executes it as a separate process.
+
+"Redistributed" payloads are the ones this project publishes; "upstream" ones
+are fetched from the publisher's own release and are redistributed by nobody
+here. Regenerate the inventory alongside the lock with:
+
+```bash
+go run ./internal/tools/toollock -licenses /dev/stdout -no-upload
+```

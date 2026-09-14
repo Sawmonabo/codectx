@@ -102,6 +102,7 @@ type Config struct {
 	Index     Index     `toml:"index"`
 	Resources Resources `toml:"resources"`
 	Storage   Storage   `toml:"storage"`
+	Tools     Tools     `toml:"tools"`
 	Providers Providers `toml:"providers"`
 	Context   Context   `toml:"context"`
 	Coverage  Coverage  `toml:"coverage"`
@@ -158,7 +159,16 @@ type Index struct {
 	WatchPendingBytes int64    `toml:"watch_pending_bytes"`
 	WatchDebounce     Duration `toml:"watch_debounce"`
 	ReconcileInterval Duration `toml:"reconcile_interval"`
-	RetainGenerations int      `toml:"retain_generations"`
+	// RetainRefs is retention by ref, not by snapshot count (Section 12.4):
+	// the results of the last N distinct refs the user actually indexed stay
+	// on disk, so switching A -> B -> C -> A finds A's units and reuses them
+	// without a run. The minimum is 1, which retains the active ref alone.
+	RetainRefs int `toml:"retain_refs"`
+	// MaxRetainedBytes is the second setting where 0 is meaningful: the
+	// retained store has no default size limit, so 0 leaves retention governed
+	// by RetainRefs alone. A user-set value evicts least-recently-used refs
+	// first and never the active one.
+	MaxRetainedBytes int64 `toml:"max_retained_bytes"`
 }
 
 // Resources is the memory, concurrency, disk and response policy.
@@ -201,7 +211,7 @@ type Providers struct {
 	TreeSitter TreeSitter `toml:"tree_sitter"`
 	SCIP       SCIP       `toml:"scip"`
 	LSP        LSP        `toml:"lsp"`
-	Joern      Joern      `toml:"joern"`
+	Dependence Dependence `toml:"dependence"`
 }
 
 // TreeSitter configures the bundled structural provider. It runs as a private
@@ -228,11 +238,77 @@ type LSP struct {
 	IdleTTL                Duration   `toml:"idle_ttl"`
 }
 
-// Joern configures the optional deep-analysis adapter.
-type Joern struct {
+// Dependence configures the control-dependence, data-dependence and fallback
+// call provider of Section 11.6. Everything here is scheduling and admission
+// policy: which backend produces the facts is a tool-lock entry the product
+// owns and never a configuration value, so no key names one.
+type Dependence struct {
+	// Enabled defaults to auto: dependence units run as low-priority
+	// background work once the base generation is active, and a query for a
+	// dependence fact promotes its units and is answered `pending` until they
+	// seal. true blocks the index on those units; false disables the provider.
 	Enabled Enablement `toml:"enabled"`
-	Profile string     `toml:"profile"`
-	Timeout Duration   `toml:"timeout"`
+	// Timeout bounds one whole unit.
+	Timeout Duration `toml:"timeout"`
+	// CacheBytes budgets the per-unit parsed-graph cache under the private
+	// data directory. That cache is what makes an unchanged unit cost nothing
+	// on refresh, so it has its own budget rather than sharing the query cache.
+	CacheBytes int64 `toml:"cache_bytes"`
+	// UnitMemoryFloorBytes is the smallest allocation a unit may be sized to.
+	// Sizing a unit near its live set costs time instead of memory, so the
+	// floor keeps a small unit from being starved into a much slower run.
+	UnitMemoryFloorBytes int64 `toml:"unit_memory_floor_bytes"`
+	// UnitMemoryCeilingBytes is 0 by default, which means the allocation is
+	// derived from the machine: free memory minus the base index footprint
+	// minus a safety margin. There is no default memory ceiling, and only a
+	// non-zero value here may reject a unit before it runs.
+	UnitMemoryCeilingBytes int64 `toml:"unit_memory_ceiling_bytes"`
+}
+
+// Tools is the managed analyzer toolchain policy of Section 11.7. The product
+// owns every external analyzer and every runtime one needs, pinned by the
+// embedded tool lock, so nothing here approves an executable: these are the
+// store, fetch and offline settings, plus the one escape hatch that replaces a
+// pinned binary. The whole table is user-configuration-only; a project file
+// that sets any of it is a trust escalation (Section 20.2).
+type Tools struct {
+	// Offline makes every fetch a typed refusal without opening a socket.
+	Offline bool `toml:"offline"`
+	// CacheDir is the absolute tool store. Empty means <data_dir>/tools, which
+	// the toolchain owner creates user-private; this package resolves neither,
+	// exactly as it leaves Storage.DataDir's subdirectories alone.
+	CacheDir string `toml:"cache_dir"`
+	// Mirror is an absolute https prefix that replaces the scheme and host of
+	// every lock asset URL, keeping the original host as the first path segment
+	// so one mirror serves every publisher the lock names. The digests stay the
+	// lock's, so a mirror can relocate bytes but never change which bytes are
+	// accepted.
+	Mirror string `toml:"mirror"`
+	// MaxFetchBytes and FetchTimeout bound one payload download.
+	MaxFetchBytes int64    `toml:"max_fetch_bytes"`
+	FetchTimeout  Duration `toml:"fetch_timeout"`
+	// Override is the `[tools.override.<name>]` table, keyed by lock entry
+	// name. Iterate it in sorted order so diagnostics are deterministic.
+	Override map[string]ToolOverride `toml:"override"`
+}
+
+// ToolOverride is the only way to run a tool the lock did not ship for this
+// platform, or to replace one it did. It changes the binary and never the
+// invocation: profile argv, environment allowlists, budgets, work directories
+// and network posture are product code, not configuration (Section 20.2).
+//
+// All three fields are required. An override names a binary outside the lock,
+// so the checksum is what makes it verifiable at all; without it the entry
+// would admit whatever happens to sit at that path on the next run.
+type ToolOverride struct {
+	// Executable is an absolute path. PATH lookup is never an approval.
+	Executable string `toml:"executable"`
+	// Version is the exact version this binary is, not a constraint: it is
+	// recorded as the tool identity behind the units the tool produces.
+	Version string `toml:"version"`
+	// Checksum is the required lowercase hex SHA-256 of Executable, verified
+	// at the start of every run.
+	Checksum string `toml:"checksum"`
 }
 
 // Context is the context-compiler ranking and budget policy. Every field feeds
@@ -374,7 +450,8 @@ func Defaults() Config {
 			WatchPendingBytes: 2097152,
 			WatchDebounce:     Duration(250 * time.Millisecond),
 			ReconcileInterval: Duration(30 * time.Second),
-			RetainGenerations: 3,
+			RetainRefs:        8,
+			MaxRetainedBytes:  0,
 		},
 		Resources: Resources{
 			BaseMemoryBudgetBytes:     805306368,
@@ -403,6 +480,13 @@ func Defaults() Config {
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),
 			QueryCursorTTL:         Duration(15 * time.Minute),
 		},
+		Tools: Tools{
+			Offline:       false,
+			CacheDir:      "",
+			Mirror:        "",
+			MaxFetchBytes: 2147483648,
+			FetchTimeout:  Duration(10 * time.Minute),
+		},
 		Providers: Providers{
 			TreeSitter: TreeSitter{
 				Enabled:       true,
@@ -417,7 +501,13 @@ func Defaults() Config {
 				MaxOutstandingRequests: 8,
 				IdleTTL:                Duration(60 * time.Second),
 			},
-			Joern: Joern{Enabled: Disabled, Profile: "pinned-default", Timeout: Duration(45 * time.Minute)},
+			Dependence: Dependence{
+				Enabled:                Auto,
+				Timeout:                Duration(45 * time.Minute),
+				CacheBytes:             4294967296,
+				UnitMemoryFloorBytes:   805306368,
+				UnitMemoryCeilingBytes: 0,
+			},
 		},
 		Context: Context{
 			DefaultPhase:                        "sweep",

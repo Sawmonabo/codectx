@@ -1,0 +1,46 @@
+30064771072,CALL,-1,,,let x = 1,6,STATIC_DISPATCH,,3,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771073,CALL,-1,,,x += 2,13,STATIC_DISPATCH,,3,<operator>.assignmentPlus,<operator>.assignmentPlus,,,2,,,,ANY
+30064771074,CALL,-1,,,x++,21,STATIC_DISPATCH,,3,<operator>.postIncrement,<operator>.postIncrement,,,3,,,,ANY
+30064771075,CALL,-1,,,--x,26,STATIC_DISPATCH,,3,<operator>.preIncrement,<operator>.preIncrement,,,4,,,,ANY
+30064771076,CALL,-1,,,s.f = 3,2,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,,,5,,,,ANY
+30064771077,CALL,1,,,s.f,2,STATIC_DISPATCH,,4,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771078,CALL,-1,,,s.arr[i] = 4,11,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,,,6,,,,ANY
+30064771079,CALL,1,,,s.arr[i],11,STATIC_DISPATCH,,4,<operator>.indexAccess,<operator>.indexAccess,,,1,,,,ANY
+30064771080,CALL,1,,,s.arr,11,STATIC_DISPATCH,,4,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771081,CALL,-1,,,g = x,25,STATIC_DISPATCH,,4,<operator>.assignment,<operator>.assignment,,,7,,,,ANY
+30064771082,CALL,-1,,,"_tmp_1 = [x, x]",6,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771083,CALL,-1,,,_tmp_0 = __ecma.Array.factory(),15,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771084,CALL,2,,,__ecma.Array.factory(),15,STATIC_DISPATCH,__ecma.Array.factory,5,__ecma.Array.factory,__ecma.Array.factory,,,2,,,,ANY
+30064771085,CALL,-1,,,_tmp_0.push(x),16,DYNAMIC_DISPATCH,,5,__ecma.Array:,,,,2,,,,ANY
+30064771086,CALL,-1,,,_tmp_0.push,16,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771087,CALL,-1,,,_tmp_0.push(x),19,DYNAMIC_DISPATCH,,5,__ecma.Array:,,,,3,,,,ANY
+30064771088,CALL,-1,,,_tmp_0.push,19,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771089,CALL,-1,,,a = _tmp_1[0],7,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,2,,,,ANY
+30064771090,CALL,2,,,_tmp_1[0],7,STATIC_DISPATCH,,5,<operator>.indexAccess,<operator>.indexAccess,,,2,,,,ANY
+30064771091,CALL,-1,,,b = _tmp_1[1],10,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,3,,,,ANY
+30064771092,CALL,2,,,_tmp_1[1],10,STATIC_DISPATCH,,5,<operator>.indexAccess,<operator>.indexAccess,,,2,,,,ANY
+30064771093,CALL,-1,,,"_tmp_3 = [b, a]",23,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771094,CALL,-1,,,_tmp_2 = __ecma.Array.factory(),32,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771095,CALL,2,,,__ecma.Array.factory(),32,STATIC_DISPATCH,__ecma.Array.factory,5,__ecma.Array.factory,__ecma.Array.factory,,,2,,,,ANY
+30064771096,CALL,-1,,,_tmp_2.push(b),33,DYNAMIC_DISPATCH,,5,__ecma.Array:,,,,2,,,,ANY
+30064771097,CALL,-1,,,_tmp_2.push,33,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771098,CALL,-1,,,_tmp_2.push(a),36,DYNAMIC_DISPATCH,,5,__ecma.Array:,,,,3,,,,ANY
+30064771099,CALL,-1,,,_tmp_2.push,36,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,ANY
+30064771100,CALL,-1,,,a = _tmp_3[0],24,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,2,,,,ANY
+30064771101,CALL,2,,,_tmp_3[0],24,STATIC_DISPATCH,,5,<operator>.indexAccess,<operator>.indexAccess,,,2,,,,ANY
+30064771102,CALL,-1,,,b = _tmp_3[1],27,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,3,,,,ANY
+30064771103,CALL,2,,,_tmp_3[1],27,STATIC_DISPATCH,,5,<operator>.indexAccess,<operator>.indexAccess,,,2,,,,ANY
+30064771104,CALL,-1,,,_tmp_4 = s,41,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771105,CALL,-1,,,a = _tmp_4.f,45,STATIC_DISPATCH,,5,<operator>.assignment,<operator>.assignment,,,2,,,,ANY
+30064771106,CALL,2,,,_tmp_4.f,45,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,2,,,,ANY
+30064771107,CALL,-1,,,let y = x = 7,6,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,,,11,,,,ANY
+30064771108,CALL,2,,,x = 7,10,STATIC_DISPATCH,,6,<operator>.assignment,<operator>.assignment,,,2,,,,ANY
+30064771109,CALL,-1,,,s.g,17,STATIC_DISPATCH,,6,<operator>.fieldAccess,<operator>.fieldAccess,,,12,,,,ANY
+30064771110,CALL,-1,,,g ??= 1,23,STATIC_DISPATCH,,6,<operator>.notNullAssert,<operator>.notNullAssert,,,13,,,,ANY
+30064771111,CALL,-1,,,"function run = function run(s, i) {
+  let x = 1; x += 2; x++; --x;
+  s.f = 3; s.arr[i] = 4; g = x;
+  let [a, b] = [x, x]; [a, b] = [b, a]; ({f: a} = s);
+  let y = x = 7; s?.g; g ??= 1;
+}",0,STATIC_DISPATCH,,2,<operator>.assignment,<operator>.assignment,,,1,,,,ANY
+30064771112,CALL,-1,,,let g = 0,4,STATIC_DISPATCH,,1,<operator>.assignment,<operator>.assignment,,,2,,,,ANY

@@ -1,0 +1,12 @@
+30064771072,CALL,1,,,Factor,5,STATIC_DISPATCH,,8,<operator>.assignment,<operator>.assignment,,,1,,,,int
+30064771073,CALL,1,,,Factor,5,STATIC_DISPATCH,,8,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,int
+30064771074,CALL,-1,,,x := 1,7,STATIC_DISPATCH,,10,<operator>.assignment,<operator>.assignment,,,2,,,,int
+30064771075,CALL,-1,,,x = helper.Scale(x),3,STATIC_DISPATCH,,12,<operator>.assignment,<operator>.assignment,,,1,,,,int
+30064771076,CALL,2,,,helper.Scale(x),7,STATIC_DISPATCH,,12,example.com/fix/helper.Scale,Scale,,,2,,example.com/fix/helper.Scale(int)int,,int
+30064771077,CALL,-1,,,c.N = x,3,STATIC_DISPATCH,,13,<operator>.assignment,<operator>.assignment,,,2,,,,int
+30064771078,CALL,1,,,c.N,3,STATIC_DISPATCH,,13,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,*example.com/fix/app.Counter.N.<FieldAccess>.<unknown>
+30064771079,CALL,-1,,,x += 3,3,STATIC_DISPATCH,,15,<operator>.assignmentPlus,<operator>.assignmentPlus,,,1,,,,int
+30064771080,CALL,-1,,,Total = x,2,STATIC_DISPATCH,,17,<operator>.assignment,<operator>.assignment,,,5,,,,int
+30064771081,CALL,1,,,Total,2,STATIC_DISPATCH,,17,<operator>.fieldAccess,<operator>.fieldAccess,,,1,,,,int
+30064771082,CALL,1,,,v * Factor,9,STATIC_DISPATCH,,5,<operator>.multiplication,<operator>.multiplication,,,1,,,,int
+30064771083,CALL,2,,,Factor,13,STATIC_DISPATCH,,5,<operator>.fieldAccess,<operator>.fieldAccess,,,2,,,,int

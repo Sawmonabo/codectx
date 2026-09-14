@@ -1,0 +1,15 @@
+94489280512,LOCAL,,G,1,,<empty>,1,G,,,5,,__builtin.int
+94489280513,LOCAL,,S,1,,<empty>,2,S,,,6,,w.py:<module>.S
+94489280514,LOCAL,,run,1,,<empty>,4,run,,,7,,ANY
+94489280515,LOCAL,,x,5,,<empty>,6,x,,,1,,__builtin.int
+94489280516,LOCAL,w.py:<module>.run:G,G,28,,<empty>,7,G,,,2,,__builtin.int
+94489280517,LOCAL,,tmp0,5,,<empty>,8,tmp0,,,3,,__builtin.tuple
+94489280518,LOCAL,,a,5,,<empty>,8,a,,,4,,__builtin.tuple.<indexAccess>
+94489280519,LOCAL,,b,8,,<empty>,8,b,,,5,,__builtin.tuple.<indexAccess>
+94489280520,LOCAL,,tmp1,18,,<empty>,8,tmp1,,,6,,__builtin.tuple
+94489280521,LOCAL,,tmp2,5,,<empty>,9,tmp2,,,7,,__builtin.int
+94489280522,LOCAL,,y,5,,<empty>,9,y,,,8,,__builtin.int
+94489280523,LOCAL,,tmp3,9,,<empty>,10,tmp3,,,9,,__builtin.dict
+94489280524,LOCAL,,d,5,,<empty>,10,d,,,10,,__builtin.dict
+94489280525,LOCAL,,__init__,5,,<empty>,3,__init__,,,3,,ANY
+94489280526,LOCAL,,__newInstance,18,,<empty>,3,__newInstance,,,1,,ANY

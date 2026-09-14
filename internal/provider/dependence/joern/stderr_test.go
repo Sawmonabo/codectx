@@ -1,0 +1,91 @@
+package joern
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/Sawmonabo/codectx/internal/process"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+)
+
+// TestClassify protects the one thing this backend exists to get right: which
+// failure class a run belongs to. Silent breakage here is a correctness
+// failure, not a cosmetic one — an out-of-memory run misread as a crash loses
+// the single retry the plan allows, a crash misread as out-of-memory burns a
+// full parse on a retry that cannot succeed, a definition-cap skip misread as
+// a clean run seals a unit as complete when its data dependence is missing
+// whole method bodies, and a zero-exit dead graph misread as success admits an
+// empty analysis as a fresh one.
+//
+// The inputs are the real engine's own bytes, captured from Joern 4.0.627 runs
+// recorded in the lane report; only absolute paths were rewritten so the
+// fixtures carry no developer's home directory. The pass-crash line is built
+// from the `Pass %s failed in %.0f ms` format string read out of
+// io.shiftleft.passes.CpgPassBase in the pinned payload, with the throwable
+// the release logs alongside it.
+func TestClassify(t *testing.T) {
+	const passCrash = "2026-09-13 23:10:01.001 WARN  CfgCreationPass           Pass CfgCreationPass failed in 3410 ms\n" +
+		"java.util.NoSuchElementException: next on empty iterator\n" +
+		"\tat scala.collection.Iterator$$anon$19.next(Iterator.scala:973)\n"
+
+	cases := []struct {
+		name      string
+		stderr    string
+		exit      int
+		timedOut  bool
+		want      dependence.FailureClass
+		pass      string
+		exception string
+		skips     int
+		firstSkip string
+	}{
+		{name: "a clean run is not a failure", want: dependence.FailureNone},
+		{name: "frontend warnings that mean nothing are not a failure",
+			stderr: fixture(t, "benign-warnings.stderr"), want: dependence.FailureNone},
+		{name: "heap exhaustion is memory even though the same stderr also reports a helper exit",
+			stderr: fixture(t, "out-of-memory.stderr"), exit: 1, want: dependence.FailureMemory,
+			exception: "java.lang.OutOfMemoryError"},
+		{name: "a definition-cap skip degrades the unit without failing it",
+			stderr: fixture(t, "definition-cap-skip.stderr"), want: dependence.FailureNone,
+			skips: 3, firstSkip: "<operator>.tupleLiteral"},
+		{name: "a pass crash names the pass and the exception",
+			stderr: passCrash, exit: 1, want: dependence.FailureEngine,
+			pass: "CfgCreationPass", exception: "java.util.NoSuchElementException"},
+		{name: "a helper crash hidden behind a zero exit is still an engine failure",
+			stderr: "2026-09-13 23:11:00.000 ERROR ExternalCommand$          Process exited with code 101.\n",
+			want:   dependence.FailureEngine},
+		{name: "a terminated run is a timeout whatever its stderr says",
+			stderr: fixture(t, "out-of-memory.stderr"), exit: -1, timedOut: true, want: dependence.FailureTimeout},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := classify(process.Result{Stderr: []byte(c.stderr), ExitCode: c.exit, TimedOut: c.timedOut,
+				StderrBytes: int64(len(c.stderr))})
+			if got.Class != c.want {
+				t.Errorf("class = %q, want %q", got.Class, c.want)
+			}
+			if got.Pass != c.pass {
+				t.Errorf("pass = %q, want %q", got.Pass, c.pass)
+			}
+			if got.Exception != c.exception {
+				t.Errorf("exception = %q, want %q", got.Exception, c.exception)
+			}
+			if got.SkippedCount != c.skips {
+				t.Errorf("skipped = %d, want %d", got.SkippedCount, c.skips)
+			}
+			if c.firstSkip != "" && (len(got.SkippedMethods) == 0 || got.SkippedMethods[0] != c.firstSkip) {
+				t.Errorf("skipped methods = %v, want the first to be %q", got.SkippedMethods, c.firstSkip)
+			}
+		})
+	}
+}
+
+func fixture(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}

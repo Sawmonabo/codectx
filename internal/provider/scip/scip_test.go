@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -79,6 +80,7 @@ type facts struct {
 	mu        sync.Mutex
 	nodes     map[model.NodeID]model.NodeFact
 	relations map[model.RelationID]model.RelationFact
+	aliases   []model.NativeAlias
 }
 
 func (f *facts) PutNodes(ctx context.Context, list []model.NodeFact) error {
@@ -97,6 +99,25 @@ func (f *facts) PutRelations(ctx context.Context, list []model.RelationFact) err
 	}
 	f.mu.Unlock()
 	return f.UnitOutput.PutRelations(ctx, list)
+}
+
+func (f *facts) PutAliases(ctx context.Context, list []model.NativeAlias) error {
+	f.mu.Lock()
+	f.aliases = append(f.aliases, list...)
+	f.mu.Unlock()
+	return f.UnitOutput.PutAliases(ctx, list)
+}
+
+// alias finds the node one scoped native key is aliased to.
+func (f *facts) alias(t *testing.T, scopeKey, nativeKey string) model.NodeID {
+	t.Helper()
+	for _, a := range f.aliases {
+		if a.ScopeKey == scopeKey && a.NativeKey == nativeKey {
+			return a.NodeID
+		}
+	}
+	t.Fatalf("no alias %q in scope %q among %d aliases", nativeKey, scopeKey, len(f.aliases))
+	return ""
 }
 
 // byNativeKey finds the one node whose evidence carries the SCIP symbol in
@@ -129,10 +150,60 @@ func (f *facts) edge(t *testing.T, from model.NodeID, kind model.RelationKind, t
 	return model.RelationFact{}
 }
 
+func newFacts(out provider.UnitOutput) *facts {
+	return &facts{UnitOutput: out, nodes: map[model.NodeID]model.NodeFact{}, relations: map[model.RelationID]model.RelationFact{}}
+}
+
+// importDelta runs one import against an explicit previous manifest, the form
+// the coordinator uses on a refresh. The fresh manifest is a private temporary
+// file the caller owns.
+func importDelta(t *testing.T, h *providertest.Harness, p *scip.Provider, scope string, inputs []string, prev *scip.DocumentManifest) (*facts, scip.Report) {
+	t.Helper()
+	u := h.Plan(t, p, scope, inputs)
+	rec := newFacts(h.Begin(t, u, inputs))
+	rep, err := p.Import(context.Background(), u.Request, rec, scip.ImportOptions{Previous: prev})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	t.Cleanup(func() { rep.Manifest.Close() })
+	return rec, rep
+}
+
+// classes reads a delta back out of a manifest pair as path sets.
+func classes(t *testing.T, fresh, prev *scip.DocumentManifest) map[scip.Class][]string {
+	t.Helper()
+	out := map[scip.Class][]string{}
+	if _, err := fresh.Diff(prev, func(c scip.Change) error {
+		out[c.Class] = append(out[c.Class], c.Path)
+		return nil
+	}); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	return out
+}
+
+// saveManifest stores a manifest and returns its bytes and a reloaded handle.
+func saveManifest(t *testing.T, m *scip.DocumentManifest, name string) (*scip.DocumentManifest, []byte) {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), name)
+	if err := m.Save(dst); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := scip.LoadDocumentManifest(dst)
+	if err != nil {
+		t.Fatalf("LoadDocumentManifest: %v", err)
+	}
+	return loaded, raw
+}
+
 func run(t *testing.T, h *providertest.Harness, p *scip.Provider, scope string, inputs []string) (*facts, model.ProviderResult) {
 	t.Helper()
 	u := h.Plan(t, p, scope, inputs)
-	rec := &facts{UnitOutput: h.Begin(t, u, inputs), nodes: map[model.NodeID]model.NodeFact{}, relations: map[model.RelationID]model.RelationFact{}}
+	rec := newFacts(h.Begin(t, u, inputs))
 	result, err := provider.RunUnit(context.Background(), p, u.Request, rec, providertest.Limits, h.Pool)
 	if err != nil {
 		t.Fatalf("RunUnit: %v", err)
@@ -218,6 +289,12 @@ func TestCanonicalFixture(t *testing.T) {
 		t.Fatalf("occurrence starts %v, want both %d and %d", seen, first, second)
 	}
 
+	// Every reference occurrence publishes the Section 11.3 call-site alias
+	// on the symbol it resolves to, keyed on the bytes it occupies; the
+	// definition of Foo does not.
+	wantCallsiteAlias(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 0, bar.Node.ID)
+	wantCallsiteAlias(t, got, "pkg/a.go", files["pkg/a.go"], "Bar", 1, bar.Node.ID)
+
 	// The external symbol exists once, from external_symbols, and is the
 	// target of the reference inside Foo.
 	println := got.byNativeKey(t, symPrintln, "")
@@ -232,7 +309,9 @@ func TestCanonicalFixture(t *testing.T) {
 		t.Fatal("local 0 of two documents merged into one identity")
 	}
 	wantRange(t, xa, files["pkg/a.go"], "x", 0)
-	got.edge(t, foo.Node.ID, model.RelReads, xa.Node.ID)
+	// A ReadAccess occurrence is a `references` edge: `reads`/`writes` are the
+	// dependence provider's facts and this provider never publishes them.
+	got.edge(t, foo.Node.ID, model.RelReferences, xa.Node.ID)
 
 	// Import and implementation relationships.
 	fileA := got.byNativeKey(t, "file:pkg/a.go", a.ID)
@@ -376,4 +455,212 @@ func appendBytes(b []byte, field int, payload []byte) []byte {
 	b = binary.AppendUvarint(b, uint64(field)<<3|2)
 	b = binary.AppendUvarint(b, uint64(len(payload)))
 	return append(b, payload...)
+}
+
+// wantCallsiteAlias asserts that the Section 11.3 call-site alias for an
+// occurrence exists, is keyed on the one-based inclusive byte range of the
+// source text needle, and names node.
+//
+// This is the key lane A6's tree-sitter provider computes for the same call
+// site with the same formula (`facts.go:callsiteKey`), so a disagreement of
+// one byte or one base silently produces an empty join: the `calls` relation
+// then keeps its syntactic callee and never acquires the compiler-resolved
+// target, and nothing downstream can tell that from a repository with no
+// resolvable calls.
+func wantCallsiteAlias(t *testing.T, got *facts, path, src, needle string, nth int, node model.NodeID) {
+	t.Helper()
+	off := -1
+	for i := 0; i <= nth; i++ {
+		next := strings.Index(src[off+1:], needle)
+		if next < 0 {
+			t.Fatalf("fixture lacks occurrence %d of %q", nth, needle)
+		}
+		off += 1 + next
+	}
+	key := "callsite:" + path + ":" + strconv.Itoa(off+1) + "-" + strconv.Itoa(off+len(needle))
+	if id := got.alias(t, "file:"+path, key); id != node {
+		t.Fatalf("call-site alias %q names node %s, want the referenced symbol %s", key, id, node)
+	}
+}
+
+// TestCallsiteAliasJoin protects the Section 11.3 call-site join and the
+// per-tool position-encoding fallback that feeds it.
+//
+// Failure modes: a UTF-16 column converted as a byte offset (scip-typescript,
+// scip-java and scip-python all emit UTF-16 columns) keys the alias on bytes
+// that are not the callee identifier, so the tree-sitter call site and the
+// compiler-resolved symbol never merge and every precise call target is
+// silently lost; a definition occurrence keyed as a call site would alias a
+// declaration to a call range and merge two different entities; and a
+// position encoding assumed from an unmeasured tool or version converts to a
+// valid, in-range, rune-aligned and **wrong** extent, which nothing
+// downstream can detect because it never errors — compiler-precision facts
+// bound to source bytes that are not the symbol.
+//
+// Every case runs the same hand-encoded index over the committed UTF-16
+// TypeScript document: a reference occurrence to Baz at UTF-16 columns
+// [25,28) of line 0, which follows a surrogate pair, so a byte reading of
+// those columns selects "n B" instead of "Baz". The canonical fixture's own
+// b.ts occurrences are all on ASCII-only lines, which cannot separate the two
+// readings. The document leaves `position_encoding` unspecified, which is how
+// every real scip-typescript, scip-java and scip-python index arrives
+// (measured: none of the three sets the field).
+func TestCallsiteAliasJoin(t *testing.T) {
+	cases := []struct {
+		name          string
+		tool, version string
+		admit         bool
+	}{
+		// The measured pair: the columns are read as UTF-16 and the join works.
+		{name: "measured tool and version", tool: "scip-typescript", version: "0.4.0", admit: true},
+		// A tool whose measured encoding is UTF-8 over UTF-16 columns. The
+		// conversion succeeds and selects "n B": the wrong-source case the
+		// self-check exists for.
+		{name: "wrong tool encoding", tool: "scip-go", version: "0.2.7"},
+		// The right tool at a version nothing was measured against.
+		{name: "unmeasured version", tool: "scip-typescript", version: "9.9.9"},
+		// A tool with no measured encoding at all.
+		{name: "unmeasured tool", tool: "scip-fixture", version: "0.1.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := fixture(t)
+			ref := occurrenceRecord(symBaz, 0, 0, 25, 28)
+			def := occurrenceRecord(symBaz, 1, 0, 25, 28)
+			files["utf16.scip"] = string(miniIndex(tc.tool, tc.version, documentRecord("web/b.ts", "typescript", 0, def, ref)))
+			inputs := append([]string{"utf16.scip"}, sourcePaths...)
+			p := newProvider(t, "utf16.scip")
+			h := providertest.New(t, files)
+			got, rep := importDelta(t, h, p, scip.ImportScope("utf16.scip"), inputs, nil)
+
+			if !tc.admit {
+				// Nothing is published and the document is counted skipped:
+				// an unproved encoding never becomes a fact.
+				if rep.Skipped != 1 || len(got.nodes) != 0 || len(got.relations) != 0 || len(got.aliases) != 0 {
+					t.Fatalf("index of %s %s: skipped=%d, %d nodes, %d relations, %d aliases %v; want the document skipped and nothing published",
+						tc.tool, tc.version, rep.Skipped, len(got.nodes), len(got.relations), len(got.aliases), aliasKeys(got))
+				}
+				return
+			}
+			b := h.File(t, "web/b.ts")
+			baz := got.byNativeKey(t, symBaz, b.ID)
+			wantCallsiteAlias(t, got, "web/b.ts", files["web/b.ts"], "Baz", 0, baz.Node.ID)
+			// The definition occurrence at the same range publishes the symbol
+			// alias, never a second call-site alias for its own declaration.
+			if n := strings.Count(strings.Join(aliasKeys(got), "\n"), "callsite:"); n != 1 {
+				t.Fatalf("%d call-site aliases over one reference and one definition, want exactly 1: %v", n, aliasKeys(got))
+			}
+		})
+	}
+}
+
+func aliasKeys(got *facts) []string {
+	var out []string
+	for _, a := range got.aliases {
+		out = append(out, a.ScopeKey+" "+a.NativeKey)
+	}
+	return out
+}
+
+// TestDeltaImport protects the Section 11.4 delta import.
+//
+// Failure modes, all silent: a document classified unchanged when its pinned
+// bytes changed leaves stored evidence naming content hashes the snapshot no
+// longer holds, which is the one way a delta serves wrong source as compiler
+// evidence; a document classified changed when nothing changed republishes
+// facts the storage writer was told to retain, duplicating them; a stored path
+// the fresh index no longer describes that is not reported removed keeps facts
+// for a file that does not exist, and a rename is a delete plus an add
+// (Section 9.4); a manifest that is not reproducible makes every refresh a
+// full rewrite.
+func TestDeltaImport(t *testing.T) {
+	files := fixture(t)
+	inputs := append([]string{"index.scip"}, sourcePaths...)
+	scope := scip.ImportScope("index.scip")
+
+	full, rep := importDelta(t, providertest.New(t, files), newProvider(t, "index.scip"), scope, inputs, nil)
+	if rep.Delta.Changed != int64(len(sourcePaths)) || rep.Delta.Unchanged != 0 || rep.Delta.Removed != 0 {
+		t.Fatalf("full import delta = %+v, want every document changed", rep.Delta)
+	}
+	if len(full.nodes) == 0 {
+		t.Fatal("full import published no node")
+	}
+	stored, storedBytes := saveManifest(t, rep.Manifest, "documents.txt")
+
+	// Re-importing the same index over the same bytes changes nothing, and the
+	// manifest is byte-identical.
+	same, rep2 := importDelta(t, providertest.New(t, files), newProvider(t, "index.scip"), scope, inputs, stored)
+	if rep2.Delta.Changed != 0 || rep2.Delta.Unchanged != int64(len(sourcePaths)) {
+		t.Fatalf("re-import delta = %+v, want every document unchanged", rep2.Delta)
+	}
+	if len(same.nodes) != 0 || len(same.relations) != 0 || len(same.aliases) != 0 || rep2.Result.RecordsEmitted != 0 {
+		t.Fatalf("re-import published %d nodes, %d relations, %d aliases (%d records); an unchanged document's rows are retained, not rewritten",
+			len(same.nodes), len(same.relations), len(same.aliases), rep2.Result.RecordsEmitted)
+	}
+	if _, again := saveManifest(t, rep2.Manifest, "documents.txt"); string(again) != string(storedBytes) {
+		t.Fatalf("document manifest is not reproducible:\n%s\n%s", storedBytes, again)
+	}
+
+	// The same index over one changed source file. The document record is
+	// identical, so only the pinned content hash in the document hash can
+	// catch it.
+	edited := fixture(t)
+	edited["pkg/d.go"] += "\n// a trailing comment that moves no occurrence\n"
+	editedHarness := providertest.New(t, edited)
+	changed, rep3 := importDelta(t, editedHarness, newProvider(t, "index.scip"), scope, inputs, stored)
+	if got := classes(t, rep3.Manifest, stored); len(got[scip.ClassChanged]) != 1 || got[scip.ClassChanged][0] != "pkg/d.go" || len(got[scip.ClassRemoved]) != 0 {
+		t.Fatalf("delta over an edited pkg/d.go = %v, want exactly that path changed", got)
+	}
+	for _, n := range changed.nodes {
+		for _, e := range n.Evidence {
+			if e.FileID != "" && e.FileID != editedHarness.File(t, "pkg/d.go").ID {
+				t.Fatalf("node %s carries evidence on %s; only the changed document publishes", n.Node.Name, e.FileID)
+			}
+		}
+	}
+
+	// A stored path the fresh index no longer describes is removed, and a
+	// document whose path escapes the project root is never admitted at all
+	// (scip-go emits 18 such `go test` mains for this repository).
+	files["small.scip"] = string(miniIndex("scip-fixture", "0.1.0",
+		documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8)),
+		documentRecord("../../outside/x.go", "go", 1, occurrenceRecord(symBar, 1, 0, 0, 1))))
+	smallInputs := append([]string{"small.scip"}, sourcePaths...)
+	_, rep4 := importDelta(t, providertest.New(t, files), newProvider(t, "small.scip"), scip.ImportScope("small.scip"), smallInputs, stored)
+	if rep4.OutsideRoot != 1 || rep4.Manifest.Len() != 1 {
+		t.Fatalf("index with an escaping path: outside_root=%d manifest=%d, want 1 rejected and 1 admitted", rep4.OutsideRoot, rep4.Manifest.Len())
+	}
+	got := classes(t, rep4.Manifest, stored)
+	if len(got[scip.ClassRemoved]) != 3 {
+		t.Fatalf("removed = %v, want the three paths the fresh index no longer describes", got[scip.ClassRemoved])
+	}
+}
+
+// miniIndex, documentRecord and occurrenceRecord hand-encode a SCIP index for
+// a case the canonical fixture cannot express. Only the fields this provider
+// reads are written; the wire form is the one scip.proto defines.
+func miniIndex(tool, version string, docs ...[]byte) []byte {
+	meta := appendBytes(nil, 2, appendBytes(appendBytes(nil, 1, []byte(tool)), 2, []byte(version)))
+	out := appendBytes(nil, 1, meta)
+	for _, d := range docs {
+		out = appendBytes(out, 2, d)
+	}
+	return out
+}
+
+func documentRecord(path, language string, encoding uint64, occurrences ...[]byte) []byte {
+	d := appendBytes(nil, 1, []byte(path))
+	d = appendBytes(d, 4, []byte(language))
+	for _, o := range occurrences {
+		d = appendBytes(d, 2, o)
+	}
+	return appendVarint(d, 6<<3|0, encoding)
+}
+
+func occurrenceRecord(symbol string, roles uint64, vals ...int32) []byte {
+	o := appendBytes(appendBytes(nil, 1, packed(vals...)), 2, []byte(symbol))
+	if roles != 0 {
+		o = appendVarint(o, 3<<3|0, roles)
+	}
+	return o
 }

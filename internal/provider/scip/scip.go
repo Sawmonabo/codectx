@@ -38,13 +38,33 @@ import (
 
 // ID and Version identify the provider. Version is part of every unit key:
 // bump it when the mapping of SCIP records to facts changes.
+//
+// Version 3 is the Section 11.3/11.4 mapping: every reference occurrence
+// publishes a call-site alias, an external entity's evidence carries no
+// location, a read or write occurrence is a `references` edge because
+// `reads`/`writes` are the dependence provider's facts (Section 11.6), and a
+// document that does not declare its position encoding is converted in the
+// measured encoding of the tool **build** that wrote the index and only after
+// that encoding is proved against the pinned bytes.
+//
+// Each bump is what makes the units of the version before it unreachable. A
+// unit sealed by an older version over unchanged inputs has the same scope key
+// and the same input hash, so without it `UnitID` would be identical and the
+// stale unit eligible for reuse. Version 1 sealed *zero* facts for
+// scip-typescript, scip-java, scip-python, scip-go and scip-clang, because
+// those five leave `position_encoding` unspecified and version 1 skipped every
+// such document; version 2 sealed `reads`/`writes` edges this provider does
+// not own, and facts converted under an encoding assumed from a tool name
+// alone, which lands a fraction of them on source bytes that are not the
+// symbol. Neither may be reused. `documentHashDomain` changes only when what
+// the document hash covers changes, which forces a bump here in turn.
 const (
 	ID      = "scip"
-	Version = "1"
+	Version = "3"
 )
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
-// aliases; references covers reference, import, read and write occurrences;
+// aliases; references covers reference and import occurrences;
 // implementations covers SCIP relationships.
 const (
 	CapabilityDefinitions     = "precise_definitions"
@@ -302,6 +322,9 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 	}
 	defer sc.close()
 	im := &importer{p: p, req: provider.UnitRequest{Content: view}, sc: sc, ctx: ctx, indexHash: fv.ContentHash}
+	if err := im.openDelta(ctx); err != nil {
+		return "", err
+	}
 	if p.manifestPath != "" {
 		if err := im.loadManifest(ctx); err != nil {
 			return "", err
@@ -311,12 +334,70 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 	return binding, err
 }
 
-// IndexUnit builds one unit: the supplied index or one profile run.
+// ImportOptions carry what the Provider interface has no room for: the
+// previous state of the unit being refreshed.
+type ImportOptions struct {
+	// Previous is the document manifest of the sealed unit this run refreshes,
+	// or nil for a full import. When it is given the run publishes facts only
+	// for the documents whose canonical hash changed, and Report.Delta names
+	// the paths whose stored rows are kept, replaced and deleted.
+	Previous *DocumentManifest
+}
+
+// Report is one import: the provider result the coordinator records, the
+// per-document delta the storage writer applies, and the fresh document
+// manifest it stores for the next refresh.
+//
+// Manifest is a private temporary file owned by the caller: Save copies it to
+// durable storage and Close removes it. It is nil only when the import failed.
+type Report struct {
+	Result   model.ProviderResult
+	Delta    Delta
+	Manifest *DocumentManifest
+
+	// Documents an index described and this import did not admit. They are
+	// counted, never guessed about: OutsideRoot is a document whose
+	// relative_path escapes the project root, DuplicatePaths a document a
+	// later document with the same path superseded, Skipped a document the
+	// snapshot does not hold or whose encoding or size the import cannot
+	// stand behind.
+	OutsideRoot, DuplicatePaths, Skipped int64
+	// SkippedOccurrences are coordinates that did not land on the pinned
+	// bytes under an unverified binding; SkippedCallsiteAliases are call-site
+	// aliases whose key would exceed the alias bounds;
+	// TruncatedEdgeOccurrences are occurrences past a relation's evidence
+	// bound.
+	SkippedOccurrences, SkippedCallsiteAliases, TruncatedEdgeOccurrences int64
+	// AssumedPositionEncoding counts documents that left `position_encoding`
+	// unspecified and were converted in the measured encoding of the tool that
+	// wrote the index (see toolPositionEncoding).
+	AssumedPositionEncoding int64
+}
+
+// IndexUnit builds one unit: the supplied index or one profile run. It is the
+// full-import form of Import, which is what the Provider interface can
+// express; a coordinator that holds the unit's previous document manifest
+// calls Import instead.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-	if req.Content == nil || req.Resolver == nil || sink == nil {
-		return model.ProviderResult{}, invalid("scip unit request needs a snapshot view, a resolver and a sink")
+	rep, err := p.Import(ctx, req, sink, ImportOptions{})
+	if err != nil {
+		return model.ProviderResult{}, err
 	}
-	im := &importer{p: p, req: req, sink: sink, ctx: ctx}
+	// A full import's manifest has no reader: IndexUnit's caller cannot
+	// receive it, so it is not left behind in the work directory.
+	if cerr := rep.Manifest.Close(); cerr != nil {
+		return model.ProviderResult{}, cerr
+	}
+	return rep.Result, nil
+}
+
+// Import builds one unit and reports the per-document delta. See ImportOptions
+// and Report.
+func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink provider.Sink, opts ImportOptions) (Report, error) {
+	if req.Content == nil || req.Resolver == nil || sink == nil {
+		return Report{}, invalid("scip unit request needs a snapshot view, a resolver and a sink")
+	}
+	im := &importer{p: p, req: req, sink: sink, ctx: ctx, previous: opts.Previous}
 	defer im.close()
 	var open opener
 	var err error
@@ -324,24 +405,24 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if strings.HasPrefix(req.Unit.ScopeKey, scopeProfile) {
 		prof, err := p.profileFor(req.Unit.ScopeKey)
 		if err != nil {
-			return model.ProviderResult{}, err
+			return Report{}, err
 		}
 		im.profile = &prof
 		// The profile's work directory is the private root of every run; it
 		// belongs to codectx, not to the user's shell, so it is created with
 		// private permissions rather than assumed to exist.
 		if err := os.MkdirAll(prof.WorkDir, 0o700); err != nil {
-			return model.ProviderResult{}, internal("scip profile work directory: " + err.Error())
+			return Report{}, internal("scip profile work directory: " + err.Error())
 		}
 		runDir, err := os.MkdirTemp(prof.WorkDir, "scip-run-")
 		if err != nil {
-			return model.ProviderResult{}, internal("scip run directory: " + err.Error())
+			return Report{}, internal("scip run directory: " + err.Error())
 		}
 		defer os.RemoveAll(runDir)
 		workDir = runDir
 		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir)
 		if err != nil {
-			return model.ProviderResult{}, err
+			return Report{}, err
 		}
 		im.manifestSHA = manifestSHA
 		open = func(context.Context) (io.ReadCloser, int64, error) {
@@ -359,18 +440,18 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	} else {
 		fv, ferr := p.importFile(ctx, req.Content, req.Unit.ScopeKey)
 		if ferr != nil {
-			return model.ProviderResult{}, ferr
+			return Report{}, ferr
 		}
 		im.indexHash, open = fv.ContentHash, p.fileOpener(req.Content, fv)
 	}
 	if im.sc, err = openScratch(ctx, workDir, p.limits.MaxSpoolBytes); err != nil {
-		return model.ProviderResult{}, im.decorate(err)
+		return Report{}, im.decorate(err)
 	}
 	defer im.sc.close()
 	if err := im.run(ctx, open); err != nil {
-		return model.ProviderResult{}, im.decorate(err)
+		return Report{}, im.decorate(err)
 	}
-	return im.result(), nil
+	return im.report(), nil
 }
 
 // profileFor resolves a profile scope key to the configured profile.
