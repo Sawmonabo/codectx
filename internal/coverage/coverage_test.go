@@ -512,6 +512,23 @@ func (s *fakeStore) AdvanceSession(ctx context.Context, req model.AdvanceRequest
 // zero, so a row that reads far into a file exercises the real position path.
 type fakeSource struct{ files map[model.FileID]*fixtureFile }
 
+var _ Source = (*fakeSource)(nil)
+
+// Checkpoint mirrors snapshot.View.Checkpoint over the fixture's sparse list,
+// so a row can read at an offset far from the checkpoint before it and prove
+// that the raw cap subtracted the real prefix rather than an assumed one.
+func (s *fakeSource) Checkpoint(ctx context.Context, id model.FileID, offset uint64) (uint64, error) {
+	f, ok := s.files[id]
+	if !ok {
+		return 0, typed(model.CodeScopeIncomplete, "file is not in the snapshot")
+	}
+	if offset > uint64(len(f.data)) {
+		return 0, typed(model.CodeArgumentInvalid,
+			"byte offset %d is past the %d-byte file", offset, len(f.data))
+	}
+	return f.checkpointFor(offset).Byte, nil
+}
+
 func (s *fakeSource) Read(ctx context.Context, id model.FileID, r model.ByteRange) (snapshot.Range, model.FileVersion, error) {
 	f, ok := s.files[id]
 	if !ok {
