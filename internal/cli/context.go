@@ -36,17 +36,6 @@ const (
 // something the process identity may stand in for.
 const actorFlagHelp = "required: the actor this session belongs to; coverage is per actor, so one agent's reads never satisfy another's requirement"
 
-// coverageWorkspace is the accessor internal/app adds for this service. The
-// frozen comment block in internal/coverage/coverage.go assigns
-// `(*app.Workspace).Coverage() *coverage.Service` to the integration lane, and
-// this file must compile before that lands. Declaring the shape here rather
-// than stubbing the service keeps the contract in one direction: the assertion
-// starts succeeding the moment INT adds the method, with no edit here, and
-// fails loudly if the spelling drifts from the frozen one.
-type coverageWorkspace interface {
-	Coverage() *coverage.Service
-}
-
 // newContextCommands builds the Section 18.1 session commands. Like the query
 // commands they are returned as a set, so this file never edits the command
 // tree it belongs to; the root adds them in one loop.
@@ -521,33 +510,15 @@ func runContext(cmd *cobra.Command, fn func(context.Context, *coverage.Service) 
 		return err
 	}
 	defer ws.Close()
-	svc, err := coverageService(ws)
-	if err != nil {
-		return err
-	}
+	// The composition builds the coverage service eagerly, so a workspace that
+	// opened has one; there is no per-command wiring check to make here.
+	svc := ws.Coverage()
 	ctx, cancel := queryContext(cmd.Context(), timeout)
 	defer cancel()
 	// queryFailure types a bare context failure: left untyped, a deadline the
 	// operator set with --timeout would reach ExitCode as the invalid-argument
 	// class and report itself as a command line they typed wrong.
 	return queryFailure(fn(ctx, svc))
-}
-
-// coverageService resolves the workspace's coverage service. A workspace that
-// does not expose one is a composition that was built without it, which is a
-// wiring defect rather than anything the operator can correct.
-func coverageService(ws *app.Workspace) (*coverage.Service, error) {
-	cw, ok := any(ws).(coverageWorkspace)
-	if !ok {
-		return nil, &model.Error{Code: model.CodeInternal,
-			Message: "this workspace exposes no coverage service"}
-	}
-	svc := cw.Coverage()
-	if svc == nil {
-		return nil, &model.Error{Code: model.CodeInternal,
-			Message: "this workspace exposes no coverage service"}
-	}
-	return svc, nil
 }
 
 // emitContext writes the one answer for the commands whose result carries no

@@ -203,6 +203,12 @@ type fakeStore struct {
 	sessions map[model.SessionID]*fakeSession
 	chunks   map[string]*fakeChunk
 	nextID   int
+
+	// scopeComplete is what the fixture manifest reports. Section 15.3's Q7
+	// compiles an ambiguous or empty scope into a manifest with
+	// ScopeComplete=false, which is the only thing that separates
+	// "everything required has been read" from "nothing was required".
+	scopeComplete bool
 }
 
 var _ Sessions = (*fakeStore)(nil)
@@ -238,7 +244,7 @@ func (s *fakeStore) Manifest(ctx context.Context, id model.ManifestID) (model.Co
 	return model.ContextManifest{
 		ID: manifestID, Binding: fixtureBinding, Phase: model.PhaseSweep,
 		RequestHash: hexID(0x30), PolicyVersion: "codectx.context.v1", CanonicalHash: hexID(0x31),
-		EntryCount: len(s.order), ScopeComplete: true,
+		EntryCount: len(s.order), ScopeComplete: s.scopeComplete,
 		EstimateMethod: model.EstimateMethodUTF8Bytes, CreatedAt: s.now(),
 	}, nil
 }
@@ -615,7 +621,7 @@ func newHarness(t *testing.T) *harness {
 	store := &fakeStore{
 		now: func() time.Time { return now }, files: files, order: order,
 		required: required, sessions: map[model.SessionID]*fakeSession{},
-		chunks: map[string]*fakeChunk{},
+		chunks: map[string]*fakeChunk{}, scopeComplete: true,
 	}
 	src := &fakeSource{files: files}
 
@@ -648,10 +654,8 @@ func newHarness(t *testing.T) *harness {
 		Signer: signer, Limits: fixtureLimits(),
 		Now: func() time.Time { return h.now },
 	})
-	// New is a stub until the fill-in lanes land; a row that needs the service
-	// fails here honestly rather than dereferencing nil.
 	if err != nil {
-		h.svc = nil
+		t.Fatalf("build coverage service: %v", err)
 	}
 	return h
 }
@@ -764,10 +768,7 @@ var scenarios = []scenario{
 			SessionID: sessionA, ActorID: actorA, FileID: file.id,
 			Offset: offset, MaxBytes: model.MaxRawChunkBytes,
 		})
-		// encodeReceipt is L2's; until it lands Read cannot return a response,
-		// and the issued row it persists first is the observable. Any other
-		// error is a real failure of the read path.
-		if err != nil && !strings.Contains(err.Error(), "coverage.encodeReceipt") {
+		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
 
@@ -957,10 +958,10 @@ var scenarios = []scenario{
 	{name: "Next resumes at the confirmed prefix without opening the source", run: func(t *testing.T, h *harness) {
 		ctx := context.Background()
 		empty, crlf := model.FileID(hexID(0x20)), model.FileID(hexID(0x21))
-		// Built directly rather than through newHarness: New is L3's and is
-		// still a stub, so h.svc is nil. The opener fails the row if Next ever
-		// reaches for source, which is what gives "no bytes" real teeth --
-		// NextContextItem has no bytes or receipt field to assert against.
+		// Built directly rather than through newHarness so the opener can fail
+		// the row if Next ever reaches for source, which is what gives "no
+		// bytes" real teeth -- NextContextItem has no bytes or receipt field to
+		// assert against.
 		svc := &Service{
 			sessions: h.store,
 			open: func(context.Context, model.SnapshotID) (Source, error) {
@@ -1020,13 +1021,138 @@ var scenarios = []scenario{
 	// L5 rows
 
 	// L6 rows
+
+	// INT rows
+
+	// The whole session lifecycle through the composed service. Every other row
+	// builds a Service literal for one endpoint, so nothing else proves that the
+	// five endpoints agree once New has wired them together: that Acknowledge
+	// really returns the status L3 builds rather than a zero value (the tail
+	// L2's lane could not reach), that Status reports the same session metadata
+	// Acknowledge just did, that Next advances to the file the confirmation did
+	// not cover, and that Close is a compare-and-swap against the version Status
+	// handed out. The readiness assertion is not L3's: L3 pins both flags false
+	// at full coverage on a hand-built Service, while this pins them false
+	// across the whole lifecycle, including the closed session -- the state a
+	// caller is most likely to mistake for "done".
+	{"int/a session reads, confirms, reports, advances and closes", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		empty := model.FileID(hexID(0x20))
+		crlf := model.FileID(hexID(0x21))
+
+		// 1. Read the empty required file. Its only possible coverage is the
+		// zero-length EOF chunk, so the receipt is the whole transaction.
+		resp, err := h.svc.Read(ctx, model.ReadChunkRequest{
+			SessionID: sessionA, ActorID: actorA, FileID: empty,
+		})
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if resp.Receipt == "" || resp.Coverage == model.CoverageFullServed {
+			t.Fatalf("read of the empty file reports coverage %q with receipt %q; "+
+				"an issued chunk is not coverage until it is confirmed", resp.Coverage, resp.Receipt)
+		}
+
+		// 2. Acknowledge it. The returned status is L3's, built from the record
+		// the confirmation just changed.
+		acked, err := h.svc.Acknowledge(ctx, model.AcknowledgeRequest{
+			SessionID: sessionA, ActorID: actorA,
+			Kind: model.AcknowledgeReceipt, Receipts: []string{resp.Receipt},
+		})
+		if err != nil {
+			t.Fatalf("acknowledge: %v", err)
+		}
+		if acked.SessionID != sessionA || acked.RequiredFiles != 4 || acked.FullyServedFiles != 1 {
+			t.Fatalf("acknowledge reports session %q with %d of %d required files served; "+
+				"want %q with 1 of 4 -- the confirmed EOF receipt is the empty file's coverage",
+				acked.SessionID, acked.FullyServedFiles, acked.RequiredFiles, sessionA)
+		}
+		h.checkOracle(sessionA, actorA, empty)
+
+		// 3. Status answers the same session, from the same record.
+		page, status, err := h.svc.Status(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
+			model.PageRequest{})
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if status.SessionID != acked.SessionID || status.ActorID != acked.ActorID ||
+			status.Binding != acked.Binding || status.ManifestID != acked.ManifestID ||
+			status.Phase != acked.Phase || status.State != acked.State ||
+			status.StateVersion != acked.StateVersion ||
+			status.RequiredFiles != acked.RequiredFiles ||
+			status.FullyServedFiles != acked.FullyServedFiles {
+			t.Fatalf("status describes %+v; acknowledge described %+v -- two endpoints "+
+				"reporting one session must not disagree", status, acked)
+		}
+		if len(page.Items) == 0 {
+			t.Fatalf("status returned no coverage records for a session with four required files")
+		}
+
+		// 4. Next advances past the file the confirmation covered.
+		item, err := h.svc.Next(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if item.FileID != crlf || item.Action != actionReadSource || item.Offset != 0 || item.Remaining != 3 {
+			t.Fatalf("next names %s (%s) at offset %d with %d remaining; want %s/%s/0/3 -- "+
+				"the empty file is served and the next required entry is unread",
+				item.FileID, item.Action, item.Offset, item.Remaining, crlf, actionReadSource)
+		}
+
+		// 5. Close is the compare-and-swap of ruling Q5 against the version
+		// Status just reported, not a CloseSession of its own: a stale version
+		// must lose rather than close a session that moved under the caller.
+		var typedErr *model.Error
+		if _, err := h.svc.Close(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
+			status.StateVersion+1); !errors.As(err, &typedErr) || typedErr.Code != model.CodeVersionConflict {
+			t.Fatalf("close at the wrong state version reports %v; want %s",
+				err, model.CodeVersionConflict)
+		}
+		closed, err := h.svc.Close(ctx, model.SessionRequest{SessionID: sessionA, ActorID: actorA},
+			status.StateVersion)
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if closed.State != model.StateClosed || closed.StateVersion != status.StateVersion+1 {
+			t.Fatalf("close leaves the session %s at version %d; want %s at %d",
+				closed.State, closed.StateVersion, model.StateClosed, status.StateVersion+1)
+		}
+		// Partial coverage never earns readiness, and neither does closing.
+		for _, st := range []model.SessionStatus{acked, status, closed} {
+			if st.ReadCompleteForSnapshot || st.ReadyForImplementation || st.StrictGateSatisfied {
+				t.Fatalf("a session with 1 of 4 required files served reports read_complete=%t "+
+					"ready_for_implementation=%t strict_gate_satisfied=%t; Task 16 grants none of them",
+					st.ReadCompleteForSnapshot, st.ReadyForImplementation, st.StrictGateSatisfied)
+			}
+		}
+	}},
+
+	// An incomplete manifest scope is not a completed read. Ruling Q7 compiles
+	// an ambiguous or empty scope into a manifest with ScopeComplete=false and
+	// no required_full entries, so the required_full walk exhausts at once and
+	// the count test "0 of 0 served" would otherwise answer actionComplete --
+	// telling the actor the reading is done when the scope never resolved.
+	// L4 could not exercise this branch: the fixture manifest it inherited
+	// reported ScopeComplete unconditionally.
+	{"int/an unresolved scope asks for review, not completion", func(t *testing.T, h *harness) {
+		h.store.scopeComplete = false
+		for id := range h.store.required {
+			h.store.required[id] = model.RequirementRecommended
+		}
+
+		item, err := h.svc.Next(context.Background(),
+			model.SessionRequest{SessionID: sessionA, ActorID: actorA})
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if item.Action != actionReviewScope || item.FileID != "" {
+			t.Fatalf("next answers %q for file %q over a manifest that resolved nothing; want %q and no file",
+				item.Action, item.FileID, actionReviewScope)
+		}
+	}},
 }
 
 func TestCoverage(t *testing.T) {
-	// Built once here as well as per row: while the table is still filling up
-	// this keeps the fixture, the signer and the oracle genuinely exercised, so
-	// the first lane to add a row does not discover a broken harness.
-	newHarness(t)
 	for _, tc := range scenarios {
 		t.Run(tc.name, func(t *testing.T) { tc.run(t, newHarness(t)) })
 	}

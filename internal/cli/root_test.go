@@ -43,9 +43,8 @@ import (
 // otherwise.
 // hexID is a well-formed resolved id. The context commands screen their
 // positional arguments before anything else, so a malformed one would be
-// rejected for the wrong reason and prove nothing about the flags. INT:
-// uncomment with the row that uses it.
-// const hexID = "00000000000000000000000000000000000000000000000000000000000000ab"
+// rejected for the wrong reason and prove nothing about the flags.
+const hexID = "00000000000000000000000000000000000000000000000000000000000000ab"
 
 func TestCommandEnvelope(t *testing.T) {
 	build := model.BuildInfo{
@@ -82,13 +81,11 @@ func TestCommandEnvelope(t *testing.T) {
 		// either guess writes a claim nobody made -- credit for bytes that may
 		// never have arrived, or a review of a file that may not be covered. The
 		// rejection also has to happen before a workspace is opened, which is
-		// what this row pins: the row names no repository, so a check that ran
-		// after the open would fail on the workspace instead of on the flags.
-		// INT: uncomment this row together with the root.go registration line.
-		// The row is green with that line in place and mutation-proved in
-		// T16-L5-report.md; without it the tree routes `context` nowhere, so the
-		// envelope reports the root command instead of the rejection.
-		// {name: "context acknowledge naming both acknowledgment kinds", args: []string{"context", "acknowledge", hexID, hexID, "--actor", "agent-a", "--receipt", "tok", "--file-review", "--json"}, exitCode: 2, ok: false, command: "context acknowledge", errCode: "CTX_ARGUMENT_INVALID"},
+		// what this row pins: it points at a path that is not a workspace, so a
+		// check that ran after the open would fail on the workspace instead of
+		// on the flags, and the service's own rejection of the same request
+		// cannot stand in for the command's.
+		{name: "context acknowledge naming both acknowledgment kinds", args: []string{"context", "acknowledge", hexID, hexID, "--actor", "agent-a", "--receipt", "tok", "--file-review", "--json"}, missingRepo: true, exitCode: 2, ok: false, command: "context acknowledge", errCode: "CTX_ARGUMENT_INVALID"},
 	}
 
 	for _, tc := range tests {
