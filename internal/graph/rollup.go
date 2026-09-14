@@ -171,9 +171,19 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	var lookup []model.NodeID
 	lookup = append(lookup, ids...)
 	for _, batch := range impactChunkNodes(ids) {
-		rels, err := e.containsEdges(ctx, batch)
+		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
+			int64(len(batch))*maxContainersPerNode)
 		if err != nil {
 			return nil, err
+		}
+		if !complete {
+			// A rollup cannot disclose truncation: its callers hand it a
+			// relation list and take a pair list back. Refusing loudly is the
+			// only honest answer left -- a rollup built on half the containment
+			// would attribute edges to the wrong packages, not merely to fewer.
+			return nil, (&model.Error{Code: model.CodeResourceLimit,
+				Message:     "this generation contains more containment edges for one batch of nodes than a rollup may read",
+				Remediation: "narrow the request scope"}).WithDetail("limit", "containers_per_node")
 		}
 		for _, r := range rels {
 			candidates[r.To] = append(candidates[r.To], r.From)
@@ -211,38 +221,50 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	return out, nil
 }
 
-// maxContainerPages bounds the keyset walk over one batch's containment edges.
-// A batch is at most adjacencyBatch (256) nodes and the reader returns at most
-// model.MaxPageItems (200) rows per page, so 16 pages carry 3200 containment
-// edges -- twelve containers per node in the worst batch. That is generous
-// headroom rather than a working limit, but the loop still has an explicit
-// finite bound, because an unbounded "read until done" is exactly how a
-// pathological graph becomes an unbounded query.
-const maxContainerPages = 16
+// maxContainersPerNode bounds how many containers one node may be read as
+// belonging to. A node legitimately sits in several -- a file is in a directory
+// and in a package -- but a graph in which one node is claimed by sixteen is
+// pathological, and an unbounded "read until done" is exactly how such a graph
+// becomes an unbounded query.
+//
+// It replaces a flat page ceiling that did not scale with the batch: sixteen
+// clamped pages carry 3200 containment rows whatever the batch size, so a batch
+// of 256 nodes silently stopped at twelve containers per node while a batch of
+// four was allowed eight hundred. The budget below is per node, so a batch
+// reads what its own size needs and the loop still has an explicit finite
+// bound.
+const maxContainersPerNode = 16
 
-// containsEdges reads the incoming `contains` edges of one batch of nodes,
-// keyset-paged by RelationID.
-func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID) ([]model.Relation, error) {
+// containsEdges reads the `contains` edges of one batch of nodes in direction,
+// keyset-paged by RelationID, up to maxEdges rows.
+//
+// It reports whether the read COMPLETED. The caller decides what an incomplete
+// containment read means for its answer -- a rollup refuses, the repository map
+// truncates and says so -- because the one thing neither may do is report a
+// partial containment as the whole of it: a package that silently loses half
+// its members reads as a smaller package, not as an incomplete answer.
+func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
+	direction model.Direction, maxEdges int64) ([]model.Relation, bool, error) {
 	var (
 		out   []model.Relation
 		after model.RelationID
 	)
-	for page := 0; page < maxContainerPages; page++ {
-		rels, err := e.adjacency.Edges(ctx, batch, model.DirectionIncoming,
+	for int64(len(out)) < maxEdges {
+		rels, err := e.adjacency.Edges(ctx, batch, direction,
 			[]model.RelationKind{model.RelContains}, after, adjacencyBatch)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, rels...)
 		// Only an empty page ends the walk: the reader clamps the requested
 		// limit down to model.MaxPageItems, so testing for a short page would
-		// stop after the first one and under-roll every package.
+		// stop after the first one and under-roll every container.
 		if len(rels) == 0 {
-			break
+			return out, true, nil
 		}
 		after = rels[len(rels)-1].ID
 	}
-	return out, nil
+	return out, false, nil
 }
 
 // evidenceCounts counts the evidence records backing each relation, in bounded
