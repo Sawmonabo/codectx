@@ -69,8 +69,10 @@ type Sessions interface {
 	// paged only for a user-visible list; counts come from CoverageSummary.
 	Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error)
 	// CoverageSummary is Task 16's aggregate and this package defines no second
-	// one: the readiness gate makes exactly one call per evaluation.
-	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+	// one: the readiness gate makes exactly one call per evaluation. Its
+	// FullyRead and Served differ only by the waiver clause and answer
+	// different questions -- see sqlite.CoverageCounts.
+	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	Manifest(ctx context.Context, id model.ManifestID) (model.ContextManifest, error)
 	ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error)
 	// RangeConfirmed reports whether one interval is already fully confirmed
@@ -243,8 +245,11 @@ type gate struct {
 	// session pinned. It rides on the gate rather than beside it because Ready
 	// is defined in terms of it and every gate reader must see the same answer.
 	Superseded bool
-	// Required, Served and Waived come from one CoverageSummary call.
-	Required, Served, Waived int64
+	// Required, FullyRead, Served and Waived come from one CoverageSummary
+	// call. FullyRead is what read completeness and the consolidation guard
+	// ask (Section 17.1: every required file fully read, waived or not);
+	// Served is what the operator is shown as fully_served_files.
+	Required, FullyRead, Served, Waived int64
 	// Blocking names the unresolved observations that hold the gate shut.
 	Blocking []model.ObservationID
 	// Reason states, for an operator, why the gate is shut -- or, when it is

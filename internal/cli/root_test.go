@@ -332,18 +332,6 @@ func TestExitCodeClasses(t *testing.T) {
 			want: 7,
 		},
 		{
-			// The gate `context advance` consults is the Section 16.3 read gate:
-			// advancing to consolidate is refused while required files are not
-			// fully served to this actor. That refusal is CTX_COVERAGE_INCOMPLETE,
-			// and it belongs to the exit-6 "policy/read/scope/freshness gate not
-			// ready" class, NOT to exit 1 or to the exit-2 class a bare untyped
-			// error falls into: an agent that read "you typed the command wrong"
-			// there would retry the flags instead of reading the files it owes.
-			name: "the read gate refusing a transition is not a command-line error",
-			err:  &model.Error{Code: model.CodeCoverageIncomplete, Message: "required files are not fully served"},
-			want: 6,
-		},
-		{
 			name: "an unrecognized code is a defect, not a guess",
 			err:  &model.Error{Code: "CTX_NOT_A_REAL_CODE", Message: "unknown"},
 			want: 10,

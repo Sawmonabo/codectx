@@ -117,7 +117,12 @@ func checkLimits(l Limits) error {
 // OpenSession compiles nothing: it opens an actor-specific session over a
 // manifest Task 15 has already persisted, acquires the model.LeaseSession
 // retention lease that stops an expired session from resurrecting deleted
-// source, and reports the resulting status. Owned by L3.
+// source, and answers the session id. Owned by L3.
+//
+// It deliberately reports no model.SessionStatus: workflow.Service.Status is the
+// only producer of one (ruling VF1), because a status this package built could
+// not answer the Section 16.3 gate and reported a weaker readiness under the
+// same field names. The composition root pairs the id with that status.
 //
 // The store owns idempotency: with a key, a retry by the same actor carrying
 // the same open-request hash returns the existing session and the freshly
@@ -125,17 +130,17 @@ func checkLimits(l Limits) error {
 // CTX_VERSION_CONFLICT. The phase gate, the manifest's generation and snapshot
 // and the session's file scope are the store's too, so none of it is repeated
 // here.
-func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (model.SessionStatus, error) {
+func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (model.SessionID, error) {
 	if err := req.Validate(); err != nil {
-		return model.SessionStatus{}, err
+		return "", err
 	}
 	if !model.ValidHexID(string(manifest)) {
-		return model.SessionStatus{}, typedErrf(model.CodeArgumentInvalid,
+		return "", typedErrf(model.CodeArgumentInvalid,
 			"context.manifest_id is not a well-formed identifier")
 	}
 	id, err := model.NewRandomID()
 	if err != nil {
-		return model.SessionStatus{}, err
+		return "", err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
@@ -150,18 +155,18 @@ func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manife
 		ExpiresAt:       s.now().Add(s.limits.SessionTTL).UTC(),
 	})
 	if err != nil {
-		return model.SessionStatus{}, err
+		return "", err
 	}
 	rec, err := s.sessions.Session(ctx, session, req.ActorID)
 	if err != nil {
-		return model.SessionStatus{}, err
+		return "", err
 	}
 	if err := s.retain(ctx, rec); err != nil {
-		return model.SessionStatus{}, err
+		return "", err
 	}
 	s.log.Debug("opened a read session", "component", "coverage",
 		"generation_id", int64(rec.Binding.GenerationID), "phase", string(rec.Phase))
-	return s.status(ctx, rec)
+	return rec.ID, nil
 }
 
 // openRequestHash folds everything that makes two open requests different. It
@@ -202,21 +207,19 @@ func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
 }
 
 // Status reports this actor's coverage for this session: one page of per-file
-// records keyed on file_id plus the honest session status. Owned by L3.
+// records keyed on file_id. Owned by L3.
 //
-// The page is keyset paged on file_id, exactly as the store orders it, and the
-// counts come from status's single CoverageSummary call rather than from
-// walking the pages -- a 250k-file session is 1250 pages and one aggregate.
-func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], model.SessionStatus, error) {
-	var (
-		emptyPage   model.Page[model.FileCoverage]
-		emptyStatus model.SessionStatus
-	)
+// The page is keyset paged on file_id, exactly as the store orders it. The
+// session-level counts are NOT reported here: workflow.Service.Status is the one
+// producer of a model.SessionStatus (ruling VF1), and the facade pairs this page
+// with it.
+func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], error) {
+	var emptyPage model.Page[model.FileCoverage]
 	if err := req.Validate(); err != nil {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
 	if err := page.Validate(); err != nil {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
@@ -224,35 +227,29 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil && !(expiredSession(err) && rec.ID != "") {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
-
 	limit := s.statusLimit(page.Limit)
 	after, err := s.resumeStatus(page.Cursor, rec)
 	if err != nil {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
 
 	// One extra record answers "is there another page" without a second query.
 	items, err := s.sessions.Coverage(ctx, req.SessionID, req.ActorID, after, limit+1)
 	if err != nil && !expiredSession(err) {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
 	more := len(items) > limit
 	if more {
 		items = items[:limit]
 	}
 
-	status, err := s.status(ctx, rec)
-	if err != nil {
-		return emptyPage, emptyStatus, err
-	}
-
 	meta := model.QueryMeta{Binding: rec.Binding}
 	if more {
 		token, why, err := s.statusCursor(ctx, rec, items[len(items)-1].FileID)
 		if err != nil {
-			return emptyPage, emptyStatus, err
+			return emptyPage, err
 		}
 		if token == "" {
 			// A page that cannot be continued says so rather than looking like
@@ -264,14 +261,14 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 	}
 	out := model.Page[model.FileCoverage]{Meta: meta, Items: items}
 	if err := out.Validate(); err != nil {
-		return emptyPage, emptyStatus, err
+		return emptyPage, err
 	}
 	for i := range out.Items {
 		if err := out.Items[i].Validate(); err != nil {
-			return emptyPage, emptyStatus, err
+			return emptyPage, err
 		}
 	}
-	return out, status, nil
+	return out, nil
 }
 
 // statusLimit resolves the requested page size, leaving room for the one extra
@@ -375,108 +372,6 @@ func statusQueryHash(rec sqlite.SessionRecord) string {
 	return model.H(statusQueryHashDomain, endpointStatus, string(rec.ID), rec.ActorID, string(rec.ManifestID))
 }
 
-// Close ends the session with the Section 17.1 compare-and-swap:
-// AdvanceSession{Target: StateClosed, ExpectedVersion}. It releases the
-// retention lease. Owned by L3.
-//
-// There is no CloseSession and no edge out of complete, so closing a completed
-// session is the store's CTX_VERSION_CONFLICT rather than an invented code --
-// the same answer a stale expected version gets, because both mean the caller's
-// view of the session is not the stored one.
-//
-// The session's retention lease is NOT released here: pagination.Leases
-// addresses a lease by the id it minted, and nothing persists that id against
-// the session, so Close has nothing to name. The lease expires with
-// coverage.session_ttl instead. See the lane report.
-func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedVersion int) (model.SessionStatus, error) {
-	if err := req.Validate(); err != nil {
-		return model.SessionStatus{}, err
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
-	defer cancel()
-
-	// A mutation never looks past CTX_SESSION_EXPIRED: an expired or already
-	// closed session has no transition to make.
-	if _, err := s.sessions.AdvanceSession(ctx, model.AdvanceRequest{
-		SessionID:       req.SessionID,
-		ActorID:         req.ActorID,
-		Target:          model.StateClosed,
-		ExpectedVersion: expectedVersion,
-	}); err != nil {
-		return model.SessionStatus{}, err
-	}
-
-	// Reporting the closed session is a read, and a just-closed session reads
-	// as expired by definition, so the record is used rather than refused.
-	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
-	if err != nil && !(expiredSession(err) && rec.ID != "") {
-		return model.SessionStatus{}, err
-	}
-	return s.status(ctx, rec)
-}
-
-// status is the one place a model.SessionStatus is built from a session record.
-// It spends exactly one CoverageSummary call for the counts -- paging Coverage
-// for them would cost 1250 round trips on a 250k-file session -- and it leaves
-// ReadyForImplementation and StrictGateSatisfied false, because Section 16.3's
-// extra preconditions are Task 17 surface and a half-built readiness evaluator
-// is a duplicate implementation. Owned by L3; called by L1, L4 and L5.
-//
-// ReadCompleteForSnapshot is the weaker, honest answer this task can give:
-// every required_full file of this manifest is full_served for THIS actor's
-// session at the pinned content hashes. A waiver is counted and reported but
-// never folded into it -- a waiver never fabricates coverage.
-//
-// An incomplete manifest scope disqualifies it outright. Task 15 compiles an
-// ambiguous or empty scope into a manifest with ScopeComplete=false and NO
-// required_full entries, so the count test alone would report a session that
-// resolved nothing as fully read.
-func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.SessionStatus, error) {
-	if rec.ID == "" {
-		return model.SessionStatus{}, typedErrf(model.CodeInternal,
-			"coverage status was asked to describe a session that was never loaded")
-	}
-	required, fullyServed, waived, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
-	if err != nil && !expiredSession(err) {
-		return model.SessionStatus{}, err
-	}
-	manifest, err := s.sessions.Manifest(ctx, rec.ManifestID)
-	if err != nil {
-		return model.SessionStatus{}, err
-	}
-	status := model.SessionStatus{
-		SessionID:               rec.ID,
-		ActorID:                 rec.ActorID,
-		Binding:                 rec.Binding,
-		ManifestID:              rec.ManifestID,
-		Phase:                   rec.Phase,
-		State:                   rec.State,
-		StateVersion:            rec.StateVersion,
-		ScopeVersion:            rec.ScopeVersion,
-		ScopeComplete:           manifest.ScopeComplete,
-		ReadCompleteForSnapshot: manifest.ScopeComplete && fullyServed == required,
-		RequiredFiles:           required,
-		FullyServedFiles:        fullyServed,
-		WaivedFiles:             waived,
-		CreatedAt:               rec.CreatedAt,
-		ExpiresAt:               rec.ExpiresAt,
-		// ReadyForImplementation and StrictGateSatisfied stay false: the verify
-		// phase, a current-scope actor review, the absence of a blocking
-		// unresolved dependency and current-source validation are Task 17's to
-		// evaluate, and this task builds no readiness evaluator.
-		//
-		// Completeness and Superseded stay zero for the same reason of honesty:
-		// no method on the Sessions surface reports per-capability completeness
-		// or whether a newer generation has superseded this one, and inventing
-		// either would be a claim nothing verified.
-	}
-	if err := status.Validate(); err != nil {
-		return model.SessionStatus{}, err
-	}
-	return status, nil
-}
-
 // expiredSession reports whether err is the CTX_SESSION_EXPIRED that
 // Store.Session and Store.Coverage return beside a partially populated record.
 // It is errors.As rather than a type assertion because model.Canceled returns
@@ -484,15 +379,6 @@ func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.S
 func expiredSession(err error) bool {
 	var typed *model.Error
 	return errors.As(err, &typed) && typed.Code == model.CodeSessionExpired
-}
-
-// notFound reports the storage contract for a lookup that matched no row:
-// CTX_ARGUMENT_INVALID carrying sqlite.ReasonNotFound, which distinguishes a
-// missing row from a malformed argument under the same code.
-func notFound(err error) bool {
-	var typed *model.Error
-	return errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid &&
-		typed.Details["reason"] == sqlite.ReasonNotFound
 }
 
 // cursorInvalid is the one rejection a bad continuation gets. Section 16.3 has

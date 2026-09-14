@@ -319,8 +319,9 @@ func newContextStatusCommand(build model.BuildInfo) *cobra.Command {
 			"at a time, with the session's own honest readiness.\n\n" +
 			"Read completeness is about the pinned snapshot: it stays true for the snapshot the " +
 			"session was opened against even after a newer generation becomes active. Strict " +
-			"implementation readiness is a stronger and separate question this command never " +
-			"answers true, and a waived file is reported as waived rather than as covered.",
+			"implementation readiness is a stronger and separate question: it is true only when " +
+			"every Section 16.3 precondition holds at this instant, and a waived file is " +
+			"reported as waived rather than as covered.",
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -445,11 +446,7 @@ func newContextCloseCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addContextFlags(cmd)
-	// No backquotes in a flag usage string: cobra reads the first backquoted
-	// word as the flag's type name, so "`context status`" would render the
-	// value placeholder as "context status" instead of "int".
-	cmd.Flags().Int(contextExpectedVersionFlag, 0,
-		"the state version this close expects, as \"codectx context status\" last reported it; the close is refused if the session has moved on")
+	addExpectedVersionFlag(cmd, "close")
 	return cmd
 }
 
@@ -595,11 +592,66 @@ func writeSessionStatus(b *strings.Builder, st model.SessionStatus) {
 	fmt.Fprintf(b, "ready       %s for implementation (strict gate %s)\n",
 		yesNo(st.ReadyForImplementation, "yes", "no"),
 		yesNo(st.StrictGateSatisfied, "satisfied", "not satisfied"))
+	writeGuaranteeLimit(b, st)
 	if st.Superseded {
 		b.WriteString("warning     a newer generation has superseded this session's snapshot\n")
 	}
 	fmt.Fprintf(b, "expires     %s\n", st.ExpiresAt.UTC().Format(time.RFC3339))
 	writeCapabilities(b, st.Completeness)
+}
+
+// writeGuaranteeLimit prints the evaluator's own words about the two readiness
+// booleans printed above it: when the gate is open it states that readiness is
+// point-in-time, and when the gate is shut it names the precondition that shut
+// it. Printing the booleans without it is the bare "yes" Section 16.3 forbids,
+// and a shut gate whose reason stays inside the service is a refusal the
+// operator cannot act on.
+//
+// The text is wrapped instead of being handed whole to tableCell: the
+// open-gate sentence is several table cells long, and clipping it would drop
+// exactly the half that says what to do before the write phase.
+func writeGuaranteeLimit(b *strings.Builder, st model.SessionStatus) {
+	if strings.TrimSpace(st.GuaranteeLimit) == "" {
+		return
+	}
+	// The gate's own two answers read as different kinds of sentence, so they
+	// are not printed under one label that would fit only one of them.
+	label := "reason"
+	if st.ReadyForImplementation {
+		label = "guarantee"
+	}
+	for i, line := range wrapCells(st.GuaranteeLimit) {
+		if i == 0 {
+			fmt.Fprintf(b, "%-11s %s\n", label, line)
+			continue
+		}
+		fmt.Fprintf(b, "            %s\n", line)
+	}
+}
+
+// wrapCells breaks one bounded sentence into table-cell-wide lines on word
+// boundaries, each sanitized by tableCell. A word longer than a cell is left
+// to tableCell's own clip: nothing this renders is a single unbroken token.
+func wrapCells(s string) []string {
+	var (
+		lines []string
+		line  string
+	)
+	for _, word := range strings.Fields(s) {
+		switch {
+		case line == "":
+			line = word
+		case utf8.RuneCountInString(line)+1+utf8.RuneCountInString(word) <= tableCellWidth:
+			line += " " + word
+		default:
+			lines = append(lines, tableCell(line))
+			line = word
+		}
+	}
+	if line != "" {
+		lines = append(lines, tableCell(line))
+	}
+	return lines
 }
 
 // writeNextItem renders the metadata-only answer. A completed session names no
@@ -1217,7 +1269,9 @@ func newContextAdvanceCommand(build model.BuildInfo) *cobra.Command {
 			"Those preconditions are the honest gate of Sections 16.3 and 17.1, not a formality: " +
 			"advancing to `consolidate` requires the required files to be fully served to this actor " +
 			"and a scope review recorded against the current scope version, and advancing to " +
-			"`complete` requires the capsule to have been sealed first. A refusal here reports which " +
+			"`complete` seals the deterministic capsule inside that guard and moves the state " +
+			"only once its hash is verified -- sealing is not a separate step to run first. " +
+			"A refusal here reports which " +
 			"precondition is unmet; it is not an error in the command line.\n\n" +
 			"`closed` is not a target of this command: closing a session is \"codectx context close\", " +
 			"which is the same guarded transition under the name operators reach for.",
