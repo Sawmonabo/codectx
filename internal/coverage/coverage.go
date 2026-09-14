@@ -159,16 +159,6 @@ type Service struct {
 	log      *slog.Logger
 }
 
-// Read serves one bounded, lossless chunk of pinned source and issues its
-// receipt. Order is the invariant: gate the actor, check the unconfirmed cap,
-// size the chunk with maxRawForWire, read through Source, plan the boundary
-// with source.PlanChunk, persist the issued row, then sign and emit. The
-// reported Coverage is the state before this chunk, which is issued and not yet
-// confirmed. Owned by L1.
-func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.ReadChunkResponse, error) {
-	return model.ReadChunkResponse{}, notImplemented("coverage.Read")
-}
-
 // Next names the next required_full file this actor has not fully served, in
 // manifest ordinal order, with its pinned hash, size and resume offset. It is
 // metadata only and never carries source bytes. Implemented in next.go (L4).
