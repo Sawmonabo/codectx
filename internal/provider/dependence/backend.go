@@ -31,9 +31,6 @@ import (
 // Engine identifies the resolved analysis payload. Version and Digest are the
 // provenance that reaches `status`, `doctor` and the ledger, through
 // Detection.ObservedVersion and the descriptor version, and nowhere else.
-// Name is the lock entry the payload was installed as; it is inventory
-// vocabulary and reaches no product surface, so nothing outside the backend
-// package that resolves it reads it.
 // ParseArgv and ExportArgv are complete argv prefixes (a launcher plus its
 // arguments, for example a managed JDK and `-jar`), so a runtime-dependent
 // payload needs no second concept here.
@@ -44,7 +41,6 @@ type Engine struct {
 	// pairs. internal/process never merges the parent environment, so this is
 	// the whole of it.
 	Env     []string
-	Name    string
 	Version string
 	Digest  string
 	// RuntimeDigest is the payload digest of the runtime the engine executes
