@@ -1276,7 +1276,53 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		binding = model.Binding{RepositoryID: model.RepositoryID(idHex(g.repo)), SnapshotID: snapshotID, GenerationID: gen, AnalysisKey: key}
 		return nil
 	})
-	return binding, err
+	if err != nil {
+		return model.Binding{}, err
+	}
+	s.refreshStatistics(ctx)
+	return binding, nil
+}
+
+// analyzedTables are the tables whose statistics the query planner actually
+// needs. A bare ANALYZE also walks search_vocab, whose posting rows outnumber
+// every other table by an order of magnitude and which no plan chooses between
+// indexes on; measured at ~1.5 s per activation on an 800-unit fixture against
+// ~30 ms for these two.
+var analyzedTables = [...]string{"node_facts", "generation_units"}
+
+// refreshStatistics rebuilds sqlite_stat1 for the newly published generation.
+//
+// Without it the database carries no statistics at all, and the planner drives
+// the qualified-name prefix range (NodeFilter.QualifiedPrefix) from
+// generation_units, probing node_facts by primary key and filtering the range
+// in memory over every node of the generation instead of using
+// idx_nodes_qname. Activation is where this belongs: it runs once per
+// publication, inside an indexing run that already paid far more, whereas a
+// read path would have to write on a query.
+//
+// It never fails an activation. The generation is published by the time this
+// runs -- the transaction above committed -- so refusing to return the binding
+// would turn a slower query plan into a failed index. The operator is told
+// instead: a stale plan is a performance fact they can act on, not a silent
+// one. Generations published before this landed keep the old plan until the
+// next activation rewrites the statistics.
+func (s *Store) refreshStatistics(ctx context.Context) {
+	// analysis_limit is SQLite's bounded-scan mode: each index is sampled
+	// rather than walked end to end, which is what makes this affordable
+	// inside an activation. The stats it writes are approximate and that is
+	// enough -- the plan only has to prefer an indexed range over a full scan.
+	if _, err := s.writer.ExecContext(ctx, `PRAGMA analysis_limit=1000`); err != nil {
+		slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
+			"component", "storage", "error", err.Error())
+		return
+	}
+	for _, table := range analyzedTables {
+		if _, err := s.writer.ExecContext(ctx, `ANALYZE `+table); err != nil {
+			slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
+				"component", "storage", "table", table, "error", err.Error())
+			return
+		}
+	}
 }
 
 // foldColumn streams one text column into h; the query must already be sorted.
