@@ -80,6 +80,10 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	addQueryFlags(cmd)
+	// The Section 18.1 spelling is `codectx symbol <name-or-id> [--limit N]
+	// [--cursor TOKEN]`, and the request carries a PageRequest that
+	// queryFlagValues reads, so the page flags have to be declared here too.
+	addPageFlags(cmd)
 	return cmd
 }
 

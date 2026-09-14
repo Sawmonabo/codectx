@@ -579,6 +579,7 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		Repo:      repo,
 		Signer:    s.signer,
 		Spools:    s.spools,
+		Content:   s.cas,
 		Resources: s.cfg.Resources,
 		CursorTTL: s.cfg.Storage.QueryCursorTTL.Std(),
 		Now:       time.Now,
