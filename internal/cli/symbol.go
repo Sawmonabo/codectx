@@ -210,11 +210,19 @@ func semanticFlagValues(cmd *cobra.Command, canonicalOnly bool) (model.SemanticS
 			WithRemediation("name one of the supported servers, for example --" + semanticProfileFlag + " gopls")
 	}
 	if source == model.SemanticCanonical && profile != "" {
+		// The remediation has to differ on the canonical-only commands:
+		// telling their caller to add `--semantic-source lsp` would send them
+		// straight into the refusal above, which is advice that cannot be
+		// followed.
+		remediation := "add --" + semanticSourceFlag + " " + string(model.SemanticLSP) +
+			", or drop --" + semanticProfileFlag
+		if canonicalOnly {
+			remediation = "drop --" + semanticProfileFlag + ": this command has no overlay route to name a server for"
+		}
 		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
 			Message: "--" + semanticProfileFlag + " names a language server, which only the " +
 				string(model.SemanticLSP) + " semantic source answers from"}).
-			WithRemediation("add --" + semanticSourceFlag + " " + string(model.SemanticLSP) +
-				", or drop --" + semanticProfileFlag)
+			WithRemediation(remediation)
 	}
 	return source, profile, nil
 }
