@@ -36,10 +36,11 @@
 //
 // Usage:
 //
-//	go run ./.github/tools-matrix --data-dir <dir> [--work <dir>] [--keep]
+//	go run ./.github/tools-matrix --store <dir> [--work <dir>] [--keep]
 //
-// --data-dir is the same directory the workflow put in tools.cache_dir, which
-// is what `codectx tools` resolved its store from.
+// --store is the tool store itself -- the same directory the workflow put in
+// tools.cache_dir, which is what `codectx tools` resolved its store from. It is
+// the store and not its parent: toolchain.Options.StoreDir takes it verbatim.
 package main
 
 import (
@@ -89,8 +90,12 @@ type check struct {
 	// which writes a binary graph rather than an index, this is empty and the
 	// output file's existence and size are the whole check.
 	documents []string
-	// needs names a host program the tool shells out to, so a missing one is
-	// reported as what it is rather than as a broken payload.
+	// needs names a host program the tool shells out to. A runner that does not
+	// provide it fails this run: the profile genuinely needs that language's own
+	// toolchain to load the project model, so its absence is the matrix not
+	// being able to prove the platform, not an honest absence like a lock entry
+	// with no payload here. The detail says which program, so the failure points
+	// at the runner image rather than at the payload.
 	needs string
 }
 
@@ -191,27 +196,27 @@ func unsupportedHere(err error) bool {
 }
 
 func main() {
-	dataDir := flag.String("data-dir", "", "data directory whose tools store the workflow prefetched into")
+	store := flag.String("store", "", "the tool store the workflow prefetched into")
 	work := flag.String("work", "", "directory to materialize the fixture in (default: a temporary directory)")
 	keep := flag.Bool("keep", false, "keep the materialized fixture and its indexes")
 	flag.Parse()
 
-	if err := run(*dataDir, *work, *keep); err != nil {
+	if err := run(*store, *work, *keep); err != nil {
 		fmt.Fprintln(os.Stderr, "tools-matrix:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dataDir, work string, keep bool) error {
-	if dataDir == "" {
-		return fmt.Errorf("--data-dir is required")
+func run(store, work string, keep bool) error {
+	if store == "" {
+		return fmt.Errorf("--store is required")
 	}
-	abs, err := filepath.Abs(dataDir)
+	abs, err := filepath.Abs(store)
 	if err != nil {
 		return err
 	}
 	res, err := toolchain.New(toolchain.Options{
-		DataDir: abs,
+		StoreDir: abs,
 		// Everything must already be installed: the workflow ran
 		// `codectx tools prefetch --all` immediately before this program.
 		Offline:       true,
@@ -238,7 +243,7 @@ func run(dataDir, work string, keep bool) error {
 		return err
 	}
 	fmt.Printf("platform  %s\nstore     %s\nfixture   %s\n\n",
-		toolchain.Current().Key(), toolchain.StoreDir(abs), root)
+		toolchain.Current().Key(), res.StoreDir(), root)
 
 	ctx := context.Background()
 	var results []result
@@ -261,7 +266,10 @@ func runIndexCheck(ctx context.Context, res *toolchain.Resolver, root string, c 
 
 	if c.needs != "" {
 		if _, err := exec.LookPath(c.needs); err != nil {
-			r.detail = c.needs + " is not on PATH; this leg needs it on the runner"
+			// Not r.skipped: an uncovered language fails summarize anyway, so
+			// recording this as a skip would reach the same verdict by a longer
+			// road while calling a broken runner "unsupported here".
+			r.detail = c.needs + " is not on PATH; this runner cannot prove this leg"
 			return r
 		}
 	}
@@ -378,7 +386,10 @@ func runTool(ctx context.Context, tool toolchain.Tool, args []string, dir string
 	argv := append(append([]string{}, tool.ArgvPrefix...), args...)
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	cmd.Env = append(append([]string{}, tool.Env...), passthroughEnv()...)
+	// The passthrough goes first and the payload's own variables last, exactly
+	// as the product's profiles compose it, so a host JAVA_HOME can never shadow
+	// the managed JDK the lock pinned.
+	cmd.Env = append(passthroughEnv(), tool.Env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return out, fmt.Errorf("%s: %w", filepath.Base(argv[0]), err)
@@ -414,8 +425,13 @@ func materialize(root string) error {
 		// The Go fixture's module file is stored as go.mod.txt: a real go.mod
 		// anywhere under this repository would make its directory a separate
 		// module, and the go command then excludes the subtree from this
-		// module's files, so //go:embed would never see it.
-		rel = strings.TrimSuffix(rel, ".txt")
+		// module's files, so //go:embed would never see it. Only that one file
+		// is renamed -- a blanket .txt strip would silently mangle the next
+		// fixture file that legitimately ends in .txt, such as the
+		// compile_flags.txt clangd and scip-clang look for.
+		if rel == "go/go.mod.txt" {
+			rel = "go/go.mod"
+		}
 		target := filepath.Join(root, filepath.FromSlash(rel))
 		if d.IsDir() {
 			return os.MkdirAll(target, 0o755)

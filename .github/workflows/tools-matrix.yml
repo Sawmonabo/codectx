@@ -57,12 +57,15 @@ jobs:
           go-version: "1.27.1"
           check-latest: false
 
-      # scip-python shells out to pip3/python3 to enumerate the environment it
-      # is indexing, and rust-analyzer loads the crate graph through cargo. Both
-      # are preinstalled on every GitHub runner. This step only records what is
-      # there: the smoke itself reports a missing host program as a runner
-      # problem rather than as a broken payload, so a runner that spells one of
-      # them differently must not kill the leg before anything is tested.
+      # scip-go loads the package graph through go, scip-python shells out to
+      # pip3/python3 to enumerate the environment it is indexing, and
+      # rust-analyzer loads the crate graph through cargo. All three are
+      # preinstalled on every GitHub runner. A runner that does not provide one
+      # fails the smoke -- that language then cannot be proved on this platform,
+      # which is a real matrix failure and not an honest absence. This step is
+      # only diagnostics, printed before the hour-long prefetch so the versions
+      # are in the log; that is the whole reason it may fail without stopping
+      # the job.
       - name: Record the host toolchains the indexers shell out to
         continue-on-error: true
         run: |
@@ -90,14 +93,24 @@ jobs:
           # why the configuration directory is normalized the same way.
           slash() { echo "$1" | sed 's|\\|/|g'; }
           store="$(slash "$GITHUB_WORKSPACE/.tools")"
+          # os.UserConfigDir -- which config.UserConfigPath is built on -- reads
+          # %AppData% on Windows. %LocalAppData% is os.UserCacheDir's variable,
+          # so writing there would leave config.Load reading nothing and the
+          # prefetch installing gigabytes into the default per-workspace store.
           case "$RUNNER_OS" in
-            Windows) config_home="$(slash "$LOCALAPPDATA")" ;;
+            Windows) config_home="$(slash "$APPDATA")" ;;
             macOS)   config_home="$HOME/Library/Application Support" ;;
             *)       config_home="${XDG_CONFIG_HOME:-$HOME/.config}" ;;
           esac
+          if [ -z "$config_home" ]; then
+            echo "no user configuration directory for $RUNNER_OS" >&2
+            exit 1
+          fi
           mkdir -p "$config_home/codectx"
           printf '[tools]\ncache_dir = "%s"\n' "$store" > "$config_home/codectx/config.toml"
-          echo "CODECTX_DATA_DIR=$store" >> "$GITHUB_ENV"
+          # tools.cache_dir is the store itself, not a data directory: the smoke
+          # takes it as --store, and nothing here sets storage.data_dir.
+          echo "CODECTX_TOOL_STORE=$store" >> "$GITHUB_ENV"
           cat "$config_home/codectx/config.toml"
 
       - name: Report the lock before anything is installed
@@ -120,7 +133,7 @@ jobs:
       # The gate itself: nine languages, including C++ and TSX explicitly, each
       # indexed by the pinned analyzer and parsed by the pinned graph engine.
       - name: Smoke every language against the polyglot fixture
-        run: go run ./.github/tools-matrix --data-dir "$CODECTX_DATA_DIR"
+        run: go run ./.github/tools-matrix --store "$CODECTX_TOOL_STORE"
 
       - name: Reclaim versions the lock no longer names
         run: |

@@ -1,19 +1,26 @@
 # The managed analyzer toolchain: what is pinned and why
 
 codectx owns every external analyzer it runs and every runtime those analyzers
-need. Nothing is looked up on `PATH`, nothing is installed by the user, and
-nothing executes that the shipped binary did not pin. This document describes
+need. codectx looks nothing up on `PATH`, installs nothing on the user's behalf
+beyond the payloads its own lock pins, and executes nothing the shipped binary
+did not pin — with one documented exception, the three host toolchains three of
+the indexers shell out to (see [Host dependencies](#host-dependencies)). This document describes
 the pinned set and the provenance behind it, the `codectx tools` commands that
 manage it, and the per-platform matrix that proves it (Section 11.7). Store
 layout, resolution order and offline refusals are implemented in
 `internal/toolchain`, whose package comment is the detailed reference.
 
-**The user needs no toolchain of their own.** Not Go, not Node, not npm, not a
-JDK. Node comes from a pinned nodejs.org distribution and the JDK from a pinned
-Eclipse Temurin build; the four Node-hosted analyzers ship as prebuilt
-`node_modules` trees produced at release time by `npm ci --omit=dev`, so no
-`npm install` ever runs on a user's machine; `gopls` is cross-compiled at
-release time for all six targets. Installing codectx installs nothing else.
+**The user installs no analyzer, no runtime and no language server.** Node comes
+from a pinned nodejs.org distribution and the JDK from a pinned Eclipse Temurin
+build; the four Node-hosted analyzers ship as prebuilt `node_modules` trees
+produced at release time by `npm ci --omit=dev`, so no `npm install` ever runs on
+a user's machine; `gopls` is cross-compiled at release time for all six targets.
+Installing codectx installs nothing else.
+
+**Three host programs are the exception, and they are the indexed language's own
+toolchain**, because the indexer loads the project model through it exactly as a
+build would — [the host dependencies](#host-dependencies) below is the one place
+they are listed.
 
 ## The three artifacts
 
@@ -180,23 +187,60 @@ platform is skipped rather than failed. Each completed fetch logs one record —
 tool, version, digest, bytes, elapsed — on stderr, and the report of what is now
 installed goes to stdout.
 
-`verify` is the expensive one: it rehashes each installed entry executable
-against the digest the lock pins for it. A store a user edited or a disk damaged
-is reported here rather than discovered inside an analyzer run, and a corrupt
-entry **fails the command** with `CTX_TOOL_CORRUPT` — a check that reports
-damage and exits 0 is a gate that passes silently in CI. A corrupt entry is
-repaired by re-running `prefetch` for it, not by `gc`: `gc` removes versions the
-lock no longer names, and a damaged tree at the pinned version is one the lock
-does name.
+`verify` is the expensive one: it rehashes each installed **entry executable**
+against the digest the lock pins for it — the binary, script or jar the lock
+names, and nothing else in the payload tree. A store a user edited or a disk
+damaged is reported here rather than discovered inside an analyzer run, and a
+corrupt entry **fails the command** with `CTX_TOOL_CORRUPT` — a check that
+reports damage and exits 0 is a gate that passes silently in CI. A corrupt entry
+is repaired by re-running `prefetch` for it, not by `gc`: `gc` removes versions
+the lock no longer names, and a damaged tree at the pinned version is one the
+lock does name.
+
+What `verify` does **not** cover is the rest of the payload: a file added,
+changed or removed anywhere but the pinned entry is not detected, because no
+per-file digest of the tree is recorded at install time. That is why a managed
+tool is never given the payload directory to write into — every profile points a
+tool's own state at its run's work directory — and why an operator who suspects a
+tampered tree reinstalls it with `prefetch` rather than trusting a green
+`verify`.
 
 `--repo` selects which workspace's resolved configuration is used, because the
-data directory is per workspace by default. Set `tools.cache_dir` in the user
-configuration to give every checkout on the machine one shared store.
+data directory is per workspace by default and the store under it is
+`<data_dir>/tools`. Set `tools.cache_dir` in the user configuration to give every
+checkout on the machine one shared store: the path it names **is** the store,
+used verbatim, not a parent that `tools` appends to. The path the reports print
+is the one the resolver actually reads, so the two can never disagree.
+
+None of the four commands creates anything it only reports on: `status`,
+`verify` and `gc` leave a machine with no store exactly as they found it, and the
+store directory appears when the first payload is installed.
 
 Exit codes follow Section 18.2: every `CTX_TOOL_*` failure is exit 5 (a managed
 tool that cannot be resolved is a provider that cannot run), except
 `CTX_TOOL_OVERRIDE_INVALID`, which is exit 3 because it is a configuration error
 the user fixes in their own file.
+
+## Host dependencies
+
+Three host programs are not pinned and are not installed, because they are the
+indexed language's own toolchain and the indexer loads the project model through
+them:
+
+| Program | Needed by | Language |
+|---|---|---|
+| `go` | `scip-go` | go |
+| `cargo` | `rust-analyzer` | rust |
+| `python3`/`pip3` | `scip-python` | python |
+
+Nothing else needs anything on the host. Java in particular does not: `scip-java`
+is driven from a `--scip-config` project description compiled with the managed
+JDK's own `javac`, so neither Maven nor Gradle is required. Where one of the
+three is absent, that language falls back to the structural and dependence
+providers and is reported at the precision they give; it is never a failure of
+another language. On the matrix runner the same absence **fails the leg**: a
+language the runner cannot prove is the platform going uncovered, which is
+exactly what the gate exists to catch.
 
 ## The per-platform matrix
 
@@ -215,12 +259,6 @@ The matrix does not run on every push: one leg downloads about 2.6 GB. It runs
 when the lock, the toolchain runtime or the matrix itself changes, on demand,
 and weekly — the weekly run is what catches an upstream asset that disappeared
 from its publisher's release while its digest in the lock stayed valid.
-
-Two host programs are assumed on the runner and are not pinned, because the
-analyzers themselves shell out to them: `scip-python` invokes `pip3`/`python3`
-to enumerate the environment it is indexing, and `rust-analyzer` loads the crate
-graph through `cargo`. A missing one is reported as a runner problem rather than
-as a broken payload.
 
 The ordinary CI workflow enforces the other half of Section 11.7: `go list
 -deps` over `./cmd/codectx` fails the build if any package outside

@@ -189,6 +189,15 @@ func checkEmptyStoreReport(t *testing.T, raw json.RawMessage) {
 	if data.Store == "" {
 		t.Errorf("store is empty")
 	}
+	// A read-only report must not materialize the store it reports on: the data
+	// directory is per workspace, so a `tools status` that creates one leaves an
+	// empty directory behind in every checkout it is ever run in, and a store
+	// that exists because a report looked at it is a false "this machine is
+	// provisioned" signal for the next reader.
+	if _, err := os.Stat(data.Store); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("store %q exists after `tools status`; a read-only report must create nothing (stat err: %v)",
+			data.Store, err)
+	}
 	want := toolchain.Embedded().Names()
 	if len(want) == 0 {
 		t.Fatalf("the embedded lock carries no tools")
