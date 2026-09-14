@@ -212,6 +212,10 @@ type LSP struct {
 	MaxServers             int        `toml:"max_servers"`
 	MaxOutstandingRequests int        `toml:"max_outstanding_requests"`
 	IdleTTL                Duration   `toml:"idle_ttl"`
+	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
+	// pinned bytes cached for coordinate conversion, and the bytes sent to and
+	// received from a server over its lifetime.
+	MaxOverlayBytes int64 `toml:"max_overlay_bytes"`
 }
 
 // Dependence configures the control-dependence, data-dependence and fallback
@@ -414,6 +418,7 @@ func Defaults() Config {
 				MaxServers:             1,
 				MaxOutstandingRequests: 8,
 				IdleTTL:                Duration(60 * time.Second),
+				MaxOverlayBytes:        536870912,
 			},
 			Dependence: Dependence{
 				Enabled:                Auto,

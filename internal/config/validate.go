@@ -49,6 +49,7 @@ func (c Config) validate() error {
 		{"storage.wal_high_water_bytes", c.Storage.WALHighWaterBytes},
 		{"providers.lsp.max_servers", int64(c.Providers.LSP.MaxServers)},
 		{"providers.lsp.max_outstanding_requests", int64(c.Providers.LSP.MaxOutstandingRequests)},
+		{"providers.lsp.max_overlay_bytes", c.Providers.LSP.MaxOverlayBytes},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
 		{"providers.dependence.unit_memory_floor_bytes", c.Providers.Dependence.UnitMemoryFloorBytes},
 		{"tools.max_fetch_bytes", c.Tools.MaxFetchBytes},
@@ -174,6 +175,10 @@ func (c Config) validateBudgets() error {
 	if c.Resources.MaxSourceResponseBytes > MaxSourceWireCeilingBytes {
 		return configInvalid("resources.max_source_response_bytes %d exceeds the %d-byte source wire ceiling",
 			c.Resources.MaxSourceResponseBytes, MaxSourceWireCeilingBytes)
+	}
+	if c.Providers.LSP.MaxOverlayBytes < c.Resources.MaxSourceResponseBytes {
+		return configInvalid("providers.lsp.max_overlay_bytes %d is smaller than resources.max_source_response_bytes %d; one served source response must fit the overlay",
+			c.Providers.LSP.MaxOverlayBytes, c.Resources.MaxSourceResponseBytes)
 	}
 	if c.Resources.MaxMetadataResponseBytes >= c.Resources.MaxSourceResponseBytes {
 		return configInvalid("resources.max_metadata_response_bytes %d is not smaller than the source budget %d; generic tools must stay under the smaller metadata limit",

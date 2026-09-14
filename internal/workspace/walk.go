@@ -3,6 +3,8 @@ package workspace
 import (
 	"cmp"
 	"context"
+	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -281,7 +283,9 @@ func (w *walker) readDir(rel string) ([]entry, error) {
 	}
 	defer f.Close()
 	names, err := f.ReadDir(maxDirEntries + 1)
-	if err != nil {
+	// ReadDir(n > 0) reports io.EOF for an empty directory; that is an empty
+	// listing, not a failure.
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, pathError("%q cannot be listed: %v", rel, err)
 	}
 	if len(names) > maxDirEntries {

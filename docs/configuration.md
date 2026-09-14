@@ -224,6 +224,7 @@ directories and network posture are product code, not configuration.
 | `lsp.max_servers` | `1` | user | Concurrent language servers. |
 | `lsp.max_outstanding_requests` | `8` | user | In-flight requests per server. |
 | `lsp.idle_ttl` | `"60s"` | user | Idle time before a server is stopped. |
+| `lsp.max_overlay_bytes` | `536870912` | user | Bounds, separately, the materialized snapshot, the pinned bytes cached for coordinate conversion, and the bytes sent to and received from a server over its lifetime. Must be at least `resources.max_source_response_bytes`. |
 | `dependence.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. `"auto"` runs dependence units as low-priority background work once the base generation is active; a query that asks for a dependence fact promotes its units and is answered `pending` until they seal. `true` blocks the index on them. The provider never delays base readiness. |
 | `dependence.timeout` | `"45m"` | user | Deadline for one dependence unit. |
 | `dependence.cache_bytes` | `4294967296` | user | Budget for the per-unit parsed-graph cache, which is what makes an unchanged unit cost nothing on refresh. |
