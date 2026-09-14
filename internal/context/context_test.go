@@ -1146,6 +1146,89 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		// INT rows
+		{
+			// A manifest identity that depended on the process, the clock or
+			// the database file would make "repeated compile requests reuse the
+			// immutable manifest" (Section 15.1) a lookup that never hits, and
+			// two actors reading the same generation for the same task would
+			// get two different plans with nothing reporting a difference. The
+			// row compiles end to end, reopens the same database and recompiles
+			// -- which must reuse rather than recompile -- and then compiles the
+			// SAME facts in a second database, where the reuse lookup cannot
+			// hit, so identity has to be re-derived from the pinned facts and
+			// the request alone.
+			name: "a manifest identity is a function of the pinned facts and the request, not of the process, the clock or the database file",
+			run: func(t *testing.T, fx *contextFixture) {
+				req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}
+				// One advancing clock for every compile in the row: CreatedAt
+				// is the only field a recompile may change, so it must be able
+				// to change.
+				tick := 0
+				now := func() time.Time {
+					tick++
+					return fixtureNow().Add(time.Duration(tick) * time.Second)
+				}
+				first, err := intCompiler(t, fx, now).Compile(fx.ctx, req)
+				if err != nil {
+					t.Fatalf("Compile: %v", err)
+				}
+				if first.ID == "" || first.CanonicalHash == "" || first.EntryCount == 0 {
+					t.Fatalf("the first compile produced %+v, want a persisted manifest with entries", first)
+				}
+				if first.Binding.GenerationID != fx.Gen || first.PolicyVersion != compilerPolicyVersion {
+					t.Fatalf("manifest header = %+v, want the pinned generation and the frozen policy version", first)
+				}
+
+				// Close the store and reopen the SAME file: the stored manifest
+				// is immutable, so the second compile must return it unchanged
+				// rather than compile a second plan over it.
+				if err := fx.Store.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+				reopened, err := store.Open(fx.ctx, fx.DBPath, store.Options{})
+				if err != nil {
+					t.Fatalf("reopen: %v", err)
+				}
+				t.Cleanup(func() { reopened.Close() })
+				fx.Store = reopened
+				second, err := intCompiler(t, fx, now).Compile(fx.ctx, req)
+				if err != nil {
+					t.Fatalf("recompile after reopen: %v", err)
+				}
+				if second.ID != first.ID || second.CanonicalHash != first.CanonicalHash ||
+					!second.CreatedAt.Equal(first.CreatedAt) {
+					t.Fatalf("recompiling after a reopen returned %s/%s at %s, want the immutable manifest %s/%s at %s",
+						second.ID, second.CanonicalHash, second.CreatedAt,
+						first.ID, first.CanonicalHash, first.CreatedAt)
+				}
+
+				// The same facts in a second database, where nothing is stored
+				// to reuse: the plan is recompiled from scratch and must land
+				// on the same identity and the same canonical projection.
+				other := newContextFixture(t)
+				third, err := intCompiler(t, other, now).Compile(other.ctx, req)
+				if err != nil {
+					t.Fatalf("compile against a second store: %v", err)
+				}
+				if third.ID != first.ID {
+					t.Fatalf("ManifestID = %s in a second store, want %s: identity must not depend on the database file", third.ID, first.ID)
+				}
+				if third.CanonicalHash != first.CanonicalHash {
+					t.Fatalf("CanonicalHash = %s in a second store, want %s: the canonical projection must exclude CreatedAt and the local generation",
+						third.CanonicalHash, first.CanonicalHash)
+				}
+				if third.EntryCount != first.EntryCount || third.SliceCount != first.SliceCount {
+					t.Fatalf("second store compiled %d entries / %d slices, want %d / %d",
+						third.EntryCount, third.SliceCount, first.EntryCount, first.SliceCount)
+				}
+				// CreatedAt is the one field a recompile is allowed to change,
+				// and it is excluded from the canonical hash precisely so that
+				// asserting both at once is possible.
+				if !third.CreatedAt.After(first.CreatedAt) {
+					t.Fatalf("second compile CreatedAt = %s, want a later instant than %s", third.CreatedAt, first.CreatedAt)
+				}
+			},
+		},
 	}
 
 	for _, row := range rows {
@@ -1321,4 +1404,62 @@ func requirementFor(t *testing.T, res scopeResult, path string) (candidate, bool
 		}
 	}
 	return candidate{}, false
+}
+
+// intCompiler composes a Compiler over fx the way internal/app does: the real
+// search service for seed resolution and a GraphFactory over the fixture's
+// engine, which the shared builder composes neither of.
+//
+// Two clocks, deliberately. now is the caller's, and the row passes ONE
+// advancing clock to every compiler it builds, because a frozen instant would
+// make two compiles agree on CreatedAt by construction and the row asserts they
+// differ. The engine keeps the real clock (scopeEngine), because it derives a
+// context deadline and the fixture's frozen instant lies in the past, which
+// would expire every walk before its first edge.
+func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compiler {
+	t.Helper()
+	dir := t.TempDir()
+	cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
+	if err != nil {
+		t.Fatalf("OpenCAS: %v", err)
+	}
+	for _, spec := range fixtureFiles {
+		if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
+			t.Fatalf("CAS.Put(%s): %v", spec.path, err)
+		}
+	}
+	signer, err := pagination.OpenSigner(dir)
+	if err != nil {
+		t.Fatalf("OpenSigner: %v", err)
+	}
+	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, fx.Store)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
+		Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
+		CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
+	if err != nil {
+		t.Fatalf("search.New: %v", err)
+	}
+	t.Cleanup(func() { svc.Close() })
+	c, err := New(Options{
+		Store:  fx.Store,
+		Repo:   fx.Repo,
+		Search: svc,
+		Graph: func(ctx stdcontext.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
+			if gen != fx.Gen {
+				t.Fatalf("the graph factory was asked for generation %d, want the pinned %d", gen, fx.Gen)
+			}
+			return fx.scopeEngine(nil, fixtureCapabilities), func() error { return nil }, nil
+		},
+		Config: fx.Cfg,
+		Now:    now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
 }
