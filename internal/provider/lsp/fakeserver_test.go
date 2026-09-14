@@ -124,7 +124,7 @@ func (f *fakeServer) handle(msg message) int {
 			}
 		}
 		f.event("encoding=%s", f.enc)
-		f.reply(msg, map[string]any{
+		result := map[string]any{
 			"capabilities": map[string]any{
 				"positionEncoding":       f.enc,
 				"textDocumentSync":       1,
@@ -135,8 +135,13 @@ func (f *fakeServer) handle(msg message) int {
 				"documentSymbolProvider": true,
 				"callHierarchyProvider":  true,
 			},
-			"serverInfo": map[string]any{"name": "fake", "version": "1.2.3"},
-		}, nil)
+		}
+		// Two of the six pinned servers answer initialize with no serverInfo at
+		// all; this flag reproduces that.
+		if os.Getenv("CODECTX_LSP_FAKE_NO_SERVERINFO") == "" {
+			result["serverInfo"] = map[string]any{"name": "fake", "version": "1.2.3"}
+		}
+		f.reply(msg, result, nil)
 	case "initialized":
 		f.notify("window/logMessage", map[string]any{"type": 3, "message": "fake server ready"})
 		f.request("workspace/configuration", map[string]any{"items": []any{map[string]any{"section": "gopls"}, map[string]any{"section": "other"}}})

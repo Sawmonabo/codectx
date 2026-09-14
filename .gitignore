@@ -11,3 +11,4 @@
 # Local git worktrees (per-session isolated workspaces; never shared via origin)
 .worktrees/
 .claude/worktrees/
+/tools-matrix

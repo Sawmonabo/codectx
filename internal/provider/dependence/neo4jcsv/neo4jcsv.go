@@ -19,8 +19,10 @@
 // Delta. The engine has no incremental mode, so a refreshed unit is a whole
 // re-parse and re-export; the storage update is the delta. Every published
 // fact carries an id-independent key (KeySet); an import handed the previous
-// run's key set publishes only the relations whose key changed and reports
-// the keys the previous run had and this one does not.
+// run's key set publishes only the relations at least one of whose keys
+// changed, and only when no key was removed; a removal disables the filter
+// and the import re-publishes in full. It reports the keys the previous run
+// had and this one does not.
 //
 // The engine's name appears nowhere in this package: not in an identifier, a
 // native key, an evidence detail or an error message.
@@ -279,7 +281,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err := e.emitAliases(ctx); err != nil {
 		return rep, err
 	}
-	if err := e.emitRelations(ctx, !opts.PreviousKeys.Empty()); err != nil {
+	if err := e.emitRelations(ctx, deltaFilter(opts.PreviousKeys, delta)); err != nil {
 		return rep, err
 	}
 
@@ -294,6 +296,22 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	}
 	return rep, nil
 }
+
+// deltaFilter reports whether this import may emit only the relations whose
+// keys the previous run did not publish.
+//
+// It may not when the previous run's key set lost a key. A removed key is a
+// digest: it cannot be mapped back to the relation it backed, and the relation
+// may still exist with its remaining occurrences — one of two identical calls
+// deleted, say, leaves the edge with an unchanged key and no changed one.
+// Storage drops that edge's previous row, because one of the keys it was
+// stored under is replaced, and a filtered emit would never republish it: the
+// edge would vanish from a delta-built unit that a full build still holds.
+// Emitting every relation is the sound over-approximation — an edge published
+// with its whole evidence list is byte-identical to what a full import writes
+// — and it costs import work, never correctness. Node facts are unaffected;
+// they are emitted whole on every run.
+func deltaFilter(prev KeySet, d Delta) bool { return !prev.Empty() && d.Removed == 0 }
 
 func internalErr(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}

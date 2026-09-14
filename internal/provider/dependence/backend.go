@@ -28,8 +28,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 )
 
-// Engine identifies the resolved analysis payload. Name, Version and Digest
-// are provenance: they reach `status`, `doctor` and the ledger through
+// Engine identifies the resolved analysis payload. Version and Digest are the
+// provenance that reaches `status`, `doctor` and the ledger, through
 // Detection.ObservedVersion and the descriptor version, and nowhere else.
 // ParseArgv and ExportArgv are complete argv prefixes (a launcher plus its
 // arguments, for example a managed JDK and `-jar`), so a runtime-dependent
@@ -41,7 +41,6 @@ type Engine struct {
 	// pairs. internal/process never merges the parent environment, so this is
 	// the whole of it.
 	Env     []string
-	Name    string
 	Version string
 	Digest  string
 	// RuntimeDigest is the payload digest of the runtime the engine executes
@@ -130,11 +129,13 @@ type Outcome struct {
 	Duration       time.Duration
 	// StderrBytes and PeakBytes are the analyzer tree's own metrics, recorded
 	// separately from the base index's accounting (Section 22). PeakBytes is
-	// the sampled peak resident memory of the whole tree; it stays zero while
-	// internal/process does not sample it, and a zero is published as an
-	// absent figure rather than as an observed zero.
-	StderrBytes int64
-	PeakBytes   int64
+	// the peak of the summed resident memory over the whole analyzer tree,
+	// sampled while it ran. PeakUnsampled reports that the platform cannot
+	// observe it at all, so the figure is unavailable rather than zero and is
+	// published as absent rather than as an observed zero.
+	StderrBytes   int64
+	PeakBytes     int64
+	PeakUnsampled bool
 }
 
 // ExportOutcome adds the liveness probe of the produced export. Live reports

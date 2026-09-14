@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -497,7 +498,7 @@ func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	var out []model.CapabilityState
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code FROM generation_capabilities
+		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, details_json FROM generation_capabilities
 			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key LIMIT ?`, r.gen, model.MaxCapabilityStates)
 		if err != nil {
 			return wrap("generation_capabilities", err)
@@ -505,8 +506,20 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 		defer rows.Close()
 		for rows.Next() {
 			var c model.CapabilityState
-			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode); err != nil {
+			var details string
+			if err := rows.Scan(&c.ProviderID, &c.Capability, &c.Scope, &c.State, &c.DiagnosticCode, &details); err != nil {
 				return wrap("generation_capabilities", err)
+			}
+			if details != "" && details != "{}" {
+				if err := json.Unmarshal([]byte(details), &c.Details); err != nil {
+					return corrupt("generation %d capability %q/%q has unreadable details", r.gen, c.ProviderID, c.Capability)
+				}
+			}
+			// The write path bounds every capability, but the read path must
+			// not trust the row: a row written by a foreign or older binary
+			// would otherwise hand a caller an unbounded detail map.
+			if err := c.Validate(); err != nil {
+				return corrupt("generation %d capability %q/%q is not a valid capability state: %v", r.gen, c.ProviderID, c.Capability, err)
 			}
 			out = append(out, c)
 		}

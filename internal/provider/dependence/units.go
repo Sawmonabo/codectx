@@ -25,6 +25,7 @@ package dependence
 
 import (
 	"context"
+	"log/slog"
 	"path"
 	"slices"
 	"strings"
@@ -53,9 +54,8 @@ type Unit struct {
 	// repository root.
 	Root string
 	// Excluded are the root-relative directories of nested projects of the
-	// same family that this unit does not own. They are pruned from the
-	// private materialization before the engine reads it, so a nested module
-	// is analysed once, by its own unit.
+	// same family that this unit does not own. They are never materialized for
+	// this unit, so a nested module is analysed once, by its own unit.
 	Excluded []string
 	// Markers are the manifest and lock files whose content is part of the
 	// unit's semantic closure (Section 11.6), sorted.
@@ -111,10 +111,29 @@ func FamilyOf(language string) Family {
 	return ""
 }
 
+// Plan is one snapshot's dependence units together with what could not be
+// planned as a unit of its own. A refused project is not a silent omission:
+// its files are analysed by the unit enclosing them, at a coarser boundary
+// than they own, so the family that owns it cannot be published fresh, and
+// Unplanned is how the provider knows that at publication time.
+type Plan struct {
+	// Units are the planned units, sorted by scope key.
+	Units []Unit
+	// Unplanned counts, per family, the projects planFamily refused because
+	// their scope key does not fit model.MaxScopeKeyBytes. Their files are
+	// analysed by the unit that encloses them, so nothing is lost, but at a
+	// coarser boundary than the project owns — which is what the family
+	// publishes partial for. It is a count and not the paths: the only paths
+	// that can appear here are longer than two kilobytes each, and a plan never
+	// holds a repository-sized list of them (Section 6). The refusal's locus is
+	// on the warning this package logs.
+	Unplanned map[Family]int
+}
+
 // PlanUnits derives every unit of the snapshot. It reads the manifest twice:
 // once to find project roots and the files of the C/C++ unit, once to fold
 // each unit's file count and byte total. Nothing repository-sized is retained.
-func PlanUnits(ctx context.Context, view model.SnapshotView) ([]Unit, error) {
+func PlanUnits(ctx context.Context, view model.SnapshotView) (Plan, error) {
 	roots := map[Family]map[string]bool{}
 	markers := map[Family]map[string][]string{}
 	present := map[Family]bool{}
@@ -144,34 +163,41 @@ func PlanUnits(ctx context.Context, view model.SnapshotView) ([]Unit, error) {
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return Plan{}, err
 	}
 
-	var plan []Unit
+	plan := Plan{}
 	for _, f := range Families {
 		if !present[f] {
 			continue
 		}
-		units, err := planFamily(f, roots[f], markers[f])
+		units, unplanned, err := planFamily(f, roots[f], markers[f])
 		if err != nil {
-			return nil, err
+			return Plan{}, err
 		}
-		plan = append(plan, units...)
+		plan.Units = append(plan.Units, units...)
+		if unplanned > 0 {
+			if plan.Unplanned == nil {
+				plan.Unplanned = map[Family]int{}
+			}
+			plan.Unplanned[f] = unplanned
+		}
 	}
-	if err := foldSizes(ctx, view, plan); err != nil {
-		return nil, err
+	if err := foldSizes(ctx, view, plan.Units); err != nil {
+		return Plan{}, err
 	}
-	plan = slices.DeleteFunc(plan, func(u Unit) bool { return u.Files == 0 })
-	slices.SortFunc(plan, func(a, b Unit) int { return strings.Compare(a.ScopeKey, b.ScopeKey) })
+	plan.Units = slices.DeleteFunc(plan.Units, func(u Unit) bool { return u.Files == 0 })
+	slices.SortFunc(plan.Units, func(a, b Unit) int { return strings.Compare(a.ScopeKey, b.ScopeKey) })
 	return plan, nil
 }
 
-// planFamily turns one family's marker directories into unit descriptors.
-func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([]Unit, error) {
+// planFamily turns one family's marker directories into unit descriptors and
+// reports how many projects it had to refuse.
+func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([]Unit, int, error) {
 	if f == FamilyC {
 		// Header resolution spans the tree, so C and C++ are the one family
 		// whose unit is the repository itself.
-		return []Unit{{ScopeKey: ScopeWorkspace, Family: f, Markers: flatten(markers)}}, nil
+		return []Unit{{ScopeKey: ScopeWorkspace, Family: f, Markers: flatten(markers)}}, 0, nil
 	}
 	dirs := make([]string, 0, len(roots))
 	for d := range roots {
@@ -191,16 +217,47 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		})
 	}
 	if len(dirs) > MaxUnitsPerFamily {
-		return nil, resourceLimit("the repository holds more dependence projects of one family than the plan bounds").
+		return nil, 0, resourceLimit("the repository holds more dependence projects of one family than the plan bounds").
 			WithDetail("family", string(f)).WithDetail("projects", itoa(int64(len(dirs)))).
 			WithDetail("limit", "MaxUnitsPerFamily").WithDetail("bound", itoa(MaxUnitsPerFamily))
 	}
-	units := make([]Unit, 0, len(dirs)+1)
+	// A project whose scope key does not fit is refused as a project, not as
+	// source. Refusing here is what keeps the failure in the planner: the unit
+	// would otherwise be admitted and fail at BeginUnit, where the scope key is
+	// already the identity every published row carries.
+	//
+	// Only the projects that survive bound the other units, so a refused
+	// directory is excluded from nothing and its files fall back to the unit
+	// that encloses it — the enclosing project, or the family's
+	// repository-root unit. No file of a family is ever orphaned — except
+	// loose Rust source outside every crate, which is deliberately left
+	// unanalysed (see the FamilyRust guard below) — and for every other
+	// family that is what guarantees the degradation below always has a unit
+	// to be published on. It is still a degradation: that source is analysed at a
+	// coarser project boundary than it owns, with the neighbouring projects'
+	// files around it, so the caller publishes the family partial and the
+	// refusal is counted rather than swallowed. The path is logged truncated
+	// because it is what locates the project for an operator and a whole one
+	// is over two kilobytes.
+	planned := make([]string, 0, len(dirs))
+	unplanned := 0
 	for _, d := range dirs {
-		units = append(units, Unit{ScopeKey: scopeKey(f, d), Family: f, Root: d,
-			Excluded: nested(d, dirs), Markers: markersUnder(markers, d, nested(d, dirs))})
+		if _, ok := scopeKey(f, d); !ok {
+			unplanned++
+			slog.Warn("a dependence project is not planned as its own unit: its scope key exceeds the identity bound",
+				"component", component, "family", string(f), "path", truncate(d, model.MaxIdentifierBytes),
+				"path_bytes", len(d), "bound", model.MaxScopeKeyBytes)
+			continue
+		}
+		planned = append(planned, d)
 	}
-	if f != FamilyRust && !slices.Contains(dirs, "") {
+	units := make([]Unit, 0, len(planned)+1)
+	for _, d := range planned {
+		key, _ := scopeKey(f, d)
+		units = append(units, Unit{ScopeKey: key, Family: f, Root: d,
+			Excluded: nested(d, planned), Markers: markersUnder(markers, d, nested(d, planned))})
+	}
+	if f != FamilyRust && !slices.Contains(planned, "") {
 		// Source of this family outside every project still has facts worth
 		// having; the engine parses a bare directory happily. Rust does not:
 		// without a Cargo.toml its helper produces an empty graph, which would
@@ -210,10 +267,18 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 		// A project rooted at the repository root already owns this scope key.
 		// Emitting a second unit under the same key would leave unitFor
 		// choosing between them by sort position, so it is not emitted at all.
-		units = append(units, Unit{ScopeKey: scopeKey(f, ""), Family: f,
-			Excluded: dirs, Markers: markersUnder(markers, "", dirs)})
+		// The root key is "pkg:<family>:", always within the bound.
+		//
+		// Excluded is every project of the family that is planned as its own
+		// unit, and only those: a refused directory is not excluded here, so
+		// its files — and its manifests, which belong in this unit's semantic
+		// closure now that it owns them — fall back to this unit rather than
+		// being analysed by nobody.
+		key, _ := scopeKey(f, "")
+		units = append(units, Unit{ScopeKey: key, Family: f,
+			Excluded: planned, Markers: markersUnder(markers, "", planned)})
 	}
-	return units, nil
+	return units, unplanned, nil
 }
 
 // foldSizes counts each unit's own files and bytes in one streaming pass.
@@ -250,8 +315,19 @@ func (u Unit) Contains(p string) bool {
 
 // scopeKey is the unit's capability and alias scope. It names the family in
 // the product's own vocabulary, never the engine's frontend name.
-func scopeKey(f Family, root string) string {
-	return truncate("pkg:"+string(f)+":"+root, model.MaxScopeKeyBytes)
+//
+// A key that does not fit model.MaxScopeKeyBytes is refused, not truncated.
+// Truncation is a colliding identity claim: two deep project directories with
+// a long common prefix would cut to the same key, and every capability row,
+// alias scope and cache entry of one would then be attributed to the other.
+// The planner drops such a project instead, which loses one project's facts
+// openly rather than mixing two projects' facts silently.
+func scopeKey(f Family, root string) (string, bool) {
+	key := "pkg:" + string(f) + ":" + root
+	if len(key) > model.MaxScopeKeyBytes {
+		return "", false
+	}
+	return key, true
 }
 
 // within reports whether p lies at or under the root-relative directory dir;

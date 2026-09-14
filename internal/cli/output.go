@@ -66,13 +66,22 @@ func ExitCode(err error) int {
 	case model.CodeArgumentInvalid:
 		return 2
 	case model.CodeWorkspaceNotFound, model.CodeConfigInvalid, model.CodeTrustRequired,
-		model.CodePathEscape, model.CodeSchemaMismatch:
+		model.CodePathEscape, model.CodeSchemaMismatch, model.CodeToolOverrideInvalid:
+		// An unusable [tools.override.<name>] is a configuration error the user
+		// fixes in their own file, which is why Task 22 Step 3 separates it from
+		// the rest of the CTX_TOOL_* family.
 		return 3
 	case model.CodeNoActiveGeneration:
 		return 4
 	case model.CodeProviderUnavailable, model.CodeProviderOutputInvalid, model.CodeProviderTimeout,
 		model.CodeSnapshotUnstable, model.CodeSnapshotChanged, model.CodeSourceIntegrity,
-		model.CodeStorageCorrupt:
+		model.CodeStorageCorrupt,
+		// A managed tool that cannot be resolved is a provider that cannot run,
+		// so the whole CTX_TOOL_* family lands in the provider class (Task 22
+		// Step 3). CTX_TOOL_UNSUPPORTED_PLATFORM only reaches here when a caller
+		// asked for that tool by name; resolution treats it as honest absence.
+		model.CodeToolOffline, model.CodeToolUnsupportedPlatform, model.CodeToolFetchFailed,
+		model.CodeToolDigestMismatch, model.CodeToolCorrupt:
 		return 5
 	case model.CodeSourceBindingUnverified, model.CodeCoverageIncomplete, model.CodeScopeIncomplete,
 		model.CodeActorMismatch:

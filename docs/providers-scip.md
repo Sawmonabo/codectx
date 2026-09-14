@@ -7,7 +7,7 @@ decoder.
 | Input | Unit scope key | Source binding |
 |---|---|---|
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
-| An approved installed indexer profile (`[analyzers.scip-go]`, `[analyzers.scip-typescript]`, `[analyzers.scip-java]`) run by codectx against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
+| One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
 The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
@@ -26,12 +26,25 @@ coordinator exists.
 - `Detect` inspects declared inputs only through the confined root: the
   import path, and the trigger manifests of each profile (`go.mod`;
   `package.json`/`tsconfig.json`; `pom.xml`/`build.gradle`/`build.gradle.kts`)
-  together with the profile executable's existence. It never runs a tool.
-  Nothing usable is `CTX_PROVIDER_UNAVAILABLE`.
-- `Scopes(detection)` lists the unit scope keys to plan. A profile whose
-  executable is not installed plans no unit, and `runProfile` refuses with
-  `CTX_PROVIDER_UNAVAILABLE` before anything is materialized, so a missing
-  tool never costs a snapshot materialization or a failed unit.
+  together with the profile payload's state. It never runs a tool.
+  Nothing usable is `CTX_PROVIDER_UNAVAILABLE`. When at least one language is
+  indexable the detection is available, and `Detection.Details` still names
+  every other triggered language and why it is not: the toolchain's own
+  `CTX_TOOL_*` code for a payload this machine cannot supply, and the marker
+  `deferred` for one the first run will fetch. The two are spelled differently
+  on purpose — a `CTX_` value is a refusal and the coordinator publishes a
+  `partial` capability row for it, while `deferred` is pending work that will
+  be indexed at full precision and publishes nothing. Without the details a
+  repository with `go.mod` and `Cargo.toml` on a machine with no usable
+  `rust-analyzer` would be reported available, plan `scip-go` only, and say
+  nothing anywhere about Rust.
+- `Scopes(detection)` lists the unit scope keys to plan. A profile this
+  machine cannot supply at all — no payload for this platform, a corrupt store
+  entry, an invalid override — plans no unit, so a missing tool never costs a
+  snapshot materialization or a failed unit. A profile whose payload the lock
+  *does* pin for this platform but the store has not installed yet **is**
+  planned: `scip.New` installs nothing, and the first unit that needs the
+  payload fetches it (see "Payload resolution" below).
 - `Verify(ctx, view, scopeKey)` decides `UnitBuild.SourceBinding` before the
   unit is opened. `IndexUnit` repeats the check and reports it in its
   capability states, so a unit opened as verified whose index is not is
@@ -377,38 +390,174 @@ held at a time, so a unit retains up to `MaxSourceFileBytes` (5 MiB) outside
 the pool's accounting, on top of the pool's own budget. That buffer is sized
 by the pinned snapshot file, whose size is checked before the read.
 
-## Profiles (ruling R9-2: the profile execution path is unverified)
+## Payload resolution
 
-The six managed indexers are installed on the development machine and their
-real output is verified end to end through this importer: `scip-go` 0.2.7,
-`scip-typescript` 0.4.0, `scip-python` 0.6.6, `scip-java`, `scip-clang` 0.4.0
-and `rust-analyzer` 1.98.0 (see the position-encoding table above and
-`docs/research/12-incremental-scip-lsp.md` §3). What remains
-unverified is this file's *profile execution* path — the argument arrays below,
-the version constraint check and the runner plumbing — which has **not** been
-exercised against a real indexer invocation and must be before a profile is
-described as working.
+`scip.New` **installs nothing**. It asks the toolchain what the store already
+holds (`toolchain.ResolveInstalled`, which is `Resolve` with the fetch
+refused), and sorts the six kinds into three states: ready, deferred (pinned
+for this platform, not installed) and unavailable (a typed `CTX_TOOL_*`
+reason). Resolving with a fetch here installed every language's indexer on a
+machine that had not run `codectx tools prefetch`, before any detection had
+happened and before any unit existed — 24.8 s of fetching at construction,
+against 50 µs and zero files written now.
 
-A profile is a `[analyzers.<kind>]` table whose name is the kind. It is
-executed through the shared `internal/process` runner with an argv array
-only (ruling R9-3: no shell anywhere), with the typed substitutions
-`${input_dir}` (the materialization root, also the working directory),
-`${output_file}` (a private file under the run directory), `${work_dir}` and
-`${manifest}`, applied in a fixed order so one configuration always yields one
-argv. The child environment is exactly the allowlisted variables.
+A deferred payload is fetched by the first unit that runs it, at the one moment
+the repository is known to contain the language; a fetch that fails fails that
+unit with the toolchain's typed code.
 
-`${manifest}` is the path codectx writes the run's input manifest to. That
-file is written **after** the tool exits, because its second line commits to
-the SHA-256 of the index the tool produced, so a tool cannot read it during
-its own run; the placeholder is still substituted because an unsubstituted one
-would reach the child as the literal text `${manifest}`. The run is bounded by the smaller of the profile timeout and
-`providers.scip.timeout`, by the profile's memory and disk budgets, and by 1
-MiB of captured output per stream. After the run the output must be a
-regular file within `MaxIndexBytes`, its metadata must name the profile's
-tool, and the tool version must satisfy `version_constraint` (an exact
-version or space-separated comparators such as `>=0.1.20 <0.2.0`); a
-mismatch is `CTX_TRUST_REQUIRED`. A profile with no `version_constraint` is
-refused outright: an unconstrained tool is not an approval.
+`Descriptor().Version` is fixed at construction — `Descriptor()` takes no
+context and has to be a deterministic function of the process — and folds the
+identity of every kind that can produce facts: the resolved fingerprint of a
+payload the store holds, and `toolchain.Resolver.PinnedFingerprint` for a
+deferred one, which computes the same fingerprint from the lock alone. The two
+are the same string for the same payload, so a unit sealed by the run that
+fetched the payload keys identically to every unit after it. Folding an empty
+slot for a deferred kind instead would key the first run on a cold machine
+under a provider version that names no tool at all, and the next process would
+re-index everything that run produced. Only a kind this machine cannot supply
+at all contributes an empty slot, and it plans no unit and produces no facts.
+
+## Profiles
+
+A profile is one of the six managed indexers. It is **product code, not
+configuration**: the tool it starts, its argument array, the parent environment
+variables it may see, its budgets, its timeout and its declared network posture
+are constants of this build, and the binary is the payload the embedded tool
+lock pinned and `internal/toolchain` verified. There is no `[analyzers.<name>]`
+table, no approved path and no PATH lookup (Section 20.2 — trust is the lock).
+
+Every one of the six was resolved through the real lock and store and run end
+to end on `linux/amd64` — materialize, index, import, seal — against a fixture
+of its own language; the exact argv, the environment allowlist and the sealed
+result of each run are in the lane B1 report. The six profiles and the argument
+arrays this build pins, after the payload's own launcher prefix:
+
+| Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture | Host toolchain it needs |
+|---|---|---|---|---|---|
+| `scip-go` | `go.mod`, `go.work` | `index --output <output>` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | allowed | `go` |
+| `scip-typescript` | `tsconfig.json`, `jsconfig.json`, `package.json` | `index --cwd <input> --output <output> --no-progress-bar` | `HOME` | denied | none (managed Node) |
+| `scip-python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt` | `index --cwd <input> --output <output> --project-version 0.0.0 --quiet` | `PATH HOME` | denied | `python3`, `pip3` |
+| `scip-java` | `pom.xml`, `build.gradle`, `build.gradle.kts` | `index --scip-config <input>/scip-java.json --targetroot <work>/scip-java-targetroot --output <output>` | `PATH HOME` | denied | none (managed JDK) |
+| `rust-analyzer` | `Cargo.toml` | `scip <input> --output <output>` | `PATH HOME CARGO_HOME RUSTUP_HOME` | allowed | `cargo` |
+| `scip-clang` | `compile_commands.json`, `compile_flags.txt` | `--compdb-path=<input>/compile_commands.json --index-output-path=<output>` | `PATH HOME` | denied | none (carries its own Clang); needs the compilation database the project's build produced |
+
+**The host-toolchain column is not optional.** Three of the six load the
+project's model through that language's own toolchain, the way any build does,
+and cannot do otherwise: `scip-go` drives go/packages, `scip-python` reads the
+project's installed distributions through the interpreter and pip, and
+`rust-analyzer` loads `cargo metadata`. Where the toolchain is absent, that
+language has no precise index — the profile exits non-zero and the unit fails
+with `CTX_PROVIDER_UNAVAILABLE` — and the structural and dependence providers
+still cover it. `scip-java` used to belong to that list, through Maven or
+Gradle; it no longer does (see below).
+
+`<input>` is the private materialization root, which is also the child's
+working directory; `<output>` and `<work>` are under the run directory, outside
+the materialization.
+
+**A profile's private copy is the whole workspace, deliberately.** The
+materialization is not narrowed to the files a unit "owns": a precise indexer
+resolves symbols through the project's own dependency context — the module
+graph, the package manifests, the installed distributions, the headers — and
+the unit's scope is the workspace, so a narrower copy would produce an index
+that describes less than the unit claims. The call site says so explicitly
+rather than leaving it to an omitted selection. The launcher prefix comes from the lock: a self-contained
+binary runs as itself, a Node-hosted indexer runs as `<managed node> <entry>`,
+and `scip-java`'s launcher runs with `JAVA_HOME` pointing at the managed JDK.
+The child's environment is exactly the allowlisted variables the parent has
+plus the variables the payload needs; the payload's come last, so a host
+`JAVA_HOME` can never shadow the pinned runtime.
+
+Everything is executed through the shared `internal/process` runner with an
+argv array only (ruling R9-3: no shell anywhere). The run is bounded by the
+smaller of the profile's own timeout and `providers.scip.timeout`, by the
+profile's memory and disk reservations, and by 1 MiB of captured output per
+stream.
+
+**`scip-java` compiles the snapshot itself.** Its default mode drives the
+project's own Maven or Gradle build, found on the host `PATH`, which resolves
+dependencies from a remote index: on a machine with neither, the profile exited
+1 and produced nothing (measured). The profile instead writes a `scip-java.json`
+into the private materialization — naming the materialization root as both the
+source root and the only source directory, with empty `classpath` and
+`dependencies` — and passes `--scip-config`, which makes the indexer compile the
+sources with the managed JDK's own `javac`. The Java profile therefore needs no
+host build tool and resolves nothing remotely, which is why its posture is
+`denied` and why `MAVEN_OPTS`/`GRADLE_USER_HOME` are not in its allowlist.
+Measured on `linux/amd64` with `PATH=/usr/bin:/bin` (no Maven, no Gradle): the
+unit seals with all three capabilities fresh. A repository's own
+`scip-java.json` is replaced in the copy: the invocation is product code, not a
+configuration surface. `--targetroot` keeps the indexer's own intermediate
+output inside the run directory rather than in the materialization.
+
+A materialization that holds **no** `.java` file is refused before the indexer
+starts, with `CTX_PROVIDER_OUTPUT_INVALID` and a remediation naming the
+source-free case. This is the aggregator POM of a multi-module repository —
+`pom.xml` triggers the profile, the root carries no source of its own — and
+without the check `javac` refuses, the indexer exits 1, and the run fails as
+`CTX_PROVIDER_UNAVAILABLE: scip-java-v0.13.1 exited with status 1` (measured):
+a process failure with no stderr and no remediation. The refusal is the same
+typed one the other profiles produce for an index that describes no admitted
+document, raised before a JVM is started rather than after.
+
+**Two pinned arguments exist because of a measured failure, not a preference.**
+`scip-python` is given `--project-version` because, left to itself, it asks git
+for the current revision; the private materialization is never a repository, so
+the lookup fails, the version stays undefined and the indexer dies inside its
+symbol constructor having written nothing. The value is a constant because it
+is part of every symbol string the indexer emits — deriving it from the
+snapshot would rename every symbol on every commit and no fact would ever be
+reusable. `scip-clang` reads a compilation database whose `directory` fields
+are absolute paths in the tree that generated it; inside the materialization
+those paths do not exist and the indexing worker crashes. The database **in the
+private copy** is therefore normalized before the run: each entry's directory
+is moved by the entries' common prefix onto the materialization root. The
+repository is never touched, and a database that is absent, unreadable,
+oversized, not a JSON array or already relative is left exactly as it is.
+
+**Tool identity.** The index's `tool_info.name` must name the profile's own
+tool; output from anything else is `CTX_PROVIDER_OUTPUT_INVALID`. The tool's
+self-reported *version* is deliberately not compared against anything: the
+lock's entry digest identifies these bytes, and two of the six payloads report
+a version no lock-derived constraint could match — `scip-java` 0.13.1 reports
+`0.0.0-SNAPSHOT` and the `rust-analyzer` release tagged `2026-08-17.4` reports
+`1.98.0 (88d9e12 2026-08-18)`. A constraint written to accept those accepts
+anything. The reported version is kept as provenance: it selects the measured
+position encoding (table above) and reaches the unit's identity through the
+payload fingerprint.
+
+**Tool identity reaches the unit key.** `[tools]` is deliberately outside
+`AnalysisConfigHash`, so `Descriptor().Version` is `3/<digest>` where the digest
+covers every profile payload's `Tool.Fingerprint()` in a fixed kind order.
+Replacing an indexer therefore makes every unit it produced unreachable instead
+of silently reusable. A kind whose payload did not resolve contributes one fixed
+empty slot, never the reason it is missing: two machines that resolved the same
+pinned payloads must key their units identically, and whether some *other*
+language's indexer is absent because the store is empty or because `tools.offline`
+is set is not part of what produced these facts. That reason is carried by
+`Detection.DiagnosticCode` instead. `Detection.ObservedVersion` carries the same
+`3/<digest>` value for the coordinator to fold in — the digest rather than a list
+of fingerprints, because `ObservedVersion` is bounded at 256 bytes and six
+82-byte fingerprints would be truncated there, silently dropping whichever
+payloads sort last. A build that resolved no payload at all carries no digest:
+its version is plain `3`. The cost is named rather than hidden: an `import:`
+unit's identity also moves when an indexer this repository does not use is
+replaced, because the frozen provider contract has one version per provider, not
+one per unit.
+
+**False readiness.** Every one of these indexers needs the project's own
+dependency context, and several exit 0 after producing a well-formed index that
+describes nothing when it is missing. A full profile import that admitted no
+record is therefore a typed failure (`CTX_PROVIDER_OUTPUT_INVALID`), not a unit
+sealed with three `fresh` capabilities over zero facts. A refresh is exempt: an
+unchanged snapshot legitimately emits nothing.
+
+**Absence is typed.** A kind whose payload does not resolve plans no unit and
+reports the toolchain's own reason — `CTX_TOOL_OFFLINE`,
+`CTX_TOOL_UNSUPPORTED_PLATFORM`, `CTX_TOOL_CORRUPT`,
+`CTX_TOOL_OVERRIDE_INVALID`, `CTX_TOOL_DIGEST_MISMATCH`,
+`CTX_TOOL_FETCH_FAILED` — on `Detection.DiagnosticCode`, so an operator can
+tell "run `codectx tools prefetch`" from "this platform has no payload".
 
 Once the run has produced its index, codectx writes the run's input manifest
 under the run directory in the v1 format above — including the SHA-256 of the
@@ -418,49 +567,12 @@ own digest, reported as `input_manifest_sha256` on every diagnostic this path
 returns, and `UnitSpec.InputHash`, which the coordinator computes over the
 unit's declared inputs.
 
-**Executable trust.** A configured `checksum` is verified against the
-executable immediately before it runs. A profile **without** a `checksum` runs
-whatever binary is at the configured path at that moment: the absolute path is
-the whole of the approval. Even with a checksum, the digest is computed by
-reading the file and the kernel then executes the path again, so a writable
-path can be swapped between the hash and the `execve` (a time-of-check to
-time-of-use window). Approve tools at paths only a trusted account can write,
-and prefer a `checksum` so an ordinary substitution is detected.
+**Network.** The posture is **recorded and not enforced**. There is no sandbox
+behind it: an indexer declared `denied` can still reach the network, because
+resolving dependencies is what several of these tools do. It is carried on every
+diagnostic the profile path returns (`network=<value>`) so a report says what
+the run was declared under.
 
-**Network.** `network` is a **declared posture that codectx records and does
-not enforce**. There is no sandbox behind it: an indexer run under
-`network = "denied"` can still reach the network, because resolving
-dependencies is what several of these tools do. The value is the posture the
-profile was approved under; it is carried on every diagnostic the profile path
-returns (`network=<value>`) so a report says what was approved, and
-`network = "allowed"` is the user's explicit opt-in, never a refusal.
-
-```toml
-[analyzers.scip-go]
-executable = "/usr/local/bin/scip-go"
-version_constraint = ">=0.1.20 <0.2.0"
-args = ["--output", "${output_file}"]
-env_allowlist = ["HOME", "PATH", "GOPATH", "GOMODCACHE", "GOCACHE", "GOFLAGS"]
-work_dir = "/home/me/.cache/codectx/scip"
-memory_budget_bytes = 2147483648
-disk_budget_bytes = 4294967296
-network = "denied"
-timeout = "20m"
-
-[analyzers.scip-typescript]
-executable = "/usr/local/bin/scip-typescript"
-version_constraint = ">=0.3.0 <0.4.0"
-args = ["index", "--output", "${output_file}"]
-env_allowlist = ["HOME", "PATH"]
-# ...
-
-[analyzers.scip-java]
-executable = "/usr/local/bin/scip-java"
-version_constraint = ">=0.10.0 <0.11.0"
-args = ["index", "--output", "${output_file}"]
-env_allowlist = ["HOME", "PATH", "JAVA_HOME"]
-# ...
-```
-
-Materializations, manifests and outputs live under the profile's `work_dir`
-in a per-run directory that is removed on success, failure and cancellation.
+Materializations, manifests and outputs live under the provider's own work
+directory (`<work_dir>/profiles/<profile>/`) in a per-run directory that is
+removed on success, failure and cancellation.

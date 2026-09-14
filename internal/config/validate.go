@@ -4,7 +4,6 @@ import (
 	"math"
 	"net/url"
 	"sort"
-	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -229,46 +228,6 @@ func (c Config) validateBudgets() error {
 		return configInvalid("context.default_max_bytes %d cannot be converted to a token estimate: %v",
 			c.Context.DefaultMaxBytes, err)
 	}
-	return c.validateAnalyzers()
-}
-
-// validateAnalyzers enforces the approved-profile shape of Section 20.2.
-func (c Config) validateAnalyzers() error {
-	for _, a := range c.SortedAnalyzers() {
-		key := "analyzers." + a.Name
-		if !isAbsolutePath(a.Executable) {
-			return configInvalid("%s.executable %q is not an absolute path; PATH lookup is not an approval", key, a.Executable)
-		}
-		if a.VersionConstraint == "" {
-			return configInvalid("%s.version_constraint is required; an unconstrained tool cannot be recorded as approved", key)
-		}
-		if a.Checksum != "" && !model.ValidHexID(a.Checksum) {
-			return configInvalid("%s.checksum is not %d lowercase hex characters", key, model.IDHexLen)
-		}
-		if !isAbsolutePath(a.WorkDir) {
-			return configInvalid("%s.work_dir %q is not an absolute private directory", key, a.WorkDir)
-		}
-		if a.MemoryBudgetBytes <= 0 || a.DiskBudgetBytes <= 0 {
-			return configInvalid("%s declares memory %d and disk %d; a budget must be positive",
-				key, a.MemoryBudgetBytes, a.DiskBudgetBytes)
-		}
-		if a.Timeout <= 0 {
-			return configInvalid("%s.timeout is %s; a profile must bound its own runtime", key, a.Timeout)
-		}
-		if !a.Network.Valid() {
-			return configInvalid("%s.network %q is not %q or %q", key, a.Network, NetworkDenied, NetworkAllowed)
-		}
-		for i, arg := range a.Args {
-			if err := validateArgTemplate(key, i, arg); err != nil {
-				return err
-			}
-		}
-		for i, name := range a.EnvAllowlist {
-			if name == "" || strings.ContainsAny(name, "=\x00") {
-				return configInvalid("%s.env_allowlist[%d] %q is not an environment variable name", key, i, name)
-			}
-		}
-	}
 	return nil
 }
 
@@ -313,35 +272,6 @@ func (c Config) validateTools() error {
 		}
 	}
 	return nil
-}
-
-// validateArgTemplate rejects an argument containing anything but the closed
-// set of typed substitutions. An unknown placeholder would otherwise reach the
-// child as a literal and silently point the tool at the wrong path.
-func validateArgTemplate(key string, i int, arg string) error {
-	if strings.ContainsRune(arg, 0) {
-		return configInvalid("%s.args[%d] contains a NUL byte", key, i)
-	}
-	// A bare "$" is a literal in an argv element: there is no shell to expand
-	// it. Only the "${...}" form is a substitution, so that is the only form
-	// checked, and a stray "}" outside one is just a character.
-	rest := arg
-	for {
-		open := strings.Index(rest, "${")
-		if open < 0 {
-			return nil
-		}
-		rest = rest[open+2:]
-		close := strings.Index(rest, "}")
-		if close < 0 {
-			return configInvalid("%s.args[%d] %q has an unterminated substitution", key, i, arg)
-		}
-		name := rest[:close]
-		if !AnalyzerSubstitutions[name] {
-			return configInvalid("%s.args[%d] uses unknown substitution ${%s}", key, i, name)
-		}
-		rest = rest[close+1:]
-	}
 }
 
 func mulNoOverflow(what string, a, b int64) (int64, error) {

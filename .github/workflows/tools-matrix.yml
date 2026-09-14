@@ -1,0 +1,148 @@
+# The per-platform real-tool gate of Section 11.7 and Task 22 Step 3: on every
+# operating system codectx ships for, install every payload the embedded lock
+# pins, re-verify the store, and index a nine-language fixture with the pinned
+# analyzers. "Unverified against a real tool" is a failure of this workflow, not
+# a label a document may carry.
+#
+# It is not part of CI on every push: one leg downloads about 2.6 GB. It runs
+# when the lock, the toolchain runtime or this workflow changes, on demand, and
+# weekly -- the weekly run is what catches an upstream asset that disappeared
+# from the publisher's release while its digest in the lock stayed valid.
+name: Tools matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Monday 05:00 UTC.
+    - cron: "0 5 * * 1"
+  push:
+    branches: ["main"]
+    paths:
+      - "internal/toolchain/**"
+      - "internal/tools/toollock/**"
+      - ".github/tools-matrix/**"
+      - ".github/workflows/tools-matrix.yml"
+  pull_request:
+    paths:
+      - "internal/toolchain/**"
+      - "internal/tools/toollock/**"
+      - ".github/tools-matrix/**"
+      - ".github/workflows/tools-matrix.yml"
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: go1.27.1
+
+jobs:
+  matrix:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not hide the state of the other two: the point
+      # of the matrix is which platforms a payload works on.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          check-latest: false
+
+      # scip-go loads the package graph through go, scip-python shells out to
+      # pip3/python3 to enumerate the environment it is indexing, and
+      # rust-analyzer loads the crate graph through cargo. All three are
+      # preinstalled on every GitHub runner. A runner that does not provide one
+      # fails the smoke -- that language then cannot be proved on this platform,
+      # which is a real matrix failure and not an honest absence. This step is
+      # only diagnostics, printed before the hour-long prefetch so the versions
+      # are in the log; that is the whole reason it may fail without stopping
+      # the job.
+      - name: Record the host toolchains the indexers shell out to
+        continue-on-error: true
+        run: |
+          go version
+          python3 --version
+          pip3 --version
+          cargo --version
+
+      - name: Build codectx
+        run: |
+          # GOEXE is ".exe" on Windows and empty everywhere else; -o takes the
+          # path literally, so without it the later steps would name a file that
+          # does not exist on the Windows leg.
+          go build -trimpath -o "./bin/codectx$(go env GOEXE)" ./cmd/codectx
+          echo "CODECTX=$GITHUB_WORKSPACE/bin/codectx$(go env GOEXE)" >> "$GITHUB_ENV"
+
+      # tools.cache_dir is user-level configuration, so the workflow writes the
+      # user configuration file rather than passing a flag. One store per job,
+      # under the workspace, so the runner reclaims it with the workspace.
+      - name: Point the tool store at this workspace
+        run: |
+          # Forward slashes throughout: TOML would read a Windows backslash as
+          # an escape, Go accepts a forward-slash absolute path on Windows, and
+          # bash cannot mkdir a path spelled with backslashes at all -- which is
+          # why the configuration directory is normalized the same way.
+          slash() { echo "$1" | sed 's|\\|/|g'; }
+          store="$(slash "$GITHUB_WORKSPACE/.tools")"
+          # os.UserConfigDir -- which config.UserConfigPath is built on -- reads
+          # %AppData% on Windows. %LocalAppData% is os.UserCacheDir's variable,
+          # so writing there would leave config.Load reading nothing and the
+          # prefetch installing gigabytes into the default per-workspace store.
+          case "$RUNNER_OS" in
+            Windows) config_home="$(slash "$APPDATA")" ;;
+            macOS)   config_home="$HOME/Library/Application Support" ;;
+            *)       config_home="${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+          esac
+          if [ -z "$config_home" ]; then
+            echo "no user configuration directory for $RUNNER_OS" >&2
+            exit 1
+          fi
+          mkdir -p "$config_home/codectx"
+          printf '[tools]\ncache_dir = "%s"\n' "$store" > "$config_home/codectx/config.toml"
+          # tools.cache_dir is the store itself, not a data directory: the smoke
+          # takes it as --store, and nothing here sets storage.data_dir.
+          echo "CODECTX_TOOL_STORE=$store" >> "$GITHUB_ENV"
+          cat "$config_home/codectx/config.toml"
+
+      - name: Report the lock before anything is installed
+        run: |
+          "$CODECTX" tools status
+
+      # Every entry the lock carries for this platform; an entry it does not
+      # carry here is honest absence and is skipped, never a failure.
+      - name: Prefetch every pinned payload
+        run: |
+          "$CODECTX" tools prefetch --all
+
+      # Rehashes every installed entry against the lock, so a payload that
+      # unpacked wrong on this platform fails here and not inside an analyzer.
+      - name: Verify the store
+        run: |
+          "$CODECTX" tools verify
+          "$CODECTX" tools status --json > "tools-status-${{ matrix.os }}.json"
+
+      # The gate itself: nine languages, including C++ and TSX explicitly, each
+      # indexed by the pinned analyzer and parsed by the pinned graph engine.
+      - name: Smoke every language against the polyglot fixture
+        run: go run ./.github/tools-matrix --store "$CODECTX_TOOL_STORE"
+
+      - name: Reclaim versions the lock no longer names
+        run: |
+          "$CODECTX" tools gc
+
+      - name: Upload the toolchain report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools-status-${{ matrix.os }}
+          path: tools-status-${{ matrix.os }}.json
+          if-no-files-found: warn

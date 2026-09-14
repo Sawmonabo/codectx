@@ -37,6 +37,24 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # Section 11.7 makes internal/toolchain the product's single network
+      # boundary: it fetches only URLs the embedded lock names, verifies every
+      # byte against a pinned digest and refuses without dialing when
+      # tools.offline is set. A second package reaching for net/http would open
+      # a path around all of that, so the shipped binary's dependency graph is
+      # the thing checked, not a grep of the source.
+      - name: Only internal/toolchain may import net/http
+        run: |
+          offenders="$(go list -deps -f '{{$p := .ImportPath}}{{range .Imports}}{{printf "%s %s\n" $p .}}{{end}}' ./cmd/codectx \
+            | awk -v m="github.com/Sawmonabo/codectx/" \
+                  '$2 == "net/http" && index($1, m) == 1 && $1 != m "internal/toolchain" { print $1 }')"
+          if [ -n "$offenders" ]; then
+            echo "net/http may only be imported by internal/toolchain (Section 11.7); these packages import it:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "net/http importers in ./cmd/codectx: internal/toolchain only"
+
       - name: Test
         run: go test ./... -count=1
 

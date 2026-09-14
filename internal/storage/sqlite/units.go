@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -182,10 +184,22 @@ type UnitWriter struct {
 	gen     model.GenerationID
 	ftsDocs int64
 	done    bool
+
+	// evidenceClipped records what SealUnit dropped to hold the evidence
+	// bound, so a caller can report the truncation instead of it being silent.
+	evidenceClipped int64
 }
 
 // UnitID is the immutable key of the unit being written.
 func (w *UnitWriter) UnitID() model.UnitID { return w.build.Spec.ID }
+
+// EvidenceClipped is the number of occurrence rows SealUnit dropped to hold
+// the Section 11.1 bound on evidence per fact. It is zero until the unit is
+// sealed. A nonzero count is not a failure; it is what keeps the truncation
+// from being silent, and SealUnit itself logs one bounded warning naming the
+// unit and the count, so the drop is on the record even for a caller that
+// never reads this.
+func (w *UnitWriter) EvidenceClipped() int64 { return w.evidenceClipped }
 
 // BeginUnit opens an immutable unit for gen. It recomputes the unit identity,
 // requires every declared dependency to be sealed, streams and hashes the
@@ -369,13 +383,41 @@ func (w *UnitWriter) checkEvidence(list []model.Evidence) error {
 	return nil
 }
 
-// PutNodes stores node facts with their evidence in one transaction. Each
+// PutNodes stores node facts with their evidence, recording no delta keys.
+func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error {
+	return w.PutKeyedNodes(ctx, facts, nil)
+}
+
+// PutKeyedNodes stores node facts with their evidence in one transaction. Each
 // fact's identity is recomputed from the repository, its kind and its
 // canonical key (Section 9.1) and registered in the node_ids dictionary before
 // the fact row references it; a fact whose ID does not derive, or whose kind
 // disagrees with the identity already registered under that ID, is malformed
 // provider output.
-func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error {
+//
+// keys is either empty or parallel to facts: keys[i] is every producer key
+// backing facts[i] — the keys its next incremental run will classify as
+// changed, unchanged or removed (Section 11.4) — sorted, without duplicates,
+// each a lowercase hex digest. A fact is backed by more than one key whenever
+// the producer's keys are finer than the identities they resolve to, which is
+// ordinary: a canonical edge is published once and derived from N occurrences.
+// Storage never derives or interprets a key; it records every one so CarryOver
+// can drop the fact when ANY of them is replaced, which is the same condition
+// the producer re-emits the whole fact on.
+//
+// A repeated node identity within one unit is not an error while it is the
+// same fact: the same declaration can be observed by more than one worker, by
+// two parts of a subdivided unit or, under a delta, by both the fresh import
+// and the carried predecessor, and its keys accumulate. A repeat whose stored
+// columns DIVERGE from the row already written is refused
+// (CTX_PROVIDER_OUTPUT_INVALID) naming the node and the first differing
+// column: the row would otherwise keep whichever description arrived first,
+// and a delta-built unit would keep a different one from a full re-import of
+// the same source. Nothing of a refused fact is stored, its evidence included.
+func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
+	if err := checkFactKeys(len(facts), keys); err != nil {
+		return err
+	}
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
@@ -397,6 +439,7 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 		n := f.Node
 		bytes += recordOverhead + int64(len(n.Name)+len(n.QualifiedName)+len(n.Signature)+len(n.Language)+len(n.Metadata)+len(f.CanonicalKey)) + evidenceBytes(f.Evidence)
 	}
+	bytes += factKeyBytes(keys)
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
@@ -413,12 +456,17 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 			}
 			defer kindOf.Close()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(unit_id, node_id) DO NOTHING`)
 			if err != nil {
 				return err
 			}
 			defer ins.Close()
-			for _, f := range facts {
+			putKey, err := w.prepareFactKeys(ctx, tx)
+			if err != nil {
+				return err
+			}
+			defer putKey.Close()
+			for i, f := range facts {
 				n := f.Node
 				nodeRaw, _ := model.DecodeID(string(n.ID))
 				if _, err := ids.ExecContext(ctx, nodeRaw, w.repoRaw, string(n.Kind), f.CanonicalKey); err != nil {
@@ -444,7 +492,15 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 					}
 					metadata = string(n.Metadata)
 				}
-				if _, err := ins.ExecContext(ctx, w.rowID, nodeRaw, n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata); err != nil {
+				res, err := ins.ExecContext(ctx, w.rowID, nodeRaw, n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
+				if err != nil {
+					return err
+				}
+				if err := w.checkRepeatedNode(ctx, tx, res, n, nodeRaw,
+					[]string{n.Language, n.Name, n.QualifiedName, n.Signature, blobText(fileRaw), intText(start), intText(end), metadata}); err != nil {
+					return err
+				}
+				if err := w.storeFactKeys(ctx, putKey, nodeRaw, nil, keysAt(keys, i)); err != nil {
 					return err
 				}
 				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
@@ -456,9 +512,22 @@ func (w *UnitWriter) PutNodes(ctx context.Context, facts []model.NodeFact) error
 	})
 }
 
-// PutRelations stores canonical edges with their occurrence evidence. Relation
-// identity is recomputed; both endpoints must already be registered identities.
+// PutRelations stores canonical edges with their occurrence evidence,
+// recording no delta keys.
 func (w *UnitWriter) PutRelations(ctx context.Context, facts []model.RelationFact) error {
+	return w.PutKeyedRelations(ctx, facts, nil)
+}
+
+// PutKeyedRelations stores canonical edges with their occurrence evidence.
+// Relation identity is recomputed; both endpoints must already be registered
+// identities. keys carries every producer key backing each fact, exactly as
+// PutKeyedNodes documents. A relation_facts row stores nothing but its
+// identity, so a repeat cannot diverge the way a node fact can; it adds its
+// keys to the ones already recorded and is otherwise a no-op.
+func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error {
+	if err := checkFactKeys(len(facts), keys); err != nil {
+		return err
+	}
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
@@ -476,6 +545,7 @@ func (w *UnitWriter) PutRelations(ctx context.Context, facts []model.RelationFac
 		}
 		bytes += recordOverhead + evidenceBytes(f.Evidence)
 	}
+	bytes += factKeyBytes(keys)
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
@@ -486,12 +556,17 @@ func (w *UnitWriter) PutRelations(ctx context.Context, facts []model.RelationFac
 				return err
 			}
 			defer ids.Close()
-			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?)`)
+			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
 			if err != nil {
 				return err
 			}
 			defer ins.Close()
-			for _, f := range facts {
+			putKey, err := w.prepareFactKeys(ctx, tx)
+			if err != nil {
+				return err
+			}
+			defer putKey.Close()
+			for i, f := range facts {
 				r := f.Relation
 				relRaw, _ := model.DecodeID(string(r.ID))
 				fromRaw, _ := model.DecodeID(string(r.From))
@@ -500,6 +575,9 @@ func (w *UnitWriter) PutRelations(ctx context.Context, facts []model.RelationFac
 					return err
 				}
 				if _, err := ins.ExecContext(ctx, w.rowID, relRaw); err != nil {
+					return err
+				}
+				if err := w.storeFactKeys(ctx, putKey, nil, relRaw, keysAt(keys, i)); err != nil {
 					return err
 				}
 				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
@@ -654,8 +732,8 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 }
 
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence) error {
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key, detail)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key, detail, content_hash_bound)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
 		return err
 	}
@@ -669,11 +747,158 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 			return err
 		}
 		start, end := rangeBytes(e.Range)
-		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw, start, end, e.NativeKey, e.Detail); err != nil {
+		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw, start, end, e.NativeKey, e.Detail,
+			boolInt(e.ContentHash != "")); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// canonicalDetails renders a capability's diagnostic pairs as the stored JSON
+// object. Keys are emitted in ascending order (encoding/json sorts map keys),
+// so the text a generation stores, and therefore the digest folded into its
+// AnalysisKey, is a function of the pairs and never of the order a publisher
+// happened to add them. An empty map is the empty object, so a state with no
+// details hashes identically whether Details was nil or allocated.
+func canonicalDetails(details map[string]string) (string, error) {
+	if len(details) == 0 {
+		return "{}", nil
+	}
+	raw, err := json.Marshal(details)
+	if err != nil {
+		return "", internal("capability details: " + err.Error())
+	}
+	return string(raw), nil
+}
+
+// checkFactKeys enforces the shape of a keyed batch: either no fact carries
+// keys or every fact carries at least one, each a lowercase hex digest, sorted
+// and without duplicates. A partly keyed batch would silently leave rows a
+// later delta could neither replace nor remove; an unsorted or duplicated key
+// list is producer state storage cannot repair, and the sorted order is what
+// makes the producer's own key set and the stored one comparable.
+func checkFactKeys(facts int, keys [][]string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if len(keys) != facts {
+		return invalid("a keyed batch carries %d key lists for %d facts", len(keys), facts)
+	}
+	for i, list := range keys {
+		if len(list) == 0 {
+			return invalid("%s is empty; a keyed batch keys every fact or none", indexedField("keys", i))
+		}
+		for j, k := range list {
+			if !model.ValidHexID(k) {
+				return invalid("%s is not a %d-character lowercase hex digest", indexedField(indexedField("keys", i), j), model.IDHexLen)
+			}
+			if j > 0 && k <= list[j-1] {
+				return invalid("%s is not sorted or repeats a key", indexedField("keys", i))
+			}
+		}
+	}
+	return nil
+}
+
+// factKeyBytes is the retained-byte contribution of a batch's keys.
+func factKeyBytes(keys [][]string) int64 {
+	var n int64
+	for _, list := range keys {
+		for _, k := range list {
+			n += int64(len(k))
+		}
+	}
+	return n
+}
+
+func keysAt(keys [][]string, i int) []string {
+	if i < len(keys) {
+		return keys[i]
+	}
+	return nil
+}
+
+func indexedField(name string, i int) string { return name + "[" + strconv.Itoa(i) + "]" }
+
+// prepareFactKeys prepares the fact_keys insert. A key already recorded for
+// this fact is not an error: two workers, two parts of a subdivided unit or a
+// carried predecessor can publish the same fact under the same keys.
+func (w *UnitWriter) prepareFactKeys(ctx context.Context, tx *sql.Tx) (*sql.Stmt, error) {
+	return tx.PrepareContext(ctx, `INSERT INTO fact_keys(unit_id, node_id, relation_id, fact_key) VALUES(?, ?, ?, ?) ON CONFLICT DO NOTHING`)
+}
+
+func (w *UnitWriter) storeFactKeys(ctx context.Context, stmt *sql.Stmt, node, relation any, keys []string) error {
+	for _, k := range keys {
+		if _, err := stmt.ExecContext(ctx, w.rowID, node, relation, k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// nodeFactColumns names the stored columns of a node fact, in the order
+// checkRepeatedNode compares them, so the column it reports is a function of
+// the divergence and not of map order.
+var nodeFactColumns = []string{"language", "name", "qualified_name", "signature", "file_id", "start_byte", "end_byte", "metadata_json"}
+
+// checkRepeatedNode refuses a repeated node identity whose stored columns
+// differ from the row already written for it. The insert yields to the row
+// that is present, so without this check the unit would silently keep whichever
+// description arrived first and discard the rest — and because CarryOver runs
+// after the provider's own batches, a delta-built unit would keep the fresh
+// description where a full re-import keeps the first-written one. Two units
+// over the same source would then hold different rows, which is the one thing
+// Section 11.4 requires a delta not to do. An identical repeat costs one
+// comparison and is free.
+func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.Result, n model.Node, raw []byte, incoming []string) error {
+	affected, err := res.RowsAffected()
+	if err != nil || affected != 0 {
+		return err
+	}
+	var language, name, qualified, signature, metadata string
+	var file []byte
+	var start, end sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
+		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, raw).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
+		return err
+	}
+	stored := []string{language, name, qualified, signature, optionalHex(file), nullIntText(start), nullIntText(end), metadata}
+	for i, col := range nodeFactColumns {
+		if stored[i] == incoming[i] {
+			continue
+		}
+		return &model.Error{Code: model.CodeProviderOutputInvalid,
+			Message:     "a repeated node identity describes the fact differently than the row already written",
+			Details:     map[string]string{"node_id": string(n.ID), "column": col, "stored": stored[i], "published": incoming[i]},
+			Remediation: "publish one description per node identity; a repeat must be identical to the fact already published"}
+	}
+	return nil
+}
+
+// blobText and intText render the values bound to an insert so they compare
+// against the columns read back.
+func blobText(v any) string {
+	raw, ok := v.([]byte)
+	if !ok {
+		return ""
+	}
+	return idHex(raw)
+}
+
+func intText(v any) string {
+	n, ok := v.(int64)
+	if !ok {
+		return ""
+	}
+	return strconv.FormatInt(n, 10)
+}
+
+func nullIntText(v sql.NullInt64) string {
+	if !v.Valid {
+		return ""
+	}
+	return strconv.FormatInt(v.Int64, 10)
 }
 
 func rangeBytes(r *model.SourceRange) (start, end any) {
@@ -730,6 +955,9 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
 	err := s.write(ctx, func(tx *sql.Tx) error {
+		if err := w.clipEvidence(ctx, tx); err != nil {
+			return err
+		}
 		checks := []struct {
 			what  string
 			query string
@@ -778,6 +1006,14 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	})
 	if err == nil {
 		w.done = true
+		if w.evidenceClipped != 0 {
+			// One bounded line per sealed unit, and only when the bound
+			// actually truncated something: the clip is legitimate but it
+			// silently drops occurrences a caller may be counting on, so the
+			// unit and the count are on the record. No source, no native keys.
+			slog.Warn("evidence occurrences were dropped to hold the per-fact bound",
+				"unit_id", string(w.build.Spec.ID), "dropped", w.evidenceClipped, "limit", model.MaxEvidencePerFact)
+		}
 	}
 	return err
 }
@@ -924,13 +1160,18 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if _, err := tx.ExecContext(ctx, `DELETE FROM generation_capabilities WHERE generation_id = ?`, g.id); err != nil {
 			return wrap("generation_capabilities", err)
 		}
-		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code) VALUES(?, ?, ?, ?, ?, ?)`)
+		capStmt, err := tx.PrepareContext(ctx, `INSERT INTO generation_capabilities(generation_id, provider_id, capability, scope_key, state, diagnostic_code, details_json)
+			VALUES(?, ?, ?, ?, ?, ?, ?)`)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
 		defer capStmt.Close()
 		for _, c := range capabilities {
-			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State), c.DiagnosticCode); err != nil {
+			details, err := canonicalDetails(c.Details)
+			if err != nil {
+				return err
+			}
+			if _, err := capStmt.ExecContext(ctx, g.id, c.ProviderID, c.Capability, c.Scope, string(c.State), c.DiagnosticCode, details); err != nil {
 				return wrap("generation_capabilities", err)
 			}
 		}
@@ -941,6 +1182,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		}
 		capsHash := model.NewHasher(domainCapabilities)
 		if err := foldColumn(ctx, tx, capsHash, `SELECT provider_id || char(0) || capability || char(0) || scope_key || char(0) || state || char(0) || diagnostic_code
+			|| char(0) || details_json
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}

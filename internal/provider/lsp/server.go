@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // serverState is the lifecycle of one language server process.
@@ -99,15 +100,16 @@ func (p pipeStream) Write(b []byte) (int, error) { return p.w.Write(b) }
 // errServerGone is the write-side error after the process has exited.
 var errServerGone = errors.New("the language server process has exited")
 
-// startServer materializes the snapshot, starts the approved executable
-// through the shared runner, performs the initialize/initialized handshake
-// and verifies the version and position encoding. Any failure releases the
-// process, the pipes and the materialization before returning.
+// startServer materializes the snapshot, starts the pinned payload through the
+// shared runner, performs the initialize/initialized handshake and negotiates
+// the position encoding. Any failure releases the process, the pipes and the
+// materialization before returning.
+//
+// The executable is not re-hashed here: internal/toolchain hashed the entry at
+// resolution and Profile.Tool carries that digest, so a second read of the same
+// file would prove nothing the fingerprint in the overlay binding does not
+// already commit to.
 func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Profile) (*server, error) {
-	sum, err := p.checksum()
-	if err != nil {
-		return nil, err
-	}
 	snap := view.Header()
 	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{
 		Dir: snapshot.MaterializeDir(m.opts.DataDir), MaxBytes: m.opts.MaxOverlayBytes,
@@ -129,16 +131,28 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 	s.conn = newConn(pipeStream{r: s.stdoutR, w: s.stdinW}, m.opts.MaxFrameBytes, m.opts.MaxOverlayBytes,
 		m.opts.MaxOutstandingRequests, s.handleServerRequest)
 
-	if err := os.MkdirAll(p.WorkDir, 0o700); err != nil {
+	workDir := p.workDir(m.opts.DataDir)
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		mat.Close()
 		return nil, unavailable("language server %q work directory cannot be created: %v", p.Name, err)
 	}
+	if p.Name == serverJDTLS && p.Tool.Source == toolchain.SourceManaged {
+		// The one payload that needs a private copy of something out of the
+		// store before it can start; see seedPlatformConfig. An override has no
+		// store payload to seed from -- it replaces the binary and owns its own
+		// launch -- so the copy is the managed payload's alone.
+		if err := seedPlatformConfig(p.Tool.Root, workDir); err != nil {
+			mat.Close()
+			return nil, err
+		}
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	s.runCancel = cancel
+	path, args := p.argv(mat.Root(), workDir)
 	spec := process.Spec{
-		Path: p.Executable,
-		Args: p.argv(mat.Root()),
-		Dir:  p.WorkDir,
+		Path: path,
+		Args: args,
+		Dir:  workDir,
 		Env:  p.env(),
 		// The client writes requests into stdinR's other end for the life of
 		// the server; the runner copies them to the child and closes the
@@ -183,7 +197,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		s.fail(err)
 	}()
 
-	if err := s.initialize(ctx, snap, sum); err != nil {
+	if err := s.initialize(ctx, snap); err != nil {
 		// A start that failed after the process exists must not leave it: the
 		// same path a running server takes on failure.
 		s.fail(err)
@@ -202,7 +216,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 }
 
 // initialize performs the handshake and checks what the server claimed.
-func (s *server) initialize(ctx context.Context, snap model.Snapshot, checksum string) error {
+func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	ctx, cancel := context.WithTimeout(ctx, s.opts.StartTimeout)
 	defer cancel()
 	params := initializeParams{
@@ -233,13 +247,17 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot, checksum s
 		return outputInvalid("the language server chose position encoding %q, which this client did not offer", truncate(wire, 32))
 	}
 	s.enc = enc
+	// A server that declines to name itself is still identified by the payload
+	// the lock pinned: pyright and typescript-language-server both answer
+	// initialize with no serverInfo at all (measured), and an empty
+	// ProviderVersion fails OverlayBinding.Validate, which made the overlay
+	// permanently unavailable for python, typescript, tsx and javascript with
+	// an error in the argument class. The *reported* string keeps feeding
+	// inputDigest unchanged, so a payload that starts reporting a version later
+	// is still a different question.
 	version := ""
 	if result.ServerInfo != nil {
 		version = result.ServerInfo.Version
-	}
-	if !versionMatches(s.profile.VersionConstraint, version) {
-		return trustRequired("language server %q reported version %q, which does not satisfy the approved constraint %q",
-			s.profile.Name, truncate(version, 64), s.profile.VersionConstraint).WithDetail("profile", s.profile.Name)
 	}
 	c := result.Capabilities
 	s.caps = Capabilities{
@@ -254,8 +272,8 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot, checksum s
 	s.sync = opensDocuments(c.TextDocumentSync)
 	s.binding = model.OverlayBinding{
 		ProviderID:      "lsp:" + s.profile.Name,
-		ProviderVersion: serverVersion(version),
-		InputDigest:     inputDigest(snap, s.profile, checksum, version, wire),
+		ProviderVersion: serverVersion(version, s.profile.Tool.Version),
+		InputDigest:     inputDigest(snap, s.profile, version, wire),
 	}
 	if err := s.binding.Validate(); err != nil {
 		return err

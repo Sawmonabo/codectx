@@ -41,6 +41,7 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 		return &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
 	})
 	root.AddCommand(newVersionCommand(build))
+	root.AddCommand(newToolsCommand(build))
 	return root
 }
 

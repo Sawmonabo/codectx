@@ -9,6 +9,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // recordingSink captures every batch the sink hands over.
@@ -181,5 +182,73 @@ func TestRegistryRejectsBrokenGraphs(t *testing.T) {
 		} else {
 			wantCode(t, err, model.CodeArgumentInvalid)
 		}
+	}
+}
+
+// TestSelectPublishesDetectionDetails protects against false readiness in the
+// mixed case: a provider can be available as a whole and unusable in part --
+// five of six SCIP indexers installed, the sixth refused -- and the reasons
+// exist only in Detection.Details. Select is the one place capability state is
+// published, so details dropped here make a partly working provider
+// indistinguishable from a healthy one at the only surface a caller can read,
+// and the missing language looks like a repository with no such code.
+func TestSelectPublishesDetectionDetails(t *testing.T) {
+	h := providertest.New(t, map[string]string{"a.go": "package a\n"})
+	desc := model.ProviderDescriptor{ID: "scip", Version: "1", Capabilities: []string{"definitions", "references"},
+		InvalidationScope: model.InvalidationFile}
+	p := providertest.Func{Desc: desc, DetectFn: func(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+		return provider.Detection{Available: true, Capabilities: desc.Capabilities}.
+			WithDetail("rust-analyzer", model.CodeToolOverrideInvalid), nil
+	}}
+	reg, err := provider.NewRegistry(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, err := reg.Select(context.Background(), h.Root, h.Policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sel.Active) != 1 {
+		t.Fatalf("Active = %d providers, want the detected one", len(sel.Active))
+	}
+	if len(sel.Inactive) != len(desc.Capabilities) {
+		t.Fatalf("published states = %+v, want one partial row per declared capability", sel.Inactive)
+	}
+	for i, got := range sel.Inactive {
+		if got.ProviderID != "scip" || got.Capability != desc.Capabilities[i] || got.Scope != provider.ScopeWorkspace ||
+			got.State != model.CapabilityPartial || got.Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
+			t.Fatalf("published state %d = %+v, want a partial workspace row carrying the detection detail", i, got)
+		}
+		if got.Validate() != nil {
+			t.Fatalf("published state %d does not validate: %v", i, got.Validate())
+		}
+	}
+	// One map per row: a caller that edits one published state must not rewrite
+	// the others.
+	sel.Inactive[0].Details["rust-analyzer"] = "edited"
+	if sel.Inactive[1].Details["rust-analyzer"] != model.CodeToolOverrideInvalid {
+		t.Fatal("published states share one details map")
+	}
+	// The other half of the same false-readiness question, in the other
+	// direction: a detail that is not a refusal must publish nothing. A pinned
+	// payload the first unit fetches and then indexes at full precision is such
+	// a detail, and it is on every SCIP kind on a cold store -- published as
+	// `partial`, the only surface carrying capability state reports every first
+	// run of the product as degraded, and a real refusal beside it becomes
+	// indistinguishable from routine.
+	pending := providertest.Func{Desc: desc, DetectFn: func(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+		return provider.Detection{Available: true, Capabilities: desc.Capabilities}.
+			WithDetail("scip-go", "deferred"), nil
+	}}
+	pendingReg, err := provider.NewRegistry(pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingSel, err := pendingReg.Select(context.Background(), h.Root, h.Policy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingSel.Active) != 1 || len(pendingSel.Inactive) != 0 {
+		t.Fatalf("a deferred-only detection published %+v, want no capability row", pendingSel.Inactive)
 	}
 }

@@ -5,6 +5,8 @@ package model
 // importing the other, and without any package importing a provider's native
 // handles (Sections 7.1, 11.1).
 
+import "maps"
+
 // InvalidationScope is the unit granularity a provider reprocesses. A file-local
 // provider reprocesses only changed files; a package or workspace provider
 // reruns its declared larger unit.
@@ -251,14 +253,51 @@ func (s UnitSpec) Validate() error {
 	return nil
 }
 
+// MaxCapabilityDetails bounds the structured detail map a capability state may
+// carry. It is the same bound Error.Details carries, for the same reason: a
+// diagnostic surface a provider fills from its own findings must not grow with
+// the size of the repository.
+const MaxCapabilityDetails = MaxErrorDetails
+
 // CapabilityState reports one provider capability at one scope. The machine
 // reason code is kept separate from user-readable remediation (Section 13.3).
+// Details carries the machine-readable particulars of a state that is not
+// fresh — which methods a partial capability skipped, which unit failed, which
+// backend pass raised — as bounded key/value pairs rather than as extra
+// capability rows invented to smuggle text through the scope column.
 type CapabilityState struct {
 	ProviderID     string               `json:"provider_id"`
 	Capability     string               `json:"capability"`
 	Scope          string               `json:"scope"`
 	State          CapabilityStateValue `json:"state"`
 	DiagnosticCode string               `json:"diagnostic_code,omitempty"`
+	Details        map[string]string    `json:"details,omitempty"`
+}
+
+// WithDetail returns the state with one bounded diagnostic pair added, so a
+// publisher can build a row in one expression. Values are truncated to
+// MaxDetailBytes and the map is capped at MaxCapabilityDetails entries; an
+// empty key and an overflowing new key are both dropped, so a detail map never
+// grows without bound and never carries a keyless value.
+//
+// The map is copied rather than written through. CapabilityState is a value
+// type that lives in slices and is copied freely, and Details is a reference:
+// writing into the receiver's own map would reach every copy that shares it,
+// so one row's detail would silently appear on another row, or on a caller's
+// state that was never passed to this method at all. The copy is bounded by
+// MaxCapabilityDetails, so it costs nothing worth trading that away for.
+func (c CapabilityState) WithDetail(key, value string) CapabilityState {
+	if key == "" {
+		return c
+	}
+	if _, replacing := c.Details[key]; !replacing && len(c.Details) >= MaxCapabilityDetails {
+		return c
+	}
+	details := make(map[string]string, len(c.Details)+1)
+	maps.Copy(details, c.Details)
+	details[key] = TruncateDetail(value)
+	c.Details = details
+	return c
 }
 
 // Validate enforces the generation_capabilities constraints.
@@ -277,6 +316,17 @@ func (c CapabilityState) Validate() error {
 	}
 	if err := boundField("capability_state.diagnostic_code", c.DiagnosticCode, MaxIdentifierBytes); err != nil {
 		return err
+	}
+	if err := boundCount("capability_state.details", len(c.Details), MaxCapabilityDetails); err != nil {
+		return err
+	}
+	for k, v := range c.Details {
+		if err := requireField("capability_state.details key", k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := boundField("capability_state.details["+k+"]", v, MaxDetailBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -487,6 +487,15 @@ func TestUnpublishedOrAlteredStoreIsInvisibleAndRepaired(t *testing.T) {
 			if f.hits.Load() != 1 {
 				t.Fatalf("first resolve fetched %d times, want 1", f.hits.Load())
 			}
+			// A consumer that plans work for a pinned-but-absent payload keys
+			// its facts by PinnedFingerprint and the same facts by
+			// Fingerprint once the payload lands. If the two ever disagree,
+			// every unit sealed by the fetching run is silently re-keyed and
+			// re-indexed by the next process.
+			pinned, err := r.PinnedFingerprint(testTool)
+			if err != nil || pinned != first.Fingerprint() {
+				t.Fatalf("PinnedFingerprint = %q (%v), want the installed %q", pinned, err, first.Fingerprint())
+			}
 
 			tc.damage(t, f)
 			// Verify is the report that rehashes, so it is the one that must
