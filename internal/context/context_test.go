@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -281,6 +282,156 @@ func TestContextCompilerScenario(t *testing.T) {
 		// L3 RANK rows
 		// L4 BUDGET rows
 		// L5 MANIFEST rows
+		{
+			// Task 16's `context next` walks manifest ordinals without
+			// re-sorting, so a plan persisted in any order other than the
+			// Section 15.3 reading order hands the actor required files after
+			// optional ones with nothing in Task 15 failing. The row feeds the
+			// manifest pass candidates in deliberately wrong order and asserts
+			// what comes back out of the four Store.Manifest* read methods.
+			name: "manifest ordinals are the actor's reading order and required_full is a prefix",
+			run: func(t *testing.T, fx *contextFixture) {
+				// The row drives the manifest pass directly: Compile's
+				// orchestration is the integration lane's, and the ordering
+				// contract lives entirely in this pass.
+				c := &Compiler{store: fx.Store, repo: fx.Repo, cfg: fx.Cfg, now: fx.Now}
+				req := model.ContextRequest{Task: "make Place idempotent", Phase: model.PhaseVerify}
+				cand := func(path string, want model.Requirement, score int64) candidate {
+					fv := fx.File(path)
+					return candidate{NodeID: fx.Node(path), FileID: fv.ID, Path: path, Requirement: want,
+						ScoreMicros: score, SizeBytes: fv.Size, Status: fv.Status, Reasons: []string{"fixture " + path}}
+				}
+				budget := model.Budget{MaxEstimatedTokens: 100_000, MaxBytes: 1 << 20, MaxFiles: 8, MaxSlices: 4}
+				// Packed in the budget pass's packing order, and within each
+				// group deliberately not in reading order.
+				// docs/order.md deliberately outscores both required_full
+				// entries: requirement rank is the FIRST key of the chain, so
+				// a plan ordered by score alone would put it first and hand the
+				// actor an optional file before the code it must read.
+				packed := [][]candidate{
+					{cand("docs/order.md", model.RequirementOptional, 990_000),
+						cand("internal/order/service.go", model.RequirementFull, 900_000)},
+					{cand("internal/order/handler.go", model.RequirementRecommended, 700_000),
+						cand("internal/order/ports.go", model.RequirementFull, 940_000)},
+				}
+				dropped := cand("config/order.toml", model.RequirementOptional, 10_000)
+				dropped.Excluded = "below the optional cut for this budget"
+				m, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
+					[]candidate{dropped}, fixtureCapabilities, true)
+				if err != nil {
+					t.Fatalf("persistManifest: %v", err)
+				}
+
+				entries, err := fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0)
+				if err != nil {
+					t.Fatalf("ManifestEntries: %v", err)
+				}
+				if len(entries) != 4 || m.EntryCount != 4 {
+					t.Fatalf("read back %d entries (header says %d), want the 4 packed candidates", len(entries), m.EntryCount)
+				}
+				var lastRank = -1
+				for i, e := range entries {
+					if e.Ordinal != i {
+						t.Fatalf("entry %d has ordinal %d; ordinals are the reading order and must be dense 0..n-1", i, e.Ordinal)
+					}
+					rank := map[model.Requirement]int{model.RequirementFull: 0, model.RequirementSymbol: 1,
+						model.RequirementRecommended: 2, model.RequirementOptional: 3}[e.Requirement]
+					if rank < lastRank {
+						t.Fatalf("entry %d is %q after a stronger requirement; required_full must be a prefix", i, e.Requirement)
+					}
+					lastRank = rank
+				}
+				if entries[0].Requirement != model.RequirementFull || entries[1].Requirement != model.RequirementFull {
+					t.Fatalf("the two required_full entries are not the prefix: got %q, %q", entries[0].Requirement, entries[1].Requirement)
+				}
+				// Within required_full the chain is score descending, so
+				// ports.go (940_000) precedes service.go (900_000).
+				if entries[0].FileID != fx.File("internal/order/ports.go").ID {
+					t.Fatalf("entry 0 is %s, want the higher-scoring required_full file", entries[0].FileID)
+				}
+
+				slices, err := fx.Store.ManifestSlices(fx.ctx, m.ID, -1, 0)
+				if err != nil {
+					t.Fatalf("ManifestSlices: %v", err)
+				}
+				if len(slices) != 2 || m.SliceCount != 2 {
+					t.Fatalf("read back %d slices (header says %d), want 2", len(slices), m.SliceCount)
+				}
+				for _, sl := range slices {
+					for i, o := range sl.EntryOrdinals {
+						if o < 0 || o >= len(entries) {
+							t.Fatalf("slice %d references ordinal %d, which is not an entry", sl.Index, o)
+						}
+						if i > 0 && o <= sl.EntryOrdinals[i-1] {
+							t.Fatalf("slice %d lists ordinals %v out of reading order", sl.Index, sl.EntryOrdinals)
+						}
+					}
+				}
+
+				excluded, err := fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0)
+				if err != nil {
+					t.Fatalf("ManifestExcluded: %v", err)
+				}
+				if len(excluded) != 1 || strings.TrimSpace(excluded[0].Reason) == "" {
+					t.Fatalf("exclusions = %+v, want exactly one carrying a nonempty reason", excluded)
+				}
+
+				// Recompiling the same request is a no-op, not a second plan.
+				if again, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
+					[]candidate{dropped}, fixtureCapabilities, true); err != nil || again.CanonicalHash != m.CanonicalHash {
+					t.Fatalf("re-persisting the identical plan = %v (hash %s), want the immutable manifest unchanged", err, again.CanonicalHash)
+				}
+				// A different plan under the same identity is the determinism
+				// alarm, never a silent overwrite of what the actor is reading.
+				_, err = c.persistManifest(fx.ctx, fx.Binding, req, budget, packed,
+					[]candidate{dropped}, fixtureCapabilities, false)
+				var typed *model.Error
+				if !errors.As(err, &typed) || typed.Code != model.CodeVersionConflict {
+					t.Fatalf("persisting a different canonical plan under the same id = %v, want %s", err, model.CodeVersionConflict)
+				}
+			},
+		},
+		{
+			// The budget pass sizes a whole selected set at once. If FilesByID
+			// leaked rows from outside the pinned snapshot, or errored on an id
+			// the snapshot does not publish, budgeting would either charge for
+			// invisible files or fail on a legitimate traversal frontier.
+			name: "FilesByID hydrates a batch from the pinned snapshot and omits ids it does not publish",
+			run: func(t *testing.T, fx *contextFixture) {
+				reader, err := fx.Store.PinGeneration(fx.ctx, fx.Repo, fx.Gen, time.Minute)
+				if err != nil {
+					t.Fatalf("PinGeneration: %v", err)
+				}
+				defer reader.Close()
+				absent := model.NewFileID(fx.Repo, "internal/order/never_captured.go")
+				want := []string{"internal/order/ports.go", "internal/order/service.go", "docs/order.md"}
+				ids := []model.FileID{absent}
+				for _, p := range want {
+					ids = append(ids, fx.File(p).ID)
+				}
+				got, err := reader.FilesByID(fx.ctx, ids)
+				if err != nil {
+					t.Fatalf("FilesByID: %v", err)
+				}
+				if len(got) != len(want) {
+					t.Fatalf("FilesByID returned %d rows for %d ids, want the %d published ones with the absent id omitted",
+						len(got), len(ids), len(want))
+				}
+				byID := map[model.FileID]model.FileVersion{}
+				for _, fv := range got {
+					byID[fv.ID] = fv
+				}
+				for _, p := range want {
+					fv, ok := byID[fx.File(p).ID]
+					if !ok {
+						t.Fatalf("FilesByID omitted %s, which the pinned snapshot publishes", p)
+					}
+					if fv.Path != p || fv.Size != fx.File(p).Size || fv.Status != fx.File(p).Status {
+						t.Fatalf("FilesByID(%s) = %+v, want the snapshot's path, size and status %+v", p, fv, fx.File(p))
+					}
+				}
+			},
+		},
 		// INT rows
 	}
 

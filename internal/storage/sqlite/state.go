@@ -20,6 +20,12 @@ import (
 // in the manifest's generation and every file must be in its snapshot.
 // Storing the same manifest ID again with the same canonical hash is a no-op;
 // a different hash under the same ID is CTX_VERSION_CONFLICT.
+//
+// Entries must arrive in the Section 15.3 reading order: ordinals 0..n-1, with
+// requirement rank non-decreasing (so required_full is a prefix) and score
+// descending within a rank. The workflow walks those ordinals directly, so an
+// order this method accepted and never checked would be a defect visible only
+// one task later.
 func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, requestJSON []byte,
 	entries []model.ContextEntry, slices []model.ContextSlice, excluded []model.ExcludedContextEntry) error {
 	if err := m.Validate(); err != nil {
@@ -37,6 +43,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 	if len(entries) != m.EntryCount || len(slices) != m.SliceCount {
 		return invalid("manifest header counts (%d entries, %d slices) disagree with the rows supplied (%d, %d)", m.EntryCount, m.SliceCount, len(entries), len(slices))
 	}
+	prevRank, prevScore := -1, int64(0)
 	for i, e := range entries {
 		if err := e.Validate(); err != nil {
 			return err
@@ -44,6 +51,22 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		if e.Ordinal != i {
 			return invalid("manifest entries must be ordered 0..n-1; entry %d has ordinal %d", i, e.Ordinal)
 		}
+		// Ordinals are the actor's canonical reading order (Section 15.3), and
+		// `context next` walks them without re-sorting. Storage enforces the
+		// two keys of that order it can see — requirement rank, then score
+		// descending within a rank — so a compiler that persisted a different
+		// order fails here rather than silently handing the actor a plan whose
+		// required_full entries are not the prefix the workflow assumes.
+		rank := requirementRank(e.Requirement)
+		switch {
+		case rank < prevRank:
+			return invalid("manifest entries must be in requirement order; entry %d is %s after %s",
+				i, e.Requirement, entries[i-1].Requirement)
+		case rank == prevRank && e.ScoreMicros > prevScore:
+			return invalid("manifest entries must be in descending score order within a requirement; entry %d scores %d after %d",
+				i, e.ScoreMicros, prevScore)
+		}
+		prevRank, prevScore = rank, e.ScoreMicros
 	}
 	for i, sl := range slices {
 		if err := sl.Validate(); err != nil {
@@ -185,6 +208,23 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		}
 		return nil
 	})
+}
+
+// requirementRank orders the first key of the Section 15.3 reading order:
+// required_full 0 ... optional 3. model.Requirement.Valid has already rejected
+// anything else by the time PutManifest calls this, so there is no silent
+// fall-through rank.
+func requirementRank(r model.Requirement) int {
+	switch r {
+	case model.RequirementFull:
+		return 0
+	case model.RequirementSymbol:
+		return 1
+	case model.RequirementRecommended:
+		return 2
+	default:
+		return 3
+	}
 }
 
 // manifestHeader is the strict typed shape of context_manifests.completeness_json:
