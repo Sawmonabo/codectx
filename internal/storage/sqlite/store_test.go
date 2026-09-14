@@ -991,7 +991,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// An expired lease is exactly the kind of leftover only the collection
 	// tail removes; Recover must run that tail, not just fail the generation.
 	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: genStale, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
-	if err := f.s.AcquireLease(ctx, expired); err != nil {
+	if err := f.s.AcquireLease(ctx, expired, ""); err != nil {
 		t.Fatalf("AcquireLease: %v", err)
 	}
 	beforeRecover := f.stats()

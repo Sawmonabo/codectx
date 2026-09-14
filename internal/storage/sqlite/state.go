@@ -591,6 +591,15 @@ func (s *Store) AdvanceSession(ctx context.Context, req model.AdvanceRequest) (m
 			string(req.Target), closedAt, raw, req.ExpectedVersion); err != nil {
 			return err
 		}
+		if req.Target == model.StateClosed {
+			// A closed session reads nothing further, so it stops pinning its
+			// generation here rather than at the end of its TTL. It is the same
+			// transaction as the close: a session that is gone never leaves a
+			// lease behind holding a generation retention may not collect.
+			if err := releaseOwnerLease(ctx, tx, model.LeaseSession, raw); err != nil {
+				return err
+			}
+		}
 		status = model.WorkflowStatus{SessionID: rec.ID, State: req.Target, StateVersion: rec.StateVersion + 1,
 			ScopeVersion: rec.ScopeVersion, ManifestID: rec.ManifestID, Phase: rec.Phase}
 		return nil
