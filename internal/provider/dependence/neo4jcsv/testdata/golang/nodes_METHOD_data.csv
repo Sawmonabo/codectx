@@ -1,0 +1,22 @@
+107374182400,METHOD,w,TYPE_DECL,"func run(s *S, p *int, i int) {
+	x := 1
+	x += 2
+	x++
+	s.F = 3
+	s.Arr[i] = 4
+	*p = 5
+	*p += 1
+	G = x
+	a, b := x, x
+	a, b = b, a
+	s.M[""k""] = 6
+	_ = a
+	_ = b
+}",1,2,w.go,w.run,<empty>,,false,11,25,run,,,1,"w.run(*w.S, *int, int)"
+107374182401,METHOD,w,TYPE_DECL,w.w.go,1,2,w.go,w.go:w.w.go,<empty>,,false,1,25,w.w.go,,,1,
+107374182402,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
+107374182403,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignmentPlus,<empty>,,true,,,<operator>.assignmentPlus,,,0,
+107374182404,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.postIncrement,<empty>,,true,,,<operator>.postIncrement,,,0,
+107374182405,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.fieldAccess,<empty>,,true,,,<operator>.fieldAccess,,,0,
+107374182406,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indexAccess,<empty>,,true,,,<operator>.indexAccess,,,0,
+107374182407,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.indirection,<empty>,,true,,,<operator>.indirection,,,0,

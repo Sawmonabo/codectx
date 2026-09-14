@@ -1,0 +1,11 @@
+167503724544,TYPE_DECL,,W.java:<global>,NAMESPACE_BLOCK,class S,1,W.java,S,LObject;,java.lang.Object,false,1,S,,,1
+167503724545,TYPE_DECL,,W.java:<global>,NAMESPACE_BLOCK,class W,1,W.java,W,LObject;,java.lang.Object,false,2,W,,,2
+167503724546,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,ANY,<empty>,,true,,ANY,,,-1
+167503724547,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,boolean,<empty>,,true,,boolean,,,-1
+167503724548,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,int,<empty>,,true,,int,,,-1
+167503724549,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,int[],<empty>,,true,,int[],,,-1
+167503724550,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,java.lang.Class,<empty>,,true,,Class,,,-1
+167503724551,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,java.lang.Object,<empty>,,true,,Object,,,-1
+167503724552,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,java.lang.String,<empty>,,true,,String,,,-1
+167503724553,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,long,<empty>,,true,,long,,,-1
+167503724554,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,void,<empty>,,true,,void,,,-1

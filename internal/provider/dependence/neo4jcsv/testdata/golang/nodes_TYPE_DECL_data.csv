@@ -1,0 +1,6 @@
+167503724544,TYPE_DECL,,,,w,1,/,w,<empty>,,false,1,w,,,1
+167503724545,TYPE_DECL,,,,"S struct {
+	F   int
+	Arr [4]int
+	M   map[string]int
+}",6,w.go,w.S,<empty>,,false,3,S,,,1

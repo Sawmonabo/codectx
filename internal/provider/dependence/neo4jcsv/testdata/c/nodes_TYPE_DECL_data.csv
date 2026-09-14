@@ -1,0 +1,9 @@
+167503724544,TYPE_DECL,,w.c:<global>,NAMESPACE_BLOCK,<global>,1,w.c,w.c:<global>,<empty>,,false,1,<global>,,,1
+167503724545,TYPE_DECL,,,,struct S { int f; int arr[4]; },1,w.c,S,<empty>,,false,1,S,,,1
+167503724546,TYPE_DECL,,w.c:<global>,TYPE_DECL,run,1,w.c,run,<empty>,,false,3,run,,,1
+167503724547,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,ANY,,<includes>,ANY,<empty>,,true,,ANY,,,-1
+167503724548,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,S*,,<includes>,S*,<empty>,,true,,S*,,,-1
+167503724549,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,int,,<includes>,int,<empty>,,true,,int,,,-1
+167503724550,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,int*,,<includes>,int*,<empty>,,true,,int*,,,-1
+167503724551,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,int[4],,<includes>,int[4],<empty>,,true,,int[4],,,-1
+167503724552,TYPE_DECL,,<includes>:<global>,NAMESPACE_BLOCK,void,,<includes>,void,<empty>,,true,,void,,,-1

@@ -1,0 +1,4 @@
+94489280512,LOCAL,,int x,7,,<empty>,4,x,,,1,,int
+94489280513,LOCAL,,int y,7,,<empty>,6,y,,,11,,int
+94489280514,LOCAL,,int g,5,,<empty>,2,g,,,2,,int
+94489280515,LOCAL,w.c:run:g,<global> g,47,,<empty>,5,g,,,0,,int
