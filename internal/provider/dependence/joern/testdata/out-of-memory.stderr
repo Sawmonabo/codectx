@@ -1,0 +1,28 @@
+2026-09-13 23:06:36.860 ERROR ExternalCommand$          Process exited with code 1.
+List(/opt/engine/gosrc2cpg, /work/src, -o, /work/run/oom2.bin)
+Input: cmd: `/opt/engine/gosrc2cpg /work/src -o /work/run/oom2.bin`, workingDir: /work, extraEnv: Map()
+Output: java.lang.OutOfMemoryError: Java heap space
+
+java.lang.RuntimeException: Could not generate CPG with language = golang and input = /work/src
+	at io.joern.joerncli.JoernParse$$anon$2.applyOrElse(JoernParse.scala:148)
+	at io.joern.joerncli.JoernParse$$anon$2.applyOrElse(JoernParse.scala:145)
+	at scala.util.Failure.recover(Try.scala:220)
+	at io.joern.joerncli.JoernParse$.generateCpg$$anonfun$2(JoernParse.scala:149)
+	at scala.util.Success.flatMap(Try.scala:244)
+	at io.joern.joerncli.JoernParse$.generateCpg(JoernParse.scala:141)
+	at io.joern.joerncli.JoernParse$.run$$anonfun$2$$anonfun$1(JoernParse.scala:90)
+	at scala.util.Success.flatMap(Try.scala:244)
+	at io.joern.joerncli.JoernParse$.run$$anonfun$2(JoernParse.scala:89)
+	at scala.util.Success.flatMap(Try.scala:244)
+	at io.joern.joerncli.JoernParse$.run(JoernParse.scala:88)
+	at io.joern.joerncli.JoernParse$.run$$anonfun$1(JoernParse.scala:78)
+	at scala.util.Success.flatMap(Try.scala:244)
+	at io.joern.joerncli.JoernParse$.run(JoernParse.scala:74)
+	at io.joern.joerncli.JoernParse$.main(JoernParse.scala:20)
+	at io.joern.joerncli.JoernParse.main(JoernParse.scala)
+Caused by: java.lang.RuntimeException: java.lang.OutOfMemoryError: Java heap space
+	at io.shiftleft.semanticcpg.utils.ExternalCommandResult.toTry(ExternalCommandResult.scala:46)
+	at io.shiftleft.semanticcpg.utils.ExternalCommandResult.verifySuccess(ExternalCommandResult.scala:35)
+	at io.joern.console.cpgcreation.CpgGenerator.runShellCommand$$anonfun$1(CpgGenerator.scala:46)
+	at io.joern.console.cpgcreation.CpgGenerator.runShellCommand$$anonfun$adapted$1(CpgGenerator.scala:47)
+	at scala.util.Try$.apply(Try.scala:195)
