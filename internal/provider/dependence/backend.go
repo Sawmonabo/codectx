@@ -25,6 +25,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 )
 
 // Engine identifies the resolved analysis payload. Name, Version and Digest
@@ -175,37 +176,42 @@ const (
 // are a function of the repository alone.
 var Families = []Family{FamilyC, FamilyGo, FamilyJava, FamilyJavaScript, FamilyPython, FamilyRust}
 
-// KeySet is the fact-key set lane A4's importer produces and consumes for a
-// delta import; nil requests a full import. The provider never inspects a key,
-// so the set is opaque here and the controller replaces this declaration with
-// an alias to the importer's concrete type when the two lanes merge.
-type KeySet any
+// The import contract is the export reader's own, not a mirror of it. A
+// mirror drifts: the declared one carried five of the ten option fields the
+// reader requires and six of its thirteen report fields, so no adapter built
+// from it could satisfy the reader's own validation. These are aliases, so
+// there is exactly one definition of an import's inputs and results and
+// Importer is satisfiable by the reader as written.
+//
+// The export format is not the engine. The engine's dialect lives behind
+// Backend; neo4jcsv reads the bulk-import CSV the export step writes and
+// names nothing of the engine, which is why this package may depend on it.
+type (
+	// KeySet is the fact-key set one import publishes and the next consumes
+	// for a delta; the zero value is the absent set and requests a full
+	// import.
+	KeySet = neo4jcsv.KeySet
+	// ImportOptions are the inputs of one import beyond the export itself.
+	ImportOptions = neo4jcsv.Options
+	// ImportReport is what one import published and what it refused.
+	ImportReport = neo4jcsv.Report
+)
 
-// ImportOptions mirrors the importer's Options exactly. Language carries the
-// Family, which is the six-frontend key the importer's reads/writes target
-// algebra is written against.
-type ImportOptions struct {
-	Language     string
-	UnitScopeKey string
-	ProjectRoot  string
-	Limits       provider.Limits
-	PreviousKeys KeySet
-}
-
-// ImportReport mirrors the importer's Report exactly.
-type ImportReport struct {
-	Nodes, Relations, Aliases   int
-	UnknownLabels               map[string]int
-	ExternalMethods             int
-	Changed, Unchanged, Removed int
-	Keys                        KeySet
-}
-
-// Importer streams one export into the sink. It is an interface here so this
-// lane's tests drive the provider without an engine and the controller binds
-// the real streaming reader at composition.
+// Importer streams one export into the sink. It is an interface so a test can
+// drive the provider's failure paths without an engine; the production
+// binding is defaultImporter, which New uses.
 type Importer interface {
 	Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts ImportOptions) (ImportReport, error)
+}
+
+// defaultImporter is the production importer: the export reader itself. With
+// the aliases above the adaptation is the identity, which is the point — a
+// translating adapter is where the two field lists would drift apart again.
+type defaultImporter struct{}
+
+func (defaultImporter) Import(ctx context.Context, exportDir string, res provider.Resolver,
+	sink provider.Sink, opts ImportOptions) (ImportReport, error) {
+	return neo4jcsv.Import(ctx, exportDir, res, sink, opts)
 }
 
 func invalid(msg string) *model.Error {
