@@ -29,13 +29,12 @@ const (
 // may have changed (Section 20.1).
 const zeroBoundHelp = " (0 uses the configured default)"
 
-// nameArgumentHelp is what these commands accept today. Ruling Q9 resolves a
-// name through PinnedReader.Nodes, which is storage rather than search, but no
-// accessor reaches a PinnedReader from here: Workspace.Query hands out a
-// *graph.Engine, whose every entry point takes an already-resolved NodeID. So a
-// name is rejected with the typed argument error rather than silently resolved
-// to the first candidate.
-const nameArgumentHelp = "Arguments are resolved node ids: 64 lowercase hex characters, as reported by a query that returned the node. A name is rejected rather than guessed at."
+// nameArgumentHelp describes the `<name-or-id>` argument. Ruling Q9: a name is
+// resolved through Workspace.ResolveNodes, which reads PinnedReader.Nodes --
+// storage rather than search, so this path does not make the graph depend on
+// search. A name several nodes carry is rejected with the candidates rather
+// than silently resolved to the first of them.
+const nameArgumentHelp = "Each argument is either a resolved node id (64 lowercase hex characters) or a symbol name. A name is matched against the exact name first and the exact qualified name second, in the pinned generation; a name that several nodes carry is rejected with the candidate ids rather than guessed at."
 
 // newQueryCommands builds the Section 18.1 query commands. They are returned as
 // a slice so the root registers them in one loop and this file never edits the
@@ -66,8 +65,12 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nodes, err := startNodes(args)
-			if err != nil {
+			// The arguments and the flags are screened before a workspace is
+			// opened: a rejection that first opened the database has already
+			// paid for work it will not do. The request itself can only be
+			// built once a name argument has been resolved against the pinned
+			// generation, so its own validation happens inside the callback.
+			if err := checkNodeArgs(args); err != nil {
 				return err
 			}
 			page, err := pageRequest(cmd)
@@ -78,21 +81,18 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			req := model.ReferenceRequest{
-				GenerationID:   gen,
-				NodeID:         nodes[0],
-				Operation:      model.ReferenceReferences,
-				SemanticSource: model.SemanticCanonical,
-				Page:           page,
-			}
-			// The request is validated before a workspace is opened: a
-			// rejection that first opened the database has already paid for
-			// work it will not do.
-			if err := req.Validate(); err != nil {
-				return err
-			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runQuery(cmd, gen, func(ctx context.Context, engine *graph.Engine) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+				req := model.ReferenceRequest{
+					GenerationID:   gen,
+					NodeID:         nodes[0],
+					Operation:      model.ReferenceReferences,
+					SemanticSource: model.SemanticCanonical,
+					Page:           page,
+				}
+				if err := req.Validate(); err != nil {
+					return err
+				}
 				result, err = engine.References(ctx, req)
 				return err
 			}); err != nil {
@@ -142,15 +142,22 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			req, err := graphRequest(cmd, args, direction, []model.RelationKind{model.RelCalls})
+			if err := checkNodeArgs(args); err != nil {
+				return err
+			}
+			gen, err := generationFlag(cmd)
 			if err != nil {
 				return err
 			}
-			if err := req.Validate(); err != nil {
-				return err
-			}
 			var result model.GraphResult
-			if err := runQuery(cmd, req.GenerationID, func(ctx context.Context, engine *graph.Engine) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+				req, err := graphRequest(cmd, nodes, direction, []model.RelationKind{model.RelCalls})
+				if err != nil {
+					return err
+				}
+				if err := req.Validate(); err != nil {
+					return err
+				}
 				if direction == model.DirectionIncoming {
 					result, err = engine.Callers(ctx, req)
 				} else {
@@ -192,8 +199,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			nodes, err := startNodes(args)
-			if err != nil {
+			if err := checkNodeArgs(args); err != nil {
 				return err
 			}
 			gen, err := generationFlag(cmd)
@@ -208,18 +214,18 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			req := model.PathRequest{
-				GenerationID: gen,
-				From:         nodes[0],
-				To:           nodes[1],
-				MaxDepth:     depth,
-				MaxVisited:   visited,
-			}
-			if err := req.Validate(); err != nil {
-				return err
-			}
 			var result model.PathResult
-			if err := runQuery(cmd, gen, func(ctx context.Context, engine *graph.Engine) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+				req := model.PathRequest{
+					GenerationID: gen,
+					From:         nodes[0],
+					To:           nodes[1],
+					MaxDepth:     depth,
+					MaxVisited:   visited,
+				}
+				if err := req.Validate(); err != nil {
+					return err
+				}
 				result, err = engine.ShortestPath(ctx, req)
 				return err
 			}); err != nil {
@@ -259,24 +265,31 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			// DirectionBoth is the request the ranking needs: Section 14.3
 			// makes the per-entry direction the discriminator, which only a
 			// two-way walk can populate.
-			base, err := graphRequest(cmd, args, model.DirectionBoth, nil)
+			if err := checkNodeArgs(args); err != nil {
+				return err
+			}
+			gen, err := generationFlag(cmd)
 			if err != nil {
 				return err
 			}
-			req := model.ImpactRequest{
-				GenerationID: base.GenerationID,
-				Start:        base.Start,
-				Direction:    base.Direction,
-				MaxDepth:     base.MaxDepth,
-				MaxVisited:   base.MaxVisited,
-				MaxEdges:     base.MaxEdges,
-				Page:         base.Page,
-			}
-			if err := req.Validate(); err != nil {
-				return err
-			}
 			var result model.ImpactResult
-			if err := runQuery(cmd, req.GenerationID, func(ctx context.Context, engine *graph.Engine) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+				base, err := graphRequest(cmd, nodes, model.DirectionBoth, nil)
+				if err != nil {
+					return err
+				}
+				req := model.ImpactRequest{
+					GenerationID: base.GenerationID,
+					Start:        base.Start,
+					Direction:    base.Direction,
+					MaxDepth:     base.MaxDepth,
+					MaxVisited:   base.MaxVisited,
+					MaxEdges:     base.MaxEdges,
+					Page:         base.Page,
+				}
+				if err := req.Validate(); err != nil {
+					return err
+				}
 				result, err = engine.Impact(ctx, req)
 				return err
 			}); err != nil {
@@ -296,32 +309,29 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 	return cmd
 }
 
-// startNodes reads the positional arguments as resolved node ids. Ruling Q9
-// would resolve a name through the pinned reader, which nothing reachable from
-// here holds, so a name is rejected with the typed argument error instead of
-// being silently resolved to one of several candidates.
-func startNodes(args []string) ([]model.NodeID, error) {
-	nodes := make([]model.NodeID, 0, len(args))
+// checkNodeArgs screens the positional arguments before any database is opened.
+// It cannot resolve a name -- that needs the pinned generation runQuery opens --
+// but it can reject an argument that is neither a resolved id nor a name worth
+// looking up, so an obviously wrong command line never pays for a workspace.
+func checkNodeArgs(args []string) error {
 	for _, arg := range args {
-		if !model.ValidHexID(arg) {
-			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: fmt.Sprintf("%q is not a resolved node id; this command takes %d lowercase hex characters",
+		if model.ValidHexID(arg) {
+			continue
+		}
+		if arg == "" || len(arg) > model.MaxIdentifierBytes || strings.ContainsAny(arg, "\x00\n\r\t") {
+			return (&model.Error{Code: model.CodeArgumentInvalid,
+				Message: fmt.Sprintf("%q is neither a resolved node id (%d lowercase hex characters) nor a symbol name",
 					clip(arg, 64), model.IDHexLen)}).WithDetail("argument", clip(arg, 64))
 		}
-		nodes = append(nodes, model.NodeID(arg))
 	}
-	return nodes, nil
+	return nil
 }
 
 // graphRequest builds the traversal request shared by the call commands and
 // impact. Direction and the relation allowlist are the command's own, never the
 // operator's: Section 4b pins them to the operation.
-func graphRequest(cmd *cobra.Command, args []string, direction model.Direction,
+func graphRequest(cmd *cobra.Command, nodes []model.NodeID, direction model.Direction,
 	relations []model.RelationKind) (model.GraphRequest, error) {
-	nodes, err := startNodes(args)
-	if err != nil {
-		return model.GraphRequest{}, err
-	}
 	gen, err := generationFlag(cmd)
 	if err != nil {
 		return model.GraphRequest{}, err
@@ -358,7 +368,8 @@ func graphRequest(cmd *cobra.Command, args []string, direction model.Direction,
 // generation and runs one query against it. The lease the engine holds is
 // released on every path, including cancellation, and a release failure never
 // masks the failure the query itself reported.
-func runQuery(cmd *cobra.Command, gen model.GenerationID, fn func(context.Context, *graph.Engine) error) (err error) {
+func runQuery(cmd *cobra.Command, gen model.GenerationID, args []string,
+	fn func(context.Context, *graph.Engine, []model.NodeID) error) (err error) {
 	repo, err := repoFlagValue(cmd)
 	if err != nil {
 		return err
@@ -380,6 +391,13 @@ func runQuery(cmd *cobra.Command, gen model.GenerationID, fn func(context.Contex
 		return queryFailure(err)
 	}
 	defer ws.Close()
+	// Names are resolved before the engine is built, against the same
+	// generation the engine will pin. An argument that is already an id is
+	// passed straight through, so an id-only invocation opens no extra lease.
+	nodes, err := ws.ResolveNodes(ctx, gen, args)
+	if err != nil {
+		return queryFailure(err)
+	}
 	engine, release, err := ws.Query(ctx, gen)
 	if err != nil {
 		return queryFailure(err)
@@ -389,7 +407,7 @@ func runQuery(cmd *cobra.Command, gen model.GenerationID, fn func(context.Contex
 			err = queryFailure(cerr)
 		}
 	}()
-	return queryFailure(fn(ctx, engine))
+	return queryFailure(fn(ctx, engine, nodes))
 }
 
 // queryFailure maps a bare context failure onto the Section 22 vocabulary. The

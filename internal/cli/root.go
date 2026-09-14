@@ -47,6 +47,11 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRefreshCommand(build))
 	root.AddCommand(newStatusCommand(build))
 	root.AddCommand(newWatchCommand(build))
+	// The Section 18.1 query commands are built as a set so query.go never
+	// edits the command tree it belongs to.
+	for _, c := range newQueryCommands(build) {
+		root.AddCommand(c)
+	}
 	return root
 }
 
