@@ -572,6 +572,48 @@ func TestGraphScenarios(t *testing.T) {
 			},
 		},
 
+		{
+			// resources.query_memory_bytes is the ONLY bound on how much of one
+			// frontier level is held in memory at once, and both the config and
+			// docs/queries.md promise it exists. A level that keeps accumulating
+			// past it restores the unbounded hub the bound was written to stop,
+			// and -- because the walk then still reports a clean finish -- the
+			// operator is never told the ceiling was crossed. n-wide's fan-out
+			// under a budget that holds only a handful of its rows is the
+			// smallest case that separates "stopped at the ceiling and said so"
+			// from "ignored the ceiling". The complementary half (the whole
+			// fan-out is carried under the 32 MiB default, untruncated) is held
+			// by the storage-clamp row above and is not repeated here.
+			name: "traverse/a level past the frontier byte budget truncates and says so",
+			run: func(t *testing.T, f *graphFixture) {
+				limits := fixtureLimits()
+				// Neither the page bound nor the edge budget may be what cuts
+				// this walk short: the frontier ceiling must be the only one
+				// n-wide's fan-out can reach.
+				limits.MaxPageItems = fixtureWideCount + 1
+				limits.FrontierBytes = 4096
+				e, err := New(Options{Adjacency: f, Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				got, err := e.Callees(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("Callees: %v", err)
+				}
+				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonFrontierBytes {
+					t.Fatalf("truncated=%v reason=%q, want true and %q: the frontier byte ceiling was crossed without disclosure",
+						got.Meta.Truncated, got.Meta.TruncationReason, reasonFrontierBytes)
+				}
+				if len(got.Relations) == 0 || len(got.Relations) >= fixtureWideCount {
+					t.Fatalf("returned %d of %d edges under a %d-byte frontier budget: the budget bounded nothing",
+						len(got.Relations), fixtureWideCount, limits.FrontierBytes)
+				}
+			},
+		},
+
 		// L2 PATH rows
 		{
 			// The two n-a -> n-z routes cost exactly the same (calls is 1 per
@@ -1099,6 +1141,68 @@ func TestGraphScenarios(t *testing.T) {
 				}
 			},
 		},
+
+		{
+			// The gate wait is admitted work like any other, so it must sit
+			// INSIDE the request deadline. If the deadline is installed after
+			// the Acquire -- or not at all -- `codectx refs` behind two busy
+			// graph slots waits forever: no timeout of its own, no cancellation,
+			// no output, and nothing in the answer to tell the operator why. The
+			// failure mode this row protects is that hang, which is why the
+			// load-bearing assertion is elapsed wall clock rather than the error
+			// code. Callers rides along because traverse.go installs the same
+			// deadline above the same Acquire and can regress the same way.
+			name: "a busy gate ends at the query deadline instead of blocking",
+			run: func(t *testing.T, f *graphFixture) {
+				const timeout = 50 * time.Millisecond
+				limits := fixtureLimits()
+				limits.QueryTimeout = timeout
+				e, err := New(Options{Adjacency: f, Limits: limits, Gate: blockingGate{}})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				calls := []struct {
+					name string
+					run  func() error
+				}{
+					{"References", func() error {
+						_, err := e.References(context.Background(), model.ReferenceRequest{
+							NodeID:         fixtureNodeID("n-b"),
+							Operation:      model.ReferenceReferences,
+							SemanticSource: model.SemanticCanonical,
+						})
+						return err
+					}},
+					{"Callers", func() error {
+						_, err := e.Callers(context.Background(), model.GraphRequest{
+							Start:     []model.NodeID{fixtureNodeID("n-b")},
+							Direction: model.DirectionIncoming,
+						})
+						return err
+					}},
+				}
+				for _, c := range calls {
+					done := make(chan error, 1)
+					start := time.Now()
+					go func() { done <- c.run() }()
+					select {
+					case err := <-done:
+						if elapsed := time.Since(start); elapsed > 100*timeout {
+							t.Fatalf("%s returned after %s under a %s query timeout: the gate wait outlives the deadline",
+								c.name, elapsed, timeout)
+						}
+						var typed *model.Error
+						if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+							t.Fatalf("%s behind a busy gate returned %v, want a %s error",
+								c.name, err, model.CodeResourceLimit)
+						}
+					case <-time.After(10 * time.Second):
+						t.Fatalf("%s is still waiting for a gate slot 10s into a %s query timeout: the deadline does not wrap the gate wait",
+							c.name, timeout)
+					}
+				}
+			},
+		},
 	}
 	for _, sc := range scenarios {
 		t.Run(sc.name, func(t *testing.T) {
@@ -1132,3 +1236,21 @@ func (unreadableAdjacency) Capabilities(context.Context) ([]model.CapabilityStat
 }
 
 var errUnreadableAdjacency = errors.New("this adjacency answers no read")
+
+// blockingGate is the process gate with every slot permanently busy: Acquire
+// waits for the caller's deadline and reports it as the same CTX_RESOURCE_LIMIT
+// the shipped graphGate reports (internal/app/query.go). A context carrying no
+// deadline therefore waits here forever, which is exactly the hang an engine
+// entry that acquires outside its deadline would inflict on `codectx refs`.
+// Release is unreachable -- Acquire never returns nil -- and exists only to
+// satisfy the graph.Gate interface.
+type blockingGate struct{}
+
+func (blockingGate) Acquire(ctx context.Context) error {
+	<-ctx.Done()
+	return &model.Error{Code: model.CodeResourceLimit, Retryable: true,
+		Message:     "every graph query slot was busy for the whole request deadline",
+		Remediation: "retry when fewer queries are running, or raise resources.max_concurrent_graph_queries"}
+}
+
+func (blockingGate) Release() {}
