@@ -412,6 +412,17 @@ func rootDeclaresDependenceProject(present func(string) bool) bool {
 			}
 		}
 	}
+	// The C/C++ family declares no project marker at all; its build files are
+	// closure markers, and a root carrying one (the out-of-source CMake layout
+	// keeps every source under src/) declares the family just as surely. Only
+	// that family's closure markers are admitted here: go.sum or yarn.lock
+	// alone must not select the engine when the project marker beside them
+	// already decides it.
+	for _, marker := range dependence.ClosureMarkers(dependence.FamilyC) {
+		if present(marker) {
+			return true
+		}
+	}
 	return false
 }
 

@@ -212,23 +212,21 @@ answer for two of the three providers but not the third:
 - **The dependence provider walks for sources.** Its C/C++ family declares no
   project marker at all — its unit is the repository itself, planned
   unconditionally — and its other families' units are found by walking the
-  tree. `--for-repo` therefore selects the graph engine and its JDK on two
+  tree. `--for-repo` therefore selects the graph engine and its JDK on three
   signals: a project marker of one of the other families at the root
   (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
   `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `Cargo.toml`), or a source file of any of the families lying at the root
-  itself.
+  `Cargo.toml`), a C or C++ build file at the root (`CMakeLists.txt`,
+  `compile_commands.json`, `Makefile` — the family's closure markers, which
+  also cover the out-of-source layout with sources under `src/`), or a source
+  file of any of the families lying at the root itself.
 
-  Two root shapes are therefore still under-served, and both fetch the graph
-  engine and its JDK at index time after a `--for-repo` prefetch reported
-  success: a root that declares nothing at all while its sources live further
-  down, and — the common one — a root that declares only a C or C++ build
-  (`CMakeLists.txt`, `compile_commands.json`, `Makefile`) with the sources
-  under `src/`. The second selects `clangd` here, from the language server's
-  root markers, but not the engine: those three files are the C/C++ family's
-  *closure* markers, not project markers, and the family has none. When
-  prefetching for an air-gapped runner from either shape, name the tools
-  explicitly or use `--all`.
+  One root shape is therefore still under-served and fetches the graph engine
+  and its JDK at index time after a `--for-repo` prefetch reported success: a
+  root that declares nothing at all while its sources live further down.
+  Closing it would need a walk, which this command refuses so a prefetch's
+  work stays bounded. When prefetching for an air-gapped runner from that
+  shape, name the tools explicitly or use `--all`.
 
 ```console
 $ codectx tools prefetch --for-repo .
