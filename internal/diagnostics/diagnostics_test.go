@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"context"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +64,140 @@ var scenarios = []scenario{
 		},
 	},
 	// L1 rows
+	{
+		// Failure mode: a figure this host cannot read is reported as a
+		// passing check with a zero value, so an operator reads "0 bytes
+		// free, minimum not breached" as a healthy disk. Section 22 requires
+		// an unmeasurable check be unavailable with a reason, and an
+		// unavailable check must not degrade the report either -- otherwise
+		// every host without the measurement reports a broken workspace.
+		name: "doctor reports an unmeasurable figure unavailable, never pass",
+		run: func(t *testing.T) {
+			opts := Options{Build: model.CurrentBuildInfo(), Workspace: &fakeWorkspace{free: nil}}
+			opts.Config.Resources.MinFreeDiskBytes = 1 << 30
+			rep, err := newTestService(t, opts).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			got := checkNamed(t, rep, checkFreeDisk)
+			if got.State != model.CheckUnavailable {
+				t.Fatalf("free space state is %q, want %q", got.State, model.CheckUnavailable)
+			}
+			if got.Detail == "" {
+				t.Fatal("an unavailable check must carry the reason it is unavailable")
+			}
+			if rep.State != model.CheckPass {
+				t.Fatalf("report state is %q; an unavailable measurement is an answer, not a defect", rep.State)
+			}
+		},
+	},
+	{
+		// Failure mode: the expensive integrity pass runs on every ordinary
+		// call, so `version`, `status` and `search` each pay for a full
+		// database and content-addressed-storage scan. Section 22's last line
+		// reserves that work for --deep, and the fake records what the store
+		// was actually asked for.
+		name: "doctor scans the database only when deep is asked for",
+		run: func(t *testing.T) {
+			ordinary := &fakeStore{}
+			if _, err := newTestService(t, Options{Store: ordinary}).Doctor(context.Background(), model.DoctorRequest{}); err != nil {
+				t.Fatalf("ordinary Doctor: %v", err)
+			}
+			if ordinary.checks != 1 || ordinary.deepChecks != 0 {
+				t.Fatalf("an ordinary doctor ran %d quick and %d deep integrity checks, want 1 and 0", ordinary.checks, ordinary.deepChecks)
+			}
+			deep := &fakeStore{}
+			if _, err := newTestService(t, Options{Store: deep}).Doctor(context.Background(), model.DoctorRequest{Deep: true}); err != nil {
+				t.Fatalf("deep Doctor: %v", err)
+			}
+			if deep.deepChecks != 1 || deep.checks != 0 {
+				t.Fatalf("a deep doctor ran %d quick and %d deep integrity checks, want 0 and 1", deep.checks, deep.deepChecks)
+			}
+			if ordinary.sampleLimit >= deep.sampleLimit {
+				t.Fatalf("ordinary sampled %d objects and deep sampled %d; deep must widen the sample", ordinary.sampleLimit, deep.sampleLimit)
+			}
+		},
+	},
+	{
+		// Failure mode: a probe's own message is passed through into the
+		// report, so the one command an operator runs on a sick workspace
+		// prints SQL text, the private absolute data directory and an
+		// analyzer's product name. Section 21 closes that channel everywhere
+		// else; a check's detail and remediation are generated from the typed
+		// code alone.
+		name: "doctor never repeats a probe's own text",
+		run: func(t *testing.T) {
+			leak := &model.Error{Code: model.CodeStorageCorrupt,
+				Message:     `quick_check: SELECT * FROM search_fts failed at /home/private/.local/share/codectx/codectx.db (acme-analyzer 4.1)`,
+				Remediation: "inspect /home/private/.local/share/codectx by hand"}
+			opts := Options{
+				Store:     &fakeStore{err: leak},
+				Workspace: &fakeWorkspace{writeErr: leak, freeErr: leak},
+				Sampler:   &fakeSampler{err: leak},
+				Toolchain: &fakeToolchain{err: leak},
+			}
+			rep, err := newTestService(t, opts).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("a failing probe must produce a report, not an error: %v", err)
+			}
+			if rep.State != model.CheckFail {
+				t.Fatalf("report state is %q, want %q when every probe failed", rep.State, model.CheckFail)
+			}
+			for _, c := range rep.Checks {
+				for _, secret := range []string{"SELECT", "search_fts", "quick_check", "/home/private", "acme-analyzer"} {
+					for field, value := range map[string]string{"detail": c.Detail, "remediation": c.Remediation, "code": c.Code} {
+						if strings.Contains(value, secret) {
+							t.Fatalf("check %q %s repeated %q from the probe's own message: %q", c.Name, field, secret, value)
+						}
+					}
+				}
+			}
+			if got := checkNamed(t, rep, checkStorageIntegrity); got.Code != model.CodeStorageCorrupt || got.Remediation == "" {
+				t.Fatalf("the typed code and a generated remediation must survive: %+v", got)
+			}
+		},
+	},
+	{
+		// Failure mode: `--scip-index typo.scip` plans no unit, the command
+		// exits 0, and the repository reads as fully indexed while its
+		// cross-file symbols are missing -- a typo'd path is today
+		// indistinguishable from no path at all. The three states must carry
+		// different states and codes, and a build that cannot tell them apart
+		// must say so rather than pass.
+		name: "doctor distinguishes a supplied index that resolved to nothing",
+		run: func(t *testing.T) {
+			run := func(t *testing.T, store StoreReader) model.DoctorCheck {
+				t.Helper()
+				rep, err := newTestService(t, Options{Store: store}).Doctor(context.Background(), model.DoctorRequest{})
+				if err != nil {
+					t.Fatalf("Doctor: %v", err)
+				}
+				return checkNamed(t, rep, checkSuppliedIndex)
+			}
+			none := run(t, &fakeStore{active: 7})
+			imported := run(t, &fakeStore{active: 7, supplied: []SuppliedIndex{{Path: "out/index.scip", Resolved: true}}})
+			typo := run(t, &fakeStore{active: 7, supplied: []SuppliedIndex{{Path: "out/indx.scip"}}})
+			if none.State != model.CheckPass || none.Code != "" {
+				t.Fatalf("no supplied index must pass with no code, got %+v", none)
+			}
+			if imported.State != model.CheckPass {
+				t.Fatalf("an imported supplied index must pass, got %+v", imported)
+			}
+			if typo.State == none.State || typo.Code == none.Code {
+				t.Fatalf("a path that resolved to nothing reports %q/%q, indistinguishable from no path at all %q/%q",
+					typo.State, typo.Code, none.State, none.Code)
+			}
+			if typo.Code != model.CodeScopeIncomplete || !strings.Contains(typo.Detail, "out/indx.scip") {
+				t.Fatalf("the unresolved path and its code must be named: %+v", typo)
+			}
+			// A store that records no supplied path cannot tell the two
+			// apart, and must report that rather than pass silently -- the
+			// composition root's adapter has to forward these probes.
+			if bare := run(t, bareStore{}); bare.State != model.CheckUnavailable {
+				t.Fatalf("a store with no supplied-index probe reports %q, want %q", bare.State, model.CheckUnavailable)
+			}
+		},
+	},
 	// L2 rows
 	// L3a rows
 	// L3b rows
@@ -96,6 +231,54 @@ type fakeStore struct {
 	// store for, which is how a row proves an ordinary call runs no scan.
 	checks     int
 	deepChecks int
+	// L1: the two optional probes doctor.go asserts for. supplied is what
+	// SuppliedIndexes reports; sampleLimit records the sample size the caller
+	// asked for, so a row can prove --deep widens it.
+	supplied    []SuppliedIndex
+	sampleLimit int
+}
+
+// SampleBlobs is the optional hash source for the content-addressed-storage
+// check (L1). It reports no hashes: a store with nothing retained is a
+// legitimate state, and the rows that care assert on sampleLimit.
+func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) {
+	f.sampleLimit = limit
+	return nil, f.err
+}
+
+// SuppliedIndexes is the optional supplied-index probe (L1).
+func (f *fakeStore) SuppliedIndexes(context.Context, model.GenerationID) ([]SuppliedIndex, error) {
+	return f.supplied, f.err
+}
+
+// bareStore is a StoreReader implementing the frozen four methods and none of
+// the optional probes, which is what the composition root hands diagnostics if
+// its adapter forgets to forward them (L1). It exists to prove that case
+// reports unavailable with a reason rather than passing silently.
+type bareStore struct{}
+
+func (bareStore) Check(context.Context, bool) error         { return nil }
+func (bareStore) Stats(context.Context) (StoreStats, error) { return StoreStats{}, nil }
+func (bareStore) Blob(context.Context, string) (model.BlobRecord, error) {
+	return model.BlobRecord{}, nil
+}
+
+func (bareStore) ActiveGeneration(context.Context, model.RepositoryID) (model.GenerationID, error) {
+	return 7, nil
+}
+
+// checkNamed returns the one check called name, failing the row if the report
+// does not carry it: a check that silently stopped being produced would
+// otherwise read as a passing assertion.
+func checkNamed(t *testing.T, r model.DoctorReport, name string) model.DoctorCheck {
+	t.Helper()
+	for _, c := range r.Checks {
+		if c.Name == name {
+			return c
+		}
+	}
+	t.Fatalf("report carries no check named %q", name)
+	return model.DoctorCheck{}
 }
 
 func (f *fakeStore) Check(_ context.Context, deep bool) error {
