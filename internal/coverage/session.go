@@ -39,13 +39,13 @@ const openRequestHashDomain = "codectx.coverage.open.v1"
 // without a continuation when no lease holder is available.
 func New(o Options) (*Service, error) {
 	if o.Sessions == nil {
-		return nil, notImplementedf(model.CodeInternal, "coverage service was built without a session store")
+		return nil, typedErrf(model.CodeInternal, "coverage service was built without a session store")
 	}
 	if o.OpenSource == nil {
-		return nil, notImplementedf(model.CodeInternal, "coverage service was built without a source opener")
+		return nil, typedErrf(model.CodeInternal, "coverage service was built without a source opener")
 	}
 	if o.Signer == nil {
-		return nil, notImplementedf(model.CodeInternal, "coverage service was built without a token signer")
+		return nil, typedErrf(model.CodeInternal, "coverage service was built without a token signer")
 	}
 	if err := checkLimits(o.Limits); err != nil {
 		return nil, err
@@ -96,18 +96,18 @@ func checkLimits(l Limits) error {
 		{"receipt_ttl", int64(l.ReceiptTTL)},
 	} {
 		if b.value <= 0 {
-			return notImplementedf(model.CodeInternal,
+			return typedErrf(model.CodeInternal,
 				"coverage limit %s is %d; every bound must be resolved to a positive value before the service is built",
 				b.name, b.value)
 		}
 	}
 	if l.MaxReceiptsPerConfirmation > model.MaxReceiptsPerConfirmation {
-		return notImplementedf(model.CodeInternal,
+		return typedErrf(model.CodeInternal,
 			"coverage limit max_receipts_per_confirmation is %d, above the %d the store enforces",
 			l.MaxReceiptsPerConfirmation, model.MaxReceiptsPerConfirmation)
 	}
 	if l.MaxPageItems > model.MaxPageItems {
-		return notImplementedf(model.CodeInternal,
+		return typedErrf(model.CodeInternal,
 			"coverage limit max_page_items is %d, above the %d a page may carry",
 			l.MaxPageItems, model.MaxPageItems)
 	}
@@ -130,7 +130,7 @@ func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manife
 		return model.SessionStatus{}, err
 	}
 	if !model.ValidHexID(string(manifest)) {
-		return model.SessionStatus{}, notImplementedf(model.CodeArgumentInvalid,
+		return model.SessionStatus{}, typedErrf(model.CodeArgumentInvalid,
 			"context.manifest_id is not a well-formed identifier")
 	}
 	id, err := model.NewRandomID()
@@ -327,7 +327,7 @@ func (s *Service) resumeStatus(token string, rec sqlite.SessionRecord) (model.Fi
 // page resumed after the session is gone would describe coverage nobody holds.
 func (s *Service) statusCursor(ctx context.Context, rec sqlite.SessionRecord, last model.FileID) (token, why string, err error) {
 	if last == "" {
-		return "", "", notImplementedf(model.CodeInternal, "a status page ended without a keyset position")
+		return "", "", typedErrf(model.CodeInternal, "a status page ended without a keyset position")
 	}
 	if s.leases == nil {
 		return "", "this workspace does not retain coverage continuations", nil
@@ -434,7 +434,7 @@ func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedV
 // resolved nothing as fully read.
 func (s *Service) status(ctx context.Context, rec sqlite.SessionRecord) (model.SessionStatus, error) {
 	if rec.ID == "" {
-		return model.SessionStatus{}, notImplementedf(model.CodeInternal,
+		return model.SessionStatus{}, typedErrf(model.CodeInternal,
 			"coverage status was asked to describe a session that was never loaded")
 	}
 	required, fullyServed, waived, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)

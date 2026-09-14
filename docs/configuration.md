@@ -157,7 +157,7 @@ All **user** trust.
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
-| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. |
+| `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |
 
 ### The data directory
 
@@ -299,6 +299,11 @@ All **user** trust.
 | `session_ttl` | `"24h"` | Lifetime of a coverage session. |
 | `max_receipts_per_confirmation` | `16` | Receipts per confirmation batch. |
 | `max_unconfirmed_chunks_per_session` | `64` | Issued but unconfirmed chunks per session. |
+
+There is no receipt lifetime of its own: a source receipt lives as long as
+`storage.query_cursor_ttl`, which the `[storage]` table above describes. A
+session that reads for longer than that must acknowledge as it goes, because an
+expired receipt cannot be confirmed and its bytes earn no coverage.
 
 ## `[mcp]` — server transport
 

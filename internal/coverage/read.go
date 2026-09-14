@@ -24,9 +24,9 @@ import (
 //     the cap is confirming, and counting first would make a client that echoes
 //     its receipts in the same call unable to ever recover.
 //  3. The cap itself, as backpressure.
-//  4. maxRawForWire sizes the chunk once, from the real checkpoint prefix, so
-//     the slicer and the serializer cannot disagree and a maximum-size chunk
-//     that does not start on a checkpoint does not blow the CAS read ceiling.
+//  4. maxRawForWire sizes the chunk once, so the slicer and the serializer
+//     cannot disagree and the window stays within the one span CAS.ReadRange
+//     admits, wherever in the file the offset falls.
 //  5. Source.Read for the verified bytes and positions, source.PlanChunk for
 //     every boundary rule.
 //  6. IssueChunk persists the issued row first; only then is the receipt signed
@@ -40,6 +40,14 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 	if err := req.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
+
+	// The one endpoint that touches the CAS and the filesystem runs under the
+	// same resources.query_timeout deadline as every other request: the CLI
+	// leaves a zero --timeout alone precisely so this applies, and checkLimits
+	// guarantees the bound is positive.
+	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	defer cancel()
+
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
@@ -87,19 +95,7 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 			Message: "the snapshot source opener returned no source and no error"}
 	}
 
-	// Where the view will really start reading. The prefix between it and the
-	// offset is read and verified along with the chunk, so it spends the same
-	// CAS budget and maxRawForWire has to subtract it.
-	checkpoint, err := src.Checkpoint(ctx, req.FileID, req.Offset)
-	if err != nil {
-		return model.ReadChunkResponse{}, err
-	}
-	if checkpoint > req.Offset {
-		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
-			"checkpoint at byte %d is after the %d-byte read offset it precedes", checkpoint, req.Offset)}
-	}
-	prefix := req.Offset - checkpoint
-	raw, err := maxRawForWire(req.MaxBytes, req.Offset, prefix, s.limits)
+	raw, err := maxRawForWire(req.MaxBytes, req.Offset, s.limits)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
@@ -108,46 +104,53 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 		end = size
 	}
 
-	// The read starts at the checkpoint rather than the offset. The bytes are
-	// the same ones the view would read either way -- it seeks back to this same
-	// checkpoint -- but asking for them explicitly yields a window that begins
-	// on a line boundary, which is the one thing source.NewCursorAt needs to
-	// report whole-file lines and columns without rescanning from byte zero.
-	// That matters because PlanChunk may end the chunk short of the window, and
-	// the response's line range has to describe the chunk, not the window.
-	window, _, err := src.Read(ctx, req.FileID, model.ByteRange{Start: checkpoint, End: end})
+	// The view returns exactly [offset, end) with the whole-file position of
+	// each end: it walks back to the nearest line checkpoint itself, in spans
+	// of its own, so nothing here has to reserve room for that prefix. Its
+	// start position is the one thing source.NewCursorAt needs to report
+	// whole-file lines and columns over the window without rescanning from byte
+	// zero, which matters because PlanChunk may end the chunk short of the
+	// window and the response's line range has to describe the chunk.
+	window, _, err := src.Read(ctx, req.FileID, model.ByteRange{Start: req.Offset, End: end})
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	if uint64(len(window.Bytes)) != end-checkpoint {
+	if uint64(len(window.Bytes)) != end-req.Offset {
 		return model.ReadChunkResponse{}, &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(
-			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-checkpoint, checkpoint, end)}
-	}
-	cursor, err := source.NewCursorAt(window.Bytes, checkpoint, window.Start.Line)
-	if err != nil {
-		return model.ReadChunkResponse{}, err
+			"the source returned %d bytes for the %d-byte window [%d,%d)", len(window.Bytes), end-req.Offset, req.Offset, end)}
 	}
 	// PlanChunk owns every boundary rule -- the rune boundary, the complete
 	// line, the over-budget split, the base64 fallback and the zero-length end
 	// of file -- and needs exactly [offset, min(offset+raw, size)).
-	chunk, err := source.PlanChunk(window.Bytes[prefix:], req.Offset, size, raw)
+	chunk, err := source.PlanChunk(window.Bytes, req.Offset, size, raw)
 	if err != nil {
 		return model.ReadChunkResponse{}, err
 	}
-	start, err := cursor.PositionAt(chunk.Range.Start)
-	if err != nil {
-		return model.ReadChunkResponse{}, err
-	}
-	stop, err := cursor.PositionAt(chunk.Range.End)
-	if err != nil {
-		return model.ReadChunkResponse{}, err
+	// The window begins at the chunk's own start, so its start position is the
+	// chunk's; only the end may fall short of the window and has to be located.
+	start := window.Start
+	stop := window.End
+	if chunk.Range.End != end {
+		cursor, err := source.NewCursorAt(window.Bytes, req.Offset, window.Start.Line)
+		if err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if stop, err = cursor.PositionAt(chunk.Range.End); err != nil {
+			return model.ReadChunkResponse{}, err
+		}
+		if stop.Line == window.Start.Line {
+			// The cursor counts columns from the window it was handed, which
+			// begins mid-line whenever the offset does; the view already
+			// resolved that offset's real column.
+			stop.Column += window.Start.Column
+		}
 	}
 
-	// window.Bytes aliases the view's own checkpoint-prefixed buffer, so nothing
-	// that outlives this call may hold it. Both encodings below copy the bytes
-	// into a fresh string, which is why no clone is taken: cloning would spend a
-	// second copy, and keeping the slice would pin the whole prefixed window.
-	body := window.Bytes[prefix : prefix+(chunk.Range.End-chunk.Range.Start)]
+	// window.Bytes aliases the view's own buffer, so nothing that outlives this
+	// call may hold it. Both encodings below copy the bytes into a fresh string,
+	// which is why no clone is taken: cloning would spend a second copy, and
+	// keeping the slice would pin the whole window.
+	body := window.Bytes[:chunk.Range.End-chunk.Range.Start]
 	content := string(body)
 	if chunk.Encoding == model.EncodingBase64 {
 		content = base64.StdEncoding.EncodeToString(body)

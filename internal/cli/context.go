@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -475,20 +474,21 @@ func contextOffsetValue(cmd *cobra.Command) (uint64, error) {
 	return uint64(v), nil
 }
 
-// contextMaxBytesValue reads --max-bytes. The request field is a uint32, so an
-// out-of-range value is rejected rather than silently wrapped into a small
-// chunk size the operator never asked for. A value above the configured ceiling
-// is not rejected here: Section 16.2 clamps it, and the service owns that
+// contextMaxBytesValue reads --max-bytes. The bound is the one
+// ReadChunkRequest.Validate enforces and the flag's own help states, so an
+// out-of-range value is named for what it is here rather than rejected a layer
+// later against a different number. A value above the *configured* ceiling is
+// not rejected at all: Section 16.2 clamps it, and the service owns that
 // ceiling.
 func contextMaxBytesValue(cmd *cobra.Command) (uint32, error) {
 	v, err := int64Flag(cmd, contextMaxBytesFlag)
 	if err != nil {
 		return 0, err
 	}
-	if v < 0 || v > math.MaxUint32 {
+	if v < 0 || v > model.MaxRawChunkBytes {
 		return 0, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: fmt.Sprintf("--%s is %d; it must be between 0 and %d, where 0 uses the configured chunk size",
-				contextMaxBytesFlag, v, int64(math.MaxUint32))}
+				contextMaxBytesFlag, v, int64(model.MaxRawChunkBytes))}
 	}
 	return uint32(v), nil
 }
