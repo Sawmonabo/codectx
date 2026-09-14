@@ -122,8 +122,29 @@ func verifyCursor(c pagination.Cursor, b model.Binding, queryHash string) error 
 	return nil
 }
 
-// spoolHits writes the hits that remain after this page into a fresh spool and
-// returns the id the next cursor carries, or "" when nothing remains.
+// spoolMetaMarker discriminates the leading record of a search spool from a
+// spooled hit. A model.SearchHit unmarshals into spoolMeta as zero values, so
+// without the marker a spool written by an older build would silently lose its
+// first hit instead of being refused.
+const spoolMetaMarker = "codectx.search.page.v1"
+
+// spoolMeta is the leading record of every search spool: the answer-level
+// facts a continuation must report as the first page did. QueryMeta.Truncated
+// describes the whole answer, not one page, and a continuation reads its hits
+// from the spool rather than from the tiers, so without this record every page
+// after the first would report a complete answer (Section 14.3, and the
+// max_page_items row of docs/configuration.md). The cursor cannot carry it:
+// pagination.Cursor is frozen and its SpoolHeader never reaches the read
+// callback.
+type spoolMeta struct {
+	Spool            string `json:"spool"`
+	Truncated        bool   `json:"truncated"`
+	TruncationReason string `json:"truncation_reason,omitempty"`
+}
+
+// spoolHits writes the answer's metadata and the hits that remain after this
+// page into a fresh spool and returns the id the next cursor carries, or ""
+// when nothing remains.
 //
 // Search cannot page by keyset: ranking is global over the candidate set, so a
 // keyset scan would have to re-rank the whole corpus to find where page 2
@@ -134,7 +155,13 @@ func verifyCursor(c pagination.Cursor, b model.Binding, queryHash string) error 
 // therefore spools exactly its own remainder and names the new spool: the
 // previous spool is left alone until its lease expires, which keeps replaying
 // an earlier cursor deterministic and non-destructive.
-func spoolHits(spools *pagination.Spools, c pagination.Cursor, hits []model.SearchHit) (string, error) {
+//
+// The superseded spools of a walk therefore accumulate against the shared
+// spool budget until their leases expire. That is a ledgered Task 20 residual
+// (offset-carrying cursors, once Cursor is unfrozen); what must never happen
+// is a silent failure, so exhausting the budget is Spools.reserve's typed
+// CTX_RESOURCE_LIMIT and it is returned from here unchanged.
+func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, hits []model.SearchHit) (string, error) {
 	if len(hits) == 0 {
 		return "", nil
 	}
@@ -148,8 +175,14 @@ func spoolHits(spools *pagination.Spools, c pagination.Cursor, hits []model.Sear
 	if err != nil {
 		return "", err
 	}
+	meta.Spool = spoolMetaMarker
+	records := make([]any, 0, len(hits)+1)
+	records = append(records, meta)
 	for _, h := range hits {
-		record, err := json.Marshal(h)
+		records = append(records, h)
+	}
+	for _, r := range records {
+		record, err := json.Marshal(r)
 		if err != nil {
 			releaseSpool(spools, sp)
 			return "", &model.Error{Code: model.CodeInternal, Message: "search: spooling a result: " + err.Error()}
@@ -175,18 +208,32 @@ func releaseSpool(spools *pagination.Spools, sp *pagination.Spool) {
 	spools.Release(sp.ID())
 }
 
-// readSpool replays the hits a cursor's spool holds, in ranked order. Spools
-// validates the header against the cursor and the lease against now, so an
-// expired lease, a released spool or a spool minted for another query is
-// CTX_CURSOR_INVALID here rather than a wrong page.
-func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time) ([]model.SearchHit, error) {
+// readSpool replays the metadata record and the hits a cursor's spool holds,
+// in ranked order. Spools validates the header against the cursor and the
+// lease against now, so an expired lease, a released spool or a spool minted
+// for another query is CTX_CURSOR_INVALID here rather than a wrong page.
+func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time) (spoolMeta, []model.SearchHit, error) {
 	if spools == nil {
-		return nil, &model.Error{Code: model.CodeInternal, Message: "search: no spool store is configured"}
+		return spoolMeta{}, nil, &model.Error{Code: model.CodeInternal, Message: "search: no spool store is configured"}
 	}
+	var meta spoolMeta
 	var hits []model.SearchHit
+	first := true
 	err := spools.Open(ctx, c, now, func(record []byte) error {
 		if err := ctx.Err(); err != nil {
 			return contextErr(err)
+		}
+		if first {
+			first = false
+			if err := json.Unmarshal(record, &meta); err != nil || meta.Spool != spoolMetaMarker {
+				// A spool whose leading record is not this build's metadata
+				// record is one this build cannot serve a faithful page from:
+				// serving it would drop a hit and misreport truncation.
+				return &model.Error{Code: model.CodeCursorInvalid,
+					Message:     "the cursor names a result page this build cannot replay",
+					Remediation: "restart the query"}
+			}
+			return nil
 		}
 		var h model.SearchHit
 		if err := json.Unmarshal(record, &h); err != nil {
@@ -196,7 +243,7 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return spoolMeta{}, nil, err
 	}
-	return hits, nil
+	return meta, hits, nil
 }

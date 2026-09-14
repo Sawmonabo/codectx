@@ -50,6 +50,7 @@ type Service struct {
 	leases  *pagination.Leases
 	content ContentReader
 	lexical *lexicalTier
+	maxPage int
 	timeout time.Duration
 	ttl     time.Duration
 	now     func() time.Time
@@ -99,6 +100,7 @@ func New(o Options) (*Service, error) {
 		leases:  pagination.NewLeases(o.Store, ttl),
 		content: o.Content,
 		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
+		maxPage: o.Resources.MaxPageItems,
 		timeout: timeout,
 		ttl:     ttl,
 		now:     now,
@@ -117,11 +119,18 @@ func optionErr(what string) error {
 // released on the path that acquired it.
 func (s *Service) Close() error { return nil }
 
-// pageLimit resolves a request's page bound. Zero means the endpoint default,
-// which Section 20.1 fixes as the configured maximum, never "unlimited".
-func pageLimit(limit int) int {
-	if limit <= 0 || limit > model.MaxPageItems {
-		return model.MaxPageItems
+// pageLimit resolves a request's page bound against resources.max_page_items,
+// which New validated and the service kept. Zero means the endpoint default,
+// which Section 20.1 fixes as the configured maximum, never "unlimited"; a
+// request above it is clamped to it, so lowering the key really does lower the
+// pages this service serves rather than only the model ceiling.
+func (s *Service) pageLimit(limit int) int {
+	maximum := s.maxPage
+	if maximum <= 0 || maximum > model.MaxPageItems {
+		maximum = model.MaxPageItems
+	}
+	if limit <= 0 || limit > maximum {
+		return maximum
 	}
 	return limit
 }
@@ -172,14 +181,20 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		if err := verifyCursor(cursor, binding, hash); err != nil {
 			return empty, err
 		}
-		if hits, err = readSpool(ctx, s.spools, cursor, now); err != nil {
+		var meta spoolMeta
+		if meta, hits, err = readSpool(ctx, s.spools, cursor, now); err != nil {
 			return empty, err
 		}
+		// The answer-level truncation the FIRST page computed. A continuation
+		// reads hits from the spool, never from the tiers, so it has nothing
+		// of its own to compute it from and must carry it forward or report a
+		// complete answer for an answer that is not.
+		truncated, reason = meta.Truncated, meta.TruncationReason
 	} else if hits, truncated, reason, err = s.rank(ctx, reader, req, filter); err != nil {
 		return empty, err
 	}
 
-	limit := pageLimit(req.Page.Limit)
+	limit := s.pageLimit(req.Page.Limit)
 	rest := []model.SearchHit(nil)
 	if len(hits) > limit {
 		hits, rest = hits[:limit], hits[limit:]
@@ -189,7 +204,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		return empty, err
 	}
 	if len(rest) > 0 {
-		if meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, rest); err != nil {
+		if meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, rest); err != nil {
 			return empty, err
 		}
 	}
@@ -215,13 +230,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 // continuation whose lease is gone is refused by the spool store and leaves
 // the generation free for retention to collect. The lease expires with the
 // cursor, so nothing here pins a generation for longer than the token lives.
-func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, rest []model.SearchHit) (string, error) {
+func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, rest []model.SearchHit) (string, error) {
 	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
 	if err != nil {
 		return "", err
 	}
 	next := newCursor(endpointSearch, b, lease.ID, hash, now.Add(s.ttl))
-	id, err := spoolHits(s.spools, next, rest)
+	id, err := spoolHits(s.spools, next, answer, rest)
 	if err != nil {
 		s.releaseLease(ctx, lease.ID)
 		return "", err
@@ -346,6 +361,32 @@ func (s *Service) hydrate(ctx context.Context, reader *sqlite.PinnedReader, hits
 	return nil
 }
 
+// hydrateNodes fills the source range of every resolved candidate that has a
+// byte interval, through the same bounded CAS window the search page uses. A
+// node with none -- a manifest dependency has no declaration site -- keeps a
+// nil Range, which the human table renders as "-" rather than as line 0.
+func (s *Service) hydrateNodes(ctx context.Context, reader *sqlite.PinnedReader, nodes []model.Node, spans []*model.ByteRange) error {
+	if len(nodes) != len(spans) {
+		return &model.Error{Code: model.CodeInternal,
+			Message: "search: resolution produced " + strconv.Itoa(len(spans)) + " byte ranges for " + strconv.Itoa(len(nodes)) + " candidates"}
+	}
+	var h *hydrator
+	for i := range nodes {
+		if spans[i] == nil {
+			continue
+		}
+		if h == nil {
+			h = newHydrator(reader, s.store, s.content)
+		}
+		rng, err := h.hydrate(ctx, nodes[i].FileID, *spans[i])
+		if err != nil {
+			return err
+		}
+		nodes[i].Range = rng
+	}
+	return nil
+}
+
 // lexicalCandidates streams the lexical tier into the collector, hydrating the
 // candidate documents in batches because the tier emits rowids and the sort
 // tuple needs a path, a start byte and an identity.
@@ -372,7 +413,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 			d, ok := byRowID[h.RowID]
 			// SearchDocuments omits rowids that are not visible; a candidate
 			// with no document has no path to filter and no identity to fold.
-			if !ok || !filter.keep(d.Path) || !matchesKind(d.Kind, req.Kinds) {
+			if !ok || !filter.keep(d.Path) || !matchesKinds(d.Kind, req.Kinds) {
 				continue
 			}
 			r := ranked{Tier: model.TierLexicalFTS, ScoreMicros: h.ScoreMicros, Path: d.Path,
@@ -457,20 +498,6 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // model.MaxPageItems, so a full tier means there were more candidates than one
 // answer can carry.
 const truncationExactTierFull = "an exact or prefix tier returned its maximum number of candidates; narrow the query or add a filter"
-
-// matchesKind applies the request's kind filter to a lexical document, which
-// storage cannot filter by kind inside the MATCH.
-func matchesKind(kind model.NodeKind, kinds []model.NodeKind) bool {
-	if len(kinds) == 0 {
-		return true
-	}
-	for _, k := range kinds {
-		if kind == k {
-			return true
-		}
-	}
-	return false
-}
 
 // hitFilter is SearchRequest.Languages and .Paths, applied uniformly to every
 // tier -- including the lexical candidates, before they are scored -- so the
@@ -559,8 +586,11 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 		}
 	}
 
-	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, pageLimit(req.Page.Limit))
+	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, s.pageLimit(req.Page.Limit))
 	if err != nil {
+		return empty, err
+	}
+	if err := s.hydrateNodes(ctx, reader, result.Nodes, result.Spans); err != nil {
 		return empty, err
 	}
 	meta := model.QueryMeta{Binding: binding}

@@ -4,6 +4,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -19,9 +20,22 @@ import (
 // unavailable row for semantic_source=lsp. The caller pins the generation, signs
 // LastKey into a cursor and supplies Binding and the reader's own completeness.
 type resolvePage struct {
-	Nodes        []model.Node
+	Nodes []model.Node
+	// Spans is the declaration byte interval of each node in Nodes, index for
+	// index, nil where the node has none. The caller turns it into
+	// model.Node.Range through the same bounded CAS window the search page
+	// uses; carrying it here keeps the hydration out of the tier walk, which
+	// has no content reader.
+	Spans        []*model.ByteRange
 	LastKey      string
 	Completeness []model.CapabilityState
+}
+
+// add appends one candidate and the byte interval its position is hydrated
+// from, keeping the two slices index for index.
+func (p *resolvePage) add(n sqlite.StoredNode) {
+	p.Nodes = append(p.Nodes, n.Node)
+	p.Spans = append(p.Spans, n.Bytes)
 }
 
 // resolveSymbols answers one page of a SymbolRequest over the non-lexical
@@ -35,10 +49,11 @@ type resolvePage struct {
 // several nodes with a cursor, never a silently chosen first candidate
 // (Section 14.1).
 //
-// model.Node.Range stays nil: StoredNode carries byte intervals by design and
-// position hydration is the paged, CAS-bounded step Q10 assigns to the search
-// page builder. Resolve's callers get Bytes-derived positions there or not at
-// all; nothing here invents a position.
+// model.Node.Range is hydrated by the caller from resolvePage.Spans, through
+// the same bounded CAS window the search page builder uses: StoredNode carries
+// byte intervals, and a candidate served without a position leaves the LINE
+// column of `codectx symbol` empty for every row of every query. A node with no
+// byte interval keeps a nil Range; nothing here invents a position.
 func resolveSymbols(ctx context.Context, r exactReader, req model.SymbolRequest, lastKey string, limit int) (resolvePage, error) {
 	if req.SemanticSource == model.SemanticLSP {
 		return resolvePage{Completeness: []model.CapabilityState{lspUnavailable(req)}}, nil
@@ -54,11 +69,52 @@ func resolveSymbols(ctx context.Context, r exactReader, req model.SymbolRequest,
 	if req.Operation == model.SymbolDocumentSymbols {
 		return documentSymbols(ctx, r, req, rank, within, limit)
 	}
+	if page, ok, err := idCandidate(ctx, r, req, rank); err != nil || ok {
+		return page, err
+	}
 	return symbolTiers(ctx, r, req, rank, within, limit)
 }
 
-// resolveLimit applies the Section 20.1 page bound; zero means the endpoint
-// default, which for a symbol page is the maximum.
+// idCandidate is the canonical-id tier: `codectx symbol <name-or-id>` is
+// spelled with an id and the Long text promises "canonical node ID", so a query
+// that IS a canonical identifier resolves to the node it names rather than
+// falling through to the name tiers, which index names and would answer an
+// empty page.
+//
+// An identifier names exactly one node in a binding (Section 9.1), so the page
+// is that node alone and carries no continuation key: there is no second
+// candidate for a cursor to point at. A query that looks like an identifier but
+// names nothing visible in this generation is not an error — ok is false and
+// the name tiers answer the same query, which is what a repository whose
+// symbols are spelled in hex needs.
+func idCandidate(ctx context.Context, r exactReader, req model.SymbolRequest, rank int) (resolvePage, bool, error) {
+	// A continuation is never issued for this tier, so a key here was written
+	// by a symbol tier and that walk owns the request.
+	if rank != noTierRank || !model.ValidHexID(req.Query) {
+		return resolvePage{}, false, nil
+	}
+	n, err := r.Node(ctx, model.NodeID(req.Query))
+	if err != nil {
+		var typed *model.Error
+		// "not visible in this generation" is storage's CTX_ARGUMENT_INVALID
+		// (query.go:164); anything else is a real read failure and must not be
+		// masked as "no such id".
+		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
+			return resolvePage{}, false, nil
+		}
+		return resolvePage{}, false, err
+	}
+	if req.Operation == model.SymbolDefinition && !isDeclaration(n) {
+		return resolvePage{}, false, nil
+	}
+	var page resolvePage
+	page.add(n)
+	return page, true, nil
+}
+
+// resolveLimit is the last defence on the page bound: Service.pageLimit has
+// already clamped the caller's limit to resources.max_page_items, and this
+// keeps a direct call inside the package from exceeding the model ceiling.
 func resolveLimit(limit int) int {
 	if limit <= 0 || limit > model.MaxPageItems {
 		return model.MaxPageItems
@@ -143,9 +199,9 @@ func documentSymbols(ctx context.Context, r exactReader, req model.SymbolRequest
 	if err != nil {
 		return resolvePage{}, err
 	}
-	page := resolvePage{Nodes: make([]model.Node, 0, len(nodes))}
+	var page resolvePage
 	for _, n := range nodes {
-		page.Nodes = append(page.Nodes, n.Node)
+		page.add(n)
 	}
 	if len(page.Nodes) == limit {
 		page.LastKey = resolveKey(model.TierExactPath, fileNodeKey(nodes[len(nodes)-1]))
@@ -165,7 +221,7 @@ func symbolTiers(ctx context.Context, r exactReader, req model.SymbolRequest, ra
 		return resolvePage{}, &model.Error{Code: model.CodeCursorInvalid, Message: "symbol cursor was not written by a symbol tier"}
 	}
 	declarationsOnly := req.Operation == model.SymbolDefinition
-	page := resolvePage{Nodes: make([]model.Node, 0, limit)}
+	var page resolvePage
 	var lastTier model.SearchTier
 	var lastNode model.NodeID
 	for _, tier := range exactTiers {
@@ -192,7 +248,7 @@ func symbolTiers(ctx context.Context, r exactReader, req model.SymbolRequest, ra
 				if declarationsOnly && !isDeclaration(n) {
 					continue
 				}
-				page.Nodes = append(page.Nodes, n.Node)
+				page.add(n)
 				lastTier, lastNode = tier, n.Node.ID
 				if len(page.Nodes) == limit {
 					break
