@@ -131,7 +131,7 @@ func New(t *testing.T, files map[string]string) *Harness {
 		t.Fatalf("OpenView: %v", err)
 	}
 	h.View = view
-	if h.Gen, err = store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic")); err != nil {
+	if h.Gen, err = store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"), "refs/heads/providertest"); err != nil {
 		t.Fatalf("BeginGeneration: %v", err)
 	}
 	if h.Root, err = workspace.Discover(repoDir); err != nil {
