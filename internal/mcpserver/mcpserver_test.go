@@ -669,6 +669,170 @@ var scenarios = []scenario{
 	// L4 rows.
 
 	// L5 rows.
+	{
+		// Failure mode: a waived session is reported ready to implement. A
+		// waiver is an audit record and never grants strict readiness
+		// (Section 16.3, and SessionStatus.Validate refuses the combination),
+		// so the honest verdict lives in the status the gate returns. If the
+		// handler substituted its own status, dropped it from waiveOutput, or
+		// the two readiness booleans collapsed into one on the wire, an agent
+		// would be told to implement against a required file nobody read.
+		name: "gate: waive keeps ready_for_implementation false over the wire",
+		facade: func(f *fakeServices) {
+			f.waiveFn = func(_ context.Context, r model.WaiverRequest) (model.WaiverRecord, model.SessionStatus, error) {
+				waiver := model.WaiverRecord{
+					SessionID:   r.SessionID,
+					ActorID:     r.ActorID,
+					FileID:      r.FileID,
+					ContentHash: "content-hash-of-the-waived-file",
+					Reason:      r.Reason,
+				}
+				status := model.SessionStatus{
+					SessionID:               r.SessionID,
+					ActorID:                 r.ActorID,
+					ReadCompleteForSnapshot: true,
+					ReadyForImplementation:  false,
+					StrictGateSatisfied:     false,
+					RequiredFiles:           3,
+					FullyServedFiles:        2,
+					WaivedFiles:             1,
+				}
+				return waiver, status, nil
+			}
+		},
+		tool: "codectx_context_waive",
+		args: model.WaiverRequest{
+			SessionID: model.SessionID(strings.Repeat("a", 64)),
+			ActorID:   "actor-1",
+			FileID:    model.FileID(strings.Repeat("b", 64)),
+			Reason:    "vendored third-party source",
+		},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("context_waive reported a tool error: %s", firstText(res))
+			}
+			var got result[waiveOutput]
+			decode(t, res, &got)
+			if string(got.Data.Waiver.FileID) != strings.Repeat("b", 64) || got.Data.Waiver.Reason != "vendored third-party source" {
+				t.Errorf("waiver = %+v, want the facade's record verbatim", got.Data.Waiver)
+			}
+			// ReadCompleteForSnapshot pins the row against a vacuous pass: a
+			// zero-valued or dropped status would also report
+			// ready_for_implementation=false.
+			if !got.Data.Status.ReadCompleteForSnapshot {
+				t.Fatalf("status = %+v, want the facade's status verbatim", got.Data.Status)
+			}
+			if got.Data.Status.WaivedFiles != 1 {
+				t.Errorf("waived_files = %d, want 1", got.Data.Status.WaivedFiles)
+			}
+			if got.Data.Status.ReadyForImplementation || got.Data.Status.StrictGateSatisfied {
+				t.Errorf("a waived session reported ready_for_implementation=%v strict_gate_satisfied=%v, want both false",
+					got.Data.Status.ReadyForImplementation, got.Data.Status.StrictGateSatisfied)
+			}
+		},
+	},
+	func() scenario {
+		// Failure mode: view="export" ships the capsule body. A capsule is
+		// bounded by context.max_capsule_bytes at 8 MiB while this tool
+		// answers under resources.max_metadata_response_bytes at 256 KiB, so
+		// returning model.Capsule whole would blow the response bound and
+		// spill stored facts, observations and coverage the six paged views
+		// exist to serve. The row proves both halves at once: the body the
+		// facade returns does NOT fit the ceiling, and the projection does,
+		// carrying counts instead of records.
+		//
+		// The row is a closure so the fixture capsule is shared by facade and
+		// check without a package-level helper another lane would collide on.
+		const sentinel = "sentinel-content-hash-no-capsule-record-may-ship"
+		sessionID := model.SessionID(strings.Repeat("a", 64))
+		manifestHash := strings.Repeat("d", 64)
+		canonicalHash := strings.Repeat("e", 64)
+		coverage := make([]model.FileCoverage, 2000)
+		for i := range coverage {
+			coverage[i] = model.FileCoverage{
+				FileID:         "file-with-a-realistically-long-identifier",
+				ContentHash:    strings.Repeat("c", 64),
+				Size:           4096,
+				ConfirmedBytes: 4096,
+				Requirement:    model.RequirementFull,
+				State:          model.CoverageFullServed,
+			}
+		}
+		coverage[0].ContentHash = sentinel
+		capsule := model.Capsule{
+			SessionID: sessionID,
+			ActorID:   "actor-1",
+			Binding: model.Binding{
+				RepositoryID: model.RepositoryID(strings.Repeat("1", 64)),
+				SnapshotID:   model.SnapshotID(strings.Repeat("2", 64)),
+				GenerationID: 42,
+			},
+			ManifestHash:  manifestHash,
+			CanonicalHash: canonicalHash,
+			ScopeVersion:  3,
+			Scope:         []model.NodeID{model.NodeID(strings.Repeat("3", 64)), model.NodeID(strings.Repeat("4", 64))},
+			Coverage:      coverage,
+			Waivers: []model.WaiverRecord{{
+				SessionID: sessionID, ActorID: "actor-1",
+				FileID: model.FileID(strings.Repeat("b", 64)), Reason: "vendored",
+			}},
+			StrictGateSatisfied: false,
+		}
+		ceiling := config.Defaults().Resources.MaxMetadataResponseBytes
+		return scenario{
+			name: "gate: capsule export returns canonical metadata under the response ceiling",
+			facade: func(f *fakeServices) {
+				f.exportFn = func(_ context.Context, _ model.SessionRequest) (model.Capsule, error) {
+					return capsule, nil
+				}
+			},
+			tool: "codectx_context_capsule",
+			args: model.CapsuleRequest{
+				SessionID: sessionID, ActorID: "actor-1",
+				View: model.CapsuleView(capsuleViewExport),
+				Page: model.PageRequest{Limit: 50},
+			},
+			check: func(t *testing.T, res *mcp.CallToolResult) {
+				body, err := json.Marshal(capsule)
+				if err != nil {
+					t.Fatalf("marshal the fixture capsule: %v", err)
+				}
+				if int64(len(body)) <= ceiling {
+					t.Fatalf("fixture capsule is %d bytes, which already fits the %d-byte ceiling; the row proves nothing",
+						len(body), ceiling)
+				}
+				if res.IsError {
+					t.Fatalf("context_capsule export reported a tool error: %s", firstText(res))
+				}
+				raw, err := json.Marshal(res.StructuredContent)
+				if err != nil {
+					t.Fatalf("marshal the structured answer: %v", err)
+				}
+				if int64(len(raw)) > ceiling {
+					t.Errorf("export answer is %d bytes, over the %d-byte metadata ceiling", len(raw), ceiling)
+				}
+				if strings.Contains(string(raw), sentinel) {
+					t.Errorf("export answer carries a capsule record; it must carry metadata only")
+				}
+				var got result[capsuleOutput]
+				decode(t, res, &got)
+				if got.Data.Page != nil {
+					t.Errorf("export answer also carries a capsule page: %+v", got.Data.Page)
+				}
+				if got.Data.Export == nil {
+					t.Fatalf("export answer carries no projection")
+				}
+				e := got.Data.Export
+				if e.CanonicalHash != canonicalHash || e.ManifestHash != manifestHash ||
+					e.ScopeVersion != 3 || e.Binding.GenerationID != 42 || e.StrictGateSatisfied {
+					t.Errorf("export = %+v, want the capsule's canonical metadata", *e)
+				}
+				if e.Counts["coverage"] != len(coverage) || e.Counts["waivers"] != 1 || e.Counts["scope"] != 2 {
+					t.Errorf("counts = %v, want the capsule's per-section lengths", e.Counts)
+				}
+			},
+		}
+	}(),
 }
 
 func TestScenarios(t *testing.T) {
