@@ -1,11 +1,15 @@
 // Package scip is the Section 11.4 provider: streaming import of SCIP
-// precise indexes and execution of approved, already-installed SCIP indexers
-// (scip-go, scip-typescript, scip-java) against a private materialization of
-// the pinned snapshot.
+// precise indexes and execution of the six pinned SCIP indexers (scip-go,
+// scip-typescript, scip-python, scip-java, rust-analyzer and scip-clang)
+// against a private materialization of the pinned snapshot.
 //
 // Two inputs feed one provider. A supplied `.scip` file inside the snapshot
-// is imported as it is; an approved profile is run through the shared
-// process runner and its output imported the same way. Both go through the
+// is imported as it is; a managed profile is run through the shared process
+// runner and its output imported the same way. A profile is product code, not
+// configuration: its argument array, environment allowlist, budgets, timeout
+// and declared network posture are constants of this build, and the binary it
+// starts is the payload the embedded tool lock pinned and internal/toolchain
+// verified (Section 20.2 — trust is the lock, not a user approval). Both go through the
 // same bounded wire decoder: top-level and nested fields are walked with a
 // reader that never allocates past a record bound, a document of any size is
 // streamed field by field, and forward and external references are resolved
@@ -26,13 +30,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -163,11 +168,12 @@ type Options struct {
 	// hashes that does not commit to the index is an assertion about some
 	// index, not about this one, and proves nothing.
 	Manifest string
-	// Analyzers are the approved profiles of the user configuration; only
-	// those named after a known SCIP indexer kind are used.
-	Analyzers []config.Analyzer
-	// Runner is the shared process runner; required when a profile is
-	// configured.
+	// Resolver hands out the pinned indexer payloads. It is the whole of the
+	// provider's trust in a tool: nothing is looked up on PATH and nothing is
+	// approved in configuration. A nil resolver means this build imports
+	// supplied indexes only and runs no profile.
+	Resolver *toolchain.Resolver
+	// Runner is the shared process runner; required when a resolver is given.
 	Runner *process.Runner
 	// Timeout caps every profile run (providers.scip.timeout).
 	Timeout time.Duration
@@ -184,17 +190,48 @@ type Options struct {
 type Provider struct {
 	importPath, manifestPath string
 	profiles                 []Profile
-	runner                   *process.Runner
-	timeout                  time.Duration
-	workDir                  string
-	limits                   Limits
-	lookupEnv                func(string) (string, bool)
+	// deferred are kinds this platform pins whose payload the store did not
+	// hold at construction. They plan units like a resolved kind; the payload
+	// is fetched by the first unit that runs one (Import).
+	deferred []Kind
+	missing  []unresolved
+	version  string
+	// resolver is kept for exactly that deferred fetch. Nothing else in the
+	// provider reaches for a tool after construction.
+	resolver  *toolchain.Resolver
+	runner    *process.Runner
+	timeout   time.Duration
+	workDir   string
+	limits    Limits
+	lookupEnv func(string) (string, bool)
 }
 
 var _ provider.Provider = (*Provider)(nil)
 
-// New validates the options and returns the provider.
-func New(o Options) (*Provider, error) {
+// New validates the options, inspects the store for every managed profile
+// payload and returns the provider.
+//
+// Construction installs nothing. It reads what the store already holds, and a
+// pinned payload that is absent becomes a deferred kind that the first unit
+// needing it fetches. Resolving with a fetch here installed the indexers of
+// every language the lock knows on a machine that had not run
+// `codectx tools prefetch`, before any detection had happened and before any
+// unit existed (measured: 24.8 s of fetching at construction).
+//
+// What does not become lazy is the descriptor's version. It is fixed here,
+// because Descriptor() takes no context and must be a deterministic function of
+// the process: a version that changed as payloads appeared would key two units
+// of the same run differently. It folds the identity of every kind that can
+// produce facts -- the resolved fingerprint of a payload the store holds and
+// the lock's pinned fingerprint of a deferred one, which are the same string
+// for the same payload -- so a unit built before the payload was installed
+// keys identically to one built after. Only a kind this machine cannot supply
+// at all contributes an empty slot, and it produces no facts to key.
+//
+// A payload that cannot be resolved at all is not an error. It is recorded
+// with the toolchain's own CTX_TOOL_* code and reported as honest absence, so
+// a machine whose platform has no C++ payload still indexes Go.
+func New(ctx context.Context, o Options) (*Provider, error) {
 	if o.Limits == (Limits{}) {
 		o.Limits = DefaultLimits()
 	}
@@ -212,17 +249,28 @@ func New(o Options) (*Provider, error) {
 	if o.Manifest != "" && o.Import == "" {
 		return nil, invalid("a scip input-hash manifest needs an index to describe")
 	}
-	profs, err := profiles(o.Analyzers)
-	if err != nil {
-		return nil, err
-	}
-	if len(profs) > 0 && o.Runner == nil {
+	if o.Resolver != nil && o.Runner == nil {
 		return nil, invalid("scip profiles require the shared process runner")
 	}
 	if o.LookupEnv == nil {
 		o.LookupEnv = os.LookupEnv
 	}
-	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, runner: o.Runner, timeout: o.Timeout,
+	var profs []Profile
+	var deferred []Kind
+	var identities map[Kind]string
+	var missing []unresolved
+	if o.Resolver != nil {
+		profs, deferred, identities, missing = resolveProfiles(ctx, o.Resolver)
+	}
+	// A build with no payload identity at all carries no tools digest: an
+	// import-only provider runs no indexer, so a digest over six empty slots
+	// would key its units by tools it never had.
+	version := Version
+	if len(identities) > 0 {
+		version = Version + "/" + toolsFingerprint(identities)
+	}
+	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
+		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout,
 		workDir: o.WorkDir, limits: o.Limits, lookupEnv: o.LookupEnv}, nil
 }
 
@@ -231,10 +279,14 @@ func New(o Options) (*Provider, error) {
 // when a profile is configured (a profile reads the package manifests).
 func (p *Provider) Descriptor() model.ProviderDescriptor {
 	deps := []string{dependsFilesystem, dependsTreeSitter}
-	if len(p.profiles) > 0 {
+	if len(p.profiles) > 0 || len(p.deferred) > 0 {
 		deps = append(deps, dependsManifest)
 	}
-	return model.ProviderDescriptor{ID: ID, Version: Version, Capabilities: capabilities, DependsOn: deps,
+	version := p.version
+	if version == "" {
+		version = Version
+	}
+	return model.ProviderDescriptor{ID: ID, Version: version, Capabilities: capabilities, DependsOn: deps,
 		InvalidationScope: model.InvalidationWorkspace, Required: false}
 }
 
@@ -249,17 +301,15 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 	if p.importPath != "" && recognized[p.importPath] {
 		out = append(out, ImportScope(p.importPath))
 	}
-	for _, prof := range p.profiles {
-		// A profile whose tool is not installed plans no unit: a planned unit
-		// materializes the whole snapshot before the run and would then fail
-		// on the missing binary, which is work and a failed unit for an
-		// absence Detect already reports honestly.
-		if !executableInstalled(prof.Executable) {
-			continue
-		}
-		for _, trig := range prof.kind.triggers {
+	for _, k := range p.runnableKinds() {
+		// A kind this machine cannot index precisely at all plans no unit: a
+		// planned unit materializes the whole snapshot before the run and would
+		// then fail on a payload Detect already reported as absent, with its
+		// typed reason. A deferred kind does plan one -- its payload is pinned
+		// for this platform and the unit fetches it.
+		for _, trig := range Triggers(k) {
 			if recognized[trig] {
-				out = append(out, ProfileScope(prof.Name))
+				out = append(out, ProfileScope(string(k)))
 				break
 			}
 		}
@@ -279,20 +329,54 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 			det.InputPaths = append(det.InputPaths, p.importPath)
 		}
 	}
-	for _, prof := range p.profiles {
+	for _, k := range p.runnableKinds() {
 		triggered := false
-		for _, trig := range prof.kind.triggers {
+		for _, trig := range Triggers(k) {
 			if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
 				triggered = true
 				det.InputPaths = append(det.InputPaths, trig)
 			}
 		}
-		if triggered && executableInstalled(prof.Executable) {
+		if triggered {
 			det.Available = true
+			if slices.Contains(p.deferred, k) {
+				// The kind is recorded as pending rather than as a refusal:
+				// Select publishes a degraded capability row for a CTX_ value and
+				// nothing for this one, which is why the spelling differs.
+				det = det.WithDetail(string(k), markerDeferred)
+			}
 		}
 	}
+	// A language this workspace triggers whose indexer this machine cannot
+	// supply is named here with the toolchain's own reason, whether or not some
+	// other language's indexer resolved. Without it a repository with go.mod and
+	// Cargo.toml on a machine with no usable rust-analyzer is reported available,
+	// plans scip-go only, and says nothing anywhere about Rust: Scopes plans no
+	// unit for the missing kind, so no capability row ever carries the reason
+	// either.
+	for _, u := range p.missing {
+		if triggeredKind(root, u.kind) {
+			det = det.WithDetail(string(u.kind), u.code)
+		}
+	}
+	// The provenance line is the same bounded digest the descriptor commits to,
+	// not a concatenation of six 82-byte fingerprints: ObservedVersion is capped
+	// at model.MaxIdentifierBytes, and a concatenation would be truncated there
+	// -- silently dropping whichever payloads sort last, so replacing one of them
+	// would change nothing the coordinator folds into UnitSpec.ProviderVersion.
+	if p.version != Version {
+		det.ObservedVersion = p.version
+	}
 	if !det.Available {
+		// The single diagnostic code of an unavailable detection is the first
+		// triggered kind's reason; Details above carries every one of them.
 		det.DiagnosticCode = model.CodeProviderUnavailable
+		for _, u := range p.missing {
+			if triggeredKind(root, u.kind) {
+				det.DiagnosticCode = u.code
+				break
+			}
+		}
 	}
 	if len(det.InputPaths) > provider.MaxDetectionInputs {
 		det.InputPaths = det.InputPaths[:provider.MaxDetectionInputs]
@@ -307,7 +391,11 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 // with CTX_SOURCE_BINDING_UNVERIFIED rather than silently exact.
 func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey string) (model.SourceBinding, error) {
 	if strings.HasPrefix(scopeKey, scopeProfile) {
-		if _, err := p.profileFor(scopeKey); err != nil {
+		// The binding of a profile unit is decided by who produced the index,
+		// not by which bytes the payload has: codectx invokes the indexer
+		// itself. A deferred payload is therefore not fetched here -- Verify
+		// runs before the unit is opened, and a fetch belongs to the run.
+		if _, err := p.profileKind(scopeKey); err != nil {
 			return "", err
 		}
 		return model.SourceBindingVerified, nil
@@ -403,18 +491,19 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	var err error
 	workDir := p.workDir
 	if strings.HasPrefix(req.Unit.ScopeKey, scopeProfile) {
-		prof, err := p.profileFor(req.Unit.ScopeKey)
+		prof, err := p.profileFor(ctx, req.Unit.ScopeKey)
 		if err != nil {
 			return Report{}, err
 		}
 		im.profile = &prof
-		// The profile's work directory is the private root of every run; it
-		// belongs to codectx, not to the user's shell, so it is created with
-		// private permissions rather than assumed to exist.
-		if err := os.MkdirAll(prof.WorkDir, 0o700); err != nil {
+		// The profile's work directory is the private root of every run. It is
+		// the provider's own work directory, never a location a user names:
+		// Section 20.2 leaves nothing about a profile to configuration.
+		profWork := filepath.Join(p.workDir, "profiles", prof.Name())
+		if err := os.MkdirAll(profWork, 0o700); err != nil {
 			return Report{}, internal("scip profile work directory: " + err.Error())
 		}
-		runDir, err := os.MkdirTemp(prof.WorkDir, "scip-run-")
+		runDir, err := os.MkdirTemp(profWork, "scip-run-")
 		if err != nil {
 			return Report{}, internal("scip run directory: " + err.Error())
 		}
@@ -451,18 +540,102 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	if err := im.run(ctx, open); err != nil {
 		return Report{}, im.decorate(err)
 	}
-	return im.report(), nil
+	rep := im.report()
+	// False readiness. Every one of the six indexers needs the project's own
+	// dependency context (research note 4), and four of them exit 0 having
+	// produced a well-formed index that describes nothing when it is missing.
+	// A unit sealed from such an index reports precise_definitions as fresh
+	// over zero facts, which a consumer reads as an analysed absence. A full
+	// profile import that admitted nothing is therefore a typed failure, not a
+	// seal. A refresh is exempt: an unchanged snapshot legitimately emits no
+	// record. This mirrors the dependence provider's export liveness gate.
+	if im.profile != nil && opts.Previous == nil && rep.Result.RecordsEmitted == 0 {
+		// This is the one refusal raised after a completed run, so it is the one
+		// that holds a built manifest. The caller never receives this Report and
+		// so can never close it; leaving it would orphan a temporary file under
+		// the work directory on every false-readiness failure.
+		_ = rep.Manifest.Close()
+		return Report{}, im.decorate(&model.Error{Code: model.CodeProviderOutputInvalid,
+			Message:     "the indexer exited successfully but its index describes no admitted document",
+			Remediation: "restore the project's dependency context (installed packages, a build, a compilation database) and re-run"})
+	}
+	return rep, nil
 }
 
-// profileFor resolves a profile scope key to the configured profile.
-func (p *Provider) profileFor(scopeKey string) (Profile, error) {
+// runnableKinds are the kinds this provider can plan a unit for, in Kinds
+// order: those whose payload the store already holds and those whose pinned
+// payload the first unit will fetch.
+func (p *Provider) runnableKinds() []Kind {
+	out := make([]Kind, 0, len(p.profiles)+len(p.deferred))
+	for _, k := range Kinds {
+		if slices.Contains(p.deferred, k) {
+			out = append(out, k)
+			continue
+		}
+		for _, prof := range p.profiles {
+			if prof.Kind == k {
+				out = append(out, k)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// triggeredKind reports whether the workspace holds a trigger of one kind. It
+// reads metadata through the confined root and nothing else.
+func triggeredKind(root workspace.Root, k Kind) bool {
+	for _, trig := range kindSpecs[k].triggers {
+		if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
+}
+
+// profileKind resolves a profile scope key to the kind it names, without
+// reaching for a payload. A kind this build knows but whose payload did not
+// resolve reports the toolchain's own code, so a unit planned before a payload
+// was lost fails with the reason rather than with "unknown profile".
+func (p *Provider) profileKind(scopeKey string) (Kind, error) {
 	name := strings.TrimPrefix(scopeKey, scopeProfile)
+	for _, k := range p.runnableKinds() {
+		if string(k) == name {
+			return k, nil
+		}
+	}
+	for _, u := range p.missing {
+		if string(u.kind) == name {
+			return "", u.err
+		}
+	}
+	return "", invalid("scip unit scope names profile " + name + ", which is not a SCIP indexer this build knows")
+}
+
+// profileFor is profileKind followed by the payload. A kind the store already
+// held is returned as it was resolved at construction; a deferred kind is
+// fetched here, at the one moment the repository is known to contain the
+// language. A fetch that fails fails the unit with the toolchain's typed code
+// -- the same failure it would have had at construction, now only for a
+// language this repository actually contains.
+func (p *Provider) profileFor(ctx context.Context, scopeKey string) (Profile, error) {
+	k, err := p.profileKind(scopeKey)
+	if err != nil {
+		return Profile{}, err
+	}
 	for _, prof := range p.profiles {
-		if prof.Name == name {
+		if prof.Kind == k {
 			return prof, nil
 		}
 	}
-	return Profile{}, invalid("scip unit scope names profile " + name + ", which is not an approved SCIP indexer profile")
+	if p.resolver == nil {
+		return Profile{}, invalid("scip unit scope names profile " + string(k) + ", whose payload this build cannot resolve")
+	}
+	t, err := p.resolver.Resolve(ctx, string(k))
+	if err != nil {
+		return Profile{}, err
+	}
+	return Profile{Kind: k, Tool: t}, nil
 }
 
 // importFile resolves an import scope key to the pinned snapshot file it

@@ -1,0 +1,661 @@
+package cli
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
+	"os"
+	"sort"
+	"strings"
+	"text/tabwriter"
+
+	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/lang"
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/lsp"
+	"github.com/Sawmonabo/codectx/internal/provider/scip"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
+	"github.com/Sawmonabo/codectx/internal/workspace"
+	"github.com/spf13/cobra"
+)
+
+const (
+	toolsRepoFlag    = "repo"
+	toolsAllFlag     = "all"
+	toolsForRepoFlag = "for-repo"
+)
+
+// cpgKind is the lock's own word for the tool the dependence provider runs.
+// The selection below asks the inventory which entry that is rather than
+// naming the engine: the engine's name appears in the lock and in the one
+// package that runs it, never on a command surface.
+const cpgKind = "cpg"
+
+// toolEntry is one line of the `tools` report. It mirrors toolchain.Status with
+// explicit wire tags, because the JSON shape of Section 18.1 is a CLI contract
+// and must not drift with a field rename inside the toolchain package.
+type toolEntry struct {
+	Name      string   `json:"name"`
+	Version   string   `json:"version"`
+	State     string   `json:"state"`
+	Languages []string `json:"languages"`
+	Detail    string   `json:"detail,omitempty"`
+}
+
+// toolReport is the data payload of `tools status`, `tools prefetch` and
+// `tools verify`. One shape for the three so a consumer parses the toolchain
+// report once; `prefetch` reports the same rows restricted to what it installed,
+// which is also its post-condition.
+type toolReport struct {
+	Platform string      `json:"platform"`
+	Store    string      `json:"store"`
+	Tools    []toolEntry `json:"tools"`
+}
+
+// toolsGCReport is the data payload of `tools gc`.
+type toolsGCReport struct {
+	Store   string `json:"store"`
+	Removed int    `json:"removed"`
+}
+
+// newToolsCommand builds `codectx tools status|prefetch|verify|gc`, the
+// lifecycle surface of Section 11.7. None of it is required for ordinary use:
+// resolution installs what a repository needs on demand, and these commands
+// exist so CI and offline hosts can do that work ahead of time, see what the
+// store holds, re-check it, and reclaim what a binary upgrade superseded.
+func newToolsCommand(build model.BuildInfo) *cobra.Command {
+	tools := &cobra.Command{
+		Use:   "tools",
+		Short: "Inspect and manage the managed analyzer toolchain",
+		Long: "The product owns every external analyzer and every runtime one needs, " +
+			"pinned by the tool lock this binary embeds. These commands install, " +
+			"report on and reclaim those payloads; none of them is a prerequisite " +
+			"for indexing or querying.",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if jsonRequested(cmd, args) {
+				return &model.Error{Code: model.CodeArgumentInvalid,
+					Message: "no tools subcommand given; run \"codectx tools --help\" for the list"}
+			}
+			return cmd.Help()
+		},
+	}
+	// The store a tools command reports on is the one the repository at --repo
+	// would resolve through, because the data directory is per workspace unless
+	// tools.cache_dir names a shared one.
+	tools.PersistentFlags().String(toolsRepoFlag, ".", "repository whose resolved configuration selects the tool store")
+
+	status := &cobra.Command{
+		Use:           "status",
+		Short:         "Report every lock entry and what the store holds for it",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, store, err := openToolchain(cmd)
+			if err != nil {
+				return err
+			}
+			// Status is the cheap report: presence and publication, no rehashing,
+			// so it stays usable for every lock entry including the 1.8 GB engine.
+			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), nil), nil)
+		},
+	}
+
+	prefetch := &cobra.Command{
+		Use:   "prefetch [--all | --for-repo PATH | NAME...]",
+		Short: "Install pinned payloads ahead of time",
+		Long: "Installs the payloads a later run would fetch on demand. Name the " +
+			"tools to install, pass --for-repo to install what one repository's " +
+			"own root selects, or pass --all for every entry the " +
+			"lock carries for this platform; one of the three is required, so a " +
+			"bare prefetch never downloads gigabytes by accident.",
+		Args:          cobra.ArbitraryArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			names, err := prefetchNames(cmd, args)
+			if err != nil {
+				return err
+			}
+			res, store, err := openToolchain(cmd)
+			if err != nil {
+				return err
+			}
+			failure := firstToolFailure(res.Prefetch(cmd.Context(), names))
+			// The rows are the post-condition of the install, so they are read
+			// back from the store rather than assumed from a nil error.
+			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), names), failure)
+		},
+	}
+	prefetch.Flags().Bool(toolsAllFlag, false, "install every entry the lock carries for this platform")
+	prefetch.Flags().String(toolsForRepoFlag, "", "install only what this repository's root manifests and sources select")
+
+	verify := &cobra.Command{
+		Use:   "verify",
+		Short: "Rehash every installed entry against the lock",
+		Long: "Rehashes each installed entry executable against the digest the lock " +
+			"pins for it, so a store a user edited or a disk damaged is reported " +
+			"here rather than discovered at the next analyzer run. A corrupt entry " +
+			"fails the command: a check that reports damage and exits 0 is a gate " +
+			"that passes silently in CI.",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, store, err := openToolchain(cmd)
+			if err != nil {
+				return err
+			}
+			rows, err := res.Verify(cmd.Context())
+			data := report(store, rows, nil)
+			if err == nil {
+				err = corruptFailure(data.Tools)
+			}
+			return emitToolReport(cmd, build, args, data, err)
+		},
+	}
+
+	gc := &cobra.Command{
+		Use:   "gc",
+		Short: "Remove store versions the current lock does not name",
+		Long: "Removes every installed version the embedded lock no longer names, " +
+			"plus unpublished and abandoned trees. This is what makes upgrading " +
+			"the binary reclaim the previous release's payloads.",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			res, store, err := openToolchain(cmd)
+			if err != nil {
+				return err
+			}
+			removed, err := res.GC(cmd.Context())
+			if err != nil {
+				return err
+			}
+			data := toolsGCReport{Store: store, Removed: removed}
+			out := cmd.OutOrStdout()
+			if jsonRequested(cmd, args) {
+				return writeEnvelope(out, successEnvelope(build.SchemaVersion, cmd.Name(), data))
+			}
+			return writeText(out, "store     %s\nremoved   %d superseded tool %s\n",
+				data.Store, data.Removed, plural(data.Removed, "version", "versions"))
+		},
+	}
+
+	tools.AddCommand(status, prefetch, verify, gc)
+	return tools
+}
+
+// openToolchain is the composition root of the managed toolchain: it resolves
+// the layered configuration for the repository at --repo and builds one
+// resolver over it. It lives here only until internal/app exists, at which
+// point it moves there whole and the command tree receives the resolver.
+func openToolchain(cmd *cobra.Command) (*toolchain.Resolver, string, error) {
+	repo, err := cmd.Flags().GetString(toolsRepoFlag)
+	if err != nil {
+		return nil, "", &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
+	}
+	cfg, err := config.Load(repo)
+	if err != nil {
+		return nil, "", err
+	}
+	// The two directories are distinct and are passed as such: config's data
+	// directory is per workspace and the store under it is <data_dir>/tools,
+	// while tools.cache_dir names the store itself -- which is how one store is
+	// shared by every checkout on the machine. Folding the second into the first
+	// would append "tools" to a path the user already pointed at the store.
+	overrides := make(map[string]toolchain.Override, len(cfg.Tools.Override))
+	for name, ov := range cfg.Tools.Override {
+		overrides[name] = toolchain.Override(ov)
+	}
+	res, err := toolchain.New(toolchain.Options{
+		DataDir:       cfg.Storage.DataDir,
+		StoreDir:      cfg.Tools.CacheDir,
+		Offline:       cfg.Tools.Offline,
+		Mirror:        cfg.Tools.Mirror,
+		MaxFetchBytes: cfg.Tools.MaxFetchBytes,
+		FetchTimeout:  cfg.Tools.FetchTimeout.Std(),
+		Overrides:     overrides,
+		// Section 11.7 requires one record per completed fetch in ordinary
+		// operation; Section 18.2 puts logs on stderr, never on the result
+		// stream a --json consumer reads.
+		Log: slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	// The reported path is the resolver's own, so the report can never name a
+	// store other than the one it read.
+	return res, res.StoreDir(), nil
+}
+
+// prefetchNames validates the requested tools against the embedded lock. A name
+// the lock does not carry is user input, not a product defect, so it is rejected
+// here as an argument error rather than reaching Resolve, which reports an
+// unknown name as CTX_INTERNAL because profiles name lock entries.
+func prefetchNames(cmd *cobra.Command, args []string) ([]string, error) {
+	all, err := cmd.Flags().GetBool(toolsAllFlag)
+	if err != nil {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
+	}
+	forRepo, err := cmd.Flags().GetString(toolsForRepoFlag)
+	if err != nil {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
+	}
+	known := toolchain.Embedded().Names()
+	switch {
+	case all && forRepo != "":
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--all installs every pinned tool, so it cannot be combined with --for-repo"}).
+			WithRemediation("pick one: `--all` for the whole lock, `--for-repo PATH` for what that repository needs")
+	case forRepo != "" && len(args) > 0:
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--for-repo selects the tools from the repository, so it cannot be combined with tool names"}).
+			WithRemediation("run `codectx tools prefetch --for-repo PATH`, or name the tools without --for-repo")
+	case all && len(args) > 0:
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--all installs every pinned tool, so it cannot be combined with tool names"}).
+			WithRemediation("run `codectx tools prefetch --all`, or name the tools without --all")
+	case all:
+		// A nil list is every entry the lock carries for this platform.
+		return nil, nil
+	case forRepo != "":
+		return toolsForRepo(forRepo)
+	case len(args) == 0:
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "prefetch needs the tools to install: pass --all, pass --for-repo PATH, or name them"}).
+			WithRemediation("pinned tools: " + strings.Join(known, ", "))
+	}
+	valid := make(map[string]bool, len(known))
+	for _, name := range known {
+		valid[name] = true
+	}
+	seen := make(map[string]bool, len(args))
+	names := make([]string, 0, len(args))
+	for _, name := range args {
+		if !valid[name] {
+			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+				Message: "no pinned tool is named " + fmt.Sprintf("%q", name)}).
+				WithRemediation("pinned tools: " + strings.Join(known, ", "))
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// toolsForRepo is the lock entries the manifests and sources at one repository's
+// root select. It reads the mappings that already decide them -- the SCIP
+// indexers' triggers, the language servers' root markers, the dependence
+// families' project markers, and lang.Of/dependence.FamilyOf for the source
+// check below -- from the packages that own them. There is deliberately no
+// table here: a second copy of the mapping that decides what gets downloaded is
+// exactly the drift policy.md forbids.
+//
+// The answer is the root's answer, not the planner's. Markers are read at the
+// repository root, through the confined handle and by metadata alone, which is
+// the same rule lsp.Definition.Detect applies: a present marker selects a
+// payload, it never starts anything, and nothing below the root is walked. That
+// matches the SCIP and LSP providers, which are root-only too, but it does not
+// match the dependence provider, which walks the tree for sources; sources
+// under a root that declares nothing are therefore outside what this command
+// can see, and docs/toolchain.md says so.
+func toolsForRepo(path string) ([]string, error) {
+	root, err := workspace.Discover(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	lock := toolchain.Embedded()
+	selected := make(map[string]bool, len(lock.Tools))
+	present := func(marker string) bool {
+		info, err := root.Lstat(marker)
+		return err == nil && info.Mode().IsRegular()
+	}
+	// A tool is selected by the first of its markers that exists; which one it
+	// was does not change the payload.
+	add := func(name string, markers []string) {
+		for _, marker := range markers {
+			if present(marker) {
+				selected[name] = true
+				return
+			}
+		}
+	}
+	for _, kind := range scip.Kinds {
+		add(string(kind), scip.Triggers(kind))
+	}
+	for _, def := range lsp.Definitions() {
+		add(def.Name, def.RootMarkers)
+	}
+	// The dependence provider is the one provider a marker pass alone
+	// under-serves. Its C/C++ family declares no project marker at all -- its
+	// unit is the repository itself, planned unconditionally -- and the other
+	// families' units are found by walking for sources, so a root carrying
+	// nothing but sources still runs the graph engine at index time. Marker-only
+	// selection therefore left a C or C++ repository without the engine or its
+	// runtime, and the user discovered that mid-index on the offline runner
+	// prefetching exists to serve. Either signal at the root selects the engine:
+	// a project marker of any family, or a source file of any family. This is
+	// still no walk -- one listing of the root directory, bounded below.
+	//
+	// Two root shapes remain under-served and docs/toolchain.md names both: a
+	// root that declares nothing and holds no source of its own, and a root
+	// declaring only a C or C++ build (CMakeLists.txt, compile_commands.json,
+	// Makefile) with its sources under src/ -- those three are the C/C++
+	// family's closure markers, which dependence does not export, not project
+	// markers. Closing the second needs a ClosureMarkers accessor beside
+	// ProjectMarkers; hardcoding the three names here is the drift this
+	// function exists to avoid.
+	if cpg := cpgEntries(lock); len(cpg) > 0 {
+		wanted := rootDeclaresDependenceProject(present)
+		if !wanted {
+			if wanted, err = rootHasDependenceSource(root); err != nil {
+				return nil, err
+			}
+		}
+		if wanted {
+			for _, name := range cpg {
+				selected[name] = true
+			}
+		}
+	}
+	// The runtimes come from the lock's own `runtime` field rather than from a
+	// second mapping: a Node-hosted indexer cannot run without node, and the
+	// point of prefetching is that nothing is fetched later.
+	for name := range maps.Clone(selected) {
+		entry, ok := lock.Tools[name]
+		if !ok {
+			// Every name above is a lock entry by construction, so a miss is a
+			// build that shipped a profile the lock does not carry.
+			return nil, &model.Error{Code: model.CodeInternal,
+				Message: "a profile names a tool the embedded lock does not carry: " + name}
+		}
+		if entry.Runtime != "" {
+			selected[entry.Runtime] = true
+		}
+	}
+	if len(selected) == 0 {
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "nothing at that repository's root selects a pinned tool: " +
+				"no manifest declares a project and no source file of an analysed language lies there"}).
+			WithRemediation("name the tools to install, or run `codectx tools prefetch --all`")
+	}
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// rootDeclaresDependenceProject reports whether the repository root carries a
+// project marker of any family the dependence provider analyses, read through
+// the same metadata-only predicate every other marker uses.
+func rootDeclaresDependenceProject(present func(string) bool) bool {
+	for _, family := range dependence.Families {
+		for _, marker := range dependence.ProjectMarkers(family) {
+			if present(marker) {
+				return true
+			}
+		}
+	}
+	// The C/C++ family declares no project marker at all; its build files are
+	// closure markers, and a root carrying a C/C++ build declaration (the
+	// out-of-source CMake layout keeps every source under src/) declares the
+	// family. Only the two that declare a C/C++ build are admitted: a Makefile
+	// is ubiquitous in Go, Python and Rust roots and would fetch the engine for
+	// a repository that never resolves it; go.sum or yarn.lock alone must not
+	// select the engine when the project marker beside them already decides it.
+	// A CMakeLists.txt at a root with no C/C++ source anywhere still selects
+	// the engine -- the planner gates on sources, this command on the root --
+	// and docs/toolchain.md says so.
+	for _, marker := range dependence.ClosureMarkers(dependence.FamilyC) {
+		if marker == "Makefile" {
+			continue
+		}
+		if present(marker) {
+			return true
+		}
+	}
+	return false
+}
+
+const (
+	// rootListingBatch is how many directory entries the source check holds at
+	// once. Nothing is retained beyond one batch: the answer is a single bit and
+	// the first source file decides it.
+	rootListingBatch = 512
+	// maxRootEntries bounds that listing. This is one directory -- a repository
+	// root -- not a traversal, and a root holding more entries than this is
+	// pathological, so refusing it keeps a prefetch's work finite instead of
+	// letting a hostile tree turn the selection into an unbounded listing.
+	maxRootEntries = 200_000
+)
+
+// rootHasDependenceSource reports whether the repository root itself holds a
+// source file of a family the dependence provider analyses. It answers the half
+// of the selection markers cannot: the C/C++ family declares no project marker,
+// so a C or C++ repository is invisible to the marker pass even though the
+// planner always gives it a unit.
+//
+// The classification is not a table here either: lang.Of names the language of
+// a path and dependence.FamilyOf names the family that analyses that language,
+// both read from the packages that own them.
+//
+// The root is opened by its own absolute path rather than through the confined
+// handle because there is nothing to confine: Root.Path is the directory
+// os.OpenRoot itself opened, no user-controlled component is joined to it, and
+// workspace.Root exposes no listing of its own (its checkPath refuses "." by
+// design). Only entry names are used, and a non-regular entry -- a directory,
+// or a symlink, which is never followed -- selects nothing.
+func rootHasDependenceSource(root workspace.Root) (bool, error) {
+	dir, err := os.Open(root.Path)
+	if err != nil {
+		return false, listingError(err.Error())
+	}
+	defer dir.Close()
+	for seen := 0; ; {
+		entries, err := dir.ReadDir(rootListingBatch)
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, listingError(err.Error())
+		}
+		if seen += len(entries); seen > maxRootEntries {
+			return false, &model.Error{Code: model.CodeResourceLimit,
+				Message: fmt.Sprintf("the repository root holds more than %d entries", maxRootEntries)}
+		}
+		for _, e := range entries {
+			if !e.Type().IsRegular() {
+				continue
+			}
+			if dependence.FamilyOf(lang.Of(e.Name())) != "" {
+				return true, nil
+			}
+		}
+	}
+}
+
+func listingError(cause string) *model.Error {
+	return (&model.Error{Code: model.CodeArgumentInvalid,
+		Message: "the repository root cannot be listed: " + cause}).
+		WithRemediation("pass --for-repo a readable repository root, or name the tools to install")
+}
+
+// cpgEntries are the lock entries of the kind the dependence provider runs.
+// Asking the inventory which entry that is keeps the engine's name out of this
+// package: `--for-repo` needs to know that a Go or Java project needs the graph
+// engine, not which engine it is.
+func cpgEntries(lock toolchain.Lock) []string {
+	var out []string
+	for _, name := range lock.Names() {
+		if lock.Tools[name].Kind == cpgKind {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// report converts the toolchain report into the CLI shape, keeping only the
+// requested names when the caller asked for some.
+func report(store string, rows []toolchain.Status, only []string) toolReport {
+	wanted := make(map[string]bool, len(only))
+	for _, name := range only {
+		wanted[name] = true
+	}
+	out := toolReport{Platform: toolchain.Current().Key(), Store: store, Tools: make([]toolEntry, 0, len(rows))}
+	for _, r := range rows {
+		if len(wanted) > 0 && !wanted[r.Name] {
+			continue
+		}
+		languages := r.Languages
+		if languages == nil {
+			// A runtime unlocks no language of its own. An empty array says that;
+			// a null would make a consumer guess whether the field was omitted.
+			languages = []string{}
+		}
+		out.Tools = append(out.Tools, toolEntry{
+			Name: r.Name, Version: r.Version, State: string(r.State),
+			Languages: languages, Detail: r.Detail,
+		})
+	}
+	return out
+}
+
+// corruptFailure turns a report carrying damaged entries into the typed failure
+// `tools verify` exits with. The names travel as one bounded detail so the JSON
+// envelope still says which entries to reinstall.
+func corruptFailure(rows []toolEntry) error {
+	var bad []string
+	for _, r := range rows {
+		if r.State == string(toolchain.StateCorrupt) {
+			bad = append(bad, r.Name)
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	return (&model.Error{Code: model.CodeToolCorrupt,
+		Message: fmt.Sprintf("%d installed %s no longer %s the digests the lock pins",
+			len(bad), plural(len(bad), "tool", "tools"), plural(len(bad), "matches", "match"))}).
+		WithDetail("tools", strings.Join(bad, ",")).
+		// A corrupt entry is repaired by a fresh install, not by gc: gc removes
+		// versions the lock no longer names, and a damaged tree at the pinned
+		// version is one the lock does name.
+		WithRemediation("run `codectx tools prefetch " + strings.Join(bad, " ") + "` to reinstall the pinned payloads")
+}
+
+// firstToolFailure reduces the joined error Prefetch returns to the one typed
+// failure the envelope reports. Every part is a typed CTX_TOOL_* error and the
+// common case -- an offline or unreachable host -- makes all of them the same,
+// so joining a dozen identical sentences into one message would be noise rather
+// than information; the count of failures travels as a bounded detail instead.
+func firstToolFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	parts := flattenJoined(err)
+	var first *model.Error
+	for _, part := range parts {
+		var typed *model.Error
+		if errors.As(part, &typed) && first == nil {
+			first = typed
+		}
+	}
+	if first == nil {
+		return err
+	}
+	if len(parts) > 1 {
+		return first.WithDetail("failed_tools", fmt.Sprint(len(parts)))
+	}
+	return first
+}
+
+// flattenJoined expands errors.Join's tree into its leaves.
+func flattenJoined(err error) []error {
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return []error{err}
+	}
+	var out []error
+	for _, part := range joined.Unwrap() {
+		out = append(out, flattenJoined(part)...)
+	}
+	return out
+}
+
+// emitToolReport renders one toolchain report under the single-envelope rule of
+// Section 18.2. A JSON failure replaces the report, because two documents on
+// stdout is exactly what that rule forbids; human output still prints the rows,
+// since they are what the operator asked for and Execute writes the failure to
+// stderr.
+func emitToolReport(cmd *cobra.Command, build model.BuildInfo, args []string, data toolReport, failure error) error {
+	if jsonRequested(cmd, args) {
+		if failure != nil {
+			return failure
+		}
+		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, cmd.Name(), data))
+	}
+	if err := writeToolTable(cmd.OutOrStdout(), data); err != nil {
+		return err
+	}
+	return failure
+}
+
+// writeToolTable renders the human report. Every column is a bounded value the
+// toolchain produced -- a name, a version, a state and a language list -- so
+// nothing here needs display sanitization beyond the store path, which is the
+// operator's own.
+func writeToolTable(w io.Writer, data toolReport) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "platform  %s\nstore     %s\n\n", data.Platform, data.Store)
+	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tVERSION\tSTATE\tLANGUAGES\tDETAIL")
+	counts := map[string]int{}
+	for _, t := range data.Tools {
+		counts[t.State]++
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", t.Name, t.Version, t.State,
+			strings.Join(t.Languages, ", "), t.Detail)
+	}
+	if err := tw.Flush(); err != nil {
+		return &model.Error{Code: model.CodeInternal, Message: "failed to render output: " + err.Error()}
+	}
+	states := make([]string, 0, len(counts))
+	for state := range counts {
+		states = append(states, fmt.Sprintf("%d %s", counts[state], state))
+	}
+	sort.Strings(states)
+	fmt.Fprintf(&b, "\n%d %s: %s\n", len(data.Tools), plural(len(data.Tools), "entry", "entries"),
+		strings.Join(states, ", "))
+	return writeText(w, "%s", b.String())
+}
+
+// writeText emits human output, failing the command when stdout cannot take it
+// rather than reporting success for something nobody received.
+func writeText(w io.Writer, format string, args ...any) error {
+	if _, err := fmt.Fprintf(w, format, args...); err != nil {
+		return &model.Error{Code: model.CodeInternal, Message: "failed to write output: " + err.Error()}
+	}
+	return nil
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}

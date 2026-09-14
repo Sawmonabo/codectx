@@ -4,7 +4,10 @@ package lsp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,7 +22,38 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
+
+// offlineResolver is a resolver over an empty store that may never fetch. Every
+// tool it can hand out is one of the overrides, so no test opens a socket.
+func offlineResolver(t *testing.T, overrides map[string]toolchain.Override) *toolchain.Resolver {
+	t.Helper()
+	r, err := toolchain.New(toolchain.Options{
+		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
+		FetchTimeout: time.Second, Overrides: overrides,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// fileDigest is the lowercase hex SHA-256 of a file, which is what a tool
+// override must declare for the resolver to accept it.
+func fileDigest(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // TestMain turns the test binary into the fake language server when the
 // runner starts it with CODECTX_LSP_FAKE=1. No binary is committed; the
@@ -66,17 +100,22 @@ const utilGo = "package main\n" +
 //   - a server-initiated workspace/applyEdit is refused (repository safety);
 //   - shutdown/exit leaves no process and no materialization (resource leak);
 //   - a crashed server releases the pending call and the overlay reports
-//     failure (resource leak, false readiness).
+//     failure (resource leak, false readiness);
+//   - a server that reports no serverInfo still opens, bound to the version of
+//     the payload the lock pinned (false readiness: pyright and
+//     typescript-language-server both answer initialize with no serverInfo, and
+//     an empty ProviderVersion fails OverlayBinding.Validate, which made the
+//     overlay permanently unavailable for four of the nine languages).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
 	}
+	t.Run("no serverInfo", runSilentServerScenario)
 }
 
-func runScenario(t *testing.T, enc string) {
+func runSilentServerScenario(t *testing.T) {
 	h := providertest.New(t, map[string]string{"main.go": mainGo, "util.go": utilGo})
-	file := h.File(t, "main.go")
-	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 2, MemoryBudgetBytes: 1 << 30, DiskBudgetBytes: 1 << 30})
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,23 +123,75 @@ func runScenario(t *testing.T, enc string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workDir := filepath.Join(t.TempDir(), "work")
 	t.Setenv("CODECTX_LSP_FAKE", "1")
-	t.Setenv("CODECTX_LSP_FAKE_ENCODING", enc)
-	cfg := config.Defaults()
-	cfg.Analyzers = map[string]config.Analyzer{"gopls": {
-		Executable: exe, VersionConstraint: "1.2", WorkDir: workDir,
-		EnvAllowlist:      []string{"CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING"},
-		MemoryBudgetBytes: 1 << 20, DiskBudgetBytes: 1 << 20, Timeout: config.Duration(time.Minute), Network: config.NetworkDenied,
-	}}
-	// An unapproved name is a trust refusal, never a start.
-	if _, err := Trusted(cfg, "clangd"); !isCode(err, model.CodeTrustRequired) {
-		t.Fatalf("Trusted(clangd) = %v, want %s", err, model.CodeTrustRequired)
-	}
-	profile, err := Trusted(cfg, "gopls")
+	t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+	t.Setenv("CODECTX_LSP_FAKE_NO_SERVERINFO", "1")
+	// The pinned version differs from the one the fake would have reported, so
+	// the assertion below cannot pass by coincidence.
+	const pinned = "9.9.9"
+	resolver := offlineResolver(t, map[string]toolchain.Override{
+		"gopls": {Executable: exe, Version: pinned, Checksum: fileDigest(t, exe)},
+	})
+	ctx := context.Background()
+	profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
 	if err != nil {
 		t.Fatal(err)
 	}
+	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING", "CODECTX_LSP_FAKE_NO_SERVERINFO")
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
+		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+	ov, err := mgr.Open(ctx, h.View, profile)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer ov.Close()
+	if got := ov.Binding(); got.ProviderVersion != pinned || got.Validate() != nil {
+		t.Fatalf("binding = %+v (%v), want provider_version %q", got, got.Validate(), pinned)
+	}
+}
+
+func runScenario(t *testing.T, enc string) {
+	h := providertest.New(t, map[string]string{"main.go": mainGo, "util.go": utilGo})
+	file := h.File(t, "main.go")
+	// The budgets are the runner's accounting, not the machine's: a profile's
+	// reservation is a product constant now, so the harness budget has to be
+	// at least one server's.
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 2, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODECTX_LSP_FAKE", "1")
+	t.Setenv("CODECTX_LSP_FAKE_ENCODING", enc)
+	cfg := config.Defaults()
+	// The fake reaches the runner the way a real server does: through the
+	// managed toolchain, as a user override of the gopls lock entry. The
+	// resolver verifies the override's checksum on every resolution, so this
+	// exercises the real resolution path and opens no socket.
+	resolver := offlineResolver(t, map[string]toolchain.Override{
+		"gopls": {Executable: exe, Version: "1.2.3", Checksum: fileDigest(t, exe)},
+	})
+	ctx0 := context.Background()
+	// A server whose payload the store cannot supply is a typed refusal with
+	// the toolchain's own code, never a crash and never a start. Without this
+	// an unresolvable server would be indistinguishable from an available one
+	// at the only moment a caller can still choose another provider.
+	if _, err := Resolve(ctx0, resolver, cfg, "clangd"); !isCode(err, model.CodeToolOffline) {
+		t.Fatalf("Resolve(clangd) = %v, want %s", err, model.CodeToolOffline)
+	}
+	profile, err := Resolve(ctx0, resolver, cfg, "gopls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// In-package: the fake needs two variables no real gopls does.
+	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
 	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, IdleTTL: 200 * time.Millisecond,
 		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
 	if err != nil {
@@ -119,7 +210,7 @@ func runScenario(t *testing.T, enc string) {
 	if ov.Capabilities().WorkspaceSymbols || !ov.Capabilities().CallHierarchy {
 		t.Fatalf("capabilities = %+v", ov.Capabilities())
 	}
-	events := eventLog{t: t, path: filepath.Join(workDir, "events.log")}
+	events := eventLog{t: t, path: filepath.Join(profile.workDir(h.Policy.DataDir), "events.log")}
 	if !strings.Contains(events.wait("encoding="), "encoding="+enc) {
 		t.Fatalf("the fake did not negotiate %s: %v", enc, events.lines())
 	}

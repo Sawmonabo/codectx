@@ -1,10 +1,13 @@
 package neo4jcsv_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,6 +27,14 @@ type counts struct {
 	alias  map[string]string // scope\x00native key -> node id
 	aliasN int               // alias records accepted, duplicates included
 	detail map[string]int
+	// relKey is the fact key list the import published for one relation,
+	// under edgeID(from, kind, to). Only a keyed put carries it.
+	relKey map[string][]string
+}
+
+// edgeID names one published edge independently of the run that published it.
+func edgeID(from model.NodeID, kind model.RelationKind, to model.NodeID) string {
+	return string(from) + "\x00" + string(kind) + "\x00" + string(to)
 }
 
 type recorder struct {
@@ -32,18 +43,41 @@ type recorder struct {
 }
 
 func (r recorder) PutNodes(ctx context.Context, f []model.NodeFact) error {
+	return r.PutKeyedNodes(ctx, f, nil)
+}
+
+// PutKeyedNodes counts the batch and forwards it with its keys, so the import
+// takes the keyed path it takes in production; a destination that cannot carry
+// keys still receives the facts. Same shape as providertest.Recorder.
+func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys [][]string) error {
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
+	}
+	if d, ok := r.Sink.(provider.DeltaSink); ok {
+		return d.PutKeyedNodes(ctx, f, keys)
 	}
 	return r.Sink.PutNodes(ctx, f)
 }
 
 func (r recorder) PutRelations(ctx context.Context, f []model.RelationFact) error {
-	for _, x := range f {
+	return r.PutKeyedRelations(ctx, f, nil)
+}
+
+// PutKeyedRelations is PutKeyedNodes for relation facts, and records each
+// edge's fact keys for TestRelationKeyTracksItsEndpoints.
+func (r recorder) PutKeyedRelations(ctx context.Context, f []model.RelationFact, keys [][]string) error {
+	for i, x := range f {
 		r.c.rel[x.Relation.Kind]++
 		for _, ev := range x.Evidence {
 			r.c.detail[ev.Detail]++
 		}
+		if i < len(keys) {
+			id := edgeID(x.Relation.From, x.Relation.Kind, x.Relation.To)
+			r.c.relKey[id] = append(r.c.relKey[id], keys[i]...)
+		}
+	}
+	if d, ok := r.Sink.(provider.DeltaSink); ok {
+		return d.PutKeyedRelations(ctx, f, keys)
 	}
 	return r.Sink.PutRelations(ctx, f)
 }
@@ -61,7 +95,7 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
 	var rep neo4jcsv.Report
 	var importErr error
 	p := providertest.Func{
@@ -312,15 +346,22 @@ func TestImportDelta(t *testing.T) {
 	if rep3.Changed+rep3.Unchanged != rep3.Keys.Count() {
 		t.Fatalf("changed %d + unchanged %d != %d keys", rep3.Changed, rep3.Unchanged, rep3.Keys.Count())
 	}
-	// Only the changed relations reach the sink; the unchanged ones are the
-	// rows storage keeps.
-	var emitted int
-	for _, n := range c.rel {
-		emitted += n
+	// This fixture's edit removes keys, which is the case a delta import may
+	// not filter: a removed key cannot be mapped back to the edge it backed,
+	// and that edge's previous row is already gone, so every relation is
+	// republished. What must hold is that the delta unit is not poorer than a
+	// full one — the same relations, the same evidence.
+	if rep3.Removed == 0 {
+		t.Fatalf("the fixture edit removed no key; it no longer covers the unfiltered case")
 	}
-	if emitted >= rep3.Changed+rep3.Unchanged {
-		t.Fatalf("a delta import published %d relation occurrences out of %d keys; it must publish only the changed ones",
-			emitted, rep3.Changed+rep3.Unchanged)
+	_, full, _, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
+		neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "full")})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if !maps.Equal(c.rel, full.rel) || !maps.Equal(c.detail, full.detail) {
+		t.Fatalf("a delta import published %v relations with %v evidence; a full import of the same export published %v and %v",
+			c.rel, c.detail, full.rel, full.detail)
 	}
 	delta, err := rep3.Keys.Diff(prev, nil)
 	if err != nil {
@@ -367,19 +408,22 @@ func TestImportConformsUnderPerPutFlush(t *testing.T) {
 	providertest.Conform(t, p, files, "pkg:fixture", paths)
 }
 
-// TestDedupeSinkAdmitsASubdividedUnit protects the subdivision path. A
+// TestSubdividedUnitAdmitsRepeatedIdentities protects the subdivision path. A
 // subdivided unit runs the engine per part and imports every part's export
-// into the one sink opened for the unit, and two parts legitimately describe
-// the same identity (above all the external stub of a shared callee). Storage
-// keys a node fact by (unit, node) with no conflict clause, so the second part
-// republishing that identity fails the whole unit and every fact in it is
-// lost. DedupeSink is the only thing between that and a lost unit.
-func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
+// into the one sink storage opened for the unit, and two parts legitimately
+// describe the same identity — above all the external stub of a callee both
+// parts reference. Storage admits a repeated node identity whose stored
+// columns are identical and refuses one whose columns diverge, so nothing
+// between the import and storage may drop or rewrite the repeat; what the
+// import publishes for one identity must be a function of that identity
+// alone. Silent breakage here loses a whole unit's facts on the one path that
+// exists to rescue them.
+func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	files, paths := readSource(t, filepath.Join("testdata", "src", "gofix"))
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
 	var part [2]struct{ nodes, aliases int }
 	nodesSoFar := func() int {
 		n := 0
@@ -391,17 +435,12 @@ func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
 	p := providertest.Func{
 		Desc: descriptor(),
 		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-			dedupe, err := neo4jcsv.NewDedupeSink(recorder{Sink: sink, c: &c}, t.TempDir())
-			if err != nil {
-				return model.ProviderResult{}, err
-			}
-			defer dedupe.Close()
 			for i := range part {
 				nodes, aliases := nodesSoFar(), c.aliasN
 				o := neo4jcsv.Options{Language: "go", UnitScopeKey: req.Unit.ScopeKey, ProjectRoot: t.TempDir(),
 					Limits: providertest.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit,
 					Run: req.Run, Content: req.Content, ScratchDir: t.TempDir()}
-				if _, err := neo4jcsv.Import(ctx, export, req.Resolver, dedupe, o); err != nil {
+				if _, err := neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o); err != nil {
 					return model.ProviderResult{}, err
 				}
 				part[i].nodes, part[i].aliases = nodesSoFar()-nodes, c.aliasN-aliases
@@ -417,9 +456,10 @@ func TestDedupeSinkAdmitsASubdividedUnit(t *testing.T) {
 	if part[0].nodes == 0 || part[0].aliases == 0 {
 		t.Fatalf("the first part published %d node facts and %d aliases; the fixture must publish both", part[0].nodes, part[0].aliases)
 	}
-	if part[1].nodes != 0 || part[1].aliases != 0 {
-		t.Fatalf("the second part re-published %d node facts and %d aliases; storage would reject them and fail the unit",
-			part[1].nodes, part[1].aliases)
+	if part[1].nodes != part[0].nodes || part[1].aliases != part[0].aliases {
+		t.Fatalf("the second part published %d node facts and %d aliases against the first part's %d and %d; "+
+			"the repeats must be identical, or storage refuses them and the unit is lost",
+			part[1].nodes, part[1].aliases, part[0].nodes, part[0].aliases)
 	}
 }
 
@@ -482,4 +522,108 @@ func keysOf(m map[string]string) []string {
 		out = append(out, strings.ReplaceAll(k, "\x00", " "))
 	}
 	return out
+}
+
+// TestRelationKeyTracksItsEndpoints guards the endpoints component of the
+// fact-key algebra (keys.go: keyAlgebraVersion "2").
+//
+// Failure mode: a relation's key is built only from the call site's own
+// coordinates — its owner, file, operator, target name and byte range — none
+// of which move when the *callee's declaration* moves. Editing above a callee
+// mints a new identity for it, but the call edge into it would keep its key,
+// the delta import would not re-emit the edge, and storage would carry the
+// previous row, whose `to` node id no longer exists in the unit. The unit then
+// fails to seal with dangling relation endpoints — or, worse, a later algebra
+// keeps it. Nothing else in the repository notices this component regressing.
+//
+// The export is the committed gofix export with one column run rewritten: the
+// callee `Scale` declared at helper.go:4-6 is moved to 5-7, exactly as a line
+// inserted above it would move it. The source tree is deliberately NOT
+// shifted: shifting it would also move every occurrence site inside helper.go
+// and change the positional component too, so the test would pass even with
+// the endpoints component removed. Moving only the declaration row leaves the
+// callee's identity as the single variable, which is the variable under test.
+func TestRelationKeyTracksItsEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join("testdata", "src", "gofix")
+	basePath := filepath.Join(dir, "base")
+	_, base, _, err := run(t, src, filepath.Join("testdata", "gofix"),
+		neo4jcsv.Options{Language: "go", KeysPath: basePath})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	moved := 0
+	export := copyExport(t, filepath.Join("testdata", "gofix"), func(name string, data []byte) []byte {
+		if name != "nodes_METHOD_data.csv" {
+			return data
+		}
+		// CODE is a multi-line quoted field, so the row is matched by its
+		// LINE_NUMBER,LINE_NUMBER_END,NAME column run, not by line surgery.
+		out := bytes.Replace(data, []byte(",false,4,6,Scale,"), []byte(",false,5,7,Scale,"), -1)
+		moved = bytes.Count(data, []byte(",false,4,6,Scale,"))
+		return out
+	})
+	if moved != 1 {
+		t.Fatalf("the callee declaration row was rewritten %d times, want exactly 1; the fixture's columns moved", moved)
+	}
+	mutRep, mut, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "moved")})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed", state)
+	}
+
+	// Precondition: moving the declaration moves the callee's published
+	// identity, and nothing else. The workspace alias is the cross-run handle.
+	scaleBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	scaleMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	runBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
+	runMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
+	if scaleBase == "" || scaleMut == "" || runBase == "" || runMut == "" {
+		t.Fatalf("the fixture did not publish both declarations: Scale %q/%q, Run %q/%q", scaleBase, scaleMut, runBase, runMut)
+	}
+	if scaleBase == scaleMut {
+		t.Fatalf("the moved callee kept identity %s; the declaration range no longer decides a declaration's identity", scaleBase)
+	}
+	if runBase != runMut {
+		t.Fatalf("the caller's identity moved (%s -> %s); the fixture no longer isolates the callee", runBase, runMut)
+	}
+
+	// The call edge Run -> Scale. Its key must move with the callee.
+	edge := func(c counts, from, to string) []string {
+		t.Helper()
+		k := c.relKey[edgeID(model.NodeID(from), model.RelCalls, model.NodeID(to))]
+		if len(k) == 0 {
+			t.Fatalf("the call edge %s -> %s published no fact key; a keyed put carries one per edge", from, to)
+		}
+		return k
+	}
+	baseKeys, mutKeys := edge(base, runBase, scaleBase), edge(mut, runMut, scaleMut)
+	for _, k := range mutKeys {
+		if slices.Contains(baseKeys, k) {
+			t.Fatalf("the call edge into the moved callee kept fact key %s; storage would carry a row whose endpoint no longer exists", k)
+		}
+	}
+
+	// The leg storage consumes: the refresh must report those keys changed.
+	prev, err := neo4jcsv.LoadKeySet(basePath)
+	if err != nil {
+		t.Fatalf("LoadKeySet: %v", err)
+	}
+	var changed []string
+	if _, err := mutRep.Keys.Diff(prev, func(key string, removed bool) error {
+		if !removed {
+			changed = append(changed, key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	for _, k := range mutKeys {
+		if !slices.Contains(changed, k) {
+			t.Fatalf("Diff did not report the call edge's key %s changed; the delta import would not re-emit the edge", k)
+		}
+	}
 }

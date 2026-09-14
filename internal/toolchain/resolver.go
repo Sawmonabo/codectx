@@ -38,7 +38,10 @@ type Tool struct {
 	// Executable is absolute; for a runtime-dependent tool it is the runtime
 	// binary, because that is the process that actually starts.
 	Executable string
-	// ArgvPrefix is the full launcher argv; ArgvPrefix[0] == Executable.
+	// ArgvPrefix is the full launcher argv; ArgvPrefix[0] == Executable. It is
+	// never empty and its first element is never the empty string: a resolution
+	// that could not name a launcher fails with CTX_INTERNAL rather than handing
+	// back a prefix a caller would have to check. Every consumer may index it.
 	ArgvPrefix []string
 	// Env carries the variables the child needs, such as JAVA_HOME. Nothing is
 	// inherited: Section 21 requires an allowlisted environment.
@@ -69,8 +72,18 @@ const fingerprintDomain = "tool-fingerprint-v1"
 // It excludes paths and every operational value, so two machines that resolved
 // the same pinned tool produce the same fingerprint.
 func (t Tool) Fingerprint() string {
-	return t.Name + "@" + t.Version + "+" +
-		model.H(fingerprintDomain, string(t.Source), t.Name, t.Version, t.PayloadDigest, t.EntryChecksum, t.Checksum)
+	return t.Name + "@" + t.Version + "+" + t.FingerprintDigest()
+}
+
+// FingerprintDigest is the digest half of Fingerprint: the same identity, in a
+// fixed-length lowercase hex form that is safe to use as a filename. The
+// rendered fingerprint carries the version verbatim, and an override's version
+// is whatever the user typed -- `..`, or a string with a separator in it --
+// so a consumer that names a directory after a tool's identity uses this half
+// rather than the whole. internal/provider/lsp is that consumer: a server's
+// private work directory is per payload identity, not per name.
+func (t Tool) FingerprintDigest() string {
+	return model.H(fingerprintDomain, string(t.Source), t.Name, t.Version, t.PayloadDigest, t.EntryChecksum, t.Checksum)
 }
 
 // Override is a user-configured replacement for a lock entry. It mirrors
@@ -89,8 +102,13 @@ type Override struct {
 // byte cap or timeout here, because a fetch with an implicit bound is an
 // unbounded operation waiting for the day the configuration stops being read.
 type Options struct {
-	// DataDir is the data directory; <data_dir>/tools is created 0o700.
+	// DataDir is the data directory; the store is <data_dir>/tools, created
+	// 0o700 by the first install. Required unless StoreDir names the store.
 	DataDir string
+	// StoreDir, when set, is the tool store itself, used verbatim. Otherwise the
+	// store is StoreDir(DataDir), i.e. <data_dir>/tools. tools.cache_dir names a
+	// store, not a parent of one, so the configuration key and the option agree.
+	StoreDir string
 	// Offline turns every fetch into a typed refusal without opening a socket.
 	Offline bool
 	// Mirror optionally replaces the scheme and host of every lock asset URL,
@@ -161,8 +179,14 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	if err := validateLock(lock); err != nil {
 		return nil, err
 	}
-	if opts.DataDir == "" || !filepath.IsAbs(opts.DataDir) {
-		return nil, invalid("the tool store needs an absolute data directory")
+	storeDir := opts.StoreDir
+	if storeDir == "" {
+		if opts.DataDir == "" || !filepath.IsAbs(opts.DataDir) {
+			return nil, invalid("the tool store needs an absolute data directory")
+		}
+		storeDir = StoreDir(opts.DataDir)
+	} else if !filepath.IsAbs(storeDir) {
+		return nil, invalid("the tool store directory must be an absolute path")
 	}
 	if opts.MaxFetchBytes <= 0 {
 		return nil, invalid("tools.max_fetch_bytes must be positive")
@@ -188,17 +212,13 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 		}
 		overrides[name] = ov
 	}
-	st, err := openStore(StoreDir(opts.DataDir))
-	if err != nil {
-		return nil, err
-	}
 	log := opts.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Resolver{
 		lock:      lock,
-		store:     st,
+		store:     &store{dir: storeDir},
 		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, opts.FetchTimeout, log),
 		platform:  Current(),
 		offline:   opts.Offline,
@@ -206,6 +226,12 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 		overrides: overrides,
 	}, nil
 }
+
+// StoreDir is the directory this resolver installs into and reports on. It is
+// the one place that answers "which store is this", so a caller that prints the
+// path -- `codectx tools` does -- cannot print a different one from the one the
+// resolver uses.
+func (r *Resolver) StoreDir() string { return r.store.dir }
 
 // Resolve returns the runnable tool named by one lock entry, installing the
 // pinned payload if it is not already in the store. Resolution order is
@@ -238,7 +264,74 @@ func (r *Resolver) Resolve(ctx context.Context, name string) (Tool, error) {
 	if err != nil {
 		return Tool{}, err
 	}
-	return compose(name, e, p, dir, entryHash, runtime), nil
+	return compose(name, e, p, dir, entryHash, runtime)
+}
+
+// PinnedFingerprint is Tool.Fingerprint() for the payload the lock pins,
+// computed from the lock alone: no store is read, nothing is fetched and no
+// filesystem path is touched. It is the identity the tool will have once its
+// payload is installed, because every field the fingerprint folds is pinned --
+// the source is managed, the version and the payload digest are the lock's, and
+// the entry digest is what a resolution verifies the installed entry against
+// before it accepts it.
+//
+// It exists for a consumer that keys facts by tool identity and plans work for
+// a payload that is pinned but not yet in the store: internal/provider/scip
+// defers such a kind, and a unit it seals must carry the same provider version
+// whether the payload landed before the process started or during it.
+//
+// A tool the user has overridden has no pinned identity -- its version and its
+// bytes are the user's -- and this refuses one. That is unreachable from the
+// deferral path it serves: an override resolves without touching the store, so
+// it is either usable now or a typed refusal now, never deferred.
+func (r *Resolver) PinnedFingerprint(name string) (string, error) {
+	t, err := r.pinned(name)
+	if err != nil {
+		return "", err
+	}
+	return t.Fingerprint(), nil
+}
+
+// pinned builds the identity half of a resolved Tool from lock data. It runs
+// compose, rather than reproducing its four launcher shapes, because the shape
+// decides which executable's digest becomes Tool.Checksum -- the entry's for a
+// tool that runs as itself, the runtime's for a Node or jar payload -- and a
+// second copy of that branch is a copy that can disagree with the one
+// resolution uses.
+//
+// The Tool it returns is meaningful in its identity fields only: composed
+// against an empty payload directory, its Root, Executable, ArgvPrefix and Env
+// are relative or derived from relative paths and nothing may run it. It stays
+// unexported for that reason, and PinnedFingerprint returns only the string.
+func (r *Resolver) pinned(name string) (Tool, error) {
+	e, ok := r.lock.Tools[name]
+	if !ok {
+		return Tool{}, internalError("no lock entry is named %q", name)
+	}
+	if _, ok := r.overrides[name]; ok {
+		return Tool{}, internalError("tool %q is replaced by a user override, whose identity the lock does not pin", name)
+	}
+	p, ok := e.Platforms[r.platform.Key()]
+	if !ok {
+		return Tool{}, unsupported(name, r.platform)
+	}
+	var runtime Tool
+	if e.Runtime != "" {
+		var err error
+		// An overridden runtime still has a fully known identity: the override
+		// names the executable and its checksum, so the hosted entry's pinned
+		// fingerprint folds the runtime the user actually supplies rather than
+		// refusing. Only the entry itself has no pinned identity when overridden.
+		if ov, ok := r.overrides[e.Runtime]; ok {
+			runtime, err = resolveOverride(e.Runtime, ov)
+		} else {
+			runtime, err = r.pinned(e.Runtime)
+		}
+		if err != nil {
+			return Tool{}, err
+		}
+	}
+	return compose(name, e, p, "", e.entryDigest(p), runtime)
 }
 
 // ensure returns the installed payload directory and the entry digest observed
@@ -328,7 +421,7 @@ func (r *Resolver) inspect(name string, e Entry, p Payload, rehash bool) (string
 // distribution ships. That script reads JAVA_HOME (verified against the real
 // Joern 4.0.627 launcher), so the managed JDK reaches it as an environment
 // variable rather than as an argv element.
-func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Tool) Tool {
+func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Tool) (Tool, error) {
 	entry := e.entryPath(p)
 	entryPath := filepath.Join(dir, filepath.FromSlash(entry))
 	t := Tool{Name: name, Version: e.Version, Root: dir, Source: SourceManaged,
@@ -347,7 +440,14 @@ func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Too
 		t.Executable, t.ArgvPrefix, t.Checksum = entryPath, []string{entryPath}, entryHash
 		t.Env = javaEnv(runtime)
 	}
-	return t
+	// Tool.ArgvPrefix promises a runnable launcher, so the promise is kept here
+	// rather than re-checked at each of the three call sites that index it. A
+	// runtime-hosted shape whose runtime resolved without an executable is the
+	// only way to reach this, and it is a product defect, not user input.
+	if len(t.ArgvPrefix) == 0 || t.ArgvPrefix[0] == "" {
+		return Tool{}, internalError("resolved tool %q has no launcher", name)
+	}
+	return t, nil
 }
 
 // javaEnv names the managed JDK for a child that looks it up itself. JAVA_HOME
@@ -391,6 +491,14 @@ func resolveOverride(name string, ov Override) (Tool, error) {
 	}
 	if got != ov.Checksum {
 		return Tool{}, overrideInvalid(name, "the configured executable does not hash to the configured checksum")
+	}
+	// ArgvPrefix's "never empty" guarantee is enforced here as well as in
+	// compose, not merely argued from the validOverride call above: consumers
+	// -- joern.Locate among them -- deleted their own prefix checks on the
+	// strength of that guarantee, so it has to hold in code at every point a
+	// Tool is constructed, including one no input reaches today.
+	if ov.Executable == "" {
+		return Tool{}, internalError("resolved tool %q has no launcher", name)
 	}
 	return Tool{
 		Name: name, Version: ov.Version, Root: filepath.Dir(ov.Executable),
@@ -486,7 +594,9 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 		if errors.As(err, &typed) && typed.Code == model.CodeToolUnsupportedPlatform {
 			continue
 		}
-		errs = append(errs, err)
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

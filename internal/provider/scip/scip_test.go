@@ -2,8 +2,11 @@ package scip_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,9 +18,11 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // The canonical fixture was encoded with the real scip Go bindings
@@ -66,7 +71,7 @@ func readFixture(t *testing.T, name string) string {
 
 func newProvider(t *testing.T, importPath string) *scip.Provider {
 	t.Helper()
-	p, err := scip.New(scip.Options{Import: importPath, WorkDir: t.TempDir()})
+	p, err := scip.New(context.Background(), scip.Options{Import: importPath, WorkDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,4 +668,102 @@ func occurrenceRecord(symbol string, roles uint64, vals ...int32) []byte {
 		o = appendVarint(o, 3<<3|0, roles)
 	}
 	return o
+}
+
+// managedResolver is a resolver over an empty store that may never fetch. With
+// no override it can resolve nothing, which is the "offline" case; with one it
+// hands back exactly the executable the override names. Neither opens a socket.
+func managedResolver(t *testing.T, overrides map[string]toolchain.Override) *toolchain.Resolver {
+	t.Helper()
+	r, err := toolchain.New(toolchain.Options{
+		DataDir: t.TempDir(), Offline: true, MaxFetchBytes: 1 << 20,
+		FetchTimeout: time.Second, Overrides: overrides,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func testBinaryDigest(t *testing.T) (string, string) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatal(err)
+	}
+	return exe, hex.EncodeToString(h.Sum(nil))
+}
+
+// TestManagedToolIdentity protects the two invariants the managed toolchain
+// moved into this provider. Neither is a wiring check; each names a way a unit
+// becomes a lie.
+//
+//   - A payload the store cannot supply must surface the toolchain's own
+//     CTX_TOOL_* code and plan no unit. Reported as "available" it would plan a
+//     unit that materializes the whole snapshot and then fails on a binary that
+//     was never there; reported as an untyped absence an operator cannot tell
+//     "run prefetch" from "this platform has no payload" — and a crash here is
+//     a detection path that takes down every provider behind it.
+//   - A changed payload must change the provider version. Section 20.2 keeps
+//     `[tools]` out of AnalysisConfigHash, so the tool identity reaches the unit
+//     key only through this version; if it did not, a unit produced by one
+//     indexer would have the same UnitID as the same scope and inputs indexed
+//     by a different one, and the stale facts would be reused as fresh.
+func TestManagedToolIdentity(t *testing.T) {
+	ctx := context.Background()
+	h := providertest.New(t, map[string]string{"go.mod": "module m\n", "a.go": "package m\n"})
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("an unresolvable payload is typed absence, not availability", func(t *testing.T) {
+		p, err := scip.New(ctx, scip.Options{WorkDir: t.TempDir(), Runner: runner, Resolver: managedResolver(t, nil)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		det, err := p.Detect(ctx, h.Root, h.Policy)
+		if err != nil {
+			t.Fatalf("Detect: %v", err)
+		}
+		if det.Available {
+			t.Fatal("Detect reports available with no payload the store can supply")
+		}
+		if det.DiagnosticCode != model.CodeToolOffline {
+			t.Fatalf("diagnostic code = %q, want %s", det.DiagnosticCode, model.CodeToolOffline)
+		}
+		if scopes := p.Scopes(det); len(scopes) != 0 {
+			t.Fatalf("Scopes = %v, want none", scopes)
+		}
+	})
+
+	t.Run("a changed payload changes the provider version", func(t *testing.T) {
+		exe, sum := testBinaryDigest(t)
+		version := func(declared string) string {
+			p, err := scip.New(ctx, scip.Options{WorkDir: t.TempDir(), Runner: runner,
+				Resolver: managedResolver(t, map[string]toolchain.Override{
+					"scip-go": {Executable: exe, Version: declared, Checksum: sum},
+				})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return p.Descriptor().Version
+		}
+		first, second := version("0.2.7"), version("0.2.8")
+		if first == second {
+			t.Fatalf("two different scip-go payloads share provider version %q", first)
+		}
+		if again := version("0.2.7"); again != first {
+			t.Fatalf("the provider version is not a function of the payloads: %q then %q", first, again)
+		}
+	})
 }

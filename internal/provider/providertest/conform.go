@@ -53,20 +53,40 @@ type Recorder struct {
 }
 
 func (r *Recorder) PutNodes(ctx context.Context, facts []model.NodeFact) error {
+	return r.PutKeyedNodes(ctx, facts, nil)
+}
+
+// PutKeyedNodes records the identities and forwards the batch with its
+// provider fact keys. The Recorder embeds the UnitOutput interface, which does
+// not carry the keyed methods, so without this an incremental provider's keyed
+// batch reaches a destination that cannot record keys and the sink refuses it
+// (provider.DeltaSink) — a property of the harness, not of the provider.
+func (r *Recorder) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
 	r.mu.Lock()
 	for _, f := range facts {
 		r.Nodes = append(r.Nodes, f.Node.ID)
 	}
 	r.mu.Unlock()
+	if d, ok := r.UnitOutput.(provider.DeltaSink); ok {
+		return d.PutKeyedNodes(ctx, facts, keys)
+	}
 	return r.UnitOutput.PutNodes(ctx, facts)
 }
 
 func (r *Recorder) PutRelations(ctx context.Context, facts []model.RelationFact) error {
+	return r.PutKeyedRelations(ctx, facts, nil)
+}
+
+// PutKeyedRelations is PutKeyedNodes for relation facts.
+func (r *Recorder) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error {
 	r.mu.Lock()
 	for _, f := range facts {
 		r.Relations = append(r.Relations, f.Relation.ID)
 	}
 	r.mu.Unlock()
+	if d, ok := r.UnitOutput.(provider.DeltaSink); ok {
+		return d.PutKeyedRelations(ctx, facts, keys)
+	}
 	return r.UnitOutput.PutRelations(ctx, facts)
 }
 
@@ -170,7 +190,7 @@ func Conform(t *testing.T, p provider.Provider, files map[string]string, scopeKe
 // flushable is the sink RunUnit hands a provider: the Sink methods plus the
 // batch flush the harness triggers after every call.
 type flushable interface {
-	provider.Sink
+	provider.DeltaSink
 	Flush(context.Context) error
 }
 
@@ -197,8 +217,20 @@ func (f flushing) PutNodes(ctx context.Context, facts []model.NodeFact) error {
 	return f.then(ctx, f.sink.PutNodes(ctx, facts))
 }
 
+// PutKeyedNodes keeps the keys of an incremental provider's batch on the
+// per-put-flush path; dropping them here would make the flush variant of the
+// conformance run exercise a different sink contract from the batched one.
+func (f flushing) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
+	return f.then(ctx, f.sink.PutKeyedNodes(ctx, facts, keys))
+}
+
 func (f flushing) PutRelations(ctx context.Context, facts []model.RelationFact) error {
 	return f.then(ctx, f.sink.PutRelations(ctx, facts))
+}
+
+// PutKeyedRelations is PutKeyedNodes for relation facts.
+func (f flushing) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error {
+	return f.then(ctx, f.sink.PutKeyedRelations(ctx, facts, keys))
 }
 
 func (f flushing) PutAliases(ctx context.Context, aliases []model.NativeAlias) error {

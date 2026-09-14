@@ -15,7 +15,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
-	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
@@ -29,7 +28,7 @@ const (
 	// classification or pinned argument arrays change. The descriptor version
 	// is this plus the engine payload digest, so a unit built by one engine
 	// release is never reused for another.
-	adapterVersion = "1"
+	adapterVersion = "3"
 	// ScopeWorkspace is the scope of the C/C++ unit, the one unit that is the
 	// whole repository.
 	ScopeWorkspace = provider.ScopeWorkspace
@@ -174,8 +173,13 @@ func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy works
 	if !languages {
 		return provider.Detection{Available: false, DiagnosticCode: model.CodeProviderUnavailable}, nil
 	}
+	// The payload's name is deliberately absent. Detection is a product
+	// surface — `status`, `doctor` and the ledger render this string — and the
+	// engine is never named on one (Section 11.6, wave-A ruling). The version
+	// and the payload digest are the whole of the provenance a reader needs:
+	// docs/providers-dependence.md maps a digest to its release.
 	return provider.Detection{Available: true, Capabilities: Capabilities, InputPaths: inputs,
-		ObservedVersion: truncate(p.engine.Name+" "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}, nil
+		ObservedVersion: truncate("engine "+p.engine.Version+" "+p.engine.Digest, model.MaxIdentifierBytes)}, nil
 }
 
 // stopWalk ends a bounded detection walk without making an early stop look
@@ -223,7 +227,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
 	defer cancel()
 
-	unit, err := p.unitFor(ctx, req)
+	unit, plan, err := p.unitFor(ctx, req)
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
@@ -243,6 +247,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
+	// A project of this family the planner had to refuse has no unit of its
+	// own: its files were analysed by whichever unit encloses them, under a
+	// scope key that names a different project. Publishing this family fresh
+	// while that is true is false readiness, and the unit that ran is the only
+	// place with a capability row to say so.
+	pub.UnplannedProjects = plan.Unplanned[unit.Family]
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
 	// source bytes are a different figure and are logged as source_bytes
@@ -259,6 +269,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
+		"unplanned_projects", pub.UnplannedProjects,
 		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes)
 	return result, nil
 }
@@ -268,17 +279,20 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 // checkout is what makes the unit's inputs the ones storage keyed it on; a
 // scope key that is not in the plan is a coordinator/provider disagreement and
 // fails rather than being guessed at.
-func (p *Provider) unitFor(ctx context.Context, req provider.UnitRequest) (Unit, error) {
+// The whole plan is returned with the unit because what the plan refused is
+// part of what this unit must publish: a family with an unplannable project is
+// not fresh anywhere.
+func (p *Provider) unitFor(ctx context.Context, req provider.UnitRequest) (Unit, Plan, error) {
 	plan, err := PlanUnits(ctx, req.Content)
 	if err != nil {
-		return Unit{}, err
+		return Unit{}, Plan{}, err
 	}
-	for _, u := range plan {
+	for _, u := range plan.Units {
 		if u.ScopeKey == req.Unit.ScopeKey {
-			return u, nil
+			return u, plan, nil
 		}
 	}
-	return Unit{}, invalid("the dependence provider has no unit for scope " + truncate(req.Unit.ScopeKey, 128) + " in this snapshot")
+	return Unit{}, Plan{}, invalid("the dependence provider has no unit for scope " + truncate(req.Unit.ScopeKey, 128) + " in this snapshot")
 }
 
 // runDir is one unit's private working directory. Everything the analyzer
@@ -357,13 +371,19 @@ func (r *runDir) close(req provider.UnitRequest) {
 func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	run *runDir, sink provider.Sink) (publication, ImportReport, error) {
 
+	// Membership is decided file by file, by the unit itself: only the files
+	// this unit owns are ever written. Copying the whole snapshot and deleting
+	// the nested projects afterwards spent the time and the disk of every
+	// sibling project, and left another unit's source inside this unit's
+	// private tree for as long as the pruning took.
 	mat, err := snapshot.Materialize(ctx, req.Content, model.FileSelection{},
-		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes})
+		snapshot.MaterializeOptions{Dir: run.path("src"), MaxBytes: maxMaterializationBytes,
+			Include: func(fv model.FileVersion) bool { return unit.Contains(fv.Path) }})
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
 	defer mat.Close()
-	source, err := pruneToUnit(mat.Root(), unit)
+	source, err := unitSource(mat.Root(), unit)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
@@ -415,10 +435,12 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 	}
 	switch outcome.Class {
 	case FailureMemory:
-		retry := p.gov.RetryCap(res)
+		retry := p.gov.RetryCap(res, observedPeak(outcome))
 		if retry == 0 {
-			// The first attempt already had the whole allocation. A retry at
-			// the same cap cannot succeed and costs a full parse.
+			// Either the first attempt already had the whole allocation, or
+			// the tree it ran in peaked at what the machine can allocate. A
+			// retry with no more memory behind it cannot succeed and costs a
+			// full parse.
 			return "", Outcome{}, failure(FailureMemory, unit.ScopeKey, outcome, res)
 		}
 		retried := res
@@ -434,10 +456,15 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 		return "", Outcome{}, failure(FailureTimeout, unit.ScopeKey, outcome, res)
 	}
 	if outcome.Class == FailureEngine {
-		// Confirm the crash reproduces before anything is split. The neutral
-		// option allowlist is empty for every frontend today, so this is the
-		// same run twice: a transient crash does not reappear, and a
-		// deterministic one does.
+		// Confirm the crash before anything is split. The neutral option
+		// allowlist is empty for every frontend today, so the confirmation
+		// runs the same argv over the same source; the engine is not
+		// run-to-run deterministic, so what it yields is a second observation
+		// of the same failure class, which raises the odds that the crash is
+		// deterministic without proving it. That is what subdivision is
+		// allowed to rest on: a class seen twice, against the cost of
+		// splitting a project, which loses more than half of its resolved
+		// calls. A crash seen once is never split on.
 		confirm, err := p.parse(ctx, req, unit, res, source, graph, p.backend.NeutralOptions(unit.Family))
 		if err != nil {
 			return "", Outcome{}, err
@@ -480,7 +507,8 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
 		"family", string(unit.Family), "exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
-		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes, "tree_peak_bytes", out.PeakBytes)
+		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
+		"tree_peak_bytes", peakForLog(out))
 	if out.Class == FailureNone {
 		if info, err := os.Stat(graph); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 			// A zero exit with no graph is the helper crash the orchestrator
@@ -591,24 +619,14 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
 		"children", len(children))
-	// Two parts of one subdivided unit legitimately describe the same entity —
-	// above all the external stub of a callee both parts reference — and
-	// storage keys a node fact by (unit, node) with no conflict clause, so the
-	// second row fails the whole unit and every fact of every part is lost.
-	// Subdivision is the only recovery from a reproducible crash, so it must
-	// survive a repeated identity. One dedupe sink for the unit's lifetime,
-	// with its seen set on disk, is what makes the parts one unit; dropping a
-	// repeat never weakens the put-order rule, because the identity it names
-	// was written by the part that published it first.
-	dedupeDir := run.path("dedupe")
-	if err := os.MkdirAll(dedupeDir, 0o700); err != nil {
-		return ImportReport{}, internalErr("the dependence dedupe directory could not be created: " + err.Error())
-	}
-	dedupe, err := neo4jcsv.NewDedupeSink(sink, dedupeDir)
-	if err != nil {
-		return ImportReport{}, err
-	}
-	defer dedupe.Close()
+	// Every part imports into the one sink storage opened for the unit. Two
+	// parts legitimately describe the same entity — above all the external
+	// stub of a callee both parts reference — and storage now admits a
+	// repeated node identity whose stored columns are identical and refuses
+	// one whose columns diverge (CTX_PROVIDER_OUTPUT_INVALID). The repeat is
+	// therefore neither dropped here nor absorbed there: identical repeats
+	// cost nothing and a divergence, which would mean the parts disagree
+	// about one entity, fails the unit where it can be seen.
 	var total ImportReport
 	var admitted int
 	for i, child := range children {
@@ -634,7 +652,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			continue
 		}
 		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
-			path.Join(unit.Root, child), dir, dedupe)
+			path.Join(unit.Root, child), dir, sink)
 		if err != nil {
 			return ImportReport{}, err
 		}
@@ -712,24 +730,13 @@ func merge(a, b ImportReport) ImportReport {
 	return a
 }
 
-// pruneToUnit narrows a whole-snapshot materialization to exactly one unit's
-// files: the nested projects it does not own are removed from the private
-// copy, so a module inside another module is analysed once, by its own unit.
-// The returned directory is what the engine reads.
-//
-// The materialization is whole because snapshot.Materialize selects by an
-// explicit path list bounded at 64 entries, which cannot carry a unit's files;
-// the report records the shared-helper change that would let it copy only the
-// unit's own files.
-func pruneToUnit(root string, unit Unit) (string, error) {
-	for _, ex := range unit.Excluded {
-		if ex == "" || strings.Contains(ex, "..") {
-			return "", invalid("a dependence unit excludes a directory that is not root-relative")
-		}
-		if err := os.RemoveAll(filepath.Join(root, filepath.FromSlash(ex))); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return "", internalErr("a nested project could not be pruned from the unit materialization: " + err.Error())
-		}
-	}
+// unitSource is the directory of a unit's materialization that the engine
+// reads. The materialization already holds only this unit's files, so the only
+// thing left to establish is that the project directory is actually there: an
+// absent one would otherwise be handed to the engine as a missing path or, for
+// the repository root, as an empty tree that parses to an empty graph
+// indistinguishable from a crashed frontend helper.
+func unitSource(root string, unit Unit) (string, error) {
 	dir := root
 	if unit.Root != "" {
 		dir = filepath.Join(root, filepath.FromSlash(unit.Root))

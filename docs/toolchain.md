@@ -1,18 +1,26 @@
 # The managed analyzer toolchain: what is pinned and why
 
 codectx owns every external analyzer it runs and every runtime those analyzers
-need. Nothing is looked up on `PATH`, nothing is installed by the user, and
-nothing executes that the shipped binary did not pin. This document describes
-the pinned set and the provenance behind it (Section 11.7). The runtime
-behaviour — store layout, resolution order, offline refusals, `codectx tools`
-commands — belongs to `internal/toolchain`.
+need. codectx looks nothing up on `PATH`, installs nothing on the user's behalf
+beyond the payloads its own lock pins, and executes nothing the shipped binary
+did not pin — with one documented exception, the three host toolchains three of
+the indexers shell out to (see [Host dependencies](#host-dependencies)). This document describes
+the pinned set and the provenance behind it, the `codectx tools` commands that
+manage it, and the per-platform matrix that proves it (Section 11.7). Store
+layout, resolution order and offline refusals are implemented in
+`internal/toolchain`, whose package comment is the detailed reference.
 
-**The user needs no toolchain of their own.** Not Go, not Node, not npm, not a
-JDK. Node comes from a pinned nodejs.org distribution and the JDK from a pinned
-Eclipse Temurin build; the four Node-hosted analyzers ship as prebuilt
-`node_modules` trees produced at release time by `npm ci --omit=dev`, so no
-`npm install` ever runs on a user's machine; `gopls` is cross-compiled at
-release time for all six targets. Installing codectx installs nothing else.
+**The user installs no analyzer, no runtime and no language server.** Node comes
+from a pinned nodejs.org distribution and the JDK from a pinned Eclipse Temurin
+build; the four Node-hosted analyzers ship as prebuilt `node_modules` trees
+produced at release time by `npm ci --omit=dev`, so no `npm install` ever runs on
+a user's machine; `gopls` is cross-compiled at release time for all six targets.
+Installing codectx installs nothing else.
+
+**Three host programs are the exception, and they are the indexed language's own
+toolchain**, because the indexer loads the project model through it exactly as a
+build would — [the host dependencies](#host-dependencies) below is the one place
+they are listed.
 
 ## The three artifacts
 
@@ -150,6 +158,174 @@ the engine is a backend swap rather than a product change.
   file, at the payload-relative path the lock already pins for it and with the
   executable bit set; the pinned entry digest then verifies it exactly as it
   verifies a member of an archive.
+
+## The `codectx tools` commands
+
+Nothing here is a prerequisite. Indexing resolves what a repository needs and
+installs it on demand, so a user who never runs `codectx tools` gets the same
+result. These commands exist for CI, for offline hosts, and for answering "what
+is on this machine and is it still intact".
+
+```bash
+codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
+codectx tools prefetch [--all | --for-repo PATH | NAME...] [--json]
+                                                       # install ahead of time
+codectx tools verify [--json]                          # rehash every installed entry against the lock
+codectx tools gc [--json]                              # remove versions the current lock does not name
+```
+
+`status` is the cheap report: it checks each entry's publication marker and the
+presence of its executable, and never rehashes, so it stays usable for a store
+holding the 1.8 GB engine. Each entry is reported in one of five states —
+`installed`, `available` (pinned but not fetched yet), `unsupported_platform`
+(the lock carries no payload here, which is honest absence and not a failure),
+`override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
+
+`prefetch` requires one of `--all`, `--for-repo PATH` or explicit names, so a
+bare invocation cannot start a multi-gigabyte download by accident. A name the
+lock does not carry is rejected before anything is fetched. An entry with no
+payload for this platform is skipped rather than failed. Each completed fetch
+logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
+report of what is now installed goes to stdout.
+
+`--for-repo PATH` installs what that repository's **root** selects, which on a Go
+repository is four payloads rather than fourteen. The selection is read from the
+mappings that already decide it — the SCIP indexers' trigger manifests, the
+language servers' root markers, the dependence families' project markers, and
+the path-to-language table for the source check below — plus each selected
+entry's `runtime` from the lock, so no second copy of any of them exists
+anywhere in the CLI. Everything is read at the repository root, by metadata or
+by filename, through the confined root handle for the markers and as one listing
+of the root directory for the sources: nothing is opened, nothing is started,
+and nothing below the root is walked, so the work is bounded by the number of
+markers plus the entries of one directory rather than by the size of the
+repository. A root that selects nothing is an argument error rather than a
+silent no-op.
+
+The root is the whole of what the command can see, and that is the planner's
+answer for two of the three providers but not the third:
+
+- **SCIP and LSP are root-only too.** Both detect from manifests at the
+  repository root, so what `--for-repo` selects for them is exactly what an
+  index run resolves. A nested `svc/pom.xml` selects no Java payload here, and
+  it selects none at index time either.
+- **The dependence provider walks for sources.** Its C/C++ family declares no
+  project marker at all — its unit is the repository itself, planned
+  unconditionally — and its other families' units are found by walking the
+  tree. `--for-repo` therefore selects the graph engine and its JDK on three
+  signals: a project marker of one of the other families at the root
+  (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
+  `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
+  `Cargo.toml`), a C or C++ build declaration at the root (`CMakeLists.txt` or
+  `compile_commands.json`, which also cover the out-of-source layout with
+  sources under `src/`; a bare `Makefile` does not count, since it is common at
+  roots of every language), or a source file of any of the families lying at
+  the root itself. This over-selects in one direction only: a root carrying
+  `CMakeLists.txt` or a project marker with no source of that family anywhere
+  in the tree still prefetches the engine, because the planner gates on sources
+  while this command reads only the root.
+
+  One root shape is therefore still under-served and fetches the graph engine
+  and its JDK at index time after a `--for-repo` prefetch reported success: a
+  root that declares nothing at all while its sources live further down.
+  Closing it would need a walk, which this command refuses so a prefetch's
+  work stays bounded. When prefetching for an air-gapped runner from that
+  shape, name the tools explicitly or use `--all`.
+
+```console
+$ codectx tools prefetch --for-repo .
+NAME     VERSION      STATE      LANGUAGES
+gopls    0.23.0       installed  go
+jdk      21.0.12.1+1  installed
+joern    4.0.627      installed  c, cpp, go, java, javascript, python, rust, tsx, typescript
+scip-go  0.2.7        installed  go
+```
+
+`verify` is the expensive one: it rehashes each installed **entry executable**
+against the digest the lock pins for it — the binary, script or jar the lock
+names, and nothing else in the payload tree. A store a user edited or a disk
+damaged is reported here rather than discovered inside an analyzer run, and a
+corrupt entry **fails the command** with `CTX_TOOL_CORRUPT` — a check that
+reports damage and exits 0 is a gate that passes silently in CI. A corrupt entry
+is repaired by re-running `prefetch` for it, not by `gc`: `gc` removes versions
+the lock no longer names, and a damaged tree at the pinned version is one the
+lock does name.
+
+What `verify` does **not** cover is the rest of the payload: a file added,
+changed or removed anywhere but the pinned entry is not detected, because no
+per-file digest of the tree is recorded at install time. That is why a managed
+tool is never given the payload directory to write into — every profile points a
+tool's own state at its run's work directory — and why an operator who suspects a
+tampered tree reinstalls it with `prefetch` rather than trusting a green
+`verify`.
+
+`--repo` selects which workspace's resolved configuration is used, because the
+data directory is per workspace by default and the store under it is
+`<data_dir>/tools`. Set `tools.cache_dir` in the user configuration to give every
+checkout on the machine one shared store: the path it names **is** the store,
+used verbatim, not a parent that `tools` appends to. The path the reports print
+is the one the resolver actually reads, so the two can never disagree.
+
+None of the four commands creates anything it only reports on: `status`,
+`verify` and `gc` leave a machine with no store exactly as they found it, and the
+store directory appears when the first payload is installed.
+
+Exit codes follow Section 18.2: every `CTX_TOOL_*` failure is exit 5 (a managed
+tool that cannot be resolved is a provider that cannot run), except
+`CTX_TOOL_OVERRIDE_INVALID`, which is exit 3 because it is a configuration error
+the user fixes in their own file.
+
+## Host dependencies
+
+Three host programs are not pinned and are not installed, because they are the
+indexed language's own toolchain and the indexer loads the project model through
+them:
+
+| Program | Needed by | Language |
+|---|---|---|
+| `go` | `scip-go` | go |
+| `cargo` | `rust-analyzer` | rust |
+| `python3`/`pip3` | `scip-python` | python |
+
+Nothing else needs anything on the host. Java in particular does not: `scip-java`
+is driven from a `--scip-config` project description compiled with the managed
+JDK's own `javac`, so neither Maven nor Gradle is required. Where one of the
+three is absent, that language falls back to the structural and dependence
+providers and is reported at the precision they give; it is never a failure of
+another language. On the matrix runner the same absence **fails the leg**: a
+language the runner cannot prove is the platform going uncovered, which is
+exactly what the gate exists to catch.
+
+## The per-platform matrix
+
+`.github/workflows/tools-matrix.yml` is the gate behind "supported". On
+`ubuntu-latest`, `macos-latest` and `windows-latest` it prefetches every payload
+the lock carries for that platform, re-verifies the store, and then runs
+`.github/tools-matrix --store <the store>`, which indexes a nine-language
+fixture — Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust, every
+one of them carrying non-ASCII identifiers and literals — with the pinned
+analyzers and parses each language family with the pinned graph engine.
+
+Every indexer run issues **the product's own argument array**: the smoke builds
+it with `scip.Argv`, the single source of every indexer invocation this product
+makes, and lays the run out the way the provider does — the index written
+outside the input directory, a private scratch root per run. A matrix that ran a
+different argv would prove that some invocation works on the platform rather
+than that the one the product issues does. The fixture and the assertion that
+each index names the documents it was given are the smoke's own. C++ and TSX are exercised
+explicitly because the research rounds covered only C and TypeScript. A language
+no run covers fails the job, so a payload that silently stopped working cannot
+leave a green matrix behind it.
+
+The matrix does not run on every push: one leg downloads about 2.6 GB. It runs
+when the lock, the toolchain runtime or the matrix itself changes, on demand,
+and weekly — the weekly run is what catches an upstream asset that disappeared
+from its publisher's release while its digest in the lock stayed valid.
+
+The ordinary CI workflow enforces the other half of Section 11.7: `go list
+-deps` over `./cmd/codectx` fails the build if any package outside
+`internal/toolchain` imports `net/http`. The shipped binary's dependency graph
+is what is checked, not a grep of the source.
 
 ## Regenerating and verifying
 

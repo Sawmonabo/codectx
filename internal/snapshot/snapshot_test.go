@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -473,5 +474,68 @@ func TestNoConfiguredCommandExecutesDuringCapture(t *testing.T) {
 	}
 	if _, ok := m["MARKER"]; ok {
 		t.Fatal("MARKER was captured; a filter ran before the walk")
+	}
+}
+
+// TestMaterializeCopiesExactlyTheSelectedFiles protects the membership
+// predicate a per-unit materialization is built on. Failure mode: an analyzer
+// that receives one file too many analyses a nested project that another unit
+// owns, and every fact of the overlap is then claimed twice under two
+// identities; one file too few is a silent hole in a result published as
+// complete. Neither is visible in the analyzer's output, so the copy itself is
+// the only place the invariant can be checked.
+func TestMaterializeCopiesExactlyTheSelectedFiles(t *testing.T) {
+	f := newFixture(t, false)
+	f.write("svc/go.mod", []byte("module svc\n"), 0o644)
+	f.write("svc/main.go", []byte("package main\n"), 0o644)
+	f.write("svc/tool.sh", []byte("#!/bin/sh\n"), 0o755)
+	f.write("svc/nested/go.mod", []byte("module nested\n"), 0o644)
+	f.write("svc/nested/lib.go", []byte("package nested\n"), 0o644)
+	f.write("other/main.go", []byte("package other\n"), 0o644)
+	_, view := f.build(f.builder())
+
+	// The unit is "svc minus its nested module": exactly what a dependence
+	// unit owns, and a shape model.FileSelection.Paths cannot express.
+	unit := func(fv model.FileVersion) bool {
+		return strings.HasPrefix(fv.Path, "svc/") && !strings.HasPrefix(fv.Path, "svc/nested/")
+	}
+	mat, err := Materialize(f.ctx, view, model.FileSelection{}, MaterializeOptions{
+		Dir: filepath.Join(f.dataDir, "mat"), MaxBytes: 1 << 20, Include: unit})
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
+	}
+	defer mat.Close()
+
+	var got []string
+	err = filepath.WalkDir(mat.Root(), func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(mat.Root(), p)
+		if err != nil {
+			return err
+		}
+		got = append(got, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	slices.Sort(got)
+	want := []string{"svc/go.mod", "svc/main.go", "svc/tool.sh"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("materialized %v, want exactly %v", got, want)
+	}
+	// The copies are the snapshot's bytes, not empty placeholders that would
+	// make the path assertion above pass over an unusable tree.
+	for _, rel := range want {
+		fv := f.manifest(view)[rel]
+		b, err := os.ReadFile(filepath.Join(mat.Root(), filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if int64(len(b)) != fv.Size {
+			t.Errorf("%s is %d bytes, want the manifest's %d", rel, len(b), fv.Size)
+		}
 	}
 }

@@ -94,7 +94,24 @@ type Result struct {
 	// Signaled reports that the child was killed by a signal rather than
 	// exiting, which is the normal outcome of a forced termination.
 	Signaled bool
+	// PeakTreeBytes is the highest summed resident set size observed over the
+	// whole process tree while it ran, sampled every treeSampleInterval. It is
+	// the tree sum at one instant, never a sum of per-process historical peaks
+	// reached at different instants (Section 22), and it is what the memory
+	// governor reports as the observed figure (Section 11.6).
+	PeakTreeBytes int64
+	// TreeUnsampled reports that this platform cannot observe a running tree's
+	// memory, so PeakTreeBytes is unavailable rather than zero. A caller that
+	// publishes the figure must omit it, not publish a zero.
+	TreeUnsampled bool
 }
+
+// treeSampleInterval is how often the process tree's resident memory is summed
+// while the child runs. It is the sampling period of the method measured in
+// docs/research/10-round3-empirical.md §1: fine enough to catch an analysis
+// pass's peak, coarse enough that the sweep costs nothing against a run
+// measured in minutes.
+const treeSampleInterval = 250 * time.Millisecond
 
 // Limits are the runner-wide admission bounds. All three are required: a zero
 // bound would mean unlimited, which Section 20.2 forbids.
@@ -287,6 +304,11 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		cmd.Wait()
 		return result, internalError("the child could not be placed under process-tree control: %v", err)
 	}
+	// The child is a group leader, so its process ID is the group the sampler
+	// follows and the runner terminates. Sampling starts only once the tree
+	// control holds it, so nothing is sampled that could still escape it.
+	sampler := startTreeSampler(cmd.Process.Pid, treeSampleInterval)
+	defer sampler.stopSampling()
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.
 	outPipe.closeWriter()
@@ -326,6 +348,10 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		<-drained
 	}
 
+	// The tree has exited, so the last sweep has already happened; stopping
+	// joins the sampling goroutine before its peak is read.
+	result.PeakTreeBytes = sampler.stopSampling()
+	result.TreeUnsampled = !treeSampled
 	result.Duration = time.Since(started)
 	result.Stdout, result.StdoutBytes = outPipe.captured()
 	result.Stderr, result.StderrBytes = errPipe.captured()

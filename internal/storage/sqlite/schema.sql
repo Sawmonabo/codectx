@@ -131,6 +131,7 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE node_ids (
@@ -170,6 +171,23 @@ CREATE TABLE relation_facts (
     relation_id BLOB NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
+-- fact_keys carries the producer's own id-independent delta keys for one fact
+-- (Section 11.4). A fact is backed by every key that produced it, not by one:
+-- a canonical edge is published once but is derived from N occurrences, each
+-- with its own key, and a refresh re-emits the whole fact when any of them
+-- changes. A carry-over therefore keeps a fact unless ANY of its keys is
+-- replaced, which is the same condition the producer re-emits on, so the fresh
+-- and carried sets partition exactly. A fact with no row here carries no key
+-- and can only be replaced by its retention bucket.
+CREATE TABLE fact_keys (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    node_id BLOB,
+    relation_id BLOB,
+    fact_key TEXT NOT NULL,
+    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
+    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
+    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
+);
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -181,14 +199,22 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
+    content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL)),
+    CHECK(content_hash_bound = 0 OR file_id IS NOT NULL),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 );
+CREATE TABLE unit_delta_state (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY(unit_id, kind)
+) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key TEXT NOT NULL,
@@ -384,6 +410,10 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
+CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
+CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
+CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
+CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);

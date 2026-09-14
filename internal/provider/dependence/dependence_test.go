@@ -48,7 +48,9 @@ type fakeBackend struct {
 
 func (b *fakeBackend) Engine() dependence.Engine {
 	return dependence.Engine{ParseArgv: []string{"/opt/engine/parse"}, ExportArgv: []string{"/opt/engine/export"},
-		Name: "engine", Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
+		// A payload name no rendered product string may contain. The real
+		// locator fills this from the tool lock entry.
+		Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
 }
 
 func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
@@ -155,6 +157,23 @@ func newProviderIn(t *testing.T, b *fakeBackend, dataDir string) provider.Provid
 // so unchanged facts could never be reused across snapshots.
 func TestSucceededUnitConforms(t *testing.T) {
 	providertest.Conform(t, newProvider(t, &fakeBackend{}), repo, rootScope, []string{"app.go", "go.mod"})
+
+	// Detection is a product surface: `status`, `doctor` and the ledger render
+	// ObservedVersion verbatim. Failure mode: the engine's payload name is
+	// composed into it from the resolved payload with no string literal at the
+	// site, so a name leak ships past every source-level check while the
+	// provenance a reader actually needs — version and payload digest — is
+	// unchanged. Only the rendered string can catch it.
+	b := &fakeBackend{}
+	h := providertest.New(t, repo)
+	det, err := newProvider(t, b).Detect(context.Background(), h.Root, h.Policy)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if want := "engine " + b.Engine().Version + " " + b.Engine().Digest; det.ObservedVersion != want {
+		t.Errorf("ObservedVersion = %q, want %q: the payload name is never rendered on a product surface",
+			det.ObservedVersion, want)
+	}
 }
 
 // TestFailedUnitAdmitsNoFacts is Task 11 Step 1's process-fault case. Failure
@@ -264,25 +283,34 @@ func TestSkippedMethodsPublishPartial(t *testing.T) {
 	if err := result.Validate(); err != nil {
 		t.Fatalf("the published result is not valid: %v", err)
 	}
-	states := map[string]model.CapabilityStateValue{}
-	for _, c := range result.Capabilities {
-		states[c.Capability] = c.State
-	}
-	if states[dependence.CapabilityDataFlowsTo] != model.CapabilityPartial {
-		t.Errorf("data_flows_to = %q, want partial", states[dependence.CapabilityDataFlowsTo])
+	rows := byCapability(result.Capabilities)
+	if rows[dependence.CapabilityDataFlowsTo].State != model.CapabilityPartial {
+		t.Errorf("data_flows_to = %q, want partial", rows[dependence.CapabilityDataFlowsTo].State)
 	}
 	for _, c := range []string{dependence.CapabilityControlDependsOn, dependence.CapabilityReads,
 		dependence.CapabilityWrites, dependence.CapabilityCalls} {
-		if states[c] != model.CapabilityFresh {
-			t.Errorf("%s = %q, want fresh: only data flow depends on the pass that skipped", c, states[c])
+		if rows[c].State != model.CapabilityFresh {
+			t.Errorf("%s = %q, want fresh: only data flow depends on the pass that skipped", c, rows[c].State)
+		}
+		// A fresh capability carries no detail. A detail on a fresh row would
+		// describe a loss the row itself denies, and a consumer reading the
+		// row would have to decide which of the two to believe.
+		if len(rows[c].Details) != 0 {
+			t.Errorf("%s is fresh but carries details %v", c, rows[c].Details)
 		}
 	}
-	if states["skipped_methods:2"] != model.CapabilityPartial {
-		t.Error("the result does not publish the exact skipped-method count")
+	// The partial row carries its own particulars. Without them the result
+	// says a capability is incomplete but nothing about what is missing, and
+	// the only remaining way to publish it is a capability row whose name is
+	// the detail text — which grows the bounded list with the repository.
+	details := rows[dependence.CapabilityDataFlowsTo].Details
+	if details["skipped_methods"] != "2" {
+		t.Errorf("skipped_methods = %q, want the exact count \"2\"", details["skipped_methods"])
 	}
 	for _, name := range b.parse.SkippedMethods {
-		if _, ok := states["skipped_method:"+name]; !ok {
-			t.Errorf("the result does not name the skipped method %q", name)
+		if !strings.Contains(details["skipped_method_names"], name) {
+			t.Errorf("the partial capability does not name the skipped method %q; names = %q",
+				name, details["skipped_method_names"])
 		}
 	}
 
@@ -300,16 +328,22 @@ func TestSkippedMethodsPublishPartial(t *testing.T) {
 	if again.parses == 0 {
 		t.Error("the second run reused a cached graph for a unit that skipped methods")
 	}
-	states = map[string]model.CapabilityStateValue{}
-	for _, c := range second.Capabilities {
-		states[c.Capability] = c.State
+	rows = byCapability(second.Capabilities)
+	if rows[dependence.CapabilityDataFlowsTo].State != model.CapabilityPartial {
+		t.Errorf("data_flows_to on reuse = %q, want partial", rows[dependence.CapabilityDataFlowsTo].State)
 	}
-	if states[dependence.CapabilityDataFlowsTo] != model.CapabilityPartial {
-		t.Errorf("data_flows_to on reuse = %q, want partial", states[dependence.CapabilityDataFlowsTo])
+	if got := rows[dependence.CapabilityDataFlowsTo].Details["skipped_methods"]; got != "2" {
+		t.Errorf("skipped_methods on reuse = %q, want the exact count \"2\"", got)
 	}
-	if states["skipped_methods:2"] != model.CapabilityPartial {
-		t.Error("the reused result does not publish the exact skipped-method count")
+}
+
+// byCapability indexes a result's capability rows by name.
+func byCapability(states []model.CapabilityState) map[string]model.CapabilityState {
+	out := make(map[string]model.CapabilityState, len(states))
+	for _, c := range states {
+		out[c.Capability] = c
 	}
+	return out
 }
 
 // TestCleanGraphIsReused is the other half of the cache contract, and the
@@ -342,10 +376,11 @@ func TestCleanGraphIsReused(t *testing.T) {
 // holds.
 func TestPlanUnits(t *testing.T) {
 	h := providertest.New(t, repo)
-	plan, err := dependence.PlanUnits(context.Background(), h.View)
+	p, err := dependence.PlanUnits(context.Background(), h.View)
 	if err != nil {
 		t.Fatal(err)
 	}
+	plan := p.Units
 	var keys []string
 	for _, u := range plan {
 		keys = append(keys, u.ScopeKey)
@@ -382,15 +417,22 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if small.Bytes() <= small.HeapCapBytes {
 		t.Error("the reservation is not above its heap cap; a cap is not a memory cap")
 	}
-	if g.RetryCap(small) <= small.HeapCapBytes {
+	if g.RetryCap(small, 0) <= small.HeapCapBytes {
 		t.Error("a unit far below the allocation has no retry available")
+	}
+	// The observed peak is the tree's, on the attempt that just failed. A tree
+	// that already reached what the machine can allocate has nowhere to grow,
+	// whatever its heap cap was, so the retry the plan allows would be a
+	// second full parse for the same failure.
+	if got := g.RetryCap(small, small.AllocationBytes); got != 0 {
+		t.Errorf("retry cap = %d, want none: the failed attempt already peaked at the whole allocation", got)
 	}
 
 	huge := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
 	if huge.HeapCapBytes != huge.AllocationBytes {
 		t.Errorf("cap %d is not bounded by the machine-derived allocation %d", huge.HeapCapBytes, huge.AllocationBytes)
 	}
-	if got := g.RetryCap(huge); got != 0 {
+	if got := g.RetryCap(huge, 0); got != 0 {
 		t.Errorf("retry cap = %d, want none: the first attempt already had the whole allocation", got)
 	}
 

@@ -79,6 +79,16 @@ func truncateUTF8(s string, limit int) string {
 	return s[:cut]
 }
 
+// TruncateDetail bounds one capability detail value to MaxDetailBytes without
+// splitting a rune, which is the rule every detail map obeys: a value is
+// shortened rather than rejected, because the detail exists to explain a state
+// and a missing explanation is worse than a clipped one. It is exported so a
+// caller that builds its own detail map -- provider.Detection, which is not a
+// CapabilityState -- enforces the same bound from the same implementation.
+func TruncateDetail(value string) string {
+	return truncateUTF8(value, MaxDetailBytes)
+}
+
 // truncateForMessage keeps a rejected value out of an unbounded log line while
 // staying useful. It never returns a partial UTF-8 sequence.
 func truncateForMessage(s string) string {
