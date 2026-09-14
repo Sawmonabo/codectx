@@ -58,7 +58,8 @@ joern-export <private graph> --repr=all --format=neo4jcsv --out <private export>
 
 * `--max-num-def 40000` replaces the engine default of 4000. Measured on a
   1.05M-line Python tree: 23% more parse time, 3% more memory, every skipped
-  method removed, every other fact count identical
+  method removed, and no change to any other fact count beyond the run-to-run
+  variance below — the measured CDG and CALL counts were equal
   (`docs/research/10-round3-empirical.md` §9a). It is part of the cache key and
   there is no second parse at a higher limit.
 * The single `all` export carries every edge family the importer reads
@@ -67,10 +68,24 @@ joern-export <private graph> --repr=all --format=neo4jcsv --out <private export>
 * The engine's argument parser rejects a repeated option, so the
   semantics-neutral option allowlist must never restate a pinned one.
 
+**The engine is not run-to-run deterministic.** Two runs of the same pinned
+argv over the same unmodified 161-file tree (this repository, Go frontend)
+produced `nodes=13675 relations=52310 aliases=16922` and
+`nodes=13677 relations=52311 aliases=16926` — a band of about 0.01%, also seen
+as CDG −4 / REACHING_DEF −6 on a 1.5M-line Java repository
+(`docs/research/10-round3-empirical.md` §4). Nothing in the provider assumes
+two runs are equal: the graph cache replays a stored graph rather than
+reparsing, fact keys are derived from source-side identity rather than from
+engine node ids, and every parity claim in this document and in the code is
+bounded by this band. A claim of *equality* between two engine runs anywhere
+in the repository is a defect.
+
 **No version probe.** `joern-parse --version` is rejected as an unknown option
 and `joern --version` drops into the interactive console, so the engine's
-name, version and payload digest come from the lock entry that installed it
-and travel on `Detection.ObservedVersion` and the descriptor version.
+version and payload digest come from the lock entry that installed it and
+travel on `Detection.ObservedVersion` and the descriptor version. The lock
+entry's *name* stays in the lock: `ObservedVersion` renders
+`engine <version> <digest>`, because detection is a product surface.
 
 ### How the payload is resolved
 
@@ -128,6 +143,14 @@ capability row, alias scope and cached graph of one project would then be
 attributed to the other. Losing one project's facts openly is the smaller
 harm, and refusing in the planner keeps the decision where the units are
 chosen rather than failing the unit once it has already begun.
+
+A refused project is never a silent omission. Its directory stays excluded
+from the family's repository-root unit — folding its files in would analyse
+them under a scope key naming a different project — so its source is analysed
+by nobody, and every capability the family publishes is therefore `partial`
+with `CTX_PROVIDER_OUTPUT_INVALID` and an `unplanned_projects` count in its
+`details`. A generation that is missing a subtree says so; it never reports the
+family fresh.
 
 | Family | Languages | Project marker | Rule |
 |---|---|---|---|
@@ -198,7 +221,8 @@ allocation  = MemAvailable - base footprint - safety margin
 
 * The cap is placed on the engine's frontend heap. It is lossless everywhere
   it succeeds: on five large repositories a capped run produced the same facts
-  as the default run, or no graph at all (§4).
+  as the default run within the engine's run-to-run variance — no systematic
+  loss and no fact class missing — or no graph at all (§4).
 * A heap cap is not a memory cap. The per-family allowance is the resident
   memory the frontend keeps outside the heap, measured in §10: C/C++ 2.6 GB,
   Python 1.9 GB, Go 0.3–0.5 GB, Java 0.1–0.4 GB, TypeScript/JavaScript 0.3 GB,
@@ -212,9 +236,12 @@ allocation  = MemAvailable - base footprint - safety margin
   explicit ceiling bounds it. Inventing a bound there would be a default
   memory ceiling by another name.
 * Out of memory is retried **exactly once**, at the machine-derived
-  allocation, and only when that allocation exceeds the cap that failed. A
-  retry at the same cap cost 100 s on a 1.05M-line Python tree and could not
-  have succeeded.
+  allocation, and only when more memory is actually available: the allocation
+  must exceed the cap that failed, **and** the analyzer tree's observed peak on
+  the failed attempt must be below the allocation. A retry with no more memory
+  behind it cost 100 s on a 1.05M-line Python tree and could not have
+  succeeded. Where the platform does not sample the tree peak, only the first
+  condition applies; an unsampled peak is absent, never zero.
 * Units are never split for memory and no analysis limit is ever lowered to
   make one fit. `max_concurrent_heavy_analyzers` (default 1) and the summed
   reservations are the coordinator's scheduling inputs; the provider exposes
@@ -272,19 +299,24 @@ and is never used for memory.
    semantics-neutral option allowlist. That list is **empty for all six
    frontends today**: every option this release offers changes results, so
    nothing can be added without changing what a success would mean. The rerun
-   therefore proves only that the crash is deterministic rather than transient,
-   which is exactly what it is for.
+   is therefore the same argv over the same source, and since the engine is not
+   run-to-run deterministic it yields a *second observation of the same failure
+   class*: that raises the odds the crash is deterministic rather than
+   transient without proving it. A crash seen once is never split on.
 3. Only then is the unit split along the next frontend-native boundary, and
    each part that produces a live export is imported into the same unit.
    Two parts legitimately describe the same entity — above all the external
-   stub of a callee both of them reference — and storage keys a node fact by
-   (unit, node), so a repeated identity would fail the whole unit and lose
-   every fact of every part. The parts therefore share one dedupe sink for the
-   unit's lifetime: the first part to publish an identity writes it and later
-   repeats are dropped. The seen set is on disk, inside the run directory, so
-   a large unit does not hold hundreds of thousands of identities in memory,
-   and dropping a repeat never breaks the put-order rule, because the identity
-   it names was already written.
+   stub of a callee both of them reference. Storage keys a node fact by
+   (unit, node) and admits a repeat of that key without failing the unit, but
+   it does not compare the two rows, so a second row whose stored columns
+   differ would be dropped with nothing said. The parts therefore share one
+   dedupe sink for the unit's lifetime, which keeps the drop in the provider,
+   where the identity is known to have been published by an earlier part of the
+   same unit: the first part to publish an identity writes it and later repeats
+   are dropped. The seen set is on disk, inside the run directory, so a large
+   unit does not hold hundreds of thousands of identities in memory, and
+   dropping a repeat never breaks the put-order rule, because the identity it
+   names was already written.
 4. Every capability the subdivided unit publishes is `partial`, carrying the
    failed unit id under `subdivided` and the backend failure under
    `backend_failure` (`<pass>/<exception>`) in its `details`. Control and

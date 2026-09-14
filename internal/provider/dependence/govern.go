@@ -13,7 +13,10 @@ package dependence
 //
 // The cap is placed on the frontend heap, which research Section 4 measured
 // as lossless everywhere it succeeds: on five large repositories a capped run
-// produced the same facts as the default run, or no graph at all. A heap cap
+// produced the same facts as the default run within the engine's run-to-run
+// variance — no systematic loss and no whole fact class missing, against an
+// engine that is not run-to-run deterministic (the observed band is recorded
+// in docs/providers-dependence.md) — or no graph at all. A heap cap
 // is not a memory cap, so the reservation adds the resident memory the
 // frontend keeps outside the heap, measured per family in research Section 10.
 
@@ -218,11 +221,23 @@ func (g Governor) Reject(r Reservation, scopeKey string) error {
 
 // RetryCap is the cap an out-of-memory unit is retried at, or zero when no
 // retry is honest. Section 11.6 allows exactly one retry, at the
-// machine-derived allocation, and only when that allocation exceeds the cap
-// that failed: a retry at the same or a smaller cap cost 100 seconds on a
+// machine-derived allocation, and only when more memory is actually
+// available: a retry at the same or a smaller cap cost 100 seconds on a
 // 1.05M-line Python tree and could not have succeeded.
-func (g Governor) RetryCap(r Reservation) int64 {
+//
+// peakBytes is the analyzer tree's observed peak on the attempt that failed,
+// or zero where the platform does not sample it. Both figures are tree-level
+// — the allocation is the machine's available memory less this process's
+// footprint and the safety margin — so a tree that already peaked at or above
+// the allocation cannot be given more, whatever the heap cap was, and the
+// retry is refused. Refusing at equality rather than only above it costs
+// nothing: a tree that used exactly the allocation has no headroom to grow
+// into, and the retry would buy a second full parse for the same failure.
+func (g Governor) RetryCap(r Reservation, peakBytes int64) int64 {
 	if r.AllocationBytes <= r.HeapCapBytes {
+		return 0
+	}
+	if peakBytes > 0 && peakBytes >= r.AllocationBytes {
 		return 0
 	}
 	cap := r.AllocationBytes

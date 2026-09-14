@@ -218,6 +218,20 @@ are identical). The earlier "prohibitive" result was purely the artificial 6 GB 
 doubled cost), the value is part of the cache key, and a body that still exceeds it is published
 `partial` with the skipped method names. No further retry.
 
+## 9b. Engine run-to-run variance (the band every parity claim is bounded by)
+The engine is not run-to-run deterministic. Two runs of the same pinned argv over the same
+unmodified tree (this repository, 161 files, Go frontend, wave B) produced:
+
+| run | nodes | relations | aliases | dropped methods | external methods |
+|---|---|---|---|---|---|
+| 1 | 13,675 | 52,310 | 16,922 | 3,983 | 1,320 |
+| 2 | 13,677 | 52,311 | 16,926 | 3,990 | 1,322 |
+
+About 0.01%, and the same order as the CDG −4 / REACHING_DEF −6 seen on spring in §4. Recorded
+here so that no later reviewer re-litigates a non-zero diff between two engine runs as a defect,
+and so that every parity claim in §4, §8 and §9a is read as "no systematic loss and no fact class
+missing, within this band" rather than as equality. Source: lane-B3 report §4.2/§5.3.
+
 ## 10. Per-frontend memory model for the governor (measured)
 | frontend | RSS above heap cap | notes |
 |---|---|---|
