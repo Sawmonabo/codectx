@@ -50,13 +50,16 @@ func (a *scipApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	}
 	defer os.RemoveAll(dir)
 
-	previous, err := a.previous(ctx, req, dir)
+	previous, reason, err := a.previous(ctx, req, dir)
 	if err != nil {
 		return Result{}, err
 	}
 
 	b := &build{store: a.store, p: a.p, limits: a.limits, pool: a.pool, req: req}
-	b.res.Full = previous == nil
+	b.res.Full, b.res.FullReason = previous == nil, reason
+	// A SCIP import with a predecessor always reparses only the documents
+	// whose hash moved, so a delta run is always a filtered one.
+	b.res.Filtered = previous != nil
 
 	var rep scip.Report
 	// The fresh manifest is a private temporary file this build owns on every
@@ -80,21 +83,48 @@ func (a *scipApplier) Apply(ctx context.Context, req Request) (Result, error) {
 			// dropping the unit's index-level bucket would leave edges
 			// carried from untouched documents without endpoints and the unit
 			// could not seal.
-			var replaced sqlite.Replaced
 			repo := req.Unit.Binding.RepositoryID
-			d, err := rep.Manifest.Diff(previous, func(c scip.Change) error {
-				if c.Class == scip.ClassUnchanged {
-					return nil
-				}
-				replaced.Files = append(replaced.Files, model.NewFileID(repo, c.Path))
-				replaced.Scopes = append(replaced.Scopes, "file:"+c.Path)
-				return nil
-			})
+			// The delta is measured first, with no side effect, and the two
+			// replaced sets are then walked once each rather than collected:
+			// a branch switch or a formatting pass leaves no document
+			// unchanged, and the set is then every document in the
+			// repository, which Section 6 forbids holding in the heap.
+			d, err := rep.Manifest.Diff(previous, nil)
 			if err != nil {
 				return err
 			}
 			b.res.Delta = Stats{Changed: d.Changed, Unchanged: d.Unchanged, Removed: d.Removed}
-			if b.res.Carried, err = w.CarryOver(ctx, req.Previous, replaced); err != nil {
+			var filesErr, scopesErr error
+			replaced := sqlite.Replaced{
+				Files: func(yield func(model.FileID) bool) {
+					filesErr = changedDocuments(rep.Manifest, previous, func(path string) error {
+						if !yield(model.NewFileID(repo, path)) {
+							return errStopDocs
+						}
+						return nil
+					})
+				},
+				Scopes: func(yield func(string) bool) {
+					scopesErr = changedDocuments(rep.Manifest, previous, func(path string) error {
+						if !yield("file:" + path) {
+							return errStopDocs
+						}
+						return nil
+					})
+				},
+			}
+			b.res.Carried, err = w.CarryOver(ctx, req.Previous, replaced)
+			// The stream errors are checked before the call's own: a stream
+			// that failed mid-walk staged fewer replaced entries than the
+			// applier named, so CarryOver's success would be a unit that kept
+			// rows it was told to drop.
+			if filesErr != nil {
+				return filesErr
+			}
+			if scopesErr != nil {
+				return scopesErr
+			}
+			if err != nil {
 				return err
 			}
 		} else {
@@ -113,34 +143,55 @@ func (a *scipApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	return b.run(ctx)
 }
 
+// errStopDocs unwinds a document walk whose consumer stopped early.
+var errStopDocs = errors.New("delta: replaced document stream stopped")
+
+// changedDocuments calls fn with the path of every document the fresh manifest
+// does not describe exactly as the stored one does — the ones this run
+// reparsed and the ones the fresh index no longer has. fn may return
+// errStopDocs to end the walk, which is not an error.
+func changedDocuments(fresh, prev *scip.DocumentManifest, fn func(string) error) error {
+	_, err := fresh.Diff(prev, func(c scip.Change) error {
+		if c.Class == scip.ClassUnchanged {
+			return nil
+		}
+		return fn(c.Path)
+	})
+	if errors.Is(err, errStopDocs) {
+		return nil
+	}
+	return err
+}
+
 // previous loads the predecessor's stored document manifest. A unit that was
 // never selected, one that stored no manifest, and one whose stored manifest
 // this build cannot read all mean the same thing to the caller — build in full
 // — because a full build is always correct and a refusal here would turn a
-// recoverable state into a failed capability. The unreadable case is the only
-// one that is not ordinary, so it is the only one that logs.
-func (a *scipApplier) previous(ctx context.Context, req Request, dir string) (*scip.DocumentManifest, error) {
+// recoverable state into a failed capability. The returned reason says which
+// it was. The unreadable case is the only one that is not ordinary, so it is
+// the only one that logs.
+func (a *scipApplier) previous(ctx context.Context, req Request, dir string) (*scip.DocumentManifest, string, error) {
 	if req.Previous == "" {
-		return nil, nil
+		return nil, FullNoPredecessor, nil
 	}
 	raw, err := a.store.DeltaState(ctx, req.Previous, KindSCIP)
 	if err != nil {
 		if isNotFound(err) {
-			return nil, nil
+			return nil, FullNoState, nil
 		}
-		return nil, err
+		return nil, "", err
 	}
 	name, err := writeState(dir, "previous-manifest", raw)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	m, err := scip.LoadDocumentManifest(name)
 	if err != nil {
 		slog.Warn("a stored scip document manifest could not be read; the unit is built in full",
 			"component", component, "unit", string(req.Previous), "kind", KindSCIP, "error", err)
-		return nil, nil
+		return nil, FullStateUnreadable, nil
 	}
-	return m, nil
+	return m, "", nil
 }
 
 // isNotFound is the not-found contract with storage: a lookup that found no

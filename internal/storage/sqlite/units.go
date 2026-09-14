@@ -1145,6 +1145,16 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			// is that its inputs exist — a unit whose files were deleted is
 			// never carried — so the carried rows are checked for existence
 			// instead, and both checks run over the frozen membership.
+			//
+			// Neither check is reachable from the store's own writers, and no
+			// test guards either: AttachUnit and AttachCarried apply the same
+			// two predicates against the same generation's snapshot, and a
+			// snapshot's snapshot_files rows are immutable once PutSnapshot
+			// returns, so the set cannot move between attach and activation.
+			// They are defence in depth over the one moment that publishes
+			// facts to every reader, and they are deliberately symmetric: do
+			// not "simplify" either away believing a test protects it, and do
+			// not delete one without the other.
 			{"member inputs that differ from the snapshot", `SELECT count(*) FROM generation_units gu JOIN unit_inputs ui ON ui.unit_id = gu.unit_id
 				WHERE gu.generation_id = ?1 AND gu.carried = 0 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
 				WHERE g.id = ?1 AND sf.file_id = ui.file_id AND sf.content_hash = ui.content_hash AND sf.executable = ui.executable AND sf.status <> 'deleted')`},
