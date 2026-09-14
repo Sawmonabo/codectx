@@ -73,6 +73,12 @@ type Sessions interface {
 	// Status needs in a single round trip instead of paging Coverage. Task 17
 	// consumes the same method and must not define a second one.
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (required, fullyServed, waived int64, err error)
+	// FilePath is one pinned file's path, read by (snapshot, file id) on the
+	// snapshot_files primary key. Next needs exactly this: the coverage and
+	// manifest records carry file identifiers and no path, and naming a file the
+	// operator cannot locate is not an answer. The whole pinned row is not asked
+	// for, so nothing here can come to depend on the rest of it.
+	FilePath(ctx context.Context, snapshot model.SnapshotID, file model.FileID) (string, error)
 	// AcknowledgeFile refuses unless the file is already full_served; it never
 	// creates coverage.
 	AcknowledgeFile(ctx context.Context, session model.SessionID, actor string, file model.FileID) error
@@ -83,20 +89,16 @@ type Sessions interface {
 }
 
 // Source is the per-snapshot verified read surface. *snapshot.View satisfies
-// it. Read seeks to the nearest stored checkpoint, verifies exactly the CAS
-// blocks it touches and returns bytes with line/column positions, rejecting a
-// boundary inside a UTF-8 sequence and a range past the file.
+// it. Read verifies exactly the CAS blocks it touches, walking back to the
+// nearest stored line checkpoint for the line and column context, and returns
+// exactly the requested bytes, rejecting a boundary inside a UTF-8 sequence and
+// a range past the file. The walk back is the view's own cost and no longer
+// bounds the chunk: it reads that prefix in spans of its own.
 //
-// Range.Bytes aliases the checkpoint-prefixed window the view read, so a caller
-// that retains the slice must copy it first.
+// Range.Bytes aliases the buffer the view read, so a caller that retains the
+// slice must copy it first.
 type Source interface {
 	Read(ctx context.Context, id model.FileID, r model.ByteRange) (snapshot.Range, model.FileVersion, error)
-	// Checkpoint reports where Read will actually begin: the byte of the nearest
-	// stored line checkpoint at or before offset. maxRawForWire needs the prefix
-	// offset - Checkpoint(offset) before it can choose a raw size, and the prefix
-	// cannot be assumed from the checkpoint spacing -- a checkpoint starts a
-	// line, so on a minified file the nearest one may be byte zero.
-	Checkpoint(ctx context.Context, id model.FileID, offset uint64) (uint64, error)
 }
 
 var _ Source = (*snapshot.View)(nil)
@@ -176,9 +178,11 @@ type receiptPayload struct {
 
 // sourceEnvelopeBytes is the headroom reserved for everything in a read
 // response that is not the encoded chunk: the JSON envelope, the binding, both
-// ranges, the receipt token (up to model.MaxTokenBytes) and the field names.
-// It is deliberately generous, because under-reserving it would let a response
-// exceed resources.max_source_response_bytes, which Section 16.2 forbids.
+// ranges, the field names and the receipt token, which measures a few hundred
+// bytes in practice against the model.MaxTokenBytes ceiling this whole
+// reservation happens to equal. It is deliberately generous, because
+// under-reserving it would let a response exceed
+// resources.max_source_response_bytes, which Section 16.2 forbids.
 const sourceEnvelopeBytes = 4096
 
 // maxRawForWire is the single chunk-size arithmetic in this package. Section
@@ -190,15 +194,12 @@ const sourceEnvelopeBytes = 4096
 //
 //   - the request: requested, or Limits.ChunkBytes when requested is zero
 //     (zero means the configured default, never unlimited);
-//   - the policy ceiling: Limits.MaxChunkBytes and model.MaxRawChunkBytes. A
-//     request above the ceiling is clamped, not rejected;
-//   - the checkpoint prefix: snapshot.View.Read asks CAS.ReadRange for
-//     [checkpoint, end), and CAS.ReadRange rejects a span over
-//     model.MaxRawChunkBytes. Checkpoint spacing is 64 KiB, so a maximum-size
-//     chunk that does not start on a checkpoint fails unless the prefix is
-//     subtracted here. checkpointPrefix is offset minus Source.Checkpoint at
-//     that offset; it is never assumed from the checkpoint spacing, which
-//     bounds nothing on a file without line breaks;
+//   - the policy ceiling: Limits.MaxChunkBytes and model.MaxRawChunkBytes,
+//     which is also the span CAS.ReadRange admits, so the window this sizes is
+//     one CAS read. A request above the ceiling is clamped, not rejected. The
+//     line/column prefix the view walks back to is not subtracted: the view
+//     reads it in spans of its own, and subtracting it made every byte of a
+//     file without line breaks past the first mebibyte unreadable;
 //   - the wire budget: the worst-case base64 encoding 4*((raw+2)/3) plus
 //     sourceEnvelopeBytes must fit Limits.MaxSourceResponseBytes. With
 //     budget = MaxSourceResponseBytes - sourceEnvelopeBytes and k = budget/4
@@ -213,15 +214,15 @@ const sourceEnvelopeBytes = 4096
 // It returns a cap only. It never errors on a small result and never inspects
 // EOF: a zero-length chunk at EOF is legal and required, and L1 issues it
 // without branching on an error here. The error return is reserved for a
-// misconfigured Limits or an impossible prefix, both of which are wiring
+// misconfigured Limits or an unstorable offset, both of which are wiring
 // defects rather than user-correctable input, so they are CTX_INTERNAL.
-func maxRawForWire(requested uint32, offset, checkpointPrefix uint64, l Limits) (uint32, error) {
+func maxRawForWire(requested uint32, offset uint64, l Limits) (uint32, error) {
 	raw := int64(requested)
 	if raw <= 0 {
 		raw = l.ChunkBytes
 	}
 	if l.ChunkBytes <= 0 || l.MaxChunkBytes <= 0 || l.MaxSourceResponseBytes <= 0 {
-		return 0, notImplementedf(model.CodeInternal,
+		return 0, typedErrf(model.CodeInternal,
 			"coverage limits are not configured: chunk_bytes=%d max_chunk_bytes=%d max_source_response_bytes=%d",
 			l.ChunkBytes, l.MaxChunkBytes, l.MaxSourceResponseBytes)
 	}
@@ -232,21 +233,10 @@ func maxRawForWire(requested uint32, offset, checkpointPrefix uint64, l Limits) 
 		raw = model.MaxRawChunkBytes
 	}
 
-	// The checkpoint prefix is read and verified along with the chunk, so it
-	// spends the same CAS.ReadRange budget.
-	if checkpointPrefix >= model.MaxRawChunkBytes {
-		return 0, notImplementedf(model.CodeInternal,
-			"checkpoint prefix %d at offset %d is not smaller than the %d-byte range ceiling",
-			checkpointPrefix, offset, model.MaxRawChunkBytes)
-	}
-	if room := int64(model.MaxRawChunkBytes) - int64(checkpointPrefix); raw > room {
-		raw = room
-	}
-
 	// Worst-case wire encoding: 4*((raw+2)/3) + sourceEnvelopeBytes.
 	budget := l.MaxSourceResponseBytes - sourceEnvelopeBytes
 	if budget <= 0 {
-		return 0, notImplementedf(model.CodeInternal,
+		return 0, typedErrf(model.CodeInternal,
 			"max_source_response_bytes %d leaves no room for the %d-byte response envelope",
 			l.MaxSourceResponseBytes, sourceEnvelopeBytes)
 	}
@@ -256,7 +246,7 @@ func maxRawForWire(requested uint32, offset, checkpointPrefix uint64, l Limits) 
 
 	// A chunk may not run past the signed 64-bit byte range SQLite stores.
 	if offset > uint64(math.MaxInt64) {
-		return 0, notImplementedf(model.CodeInternal, "read offset %d is past the storable byte range", offset)
+		return 0, typedErrf(model.CodeInternal, "read offset %d is past the storable byte range", offset)
 	}
 	if room := math.MaxInt64 - int64(offset); raw > room {
 		raw = room
@@ -290,9 +280,10 @@ const (
 // caller: Next answers actionComplete instead.
 var errNoSource = errors.New("no unserved required file remains")
 
-// notImplementedf builds a typed model.Error without leaking source bytes,
-// receipt tokens or the dependence engine's name into the message.
-func notImplementedf(code, format string, args ...any) *model.Error {
+// typedErrf builds a typed model.Error without leaking source bytes,
+// receipt tokens or the dependence engine's name into the message. It is this
+// package's only typed-error builder and constructs every error it raises.
+func typedErrf(code, format string, args ...any) *model.Error {
 	return &model.Error{Code: code, Message: fmt.Sprintf(format, args...)}
 }
 

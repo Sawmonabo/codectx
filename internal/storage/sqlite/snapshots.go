@@ -82,6 +82,35 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 	return fv, err
 }
 
+// FilePath is one pinned file's path and nothing else: a point read on the
+// snapshot_files primary key joined to files, for callers that hold a file
+// identifier and must name the file to an operator. It is deliberately not
+// SnapshotFile: a caller that needs only the path must not be handed -- or come
+// to depend on -- the rest of the pinned row.
+func (s *Store) FilePath(ctx context.Context, snapshot model.SnapshotID, id model.FileID) (string, error) {
+	snapRaw, err := idBlob("snapshot.id", string(snapshot))
+	if err != nil {
+		return "", err
+	}
+	fileRaw, err := idBlob("file_id", string(id))
+	if err != nil {
+		return "", err
+	}
+	var path string
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT f.path FROM snapshot_files sf JOIN files f ON f.id = sf.file_id
+			WHERE sf.snapshot_id = ?1 AND sf.file_id = ?2`, snapRaw, fileRaw).Scan(&path)
+		if isNoRows(err) {
+			return notFound("file %s is not in snapshot %s", id, snapshot)
+		}
+		if err != nil {
+			return wrap("snapshot_files", err)
+		}
+		return nil
+	})
+	return path, err
+}
+
 // SnapshotFiles pages a snapshot's manifest in canonical path order, keyset on
 // the path itself (the empty string starts from the beginning). Paths compare
 // bytewise under the column's BINARY collation, which is the order the capture
