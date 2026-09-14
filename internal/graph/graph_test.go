@@ -321,7 +321,11 @@ func TestGraphScenarios(t *testing.T) {
 				}
 			}
 			// A tampered token is never honoured with a budget of its own choosing.
-			_, err = e.resumeTraversal(context.Background(), token[:len(token)-1]+"A", endpoint, queryHash)
+			tampered := token[:len(token)-1] + "A"
+			if tampered == token {
+				tampered = token[:len(token)-1] + "B"
+			}
+			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
 			var typed *model.Error
 			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
 				t.Fatalf("tampered cursor: err %v; want %s", err, model.CodeCursorInvalid)
