@@ -120,11 +120,13 @@ func entryDigest(t *testing.T, archive []byte, name string) string {
 	tr := tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
-		if err != nil {
-			// EOF, or a gzip stream that is not a tar at all: either way the
-			// fixture carries no such member, and a payload that never reaches
+		if err == io.EOF {
+			// The fixture carries no such member; a payload that never reaches
 			// its entry check only needs a well-formed digest in the lock.
 			return strings.Repeat("0", 64)
+		}
+		if err != nil {
+			t.Fatalf("tar: %v", err)
 		}
 		if hdr.Name != name {
 			continue

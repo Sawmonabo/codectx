@@ -383,7 +383,7 @@ The six managed indexers are installed on the development machine and their
 real output is verified end to end through this importer: `scip-go` 0.2.7,
 `scip-typescript` 0.4.0, `scip-python` 0.6.6, `scip-java`, `scip-clang` 0.4.0
 and `rust-analyzer` 1.98.0 (see the position-encoding table above and
-`.superpowers/sdd/implementation-plan/lane-A7-report.md`). What remains
+`docs/research/12-incremental-scip-lsp.md` §3). What remains
 unverified is this file's *profile execution* path — the argument arrays below,
 the version constraint check and the runner plumbing — which has **not** been
 exercised against a real indexer invocation and must be before a profile is
