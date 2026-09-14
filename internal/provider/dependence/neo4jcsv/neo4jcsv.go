@@ -19,8 +19,10 @@
 // Delta. The engine has no incremental mode, so a refreshed unit is a whole
 // re-parse and re-export; the storage update is the delta. Every published
 // fact carries an id-independent key (KeySet); an import handed the previous
-// run's key set publishes only the relations whose key changed and reports
-// the keys the previous run had and this one does not.
+// run's key set publishes only the relations at least one of whose keys
+// changed, and only when no key was removed; a removal disables the filter
+// and the import re-publishes in full. It reports the keys the previous run
+// had and this one does not.
 //
 // The engine's name appears nowhere in this package: not in an identifier, a
 // native key, an evidence detail or an error message.

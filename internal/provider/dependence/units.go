@@ -229,9 +229,11 @@ func planFamily(f Family, roots map[string]bool, markers map[string][]string) ([
 	// Only the projects that survive bound the other units, so a refused
 	// directory is excluded from nothing and its files fall back to the unit
 	// that encloses it — the enclosing project, or the family's
-	// repository-root unit. No file of a family is ever orphaned, which is
-	// also what guarantees the degradation below always has a unit to be
-	// published on. It is still a degradation: that source is analysed at a
+	// repository-root unit. No file of a family is ever orphaned — except
+	// loose Rust source outside every crate, which is deliberately left
+	// unanalysed (see the FamilyRust guard below) — and for every other
+	// family that is what guarantees the degradation below always has a unit
+	// to be published on. It is still a degradation: that source is analysed at a
 	// coarser project boundary than it owns, with the neighbouring projects'
 	// files around it, so the caller publishes the family partial and the
 	// refusal is counted rather than swallowed. The path is logged truncated
