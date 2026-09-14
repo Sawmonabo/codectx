@@ -549,7 +549,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	label := "node:" + it.kind
 	keyOwner := e.keyOwner(it.fullName, it.ownerFullName)
 	positional := e.positional(it.fullName, it.ownerFullName, it.rng, it.name, it.signature)
-	key := FactKey(label, keyOwner, it.relPath, "", name, positional)
+	key := FactKey(label, keyOwner, it.relPath, "", name, positional, "")
 	if err := e.sc.exec(ctx, `INSERT INTO ident(ent, node_id, fact_json, alias_json, key) VALUES(?,?,?,?,?)`,
 		it.id, string(node.ID), string(factJSON), string(aliasJSON), key); err != nil {
 		return err
@@ -563,7 +563,8 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		// The key must stay a digest: saveKeys unions relation keys into the
 		// key set and LoadKeySet refuses any line that is not one, so a
 		// composed key here would write a set the next refresh cannot load.
-		altKey := FactKey("rel:may_refer_to", keyOwner, it.relPath, "ambiguous", string(alt), positional)
+		altKey := FactKey("rel:may_refer_to", keyOwner, it.relPath, "ambiguous", string(alt), positional,
+			string(node.ID)+keySep+string(alt))
 		if err := e.stageRelation(ctx, node.ID, model.RelMayReferTo, alt, evFile, evHash, evRange,
 			qualified, detailAssignment, altKey); err != nil {
 			return err
@@ -705,7 +706,7 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 				rng = &r
 			}
 			factKey := FactKey("rel:"+o.kind, o.owner, o.relPath, o.op, o.key.target,
-				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target))
+				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target), o.from+keySep+o.to)
 			if err := e.stageRelation(ctx, model.NodeID(o.from), kind, model.NodeID(o.to), model.FileID(o.fileID),
 				o.hash, rng, o.owner, o.detail, factKey); err != nil {
 				return err

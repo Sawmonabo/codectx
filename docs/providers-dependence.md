@@ -354,12 +354,25 @@ The engine has no incremental mode, no merge and no per-file export
 (joern#5757), so a refreshed unit is a whole parse and export — unless the
 cache key still matches, in which case nothing runs at all.
 
-What is wired today, exactly. Every import derives an id-independent semantic
-key per fact (the fact label, its owning method's full name, its file, the
-operator it was lowered from, its target name and its ordered byte ranges;
+What is wired today, exactly. Every import derives an engine-id-independent
+semantic key per fact (the fact label, its owning method's full name, its
+file, the operator it was lowered from, its target name, its ordered byte
+ranges and — for a relation — its two endpoints' published identities;
 `<clinit>`-owned facts use a digest of their endpoints' source text instead of
 their coordinates, because the Go frontend shuffles those between two parses
-of identical source). The importer streams that key set to a sorted file,
+of identical source). The endpoints are part of the key because a relation's
+published identity is derived from them and a located declaration's identity
+is derived from its declaration range: edit a callee and every call edge into
+it moves to a new identity while the site's own file, owner, target name and
+byte range do not move at all. Without them one key would name two different
+facts across a refresh, the previous row would be carried under a key the
+fresh run still publishes, and the unit would hold an edge whose endpoint no
+longer exists. A node fact takes no endpoints component — its identity
+already tracks through its file and its coordinates, and an identity minted
+from a declaration range would reintroduce the initializer nondeterminism the
+coordinate rule exists to defeat. Two independent engine runs over one
+unchanged tree of this repository published the same 6842 keys, none changed
+and none removed. The importer streams that key set to a sorted file,
 diffs a supplied previous set against it in one merge pass, and can publish
 only the relations whose key changed. Deriving the keys measured 1–5 s per
 unit against 17–65 s engine runs, and a one-line edit changes about one fact
@@ -375,7 +388,10 @@ storage would keep the old row under a key the fresh fact never names, and the
 unit would hold two descriptions of one identity. The list is sorted and
 deduplicated because storage refuses an unsorted one, and there is no bound on
 its length beyond the record-byte accounting every fact is already charged
-under, which fails closed with `CTX_RESOURCE_LIMIT`.
+under, which fails closed with `CTX_RESOURCE_LIMIT`. Measured on a real
+engine export of one package of this repository (973 node facts, 3389
+relations, 6865 keys): at most 5 keys behind one node fact and 51 behind one
+relation.
 
 A delta import filters whole relations, never occurrences: an edge is
 republished if any of its occurrences carries a changed key, and it is then
