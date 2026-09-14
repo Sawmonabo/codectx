@@ -591,11 +591,15 @@ func (s *Store) AdvanceSession(ctx context.Context, req model.AdvanceRequest) (m
 			string(req.Target), closedAt, raw, req.ExpectedVersion); err != nil {
 			return err
 		}
-		if req.Target == model.StateClosed {
-			// A closed session reads nothing further, so it stops pinning its
-			// generation here rather than at the end of its TTL. It is the same
-			// transaction as the close: a session that is gone never leaves a
-			// lease behind holding a generation retention may not collect.
+		if closedAt != nil {
+			// A terminal session reads nothing further -- session() refuses one
+			// whose closed_at is set -- so it stops pinning its generation here
+			// rather than at the end of its TTL, on the SAME condition that
+			// stamped closed_at. complete is terminal too and has no edge out,
+			// and Export serves the stored capsule row, never retained source.
+			// It is the same transaction as the transition: a session that is
+			// over never leaves a lease holding a generation retention may not
+			// collect.
 			if err := releaseOwnerLease(ctx, tx, model.LeaseSession, raw); err != nil {
 				return err
 			}
