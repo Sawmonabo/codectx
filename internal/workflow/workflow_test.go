@@ -1070,7 +1070,10 @@ func (s *fakeStore) CoverageSummary(_ context.Context, session model.SessionID, 
 	var required, served, waived int64
 	for _, f := range fs.files {
 		required++
-		if f.state() == model.CoverageFullServed {
+		// The real aggregate excludes a waived file from the served count
+		// whatever its bytes say (coverageSummarySQL); the fake must answer the
+		// same or these rows test a store that does not exist.
+		if f.state() == model.CoverageFullServed && !f.waived {
 			served++
 		}
 		if f.waived {

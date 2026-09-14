@@ -661,14 +661,16 @@ func TestStorePublicationScenario(t *testing.T) {
 	// The summary reimplements Coverage's state switch in SQL so Status costs
 	// one round trip; the two answering differently is the duplicate
 	// implementation Section 30.1 forbids, so assert agreement rather than only
-	// the absolute counts.
+	// the absolute counts. The summary's served column is "fully confirmed AND
+	// not waived", so the paged count applies the waiver clause too -- and the
+	// waiver written below re-checks the same agreement once one exists.
 	page, err := f.s.Coverage(ctx, open.ID, actorID, "", 10)
 	if err != nil {
 		t.Fatalf("Coverage: %v", err)
 	}
 	var paged int64
 	for _, fc := range page {
-		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed {
+		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed && !fc.Waived {
 			paged++
 		}
 	}
@@ -696,13 +698,31 @@ func TestStorePublicationScenario(t *testing.T) {
 		t.Fatalf("SessionFilePaths returned %d paths including a file outside the session's scope: %v", len(paths), paths)
 	}
 
-	// A waiver is audited beside coverage, never as coverage: it raises the
-	// waived count and leaves the served count alone (Section 17.3).
+	// A waiver is audited beside coverage, never AS coverage: it raises the
+	// waived count and REMOVES the file from the served count, even though this
+	// one is fully served (its confirmed zero-length EOF chunk). A summary that
+	// counted it in both columns reported a fully waived session as fully
+	// covered, which is the claim the waiver exists to deny (Section 17.3).
 	if _, err := f.s.Waive(ctx, model.WaiverRequest{SessionID: open.ID, ActorID: actorID, FileID: empty.id, Reason: "generated file reviewed out of band"}); err != nil {
 		t.Fatalf("Waive: %v", err)
 	}
-	if required, served, waived := summary("waived"); required != 2 || served != 2 || waived != 1 {
-		t.Fatalf("summary after waiving a required file = %d required %d served %d waived, want 2/2/1", required, served, waived)
+	if required, served, waived := summary("waived"); required != 2 || served != 1 || waived != 1 {
+		t.Fatalf("summary after waiving a fully served required file = %d required %d served %d waived, want 2/1/1", required, served, waived)
+	}
+	// ...and Coverage still reports the file full_served with the waived flag
+	// set, so the two readers agree under the same definition.
+	waivedPage, err := f.s.Coverage(ctx, open.ID, actorID, "", 10)
+	if err != nil {
+		t.Fatalf("Coverage after the waiver: %v", err)
+	}
+	paged = 0
+	for _, fc := range waivedPage {
+		if fc.Requirement == model.RequirementFull && fc.State == model.CoverageFullServed && !fc.Waived {
+			paged++
+		}
+	}
+	if _, served, _ := summary("agreement under a waiver"); paged != served {
+		t.Fatalf("CoverageSummary says %d served with a waiver in scope; paging Coverage says %d", served, paged)
 	}
 	// The waiver's reason survives only in coverage_waivers: Waive's return
 	// value echoes the request, so this read-back is what proves the stored row
