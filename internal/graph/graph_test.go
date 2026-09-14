@@ -118,6 +118,22 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for i := 0; i < fixtureWideCount; i++ {
 		addNode(fmt.Sprintf("n-wide-leaf-%03d", i), model.NodeFunction, fmt.Sprintf("wide%03d", i))
 	}
+	// pkg-wide-a and pkg-wide-b make n-wide's fan-out a CROSS-package one, so a
+	// rollup seeded at n-wide has 261 distinct endpoints and containerPackages
+	// asks containsEdges for a 256-node batch whose containment rows do not fit
+	// in one clamped page. Two packages, never one: an edge whose endpoints
+	// share a container rolls up to nothing, and an edge BETWEEN the two would
+	// give ShortestPath a second route into the leaves.
+	addNode("pkg-wide-a", model.NodePackage, "wide-a")
+	addNode("pkg-wide-b", model.NodePackage, "wide-b")
+	// n-ref is the reference target whose incoming edges outrun one clamped
+	// page. Its sources are fresh nodes rather than the n-wide leaves, so no
+	// existing scenario's neighbourhood gains an edge it did not have.
+	addNode("n-ref", model.NodeFunction, "n-ref")
+	addNode("n-ref-caller", model.NodeFunction, "n-ref-caller")
+	for i := 0; i < fixtureWideCount; i++ {
+		addNode(fmt.Sprintf("n-ref-src-%03d", i), model.NodeFunction, fmt.Sprintf("refsrc%03d", i))
+	}
 
 	// edges are declared in a stable order; RelationIDs are assigned from it so
 	// the keyset order is reproducible from the source alone.
@@ -157,6 +173,17 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		{"n-b", model.RelDataFlowsTo, "n-sink"},
 		{"n-c", model.RelControlDependsOn, "n-sink"},
 	}
+	// bare names, by declaration position, the edges that carry NO evidence
+	// row. Containment legitimately carries none (rollup.go says so), and an
+	// evidence-free relation is the only shape that lets a reference walk
+	// advance its keyset across a whole clamped page without filling the page
+	// -- which is the only way referencePage's empty-page termination is
+	// reached at all.
+	bare := map[int]bool{}
+	addBare := func(e edge) {
+		bare[len(edges)] = true
+		edges = append(edges, e)
+	}
 	for i := 0; i < fixtureLeafCount; i++ {
 		edges = append(edges, edge{"n-hub", model.RelCalls, fmt.Sprintf("n-leaf-%02d", i)})
 	}
@@ -167,6 +194,23 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for i := 0; i < fixtureWideCount; i++ {
 		edges = append(edges, edge{"n-wide", model.RelCalls, fmt.Sprintf("n-wide-leaf-%03d", i)})
 	}
+	// Containment for that neighbourhood, again declared after everything that
+	// existed before it. 261 incoming contains rows over a 256-node batch is
+	// more than one clamped page, which is what makes rollup.go's containsEdges
+	// loop observable at all.
+	addBare(edge{"pkg-wide-a", model.RelContains, "n-wide"})
+	for i := 0; i < fixtureWideCount; i++ {
+		addBare(edge{"pkg-wide-b", model.RelContains, fmt.Sprintf("n-wide-leaf-%03d", i)})
+	}
+	// n-ref's incoming references carry no evidence, so a reference walk reads
+	// them, advances its keyset past them and emits nothing for them...
+	for i := 0; i < fixtureWideCount; i++ {
+		addBare(edge{fmt.Sprintf("n-ref-src-%03d", i), model.RelReferences, "n-ref"})
+	}
+	// ...and this is the one occurrence-bearing relation, declared last so it
+	// sorts beyond the first clamped page. A walk that ended on a short page
+	// never reads it and reports a referenced symbol as unreferenced.
+	edges = append(edges, edge{"n-ref-caller", model.RelCalls, "n-ref"})
 
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
@@ -192,6 +236,12 @@ func newGraphFixture(t *testing.T) *graphFixture {
 		id := fixtureRelationID(i)
 		f.relations = append(f.relations, model.Relation{
 			ID: id, From: fixtureNodeID(e.from), Kind: e.kind, To: fixtureNodeID(e.to)})
+		if bare[i] {
+			// A canonical relation with no evidence row at all. References
+			// contributes no occurrence for it; every other reader still sees
+			// the relation.
+			continue
+		}
 		// One occurrence per edge, except n-a -> n-b, which carries two: the
 		// §9.2 relation-count vs occurrence-count distinction needs a relation
 		// that is one relation and two occurrences.
@@ -891,6 +941,51 @@ func TestGraphScenarios(t *testing.T) {
 				}
 				if page.Meta.Truncated {
 					t.Fatalf("a complete two-occurrence answer must not be truncated: %q", page.Meta.TruncationReason)
+				}
+			},
+		},
+
+		// FX-C14c-PROOF row
+		{
+			// The last two keyset loops that ask Adjacency.Edges for
+			// adjacencyBatch (256) rows: rollup.go's containsEdges and
+			// references.go's referencePage. The reader clamps every request
+			// down to model.MaxPageItems (200), so "the page came back shorter
+			// than I asked for" is true of EVERY page, and a loop that ends on
+			// it ends after its first one. Both sites are pinned here because
+			// both then answer silently wrong rather than failing: the rollup
+			// loses the containers of every node past row 200 and under-counts
+			// the pair, and the reference walk loses every occurrence past row
+			// 200 and reports a referenced symbol as unreferenced.
+			name: "keyset walks past the storage page clamp read every page",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				roll, err := e.PackageDependencies(context.Background(), model.GraphRequest{
+					Start:     []model.NodeID{fixtureNodeID("n-wide")},
+					Relations: []model.RelationKind{model.RelCalls},
+					Direction: model.DirectionOutgoing,
+				})
+				if err != nil {
+					t.Fatalf("PackageDependencies: %v", err)
+				}
+				if len(roll.Items) != 1 || roll.Items[0].PairCount != int64(fixtureWideCount) {
+					t.Fatalf("containsEdges: rollup returned %+v, want one wide-a -> wide-b pair over %d edges; a short-page break loses the containers past the first clamped page",
+						roll.Items, fixtureWideCount)
+				}
+				refs, err := e.References(context.Background(), model.ReferenceRequest{
+					NodeID:         fixtureNodeID("n-ref"),
+					Operation:      model.ReferenceReferences,
+					SemanticSource: model.SemanticCanonical,
+				})
+				if err != nil {
+					t.Fatalf("References: %v", err)
+				}
+				if len(refs.Items) != 1 || refs.Items[0].FromNodeID != fixtureNodeID("n-ref-caller") {
+					t.Fatalf("referencePage: references returned %d occurrences (%+v), want the single one from n-ref-caller; it sorts past the first clamped page of evidence-free relations",
+						len(refs.Items), refs.Items)
 				}
 			},
 		},
