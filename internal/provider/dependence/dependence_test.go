@@ -14,6 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
 )
 
@@ -95,7 +96,7 @@ func (b *fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (d
 type fakeImporter struct{ report dependence.ImportReport }
 
 func (f fakeImporter) Import(ctx context.Context, dir string, res provider.Resolver,
-	sink provider.Sink, opts dependence.ImportOptions) (dependence.ImportReport, error) {
+	sink provider.Sink, opts neo4jcsv.Options) (dependence.ImportReport, error) {
 
 	cand := model.NodeCandidate{ProviderID: dependence.ProviderID, ScopeKey: opts.UnitScopeKey,
 		NativeKey: "method:Run", Kind: model.NodeFunction, Language: opts.Language, Name: "Run"}

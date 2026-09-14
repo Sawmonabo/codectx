@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // run drives one import through the production sink, resolver and seal path:
@@ -626,4 +627,184 @@ func TestRelationKeyTracksItsEndpoints(t *testing.T) {
 			t.Fatalf("Diff did not report the call edge's key %s changed; the delta import would not re-emit the edge", k)
 		}
 	}
+
+	// And the leg where storage keeps the rows: the refresh inherits the base
+	// unit, so a key that failed to move becomes a dangling endpoint.
+	carryOver(t, src, filepath.Join("testdata", "gofix"), export, dir)
+}
+
+// carryOver is the leg storage actually consumes: both imports run over one
+// store, the base unit is sealed with its fact keys, and the refresh inherits
+// it minus everything the key diff names — which is what a delta build does in
+// production (internal/index/delta).
+//
+// The assertion is that the refreshed unit SEALS, and that it inherited
+// something. The base unit holds the call edge Run -> Scale declared at 4-6.
+// The refresh publishes Run -> Scale declared at 5-7 and never publishes the
+// old callee's node fact, so the base edge is carried if and only if its key
+// survived the diff. A carried relation whose `to` node the unit does not hold
+// is precisely what SealUnit refuses. Remove the endpoints component from
+// FactKey and this leg fails with "relation endpoints with no visible node
+// fact" — the import assertions above cannot see that, because they never let
+// storage keep a row.
+func carryOver(t *testing.T, src, baseExport, mutExport, dir string) {
+	t.Helper()
+	ctx := context.Background()
+	files, paths := readSource(t, src)
+	// The refresh must be a different unit: a unit cannot carry over from
+	// itself, and these two imports read byte-identical sources. One extra
+	// declared input is the smallest honest difference, and it declares no
+	// facts, so it changes nothing else.
+	const marker = "refresh.marker"
+	files[marker] = "refresh\n"
+	h := providertest.New(t, files)
+
+	baseKeys := filepath.Join(dir, "carry-base")
+	base, baseRep := imports(t, baseExport, neo4jcsv.Options{Language: "go", KeysPath: baseKeys})
+	baseUnit := h.Plan(t, base, "pkg:fixture", paths)
+	res, err := provider.RunUnit(ctx, base, baseUnit.Request, h.Begin(t, baseUnit, paths), providertest.Limits, h.Pool)
+	if err != nil {
+		t.Fatalf("base RunUnit: %v", err)
+	}
+	if err := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); err != nil {
+		t.Fatalf("CompleteProviderRun: %v", err)
+	}
+
+	prev, err := neo4jcsv.LoadKeySet(baseKeys)
+	if err != nil {
+		t.Fatalf("LoadKeySet: %v", err)
+	}
+	// A refresh is a new generation: one generation selects one unit per
+	// provider and scope, so the successor cannot be sealed beside the unit it
+	// carries over from. (L1 widens BeginGeneration with a ref parameter; this
+	// call site is listed in the lane report.)
+	gen, err := h.Store.BeginGeneration(ctx, h.Repo, h.Snapshot.ID, model.H("providertest-semantic"))
+	if err != nil {
+		t.Fatalf("BeginGeneration: %v", err)
+	}
+	h.Gen = gen
+
+	refresh, refreshRep := imports(t, mutExport, neo4jcsv.Options{Language: "go",
+		KeysPath: filepath.Join(dir, "carry-refresh"), PreviousKeys: prev})
+	refreshPaths := append(slices.Clone(paths), marker)
+	refreshUnit := h.Plan(t, refresh, "pkg:fixture", refreshPaths)
+	w, err := h.Store.BeginUnit(ctx, h.Gen, refreshUnit.Build, unitInputs(t, h, refreshPaths))
+	if err != nil {
+		t.Fatalf("BeginUnit: %v", err)
+	}
+
+	var stats sqlite.CarryOverStats
+	var delta neo4jcsv.Delta
+	var diffErr error
+	out := &carryOut{UnitWriter: w, store: h.Store, carry: func(ctx context.Context, w *sqlite.UnitWriter) error {
+		fresh := refreshRep.Keys
+		d, err := fresh.Diff(prev, nil)
+		if err != nil {
+			return err
+		}
+		delta = d
+		replaced := sqlite.Replaced{
+			// The unlocated bucket is dropped exactly when the emit was
+			// unfiltered, which is when a key was removed.
+			IndexLevel: d.Removed > 0,
+			Keys: func(yield func(string) bool) {
+				_, diffErr = fresh.Diff(prev, func(key string, removed bool) error {
+					yield(key)
+					return nil
+				})
+			},
+		}
+		if stats, err = w.CarryOver(ctx, baseUnit.Build.Spec.ID, replaced); err != nil {
+			return err
+		}
+		return diffErr
+	}}
+	res, err = provider.RunUnit(ctx, refresh, refreshUnit.Request, out, providertest.Limits, h.Pool)
+	if err != nil {
+		t.Fatalf("refresh RunUnit: %v; the refresh inherited a relation the fresh import no longer publishes", err)
+	}
+	if err := h.Store.CompleteProviderRun(ctx, res, provider.CodeOf(err)); err != nil {
+		t.Fatalf("CompleteProviderRun: %v", err)
+	}
+	if state, _ := h.UnitState(t, refreshUnit.Build.Spec.ID); state != model.UnitSealed {
+		t.Fatalf("refreshed unit state = %q, want sealed", state)
+	}
+	if baseRep.Keys.Count() == 0 {
+		t.Fatal("the base unit published no fact keys; carry-over had nothing to diff")
+	}
+	// Moving the callee retires the keys of its declaration and of every edge
+	// into it, so this refresh emits unfiltered and republishes every relation
+	// that still exists. The carried set is therefore the complement: it must
+	// be empty, and the one row that would land in it is the stale edge whose
+	// endpoints moved. Strip the endpoints component from FactKey and this
+	// fires, one line before the seal refuses the dangling endpoint.
+	if delta.Removed == 0 {
+		t.Fatalf("the refresh removed no key (%+v); the fixture no longer retires the moved callee's keys", delta)
+	}
+	if stats.Relations != 0 {
+		t.Fatalf("the refresh inherited %d relations from a unit whose every surviving relation it republished; "+
+			"a relation whose endpoints moved kept its fact key", stats.Relations)
+	}
+}
+
+// imports is one provider whose whole index is a neo4jcsv import of export,
+// plus the report it produced. The report is read after RunUnit returns, or
+// inside the seal the caller wraps around it.
+func imports(t *testing.T, export string, opts neo4jcsv.Options) (provider.Provider, *neo4jcsv.Report) {
+	t.Helper()
+	projectRoot := t.TempDir()
+	rep := new(neo4jcsv.Report)
+	p := providertest.Func{
+		Desc: descriptor(),
+		IndexFn: func(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+			o := opts
+			o.UnitScopeKey, o.ProjectRoot = req.Unit.ScopeKey, projectRoot
+			o.Limits = providertest.Limits
+			o.Repository, o.Unit, o.Run, o.Content = req.Binding.RepositoryID, req.Unit, req.Run, req.Content
+			r, err := neo4jcsv.Import(ctx, export, req.Resolver, sink, o)
+			if err != nil {
+				return model.ProviderResult{}, err
+			}
+			*rep = r
+			return providertest.Succeeded(req, uint64(r.Nodes+r.Relations+r.Aliases), r.BytesRead), nil
+		},
+	}
+	return p, rep
+}
+
+// unitInputs streams the harness rows for paths in the ascending file order
+// BeginUnit requires.
+func unitInputs(t *testing.T, h *providertest.Harness, paths []string) func(yield func(model.UnitInput) error) error {
+	t.Helper()
+	ins := make([]model.UnitInput, 0, len(paths))
+	for _, p := range paths {
+		fv := h.File(t, p)
+		ins = append(ins, model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
+	}
+	slices.SortFunc(ins, func(a, b model.UnitInput) int { return strings.Compare(string(a.FileID), string(b.FileID)) })
+	return func(yield func(model.UnitInput) error) error {
+		for _, in := range ins {
+			if err := yield(in); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
+// carryOut is provider.StoreUnit with a carry-over wedged in front of the
+// seal, the shape internal/index/delta builds a unit in. It embeds the
+// concrete writer so the sink still finds the keyed puts behind its
+// provider.DeltaSink assertion.
+type carryOut struct {
+	*sqlite.UnitWriter
+	store *sqlite.Store
+	carry func(ctx context.Context, w *sqlite.UnitWriter) error
+}
+
+func (o *carryOut) Seal(ctx context.Context) error {
+	if err := o.carry(ctx, o.UnitWriter); err != nil {
+		return err
+	}
+	return o.store.SealUnit(ctx, o.UnitWriter)
 }
