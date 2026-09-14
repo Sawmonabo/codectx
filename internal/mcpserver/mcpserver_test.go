@@ -616,6 +616,15 @@ var scenarios = []scenario{
 							Start: model.Position{Byte: 0, Line: 1, Column: 1},
 							End:   model.Position{Byte: 10, Line: 2, Column: 1},
 						},
+						// Non-empty Metadata is load-bearing, not decoration:
+						// it is json.RawMessage, so without registry.go's
+						// output-schema preset the SDK validates this object
+						// against an inferred ["null","array"] and turns the
+						// whole answer into a JSON-RPC protocol error. An empty
+						// Metadata is dropped by omitempty and never reaches
+						// that check. The LSP overlay really does populate it
+						// (app/overlay.go's container).
+						Metadata:       json.RawMessage(`{"container":"internal/mcpserver"}`),
 						SemanticSource: model.SemanticLSP,
 					}},
 				}, nil
@@ -642,7 +651,11 @@ var scenarios = []scenario{
 				t.Errorf("meta.overlay = %+v, want the facade's label verbatim", *got.Data.Meta.Overlay)
 			}
 			if len(got.Data.Items) != 1 || got.Data.Items[0].SemanticSource != model.SemanticLSP {
-				t.Errorf("items = %+v, want one node labelled lsp", got.Data.Items)
+				t.Fatalf("items = %+v, want one node labelled lsp", got.Data.Items)
+			}
+			if string(got.Data.Items[0].Metadata) != `{"container":"internal/mcpserver"}` {
+				t.Errorf("items[0].metadata = %s, want the facade's raw JSON verbatim",
+					got.Data.Items[0].Metadata)
 			}
 			// model.Node carries no body today; this keeps it that way by
 			// failing the moment a source-bearing field (ReadChunkResponse's
