@@ -21,7 +21,15 @@ const (
 
 // BeginGeneration opens a staging generation over snapshot. Staging facts are
 // invisible to every reader until Activate publishes the pointer.
-func (s *Store) BeginGeneration(ctx context.Context, repo model.RepositoryID, snapshot model.SnapshotID, semanticConfigHash string) (model.GenerationID, error) {
+//
+// ref is the ref this generation is built from and is what retention groups
+// by (Section 12.4): keeping the last retain_refs DISTINCT refs is what makes
+// switching A -> B -> C -> A find A's units still on disk. Storage never
+// interprets it. The coordinator supplies a branch name, the HEAD object id
+// when HEAD is detached, or the sentinel "(none)" when the workspace is not a
+// Git repository; an empty ref is refused rather than silently grouping every
+// non-Git generation under one nameless bucket.
+func (s *Store) BeginGeneration(ctx context.Context, repo model.RepositoryID, snapshot model.SnapshotID, semanticConfigHash, ref string) (model.GenerationID, error) {
 	repoRaw, err := idBlob("repository_id", string(repo))
 	if err != nil {
 		return 0, err
@@ -33,10 +41,14 @@ func (s *Store) BeginGeneration(ctx context.Context, repo model.RepositoryID, sn
 	if !model.ValidHexID(semanticConfigHash) {
 		return 0, invalid("semantic_config_hash must be a %d-character lowercase hex digest", model.IDHexLen)
 	}
+	// A refname is path-shaped, so MaxPathBytes is its structural ceiling.
+	if ref == "" || len(ref) > model.MaxPathBytes {
+		return 0, invalid("generation ref is required and bounded to %d bytes", model.MaxPathBytes)
+	}
 	var id int64
 	err = s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `INSERT INTO generations(repository_id, snapshot_id, analysis_key, semantic_config_hash, status, health, created_at)
-			VALUES(?, ?, NULL, ?, ?, ?, ?)`, repoRaw, snapRaw, semanticConfigHash, string(model.GenerationStaging), string(model.HealthFresh), formatTime(time.Now()))
+		res, err := tx.ExecContext(ctx, `INSERT INTO generations(repository_id, snapshot_id, ref, analysis_key, semantic_config_hash, status, health, created_at)
+			VALUES(?, ?, ?, NULL, ?, ?, ?, ?)`, repoRaw, snapRaw, ref, semanticConfigHash, string(model.GenerationStaging), string(model.HealthFresh), formatTime(time.Now()))
 		if err != nil {
 			return wrap("generations", err)
 		}
@@ -1002,7 +1014,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {
 			return err
 		}
-		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey)
+		return s.attach(ctx, tx, w.gen, w.rowID, w.build.Spec.ProviderID, w.build.Spec.ScopeKey, false, Carry{})
 	})
 	if err == nil {
 		w.done = true
@@ -1018,12 +1030,15 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	return err
 }
 
-// attach inserts the generation membership row for a unit.
-func (s *Store) attach(ctx context.Context, tx *sql.Tx, gen model.GenerationID, unitRow int64, providerID, scopeKey string) error {
+// attach inserts the generation membership row for a unit. carried and its
+// distance are zero for every fresh or reused member; only AttachCarried
+// passes a nonzero carry (Section 13.3).
+func (s *Store) attach(ctx context.Context, tx *sql.Tx, gen model.GenerationID, unitRow int64, providerID, scopeKey string, carried bool, c Carry) error {
 	if _, err := s.generationRow(ctx, tx, gen, model.GenerationStaging); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO generation_units(generation_id, provider_id, scope_key, unit_id) VALUES(?, ?, ?, ?)`, int64(gen), providerID, scopeKey, unitRow)
+	_, err := tx.ExecContext(ctx, `INSERT INTO generation_units(generation_id, provider_id, scope_key, unit_id, carried, distance_generations, distance_files)
+		VALUES(?, ?, ?, ?, ?, ?, ?)`, int64(gen), providerID, scopeKey, unitRow, boolInt(carried), c.DistanceGenerations, c.DistanceFiles)
 	if err != nil {
 		wrapped := wrap("generation_units", err)
 		if typed, ok := wrapped.(*model.Error); ok && typed.Code == model.CodeArgumentInvalid {
@@ -1072,7 +1087,7 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 				Message: fmt.Sprintf("unit cannot be reused: %d of its inputs differ from the selected snapshot", mismatched),
 				Details: map[string]string{"unit_id": string(unit)}}
 		}
-		return s.attach(ctx, tx, gen, row, providerID, scopeKey)
+		return s.attach(ctx, tx, gen, row, providerID, scopeKey, false, Carry{})
 	})
 }
 
@@ -1124,9 +1139,18 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			{"members that are not sealed", `SELECT count(*) FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ?1 AND u.state <> 'sealed'`},
 			{"member dependencies that are not members", `SELECT count(*) FROM generation_units gu JOIN unit_dependencies ud ON ud.unit_id = gu.unit_id
 				WHERE gu.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM generation_units g2 WHERE g2.generation_id = ?1 AND g2.unit_id = ud.dependency_id)`},
+			// A carried member is exempt from input equality and from it alone:
+			// Section 13.3 carries the previous sealed unit precisely because
+			// its inputs no longer match the snapshot. What still holds for it
+			// is that its inputs exist — a unit whose files were deleted is
+			// never carried — so the carried rows are checked for existence
+			// instead, and both checks run over the frozen membership.
 			{"member inputs that differ from the snapshot", `SELECT count(*) FROM generation_units gu JOIN unit_inputs ui ON ui.unit_id = gu.unit_id
-				WHERE gu.generation_id = ?1 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
+				WHERE gu.generation_id = ?1 AND gu.carried = 0 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
 				WHERE g.id = ?1 AND sf.file_id = ui.file_id AND sf.content_hash = ui.content_hash AND sf.executable = ui.executable AND sf.status <> 'deleted')`},
+			{"carried member inputs that no longer exist in the snapshot", `SELECT count(*) FROM generation_units gu JOIN unit_inputs ui ON ui.unit_id = gu.unit_id
+				WHERE gu.generation_id = ?1 AND gu.carried = 1 AND NOT EXISTS (SELECT 1 FROM snapshot_files sf JOIN generations g ON g.snapshot_id = sf.snapshot_id
+				WHERE g.id = ?1 AND sf.file_id = ui.file_id AND sf.status <> 'deleted')`},
 			{"relation endpoints with no visible node fact", `SELECT count(*) FROM generation_units gu JOIN relation_facts rf ON rf.unit_id = gu.unit_id
 				JOIN relation_ids ri ON ri.id = rf.relation_id WHERE gu.generation_id = ?1 AND (
 				NOT EXISTS (SELECT 1 FROM node_facts nf JOIN generation_units g2 ON g2.unit_id = nf.unit_id WHERE g2.generation_id = ?1 AND nf.node_id = ri.from_node_id)
@@ -1176,8 +1200,14 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			}
 		}
 
+		// The membership digest folds each member's staleness with its key.
+		// Folding the key alone would make a generation that carries a stale
+		// unit byte-identical to one that rebuilt it over the same snapshot,
+		// so the two would share an AnalysisKey and a stale answer could not
+		// be told from a fresh one (Section 20.2 determinism).
 		membership := model.NewHasher(domainMembership)
-		if err := foldColumn(ctx, tx, membership, `SELECT lower(hex(u.unit_key)) FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ? ORDER BY u.unit_key`, g.id); err != nil {
+		if err := foldColumn(ctx, tx, membership, `SELECT lower(hex(u.unit_key)) || char(0) || gu.carried || char(0) || gu.distance_generations || char(0) || gu.distance_files
+			FROM generation_units gu JOIN units u ON u.id = gu.unit_id WHERE gu.generation_id = ? ORDER BY u.unit_key`, g.id); err != nil {
 			return err
 		}
 		capsHash := model.NewHasher(domainCapabilities)
