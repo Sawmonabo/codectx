@@ -198,30 +198,37 @@ func SearchUnitBytes(u model.SearchUnit) int64 {
 
 // DeltaSink is the optional extension of Sink for a provider that imports
 // incrementally (Section 11.4). Its destination records, alongside each fact,
-// the producer's own id-independent key — the key the provider's next run
-// classifies as changed, unchanged or removed. Storage needs it because a
-// removed fact cannot be named any other way: a fact identity is derived from
-// the resolved entities, which an edit changes, and a cross-file edge can
-// disappear while every file holding its evidence is untouched.
+// every one of the producer's own id-independent keys — the keys the
+// provider's next run classifies as changed, unchanged or removed. Storage
+// needs them because a removed fact cannot be named any other way: a fact
+// identity is derived from the resolved entities, which an edit changes, and a
+// cross-file edge can disappear while every file holding its evidence is
+// untouched.
 //
 // keys is either empty, meaning the batch carries no keys, or parallel to
-// facts. A batch keys every fact or none.
+// facts: keys[i] is every key backing facts[i] — at least one, each a
+// lowercase hex digest, sorted and without duplicates. One fact is backed by
+// several keys whenever the producer's keys are finer than the identities they
+// resolve to, which is ordinary: a canonical edge is published once and
+// derived from N occurrences, each with its own key. The destination drops the
+// fact when any of them is replaced, which is the condition the producer
+// re-emits the whole fact on.
 //
 // A destination that does not implement DeltaSink cannot serve a keyed batch;
 // the sink refuses it rather than dropping the keys, because a unit written
 // without them silently cannot be delta-refreshed.
 type DeltaSink interface {
 	Sink
-	PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys []string) error
-	PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys []string) error
+	PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error
+	PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error
 }
 
-// keyed pairs one queued fact with the producer's delta key, empty when the
+// keyed pairs one queued fact with the producer's delta keys, nil when the
 // producer supplied none. Facts are queued keyed so a batch sorts, flushes and
 // is accounted for exactly once whether or not the provider is incremental.
 type keyed[T any] struct {
 	fact T
-	key  string
+	keys []string
 }
 
 // batch is one bounded, typed accumulation awaiting persistence.
@@ -256,6 +263,45 @@ type BatchSink struct {
 	discarded bool
 	records   uint64
 	bytes     uint64
+
+	// nodesKeyed and relationsKeyed latch whether this unit's node and
+	// relation facts carry producer keys. The first Put of each kind fixes it
+	// for the unit; see keyedness.
+	nodesKeyed     keyedness
+	relationsKeyed keyedness
+}
+
+// keyedness is a unit's latched decision about one kind of fact: whether it
+// carries producer delta keys. It is a property of the unit, not of a batch.
+// Deciding per batch would make delta coverage depend on where a flush
+// happened to land — and a flush can be forced by another sink's pressure
+// through Pool.acquire — so the same import could seal a key-deltable unit or
+// a unit with unkeyed rows that only a retention bucket can ever replace.
+type keyedness uint8
+
+const (
+	keyednessUnset keyedness = iota
+	keyednessKeyed
+	keyednessUnkeyed
+)
+
+// fix latches the unit's keyed-ness for one kind of fact and refuses a Put of
+// the other kind.
+func (k *keyedness) fix(keyed bool, what string) error {
+	want := keyednessUnkeyed
+	if keyed {
+		want = keyednessKeyed
+	}
+	if *k == keyednessUnset {
+		*k = want
+		return nil
+	}
+	if *k == want {
+		return nil
+	}
+	return &model.Error{Code: model.CodeProviderOutputInvalid,
+		Message:     "a unit's " + what + " are either all keyed or all unkeyed; this unit already published the other kind",
+		Remediation: "publish the producer's fact keys for every fact of the unit, or for none"}
 }
 
 // NewBatchSink binds a sink to its destination, limits and shared pool and
@@ -319,17 +365,30 @@ func (s *BatchSink) PutNodes(ctx context.Context, facts []model.NodeFact) error 
 }
 
 // PutKeyedNodes accepts node facts with the producer's delta keys.
-func (s *BatchSink) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys []string) error {
+func (s *BatchSink) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, keys [][]string) error {
 	if err := checkKeys(len(facts), keys); err != nil {
 		return err
 	}
+	if len(facts) == 0 {
+		return nil
+	}
+	if err := s.fixKeyedness(&s.nodesKeyed, len(keys) != 0, "node facts"); err != nil {
+		return err
+	}
 	for i, f := range facts {
-		k := keyAt(keys, i)
-		if err := put(s, ctx, &s.nodes, keyed[model.NodeFact]{fact: f, key: k}, NodeFactBytes(f)+int64(len(k))); err != nil {
+		k := keysAt(keys, i)
+		if err := put(s, ctx, &s.nodes, keyed[model.NodeFact]{fact: f, keys: k}, NodeFactBytes(f)+keyBytes(k)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// fixKeyedness latches one kind's keyed-ness under the sink lock.
+func (s *BatchSink) fixKeyedness(k *keyedness, keyed bool, what string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return k.fix(keyed, what)
 }
 
 // PutRelations accepts relation facts.
@@ -338,58 +397,81 @@ func (s *BatchSink) PutRelations(ctx context.Context, facts []model.RelationFact
 }
 
 // PutKeyedRelations accepts relation facts with the producer's delta keys.
-func (s *BatchSink) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys []string) error {
+func (s *BatchSink) PutKeyedRelations(ctx context.Context, facts []model.RelationFact, keys [][]string) error {
 	if err := checkKeys(len(facts), keys); err != nil {
 		return err
 	}
+	if len(facts) == 0 {
+		return nil
+	}
+	if err := s.fixKeyedness(&s.relationsKeyed, len(keys) != 0, "relation facts"); err != nil {
+		return err
+	}
 	for i, f := range facts {
-		k := keyAt(keys, i)
-		if err := put(s, ctx, &s.relations, keyed[model.RelationFact]{fact: f, key: k}, RelationFactBytes(f)+int64(len(k))); err != nil {
+		k := keysAt(keys, i)
+		if err := put(s, ctx, &s.relations, keyed[model.RelationFact]{fact: f, keys: k}, RelationFactBytes(f)+keyBytes(k)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// checkKeys enforces that a keyed batch keys every fact. A partly keyed batch
-// would leave rows a later refresh could neither replace nor remove.
-func checkKeys(facts int, keys []string) error {
+// checkKeys enforces that a keyed batch keys every fact with at least one
+// non-empty key. A partly keyed batch would leave rows a later refresh could
+// neither replace nor remove. The destination enforces the rest of the key
+// contract (digest shape, ordering, no duplicates), which is where it is
+// stored and therefore where it must hold.
+func checkKeys(facts int, keys [][]string) error {
 	if len(keys) == 0 {
 		return nil
 	}
 	if len(keys) != facts {
-		return invalid(fmt.Sprintf("a keyed batch carries %d keys for %d facts", len(keys), facts))
+		return invalid(fmt.Sprintf("a keyed batch carries %d key lists for %d facts", len(keys), facts))
 	}
-	for _, k := range keys {
-		if k == "" {
-			return invalid("a keyed batch keys every fact or none; one key is empty")
+	for _, list := range keys {
+		if len(list) == 0 {
+			return invalid("a keyed batch keys every fact or none; one fact has no key")
+		}
+		for _, k := range list {
+			if k == "" {
+				return invalid("a fact key is empty")
+			}
 		}
 	}
 	return nil
 }
 
-func keyAt(keys []string, i int) string {
+func keysAt(keys [][]string, i int) []string {
 	if i < len(keys) {
 		return keys[i]
 	}
-	return ""
+	return nil
+}
+
+func keyBytes(keys []string) int64 {
+	var n int64
+	for _, k := range keys {
+		n += int64(len(k))
+	}
+	return n
 }
 
 // unkey splits a sorted batch into the parallel slices the destination takes.
-// keys is nil when the batch carried none, so an unkeyed batch reaches a plain
-// Sink unchanged.
-func unkey[T any](list []keyed[T]) ([]T, []string) {
+// keyed says whether this unit's facts of that kind carry keys, which is
+// latched for the whole unit rather than inferred from the batch: inferring it
+// would make a flush boundary that happened to hold only unkeyed items write
+// rows no key could ever replace.
+func unkey[T any](list []keyed[T], keyed bool) ([]T, [][]string) {
 	facts := make([]T, len(list))
-	keys := make([]string, len(list))
-	any := false
-	for i, item := range list {
-		facts[i], keys[i] = item.fact, item.key
-		if item.key != "" {
-			any = true
+	if !keyed {
+		for i, item := range list {
+			facts[i] = item.fact
 		}
-	}
-	if !any {
 		return facts, nil
+	}
+	keys := make([][]string, len(list))
+	for i, item := range list {
+		facts[i], keys[i] = item.fact, item.keys
 	}
 	return facts, keys
 }
@@ -588,7 +670,7 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 	switch list := items.(type) {
 	case []keyed[model.NodeFact]:
 		slices.SortFunc(list, func(a, b keyed[model.NodeFact]) int { return cmp.Compare(a.fact.Node.ID, b.fact.Node.ID) })
-		facts, keys := unkey(list)
+		facts, keys := unkey(list, s.nodesKeyed == keyednessKeyed)
 		if keys == nil {
 			return s.dst.PutNodes(ctx, facts)
 		}
@@ -599,7 +681,7 @@ func (s *BatchSink) write(ctx context.Context, items any) error {
 		return dst.PutKeyedNodes(ctx, facts, keys)
 	case []keyed[model.RelationFact]:
 		slices.SortFunc(list, func(a, b keyed[model.RelationFact]) int { return cmp.Compare(a.fact.Relation.ID, b.fact.Relation.ID) })
-		facts, keys := unkey(list)
+		facts, keys := unkey(list, s.relationsKeyed == keyednessKeyed)
 		if keys == nil {
 			return s.dst.PutRelations(ctx, facts)
 		}

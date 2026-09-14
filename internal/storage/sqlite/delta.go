@@ -30,8 +30,12 @@ import (
 //     cross-file edge can disappear while every file holding its evidence is
 //     unchanged, so a path bucket cannot express its removals. Its applier
 //     names the changed and removed keys, which storage matches against the
-//     fact_key each producer supplied through PutKeyedNodes/PutKeyedRelations.
-//     Storage never derives or interprets a key.
+//     fact_keys rows each producer supplied through
+//     PutKeyedNodes/PutKeyedRelations. A fact is backed by every key that
+//     produced it, and is dropped when ANY of them is replaced — the same
+//     condition the producer re-emits the whole fact on, so the fresh and
+//     carried sets partition exactly. Storage never derives or interprets a
+//     key.
 //
 // Aliases have neither evidence nor a file column, so they are excluded by
 // their scope key, which the applier already owns, and are otherwise carried
@@ -124,9 +128,7 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 		}
 		if keyed > 0 {
 			var stored int64
-			if err := tx.QueryRowContext(ctx, `SELECT
-				(SELECT count(*) FROM node_facts WHERE unit_id = ?1 AND fact_key <> '')
-				+ (SELECT count(*) FROM relation_facts WHERE unit_id = ?1 AND fact_key <> '')`, prevRow).Scan(&stored); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM fact_keys WHERE unit_id = ?1`, prevRow).Scan(&stored); err != nil {
 				return wrap("fact keys", err)
 			}
 			if stored == 0 {
@@ -209,8 +211,8 @@ func (w *UnitWriter) stageReplaced(ctx context.Context, tx *sql.Tx, files [][]by
 	defer stmt.Close()
 	var n int64
 	for key := range keys {
-		if key == "" || len(key) > model.MaxNativeKeyBytes {
-			return 0, invalid("a replaced fact key is empty or exceeds %d bytes", model.MaxNativeKeyBytes)
+		if !model.ValidHexID(key) {
+			return 0, invalid("a replaced fact key is not a %d-character lowercase hex digest", model.IDHexLen)
 		}
 		if _, err := stmt.ExecContext(ctx, key); err != nil {
 			return 0, wrap("carry-over staging", err)
@@ -255,7 +257,14 @@ func (w *UnitWriter) checkCarriedInputs(ctx context.Context, tx *sql.Tx, prevRow
 const bucketSurvives = `((%[1]s.file_id IS NULL AND ?2 = 0)
 	OR (%[1]s.file_id IS NOT NULL AND %[1]s.file_id NOT IN (SELECT file_id FROM cx_carry_files)))`
 
-const keySurvives = `(%[1]s.fact_key = '' OR %[1]s.fact_key NOT IN (SELECT fact_key FROM cx_carry_keys))`
+// keySurvives is the Section 11.4 fact-key predicate: a fact is carried unless
+// ANY of its keys was replaced. A fact with no keys has no fact_keys row, so
+// NOT EXISTS holds and only its retention bucket can replace it. Matching on
+// "any" rather than "all" is what makes the carried set the exact complement of
+// what the producer re-emitted: the emitter republishes a whole fact as soon as
+// one of its occurrence keys changes.
+const keySurvives = `NOT EXISTS (SELECT 1 FROM fact_keys fk WHERE fk.unit_id = ?1 AND fk.%[2]s = %[1]s.%[2]s
+	AND fk.fact_key IN (SELECT fact_key FROM cx_carry_keys))`
 
 func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, stats *CarryOverStats) error {
 	indexArg := boolInt(replaceIndexLevel)
@@ -271,12 +280,12 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	// Nodes first: relations, aliases, search documents and evidence all
 	// reference the node facts of this unit through a foreign key.
 	n, err := exec("node_facts", `INSERT INTO node_facts(unit_id, node_id, language, name, qualified_name, signature,
-		file_id, start_byte, end_byte, metadata_json, fact_key)
+		file_id, start_byte, end_byte, metadata_json)
 		SELECT ?3, nf.node_id, nf.language, nf.name, nf.qualified_name, nf.signature,
-			nf.file_id, nf.start_byte, nf.end_byte, nf.metadata_json, nf.fact_key
+			nf.file_id, nf.start_byte, nf.end_byte, nf.metadata_json
 		FROM node_facts nf WHERE nf.unit_id = ?1
 			AND `+fmt.Sprintf(bucketSurvives, "nf")+`
-			AND `+fmt.Sprintf(keySurvives, "nf")+`
+			AND `+fmt.Sprintf(keySurvives, "nf", "node_id")+`
 		ON CONFLICT(unit_id, node_id) DO NOTHING`, prevRow, indexArg, w.rowID)
 	if err != nil {
 		return err
@@ -285,15 +294,29 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 
 	// A relation is inherited only while at least one of its occurrences is:
 	// SealUnit requires every relation fact to keep evidence.
-	if n, err = exec("relation_facts", `INSERT INTO relation_facts(unit_id, relation_id, fact_key)
-		SELECT ?3, rf.relation_id, rf.fact_key FROM relation_facts rf WHERE rf.unit_id = ?1
-			AND `+fmt.Sprintf(keySurvives, "rf")+`
+	if n, err = exec("relation_facts", `INSERT INTO relation_facts(unit_id, relation_id)
+		SELECT ?3, rf.relation_id FROM relation_facts rf WHERE rf.unit_id = ?1
+			AND `+fmt.Sprintf(keySurvives, "rf", "relation_id")+`
 			AND EXISTS (SELECT 1 FROM evidence e WHERE e.unit_id = ?1 AND e.relation_id = rf.relation_id
 				AND `+fmt.Sprintf(bucketSurvives, "e")+`)
 		ON CONFLICT(unit_id, relation_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
 		return err
 	}
 	stats.Relations = n
+
+	// The keys of every fact that was carried come with it, or the successor
+	// would hold facts no later refresh could ever replace or remove: it would
+	// look like a unit its producer never keyed. Only the keys of facts this
+	// unit actually holds are copied, and a key the fresh import already
+	// recorded for the same fact yields.
+	if _, err = exec("fact_keys", `INSERT INTO fact_keys(unit_id, node_id, relation_id, fact_key)
+		SELECT ?3, fk.node_id, fk.relation_id, fk.fact_key FROM fact_keys fk WHERE fk.unit_id = ?1
+			AND fk.fact_key NOT IN (SELECT fact_key FROM cx_carry_keys)
+			AND ((fk.node_id IS NOT NULL AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = fk.node_id))
+			  OR (fk.relation_id IS NOT NULL AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.unit_id = ?3 AND rf.relation_id = fk.relation_id)))
+		ON CONFLICT DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
+		return err
+	}
 
 	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key, native_key, node_id)
 		SELECT ?3, na.scope_key, na.native_key, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
