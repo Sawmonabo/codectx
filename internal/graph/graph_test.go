@@ -272,6 +272,47 @@ func TestGraphScenarios(t *testing.T) {
 		// L1 TRAVERSE rows
 
 		// L2 PATH rows
+		{
+			// The two n-a -> n-z routes cost exactly the same (calls is 1 per
+			// hop), so nothing about the facts orders them: the ONLY thing that
+			// fixes the answer is the frozen tie-break -- cost ascending, then
+			// the RelationID sequence compared lexicographically. If map
+			// iteration order or heap-insertion order leaked into the walk,
+			// two identical queries over identical facts would answer
+			// differently, which is precisely the determinism Section 15.1
+			// canonical context identity rests on. The query is run 100 times
+			// because a map-order defect surfaces across runs, not within one.
+			name: "path/equal_cost_routes_keep_the_frozen_order",
+			run: func(t *testing.T, f *graphFixture) {
+				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				want := [][]model.RelationID{
+					{"rel-0013", "rel-0014"}, // n-a -> n-p -> n-z
+					{"rel-0015", "rel-0016"}, // n-a -> n-q -> n-z
+				}
+				for run := 0; run < 100; run++ {
+					got, err := engine.ShortestPath(context.Background(), model.PathRequest{
+						From: "n-a", To: "n-z", Relations: []model.RelationKind{model.RelCalls},
+					})
+					if err != nil {
+						t.Fatalf("run %d: ShortestPath: %v", run, err)
+					}
+					if len(got.Paths) != len(want) {
+						t.Fatalf("run %d: got %d paths, want %d: %+v", run, len(got.Paths), len(want), got.Paths)
+					}
+					for i, w := range want {
+						if fmt.Sprint(got.Paths[i].Relations) != fmt.Sprint(w) {
+							t.Fatalf("run %d: path %d relations = %v, want %v", run, i, got.Paths[i].Relations, w)
+						}
+						if got.Paths[i].CostUnits != 2 {
+							t.Fatalf("run %d: path %d cost_units = %d, want 2", run, i, got.Paths[i].CostUnits)
+						}
+					}
+				}
+			},
+		},
 
 		// L3 IMPACT rows
 
