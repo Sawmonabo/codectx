@@ -10,11 +10,12 @@ import (
 )
 
 // Next answers `context next`: the first required_full file of this session's
-// manifest that is not yet full_served for this actor, with the pinned content
-// hash, the stored size, the offset to resume at and how many required files
-// remain. Section 19.2 marks the tool metadata only, so this path never opens a
-// Source, never reads a byte and never signs a receipt -- the read endpoint is
-// the only way to obtain source, and only a confirmed receipt grants coverage.
+// manifest that is not yet full_served for this actor, with its path, the
+// pinned content hash, the stored size, the offset to resume at and how many
+// required files remain. Section 19.2 marks the tool metadata only, so this
+// path never opens a Source, never reads a byte and never signs a receipt --
+// the read endpoint is the only way to obtain source, and only a confirmed
+// receipt grants coverage.
 //
 // The walk is the frozen Task 15 manifest contract and nothing more: entries
 // persist in Section 15.3 tie-break order, ordinals 0..n-1 are the canonical
@@ -26,6 +27,10 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 	if err := req.Validate(); err != nil {
 		return model.NextContextItem{}, err
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	defer cancel()
+
 	// Gate the actor before anything else: Store.Session skips its actor check
 	// on an empty actor, and UnconfirmedChunks below takes no actor at all.
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
@@ -67,7 +72,24 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 	case err != nil:
 		return model.NextContextItem{}, err
 	default:
+		// The pinned manifest row is the only place the path lives: coverage
+		// and manifest entries carry identifiers alone, and `context next`
+		// names a file the operator has to be able to find. One point read on
+		// the snapshot_files primary key, only on the branch that names a file.
+		path, err := s.sessions.FilePath(ctx, rec.Binding.SnapshotID, cov.FileID)
+		if err != nil {
+			// A file the session pinned that the snapshot does not hold is the
+			// same manifest/session disagreement coverageOf reports, and it is
+			// not the caller's argument that is wrong: storage marks a missing
+			// row CTX_ARGUMENT_INVALID, which would blame the request.
+			if notFound(err) {
+				return model.NextContextItem{}, typedErrf(model.CodeScopeIncomplete,
+					"file %s is in this session's scope but not in the pinned snapshot", cov.FileID)
+			}
+			return model.NextContextItem{}, err
+		}
 		item.FileID = cov.FileID
+		item.Path = path
 		item.ContentHash = cov.ContentHash
 		item.Requirement = cov.Requirement
 		item.Size = cov.Size
@@ -194,7 +216,7 @@ func (s *Service) coverageOf(ctx context.Context, rec sqlite.SessionRecord, file
 	// OpenSession populates session_files from the manifest, so a manifest
 	// entry with no coverage row means the session's pinned scope and the
 	// manifest disagree. That is not a file to skip silently.
-	return model.FileCoverage{}, notImplementedf(model.CodeScopeIncomplete,
+	return model.FileCoverage{}, typedErrf(model.CodeScopeIncomplete,
 		"manifest entry %s has no coverage row in this session", file)
 }
 
@@ -206,7 +228,7 @@ func (s *Service) coverageOf(ctx context.Context, rec sqlite.SessionRecord, file
 func previousFileID(file model.FileID) (model.FileID, error) {
 	raw, err := model.DecodeID(string(file))
 	if err != nil {
-		return "", notImplementedf(model.CodeArgumentInvalid, "manifest entry carries a malformed file identifier")
+		return "", typedErrf(model.CodeArgumentInvalid, "manifest entry carries a malformed file identifier")
 	}
 	for i := len(raw) - 1; i >= 0; i-- {
 		if raw[i] == 0 {

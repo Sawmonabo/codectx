@@ -98,7 +98,7 @@ where the workspace is composed, and handed to it.
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
 | `resources.query_memory_bytes` | Ceiling on the edges one frontier level of a traversal may hold at once. A level that reaches it stops reading, and the answer is truncated with `frontier memory budget exhausted` rather than accumulating a hub without a bound. |
-| `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. |
+| `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts
 
