@@ -40,8 +40,11 @@ type symbol struct {
 	scheme, manager, name, version string
 	// descriptors is the raw descriptor string; lastName and lastSuffix
 	// describe its final descriptor, prevSuffix the one before it.
+	// lastEscaped records that lastName arrived backtick-escaped, which is how
+	// the grammar spells a name that is not a plain identifier.
 	descriptors string
 	lastName    string
+	lastEscaped bool
 	lastSuffix  descriptorSuffix
 	prevSuffix  descriptorSuffix
 }
@@ -101,7 +104,7 @@ func splitComponent(s string) (component, rest string, ok bool) {
 func (sym *symbol) parseDescriptors() error {
 	d := sym.descriptors
 	for i := 0; i < len(d); {
-		var name string
+		var raw string
 		var suffix descriptorSuffix
 		switch d[i] {
 		case '[':
@@ -109,21 +112,21 @@ func (sym *symbol) parseDescriptors() error {
 			if err != nil {
 				return err
 			}
-			name, suffix, i = unescapeName(d[i+1:end]), suffixTypeParameter, end+1
+			raw, suffix, i = d[i+1:end], suffixTypeParameter, end+1
 		case '(':
 			end, err := nameEnd(d, i+1, ')')
 			if err != nil {
 				return err
 			}
-			name, suffix, i = unescapeName(d[i+1:end]), suffixParameter, end+1
+			raw, suffix, i = d[i+1:end], suffixParameter, end+1
 		default:
 			end, err := nameEnd(d, i, 0)
 			if err != nil {
 				return err
 			}
-			name = unescapeName(d[i:end])
+			raw = d[i:end]
 			if end >= len(d) {
-				return malformed("descriptor " + name + " has no suffix")
+				return malformed("descriptor " + unescapeName(raw) + " has no suffix")
 			}
 			switch d[end] {
 			case '/':
@@ -146,10 +149,12 @@ func (sym *symbol) parseDescriptors() error {
 				return malformed("descriptor has an unknown suffix " + strconv.QuoteRune(rune(d[end])))
 			}
 		}
+		name := unescapeName(raw)
 		if name == "" {
 			return malformed("descriptor has an empty name")
 		}
-		sym.prevSuffix, sym.lastSuffix, sym.lastName = sym.lastSuffix, suffix, name
+		sym.prevSuffix, sym.lastSuffix = sym.lastSuffix, suffix
+		sym.lastName, sym.lastEscaped = name, len(raw) >= 2 && raw[0] == '`'
 	}
 	if sym.lastSuffix == suffixNone {
 		return malformed("symbol has no descriptors")
@@ -203,6 +208,34 @@ func unescapeName(s string) string {
 		return strings.ReplaceAll(s[1:len(s)-1], "``", "`")
 	}
 	return s
+}
+
+// probeName is the identifier a definition occurrence of this symbol must
+// select in the source, and ok reports whether the symbol has one. It exists
+// for the position-encoding self-check of `encodingHolds`, which needs a
+// symbol whose last descriptor is the token the source literally spells:
+//
+//   - a `local N` symbol carries no descriptor at all;
+//   - a namespace descriptor names a package, module or file path
+//     (`example.com/m`, `a.ts`), which is not the text at the occurrence —
+//     measured: scip-go, scip-typescript and scip-clang all put the package
+//     descriptor's occurrence on the short package clause;
+//   - a meta descriptor names a synthetic member (`__init__` on a Python
+//     module's `[0,0,0]` range);
+//   - a backtick-escaped name is one the grammar cannot spell plainly
+//     (`<init>`, an operator, a path), so it is not an identifier token.
+//
+// Everything else — a type, term, method, type parameter, parameter or macro
+// descriptor with a plain name — is spelled at the occurrence.
+func (sym symbol) probeName() (string, bool) {
+	if sym.local || sym.lastEscaped || sym.lastName == "" {
+		return "", false
+	}
+	switch sym.lastSuffix {
+	case suffixType, suffixTerm, suffixMethod, suffixTypeParameter, suffixParameter, suffixMacro:
+		return sym.lastName, true
+	}
+	return "", false
 }
 
 // scopeKey is ruling R9-1: a local symbol is scoped to its document, a global

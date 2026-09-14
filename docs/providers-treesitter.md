@@ -114,8 +114,8 @@ symbols without rescanning):
 - `("file:"+path, qualified name)` → every declaration.
 - `("file:"+path, "decl:"+name+"@"+path+":"+startLine+"-"+endLine)` → every
   declaration. This is the cross-provider declaration key fixed by controller
-  ruling, shared byte-for-byte with the `joern` provider, whose exported
-  `METHOD` strong key is exactly this string:
+  ruling, shared byte-for-byte with the `dependence` provider, whose exported
+  declaration key is exactly this string:
 
   ```
   scope key  file:<path>
