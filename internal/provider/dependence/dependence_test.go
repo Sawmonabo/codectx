@@ -50,7 +50,7 @@ func (b *fakeBackend) Engine() dependence.Engine {
 	return dependence.Engine{ParseArgv: []string{"/opt/engine/parse"}, ExportArgv: []string{"/opt/engine/export"},
 		// A payload name no rendered product string may contain. The real
 		// locator fills this from the tool lock entry.
-		Name: "cpg-engine-payload", Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
+		Version: "1.0.0", Digest: strings.Repeat("a", 64), RuntimeDigest: strings.Repeat("b", 64)}
 }
 
 func (b *fakeBackend) Argv(dependence.Family) []string { return []string{"--pinned"} }
