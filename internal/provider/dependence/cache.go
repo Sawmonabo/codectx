@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -52,16 +51,16 @@ func CacheKey(ctx context.Context, view model.SnapshotView, u Unit, argv []strin
 	}
 	h.AddString(e.Digest)
 	h.AddString(e.RuntimeDigest)
-	markers := slices.Clone(u.Markers)
-	slices.Sort(markers)
 	// The manifest is served in ascending path order, so folding it in stream
-	// order is deterministic without retaining it.
+	// order is deterministic without retaining it. A tombstone is skipped
+	// before membership is asked: the key folds live content hashes, and a
+	// deleted file has none. The unit is still invalidated by the deletion,
+	// because the file's hash leaves the fold.
 	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
-		source := FamilyOf(lang.Of(fv.Path)) == u.Family && u.Contains(fv.Path)
-		if !source && !(slices.Contains(markers, fv.Path) && u.Contains(fv.Path)) {
+		if !u.OwnsInput(fv.Path) {
 			return nil
 		}
 		h.AddString(fv.Path)

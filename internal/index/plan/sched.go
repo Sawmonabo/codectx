@@ -127,7 +127,8 @@ func (s *Scheduler) pump() {
 	}
 }
 
-// remove drops a canceled waiter from the queue. The mutex must be held.
+// remove drops a canceled waiter from the queue and lets the queue move.
+// The mutex must be held.
 func (s *Scheduler) remove(w *waiter) {
 	for i, q := range s.queue {
 		if q == w {
@@ -136,6 +137,11 @@ func (s *Scheduler) remove(w *waiter) {
 			copy(s.queue[i:], s.queue[i+1:])
 			s.queue[len(s.queue)-1] = nil
 			s.queue = s.queue[:len(s.queue)-1]
+			// pump stops at the first waiter that does not fit, so the head
+			// this one was blocking behind is granted only when something
+			// pumps. Without this the new head waits for an unrelated release
+			// -- a full engine parse away -- although it fits right now.
+			s.pump()
 			return
 		}
 	}
