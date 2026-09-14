@@ -42,7 +42,6 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 	if err != nil {
 		return nil, err
 	}
-	leaseRaw, _ := model.DecodeID(leaseID)
 	r := &PinnedReader{s: s, repo: repoRaw, lease: leaseID}
 	err = s.write(ctx, func(tx *sql.Tx) error {
 		id := int64(gen)
@@ -65,9 +64,17 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 			return &model.Error{Code: model.CodeNoActiveGeneration,
 				Message: "generation " + string(status) + " has never been published and cannot be pinned"}
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO retention_leases(id, generation_id, snapshot_id, owner_kind, expires_at) VALUES(?, ?, ?, ?, ?)`,
-			leaseRaw, id, snapshot, string(model.LeaseQuery), formatTime(time.Now().Add(ttl))); err != nil {
-			return wrap("retention_leases", err)
+		// Through insertLease, never a statement of its own: a query lease is
+		// a retention_leases row like any other, and a second write path here
+		// is one model.Lease.Validate never sees.
+		if err := insertLease(ctx, tx, model.Lease{
+			ID:           leaseID,
+			GenerationID: model.GenerationID(id),
+			SnapshotID:   model.SnapshotID(idHex(snapshot)),
+			OwnerKind:    model.LeaseQuery,
+			ExpiresAt:    time.Now().Add(ttl),
+		}, nil); err != nil {
+			return err
 		}
 		r.gen = id
 		r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),

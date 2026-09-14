@@ -417,7 +417,7 @@ type fixtureLeases struct {
 
 func newFixtureLeases() *fixtureLeases { return &fixtureLeases{live: map[string]time.Time{}} }
 
-func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease) error {
+func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease, _ string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.live[lease.ID] = lease.ExpiresAt

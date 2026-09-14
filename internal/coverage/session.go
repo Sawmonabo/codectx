@@ -198,11 +198,22 @@ func openRequestHash(req model.PlanRequest, manifest model.ManifestID) string {
 //
 // A session whose lease could not be acquired is reported as a failure rather
 // than served: retention may collect the blobs it is about to hand out.
+//
+// The lease is taken FOR the session, which is what lets the close release it
+// and what makes this retry-safe: an idempotent re-open returns the session
+// that already exists, and the store refuses its second acquire instead of
+// pinning the generation again under a lease id nothing will ever release. That
+// refusal is this session already holding exactly what retain is asking for, so
+// it is the success case and not an error to report.
 func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
 	if s.leases == nil {
 		return nil
 	}
-	_, err := s.leases.Acquire(ctx, rec.Binding.GenerationID, rec.Binding.SnapshotID, model.LeaseSession)
+	_, err := s.leases.AcquireFor(ctx, rec.Binding.GenerationID, rec.Binding.SnapshotID,
+		model.LeaseSession, string(rec.ID))
+	if sqlite.OwnerLeaseConflict(err) {
+		return nil
+	}
 	return err
 }
 
