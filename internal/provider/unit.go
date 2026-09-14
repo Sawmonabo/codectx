@@ -11,11 +11,15 @@ import (
 // UnitOutput is the storage side of one building unit: the writer the sink
 // drains into, sealing after whole-unit validation, and discarding on failure.
 // Seal is the only path to generation membership; Fail deletes every row the
-// unit wrote so unsealed output can never be queried (Section 11.1).
+// unit wrote so unsealed output can never be queried (Section 11.1). Abandon
+// is the cancel-path discard: it gives up the unit without the cascading
+// delete, leaving the rows for storage's own collection, which is what keeps
+// an interrupt from waiting on a rollback nobody is going to read.
 type UnitOutput interface {
 	Sink
 	Seal(context.Context) error
 	Fail(context.Context) error
+	Abandon(context.Context) error
 }
 
 // storeUnit adapts storage's writer and store to UnitOutput. Sealing lives on
@@ -83,8 +87,18 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 	if cause := context.Cause(runCtx); cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(err, cause) {
 		err = errors.Join(cause, err)
 	}
+	// The cleanup runs uncancelled so a stop cannot leave a half-discarded
+	// unit; that is precisely why a build the caller has already stopped must
+	// take the bounded discard rather than the cascading one. The caller's own
+	// context is the signal, not the error: a cancellation reaches this
+	// function through whatever the provider wrapped it in, and can classify
+	// as any failure code.
 	cleanup := context.WithoutCancel(ctx)
-	if failErr := out.Fail(cleanup); failErr != nil {
+	discard := out.Fail
+	if ctx.Err() != nil {
+		discard = out.Abandon
+	}
+	if failErr := discard(cleanup); failErr != nil {
 		err = errors.Join(err, failErr)
 	}
 	return failedResult(req.Run, stateOf(err), sink), err

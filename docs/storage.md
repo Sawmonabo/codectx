@@ -36,6 +36,34 @@ The copy is also strictly cheaper than the re-import it replaces: nothing is
 decoded, resolved, validated against the snapshot or re-tokenized —
 `search_units.token_count` is copied, not recomputed.
 
+## Discarding a unit: two costs, two paths
+
+`UnitWriter.Fail` unwinds a building unit synchronously: the FTS delete, every
+fact table, and then the identity sweeps that ask, per candidate node, whether
+anything still references it. That is proportional to the unit's output, not to
+the failure, and for a large unit it is seconds to minutes of work that cannot
+be cancelled (it runs under `context.WithoutCancel` so a stop cannot leave a
+half-discarded unit).
+
+A build the caller cancelled therefore takes `UnitWriter.Abandon` instead: one
+`UPDATE` marking the unit `failed`. The rows stay, and stay invisible — every
+read joins `generation_units`, and an abandoned unit is a member of no
+generation — until `collectUnreachableUnits` removes them from the next
+`Store.Recover` or a retention sweep. A non-cancel failure keeps the cascading
+`Fail`: nobody is waiting on the process, and the store is left minimal.
+
+`collectUnreachableUnits` decides "nothing is still writing this" from the
+origin run's status rather than the unit's state, because a unit is only ever
+written while its origin run is running. That also covers the unit a process
+killed mid-build, whose generation may already be gone (`provider_runs.
+generation_id` is `ON DELETE SET NULL`), which the generation-scoped `Abort`
+query cannot see.
+
+The identity sweep is indexed on both sides it interrogates
+(`idx_alias_node`, `idx_context_entries_node`); without them each candidate
+node costs a full scan of `native_aliases`, which is quadratic in the unit
+being deleted.
+
 ## The two granularities
 
 Two wave-A importers produce deltas at two different granularities, and

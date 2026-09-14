@@ -930,6 +930,30 @@ func requireJSONObject(field string, raw []byte) error {
 	return nil
 }
 
+// Abandon gives up a building unit without deleting the rows it wrote: the
+// unit is marked failed, which is all that is needed to keep it invisible
+// (every read joins generation_units, and an abandoned unit is a member of no
+// generation) and to keep a rebuild of the same scope from colliding with it.
+// Its rows are reclaimed by the next Recover and by retention, through
+// collectUnreachableUnits.
+//
+// This is the cancel path and only the cancel path. Fail's cascade walks every
+// fact, identity and search document the unit wrote, which for a large unit is
+// seconds to minutes of uncancellable work; running it when the caller has
+// already asked the process to stop turns Ctrl-C into a long wait for a
+// rollback whose result is discarded either way.
+func (w *UnitWriter) Abandon(ctx context.Context) error {
+	if w.done {
+		return nil
+	}
+	w.done = true
+	return w.s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
+			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
+		return wrap("units", err)
+	})
+}
+
 // Fail discards a building unit and every row it wrote. Unsealed output is
 // deleted, never quarantined into visibility.
 func (w *UnitWriter) Fail(ctx context.Context) error {
