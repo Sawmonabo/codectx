@@ -201,7 +201,7 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
-	c.log.Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
+	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
 	return m, nil
 }
@@ -209,6 +209,17 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 // Close releases the compiler's own resources. It does not close the injected
 // Store or Search service, which the composition root owns.
 func (c *Compiler) Close() error { return nil }
+
+// logger is the compiler's log sink. New always sets one, but Compile is also
+// reachable from a Compiler built field by field, so the discarding default is
+// applied here too rather than left as a nil dereference in the one line that
+// logs.
+func (c *Compiler) logger() *slog.Logger {
+	if c.log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return c.log
+}
 
 // hydrateFiles reads Size, Path and Status for every candidate's file in
 // bounded batches and writes them onto the candidates in place.
