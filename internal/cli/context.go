@@ -452,8 +452,11 @@ func newContextCloseCommand(build model.BuildInfo) *cobra.Command {
 }
 
 // addContextFlags declares what every command in this group shares. It is not
-// addQueryFlags: that one also declares --generation, which no session request
-// has a field for.
+// addQueryFlags: that one also declares --generation, which no command here
+// sets. ContextRequest does carry a generation, but `context plan` compiles
+// against the active one for the reason the flag block at the top of this file
+// gives -- a session pins its generation when it is opened, and every later
+// command reads the one the session pinned.
 func addContextFlags(cmd *cobra.Command) {
 	addRepoFlag(cmd)
 	cmd.Flags().String(contextActorFlag, "", actorFlagHelp)
@@ -1159,6 +1162,20 @@ func readObservationInput(path string) (observationInput, error) {
 			Message: fmt.Sprintf("--%s could not be read: %s", contextInputFlag, clip(err.Error(), model.MaxDetailBytes))}
 	}
 	defer f.Close()
+	// The size is checked before the decode rather than by bounding the reader,
+	// so an oversized file is refused for being oversized. A LimitReader would
+	// cut the document mid-token and report the truncation as malformed JSON,
+	// which sends the operator looking for a syntax error that is not there.
+	// The LimitReader stays as the guard for what the stat cannot size -- a
+	// growing file, a fifo, a device.
+	info, err := f.Stat()
+	if err != nil {
+		return body, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("--%s could not be read: %s", contextInputFlag, clip(err.Error(), model.MaxDetailBytes))}
+	}
+	if info.Size() > maxObservationInputBytes {
+		return body, errObservationInputTooLarge()
+	}
 	dec := json.NewDecoder(io.LimitReader(f, maxObservationInputBytes+1))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
@@ -1172,11 +1189,19 @@ func readObservationInput(path string) (observationInput, error) {
 		return observationInput{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "--" + contextInputFlag + " carries more than one JSON document; one observation is recorded per command"}
 	}
+	// Reached by what the stat could not size: a stream the LimitReader cut at
+	// the bound after consuming a complete JSON value.
 	if dec.InputOffset() > maxObservationInputBytes {
-		return observationInput{}, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: fmt.Sprintf("--%s is larger than %d bytes, which no observation document is", contextInputFlag, maxObservationInputBytes)}
+		return observationInput{}, errObservationInputTooLarge()
 	}
 	return body, nil
+}
+
+// errObservationInputTooLarge is the one refusal both size checks report.
+func errObservationInputTooLarge() error {
+	return &model.Error{Code: model.CodeArgumentInvalid,
+		Message: fmt.Sprintf("--%s is larger than %d bytes, which no observation document is",
+			contextInputFlag, maxObservationInputBytes)}
 }
 
 // parseSourceCitation reads one --source FILE:HASH:START:END. The pinned
