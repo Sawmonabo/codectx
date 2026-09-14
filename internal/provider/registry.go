@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -167,7 +168,16 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 			// Detection.Details, which nothing else publishes, so without this
 			// row a partly working provider is indistinguishable from a healthy
 			// one at the only surface that carries capability state.
-			if len(details) == 0 {
+			//
+			// Only a refusal degrades. A provider also uses Details to say what
+			// a part of it is about to do -- a pinned payload the first unit
+			// will fetch and then index at full precision -- and publishing
+			// that as `partial` reports every first run of the product as
+			// degraded. The discriminator is the value: a CTX_ code is a
+			// refusal, anything else is a marker, and a row carries the
+			// refusals alone so a reader cannot mistake one for the other.
+			refusals := refusalDetails(details)
+			if len(refusals) == 0 {
 				continue
 			}
 			for _, c := range d.Capabilities {
@@ -176,7 +186,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 					// One map per row: every other detail map in the tree is
 					// copy-on-write, and sharing one would let a later edit of
 					// any row rewrite its siblings.
-					Details: maps.Clone(details)})
+					Details: maps.Clone(refusals)})
 			}
 			continue
 		}
@@ -191,6 +201,24 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		}
 	}
 	return sel, nil
+}
+
+// refusalDetails keeps the detection details that name something the provider
+// cannot do: those whose value is a Section 22 CTX_ code. It returns nil when
+// none is left, so a detection that only carries markers publishes nothing at
+// all rather than an empty degraded row.
+func refusalDetails(details map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range details {
+		if !strings.HasPrefix(v, "CTX_") {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string, len(details))
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // inactiveProvider records why a provider will not run, so a dependent can

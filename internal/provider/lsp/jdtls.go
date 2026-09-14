@@ -42,6 +42,11 @@ const maxPlatformConfigBytes = 4 << 20
 // The copy is seeded once per work directory and never refreshed: the manager
 // reuses the work directory across server starts, and overwriting a live
 // Equinox configuration underneath a running server would corrupt its state.
+// That is correct only because the work directory is per payload identity
+// (Profile.workDir): the configuration names bundle jars by exact version, so a
+// directory shared across payloads would boot a new payload against the old
+// one's bundle list and fail at startup for ever. A new payload seeds a new
+// directory instead.
 func seedPlatformConfig(payloadRoot, workDir string) error {
 	dst := filepath.Join(workDir, "config")
 	if _, err := os.Lstat(dst); err == nil {
