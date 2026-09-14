@@ -194,14 +194,6 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (mo
 	return model.Page[model.ReferenceOccurrence]{}, notImplemented("references")
 }
 
-// ShortestPath runs a nonnegative integer-cost Dijkstra over the request's
-// relation allowlist. An exhausted depth, visited budget or deadline is
-// reported as truncation together with the paths found so far -- never as "no
-// path exists", which is reserved for a genuinely unreachable target.
-func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model.PathResult, error) {
-	return model.PathResult{}, notImplemented("shortest_path")
-}
-
 // Impact ranks the entities a change to the seeds may affect. Every entry
 // carries the direction that made it affected -- incoming means it may need
 // modification, outgoing that it may need reading -- and at least one
