@@ -81,7 +81,21 @@ func (a adjacency) NodesByID(ctx context.Context, ids []model.NodeID) ([]model.N
 
 func (a adjacency) EvidenceFor(ctx context.Context, relations []model.RelationID,
 	limit int) (map[model.RelationID][]model.EvidenceID, error) {
-	return a.reader.EvidenceBatch(ctx, relations, limit)
+	// Storage hydrates whole evidence rows; traversal only needs their
+	// identities and hydrates the rows it actually returns per page.
+	stored, err := a.reader.EvidenceBatch(ctx, relations, limit)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[model.RelationID][]model.EvidenceID, len(stored))
+	for rel, rows := range stored {
+		out := make([]model.EvidenceID, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.Evidence.ID)
+		}
+		ids[rel] = out
+	}
+	return ids, nil
 }
 
 func (a adjacency) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
