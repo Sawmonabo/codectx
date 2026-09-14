@@ -77,12 +77,14 @@ const (
 	// modeIndex composes for a run that will index: it takes the cross-process
 	// workspace lock for the whole session and runs startup recovery under it.
 	modeIndex openMode = iota
-	// modeReport composes for a read-only report. It takes no lock and writes
-	// nothing, so `codectx status` answers while a `watch` session holds the
-	// workspace instead of being refused for a lock it does not need: Section
-	// 12.3 makes the active generation immutable once published, and a report
-	// reads only that (ledger 159 keeps the same path from installing
-	// anything, which the providers now honour by construction).
+	// modeReport composes for a read-only report. It takes no lock, mutates no
+	// generation and installs nothing -- it still creates the cache's own
+	// directories, which is what opening a store means -- so `codectx status`
+	// answers while a `watch` session holds the workspace instead of being
+	// refused for a lock it does not need: Section 12.3 makes the active
+	// generation immutable once published, and a report reads only that
+	// (ledger 159 keeps the same path from installing anything, which the
+	// providers now honour by construction).
 	modeReport
 )
 
