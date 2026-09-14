@@ -132,6 +132,12 @@ func (r *Registry) Lookup(id string) (Provider, bool) {
 type Selection struct {
 	Active []Provider
 	States []model.CapabilityState
+	// Detections holds the validated Detection of every Active provider, by
+	// provider ID. The planner needs two things only a Detection carries --
+	// ObservedVersion, folded into UnitSpec.ProviderVersion, and InputPaths,
+	// which scope the SCIP profile units -- and must not re-run detection
+	// against the live checkout when the plan is about the pinned snapshot.
+	Detections map[string]Detection
 }
 
 // Select runs trusted detection over the registry in dependency order.
@@ -155,7 +161,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		if enablement != nil {
 			mode = enablement(id)
 		}
-		state, code, details := detect(ctx, p, d, mode, root, policy, active, inactive)
+		state, code, details, det := detect(ctx, p, d, mode, root, policy, active, inactive)
 		if err := ctx.Err(); err != nil {
 			// A stopped selection is not a list of failed providers.
 			return Selection{}, model.Canceled(err)
@@ -163,6 +169,10 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		if state == "" {
 			active[id] = true
 			sel.Active = append(sel.Active, p)
+			if sel.Detections == nil {
+				sel.Detections = make(map[string]Detection, len(r.order))
+			}
+			sel.Detections[id] = det
 			// A provider can be available as a whole and degraded in a part --
 			// one of six SCIP indexers missing, say. Those reasons live only in
 			// Detection.Details, which nothing else publishes, so without this
@@ -233,9 +243,9 @@ type inactiveProvider struct {
 // the detection's own either way: an active provider can still name the parts
 // of itself that are unavailable.
 func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode config.Enablement, root workspace.Root, policy workspace.Policy,
-	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string, map[string]string) {
+	active map[string]bool, inactive map[string]inactiveProvider) (model.CapabilityStateValue, string, map[string]string, Detection) {
 	if mode == config.Disabled {
-		return model.CapabilityUnavailable, model.CodeProviderUnavailable, nil
+		return model.CapabilityUnavailable, model.CodeProviderUnavailable, nil, Detection{}
 	}
 	for _, dep := range d.DependsOn {
 		if active[dep] {
@@ -245,25 +255,25 @@ func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode co
 		// provider waiting on a disabled tool is absent for that reason, one
 		// waiting on a failed enabled tool has failed for the same reason.
 		why := inactive[dep]
-		return why.state, why.code, nil
+		return why.state, why.code, nil, Detection{}
 	}
 	det, err := p.Detect(ctx, root, policy)
 	if err == nil {
 		err = det.Validate(d)
 	}
 	if err != nil {
-		return model.CapabilityFailed, CodeOf(err), nil
+		return model.CapabilityFailed, CodeOf(err), nil, Detection{}
 	}
 	if det.Available {
-		return "", det.DiagnosticCode, det.Details
+		return "", det.DiagnosticCode, det.Details, det
 	}
 	// The details belong to the available case alone: an inactive provider's
 	// whole reason is its diagnostic code, and Select publishes no partial row
 	// for it to carry them.
 	if mode == config.Auto {
-		return model.CapabilityUnavailable, det.DiagnosticCode, nil
+		return model.CapabilityUnavailable, det.DiagnosticCode, nil, Detection{}
 	}
-	return model.CapabilityFailed, det.DiagnosticCode, nil
+	return model.CapabilityFailed, det.DiagnosticCode, nil, Detection{}
 }
 
 // CodeOf extracts the Section 22 code an error carries for a diagnostic
