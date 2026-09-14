@@ -371,14 +371,8 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 	}
 	out := make([]model.DoctorCheck, 0, len(statuses))
 	for _, st := range statuses {
-		// The lock entry is projected through toolchain.DisplayName before it
-		// reaches a check name or a detail: the dependence backend's own
-		// project name is the one string Section 21 keeps out of every shipped
-		// diagnostic, and a per-lock-entry check is exactly where it would
-		// otherwise arrive.
-		name := toolchain.DisplayName(st.Name)
-		c := model.DoctorCheck{Name: checkToolchainPrefix + name, State: model.CheckPass,
-			Detail: name + " " + st.Version + " is " + string(st.State)}
+		c := model.DoctorCheck{Name: checkToolchainPrefix + st.Name, State: model.CheckPass,
+			Detail: st.Name + " " + st.Version + " is " + string(st.State)}
 		switch st.State {
 		case toolchain.StateAvailable:
 			c.State = model.CheckWarn
@@ -386,7 +380,7 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 			c.Remediation = "run codectx tools install to fetch the payloads this lock names"
 		case toolchain.StateUnsupportedPlatform:
 			c.State = model.CheckUnavailable
-			c.Detail = name + " publishes no payload for this platform"
+			c.Detail = st.Name + " publishes no payload for this platform"
 		case toolchain.StateCorrupt:
 			c.State = model.CheckFail
 			c.Code = model.CodeToolCorrupt
