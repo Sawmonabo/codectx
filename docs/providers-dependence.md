@@ -370,9 +370,12 @@ fresh run still publishes, and the unit would hold an edge whose endpoint no
 longer exists. A node fact takes no endpoints component — its identity
 already tracks through its file and its coordinates, and an identity minted
 from a declaration range would reintroduce the initializer nondeterminism the
-coordinate rule exists to defeat. Two independent engine runs over one
-unchanged tree of this repository published the same 6842 keys, none changed
-and none removed. The importer streams that key set to a sorted file,
+coordinate rule exists to defeat. One measured pair of independent engine runs
+over one unchanged package of this repository published the same 6842 keys,
+none changed and none removed — one sample, not a determinism guarantee: the
+engine is not run-to-run deterministic (see §The engine for its variance
+band), and what this measures is that the variance did not reach the key
+algebra on that pair. The importer streams that key set to a sorted file,
 diffs a supplied previous set against it in one merge pass, and can publish
 only the relations whose key changed. Deriving the keys measured 1–5 s per
 unit against 17–65 s engine runs, and a one-line edit changes about one fact
