@@ -95,7 +95,10 @@ A pass does these things, in this order:
 1. **Sessions.** Live sessions past their deadline are expired; closed sessions
    older than `storage.closed_session_retention` are pruned.
 2. **Pagination spools.** Spool files whose lease has expired or whose
-   continuation was consumed are removed.
+   continuation was consumed are removed. What the pass reports for this phase
+   is a **byte** total, not a file count: the sweep reconciles the spool
+   directory against its byte budget, so the figure is the live spool bytes it
+   ended the pass with.
 3. **Snapshot staging and content-store temporaries.** Crash leftovers under the
    data directory are removed. A published content object is never touched here.
 4. **Tool store.** Staging directories no install owns, and installed versions
@@ -125,9 +128,11 @@ fixed: the block and line-checkpoint rows are removed only after the blob row
 itself, never before, so a crash mid-delete can never leave a blob that claims
 bytes it no longer has.
 
-The grace window is a bounded duration the collector is configured with. It
-trades disk against the cost of losing bytes an in-flight answer still cites;
-shortening it reclaims sooner and narrows that safety margin.
+The grace window is `retention.blob_grace`, a bounded duration defaulting to
+`24h`. It trades disk against the cost of losing bytes an in-flight answer still
+cites; shortening it reclaims sooner and narrows that safety margin. A
+non-positive value is refused by configuration validation, so the window can be
+tuned but never switched off.
 
 ### What is *not* collected automatically
 
@@ -207,9 +212,19 @@ reports `unavailable`. It never reports `0`.
 | Live subprocesses | platform-independent | platform-independent | platform-independent | Counted in-process by the runner as children start and are reaped, never sampled from the OS, so no platform lacks a reader for it. |
 | Database, WAL, temporary and content-store bytes | measured | measured | measured | Filesystem sizes. |
 | Free disk bytes | measured, else `unavailable` | measured, else `unavailable` | measured, else `unavailable` | Reported by the OS for the data directory's filesystem. A filesystem that refuses to answer yields `unavailable`, not `0`. |
-| Unit reuse and parse counts | measured | measured | measured | Counted during the run. |
+| Unit reuse and parse counts | `unavailable` | `unavailable` | `unavailable` | Counted per indexing run and reported on that run's result, where `codectx index` prints them. They are **not** process-wide totals, and the resource block reports no figure rather than reporting `0` for a process that has indexed nothing this run. No platform differs. |
+| Pending watch events | `unavailable` | `unavailable` | `unavailable` | A running `codectx watch` reports its own pending-path count through `codectx status`. A *second* process has no cross-process source for it, because no watch heartbeat is persisted; the resource block therefore omits the figure rather than reporting `0`, which would read as "the watch is caught up". |
 | Query, cache and queue reservations | platform-independent | platform-independent | platform-independent | Derived from the resolved `[resources]` configuration, so they are what was reserved, not what was touched, and no platform differs. |
 | Hard OS memory enforcement | partial | none | partial | Enforcement uses cgroup and job controls where they exist. Where they do not, codectx **admits and monitors only**, and says so rather than implying a limit it cannot enforce. |
+
+Two limitations of the Linux sampler itself, which the figures above do not
+otherwise disclose. Membership in a sample is decided by **parent chain**, not by
+process group: a descendant that is re-parented away after its own parent exits
+leaves the sampled set, so a peak taken across such an exit can under-report. And
+a sweep that reaches its bounded process ceiling returns the base-worker and
+native figures **both absent** rather than a smaller sum — a truncated sweep can
+drop an intermediate ancestor and hide every descendant below it, and a partial
+sum presented as a total is the misreport this rule exists to prevent.
 
 The practical consequence on macOS and Windows: an analyzer's memory is bounded
 by admission control and by the runner's own limits, and its *observed* peak is
