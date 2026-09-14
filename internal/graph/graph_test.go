@@ -2,12 +2,14 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // This is the whole test budget for the graph engine: one shared in-memory
@@ -276,6 +278,59 @@ func TestGraphScenarios(t *testing.T) {
 		// L3 IMPACT rows
 
 		// L5 CURSOR rows
+		{name: "resumed page keeps the cumulative budget, neither reset nor doubled", run: func(t *testing.T, f *graphFixture) {
+			signer, err := pagination.OpenSigner(t.TempDir())
+			if err != nil {
+				t.Fatalf("open signer: %v", err)
+			}
+			e, err := New(Options{Adjacency: f, Signer: signer, Limits: fixtureLimits()})
+			if err != nil {
+				t.Fatalf("new engine: %v", err)
+			}
+			lease, err := model.NewRandomID()
+			if err != nil {
+				t.Fatalf("lease id: %v", err)
+			}
+			const endpoint = "graph.neighbors"
+			queryHash := traversalQueryHash(model.DirectionOutgoing,
+				[]model.RelationKind{model.RelCalls}, []model.NodeID{"n-a"}, 3, 200)
+
+			// Page 1 spent this much of the cumulative budget.
+			const spentVisited, spentEdges = 7, 11
+			token, err := e.nextTraversalCursor(&budget{visited: spentVisited, edges: spentEdges},
+				continuation{Endpoint: endpoint, QueryHash: queryHash, LeaseID: lease,
+					Depth: 1, LastKey: "rel-0003"})
+			if err != nil || token == "" {
+				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
+			}
+			// Replaying page 1's cursor restores the SAME allowance every time: a
+			// resume that reset it would hand the walk a fresh budget, and one that
+			// accumulated would double it on the second replay.
+			for attempt := 1; attempt <= 2; attempt++ {
+				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash)
+				if err != nil {
+					t.Fatalf("resume %d: %v", attempt, err)
+				}
+				if got.Budget.visited != spentVisited || got.Budget.edges != spentEdges {
+					t.Fatalf("resume %d: budget = visited %d, edges %d; want %d and %d",
+						attempt, got.Budget.visited, got.Budget.edges, spentVisited, spentEdges)
+				}
+				if got.Cursor.LastKey != "rel-0003" || got.Cursor.Depth != 1 {
+					t.Fatalf("resume %d: keyset position = %q at depth %d; want rel-0003 at depth 1",
+						attempt, got.Cursor.LastKey, got.Cursor.Depth)
+				}
+			}
+			// A tampered token is never honoured with a budget of its own choosing.
+			tampered := token[:len(token)-1] + "A"
+			if tampered == token {
+				tampered = token[:len(token)-1] + "B"
+			}
+			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
+				t.Fatalf("tampered cursor: err %v; want %s", err, model.CodeCursorInvalid)
+			}
+		}},
 
 		// L7 REFS rows
 	}
