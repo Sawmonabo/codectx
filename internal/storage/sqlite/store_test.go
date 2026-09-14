@@ -556,6 +556,43 @@ func TestStorePublicationScenario(t *testing.T) {
 	if _, err := f.s.OpenSession(ctx, open); err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
+	// Phase: a session's retention lease lives and dies with the session.
+	//
+	// The failure mode is silent and unbounded: OpenSession is idempotent, so a
+	// retried plan returns the session that already exists, and an acquire that
+	// minted a second lease each time would pin the generation under lease ids
+	// nobody holds -- every retry adding one, none of them ever released. The
+	// other half is the close: a session that ends must stop pinning, or a
+	// generation no reader can reach still refuses collection for the rest of
+	// the lease TTL.
+	retried := model.SessionOpen{ID: model.SessionID(model.H("session", "retried")), ActorID: actorID,
+		OpenRequestHash: model.H("open"), ManifestID: manifest.ID, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	if _, err := f.s.OpenSession(ctx, retried); err != nil {
+		t.Fatalf("OpenSession(retried): %v", err)
+	}
+	beforeLease := f.stats().Leases
+	sessionLease := func(tag string) model.Lease {
+		return model.Lease{ID: model.H("lease", tag), GenerationID: manifest.Binding.GenerationID,
+			OwnerKind: model.LeaseSession, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	}
+	if err := f.s.AcquireLease(ctx, sessionLease("open"), string(retried.ID)); err != nil {
+		t.Fatalf("AcquireLease(session): %v", err)
+	}
+	err = f.s.AcquireLease(ctx, sessionLease("reopen"), string(retried.ID))
+	if !store.OwnerLeaseConflict(err) {
+		t.Fatalf("a second lease for one session was accepted (err = %v); an idempotent re-open must leave the one lease it already holds", err)
+	}
+	if live := f.stats().Leases; live != beforeLease+1 {
+		t.Fatalf("re-opening the session left %d leases, want %d; a retried open must not pin the generation twice", live, beforeLease+1)
+	}
+	if _, err := f.s.AdvanceSession(ctx, model.AdvanceRequest{SessionID: retried.ID, ActorID: actorID,
+		Target: model.StateClosed, ExpectedVersion: 1}); err != nil {
+		t.Fatalf("AdvanceSession(closed): %v", err)
+	}
+	if live := f.stats().Leases; live != beforeLease {
+		t.Fatalf("closing the session left %d leases, want %d; a closed session must stop pinning its generation", live, beforeLease)
+	}
+
 	// Phase: cross-snapshot FK. A session pinned to snap2 cannot record a
 	// chunk issued for snap1's bytes of b.go, and no other actor can issue
 	// chunks into this session at all.
@@ -998,7 +1035,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// An expired lease is exactly the kind of leftover only the collection
 	// tail removes; Recover must run that tail, not just fail the generation.
 	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: genStale, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
-	if err := f.s.AcquireLease(ctx, expired); err != nil {
+	if err := f.s.AcquireLease(ctx, expired, ""); err != nil {
 		t.Fatalf("AcquireLease: %v", err)
 	}
 	beforeRecover := f.stats()

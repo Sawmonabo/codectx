@@ -224,6 +224,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 	}
+	if req.Page.Cursor != "" {
+		s.consumed(ctx, cursor)
+	}
 	s.log.Debug("answered a search query", "component", "search", "generation_id", int64(binding.GenerationID),
 		"hits", len(page.Items), "truncated", meta.Truncated, "continued", meta.NextCursor != "")
 	return page, nil
@@ -613,6 +616,9 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	page := model.Page[model.Node]{Meta: meta, Items: result.Nodes}
 	if err := page.Validate(); err != nil {
 		return empty, err
+	}
+	if req.Page.Cursor != "" {
+		s.consumed(ctx, cursor)
 	}
 	s.log.Debug("answered a symbol query", "component", "search", "generation_id", int64(binding.GenerationID),
 		"operation", string(req.Operation), "candidates", len(page.Items), "continued", meta.NextCursor != "")

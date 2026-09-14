@@ -199,6 +199,31 @@ func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, h
 	return sp.ID(), nil
 }
 
+// consumed ends a continuation that has just been served: the spool it was
+// replayed from and the cursor-owned lease it was minted with.
+//
+// A continuation is used exactly once. Its page has now been built, and every
+// further page of this walk hangs off the FRESH spool and lease the answer
+// carries, so leaving the consumed pair alive until the 15-minute TTL pins a
+// generation against retention for state nothing will read again -- one lease
+// and one spool per page of every walk in the process. Presenting the same
+// token a second time is CTX_CURSOR_INVALID rather than a replayed page; that
+// is the deliberate trade of Section 14.3's residual, and the client's remedy
+// is the continuation it was just given.
+//
+// It is called only after the page validates, so a request that fails late
+// leaves the continuation intact for the caller to present again. Neither
+// release can fail the answer that is already built: both are reported.
+func (s *Service) consumed(ctx context.Context, c pagination.Cursor) {
+	if c.SpoolID != "" {
+		if err := s.spools.Release(c.SpoolID); err != nil {
+			s.log.Warn("a consumed continuation's spool could not be released",
+				"component", "search", "error", err.Error())
+		}
+	}
+	s.releaseLease(ctx, c.LeaseID)
+}
+
 // releaseSpool abandons a spool whose page never reached the caller, returning
 // its bytes to the shared budget. Close comes first: Release accounts by the
 // file's size on disk, so releasing an unflushed spool would hand the budget
