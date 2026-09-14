@@ -6,11 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/lsp"
@@ -109,8 +111,8 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 		Use:   "prefetch [--all | --for-repo PATH | NAME...]",
 		Short: "Install pinned payloads ahead of time",
 		Long: "Installs the payloads a later run would fetch on demand. Name the " +
-			"tools to install, pass --for-repo to install exactly what one " +
-			"repository's manifests select, or pass --all for every entry the " +
+			"tools to install, pass --for-repo to install what one repository's " +
+			"own root selects, or pass --all for every entry the " +
 			"lock carries for this platform; one of the three is required, so a " +
 			"bare prefetch never downloads gigabytes by accident.",
 		Args:          cobra.ArbitraryArgs,
@@ -132,7 +134,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	prefetch.Flags().Bool(toolsAllFlag, false, "install every entry the lock carries for this platform")
-	prefetch.Flags().String(toolsForRepoFlag, "", "install only what this repository's own manifests select")
+	prefetch.Flags().String(toolsForRepoFlag, "", "install only what this repository's root manifests and sources select")
 
 	verify := &cobra.Command{
 		Use:   "verify",
@@ -293,19 +295,22 @@ func prefetchNames(cmd *cobra.Command, args []string) ([]string, error) {
 	return names, nil
 }
 
-// toolsForRepo is the lock entries one repository would ever resolve. It reads
-// the three mappings that already decide it -- the SCIP indexers' triggers, the
-// language servers' root markers and the dependence families' project markers
-// -- from the packages that own them, so this command cannot disagree with the
-// planner about what a repository needs. There is deliberately no table here:
-// a second copy of the mapping that decides what gets downloaded is exactly the
-// drift policy.md forbids.
+// toolsForRepo is the lock entries the manifests and sources at one repository's
+// root select. It reads the mappings that already decide them -- the SCIP
+// indexers' triggers, the language servers' root markers, the dependence
+// families' project markers, and lang.Of/dependence.FamilyOf for the source
+// check below -- from the packages that own them. There is deliberately no
+// table here: a second copy of the mapping that decides what gets downloaded is
+// exactly the drift policy.md forbids.
 //
-// Markers are read at the repository root, through the confined handle and by
-// metadata alone, which is the same rule lsp.Definition.Detect applies: a
-// present marker selects a payload, it never starts anything, and nothing below
-// the root is walked, so the answer is bounded by the number of markers rather
-// than by the size of the repository.
+// The answer is the root's answer, not the planner's. Markers are read at the
+// repository root, through the confined handle and by metadata alone, which is
+// the same rule lsp.Definition.Detect applies: a present marker selects a
+// payload, it never starts anything, and nothing below the root is walked. That
+// matches the SCIP and LSP providers, which are root-only too, but it does not
+// match the dependence provider, which walks the tree for sources; sources
+// under a root that declares nothing are therefore outside what this command
+// can see, and docs/toolchain.md says so.
 func toolsForRepo(path string) ([]string, error) {
 	root, err := workspace.Discover(path)
 	if err != nil {
@@ -335,9 +340,36 @@ func toolsForRepo(path string) ([]string, error) {
 	for _, def := range lsp.Definitions() {
 		add(def.Name, def.RootMarkers)
 	}
-	for _, name := range cpgEntries(lock) {
-		for _, family := range dependence.Families {
-			add(name, dependence.ProjectMarkers(family))
+	// The dependence provider is the one provider a marker pass alone
+	// under-serves. Its C/C++ family declares no project marker at all -- its
+	// unit is the repository itself, planned unconditionally -- and the other
+	// families' units are found by walking for sources, so a root carrying
+	// nothing but sources still runs the graph engine at index time. Marker-only
+	// selection therefore left a C or C++ repository without the engine or its
+	// runtime, and the user discovered that mid-index on the offline runner
+	// prefetching exists to serve. Either signal at the root selects the engine:
+	// a project marker of any family, or a source file of any family. This is
+	// still no walk -- one listing of the root directory, bounded below.
+	//
+	// Two root shapes remain under-served and docs/toolchain.md names both: a
+	// root that declares nothing and holds no source of its own, and a root
+	// declaring only a C or C++ build (CMakeLists.txt, compile_commands.json,
+	// Makefile) with its sources under src/ -- those three are the C/C++
+	// family's closure markers, which dependence does not export, not project
+	// markers. Closing the second needs a ClosureMarkers accessor beside
+	// ProjectMarkers; hardcoding the three names here is the drift this
+	// function exists to avoid.
+	if cpg := cpgEntries(lock); len(cpg) > 0 {
+		wanted := rootDeclaresDependenceProject(present)
+		if !wanted {
+			if wanted, err = rootHasDependenceSource(root); err != nil {
+				return nil, err
+			}
+		}
+		if wanted {
+			for _, name := range cpg {
+				selected[name] = true
+			}
 		}
 	}
 	// The runtimes come from the lock's own `runtime` field rather than from a
@@ -357,7 +389,8 @@ func toolsForRepo(path string) ([]string, error) {
 	}
 	if len(selected) == 0 {
 		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
-			Message: "no manifest at that repository's root selects a pinned tool"}).
+			Message: "nothing at that repository's root selects a pinned tool: " +
+				"no manifest declares a project and no source file of an analysed language lies there"}).
 			WithRemediation("name the tools to install, or run `codectx tools prefetch --all`")
 	}
 	names := make([]string, 0, len(selected))
@@ -366,6 +399,83 @@ func toolsForRepo(path string) ([]string, error) {
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+// rootDeclaresDependenceProject reports whether the repository root carries a
+// project marker of any family the dependence provider analyses, read through
+// the same metadata-only predicate every other marker uses.
+func rootDeclaresDependenceProject(present func(string) bool) bool {
+	for _, family := range dependence.Families {
+		for _, marker := range dependence.ProjectMarkers(family) {
+			if present(marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+const (
+	// rootListingBatch is how many directory entries the source check holds at
+	// once. Nothing is retained beyond one batch: the answer is a single bit and
+	// the first source file decides it.
+	rootListingBatch = 512
+	// maxRootEntries bounds that listing. This is one directory -- a repository
+	// root -- not a traversal, and a root holding more entries than this is
+	// pathological, so refusing it keeps a prefetch's work finite instead of
+	// letting a hostile tree turn the selection into an unbounded listing.
+	maxRootEntries = 200_000
+)
+
+// rootHasDependenceSource reports whether the repository root itself holds a
+// source file of a family the dependence provider analyses. It answers the half
+// of the selection markers cannot: the C/C++ family declares no project marker,
+// so a C or C++ repository is invisible to the marker pass even though the
+// planner always gives it a unit.
+//
+// The classification is not a table here either: lang.Of names the language of
+// a path and dependence.FamilyOf names the family that analyses that language,
+// both read from the packages that own them.
+//
+// The root is opened by its own absolute path rather than through the confined
+// handle because there is nothing to confine: Root.Path is the directory
+// os.OpenRoot itself opened, no user-controlled component is joined to it, and
+// workspace.Root exposes no listing of its own (its checkPath refuses "." by
+// design). Only entry names are used, and a non-regular entry -- a directory,
+// or a symlink, which is never followed -- selects nothing.
+func rootHasDependenceSource(root workspace.Root) (bool, error) {
+	dir, err := os.Open(root.Path)
+	if err != nil {
+		return false, listingError(err.Error())
+	}
+	defer dir.Close()
+	for seen := 0; ; {
+		entries, err := dir.ReadDir(rootListingBatch)
+		if errors.Is(err, io.EOF) {
+			return false, nil
+		}
+		if err != nil {
+			return false, listingError(err.Error())
+		}
+		if seen += len(entries); seen > maxRootEntries {
+			return false, &model.Error{Code: model.CodeResourceLimit,
+				Message: fmt.Sprintf("the repository root holds more than %d entries", maxRootEntries)}
+		}
+		for _, e := range entries {
+			if !e.Type().IsRegular() {
+				continue
+			}
+			if dependence.FamilyOf(lang.Of(e.Name())) != "" {
+				return true, nil
+			}
+		}
+	}
+}
+
+func listingError(cause string) *model.Error {
+	return (&model.Error{Code: model.CodeArgumentInvalid,
+		Message: "the repository root cannot be listed: " + cause}).
+		WithRemediation("pass --for-repo a readable repository root, or name the tools to install")
 }
 
 // cpgEntries are the lock entries of the kind the dependence provider runs.
