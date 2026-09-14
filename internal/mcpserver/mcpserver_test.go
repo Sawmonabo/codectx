@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -323,10 +324,11 @@ func connect(t *testing.T, s *mcp.Server) *mcp.ClientSession {
 // wire contract of a tool in a diff that never mentions this package. That is
 // exactly the silent change a snapshot exists to catch.
 //
-// codectx_index_status takes no arguments, so it requires none.
+// codectx_index_status and codectx_refresh_index take no arguments, so they
+// require none.
 var toolSchemas = map[string][]string{
 	"codectx_index_status":        nil,
-	"codectx_refresh_index":       {"full", "rebuild"},
+	"codectx_refresh_index":       nil,
 	"codectx_repo_overview":       {"depth", "page"},
 	"codectx_search":              {"query", "page"},
 	"codectx_find_symbol":         {"query", "operation", "semantic_source", "page"},
@@ -479,6 +481,18 @@ type scenario struct {
 	tool   string
 	args   any
 	check  func(*testing.T, *mcp.CallToolResult)
+
+	// wantCallErr says this row expects CallTool ITSELF to fail rather than
+	// return a result. Every other row keeps the fatal-on-unexpected rule: a
+	// protocol error is a defect unless the row is about one. check is not
+	// called for such a row -- there is no result to inspect.
+	wantCallErr bool
+	// callCtx replaces the context the call is made with, and is where a row
+	// that needs the call abandoned mid-flight arranges it. It is handed the
+	// fake so the handler that must be running when the cancellation arrives
+	// can be the thing that triggers it, which is what makes the row
+	// deterministic instead of timing-dependent.
+	callCtx func(*testing.T, *fakeServices) context.Context
 }
 
 var scenarios = []scenario{
@@ -541,6 +555,32 @@ var scenarios = []scenario{
 					text, model.CodeResourceLimit)
 			}
 		},
+	},
+
+	{
+		// Failure mode: a client that goes away mid-call stops being an
+		// observable outcome. The SDK answers a canceled tools/call with
+		// (nil, context canceled) -- no CallToolResult at all -- so a caller
+		// that only ever inspects a result cannot tell an abandoned call from
+		// one that never happened, and the middleware's own bounded waits
+		// (limits.acquire, the per-call deadline) hang off the same ctx. This
+		// row pins the SDK's ACTUAL behaviour, observed rather than presumed.
+		name: "a canceled tools/call reports the cancellation, not a result",
+		tool: "codectx_index_status",
+		args: emptyInput{},
+		callCtx: func(_ *testing.T, f *fakeServices) context.Context {
+			ctx, cancel := context.WithCancel(context.Background())
+			f.indexStatusFn = func(handlerCtx context.Context) (model.IndexStatus, error) {
+				// The call is abandoned while this handler is the one running,
+				// and the handler waits for the cancellation to reach it, so
+				// neither side of the transport races the other.
+				cancel()
+				<-handlerCtx.Done()
+				return model.IndexStatus{}, handlerCtx.Err()
+			}
+			return ctx
+		},
+		wantCallErr: true,
 	},
 
 	// L2 rows.
@@ -1028,12 +1068,28 @@ func TestScenarios(t *testing.T) {
 				sc.facade(f)
 			}
 			cs := connect(t, newTestServer(f))
-			res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{
+			ctx := t.Context()
+			if sc.callCtx != nil {
+				ctx = sc.callCtx(t, f)
+			}
+			res, err := cs.CallTool(ctx, &mcp.CallToolParams{
 				Name:      sc.tool,
 				Arguments: sc.args,
 			})
 			if err != nil {
-				t.Fatalf("tools/call %s raised a protocol error: %v", sc.tool, err)
+				if !sc.wantCallErr {
+					t.Fatalf("tools/call %s raised a protocol error: %v", sc.tool, err)
+				}
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("tools/call %s failed with %v, want the cancellation", sc.tool, err)
+				}
+				if res != nil {
+					t.Errorf("a canceled call also returned %+v; the SDK reports no result", res)
+				}
+				return
+			}
+			if sc.wantCallErr {
+				t.Fatalf("tools/call %s returned a result; want the call to fail", sc.tool)
 			}
 			sc.check(t, res)
 		})

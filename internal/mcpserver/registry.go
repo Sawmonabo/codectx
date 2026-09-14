@@ -24,7 +24,7 @@ func register(s *mcp.Server, h *handlers) {
 	// --- L2: index and discovery ---------------------------------------
 	mcp.AddTool(s, toolFor[emptyInput]("codectx_index_status", "Index status",
 		"Active generation, health, coherence and capability completeness."), h.indexStatus)
-	mcp.AddTool(s, toolFor[refreshInput]("codectx_refresh_index", "Refresh index",
+	mcp.AddTool(s, toolFor[emptyInput]("codectx_refresh_index", "Refresh index",
 		"Build an incremental generation over the current workspace."), h.refreshIndex)
 	mcp.AddTool(s, toolFor[model.OverviewRequest]("codectx_repo_overview", "Repository overview",
 		"Bounded repository, package, module and language map."), h.repoOverview)
