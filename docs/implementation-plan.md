@@ -972,7 +972,7 @@ Initialize one current schema from embedded `schema.sql`. Store its version and 
 
 The physical model stores source manifests separately from reusable analysis units. `generation_units` selects one immutable unit per provider/scope. Node/relation identity dictionaries are not themselves visible facts; queries join through visible unit membership. Reusing a unit preserves evidence, aliases, and search documents. Numeric unit row IDs are compact internal join keys; exported UnitID is its 32-byte key encoded as hex. Provider run provenance outlives the creating generation when a retained unit still references it.
 
-The following is the complete initial DDL, including workflow/coverage state. Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
+The following is the complete DDL, kept byte-identical to `internal/storage/sqlite/schema.sql` (the embedded schema whose SHA-256 is the store fingerprint); it includes workflow/coverage state and the delta tables (`fact_keys`, `unit_delta_state`). Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
 
 ```sql
 CREATE TABLE schema_meta (
@@ -1036,6 +1036,13 @@ CREATE TABLE snapshot_files (
     CHECK((status = 'deleted' AND content_hash IS NULL AND size_bytes = 0)
        OR (status <> 'deleted' AND content_hash IS NOT NULL))
 ) WITHOUT ROWID;
+-- generations.ref is the ref the generation was built from (Section 12.4):
+-- retention keeps the last retain_refs DISTINCT refs the user actually
+-- indexed, not the last N generations, which is what makes A -> B -> C -> A
+-- find A's units still on disk. The value is the caller's: a branch name, the
+-- HEAD object id when HEAD is detached, or the fixed sentinel '(none)' for a
+-- workspace that is not a Git repository. Storage never interprets it, only
+-- groups by it.
 CREATE TABLE generations (
     id INTEGER PRIMARY KEY,
     repository_id BLOB NOT NULL REFERENCES repositories(id),
@@ -1093,6 +1100,15 @@ CREATE TABLE unit_dependencies (
     PRIMARY KEY(unit_id, dependency_id),
     CHECK(unit_id <> dependency_id)
 ) WITHOUT ROWID;
+-- carried marks the Section 13.3 stale-with-distance member: the scope's
+-- previous sealed unit, kept in the generation while its fresh rebuild is
+-- still running. Such a unit's inputs differ from the generation's snapshot by
+-- definition, so AttachCarried admits it where AttachUnit refuses, and the two
+-- distance columns record how far behind it is (generations, and changed files
+-- between its snapshot and this one). All three columns are folded into the
+-- membership digest, and therefore into the AnalysisKey: without them a
+-- generation carrying a stale unit would be byte-identical to one that rebuilt
+-- it, and a stale answer would be indistinguishable from a fresh one.
 CREATE TABLE generation_units (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL,
@@ -1153,6 +1169,23 @@ CREATE TABLE relation_facts (
     relation_id BLOB NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
+-- fact_keys carries the producer's own id-independent delta keys for one fact
+-- (Section 11.4). A fact is backed by every key that produced it, not by one:
+-- a canonical edge is published once but is derived from N occurrences, each
+-- with its own key, and a refresh re-emits the whole fact when any of them
+-- changes. A carry-over therefore keeps a fact unless ANY of its keys is
+-- replaced, which is the same condition the producer re-emits on, so the fresh
+-- and carried sets partition exactly. A fact with no row here carries no key
+-- and can only be replaced by its retention bucket.
+CREATE TABLE fact_keys (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    node_id BLOB,
+    relation_id BLOB,
+    fact_key TEXT NOT NULL,
+    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
+    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
+    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
+);
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -1164,14 +1197,22 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
+    content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL)),
+    CHECK(content_hash_bound = 0 OR file_id IS NOT NULL),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 );
+CREATE TABLE unit_delta_state (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY(unit_id, kind)
+) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key TEXT NOT NULL,
@@ -1357,6 +1398,8 @@ CREATE TABLE retention_leases (
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
+-- Retention ranks a repository's refs by the most recent generation each was
+-- activated for, then sweeps everything below the retain_refs cut.
 CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at);
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
@@ -1368,6 +1411,10 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
+CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
+CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
+CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
+CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
@@ -1394,7 +1441,7 @@ Storage invariants beyond DDL:
 
 The indexing lock is held from snapshot capture through publication. Seal each bounded unit only after its source and references are validated. Required provider failure aborts the staging generation. An optional provider can contribute completed independent units only when it explicitly reports their coverage; a malformed unit is not partially admitted. A failure must not keep old facts whose input hashes no longer match.
 
-Before publication, calculate the AnalysisKey from the sorted selected unit keys, source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
+Before publication, calculate the AnalysisKey from the sorted membership rows — each selected unit key together with its `carried` marker and provenance distance (`distance_generations`, `distance_files`), so a generation carrying a stale unit never shares a key with an all-fresh generation of the same units (Section 13.3) — the source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
 
 ```sql
 BEGIN IMMEDIATE;
