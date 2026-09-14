@@ -119,7 +119,7 @@ func (r *Registry) Lookup(id string) (Provider, bool) {
 }
 
 // Selection is the outcome of detection over one workspace. Active holds the
-// providers that will run, in dependency order. Inactive holds every capability
+// providers that will run, in dependency order. States holds every capability
 // row detection publishes, at ScopeWorkspace and one per declared capability:
 // `unavailable` for a disabled or absent optional provider, `failed` for an
 // enabled provider that could not be detected, and `partial` for a provider
@@ -130,8 +130,8 @@ func (r *Registry) Lookup(id string) (Provider, bool) {
 // (Sections 11.1, 13.3); a partial row is the middle case -- the provider runs,
 // and the coordinator publishes the reasons the rest of it will not.
 type Selection struct {
-	Active   []Provider
-	Inactive []model.CapabilityState
+	Active []Provider
+	States []model.CapabilityState
 }
 
 // Select runs trusted detection over the registry in dependency order.
@@ -181,7 +181,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 				continue
 			}
 			for _, c := range d.Capabilities {
-				sel.Inactive = append(sel.Inactive, model.CapabilityState{ProviderID: id, Capability: c,
+				sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c,
 					Scope: ScopeWorkspace, State: model.CapabilityPartial, DiagnosticCode: code,
 					// One map per row: every other detail map in the tree is
 					// copy-on-write, and sharing one would let a later edit of
@@ -197,7 +197,7 @@ func (r *Registry) Select(ctx context.Context, root workspace.Root, policy works
 		}
 		inactive[id] = inactiveProvider{state: state, code: code}
 		for _, c := range d.Capabilities {
-			sel.Inactive = append(sel.Inactive, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code})
+			sel.States = append(sel.States, model.CapabilityState{ProviderID: id, Capability: c, Scope: ScopeWorkspace, State: state, DiagnosticCode: code})
 		}
 	}
 	return sel, nil
