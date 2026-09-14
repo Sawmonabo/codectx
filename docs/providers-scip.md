@@ -9,7 +9,7 @@ decoder.
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
 | An approved installed indexer profile (`[analyzers.scip-go]`, `[analyzers.scip-typescript]`, `[analyzers.scip-java]`) run by codectx against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
-The descriptor is `scip`, version `2`, capabilities `precise_definitions`,
+The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
 `workspace`, optional. It depends on `filesystem` and `treesitter`, plus
 `manifest` when a profile is configured (profiles read package manifests).
@@ -183,22 +183,47 @@ pinned bytes in the document's `position_encoding` (UTF-8, UTF-16 or UTF-32).
 
 Five of the six managed indexers leave that field unspecified, so a document
 that does not declare an encoding is converted in the measured encoding of the
-tool named in `Index.metadata.tool_info`. Measured on this machine against a
-fixture whose line carries a 4-byte and a 2-byte rune before an identifier,
-decoding every occurrence range under all three encodings:
+**tool build** — the `Index.metadata.tool_info` name *and* version — that wrote
+the index. Measured on this machine against a fixture whose line carries a
+4-byte and a 2-byte rune before an identifier, decoding every occurrence range
+under all three encodings:
 
-| Tool | `Document.position_encoding` | Columns actually are |
+| Tool build | `Document.position_encoding` | Columns actually are |
 |---|---|---|
 | `scip-go` 0.2.7 | absent | UTF-8 |
 | `scip-clang` 0.4.0 | absent | UTF-8 |
-| `rust-analyzer` 1.98.0 | `UTF8` | UTF-8 |
 | `scip-typescript` 0.4.0 | absent | **UTF-16** |
-| `scip-java` | absent | **UTF-16** |
 | `scip-python` 0.6.6 | absent | **UTF-16** |
+| `scip-java` 0.0.0-SNAPSHOT | absent | **UTF-16** |
+| `rust-analyzer` 1.98.0 | `UTF8` | UTF-8 — declared, never assumed |
 
 `scip-python` is UTF-16 rather than the UTF-32 `scip.proto` suggests for Python
 indexers, because it is a TypeScript program (a pyright fork) — which is why
-the table is measured rather than read off the proto's advice.
+the table is measured rather than read off the proto's advice. `rust-analyzer`
+declares its encoding on every document, so it is not in the fallback table at
+all: a build that stopped declaring it would be an unmeasured pair and its
+documents would be skipped.
+
+The key is the name *and* the version, and the version comparison ignores a
+leading `v` and any build or pre-release suffix. A table keyed on the name
+alone would be an assertion about every build a tool will ever have, and a
+wrong encoding does not announce itself: reading a UTF-16 column as a byte
+offset lands inside a UTF-8 sequence only by luck and far more often selects a
+valid, in-range, rune-aligned extent a few bytes off the identifier, which is
+then published at `compiler` precision against source that is not the symbol.
+
+An assumed encoding is therefore **proved once per document before any of its
+occurrences is admitted**: the first definition occurrence whose symbol names
+an identifier the source spells literally must select exactly that identifier.
+Namespace descriptors (package, module and file paths), meta descriptors
+(Python's `__init__`), backtick-escaped names (`<init>`, operators) and `local`
+symbols carry no such name and are passed over; a document in which none of
+the first 256 definitions carries one is skipped rather than admitted on an
+unchecked guess. On a line with a non-ASCII rune before the token the readings
+disagree and a wrong guess is caught; on an ASCII-only line every reading
+converts to the same bytes, so there is nothing to catch. A document whose
+guess does not hold is skipped and the capabilities are `partial` with
+`CTX_PROVIDER_OUTPUT_INVALID`.
 
 `Metadata.text_document_encoding` is deliberately never consulted. All six
 indexers set it to `UTF8`, including the three whose columns are UTF-16,
@@ -206,10 +231,11 @@ because `scip.proto` defines it as the encoding of the source files on disk and
 says it is unrelated to ranges. Reading it as a position encoding would convert
 every UTF-16 column as a byte offset.
 
-A document of any other tool that does not declare an encoding is skipped and
-the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`: Section 9.3
-forbids guessing one. `Report.AssumedPositionEncoding` counts the documents
-converted through the per-tool table. A
+A document of any other tool build that does not declare an encoding is
+skipped and the capabilities are `partial` with `CTX_PROVIDER_OUTPUT_INVALID`:
+Section 9.3 forbids guessing one. `Report.AssumedPositionEncoding` counts the
+documents that were converted through the per-tool-build table **and** proved
+against their pinned bytes. A
 coordinate that does not land on the bytes is `CTX_PROVIDER_OUTPUT_INVALID`
 and fails the unit under a verified binding (the index claims to describe
 these bytes and does not); under an unverified binding it is skipped and
@@ -283,8 +309,6 @@ namespace, `#` class, `().` method under a type else function, `.` variable,
 | SCIP | Relation | From | Evidence range |
 |---|---|---|---|
 | occurrence with role `Import` | `imports` | innermost definition whose enclosing range contains the occurrence, else the document's file node | the occurrence |
-| role `WriteAccess` | `writes` | same | the occurrence |
-| role `ReadAccess` | `reads` | same | the occurrence |
 | any other non-definition occurrence | `references` | same | the occurrence |
 | relationship `is_implementation` | `implements` | the symbol's definition node | the symbol's definition |
 | relationship `is_reference` or `is_type_definition` | `references` | same | the symbol's definition |
@@ -298,12 +322,15 @@ rows; further occurrences are counted and the capabilities are `partial`
 with `CTX_RESOURCE_LIMIT`. The first definition of a symbol is the one
 references bind to; a later definition keeps its own located identity.
 
-No indexer measured here sets `WriteAccess`, and none distinguishes a call-site
-reference from a reference to a function value, so `writes` from this provider
-is a mapping that real output never exercises and `reads`/`writes` remain
-dependence-tier facts (Section 11.6). The role mapping is kept because the
-format defines it; the call identification it cannot do is the call-site join
-below.
+The occurrence roles `ReadAccess` and `WriteAccess` are deliberately not
+mapped. `reads` and `writes` are the `dependence` provider's facts, derived
+from the graph's assignment operators (Section 11.6), and two providers
+publishing one relation kind from different precisions is the parallel
+implementation policy forbids. A read or write occurrence is a `references`
+edge here, like any other non-definition, non-import occurrence. No indexer
+measured here distinguishes a call-site reference from a reference to a
+function value either; the call identification SCIP cannot do is the
+call-site join below.
 
 ## Call-site join (Section 11.3)
 
