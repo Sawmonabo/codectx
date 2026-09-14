@@ -4,7 +4,10 @@ import (
 	stdcontext "context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -411,6 +414,177 @@ func TestContextCompilerScenario(t *testing.T) {
 			},
 		},
 		// L4 BUDGET rows
+		{
+			// Guards the Section 15.4 rule that entry overhead is MEASURED, not
+			// assumed: a budget that counted only the wire-encoded source would
+			// under-count every header, delimiter and escape and overfill a
+			// slice the caller was promised would fit.
+			name: "entry sizes count measured metadata on top of worst-case wire bytes",
+			run: func(t *testing.T, fx *contextFixture) {
+				paths := []string{"internal/order/ports.go", "internal/order/service.go", "internal/order/handler.go"}
+				cands, files := budgetRowInput(fx, paths, model.RequirementFull)
+				b, err := resolveBudget(model.Budget{}, fx.Cfg.Context)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				// A zero budget resolves to the configured default, never to
+				// unlimited (Section 20.2).
+				if b.MaxBytes != fx.Cfg.Context.DefaultMaxBytes || b.MaxSlices != fx.Cfg.Context.MaxSlices {
+					t.Fatalf("zero budget resolved to %+v, want the configured context defaults", b)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err != nil {
+					t.Fatalf("buildPlan: %v", err)
+				}
+				if len(p.Entries) != len(paths) {
+					t.Fatalf("plan holds %d entries, want %d", len(p.Entries), len(paths))
+				}
+				for _, e := range p.Entries {
+					wire, err := wireEncodedBytes(fx.Files[pathOfEntry(t, fx, e)].Size)
+					if err != nil {
+						t.Fatalf("wireEncodedBytes: %v", err)
+					}
+					raw, err := json.Marshal(e)
+					if err != nil {
+						t.Fatalf("Marshal: %v", err)
+					}
+					// The measured size is a fixed point: the stored entry,
+					// serialized exactly as persisted, plus its worst-case
+					// source encoding, is the number the entry reports.
+					if want := wire + int64(len(raw)); e.EstimatedBytes != want {
+						t.Errorf("entry %d estimated_bytes = %d, want %d (wire %d + measured metadata %d)",
+							e.Ordinal, e.EstimatedBytes, want, wire, len(raw))
+					}
+					if e.EstimatedBytes <= wire {
+						t.Errorf("entry %d counted no metadata: estimated_bytes %d <= wire %d", e.Ordinal, e.EstimatedBytes, wire)
+					}
+					tokens, err := model.EstimateTokensUTF8Bytes(e.EstimatedBytes)
+					if err != nil {
+						t.Fatalf("EstimateTokensUTF8Bytes: %v", err)
+					}
+					if e.EstimatedTokens != tokens {
+						t.Errorf("entry %d estimated_tokens = %d, want %d", e.Ordinal, e.EstimatedTokens, tokens)
+					}
+				}
+			},
+		},
+		{
+			// THE Task 15 invariant: required scope never silently shrinks to
+			// fit a budget. A required file too large for one slice must raise
+			// the typed floor, never be demoted, truncated, or relabelled.
+			name: "a required file larger than the byte budget raises the minimum-budget floor",
+			run: func(t *testing.T, fx *contextFixture) {
+				oversized := "internal/order/generated.go"
+				cands, files := budgetRowInput(fx, []string{oversized}, model.RequirementFull)
+				b, err := resolveBudget(model.Budget{}, fx.Cfg.Context)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				wire, err := wireEncodedBytes(fx.File(oversized).Size)
+				if err != nil {
+					t.Fatalf("wireEncodedBytes: %v", err)
+				}
+				if wire <= b.MaxBytes {
+					t.Fatalf("fixture file is not oversized: wire %d <= budget %d", wire, b.MaxBytes)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err == nil {
+					t.Fatalf("an oversized required file produced a plan with %d entries and %d slices instead of the minimum-budget floor",
+						len(p.Entries), len(p.Slices))
+				}
+				var got *model.Error
+				if !errors.As(err, &got) || got.Code != model.CodeMinimumBudget {
+					t.Fatalf("buildPlan error = %v, want code %s", err, model.CodeMinimumBudget)
+				}
+				floor, ok := got.Details["min_bytes"]
+				if !ok {
+					t.Fatalf("minimum-budget error carries no min_bytes; details %v", got.Details)
+				}
+				if n, err := strconv.ParseInt(floor, 10, 64); err != nil || n < wire {
+					t.Errorf("min_bytes = %q, want a floor of at least the file's wire size %d", floor, wire)
+				}
+				for _, key := range []string{"min_estimated_tokens", "min_slices", "min_files", "missing"} {
+					if v, ok := got.Details[key]; !ok || v == "" {
+						t.Errorf("minimum-budget error is missing the frozen detail %q", key)
+					}
+				}
+				if !strings.Contains(got.Details["missing"], oversized) {
+					t.Errorf("missing = %q, want it to name %q", got.Details["missing"], oversized)
+				}
+			},
+		},
+		{
+			// Guards against a silent omission: when a complete scope needs
+			// more than one slice, every entry must still be reachable through
+			// exactly one slice, and anything dropped must leave a reason.
+			name: "a scope packed into two slices accounts for every ordinal and omits nothing silently",
+			run: func(t *testing.T, fx *contextFixture) {
+				paths := []string{"internal/order/ports.go", "internal/order/service.go",
+					"internal/order/handler.go", "internal/order/service_test.go"}
+				cands, files := budgetRowInput(fx, paths, model.RequirementFull)
+				// Two optional candidates the file budget has no room for.
+				// They are what makes the accounting assertion below real: a
+				// plan that quietly forgot them would still satisfy a count of
+				// its own entries.
+				spare, spareFiles := budgetRowInput(fx,
+					[]string{"docs/order.md", "config/order.toml"}, model.RequirementOptional)
+				cands = append(cands, spare...)
+				files = append(files, spareFiles...)
+				// A byte bound that holds some but not all of the required
+				// files forces a split at a file boundary; the file bound
+				// admits the four required files and nothing more.
+				b, err := resolveBudget(model.Budget{MaxBytes: 800, MaxFiles: len(paths)}, fx.Cfg.Context)
+				if err != nil {
+					t.Fatalf("resolveBudget: %v", err)
+				}
+				p, err := buildPlan(cands, files, b)
+				if err != nil {
+					t.Fatalf("buildPlan: %v", err)
+				}
+				if len(p.Slices) != 2 {
+					t.Fatalf("plan holds %d slices, want 2 (entries %d, budget %+v)", len(p.Slices), len(p.Entries), b)
+				}
+				if len(p.Entries) != len(paths) {
+					t.Fatalf("plan selected %d entries, want the %d required files", len(p.Entries), len(paths))
+				}
+				// The candidates the budget had no room for are persisted as
+				// exclusions, not dropped: every candidate is accounted for in
+				// exactly one of the two lists.
+				if len(p.Excluded) != len(spare) {
+					t.Fatalf("plan persisted %d exclusions, want %d; an unselected candidate vanished silently",
+						len(p.Excluded), len(spare))
+				}
+				if len(p.Entries)+len(p.Excluded) != len(cands) {
+					t.Fatalf("plan accounts for %d entries + %d exclusions, want all %d candidates",
+						len(p.Entries), len(p.Excluded), len(cands))
+				}
+				seen := map[int]int{}
+				for _, s := range p.Slices {
+					if err := s.Validate(); err != nil {
+						t.Fatalf("slice %d is invalid: %v", s.Index, err)
+					}
+					if s.EstimatedBytes > b.MaxBytes {
+						t.Errorf("slice %d holds %d bytes, over the per-slice budget %d", s.Index, s.EstimatedBytes, b.MaxBytes)
+					}
+					for _, o := range s.EntryOrdinals {
+						seen[o]++
+					}
+				}
+				for i, e := range p.Entries {
+					if e.Ordinal != i {
+						t.Fatalf("entry %d carries ordinal %d; ordinals must be 0..n-1 in stored order", i, e.Ordinal)
+					}
+					if seen[e.Ordinal] != 1 {
+						t.Errorf("ordinal %d appears in %d slices, want exactly 1", e.Ordinal, seen[e.Ordinal])
+					}
+				}
+				for _, x := range p.Excluded {
+					if strings.TrimSpace(x.Reason) == "" {
+						t.Errorf("exclusion %d carries no reason, which is a silent omission", x.Ordinal)
+					}
+				}
+			},
+		},
 		// L5 MANIFEST rows
 		// INT rows
 	}
@@ -424,4 +598,43 @@ func TestContextCompilerScenario(t *testing.T) {
 			row.run(t, fx)
 		})
 	}
+}
+
+// budgetRowInput builds the candidate set and the hydrated snapshot metadata a
+// `// L4 BUDGET rows` row compiles, standing in for the seed, scope and ranking
+// passes the fill-in lanes own. Scores descend with the given order so the
+// Section 15.3 tie-break order is the order the paths are named in, which is
+// what makes an ordinal assertion readable.
+func budgetRowInput(fx *contextFixture, paths []string, req model.Requirement) ([]candidate, []model.FileVersion) {
+	fx.t.Helper()
+	cands := make([]candidate, 0, len(paths))
+	files := make([]model.FileVersion, 0, len(paths))
+	for i, path := range paths {
+		fv := fx.File(path)
+		files = append(files, fv)
+		cands = append(cands, candidate{
+			NodeID:      fx.Node(path),
+			FileID:      fv.ID,
+			Path:        path,
+			Requirement: req,
+			Origin:      originExplicitSeed,
+			ScoreMicros: seedContribution - int64(i),
+			Reasons:     []string{"named by the task"},
+		})
+	}
+	return cands, files
+}
+
+// pathOfEntry maps a persisted entry back to the fixture path it covers, so a
+// size assertion can read the file's own metadata without the row tracking
+// ordinals by hand.
+func pathOfEntry(t *testing.T, fx *contextFixture, e model.ContextEntry) string {
+	t.Helper()
+	for path, fv := range fx.Files {
+		if fv.ID == e.FileID {
+			return path
+		}
+	}
+	t.Fatalf("entry %d names file %q, which the fixture does not publish", e.Ordinal, e.FileID)
+	return ""
 }
