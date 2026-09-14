@@ -2,6 +2,7 @@ package diagnostics
 
 import (
 	"context"
+	"os/exec"
 	"runtime"
 	"testing"
 	"time"
@@ -38,7 +39,8 @@ var scenarios = []scenario{
 		// the platforms that happen to lack the measurement.
 		name: "unmeasurable metric is absent, not zero",
 		run: func(t *testing.T) {
-			blind := &HostSampler{parentRSS: func() *uint64 { return nil }}
+			blind := NewHostSampler(HostSamplerOptions{})
+			blind.parentRSS = func() *uint64 { return nil }
 			got, err := blind.Sample(context.Background())
 			if err != nil {
 				t.Fatalf("Sample on a host that cannot read its own RSS: %v", err)
@@ -53,7 +55,7 @@ var scenarios = []scenario{
 				t.Fatalf("partial report must still validate: %v", err)
 			}
 
-			real, err := NewHostSampler().Sample(context.Background())
+			real, err := NewHostSampler(HostSamplerOptions{}).Sample(context.Background())
 			if err != nil {
 				t.Fatalf("Sample on this host: %v", err)
 			}
@@ -64,6 +66,59 @@ var scenarios = []scenario{
 	},
 	// L1 rows
 	// L2 rows
+	{
+		// Failure mode: a host that cannot observe a running process tree
+		// reports the worker and analyzer figures as zero instead of as
+		// absent, so an operator diagnosing memory pressure reads "the
+		// children use no memory" from a sampler that simply cannot see them
+		// -- and on a host that can see them, a tree measured only after its
+		// children have exited reports the same zero for a tree that was
+		// there. Both halves are the same Section 23 invariant, and the
+		// unmeasurable half is driven through the sampler's reader seam so it
+		// is proved on this host rather than only on darwin and windows.
+		name: "a live tree is measured and an unobservable one is absent, not zero",
+		run: func(t *testing.T) {
+			blind := NewHostSampler(HostSamplerOptions{})
+			blind.treeRSS = func() (*uint64, *uint64) { return nil, nil }
+			got, err := blind.Sample(context.Background())
+			if err != nil {
+				t.Fatalf("Sample on a host with no process accounting: %v", err)
+			}
+			if got.BaseWorkerRSSBytes != nil || got.NativeWorkerBytes != nil {
+				t.Fatalf("unobservable tree reported as base=%v native=%v, want both absent",
+					deref(got.BaseWorkerRSSBytes), deref(got.NativeWorkerBytes))
+			}
+
+			// A real child, still running while the sweep happens: the tree
+			// figure must exceed nothing at all, and the parent's own reading
+			// must not be what is counted for it.
+			if runtime.GOOS != "linux" {
+				return
+			}
+			child := exec.Command("/bin/sh", "-c", "sleep 5")
+			if err := child.Start(); err != nil {
+				t.Skipf("no /bin/sh on this host: %v", err)
+			}
+			defer func() { child.Process.Kill(); child.Wait() }()
+			var native uint64
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				live, err := NewHostSampler(HostSamplerOptions{}).Sample(context.Background())
+				if err != nil {
+					t.Fatalf("Sample with a live child: %v", err)
+				}
+				if live.NativeWorkerBytes == nil {
+					t.Fatal("this host exposes /proc, so a live descendant must be measured, not absent")
+				}
+				if native = *live.NativeWorkerBytes; native > 0 {
+					break
+				}
+			}
+			if native == 0 {
+				t.Fatal("a descendant that is still running was summed as zero bytes")
+			}
+		},
+	},
 	// L3a rows
 	// L3b rows
 	// L4 rows
@@ -166,4 +221,12 @@ func newTestService(t *testing.T, opts Options) *Service {
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+// deref renders a possibly absent byte count for a failure message.
+func deref(p *uint64) any {
+	if p == nil {
+		return "absent"
+	}
+	return *p
 }
