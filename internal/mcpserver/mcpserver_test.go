@@ -36,10 +36,9 @@ type fakeServices struct {
 	referencesFn func(context.Context, model.ReferenceRequest) (model.Page[model.ReferenceOccurrence], error)
 	graphFn      func(context.Context, model.GraphRequest) (model.GraphResult, error)
 	pathFn       func(context.Context, model.PathRequest) (model.PathResult, error)
-	// impactFn tracks ExploreService.Impact. Task 17 INT changes that method to
-	// return (model.ImpactResult, error); when it lands, this field's type and
-	// the Impact method below are the only two lines here that change.
-	impactFn func(context.Context, model.ImpactRequest) (model.Page[model.ImpactEntry], error)
+	// impactFn tracks ExploreService.Impact, which returns model.ImpactResult
+	// whole (Task 17 INT).
+	impactFn func(context.Context, model.ImpactRequest) (model.ImpactResult, error)
 
 	planFn          func(context.Context, model.PlanRequest) (model.PlanResult, model.SessionStatus, error)
 	sessionStatusFn func(context.Context, model.SessionRequest, model.PageRequest) (model.Page[model.FileCoverage], model.SessionStatus, error)
@@ -133,9 +132,9 @@ func (f *fakeServices) Path(ctx context.Context, r model.PathRequest) (model.Pat
 	return f.pathFn(ctx, r)
 }
 
-func (f *fakeServices) Impact(ctx context.Context, r model.ImpactRequest) (model.Page[model.ImpactEntry], error) {
+func (f *fakeServices) Impact(ctx context.Context, r model.ImpactRequest) (model.ImpactResult, error) {
 	if f.impactFn == nil {
-		return model.Page[model.ImpactEntry]{}, unset("Impact")
+		return model.ImpactResult{}, unset("Impact")
 	}
 	return f.impactFn(ctx, r)
 }
