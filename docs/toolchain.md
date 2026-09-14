@@ -188,18 +188,47 @@ payload for this platform is skipped rather than failed. Each completed fetch
 logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
 report of what is now installed goes to stdout.
 
-`--for-repo PATH` installs exactly what that repository would ever resolve, which
-on a Go repository is four payloads rather than fourteen. The selection is read
-from the three mappings that already decide it — the SCIP indexers' trigger
-manifests, the language servers' root markers and the dependence families'
-project markers — plus each selected entry's `runtime` from the lock, so the
-command cannot disagree with the planner about what a repository needs and no
-second copy of the mapping exists anywhere in the CLI. Markers are read at the
-repository root, by metadata, through the confined root handle: a present marker
-selects a payload and never starts anything, and nothing below the root is
-walked, so the work is bounded by the number of markers rather than by the size
-of the repository. A root whose manifests select nothing is an argument error
-rather than a silent no-op.
+`--for-repo PATH` installs what that repository's **root** selects, which on a Go
+repository is four payloads rather than fourteen. The selection is read from the
+mappings that already decide it — the SCIP indexers' trigger manifests, the
+language servers' root markers, the dependence families' project markers, and
+the path-to-language table for the source check below — plus each selected
+entry's `runtime` from the lock, so no second copy of any of them exists
+anywhere in the CLI. Everything is read at the repository root, by metadata or
+by filename, through the confined root handle for the markers and as one listing
+of the root directory for the sources: nothing is opened, nothing is started,
+and nothing below the root is walked, so the work is bounded by the number of
+markers plus the entries of one directory rather than by the size of the
+repository. A root that selects nothing is an argument error rather than a
+silent no-op.
+
+The root is the whole of what the command can see, and that is the planner's
+answer for two of the three providers but not the third:
+
+- **SCIP and LSP are root-only too.** Both detect from manifests at the
+  repository root, so what `--for-repo` selects for them is exactly what an
+  index run resolves. A nested `svc/pom.xml` selects no Java payload here, and
+  it selects none at index time either.
+- **The dependence provider walks for sources.** Its C/C++ family declares no
+  project marker at all — its unit is the repository itself, planned
+  unconditionally — and its other families' units are found by walking the
+  tree. `--for-repo` therefore selects the graph engine and its JDK on two
+  signals: a project marker of one of the other families at the root
+  (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
+  `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
+  `Cargo.toml`), or a source file of any of the families lying at the root
+  itself.
+
+  Two root shapes are therefore still under-served, and both fetch the graph
+  engine and its JDK at index time after a `--for-repo` prefetch reported
+  success: a root that declares nothing at all while its sources live further
+  down, and — the common one — a root that declares only a C or C++ build
+  (`CMakeLists.txt`, `compile_commands.json`, `Makefile`) with the sources
+  under `src/`. The second selects `clangd` here, from the language server's
+  root markers, but not the engine: those three files are the C/C++ family's
+  *closure* markers, not project markers, and the family has none. When
+  prefetching for an air-gapped runner from either shape, name the tools
+  explicitly or use `--all`.
 
 ```console
 $ codectx tools prefetch --for-repo .
