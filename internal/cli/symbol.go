@@ -31,8 +31,16 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			"reports a continuation token; pass it back with --cursor to read the " +
 			"next page from the generation the first page was read from, which is " +
 			"why --cursor and --generation cannot be combined.\n\n" +
-			"Only sealed canonical facts are resolved here; nothing is read from a " +
-			"dirty worktree and nothing is built.",
+			"--operation picks the typed symbol operation. `resolve` (the default), " +
+			"`workspace-symbols` and `definition` take the argument as a name or a " +
+			"canonical node id; `document-symbols` lists one file, so its argument " +
+			"is a canonical FILE id rather than a name.\n\n" +
+			"--semantic-source picks where the answer comes from. `canonical` (the " +
+			"default) reads sealed facts only: nothing is read from a dirty " +
+			"worktree and nothing is built. `lsp` answers from a managed language " +
+			"server named by --profile; those rows are labeled overlay results " +
+			"bound to their exact input, are never persisted as canonical facts, " +
+			"and never grant coverage credit.",
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -41,16 +49,34 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			// Section 18.1 gives this command one spelling and no operation
-			// flag, so it is the resolve operation over canonical facts. Both
-			// are set explicitly because Validate rejects an empty either way,
-			// and a zero value would be a default nobody wrote down.
+			operation, err := symbolOperationValue(cmd)
+			if err != nil {
+				return err
+			}
+			source, profile, err := semanticFlagValues(cmd, false)
+			if err != nil {
+				return err
+			}
+			// Both selectors are carried explicitly because Validate rejects an
+			// empty either way, and a zero value would be a default nobody
+			// wrote down. Their flag defaults are the pre-Task-17 request, so a
+			// bare `codectx symbol NAME` builds exactly the request it always
+			// did.
 			req := model.SymbolRequest{
 				GenerationID:   generation,
-				Query:          args[0],
-				Operation:      model.SymbolResolve,
-				SemanticSource: model.SemanticCanonical,
+				Operation:      operation,
+				SemanticSource: source,
+				Profile:        profile,
 				Page:           page,
+			}
+			// document-symbols lists ONE file and carries no query, so the
+			// single positional argument is that file's canonical id. Every
+			// other operation reads the argument as the name-or-id the Use line
+			// promises. Validate enforces the shape of whichever was filled.
+			if operation == model.SymbolDocumentSymbols {
+				req.FileID = model.FileID(args[0])
+			} else {
+				req.Query = args[0]
 			}
 			// Rejected before a workspace is opened, for the reason `search`
 			// gives: Section 14.1 bounds the request before any work.
@@ -68,9 +94,20 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			defer ws.Close()
 			ctx, cancel := queryContext(cmd.Context(), timeout)
 			defer cancel()
+			// Ruling Q13 keeps the canonical query commands on the path they
+			// already have -- Task 18 re-points them at the facade -- so the
+			// default route is byte-for-byte the one Task 13 built. Only the
+			// overlay route goes through Services(), which is the consumer
+			// ruling Q14 says drives Symbol for the LSP source.
+			//
 			// Typed for the reason `search` gives: a query deadline must not
 			// reach the operator as an invalid command line.
-			result, err := ws.Search().Resolve(ctx, req)
+			var result model.Page[model.Node]
+			if source == model.SemanticLSP {
+				result, err = ws.Services().Symbol(ctx, req)
+			} else {
+				result, err = ws.Search().Resolve(ctx, req)
+			}
 			if err != nil {
 				return queryFailure(err)
 			}
@@ -87,7 +124,117 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 	// queryFlagValues reads, so the page flags have to be declared here too.
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
+	cmd.Flags().String(symbolOperationFlag, string(model.SymbolResolve),
+		"typed symbol operation: resolve, document-symbols, workspace-symbols or definition"+
+			" (document-symbols takes a canonical file id as its argument)")
+	addSemanticFlags(cmd, false)
 	return cmd
+}
+
+// Flag spellings for the Section 18.1 live-query selectors. They are declared
+// here, beside the command that owns every one of them, and shared by query.go:
+// flags.go holds the flags EVERY query command has, and refs, callers and
+// callees take a strict subset of these four.
+const (
+	semanticSourceFlag  = "semantic-source"
+	semanticProfileFlag = "profile"
+	symbolOperationFlag = "operation"
+	referenceKindFlag   = "kind"
+)
+
+// addSemanticFlags declares --semantic-source and --profile. shared by query.go
+//
+// canonicalOnly says whether this command can actually answer from the overlay.
+// The call-hierarchy commands cannot: model.GraphRequest carries no semantic
+// source and ExploreService.Graph is canonical-only, so `--semantic-source lsp`
+// there is refused by semanticFlagValues. The flag is still declared, because
+// Section 18.1 gives the call-hierarchy commands the selector and because a
+// command that silently answered a canonical result to an `lsp` request would
+// be the substituted answer Section 11.6 forbids -- but the help text has to
+// say so rather than advertise a route the command does not have.
+func addSemanticFlags(cmd *cobra.Command, canonicalOnly bool) {
+	source := "answer from the sealed canonical index (canonical, the default) or from the managed language server named by --profile (lsp)"
+	profile := "managed language server to answer from; required with --" + semanticSourceFlag + " lsp and meaningless without it"
+	if canonicalOnly {
+		source = "answer from the sealed canonical index; this command has only the canonical route, and `lsp` is refused rather than answered from canonical facts"
+		profile = "managed language server to answer from; this command has no overlay route, so naming one is refused"
+	}
+	cmd.Flags().String(semanticSourceFlag, string(model.SemanticCanonical), source)
+	cmd.Flags().String(semanticProfileFlag, "", profile)
+}
+
+// semanticFlagValues reads and screens the two selectors before any workspace
+// is opened, for the reason `search` gives: a rejection that first opened the
+// database has already paid for work it will not do. shared by query.go
+//
+// An unknown source is the caller's typo. A `lsp` request with no profile is
+// rejected here rather than passed on, because nothing downstream may guess
+// which of the six supported servers was meant -- a root marker is a hint, not
+// a choice (Section 11.5) -- and a profile named beside `canonical` is a
+// command line that would silently do nothing. The profile name itself is NOT
+// checked against the supported set here: that list belongs to
+// internal/provider/lsp, which the facade exists to keep out of the command
+// tree, and SymbolRequest.Validate already bounds the string.
+func semanticFlagValues(cmd *cobra.Command, canonicalOnly bool) (model.SemanticSource, string, error) {
+	raw, err := stringFlag(cmd, semanticSourceFlag)
+	if err != nil {
+		return "", "", err
+	}
+	source := model.SemanticSource(raw)
+	if !source.Valid() {
+		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("--%s %q is not a known semantic source", semanticSourceFlag, clip(raw, 64))}).
+			WithRemediation("pass --" + semanticSourceFlag + " " + string(model.SemanticCanonical) +
+				" or --" + semanticSourceFlag + " " + string(model.SemanticLSP))
+	}
+	profile, err := stringFlag(cmd, semanticProfileFlag)
+	if err != nil {
+		return "", "", err
+	}
+	if canonicalOnly && source == model.SemanticLSP {
+		// Section 11.6's explicit unavailable answer, not a silently
+		// substituted canonical one. CTX_PROVIDER_UNAVAILABLE is the provider
+		// exit class (5), which is where "this route cannot run" belongs; it is
+		// not the exit-2 class, because the command line is well formed and the
+		// capability is what is missing.
+		return "", "", (&model.Error{Code: model.CodeProviderUnavailable,
+			Message: "the call hierarchy is answered from canonical facts only; there is no " +
+				string(model.SemanticLSP) + " route for this command"}).
+			WithDetail("semantic_source", string(model.SemanticLSP)).
+			WithRemediation("drop --" + semanticSourceFlag + ", or ask the overlay for symbols or references instead")
+	}
+	if source == model.SemanticLSP && profile == "" {
+		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--" + semanticSourceFlag + " " + string(model.SemanticLSP) +
+				" needs --" + semanticProfileFlag + ": the language server to answer from is never guessed"}).
+			WithRemediation("name one of the supported servers, for example --" + semanticProfileFlag + " gopls")
+	}
+	if source == model.SemanticCanonical && profile != "" {
+		return "", "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "--" + semanticProfileFlag + " names a language server, which only the " +
+				string(model.SemanticLSP) + " semantic source answers from"}).
+			WithRemediation("add --" + semanticSourceFlag + " " + string(model.SemanticLSP) +
+				", or drop --" + semanticProfileFlag)
+	}
+	return source, profile, nil
+}
+
+// symbolOperationValue reads --operation. The enum is the model's, so an
+// unknown value is rejected with the same vocabulary the request would use.
+func symbolOperationValue(cmd *cobra.Command) (model.SymbolOperation, error) {
+	raw, err := stringFlag(cmd, symbolOperationFlag)
+	if err != nil {
+		return "", err
+	}
+	op := model.SymbolOperation(raw)
+	if !op.Valid() {
+		return "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("--%s %q is not a known symbol operation", symbolOperationFlag, clip(raw, 64))}).
+			WithRemediation("pass one of: " + string(model.SymbolResolve) + ", " +
+				string(model.SymbolDocumentSymbols) + ", " + string(model.SymbolWorkspaceSymbols) +
+				", " + string(model.SymbolDefinition))
+	}
+	return op, nil
 }
 
 // writeSymbolTable renders the human page. The candidate columns are the ones

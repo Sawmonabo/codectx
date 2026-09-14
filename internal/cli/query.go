@@ -58,9 +58,11 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 			"Section 9.2 separates the two counts this answer carries: several occurrences may " +
 			"share one canonical relation, so the summary reports occurrences and distinct " +
 			"relations separately and never collapses them.\n\n" +
-			"Only canonical facts are answered. There is no flag for the editor overlay and none " +
-			"for the implements or type-definition variants; those reach the same engine through " +
-			"the MCP surface.\n\n" + nameArgumentHelp,
+			"--kind picks the evidence asked for: references (the default), implements or " +
+			"type-definition. --semantic-source picks where it comes from: canonical (the " +
+			"default) answers sealed facts only, and lsp answers from the managed language " +
+			"server named by --profile as labeled overlay rows that are never persisted as " +
+			"canonical facts and never grant coverage credit.\n\n" + nameArgumentHelp,
 		Args:          cobra.ExactArgs(1),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -81,19 +83,35 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			operation, err := referenceKindValue(cmd)
+			if err != nil {
+				return err
+			}
+			source, profile, err := semanticFlagValues(cmd, false)
+			if err != nil {
+				return err
+			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, ws *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
 				req := model.ReferenceRequest{
 					GenerationID:   gen,
 					NodeID:         nodes[0],
-					Operation:      model.ReferenceReferences,
-					SemanticSource: model.SemanticCanonical,
+					Operation:      operation,
+					SemanticSource: source,
+					Profile:        profile,
 					Page:           page,
 				}
 				if err := req.Validate(); err != nil {
 					return err
 				}
-				result, err = engine.References(ctx, req)
+				// Ruling Q13 leaves the canonical route on the engine Task 14
+				// built, byte for byte; ruling Q14 makes this command the
+				// consumer that drives References for the overlay source.
+				if source == model.SemanticLSP {
+					result, err = ws.Services().References(ctx, req)
+				} else {
+					result, err = engine.References(ctx, req)
+				}
 				return err
 			}); err != nil {
 				return err
@@ -106,7 +124,30 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 	addQueryFlags(cmd, true)
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
+	cmd.Flags().String(referenceKindFlag, string(model.ReferenceReferences),
+		"evidence to answer: references, implements or type-definition")
+	addSemanticFlags(cmd, false)
 	return cmd
+}
+
+// referenceKindValue reads --kind. `refs` spells the reference operation as a
+// kind because that is what the three values name -- which evidence about the
+// node is wanted -- and because --operation is `symbol`'s flag over a different
+// enum; one spelling over two enums would make the two commands look
+// interchangeable when they are not.
+func referenceKindValue(cmd *cobra.Command) (model.ReferenceOperation, error) {
+	raw, err := stringFlag(cmd, referenceKindFlag)
+	if err != nil {
+		return "", err
+	}
+	op := model.ReferenceOperation(raw)
+	if !op.Valid() {
+		return "", (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: fmt.Sprintf("--%s %q is not a known reference operation", referenceKindFlag, clip(raw, 64))}).
+			WithRemediation("pass one of: " + string(model.ReferenceReferences) + ", " +
+				string(model.ReferenceImplements) + ", " + string(model.ReferenceTypeDefinition))
+	}
+	return op, nil
 }
 
 // newCallersCommand builds `codectx callers`.
@@ -138,7 +179,11 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			"--visited and --edges cap the distinct nodes and relations it may admit, and each of " +
 			"those budgets is cumulative across the pages of one traversal rather than refilled " +
 			"per page. Exhausting any of them, or --timeout, reports the answer as truncated with " +
-			"the reason rather than presenting it as exhaustive.\n\n" + nameArgumentHelp,
+			"the reason rather than presenting it as exhaustive.\n\n" +
+			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
+			"that asking for the overlay is refused explicitly rather than answered from canonical " +
+			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
+			nameArgumentHelp,
 		Args:          cobra.RangeArgs(1, model.MaxStartNodes),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -150,8 +195,14 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			if err != nil {
 				return err
 			}
+			// Screened for its refusal, not for a value: the call hierarchy has
+			// only the canonical route, so this rejects `--semantic-source lsp`
+			// explicitly instead of answering it from canonical facts.
+			if _, _, err := semanticFlagValues(cmd, true); err != nil {
+				return err
+			}
 			var result model.GraphResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
 				req, err := graphRequest(cmd, nodes, direction, []model.RelationKind{model.RelCalls})
 				if err != nil {
 					return err
@@ -181,6 +232,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 	addLimitFlag(cmd)
 	addCursorFlag(cmd)
 	addTraversalFlags(cmd, true, true)
+	addSemanticFlags(cmd, true)
 	return cmd
 }
 
@@ -217,7 +269,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.PathResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
 				req := model.PathRequest{
 					GenerationID: gen,
 					From:         nodes[0],
@@ -275,7 +327,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runQuery(cmd, gen, args, func(ctx context.Context, engine *graph.Engine, nodes []model.NodeID) error {
+			if err := runQuery(cmd, gen, args, func(ctx context.Context, _ *app.Workspace, engine *graph.Engine, nodes []model.NodeID) error {
 				base, err := graphRequest(cmd, nodes, model.DirectionBoth, nil)
 				if err != nil {
 					return err
@@ -371,8 +423,15 @@ func graphRequest(cmd *cobra.Command, nodes []model.NodeID, direction model.Dire
 // generation and runs one query against it. The lease the engine holds is
 // released on every path, including cancellation, and a release failure never
 // masks the failure the query itself reported.
+//
+// The workspace is handed to the callback beside the engine so `refs` can take
+// the overlay route through ws.Services() without opening a second workspace.
+// That route still pays for the engine this function built: the seeds have to
+// be resolved against the pinned generation either way, and one composition
+// that sometimes builds a lease it does not read is cheaper to keep honest than
+// two open paths.
 func runQuery(cmd *cobra.Command, gen model.GenerationID, args []string,
-	fn func(context.Context, *graph.Engine, []model.NodeID) error) (err error) {
+	fn func(context.Context, *app.Workspace, *graph.Engine, []model.NodeID) error) (err error) {
 	repo, err := repoFlagValue(cmd)
 	if err != nil {
 		return err
@@ -410,7 +469,7 @@ func runQuery(cmd *cobra.Command, gen model.GenerationID, args []string,
 			err = queryFailure(cerr)
 		}
 	}()
-	return queryFailure(fn(ctx, engine, nodes))
+	return queryFailure(fn(ctx, ws, engine, nodes))
 }
 
 // queryFailure maps a bare context failure onto the Section 22 vocabulary. The
