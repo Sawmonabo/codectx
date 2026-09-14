@@ -418,30 +418,6 @@ var toolLanguages = map[string][]string{
 	"joern":                      {"c", "cpp", "go", "java", "javascript", "python", "rust", "tsx", "typescript"},
 }
 
-// EngineLockEntry is the tools.lock.json entry name of the dependence backend,
-// and EngineDisplayName is what every shipped string calls it instead.
-//
-// Section 21 keeps the backend's own project name out of every id, key,
-// evidence row, log line, observed version and diagnostic string this product
-// emits -- dependence/provider.go already reports it as `engine <version>
-// <digest>`. The lock file is generated from the upstream catalogue and must
-// keep the real name, so a consumer that renders a lock entry to an operator
-// projects it through these two constants rather than carrying a second copy
-// of the name.
-const (
-	EngineLockEntry   = "joern"
-	EngineDisplayName = "engine"
-)
-
-// DisplayName is the operator-facing name of a lock entry: the entry's own name
-// for a managed tool, and the anonymous `engine` for the dependence backend.
-func DisplayName(entry string) string {
-	if entry == EngineLockEntry {
-		return EngineDisplayName
-	}
-	return entry
-}
-
 // languagesOf reports the languages a lock entry unlocks, as a fresh slice so
 // no caller can mutate either source. The lock's own list wins: it is generated
 // from the same Section 11.7 matrix and keeping two lists where one is
