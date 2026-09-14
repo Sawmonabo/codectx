@@ -24,8 +24,9 @@ import (
 // stream the operating system actually delivers.
 func TestWatchOverflowCollapsesToFullReconciliation(t *testing.T) {
 	dir := t.TempDir()
-	// One file must exist before the watch set is derived, because the watch
-	// set is the directories that hold admitted files.
+	// A seed file so the fixture is a populated repository rather than a bare
+	// directory; the watch set is every directory the policy admits, so the
+	// root is watched either way.
 	if err := os.WriteFile(filepath.Join(dir, "seed.go"), []byte("package p\n"), 0o600); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}
