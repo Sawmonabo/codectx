@@ -1282,7 +1282,7 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// needs FX-D16-A: F2 puts context.WithTimeout(ctx, QueryTimeout) atop
+	// F2 puts context.WithTimeout(ctx, QueryTimeout) atop
 	// Read, as OpenSession and Status already do. Read is the one endpoint
 	// that touches the CAS and the filesystem, and `--timeout` defaults to
 	// zero precisely so resources.query_timeout applies, so an unbounded Read
@@ -1319,7 +1319,7 @@ var scenarios = []scenario{
 		}
 	}},
 
-	// needs FX-D16-A: F4 assigns NextContextItem.Path from the widened
+	// F4 assigns NextContextItem.Path from the widened
 	// Sessions. `context next` names the file the actor must read, and a
 	// response carrying only a 64-hex file id names a file the operator
 	// cannot open.

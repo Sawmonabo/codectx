@@ -585,12 +585,10 @@ func writeImpactEntries(b *strings.Builder, entries []model.ImpactEntry) {
 	}
 	fmt.Fprintf(b, "entries     %d\n", len(entries))
 	for _, e := range entries {
-		// ImpactEntry.Path carries the entry's QUALIFIED NAME: model.Node has no
-		// file path, and the hydration fills this field from QualifiedName. The
-		// column is labelled for what it holds, so a reader does not take it
-		// for a file path sitting next to a FileID.
+		// ImpactEntry.Name is the entry's qualified name (model.Node has no file
+		// path); the column is labelled for what it holds.
 		fmt.Fprintf(b, "  %s  %-9s depth %d  score %d  name %s\n", e.NodeID, e.Direction, e.Depth,
-			e.ScoreMicros, clip(e.Path, 70))
+			e.ScoreMicros, clip(e.Name, 70))
 		for _, reason := range e.Reasons {
 			fmt.Fprintf(b, "    %s\n", clip(reason, 100))
 		}

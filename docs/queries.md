@@ -52,7 +52,7 @@ evidence row behind it.
 | Flag | Commands | Meaning |
 |---|---|---|
 | `--repo` | all | Workspace root to answer from. |
-| `--generation` | all | Answer from this generation instead of the active one. Not combinable with `--cursor`. |
+| `--generation` | all | Answer from this generation instead of the active one. On every command but `path`, which issues no continuation, it is not combinable with `--cursor`. |
 | `--timeout` | all | Deadline for this invocation. Zero leaves the configured query deadline in charge. |
 | `--limit` | all but `path` | Items in one page. |
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |

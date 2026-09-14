@@ -787,6 +787,11 @@ func TestContextCompilerScenario(t *testing.T) {
 						Status: caller.Status, Paths: []model.RelationPath{
 							{Relations: []model.RelationID{edge}},
 							{Relations: []model.RelationID{second}},
+							// A third admissible route, too long to store. It
+							// reuses the same two relation ids, so it adds no
+							// distinct edge to the package centrality and
+							// changes no score -- only the count MorePaths owes.
+							{Relations: longRoute(edge, second)},
 						}},
 					{NodeID: "n2", Path: "a.go", StartByte: 5, Requirement: model.RequirementOptional, Origin: originLexical},
 					{NodeID: "n3", Path: "a.go", StartByte: 0, Requirement: model.RequirementOptional, Origin: originLexical},
@@ -838,17 +843,19 @@ func TestContextCompilerScenario(t *testing.T) {
 						t.Fatalf("rank[%d] carries %d reasons, over the bound %d", i, len(got.Reasons), model.MaxReasonsPerEntry)
 					}
 				}
-				// Two admitted routes, one retained: the route the manifest
-				// cannot enumerate must still be disclosed. model.ContextEntry
-				// has no other channel for the count, so a bounded reason
-				// carrying it is what keeps the entry from reading as an
-				// unexplained selection.
-				if ranked[1].MorePaths != 1 || len(ranked[1].Paths) != 1 {
-					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 1",
+				// Three admitted routes, one retained: the two the manifest
+				// cannot enumerate must BOTH be disclosed -- the weaker short
+				// route AND the route dropped for exceeding
+				// model.MaxRelationsPerPath. Counting only the retainable tail
+				// would understate the routes that exist, which is the one
+				// channel model.ContextEntry has for them, and a bounded
+				// explanation would then read as an unexplained selection.
+				if ranked[1].MorePaths != 2 || len(ranked[1].Paths) != 1 {
+					t.Fatalf("caller retained %d paths with MorePaths %d, want 1 and 2",
 						len(ranked[1].Paths), ranked[1].MorePaths)
 				}
-				if !slices.Contains(ranked[1].Reasons, "1 further route(s) reach this entity and are not enumerated") {
-					t.Fatalf("the unenumerated route was never disclosed: %q", ranked[1].Reasons)
+				if !slices.Contains(ranked[1].Reasons, "2 further route(s) reach this entity and are not enumerated") {
+					t.Fatalf("the unenumerated routes were never disclosed: %q", ranked[1].Reasons)
 				}
 			},
 		},
@@ -1597,7 +1604,8 @@ func searchService(t *testing.T, fx *contextFixture) *search.Service {
 		t.Fatalf("NewSpools: %v", err)
 	}
 	svc, err := search.New(search.Options{Store: fx.Store, Repo: fx.Repo, Signer: signer,
-		Spools: spools, Content: cas, Resources: fx.Cfg.Resources,
+		Spools: spools, Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
+		Content: cas, Resources: fx.Cfg.Resources,
 		CursorTTL: pagination.DefaultCursorTTL, Now: fx.Now})
 	if err != nil {
 		t.Fatalf("search.New: %v", err)
@@ -1638,4 +1646,15 @@ func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compil
 	}
 	t.Cleanup(func() { c.Close() })
 	return c
+}
+
+// longRoute builds a route one hop past model.MaxRelationsPerPath out of the
+// ids it is given, so a row can exercise the "admissible but too long to store"
+// branch of scoreRoutes without adding a distinct edge to package centrality.
+func longRoute(ids ...model.RelationID) []model.RelationID {
+	out := make([]model.RelationID, 0, model.MaxRelationsPerPath+1)
+	for i := 0; i <= model.MaxRelationsPerPath; i++ {
+		out = append(out, ids[i%len(ids)])
+	}
+	return out
 }
