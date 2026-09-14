@@ -38,7 +38,10 @@ type Tool struct {
 	// Executable is absolute; for a runtime-dependent tool it is the runtime
 	// binary, because that is the process that actually starts.
 	Executable string
-	// ArgvPrefix is the full launcher argv; ArgvPrefix[0] == Executable.
+	// ArgvPrefix is the full launcher argv; ArgvPrefix[0] == Executable. It is
+	// never empty and its first element is never the empty string: a resolution
+	// that could not name a launcher fails with CTX_INTERNAL rather than handing
+	// back a prefix a caller would have to check. Every consumer may index it.
 	ArgvPrefix []string
 	// Env carries the variables the child needs, such as JAVA_HOME. Nothing is
 	// inherited: Section 21 requires an allowlisted environment.
@@ -89,8 +92,13 @@ type Override struct {
 // byte cap or timeout here, because a fetch with an implicit bound is an
 // unbounded operation waiting for the day the configuration stops being read.
 type Options struct {
-	// DataDir is the data directory; <data_dir>/tools is created 0o700.
+	// DataDir is the data directory; the store is <data_dir>/tools, created
+	// 0o700 by the first install. Required unless StoreDir names the store.
 	DataDir string
+	// StoreDir, when set, is the tool store itself, used verbatim. Otherwise the
+	// store is StoreDir(DataDir), i.e. <data_dir>/tools. tools.cache_dir names a
+	// store, not a parent of one, so the configuration key and the option agree.
+	StoreDir string
 	// Offline turns every fetch into a typed refusal without opening a socket.
 	Offline bool
 	// Mirror optionally replaces the scheme and host of every lock asset URL,
@@ -161,8 +169,14 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 	if err := validateLock(lock); err != nil {
 		return nil, err
 	}
-	if opts.DataDir == "" || !filepath.IsAbs(opts.DataDir) {
-		return nil, invalid("the tool store needs an absolute data directory")
+	storeDir := opts.StoreDir
+	if storeDir == "" {
+		if opts.DataDir == "" || !filepath.IsAbs(opts.DataDir) {
+			return nil, invalid("the tool store needs an absolute data directory")
+		}
+		storeDir = StoreDir(opts.DataDir)
+	} else if !filepath.IsAbs(storeDir) {
+		return nil, invalid("the tool store directory must be an absolute path")
 	}
 	if opts.MaxFetchBytes <= 0 {
 		return nil, invalid("tools.max_fetch_bytes must be positive")
@@ -188,17 +202,13 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 		}
 		overrides[name] = ov
 	}
-	st, err := openStore(StoreDir(opts.DataDir))
-	if err != nil {
-		return nil, err
-	}
 	log := opts.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Resolver{
 		lock:      lock,
-		store:     st,
+		store:     &store{dir: storeDir},
 		fetch:     newFetcher(transport, mirror, opts.MaxFetchBytes, opts.FetchTimeout, log),
 		platform:  Current(),
 		offline:   opts.Offline,
@@ -206,6 +216,12 @@ func newResolver(lock Lock, opts Options, transport http.RoundTripper) (*Resolve
 		overrides: overrides,
 	}, nil
 }
+
+// StoreDir is the directory this resolver installs into and reports on. It is
+// the one place that answers "which store is this", so a caller that prints the
+// path -- `codectx tools` does -- cannot print a different one from the one the
+// resolver uses.
+func (r *Resolver) StoreDir() string { return r.store.dir }
 
 // Resolve returns the runnable tool named by one lock entry, installing the
 // pinned payload if it is not already in the store. Resolution order is
@@ -238,7 +254,7 @@ func (r *Resolver) Resolve(ctx context.Context, name string) (Tool, error) {
 	if err != nil {
 		return Tool{}, err
 	}
-	return compose(name, e, p, dir, entryHash, runtime), nil
+	return compose(name, e, p, dir, entryHash, runtime)
 }
 
 // ensure returns the installed payload directory and the entry digest observed
@@ -328,7 +344,7 @@ func (r *Resolver) inspect(name string, e Entry, p Payload, rehash bool) (string
 // distribution ships. That script reads JAVA_HOME (verified against the real
 // Joern 4.0.627 launcher), so the managed JDK reaches it as an environment
 // variable rather than as an argv element.
-func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Tool) Tool {
+func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Tool) (Tool, error) {
 	entry := e.entryPath(p)
 	entryPath := filepath.Join(dir, filepath.FromSlash(entry))
 	t := Tool{Name: name, Version: e.Version, Root: dir, Source: SourceManaged,
@@ -347,7 +363,14 @@ func compose(name string, e Entry, p Payload, dir, entryHash string, runtime Too
 		t.Executable, t.ArgvPrefix, t.Checksum = entryPath, []string{entryPath}, entryHash
 		t.Env = javaEnv(runtime)
 	}
-	return t
+	// Tool.ArgvPrefix promises a runnable launcher, so the promise is kept here
+	// rather than re-checked at each of the three call sites that index it. A
+	// runtime-hosted shape whose runtime resolved without an executable is the
+	// only way to reach this, and it is a product defect, not user input.
+	if len(t.ArgvPrefix) == 0 || t.ArgvPrefix[0] == "" {
+		return Tool{}, internalError("resolved tool %q has no launcher", name)
+	}
+	return t, nil
 }
 
 // javaEnv names the managed JDK for a child that looks it up itself. JAVA_HOME
@@ -391,6 +414,14 @@ func resolveOverride(name string, ov Override) (Tool, error) {
 	}
 	if got != ov.Checksum {
 		return Tool{}, overrideInvalid(name, "the configured executable does not hash to the configured checksum")
+	}
+	// ArgvPrefix's "never empty" guarantee is enforced here as well as in
+	// compose, not merely argued from the validOverride call above: consumers
+	// -- joern.Locate among them -- deleted their own prefix checks on the
+	// strength of that guarantee, so it has to hold in code at every point a
+	// Tool is constructed, including one no input reaches today.
+	if ov.Executable == "" {
+		return Tool{}, internalError("resolved tool %q has no launcher", name)
 	}
 	return Tool{
 		Name: name, Version: ov.Version, Root: filepath.Dir(ov.Executable),
@@ -486,7 +517,9 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 		if errors.As(err, &typed) && typed.Code == model.CodeToolUnsupportedPlatform {
 			continue
 		}
-		errs = append(errs, err)
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }

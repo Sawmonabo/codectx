@@ -17,25 +17,23 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// store is the private tool store: <data_dir>/tools. Installs are atomic --
-// fetch and extract into .staging, verify, rename the finished tree into place,
-// then write the publication marker -- so a version directory a reader can see
-// is either complete or invisible, never half a payload.
+// store is the private tool store. Installs are atomic -- fetch and extract
+// into .staging, verify, rename the finished tree into place, then write the
+// publication marker -- so a version directory a reader can see is either
+// complete or invisible, never half a payload.
+//
+// The directory is not created here. A store value is a path and nothing else,
+// so building a resolver -- which `tools status`, `tools verify` and `tools gc`
+// all do -- touches no filesystem at all; the first install creates the tree on
+// the way in, through the MkdirAll that newStaging, acquire and publish each
+// already perform for the path they need. A read-only report that materialized
+// a per-workspace data directory would leave one behind in every checkout it
+// was ever run in.
 type store struct{ dir string }
 
 // lockPollInterval is how often a bounded wait for a per-tool install lock
 // retries.
 const lockPollInterval = 100 * time.Millisecond
-
-func openStore(dir string) (*store, error) {
-	if !filepath.IsAbs(dir) {
-		return nil, invalid("the tool store directory must be an absolute path")
-	}
-	if err := os.MkdirAll(dir, storeDirPerm); err != nil {
-		return nil, ioError("tool store directory", err)
-	}
-	return &store{dir: dir}, nil
-}
 
 func (s *store) toolDir(name string) string    { return filepath.Join(s.dir, name) }
 func (s *store) locksDir() string              { return filepath.Join(s.dir, locksDirName) }
