@@ -72,28 +72,35 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 	case err != nil:
 		return model.NextContextItem{}, err
 	default:
-		// The pinned manifest row is the only place the path lives: coverage
+		// The pinned session row is the only place the path lives: coverage
 		// and manifest entries carry identifiers alone, and `context next`
-		// names a file the operator has to be able to find. One point read on
-		// the snapshot_files primary key, only on the branch that names a file.
-		path, err := s.sessions.FilePath(ctx, rec.Binding.SnapshotID, cov.FileID)
+		// names a file the operator has to be able to find. The batch reader is
+		// asked for the one file this branch named -- Next answers with a
+		// single item, so a page of paths would be a page of one -- and it is
+		// scoped by session_files, so it can never name a file outside the
+		// actor's pinned scope.
+		paths, err := s.sessions.SessionFilePaths(ctx, rec.ID, rec.ActorID, []model.FileID{cov.FileID})
 		if err != nil {
-			// A file the session pinned that the snapshot does not hold is the
-			// same manifest/session disagreement coverageOf reports, and it is
-			// not the caller's argument that is wrong: storage marks a missing
-			// row CTX_ARGUMENT_INVALID, which would blame the request.
-			if notFound(err) {
-				return model.NextContextItem{}, typedErrf(model.CodeScopeIncomplete,
-					"file %s is in this session's scope but not in the pinned snapshot", cov.FileID)
-			}
 			return model.NextContextItem{}, err
+		}
+		path, ok := paths[cov.FileID]
+		if !ok {
+			// A file the session pinned that the snapshot no longer holds at
+			// that hash is the same manifest/session disagreement coverageOf
+			// reports. Absence is the batch reader's answer for it, and it is
+			// not the caller's argument that is wrong.
+			return model.NextContextItem{}, typedErrf(model.CodeScopeIncomplete,
+				"file %s is in this session's scope but not in the pinned snapshot", cov.FileID)
 		}
 		item.FileID = cov.FileID
 		item.Path = path
 		item.ContentHash = cov.ContentHash
 		item.Requirement = cov.Requirement
 		item.Size = cov.Size
-		item.Offset = resumeOffset(cov)
+		item.Offset, err = s.resumeOffset(ctx, rec, cov)
+		if err != nil {
+			return model.NextContextItem{}, err
+		}
 		item.Action, err = s.nextAction(ctx, rec, item.Offset >= uint64(cov.Size))
 		if err != nil {
 			return model.NextContextItem{}, err
@@ -105,26 +112,58 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 	return item, nil
 }
 
-// resumeOffset is where the actor should resume reading this file: the end of
-// the coverage it has already confirmed.
+// resumeOffset is where the actor should resume reading this file: the first
+// byte of it this actor has not confirmed.
 //
-// ConfirmedBytes is the size of the disjoint served union, which equals the end
-// of the confirmed prefix for a client that reads forward, and over-states it
-// when a client confirmed a later range with a hole before it. The frozen
-// Sessions surface exposes no served-ranges reader, so the prefix end is not
-// derivable here. That is safe in the direction that matters: the offset is
-// advisory metadata, credit still comes only from confirmed ranges, so an
-// over-stated resume point can stall a client that read out of order but can
-// never grant coverage for bytes nobody read.
-func resumeOffset(cov model.FileCoverage) uint64 {
-	offset := cov.ConfirmedBytes
-	if offset > cov.Size {
-		offset = cov.Size
+// ConfirmedBytes is the size of the disjoint served union, so it is the end of
+// the confirmed prefix for a client that reads forward and over-states it when
+// a client confirmed a later range with a hole before it. An over-stated offset
+// sends the actor past bytes nobody read, and on a partially served file it can
+// leave the file permanently short of full coverage. The prefix end is
+// therefore asked of storage, which answers containment of [0,p) in SQL.
+//
+// The union size bounds the prefix end from above, so ConfirmedBytes is both
+// the first guess and the top of the search: the forward-reading client is one
+// query, and a client that confirmed out of order costs a binary search over
+// [0,ConfirmedBytes] -- at most 1 + log2(ConfirmedBytes) bounded boolean
+// questions, and never an interval list crossing into Go.
+func (s *Service) resumeOffset(ctx context.Context, rec sqlite.SessionRecord, cov model.FileCoverage) (uint64, error) {
+	hi := cov.ConfirmedBytes
+	if hi > cov.Size {
+		hi = cov.Size
 	}
-	if offset < 0 {
-		offset = 0
+	if hi <= 0 {
+		// Nothing is confirmed, so the whole file is still to read. Storage is
+		// not asked: the empty interval is not a range it can be asked about.
+		return 0, nil
 	}
-	return uint64(offset)
+	confirmed := func(end int64) (bool, error) {
+		return s.sessions.RangeConfirmed(ctx, rec.ID, rec.ActorID, cov.FileID, cov.ContentHash,
+			model.ByteRange{Start: 0, End: uint64(end)})
+	}
+	ok, err := confirmed(hi)
+	if err != nil {
+		return 0, err
+	}
+	if ok {
+		return uint64(hi), nil
+	}
+	// Invariant: [0,lo) is confirmed and [0,hi) is not, so the first uncovered
+	// byte is in [lo,hi). lo starts at zero, which is vacuously confirmed.
+	lo := int64(0)
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		ok, err := confirmed(mid)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			lo = mid
+		} else {
+			hi = mid
+		}
+	}
+	return uint64(lo), nil
 }
 
 // nextAction names what the actor should do with the file Next selected.
