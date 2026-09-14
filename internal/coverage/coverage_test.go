@@ -567,7 +567,6 @@ type fakeSource struct{ files map[model.FileID]*fixtureFile }
 
 var _ Source = (*fakeSource)(nil)
 
-
 func (s *fakeSource) Read(ctx context.Context, id model.FileID, r model.ByteRange) (snapshot.Range, model.FileVersion, error) {
 	f, ok := s.files[id]
 	if !ok {
