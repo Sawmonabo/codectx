@@ -274,6 +274,11 @@ func peakParentRSSBytes() *uint64 {
 // Git plumbing command, a language server, a SCIP indexer, the dependence
 // engine -- is native.
 //
+// The split itself has no test row -- the two rows this lane is allotted go to
+// the absent-not-zero invariant and the live-subprocess counter -- and was
+// verified instead by the Task 20 obligation-18 measurement harness, where the
+// parser worker was the sole descendant and was summed into the base figure.
+//
 // Membership is by parent chain, not by process group, because each child is
 // its own group leader (internal/process places it there) and there is no
 // registry of those groups here. The honest limitation, which
@@ -299,9 +304,12 @@ func descendantRSSBytes() (base, native *uint64) {
 		}
 		// The same finite bound the runner's own sweep uses: one pass is
 		// O(processes on the machine), and 4096 is far above the process count
-		// of any host this runs on.
+		// of any host this runs on. Reaching it makes both figures ABSENT
+		// rather than smaller: a truncated sweep can drop an intermediate
+		// ancestor, which hides every descendant below it, and a confidently
+		// smaller number is a wrong measurement where a missing one is not.
 		if scanned++; scanned > maxSampledProcesses {
-			break
+			return nil, nil
 		}
 		comm, parent, pages, ok := statProcess(pid)
 		if !ok {
