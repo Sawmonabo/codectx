@@ -44,9 +44,12 @@ func resolveSymbols(ctx context.Context, r exactReader, req model.SymbolRequest,
 		return resolvePage{Completeness: []model.CapabilityState{lspUnavailable(req)}}, nil
 	}
 	limit = resolveLimit(limit)
-	rank, within, err := parseResolveKey(lastKey)
-	if err != nil {
-		return resolvePage{}, err
+	rank, within := noTierRank, ""
+	if lastKey != "" {
+		var err error
+		if rank, within, err = parseResolveKey(lastKey); err != nil {
+			return resolvePage{}, err
+		}
 	}
 	if req.Operation == model.SymbolDocumentSymbols {
 		return documentSymbols(ctx, r, req, rank, within, limit)
@@ -86,17 +89,27 @@ func fileNodeKey(n sqlite.StoredNode) string {
 }
 
 // parseResolveKey splits a continuation key into its tier rank and within-tier
-// position; the first page has no key and reports rank noTierRank. A key that is
-// not one this endpoint wrote is CTX_CURSOR_INVALID rather than a silently
-// restarted page.
+// position. A key that is not one this endpoint wrote -- an empty key, an
+// unparseable rank, a rank no symbol tier owns, or a within-tier position whose
+// shape does not match that tier's keyset -- is CTX_CURSOR_INVALID rather than
+// a silently restarted page. The caller supplies the first page's absence of a
+// key; this function never treats "" as one.
 func parseResolveKey(key string) (int, string, error) {
-	if key == "" {
-		return noTierRank, "", nil
-	}
 	head, within, ok := strings.Cut(key, "\x00")
 	rank, err := strconv.Atoi(head)
 	if !ok || err != nil || rank < 0 || rank >= model.TierLexicalFTS.Rank() || within == "" {
 		return noTierRank, "", &model.Error{Code: model.CodeCursorInvalid, Message: "symbol cursor does not carry a symbol-tier position"}
+	}
+	// The within-tier position is the keyset of the tier that wrote it: the
+	// exact_path tier pages on (start_byte, node_id), every symbol tier on
+	// node_id alone. Checking the shape here is what makes a hand-written key
+	// a rejected cursor instead of a storage argument error later.
+	if rank == model.TierExactPath.Rank() {
+		if _, _, err := splitFileNodeKey(within); err != nil {
+			return noTierRank, "", err
+		}
+	} else if !model.ValidHexID(within) {
+		return noTierRank, "", &model.Error{Code: model.CodeCursorInvalid, Message: "symbol cursor does not carry a node identity"}
 	}
 	return rank, within, nil
 }

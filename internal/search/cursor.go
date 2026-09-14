@@ -122,31 +122,6 @@ func verifyCursor(c pagination.Cursor, b model.Binding, queryHash string) error 
 	return nil
 }
 
-// resolveKey is the digest §5 keyset continuation for Resolve: the tier
-// ordinal and the node id of the last row served. It fits the 1024-byte
-// Cursor.LastKey bound, which is why Resolve needs no spool.
-func resolveKey(tier model.SearchTier, node model.NodeID) string {
-	return strconv.Itoa(tier.Rank()) + "\x00" + string(node)
-}
-
-// parseResolveKey reads a continuation key back. A malformed key is a tampered
-// or foreign cursor, not an internal defect.
-func parseResolveKey(key string) (rank int, node model.NodeID, err error) {
-	sep := strings.IndexByte(key, 0)
-	if sep < 0 {
-		return 0, "", &model.Error{Code: model.CodeCursorInvalid, Message: "the cursor's sort key is malformed"}
-	}
-	rank, perr := strconv.Atoi(key[:sep])
-	if perr != nil || rank < 0 {
-		return 0, "", &model.Error{Code: model.CodeCursorInvalid, Message: "the cursor's sort key is malformed"}
-	}
-	node = model.NodeID(key[sep+1:])
-	if node != "" && !model.ValidHexID(string(node)) {
-		return 0, "", &model.Error{Code: model.CodeCursorInvalid, Message: "the cursor's sort key is malformed"}
-	}
-	return rank, node, nil
-}
-
 // spoolHits writes the hits that remain after this page into a fresh spool and
 // returns the id the next cursor carries, or "" when nothing remains.
 //
