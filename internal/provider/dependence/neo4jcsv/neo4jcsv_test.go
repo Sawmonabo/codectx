@@ -1,11 +1,13 @@
 package neo4jcsv_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -25,6 +27,14 @@ type counts struct {
 	alias  map[string]string // scope\x00native key -> node id
 	aliasN int               // alias records accepted, duplicates included
 	detail map[string]int
+	// relKey is the fact key list the import published for one relation,
+	// under edgeID(from, kind, to). Only a keyed put carries it.
+	relKey map[string][]string
+}
+
+// edgeID names one published edge independently of the run that published it.
+func edgeID(from model.NodeID, kind model.RelationKind, to model.NodeID) string {
+	return string(from) + "\x00" + string(kind) + "\x00" + string(to)
 }
 
 type recorder struct {
@@ -33,18 +43,41 @@ type recorder struct {
 }
 
 func (r recorder) PutNodes(ctx context.Context, f []model.NodeFact) error {
+	return r.PutKeyedNodes(ctx, f, nil)
+}
+
+// PutKeyedNodes counts the batch and forwards it with its keys, so the import
+// takes the keyed path it takes in production; a destination that cannot carry
+// keys still receives the facts. Same shape as providertest.Recorder.
+func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys [][]string) error {
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
+	}
+	if d, ok := r.Sink.(provider.DeltaSink); ok {
+		return d.PutKeyedNodes(ctx, f, keys)
 	}
 	return r.Sink.PutNodes(ctx, f)
 }
 
 func (r recorder) PutRelations(ctx context.Context, f []model.RelationFact) error {
-	for _, x := range f {
+	return r.PutKeyedRelations(ctx, f, nil)
+}
+
+// PutKeyedRelations is PutKeyedNodes for relation facts, and records each
+// edge's fact keys for TestRelationKeyTracksItsEndpoints.
+func (r recorder) PutKeyedRelations(ctx context.Context, f []model.RelationFact, keys [][]string) error {
+	for i, x := range f {
 		r.c.rel[x.Relation.Kind]++
 		for _, ev := range x.Evidence {
 			r.c.detail[ev.Detail]++
 		}
+		if i < len(keys) {
+			id := edgeID(x.Relation.From, x.Relation.Kind, x.Relation.To)
+			r.c.relKey[id] = append(r.c.relKey[id], keys[i]...)
+		}
+	}
+	if d, ok := r.Sink.(provider.DeltaSink); ok {
+		return d.PutKeyedRelations(ctx, f, keys)
 	}
 	return r.Sink.PutRelations(ctx, f)
 }
@@ -62,7 +95,7 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
 	var rep neo4jcsv.Report
 	var importErr error
 	p := providertest.Func{
@@ -390,7 +423,7 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
 	var part [2]struct{ nodes, aliases int }
 	nodesSoFar := func() int {
 		n := 0
@@ -489,4 +522,108 @@ func keysOf(m map[string]string) []string {
 		out = append(out, strings.ReplaceAll(k, "\x00", " "))
 	}
 	return out
+}
+
+// TestRelationKeyTracksItsEndpoints guards the endpoints component of the
+// fact-key algebra (keys.go: keyAlgebraVersion "2").
+//
+// Failure mode: a relation's key is built only from the call site's own
+// coordinates — its owner, file, operator, target name and byte range — none
+// of which move when the *callee's declaration* moves. Editing above a callee
+// mints a new identity for it, but the call edge into it would keep its key,
+// the delta import would not re-emit the edge, and storage would carry the
+// previous row, whose `to` node id no longer exists in the unit. The unit then
+// fails to seal with dangling relation endpoints — or, worse, a later algebra
+// keeps it. Nothing else in the repository notices this component regressing.
+//
+// The export is the committed gofix export with one column run rewritten: the
+// callee `Scale` declared at helper.go:4-6 is moved to 5-7, exactly as a line
+// inserted above it would move it. The source tree is deliberately NOT
+// shifted: shifting it would also move every occurrence site inside helper.go
+// and change the positional component too, so the test would pass even with
+// the endpoints component removed. Moving only the declaration row leaves the
+// callee's identity as the single variable, which is the variable under test.
+func TestRelationKeyTracksItsEndpoints(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join("testdata", "src", "gofix")
+	basePath := filepath.Join(dir, "base")
+	_, base, _, err := run(t, src, filepath.Join("testdata", "gofix"),
+		neo4jcsv.Options{Language: "go", KeysPath: basePath})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+
+	moved := 0
+	export := copyExport(t, filepath.Join("testdata", "gofix"), func(name string, data []byte) []byte {
+		if name != "nodes_METHOD_data.csv" {
+			return data
+		}
+		// CODE is a multi-line quoted field, so the row is matched by its
+		// LINE_NUMBER,LINE_NUMBER_END,NAME column run, not by line surgery.
+		out := bytes.Replace(data, []byte(",false,4,6,Scale,"), []byte(",false,5,7,Scale,"), -1)
+		moved = bytes.Count(data, []byte(",false,4,6,Scale,"))
+		return out
+	})
+	if moved != 1 {
+		t.Fatalf("the callee declaration row was rewritten %d times, want exactly 1; the fixture's columns moved", moved)
+	}
+	mutRep, mut, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "moved")})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed", state)
+	}
+
+	// Precondition: moving the declaration moves the callee's published
+	// identity, and nothing else. The workspace alias is the cross-run handle.
+	scaleBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	scaleMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/helper.Scale"]
+	runBase := base.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
+	runMut := mut.alias[provider.ScopeWorkspace+"\x00"+neo4jcsv.ProviderID+":method:example.com/fix/app.Run"]
+	if scaleBase == "" || scaleMut == "" || runBase == "" || runMut == "" {
+		t.Fatalf("the fixture did not publish both declarations: Scale %q/%q, Run %q/%q", scaleBase, scaleMut, runBase, runMut)
+	}
+	if scaleBase == scaleMut {
+		t.Fatalf("the moved callee kept identity %s; the declaration range no longer decides a declaration's identity", scaleBase)
+	}
+	if runBase != runMut {
+		t.Fatalf("the caller's identity moved (%s -> %s); the fixture no longer isolates the callee", runBase, runMut)
+	}
+
+	// The call edge Run -> Scale. Its key must move with the callee.
+	edge := func(c counts, from, to string) []string {
+		t.Helper()
+		k := c.relKey[edgeID(model.NodeID(from), model.RelCalls, model.NodeID(to))]
+		if len(k) == 0 {
+			t.Fatalf("the call edge %s -> %s published no fact key; a keyed put carries one per edge", from, to)
+		}
+		return k
+	}
+	baseKeys, mutKeys := edge(base, runBase, scaleBase), edge(mut, runMut, scaleMut)
+	for _, k := range mutKeys {
+		if slices.Contains(baseKeys, k) {
+			t.Fatalf("the call edge into the moved callee kept fact key %s; storage would carry a row whose endpoint no longer exists", k)
+		}
+	}
+
+	// The leg storage consumes: the refresh must report those keys changed.
+	prev, err := neo4jcsv.LoadKeySet(basePath)
+	if err != nil {
+		t.Fatalf("LoadKeySet: %v", err)
+	}
+	var changed []string
+	if _, err := mutRep.Keys.Diff(prev, func(key string, removed bool) error {
+		if !removed {
+			changed = append(changed, key)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+	for _, k := range mutKeys {
+		if !slices.Contains(changed, k) {
+			t.Fatalf("Diff did not report the call edge's key %s changed; the delta import would not re-emit the edge", k)
+		}
+	}
 }
