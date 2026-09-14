@@ -3,6 +3,7 @@ package neo4jcsv_test
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -312,15 +313,22 @@ func TestImportDelta(t *testing.T) {
 	if rep3.Changed+rep3.Unchanged != rep3.Keys.Count() {
 		t.Fatalf("changed %d + unchanged %d != %d keys", rep3.Changed, rep3.Unchanged, rep3.Keys.Count())
 	}
-	// Only the changed relations reach the sink; the unchanged ones are the
-	// rows storage keeps.
-	var emitted int
-	for _, n := range c.rel {
-		emitted += n
+	// This fixture's edit removes keys, which is the case a delta import may
+	// not filter: a removed key cannot be mapped back to the edge it backed,
+	// and that edge's previous row is already gone, so every relation is
+	// republished. What must hold is that the delta unit is not poorer than a
+	// full one — the same relations, the same evidence.
+	if rep3.Removed == 0 {
+		t.Fatalf("the fixture edit removed no key; it no longer covers the unfiltered case")
 	}
-	if emitted >= rep3.Changed+rep3.Unchanged {
-		t.Fatalf("a delta import published %d relation occurrences out of %d keys; it must publish only the changed ones",
-			emitted, rep3.Changed+rep3.Unchanged)
+	_, full, _, err := run(t, filepath.Join("testdata", "src", "gofix-edit"), filepath.Join("testdata", "gofix-edit"),
+		neo4jcsv.Options{Language: "go", KeysPath: filepath.Join(dir, "full")})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if !maps.Equal(c.rel, full.rel) || !maps.Equal(c.detail, full.detail) {
+		t.Fatalf("a delta import published %v relations with %v evidence; a full import of the same export published %v and %v",
+			c.rel, c.detail, full.rel, full.detail)
 	}
 	delta, err := rep3.Keys.Diff(prev, nil)
 	if err != nil {
