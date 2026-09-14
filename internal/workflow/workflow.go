@@ -84,6 +84,11 @@ type Sessions interface {
 	// naming a file the operator cannot locate is not an answer. NEW -- L6.
 	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
 		ids []model.FileID) (map[model.FileID]string, error)
+	// Waivers reads the session's recorded coverage exceptions in file-id
+	// order. Waive's returned record echoes the request's reason and
+	// FileCoverage carries only the Waived flag, so this is the only source of
+	// the stored reasons a sealed capsule must carry. NEW -- L6b.
+	Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error)
 }
 
 // The store is the production Sessions; the assertion keeps the interface
