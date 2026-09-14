@@ -29,7 +29,7 @@ func addQueryFlags(cmd *cobra.Command) {
 // page. `path` has none: its routes are bounded by the reason-path cap.
 func addPageFlags(cmd *cobra.Command) {
 	cmd.Flags().Int(queryLimitFlag, 0, "items in one page"+zeroBoundHelp)
-	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on that answer's generation")
+	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation is refused if the active generation has moved past the one it was issued against")
 }
 
 // pageRequest reads the page flags of a command that declares them.
