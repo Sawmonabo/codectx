@@ -704,6 +704,22 @@ func TestStorePublicationScenario(t *testing.T) {
 	if required, served, waived := summary("waived"); required != 2 || served != 2 || waived != 1 {
 		t.Fatalf("summary after waiving a required file = %d required %d served %d waived, want 2/2/1", required, served, waived)
 	}
+	// The waiver's reason survives only in coverage_waivers: Waive's return
+	// value echoes the request, so this read-back is what proves the stored row
+	// is what a sealed capsule carries.
+	waivers, err := f.s.Waivers(ctx, open.ID, actorID)
+	if err != nil {
+		t.Fatalf("Waivers: %v", err)
+	}
+	if len(waivers) != 1 || waivers[0].FileID != empty.id || waivers[0].Reason != "generated file reviewed out of band" ||
+		waivers[0].ActorID != actorID || waivers[0].CreatedAt.IsZero() {
+		t.Fatalf("Waivers read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
+	}
+	if _, err := f.s.Waivers(ctx, open.ID, "someone-else"); err == nil {
+		t.Fatal("Waivers answered for another actor; a waiver is never shared across actors")
+	} else {
+		wantCode(t, err, model.CodeActorMismatch)
+	}
 	if _, _, _, err := f.s.CoverageSummary(ctx, open.ID, "someone-else"); err == nil {
 		t.Fatal("CoverageSummary answered for another actor; coverage is never shared across actors")
 	} else {
