@@ -88,12 +88,7 @@ type Sessions interface {
 
 // The store is the production Sessions; the assertion keeps the interface
 // honest against it rather than discovering a drift at composition.
-//
-// L6 restores: RangeConfirmed and SessionFilePaths do not exist on *sqlite.Store
-// until L6 appends them to internal/storage/sqlite/state.go. Uncomment this line
-// in that lane -- it is the assertion that proves the append matches this
-// interface byte for byte.
-// var _ Sessions = (*sqlite.Store)(nil)
+var _ Sessions = (*sqlite.Store)(nil)
 
 // Compiler recompiles a manifest when Include extends a session's scope. The
 // pinned generation travels on the request, so this package never picks one.
