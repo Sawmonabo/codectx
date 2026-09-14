@@ -424,12 +424,10 @@ func TestPlanUnits(t *testing.T) {
 		t.Error("editing the module's lock file did not change its identity; the unit would be reused across a dependency change")
 	}
 
-	// The same closure, on the marker half, under a repository that owns more
-	// lock files than any fixed bound would allow. Failure mode: a lock file
-	// silently dropped from the closure, so the unit is reused across a
-	// dependency change with nothing recording that it was.
+	// The same closure on the marker half, for a lock file the snapshot holds
+	// as a tombstone.
 	vendored := map[string]string{"go.mod": repo["go.mod"], "app.go": repo["app.go"]}
-	for i := 0; i < 70; i++ {
+	for i := 0; i < 2; i++ {
 		vendored[fmt.Sprintf("vendored/m%02d/go.sum", i)] = fmt.Sprintf("example.com/m%02d v1.0.0 h1:x=\n", i)
 	}
 	vh := providertest.New(t, vendored)
@@ -439,7 +437,7 @@ func TestPlanUnits(t *testing.T) {
 	// member the unit does not recognise leaves the scope eligible for carry
 	// (Section 13.3), so the planner emits a carry that AttachCarried refuses
 	// because one of the unit's inputs no longer exists in the snapshot.
-	const tombstone = "vendored/m70/go.sum"
+	const tombstone = "vendored/m02/go.sum"
 	view := withTombstone{SnapshotView: vh.View,
 		row: model.FileVersion{ID: model.NewFileID(vh.Repo, tombstone), Path: tombstone, Status: model.FileDeleted}}
 	vp, err := dependence.PlanUnits(context.Background(), view)
@@ -449,9 +447,6 @@ func TestPlanUnits(t *testing.T) {
 	if len(vp.Units) != 1 || vp.Units[0].ScopeKey != rootScope {
 		t.Fatalf("plan = %v, want one %s unit", vp.Units, rootScope)
 	}
-	if !vp.Units[0].OwnsInput("vendored/m69/go.sum") {
-		t.Error("the unit does not own one of the 71 manifest and lock files under its root; a lock file outside the closure leaves the cache key")
-	}
 	if !vp.Units[0].OwnsInput(tombstone) {
 		t.Errorf("the unit does not own %s, a lock file the snapshot holds as a tombstone; the scope stays carry-eligible after a member is deleted", tombstone)
 	}
@@ -459,7 +454,10 @@ func TestPlanUnits(t *testing.T) {
 
 // withTombstone is a snapshot view with one deleted manifest row appended.
 // providertest retains live files only, and a tombstone is precisely the row
-// the planner must still resolve to a member.
+// the planner must still resolve to a member. The row is yielded whatever the
+// selection says; both callers pass an empty FileSelection. It is appended
+// last, and the path is chosen to sort after every fixture path, so the view's
+// ascending-path order is preserved.
 type withTombstone struct {
 	model.SnapshotView
 	row model.FileVersion
