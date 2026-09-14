@@ -14,6 +14,7 @@ package provider
 
 import (
 	"context"
+	"maps"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/workspace"
@@ -52,6 +53,40 @@ type Detection struct {
 	// UnitSpec.ProviderVersion so units are keyed by the tool that actually
 	// produced them; Descriptor() itself stays static.
 	ObservedVersion string `json:"observed_version,omitempty"`
+	// Details carry the machine-readable particulars of a detection that
+	// DiagnosticCode cannot hold, as bounded key/value pairs. A provider that
+	// covers several languages through several payloads is available as soon as
+	// one of them resolves, and then has no other place to say that another
+	// language's indexer is absent and why: it plans no unit for that language,
+	// so no capability row is ever produced for it either. One pair per
+	// affected input -- `details["rust-analyzer"] = "CTX_TOOL_OFFLINE"` --
+	// keeps that typed rather than silent.
+	Details map[string]string `json:"details,omitempty"`
+}
+
+// WithDetail returns the detection with one bounded diagnostic pair added, so
+// a provider can build its answer in one expression. It is
+// model.CapabilityState.WithDetail in shape and in bound: values are truncated
+// to model.MaxDetailBytes, the map is capped at model.MaxCapabilityDetails
+// entries, an empty key and an overflowing new key are both dropped, and the
+// map is copied rather than written through, because a Detection is a value
+// type a caller may already have copied.
+func (d Detection) WithDetail(key, value string) Detection {
+	if key == "" {
+		return d
+	}
+	if _, replacing := d.Details[key]; !replacing && len(d.Details) >= model.MaxCapabilityDetails {
+		return d
+	}
+	details := make(map[string]string, len(d.Details)+1)
+	maps.Copy(details, d.Details)
+	// The truncation is model's own. CapabilityState.WithDetail applies exactly
+	// the bound Validate checks below, and the helper underneath it is not
+	// exported, so borrowing the method keeps one implementation of the rule
+	// rather than a second copy that can drift from the bound it must satisfy.
+	details[key] = model.CapabilityState{}.WithDetail(key, value).Details[key]
+	d.Details = details
+	return d
 }
 
 // Validate enforces the detection shape against the provider's descriptor:
@@ -81,6 +116,14 @@ func (d Detection) Validate(desc model.ProviderDescriptor) error {
 	}
 	if len(d.ObservedVersion) > model.MaxIdentifierBytes {
 		return outputInvalid(desc.ID, "detection observed version exceeds its bound")
+	}
+	if len(d.Details) > model.MaxCapabilityDetails {
+		return outputInvalid(desc.ID, "detection carries more details than the bound")
+	}
+	for k, v := range d.Details {
+		if k == "" || len(k) > model.MaxIdentifierBytes || len(v) > model.MaxDetailBytes {
+			return outputInvalid(desc.ID, "detection detail key or value is empty or exceeds its bound")
+		}
 	}
 	if len(d.InputPaths) > MaxDetectionInputs {
 		return outputInvalid(desc.ID, "detection lists more inputs than the bound")
