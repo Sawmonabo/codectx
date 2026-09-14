@@ -871,3 +871,33 @@ func (p CapsulePage) Validate() error {
 	}
 	return nil
 }
+
+// CapsuleRequest pages one projection of a session's sealed capsule, the
+// request type CapsuleView has lacked. Like every other session operation it
+// names the actor explicitly (Section 16.1): one subagent's capsule is never
+// readable through another's request.
+type CapsuleRequest struct {
+	SessionID SessionID   `json:"session_id"`
+	ActorID   string      `json:"actor_id"`
+	View      CapsuleView `json:"view"`
+	Page      PageRequest `json:"page"`
+}
+
+// Validate enforces the request shape. There is no generation on it for the
+// same reason ContextPageRequest carries none: the session already pins one and
+// the caller cannot repin it.
+func (r CapsuleRequest) Validate() error {
+	if err := requireID("capsule_request.session_id", string(r.SessionID)); err != nil {
+		return err
+	}
+	if err := requireTrimmed("capsule_request.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if !r.View.Valid() {
+		return invalid("capsule_request.view %q is not a known capsule view", truncateForMessage(string(r.View)))
+	}
+	if err := r.Page.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
