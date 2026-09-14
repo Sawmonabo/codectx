@@ -13,6 +13,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/source"
+	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
 // serverState is the lifecycle of one language server process.
@@ -135,9 +136,11 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		mat.Close()
 		return nil, unavailable("language server %q work directory cannot be created: %v", p.Name, err)
 	}
-	if p.Name == serverJDTLS {
+	if p.Name == serverJDTLS && p.Tool.Source == toolchain.SourceManaged {
 		// The one payload that needs a private copy of something out of the
-		// store before it can start; see seedPlatformConfig.
+		// store before it can start; see seedPlatformConfig. An override has no
+		// store payload to seed from -- it replaces the binary and owns its own
+		// launch -- so the copy is the managed payload's alone.
 		if err := seedPlatformConfig(p.Tool.Root, workDir); err != nil {
 			mat.Close()
 			return nil, err

@@ -1,7 +1,9 @@
 package lsp
 
 import (
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,9 +44,9 @@ const maxPlatformConfigBytes = 4 << 20
 // Equinox configuration underneath a running server would corrupt its state.
 func seedPlatformConfig(payloadRoot, workDir string) error {
 	dst := filepath.Join(workDir, "config")
-	if _, err := os.Stat(dst); err == nil {
+	if _, err := os.Lstat(dst); err == nil {
 		return nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return unavailable("the language server configuration directory cannot be inspected: %v", err)
 	}
 	name, ok := platformConfigDirs[runtime.GOOS+"/"+runtime.GOARCH]
@@ -64,7 +66,7 @@ func seedPlatformConfig(payloadRoot, workDir string) error {
 	if err := copyConfigTree(src, staging, &budget); err != nil {
 		return err
 	}
-	if err := os.Rename(staging, dst); err != nil && !os.IsExist(err) {
+	if err := os.Rename(staging, dst); err != nil && !errors.Is(err, fs.ErrExist) {
 		// Another start of the same server won the race; its copy is as good as
 		// this one, and the caller is about to use it.
 		if _, serr := os.Stat(dst); serr != nil {

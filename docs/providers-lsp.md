@@ -74,8 +74,8 @@ would never boot. They are the application identity Eclipse expects
 `-Declipse.product=org.eclipse.jdt.ls.core.product`) and the module openings
 jdt.ls reflects through (`--add-modules=ALL-SYSTEM`, `--add-opens
 java.base/java.util=ALL-UNNAMED`, `--add-opens
-java.base/java.lang=ALL-UNNAMED`). Setting them on a payload that is not
-runtime-hosted is a product defect and `Resolve` refuses it with
+java.base/java.lang=ALL-UNNAMED`). Setting them on a *pinned* payload that is
+not runtime-hosted is a product defect and `Resolve` refuses it with
 `CTX_INTERNAL`. The second is the configuration directory: Equinox **writes**
 into whatever `-configuration` names, so `${work_dir}/config` is a private copy
 seeded once from the payload's own `config_linux`/`config_mac`/`config_win`
@@ -84,6 +84,13 @@ three starts left four new paths inside the store's published,
 digest-identified version directory while `codectx tools verify` still reported
 `14 installed`, exit 0 — verify rehashes the pinned entry, not the payload
 tree.
+
+Both specials belong to the pinned payload alone. A `[tools.override.jdtls]`
+is run directly, with no managed runtime composed around it and no payload tree
+to seed from, so the runtime arguments are dropped from its argv (which changes
+`input_digest`, correctly: a different invocation is a different question) and
+no configuration is copied. An override replaces the binary and never the
+invocation; a wrapper script that needs JVM options passes its own.
 
 **Verification status.** All six servers were run through `lsp.Resolve` +
 `Manager.Open` on `linux/amd64` against a fixture of their own language, over
