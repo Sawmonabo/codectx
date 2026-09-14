@@ -49,7 +49,10 @@ type Spec struct {
 	Env []string
 	// Stdin is the optional bounded input. At most MaxStdinBytes are copied and
 	// the child's stdin is then closed, so a child cannot stall the parent by
-	// refusing to read.
+	// refusing to read. A Stdin that implements io.Closer is closed when the
+	// run ends -- on every path, not only on a failure -- so the runner takes
+	// ownership of it: hand it a reader whose lifetime is this run, never one
+	// the caller reads again afterwards.
 	Stdin         io.Reader
 	MaxStdinBytes int64
 	// Stdout and Stderr optionally receive the streams. When either is nil the
@@ -641,6 +644,12 @@ func (p *stdinPump) stop(grace time.Duration) error {
 
 func (p *stdinPump) closeBoth() {
 	p.closeOnce.Do(func() {
+		// A caller-supplied reader is the only thing the pump can still be
+		// parked inside after both pipe ends are gone; closing it is what
+		// releases that goroutine.
+		if c, ok := p.src.(io.Closer); ok {
+			c.Close()
+		}
 		p.dst.Close()
 		p.childEnd.Close()
 	})

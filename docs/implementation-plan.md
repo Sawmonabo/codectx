@@ -885,7 +885,7 @@ export: <engine>-export <private cpg> --repr=all --format=neo4jcsv --out <privat
 
 One parse handles exactly one language, so the coordinator schedules one unit per (language, frontend-native project): a Go module, a Maven or Gradle module, a `package.json`/`tsconfig.json` project, a Python package with its environment, a Cargo package (which needs `cargo` on the engine's allowlisted PATH). C and C++ are one unit per repository with real include paths, because header resolution spans the whole tree. A call whose target lives in another unit keeps its edge and the callee's fully qualified name on an external stub; the reconciler aliases that stub to the real declaration from the other unit or from SCIP. The single `all` export already carries every edge family the provider imports (`CALL`, `CDG`, `REACHING_DEF`, `CONTAINS`); no second export exists, and `--repr=pdg|cdg|ddg` is not implemented for CSV or GraphML in the pinned engine.
 
-The provider never delays base readiness. Nothing runs before the base generation is active. With `providers.dependence.enabled = "auto"` (the default), the coordinator then enqueues every dependence unit as low-priority background work under the resource governor; a query that asks for a dependence fact promotes its units to the front of that queue and answers with a typed `pending` capability (unit count, position, estimate) until they seal. `true` blocks the index on the units; `false` disables the provider. A sealed dependence unit never mutates the active generation: the coordinator builds a new generation from the active generation's units plus the sealed unit, validates it, and activates it atomically through the same path a refresh uses (Section 13.1); seals landing in one scheduler tick coalesce into one generation, and the `pending` answer becomes a real answer exactly at activation. The parsed graph is cached per unit under the private data directory and reused across generations, so unchanged code pays nothing on refresh. The cache key is the complete semantic closure: the unit's source file hashes, its manifest and lock files (`go.mod`/`go.sum`, `package.json`/lockfile/`tsconfig.json`, `pyproject.toml`/`requirements*.txt`, `Cargo.toml`/`Cargo.lock`, `compile_commands.json` and include paths), the frontend argv including excludes and the definition cap, the engine payload digest, and the runtime payload digest. Any of these changing invalidates the unit.
+The provider never delays base readiness. Nothing runs before the base generation is active, and nothing is installed when the workspace is opened: the backend construction resolves the analysis payload only if the store already holds it, keeps the payload's pinned identity otherwise, and the first unit that needs the engine fetches it at unit time. With `providers.dependence.enabled = "auto"` (the default), the coordinator then enqueues every dependence unit as low-priority background work under the resource governor; a query that asks for a dependence fact promotes its units to the front of that queue and answers with a typed `pending` capability (unit count, position, estimate) until they seal. A one-shot building command is not exempt from that queue: `codectx index` and `codectx refresh` alike print their own generation as soon as it activates, then drain the deferred queue to empty, printing one line per publication, and exit. An interrupted run keeps that generation and every generation already published and reports the pending unit count; `providers.dependence.enabled = false` is the opt-out, and there is no flag that skips the drain while still planning the work. `true` blocks the index on the units; `false` disables the provider. A sealed dependence unit never mutates the active generation: the coordinator builds a new generation from the active generation's units plus the sealed unit, validates it, and activates it atomically through the same path a refresh uses (Section 13.1); seals landing in one scheduler tick coalesce into one generation, and the `pending` answer becomes a real answer exactly at activation. The parsed graph is cached per unit under the private data directory and reused across generations, so unchanged code pays nothing on refresh. The cache key is the complete semantic closure: the unit's source file hashes, its manifest and lock files (`go.mod`/`go.sum`, `package.json`/lockfile/`tsconfig.json`, `pyproject.toml`/`requirements*.txt`, `Cargo.toml`/`Cargo.lock`, `compile_commands.json` and include paths), the frontend argv including excludes and the definition cap, the engine payload digest, and the runtime payload digest. Any of these changing invalidates the unit.
 
 Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin, further bounded only by an explicit user limit (`unit_memory_ceiling_bytes` set by the user; `0` means machine-derived). Only that explicit user limit may reject a unit before it runs. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. Heavy analyzers run one at a time by default (`max_concurrent_heavy_analyzers = 1`); the scheduler admits a second only when the sum of reservations fits the machine-derived allocation. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-round3-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. The provider captures stderr, parses any remaining skip warnings, and publishes `data_flows_to` as `partial` with the count and the skipped method names.
 
@@ -972,7 +972,7 @@ Initialize one current schema from embedded `schema.sql`. Store its version and 
 
 The physical model stores source manifests separately from reusable analysis units. `generation_units` selects one immutable unit per provider/scope. Node/relation identity dictionaries are not themselves visible facts; queries join through visible unit membership. Reusing a unit preserves evidence, aliases, and search documents. Numeric unit row IDs are compact internal join keys; exported UnitID is its 32-byte key encoded as hex. Provider run provenance outlives the creating generation when a retained unit still references it.
 
-The following is the complete initial DDL, including workflow/coverage state. Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
+The following is the complete DDL, kept byte-identical to `internal/storage/sqlite/schema.sql` (the embedded schema whose SHA-256 is the store fingerprint); it includes workflow/coverage state and the delta tables (`fact_keys`, `unit_delta_state`). Logical range, ownership, visibility, JSON shape, completeness, and state-transition checks that require joins are additionally enforced by the single store API at unit seal/publication or mutation. No provider gets a SQL handle.
 
 ```sql
 CREATE TABLE schema_meta (
@@ -1036,10 +1036,18 @@ CREATE TABLE snapshot_files (
     CHECK((status = 'deleted' AND content_hash IS NULL AND size_bytes = 0)
        OR (status <> 'deleted' AND content_hash IS NOT NULL))
 ) WITHOUT ROWID;
+-- generations.ref is the ref the generation was built from (Section 12.4):
+-- retention keeps the last retain_refs DISTINCT refs the user actually
+-- indexed, not the last N generations, which is what makes A -> B -> C -> A
+-- find A's units still on disk. The value is the caller's: a branch name, the
+-- HEAD object id when HEAD is detached, or the fixed sentinel '(none)' for a
+-- workspace that is not a Git repository. Storage never interprets it, only
+-- groups by it.
 CREATE TABLE generations (
     id INTEGER PRIMARY KEY,
     repository_id BLOB NOT NULL REFERENCES repositories(id),
     snapshot_id BLOB NOT NULL,
+    ref TEXT NOT NULL CHECK(length(ref) > 0),
     analysis_key BLOB CHECK(analysis_key IS NULL OR length(analysis_key) = 32),
     semantic_config_hash TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('staging','active','superseded','failed')),
@@ -1092,14 +1100,27 @@ CREATE TABLE unit_dependencies (
     PRIMARY KEY(unit_id, dependency_id),
     CHECK(unit_id <> dependency_id)
 ) WITHOUT ROWID;
+-- carried marks the Section 13.3 stale-with-distance member: the scope's
+-- previous sealed unit, kept in the generation while its fresh rebuild is
+-- still running. Such a unit's inputs differ from the generation's snapshot by
+-- definition, so AttachCarried admits it where AttachUnit refuses, and the two
+-- distance columns record how far behind it is (generations, and changed files
+-- between its snapshot and this one). All three columns are folded into the
+-- membership digest, and therefore into the AnalysisKey: without them a
+-- generation carrying a stale unit would be byte-identical to one that rebuilt
+-- it, and a stale answer would be indistinguishable from a fresh one.
 CREATE TABLE generation_units (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     provider_id TEXT NOT NULL,
     scope_key TEXT NOT NULL,
     unit_id INTEGER NOT NULL,
+    carried INTEGER NOT NULL CHECK(carried IN (0,1)),
+    distance_generations INTEGER NOT NULL CHECK(distance_generations >= 0),
+    distance_files INTEGER NOT NULL CHECK(distance_files >= 0),
     PRIMARY KEY(generation_id, provider_id, scope_key),
     UNIQUE(generation_id, unit_id),
-    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key)
+    FOREIGN KEY(unit_id, provider_id, scope_key) REFERENCES units(id, provider_id, scope_key),
+    CHECK(carried = 1 OR (distance_generations = 0 AND distance_files = 0))
 ) WITHOUT ROWID;
 CREATE TABLE generation_capabilities (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
@@ -1108,6 +1129,7 @@ CREATE TABLE generation_capabilities (
     scope_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK(state IN ('fresh','partial','stale','unavailable','failed')),
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
 CREATE TABLE node_ids (
@@ -1147,6 +1169,23 @@ CREATE TABLE relation_facts (
     relation_id BLOB NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
+-- fact_keys carries the producer's own id-independent delta keys for one fact
+-- (Section 11.4). A fact is backed by every key that produced it, not by one:
+-- a canonical edge is published once but is derived from N occurrences, each
+-- with its own key, and a refresh re-emits the whole fact when any of them
+-- changes. A carry-over therefore keeps a fact unless ANY of its keys is
+-- replaced, which is the same condition the producer re-emits on, so the fresh
+-- and carried sets partition exactly. A fact with no row here carries no key
+-- and can only be replaced by its retention bucket.
+CREATE TABLE fact_keys (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    node_id BLOB,
+    relation_id BLOB,
+    fact_key TEXT NOT NULL,
+    FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
+    FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
+    CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
+);
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
@@ -1158,14 +1197,22 @@ CREATE TABLE evidence (
     end_byte INTEGER,
     native_key TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
+    content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL)),
+    CHECK(content_hash_bound = 0 OR file_id IS NOT NULL),
     CHECK((start_byte IS NULL AND end_byte IS NULL)
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 );
+CREATE TABLE unit_delta_state (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY(unit_id, kind)
+) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key TEXT NOT NULL,
@@ -1351,6 +1398,9 @@ CREATE TABLE retention_leases (
     CHECK(generation_id IS NOT NULL OR snapshot_id IS NOT NULL)
 );
 CREATE INDEX idx_generation_snapshot ON generations(snapshot_id);
+-- Retention ranks a repository's refs by the most recent generation each was
+-- activated for, then sweeps everything below the retain_refs cut.
+CREATE INDEX idx_generation_ref ON generations(repository_id, ref, activated_at);
 CREATE INDEX idx_generation_units_unit ON generation_units(unit_id, generation_id);
 CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
@@ -1361,9 +1411,19 @@ CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
+CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
+CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
+CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
+CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
 CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
+-- The identity sweep in unit deletion asks, per candidate node, whether any
+-- alias still points at it. Without this index that question is a full scan of
+-- native_aliases per node, which is quadratic in the size of the unit being
+-- deleted; the same holds for a manifest entry's node.
+CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
+CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
@@ -1387,7 +1447,7 @@ Storage invariants beyond DDL:
 
 The indexing lock is held from snapshot capture through publication. Seal each bounded unit only after its source and references are validated. Required provider failure aborts the staging generation. An optional provider can contribute completed independent units only when it explicitly reports their coverage; a malformed unit is not partially admitted. A failure must not keep old facts whose input hashes no longer match.
 
-Before publication, calculate the AnalysisKey from the sorted selected unit keys, source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
+Before publication, calculate the AnalysisKey from the sorted membership rows — each selected unit key together with its `carried` marker and provenance distance (`distance_generations`, `distance_files`), so a generation carrying a stale unit never shares a key with an all-fresh generation of the same units (Section 13.3) — the source snapshot, complete capability report, normalization/schema/config fingerprints, and ranking-relevant inputs. Validate foreign keys and domain invariants, visible endpoints, mandatory provider coverage, source availability, and all required input bindings. Record a validation digest tied to that exact membership; the membership is frozen before the pointer transaction.
 
 ```sql
 BEGIN IMMEDIATE;
@@ -1795,9 +1855,10 @@ Canonical capsule hashing excludes operational timestamps, local generation/run 
 ```text
 codectx init [path] [--force]
 codectx doctor [path] [--offline] [--deep] [--json]
-codectx index [path] [--full] [--rebuild] [--watch] [--json]
-codectx refresh [path] [--json]
-codectx status [path] [--json]
+codectx index [--repo PATH] [--full] [--rebuild] [--watch] [--json]
+codectx refresh [paths...] [--repo PATH] [--json]
+codectx status [--repo PATH] [--json]
+codectx watch [--repo PATH] [--json]
 codectx repo-map [path] [--depth N] [--limit N] [--cursor TOKEN] [--json]
 codectx search <query> [--kind K] [--language L] [--limit N] [--cursor TOKEN] [--json]
 codectx symbol <name-or-id> [--limit N] [--cursor TOKEN] [--json]

@@ -4,16 +4,26 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/index"
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
+	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // TestMain makes this test binary the parser worker, as the codectx binary
@@ -134,5 +144,144 @@ func TestParserResourcePlateau(t *testing.T) {
 		} else if !errors.Is(err, syscall.ESRCH) && !errors.Is(err, syscall.EPERM) {
 			t.Fatalf("probing pid %d: %v", pid, err)
 		}
+	}
+}
+
+// TestIncrementalReuse measures the Section 13.1 plateau at the other end of
+// the product: a no-op refresh over an already indexed repository must reuse
+// every unit, parse nothing and rewrite no lexical body, and must therefore
+// cost a small fraction of the cold index.
+//
+// Failure mode: a coordinator that rebuilds units whose inputs did not move
+// turns every refresh into a cold index -- the "secretly rerun every base
+// provider over the full repository on each small edit" Section 13.1 forbids.
+// It is measured here rather than only asserted in internal/index because the
+// cost, not the count, is what makes the difference visible: a reuse path that
+// still parses would pass a count assertion if it rebuilt nothing but read
+// everything.
+func TestIncrementalReuse(t *testing.T) {
+	if testing.Short() {
+		t.Skip("incremental reuse benchmark; run without -short")
+	}
+	const files = 400
+	ctx := context.Background()
+	dir := t.TempDir()
+	repoDir, dataDir := filepath.Join(dir, "repo"), filepath.Join(dir, "data")
+	source, err := os.ReadFile(filepath.Join("..", "provider", "treesitter", "testdata", "sample.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range files {
+		abs := filepath.Join(repoDir, "pkg", fmt.Sprintf("f%03d", i), "sample.go")
+		if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, source, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "go.mod"), []byte("module example.com/bench\n\ngo 1.27\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Defaults()
+	cfg.Storage.DataDir = dataDir
+	cfg.Providers.SCIP.Enabled = config.Disabled
+	cfg.Providers.LSP.Enabled = config.Disabled
+	cfg.Providers.Dependence.Enabled = config.Disabled
+
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := snapshot.LockWorkspace(ctx, dataDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	root, err := workspace.Discover(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsers := filepath.Join(dataDir, "parsers")
+	if err := os.MkdirAll(parsers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
+		WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := provider.NewRegistry(fs, mf, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := provider.NewPool(cfg.Index.QueueBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
+		CAS: cas, Lock: lock, Pool: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	started := time.Now()
+	cold, err := c.Index(ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("cold index: %v", err)
+	}
+	coldFor := time.Since(started)
+	started = time.Now()
+	refreshed, err := c.Refresh(ctx, nil)
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	refreshFor := time.Since(started)
+	t.Logf("cold: %d units built, %d files parsed in %s; refresh: %d reused, %d built, %d parsed in %s",
+		cold.UnitsBuilt, cold.FilesParsed, coldFor, refreshed.UnitsReused, refreshed.UnitsBuilt,
+		refreshed.FilesParsed, refreshFor)
+	// That the refresh rebuilt and reparsed nothing is proven by
+	// TestIncrementalScenario's no-op leg in internal/index, which also checks
+	// unit identity and the FTS document count; repeating those counts here
+	// would add nothing. The reuse count stays because the ratio below is only
+	// meaningful as a statement about the same work.
+	if refreshed.UnitsReused != cold.UnitsBuilt {
+		t.Fatalf("the refresh reused %d of the %d units the cold index built", refreshed.UnitsReused, cold.UnitsBuilt)
+	}
+	// The cost, not the count, is what this test exists for. A generous margin
+	// keeps it from failing on a loaded machine, where the measured ratio was
+	// 13x.
+	if refreshFor*4 > coldFor {
+		t.Fatalf("the no-op refresh took %s against a %s cold index; reuse is not paying for itself", refreshFor, coldFor)
 	}
 }

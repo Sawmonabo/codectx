@@ -3,6 +3,8 @@ package dependence_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -10,10 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/provider/providertest"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // repo is one Go module with a nested module. It exercises the two planning
@@ -94,7 +100,7 @@ func (b *fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (d
 type fakeImporter struct{ report dependence.ImportReport }
 
 func (f fakeImporter) Import(ctx context.Context, dir string, res provider.Resolver,
-	sink provider.Sink, opts dependence.ImportOptions) (dependence.ImportReport, error) {
+	sink provider.Sink, opts neo4jcsv.Options) (dependence.ImportReport, error) {
 
 	cand := model.NodeCandidate{ProviderID: dependence.ProviderID, ScopeKey: opts.UnitScopeKey,
 		NativeKey: "method:Run", Kind: model.NodeFunction, Language: opts.Language, Name: "Run"}
@@ -399,6 +405,126 @@ func TestPlanUnits(t *testing.T) {
 		t.Errorf("outer module folded %d files and %d bytes; the governor sizes the heap cap from these",
 			plan[0].Files, plan[0].Bytes)
 	}
+
+	// A unit's cache key and its planned identity are its semantic closure and
+	// nothing else (Section 11.6). Failure mode on the wide side: a
+	// documentation edit invalidates the heaviest unit in the product, which is
+	// a full engine parse and export. Failure mode on the narrow side, which is
+	// the one that corrupts answers: a source file or a lock file leaves the
+	// key, so the unit is reused across a change it never saw and serves stale
+	// dependence facts as fresh.
+	base := dependenceUnitID(t, repo)
+	if got := dependenceUnitID(t, edited(repo, "docs/overview.md", "# overview, revised\n")); got != base {
+		t.Error("editing a documentation file changed the dependence unit's identity; every README edit would reparse the module")
+	}
+	if got := dependenceUnitID(t, edited(repo, "app.go", "package app\n\nfunc Run(x int) int { return x }\n")); got == base {
+		t.Error("editing the module's own source did not change its identity; the unit would be reused across a source change")
+	}
+	if got := dependenceUnitID(t, edited(repo, "go.sum", "example.com/dep v1.2.3 h1:abc=\n")); got == base {
+		t.Error("editing the module's lock file did not change its identity; the unit would be reused across a dependency change")
+	}
+
+	// The same closure on the marker half, for a lock file the snapshot holds
+	// as a tombstone.
+	vendored := map[string]string{"go.mod": repo["go.mod"], "app.go": repo["app.go"]}
+	for i := 0; i < 2; i++ {
+		vendored[fmt.Sprintf("vendored/m%02d/go.sum", i)] = fmt.Sprintf("example.com/m%02d v1.0.0 h1:x=\n", i)
+	}
+	vh := providertest.New(t, vendored)
+	// A lock file the previous generation's unit declared and this snapshot
+	// holds as a tombstone. Failure mode, and the reason membership is a
+	// predicate rather than a list built from the live manifest: a deleted
+	// member the unit does not recognise leaves the scope eligible for carry
+	// (Section 13.3), so the planner emits a carry that AttachCarried refuses
+	// because one of the unit's inputs no longer exists in the snapshot.
+	const tombstone = "vendored/m02/go.sum"
+	view := withTombstone{SnapshotView: vh.View,
+		row: model.FileVersion{ID: model.NewFileID(vh.Repo, tombstone), Path: tombstone, Status: model.FileDeleted}}
+	vp, err := dependence.PlanUnits(context.Background(), view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vp.Units) != 1 || vp.Units[0].ScopeKey != rootScope {
+		t.Fatalf("plan = %v, want one %s unit", vp.Units, rootScope)
+	}
+	if !vp.Units[0].OwnsInput(tombstone) {
+		t.Errorf("the unit does not own %s, a lock file the snapshot holds as a tombstone; the scope stays carry-eligible after a member is deleted", tombstone)
+	}
+}
+
+// withTombstone is a snapshot view with one deleted manifest row appended.
+// providertest retains live files only, and a tombstone is precisely the row
+// the planner must still resolve to a member. The row is yielded whatever the
+// selection says; both callers pass an empty FileSelection. It is appended
+// last, and the path is chosen to sort after every fixture path, so the view's
+// ascending-path order is preserved.
+type withTombstone struct {
+	model.SnapshotView
+	row model.FileVersion
+}
+
+func (v withTombstone) EachFile(ctx context.Context, sel model.FileSelection, fn func(model.FileVersion) error) error {
+	if err := v.SnapshotView.EachFile(ctx, sel, fn); err != nil {
+		return err
+	}
+	return fn(v.row)
+}
+
+// planStub is the dependence provider as the planner sees it. The planner
+// dispatches on descriptor identity and asks a dependence provider nothing
+// else -- the scopes come from dependence.PlanUnits over the snapshot -- so
+// the closure rows above need no engine.
+type planStub struct{}
+
+func (planStub) Descriptor() model.ProviderDescriptor {
+	return model.ProviderDescriptor{ID: dependence.ProviderID, Version: "planstub",
+		Capabilities: dependence.Capabilities, InvalidationScope: model.InvalidationPackage}
+}
+
+func (planStub) Detect(context.Context, workspace.Root, workspace.Policy) (provider.Detection, error) {
+	return provider.Detection{}, errors.New("the planner never detects")
+}
+
+func (planStub) IndexUnit(context.Context, provider.UnitRequest, provider.Sink) (model.ProviderResult, error) {
+	return model.ProviderResult{}, errors.New("the planner never runs a unit")
+}
+
+// dependenceUnitID plans files through the real planner and folds the identity
+// of the root module's unit, which is what reuse compares byte for byte. Two
+// harnesses over the same content mint the same identities (providertest fixes
+// the repository id for exactly this comparison), so a difference here is a
+// difference in the closure and nothing else.
+func dependenceUnitID(t *testing.T, files map[string]string) model.UnitID {
+	t.Helper()
+	h := providertest.New(t, files)
+	cfg := config.Defaults()
+	p, err := plan.Build(context.Background(), plan.Inputs{View: h.View, Store: h.Store, Config: cfg,
+		Selection: provider.Selection{Active: []provider.Provider{planStub{}},
+			Detections: map[string]provider.Detection{dependence.ProviderID: {Available: true,
+				Capabilities: dependence.Capabilities}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range p.Units {
+		if u.ScopeKey != rootScope {
+			continue
+		}
+		spec, err := u.Spec(cfg.AnalysisConfigHash())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return spec.ID
+	}
+	t.Fatalf("the planner planned no %s unit", rootScope)
+	return ""
+}
+
+// edited is files with one path's content replaced. It copies, because the
+// fixture map is shared with every other row in this file.
+func edited(files map[string]string, path, content string) map[string]string {
+	out := maps.Clone(files)
+	out[path] = content
+	return out
 }
 
 // TestGovernorRetriesOnceAndOnlyHigher protects the memory ruling: there is no
@@ -451,4 +577,42 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if capped.Reject(capped.Reserve(dependence.FamilyC, 1<<30, plenty), rootScope) == nil {
 		t.Error("an explicit ceiling did not reject a unit that does not fit it")
 	}
+
+	// Admission is the other half of the same ruling: a reservation orders and
+	// serializes heavy work, and two heavy analyzers run together only when
+	// their reservations sum inside the machine-derived allocation. Failure
+	// mode: admission grants two heavy analyzers whose summed reservations
+	// exceed the allocation, so an indexing run OOM-kills the machine.
+	//
+	// maxHeavy is 2 here on purpose: at the default of 1 the count alone would
+	// serialize the second unit and the memory gate would never be exercised.
+	sched := plan.NewScheduler(2, plenty)
+	heavy := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
+	if 2*heavy.Bytes() <= heavy.AllocationBytes {
+		t.Fatalf("two %d-byte reservations fit the %d-byte allocation; this row no longer proves the gate",
+			heavy.Bytes(), heavy.AllocationBytes)
+	}
+	release, err := sched.Admit(context.Background(), heavy)
+	if err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	blocked, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, err := sched.Admit(blocked, heavy); err == nil {
+		t.Error("admission granted a second heavy analyzer whose reservation does not fit beside the first")
+	}
+	// The first slot back is what lets the queue move: a reservation never
+	// refuses work, it only orders it.
+	release()
+	release() // releasing twice must not free a slot that was never taken
+	second, err := sched.Admit(context.Background(), heavy)
+	if err != nil {
+		t.Fatalf("Admit after release: %v", err)
+	}
+	stillBlocked, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel2()
+	if _, err := sched.Admit(stillBlocked, heavy); err == nil {
+		t.Error("releasing one admission twice freed a slot that was never taken")
+	}
+	second()
 }

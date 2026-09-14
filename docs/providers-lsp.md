@@ -318,13 +318,11 @@ does not have to rediscover it.
   language server here, and when it elapses the runner terminates the tree and
   the next `Open` starts a fresh server. An operator approving a server for
   interactive use approves a `timeout` of that length.
-- **`Options.MaxOverlayBytes` has no configuration key yet** and defaults to
-  512 MiB. It bounds the materialized snapshot, the pinned bytes cached for
-  coordinate conversion, and the bytes exchanged with the server over its
-  lifetime — all three separately. The composer (Task 20) is expected to
-  derive it from a resource setting, for example a share of
-  `resources.max_temp_bytes`, rather than leaving the package default in
-  place.
+- **`Options.MaxOverlayBytes` is set from `providers.lsp.max_overlay_bytes`**
+  (default 512 MiB, validated to be at least
+  `resources.max_source_response_bytes`). It bounds the materialized snapshot,
+  the pinned bytes cached for coordinate conversion, and the bytes exchanged
+  with the server over its lifetime — all three separately.
 - **`jdtls` writes into `work_dir` by design.** Its default argv is
   `-data ${work_dir}`, so the private working directory is also its workspace
   data directory and it accumulates state there across runs. Approving
