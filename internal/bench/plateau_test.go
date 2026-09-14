@@ -270,15 +270,17 @@ func TestIncrementalReuse(t *testing.T) {
 	t.Logf("cold: %d units built, %d files parsed in %s; refresh: %d reused, %d built, %d parsed in %s",
 		cold.UnitsBuilt, cold.FilesParsed, coldFor, refreshed.UnitsReused, refreshed.UnitsBuilt,
 		refreshed.FilesParsed, refreshFor)
-	if refreshed.UnitsBuilt != 0 || refreshed.FilesParsed != 0 {
-		t.Fatalf("a no-op refresh built %d units and parsed %d files", refreshed.UnitsBuilt, refreshed.FilesParsed)
-	}
+	// That the refresh rebuilt and reparsed nothing is proven by
+	// TestIncrementalScenario's no-op leg in internal/index, which also checks
+	// unit identity and the FTS document count; repeating those counts here
+	// would add nothing. The reuse count stays because the ratio below is only
+	// meaningful as a statement about the same work.
 	if refreshed.UnitsReused != cold.UnitsBuilt {
 		t.Fatalf("the refresh reused %d of the %d units the cold index built", refreshed.UnitsReused, cold.UnitsBuilt)
 	}
-	// The counts above carry the invariant; this only has to be unambiguous.
-	// A generous margin keeps it from failing on a loaded machine, where the
-	// measured ratio was 13x.
+	// The cost, not the count, is what this test exists for. A generous margin
+	// keeps it from failing on a loaded machine, where the measured ratio was
+	// 13x.
 	if refreshFor*4 > coldFor {
 		t.Fatalf("the no-op refresh took %s against a %s cold index; reuse is not paying for itself", refreshFor, coldFor)
 	}

@@ -340,6 +340,31 @@ func (g *Git) ListIndex(ctx context.Context, root string, maxEntries int64, visi
 	return g.stream(ctx, root, nil, p, maxEntries, "ls-files", "-z", "-s", "-t")
 }
 
+// ListIgnoredRoots streams the outermost ignored paths of the worktree
+// (`git ls-files -z --others --ignored --directory --exclude-standard`) to
+// visit: a wholly ignored directory arrives once, as the directory itself with
+// a trailing slash, and an individually ignored untracked file arrives as that
+// file.
+//
+// Only untracked paths are listed, which is what makes the answer usable as a
+// traversal exclusion: Section 10.2 requires a tracked file to win over an
+// ignore match, and a tracked file is never in this output no matter what the
+// ignore rules say.
+//
+// The listing is bounded by maxEntries exactly as every other listing here is,
+// and a repository that exceeds it is a typed resource limit rather than a
+// truncated answer that would silently admit ignored trees.
+func (g *Git) ListIgnoredRoots(ctx context.Context, root string, maxEntries int64, visit func(string) error) error {
+	p := newParser(func(record []byte) error {
+		if len(record) == 0 {
+			return corruptOutput("ls-files", record)
+		}
+		return visit(string(record))
+	})
+	return g.stream(ctx, root, nil, p, maxEntries,
+		"ls-files", "-z", "--others", "--ignored", "--directory", "--exclude-standard")
+}
+
 // Status streams every path that differs from HEAD, and every untracked
 // non-ignored path when untracked is set, to visit. Rename detection is off so
 // a rename arrives as a deletion and an addition, matching path identity.
