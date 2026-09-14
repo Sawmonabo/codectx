@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -68,37 +69,103 @@ const (
 // The probe only needs to know whether there is a first data row.
 const maxProbeBytes = 64 << 10
 
-// Backend is the engine adapter. It holds the payload the locator resolved and
-// the shared process runner; it starts nothing else and owns no state.
+// Backend is the engine adapter. It holds the payload's identity, the locator
+// that can produce its command lines, and the shared process runner; it starts
+// nothing else and owns no state beyond the memoized resolution.
 type Backend struct {
-	engine dependence.Engine
-	runner *process.Runner
+	locator *Locator
+	runner  *process.Runner
+
+	// identity is what the payload *is* -- version, payload digest, runtime
+	// digest -- fixed at construction and the same string whether the payload
+	// was installed before this process started or during it. Section 11.6
+	// keys the graph cache and the provider descriptor on it, so it must not
+	// depend on when the bytes arrived.
+	identity dependence.Engine
+
+	// once resolves the command lines on first use. The error is memoized with
+	// them: a payload that could not be installed is not re-attempted once per
+	// unit, which on a cold machine would be one multi-gigabyte fetch attempt
+	// per language family rather than one.
+	once       sync.Once
+	resolved   dependence.Engine
+	resolveErr error
 }
 
-// New resolves the engine payload once and binds it to the shared runner. The
-// payload's name, version and digest come from the toolchain lock that
-// installed it: the pinned release has no noninteractive version flag
-// (`joern-parse --version` is rejected as an unknown option and `joern
-// --version` opens the interactive console), so a version probe would be a
-// guess dressed as a measurement.
-func New(ctx context.Context, locator dependence.EngineLocator, runner *process.Runner) (*Backend, error) {
+// New binds the engine's identity to the shared runner without installing
+// anything. The payload's version and digest come from the toolchain lock: the
+// pinned release has no noninteractive version flag (`joern-parse --version` is
+// rejected as an unknown option and `joern --version` opens the interactive
+// console), so a version probe would be a guess dressed as a measurement.
+//
+// A payload the store already holds is described here and used as it was
+// resolved. A payload the lock pins but the store does not hold is *not*
+// fetched: construction keeps the pinned identity and the first Parse or
+// Export resolves the command lines, which is what installs it. Section 11.6's
+// "the provider never delays base readiness" is a guarantee about
+// OpenWorkspace, and resolving here broke it by roughly two gigabytes on every
+// cold open.
+func New(ctx context.Context, locator *Locator, runner *process.Runner) (*Backend, error) {
 	if locator == nil || runner == nil {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the dependence backend needs an engine locator and the shared process runner"}
 	}
-	e, err := locator.Locate(ctx)
+	e, installed, err := locator.LocateInstalled(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if len(e.ParseArgv) == 0 || len(e.ExportArgv) == 0 || e.Digest == "" {
+	if e.Digest == "" {
 		return nil, &model.Error{Code: model.CodeProviderUnavailable,
-			Message: "the analysis engine payload is incomplete"}
+			Message: "the analysis engine payload has no pinned identity"}
 	}
-	return &Backend{engine: e, runner: runner}, nil
+	b := &Backend{locator: locator, runner: runner, identity: e}
+	if installed {
+		if len(e.ParseArgv) == 0 || len(e.ExportArgv) == 0 {
+			return nil, &model.Error{Code: model.CodeProviderUnavailable,
+				Message: "the analysis engine payload is incomplete"}
+		}
+		b.once.Do(func() { b.resolved = e })
+	}
+	return b, nil
 }
 
-// Engine is the resolved payload.
-func (b *Backend) Engine() dependence.Engine { return b.engine }
+// Engine is the payload's identity. It is complete in Version, Digest and
+// RuntimeDigest from construction; its argument arrays are populated only once
+// a unit has resolved the payload, because an uninstalled payload has no path
+// on this machine to name.
+func (b *Backend) Engine() dependence.Engine { return b.identity }
+
+// resolve produces the command lines, installing the payload on the first call
+// that needs them.
+//
+// The digest is re-checked against the identity construction published: the
+// descriptor version and every cache key already committed to that string, so a
+// payload that resolved to different bytes must fail the unit rather than seal
+// facts under an identity that did not produce them. PinnedFingerprint's
+// contract makes the two equal for the pinned payload, so this can only fire on
+// a lock or store defect.
+func (b *Backend) resolve(ctx context.Context) (dependence.Engine, error) {
+	b.once.Do(func() {
+		e, err := b.locator.Locate(ctx)
+		switch {
+		case err != nil:
+			b.resolveErr = err
+		case len(e.ParseArgv) == 0 || len(e.ExportArgv) == 0 || e.Digest == "":
+			b.resolveErr = &model.Error{Code: model.CodeProviderUnavailable,
+				Message: "the analysis engine payload is incomplete"}
+		case e.Digest != b.identity.Digest:
+			b.resolveErr = &model.Error{Code: model.CodeToolDigestMismatch,
+				Message:     "the installed analysis payload is not the one this workspace's facts are keyed on",
+				Remediation: "run `codectx tools verify` and re-install the payload"}
+		default:
+			b.resolved = e
+		}
+	})
+	if b.resolveErr != nil {
+		return dependence.Engine{}, b.resolveErr
+	}
+	return b.resolved, nil
+}
 
 // Argv is the pinned parse argument array for a family, without the paths. It
 // is what the cache key folds in, so changing a pinned argument invalidates
@@ -125,25 +192,33 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 		return dependence.Outcome{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the analysis engine has no frontend for this language family"}
 	}
-	args := append([]string{}, b.engine.ParseArgv[1:]...)
+	e, err := b.resolve(ctx)
+	if err != nil {
+		return dependence.Outcome{}, err
+	}
+	args := append([]string{}, e.ParseArgv[1:]...)
 	args = append(args, "--language", fe, "--max-num-def", maxNumDef)
 	args = append(args, req.ExtraArgs...)
 	args = append(args, req.SourceDir, "--output", req.OutputPath)
-	return stepOutcome(b.run(ctx, b.engine.ParseArgv[0], args, filepath.Dir(req.OutputPath),
+	return stepOutcome(b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
 		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
 }
 
 // Export writes the graph out as the single Neo4j CSV export the importer
 // reads, and probes whether the result is a live graph at all.
 func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dependence.ExportOutcome, error) {
+	e, err := b.resolve(ctx)
+	if err != nil {
+		return dependence.ExportOutcome{}, err
+	}
 	// The engine refuses an output directory that already exists.
 	if err := os.RemoveAll(req.OutputDir); err != nil {
 		return dependence.ExportOutcome{}, &model.Error{Code: model.CodeInternal,
 			Message: "the previous analysis export could not be removed: " + err.Error()}
 	}
-	args := append([]string{}, b.engine.ExportArgv[1:]...)
+	args := append([]string{}, e.ExportArgv[1:]...)
 	args = append(args, req.GraphPath, "--repr=all", "--format=neo4jcsv", "--out", req.OutputDir)
-	outcome, err := stepOutcome(b.run(ctx, b.engine.ExportArgv[0], args, filepath.Dir(req.OutputDir),
+	outcome, err := stepOutcome(b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
 		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
 	if err != nil {
 		return dependence.ExportOutcome{}, err
@@ -180,10 +255,10 @@ func stepOutcome(res process.Result, err error) (dependence.Outcome, error) {
 // it. The log level is pinned because the classifier reads the warnings the
 // engine emits at WARN, and a host environment that raised the level would
 // silence a definition-cap skip into a silent loss of data dependence.
-func (b *Backend) run(ctx context.Context, path string, args []string, dir string,
+func (b *Backend) run(ctx context.Context, e dependence.Engine, path string, args []string, dir string,
 	heapCap, reservation int64, timeout time.Duration) (process.Result, error) {
 
-	env := append([]string{}, b.engine.Env...)
+	env := append([]string{}, e.Env...)
 	env = append(env, "JAVA_OPTS=-Xmx"+strconv.FormatInt(max(heapCap, 1<<20)/(1<<20), 10)+"m", "SL_LOGGING_LEVEL=WARN")
 	return b.runner.Run(ctx, process.Spec{Path: path, Args: args, Dir: dir, Env: env,
 		Stdout: io.Discard, MaxStdoutBytes: maxStdoutBytes, MaxStderrBytes: maxStderrBytes,

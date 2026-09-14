@@ -36,6 +36,11 @@ import (
 // branches -- exit 2 ("you typed it wrong") or exit 10 ("this is a defect") --
 // and a machine consumer would then retry a workspace that does not exist, or
 // file a bug against a path the user mistyped.
+//
+// Every row also pins the envelope's `command` to the command path without the
+// binary's own name, which is what distinguishes `codectx tools status` from
+// `codectx status`: the two carry different data shapes under one label
+// otherwise.
 func TestCommandEnvelope(t *testing.T) {
 	build := model.BuildInfo{
 		Version:       "1.2.3",
@@ -61,8 +66,8 @@ func TestCommandEnvelope(t *testing.T) {
 		{name: "version json", args: []string{"version", "--json"}, exitCode: 0, ok: true, command: "version", checkData: checkBuildData(build)},
 		{name: "unknown flag", args: []string{"version", "--bogus", "--json"}, exitCode: 2, ok: false, command: "version", errCode: "CTX_ARGUMENT_INVALID"},
 		{name: "unknown command", args: []string{"bogus", "--json"}, exitCode: 2, ok: false, command: "codectx", errCode: "CTX_ARGUMENT_INVALID"},
-		{name: "tools status on an empty store", args: []string{"tools", "status", "--json"}, exitCode: 0, ok: true, command: "status", checkData: checkEmptyStoreReport},
-		{name: "tools prefetch while offline", args: []string{"tools", "prefetch", "--all", "--json"}, userConfig: "[tools]\noffline = true\n", exitCode: 5, ok: false, command: "prefetch", errCode: "CTX_TOOL_OFFLINE"},
+		{name: "tools status on an empty store", args: []string{"tools", "status", "--json"}, exitCode: 0, ok: true, command: "tools status", checkData: checkEmptyStoreReport},
+		{name: "tools prefetch while offline", args: []string{"tools", "prefetch", "--all", "--json"}, userConfig: "[tools]\noffline = true\n", exitCode: 5, ok: false, command: "tools prefetch", errCode: "CTX_TOOL_OFFLINE"},
 		{name: "status on a path that is not a workspace", args: []string{"status", "--json"}, missingRepo: true, exitCode: 3, ok: false, command: "status", errCode: "CTX_WORKSPACE_NOT_FOUND"},
 	}
 
