@@ -274,6 +274,11 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"cursor/resolve_pages_by_a_bounded_keyset", legResolveKeyset},
 		{"cursor/search_pages_through_a_spool", legSpooledPage},
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
+
+		// FX-C13b rows
+		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierBound},
+		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
+		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -934,5 +939,185 @@ func legEndToEndRanking(t *testing.T, f *fixture) {
 		if len(got.Items) == 0 {
 			t.Errorf("Search(%q) matched nothing", q)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FX-C13b regression legs. Each guards one behavioural fix that the review
+// showed no test could see: mutating the fixed line left the suite green.
+// ---------------------------------------------------------------------------
+
+// stubExact is a pinned read surface holding one file whose declarations are
+// ordered so that the first `limit` of them are of a kind the caller filters
+// out. Storage applies the page bound BEFORE the kind filter (NodesInFile takes
+// no kinds), so this is the shape that turns a bounded single read into "0
+// hits, not truncated" for a file that has three matching declarations. The
+// fixture corpus publishes one node per file and cannot express it.
+type stubExact struct {
+	file  model.FileID
+	path  string
+	nodes []sqlite.StoredNode
+}
+
+func (s *stubExact) Node(context.Context, model.NodeID) (sqlite.StoredNode, error) {
+	return sqlite.StoredNode{}, &model.Error{Code: model.CodeArgumentInvalid, Message: "unknown node"}
+}
+
+func (s *stubExact) FileByPath(_ context.Context, p string) (model.FileID, error) {
+	if p != s.path {
+		return "", &model.Error{Code: model.CodeArgumentInvalid, Message: "unknown path"}
+	}
+	return s.file, nil
+}
+
+func (s *stubExact) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
+	return model.FileVersion{ID: id, Path: s.path}, nil
+}
+
+// NodesInFile pages the declarations on the (start_byte, node_id) keyset, which
+// is the contract exact.go walks; it applies no kind filter, exactly as storage
+// does not.
+func (s *stubExact) NodesInFile(_ context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	if file != s.file {
+		return nil, nil
+	}
+	var out []sqlite.StoredNode
+	for _, n := range s.nodes {
+		start := nodeStartByte(n)
+		if start < afterStart || (start == afterStart && n.Node.ID <= after) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, nil
+}
+
+// legPathTierBound proves the exact_path tier both announces its overflow and
+// applies the kind filter across the whole keyset rather than to one bounded
+// read. Serving five of eight candidates as a complete answer, or answering
+// "nothing here" for a file whose three functions sit past the bound, are both
+// the silent drop Section 14.3 forbids.
+func legPathTierBound(t *testing.T, _ *fixture) {
+	const limit = 5
+	stub := &stubExact{file: model.FileID(model.H("stub-file")), path: "pkg/wide.go"}
+	for i := range 8 {
+		kind := model.NodeVariable
+		if i >= limit {
+			kind = model.NodeFunction
+		}
+		id := model.NodeID(model.H("stub-node", strconv.Itoa(i)))
+		stub.nodes = append(stub.nodes, sqlite.StoredNode{
+			Node:  model.Node{ID: id, Kind: kind, Name: "n" + strconv.Itoa(i)},
+			Bytes: &model.ByteRange{Start: uint64(i * 10), End: uint64(i*10 + 1)},
+		})
+	}
+
+	out, full, err := pathCandidates(context.Background(), stub, stub.path, nil, limit)
+	if err != nil {
+		t.Fatalf("pathCandidates(unfiltered): %v", err)
+	}
+	if len(out) != limit || !full {
+		t.Fatalf("pathCandidates(unfiltered) served %d candidates, truncated=%t; want %d and true: three of the eight were dropped",
+			len(out), full, limit)
+	}
+
+	out, full, err = pathCandidates(context.Background(), stub, stub.path, []model.NodeKind{model.NodeFunction}, limit)
+	if err != nil {
+		t.Fatalf("pathCandidates(kind filter): %v", err)
+	}
+	if len(out) != 3 || full {
+		t.Fatalf("pathCandidates(kind filter) served %d candidates, truncated=%t; want 3 and false: the filter runs over the keyset, not over one bounded read",
+			len(out), full)
+	}
+}
+
+// legContinuationTruncation proves that Service.Search's continuation branch
+// reports the answer-level truncation the FIRST page computed. A continuation
+// reads its hits from the spool and has nothing of its own to recompute
+// truncation from, so a page that dropped the metadata would present the tail
+// of an admittedly incomplete answer as complete.
+//
+// The spool round-trip itself is legSpooledPage's; what is asserted here is
+// only what comes out of Service.Search. The truncated continuation is minted
+// rather than produced by a first page because neither answer-level bound --
+// 200 exact candidates, 512 term offsets -- is reachable on a three-document
+// corpus.
+func legContinuationTruncation(t *testing.T, f *fixture) {
+	s := newService(t, f.opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	first, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("Search(page 1): %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a bounded page over three matching documents minted no continuation")
+	}
+	if first.Meta.Truncated {
+		t.Fatalf("the control page reports truncation (%q); the assertion below would be vacuous", first.Meta.TruncationReason)
+	}
+	continued := req
+	continued.Page.Cursor = first.Meta.NextCursor
+	second, err := s.Search(f.ctx, continued)
+	if err != nil {
+		t.Fatalf("Search(page 2): %v", err)
+	}
+	if len(second.Items) == 0 || second.Items[0].NodeID == first.Items[0].NodeID {
+		t.Fatalf("page 2 served %d items starting at the page-1 hit; the continuation did not advance", len(second.Items))
+	}
+	if second.Meta.Truncated {
+		t.Error("a continuation of a complete answer reports truncation")
+	}
+
+	leases := pagination.NewLeases(f.store, time.Minute)
+	lease, err := leases.Acquire(f.ctx, f.gen, "", model.LeaseCursor)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	now := time.Now().UTC()
+	c := newCursor(endpointSearch, f.binding, lease.ID, searchQueryHash(req), now.Add(time.Minute))
+	id, err := spoolHits(f.opts.Spools, c, spoolMeta{Truncated: true, TruncationReason: truncationExactTierFull}, second.Items)
+	if err != nil {
+		t.Fatalf("spoolHits: %v", err)
+	}
+	c.SpoolID = id
+	token, err := f.opts.Signer.EncodeCursor(c)
+	if err != nil {
+		t.Fatalf("EncodeCursor: %v", err)
+	}
+	continued.Page.Cursor = token
+	page, err := s.Search(f.ctx, continued)
+	if err != nil {
+		t.Fatalf("Search(truncated continuation): %v", err)
+	}
+	if !page.Meta.Truncated || page.Meta.TruncationReason != truncationExactTierFull {
+		t.Fatalf("the continuation reports (%t, %q), want the first page's (true, %q)",
+			page.Meta.Truncated, page.Meta.TruncationReason, truncationExactTierFull)
+	}
+}
+
+// legSymbolByCanonicalID proves the canonical-id tier of `codectx symbol`. The
+// command's Long text promises a canonical node ID resolves, and the name tiers
+// index names: without this tier a query spelled as an id falls through them
+// and the documented call answers an empty page.
+func legSymbolByCanonicalID(t *testing.T, f *fixture) {
+	s := newService(t, f.opts)
+	want := f.nodes["pkg/beta.go"]
+	page, err := s.Resolve(f.ctx, model.SymbolRequest{Query: string(want),
+		Operation: model.SymbolResolve, SemanticSource: model.SemanticCanonical})
+	if err != nil {
+		t.Fatalf("Resolve(canonical id): %v", err)
+	}
+	if len(page.Items) != 1 || page.Items[0].ID != want {
+		t.Fatalf("Resolve(%q) served %d items, want the one node it names", want, len(page.Items))
+	}
+	if page.Meta.NextCursor != "" {
+		t.Error("the canonical-id tier minted a continuation for a single-node answer")
 	}
 }
