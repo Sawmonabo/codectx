@@ -559,7 +559,11 @@ func writeOccurrences(b *strings.Builder, items []model.ReferenceOccurrence) {
 		// occurrence carries a range (the language server overlay's rows do).
 		location := string(o.FileID)
 		if o.Path != "" {
-			location = o.Path
+			// The overlay is the only producer that sets Path, and it is text
+			// an external language server chose, so it goes through the same
+			// cell sanitizer the other human tables use: clip only bounds
+			// width, and a path carrying a newline would forge a table row.
+			location = tableCell(o.Path)
 		}
 		if o.Range != nil {
 			location = fmt.Sprintf("%s:%d:%d", location, o.Range.Start.Line, o.Range.Start.Column)
