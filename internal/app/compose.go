@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -165,7 +167,9 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// roughly two gigabytes for a flag that is about the database.
 	toolCfg := cfg
 	if o.rebuild {
-		cfg.Storage.DataDir = rebuildDir(cfg.Storage.DataDir, time.Now())
+		if cfg.Storage.DataDir, err = makeRebuildDir(cfg.Storage.DataDir, time.Now()); err != nil {
+			return nil, err
+		}
 	}
 	// cfg.Storage.DataDir is the effective cache from here on, including in
 	// Config.TraversalPolicy, which excludes it from the walk: a rebuild cache
@@ -355,10 +359,17 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// watcher a report constructed would place inotify watches over the whole
 	// workspace to answer a question that reads one row.
 	//
-	// The policy is the capture's own, not bare Config.TraversalPolicy(): the
-	// Git ignore and force-include hooks decide which directories are watched,
-	// and without them the watch set and the periodic rescan cover every
-	// gitignored build tree the snapshot can never contain.
+	// The policy is the capture's own, not bare Config.TraversalPolicy():
+	// snapshot.TraversalPolicy installs the Git ignore predicate -- and only
+	// that, because the force-include hooks a capture pass adds are backed by
+	// that capture's staging database and have no standalone form, so they stay
+	// nil here. Without the ignore predicate the watch set and the periodic
+	// rescan cover every gitignored build tree the snapshot can never contain.
+	//
+	// The ignored set is read once, here: a .gitignore edited during a session
+	// is honoured by the next generation's own traversal, which recomputes it,
+	// but not by the watch set, which keeps this snapshot of it until the
+	// workspace is reopened. Watcher.Coverage's doc names that window.
 	if o.mode == modeIndex {
 		policy, perr := snapshot.TraversalPolicy(ctx, cfg.TraversalPolicy(), root, s.git)
 		if perr != nil {
@@ -386,9 +397,55 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 // see both and remove the one they no longer want.
 //
 // The instant is a parameter so the name is a function of the run rather than
-// of a clock read somewhere inside the composition.
+// of a clock read somewhere inside the composition. The name it derives is a
+// candidate, not the answer: makeRebuildDir owns which directory is actually
+// created.
 func rebuildDir(dataDir string, now time.Time) string {
 	return dataDir + "-rebuild-" + now.UTC().Format("20060102T150405Z")
+}
+
+// maxRebuildAttempts bounds the disambiguating ladder below. The timestamp has
+// one-second granularity, so the ladder exists for runs inside the same second;
+// a workspace that has produced 64 rebuild caches in one second is a script in
+// a loop, not an operator, and it deserves an error rather than a 65th cache.
+const maxRebuildAttempts = 64
+
+// makeRebuildDir creates the sibling cache and returns the directory it made.
+//
+// It is os.Mkdir and not os.MkdirAll because the difference is the whole
+// contract: MkdirAll accepts a directory that already exists, so two
+// `index --rebuild` runs inside the same second silently shared one cache while
+// the second run told the operator a new one had been created. An existing
+// directory is therefore visible here, and the name gains a `-2`, `-3`, ...
+// suffix until one is free -- the timestamp still names the run, the suffix
+// only distinguishes runs the timestamp cannot.
+//
+// The parent is created with MkdirAll: the configured data directory's own
+// parent may not exist yet on a first run, and that directory is not the one
+// whose prior existence means anything.
+func makeRebuildDir(dataDir string, now time.Time) (string, error) {
+	base := rebuildDir(dataDir, now)
+	if err := os.MkdirAll(filepath.Dir(base), 0o700); err != nil {
+		return "", &model.Error{Code: model.CodeInternal,
+			Message: "the private data directory cannot be created: " + err.Error()}
+	}
+	for attempt := 1; attempt <= maxRebuildAttempts; attempt++ {
+		candidate := base
+		if attempt > 1 {
+			candidate = base + "-" + strconv.Itoa(attempt)
+		}
+		err := os.Mkdir(candidate, 0o700)
+		if err == nil {
+			return candidate, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", &model.Error{Code: model.CodeInternal,
+				Message: "the rebuild cache cannot be created: " + err.Error()}
+		}
+	}
+	return "", &model.Error{Code: model.CodeArgumentInvalid,
+		Message: "a new rebuild cache cannot be named beside " + dataDir +
+			": every candidate from " + base + " onwards already exists. Remove the rebuild caches you no longer need, or wait a second and run the command again."}
 }
 
 // openDependence builds the dependence provider, or reports its absence.
