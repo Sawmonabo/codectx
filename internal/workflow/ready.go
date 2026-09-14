@@ -57,25 +57,31 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// Precondition 3's inputs, in one call. Paging Coverage for counts would
 	// cost a round trip per page on a large session, which is exactly why
 	// CoverageSummary exists; this package defines no second aggregate.
-	required, served, waived, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
+	c, err := s.sessions.CoverageSummary(ctx, rec.ID, rec.ActorID)
 	if err != nil && !expiredSession(err) {
 		return gate{}, err
 	}
 
 	e := gate{
-		Required:      required,
-		Waived:        waived,
+		Required:      c.Required,
+		FullyRead:     c.FullyRead,
+		Waived:        c.Waived,
 		ScopeComplete: m.ScopeComplete,
 	}
-	// A waiver is an admission that a required file was NOT read, so it never
-	// counts as served, and CoverageSummary is where that is decided: the store
-	// excludes a waived file from the served count whether or not bytes were
-	// also delivered for it, so this reports the aggregate unaltered.
-	e.Served = served
+	// The two counts are carried apart because they answer different
+	// questions. Served is the reported fully_served_files and excludes a
+	// waived file whatever its bytes say -- a waiver is an admission that a
+	// required file was not read, and a fully waived session reporting full
+	// coverage is the claim the waiver exists to deny. Read completeness is the
+	// other question (Section 17.1): a waiver excuses a file from being read,
+	// it does not unread one that was, so it counts FullyRead. The gap between
+	// them is precisely a waived-and-read file, and it stays visible because
+	// precondition 6 below shuts the strict gate on any waiver at all.
+	e.Served = c.Served
 	// Task 16's honest weaker answer, otherwise unchanged: an incomplete
 	// manifest scope disqualifies the session outright even when the counts
 	// agree.
-	e.ReadComplete = m.ScopeComplete && served == required
+	e.ReadComplete = m.ScopeComplete && c.FullyRead == c.Required
 
 	var shut []string
 
@@ -118,7 +124,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// Precondition 6 -- no required-file waiver. A waiver is an honest
 	// admission that a required file was not read; SessionStatus.Validate
 	// refuses the combination outright, so a bug here fails loudly.
-	if waived > 0 {
+	if c.Waived > 0 {
 		shut = append(shut, "the session carries a required-file waiver")
 	}
 
@@ -140,7 +146,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// the same one as supersession: a file may have moved under a session whose
 	// generation is still active (the snapshot was re-taken), and a generation
 	// may have been republished with every pinned file untouched.
-	current, err := s.sourcesCurrent(ctx, rec, required)
+	current, err := s.sourcesCurrent(ctx, rec, c.Required)
 	if err != nil {
 		return gate{}, err
 	}
