@@ -43,8 +43,8 @@ Two wave-A importers produce deltas at two different granularities, and
 
 | Producer | Delta unit | What the applier names |
 |---|---|---|
-| `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) |
-| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) |
+| `internal/provider/scip` | one SCIP document | `Replaced.Files` (the changed and removed paths' `FileID`s) and `Replaced.Scopes` (their alias scopes) — **shipped**; the applier sketch below is against the code as it stands |
+| `internal/provider/dependence/neo4jcsv` | one fact | `Replaced.Keys` (the changed and removed fact keys) — **planned (Task 12)**: the storage side below is shipped, but no `neo4jcsv` path calls `PutKeyedNodes`/`PutKeyedRelations` yet, so its units store no keys and only their retention buckets can replace them. The adoption is its own lane |
 
 `Replaced` names the **complement** — what does *not* survive — rather than the
 survivors. For both importers that is a handful of entries against tens of
@@ -64,11 +64,11 @@ republishes every unlocated fact on every run sets it. The SCIP importer does
 it reparsed, so dropping that bucket would leave edges carried from untouched
 documents without endpoints, and the unit could not seal.
 
-### The fact key
+### The fact keys
 
-`node_facts.fact_key` and `relation_facts.fact_key` hold the producer's own
-id-independent key, supplied through `PutKeyedNodes` / `PutKeyedRelations`
-(`provider.DeltaSink`). Storage never derives or interprets it.
+`fact_keys(unit_id, node_id, relation_id, fact_key)` holds the producer's own
+id-independent keys, supplied through `PutKeyedNodes` / `PutKeyedRelations`
+(`provider.DeltaSink`). Storage never derives or interprets one.
 
 A key is needed because a path bucket cannot express every removal. A
 dependence edge can disappear while every file holding its evidence is
@@ -77,18 +77,51 @@ caller's — so only the producer can say the fact is gone. It cannot say so by
 fact identity either: a `RelationID` is derived from the resolved endpoints,
 which an edit changes, so the removed fact has no identity to name.
 
-Rows written with no key (`fact_key = ''`) are never key-excluded; only their
-bucket can replace them. If the applier names replaced keys and the previous
-unit stored none, `CarryOver` refuses rather than silently carrying everything.
+**One fact is backed by every key that produced it, not by one.** A canonical
+edge is published once and derived from N occurrences, each with its own key,
+and the emitter re-emits the whole fact as soon as one of those keys changes.
+That is why the keys live in a side table and why `PutKeyedNodes` and
+`PutKeyedRelations` take `keys [][]string`, parallel to the facts: `keys[i]`
+is every key backing `facts[i]`, at least one, each a lowercase hex digest,
+sorted and without duplicates.
 
-A row holds **one** key, so a producer's keys must be one per published fact
-identity, not one per emitted row. Several rows collapsing to one identity is
-ordinary — it is why `provider.DedupeSink` exists — but if they arrived under
-*different* keys the stored row would remember one of them, and a refresh that
-removed only that key while the others still held would drop a fact the source
-still contains, with nothing to re-emit it. `PutKeyedNodes` and
-`PutKeyedRelations` refuse the second key
-(`CTX_PROVIDER_OUTPUT_INVALID`) rather than store a row that can be lost later.
+Folding a fact's keys into one was considered and rejected: `Replaced.Keys`
+must name the **previous** unit's keys, and the previous run's grouping of
+occurrence keys per fact is not recoverable from what a producer persists
+(`neo4jcsv.KeySet` is a flat sorted file of bare digests). A folded key would
+also change whenever any occurrence moved, so every such fact would be
+reported replaced and re-added — defeating the delta in exactly the
+cross-file-edge case the key exists for.
+
+**Carry unless any key is replaced.** A fact is inherited unless ANY of its
+keys is in `Replaced.Keys`. That is the same condition the producer re-emits
+on, so the fresh and carried sets partition exactly: carrying on "some key
+survives" would keep a stale copy beside the fresh one, and dropping only on
+"every key replaced" would do the same. A carried fact carries its keys with
+it, or the successor would hold facts no later refresh could replace.
+
+Facts written with no keys have no `fact_keys` row and are never key-excluded;
+only their bucket can replace them. If the applier names replaced keys and the
+previous unit stored none, `CarryOver` refuses rather than silently carrying
+everything.
+
+A repeated fact identity is ordinary — two workers, two parts of a subdivided
+unit, or the fresh import and the carried predecessor — and its keys
+accumulate: the carried set is the union of the keys the fresh import
+published and the predecessor's keys that this refresh did not replace. In a
+conformant refresh that union is exactly the fresh set, because `Replaced.Keys`
+names the complement — every previous key the fresh run no longer emits — so a
+fact whose keys changed has its old keys named replaced by the same refresh
+that re-publishes it. A producer that changes a fact's keys without naming the
+old ones leaves the stale key attached, and a later refresh replacing that
+stale key drops a live fact; the contract, not the copy, is what rules that
+out. A repeat that describes a node **differently** from the row already
+written is refused (`CTX_PROVIDER_OUTPUT_INVALID`, naming the node and the
+first differing column): the insert yields to the row that is present, so the
+unit would otherwise silently keep whichever description arrived first, and,
+since `CarryOver` runs last, a delta-built unit would keep a different one from
+a full re-import of the same source. A `relation_facts` row stores nothing but
+its identity, so no repeat of one can diverge.
 
 ### Aliases
 
@@ -123,7 +156,8 @@ fact of the new unit, which is exactly the condition `SealUnit` enforces.
   surplus is chosen by evidence id, a function of the occurrence's own content,
   so the retained set is the same for the same union however it was assembled,
   and fresh rows are not preferred to carried ones. `UnitWriter.EvidenceClipped`
-  is what keeps that truncation from being silent.
+  is what keeps that truncation from being silent, and `SealUnit` logs one
+  bounded warning with the unit id and the count whenever it is nonzero.
 - **A failed delta changes nothing.** `Fail` deletes the new unit's rows. The
   carried rows are the new unit's own copies, so the previous unit is untouched
   and stays sealed and published.
@@ -142,11 +176,16 @@ selected for the same provider and scope.
 ## Applier sketch
 
 ```go
-prev, _ := store.SelectedUnit(ctx, previousGeneration, scip.ProviderID, scope)
-manifest, _ := store.DeltaState(ctx, prev, "scip.document_manifest")
-// ... write manifest to a file, scip.LoadDocumentManifest, Import with it ...
+prev, _ := store.SelectedUnit(ctx, previousGeneration, providerID, scope)
+raw, _ := store.DeltaState(ctx, prev, "scip.document_manifest")
+os.WriteFile(manifestPath, raw, 0o600)
+previous, _ := scip.LoadDocumentManifest(manifestPath)
+defer previous.Close()
+
 w, _ := store.BeginUnit(ctx, gen, build, inputs)
 rep, _ := p.Import(ctx, req, sink, scip.ImportOptions{Previous: previous})
+sink.Flush(ctx)
+
 var replaced sqlite.Replaced
 rep.Manifest.Diff(previous, func(c scip.Change) error {
     if c.Class != scip.ClassUnchanged {
@@ -156,9 +195,19 @@ rep.Manifest.Diff(previous, func(c scip.Change) error {
     return nil
 })
 stats, _ := w.CarryOver(ctx, prev, replaced)
-w.PutDeltaState(ctx, "scip.document_manifest", freshManifestBytes)
+
+fresh := filepath.Join(workDir, "manifest")
+rep.Manifest.Save(fresh)
+freshBytes, _ := os.ReadFile(fresh)
+w.PutDeltaState(ctx, "scip.document_manifest", freshBytes)
 store.SealUnit(ctx, w)
+rep.Manifest.Close()
 ```
+
+This is the sequence the lane's real-tool proof runs (scip-go 0.2.7 over two
+copies of this repository, one file edited): `changed=1`, `unchanged=159`, and
+the delta-built unit is row-identical to a full re-import across every fact
+table.
 
 ## Capability details
 
