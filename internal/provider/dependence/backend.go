@@ -28,8 +28,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 )
 
-// Engine identifies the resolved analysis payload. Name, Version and Digest
-// are provenance: they reach `status`, `doctor` and the ledger through
+// Engine identifies the resolved analysis payload. Version and Digest are the
+// provenance that reaches `status`, `doctor` and the ledger, through
 // Detection.ObservedVersion and the descriptor version, and nowhere else.
 // ParseArgv and ExportArgv are complete argv prefixes (a launcher plus its
 // arguments, for example a managed JDK and `-jar`), so a runtime-dependent
@@ -41,7 +41,6 @@ type Engine struct {
 	// pairs. internal/process never merges the parent environment, so this is
 	// the whole of it.
 	Env     []string
-	Name    string
 	Version string
 	Digest  string
 	// RuntimeDigest is the payload digest of the runtime the engine executes
