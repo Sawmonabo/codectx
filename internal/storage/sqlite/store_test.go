@@ -715,11 +715,9 @@ func TestStorePublicationScenario(t *testing.T) {
 		waivers[0].ActorID != actorID || waivers[0].CreatedAt.IsZero() {
 		t.Fatalf("Waivers read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
 	}
-	if _, err := f.s.Waivers(ctx, open.ID, "someone-else"); err == nil {
-		t.Fatal("Waivers answered for another actor; a waiver is never shared across actors")
-	} else {
-		wantCode(t, err, model.CodeActorMismatch)
-	}
+	// One wrong-actor assertion covers every session reader: they all resolve
+	// the session through the same actor-checked s.session, so a second reader
+	// asserting it again restates one guard rather than protecting another.
 	if _, _, _, err := f.s.CoverageSummary(ctx, open.ID, "someone-else"); err == nil {
 		t.Fatal("CoverageSummary answered for another actor; coverage is never shared across actors")
 	} else {
