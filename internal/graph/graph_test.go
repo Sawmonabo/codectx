@@ -341,6 +341,25 @@ func (f *graphFixture) Capabilities(ctx context.Context) ([]model.CapabilityStat
 
 func (f *graphFixture) Binding() model.Binding { return f.binding }
 
+// LeaseID makes the fixture a LeaseHolder: a continuation token names the
+// retention lease holding its generation, and an Adjacency without one offers
+// no continuation at all, so a paging case could not run against a fake that
+// held no lease.
+func (f *graphFixture) LeaseID() string { return fixtureID("lease-1") }
+
+// fixtureLeases is the LeaseStore pagination.Spools consults before it writes
+// or replays a spool. Storage owns the real retention_leases rows; the graph
+// engine only needs a live lease to exist, so the fake reports every lease as
+// live for the fixture window.
+type fixtureLeases struct{}
+
+func (fixtureLeases) AcquireLease(context.Context, model.Lease) error     { return nil }
+func (fixtureLeases) RenewLease(context.Context, string, time.Time) error { return nil }
+func (fixtureLeases) ReleaseLease(context.Context, string) error          { return nil }
+func (fixtureLeases) LeaseExpiry(context.Context, string) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
+
 // fixtureLimits is the resolved budget every scenario starts from. A case that
 // needs a tighter bound copies it and overrides the one field it is testing,
 // so no case depends on another case's mutation.
@@ -609,7 +628,7 @@ func TestGraphScenarios(t *testing.T) {
 			const spentVisited, spentEdges = 7, 11
 			token, err := e.nextTraversalCursor(&budget{visited: spentVisited, edges: spentEdges},
 				continuation{Endpoint: endpoint, QueryHash: queryHash, LeaseID: lease,
-					Depth: 1, LastKey: "rel-0003"})
+					Depth: 1, LastOwner: fixtureNodeID("n-a"), LastKey: "rel-0003"})
 			if err != nil || token == "" {
 				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
 			}
@@ -617,7 +636,7 @@ func TestGraphScenarios(t *testing.T) {
 			// resume that reset it would hand the walk a fresh budget, and one that
 			// accumulated would double it on the second replay.
 			for attempt := 1; attempt <= 2; attempt++ {
-				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash)
+				got, err := e.resumeTraversal(context.Background(), token, endpoint, queryHash, time.Now().Add(time.Minute))
 				if err != nil {
 					t.Fatalf("resume %d: %v", attempt, err)
 				}
@@ -643,12 +662,95 @@ func TestGraphScenarios(t *testing.T) {
 				flipped = 'B'
 			}
 			tampered := token[:at] + string(flipped) + token[at+1:]
-			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
+			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash, time.Now().Add(time.Minute))
 			var typed *model.Error
 			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
 				t.Fatalf("tampered cursor: err %v; want %s", err, model.CodeCursorInvalid)
 			}
 		}},
+		{
+			// A traversal level is emitted in (owner.Node asc, rel.ID asc) order
+			// across independently keyset-paged node chunks, so a page that stops
+			// mid-level cannot be resumed from a relation id alone. These two
+			// seeds make that concrete: n-wide sorts BELOW n-a as a node id while
+			// its 260 relation ids all sort ABOVE n-a's four, so the level emits
+			// the high ids first. A resume that skipped on the relation id alone
+			// would drop every n-a row as "already seen" -- a silent gap in a
+			// paged neighbourhood, which is the C1 failure wearing a cursor.
+			name: "a resumed traversal page repeats no edge and drops none",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				spools, err := pagination.NewSpools(t.TempDir(), 1<<20, fixtureLeases{})
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 400
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools, Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+				seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+				req := model.GraphRequest{GenerationID: 1, Start: seeds,
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+				// Ground truth: the same walk in one page.
+				whole, err := e.Neighbors(context.Background(), req)
+				if err != nil {
+					t.Fatalf("unpaged walk: %v", err)
+				}
+				if whole.Meta.Truncated {
+					t.Fatalf("ground-truth walk must be complete, got %q", whole.Meta.TruncationReason)
+				}
+
+				// The same walk in pages of 120, which lands the first boundary
+				// inside n-wide's fan-out and the last one past it.
+				req.Page = model.PageRequest{Limit: 120}
+				seen := map[model.RelationID]int{}
+				var order []model.RelationID
+				for page := 1; ; page++ {
+					if page > 8 {
+						t.Fatalf("paged walk did not terminate after %d pages", page-1)
+					}
+					res, err := e.Neighbors(context.Background(), req)
+					if err != nil {
+						t.Fatalf("page %d: %v", page, err)
+					}
+					for _, rel := range res.Relations {
+						seen[rel.ID]++
+						order = append(order, rel.ID)
+					}
+					if res.Meta.NextCursor == "" {
+						break
+					}
+					// A cumulative counter that reset per page would let a walk
+					// spend its whole budget again on every continuation.
+					if res.VisitedCount < int64(len(seen)) {
+						t.Fatalf("page %d: visited %d is below the %d nodes already admitted",
+							page, res.VisitedCount, len(seen))
+					}
+					// A cursor pins its own generation, and the page limit is part
+					// of the normalized query the cursor is bound to, so a
+					// continuation repeats the limit and drops the generation.
+					req.GenerationID = 0
+					req.Page = model.PageRequest{Limit: 120, Cursor: res.Meta.NextCursor}
+				}
+				if len(order) != len(whole.Relations) || len(seen) != len(order) {
+					t.Fatalf("paged walk returned %d relations (%d distinct); the one-page walk returned %d",
+						len(order), len(seen), len(whole.Relations))
+				}
+				for _, rel := range whole.Relations {
+					if seen[rel.ID] != 1 {
+						t.Fatalf("relation %s appeared %d times across the paged walk, want exactly once",
+							rel.ID, seen[rel.ID])
+					}
+				}
+			},
+		},
 
 		// L7 REFS rows
 		{

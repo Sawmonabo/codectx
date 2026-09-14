@@ -216,6 +216,10 @@ type expandOptions struct {
 	// Zero leaves the accumulation unbounded and is only reachable from a test
 	// that builds expandOptions directly.
 	FrontierBytes int64
+	// Resume, when non-nil, is the state a continuation restored: the walk
+	// starts from the spooled frontier at the cursor's depth instead of from
+	// seeds, and skips the rows the issuing page already emitted.
+	Resume *resumeState
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.
@@ -254,6 +258,18 @@ type EvidenceRowReader interface {
 // pins. An Adjacency that does not hold a lease simply offers no continuation.
 type LeaseHolder interface {
 	LeaseID() string
+}
+
+// leaseID is the retention lease every continuation token names, or "" when
+// this Adjacency holds none. It is the one place the optional seam is
+// type-asserted, so reference and traversal cursors cannot disagree about when
+// a continuation may be offered.
+func (e *Engine) leaseID() string {
+	holder, ok := e.adjacency.(LeaseHolder)
+	if !ok {
+		return ""
+	}
+	return holder.LeaseID()
 }
 
 // typedContextError is the ONE place a bare context failure becomes a Section 8

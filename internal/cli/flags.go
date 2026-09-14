@@ -18,25 +18,44 @@ const (
 )
 
 // addQueryFlags declares the flags every query command shares. --repo reuses
-// the one spelling the rest of the tree already has.
-func addQueryFlags(cmd *cobra.Command) {
+// the one spelling the rest of the tree already has. cursored says whether this
+// command also declares --cursor: the generation help may only mention a flag
+// the command actually has, so `path` and `impact`, which issue no
+// continuation, are not told about a combination they cannot make.
+func addQueryFlags(cmd *cobra.Command, cursored bool) {
 	addRepoFlag(cmd)
-	cmd.Flags().Int64(queryGenerationFlag, 0, "answer from this generation instead of the active one (0 pins the active generation; not combinable with --cursor)")
+	generation := "answer from this generation instead of the active one (0 pins the active generation"
+	if cursored {
+		generation += "; not combinable with --cursor"
+	}
+	cmd.Flags().Int64(queryGenerationFlag, 0, generation+")")
 	cmd.Flags().Duration(queryTimeoutFlag, 0, "give up after this much wall clock"+zeroBoundHelp)
 }
 
-// addPageFlags declares the page flags, for the commands whose request has a
-// page. `path` has none: its routes are bounded by the reason-path cap.
-func addPageFlags(cmd *cobra.Command) {
+// addLimitFlag declares --limit, for the commands whose request has a page.
+// `path` has none: its routes are bounded by the reason-path cap.
+func addLimitFlag(cmd *cobra.Command) {
 	cmd.Flags().Int(queryLimitFlag, 0, "items in one page"+zeroBoundHelp)
+}
+
+// addCursorFlag declares --cursor, for the commands that actually MINT a
+// continuation token. It is separate from addLimitFlag because `impact` pages
+// its ranked entry list without being resumable: its page boundary is a rank,
+// not a keyset position in the walk, so it prints no token and offering the
+// flag would advertise a workflow the command refuses.
+func addCursorFlag(cmd *cobra.Command) {
 	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, or was issued for a different query or command")
 }
 
-// pageRequest reads the page flags of a command that declares them.
+// pageRequest reads the page flags of a command that declares them. A command
+// with --limit but no --cursor simply builds a page request with no cursor.
 func pageRequest(cmd *cobra.Command) (model.PageRequest, error) {
 	limit, err := intFlag(cmd, queryLimitFlag)
 	if err != nil {
 		return model.PageRequest{}, err
+	}
+	if cmd.Flags().Lookup(queryCursorFlag) == nil {
+		return model.PageRequest{Limit: limit}, nil
 	}
 	cursor, err := stringFlag(cmd, queryCursorFlag)
 	if err != nil {
