@@ -18,7 +18,8 @@ import (
 // Nothing here resolves names, reads config or touches storage: seeds arrive
 // already resolved, every bound arrives in Limits, and every fact arrives
 // through Adjacency.
-func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (model.ImpactResult, error) {
+func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model.ImpactResult, err error) {
+	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
 		return model.ImpactResult{}, err
 	}
