@@ -33,8 +33,13 @@ const (
 // relation allowlist. An exhausted depth, visited budget or deadline is
 // reported as truncation together with the paths found so far -- never as "no
 // path exists", which is reserved for a genuinely unreachable target.
-func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model.PathResult, error) {
-	if err := pathValidate(req); err != nil {
+func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res model.PathResult, err error) {
+	defer func() { err = typedContextError(ctx, err) }()
+	// The landed model validator is the request contract: it screens the
+	// generation, the resolved id spelling of both endpoints, the relation
+	// vocabulary and the bound signs. A second hand-written copy here would
+	// drift from it, which is exactly how an unvalidated id reached the walk.
+	if err := req.Validate(); err != nil {
 		return model.PathResult{}, err
 	}
 
@@ -55,7 +60,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model
 		kinds = DefaultRelations()
 	}
 
-	res := model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
+	res = model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
 	completeness, deferred, err := e.pathCompleteness(ctx, kinds)
 	if err != nil {
 		return model.PathResult{}, err
@@ -137,42 +142,6 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (model
 	}
 	res.Nodes = nodes
 	return res, nil
-}
-
-// pathValidate checks the request shape the engine itself depends on. It
-// deliberately does NOT call model.PathRequest.Validate: that validator also
-// enforces the 64-hex wire spelling of a NodeID, which belongs at the request
-// boundary where an id arrives from a caller. The engine is handed
-// already-resolved ids by the CLI and the facade, which have validated them,
-// and imposing the wire spelling again here would make the port unusable by any
-// in-process caller that addresses nodes by their own identifiers. Everything
-// the traversal actually relies on -- both endpoints present, every named
-// relation kind known, no negative bound -- is still rejected with
-// CTX_ARGUMENT_INVALID.
-func pathValidate(req model.PathRequest) error {
-	if req.From == "" {
-		return &model.Error{Code: model.CodeArgumentInvalid, Message: "path.from is required"}
-	}
-	if req.To == "" {
-		return &model.Error{Code: model.CodeArgumentInvalid, Message: "path.to is required"}
-	}
-	if len(req.Relations) > model.MaxFilterValues {
-		return (&model.Error{Code: model.CodeArgumentInvalid,
-			Message: "path.relations exceeds the filter-value bound"}).
-			WithDetail("count", strconv.Itoa(len(req.Relations)))
-	}
-	for _, k := range req.Relations {
-		if !k.Valid() {
-			return (&model.Error{Code: model.CodeArgumentInvalid,
-				Message: "path.relations names an unknown relation kind"}).
-				WithDetail("relation", string(k))
-		}
-	}
-	if req.MaxDepth < 0 || req.MaxVisited < 0 {
-		return &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "path bounds must not be negative"}
-	}
-	return nil
 }
 
 // pathBound resolves a request bound: zero means "the configured default", and

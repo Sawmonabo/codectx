@@ -17,7 +17,8 @@ import (
 // counts ride on every pair and the endpoints are always container nodes: a
 // consumer can see that "app depends on lib" rests on nine edges without ever
 // being told which function called which.
-func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest) (model.Page[model.PackageEdge], error) {
+func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest) (page model.Page[model.PackageEdge], err error) {
+	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
@@ -70,7 +71,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		items = items[:limit]
 		markTruncated(&meta, reasonPageFull)
 	}
-	page := model.Page[model.PackageEdge]{Meta: meta, Items: items}
+	page = model.Page[model.PackageEdge]{Meta: meta, Items: items}
 	if err := page.Validate(); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}

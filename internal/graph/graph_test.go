@@ -51,6 +51,12 @@ func fixtureID(name string) string {
 // fixtureNodeID is fixtureID for node names; a test names its seeds with it.
 func fixtureNodeID(name string) model.NodeID { return model.NodeID(fixtureID(name)) }
 
+// fixtureRelationID is the RelationID the fixture assigns to the i-th declared
+// edge. Edge ids are the zero-padded hex counter of the declaration order, so
+// the keyset order is still readable from the source; a case naming an edge
+// derives its id here rather than writing the padded literal out.
+func fixtureRelationID(i int) model.RelationID { return model.RelationID(fmt.Sprintf("%064x", i)) }
+
 // fixtureLeafCount is the hub's fan-out. It is larger than any per-page bound a
 // test sets, so a truncation case has something real to truncate.
 const fixtureLeafCount = 40
@@ -61,7 +67,7 @@ const fixtureLeafCount = 40
 type graphFixture struct {
 	nodes     map[model.NodeID]model.Node
 	relations []model.Relation
-	evidence  map[model.RelationID][]model.EvidenceID
+	evidence  map[model.RelationID][]model.Evidence
 	caps      []model.CapabilityState
 	binding   model.Binding
 
@@ -75,7 +81,7 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	t.Helper()
 	f := &graphFixture{
 		nodes:    map[model.NodeID]model.Node{},
-		evidence: map[model.RelationID][]model.EvidenceID{},
+		evidence: map[model.RelationID][]model.Evidence{},
 		binding: model.Binding{
 			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
 			SnapshotID:   model.SnapshotID(fixtureID("snap-1")),
@@ -146,18 +152,36 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// n-a calls the hub, so the fan-out is reachable from the same seed as the cycle.
 	edges = append(edges, edge{"n-a", model.RelCalls, "n-hub"})
 
+	// evidenceRow is a whole evidence row, not just its id: an occurrence's
+	// precision class, file and byte range live here and nowhere else, so a
+	// fixture that carried ids alone could not tell a hydrated occurrence from
+	// an unhydrated one.
+	evidenceRow := func(rel model.RelationID, i, n int) model.Evidence {
+		return model.Evidence{
+			ID:              model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-%d", i, n))),
+			UnitID:          model.UnitID(fixtureID("unit-1")),
+			ProviderID:      "treesitter",
+			ProviderVersion: "0.0.1",
+			OriginRunID:     model.ProviderRunID(fixtureID("run-1")),
+			RelationID:      rel,
+			Precision:       model.PrecisionSyntax,
+			FileID:          model.FileID(fixtureID("file-1")),
+			Range: &model.SourceRange{
+				Start: model.Position{Byte: uint64(i) * 16, Line: uint32(i) + 1, Column: 0},
+				End:   model.Position{Byte: uint64(i)*16 + 8, Line: uint32(i) + 1, Column: 8},
+			},
+		}
+	}
 	for i, e := range edges {
-		// Zero-padded hex counters keep the keyset order identical to the
-		// declaration order above, so the order is still readable from source.
-		id := model.RelationID(fmt.Sprintf("%064x", i))
+		id := fixtureRelationID(i)
 		f.relations = append(f.relations, model.Relation{
 			ID: id, From: fixtureNodeID(e.from), Kind: e.kind, To: fixtureNodeID(e.to)})
 		// One occurrence per edge, except n-a -> n-b, which carries two: the
 		// §9.2 relation-count vs occurrence-count distinction needs a relation
 		// that is one relation and two occurrences.
-		f.evidence[id] = []model.EvidenceID{model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-0", i)))}
+		f.evidence[id] = []model.Evidence{evidenceRow(id, i, 0)}
 		if e.from == "n-a" && e.to == "n-b" && e.kind == model.RelCalls {
-			f.evidence[id] = append(f.evidence[id], model.EvidenceID(fixtureID(fmt.Sprintf("ev-%04d-1", i))))
+			f.evidence[id] = append(f.evidence[id], evidenceRow(id, i, 1))
 		}
 	}
 	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
@@ -239,12 +263,33 @@ func (f *graphFixture) NodesByID(ctx context.Context, ids []model.NodeID) ([]mod
 	return out, nil
 }
 
-// EvidenceFor hydrates the evidence backing a page of relations in one call.
+// EvidenceFor hydrates the evidence IDENTITIES backing a page of relations in
+// one call -- the frozen Adjacency port, which is all a traversal needs.
 func (f *graphFixture) EvidenceFor(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.EvidenceID, error) {
+	rows, err := f.EvidenceRows(ctx, relations, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[model.RelationID][]model.EvidenceID, len(rows))
+	for rel, list := range rows {
+		ids := make([]model.EvidenceID, 0, len(list))
+		for _, row := range list {
+			ids = append(ids, row.ID)
+		}
+		out[rel] = ids
+	}
+	return out, nil
+}
+
+// EvidenceRows is the optional hydration seam: whole rows, so a reference
+// occurrence carries the precision class, file and range that make it
+// checkable. The fixture implements it because the app adapter does, and a fake
+// that omitted it would let a hydration regression pass unnoticed.
+func (f *graphFixture) EvidenceRows(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.Evidence, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	out := make(map[model.RelationID][]model.EvidenceID, len(relations))
+	out := make(map[model.RelationID][]model.Evidence, len(relations))
 	for _, id := range relations {
 		ev := f.evidence[id]
 		if len(ev) == 0 {
@@ -253,7 +298,7 @@ func (f *graphFixture) EvidenceFor(ctx context.Context, relations []model.Relati
 		if limit > 0 && len(ev) > limit {
 			ev = ev[:limit]
 		}
-		out[id] = append([]model.EvidenceID(nil), ev...)
+		out[id] = append([]model.Evidence(nil), ev...)
 	}
 	return out, nil
 }
@@ -356,12 +401,14 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("New: %v", err)
 				}
 				want := [][]model.RelationID{
-					{"rel-0013", "rel-0014"}, // n-a -> n-p -> n-z
-					{"rel-0015", "rel-0016"}, // n-a -> n-q -> n-z
+					{fixtureRelationID(13), fixtureRelationID(14)}, // n-a -> n-p -> n-z
+					{fixtureRelationID(15), fixtureRelationID(16)}, // n-a -> n-q -> n-z
 				}
 				for run := 0; run < 100; run++ {
 					got, err := engine.ShortestPath(context.Background(), model.PathRequest{
-						From: "n-a", To: "n-z", Relations: []model.RelationKind{model.RelCalls},
+						From:      fixtureNodeID("n-a"),
+						To:        fixtureNodeID("n-z"),
+						Relations: []model.RelationKind{model.RelCalls},
 					})
 					if err != nil {
 						t.Fatalf("run %d: ShortestPath: %v", run, err)
@@ -503,11 +550,19 @@ func TestGraphScenarios(t *testing.T) {
 						attempt, got.Cursor.LastKey, got.Cursor.Depth)
 				}
 			}
-			// A tampered token is never honoured with a budget of its own choosing.
-			tampered := token[:len(token)-1] + "A"
-			if tampered == token {
-				tampered = token[:len(token)-1] + "B"
+			// A tampered token is never honoured with a budget of its own
+			// choosing. The flipped character must NOT be the last one: the
+			// token is unpadded base64 and Go's non-strict decoder ignores the
+			// final character's unused low bits, so up to 16 distinct
+			// characters there decode to identical bytes -- a "tamper" that is
+			// a no-op on roughly one run in four, which is a flaky test rather
+			// than a weak signature. Every interior character is significant.
+			at := len(token) / 2
+			flipped := byte('A')
+			if token[at] == flipped {
+				flipped = 'B'
 			}
+			tampered := token[:at] + string(flipped) + token[at+1:]
 			_, err = e.resumeTraversal(context.Background(), tampered, endpoint, queryHash)
 			var typed *model.Error
 			if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
