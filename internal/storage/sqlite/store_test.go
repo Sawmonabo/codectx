@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1521,18 +1522,32 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatal(err)
 		}
 		run1 := f.run(gen1)
-		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture) (model.UnitID, model.NodeID) {
+		// fanOut is the number of edges the unit publishes from one extra node,
+		// one more than a page can hold, so a single batch over that node
+		// cannot come back whole. It hangs off nothing the assertions below
+		// name, so it changes no other count in this scenario.
+		const fanOut = model.MaxPageItems + 1
+		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, wide int) (model.UnitID, model.NodeID, model.NodeID) {
 			w := f.begin(gen, run, ff)
 			from := f.putNode(w, run, ff.path, "F", &ff, "key:node:from:"+ff.path)
 			to := f.putNode(w, run, ff.path, "G", &ff, "key:node:to:"+ff.path)
 			f.putRelation(w, run, from, to, "key:rel:"+ff.path, &ff)
+			var hub model.NodeID
+			if wide > 0 {
+				hub = f.putNode(w, run, ff.path, "W", &ff, "key:node:wide:"+ff.path)
+				for i := 0; i < wide; i++ {
+					name := fmt.Sprintf("W%03d", i)
+					leaf := f.putNode(w, run, ff.path, name, &ff, "key:node:wide:"+name+":"+ff.path)
+					f.putRelation(w, run, hub, leaf, "key:rel:wide:"+name+":"+ff.path, &ff)
+				}
+			}
 			if err := f.s.SealUnit(f.ctx, w); err != nil {
 				t.Fatalf("SealUnit(%s): %v", ff.path, err)
 			}
-			return w.UnitID(), from
+			return w.UnitID(), from, hub
 		}
-		unitA, fromA := edge(gen1, run1, a)
-		_, fromB := edge(gen1, run1, b)
+		unitA, fromA, wideA := edge(gen1, run1, a, fanOut)
+		_, fromB, _ := edge(gen1, run1, b, 0)
 		f.activate(gen1, 0)
 
 		// gen2 drops b.go entirely: only unit A is a member, so b.go's edge is
@@ -1554,7 +1569,11 @@ func TestDeltaImportInvariants(t *testing.T) {
 				t.Fatalf("PinGeneration(%d): %v", gen, err)
 			}
 			defer r.Close()
-			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", model.MaxPageItems)
+			// 256 is the limit the graph engine actually passes (its
+			// adjacencyBatch), which is ABOVE model.MaxPageItems: pageLimit
+			// clamps it, and a row calling with exactly MaxPageItems would
+			// never exercise that clamp at all.
+			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", 256)
 			if err != nil {
 				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
 			}
@@ -1573,6 +1592,35 @@ func TestDeltaImportInvariants(t *testing.T) {
 				t.Fatalf("gen2 %s batch = %+v, want only unit A's edge from %s", dir, got, fromA)
 			}
 		}
+
+		// The clamp itself, observed rather than assumed: the engine asks for
+		// 256 and pageLimit hands back at most model.MaxPageItems, so a caller
+		// that read a short page as the end of the walk would stop one row
+		// short of this node's neighbourhood and call it complete.
+		func() {
+			r, err := f.s.PinGeneration(f.ctx, f.repo, gen1, time.Minute)
+			if err != nil {
+				t.Fatalf("PinGeneration(%d): %v", gen1, err)
+			}
+			defer r.Close()
+			first, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil, "", 256)
+			if err != nil {
+				t.Fatalf("EdgesBatch(wide): %v", err)
+			}
+			if len(first) != model.MaxPageItems {
+				t.Fatalf("a 256-row request over a %d-edge node returned %d rows, want the %d-row clamp",
+					fanOut, len(first), model.MaxPageItems)
+			}
+			next, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil,
+				first[len(first)-1].ID, 256)
+			if err != nil {
+				t.Fatalf("EdgesBatch(wide, after): %v", err)
+			}
+			if len(next) != fanOut-model.MaxPageItems {
+				t.Fatalf("the page after the clamp returned %d rows, want the remaining %d: the clamped page was the whole neighbourhood after all",
+					len(next), fanOut-model.MaxPageItems)
+			}
+		}()
 	})
 }
 

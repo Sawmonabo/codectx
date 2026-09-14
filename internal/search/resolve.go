@@ -254,9 +254,16 @@ func symbolTiers(ctx context.Context, r exactReader, req model.SymbolRequest, ra
 					break
 				}
 			}
-			if len(nodes) < limit {
-				break
-			}
+			// A SHORT page is not the end of this tier. Nodes applies its SQL
+			// LIMIT to node_facts rows and only then collapses the duplicate
+			// node_id rows the Section 9.4 precedence order leaves behind
+			// (storage/sqlite/query.go:246-263), so a full-bound read routinely
+			// returns fewer nodes than it was asked for while the keyset still
+			// has rows. Ending here would drop the rest of the tier silently,
+			// which Section 14.3 forbids. Only an EMPTY page ends the walk, and
+			// `after` advances strictly on every non-empty one, so it
+			// terminates. pathCandidates may break on a short page because
+			// NodesInFile has no SQL LIMIT; this walk may not.
 		}
 		if len(page.Nodes) == limit {
 			break

@@ -103,8 +103,9 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd)
-	addPageFlags(cmd)
+	addQueryFlags(cmd, true)
+	addLimitFlag(cmd)
+	addCursorFlag(cmd)
 	return cmd
 }
 
@@ -176,9 +177,10 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			})
 		},
 	}
-	addQueryFlags(cmd)
-	addPageFlags(cmd)
-	addTraversalFlags(cmd, true)
+	addQueryFlags(cmd, true)
+	addLimitFlag(cmd)
+	addCursorFlag(cmd)
+	addTraversalFlags(cmd, true, true)
 	return cmd
 }
 
@@ -238,8 +240,8 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd)
-	addTraversalFlags(cmd, false)
+	addQueryFlags(cmd, false)
+	addTraversalFlags(cmd, false, false)
 	return cmd
 }
 
@@ -303,9 +305,10 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd)
-	addPageFlags(cmd)
-	addTraversalFlags(cmd, true)
+	addQueryFlags(cmd, true)
+	addLimitFlag(cmd)
+	addCursorFlag(cmd)
+	addTraversalFlags(cmd, true, true)
 	return cmd
 }
 
@@ -598,21 +601,22 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 	}
 }
 
-// addTraversalFlags declares the walk budgets. paged is false for `path`
-// alone, which is both the one command whose request carries no edge budget and
-// the one that is not paged -- a flag with no field behind it would be help
-// text describing a request the command cannot build, and "cumulative across
-// pages" on a command that has no pages describes a workflow it cannot perform.
-func addTraversalFlags(cmd *cobra.Command, paged bool) {
+// addTraversalFlags declares the walk budgets. The two switches are separate
+// because the commands differ on both axes: `path` carries no edge budget at
+// all and issues no continuation, while `impact` carries one and pages its
+// ranked list. A flag with no field behind it would describe a request the
+// command cannot build, and "cumulative across pages" on a command that issues
+// no continuation would describe a workflow it cannot perform.
+func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
-	acrossPages := ""
-	if paged {
-		acrossPages = ", cumulative across pages"
+	cumulative := ""
+	if acrossPages {
+		cumulative = ", cumulative across pages"
 	}
-	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+acrossPages+zeroBoundHelp)
-	if paged {
+	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+cumulative+zeroBoundHelp)
+	if edges {
 		cmd.Flags().Int(queryEdgesFlag, 0,
-			"maximum distinct relations the walk may admit, cumulative across pages"+zeroBoundHelp)
+			"maximum distinct relations the walk may admit"+cumulative+zeroBoundHelp)
 	}
 }
 
