@@ -160,6 +160,28 @@ func New(o Options) (*Watcher, error) {
 	if o.MaxPaths < 0 || o.MaxBytes < 0 {
 		return nil, invalid("index.watch_pending_paths and index.watch_pending_bytes must not be negative")
 	}
+	// These two stay reservations with a finite default, and 0 means "use the
+	// default" rather than "unlimited". That is the documented behaviour for a
+	// class-A bound, not an oversight of the "0 = unlimited" rule:
+	//
+	//   - The pending set is a heap-resident structure whose size is the number
+	//     of paths changed between two debounce ticks. On a monorepo a branch
+	//     switch or a generated-code run changes every file at once, so an
+	//     unlimited pending set IS the repository-sized heap allocation the
+	//     scale ruling forbids. "Unlimited" is never "load everything into
+	//     heap"; here the two rules point in opposite directions and the memory
+	//     one wins.
+	//   - Nothing is lost when the reservation is exceeded. Overflow does not
+	//     drop a path: it clears the pending set and forces a FULL
+	//     reconciliation, which is strictly more work over strictly more paths,
+	//     and it is reported three ways (Overflow, the batch Reason, Coverage).
+	//     A bound that can only cost time, never fidelity, has no reason to be
+	//     unlimited.
+	//
+	// So a user who writes 0 is asking for the product's reservation, and the
+	// product must have one; an operator who wants a larger window sets a
+	// larger number. Ruling applied: H-L0 report deviation 2, over the plan's
+	// row-12 sentence.
 	if o.MaxPaths == 0 {
 		o.MaxPaths = DefaultMaxPaths
 	}
@@ -451,6 +473,18 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // `npm install` under
 // an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
+// Peak RSS: `want` is one entry per ADMITTED DIRECTORY, never one per file,
+// and the loop below refuses past maxWatchedDirs (65536), so the map is capped
+// at 65536 short relative paths -- on the order of a few megabytes -- however
+// many files the tree holds. A 300 000-file monorepo at a realistic 10 files
+// per directory wants ~30 000 entries, well inside that bound; a tree that
+// exceeds it stops at the cap, reports coverage incomplete and keeps working.
+// It is therefore already bounded by watch-set size rather than repository
+// size, and a streamed diff against a spooled directory list would trade a
+// bounded map for a temp file and buy nothing. (Row 12b asks for a diff
+// against a SQLite watched-directory table; no such table exists and
+// schema.sql is frozen this wave -- but on this bound the diff is not the
+// memory fix it would be for a per-file structure.)
 func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map[string]bool) {
 	want := make(map[string]bool, len(watched)+16)
 	// The root is wanted even when the traversal cannot start: a workspace
