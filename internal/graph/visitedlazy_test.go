@@ -68,7 +68,7 @@ func TestTheMembershipSummaryIsFrozenOnlyByAWalkThatPages(t *testing.T) {
 	// restated so that the assertion is "exactly one freeze", not "exactly this
 	// many bytes".
 	newEngine := func(adj Adjacency, now func() time.Time) (*Engine, *heapProbe) {
-		e, err := New(Options{Adjacency: adj, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: adj, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits, Now: now})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)

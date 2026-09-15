@@ -162,7 +162,7 @@ func probedImpactEngine(t *testing.T, f *graphFixture) (*Engine, *heapProbe) {
 	// longer be the whole one -- and far below what would let either ranking
 	// hold its records in one run buffer.
 	limits.FrontierBytes = 8 << 20
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)

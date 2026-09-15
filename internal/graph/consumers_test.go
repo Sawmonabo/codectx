@@ -8,6 +8,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -118,4 +119,57 @@ func TestOverviewCountsAreUnchangedByTheReader(t *testing.T) {
 		t.Fatal("the map listed no container; the fixture proves nothing")
 	}
 	golden(t, "overview_items.json", page.Items)
+}
+
+// TestContainmentScanEndsOnTheLastEntry is F7, carried onto the packed reader:
+// the containment scan used to report an incomplete read the moment its edge
+// allowance was reached, so a containment set whose entries fill the allowance
+// EXACTLY reported complete=false -- and both callers refuse an incomplete
+// containment read, turning a whole answer into an omitted container. Only an
+// allowance with an entry still standing in front of it is incomplete.
+//
+// Mutation: make the allowance test `maxEdges.Exceeded(read)` in
+// scanNeighbours and the exact-fill leg below fails.
+func TestContainmentScanEndsOnTheLastEntry(t *testing.T) {
+	f := newGraphFixture(t)
+	reader := memGraphFor(f)
+	contains, ok := reader.Kinds().Code(model.RelContains)
+	if !ok {
+		t.Fatal("the fixture seals no containment; the scan cannot be exercised")
+	}
+	// pkg-app's outgoing containment: four `contains` children, a fixed count
+	// the allowances below are set against.
+	owner := sortedRefs(context.Background(), reader, []model.NodeID{fixtureNodeID("pkg-app")})
+	if len(owner) != 1 {
+		t.Fatalf("pkg-app resolved to %d surrogate(s), want 1", len(owner))
+	}
+	const rows = 4
+	for _, tc := range []struct {
+		name     string
+		budget   int64
+		wantRead int
+		wantDone bool
+	}{
+		{name: "the allowance is exactly filled", budget: rows, wantRead: rows, wantDone: true},
+		{name: "an entry is left past the allowance", budget: rows - 1, wantRead: rows - 1, wantDone: false},
+		{name: "the allowance is unlimited", budget: 0, wantRead: rows, wantDone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			read := 0
+			b := &budget{}
+			done, err := scanNeighbours(context.Background(), reader, owner,
+				model.DirectionOutgoing, []KindCode{contains}, config.Limit(tc.budget), b,
+				func(owners, _ []NodeRef) error { read += len(owners); return nil })
+			if err != nil {
+				t.Fatalf("scanNeighbours: %v", err)
+			}
+			if read != tc.wantRead || done != tc.wantDone {
+				t.Fatalf("read %d entr(ies), complete=%v; want %d, complete=%v",
+					read, done, tc.wantRead, tc.wantDone)
+			}
+			if b.edges != int64(tc.wantRead) {
+				t.Fatalf("the scan charged %d edge(s) to the page budget, want %d", b.edges, tc.wantRead)
+			}
+		})
+	}
 }

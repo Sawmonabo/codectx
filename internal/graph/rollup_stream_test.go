@@ -82,7 +82,7 @@ func pairEngine(t *testing.T, f *graphFixture) *Engine {
 	// below is about the disk-backed path, and a budget that held everything
 	// would prove nothing about it.
 	limits.FrontierBytes = 1
-	e, err := New(Options{Adjacency: f, Limits: limits})
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}

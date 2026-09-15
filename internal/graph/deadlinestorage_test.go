@@ -69,7 +69,7 @@ func (l *ctxLeases) LeaseExpiry(ctx context.Context, id string) (time.Time, erro
 
 // newStorageDeadlineEngine builds an engine over adj with the given per-request
 // query timeout and the full continuation machinery.
-func newStorageDeadlineEngine(t *testing.T, adj Adjacency, timeout time.Duration) *Engine {
+func newStorageDeadlineEngine(t *testing.T, f *graphFixture, adj Adjacency, timeout time.Duration) *Engine {
 	t.Helper()
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
@@ -85,7 +85,7 @@ func newStorageDeadlineEngine(t *testing.T, adj Adjacency, timeout time.Duration
 	limits.MaxPageItems = 200
 	limits.QueryTimeout = timeout
 	limits.FrontierBytes = 8 << 20
-	e, err := New(Options{Adjacency: adj, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: adj, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -131,7 +131,7 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	// clock also CALIBRATES the subject's budget, so the case holds its shape
 	// under -race and on a loaded machine instead of pinning a constant that a
 	// ten-times-slower build turns into a walk that cannot advance at all.
-	ref := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, 10*time.Minute)
+	ref := newStorageDeadlineEngine(t, f, &ctxAdjacency{graphFixture: f}, 10*time.Minute)
 	start := time.Now()
 	want, stalledRef := drainImpact(t, ref, req, "reference")
 	if stalledRef {
@@ -165,7 +165,7 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 		if attempt > 0 {
 			budget *= 4
 		}
-		e := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, budget)
+		e := newStorageDeadlineEngine(t, f, &ctxAdjacency{graphFixture: f}, budget)
 		got, stalled = drainImpact(t, e, req, "deadline-split")
 	}
 
