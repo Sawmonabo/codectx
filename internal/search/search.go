@@ -106,7 +106,7 @@ func New(o Options) (*Service, error) {
 		spools:  o.Spools,
 		leases:  o.Leases,
 		content: o.Content,
-		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
+		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms.Int(), defaultStatsCacheBytes),
 		maxPage: o.Resources.MaxPageItems,
 		timeout: timeout,
 		ttl:     ttl,

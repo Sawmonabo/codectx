@@ -158,9 +158,9 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		// Both directions: a caller reaches the seed through an incoming edge
 		// and a callee through an outgoing one, and Section 15.2 requires both.
 		Direction:  model.DirectionBoth,
-		MaxDepth:   cfg.MaxGraphDepth,
-		MaxVisited: cfg.MaxVisitedNodes,
-		MaxEdges:   cfg.MaxGraphEdges,
+		MaxDepth:   cfg.MaxGraphDepth.Int(),
+		MaxVisited: cfg.MaxVisitedNodes.Int(),
+		MaxEdges:   cfg.MaxGraphEdges.Int(),
 	})
 	if err != nil {
 		return scopeResult{}, contextErr(ctx, err)
@@ -188,7 +188,7 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			Origin:      originExpansion,
 			Depth:       e.Depth,
 			Reasons:     boundReasons(e.Reasons),
-			Paths:       boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry),
+			Paths:       boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry.Int()),
 		}
 		if admitted[c.entityID()] {
 			// A seed the walk reached again keeps its seed requirement, which

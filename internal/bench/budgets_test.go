@@ -683,12 +683,17 @@ var budgetRows = []budgetRow{
 // depth cannot show that.
 func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 	bounds := config.Defaults().Context
+	// The default depth is unlimited now, so the row probes a fixed ladder
+	// instead of the default value: what it measures is how visited and edge
+	// counts GROW per hop, and the ceiling assertion below is what pins the
+	// plan size. scopeWalkProbeDepth is the depth that assertion is made at.
+	const scopeWalkProbeDepth = 3
 	var out []string
 	var atConfigured string
-	for depth := 1; depth <= bounds.MaxGraphDepth+1; depth++ {
+	for depth := 1; depth <= scopeWalkProbeDepth+1; depth++ {
 		res, err := f.svc.Impact(context.Background(), model.ImpactRequest{Start: f.seeds,
 			Direction: model.DirectionBoth, MaxDepth: depth,
-			MaxVisited: bounds.MaxVisitedNodes, MaxEdges: bounds.MaxGraphEdges})
+			MaxVisited: bounds.MaxVisitedNodes.Int(), MaxEdges: bounds.MaxGraphEdges.Int()})
 		if err != nil {
 			t.Fatalf("scope traversal at depth %d: %v", depth, err)
 		}
@@ -696,7 +701,7 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 			depth, res.VisitedCount, res.EdgeCount, len(res.Entries), res.Meta.Truncated,
 			float64(res.EdgeCount)/float64(max(res.VisitedCount, 1)))
 		out = append(out, line)
-		if depth == bounds.MaxGraphDepth {
+		if depth == scopeWalkProbeDepth {
 			atConfigured = line
 			if res.VisitedCount > budgetContextPlanVisitedNodes {
 				t.Errorf("BUDGET MISSED: the scope walk visited %d nodes against a %d-node ceiling",
@@ -704,7 +709,7 @@ func measureScopeWalk(t *testing.T, f *budgetFixture) string {
 			}
 		}
 	}
-	return fmt.Sprintf("%d seeds, ceiling %d nodes; at the configured depth %s\n\t%s",
+	return fmt.Sprintf("%d seeds, ceiling %d nodes; at probe depth %s\n\t%s",
 		len(f.seeds), budgetContextPlanVisitedNodes, atConfigured, strings.Join(out, "\n\t"))
 }
 
