@@ -530,3 +530,41 @@ func TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet(t *testing.T) {
 		t.Fatalf("capability detail %q = %q, want the count that crossed the bound", manifest.BoundDependencies, got)
 	}
 }
+
+// TestNoDefaultBoundDegradesARealManifest is the VF5 regression: two shapes a
+// real repository holds that the provider degraded on a default
+// configuration. A long CHANGELOG crossed the 1024-entry cap and published
+// `partial`/CTX_RESOURCE_LIMIT with no user-set bound anywhere; a
+// tool-configuration-only pyproject.toml — no [project], no [tool.poetry],
+// which is a valid and common file — published `failed`/CTX_ARGUMENT_INVALID,
+// saying a file that parsed cleanly did not parse as its format.
+func TestNoDefaultBoundDegradesARealManifest(t *testing.T) {
+	var md strings.Builder
+	for i := range 1500 {
+		fmt.Fprintf(&md, "## Release %d\n\nSee [entry %d](./notes/%d.md).\n\n", i, i, i)
+	}
+	files := map[string]string{
+		"CHANGELOG.md": md.String(),
+		"QA/pyproject.toml": "[tool.ruff]\nline-length = 100\n\n[tool.ruff.lint]\nselect = [\"E\", \"W\"]\n\n" +
+			"[tool.robocop]\nreports = [\"all\"]\n",
+	}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := providertest.New(t, files)
+	states := map[string]model.CapabilityState{}
+	for _, path := range []string{"CHANGELOG.md", "QA/pyproject.toml"} {
+		runUnit(t, h, mf, path, &capture{}, states)
+	}
+	for _, want := range []struct{ capability, path string }{
+		{manifest.CapabilityDocumentation, "CHANGELOG.md"},
+		{manifest.CapabilityManifests, "QA/pyproject.toml"},
+	} {
+		cs := states[manifest.ID+" "+want.capability+" "+filesystem.ScopeKey(want.path)]
+		if cs.State != model.CapabilityFresh || cs.DiagnosticCode != "" {
+			t.Fatalf("%s published %s/%s for %s on a default configuration, want fresh: no default bound may degrade a capability",
+				want.capability, cs.State, cs.DiagnosticCode, want.path)
+		}
+	}
+}
