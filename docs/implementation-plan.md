@@ -2037,7 +2037,6 @@ busy_timeout = "5s"
 read_connections = 2
 writer_cache_kib = 8192
 reader_cache_kib = 4096
-wal_high_water_bytes = 67108864
 closed_session_retention = "7d"
 query_cursor_ttl = "15m"
 synchronous = "normal"          # WAL writer sync mode; "full" opts back into per-commit fsync (ADR-0004)

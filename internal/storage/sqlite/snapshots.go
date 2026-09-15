@@ -29,7 +29,7 @@ func (s *Store) Snapshot(ctx context.Context, id model.SnapshotID) (model.Snapsh
 		return model.Snapshot{}, err
 	}
 	var snap model.Snapshot
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		var repo []byte
 		var count, bytes int64
 		var created string
@@ -64,7 +64,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 		return model.FileVersion{}, err
 	}
 	var fv model.FileVersion
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND sf.file_id = ?2 LIMIT 1`, snapRaw, fileRaw)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -97,7 +97,7 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 		return nil, invalid("after_path is %d bytes, limit %d", len(afterPath), model.MaxPathBytes)
 	}
 	var out []model.FileVersion
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, snapshotFileQuery+` AND f.path > ?2 ORDER BY f.path LIMIT ?3`, snapRaw, afterPath, limit)
 		if err != nil {
 			return wrap("snapshot_files", err)
@@ -121,7 +121,7 @@ func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPat
 // caller may serve bytes it cannot verify against stored digests.
 func (s *Store) Blob(ctx context.Context, hash string) (model.BlobRecord, error) {
 	var rec model.BlobRecord
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		var err error
 		rec, err = blobRecord(ctx, tx, hash)
 		return err

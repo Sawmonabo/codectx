@@ -70,14 +70,17 @@ type StoreStats struct {
 	WALBytes      int64
 }
 
-// StoreSizer reports only the on-disk sizes -- two file stats, no query. It is
-// an optional interface beside StoreReader because StoreReader is frozen, and
-// it exists so a shallow doctor can still report database and write-ahead-log
-// bytes (and warn on a WAL past its high-water mark) without paying for Stats,
-// whose eleven `count(*)` scans are O(rows). A store that does not implement it
-// reports the accounting sizes as unavailable rather than as zero.
+// StoreSizer reports only the on-disk sizes -- two file stats, no query -- and
+// the write-ahead log size the store itself treats as the largest a run leaves
+// behind. It is an optional interface beside StoreReader because StoreReader is
+// frozen, and it exists so a shallow doctor can still report database and
+// write-ahead-log bytes (and warn on a log past the store's bound) without
+// paying for Stats, whose eleven `count(*)` scans are O(rows). A store that
+// does not implement it reports the accounting sizes as unavailable rather
+// than as zero.
 type StoreSizer interface {
 	StoreSizes(ctx context.Context) (databaseBytes, walBytes int64, err error)
+	WALBoundBytes() int64
 }
 
 // ToolchainReporter reports one status per lock entry. The lock entry name is

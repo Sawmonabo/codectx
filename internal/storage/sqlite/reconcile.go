@@ -22,7 +22,7 @@ func (s *Store) UnitState(ctx context.Context, id model.UnitID) (state model.Uni
 	if err != nil {
 		return "", false, err
 	}
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE unit_key = ?`, key).Scan(&state)
 		if isNoRows(err) {
 			return nil
@@ -90,7 +90,7 @@ func (s *Store) LookupAliases(ctx context.Context, units []model.UnitID, scopeKe
 	}
 	seen := make(map[model.NodeID]bool)
 	var out []StoredAlias
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		// The dictionaries are RESOLVED here, never created: this is a read
 		// transaction, and a key no unit has ever published is aliased to
 		// nothing, which is the same empty answer the old TEXT predicate gave.

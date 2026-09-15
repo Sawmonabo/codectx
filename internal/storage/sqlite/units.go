@@ -46,7 +46,7 @@ func (s *Store) BeginGeneration(ctx context.Context, repo model.RepositoryID, sn
 		return 0, invalid("generation ref is required and bounded to %d bytes", model.MaxPathBytes)
 	}
 	var id int64
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `INSERT INTO generations(repository_id, snapshot_id, ref, analysis_key, semantic_config_hash, status, health, created_at)
 			VALUES(?, ?, ?, NULL, ?, ?, ?, ?)`, repoRaw, snapRaw, ref, semanticConfigHash, string(model.GenerationStaging), string(model.HealthFresh), formatTime(time.Now()))
 		if err != nil {
@@ -69,7 +69,7 @@ func (s *Store) BeginProviderRun(ctx context.Context, gen model.GenerationID, pr
 		return "", err
 	}
 	raw, _ := model.DecodeID(id)
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		if _, err := s.generationRow(ctx, tx, gen, model.GenerationStaging); err != nil {
 			return err
 		}
@@ -108,7 +108,7 @@ func (s *Store) CompleteProviderRun(ctx context.Context, result model.ProviderRe
 	if err != nil {
 		return internal("counters: " + err.Error())
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		return exec1(ctx, tx, conflict("provider run %s is not running", result.RunID),
 			`UPDATE provider_runs SET status = ?, counters_json = ?, diagnostic_code = ?, completed_at = ? WHERE id = ? AND status = 'running'`,
 			string(result.State), string(counters), diagnosticCode, formatTime(time.Now()), raw)
@@ -123,7 +123,7 @@ func (s *Store) ProviderRun(ctx context.Context, id model.ProviderRunID) (model.
 		return model.ProviderRun{}, err
 	}
 	var run model.ProviderRun
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		var gen sql.NullInt64
 		var counters, started string
 		var completed sql.NullString
@@ -248,7 +248,7 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen,
 		ids: newInterner(s.opts), nodes: newRefCache(max(s.opts.BatchRecords, internCacheFloor))}
 	var snapshot []byte
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -329,7 +329,7 @@ func (w *UnitWriter) streamInputs(ctx context.Context, snapshot []byte, inputs f
 		if len(batch) == 0 {
 			return nil
 		}
-		err := w.s.write(ctx, func(tx *sql.Tx) error {
+		err := w.s.ingest(ctx, func(tx *sql.Tx) error {
 			check, err := tx.PrepareContext(ctx, `SELECT 1 FROM snapshot_files WHERE snapshot_id = ? AND file_id = ? AND content_hash = ? AND executable = ? AND status <> 'deleted'`)
 			if err != nil {
 				return wrap("snapshot_files", err)
@@ -486,7 +486,7 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
@@ -595,7 +595,7 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 	if err := w.s.checkBatch(len(facts), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
@@ -653,7 +653,7 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 	if err := w.s.checkBatch(len(aliases), bytes); err != nil {
 		return err
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id) VALUES(?, ?, ?, ?)`)
@@ -714,7 +714,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 		return err
 	}
 	var inserted int64
-	err = w.s.write(ctx, func(tx *sql.Tx) error {
+	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(tx, func() error {
 			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -1094,7 +1094,7 @@ func (w *UnitWriter) Abandon(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
 			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
 		return wrap("units", err)
@@ -1108,7 +1108,7 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		return nil
 	}
 	w.done = true
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		var state model.UnitState
 		err := tx.QueryRowContext(ctx, `SELECT state FROM units WHERE id = ?`, w.rowID).Scan(&state)
 		if isNoRows(err) {
@@ -1137,7 +1137,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingest(ctx, func(tx *sql.Tx) error {
 		if err := w.clipEvidence(ctx, tx); err != nil {
 			return err
 		}
@@ -1229,7 +1229,7 @@ func (s *Store) AttachUnit(ctx context.Context, gen model.GenerationID, unit mod
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -1289,7 +1289,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		}
 	}
 	var binding model.Binding
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
@@ -1478,17 +1478,20 @@ func (s *Store) refreshStatistics(ctx context.Context) {
 	// chosen: on the 66,307-node proof store the plan flips to idx_nodes_qname
 	// at 10,000 and not at 1,000, so it is set an order of magnitude above the
 	// point where it starts working.
-	if _, err := s.writer.ExecContext(ctx, `PRAGMA analysis_limit=10000`); err != nil {
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `PRAGMA analysis_limit=10000`); err != nil {
+			return wrap("analysis_limit", err)
+		}
+		for _, table := range analyzedTables {
+			if _, err := tx.ExecContext(ctx, `ANALYZE `+table); err != nil {
+				return wrap("analyze "+table, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
 			"component", "storage", "error", err.Error())
-		return
-	}
-	for _, table := range analyzedTables {
-		if _, err := s.writer.ExecContext(ctx, `ANALYZE `+table); err != nil {
-			slog.Default().Warn("the query planner statistics could not be refreshed; prefix queries may use a slower plan",
-				"component", "storage", "table", table, "error", err.Error())
-			return
-		}
 	}
 }
 
@@ -1514,7 +1517,7 @@ func foldColumn(ctx context.Context, tx *sql.Tx, h *model.Hasher, query string, 
 // runs were building are deleted. Sealed units stay reusable and the active
 // pointer is untouched.
 func (s *Store) Abort(ctx context.Context, gen model.GenerationID) error {
-	err := s.write(ctx, func(tx *sql.Tx) error {
+	err := s.ingestAndCommit(ctx, func(tx *sql.Tx) error {
 		if err := exec1(ctx, tx, conflict("generation %d is not staging", gen),
 			`UPDATE generations SET status = 'failed', health = 'failed' WHERE id = ? AND status = 'staging'`, int64(gen)); err != nil {
 			return err
@@ -1555,7 +1558,7 @@ func activeGeneration(ctx context.Context, tx *sql.Tx, repo []byte, gen *int64) 
 // GenerationStatus reads one generation's lifecycle status.
 func (s *Store) GenerationStatus(ctx context.Context, gen model.GenerationID) (model.GenerationStatus, error) {
 	var status model.GenerationStatus
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT status FROM generations WHERE id = ?`, int64(gen)).Scan(&status)
 		if isNoRows(err) {
 			return invalid("generation %d does not exist", gen)
@@ -1572,7 +1575,7 @@ func (s *Store) GenerationStatus(ctx context.Context, gen model.GenerationID) (m
 // workspace is serving".
 func (s *Store) GenerationCapturedAt(ctx context.Context, gen model.GenerationID) (time.Time, error) {
 	var captured time.Time
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		var created string
 		err := tx.QueryRowContext(ctx, `SELECT s.created_at FROM generations g JOIN snapshots s ON s.id = g.snapshot_id
 			WHERE g.id = ?`, int64(gen)).Scan(&created)
@@ -1596,7 +1599,7 @@ func (s *Store) UnitOrigin(ctx context.Context, unit model.UnitID) (model.Provid
 		return "", err
 	}
 	var origin []byte
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT origin_run_id FROM units WHERE unit_key = ?`, key).Scan(&origin)
 		if isNoRows(err) {
 			return invalid("unit %s does not exist", unit)

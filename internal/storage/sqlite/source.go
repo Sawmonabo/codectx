@@ -24,7 +24,7 @@ func (s *Store) EnsureRepository(ctx context.Context, id model.RepositoryID, roo
 	if rootPath == "" || len(rootPath) > model.MaxPathBytes {
 		return invalid("repository root path is empty or exceeds %d bytes", model.MaxPathBytes)
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO repositories(id, root_path, created_at) VALUES(?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET root_path = excluded.root_path`, raw, rootPath, formatTime(time.Now()))
 		return wrap("repositories", err)
@@ -43,7 +43,7 @@ func (s *Store) PutBlob(ctx context.Context, b model.BlobRecord) error {
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		var size int64
 		var state model.BlobState
 		err := tx.QueryRowContext(ctx, `SELECT size_bytes, state FROM blobs WHERE hash = ?`, hash).Scan(&size, &state)
@@ -125,7 +125,7 @@ func (s *Store) PutSnapshot(ctx context.Context, snap model.Snapshot, files func
 		return err
 	}
 	complete := false
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	err = s.ingest(ctx, func(tx *sql.Tx) error {
 		var count, bytes int64
 		err := tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(size_bytes), 0) FROM snapshot_files WHERE snapshot_id = ?`, snapID).Scan(&count, &bytes)
 		if err != nil {
@@ -167,7 +167,7 @@ func (s *Store) PutSnapshot(ctx context.Context, snap model.Snapshot, files func
 		if len(batch) == 0 {
 			return nil
 		}
-		err := s.write(ctx, func(tx *sql.Tx) error {
+		err := s.ingest(ctx, func(tx *sql.Tx) error {
 			return s.insertManifestRows(ctx, tx, snapID, repo, snap.RepositoryID, batch)
 		})
 		batch = batch[:0]
@@ -196,7 +196,7 @@ func (s *Store) PutSnapshot(ctx context.Context, snap model.Snapshot, files func
 		// Leave no half-imported snapshot behind; the next attempt would
 		// otherwise have to detect and replace it. A cleanup failure is
 		// reported with the cause, not hidden behind it.
-		return errors.Join(err, s.write(ctx, func(tx *sql.Tx) error {
+		return errors.Join(err, s.ingest(ctx, func(tx *sql.Tx) error {
 			_, derr := tx.ExecContext(ctx, `DELETE FROM snapshots WHERE id = ?`, snapID)
 			return wrap("snapshots", derr)
 		}))

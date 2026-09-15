@@ -419,6 +419,36 @@ ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
 
+## How an index run commits
+
+Every write an index run makes -- the snapshot's blobs and file rows, each
+unit's batches of facts, evidence, aliases and search documents, the seal, the
+membership rows, the packed builds and the activation itself -- joins one
+write transaction, the **ingestion group**, instead of committing on its own.
+Inside the group each call runs in a savepoint, so a refused batch rolls back
+alone and the units already in the group are kept. The group commits when its
+write-ahead log reaches 1 GiB, when another writer needs the database (a
+session, a lease, a heartbeat, a retention sweep: each ends the group before
+it runs and never waits longer than one batch), at activation or abort, and
+when the store closes. Readers on the reader pool see a run's units at those
+commits and not before; the ingestion side reads its own writes (unit states,
+aliases of dependency units, the snapshot and blobs a capture recorded) on
+the group's own connection, so a run reasons about what it has stored without
+waiting for a commit.
+
+The reason is what a commit costs. SQLite writes every page a transaction
+dirtied to the log in full, and the checkpoint copies each once more; a batch
+of a thousand facts dirties a leaf in every hash-keyed index for almost every
+row, plus the root and interior pages of every b-tree it touched. Committing
+per batch therefore sent to disk about forty-six pages per commit plus
+seven-tenths of a page per fact, measured: the reference repository's index
+wrote 47 GB for a 624 MB database, and the store's ingestion test wrote 1 854
+MiB for 41 MiB stored. One group per run writes each dirtied page once per
+group: the same test writes 74 MiB for 73 MiB stored, and a run's disk traffic
+is bounded by the pages it touches, not by the number of batches it commits.
+[ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurement, the
+alternatives and the residual cost that remains for hash-keyed indexes.
+
 ## Durability after a power loss
 
 The database runs in WAL mode and its single writer connection runs at

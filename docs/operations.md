@@ -58,8 +58,9 @@ The parser smoke checks are also `--deep` only.
 - **Workspace and data-directory permissions** — that the data directory exists,
   is user-private and is writable.
 - **Free space** — measured against `resources.min_free_disk_bytes`.
-- **Database schema, full-text index and write-ahead log** — including WAL size
-  against `storage.wal_high_water_bytes`.
+- **Database schema, full-text index and write-ahead log** — including a
+  write-ahead log larger than the store's ingestion group bound, which means it
+  has not been checkpointed since the last run.
 - **The active generation pointer** — whether this repository has one at all.
 - **Recent capture and freshness** — how stale the active generation is.
 - **Sampled content-store blocks** — a bounded sample of stored source blocks is

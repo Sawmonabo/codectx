@@ -16,6 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -28,13 +30,12 @@ import (
 // `[index]` batch bounds the store enforces on unit writes. For the numeric
 // settings zero selects the documented default; no value means unlimited.
 type Options struct {
-	BusyTimeout       time.Duration // busy_timeout, default 5s
-	ReadConnections   int           // read_connections, default 2
-	WriterCacheKiB    int           // writer_cache_kib, default 8192
-	ReaderCacheKiB    int           // reader_cache_kib, default 4096
-	WALHighWaterBytes int64         // wal_high_water_bytes, default 64 MiB
-	BatchRecords      int           // index.batch_records, default 1000
-	BatchBytes        int64         // index.batch_bytes, default 4 MiB
+	BusyTimeout     time.Duration // busy_timeout, default 5s
+	ReadConnections int           // read_connections, default 2
+	WriterCacheKiB  int           // writer_cache_kib, default 8192
+	ReaderCacheKiB  int           // reader_cache_kib, default 4096
+	BatchRecords    int           // index.batch_records, default 1000
+	BatchBytes      int64         // index.batch_bytes, default 4 MiB
 	// MaxJSONBytes bounds every stored JSON column that has no tighter model
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
@@ -93,7 +94,7 @@ func synchronousPragma(mode string) (pragma, error) {
 // number is itself the answer.
 func (s *Store) SynchronousMode(ctx context.Context) (string, error) {
 	var raw string
-	if err := s.writer.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&raw); err != nil {
+	if err := s.writerQueryRow(ctx, `PRAGMA synchronous`, &raw); err != nil {
 		return "", wrap("read the synchronous mode", err)
 	}
 	switch raw {
@@ -122,9 +123,6 @@ func (o Options) withDefaults() Options {
 	if o.ReaderCacheKiB <= 0 {
 		o.ReaderCacheKiB = 4096
 	}
-	if o.WALHighWaterBytes <= 0 {
-		o.WALHighWaterBytes = 64 << 20
-	}
 	if o.BatchRecords <= 0 {
 		o.BatchRecords = 1000
 	}
@@ -152,6 +150,21 @@ type Store struct {
 	readers   *sql.DB
 	postings  *sql.DB
 	tokenizer *sql.DB
+
+	// The ingestion group: one write transaction that every ingestion call
+	// joins, so a run commits when the log has grown by ingestGroupBytes, when
+	// another writer needs the database, at activation, and at close -- never
+	// per batch. groupMu guards group and every statement issued on it.
+	// writerMu is held by whichever holds the single writer connection: an
+	// open group, or an exclusive write for its duration. Lock order is
+	// groupMu then writerMu, and neither is held across a call that takes the
+	// other in the opposite order. writerWanted counts exclusive writers
+	// waiting for the connection; an ingestion call that ends with one waiting
+	// commits the group before returning.
+	groupMu      sync.Mutex
+	group        *sql.Tx
+	writerMu     sync.Mutex
+	writerWanted atomic.Int32
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -355,9 +368,15 @@ func (s *Store) checkEngine(ctx context.Context) error {
 	return nil
 }
 
-// Close releases every pool. It is safe to call once.
+// Close commits any open ingestion group and releases every pool. It is safe
+// to call once.
 func (s *Store) Close() error {
 	var first error
+	s.groupMu.Lock()
+	if err := s.commitGroupLocked(); err != nil {
+		first = err
+	}
+	s.groupMu.Unlock()
 	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
 		if db == nil {
 			continue
@@ -369,9 +388,35 @@ func (s *Store) Close() error {
 	return first
 }
 
-// write runs fn in one immediate write transaction on the single writer
+// ingestGroupBytes is the write-ahead log size at which an open ingestion
+// group commits. A commit writes every page the group dirtied once to the log
+// and the checkpoint copies it once more, so the bytes an index run sends to
+// disk are the number of distinct pages its groups touch, not the number of
+// rows it stores. Content-addressed identities land on pages spread across
+// their whole index, and a page pays for itself only when a group lands many
+// rows on it: 1 GiB of log is about 262 000 pages, the size of the hash-keyed
+// index set of a reference store of 100 000 files, so a group that large
+// touches each such page several times before paying for it. The bound is
+// disk, not memory: the writer's page cache spills to the log as it fills.
+const ingestGroupBytes = 1 << 30
+
+// write runs fn in one immediate write transaction of its own on the single
+// writer connection, committed before it returns. It is the path for state
+// that must be visible to every connection the moment the call returns --
+// sessions, leases, heartbeats, retention, the query planner's statistics --
+// and it ends any open ingestion group first, since the group holds the
 // connection. Any error rolls back; the caller sees the first typed failure.
 func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	s.writerWanted.Add(1)
+	defer s.writerWanted.Add(-1)
+	s.groupMu.Lock()
+	err := s.commitGroupLocked()
+	s.groupMu.Unlock()
+	if err != nil {
+		return err
+	}
+	s.writerMu.Lock()
+	defer s.writerMu.Unlock()
 	tx, err := s.writer.BeginTx(ctx, nil)
 	if err != nil {
 		return wrap("begin", err)
@@ -384,6 +429,156 @@ func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 		return wrap("commit", err)
 	}
 	return nil
+}
+
+// ingest runs fn inside the ingestion group, opening the group when none is
+// open. fn is atomic on its own -- it runs inside a savepoint, so a refused
+// batch rolls back alone and the units already in the group are kept -- and
+// the group commits when its log reaches ingestGroupBytes or an exclusive
+// writer is waiting. The group's transaction is begun under a context that
+// outlives any one caller: a caller whose context ends loses its own
+// statement, never the run.
+func (s *Store) ingest(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return s.ingestGroup(ctx, false, fn)
+}
+
+// ingestAndCommit is ingest followed by the group's commit, whether fn
+// succeeded or was rolled back, for the calls whose outcome must be durable
+// when they return: a generation's activation or abort.
+func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	return s.ingestGroup(ctx, true, fn)
+}
+
+func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) error {
+	s.groupMu.Lock()
+	defer s.groupMu.Unlock()
+	if s.group == nil {
+		s.writerMu.Lock()
+		tx, err := s.writer.BeginTx(context.WithoutCancel(ctx), nil)
+		if err != nil {
+			s.writerMu.Unlock()
+			return wrap("begin", err)
+		}
+		s.group = tx
+	}
+	tx := s.group
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
+		return wrap("savepoint", err)
+	}
+	if err := fn(tx); err != nil {
+		if _, rbErr := tx.ExecContext(context.WithoutCancel(ctx), `ROLLBACK TO ingest`); rbErr != nil {
+			// The savepoint could not be unwound: the group is no longer a
+			// state the run can build on, so it ends here.
+			s.abandonGroupLocked()
+			return errors.Join(err, wrap("rollback to savepoint", rbErr))
+		}
+		if _, relErr := tx.ExecContext(context.WithoutCancel(ctx), `RELEASE ingest`); relErr != nil {
+			s.abandonGroupLocked()
+			return errors.Join(err, wrap("release savepoint", relErr))
+		}
+		if commitErr := s.commitGroupIfDueLocked(commit); commitErr != nil {
+			return errors.Join(err, commitErr)
+		}
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `RELEASE ingest`); err != nil {
+		s.abandonGroupLocked()
+		return wrap("release savepoint", err)
+	}
+	return s.commitGroupIfDueLocked(commit)
+}
+
+// commitGroupIfDueLocked commits the open group when the caller asks for it,
+// when an exclusive writer is waiting, or when the log has reached
+// ingestGroupBytes. groupMu is held.
+func (s *Store) commitGroupIfDueLocked(force bool) error {
+	if s.group == nil {
+		return nil
+	}
+	if !force && s.writerWanted.Load() == 0 {
+		wal, err := s.walBytes()
+		if err != nil {
+			return err
+		}
+		if wal < ingestGroupBytes {
+			return nil
+		}
+	}
+	return s.commitGroupLocked()
+}
+
+// commitGroupLocked commits the open group, if any, and releases the writer
+// connection. groupMu is held.
+func (s *Store) commitGroupLocked() error {
+	if s.group == nil {
+		return nil
+	}
+	tx := s.group
+	s.group = nil
+	err := tx.Commit()
+	s.writerMu.Unlock()
+	if err != nil {
+		return wrap("commit", err)
+	}
+	return nil
+}
+
+// abandonGroupLocked rolls the open group back and releases the writer
+// connection. groupMu is held.
+func (s *Store) abandonGroupLocked() {
+	if s.group == nil {
+		return
+	}
+	tx := s.group
+	s.group = nil
+	tx.Rollback()
+	s.writerMu.Unlock()
+}
+
+// WALBoundBytes is the write-ahead log size at which an open ingestion group
+// commits, and so the largest log a run leaves behind before the checkpoint
+// folds it; a diagnostic that finds a larger log with no run open has found one
+// that was never checkpointed.
+func (s *Store) WALBoundBytes() int64 { return ingestGroupBytes }
+
+// Flush commits the open ingestion group, if any. The coordinator calls it
+// where a run's work must be on disk without a publication: before it hands
+// deferred units to a later publication and before the process exits.
+func (s *Store) Flush(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return wrap("flush", err)
+	}
+	s.groupMu.Lock()
+	defer s.groupMu.Unlock()
+	return s.commitGroupLocked()
+}
+
+// readOwn runs fn where it sees the ingestion group's own writes: on the
+// group's transaction while one is open, and on the reader pool otherwise.
+// It is the read path of the ingestion side -- unit states, aliases of
+// dependency units, the snapshot and blobs a capture just recorded -- whose
+// callers reason about what this run has already stored. Query paths read
+// through read and never see a group in progress.
+func (s *Store) readOwn(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	s.groupMu.Lock()
+	if s.group != nil {
+		defer s.groupMu.Unlock()
+		return fn(s.group)
+	}
+	s.groupMu.Unlock()
+	return s.read(ctx, fn)
+}
+
+// writerQueryRow issues one row query on the writer connection, through the
+// open group when there is one so the probe never waits on the run.
+func (s *Store) writerQueryRow(ctx context.Context, query string, dest ...any) error {
+	s.groupMu.Lock()
+	if s.group != nil {
+		defer s.groupMu.Unlock()
+		return s.group.QueryRowContext(ctx, query).Scan(dest...)
+	}
+	s.groupMu.Unlock()
+	return s.writer.QueryRowContext(ctx, query).Scan(dest...)
 }
 
 // read runs fn in one short deferred read transaction on the reader pool, so

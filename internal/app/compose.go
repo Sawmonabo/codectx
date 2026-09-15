@@ -317,14 +317,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	if s.store, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
-		BusyTimeout:       cfg.Storage.BusyTimeout.Std(),
-		ReadConnections:   cfg.Storage.ReadConnections,
-		WriterCacheKiB:    cfg.Storage.WriterCacheKiB,
-		ReaderCacheKiB:    cfg.Storage.ReaderCacheKiB,
-		WALHighWaterBytes: cfg.Storage.WALHighWaterBytes,
-		BatchRecords:      cfg.Index.BatchRecords,
-		BatchBytes:        cfg.Index.BatchBytes,
-		MaxJSONBytes:      cfg.Context.MaxManifestBytes.Value(),
+		BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+		ReadConnections: cfg.Storage.ReadConnections,
+		WriterCacheKiB:  cfg.Storage.WriterCacheKiB,
+		ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+		BatchRecords:    cfg.Index.BatchRecords,
+		BatchBytes:      cfg.Index.BatchBytes,
+		MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
 		// Seal clips to the same number the providers emitted under, so the
 		// retained set does not depend on whether a unit was assembled fresh
 		// or merged from carried occurrences.

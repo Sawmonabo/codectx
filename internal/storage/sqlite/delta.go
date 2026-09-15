@@ -139,7 +139,7 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 		return CarryOverStats{}, err
 	}
 	var stats CarryOverStats
-	err = w.s.write(ctx, func(tx *sql.Tx) error {
+	err = w.s.ingest(ctx, func(tx *sql.Tx) error {
 		prevRow, err := w.previousUnitRow(ctx, tx, prev, prevKey)
 		if err != nil {
 			return err
@@ -629,7 +629,7 @@ func (w *UnitWriter) PutDeltaState(ctx context.Context, kind string, payload []b
 		return &model.Error{Code: model.CodeResourceLimit,
 			Message: fmt.Sprintf("delta state %q is %d bytes, limit %d", kind, len(payload), MaxDeltaStateBytes)}
 	}
-	return w.s.write(ctx, func(tx *sql.Tx) error {
+	return w.s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO unit_delta_state(unit_id, kind, payload) VALUES(?, ?, ?)
 			ON CONFLICT(unit_id, kind) DO UPDATE SET payload = excluded.payload`, w.rowID, kind, payload)
 		return wrap("unit_delta_state", err)
@@ -645,7 +645,7 @@ func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string) 
 		return nil, err
 	}
 	var payload []byte
-	err = s.read(ctx, func(tx *sql.Tx) error {
+	err = s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT ds.payload FROM unit_delta_state ds JOIN units u ON u.id = ds.unit_id
 			WHERE u.unit_key = ? AND ds.kind = ?`, key, kind).Scan(&payload)
 		if isNoRows(err) {
@@ -687,7 +687,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 			return
 		}
 		var row int64
-		if err := s.read(ctx, func(tx *sql.Tx) error {
+		if err := s.readOwn(ctx, func(tx *sql.Tx) error {
 			var state model.UnitState
 			err := tx.QueryRowContext(ctx, `SELECT id, state FROM units WHERE unit_key = ?`, key).Scan(&row, &state)
 			if isNoRows(err) {
@@ -708,7 +708,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 		page := make([]model.UnitInput, 0, unitInputsPage)
 		for {
 			var last []byte
-			if err := s.read(ctx, func(tx *sql.Tx) error {
+			if err := s.readOwn(ctx, func(tx *sql.Tx) error {
 				page = page[:0]
 				last = nil
 				rows, err := tx.QueryContext(ctx, `SELECT file_id, content_hash, executable FROM unit_inputs
@@ -751,7 +751,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 // is CTX_ARGUMENT_INVALID with reason not_found.
 func (s *Store) SelectedUnit(ctx context.Context, gen model.GenerationID, providerID, scopeKey string) (model.UnitID, error) {
 	var raw []byte
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT u.unit_key FROM generation_units gu JOIN units u ON u.id = gu.unit_id
 			WHERE gu.generation_id = ? AND gu.provider_id = ? AND gu.scope_key = ?`, int64(gen), providerID, scopeKey).Scan(&raw)
 		if isNoRows(err) {

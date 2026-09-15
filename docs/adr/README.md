@@ -20,3 +20,4 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0005](ADR-0005-graph-traversal-layout.md) | Graph traversal layout: packed per-generation adjacency, surrogate walk, bitset visited set | Accepted, 2026-09-15 |
 | [ADR-0006](ADR-0006-language-servers.md) | Language servers and indexers: the Python server moves to a native checker | Accepted, 2026-09-15 |
 | [ADR-0007](ADR-0007-lexical-first-page.md) | Lexical first page: packed term statistics at activation, rank before hydrate, heap-served first page | Accepted, 2026-09-15 |
+| [ADR-0008](ADR-0008-ingestion-group.md) | Ingestion commits once per run: the ingestion group | Accepted, 2026-09-15 |

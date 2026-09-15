@@ -185,6 +185,7 @@ func TestDeltaCarriesTheTextItIndexed(t *testing.T) {
 	// of another provider or scope key, and generation_units is keyed by
 	// (generation_id, provider_id, scope_key) -- and it has to hold by
 	// induction over repeated deltas, so it is asserted rather than argued.
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

@@ -29,7 +29,7 @@ func (s *Store) RecordSuppliedIndex(ctx context.Context, gen model.GenerationID,
 	if path == "" {
 		return invalid("a supplied index path cannot be empty")
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	return s.ingest(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `INSERT INTO generation_supplied_indexes(generation_id, path, resolved)
 			VALUES(?, ?, ?) ON CONFLICT(generation_id, path) DO UPDATE SET resolved = excluded.resolved`,
 			int64(gen), path, boolInt(resolved))
@@ -44,7 +44,7 @@ func (s *Store) RecordSuppliedIndex(ctx context.Context, gen model.GenerationID,
 // exists, where before the same emptiness was merely the absence of a feature.
 func (s *Store) SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error) {
 	var out []SuppliedIndex
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err := s.readOwn(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT path, resolved FROM generation_supplied_indexes
 			WHERE generation_id = ? ORDER BY path`, int64(gen))
 		if err != nil {
