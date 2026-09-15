@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -135,10 +136,14 @@ func TestReferencePagesAreIdenticalUnderEitherSurrogateOrder(t *testing.T) {
 // page two re-serves page one's relation and the duplicate check fails.
 func TestReferenceSecondPageIsServedByOffset(t *testing.T) {
 	f := newGraphFixture(t)
+	// THREE pages, not two: with only two, page two begins at the first record
+	// of the spool, which is where a reader that ignored the offset would start
+	// anyway, and the offset would carry no weight.
+	widenReferences(t, f, "n-z", 2)
 	whole, _ := refsEngine(t, f, MemoryGraphOrder{}, 200)
 	want := refsPage(t, whole, "n-z", "")
-	if len(want.Items) < 2 {
-		t.Fatalf("the fixture served %d occurrences for n-z; paging needs at least two", len(want.Items))
+	if len(want.Items) < 4 {
+		t.Fatalf("the fixture served %d occurrences for n-z; three pages need at least four", len(want.Items))
 	}
 
 	// One occurrence per page, so the page ends on the first relation boundary
@@ -185,6 +190,38 @@ func TestReferenceListThatFitsOnePageRetainsNothing(t *testing.T) {
 	if leases.liveCount() != 0 {
 		t.Fatalf("liveCount = %d, want none: a list that fits one page retains nothing", leases.liveCount())
 	}
+}
+
+// widenReferences adds n further evidence-bearing callers of node to the
+// fixture. Their relation ids sort after every declared edge, so no existing
+// scenario's keyset order moves and no other answer gains an occurrence.
+func widenReferences(t *testing.T, f *graphFixture, node string, n int) {
+	t.Helper()
+	var proto model.Evidence
+	for _, r := range f.relations {
+		if rows := f.evidence[r.ID]; len(rows) > 0 {
+			proto = rows[0]
+			break
+		}
+	}
+	if proto.ID == "" {
+		t.Fatalf("the fixture carries no evidence row to model a new one on")
+	}
+	target := fixtureNodeID(node)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("n-page-src-%d", i)
+		src := fixtureNodeID(name)
+		f.nodes[src] = model.Node{ID: src, Kind: model.NodeFunction, Name: name,
+			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
+		rel := model.RelationID(fmt.Sprintf("%064x", 0xf000+i))
+		f.relations = append(f.relations, model.Relation{
+			ID: rel, From: src, Kind: model.RelCalls, To: target})
+		row := proto
+		row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-page-%d", i)))
+		row.RelationID = rel
+		f.evidence[rel] = []model.Evidence{row}
+	}
+	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
 }
 
 func mustJSON(t *testing.T, v any) string {
