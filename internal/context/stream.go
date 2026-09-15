@@ -712,14 +712,6 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 	return run
 }
 
-// errNotImplemented is the body of every pass this freeze declares and does not
-// write. It is a defect code and not a user-facing one: reaching it means a
-// lane's pass was wired in before it existed, which is a composition error.
-func errNotImplemented(pass string) error {
-	return &model.Error{Code: model.CodeInternal,
-		Message: "the streamed context compile pass " + pass + " is not implemented"}
-}
-
 // ---------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------
