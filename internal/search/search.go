@@ -196,11 +196,10 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// hits ranked before it are a real ordered prefix, and a query that
 	// returned nothing at all because it took too long to look is the
 	// refusal the scale posture forbids. Everything after the search (pinning,
-	// hydrating one page, writing the tail into the continuation spool) is
-	// work over a set already in hand, bounded by one page and one spool
-	// write, and runs under the CALLER's context -- so a search that ended on
-	// its deadline still has a live context to serve its page with, and a
-	// caller who stopped asking still stops all of it.
+	// selecting one page, writing the candidates into the continuation spool)
+	// is work over a set already in hand and runs under the CALLER's context --
+	// so a search that ended on its deadline still has a live context to serve
+	// its page with, and a caller who stopped asking still stops all of it.
 	// Every storage read this answer makes resolves its page bound against the
 	// wire ceiling; a request the storage layer served at a different size than
 	// it was asked for is reported on the answer rather than applied silently.
@@ -209,12 +208,12 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	hash := searchQueryHash(req)
 
 	generation := req.GenerationID
-	var cursor pagination.Cursor
+	var resumed searchCursor
 	if req.Page.Cursor != "" {
-		if cursor, err = decodeCursor(s.signer, req.Page.Cursor, endpointSearch, now); err != nil {
+		if resumed, err = s.resumeSearch(req.Page.Cursor, hash, now); err != nil {
 			return empty, err
 		}
-		generation = cursor.GenerationID
+		generation = resumed.GenerationID
 	}
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
@@ -226,37 +225,17 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	limit, clampNotice := s.pageLimit(req.Page.Limit)
 	var (
 		hits      []model.SearchHit
+		next      string
 		truncated bool
 		reason    string
-		// tail streams the hits after this page into the continuation spool.
-		// restN is how many there are, which the spool-budget reason names.
-		tail  func(func(spooledHit) error) error
-		restN int
 	)
 	if req.Page.Cursor != "" {
-		if err := verifyCursor(cursor, binding, hash); err != nil {
+		if err := checkSearchCursor(resumed, binding); err != nil {
 			return empty, err
 		}
-		var meta spoolMeta
-		var spooled []spooledHit
-		if meta, spooled, restN, err = readSpool(ctx, s.spools, cursor, now, limit); err != nil {
+		truncated, reason = resumed.Truncated, resumed.TruncationReason
+		if hits, next, err = s.resumedPage(ctx, reader, resumed, limit); err != nil {
 			return empty, err
-		}
-		// The source ranges of THIS page are read here, not when the spool was
-		// written: a spooled hit carries the byte interval it hydrates from.
-		if hits, err = s.hydratedSpool(ctx, reader, spooled); err != nil {
-			return empty, err
-		}
-		// The answer-level truncation the FIRST page computed. A continuation
-		// reads hits from the spool, never from the tiers, so it has nothing
-		// of its own to compute it from and must carry it forward or report a
-		// complete answer for an answer that is not.
-		truncated, reason = meta.Truncated, meta.TruncationReason
-		if restN > 0 {
-			// The remainder is streamed from the consumed spool into the next
-			// one rather than carried here: it is the tail of the answer, and
-			// a continuation's heap must be the page, not what follows it.
-			tail = spoolTail(ctx, s.spools, cursor, now, len(hits))
 		}
 	} else {
 		var run *pagination.SortedRun[scored]
@@ -267,46 +246,19 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		defer run.Close()
-		if hits, err = s.pageFrom(ctx, reader, run, limit); err != nil {
+		if hits, next, truncated, reason, err = s.firstPage(ctx, reader, run, limit,
+			binding, hash, now, truncated, reason); err != nil {
 			return empty, err
-		}
-		if restN = int(run.Len()) - len(hits); restN > 0 {
-			tail = tailOf(ctx, run, len(hits))
 		}
 	}
 
 	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason,
-		Notices: clamps.Notices()}
+		NextCursor: next, Notices: clamps.Notices()}
 	if clampNotice != "" {
 		meta.Notices = append(meta.Notices, clampNotice)
 	}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
-	}
-	if restN > 0 {
-		// A spool budget that is already full must end THIS page, never the
-		// query: the hits of page 1 are in hand and refusing to serve them
-		// because the tail could not be written is the class-D refusal the
-		// scale posture forbids. The answer says it is incomplete and why, and
-		// carries no continuation because there is nothing to continue from.
-		// Every other spool failure -- a disk fault, a corrupt spool -- is a
-		// real fault and still surfaces.
-		meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, tail)
-		switch {
-		case err == nil:
-		case pagination.IsBudgetExhausted(err):
-			// This reason OVERWRITES whatever a tier reported. A tier's
-			// truncation says the candidate set was bounded; this one says a
-			// named number of already-ranked hits were thrown away and there is
-			// no continuation to reach them. Reporting only the tier would hide
-			// exactly the drop the posture forbids.
-			meta.Truncated, meta.NextCursor = true, ""
-			meta.TruncationReason = spoolBudgetFullReason(restN)
-			s.log.Warn("a search answer was cut short by the spool disk budget", "component", "search",
-				"generation_id", int64(binding.GenerationID), "dropped_hits", restN)
-		default:
-			return empty, err
-		}
 	}
 	page := model.Page[model.SearchHit]{Meta: meta, Items: hits}
 	if err := page.Validate(); err != nil {
@@ -317,41 +269,332 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 	}
-	if req.Page.Cursor != "" {
-		s.consumed(ctx, cursor)
-	}
 	s.log.Debug("answered a search query", "component", "search", "generation_id", int64(binding.GenerationID),
 		"hits", len(page.Items), "truncated", meta.Truncated, "continued", meta.NextCursor != "")
 	return page, nil
 }
 
-// spoolNext writes the remainder of a ranked answer to a fresh spool and signs
-// the cursor that names it.
+// firstPage serves page 1 out of the bounded heap and, when the answer runs
+// past it, lays every scored candidate into the raw continuation spool
+// (ADR-0007 Decision 3). It returns the page, the continuation token, and the
+// answer-level truncation as the spool write left it.
 //
-// The cursor carries a NEW cursor-owned retention lease, not the pinned
-// reader's query lease: that one is released when this request returns, and a
-// continuation whose lease is gone is refused by the spool store and leaves
-// the generation free for retention to collect. The lease expires with the
-// cursor, so nothing here pins a generation for longer than the token lives.
-func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, tail func(func(spooledHit) error) error) (string, error) {
-	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
+// ONE walk of the candidate set does both. The heap holds one page plus one
+// entry, so on the arrival that first overflows the page the heap holds
+// exactly the candidates seen so far: that is the moment the spool is opened
+// and those candidates are laid into it, and every later arrival is appended as
+// it passes. An answer that fits one page never reaches that moment and
+// therefore writes no spool, takes no lease and runs no sort.
+func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored],
+	limit int, b model.Binding, hash string, now time.Time, truncated bool, reason string) ([]model.SearchHit, string, bool, string, error) {
+	h := &pageHeap{limit: limit}
+	w := &rawWriter{svc: s, binding: b, hash: hash, now: now}
+	total := int64(0)
+	err := run.Each(func(v scored) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(err)
+		}
+		// The deduplication pass is closed, so a survivor's folded score is
+		// final and becomes the score it is ranked, spooled and served with.
+		v.ScoreMicros = v.Folded
+		total++
+		if w.started() {
+			if err := w.append(ctx, v); err != nil {
+				return err
+			}
+			h.offer(v)
+			return nil
+		}
+		h.offer(v)
+		if !h.full() {
+			return nil
+		}
+		return w.start(ctx, h.items)
+	})
 	if err != nil {
+		w.abandon(ctx)
+		return nil, "", false, "", err
+	}
+	hits, err := s.hydrated(ctx, reader, h.page())
+	if err != nil {
+		w.abandon(ctx)
+		return nil, "", false, "", err
+	}
+	spool, err := w.close(ctx)
+	if err != nil {
+		return nil, "", false, "", err
+	}
+	if w.dropped {
+		// A spool budget that is already full must end THIS page, never the
+		// query: the hits of page 1 are in hand and refusing to serve them
+		// because the tail could not be written is the class-D refusal the
+		// scale posture forbids. This reason OVERWRITES whatever a tier
+		// reported: a tier's truncation says the candidate set was bounded,
+		// this one says a named number of already-ranked hits were thrown away
+		// and there is no continuation to reach them.
+		dropped := int(total) - len(hits)
+		s.log.Warn("a search answer was cut short by the spool disk budget", "component", "search",
+			"generation_id", int64(b.GenerationID), "dropped_hits", dropped)
+		return hits, "", true, spoolBudgetFullReason(dropped), nil
+	}
+	if spool == "" {
+		return hits, "", truncated, reason, nil
+	}
+	c := s.newSearchCursor(b, hash, w.lease, now)
+	c.SpoolID, c.Served, c.Total = spool, int64(len(hits)), total
+	c.Truncated, c.TruncationReason = truncated, reason
+	token, err := s.signSearchCursor(c)
+	if err != nil {
+		s.spools.Release(spool)
+		s.releaseLease(ctx, w.lease)
+		return nil, "", false, "", err
+	}
+	return hits, token, truncated, reason, nil
+}
+
+// rawWriter lays an answer's scored candidates into the raw continuation
+// spool, in the order the deduplication pass presents them, under the sort's
+// own record codec. Ordering them is exactly the cost ADR-0007 Decision 3
+// defers to the request that needs it.
+//
+// It is opened LAZILY, by the first candidate past the page bound, so a
+// single-page answer takes neither a lease nor a spool. The cursor-owned lease
+// is minted here and not the pinned reader's query lease: that one is released
+// when the request returns, and a continuation whose lease is gone is refused
+// by the spool store.
+type rawWriter struct {
+	svc     *Service
+	binding model.Binding
+	hash    string
+	now     time.Time
+	lease   string
+	spool   *pagination.Spool
+	// dropped records that the shared spool budget refused a record. The walk
+	// continues -- the count of candidates is what the truncation reason names
+	// -- but nothing further is written and the answer carries no continuation.
+	dropped bool
+}
+
+// started reports whether the spool has been opened, or opening it has already
+// been given up on.
+func (w *rawWriter) started() bool { return w.spool != nil || w.dropped }
+
+// start opens the spool and writes every candidate the heap holds.
+func (w *rawWriter) start(ctx context.Context, held []scored) error {
+	lease, err := w.svc.leases.Acquire(ctx, w.binding.GenerationID, w.binding.SnapshotID, model.LeaseCursor)
+	if err != nil {
+		return err
+	}
+	w.lease = lease.ID
+	c := w.svc.newSearchCursor(w.binding, w.hash, lease.ID, w.now)
+	sp, err := w.svc.spools.Create(c.spoolBinding())
+	if err != nil {
+		w.svc.releaseLease(ctx, lease.ID)
+		w.lease = ""
+		if pagination.IsBudgetExhausted(err) {
+			w.dropped = true
+			return nil
+		}
+		return err
+	}
+	w.spool = sp
+	for _, v := range held {
+		if err := w.append(ctx, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// append writes one candidate. A budget refusal ends the WRITING, not the
+// walk; every other spool failure -- a disk fault, a corrupt spool -- is a real
+// fault and still surfaces.
+func (w *rawWriter) append(ctx context.Context, v scored) error {
+	if w.spool == nil {
+		return nil
+	}
+	record, err := encodeScored(v)
+	if err != nil {
+		return err
+	}
+	if err := w.spool.Append(record); err != nil {
+		if pagination.IsBudgetExhausted(err) {
+			w.abandon(ctx)
+			w.dropped = true
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// close flushes the spool and returns the id the continuation names, or "" when
+// the answer fit one page or the budget refused it.
+func (w *rawWriter) close(ctx context.Context) (string, error) {
+	if w.spool == nil {
+		return "", nil
+	}
+	if err := w.spool.Close(); err != nil {
+		w.svc.spools.Release(w.spool.ID())
+		w.svc.releaseLease(ctx, w.lease)
+		w.spool = nil
 		return "", err
 	}
-	next := newCursor(endpointSearch, b, lease.ID, hash, now.Add(s.ttl))
-	id, err := spoolHits(s.spools, next, answer, tail)
-	if err != nil {
-		s.releaseLease(ctx, lease.ID)
-		return "", err
+	return w.spool.ID(), nil
+}
+
+// abandon returns a spool and lease whose page never reached the caller.
+func (w *rawWriter) abandon(ctx context.Context) {
+	if w.spool != nil {
+		releaseSpool(w.svc.spools, w.spool)
+		w.spool = nil
 	}
-	next.SpoolID = id
-	token, err := s.signer.EncodeCursor(next)
-	if err != nil {
-		s.spools.Release(id)
-		s.releaseLease(ctx, lease.ID)
-		return "", err
+	if w.lease != "" {
+		w.svc.releaseLease(ctx, w.lease)
+		w.lease = ""
 	}
-	return token, nil
+}
+
+// resumedPage serves one page out of the spool the walk is reading, ordering
+// the candidates first if this is the first continuation (ADR-0007 Decision 3).
+// Once the order is settled the page costs its own page and never the
+// remainder behind it: it seeks to the byte offset the presented cursor
+// carries and stops at its own last record.
+func (s *Service) resumedPage(ctx context.Context, reader *sqlite.PinnedReader, c searchCursor,
+	limit int) ([]model.SearchHit, string, error) {
+	if !c.Ordered {
+		if err := s.orderSpool(ctx, &c); err != nil {
+			return nil, "", err
+		}
+	}
+	now := s.now()
+	chunk := make([]scored, 0, min(limit, model.MaxPageItems))
+	end, err := s.spools.OpenAt(ctx, c.spoolCursor(), now, c.Offset, func(record []byte) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(err)
+		}
+		v, err := decodeScored(record)
+		if err != nil {
+			return err
+		}
+		if chunk = append(chunk, v); len(chunk) == limit {
+			return pagination.ErrStopSpool
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(chunk) == 0 {
+		// The spool ended before Total. The cursor's counts and the file
+		// disagree, which is corruption of the continuation state, not an
+		// answer that quietly stops short.
+		return nil, "", cursorInvalid("continuation state is shorter than the answer it names")
+	}
+	hits, err := s.hydrated(ctx, reader, chunk)
+	if err != nil {
+		return nil, "", err
+	}
+	served := c.Served + int64(len(chunk))
+	if served >= c.Total {
+		// The answer is complete. The spool and the lease it pinned are
+		// released here rather than left to their TTL, so a walk read to
+		// exhaustion holds nothing.
+		if err := s.spools.Release(c.SpoolID); err != nil {
+			s.releaseLease(ctx, c.LeaseID)
+			return nil, "", err
+		}
+		s.releaseLease(ctx, c.LeaseID)
+		return hits, "", nil
+	}
+	// The spool's liveness is its lease's and the token's is its own expiry, so
+	// a cursor that carried page one's expiry forward would bound the WHOLE
+	// answer by one CursorTTL: a long answer would stop being reachable part
+	// way through, which is truncation by clock.
+	if _, err := s.leases.Renew(ctx, c.LeaseID); err != nil {
+		return nil, "", err
+	}
+	next := c
+	next.Offset, next.Served = end, served
+	next.ExpiresAt = now.Add(s.ttl).UTC().Truncate(time.Second)
+	token, err := s.signSearchCursor(next)
+	if err != nil {
+		return nil, "", err
+	}
+	return hits, token, nil
+}
+
+// orderSpool runs the external merge sort ONCE, on the first continuation,
+// over the raw candidate spool the first page wrote, and lays the ordered tail
+// -- the candidates page 1 did not serve -- into the spool every later page
+// reads by byte offset. c is advanced onto that spool.
+//
+// The raw spool is released as soon as the ordered run exists and BEFORE the
+// tail spool is created, so the shared byte budget is never charged for both at
+// once: the ordered run lives in the sort directory, which
+// resources.max_temp_bytes deliberately does not bound (pagination.Spools.SortDir).
+func (s *Service) orderSpool(ctx context.Context, c *searchCursor) error {
+	sorter, err := newScoredSort(s.spools.SortDir(), "searchrank-", s.runBytes, cmpScored)
+	if err != nil {
+		return err
+	}
+	defer sorter.Close()
+	now := s.now()
+	if err := s.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(err)
+		}
+		v, err := decodeScored(record)
+		if err != nil {
+			return err
+		}
+		return sorter.Add(v)
+	}); err != nil {
+		return err
+	}
+	run, err := sorter.Sorted()
+	if err != nil {
+		return err
+	}
+	defer run.Close()
+	if run.Len() != c.Total {
+		return cursorInvalid("continuation state holds a different number of results than the answer it names")
+	}
+	if err := s.spools.Release(c.SpoolID); err != nil {
+		return err
+	}
+	sp, err := s.spools.Create(c.spoolBinding())
+	if err != nil {
+		return err
+	}
+	// Written counts the header frame Create wrote, so this is where the first
+	// record lands and where this page begins reading.
+	offset := sp.Written()
+	at := int64(0)
+	err = run.Each(func(v scored) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(err)
+		}
+		// The candidates page 1 served are not written again: the walk resumes
+		// at the first record the caller has not seen.
+		if at++; at <= c.Served {
+			return nil
+		}
+		record, err := encodeScored(v)
+		if err != nil {
+			return err
+		}
+		return sp.Append(record)
+	})
+	if err == nil {
+		err = sp.Close()
+	}
+	if err != nil {
+		releaseSpool(s.spools, sp)
+		return err
+	}
+	c.SpoolID, c.Offset, c.Ordered = sp.ID(), offset, true
+	return nil
 }
 
 // releaseLease returns a lease whose cursor never reached the caller. The
@@ -438,7 +681,7 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 		truncated, reason = true, deadlineReason
 	}
 
-	run, err := c.results()
+	run, err := c.deduped()
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -469,29 +712,6 @@ func isQueryDeadline(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
-// errStopWalk ends a sorted-run walk early. SortedRun.Each returns a
-// callback's error unchanged, so this never reaches a caller.
-var errStopWalk = errors.New("stop")
-
-// pageFrom reads the FIRST page out of the ranked run and hydrates it.
-func (s *Service) pageFrom(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], limit int) ([]model.SearchHit, error) {
-	chunk := make([]scored, 0, min(limit, model.MaxPageItems))
-	err := run.Each(func(it scored) error {
-		if err := ctx.Err(); err != nil {
-			return contextErr(err)
-		}
-		chunk = append(chunk, it)
-		if len(chunk) == limit {
-			return errStopWalk
-		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, errStopWalk) {
-		return nil, err
-	}
-	return s.hydrated(ctx, reader, chunk)
-}
-
 // hydrated projects one chunk of ranked candidates into served hits and fills
 // their source ranges.
 //
@@ -516,26 +736,6 @@ func (s *Service) hydrated(ctx context.Context, reader *sqlite.PinnedReader, chu
 	return hits, nil
 }
 
-// hydratedSpool fills the source ranges of one page replayed from a spool. It
-// is hydrated's counterpart for the records tailOf wrote unhydrated: the hit
-// is already servable, only its Range is missing.
-func (s *Service) hydratedSpool(ctx context.Context, reader *sqlite.PinnedReader, chunk []spooledHit) ([]model.SearchHit, error) {
-	hits := make([]model.SearchHit, 0, len(chunk))
-	spans := make([]model.ByteRange, 0, len(chunk))
-	located := make([]int, 0, len(chunk))
-	for _, it := range chunk {
-		if it.Span != nil {
-			located = append(located, len(hits))
-			spans = append(spans, *it.Span)
-		}
-		hits = append(hits, it.Hit)
-	}
-	if err := s.hydrate(ctx, reader, hits, located, spans); err != nil {
-		return nil, err
-	}
-	return hits, nil
-}
-
 // servableHit projects a ranked candidate into the hit that is served.
 func servableHit(it scored) model.SearchHit {
 	hit := it.Hit
@@ -546,36 +746,6 @@ func servableHit(it scored) model.SearchHit {
 	// that was not actually found.
 	hit.OccurrenceCount = max(it.Occurrences, 1)
 	return hit
-}
-
-// tailOf streams the hits after the first page into the continuation spool,
-// one at a time, so the answer's tail is never held in heap.
-//
-// It hydrates NOTHING. A spooled hit carries the byte interval it will be
-// hydrated from, and the page that finally serves it hydrates only itself, so
-// a first page no longer pays the CAS read, the block-hash verification and
-// the line/column scan of every hit it is not serving. The served bytes are
-// identical: hydration is a pure function of (file, interval) over the pinned
-// generation the continuation lease holds open.
-//
-// It is ONE walk of the run. A file-backed sorted run reopens its file and
-// decodes from the first record on every walk, so a chunk loop that re-walked
-// it per chunk would cost a quadratic number of decodes and would surface on a
-// wide answer as a query-deadline failure -- on exactly the query this streams
-// for.
-func tailOf(ctx context.Context, run *pagination.SortedRun[scored], skip int) func(func(spooledHit) error) error {
-	return func(yield func(spooledHit) error) error {
-		at := 0
-		return run.Each(func(it scored) error {
-			if err := ctx.Err(); err != nil {
-				return contextErr(err)
-			}
-			if at++; at <= skip {
-				return nil
-			}
-			return yield(spooledHit{Hit: servableHit(it), Span: it.Span})
-		})
-	}
 }
 
 // hydrate fills the source range of every hit that has a byte interval. A node
