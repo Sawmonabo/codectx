@@ -585,6 +585,12 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 // a record the fold dropped never reaches the walk and its routes are therefore
 // never emitted -- which is what keeps P-C's `wanted` set the survivors' set,
 // exactly as today's relationsOnPaths loop over res.Candidates does.
+//
+// Only an expansion entry carries routes: a model.RelationPath is produced by a
+// graph walk, and every seed producer (seeds.go) resolves through search and
+// attaches none. A seed producer that began attaching one would lose it here,
+// and with it the edges it puts on P-C's wanted set, so it must emit its routes
+// through this same stream rather than on the candidate.
 func finishIngest(s *compileSorts, out *ingested,
 	entitySort, candSort *pagination.ExternalSort[candRec],
 	entries []model.ImpactEntry, impactBase int64, maxPaths config.Limit) (*ingested, error) {

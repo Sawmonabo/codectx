@@ -149,8 +149,13 @@ func TestStreamedHydrationCarriesBothPathValues(t *testing.T) {
 		{NodeID: "n-gone", FileID: model.FileID("00000000000000000000000000000000000000000000000000000000000000ff")},
 		{Path: "seed discovery: exact", Excluded: "the step stopped at its bound"},
 	}
-	c := &Compiler{cfg: fx.Cfg}
-	sorts := openSorts(t, fx.Cfg)
+	// Two records per batch, so the spool really is read in batches and a file
+	// row fetched for the first batch cannot leak into the second: batching is
+	// the whole of what P-B adds over hydrateFiles.
+	cfg := fx.Cfg
+	cfg.Resources.MaxPageItems = 2
+	c := &Compiler{cfg: cfg}
+	sorts := openSorts(t, cfg)
 	defer func() {
 		if err := sorts.Close(); err != nil {
 			t.Fatalf("releasing the sort area: %v", err)
