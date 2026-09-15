@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -306,7 +307,7 @@ func (g *MemoryGraph) Neighbours(ctx context.Context, refs []NodeRef, direction 
 				continue
 			}
 			if err := fn(e); err != nil {
-				if err == ErrStopScan {
+				if errors.Is(err, ErrStopScan) {
 					return EdgePos{Node: ref, Index: uint32(i)}, nil
 				}
 				return EdgePos{Node: ref, Index: uint32(i)}, err
