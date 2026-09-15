@@ -443,7 +443,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries})
+		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries,
+		MaxTOMLLines: cfg.Providers.Manifest.MaxTOMLLines, MaxXMLElements: cfg.Providers.Manifest.MaxXMLElements})
 	if err != nil {
 		return nil, err
 	}

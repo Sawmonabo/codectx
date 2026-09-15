@@ -180,10 +180,12 @@ statement about a transitive graph this provider does not resolve, and
 emitting its coordinates as a dependency would be a wrong fact, not a missing
 one.
 
-TOML evidence ranges come from a bounded line scan (`maxTOMLLines`, 200000).
-A manifest with more lines than that gets an empty layout and every fact of
-it carries evidence without a range: the documented degradation is evidence
-without a range, never a guessed one.
+TOML evidence ranges come from a line scan bounded by
+`providers.manifest.max_toml_lines`, which is unlimited by default. When an
+operator sets it, the scan stops at that line: facts declared before it keep
+their exact byte ranges and only the facts past it carry evidence without a
+range. The documented degradation is evidence without a range, never a
+guessed one.
 
 Every fact carries evidence at precision `syntax` with the exact byte range
 of the declaring line, element or token when the parser exposes one;
@@ -198,7 +200,7 @@ scope:
 | Outcome | State | Diagnostic |
 |---|---|---|
 | parsed | `fresh` | |
-| a list was cut at `MaxDependencies` (4096) or `MaxEntries` (1024) | `partial` | `CTX_RESOURCE_LIMIT` |
+| a list was cut at `providers.manifest.max_dependencies` or `max_entries`, or the parse at `max_toml_lines` or `max_xml_elements` — all four unlimited by default | `partial` | `CTX_RESOURCE_LIMIT` |
 | one entry was unusable (a dependency without a name, a path outside the workspace) | `partial` | `CTX_ARGUMENT_INVALID` |
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |

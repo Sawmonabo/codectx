@@ -103,6 +103,8 @@ func (c Config) validate() error {
 		{"index.watch_max_directories", c.Index.WatchMaxDirectories},
 		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
 		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
+		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
+		{"providers.manifest.max_xml_elements", c.Providers.Manifest.MaxXMLElements},
 		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
