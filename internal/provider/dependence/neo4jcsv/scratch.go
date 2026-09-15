@@ -6,6 +6,8 @@ import (
 	"net/url"
 
 	"modernc.org/sqlite"
+
+	"github.com/Sawmonabo/codectx/internal/config"
 )
 
 // Export labels this import consumes. A mapped label produces facts or is an
@@ -102,10 +104,10 @@ type graphNode struct {
 type scratch struct {
 	db   *sql.DB
 	rows int64
-	// maxRows is the user's `providers.dependence.max_staged_rows`, 0 for
+	// maxRows is the user's `providers.dependence.max_staged_rows`, unlimited for
 	// unlimited. It never stops the staging: crossing it sets overRows once,
 	// which the import reports.
-	maxRows  int64
+	maxRows  config.Limit
 	overRows bool
 	// derivedRows is how many relation occurrences project() derived. It is a
 	// count, never a bound: the projection is not truncated and the unit is
@@ -171,7 +173,7 @@ CREATE TABLE walk(start TEXT NOT NULL, node TEXT NOT NULL, depth INTEGER NOT NUL
 // openScratch creates the import's staging database. Durability is
 // deliberately off: the file is private, single-writer and deleted with the
 // import's scratch directory.
-func openScratch(ctx context.Context, path string, maxRows int64) (*scratch, error) {
+func openScratch(ctx context.Context, path string, maxRows config.Limit) (*scratch, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)", "cache_size(-32768)"} {
 		q.Add("_pragma", p)
@@ -251,7 +253,7 @@ func (s *scratch) commit(ctx context.Context) error {
 // capability rows. This package does no logging of its own.
 func (s *scratch) staged(ctx context.Context) error {
 	s.rows++
-	if s.maxRows > 0 && s.rows > s.maxRows {
+	if s.maxRows.Exceeded(s.rows) {
 		s.overRows = true
 	}
 	if s.rows%commitEvery != 0 {

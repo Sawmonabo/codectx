@@ -86,6 +86,18 @@ type Spec struct {
 	// It replaces the wall clock rather than supplementing it: however large
 	// the repository, a wedged process still makes no progress.
 	StallTimeout time.Duration
+	// ProgressFiles are the outputs this run writes, named so the stall
+	// detector can see a tool that writes its answer straight to a file and
+	// says nothing on either pipe. Their sizes are summed into the progress
+	// signal; a path is stated, never opened, and one that does not exist yet
+	// contributes nothing. A named directory is summed one level deep over its
+	// regular entries, which is how a step whose output is a directory of
+	// files grows.
+	//
+	// Naming them is not optional for a quiet tool: without this signal such a
+	// tool's only progress is its CPU time, which no platform but Linux
+	// samples, so a StallTimeout would terminate it mid-work.
+	ProgressFiles []string
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
 	// native child can temporarily exceed a reservation, and only an OS control
@@ -119,7 +131,8 @@ type Result struct {
 	// exiting, which is the normal outcome of a forced termination.
 	Signaled bool
 	// PeakTreeBytes is the highest summed resident set size observed over the
-	// whole process tree while it ran, sampled every treeSampleInterval. It is
+	// whole process tree while it ran, sampled at most treeSampleInterval
+	// apart, and more often where a short StallTimeout polls faster. It is
 	// the tree sum at one instant, never a sum of per-process historical peaks
 	// reached at different instants (Section 22), and it is what the memory
 	// governor reports as the observed figure (Section 11.6).
@@ -134,7 +147,10 @@ type Result struct {
 // while the child runs. It is the sampling period of the method measured in
 // docs/research/10-round3-empirical.md §1: fine enough to catch an analysis
 // pass's peak, coarse enough that the sweep costs nothing against a run
-// measured in minutes.
+// measured in minutes. It is the upper bound on the period, not the period
+// itself: a run with a stall timeout short enough to poll faster than this
+// samples at the watchdog's poll interval instead, so the CPU signal the
+// watchdog reads is never staler than one of its own polls.
 const treeSampleInterval = 250 * time.Millisecond
 
 // Limits are the runner-wide admission bounds. All three are required: a zero
@@ -443,7 +459,16 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// The child is a group leader, so its process ID is the group the sampler
 	// follows and the runner terminates. Sampling starts only once the tree
 	// control holds it, so nothing is sampled that could still escape it.
-	sampler := startTreeSampler(cmd.Process.Pid, treeSampleInterval)
+	// The CPU figure the stall watchdog reads is refreshed by this sampler, so
+	// it must be refreshed at least as often as the watchdog polls: a stall
+	// timeout short enough to poll faster than treeSampleInterval would
+	// otherwise see an unchanged CPU count for a whole window and call a
+	// computing tree wedged.
+	sampleEvery := treeSampleInterval
+	if spec.StallTimeout > 0 {
+		sampleEvery = min(sampleEvery, stallPoll(spec.StallTimeout))
+	}
+	sampler := startTreeSampler(cmd.Process.Pid, sampleEvery)
 	defer sampler.stopSampling()
 	// The parent's copies of the write ends must be closed or the drains never
 	// see end of file, however promptly the child exits.
@@ -473,7 +498,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	// The watchdog is joined before this function returns, like the sampler:
 	// no goroutine this package starts outlives the run that started it.
-	watchdog := startStallWatchdog(spec.StallTimeout, outPipe, errPipe, sampler)
+	watchdog := startStallWatchdog(spec.StallTimeout, outPipe, errPipe, sampler, spec.ProgressFiles)
 	defer watchdog.stopWatching()
 
 	waiter := newWaiter(cmd)

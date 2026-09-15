@@ -1,9 +1,18 @@
 package process
 
 import (
+	"os"
 	"sync"
 	"time"
 )
+
+// stallPoll is the interval at which the watchdog samples progress within one
+// stall timeout. It is exported to the runner as well as used here, because
+// the tree sampler must refresh the CPU signal at least as often as this, or a
+// silent but computing tree would look unchanged for a whole short window.
+func stallPoll(timeout time.Duration) time.Duration {
+	return max(timeout/stallPollsPerTimeout, minStallPoll)
+}
 
 // stallPollsPerTimeout is how many times the watchdog samples progress within
 // one stall timeout. Sampling at the timeout itself would let a tree that
@@ -25,7 +34,12 @@ const minStallPoll = 10 * time.Millisecond
 // output limit, and whether or not the bytes are kept, so a stream pointed at
 // io.Discard still speaks -- and, where the platform samples a running tree,
 // the tree's consumed CPU time, so a silent computation is not mistaken for a
-// hang.
+// hang -- and the size of every file the caller named in Spec.ProgressFiles,
+// which is the signal a tool that writes its answer straight to an output file
+// and says nothing on either pipe has. That last signal is what keeps the
+// detector honest where there is no CPU sampling: on a platform with no tree
+// sampler cpuTicks is a constant zero, so without it a quiet writer would have
+// had no signal at all and would have been killed mid-work.
 //
 // A nil watchdog is the disabled form: stalledC returns a nil channel, which
 // blocks forever in a select, and stopWatching does nothing. That is how a
@@ -42,17 +56,19 @@ type stallWatchdog struct {
 
 // startStallWatchdog begins watching the two pipes and the tree sampler. A
 // timeout of zero, which is the default, returns nil: no detector.
-func startStallWatchdog(timeout time.Duration, outPipe, errPipe *streamPipe, sampler *treeSampler) *stallWatchdog {
+func startStallWatchdog(timeout time.Duration, outPipe, errPipe *streamPipe, sampler *treeSampler,
+	progressFiles []string) *stallWatchdog {
+
 	if timeout <= 0 {
 		return nil
 	}
 	w := &stallWatchdog{stop: make(chan struct{}), done: make(chan struct{}), stalled: make(chan struct{})}
-	poll := max(timeout/stallPollsPerTimeout, minStallPoll)
+	poll := stallPoll(timeout)
 	go func() {
 		defer close(w.done)
 		ticker := time.NewTicker(poll)
 		defer ticker.Stop()
-		last := stallProgress(outPipe, errPipe, sampler)
+		last := stallProgress(outPipe, errPipe, sampler, progressFiles)
 		// The clock is only ever read here and compared against itself, so a
 		// wall-clock step does not make an active tree look wedged for longer
 		// than one step.
@@ -63,7 +79,7 @@ func startStallWatchdog(timeout time.Duration, outPipe, errPipe *streamPipe, sam
 				return
 			case <-ticker.C:
 			}
-			now := stallProgress(outPipe, errPipe, sampler)
+			now := stallProgress(outPipe, errPipe, sampler, progressFiles)
 			if now != last {
 				last, lastChange = now, time.Now()
 				continue
@@ -79,9 +95,57 @@ func startStallWatchdog(timeout time.Duration, outPipe, errPipe *streamPipe, sam
 
 // stallProgress is the one number the watchdog watches. Summing the signals is
 // sound because each is monotonic: any advance changes the sum, and only a tree
-// where none of them advanced leaves it unchanged.
-func stallProgress(outPipe, errPipe *streamPipe, sampler *treeSampler) int64 {
-	return outPipe.progressed() + errPipe.progressed() + sampler.cpuTicks()
+// where none of them advanced leaves it unchanged. A signal the platform or the
+// caller does not supply contributes a constant zero, which neither invents
+// progress nor hides another signal's.
+func stallProgress(outPipe, errPipe *streamPipe, sampler *treeSampler, progressFiles []string) int64 {
+	return outPipe.progressed() + errPipe.progressed() + sampler.cpuTicks() + progressBytes(progressFiles)
+}
+
+// progressBytes sums the bytes the run has written to the outputs the caller
+// named. A path that does not exist yet, or cannot be stated at this instant,
+// contributes nothing: the tool creates its output part way through the run,
+// and an unreadable path is the absence of a signal, not a reason to fail a
+// run the pipes may still be speaking for.
+//
+// A named directory is summed one level deep over its regular entries, because
+// a step whose output is a directory of files grows the files, not the
+// directory inode. The sweep is not recursive: it is a liveness question asked
+// four times per stall timeout, not a measurement.
+//
+// It is not monotonic in the strict sense -- a tool that rewrites its output
+// can shrink it -- but the watchdog compares the sum for equality, not for
+// growth, so any change at all is progress. The one shape that hides is a
+// shrink that exactly cancels another signal's advance within one poll; it
+// costs a single poll, because the next one sees a different sum.
+func progressBytes(paths []string) int64 {
+	var total int64
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if !info.IsDir() {
+			total += info.Size()
+			continue
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			if sub, err := entry.Info(); err == nil {
+				total += sub.Size()
+			}
+		}
+	}
+	return total
 }
 
 // stalledC is closed when the tree has made no progress for the whole timeout.

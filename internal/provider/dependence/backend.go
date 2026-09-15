@@ -58,10 +58,14 @@ type Engine struct {
 type Backend interface {
 	// Engine is the payload this backend resolved, fixed for its lifetime.
 	Engine() Engine
-	// Parse builds the graph for one unit.
+	// Parse builds the graph for one unit. The implementation must name the
+	// step's output to the process runner as its progress file: the engine is
+	// quiet, so its output is the only thing that tells the stall detector the
+	// step is still working.
 	Parse(ctx context.Context, req ParseRequest) (Outcome, error)
 	// Export writes the graph out for import and reports whether the result is
-	// a live graph at all.
+	// a live graph at all. Like Parse, it must name its output directory as the
+	// run's progress file.
 	Export(ctx context.Context, req ExportRequest) (ExportOutcome, error)
 	// NeutralOptions is the frontend's fixed allowlist of semantics-neutral
 	// parse options, used once to confirm a crash reproduces before a unit is

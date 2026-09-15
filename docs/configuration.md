@@ -65,10 +65,10 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | Table | Keys defaulting to `0` / `"unlimited"` |
   |---|---|
   | `[workspace]` | `max_files`, `max_parse_file_bytes`, `max_search_file_bytes` |
-  | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone) |
+  | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone), `watch_max_directories` |
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
-  | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows` |
+  | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
   | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
@@ -176,6 +176,7 @@ it concludes. All are **user** trust.
 | `reconcile_interval` | `"30s"` | Period of full reconciliation, which catches missed and timestamp-preserving changes. |
 | `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. `0` retains every ref, matching `max_retained_bytes`. This keeps a finite default because a generation is reconstructible by re-indexing, so evicting one is lifecycle retention rather than a dropped row. |
 | `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
+| `watch_max_directories` | `0` (unlimited) | How many directories one watcher may watch. Unlimited by default: a repository's directory count is a property of the repository, and the host's own notification limit is the real ceiling — reaching that is refused by the host and reported as incomplete watch coverage with a reason. A set value stops the watch set at that many directories and reports coverage incomplete, never silently. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
 
@@ -298,6 +299,7 @@ directories and network posture are product code, not configuration.
 | `dependence.max_units_per_family` | `0` (unlimited) | user | How many frontend-native projects of one language family you want a plan to hold. Unlimited by default: a monorepo's project count belongs to the repository, so every project is planned as its own unit and a crashed unit is still split along every one of its parts. A set value refuses nothing and drops nothing — crossing it marks the family's capability rows partial with `CTX_RESOURCE_LIMIT`, naming the family, the project count and this value. |
 | `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (roughly 10× the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
 | `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
+| `dependence.max_export_files` | `0` (unlimited) | user | How many entries one analysis export directory may hold. Unlimited by default: the file count follows the export's label vocabulary rather than the repository, and the directory is read one entry at a time. A set value is the only thing that refuses an import here, with `CTX_RESOURCE_LIMIT` naming this key. |
 
 ### Timeouts here are hang detectors, not size limits
 
