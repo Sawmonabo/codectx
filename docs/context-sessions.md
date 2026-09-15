@@ -188,10 +188,14 @@ served, what was reviewed, what was waived and with which reason, and every
 observation with its citations.
 
 **The capsule is paged.** The sealed record itself carries the session's
-identity, both hashes and a *count* per list; the records live beside it as
-durable rows and are read one page at a time. So a completion is never refused,
-truncated or held whole in memory because of how much a session recorded, on a
-repository of any size.
+identity, both hashes and a *count* per list; the records live beside it in
+`context_capsule_rows`, one durable row per record, keyed
+`(session_id, list, ordinal)` so a page is an ordinal keyset over the list's own
+order, and read one page at a time. A caller's cursor is turned back into that
+ordinal through `idx_capsule_row_key`, the unique index on
+`(session_id, list, row_key)`. So a completion is never refused, truncated or
+held whole in memory because of how much a session recorded, on a repository of
+any size.
 
 - `capsule --view <list>` returns **one keyset page of one list**, with
   `meta.next_cursor` when records remain. Pass that value back as `--cursor` to
