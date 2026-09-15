@@ -156,3 +156,60 @@ func TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary(t *testing.T) {
 			out.Excluded)
 	}
 }
+
+// TestChangedFileSeedsKeepReadingPastTheFirstPage is the OTHER half of the
+// bound removal, and the half wave-h review finding A5 records the test above
+// as unable to prove.
+//
+// The test above publishes exactly one captured change, so page 1 is full and
+// page 2 is empty: it proves that a full last page is not mistaken for a
+// remainder, and nothing else. A step that read page 1 and stopped would pass
+// it unchanged, because with one change page 1 IS the whole working tree. The
+// failure mode that made the bound worth removing -- a branch with more changed
+// files than one page contributing the arbitrary prefix a page boundary
+// happened to cut -- needs a working tree whose changes outnumber one page, and
+// an assertion that names a change only the SECOND read can reach.
+//
+// The generated fixture publishes generatedChanged captured changes; at a page
+// size of one, the last of them is generatedChanged reads in.
+func TestChangedFileSeedsKeepReadingPastTheFirstPage(t *testing.T) {
+	if generatedChanged < 2 {
+		t.Fatalf("the generated fixture publishes %d captured changes; one page cannot be exceeded",
+			generatedChanged)
+	}
+	fx := newGeneratedFixture(t)
+	// One changed file per read, over generatedChanged of them: every change
+	// but the first lies beyond the first page.
+	fx.Cfg.Resources.MaxPageItems = 1
+	c := intCompiler(t, fx, fx.Now)
+	reader, err := c.store.PinGeneration(fx.ctx, c.repo, fx.Binding.GenerationID, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	defer reader.Close()
+
+	var out seedSet
+	if err := c.changedFileSeeds(fx.ctx, reader, map[string]bool{}, &out); err != nil {
+		t.Fatalf("changedFileSeeds: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, cand := range out.Candidates {
+		if cand.Origin == originChangedFile {
+			seen[cand.Path] = true
+		}
+	}
+	var missing []string
+	for i := 0; i < generatedChanged; i++ {
+		if !seen[genLeaf(i)] {
+			missing = append(missing, genLeaf(i))
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("the step admitted %d of the %d captured changes at a page size of 1 and missed %v; "+
+			"it stopped at a page boundary instead of reading the working tree to the end",
+			len(seen), generatedChanged, missing)
+	}
+	if out.Unresolved {
+		t.Errorf("a working tree the step read to the end was reported INCOMPLETE: %v", out.Excluded)
+	}
+}

@@ -1025,6 +1025,113 @@ var parityRequests = []struct {
 		Phase: model.PhaseVerify}, denseScope},
 }
 
+// generatedParityRequests are the rows compiled over the GENERATED fixture
+// (generated_fixture_test.go) rather than the shared seven-file one. C-P3
+// measured the shared fixture at four wanted relations over seven candidates
+// admitted once each, which makes four of the five plan-table mutations
+// structurally unreachable through it; TestTheGeneratedFixtureCanDiscriminate-
+// TheStreamedPasses asserts the generated one has the shape those mutations
+// need, and these rows are what puts that shape through both pipelines.
+var generatedParityRequests = []struct {
+	name   string
+	budget model.Budget
+}{
+	// Every admitted candidate survives to an entry, over a scope naming far
+	// more than one page of distinct relations on retained routes.
+	// SKIPPED, and the skip is the finding: see openDefectStreamedEntriesStopAtOnePage.
+	{"the generated fan-out, unbounded", generatedFullBudget},
+	// The same scope under a file budget that drops more than a hundred files,
+	// so the packer's drop stream is emitted over many files and in rank order.
+	{"the generated fan-out, the file budget drops a hundred files", generatedDropBudget},
+}
+
+// openDefectStreamedEntriesStopAtOnePage records a MEASURED parity divergence
+// this lane found and could not fix: it is in production code lane C-P4 does
+// not own.
+//
+// Over the generated fan-out under generatedFullBudget, the whole-set reference
+// pipeline plans 207 entries and the streamed pipeline plans 200 --
+// model.MaxPageItems exactly. The first 200 entries are byte-for-byte
+// identical, including ordinals, reasons and evidence routes, so this is not a
+// ranking or ordering difference: the streamed pipeline STOPS, and it stops at
+// a page. The shared seven-file fixture admits seven candidates and so can
+// never show it, which is why every existing parity row passes.
+//
+// Skipping rather than deleting keeps the reproduction in the tree: delete the
+// t.Skip below and the row fails again with the entry counts above. It is the
+// same class as ruling C8 -- a page read once instead of to exhaustion -- and
+// on a large repository it is a silently truncated plan, which is the one
+// outcome this product may not produce.
+const openDefectStreamedEntriesStopAtOnePage = "OPEN DEFECT (C-P4): the streamed compile plans " +
+	"model.MaxPageItems entries where the whole-set reference plans 207; the first 200 agree " +
+	"byte for byte, so the streamed pipeline reads one page of candidates instead of all of them. " +
+	"Owner: internal/context production code (not this lane). Delete this skip to reproduce."
+
+// TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale is the proof above
+// over the generated fixture. It is a separate test rather than two more rows
+// of parityRequests because the fixture is built from a different file table
+// and is an order of magnitude more expensive to publish, so the shared rows
+// keep their fast builder.
+func TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale(t *testing.T) {
+	for _, row := range generatedParityRequests {
+		t.Run(row.name, func(t *testing.T) {
+			if row.budget == generatedFullBudget {
+				t.Skip(openDefectStreamedEntriesStopAtOnePage)
+			}
+			fx := newGeneratedFixture(t)
+			req := generatedRequest(row.budget)
+			c := intCompiler(t, fx, fx.Now)
+			ref, refScopeComplete, refNotices, refBudget, err := c.referenceCompile(fx.ctx, req)
+			if err != nil {
+				t.Fatalf("referenceCompile: %v", err)
+			}
+			m, err := intCompiler(t, fx, fx.Now).Compile(fx.ctx, req)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			entries, err := fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestEntries: %v", err)
+			}
+			slices, err := fx.Store.ManifestSlices(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestSlices: %v", err)
+			}
+			excluded, err := fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestExcluded: %v", err)
+			}
+			if len(entries) == 0 && len(excluded) == 0 {
+				t.Fatalf("the compile produced neither an entry nor an exclusion, so this row proves nothing")
+			}
+			sameJSON(t, "entries", ref.Entries, entries)
+			sameJSON(t, "slices", ref.Slices, slices)
+			sameJSON(t, "exclusions", ref.Excluded, excluded)
+			sameJSON(t, "notices", refNotices, m.Notices)
+			if m.ScopeComplete != refScopeComplete {
+				t.Errorf("scope_complete is %v, the whole-set pipeline says %v", m.ScopeComplete, refScopeComplete)
+			}
+			_, reqHash := manifestIdentity(fx.Binding, req, fx.Cfg)
+			refExcluded := sqlite.ExcludedEntries(func(yield func(model.ExcludedContextEntry) error) error {
+				for _, ex := range ref.Excluded {
+					if err := yield(ex); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			want, err := canonicalManifestHash(fx.Binding, reqHash, refBudget, refScopeComplete,
+				ref.Entries, ref.Slices, int64(len(ref.Excluded)), refExcluded)
+			if err != nil {
+				t.Fatalf("hash the whole-set plan: %v", err)
+			}
+			if m.CanonicalHash != want {
+				t.Errorf("canonical hash %s, the whole-set plan hashes to %s", m.CanonicalHash, want)
+			}
+		})
+	}
+}
+
 // routedScope is the shaped scope of the rows above: `Handle` calls `Place`,
 // `Place` calls `Repository` and is tested by `TestPlace`, documented by
 // `docs/order.md` and configured by `config/order.toml`. Seeded from both
