@@ -38,15 +38,16 @@ var scopeRelations = []model.RelationKind{
 	model.RelReferences, model.RelExports,
 }
 
-// scopeResult is what the expansion pass hands to ranking: the seeds with their
-// requirements assigned plus every boundary the walk admitted, the capability
-// rows that made the answer less than complete, and the ScopeComplete verdict.
+// scopeResult is the expansion pass's SCALAR verdict: the capability rows that
+// made the answer less than complete, the ScopeComplete verdict and the two
+// explanation-cut counts. The candidates themselves are not here -- they are
+// the sorted streams finishIngest answers -- so nothing about this record is
+// sized by the repository, which is what lets a checkpoint carry it whole.
 //
-// Exclusions are not a separate list: a candidate whose Excluded reason is set
-// is the excluded record (compiler.go), so an omission cannot be dropped on the
-// way from one pass to the next.
+// Exclusions are not a separate list either: a candidate whose Excluded reason
+// is set is the excluded record (compiler.go), so an omission cannot be dropped
+// on the way from one pass to the next.
 type scopeResult struct {
-	Candidates []candidate
 	// Completeness holds the non-fresh capability rows behind ScopeComplete,
 	// deduplicated and ordered, for the manifest header.
 	Completeness []model.CapabilityState
@@ -159,6 +160,18 @@ func boundPaths(paths []model.RelationPath, max config.Limit) ([]model.RelationP
 	}
 	keep := max.Int()
 	return append([]model.RelationPath(nil), paths[:keep]...), int64(len(paths) - keep)
+}
+
+// countBoundPaths answers only what boundPaths would have dropped. The walk
+// keeps the COUNT on the candidate record and sends the routes themselves to
+// the route sorts, so calling boundPaths there allocated and discarded one
+// path slice per entry -- once per boundary the walk admits, which is the
+// hottest loop P-A has.
+func countBoundPaths(paths []model.RelationPath, max config.Limit) int64 {
+	if !max.Exceeded(int64(len(paths))) {
+		return 0
+	}
+	return int64(len(paths) - max.Int())
 }
 
 // degradedCapabilities is every capability row that is not fresh, from the
@@ -479,7 +492,7 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 
 // expandScopeStream is expandScope as sorted streams. It produces the same
 // candidates, in the same admission order, with the same scope verdict, holding
-// one sort run buffer per sort instead of res.Candidates and
+// one sort run buffer per sort instead of a whole-set candidate list and
 // `admitted map[string]bool` (ruling C2).
 //
 // The dedupe is two folds and no join. Seeds that participate in today's
@@ -596,7 +609,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			// Only the disclosure count is kept on the record; the routes
 			// themselves go to the route sorts, and finishIngest keeps the ones
 			// whose candidate survived the fold.
-			_, cand.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
+			cand.MorePaths = countBoundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
 			seq := in.seq
 			in.seq++
 			if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {

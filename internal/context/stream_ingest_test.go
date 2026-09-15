@@ -93,9 +93,8 @@ func TestStreamedIngestMatchesTheMapDedupe(t *testing.T) {
 			if !reflect.DeepEqual(cands, want.Candidates) {
 				t.Fatalf("the streamed survivors differ from the map's\n got %+v\nwant %+v", cands, want.Candidates)
 			}
-			got.Scope.Candidates = want.Candidates
-			if !reflect.DeepEqual(got.Scope, want) {
-				t.Fatalf("the streamed scope verdict = %+v, want %+v", got.Scope, want)
+			if !reflect.DeepEqual(got.Scope, want.scopeResult) {
+				t.Fatalf("the streamed scope verdict = %+v, want %+v", got.Scope, want.scopeResult)
 			}
 			var excluded int
 			for _, c := range cands {
