@@ -3,7 +3,9 @@ package graph
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,12 +19,12 @@ import (
 // saw. Ruling P2 ranks the whole admitted set in two passes over a
 // pagination.ExternalSort, and that sort is built and dropped inside one
 // request; ruling P3 lets the query deadline end a page mid-walk and carry the
-// frontier forward in the `f` cursor. Put together, a resumed request used to
-// rank only its own leg: the cumulative visited set the cursor carries
-// guarantees the earlier legs' nodes are never admitted again, so they were
-// neither re-walked nor ranked, and the answer silently lost them.
+// frontier forward in the `f` cursor. A request that ranked only its own leg
+// would lose every earlier leg silently: the cumulative visited set the cursor
+// carries guarantees those nodes are never admitted again, so nothing re-walks
+// or re-ranks them.
 //
-// retainedWalk is the missing half. It is the pass-1 INPUT -- every admitted
+// retainedWalk is the other half. It is the pass-1 INPUT -- every admitted
 // impactRecord and every rollup pairRecord, exactly as the walk produced them
 // -- appended to a state directory that survives the request behind the same
 // `f` cursor as the frontier. Each continuation reopens it, resumes the walk,
@@ -30,8 +32,8 @@ import (
 // pass 1 and pass 2 over the WHOLE retained input. The served order is then the
 // single unbounded walk's order whatever requests it was spread over.
 //
-// Retaining the pass-1 input rather than the sort's runs is what also makes
-// ruling P7 work: a deadline that lands mid-RANK persists nothing extra,
+// Retaining the pass-1 input rather than the sort's runs is what makes ruling
+// P7 work: a deadline that lands mid-RANK persists nothing extra,
 // because the input the sort would re-read is already retained. The next
 // request re-sorts from it, which is O(n log n) over spooled records and holds
 // nothing more in heap than a fresh rank would.
@@ -68,9 +70,55 @@ const (
 	retainLevelFile = "level.recs"
 )
 
+// dirMaker is the retained directory, created on the FIRST write into it.
+//
+// A walk whose level fits in memory, whose bitsets stay inside their page
+// caches and which serves its whole answer in one page has no state to carry
+// forward, so it must leave nothing behind: an empty directory would still be
+// adopted, leased, charged against the spool budget and swept. Every write path
+// -- a bitset page eviction, a raw, sorted or admitted level file, and the
+// detach that hands the directory to a continuation -- goes through ensure, and
+// nothing else creates it.
+//
+// The NAME is chosen up front so that every path inside the directory is
+// absolute from the moment the handle exists; only the mkdir is deferred.
+type dirMaker struct {
+	path    string
+	created bool
+}
+
+// existingDir is a directory that is already on disk: the one a continuation
+// reopens, and the temporary directory a test hands a bitset.
+func existingDir(path string) *dirMaker { return &dirMaker{path: path, created: true} }
+
+// pendingDir names a directory under parent that nothing has created yet.
+func pendingDir(parent string) (*dirMaker, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil, internalErr("graph: naming the walk retention directory: " + err.Error())
+	}
+	return &dirMaker{path: filepath.Join(parent, "walkretain-"+hex.EncodeToString(raw[:]))}, nil
+}
+
+// exists reports whether the directory is on disk. A reader consults it so that
+// asking for a file does not bring the directory into being.
+func (d *dirMaker) exists() bool { return d.created }
+
+// ensure creates the directory, once, and returns it.
+func (d *dirMaker) ensure() (string, error) {
+	if d.created {
+		return d.path, nil
+	}
+	if err := os.MkdirAll(d.path, 0o700); err != nil {
+		return "", internalErr("graph: opening the walk retention directory: " + err.Error())
+	}
+	d.created = true
+	return d.path, nil
+}
+
 // retainedWalk is one request's handle on that directory.
 type retainedWalk struct {
-	dir string
+	home *dirMaker
 	// prevID is the store id this directory was adopted under by the page that
 	// created or last extended it, empty for a directory this request created.
 	// The re-adoption that carries it to the next page charges only the bytes
@@ -88,6 +136,11 @@ type retainedWalk struct {
 	// counted or served twice when a cycle, an overlapping level or a
 	// DirectionBoth edge brings the walk back to it.
 	emitted *pagedBitset
+	// frontier is the CURRENT level's node set, rebuilt from admitted.<level>
+	// at every level transition. It answers "is this neighbour on the level
+	// being scanned?", which the direction dedup rule asks of every delivered
+	// entry, without holding the level in heap.
+	frontier *pagedBitset
 	// owned marks a directory this request created and must remove itself if
 	// nothing adopts it. A directory REOPENED from the store is owned by the
 	// store, and is released through the consumed continuation instead --
@@ -98,20 +151,15 @@ type retainedWalk struct {
 	pairs   *retainFile
 }
 
-// openRetainedWalk creates a fresh retained input under parent.
+// openRetainedWalk names a fresh retained input under parent. Nothing is
+// created on disk until the first write into it (dirMaker).
 func openRetainedWalk(parent string, max walkBounds, probe *heapProbe) (*retainedWalk, error) {
-	if err := os.MkdirAll(parent, 0o700); err != nil {
-		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
-	}
-	dir, err := os.MkdirTemp(parent, "walkretain-")
+	home, err := pendingDir(parent)
 	if err != nil {
-		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
-	}
-	w := &retainedWalk{dir: dir, owned: true}
-	if err := w.open(); err != nil {
-		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	w := &retainedWalk{home: home, owned: true}
+	w.open()
 	if err = w.openSets(max, probe); err != nil {
 		w.discard()
 		return nil, err
@@ -122,10 +170,8 @@ func openRetainedWalk(parent string, max walkBounds, probe *heapProbe) (*retaine
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
 func reopenRetainedWalk(dir, prevID string, max walkBounds, probe *heapProbe) (*retainedWalk, error) {
-	w := &retainedWalk{dir: dir, prevID: prevID}
-	if err := w.open(); err != nil {
-		return nil, err
-	}
+	w := &retainedWalk{home: existingDir(dir), prevID: prevID}
+	w.open()
 	if err := w.openSets(max, probe); err != nil {
 		w.discard()
 		return nil, err
@@ -139,10 +185,13 @@ func reopenRetainedWalk(dir, prevID string, max walkBounds, probe *heapProbe) (*
 // cursor's fence is ever consulted.
 func (w *retainedWalk) openSets(max walkBounds, probe *heapProbe) error {
 	var err error
-	if w.bits, err = openBitset(w.dir, bitsetNodeFile, uint64(max.Node), probe); err != nil {
+	if w.bits, err = openBitset(w.home, bitsetNodeFile, uint64(max.Node), probe); err != nil {
 		return err
 	}
-	w.emitted, err = openBitset(w.dir, bitsetRelFile, uint64(max.Relation), probe)
+	if w.emitted, err = openBitset(w.home, bitsetRelFile, uint64(max.Relation), probe); err != nil {
+		return err
+	}
+	w.frontier, err = openBitset(w.home, bitsetFrontierFile, uint64(max.Node), probe)
 	return err
 }
 
@@ -158,13 +207,9 @@ func boundsOf(r GraphReader) walkBounds {
 	return walkBounds{Node: r.MaxNode(), Relation: r.MaxRelation()}
 }
 
-func (w *retainedWalk) open() error {
-	var err error
-	if w.entries, err = openRetainFile(filepath.Join(w.dir, retainEntriesFile)); err != nil {
-		return err
-	}
-	w.pairs, err = openRetainFile(filepath.Join(w.dir, retainPairsFile))
-	return err
+func (w *retainedWalk) open() {
+	w.entries = openRetainFile(w.home, retainEntriesFile)
+	w.pairs = openRetainFile(w.home, retainPairsFile)
 }
 
 // addEntry appends one admitted impactRecord. It is the accumulator's emit
@@ -215,11 +260,16 @@ func (w *retainedWalk) eachPair(add func(pairRecord) error) error {
 // which retains it under a fresh lease. The handle owns nothing afterwards, so
 // the deferred discard becomes a no-op.
 func (w *retainedWalk) detach() (string, error) {
+	// The mint is a write: the next request opens this directory by name, so
+	// it has to be there even when nothing else forced it into being.
+	dir, err := w.home.ensure()
+	if err != nil {
+		return "", err
+	}
 	if err := w.close(); err != nil {
 		return "", err
 	}
-	dir := w.dir
-	w.dir, w.owned = "", false
+	w.home, w.owned = existingDir(""), false
 	return dir, nil
 }
 
@@ -228,15 +278,15 @@ func (w *retainedWalk) detach() (string, error) {
 // continuation's release, and one already detached is left to whoever took it.
 func (w *retainedWalk) discard() {
 	_ = w.close()
-	if w.owned && w.dir != "" {
-		_ = os.RemoveAll(w.dir)
+	if w.owned && w.home.exists() {
+		_ = os.RemoveAll(w.home.path)
 	}
-	w.dir = ""
+	w.home = existingDir("")
 }
 
 func (w *retainedWalk) close() error {
 	var first error
-	for _, b := range []*pagedBitset{w.bits, w.emitted} {
+	for _, b := range []*pagedBitset{w.bits, w.emitted, w.frontier} {
 		if b == nil {
 			continue
 		}
@@ -244,7 +294,7 @@ func (w *retainedWalk) close() error {
 			first = err
 		}
 	}
-	w.bits, w.emitted = nil, nil
+	w.bits, w.emitted, w.frontier = nil, nil, nil
 	for _, f := range []*retainFile{w.entries, w.pairs} {
 		if f == nil {
 			continue
@@ -260,54 +310,144 @@ func (w *retainedWalk) close() error {
 // retainFile is one append-only record file of that directory: length-prefixed
 // frames, the same framing pagination's spools use, so a record's bytes are
 // opaque to the file and no record can be mistaken for a delimiter.
+//
+// The file, and the directory holding it, are created by the first append. A
+// file nothing ever appended to reads as empty rather than as an error, which
+// is the same answer it would give if it had been created and left empty.
 type retainFile struct {
-	path string
+	home *dirMaker
+	name string
 	f    *os.File
 	w    *bufio.Writer
+	// bytes is how many record bytes, frames included, this file holds. It is
+	// the truncation point a COLLECTING level's cursor carries.
+	bytes int64
 }
 
-func openRetainFile(path string) (*retainFile, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+func openRetainFile(home *dirMaker, name string) *retainFile {
+	return &retainFile{home: home, name: name}
+}
+
+// path is the file's absolute location, whether or not it is there.
+func (r *retainFile) path() string { return filepath.Join(r.home.path, r.name) }
+
+// writer opens the file for append, creating the retained directory with it.
+func (r *retainFile) writer() (*bufio.Writer, error) {
+	if r.w != nil {
+		return r.w, nil
+	}
+	dir, err := r.home.ensure()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, r.name), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, internalErr("graph: the retained walk input: " + err.Error())
 	}
-	return &retainFile{path: path, f: f, w: bufio.NewWriter(f)}, nil
+	r.f, r.w = f, bufio.NewWriter(f)
+	return r.w, nil
+}
+
+// truncate cuts the file back to n bytes and reopens it for append. It is how a
+// COLLECTING level resumes: the cursor carries the byte count the interrupted
+// request had committed, and anything after it is a partial frame or a record
+// the scan is about to deliver again.
+func (r *retainFile) truncate(n int64) error {
+	if err := r.close(); err != nil {
+		return err
+	}
+	if n == 0 && !r.home.exists() {
+		r.bytes = 0
+		return nil
+	}
+	if err := os.Truncate(r.path(), n); err != nil {
+		if os.IsNotExist(err) && n == 0 {
+			r.bytes = 0
+			return nil
+		}
+		return internalErr("graph: the retained walk input: " + err.Error())
+	}
+	r.bytes = n
+	return nil
+}
+
+// remove deletes the file. A file that was never created is already gone.
+func (r *retainFile) remove() error {
+	if err := r.close(); err != nil {
+		return err
+	}
+	r.bytes = 0
+	if err := os.Remove(r.path()); err != nil && !os.IsNotExist(err) {
+		return internalErr("graph: the retained walk input: " + err.Error())
+	}
+	return nil
 }
 
 // retainFrameBytes is the fixed frame prefix: one record's length.
 const retainFrameBytes = 4
 
 func (r *retainFile) append(record []byte) error {
+	w, err := r.writer()
+	if err != nil {
+		return err
+	}
 	var head [retainFrameBytes]byte
 	binary.BigEndian.PutUint32(head[:], uint32(len(record)))
-	if _, err := r.w.Write(head[:]); err != nil {
+	if _, err := w.Write(head[:]); err != nil {
 		return internalErr("graph: the retained walk input: " + err.Error())
 	}
-	if _, err := r.w.Write(record); err != nil {
+	if _, err := w.Write(record); err != nil {
 		return internalErr("graph: the retained walk input: " + err.Error())
 	}
+	r.bytes += retainFrameBytes + int64(len(record))
 	return nil
 }
 
-// each replays the file from the start, one record at a time. The writer is
-// flushed first, so a replay inside the request that is still appending sees
-// everything it has appended.
+// each replays the whole file, one record at a time.
 func (r *retainFile) each(fn func([]byte) error) error {
+	return r.eachFrom(0, func(rec []byte, _ int64) error { return fn(rec) })
+}
+
+// eachFrom replays the file from byte offset from, handing fn each record and
+// the offset of the NEXT one. That offset is what a SERVING level's cursor
+// carries: a page reads from it and the page after resumes exactly where this
+// one stopped, with no record delivered twice and none skipped.
+//
+// The writer is flushed first, so a replay inside the request that is still
+// appending sees everything it has appended. A file that was never created
+// holds no records, which is what an empty replay means.
+func (r *retainFile) eachFrom(from int64, fn func(rec []byte, next int64) error) error {
 	if r.w != nil {
 		if err := r.w.Flush(); err != nil {
 			return internalErr("graph: the retained walk input: " + err.Error())
 		}
 	}
-	f, err := os.Open(r.path)
+	f, err := os.Open(r.path())
 	if err != nil {
+		if os.IsNotExist(err) {
+			// A file nothing has appended to holds no records. It is not
+			// created until the first append (writer), so its absence is the
+			// empty replay and not a loss: a file that was written and then
+			// lost its tail is caught by the frame reader below instead.
+			return nil
+		}
 		return internalErr("graph: the retained walk input: " + err.Error())
 	}
 	defer f.Close()
+	if from < 0 {
+		return internalErr("graph: the retained walk input was replayed from a negative offset")
+	}
+	if from > 0 {
+		if _, err := f.Seek(from, io.SeekStart); err != nil {
+			return internalErr("graph: the retained walk input: " + err.Error())
+		}
+	}
 	in := bufio.NewReader(f)
 	var head [retainFrameBytes]byte
 	// One reusable buffer, grown to the largest record seen: a replay's heap is
 	// one record, never the retained set.
 	var buf []byte
+	at := from
 	for {
 		if _, err := io.ReadFull(in, head[:]); err != nil {
 			if err == io.EOF {
@@ -323,7 +463,8 @@ func (r *retainFile) each(fn func([]byte) error) error {
 		if _, err := io.ReadFull(in, buf); err != nil {
 			return retainCorrupt(err)
 		}
-		if err := fn(buf); err != nil {
+		at += retainFrameBytes + int64(n)
+		if err := fn(buf, at); err != nil {
 			return err
 		}
 	}
@@ -331,6 +472,7 @@ func (r *retainFile) each(fn func([]byte) error) error {
 
 func (r *retainFile) close() error {
 	if r.f == nil {
+		r.w = nil
 		return nil
 	}
 	err := r.w.Flush()
@@ -399,7 +541,7 @@ type rankProgress struct {
 
 // rankProgress reads the manifest. A missing one is the zero value.
 func (w *retainedWalk) rankProgress() (rankProgress, error) {
-	b, err := os.ReadFile(filepath.Join(w.dir, retainRankFile))
+	b, err := os.ReadFile(filepath.Join(w.home.path, retainRankFile))
 	if os.IsNotExist(err) {
 		return rankProgress{}, nil
 	}
@@ -421,11 +563,15 @@ func (w *retainedWalk) setRankProgress(p rankProgress) error {
 	if err != nil {
 		return internalErr("graph: encoding the retained ranking manifest: " + err.Error())
 	}
-	tmp := filepath.Join(w.dir, retainRankFile+".tmp")
+	dir, err := w.home.ensure()
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, retainRankFile+".tmp")
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return internalErr("graph: the retained ranking manifest: " + err.Error())
 	}
-	if err := os.Rename(tmp, filepath.Join(w.dir, retainRankFile)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(dir, retainRankFile)); err != nil {
 		_ = os.Remove(tmp)
 		return internalErr("graph: the retained ranking manifest: " + err.Error())
 	}
@@ -436,6 +582,10 @@ func (w *retainedWalk) setRankProgress(p rankProgress) error {
 // and returns their names there. Ownership moves with them, exactly as
 // pagination.Detach states: the sort that adopts them removes them.
 func (w *retainedWalk) adoptRunFiles(paths []string) ([]string, error) {
+	dir, err := w.home.ensure()
+	if err != nil {
+		return nil, err
+	}
 	names := make([]string, 0, len(paths))
 	for i, from := range paths {
 		// The name is the run's INDEX, not its source name. Detach returns the
@@ -445,7 +595,7 @@ func (w *retainedWalk) adoptRunFiles(paths []string) ([]string, error) {
 		// already sitting at that name is the one being re-detached and is left
 		// where it is rather than renamed onto itself.
 		name := fmt.Sprintf("run-%06d", i)
-		to := filepath.Join(w.dir, name)
+		to := filepath.Join(dir, name)
 		if from != to {
 			if err := os.Rename(from, to); err != nil {
 				return nil, internalErr("graph: retaining an interrupted sort run: " + err.Error())
@@ -460,7 +610,7 @@ func (w *retainedWalk) adoptRunFiles(paths []string) ([]string, error) {
 func (w *retainedWalk) runPaths(names []string) []string {
 	paths := make([]string, 0, len(names))
 	for _, name := range names {
-		paths = append(paths, filepath.Join(w.dir, name))
+		paths = append(paths, filepath.Join(w.home.path, name))
 	}
 	return paths
 }
@@ -469,17 +619,23 @@ func (w *retainedWalk) runPaths(names []string) []string {
 // abandoned earlier attempt left: the folded set is rewritten whole or not at
 // all, and half of one appended to half of another is not a fold of anything.
 func (w *retainedWalk) openFolded() (*retainFile, error) {
-	path := filepath.Join(w.dir, retainFoldedFile)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return nil, internalErr("graph: the retained fold output: " + err.Error())
+	f := openRetainFile(w.home, retainFoldedFile)
+	if err := f.remove(); err != nil {
+		return nil, err
 	}
-	return openRetainFile(path)
+	return f, nil
 }
 
 // eachFolded replays the retained pass-2 input, the same way eachEntry replays
 // pass 1's. The file has no open writer by then, so nothing is flushed first.
 func (w *retainedWalk) eachFolded(add func(impactRecord) error) error {
-	f := &retainFile{path: filepath.Join(w.dir, retainFoldedFile)}
+	f := openRetainFile(w.home, retainFoldedFile)
+	// The fold output is the pass-2 INPUT: a missing one is the whole ranking
+	// lost, not an empty one, so it is a typed corruption rather than a short
+	// answer. Every other retained file may legitimately have no records.
+	if _, err := os.Stat(f.path()); err != nil {
+		return retainCorrupt(err)
+	}
 	return f.each(func(b []byte) error {
 		r, err := decodeImpactRecord(b)
 		if err != nil {
@@ -521,11 +677,15 @@ func (w *retainedWalk) spoolLevel(level []frontierState) error {
 			buf = binary.AppendUvarint(buf, uint64(r))
 		}
 	}
-	tmp := filepath.Join(w.dir, retainLevelFile+".tmp")
+	dir, err := w.home.ensure()
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, retainLevelFile+".tmp")
 	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
 		return internalErr("graph: spooling the frontier level: " + err.Error())
 	}
-	if err := os.Rename(tmp, filepath.Join(w.dir, retainLevelFile)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(dir, retainLevelFile)); err != nil {
 		_ = os.Remove(tmp)
 		return internalErr("graph: spooling the frontier level: " + err.Error())
 	}
@@ -536,7 +696,7 @@ func (w *retainedWalk) spoolLevel(level []frontierState) error {
 // that has committed no level yet -- the seeds' own level -- and is the empty
 // frontier, not an error.
 func (w *retainedWalk) adoptLevel() ([]frontierState, error) {
-	raw, err := os.ReadFile(filepath.Join(w.dir, retainLevelFile))
+	raw, err := os.ReadFile(filepath.Join(w.home.path, retainLevelFile))
 	if os.IsNotExist(err) {
 		return nil, nil
 	}

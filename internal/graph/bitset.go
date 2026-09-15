@@ -46,6 +46,12 @@ const (
 	// relations is sized by the walk's EDGE count, which on a large repository
 	// is the largest structure a traversal holds.
 	bitsetRelFile = "emitted.bits"
+	// bitsetFrontierFile is the CURRENT level's frontier over node surrogates.
+	// It is rebuilt from admitted.<level> at every level transition, so it
+	// answers "is this neighbour on the level being scanned?" without holding
+	// the level in heap -- the question the direction dedup rule asks of every
+	// delivered entry.
+	bitsetFrontierFile = "frontier.bits"
 	// bitsetManifestSuffix names a bit file's manifest. The count is maintained
 	// rather than recomputed because scanning the file for it would make an
 	// O(1) report cost O(nodes).
@@ -65,21 +71,13 @@ const (
 	bitsetCachePages = 256
 )
 
-// bitsetVersion is the on-disk layout version. A manifest written by another
-// layout is refused rather than read under this one's assumptions; the
-// traversal cursor version is bumped with it, so a token naming such a
-// directory never reaches here.
-//
-// Version 2 is the surrogate walk's layout: the directory holds a set per
-// NAMED file (visited.bits for nodes, emitted.bits for relations) where
-// version 1 held the single visited set of the run-and-merge walk, and both
-// are now bounded by the generation's declared maximum surrogate.
-const bitsetVersion = 2
-
 // bitsetManifest is the O(1) state a resumed page reads: the population count
 // and nothing per-page, so a page's own write never grows with the page number.
+//
+// It carries no version of its own. The retained directory is reachable only
+// through a signed traversal cursor, and that cursor's wire version is the one
+// fence that refuses state written under another layout.
 type bitsetManifest struct {
-	Version int `json:"version"`
 	// Count is how many DISTINCT surrogates have been admitted. It counts bit
 	// transitions, not set calls, because adoption re-applies the last spooled
 	// level and a re-applied bit must not be counted twice.
@@ -96,7 +94,11 @@ type bitsetPage struct {
 // pagedBitset is one request's handle on the set.
 type pagedBitset struct {
 	name string
-	path string
+	// home is the retained directory, which does not exist until something is
+	// written into it. A set that stays inside its page cache for a whole
+	// request never asks for it, so a walk that neither evicts nor detaches
+	// leaves nothing on disk.
+	home *dirMaker
 	f    *os.File
 	// limit is the largest surrogate the pinned generation carries. A ref above
 	// it is a surrogate from another generation and is refused rather than
@@ -113,7 +115,6 @@ type pagedBitset struct {
 	pages map[int64]*list.Element // page index -> element holding *bitsetPage
 	lru   *list.List              // most recently used at the front
 
-	dir      string
 	admitted uint64
 	// grown is how many bytes this handle has written: the pages it flushed
 	// plus the manifests it replaced. It is what the walk charges to the probe,
@@ -123,33 +124,44 @@ type pagedBitset struct {
 	probe *heapProbe
 }
 
-// openBitset opens the set in dir, creating it when it is not there and
-// adopting the count an earlier page left when it is. maxNode sizes the address
-// space; nothing is allocated for it, because the file is extended lazily by
-// the first write into a region.
-func openBitset(dir, name string, maxRef uint64, probe *heapProbe) (*pagedBitset, error) {
-	path := filepath.Join(dir, name)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, bitsetErr(err)
-	}
+// openBitset opens the set named name in home, adopting the count an earlier
+// page left when the directory is already there. maxRef sizes the address
+// space; nothing is allocated for it, and no file is opened until a page is
+// evicted or the set is persisted, because the file is extended lazily by the
+// first write into a region.
+func openBitset(home *dirMaker, name string, maxRef uint64, probe *heapProbe) (*pagedBitset, error) {
 	b := &pagedBitset{
 		name:  name,
-		path:  path,
-		f:     f,
+		home:  home,
 		limit: maxRef,
 		pages: make(map[int64]*list.Element, bitsetCachePages),
 		lru:   list.New(),
-		dir:   dir,
 		probe: probe,
 	}
-	m, err := readBitsetManifest(dir, name)
+	m, err := readBitsetManifest(home.path, name)
 	if err != nil {
-		_ = f.Close()
 		return nil, err
 	}
 	b.admitted = m.Count
 	return b, nil
+}
+
+// file opens the set's backing file, creating the retained directory with it.
+// Every caller is a WRITE, or a read of a directory that already exists.
+func (b *pagedBitset) file() (*os.File, error) {
+	if b.f != nil {
+		return b.f, nil
+	}
+	dir, err := b.home.ensure()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, b.name), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, bitsetErr(err)
+	}
+	b.f = f
+	return f, nil
 }
 
 // readBitsetManifest reads the count a previous page left. A missing manifest
@@ -157,7 +169,7 @@ func openBitset(dir, name string, maxRef uint64, probe *heapProbe) (*pagedBitset
 func readBitsetManifest(dir, name string) (bitsetManifest, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, name+bitsetManifestSuffix))
 	if os.IsNotExist(err) {
-		return bitsetManifest{Version: bitsetVersion}, nil
+		return bitsetManifest{}, nil
 	}
 	if err != nil {
 		return bitsetManifest{}, bitsetErr(err)
@@ -166,10 +178,6 @@ func readBitsetManifest(dir, name string) (bitsetManifest, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return bitsetManifest{}, &model.Error{Code: model.CodeStorageCorrupt,
 			Message: "graph: the retained visited bitset manifest is not readable"}
-	}
-	if m.Version != bitsetVersion {
-		return bitsetManifest{}, &model.Error{Code: model.CodeStorageCorrupt,
-			Message: "graph: the retained visited bitset was written by another layout"}
 	}
 	return m, nil
 }
@@ -250,6 +258,13 @@ func bitsetSet[T ~uint64](b *pagedBitset, refs []T) (int64, error) {
 // manifest that named a count whose bits were not yet on disk would resume a
 // walk into a set smaller than the count it discloses.
 func (b *pagedBitset) sync() error {
+	// Nothing on disk and no directory to put it in: the set is resident pages
+	// only, and syncing it would be the eager creation item 6 removes. The
+	// pages reach disk when one is evicted or when the walk detaches, which is
+	// the only moment a later request can read them.
+	if b.f == nil && !b.home.exists() {
+		return nil
+	}
 	for e := b.lru.Back(); e != nil; e = e.Prev() {
 		if err := b.flush(e.Value.(*bitsetPage)); err != nil {
 			return err
@@ -293,9 +308,17 @@ func (b *pagedBitset) page(index int64) (*bitsetPage, error) {
 		delete(b.pages, p.index)
 	}
 	p := &bitsetPage{index: index, data: make([]byte, bitsetPageBytes)}
-	if _, err := b.f.ReadAt(p.data, index*bitsetPageBytes); err != nil &&
-		!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return nil, bitsetErr(err)
+	// A directory that does not exist holds no bits, and asking for the file
+	// would create it. An unwritten region reads as zeros either way.
+	if b.f != nil || b.home.exists() {
+		f, err := b.file()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.ReadAt(p.data, index*bitsetPageBytes); err != nil &&
+			!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, bitsetErr(err)
+		}
 	}
 	b.pages[index] = b.lru.PushFront(p)
 	return p, nil
@@ -307,7 +330,11 @@ func (b *pagedBitset) flush(p *bitsetPage) error {
 	if !p.dirty {
 		return nil
 	}
-	n, err := b.f.WriteAt(p.data, p.index*bitsetPageBytes)
+	f, err := b.file()
+	if err != nil {
+		return err
+	}
+	n, err := f.WriteAt(p.data, p.index*bitsetPageBytes)
 	b.grown += int64(n)
 	if err != nil {
 		return bitsetErr(err)
@@ -319,15 +346,19 @@ func (b *pagedBitset) flush(p *bitsetPage) error {
 // writeManifest replaces the count atomically: a torn manifest would resume a
 // walk with a visited_count that never existed.
 func (b *pagedBitset) writeManifest() error {
-	raw, err := json.Marshal(bitsetManifest{Version: bitsetVersion, Count: b.admitted})
+	raw, err := json.Marshal(bitsetManifest{Count: b.admitted})
 	if err != nil {
 		return internalErr("graph: encoding the retained visited bitset manifest: " + err.Error())
 	}
-	tmp := filepath.Join(b.dir, b.name+bitsetManifestSuffix+".tmp")
+	dir, err := b.home.ensure()
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(dir, b.name+bitsetManifestSuffix+".tmp")
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return bitsetErr(err)
 	}
-	if err := os.Rename(tmp, filepath.Join(b.dir, b.name+bitsetManifestSuffix)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(dir, b.name+bitsetManifestSuffix)); err != nil {
 		_ = os.Remove(tmp)
 		return bitsetErr(err)
 	}
@@ -338,15 +369,44 @@ func (b *pagedBitset) writeManifest() error {
 // close flushes and releases the handle. The FILE outlives it: the retained
 // walk directory is what the continuation carries forward.
 func (b *pagedBitset) close() error {
-	if b.f == nil {
+	if b.pages == nil {
 		return nil
 	}
 	err := b.sync()
-	if cerr := b.f.Close(); err == nil && cerr != nil {
-		err = bitsetErr(cerr)
+	if b.f != nil {
+		if cerr := b.f.Close(); err == nil && cerr != nil {
+			err = bitsetErr(cerr)
+		}
 	}
 	b.f, b.pages, b.lru = nil, nil, nil
 	return err
+}
+
+// clear empties the set: every resident page is dropped unflushed, the count
+// goes back to zero and the file behind it is truncated. It is how the FRONTIER
+// set is rebuilt at a level transition -- the frontier is one level's nodes, not
+// a cumulative set, so the previous level's bits must be gone before the new
+// level's are set rather than merged with them.
+//
+// It never touches the visited set, which is cumulative by contract.
+func (b *pagedBitset) clear() error {
+	if b.pages == nil {
+		return internalErr("graph: the " + b.name + " set was cleared after it was closed")
+	}
+	b.pages = make(map[int64]*list.Element, bitsetCachePages)
+	b.lru = list.New()
+	b.admitted = 0
+	if b.f == nil && !b.home.exists() {
+		return nil
+	}
+	f, err := b.file()
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(0); err != nil {
+		return bitsetErr(err)
+	}
+	return b.writeManifest()
 }
 
 func bitsetErr(err error) error {

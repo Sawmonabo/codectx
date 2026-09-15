@@ -53,7 +53,7 @@ func TestALevelCutBetweenRecordsAndBitsLosesNothingAndAdmitsNothingTwice(t *test
 		t.Fatalf("close the cut walk: %v", err)
 	}
 
-	resumed, err := reopenRetainedWalk(w.dir, "", walkBounds{Node: 64, Relation: 64}, &heapProbe{})
+	resumed, err := reopenRetainedWalk(w.home.path, "", walkBounds{Node: 64, Relation: 64}, &heapProbe{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
