@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -341,12 +340,20 @@ const (
 // deadlineReached reports whether ctx has nothing left to spend. It is checked
 // only at a checkpointed boundary, where a true answer means "stop and
 // continue" rather than "fail".
-func deadlineReached(ctx context.Context) bool {
+//
+// The question is asked of the COMPILER'S clock (Options.Now, the same one the
+// manifest is stamped from) and not of time.Now, so that "the deadline fired at
+// this boundary" is a thing a caller can arrange deterministically. That is not
+// a test affordance bolted on: a wall-clock deadline inside a compile lands in
+// the middle of a pass far more often than on a boundary, so without a clock
+// the caller owns, the branch that writes the checkpoint and refuses to persist
+// a manifest is reachable in production and unreachable in any test.
+func (c *Compiler) deadlineReached(ctx context.Context) bool {
 	if ctx.Err() != nil {
 		return true
 	}
 	dl, ok := ctx.Deadline()
-	return ok && !time.Now().Before(dl)
+	return ok && !c.now().Before(dl)
 }
 
 // resumedHalf is an opened continuation: the verified cursor, the leased state
