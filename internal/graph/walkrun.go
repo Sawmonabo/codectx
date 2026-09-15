@@ -390,54 +390,103 @@ func isRankDeadline(err error) bool {
 	return errors.As(err, &typed) && typed.Code == model.CodeQueryDeadline
 }
 
-// servePage reads at most limit records out of the spool tail names, starting
-// at tail.Offset, and returns them with the handle the NEXT page continues
-// from. The records after the page are copied straight into a fresh spool, so
-// neither the page nor the continuation ever holds the remainder in heap.
-//
-// c is the binding the spool was written under and now the clock the lease is
-// checked against, exactly as pagination.Spools.Open takes them. decode is the
-// record codec -- decodeImpactRecord or decodePairRecord -- which is what lets
-// one page reader serve both ranked answers; the two can never be crossed,
-// because a cursor is bound to the endpoint that issued it.
-//
-// The returned handle's Offset is how many records of THIS spool the page
-// consumed, which is the skip the caller hands to rankedSpoolTail when it
-// copies the remainder forward. A cursor minted from that copy therefore always
-// carries RankOffset zero: one fresh spool per page (cursor.go) means the next
-// spool begins at the next record.
-//
-// Owned by lane P-b (dispatch), declared by P-a for P-INT.
-func servePage[T any](ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time,
-	tail rankedTail, limit int, decode func([]byte) (T, error)) ([]T, rankedTail, error) {
-	if spools == nil {
-		return nil, rankedTail{}, cursorInvalid("continuation state has expired or was released")
-	}
-	// The capacity is the page bound the caller already clamped to
-	// model.MaxPageItems, so this allocation cannot track the answer.
-	out := make([]T, 0, limit)
-	at := 0
-	header := true
-	var total int64
-	err := spools.Open(ctx, c, now, func(record []byte) error {
+// rankedSpoolHeader reads the leading rankedHeader record of a ranked spool and
+// reports where the records after it begin, plus the bytes this read took off
+// disk. It is O(1) work per page and it is the KIND guard: a cursor bound to
+// this query and lease could otherwise name the frontier spool of the same
+// walk, and decodeRankedHeader is what refuses that.
+func rankedSpoolHeader(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
+	now time.Time) (rankedHeader, int64, int64, error) {
+	var h rankedHeader
+	got := false
+	end, err := spools.OpenAt(ctx, c, now, 0, func(record []byte) error {
 		if err := ctx.Err(); err != nil {
 			return typedContextError(ctx, err)
 		}
-		if header {
-			header = false
-			h, err := decodeRankedHeader(record)
-			if err != nil {
-				return err
-			}
-			total = h.Total
-			return nil
+		var err error
+		if h, err = decodeRankedHeader(record); err != nil {
+			return err
 		}
-		if at++; at <= tail.Offset || len(out) == limit {
-			// Before the page, or past it: past-the-page records are neither
-			// decoded nor kept -- rankedSpoolTail walks them again straight
-			// into the next spool.
-			return nil
+		got = true
+		return pagination.ErrStopSpool
+	})
+	if err != nil {
+		return rankedHeader{}, 0, 0, err
+	}
+	if !got {
+		return rankedHeader{}, 0, 0, cursorInvalid("the cursor names a result page this build cannot replay")
+	}
+	// end is one past the header record, so it is both the offset the first
+	// ranked record begins at and the bytes this read consumed from the file.
+	return h, end, end, nil
+}
+
+// readRankedSection takes at most want records out of a ranked spool starting
+// at offset and hands each to take. It returns the offset one past the last
+// record it took -- the next page's resume point -- and the bytes it read.
+//
+// The read STOPS at the page bound rather than streaming to the end of the
+// spool, which is what makes a page cost its own page: with the offset carried
+// forward, no page ever touches the records of another.
+func readRankedSection(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
+	now time.Time, offset int64, want int, take func([]byte) error) (int64, int64, error) {
+	if want <= 0 {
+		return offset, 0, nil
+	}
+	taken := 0
+	end, err := spools.OpenAt(ctx, c, now, offset, func(record []byte) error {
+		if err := ctx.Err(); err != nil {
+			return typedContextError(ctx, err)
 		}
+		if err := take(record); err != nil {
+			return err
+		}
+		if taken++; taken == want {
+			return pagination.ErrStopSpool
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return end, end - offset, nil
+}
+
+// servePage reads ONE page out of a single-section ranked spool at the byte
+// offset the presenting cursor carries, and reports where the page after it
+// begins.
+//
+// c is the binding the spool was written under and now the clock the lease is
+// checked against, exactly as pagination.Spools.OpenAt takes them. decode is
+// the record codec -- decodeImpactRecord or decodePairRecord -- which is what
+// lets one page reader serve both ranked answers; the two can never be crossed,
+// because a cursor is bound to the endpoint that issued it.
+//
+// The returned handle names the SAME spool and lease: the spool the first page
+// wrote holds the whole ranked remainder and every later page reads its own
+// byte range out of it. Nothing is copied forward, so the work a page does is a
+// function of the page limit alone.
+func servePage[T any](ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time,
+	tail rankedTail, limit int, decode func([]byte) (T, error)) ([]T, rankedTail, int64, error) {
+	if spools == nil {
+		return nil, rankedTail{}, 0, cursorInvalid("continuation state has expired or was released")
+	}
+	h, _, read, err := rankedSpoolHeader(ctx, spools, c, now)
+	if err != nil {
+		return nil, rankedTail{}, 0, err
+	}
+	remaining := h.Total - tail.Served
+	if err := h.checkAgainst(remaining, 0); err != nil {
+		return nil, rankedTail{}, 0, err
+	}
+	want := limit
+	if int64(want) > remaining {
+		want = int(remaining)
+	}
+	// The capacity is the page bound the caller already clamped to
+	// model.MaxPageItems, so this allocation cannot track the answer.
+	out := make([]T, 0, max(want, 0))
+	end, n, err := readRankedSection(ctx, spools, c, now, tail.Offset, want, func(record []byte) error {
 		v, err := decode(record)
 		if err != nil {
 			return err
@@ -446,53 +495,26 @@ func servePage[T any](ctx context.Context, spools *pagination.Spools, c paginati
 		return nil
 	})
 	if err != nil {
-		return nil, rankedTail{}, err
+		return nil, rankedTail{}, 0, err
 	}
+	read += n
 	next := rankedTail{
 		SpoolID: c.SpoolID, LeaseID: c.LeaseID,
-		Offset: tail.Offset + len(out),
+		Offset: end,
 		Served: tail.Served + int64(len(out)),
-		Total:  total,
+		Total:  h.Total,
 	}
-	if next.done() {
-		// Nothing follows this page: the caller mints no continuation, and the
-		// empty SpoolID is what says so.
+	if next.Served >= next.Total {
+		// Nothing follows this page: the caller mints no continuation, releases
+		// the spool, and the empty SpoolID is what says so.
 		next.SpoolID = ""
 	}
-	return out, next, nil
+	return out, next, read, nil
 }
 
-// rankedSpoolTail streams the records after the first skip of a ranked spool
-// into the sink that writes the next one, one record at a time. It is the
-// continuation-page counterpart of rankedRunTail: the source spool is still
-// live -- a consumed cursor's spool and lease are released only after the page
-// validates -- so the remainder is copied spool to spool without ever standing
-// in heap.
-func rankedSpoolTail(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time,
-	skip int) func(func([]byte) error) error {
-	return func(yield func([]byte) error) error {
-		at := 0
-		header := true
-		return spools.Open(ctx, c, now, func(record []byte) error {
-			if err := ctx.Err(); err != nil {
-				return typedContextError(ctx, err)
-			}
-			if header {
-				// The leading header is not a record: the new spool writes its
-				// own, so it is skipped rather than counted.
-				header = false
-				return nil
-			}
-			if at++; at <= skip {
-				return nil
-			}
-			return yield(record)
-		})
-	}
-}
-
-// rankedRunTail is the same stream taken off the sorted run on the FIRST page,
-// where there is no source spool yet.
+// rankedRunTail is the stream taken off the sorted run on the FIRST page, where
+// there is no source spool yet: it skips the records the page served and writes
+// every one after them into the spool every later page will read.
 func rankedRunTail[T any](ctx context.Context, run *pagination.SortedRun[T], skip int,
 	encode func(T) ([]byte, error)) func(func([]byte) error) error {
 	return func(yield func([]byte) error) error {
@@ -514,112 +536,47 @@ func rankedRunTail[T any](ctx context.Context, run *pagination.SortedRun[T], ski
 }
 
 // serveRankedSections reads ONE page out of a combined ranked spool: at most
-// limit records of the leading entity section and at most limit of the package
-// section that follows it. The header's Count is the boundary between the two
-// (cursor.go states the layout), so a record's section is a fact of its
-// position and never a guess at its bytes.
+// wantEntities records of the leading entity section at rankOff, and at most
+// wantPairs of the package section at pairOff. The cursor carries both offsets
+// because the two sections are read independently, and each read stops at its
+// own page bound, so neither section's cost depends on what is left in it.
 //
 // It is impact's page reader. The endpoints that rank a single list use
 // servePage above; the two cannot be crossed, because a cursor is bound to the
 // endpoint that issued it.
 func serveRankedSections(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
-	now time.Time, limit int) ([]impactRecord, []pairRecord, rankedHeader, error) {
+	now time.Time, rankOff, pairOff int64, wantEntities, wantPairs int) (
+	[]impactRecord, []pairRecord, int64, int64, int64, error) {
 	if spools == nil {
-		return nil, nil, rankedHeader{}, cursorInvalid("continuation state has expired or was released")
+		return nil, nil, 0, 0, 0, cursorInvalid("continuation state has expired or was released")
 	}
 	// Both capacities are the page bound the caller already clamped to
 	// model.MaxPageItems, so neither allocation can track the answer.
-	entries := make([]impactRecord, 0, limit)
-	pairs := make([]pairRecord, 0, limit)
-	var h rankedHeader
-	at, header := 0, true
-	err := spools.Open(ctx, c, now, func(record []byte) error {
-		if err := ctx.Err(); err != nil {
-			return typedContextError(ctx, err)
-		}
-		if header {
-			header = false
-			var err error
-			h, err = decodeRankedHeader(record)
-			return err
-		}
-		i := at
-		at++
-		if i < h.Count {
-			if len(entries) == limit {
-				// Past this page's entity records: neither decoded nor kept --
-				// rankedSpoolSections walks them again straight into the next
-				// spool.
-				return nil
-			}
+	entries := make([]impactRecord, 0, max(wantEntities, 0))
+	pairs := make([]pairRecord, 0, max(wantPairs, 0))
+	endRank, readRank, err := readRankedSection(ctx, spools, c, now, rankOff, wantEntities,
+		func(record []byte) error {
 			v, err := decodeImpactRecord(record)
 			if err != nil {
 				return err
 			}
 			entries = append(entries, v)
 			return nil
-		}
-		if len(pairs) == limit {
-			return nil
-		}
-		v, err := decodePairRecord(record)
-		if err != nil {
-			return err
-		}
-		pairs = append(pairs, v)
-		return nil
-	})
-	if err != nil {
-		return nil, nil, rankedHeader{}, err
-	}
-	return entries, pairs, h, nil
-}
-
-// rankedSpoolSections is the combined counterpart of rankedSpoolTail: it
-// streams what follows the page in BOTH sections of a combined spool into the
-// sink that writes the next one, one record at a time, preserving the section
-// order the header describes.
-func rankedSpoolSections(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
-	now time.Time, h rankedHeader, skipEntries, skipPairs int) func(func([]byte) error) error {
-	return func(yield func([]byte) error) error {
-		at, header := 0, true
-		return spools.Open(ctx, c, now, func(record []byte) error {
-			if err := ctx.Err(); err != nil {
-				return typedContextError(ctx, err)
-			}
-			if header {
-				// The leading header is not a record: the new spool writes its
-				// own, so it is skipped rather than counted.
-				header = false
-				return nil
-			}
-			i := at
-			at++
-			if i < h.Count {
-				if i < skipEntries {
-					return nil
-				}
-				return yield(record)
-			}
-			if i-h.Count < skipPairs {
-				return nil
-			}
-			return yield(record)
 		})
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
 	}
-}
-
-// chainTails writes several record streams into one spool, in order. It is how
-// the FIRST page of an impact answer spills its two sorted runs -- the ranked
-// entities, then the ranked package pairs -- as the one sectioned spool the
-// reader above expects.
-func chainTails(tails ...func(func([]byte) error) error) func(func([]byte) error) error {
-	return func(yield func([]byte) error) error {
-		for _, tail := range tails {
-			if err := tail(yield); err != nil {
+	endPair, readPair, err := readRankedSection(ctx, spools, c, now, pairOff, wantPairs,
+		func(record []byte) error {
+			v, err := decodePairRecord(record)
+			if err != nil {
 				return err
 			}
-		}
-		return nil
+			pairs = append(pairs, v)
+			return nil
+		})
+	if err != nil {
+		return nil, nil, 0, 0, 0, err
 	}
+	return entries, pairs, endRank, endPair, readRank + readPair, nil
 }
