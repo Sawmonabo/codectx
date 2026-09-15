@@ -142,8 +142,16 @@ func morePathsReason(more int64) []string {
 }
 
 // reasonPathLimit is the configured cap on stored explanation paths per entry,
-// floored at the model bound so a zero or oversized config value cannot make a
-// manifest that PutManifest rejects.
+// floored at the model bound so an unlimited or oversized config value cannot
+// make a manifest that PutManifest rejects.
+//
+// L2 owns finishing this: the configuration now ACCEPTS a value above
+// model.MaxReasonPathsPerEntry (validateStructuralCeilings no longer couples the
+// two, because a per-entry explanation count is a report threshold and not a
+// wire ceiling), and this function still silently discards it. Until
+// model.MaxReasonPathsPerEntry stops being a hard manifest bound, a user who
+// sets a larger value gets the smaller one with no report -- the class-G shape
+// this wave exists to remove.
 func (c *Compiler) reasonPathLimit() int {
 	limit := c.cfg.Context.MaxReasonPathsPerEntry
 	if limit.IsUnlimited() || limit.Int() > model.MaxReasonPathsPerEntry {
