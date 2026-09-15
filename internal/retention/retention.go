@@ -135,6 +135,26 @@ type Report struct {
 	// object going together under the grace protocol, this is a file that
 	// never had a row.
 	OrphanObjectsSwept int64
+	// OrphanSweepRan says whether the cadence gate let the orphan sweep walk
+	// the store at all this pass. Without it a pass that SKIPPED the walk
+	// because it was inside the grace window and a pass that walked every
+	// bucket and found nothing both report `orphan_objects_swept=0`, and an
+	// operator reading a log cannot tell "nothing to reclaim" from "not looked
+	// at yet". It is set from the gate's own verdict rather than inferred from
+	// the count, because the gate fails OPEN -- a missing, unreadable,
+	// malformed or future-dated stamp sweeps -- and each of those is a pass
+	// that ran.
+	OrphanSweepRan bool
+}
+
+// OrphanSweepPhrase renders OrphanSweepRan for a log line, so the two passes
+// that report one -- the startup collection pass and the post-activation one --
+// say the same words for the same state rather than each inventing its own.
+func (r Report) OrphanSweepPhrase() string {
+	if r.OrphanSweepRan {
+		return "ran"
+	}
+	return "skipped: within grace window"
 }
 
 // Collector runs one collection pass. It holds no mutable state; the lock order

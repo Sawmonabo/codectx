@@ -218,6 +218,14 @@ var scenarios = []scenario{
 				t.Fatalf("the pass that did sweep reported %d objects, want the 3 it reclaimed",
 					report.OrphanObjectsSwept)
 			}
+			// The skipped pass must be readable AS skipped: its count is the
+			// carried 3 and a pass that walked every bucket and found nothing
+			// would report the same count, so without this flag an operator
+			// cannot tell "nothing to reclaim" from "not looked at yet".
+			if report.OrphanSweepRan {
+				t.Fatalf("a pass inside the %v window reported the orphan sweep as %q; it did not run",
+					window, report.OrphanSweepPhrase())
+			}
 			if _, err := os.Stat(filepath.Join(dataDir, orphanSweepPath)); err != nil {
 				t.Fatalf("the sweep recorded no stamp, so the gate has nothing to read next pass: %v", err)
 			}
@@ -235,6 +243,10 @@ var scenarios = []scenario{
 			}
 			if report.OrphanObjectsSwept != 6 {
 				t.Fatalf("the second sweep's %d objects did not reach the report", report.OrphanObjectsSwept)
+			}
+			if !report.OrphanSweepRan {
+				t.Fatalf("the pass past the window walked the store but reported the orphan sweep as %q",
+					report.OrphanSweepPhrase())
 			}
 
 			// A clock stepped backwards leaves a stamp in the future, which a
