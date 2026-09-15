@@ -99,7 +99,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 	var routes [][]model.Relation
 	if w.settled[req.To] {
-		want := min(e.limits.MaxReasonPaths, model.MaxReasonPathsPerEntry)
+		// ValueOr before min: an unlimited bound is the top of the lattice, so
+		// it must fall back to the wire ceiling rather than min to zero routes.
+		want := min(int(e.limits.ReasonPaths().ValueOr(model.MaxReasonPathsPerEntry)), model.MaxReasonPathsPerEntry)
 		var capped bool
 		routes, capped = w.routes(req.From, req.To, want)
 		if capped {
