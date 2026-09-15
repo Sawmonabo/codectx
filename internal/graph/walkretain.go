@@ -639,13 +639,11 @@ func (w *retainedWalk) openFolded() (*retainFile, error) {
 // eachFolded replays the retained pass-2 input, the same way eachEntry replays
 // pass 1's. The file has no open writer by then, so nothing is flushed first.
 func (w *retainedWalk) eachFolded(add func(impactRecord) error) error {
+	// A fold that produced no record writes no file: openFolded creates it on
+	// the first append, and a walk that admitted nothing has none to make. The
+	// empty replay is that walk's answer, and a file written and then cut short
+	// is still caught by the frame reader.
 	f := openRetainFile(w.home, retainFoldedFile)
-	// The fold output is the pass-2 INPUT: a missing one is the whole ranking
-	// lost, not an empty one, so it is a typed corruption rather than a short
-	// answer. Every other retained file may legitimately have no records.
-	if _, err := os.Stat(f.path()); err != nil {
-		return retainCorrupt(err)
-	}
 	return f.each(func(b []byte) error {
 		r, err := decodeImpactRecord(b)
 		if err != nil {
