@@ -101,8 +101,13 @@ type graphNode struct {
 // emission is an ordered query, so the facts are a function of the export's
 // content and not of the order its files were read.
 type scratch struct {
-	db           *sql.DB
-	rows         int64
+	db   *sql.DB
+	rows int64
+	// maxRows is the user's `providers.dependence.max_staged_rows`, 0 for
+	// unlimited. It never stops the staging: crossing it sets overRows once,
+	// which the import reports.
+	maxRows      int64
+	overRows     bool
 	unknown      map[string]uint64
 	unknownN     uint64
 	ignoredFiles int
@@ -162,7 +167,7 @@ CREATE TABLE walk(start TEXT NOT NULL, node TEXT NOT NULL, depth INTEGER NOT NUL
 // openScratch creates the import's staging database. Durability is
 // deliberately off: the file is private, single-writer and deleted with the
 // import's scratch directory.
-func openScratch(ctx context.Context, path string) (*scratch, error) {
+func openScratch(ctx context.Context, path string, maxRows int64) (*scratch, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)", "cache_size(-32768)"} {
 		q.Add("_pragma", p)
@@ -179,7 +184,7 @@ func openScratch(ctx context.Context, path string) (*scratch, error) {
 		db.Close()
 		return nil, internalErr("import scratch schema: %v", err)
 	}
-	return &scratch{db: db, unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
+	return &scratch{db: db, maxRows: maxRows, unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
 }
 
 // commitEvery is how many staged rows one staging transaction holds before it
@@ -231,12 +236,19 @@ func (s *scratch) commit(ctx context.Context) error {
 	return nil
 }
 
-// staged accounts one staged row against the import's row bound and commits
-// the staging transaction at every commitEvery rows.
+// staged counts one staged row and commits the staging transaction at every
+// commitEvery rows.
+//
+// A row count is a property of the repository's source, so it never fails the
+// unit: staging is an on-disk database read back through keyset pages, so the
+// rows bound disk, not heap. A user who set `providers.dependence.max_staged_rows`
+// is told the import crossed it: Report.StagedRows and Report.OverStagedRows
+// carry it out to the provider, which logs it and publishes it on the unit's
+// capability rows. This package does no logging of its own.
 func (s *scratch) staged(ctx context.Context) error {
 	s.rows++
-	if s.rows > maxStagedRows {
-		return resourceLimit("the export stages more than %d rows", maxStagedRows).WithDetail("limit", "max_staged_rows")
+	if s.maxRows > 0 && s.rows > s.maxRows {
+		s.overRows = true
 	}
 	if s.rows%commitEvery != 0 {
 		return nil

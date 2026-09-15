@@ -834,9 +834,10 @@ func (e *emitter) emitNodes(ctx context.Context) error {
 // one identity, or two occurrences of one edge, can share a key — and storage
 // refuses a list that holds one. There is deliberately no per-fact bound:
 // dropping a key would blind removal detection for that fact, and every key is
-// one of the export's rows, so the export's row bounds are the only ceiling —
-// maxStagedRows for a node fact's keys and maxDerivedRows for a relation's
-// (51 keys on one relation was the measured peak on this repository).
+// one of the export's rows, so a fact's key list is bounded by what the export
+// holds — the staged rows for a node fact's keys, maxDerivedRows for a
+// relation's (51 keys on one relation was the measured peak on this
+// repository).
 func sortedKeys(keys []string) []string {
 	slices.Sort(keys)
 	return slices.Compact(keys)

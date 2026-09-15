@@ -151,6 +151,23 @@ type publication struct {
 	// analysis ran at a coarser project boundary than the source owns — which
 	// degrades every capability of the family alike, not one pass.
 	UnplannedProjects int
+	// Family is the unit's language family, carried so the two user-set
+	// threshold reports below can name it: a capability row carries a scope
+	// key, and the project count they report is the family's, not the scope's.
+	Family Family
+	// OverUnitsPerFamily is the project count that crossed a user-set
+	// providers.dependence.max_units_per_family (0 when it did not, or when
+	// the user set no threshold), and UnitsPerFamilyBound that threshold.
+	// Nothing was refused or dropped: every project has its unit and every
+	// part of a subdivided unit was analysed. The row says so because the user
+	// asked to be told, which is the only reason these two keys exist.
+	OverUnitsPerFamily  int
+	UnitsPerFamilyBound int64
+	// StagedRows is the import's staged row count and StagedRowsBound the
+	// user-set providers.dependence.max_staged_rows it crossed; both are zero
+	// unless it crossed. The import staged and published every row regardless.
+	StagedRows      int64
+	StagedRowsBound int64
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -188,6 +205,23 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 		if p.UnplannedProjects > 0 {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
 			row = row.WithDetail("unplanned_projects", strconv.Itoa(p.UnplannedProjects))
+		}
+		// Neither threshold below lost anything: they are the user's own
+		// reporting bounds on a count that belongs to the repository. The row
+		// is marked partial with CodeResourceLimit all the same, because a
+		// fresh row's Details are nil'd on the way into the generation
+		// (internal/index/status.go) and a report nobody can read is the
+		// silence the posture forbids as squarely as a refusal.
+		if p.OverUnitsPerFamily > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("family", string(p.Family)).
+				WithDetail("units_per_family", strconv.Itoa(p.OverUnitsPerFamily)).
+				WithDetail("max_units_per_family", strconv.FormatInt(p.UnitsPerFamilyBound, 10))
+		}
+		if p.StagedRows > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("staged_rows", strconv.FormatInt(p.StagedRows, 10)).
+				WithDetail("max_staged_rows", strconv.FormatInt(p.StagedRowsBound, 10))
 		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid

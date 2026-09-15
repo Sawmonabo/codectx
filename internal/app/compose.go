@@ -624,6 +624,8 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				CacheBytes:             s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes:   s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,
+				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily.Value(),
+				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows.Value(),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
