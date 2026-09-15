@@ -357,21 +357,25 @@ parallel on different problems — the planner's input sort and the search top-K
 created a bounded external sort at the *same path* in the pagination package. Both are correct;
 they differ in that the second adds a capped merge fan-in (excess runs are collapsed in groups
 first, so the live set stays constant instead of growing with the input) and derives its run budget
-from the query memory admission. At the time of writing, the merged tree carries **one** of them —
-the planner's — and the search sorter is still on an unmerged branch, unwired to any caller. The
-resolution is one primitive, not two: integration collapses them, keeping the capped fan-in, and
-the search wiring follows. This is recorded as an open consequence rather than a completed
-decision, because it is not yet in the tree.
+from the query memory admission. The resolution was one primitive, not two: the planner's sorter
+was extended with the capped fan-in, a collapse that removes each group's inputs as the group
+completes (so peak temporary disk stays at the run set plus the one run being written), a run byte
+budget derived from the query memory admission, a fold applied exactly once over the fully ordered
+stream (which is what keeps the planner's digest byte-identical: runs are stable-sorted and ties break
+by run index over runs written in arrival order), and a live-record high-water mark for the
+structural memory assertion. The second implementation was not merged. Search's deduplication and
+ranking now stream through this one primitive.
 
-**Consequences.** Two heap-resident structures remain on this path and are named rather than
-claimed: the ranked set is proportional to the *distinct results in the answer*, not to the
-corpus — a few megabytes at 5 000 hits against a 33 MiB query admission, but a genuinely large
-answer costs heap proportional to it; and the candidate-deduplication set for a one- or
-two-character prefix query is proportional to the range scan, which is neither page-sized nor
-answer-sized. Wiring the external sorter into the ranking path is the fix for both, and it is the
-open item. A known defect in the committed primitive is also recorded: during a collapse pass,
-input runs are removed only after the whole pass finishes, so peak *temporary disk* is twice the
-run set for the duration of a pass. Heap is unaffected.
+**Consequences.** The ranked set and the candidate-deduplication set are no longer heap-resident in
+proportion to the answer or to the range scan: two sort passes (deduplicate and fold, then rank) feed
+one page and a streamed spool tail, so peak heap on this path is the run budget plus the merge fan-in's
+blocks plus one page, independent of the match count. Measured live-record high-water mark: 190
+records at 20 000 candidates and 189 at 200 000; the mutation that removes the run budget raises it
+to the match count (20 000 and 65 536) and the assertion fails. Two residuals are named rather than
+claimed: a continuation page still materialises the whole spooled tail it was handed before
+re-spooling the remainder (the fix is to read one page and stream the rest into the next spool), and
+per-request sort runs are not charged to the temporary-bytes reservation, though they live under the
+same spool directory and are counted as real disk by the sweeper.
 
 ### 2.5 Field bounds truncate and flag
 
