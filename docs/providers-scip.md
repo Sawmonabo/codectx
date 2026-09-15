@@ -142,9 +142,10 @@ codectx-scip-documents v1
 
 sorted by path with strictly increasing paths. `Provider.Version` moves with
 the hash domain, so a manifest written under an earlier mapping is never
-reachable: the old unit has a different `UnitID` and is not reused. `LoadDocumentManifest` validates
-all of that and refuses a malformed file rather than treating it as an empty
-previous state, because an empty previous state silently imports everything.
+reachable: the old unit has a different `UnitID` and is not reused.
+`LoadDocumentManifest` validates all of that and refuses a malformed file
+rather than treating it as an empty previous state, because an empty previous
+state silently imports everything.
 `Save` writes through a temporary file and one rename; `Close` removes the
 private temporary an import produced. `Diff(prev, fn)` is a merge join over the
 two sorted files: it returns the `Delta` counts and streams each path to `fn`
@@ -438,8 +439,9 @@ while a source file is bounded only by what the operator set in
 case. At most one document's source is held at a time, so a unit retains one
 document's source outside the pool's accounting, on top of the pool's own
 budget — the one place an unset bound leaves peak memory a function of the
-largest file the index describes, which is why this bound exists to be set. That buffer is sized
-by the pinned snapshot file, whose size is checked before the read.
+largest file the index describes, which is why this bound exists to be set.
+That buffer is sized by the pinned snapshot file, whose size is checked before
+the read.
 
 ## Payload resolution
 
@@ -513,12 +515,13 @@ resolves symbols through the project's own dependency context — the module
 graph, the package manifests, the installed distributions, the headers — and
 the unit's scope is the workspace, so a narrower copy would produce an index
 that describes less than the unit claims. The call site says so explicitly
-rather than leaving it to an omitted selection. The launcher prefix comes from the lock: a self-contained
-binary runs as itself, a Node-hosted indexer runs as `<managed node> <entry>`,
-and `scip-java`'s launcher runs with `JAVA_HOME` pointing at the managed JDK.
-The child's environment is exactly the allowlisted variables the parent has
-plus the variables the payload needs; the payload's come last, so a host
-`JAVA_HOME` can never shadow the pinned runtime.
+rather than leaving it to an omitted selection. The launcher prefix comes from
+the lock: a self-contained binary runs as itself, a Node-hosted indexer runs
+as `<managed node> <entry>`, and `scip-java`'s launcher runs with `JAVA_HOME`
+pointing at the managed JDK. The child's environment is exactly the
+allowlisted variables the parent has plus the variables the payload needs; the
+payload's come last, so a host `JAVA_HOME` can never shadow the pinned
+runtime.
 
 Everything is executed through the shared `internal/process` runner with an
 argv array only (ruling R9-3: no shell anywhere). The run is bounded by the

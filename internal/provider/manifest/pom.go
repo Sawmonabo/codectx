@@ -17,9 +17,8 @@ const (
 	ecosystemMaven = "maven"
 	languageJava   = "java"
 
-	maxXMLDepth    = 32
-	maxXMLElements = 200000
-	maxXMLText     = 4096
+	maxXMLDepth = 32
+	maxXMLText  = 4096
 )
 
 // pomDependency is one <dependency> or the <parent> element with its span.
@@ -55,7 +54,7 @@ type pomEntry struct {
 // `${property}` references are carried verbatim and marked unresolved, never
 // evaluated.
 func (u *unit) pom(ctx context.Context) error {
-	m, ok, overElements := parsePom(u.data, u.entries)
+	m, ok, cutElements := parsePom(u.data, u.entries, u.xmlElements)
 	if !ok {
 		u.malformed()
 		return nil
@@ -63,12 +62,12 @@ func (u *unit) pom(ctx context.Context) error {
 	if m.cutProperties > 0 {
 		u.overBound(BoundEntries, u.entries, int64(len(m.properties))+m.cutProperties)
 	}
-	if overElements {
-		// The element bound cut the token stream. What was parsed before the
-		// cut is published; the file is reported partial with
+	if cutElements > 0 {
+		// The configured element bound cut the token stream. What was parsed
+		// before the cut is published; the file is reported partial with
 		// CTX_RESOURCE_LIMIT rather than malformed, because a large POM is
 		// large, not invalid.
-		u.degraded(BoundXMLElements, "token stream stopped at the element ceiling")
+		u.overBound(BoundXMLElements, u.xmlElements, cutElements)
 	}
 	group, version := m.group, m.version
 	var inherited []string
@@ -179,35 +178,40 @@ func mavenKind(d pomDependency) string {
 // offset before a StartElement token is the start of its tag (the preceding
 // character data is its own token), and the offset after an EndElement is
 // the end of the element.
-func parsePom(data []byte, entries config.Limit) (pomModel, bool, bool) {
+// parsePom's third result is the element count that crossed elements, which
+// is providers.manifest.max_xml_elements, and zero when the bound did not cut
+// the walk. The bound is unlimited by default: how many elements a POM has is
+// a property of the repository, and a user-set value cuts the stream rather
+// than refusing the file.
+func parsePom(data []byte, entries, elements config.Limit) (pomModel, bool, int64) {
 	m := pomModel{properties: map[string]string{}}
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	var stack []string
 	var text strings.Builder
 	var cur *pomDependency
 	var entryStart int
-	elements := 0
-	overElements := false
-	for !overElements {
+	var seen int64
+	var cut int64
+	for cut == 0 {
 		before := int(dec.InputOffset())
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return m, false, false
+			return m, false, 0
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, t.Name.Local)
 			if len(stack) > maxXMLDepth || (len(stack) == 1 && t.Name.Local != "project") {
-				return m, false, false
+				return m, false, 0
 			}
-			if elements++; elements > maxXMLElements {
-				// Stop reading and report the cut. Refusing here said the
-				// file was malformed, which a large but perfectly valid POM
-				// is not.
-				overElements = true
+			if seen++; elements.Exceeded(seen) {
+				// Stop reading and report the count that crossed the bound.
+				// Refusing here said the file was malformed, which a large
+				// but perfectly valid POM is not.
+				cut = seen
 				break
 			}
 			text.Reset()
@@ -265,13 +269,13 @@ func parsePom(data []byte, entries config.Limit) (pomModel, bool, bool) {
 			text.Reset()
 		}
 	}
-	if overElements {
+	if cut > 0 {
 		// A cut stream leaves the element stack open, which is the
 		// well-formedness test below. The file parsed cleanly up to the
 		// bound, so it is valid and partial, not malformed.
-		return m, true, true
+		return m, true, cut
 	}
-	return m, len(stack) == 0 && elements > 0, false
+	return m, len(stack) == 0 && seen > 0, 0
 }
 
 func setCoordinate(d *pomDependency, field, val string) {

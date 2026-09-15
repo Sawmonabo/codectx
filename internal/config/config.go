@@ -251,11 +251,12 @@ type Providers struct {
 }
 
 // Manifest configures the build-metadata and documentation provider of
-// Section 11.2. Both bounds are how much of one manifest the user wants
-// indexed; neither has a default, because how many dependencies a manifest
-// declares is a property of the repository. A manifest is parsed as a whole
-// file whose size workspace.max_parse_file_bytes already bounds, so an
-// unlimited list bound costs one file's heap, never the repository's.
+// Section 11.2. All four bounds are how much of one manifest the user wants
+// indexed -- two over the lists it declares, two over the parse that reads
+// them -- and none has a default, because how much a manifest declares is a
+// property of the repository. A manifest is parsed as a whole file whose size
+// workspace.max_parse_file_bytes already bounds, so leaving all four
+// unlimited costs one file's heap, never the repository's.
 type Manifest struct {
 	// MaxDependencies is how many dependencies the user wants one manifest to
 	// declare. Unlimited by default; a user-set value that is crossed cuts
@@ -266,6 +267,18 @@ type Manifest struct {
 	// excluded modules, workspace members, properties, and a document's
 	// headings and links.
 	MaxEntries Limit `toml:"max_entries"`
+	// MaxTOMLLines is how many lines of one TOML manifest the user wants the
+	// evidence-range line scan to place. Unlimited by default. A user-set
+	// value that is crossed stops the scan there: the facts whose lines the
+	// scan did place keep their exact ranges and only the facts past the
+	// bound carry evidence without one, and the cut is reported with the
+	// line count that crossed it.
+	MaxTOMLLines Limit `toml:"max_toml_lines"`
+	// MaxXMLElements is the same contract for the token stream of one POM:
+	// unlimited by default, and a user-set value that is crossed stops the
+	// parse there and reports the cut with the element count, publishing
+	// what parsed cleanly before it rather than calling the file malformed.
+	MaxXMLElements Limit `toml:"max_xml_elements"`
 }
 
 // TreeSitter configures the bundled structural provider. It runs as a private
@@ -639,7 +652,8 @@ func Defaults() Config {
 				MaxDerivedRows:         Unlimited,
 				MaxExportFiles:         Unlimited,
 			},
-			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited},
+			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited,
+				MaxTOMLLines: Unlimited, MaxXMLElements: Unlimited},
 		},
 		Context: Context{
 			DefaultPhase:                        "sweep",

@@ -75,11 +75,12 @@ func (u *unit) cargo(ctx context.Context) error {
 		u.malformed()
 		return nil
 	}
-	layout, overLines := layoutTOML(u.data)
-	if overLines {
-		// The layout was not built, so every fact of this manifest is
-		// published without a range. That is a cut, and it is reported.
-		u.degraded(BoundTOMLLines, "layout not built; facts carry no range")
+	layout, cutLines := layoutTOML(u.data, u.tomlLines)
+	if cutLines > 0 {
+		// The scan stopped at the configured line bound. Facts declared past
+		// that line are published without a range; every fact before it keeps
+		// its exact range. The line count that crossed the bound is reported.
+		u.overBound(BoundTOMLLines, u.tomlLines, cutLines)
 	}
 	rel := u.e.File().Path
 	var owner model.Node
