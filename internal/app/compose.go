@@ -325,7 +325,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		BatchRecords:      cfg.Index.BatchRecords,
 		BatchBytes:        cfg.Index.BatchBytes,
 		MaxJSONBytes:      cfg.Context.MaxManifestBytes.Value(),
-		Synchronous:       cfg.Storage.Synchronous,
+		// Seal clips to the same number the providers emitted under, so the
+		// retained set does not depend on whether a unit was assembled fresh
+		// or merged from carried occurrences.
+		MaxEvidencePerFact: evidenceClip(cfg),
+		Synchronous:        cfg.Storage.Synchronous,
 	}); err != nil {
 		return nil, err
 	}
@@ -1155,6 +1159,15 @@ func (s *stack) Close() error {
 // is the only thing that refuses a fetch, because a second resolver that
 // refused them regardless reported a payload that is merely not installed as a
 // payload the operator's own offline setting withheld.
+// evidenceClip is index.max_evidence_per_fact as the finite number every
+// producer and the seal compare against. Unlimited (the default) is the model's
+// record ceiling: a fact can never carry more occurrences than the record
+// tolerates, so "no clip" and "the ceiling" are the same instruction. Resolving
+// it once here is what keeps the providers and storage clipping to one number.
+func evidenceClip(cfg config.Config) int {
+	return int(cfg.Index.MaxEvidencePerFact.ValueOr(model.MaxEvidencePerFact))
+}
+
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace and the store under it is <data_dir>/tools,
