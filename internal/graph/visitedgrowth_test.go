@@ -111,3 +111,132 @@ func TestAWalkWritesItsVisitedSetOnce(t *testing.T) {
 	t.Logf("%d nodes admitted, cumulative set grew by %d bytes (ceiling %d)",
 		res.VisitedCount, probe.VisitedBytes, res.VisitedCount*perNode)
 }
+
+// TestANeighboursPageAppendsOnlyItsOwnAdmissions is the same append-only
+// invariant on the OTHER paged walk: the neighbours endpoint, which serves
+// callers and callees a page at a time and carries its cumulative admitted-node
+// set forward across REQUESTS rather than across the internal legs of one.
+//
+// Impact's measurement above drives a single request split into legs, so it
+// proves what a LEG appends. A neighbours walk never chains in process: every
+// page is its own request, and the run each page appends is written by
+// nextTraversalCursor before the token it hands back is signed. That makes the
+// per-page shape visible, and it is the shape a client actually pays:
+//
+//	(a) the bytes a page grows the cumulative set by are bounded by what THAT
+//	    page admitted -- a build that re-wrote the whole set per page would grow
+//	    its write with the page number, which is the quadratic walk this layout
+//	    closed;
+//	(b) the records a page decodes on RESUME are a function of the frontier the
+//	    page before it stopped at and never of the cumulative set behind it, so
+//	    on this chain-shaped fixture they are flat from the second page to the
+//	    last.
+//
+// The fixture is newConvergentAdjacency: a chain whose every link also calls one
+// shared sink, so the walk is many pages deep with a frontier of one or two
+// nodes -- which is what makes (b) a constant rather than a per-level width.
+//
+// Mutation, run and pasted in the lane report: cursor.go's
+// `store.appendRun(c.Visited)` given the whole cumulative set (the store
+// streamed into a slice) instead of the page's own admissions -- (a) fails.
+func TestANeighboursPageAppendsOnlyItsOwnAdmissions(t *testing.T) {
+	a := newConvergentAdjacencyOfLength(250)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	leases := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 1<<20, leases)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 4 // a handful of relations a page: the walk pays a request per handful a page: the walk pays a request per edge
+	limits.QueryTimeout = 10 * time.Minute
+	limits.FrontierBytes = 64 << 10
+
+	probe := &heapProbe{}
+	e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	e.probe = probe
+
+	type sample struct {
+		page          int
+		admitted      int64
+		visitedBytes  int64
+		resumeRecords int64
+	}
+	var (
+		samples []sample
+		req     = model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("c-0000")},
+			Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		lastByte, lastRec, lastVisited int64
+	)
+	for pages := 1; ; pages++ {
+		if pages > 5000 {
+			t.Fatalf("the neighbours walk did not terminate after %d pages", pages-1)
+		}
+		res, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		samples = append(samples, sample{page: pages,
+			admitted:      res.VisitedCount - lastVisited,
+			visitedBytes:  probe.VisitedBytes - lastByte,
+			resumeRecords: probe.ResumeRecords - lastRec,
+		})
+		lastVisited, lastByte, lastRec = res.VisitedCount, probe.VisitedBytes, probe.ResumeRecords
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page, req.GenerationID = model.PageRequest{Cursor: res.Meta.NextCursor}, 0
+	}
+	if len(samples) < 100 {
+		t.Fatalf("the walk took %d pages; a per-page bound read at pages 2, 50 and 100 needs at least a hundred",
+			len(samples))
+	}
+
+	// (a). One node id, its separator, the filter words a run's probes may
+	// dirty and the O(1) manifest an append rewrites -- charged per node the
+	// PAGE admitted, because that is what the page hands the store.
+	const manifestCeiling = 128
+	perNode := int64(len(fixtureNodeID("c-0000")) + 1 + visitedFilterProbes*8 + manifestCeiling)
+	for _, s := range samples {
+		if bound := s.admitted * perNode; s.visitedBytes > bound {
+			t.Fatalf("page %d admitted %d node(s) and grew the cumulative set by %d bytes; its own "+
+				"admissions bound that at %d. A page re-writing the whole set is what the excess reads as",
+				s.page, s.admitted, s.visitedBytes, bound)
+		}
+	}
+
+	// (b). The records a resume decodes never grow with the page number: this
+	// chain stops at a frontier of a handful of nodes whatever page it is on,
+	// so no page may decode more than that frontier holds. A resume that
+	// replayed the cumulative set instead would decode one record per node
+	// admitted so far, which on the last page here is two hundred and fifty.
+	const frontierRecords = 8
+	for _, s := range samples {
+		if s.resumeRecords > frontierRecords {
+			t.Fatalf("page %d decoded %d continuation record(s) on resume for a walk whose frontier "+
+				"holds at most %d: a resume is replaying the cumulative set, not the frontier",
+				s.page, s.resumeRecords, frontierRecords)
+		}
+	}
+	// Flat, and not merely bounded, once the walk has reached its steady state:
+	// pages 50 and 100 stop at the same frontier and must cost the same.
+	if got, want := samples[99].resumeRecords, samples[49].resumeRecords; got != want {
+		t.Fatalf("page 100 decoded %d continuation record(s) on resume, page 50 decoded %d: the cost of "+
+			"a resume is moving with the page number", got, want)
+	}
+
+	for _, s := range samples {
+		if s.page <= 3 || s.page == 50 || s.page == 100 || s.page == len(samples) {
+			t.Logf("page %3d: admitted %d, visited bytes appended %4d, resume records %2d",
+				s.page, s.admitted, s.visitedBytes, s.resumeRecords)
+		}
+	}
+}

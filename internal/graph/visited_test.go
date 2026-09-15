@@ -129,6 +129,13 @@ type convergentAdjacency struct {
 const convergentChain = 60
 
 func newConvergentAdjacency() *convergentAdjacency {
+	return newConvergentAdjacencyOfLength(convergentChain)
+}
+
+// newConvergentAdjacencyOfLength is the same shape at a chosen length, so a
+// measurement that reads a per-page figure at a named page can make the walk
+// long enough to reach it.
+func newConvergentAdjacencyOfLength(links int) *convergentAdjacency {
 	a := &convergentAdjacency{
 		binding: model.Binding{
 			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
@@ -149,9 +156,9 @@ func newConvergentAdjacency() *convergentAdjacency {
 		a.rels = append(a.rels, model.Relation{ID: fixtureRelationID(len(a.rels) + 1),
 			From: from, To: to, Kind: model.RelCalls})
 	}
-	prev := add("c-00")
-	for i := 1; i < convergentChain; i++ {
-		next := add(fmt.Sprintf("c-%02d", i))
+	prev := add("c-0000")
+	for i := 1; i < links; i++ {
+		next := add(fmt.Sprintf("c-%04d", i))
 		edge(prev, next)
 		edge(prev, sink)
 		prev = next
@@ -226,7 +233,7 @@ func TestSpooledVisitedSetAnswersACrossPageRevisit(t *testing.T) {
 		}
 		return e
 	}
-	req := model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("c-00")},
+	req := model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("c-0000")},
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
 	whole, err := engine(t, 2000).Neighbors(context.Background(), req)
@@ -457,7 +464,7 @@ func resumeSpooledWalk(t *testing.T, pages int) *resumeState {
 		t.Fatalf("new engine: %v", err)
 	}
 	kinds := []model.RelationKind{model.RelCalls}
-	start := []model.NodeID{fixtureNodeID("c-00")}
+	start := []model.NodeID{fixtureNodeID("c-0000")}
 	req := model.GraphRequest{GenerationID: 1, Start: start,
 		Direction: model.DirectionOutgoing, Relations: kinds}
 	cursor := ""
