@@ -186,6 +186,32 @@ func (r *reader) str(limit int, what string, buf []byte) (string, []byte, error)
 	return string(buf), buf, nil
 }
 
+// strBounded reads one length-delimited string field whose bound is a field
+// bound rather than a pre-allocation ceiling: a value longer than limit is
+// consumed and discarded, and reported through dropped, instead of failing the
+// message. One long symbol in a million-symbol index is degradation of that
+// record, not a malformed index, and must not abort the import.
+//
+// size is the value's encoded length whether or not it was kept, so a caller
+// can report how much it dropped.
+func (r *reader) strBounded(limit int, what string, buf []byte) (value string, out []byte, size int64, dropped bool, err error) {
+	n, err := r.length()
+	if err != nil {
+		return "", buf, 0, false, err
+	}
+	if n > int64(limit) {
+		if err := r.discardSub(n); err != nil {
+			return "", buf, n, false, err
+		}
+		return "", buf, n, true, nil
+	}
+	buf, err = r.bytes(n, int64(limit), what, buf)
+	if err != nil {
+		return "", buf, n, false, err
+	}
+	return string(buf), buf, n, false, nil
+}
+
 // skip drops one field of the given wire type.
 func (r *reader) skip(wt wireType) error {
 	switch wt {

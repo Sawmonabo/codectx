@@ -97,6 +97,9 @@ type importer struct {
 	outsideRoot, duplicatePaths, skippedAliases     int64
 	assumedEncoding                                 int64
 	partialCode                                     string
+	// drops is the one account of everything the wire decoder discarded for
+	// exceeding a field bound, across every pass of this import.
+	drops decodeDrops
 }
 
 // location is a pinned file plus a byte range on it: where evidence points.
@@ -183,7 +186,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceBinding, metadata, error) {
 	var meta metadata
 	var verified, unverified int64
-	w := &walker{limits: im.p.limits, onGrow: im.reserve,
+	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops,
 		onMetadata: func(m metadata) error { meta = m; return nil },
 		onDocument: func(d document) error {
 			admitted, err := im.seeDocument(ctx, d)
@@ -379,7 +382,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 // passDefinitions is pass 1: spool occurrences and symbols, bind each
 // document to its snapshot file when it ends, and publish its definitions.
 func (im *importer) passDefinitions(ctx context.Context, open opener) error {
-	w := &walker{limits: im.p.limits, onGrow: im.reserve,
+	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops,
 		onOccurrence: func(doc, seq int64, o occurrence, n int64) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
@@ -1266,6 +1269,9 @@ func (im *importer) emitEdges(ctx context.Context) error {
 // each capability partial under the first degradation reason (an unverified
 // binding, an unprocessable document, or truncated occurrence evidence).
 func (im *importer) result() model.ProviderResult {
+	if im.drops.any() {
+		im.degrade(model.CodeResourceLimit)
+	}
 	state := model.CapabilityFresh
 	if im.partialCode != "" {
 		state = model.CapabilityPartial
@@ -1278,7 +1284,21 @@ func (im *importer) result() model.ProviderResult {
 	// through the capability states below, which is the channel that exists.
 	r := model.ProviderResult{RunID: im.req.Run, State: model.RunSucceeded, RecordsEmitted: im.records, BytesProcessed: im.indexBytes}
 	for _, c := range capabilities {
-		r.Capabilities = append(r.Capabilities, model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode})
+		cs := model.CapabilityState{ProviderID: ID, Capability: c, Scope: im.req.Unit.ScopeKey, State: state, DiagnosticCode: im.partialCode}
+		// What the wire decoder discarded for exceeding a field bound, named
+		// per bound and split by what the bound cost: a whole record whose
+		// identity was unreadable, or one decorative field of a record that is
+		// still published. Silence here was the class-G defect (plan row 26).
+		if v := summarizeDrops(im.drops.records); v != "" {
+			cs = cs.WithDetail(detailDroppedRecords, v)
+		}
+		if v := summarizeDrops(im.drops.fields); v != "" {
+			cs = cs.WithDetail(detailDroppedFields, v)
+		}
+		if im.drops.any() {
+			cs = cs.WithDetail(detailDropReason, dropReason)
+		}
+		r.Capabilities = append(r.Capabilities, cs)
 	}
 	return r
 }

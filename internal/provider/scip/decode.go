@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -119,11 +121,99 @@ type document struct {
 	occurrences int64
 }
 
+// Bound names a decode drop is counted under. They are the wire reader's own
+// `what` strings, so a count and the message a class-B refusal would have
+// carried name the same bound.
+const (
+	boundOccurrenceSymbol   = "occurrence symbol"
+	boundSymbol             = "symbol"
+	boundRelationshipSymbol = "relationship symbol"
+	boundDisplayName        = "display name"
+	boundSignature          = "signature"
+	boundRelationships      = "relationships per symbol"
+)
+
+// Detail keys the decode drop counts are published under on the unit's
+// capability row, and the reason they share.
+const (
+	detailDroppedRecords = "decode_dropped_records"
+	detailDroppedFields  = "decode_dropped_fields"
+	detailDropReason     = "decode_drop_reason"
+	dropReason           = "value exceeds its field bound"
+)
+
+// decodeDrops counts what the decoder discarded because a value exceeded a
+// field bound (plan row 26). The split is what the bound costs:
+//
+//   - An IDENTIFYING field cannot be dropped on its own. A symbol without its
+//     symbol string is not a fact about anything, and `decodeSymbolInfo` ends
+//     in "symbol information has no symbol", so dropping just the string would
+//     turn an over-limit into a malformed abort. The whole RECORD is dropped
+//     and counted.
+//   - A DECORATIVE field (display name, signature text, the relationships past
+//     the pre-allocation bound) is dropped on its own and the record is kept
+//     and published.
+//
+// Neither ever fails the unit: the counts are published as degradation details
+// on the unit's capability row, which is where the answer says what it cut.
+type decodeDrops struct {
+	records map[string]int64
+	fields  map[string]int64
+}
+
+func (d *decodeDrops) dropRecord(bound string) {
+	if d == nil {
+		return
+	}
+	if d.records == nil {
+		d.records = map[string]int64{}
+	}
+	d.records[bound]++
+}
+
+func (d *decodeDrops) dropField(bound string) {
+	if d == nil {
+		return
+	}
+	if d.fields == nil {
+		d.fields = map[string]int64{}
+	}
+	d.fields[bound]++
+}
+
+func (d *decodeDrops) any() bool { return d != nil && (len(d.records) > 0 || len(d.fields) > 0) }
+
+// summary renders one count map as a stable, sorted `bound=n` list so the
+// detail value is reproducible across runs of the same index.
+func summarizeDrops(counts map[string]int64) string {
+	if len(counts) == 0 {
+		return ""
+	}
+	bounds := make([]string, 0, len(counts))
+	for b := range counts {
+		bounds = append(bounds, b)
+	}
+	sort.Strings(bounds)
+	var b strings.Builder
+	for i, name := range bounds {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(name)
+		b.WriteByte('=')
+		b.WriteString(strconv.FormatInt(counts[name], 10))
+	}
+	return b.String()
+}
+
 // walker streams one index through the wire reader. Callbacks that are nil
 // mean the walker skips that record kind without decoding it, which is how
 // the binding pre-pass reads only paths and text hashes.
 type walker struct {
 	limits Limits
+	// drops counts the records and fields this walk discarded for exceeding a
+	// field bound. It is owned by the caller so one account covers every pass.
+	drops *decodeDrops
 	// buf holds the record being read; strs holds strings cut from it while
 	// it is decoded. They must be distinct: decoding reads from buf.
 	buf, strs []byte
@@ -206,7 +296,8 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 				break
 			}
 			var s symbolInfo
-			if s, err = decodeSymbolInfo(w.buf); err == nil {
+			var dropped bool
+			if s, dropped, err = decodeSymbolInfo(w.buf, w.drops); err == nil && !dropped {
 				err = w.onExternal(s, n)
 			}
 		default:
@@ -281,9 +372,14 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 			if err := w.record(ctx, r, n, "occurrence record"); err != nil {
 				return err
 			}
-			o, err := w.decodeOccurrence(w.buf)
+			o, dropped, err := w.decodeOccurrence(w.buf)
 			if err != nil {
 				return err
+			}
+			if dropped {
+				// The occurrence's symbol is over its bound: this occurrence
+				// publishes nothing, the rest of the document still does.
+				continue
 			}
 			if err := w.onOccurrence(index, seq, o, n); err != nil {
 				return err
@@ -299,9 +395,12 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 			if err := w.record(ctx, r, n, "symbol record"); err != nil {
 				return err
 			}
-			s, err := decodeSymbolInfo(w.buf)
+			s, dropped, err := decodeSymbolInfo(w.buf, w.drops)
 			if err != nil {
 				return err
+			}
+			if dropped {
+				continue
 			}
 			if err := w.onSymbol(index, s, n); err != nil {
 				return err
@@ -333,7 +432,11 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 // on a writer's field order, or the same index would yield different evidence
 // bytes from one encoder to the next. Both forms are still consumed, so the
 // record stays in sync.
-func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
+// The second result reports that the occurrence was DROPPED: its symbol -- the
+// only field that identifies what the occurrence is about -- was over its
+// bound, so there is nothing to publish. The index is not malformed and the
+// walk continues.
+func (w *walker) decodeOccurrence(buf []byte) (occurrence, bool, error) {
 	r := newReader(bytes.NewReader(buf), int64(len(buf)))
 	var o occurrence
 	var legacyRange, legacyEnclosing []int32
@@ -341,33 +444,33 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return o, err
+			return o, false, err
 		}
 		switch field {
 		case fieldOccurrenceRange:
 			if legacyRange, err = r.ints(wt, legacyRange[:0], 4); err != nil {
-				return o, err
+				return o, false, err
 			}
 		case fieldOccurrenceEnclosingRange:
 			enclosingSeen = true
 			if legacyEnclosing, err = r.ints(wt, legacyEnclosing[:0], 4); err != nil {
-				return o, err
+				return o, false, err
 			}
 		case fieldOccurrenceSingleRange, fieldOccurrenceMultiRange, fieldOccurrenceSingleEnclosing, fieldOccurrenceMultiEnclosing:
 			if wt != wireBytes {
-				return o, malformed("typed range has an unexpected wire type")
+				return o, false, malformed("typed range has an unexpected wire type")
 			}
 			n, err := r.length()
 			if err != nil {
-				return o, err
+				return o, false, err
 			}
 			body, err := r.sub(n)
 			if err != nil {
-				return o, err
+				return o, false, err
 			}
 			vals, err := decodeTypedRange(body, field == fieldOccurrenceSingleRange || field == fieldOccurrenceSingleEnclosing)
 			if err != nil {
-				return o, err
+				return o, false, err
 			}
 			if field == fieldOccurrenceSingleRange || field == fieldOccurrenceMultiRange {
 				o.rng, rangeTyped = vals, true
@@ -376,23 +479,27 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 			}
 		case fieldOccurrenceSymbol:
 			if wt != wireBytes {
-				return o, malformed("occurrence symbol has an unexpected wire type")
+				return o, false, malformed("occurrence symbol has an unexpected wire type")
 			}
-			if o.symbol, w.strs, err = r.str(model.MaxNativeKeyBytes, "occurrence symbol", w.strs); err != nil {
-				return o, err
+			var dropped bool
+			if o.symbol, w.strs, _, dropped, err = r.strBounded(model.MaxNativeKeyBytes, boundOccurrenceSymbol, w.strs); err != nil {
+				return o, false, err
+			} else if dropped {
+				w.drops.dropRecord(boundOccurrenceSymbol)
+				return o, true, nil
 			}
 		case fieldOccurrenceRoles:
 			if wt != wireVarint {
-				return o, malformed("occurrence roles have an unexpected wire type")
+				return o, false, malformed("occurrence roles have an unexpected wire type")
 			}
 			v, err := r.varint()
 			if err != nil {
-				return o, err
+				return o, false, err
 			}
 			o.roles = int32(v)
 		default:
 			if err := r.skip(wt); err != nil {
-				return o, err
+				return o, false, err
 			}
 		}
 	}
@@ -404,12 +511,12 @@ func (w *walker) decodeOccurrence(buf []byte) (occurrence, error) {
 	}
 	o.hasEnclosing = enclosingSeen
 	if len(o.rng) != 3 && len(o.rng) != 4 {
-		return o, malformed("occurrence range has " + strconv.Itoa(len(o.rng)) + " values, want 3 or 4")
+		return o, false, malformed("occurrence range has " + strconv.Itoa(len(o.rng)) + " values, want 3 or 4")
 	}
 	if o.hasEnclosing && len(o.enclosing) != 3 && len(o.enclosing) != 4 {
-		return o, malformed("enclosing range has " + strconv.Itoa(len(o.enclosing)) + " values, want 3 or 4")
+		return o, false, malformed("enclosing range has " + strconv.Itoa(len(o.enclosing)) + " values, want 3 or 4")
 	}
-	return o, nil
+	return o, false, nil
 }
 
 // decodeTypedRange reads a SingleLineRange {line, start, end} or a
@@ -443,136 +550,172 @@ func decodeTypedRange(r *reader, single bool) ([]int32, error) {
 // decodeSymbolInfo decodes one bounded SymbolInformation record: symbol,
 // kind, display name, signature text and relationships. Documentation is
 // skipped; it is not a fact this provider publishes.
-func decodeSymbolInfo(buf []byte) (symbolInfo, error) {
+// The second result reports that the record was DROPPED: its `symbol` was over
+// the native-key bound, so the record cannot be published under any identity.
+func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) {
 	r := newReader(bytes.NewReader(buf), int64(len(buf)))
 	var s symbolInfo
 	var scratch []byte
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return s, err
+			return s, false, err
 		}
 		switch {
 		case field == fieldSymbolInfoKind && wt == wireVarint:
 			v, err := r.varint()
 			if err != nil {
-				return s, err
+				return s, false, err
 			}
 			s.kind = int32(v)
 		case field == fieldSymbolInfoSymbol && wt == wireBytes:
-			if s.symbol, scratch, err = r.str(model.MaxNativeKeyBytes, "symbol", scratch); err != nil {
-				return s, err
+			var dropped bool
+			if s.symbol, scratch, _, dropped, err = r.strBounded(model.MaxNativeKeyBytes, boundSymbol, scratch); err != nil {
+				return s, false, err
+			} else if dropped {
+				drops.dropRecord(boundSymbol)
+				return s, true, nil
 			}
 		case field == fieldSymbolInfoDisplayName && wt == wireBytes:
-			if s.displayName, scratch, err = r.str(model.MaxNameBytes, "display name", scratch); err != nil {
-				return s, err
+			// Decorative: the record keeps its identity without it.
+			var dropped bool
+			if s.displayName, scratch, _, dropped, err = r.strBounded(model.MaxNameBytes, boundDisplayName, scratch); err != nil {
+				return s, false, err
+			} else if dropped {
+				drops.dropField(boundDisplayName)
 			}
 		case field == fieldSymbolInfoSignature && wt == wireBytes:
 			n, err := r.length()
 			if err != nil {
-				return s, err
+				return s, false, err
 			}
 			sig, err := r.sub(n)
 			if err != nil {
-				return s, err
+				return s, false, err
 			}
-			if s.signature, err = decodeSignature(sig); err != nil {
-				return s, err
+			var dropped bool
+			if s.signature, dropped, err = decodeSignature(sig); err != nil {
+				return s, false, err
+			} else if dropped {
+				drops.dropField(boundSignature)
 			}
 		case field == fieldSymbolInfoRelationships && wt == wireBytes:
 			n, err := r.length()
 			if err != nil {
-				return s, err
+				return s, false, err
 			}
 			body, err := r.sub(n)
 			if err != nil {
-				return s, err
+				return s, false, err
 			}
-			rel, err := decodeRelationship(body)
-			if err != nil {
-				return s, err
-			}
+			// The class-B pre-allocation bound stays; what changes is that the
+			// relationships past it are discarded and counted rather than
+			// aborting the import of a deep type hierarchy.
 			if len(s.relationships) >= maxRelationships {
-				return s, overLimit("relationships per symbol", int64(len(s.relationships))+1, maxRelationships)
+				if err := body.discard(); err != nil {
+					return s, false, err
+				}
+				drops.dropField(boundRelationships)
+				continue
+			}
+			rel, dropped, err := decodeRelationship(body, drops)
+			if err != nil {
+				return s, false, err
+			}
+			if dropped {
+				continue
 			}
 			s.relationships = append(s.relationships, rel)
 		default:
 			if err := r.skip(wt); err != nil {
-				return s, err
+				return s, false, err
 			}
 		}
 	}
 	if s.symbol == "" {
-		return s, malformed("symbol information has no symbol")
+		return s, false, malformed("symbol information has no symbol")
 	}
-	return s, nil
+	return s, false, nil
 }
 
 // decodeSignature reads Signature.text, bounded at the signature ceiling;
 // a longer signature is dropped rather than truncated into a wrong one.
-func decodeSignature(r *reader) (string, error) {
+// The second result reports that the text was dropped for exceeding the
+// signature bound, which the caller counts as a field drop.
+func decodeSignature(r *reader) (string, bool, error) {
 	var text string
+	var dropped bool
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if field != fieldSignatureText || wt != wireBytes {
 			if err := r.skip(wt); err != nil {
-				return "", err
+				return "", false, err
 			}
 			continue
 		}
 		n, err := r.length()
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		if n > int64(model.MaxSignatureBytes) {
 			if err := r.discardSub(n); err != nil {
-				return "", err
+				return "", false, err
 			}
+			dropped = true
 			continue
 		}
-		buf, err := r.bytes(n, n, "signature", nil)
+		buf, err := r.bytes(n, n, boundSignature, nil)
 		if err != nil {
-			return "", err
+			return "", false, err
 		}
 		text = string(buf)
 	}
-	return text, nil
+	return text, dropped, nil
 }
 
-func decodeRelationship(r *reader) (relationship, error) {
+// The second result reports that the relationship was DROPPED: its symbol was
+// over the native-key bound, so it names no target.
+func decodeRelationship(r *reader, drops *decodeDrops) (relationship, bool, error) {
 	var rel relationship
 	var scratch []byte
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return rel, err
+			return rel, false, err
 		}
 		switch {
 		case field == fieldRelationshipSymbol && wt == wireBytes:
-			if rel.symbol, scratch, err = r.str(model.MaxNativeKeyBytes, "relationship symbol", scratch); err != nil {
-				return rel, err
+			var dropped bool
+			if rel.symbol, scratch, _, dropped, err = r.strBounded(model.MaxNativeKeyBytes, boundRelationshipSymbol, scratch); err != nil {
+				return rel, false, err
+			} else if dropped {
+				drops.dropRecord(boundRelationshipSymbol)
+				if err := r.discard(); err != nil {
+					return rel, false, err
+				}
+				return rel, true, nil
 			}
 		case wt == wireVarint && field >= fieldRelationshipIsReference && field <= fieldRelationshipIsDefinition:
 			v, err := r.varint()
 			if err != nil {
-				return rel, err
+				return rel, false, err
 			}
 			if v != 0 {
 				rel.flags |= 1 << (field - fieldRelationshipIsReference)
 			}
 		default:
 			if err := r.skip(wt); err != nil {
-				return rel, err
+				return rel, false, err
 			}
 		}
 	}
 	if rel.symbol == "" {
-		return rel, malformed("relationship has no symbol")
+		return rel, false, malformed("relationship has no symbol")
 	}
-	return rel, nil
+	return rel, false, nil
 }
 
 // decodeMetadata reads the tool identity and text encoding of the index.
