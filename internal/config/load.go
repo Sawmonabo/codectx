@@ -44,6 +44,7 @@ var projectPermitted = map[string]bool{
 	"workspace.max_files":              true,
 	"workspace.max_parse_file_bytes":   true,
 	"workspace.max_search_file_bytes":  true,
+	"index.max_evidence_per_fact":      true,
 	"providers.tree_sitter.languages":  true,
 	"context.default_phase":            true,
 	"context.default_estimated_tokens": true,
@@ -185,6 +186,8 @@ func applyProjectKey(cfg, scratch *Config, key string) error {
 		return lowerOnlyLimit(key, &cfg.Workspace.MaxParseFileBytes, scratch.Workspace.MaxParseFileBytes)
 	case "workspace.max_search_file_bytes":
 		return lowerOnlyLimit(key, &cfg.Workspace.MaxSearchFileBytes, scratch.Workspace.MaxSearchFileBytes)
+	case "index.max_evidence_per_fact":
+		return lowerOnlyLimit(key, &cfg.Index.MaxEvidencePerFact, scratch.Index.MaxEvidencePerFact)
 	case "providers.tree_sitter.languages":
 		cfg.Providers.TreeSitter.Languages = scratch.Providers.TreeSitter.Languages
 	case "context.default_phase":

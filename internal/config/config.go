@@ -184,6 +184,15 @@ type Index struct {
 	// busy monorepo would be a scale refusal, whereas a deadline ends a
 	// worktree that genuinely never settles. Attempts are reported either way.
 	CaptureMaxRetries Limit `toml:"capture_max_retries"`
+	// MaxEvidencePerFact is how many evidence occurrences one node or relation
+	// fact may carry in a sealed unit. Unlimited (0) by default: a fact keeps
+	// every occurrence the providers found, up to the record ceiling
+	// model.MaxEvidencePerFact, which is a wire and record bound rather than a
+	// setting. A user-set value clips a fact at that many occurrences, and the
+	// cut is reported on the unit's capability detail, never silent. It is a
+	// semantic input -- a unit sealed under a clip concludes less from the same
+	// bytes -- so it is part of AnalysisConfigHash.
+	MaxEvidencePerFact Limit `toml:"max_evidence_per_fact"`
 	// CaptureRetryDeadline bounds the whole validated capture. It is finite by
 	// design and not a size bound: with CaptureMaxRetries unlimited it is the
 	// only thing that ends a capture of a worktree that is always changing.
@@ -621,6 +630,9 @@ func Defaults() Config {
 			MaxRetainedBytes:     0,
 			// Unlimited: only a user-set bound stops the watch set.
 			WatchMaxDirectories: Unlimited,
+			// Unlimited: a fact keeps every occurrence up to the record
+			// ceiling; only a user-set clip cuts one.
+			MaxEvidencePerFact: Unlimited,
 		},
 		Resources: Resources{
 			BaseMemoryBudgetBytes:     805306368,
