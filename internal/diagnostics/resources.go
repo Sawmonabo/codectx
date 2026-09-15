@@ -16,6 +16,12 @@ import (
 // unavailable metric is absent and never zero -- a nil field says "not measured
 // on this host", a zero says "measured, and it is zero".
 //
+// The pending-event count is the one figure here that a second process could
+// not report at all until a watch published a heartbeat: the sampler measures
+// the host, and a notification queue belongs to whichever process holds the
+// watcher. It is read from the store for that reason and reported only while
+// the writer's own deadline holds.
+//
 // A failure to read the store is not a failure to report resources: the host
 // figures the sampler produced are still true, so the database and write-ahead
 // log sizes are left absent and the call succeeds. The alternative would let an
@@ -32,11 +38,33 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.DatabaseBytes = nonNegativeBytes(stats.DatabaseBytes)
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
+	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
 	if err := report.Validate(); err != nil {
 		return model.ResourceReport{}, err
 	}
 	return report, nil
+}
+
+// pendingWatchEvents fills the pending-event count from the live watch
+// heartbeat, and leaves it absent otherwise.
+//
+// Absent covers three different situations on purpose -- no watch is running,
+// the watch that was running stopped refreshing its row, or the heartbeat could
+// not be read -- because all three mean the same thing to this block: nobody is
+// measuring the queue right now. Reporting the last figure a dead watcher wrote
+// would read as "the watch is caught up", which is precisely the claim a stale
+// row must never make; which of the three it is, and whether it needs acting
+// on, is what the doctor's `watch_heartbeat` check reports.
+//
+// A watch running without a notification source leaves the figure absent too:
+// periodic reconciliation has no queue to count, so it writes none.
+func (s *Service) pendingWatchEvents(ctx context.Context, report *model.ResourceReport) {
+	hb, live, _ := s.liveWatch(ctx)
+	if live && hb.PendingEvents != nil && *hb.PendingEvents >= 0 {
+		pending := *hb.PendingEvents
+		report.PendingEvents = &pending
+	}
 }
 
 // reservations fills the three figures that are not measured but promised: what

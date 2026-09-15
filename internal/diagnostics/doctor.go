@@ -25,6 +25,7 @@ const (
 	checkActiveGeneration = "active_generation"
 	checkSourceRetention  = "source_retention"
 	checkSuppliedIndex    = "supplied_index"
+	checkWatchHeartbeat   = "watch_heartbeat"
 	checkAnalyzerRestrict = "analyzer_restriction"
 	checkTemporaryState   = "temporary_state"
 	checkBundledGrammars  = "bundled_grammars"
@@ -79,6 +80,55 @@ type SuppliedIndexReader interface {
 	SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error)
 }
 
+// WatchHeartbeat is what a running watch published about itself, read from the
+// store by a process that is not the one watching.
+//
+// ExpiresAt is the writer's own deadline and the only liveness signal this
+// package consults. A watching process refreshes it while it lives, so an
+// expired row means the writer stopped refreshing -- the one signal of process
+// death that needs no pid probe and works on every platform. LastPassAt and
+// PendingEvents are absent when nothing measured them: a watch driven only by
+// periodic reconciliation counts no notification queue, and a watch that has
+// completed no pass has no pass time.
+type WatchHeartbeat struct {
+	WriterPID     int
+	LastPassAt    *time.Time
+	PendingEvents *int64
+	ExpiresAt     time.Time
+}
+
+// WatchHeartbeatReader reports the repository's watch heartbeat, and whether
+// one exists at all -- absent and expired are different answers. Like
+// SuppliedIndexReader it is optional, exported, and converts rather than
+// forwards, so the composition root asserts it at compile time instead of
+// leaving a signature drift to show up as a check that is unavailable forever.
+type WatchHeartbeatReader interface {
+	WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (WatchHeartbeat, bool, error)
+}
+
+// liveWatch reports the heartbeat of a watch that is running now: the row
+// exists and the writer's own deadline has not passed. An expired row is a
+// watch that stopped, and is reported as no watch at all rather than as
+// coverage -- a figure from a dead process would read as "the watch is caught
+// up" for as long as nobody rebooted it.
+//
+// The second result separates "no heartbeat is live" from "this build cannot
+// tell", which the two callers render differently.
+func (s *Service) liveWatch(ctx context.Context) (hb WatchHeartbeat, live bool, ok bool) {
+	reader, isReader := s.opts.Store.(WatchHeartbeatReader)
+	if !isReader {
+		return WatchHeartbeat{}, false, false
+	}
+	hb, found, err := reader.WatchHeartbeat(ctx, s.opts.Repo)
+	if err != nil {
+		return WatchHeartbeat{}, false, false
+	}
+	if !found {
+		return WatchHeartbeat{}, false, true
+	}
+	return hb, hb.ExpiresAt.After(s.opts.Now()), true
+}
+
 // captureReader reports when the capture behind a generation was taken -- the
 // snapshot's own creation time, not the generation's. Like blobSampler it is an
 // optional interface on the frozen StoreReader, so a reader that cannot answer
@@ -124,6 +174,7 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 		s.checkCaptureFreshness(ctx, active),
 		s.checkCAS(ctx, req.Deep, stats, statsErr),
 		s.checkSuppliedIndex(ctx, active),
+		s.checkWatchHeartbeat(ctx),
 		s.checkGrammars(),
 		s.checkTemporary(ctx),
 		s.checkAnalyzerRestriction(),
@@ -537,6 +588,42 @@ func bytesPhrase(n int64) string { return strconv.FormatInt(n, 10) + " bytes" }
 func (s *Service) checkAnalyzerRestriction() model.DoctorCheck {
 	return model.DoctorCheck{Name: checkAnalyzerRestrict, State: model.CheckUnavailable,
 		Detail: "whether an OS-level restriction confines the analyzer subprocesses is not measured on this platform, so this installation neither claims nor denies that one is active"}
+}
+
+// checkWatchHeartbeat reports whether a watch is running for this workspace,
+// from the row a watching process publishes and refreshes (Section 13.2).
+//
+// The three states are three different facts and never collapse. `pass` is a
+// live row: some process is watching, and it says which one, so an operator who
+// wants it stopped knows what to stop. `warn` is an expired row: a watch ran and
+// is no longer refreshing, so every change since is unseen while the workspace
+// still looks watched -- the one state an operator must act on. `unavailable` is
+// no row at all, which is the ordinary state of a workspace nobody is watching
+// and not a defect; it is also what a build with no heartbeat reader reports.
+func (s *Service) checkWatchHeartbeat(ctx context.Context) model.DoctorCheck {
+	hb, live, ok := s.liveWatch(ctx)
+	switch {
+	case !ok:
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,
+			Detail: "this build publishes no watch heartbeat, so whether a watch is running for this workspace cannot be told from another process"}
+	case live:
+		detail := "a watch is running in process " + strconv.Itoa(hb.WriterPID)
+		if hb.PendingEvents != nil {
+			detail += ", with " + strconv.FormatInt(*hb.PendingEvents, 10) + " pending event/events"
+		}
+		if hb.LastPassAt != nil {
+			detail += "; its last pass completed " + hb.LastPassAt.UTC().Format(time.RFC3339)
+		}
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckPass, Detail: detail}
+	case hb.ExpiresAt.IsZero():
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckUnavailable,
+			Detail: "no watch has published a heartbeat for this workspace, so there is no watch coverage to report"}
+	default:
+		return model.DoctorCheck{Name: checkWatchHeartbeat, State: model.CheckWarn,
+			Detail:      "the watch that was running here stopped refreshing its heartbeat at " + hb.ExpiresAt.UTC().Format(time.RFC3339) + ", so changes since then have not been reconciled",
+			Code:        model.CodeSnapshotChanged,
+			Remediation: "start `codectx watch` again, or run `codectx index` once to reconcile what changed while it was down"}
+	}
 }
 
 // checkGrammars answers Section 22's bundled-grammar question: whether this
