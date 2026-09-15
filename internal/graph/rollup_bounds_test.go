@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -16,12 +17,33 @@ import (
 // now -- unlimited by default -- and a user-set allowance omits the nodes it
 // stopped on and says so, instead of refusing.
 //
-// Mutation proof: restore `config.Limit(int64(len(batch))*16)` as the bound in
-// containerPackages and the unlimited leg still passes (16 per node is enough
-// for this fixture), but restore the `CTX_RESOURCE_LIMIT` return in place of
-// cut(batch) and the bounded leg fails with that error instead of an answer.
+// Mutation proofs. Restore the `CTX_RESOURCE_LIMIT` return in place of
+// cut(batch): the bounded leg fails with that error instead of an answer.
+// Restore `config.Limit(int64(len(batch))*16)` as the bound: the bounded leg
+// fails too ("a cut containment read named no bound"), because the read stops
+// obeying the allowance the operator set. The unlimited leg cannot separate the
+// two -- the old bound was per BATCH (sixteen times the batch size, some four
+// thousand rows for this fixture's 261 endpoints), so no fixture small enough
+// to keep in a unit test reaches it. That the old ceiling refuses on a default
+// configuration at repository scale is read-verified, not proved here.
 func TestRollupContainmentIsUnboundedByDefaultAndOmittedWhenBounded(t *testing.T) {
 	f := newGraphFixture(t)
+	// One node claimed by more containers than the deleted hard-coded ceiling
+	// of sixteen. Without it the fixture never reaches that ceiling and the
+	// unlimited leg below would pass with the ceiling restored, proving
+	// nothing about the invariant this test exists for. It is appended to THIS
+	// test's own fixture instance, so no other test's counts move.
+	const claimants = 20
+	claimed := fixtureNodeID("n-wide-leaf-000")
+	for i := 0; i < claimants; i++ {
+		name := fmt.Sprintf("pkg-claimant-%02d", i)
+		id := fixtureNodeID(name)
+		f.nodes[id] = model.Node{ID: id, Kind: model.NodePackage, Name: name,
+			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
+		f.relations = append(f.relations, model.Relation{
+			ID: fixtureRelationID(len(f.relations)), From: id,
+			Kind: model.RelContains, To: claimed})
+	}
 	engine := func(t *testing.T, maxEdges int) *Engine {
 		t.Helper()
 		signer, err := pagination.OpenSigner(t.TempDir())

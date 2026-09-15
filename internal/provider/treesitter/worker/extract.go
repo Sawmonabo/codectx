@@ -19,7 +19,7 @@ const parseChunkBytes = 64 << 10
 // request carries. A zero bound -- the default -- is unlimited, so the file
 // yields what it yields; only a value the operator set can stop it, and a file
 // it stops is reported truncated.
-func atRecordBound(max uint32, have int) bool {
+func atRecordBound(max uint64, have int) bool {
 	return max != 0 && uint64(have) >= uint64(max)
 }
 
@@ -82,7 +82,15 @@ type extraction struct {
 	truncated    bool
 	// maxRecords is the request's MaxRecordsPerFile, the one per-file record
 	// bound; 0 is unlimited.
-	maxRecords uint32
+	maxRecords uint64
+	// declCount is how many declaration RECORDS this extraction will emit --
+	// one per (range, name start) pair, which is what emit flattens e.decls
+	// into and therefore what the parent counts as it reads the frames back.
+	// len(e.decls) is the number of RANGES and is smaller whenever one range
+	// declares several names (`var a, b = ...`), so bounding on it would let
+	// the worker send more frames than the parent was told to accept and the
+	// parent would fail a healthy unit.
+	declCount int
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -180,10 +188,6 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	key := span{node.StartByte(), node.EndByte()}
 	byName := e.decls[key]
 	if byName == nil {
-		if atRecordBound(e.maxRecords, len(e.decls)) {
-			e.truncated = true
-			return
-		}
 		byName = map[uint]*decl{}
 		e.decls[key] = byName
 	}
@@ -193,7 +197,12 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 		}
 		return
 	}
+	if atRecordBound(e.maxRecords, e.declCount) {
+		e.truncated = true
+		return
+	}
 	byName[d.nameStart] = d
+	e.declCount++
 }
 
 func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {

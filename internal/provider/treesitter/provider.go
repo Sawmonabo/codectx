@@ -236,7 +236,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
 	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint32(len(src)),
-		MaxRecordsPerFile: uint32(p.opts.MaxRecordsPerFile.Value())}, src)
+		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
@@ -363,7 +363,7 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file exceeds max parse file bytes"}
 	}
 	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint32(len(src)),
-		MaxRecordsPerFile: uint32(p.opts.MaxRecordsPerFile.Value())}, src)
+		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
 	if err != nil {
 		return Probe{}, err
 	}

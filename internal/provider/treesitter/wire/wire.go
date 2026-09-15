@@ -93,7 +93,7 @@ type Request struct {
 	// its own constant would kill a healthy worker's output the moment the
 	// operator raised the limit. A file that reaches it is reported truncated
 	// through Done.Truncated and its structural coverage is partial.
-	MaxRecordsPerFile uint32 `json:"max_records_per_file,omitempty"`
+	MaxRecordsPerFile uint64 `json:"max_records_per_file,omitempty"`
 }
 
 // Decl is one declaration. Offsets are byte offsets into the source; Parent
