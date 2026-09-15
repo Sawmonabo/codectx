@@ -82,6 +82,7 @@ func (c Config) validate() error {
 		{"workspace.max_search_file_bytes", c.Workspace.MaxSearchFileBytes},
 		{"index.retain_refs", c.Index.RetainRefs},
 		{"index.max_retained_bytes", c.Index.MaxRetainedBytes},
+		{"index.capture_max_retries", c.Index.CaptureMaxRetries},
 		{"resources.max_query_terms", c.Resources.MaxQueryTerms},
 		{"resources.max_provider_record_bytes", c.Resources.MaxProviderRecordBytes},
 		{"providers.lsp.max_overlay_bytes", c.Providers.LSP.MaxOverlayBytes},
@@ -114,6 +115,7 @@ func (c Config) validate() error {
 	}{
 		{"index.watch_debounce", c.Index.WatchDebounce},
 		{"index.reconcile_interval", c.Index.ReconcileInterval},
+		{"index.capture_retry_deadline", c.Index.CaptureRetryDeadline},
 		{"resources.query_timeout", c.Resources.QueryTimeout},
 		{"storage.busy_timeout", c.Storage.BusyTimeout},
 		{"storage.closed_session_retention", c.Storage.ClosedSessionRetention},
