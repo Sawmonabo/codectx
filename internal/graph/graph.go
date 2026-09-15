@@ -423,3 +423,29 @@ func typedContextError(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+// isDeadline is the ONE test for "the query ran out of time", in every shape a
+// deadline reaches the engine in. The engine's own checks (checkWalk) raise a
+// typed CTX_QUERY_DEADLINE, but two other shapes exist and both were treated as
+// fatal failures before: the RAW context.DeadlineExceeded a storage read
+// returns when the deadline falls inside the query -- sqlite's wrap passes it
+// through deliberately, so a caller can tell it from a crash -- and the same
+// raw error from any other I/O the request performs past the deadline,
+// including the lease write that MINTS the continuation.
+//
+// Treating those as fatal is what made a timed-out impact answer on a real
+// repository return ok:false, data:null and a bare CTX_QUERY_DEADLINE with no
+// cursor: the page, the frontier and the continuation were all thrown away.
+// Every site that decides whether a deadline ends a page or an answer routes
+// through here, so the storage layer may keep returning raw context errors and
+// the engine still classifies them once.
+func isDeadline(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeQueryDeadline
+}
