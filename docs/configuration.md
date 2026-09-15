@@ -70,6 +70,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows` |
   | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes` |
+  | `[providers.manifest]` | `max_dependencies`, `max_entries` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
 
@@ -295,6 +296,8 @@ directories and network posture are product code, not configuration.
 | `dependence.max_units_per_family` | `0` (unlimited) | user | How many frontend-native projects of one language family you want a plan to hold. Unlimited by default: a monorepo's project count belongs to the repository, so every project is planned as its own unit and a crashed unit is still split along every one of its parts. A set value refuses nothing and drops nothing — crossing it marks the family's capability rows partial with `CTX_RESOURCE_LIMIT`, naming the family, the project count and this value. |
 | `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (roughly 10× the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
 | `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
+| `manifest.max_dependencies` | `0` (unlimited) | user | How many dependencies you want one manifest file to declare. Unlimited by default: a `go.mod`, `package.json` or `pom.xml` declares what the repository declares. A set value cuts the list at the bound and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_dependencies` as the count that crossed it against this value. A manifest is one file whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory, never the repository's. |
+| `manifest.max_entries` | `0` (unlimited) | user | The same contract for the other lists one manifest declares: modules, replaced and excluded modules, workspace members and Maven properties, and a Markdown document's headings and source links. Crossing it is reported as `max_entries` on that file's capability row. |
 
 ### Timeouts here are hang detectors, not size limits
 

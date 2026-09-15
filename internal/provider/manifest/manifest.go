@@ -16,11 +16,12 @@ package manifest
 
 import (
 	"context"
-	"github.com/Sawmonabo/codectx/internal/config"
 	"io"
 	"path"
+	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
@@ -51,11 +52,19 @@ const (
 	KindTest     = "test"
 )
 
-// Bounds on what one manifest may declare. A manifest over a bound is
-// reported partial with CTX_RESOURCE_LIMIT rather than indexed without limit.
+// Bound names. A manifest over one of them is reported partial with
+// CTX_RESOURCE_LIMIT and the capability carries the count that crossed it.
+// Both bounds are unlimited by default: how many dependencies a manifest
+// declares is a property of the repository, not something the product cuts on
+// the user's behalf.
 const (
-	MaxDependencies = 4096
-	MaxEntries      = 1024 // modules, members, headings, links, properties
+	BoundDependencies = "max_dependencies"
+	BoundEntries      = "max_entries" // modules, members, headings, links, properties
+	// BoundXMLElements and BoundTOMLLines are parser ceilings, not user-set
+	// list bounds: they bound the token stream and the line layout before
+	// either can be allocated. They cut rather than refuse, and say so.
+	BoundXMLElements = "max_xml_elements"
+	BoundTOMLLines   = "max_toml_lines"
 )
 
 // Options are the admission settings this provider honours
@@ -66,6 +75,14 @@ type Options struct {
 	// larger file stays retained and searchable; its capability here is
 	// unavailable.
 	MaxParseFileBytes config.Limit
+	// MaxDependencies is providers.manifest.max_dependencies: how many
+	// dependencies the user wants one manifest to declare. Unlimited by
+	// default; a user-set value that is crossed cuts the list and is
+	// reported on the unit's capability with the count.
+	MaxDependencies config.Limit
+	// MaxEntries is providers.manifest.max_entries, the same contract for a
+	// manifest's modules, members, headings, links and properties.
+	MaxEntries config.Limit
 }
 
 // Provider is the manifest provider.
@@ -148,7 +165,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, &model.Error{Code: model.CodeSourceIntegrity, Message: "retained bytes differ in length from the manifest"}
 	}
 	e.AddBytes(uint64(len(data)))
-	u := &unit{e: e, data: data, cursor: source.NewCursor(data), capability: capability, state: model.CapabilityFresh}
+	u := &unit{e: e, data: data, cursor: source.NewCursor(data), capability: capability, state: model.CapabilityFresh,
+		deps: p.opts.MaxDependencies, entries: p.opts.MaxEntries}
 	switch cls.Format {
 	case filesystem.FormatGoMod:
 		err = u.goMod(ctx)
@@ -169,6 +187,9 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	e.Capability(capability, u.state, u.code)
+	for bound, detail := range u.over {
+		e.CapabilityDetail(capability, bound, detail)
+	}
 	if err := e.Flush(ctx); err != nil {
 		return model.ProviderResult{}, err
 	}
@@ -191,6 +212,11 @@ type unit struct {
 	capability string
 	state      model.CapabilityStateValue
 	code       string
+
+	// deps and entries are the unit's configured list bounds, and over holds
+	// one capability detail per bound this unit cut, keyed by bound name.
+	deps, entries config.Limit
+	over          map[string]string
 }
 
 // fileNode resolves this manifest's own file node. The node is the
@@ -212,11 +238,35 @@ func (u *unit) fileNode(ctx context.Context) (model.Node, error) {
 // capability outcome, never a provider failure.
 func (u *unit) malformed() { u.state, u.code = model.CapabilityFailed, model.CodeArgumentInvalid }
 
-// overBound records that a bounded list was cut.
-func (u *unit) overBound() {
+// overBound records that a user-set list bound was crossed: the unit is
+// partial with CTX_RESOURCE_LIMIT and seen -- the count that crossed the
+// bound -- is kept so the capability can report it. Nothing is cut when the
+// bound is unlimited, so this is never reached for a default configuration.
+func (u *unit) overBound(bound string, limit config.Limit, seen int64) {
+	u.degraded(bound, strconv.FormatInt(seen, 10)+" over "+limit.String())
+}
+
+// degraded records that a parser bound cut this manifest. Unlike the list
+// bounds these are structural ceilings with no count to report -- a token
+// stream stopped, a layout not built -- so the detail names what was cut.
+func (u *unit) degraded(bound, detail string) {
 	if u.state == model.CapabilityFresh {
 		u.state, u.code = model.CapabilityPartial, model.CodeResourceLimit
 	}
+	if u.over == nil {
+		u.over = map[string]string{}
+	}
+	u.over[bound] = detail
+}
+
+// cut reports whether n crosses the bound, recording the crossing when it
+// does. It is the one place a manifest list bound is enforced.
+func (u *unit) cut(bound string, limit config.Limit, n int64) bool {
+	if !limit.Exceeded(n) {
+		return false
+	}
+	u.overBound(bound, limit, n)
+	return true
 }
 
 // rng converts a byte interval of the file to a source range, or nil when the

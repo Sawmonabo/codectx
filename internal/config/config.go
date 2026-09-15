@@ -206,12 +206,31 @@ type Retention struct {
 	BlobGrace Duration `toml:"blob_grace"`
 }
 
-// Providers groups the four provider families of Section 20.1.
+// Providers groups the provider families of Section 20.1.
 type Providers struct {
 	TreeSitter TreeSitter `toml:"tree_sitter"`
 	SCIP       SCIP       `toml:"scip"`
 	LSP        LSP        `toml:"lsp"`
 	Dependence Dependence `toml:"dependence"`
+	Manifest   Manifest   `toml:"manifest"`
+}
+
+// Manifest configures the build-metadata and documentation provider of
+// Section 11.2. Both bounds are how much of one manifest the user wants
+// indexed; neither has a default, because how many dependencies a manifest
+// declares is a property of the repository. A manifest is parsed as a whole
+// file whose size workspace.max_parse_file_bytes already bounds, so an
+// unlimited list bound costs one file's heap, never the repository's.
+type Manifest struct {
+	// MaxDependencies is how many dependencies the user wants one manifest to
+	// declare. Unlimited by default; a user-set value that is crossed cuts
+	// the list and is reported on the file's capability row with the count
+	// that crossed it and this bound.
+	MaxDependencies Limit `toml:"max_dependencies"`
+	// MaxEntries is the same contract for a manifest's modules, replaced and
+	// excluded modules, workspace members, properties, and a document's
+	// headings and links.
+	MaxEntries Limit `toml:"max_entries"`
 }
 
 // TreeSitter configures the bundled structural provider. It runs as a private
@@ -504,6 +523,7 @@ func Defaults() Config {
 				MaxStagedRows:          Unlimited,
 				MaxDerivedRows:         Unlimited,
 			},
+			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited},
 		},
 		Context: Context{
 			DefaultPhase:                        "sweep",
