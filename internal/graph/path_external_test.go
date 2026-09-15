@@ -1,11 +1,13 @@
 package graph
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -782,4 +784,65 @@ func TestPathResumesInsideOneNodeEdgeList(t *testing.T) {
 	// page ceiling above rather than by a counter: the answer carries the
 	// visited count but not the edge one, and a resumed scan that re-charges
 	// the entries before its stop never gets past the first list at all.
+}
+
+// TestPathTieBreakSettlesOnCanonicalIdNotSurrogate is the equal-cost half of
+// the scratch's ordering contract. The fixture offers two routes from n-a to
+// n-z of exactly the same cost, so which one is reported is decided by the
+// settle tie-break alone, and that tie-break is the CANONICAL node id.
+//
+// It needs a reader whose surrogates do not ascend with the canonical ids:
+// while the two orders agree, a search that settled on the surrogate reports
+// the same route as one that settled on the canonical id, and the invariant is
+// unobservable. Reversing the surrogate assignment makes the two disagree on
+// every node, so the route is the same one only if the canonical id decided it.
+//
+// Mutation (the relaxation inserts the settled endpoint's SURROGATE where its
+// canonical node id belongs, so the bucket's (cost, node) order becomes a
+// surrogate order): the reversed reader reports the other equal-cost route and
+// this fails.
+func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
+	f := newGraphFixture(t)
+	nodes := make([]model.Node, 0, len(f.nodes))
+	for _, n := range f.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	relations := append([]model.Relation(nil), f.relations...)
+
+	// ONE reported route, not three. The fixture's two routes are equal-cost
+	// and the default reason-path bound reports BOTH, which breaks no tie at
+	// all: the answer would be the same whatever the settle order did.
+	limits := fixtureLimits()
+	limits.MaxReasonPaths = 1
+
+	route := func(order MemoryGraphOrder) []model.RelationID {
+		t.Helper()
+		e, err := New(Options{Adjacency: f, Limits: limits,
+			Reader: NewMemoryGraphOrdered(f.binding, nodes, relations, order)})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		res, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+			From: fixtureNodeID("n-a"), To: fixtureNodeID("n-z"),
+			Relations: []model.RelationKind{model.RelCalls}})
+		if err != nil {
+			t.Fatalf("ShortestPath: %v", err)
+		}
+		if len(res.Paths) != 1 {
+			t.Fatalf("got %d routes from n-a to n-z, want exactly one: two reported "+
+				"equal-cost routes break no tie", len(res.Paths))
+		}
+		return res.Paths[0].Relations
+	}
+
+	canonical := route(MemoryGraphOrder{})
+	reversed := route(MemoryGraphOrder{
+		Nodes:     func(a, b model.NodeID) int { return -cmp.Compare(a, b) },
+		Relations: func(a, b model.RelationID) int { return -cmp.Compare(a, b) },
+	})
+	if !slices.Equal(canonical, reversed) {
+		t.Fatalf("the equal-cost tie settled on the surrogate order\n canonical: %v\n reversed:  %v",
+			canonical, reversed)
+	}
 }
