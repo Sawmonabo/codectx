@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -611,6 +612,35 @@ func TestIncrementalScenario(t *testing.T) {
 		if rows[0].State != model.CapabilityFailed || rows[0].Scope != provider.ScopeWorkspace {
 			t.Fatalf("the surviving row is %q at scope %q, want failed at the workspace scope",
 				rows[0].State, rows[0].Scope)
+		}
+
+		// Above model.MaxCapabilityStates the bound collapses per-scope rows
+		// by provider capability AND state and rewrites every fold to the
+		// workspace scope, which regenerates the same duplicate key on the far
+		// side of the fold above: the partial fold and the failure fold both
+		// land at the workspace scope. A repository with a few hundred
+		// degraded scopes reaches this, so the key must be closed after the
+		// collapse and not only before it.
+		big := newCapabilityReport()
+		for i := range model.MaxCapabilityStates + 44 {
+			big.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+				Scope:          "pkg:go:" + strconv.Itoa(i),
+				State:          model.CapabilityPartial,
+				DiagnosticCode: model.CodeProviderOutputInvalid})
+		}
+		big.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+		bounded, _ := big.finish(f.c.log)
+		seen := map[string]int{}
+		for _, s := range bounded {
+			seen[s.ProviderID+"\x00"+s.Capability+"\x00"+s.Scope]++
+		}
+		for key, n := range seen {
+			if n > 1 {
+				t.Fatalf("the bound published %d rows for primary key %q: %+v", n, key, bounded)
+			}
+		}
+		if len(bounded) != 1 || bounded[0].State != model.CapabilityFailed {
+			t.Fatalf("the bounded report is %+v, want one failed row for the capability", bounded)
 		}
 	})
 
