@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -323,12 +324,33 @@ func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck
 	}
 	if !deep {
 		return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckUnverified,
-			Detail: "the index database header, page count, schema fingerprint and write-ahead-log mode read back; " +
-				"the integrity and referential checks walk the whole database and were " + shallowUnverified,
+			Detail: "the index database header, page count, schema fingerprint and write-ahead-log mode read back" +
+				s.synchronousPhrase() + "; the integrity and referential checks walk the whole database and were " +
+				shallowUnverified,
 			Remediation: shallowRemediation}
 	}
 	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass,
-		Detail: "the index database passed its full integrity checks, including the search index"}
+		Detail: "the index database passed its full integrity checks, including the search index" +
+			s.synchronousPhrase()}
+}
+
+// synchronousPhrase names the durability mode the storage layer is running in,
+// for both readings of the storage check. ADR-0004 Decision 1a states that a
+// receipt acknowledged under `normal` can be lost to a machine-level crash and
+// that `full` closes that window, so which mode is live is an operational fact
+// an operator has to be able to read back -- the same reason checkTemporary
+// echoes its configured ceiling.
+//
+// It reports the CONFIGURED mode, which is the live one by construction:
+// sqlite.Open switches on this same config value (A11), so there is no second
+// spelling the database could be running under. Diagnostics reads no pragma of
+// its own because StoreReader is frozen and carries none.
+func (s *Service) synchronousPhrase() string {
+	mode := s.opts.Config.Storage.Synchronous
+	if mode == "" {
+		mode = config.SynchronousNormal
+	}
+	return " (storage.synchronous = " + mode + ")"
 }
 
 // shallowUnverified is the one phrase every check skipped by shallow mode ends
