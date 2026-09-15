@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -21,9 +22,11 @@ import (
 //     transitive file count is the whole subtree, which is the repository
 //     again; the direct counts compose into the same total on the consumer's
 //     side without any single answer holding the tree.
-//  3. An answer that could not finish says so. A container tree that outruns
-//     the edge budget is reported Truncated, never silently short: a repo-map
-//     that omits packages reads to a model as a repository that has none.
+//  3. An answer that could not finish says so. Where the budget bounds which
+//     containers were REACHED, that is reported Truncated; where it bounds the
+//     per-container counts, the map refuses outright, because a short count is
+//     a wrong measurement and a repo-map that under-reports a package reads to
+//     a model as the repository's shape rather than as an incomplete answer.
 
 // overviewEndpoint is the continuation endpoint tag. A cursor minted here is
 // refused by every other paging endpoint and vice versa.
@@ -60,6 +63,21 @@ func overviewContainerKinds() []model.NodeKind {
 		model.NodePackage, model.NodeModule, model.NodeNamespace}
 }
 
+// overviewRelationKinds is the containment vocabulary the map is counted over.
+//
+// `contains` alone is not it. A provider attaches a TOP-LEVEL declaration to
+// the module that holds it with `defines` and reserves `contains` for a NESTED
+// one (internal/provider/treesitter/facts.go), so a map counted over `contains`
+// alone reports a confident SymbolCount 0 for every ordinary package -- a wrong
+// measurement, which is the one thing this answer may not ship.
+//
+// Ancestry deliberately does not use it: `defines` never reaches a container,
+// so reading it while climbing a containment chain could only add non-container
+// candidates to a parent lookup that then discards them.
+func overviewRelationKinds() []model.RelationKind {
+	return []model.RelationKind{model.RelContains, model.RelDefines}
+}
+
 // Overview answers one page of the repository map: container nodes in NodeID
 // keyset order, each with the files, symbols and source bytes it directly
 // contains, its immediate container parent and its containment depth.
@@ -89,11 +107,11 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	maxDepth := resolveBound(req.Depth, e.limits.MaxDepth)
 	// The cursor is bound to the normalized query the way every traversal
 	// cursor is: a token issued for one depth or page size is refused by
-	// another rather than silently answering a different question. Containment
-	// is the only kind this endpoint reads and it has no seeds, so those two
-	// components are the constant and the empty list.
+	// another rather than silently answering a different question. This
+	// endpoint reads one fixed containment vocabulary and has no seeds, so
+	// those two components are the constant and the empty list.
 	queryHash := traversalQueryHash(model.DirectionOutgoing,
-		[]model.RelationKind{model.RelContains}, nil, maxDepth, limit)
+		overviewRelationKinds(), nil, maxDepth, limit)
 
 	b := &budget{deadline: deadline, now: e.now}
 	var after model.NodeID
@@ -120,9 +138,9 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
 	// The deferred flag is discarded deliberately: it reports that a
 	// DEPENDENCE-only kind was asked for while its units are still building,
-	// and containment is a canonical kind no provider defers. The capability
-	// rows themselves still ride on every answer.
-	caps, _, err := e.completeness(ctx, []model.RelationKind{model.RelContains})
+	// and both kinds this map counts are canonical ones no provider defers. The
+	// capability rows themselves still ride on every answer.
+	caps, _, err := e.completeness(ctx, overviewRelationKinds())
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
@@ -140,14 +158,15 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
-	// Unlike Neighbors and PackageDependencies, a failed containment read is
-	// NOT turned into a truncated answer here (impactPhaseError's
-	// deadline-to-reasonDeadline path). Those endpoints report the edges they
-	// did read; this one reports COUNTS, and a container whose children were
-	// never read renders as SymbolCount 0 -- a wrong measurement rather than a
-	// missing one, which is the one thing Section 23 forbids above all. A map
-	// that could not be counted refuses instead.
-	held, err := e.containerContents(ctx, ids, b, &meta)
+	// Unlike Neighbors and PackageDependencies, a failed or exhausted
+	// containment read is NOT turned into a truncated answer here
+	// (impactPhaseError's deadline-to-reasonDeadline path). Those endpoints
+	// report the edges they did read; this one reports COUNTS, and a container
+	// whose children were only half read renders as a smaller container -- a
+	// wrong measurement rather than a missing one, which is the one thing
+	// Section 23 forbids above all. A map that could not be counted refuses
+	// instead, which is what containerContents does on an exhausted budget.
+	held, err := e.containerContents(ctx, ids, b)
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
@@ -161,11 +180,12 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 			continue
 		}
 		counts := held[c.ID]
+		path, name := containerLabels(c)
 		items = append(items, model.OverviewItem{
 			NodeID:       c.ID,
 			Kind:         c.Kind,
-			Path:         clipPath(packageLabel(c)),
-			Name:         clipTo(c.Name, model.MaxNameBytes),
+			Path:         path,
+			Name:         name,
 			Language:     c.Language,
 			Depth:        depth,
 			FileCount:    counts.files,
@@ -269,12 +289,19 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 // package -- so the lowest NodeID wins, the same tie-break containerPackages
 // applies, so the map is reproducible from the facts rather than from the order
 // the adjacency happened to return them in.
+//
+// An exhausted budget is reported as Truncated here rather than refused: what
+// is lost is which containers the page REACHED and at what depth, and a page
+// that says it is not the whole map is an honest answer. It is the per-
+// container COUNTS that may not be short, and containerContents refuses for
+// exactly that reason.
 func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]model.NodeID, error) {
 	candidates := map[model.NodeID][]model.NodeID{}
 	lookup := make([]model.NodeID, 0, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
-		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming, containmentBudget(b, e.limits))
+		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
+			[]model.RelationKind{model.RelContains}, containmentBudget(b, e.limits))
 		if err != nil {
 			return nil, err
 		}
@@ -317,19 +344,26 @@ type containerCounts struct{ files, symbols, bytes int64 }
 // page: the files it holds, the symbols declared in it, and the source bytes
 // those files carry. Children are read in batched containment round trips and
 // hydrated in batches, never one node at a time, and the whole page shares one
-// cumulative edge budget: a container tree that outruns it truncates the answer
-// rather than reporting a short count as a complete one.
+// cumulative edge budget.
+//
+// A container tree that outruns that budget REFUSES with CTX_RESOURCE_LIMIT.
+// Nothing here can be reported instead: the counts already accumulated are
+// short by an unknown amount, and a page flag naming no container would leave
+// every number on it indistinguishable from a measured one.
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
-	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts, error) {
+	b *budget) (map[model.NodeID]containerCounts, error) {
 	out := make(map[model.NodeID]containerCounts, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
-		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing, containmentBudget(b, e.limits))
+		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing,
+			overviewRelationKinds(), containmentBudget(b, e.limits))
 		if err != nil {
 			return nil, err
 		}
 		b.edges += int64(len(rels))
 		if !complete {
-			markTruncated(meta, reasonEdgeBudget)
+			return nil, (&model.Error{Code: model.CodeResourceLimit,
+				Message:     "this generation holds more containment edges under one page of containers than a repository map may read, so its per-container counts cannot be measured",
+				Remediation: "narrow the request scope"}).WithDetail("limit", "edges")
 		}
 		children := make([]model.NodeID, 0, len(rels))
 		for _, r := range rels {
@@ -374,6 +408,49 @@ func containmentBudget(b *budget, limits Limits) int64 {
 		return 0
 	}
 	return left
+}
+
+// containerLabels is the operator-facing path and name of one container.
+//
+// Both are the container's CANONICAL qualified name -- its own Name is a bare
+// label a provider is free to spell the way its language quotes a scope, and a
+// Go package scope reaches this map backquoted and slash-terminated, the way
+// the scope itself is spelled, while a standard-library one reaches it as
+// "fmt/". A repo-map row is read as
+// the container's identity by a person and by a model, so the quoting is
+// stripped HERE, at the producer: doing it in the CLI would leave the JSON and
+// the MCP answer spelling the same container two other ways, and doing it
+// nowhere publishes provider syntax as a repository's structure.
+//
+// The name also loses the trailing separator the scope carries -- a name is not
+// a prefix -- while the path keeps it, because that is what a path is. A label
+// that is nothing BUT quoting is kept as it stands: both fields are required,
+// and an empty column reads as a name that failed to render.
+func containerLabels(n model.Node) (path, name string) {
+	label := packageLabel(n)
+	clean := stripQuoting(label)
+	if clean == "" {
+		clean = label
+	}
+	name = strings.TrimRight(clean, "/")
+	if name == "" {
+		name = clean
+	}
+	return clipPath(clean), clipTo(name, model.MaxNameBytes)
+}
+
+// stripQuoting removes the quoting characters a provider may have spelled a
+// scope with. It is deliberately a removal and not an escape: the quotes carry
+// no information the reader of a map needs, and an escaped one would still read
+// as part of the container's name.
+func stripQuoting(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '`', '\'', '"':
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // isOverviewContainer reports whether a node kind is part of the repository

@@ -282,7 +282,8 @@ func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
 		return traversalCursor{}, nil, cursorInvalid("cursor was issued by a different endpoint")
 	}
 	if c.QueryHash != queryHash {
-		return traversalCursor{}, nil, cursorInvalid("cursor was issued for a different query")
+		return traversalCursor{}, nil, cursorInvalid(
+			"cursor was issued for a different query: the direction, relation kinds, seeds, depth and page limit that minted it must be repeated on every page")
 	}
 	binding := e.adjacency.Binding()
 	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {

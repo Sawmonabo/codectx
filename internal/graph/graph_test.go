@@ -111,6 +111,13 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for _, name := range []string{"n-a", "n-b", "n-c", "n-hub", "n-p", "n-q", "n-z"} {
 		addNode(name, model.NodeFunction, name)
 	}
+	// n-d is pkg-app's TOP-LEVEL declaration, attached with `defines` rather
+	// than `contains` -- which is how a provider actually emits one
+	// (internal/provider/treesitter/facts.go reserves `contains` for a nested
+	// declaration). Without one such node the fixture's containers hold only
+	// `contains` children and a map counted over `contains` alone passes here
+	// while reporting SymbolCount 0 for every package of a real repository.
+	addNode("n-d", model.NodeFunction, "n-d")
 	addNode("n-var", model.NodeVariable, "n-var")
 	addNode("n-sink", model.NodeFunction, "n-sink")
 	for i := 0; i < fixtureLeafCount; i++ {
@@ -213,6 +220,8 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// sorts beyond the first clamped page. A walk that ended on a short page
 	// never reads it and reports a referenced symbol as unreferenced.
 	edges = append(edges, edge{"n-ref-caller", model.RelCalls, "n-ref"})
+	// Declared last so every relation id above keeps the position it had.
+	edges = append(edges, edge{"pkg-app", model.RelDefines, "n-d"})
 
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
@@ -1380,12 +1389,34 @@ func TestGraphScenarios(t *testing.T) {
 				if !ok {
 					t.Fatalf("pkg-app is absent from the map")
 				}
-				// pkg-app contains n-a, n-b, n-hub and n-p and imports pkg-lib:
-				// an aggregate that counted the import would report structure
-				// the container does not hold.
-				if app.SymbolCount != 4 || app.FileCount != 0 {
-					t.Fatalf("pkg-app holds %d symbols and %d files, want 4 and 0",
+				// pkg-app contains n-a, n-b, n-hub and n-p, DEFINES the
+				// top-level n-d, and imports pkg-lib: an aggregate that counted
+				// the import would report structure the container does not
+				// hold, and one that read `contains` alone would drop n-d --
+				// which is every top-level declaration of a real repository,
+				// and so the difference between a measured symbol column and a
+				// confident zero.
+				if app.SymbolCount != 5 || app.FileCount != 0 {
+					t.Fatalf("pkg-app holds %d symbols and %d files, want 5 and 0",
 						app.SymbolCount, app.FileCount)
+				}
+				// The other half of the same failure mode: when the edge budget
+				// cannot cover one page's children, the counts that WERE
+				// accumulated are short by an unknown amount, so the map must
+				// refuse rather than hand back numbers no caller can tell from
+				// measured ones.
+				starved := fixtureLimits()
+				starved.MaxEdges = 1
+				se, err := New(Options{Adjacency: f, Limits: starved})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				page, err := se.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID})
+				var typed *model.Error
+				if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+					t.Fatalf("a map whose containment budget is spent returned (%+v, %v), want a %s refusal",
+						page.Items, err, model.CodeResourceLimit)
 				}
 			},
 		},
