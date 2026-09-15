@@ -769,7 +769,7 @@ func TestGraphScenarios(t *testing.T) {
 			token, err := e.nextTraversalCursor(context.Background(),
 				&budget{visited: spentVisited, edges: spentEdges},
 				continuation{Endpoint: endpoint, QueryHash: queryHash,
-					Depth: 1, LastOwner: fixtureNodeID("n-a"), LastKey: "rel-0003"})
+					Depth: 1, LastNode: 3})
 			if err != nil || token == "" {
 				t.Fatalf("page 1 cursor: token %q, err %v", token, err)
 			}
@@ -785,9 +785,9 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("resume %d: budget = visited %d, edges %d; want %d and %d",
 						attempt, got.Budget.visited, got.Budget.edges, spentVisited, spentEdges)
 				}
-				if got.Cursor.LastKey != "rel-0003" || got.Cursor.Depth != 1 {
-					t.Fatalf("resume %d: keyset position = %q at depth %d; want rel-0003 at depth 1",
-						attempt, got.Cursor.LastKey, got.Cursor.Depth)
+				if got.Cursor.LastNode != 3 || got.Cursor.Depth != 1 {
+					t.Fatalf("resume %d: enumeration position = %d at depth %d; want 3 at depth 1",
+						attempt, got.Cursor.LastNode, got.Cursor.Depth)
 				}
 			}
 			// A tampered token is never honoured with a budget of its own
@@ -1290,9 +1290,12 @@ func TestGraphScenarios(t *testing.T) {
 			// Protects the straddled-generation failure mode: every page of one
 			// map must be bound to the generation page 1 pinned, and page 2 must
 			// start where the cursor said and nowhere else. A continuation that
-			// re-pinned, or that restarted the keyset, would splice two
-			// repositories into one map without saying so.
-			name: "overview/page 2 keeps page 1's generation and starts at its keyset",
+			// re-pinned, or that restarted the enumeration, would splice two
+			// repositories into one map without saying so. The position itself
+			// travels as the reader's surrogate and is named back through the
+			// reader, so resuming from the wrong one lists a container twice or
+			// skips it -- which is what the ordering check below catches.
+			name: "overview/page 2 keeps page 1's generation and starts at its enumeration position",
 			run: func(t *testing.T, f *graphFixture) {
 				signer, err := pagination.OpenSigner(t.TempDir())
 				if err != nil {
@@ -1330,7 +1333,7 @@ func TestGraphScenarios(t *testing.T) {
 				last := first.Items[len(first.Items)-1].NodeID
 				for _, item := range second.Items {
 					if item.NodeID <= last {
-						t.Fatalf("page 2 lists %s at or before page 1's last container %s: the keyset restarted",
+						t.Fatalf("page 2 lists %s at or before page 1's last container %s: the enumeration restarted",
 							item.NodeID, last)
 					}
 				}

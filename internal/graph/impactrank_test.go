@@ -191,7 +191,7 @@ func TestRankedCursorFieldsAreRefusedOnAWalkContinuation(t *testing.T) {
 	}{
 		{"walk cursor carrying a ranked position", func(c *traversalCursor) { c.Ranked = false; c.SpoolID = "" }},
 		{"ranked cursor naming no spool", func(c *traversalCursor) { c.SpoolID = "" }},
-		{"ranked cursor carrying a keyset position", func(c *traversalCursor) { c.LastOwner = "n1"; c.LastKey = "r1" }},
+		{"ranked cursor carrying an enumeration position", func(c *traversalCursor) { c.LastNode = 7 }},
 		{"ranked cursor continuing past the answer", func(c *traversalCursor) { c.RankServed = c.RankTotal + 1 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
