@@ -793,8 +793,8 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // seeds (ruling C10): by the time this pass runs the seeds are already inside
 // the sort area, and what remains is the walk and the folds over them.
 func (c *Compiler) passAIngest(ctx context.Context, in *seedIngest, eng *graph.Engine,
-	gen model.GenerationID, caps []model.CapabilityState) (*ingested, error) {
-	return c.expandScopeStream(ctx, in, eng, gen, caps)
+	gen model.GenerationID, caps []model.CapabilityState, stop func() bool) (*ingested, bool, error) {
+	return c.expandScopeStream(ctx, in, eng, gen, caps, stop)
 }
 
 // passBHydrate — §2 P-B, lane L1. Streams the candidate spool in pageLimit()
