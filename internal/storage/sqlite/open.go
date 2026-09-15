@@ -38,6 +38,20 @@ type Options struct {
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
 	MaxJSONBytes int64
+	// Content is the content store's verified range reader. The database keeps
+	// no copy of source text (ADR-0003 §2.1), so the one write path that has to
+	// re-index text it did not receive -- the delta carry-over, which copies a
+	// previous unit's lexical documents -- resolves each document's bytes
+	// through this reader. A store opened without one refuses that carry-over
+	// with a typed error rather than indexing a document without its body.
+	Content BlobReader
+}
+
+// BlobReader reads one verified byte range of one retained content-store
+// object. It is the range reader Section 10.3 defines, narrowed to what
+// storage needs; *snapshot.CAS satisfies it.
+type BlobReader interface {
+	ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error)
 }
 
 func (o Options) withDefaults() Options {

@@ -86,9 +86,34 @@ delete rows a published generation was serving. The copy costs one bounded
 `INSERT .. SELECT` per fact table and leaves queries, membership and collection
 untouched.
 
-The copy is also strictly cheaper than the re-import it replaces: nothing is
-decoded, resolved, validated against the snapshot or re-tokenized —
-`search_units.token_count` is copied, not recomputed.
+The copy is also cheaper than the re-import it replaces: nothing is decoded,
+resolved or validated against the snapshot, and `search_units.token_count` is
+copied rather than recomputed. The one thing the copy cannot take from the
+database is the carried documents' text, because the database no longer holds
+any (below); the copy re-reads each carried document's bytes from the content
+store through the verified range reader and feeds them to the index, one
+bounded page of documents at a time.
+
+## The lexical index keeps no second copy of the source
+
+`search_units` has no `body` column and `search_fts` is a **contentless** FTS5
+index (`content=''`, `contentless_delete=1`), which is what keeps `DELETE` and
+`INSERT OR REPLACE` available when a unit is invalidated. The indexed body text
+therefore exists only as index postings; the source itself lives once, in the
+content store, and every answer that needs the text — snippets, highlights, the
+hydrated window around a hit — reads it there through the verified range reader,
+over the `file_id` and byte range each document row already carries. Generic
+results still carry no body (Section 14.2); this is about where the bytes are
+kept, not about what a result returns.
+
+Two consequences are worth stating plainly. First, **the index's rebuild source
+is the content store, not the database**: the index can no longer be
+reconstructed or cross-checked from the database alone, so the content store's
+durability is now the lexical tier's durability as well. Second, the deep
+integrity check (`Store.Check`) proves the index is internally consistent and
+that no indexed document outlives its `search_units` row; it cannot compare the
+index against a stored copy of the text, because there is none — the text's own
+authority is the content store, which verifies every block digest on read.
 
 ## Discarding a unit: two costs, two paths
 

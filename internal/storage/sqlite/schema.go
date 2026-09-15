@@ -103,7 +103,14 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 
 // Check runs the integrity checks Section 12.1 reserves for initialization,
 // doctor and recovery: quick_check, foreign_key_check and, when deep, the FTS5
-// external-content integrity check. It never runs per query.
+// integrity check plus the vocabulary staleness count. It never runs per query.
+//
+// search_fts is contentless (ADR-0003 §2.1), so its integrity-check proves the
+// index is internally consistent, not that it agrees with a stored copy of the
+// text -- there is no stored copy, and the text's own authority is the content
+// store, which verifies every block digest on read. Document membership is
+// still checked both ways: the FTS rowid space is search_units.rowid, and the
+// vocabulary scan below reports any indexed document whose row is gone.
 func (s *Store) Check(ctx context.Context, deep bool) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var result string
@@ -122,11 +129,11 @@ func (s *Store) Check(ctx context.Context, deep bool) error {
 		}
 		if deep {
 			if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
-				return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index disagrees with its content table: " + err.Error(),
+				return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index failed its internal integrity check: " + err.Error(),
 					Remediation: "rebuild the cache with index --rebuild"}
 			}
-			// integrity-check walks the content table into the index; it does not
-			// report index entries whose content row is gone. The vocabulary table
+			// integrity-check inspects only the index's own structures; it cannot
+			// report index entries whose search_units row is gone. The vocabulary table
 			// enumerates every indexed instance, so a stale document shows up here.
 			var stale int64
 			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.rowid = v.doc)`).Scan(&stale); err != nil {
