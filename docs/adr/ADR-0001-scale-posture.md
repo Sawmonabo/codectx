@@ -799,6 +799,29 @@ duplicates an existing assertion.
   today is to re-run the query or raise the query timeout. Closing it is a Minor — give the external
   sort a constructor that adopts the runs a previous request spilled — and it is the only stop on
   these two endpoints that returns truncated with no cursor.
+- **`resources.max_temp_bytes` still defaults to 4 GiB, and a paged walk still re-copies its
+  cumulative visited set.** Two rulings are accepted and only partly landed. (a) The temporary-byte
+  budget is a bound nobody set, so it must default to unlimited like every other count or size
+  bound; the spool store now reads a non-positive cap as unlimited (it refuses no write and keeps
+  the accounting the resource envelope reports), but the configuration default, the
+  `max_temp_bytes > min_free_disk_bytes` validation and the process runners' disk admission still
+  require a positive value, so flipping the default is a follow-up. `min_free_disk_bytes` stays as
+  it is: it protects the host's free space rather than capping work. (b) A walk page writes a FRESH
+  continuation spool holding the WHOLE cumulative visited set -- the previous page's visited section
+  is streamed record by record into the new spool -- and the resume decodes that same section again
+  to rebuild the frontier and the membership summary. Both are O(visited) per page, which is the
+  measured linear growth in page latency (0.31 s/page over the first fifty pages of a real
+  repository walk, 2.20 s/page by page 400) and therefore a quadratic walk to completion. The state
+  a page keeps must become append-only -- one new ascending run per page plus a small manifest, the
+  concatenated-ascending-runs shape the membership merge-join already reads -- with the membership
+  summary persisted rather than rebuilt. Two constraints hold for whoever lands it: the filter's bit
+  count and probe count must be FROZEN at creation and carried in the manifest, because bits set
+  under one size and probed under another produce false negatives and therefore a cross-page
+  re-admission of the same entity; and the retained state directory is re-adopted whole on every
+  page (`AdoptDir` measures the directory and reserves it again while the previous reservation is
+  released only afterwards), so the shared budget holds roughly twice the cumulative retained bytes
+  at every page boundary -- append-only runs alone do not fix that, the reservation has to become
+  incremental.
 - **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
   walk holds its settled set, distances, depths and cached edges for the length of the walk, and
   unlike a breadth-first frontier that state cannot spill, because a search resumed from a
