@@ -102,9 +102,9 @@ func Execute(ctx context.Context, build model.BuildInfo, root *cobra.Command, ar
 
 // commandName is the envelope's `command` field: the command path with the
 // root binary's own name removed, so `codectx tools status` is "tools status"
-// and `codectx status` is "status". Both used to report "status" for two
-// different data shapes, which left a consumer unable to tell which report it
-// was decoding. The root itself keeps its own name: an argument the tree could
+// and `codectx status` is "status". The path is what separates them: one name
+// for two different data shapes would leave a consumer unable to tell which
+// report it is decoding. The root itself keeps its own name: an argument the tree could
 // not route to any command belongs to the binary.
 func commandName(cmd *cobra.Command) string {
 	path, root := cmd.CommandPath(), cmd.Root().Name()

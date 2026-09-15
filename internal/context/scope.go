@@ -126,7 +126,7 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 // model.ContextEntry.Validate would reject at persistence time, one pass too
 // late to explain itself.
 //
-// The cut is no longer silent. Both halves are counted and surfaced as manifest
+// The cut is never silent. Both halves are counted and surfaced as manifest
 // notices by the compiler: an explanation shortened without saying so reads as
 // the whole reason an entity was selected. The flag does NOT ride on the
 // entry's own Reasons -- the caps this function enforces are exactly the ones
@@ -154,11 +154,11 @@ func boundReasons(reasons []string) (out []string, dropped, truncated int64) {
 // expansion entry arrives with, and returns the number it could not carry so
 // the caller discloses them rather than losing them.
 //
-// It no longer floors the setting at model.MaxReasonPathsPerEntry. That
-// constant is a report threshold, not a wire ceiling: rank.go honours a
-// configured value above it, and re-clamping to 3 here would silently undo
-// the operator's setting one lane later -- the class-G shape this wave removes.
-// config.Limit owns the test, so unlimited keeps every route.
+// It does NOT floor the setting at model.MaxReasonPathsPerEntry. That constant
+// is a report threshold, not a wire ceiling: rank.go honours a configured value
+// above it, and re-clamping to 3 here would silently undo the operator's
+// setting one lane later. config.Limit owns the test, so unlimited keeps every
+// route.
 func boundPaths(paths []model.RelationPath, max config.Limit) ([]model.RelationPath, int64) {
 	if !max.Exceeded(int64(len(paths))) {
 		return append([]model.RelationPath(nil), paths...), 0
@@ -360,9 +360,9 @@ func (in *seedIngest) BeginStep(origin originKind, step string) {
 	in.stages = append(in.stages, seedStage{origin: origin, step: step, firstSeq: in.seq})
 }
 
-// Admit takes one discovered seed. It is the sink: the whole of what used to be
-// expandScope's loop over the accumulated slice, run once per seed as the
-// producer finds it.
+// Admit takes one discovered seed. It is the sink: the whole of the admission
+// decision, run once per seed as the producer finds it, with no accumulated
+// slice to loop over.
 //
 // An excluded candidate is not diverted -- it goes on the admission spool with
 // its reason, which is where P-I's exclusion projection reads it -- except that
@@ -536,7 +536,7 @@ func (in *seedIngest) discloseUnwalkedRoots(n int64, width config.Limit) error {
 
 // discloseCut names every Section 15.2 step the context.max_seeds bound stopped:
 // the step the first dropped seed belongs to, and every step after it, one
-// exclusion row each, exactly as the per-step cut the producers used to report.
+// exclusion row each, which is the per-step cut a reader of the plan needs.
 // A step is stopped when any of its arrivals lies at or past the cut.
 func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 	for i, st := range in.stages {

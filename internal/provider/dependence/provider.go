@@ -462,12 +462,12 @@ func sweepPrivate(dataDir string) {
 		if err != nil {
 			continue
 		}
-		// Every entry is swept, however many there are. The scan used to stop
-		// at a fixed count, which left the rest of a large private root on
-		// disk without saying so -- and saved nothing, because the directory
-		// was already read in full to find them. What the sweep did is
-		// disclosed as a count per root, so leftover disk is visible even when
-		// per-entry logging is not read.
+		// Every entry is swept, however many there are. Stopping at a fixed
+		// count would leave the rest of a large private root on disk without
+		// saying so, and would save nothing: the directory is read in full to
+		// find them either way. What the sweep did is disclosed as a count per
+		// root, so leftover disk is visible even when per-entry logging is not
+		// read.
 		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())

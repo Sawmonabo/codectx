@@ -166,7 +166,7 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 // The path COUNT is not re-bounded here. The ranking lane already applied
 // context.max_reason_paths_per_entry as written -- including a value above
 // model.MaxReasonPathsPerEntry, and including unlimited -- and
-// model.ContextEntry.Validate no longer refuses the entry on that count, so a
+// model.ContextEntry.Validate does not refuse the entry on that count, so a
 // second clip at 3 would discard routes the operator asked to keep after the
 // lane that honoured the setting had produced them. Only the per-path relation
 // list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
