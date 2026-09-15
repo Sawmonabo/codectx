@@ -238,6 +238,7 @@ $ codectx version --json
 | [docs/storage.md](docs/storage.md) | Generations, delta imports and carry-over |
 | [docs/providers.md](docs/providers.md) | The provider contract, and the per-provider pages beside it |
 | [docs/threat-model.md](docs/threat-model.md) | What is defended, what is not, and the honest limitations |
+| [docs/adr/](docs/adr/) | Architecture decision records: the decision, the alternatives weighed against it, and why it won |
 | [SECURITY.md](SECURITY.md) | The operator-facing trust boundary and how to report an issue |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The pinned toolchain, the verification set and the test policy |
 
