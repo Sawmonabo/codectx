@@ -100,11 +100,14 @@ type Sessions interface {
 	// naming a file the operator cannot locate is not an answer. NEW -- L6.
 	SessionFilePaths(ctx context.Context, session model.SessionID, actor string,
 		ids []model.FileID) (map[model.FileID]string, error)
-	// Waivers reads the session's recorded coverage exceptions in file-id
-	// order. Waive's returned record echoes the request's reason and
+	// WaiversAfter pages the session's recorded coverage exceptions by keyset
+	// on file_id. Waive's returned record echoes the request's reason and
 	// FileCoverage carries only the Waived flag, so this is the only source of
-	// the stored reasons a sealed capsule must carry. NEW -- L6b.
-	Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error)
+	// the stored reasons a sealed capsule must carry. It is a page read, not a
+	// whole-list read: the seal streams it like every other capsule list, so
+	// heap is a function of the page and not of the session's waiver count.
+	WaiversAfter(ctx context.Context, session model.SessionID, actor string,
+		after model.FileID, limit int) ([]model.WaiverRecord, error)
 	// ActiveGeneration is the repository's currently published generation. It
 	// is Task 12's existing read (internal/storage/sqlite/units.go), widened
 	// onto this interface rather than reinvented: supersession is "a newer

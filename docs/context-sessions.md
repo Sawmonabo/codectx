@@ -193,9 +193,11 @@ identity, both hashes and a *count* per list; the records live beside it in
 `(session_id, list, ordinal)` so a page is an ordinal keyset over the list's own
 order, and read one page at a time. A caller's cursor is turned back into that
 ordinal through `idx_capsule_row_key`, the unique index on
-`(session_id, list, row_key)`. So a completion is never refused, truncated or
-held whole in memory because of how much a session recorded, on a repository of
-any size.
+`(session_id, list, row_key)`. The seal reads the session the same way: every
+list it draws on — scope, observations, coverage and waivers alike — is walked
+by keyset one page at a time, so no list crosses into memory whole on the way
+in either. So a completion is never refused, truncated or held whole in memory
+because of how much a session recorded, on a repository of any size.
 
 - `capsule --view <list>` returns **one keyset page of one list**, with
   `meta.next_cursor` when records remain. Pass that value back as `--cursor` to
