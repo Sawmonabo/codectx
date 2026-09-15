@@ -5,6 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -239,5 +242,84 @@ func assertWalkDirs(t *testing.T, root Root, policy Policy, want []string) {
 		if got[i] != want[i] {
 			t.Fatalf("WalkDirs yielded %v, want %v", got, want)
 		}
+	}
+}
+
+// TestFileBudgetIsReportedNotRefused protects the scale-posture ruling at the
+// walk's own budget: a repository holding more files than a user-set
+// workspace.max_files is captured in full, and the operator learns the budget
+// was passed. The behaviour this replaces refused the whole repository, so a
+// test that asserts only the refusal would pin the defect.
+func TestFileBudgetIsReportedNotRefused(t *testing.T) {
+	root, _ := safeTree(t)
+	for i := range 5 {
+		mustWrite(t, filepath.Join(root.Path, "f"+strconv.Itoa(i)+".go"), "package p\n")
+	}
+	// Unlimited is the default: it emits the whole tree and reports nothing.
+	policy := testPolicy(root)
+	var reports []string
+	policy.OnSkip = func(rel, reason string) { reports = append(reports, reason+" "+rel) }
+	whole := 0
+	if err := Walk(t.Context(), root, policy, func(File) error { whole++; return nil }); err != nil {
+		t.Fatalf("Walk with an unlimited budget: %v", err)
+	}
+	if whole < 5 || len(reports) != 0 {
+		t.Fatalf("unlimited walk emitted %d files with reports %q, want the whole tree and no report", whole, reports)
+	}
+
+	// A user-set budget far below the tree emits exactly the same files and
+	// reports the budget once.
+	policy.MaxFiles, reports = 2, nil
+	emitted := 0
+	if err := Walk(t.Context(), root, policy, func(File) error { emitted++; return nil }); err != nil {
+		t.Fatalf("Walk over a repository past its file budget: %v", err)
+	}
+	if emitted != whole {
+		t.Fatalf("the walk emitted %d files under a budget of 2, want all %d: a budget reports, it never clamps", emitted, whole)
+	}
+	if len(reports) != 1 || !strings.HasPrefix(reports[0], SkipFileBudget+" ") {
+		t.Fatalf("reports = %q, want exactly one %s report", reports, SkipFileBudget)
+	}
+}
+
+// TestLongPathSkipsOnePathNotTheWalk protects the skip-and-report contract for
+// model.MaxPathBytes: one unrepresentable path must cost that path and nothing
+// else. Failing the walk -- the behaviour this replaces -- turned a single deep
+// generated path into a repository that cannot be captured at all.
+//
+// The tree is built by descending one component at a time, because the whole
+// path is longer than the PATH_MAX a single syscall argument may carry.
+func TestLongPathSkipsOnePathNotTheWalk(t *testing.T) {
+	root, _ := safeTree(t)
+	mustWrite(t, filepath.Join(root.Path, "ok.go"), "package p\n")
+
+	component := strings.Repeat("d", 200)
+	func() {
+		t.Chdir(root.Path)
+		for depth := 0; depth*(len(component)+1) <= model.MaxPathBytes; depth++ {
+			if err := os.Mkdir(component, 0o700); err != nil {
+				t.Fatalf("mkdir at depth %d: %v", depth, err)
+			}
+			if err := os.Chdir(component); err != nil {
+				t.Fatalf("chdir at depth %d: %v", depth, err)
+			}
+		}
+		if err := os.WriteFile("buried.go", []byte("package p\n"), 0o600); err != nil {
+			t.Fatalf("write the buried file: %v", err)
+		}
+	}()
+
+	policy := testPolicy(root)
+	var reports []string
+	policy.OnSkip = func(_, reason string) { reports = append(reports, reason) }
+	var seen []string
+	if err := Walk(t.Context(), root, policy, func(f File) error { seen = append(seen, f.Path); return nil }); err != nil {
+		t.Fatalf("Walk over a tree holding one over-long path: %v", err)
+	}
+	if !slices.Contains(seen, "ok.go") {
+		t.Fatalf("the walk emitted %d files and not ok.go; one over-long path must not cost the rest of the repository", len(seen))
+	}
+	if !slices.Contains(reports, SkipPathTooLong) {
+		t.Fatalf("reports = %q, want a %s report: a skipped path that nothing reports is a silent loss", reports, SkipPathTooLong)
 	}
 }
