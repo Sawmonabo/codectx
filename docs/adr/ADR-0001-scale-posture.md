@@ -822,12 +822,16 @@ duplicates an existing assertion.
   cross-page re-admission of the same entity. The carrier is `retainedWalk`
   (`internal/graph/walkretain.go`), which already travels through the impact and rollup endpoints,
   is reopened for append on every resume and is carried forward by rename; `expandOptions.Visited`
-  is the hop that lets the INTERNAL links append to it directly, and `spill` skips the visited
-  section entirely whenever a run store exists. The retained directory is re-adopted incrementally
+  is the hop that lets the INTERNAL links append to it directly. EVERY paged endpoint keeps its set
+  there now -- the neighbours traversal included -- so a continuation spool holds frontier records
+  and nothing else, and the visited section, its record kind and the per-page filter rebuilt from it
+  are gone rather than merely bypassed (payload version 7). A neighbours page creates the store only
+  when it actually mints a continuation, and the filter is clamped to the same share of the shared
+  continuation byte budget that it takes of the frontier ceiling: it is an accelerator, so a tight
+  `resources.max_temp_bytes` makes it denser, never makes paging a walk impossible. The retained directory is re-adopted incrementally
   (`Spools.ReadoptDir` transfers the previous reservation inside one critical section and charges
   only the delta), so the shared budget no longer holds two copies of the cumulative state at every
-  page boundary. The neighbours endpoint builds its own continuation in `traverse.go` and still
-  uses the spooled visited section; giving it a store of its own is the one piece outstanding. The RANKED tail of those same two endpoints is O(page) per page
+  page boundary. The RANKED tail of those same two endpoints is O(page) per page
   as well: the page that settles the order writes one spool and every later page seeks to the byte
   offsets its cursor carries (`RankOffset`, `PairOffset`, payload version 6) and reads only its own
   page out of it, where it used to re-open the spool at record zero and copy the whole unserved
