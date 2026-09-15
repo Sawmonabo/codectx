@@ -554,3 +554,106 @@ func cursorKeysetOwner(t *testing.T, e *Engine, token string) model.NodeID {
 	}
 	return c.LastOwner
 }
+
+// TestALevelBoundaryDeadlineKeepsTheWholeAnswer is the cross-request half of
+// the level-boundary rule.
+//
+// A deadline can stop a walk BETWEEN levels: the level just finished, the next
+// one is standing in the frontier and has not been read at all. The keyset
+// position the page last emitted belongs to the finished level, so a
+// continuation carrying it hands levelEdges a filter rather than a resume
+// point, and every row of the NEW level whose owner sorts below that node is
+// dropped. Dropped silently: those owners are already in the cumulative visited
+// set, so no later page can reach them, and the answer ends untruncated -- a
+// short answer presented as a whole one, which is the one failure the paging
+// contract may not have.
+//
+// traverse.go applies the rule to the traversal endpoint and walkrun.go to a
+// walk's internal links; continueWalk, which mints the impact and package
+// continuations, did not.
+//
+// Mutation (applied, run, reverted in one command): continueWalk's
+// LevelBoundary branch deleted -- the resumed walk serves 38 of the 56 entities
+// the unbounded walk serves, with no truncation reason, and this case fails.
+func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
+	// A seed whose whole level fits in ONE adjacency read: the deadline then
+	// lands after the level is finished and before the next is read, which is
+	// the level boundary this case needs.
+	const mids, fanOut = 8, 6
+
+	f := newReachableFixture(t, mids, fanOut)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 0, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 8
+	limits.QueryTimeout = time.Minute
+	limits.FrontierBytes = 8 << 20
+	limits.CursorTTL = time.Hour
+
+	clock := time.Now()
+	calls, fired := 0, false
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
+	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	start := []model.NodeID{fixtureNodeID("bound-seed")}
+	first, err := paged.Impact(context.Background(), model.ImpactRequest{GenerationID: 1,
+		Start: start, Direction: model.DirectionOutgoing,
+		Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatalf("page 1 ended the answer with %q; it must hand the standing frontier on",
+			first.Meta.TruncationReason)
+	}
+	if owner := cursorKeysetOwner(t, paged, first.Meta.NextCursor); owner != "" {
+		t.Fatalf("the level-boundary continuation carries keyset owner %q: the level it names has "+
+			"not been read, so any position in it is a filter over rows nobody has seen", owner)
+	}
+
+	// The rest of the walk, read by a reader that does not run past the
+	// deadline, must reach the whole answer.
+	warm, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new warm engine: %v", err)
+	}
+	served := 0
+	req := model.ImpactRequest{Start: start, Direction: model.DirectionOutgoing,
+		Relations: []model.RelationKind{model.RelCalls},
+		Page:      model.PageRequest{Cursor: first.Meta.NextCursor}}
+	for pages := 1; pages <= 400; pages++ {
+		res, err := warm.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("resume page %d: %v", pages, err)
+		}
+		served += len(res.Entries)
+		if res.Meta.NextCursor == "" {
+			if res.Meta.Truncated {
+				t.Fatalf("the resumed walk ended truncated with %q", res.Meta.TruncationReason)
+			}
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+	if want := unboundedImpactCount(t, f, signer, store, spoolDir, limits, start); served != want {
+		t.Fatalf("the walk a level-boundary deadline split served %d entities and reported no "+
+			"truncation; the unbounded walk serves %d", served, want)
+	}
+	t.Logf("the level-boundary split served the whole answer: %d entities", served)
+}
