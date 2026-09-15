@@ -102,6 +102,7 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	admitted := newVisitedSet(nil)
 	if o.Resume != nil {
 		admitted.stream = o.Resume.Visited
+		admitted.filter = o.Resume.Filter
 	}
 	// A relation is admitted at most once for the whole walk: a cycle, an
 	// overlapping batch or a DirectionBoth edge whose two endpoints are both on
