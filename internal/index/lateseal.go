@@ -585,7 +585,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	err = l.attach(ctx, g, replacing)
 	if err == nil {
 		g.coverage()
-		states, _ = g.caps.finish(c.log)
+		states = g.caps.finish(c.log)
 		health = healthOf(states)
 		// The publication generation is a new row, so it carries none of the
 		// working generation's supplied-index record: it is re-recorded here

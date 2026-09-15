@@ -333,10 +333,11 @@ func (c CapabilityState) Validate() error {
 
 // validateCapabilityStates bounds and checks a completeness list; every public
 // result carries one.
+// The list itself is NOT length-bounded: a completeness report names every
+// capability the answer actually rests on, and failing the answer because the
+// repository has more capabilities than a constant anticipated withholds the
+// very report the caller needs. Each row is still bounded in every field.
 func validateCapabilityStates(field string, states []CapabilityState) error {
-	if err := boundCount(field, len(states), MaxCapabilityStates); err != nil {
-		return err
-	}
 	for _, s := range states {
 		if err := s.Validate(); err != nil {
 			return err

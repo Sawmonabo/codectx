@@ -67,8 +67,13 @@ type generation struct {
 	sealed map[string]bool
 
 	// mu guards everything the unit workers accumulate.
-	mu          sync.Mutex
-	runs        []model.ProviderResult
+	mu   sync.Mutex
+	runs []model.ProviderResult
+	// runsTotal counts every run the generation produced, including the ones
+	// past the per-result wire ceiling that runs does not carry. The ceiling is
+	// a page-sized bound on one response (class B); the omitted count is what
+	// keeps it from being a silent drop.
+	runsTotal   int64
 	reused      int64
 	built       int64
 	carried     int64
@@ -190,7 +195,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	if err := g.c.recordSuppliedIndexes(ctx, g.gen); err != nil {
 		return model.IndexResult{}, err
 	}
-	states, _ := g.caps.finish(g.c.log)
+	states := g.caps.finish(g.c.log)
 	health := healthOf(states)
 	binding, err := g.c.opts.Store.Activate(ctx, g.gen, g.prev, health, states, NormalizationVersion)
 	if err != nil {
@@ -206,7 +211,8 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, StartedAt: g.started, CompletedAt: g.c.now()}, nil
+		Runs: g.runs, RunsOmitted: g.runsTotal - int64(len(g.runs)),
+		StartedAt: g.started, CompletedAt: g.c.now()}, nil
 }
 
 // attachReused makes every unit the plan proved identical a member of this
@@ -517,6 +523,7 @@ func (g *generation) record(out outcome) {
 	if out.invalidated {
 		g.invalidated++
 	}
+	g.runsTotal++
 	if len(g.runs) < model.MaxRecordsPerResult {
 		g.runs = append(g.runs, out.result)
 	}
@@ -539,8 +546,11 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 	code := provider.CodeOf(cause)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if res.RunID != "" && len(g.runs) < model.MaxRecordsPerResult {
-		g.runs = append(g.runs, res)
+	if res.RunID != "" {
+		g.runsTotal++
+		if len(g.runs) < model.MaxRecordsPerResult {
+			g.runs = append(g.runs, res)
+		}
 	}
 	for _, capability := range p.Descriptor().Capabilities {
 		g.caps.addFailure(u.ProviderID, capability, u.ScopeKey, code)
