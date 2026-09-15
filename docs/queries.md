@@ -223,13 +223,14 @@ edge exactly once — under `--direction both` an edge whose two ends are on the
 same level is kept from its source, and one that reaches back to an earlier
 level was already delivered there. Nothing is served from a level being
 collected; a deadline here hands back the position the read reached. The level
-is then sorted **once**, by the node an entry reaches, then the node it was
-reached from, then the relation — all three identifiers of the facts themselves,
-so two indexes of the same tree serve one order — and every page of that level
-is a read straight out of the sorted level at the byte offset the cursor
-carries. A continuation therefore resumes either the read that was collecting
-the level or the offset that was serving it, and in both cases it neither
-repeats an edge nor loses one. `visited_count` counts the nodes each level
+is then sorted **once**, and that sort IS the served order within a level: the
+canonical id of the neighbour the entry reaches, then the canonical id of the
+owner it was reached from, then the canonical relation id. All three are
+identifiers of the facts themselves, so two indexes of the same tree serve one
+order, and every page of that level is a read straight out of the sorted level
+at the byte offset the cursor carries. A continuation therefore resumes either
+the read that was collecting the level or the offset that was serving it, and in
+both cases it neither repeats an edge nor loses one. `visited_count` counts the nodes each level
 admits as the level closes, which is when the walk admits them.
 
 Two stops end an answer rather than a page, and both say so. `--depth` is part
