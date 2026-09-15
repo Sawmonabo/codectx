@@ -580,6 +580,40 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 	})
 
+	t.Run("one provider capability publishes one row per scope key", func(t *testing.T) {
+		// Failure mode: generation_capabilities is keyed (generation,
+		// provider, capability, scope_key) with no state column, while the
+		// report keys its rows by state as well. A provider capability that
+		// reaches the publication with a sibling unit's fresh row folded to
+		// the workspace scope, a workspace-scoped partial degradation, a
+		// failed unit and a carried workspace scope publishes four rows under
+		// one primary key: the insert is rejected and `codectx index` exits on
+		// a constraint error instead of publishing the degraded generation.
+		r := newCapabilityReport()
+		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+			Scope: "pkg:go:", State: model.CapabilityFresh})
+		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+			Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
+			DiagnosticCode: model.CodeProviderOutputInvalid})
+		r.addCarried(scip.ID, "references", provider.ScopeWorkspace, 1, 2)
+		r.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+		states, _ := r.finish(f.c.log)
+		var rows []model.CapabilityState
+		for _, s := range states {
+			if s.ProviderID == scip.ID && s.Capability == "references" {
+				rows = append(rows, s)
+			}
+		}
+		if len(rows) != 1 {
+			t.Fatalf("one provider capability published %d rows for one scope key: %+v", len(rows), rows)
+		}
+		// Under-claim, never over-claim: the most severe row is the survivor.
+		if rows[0].State != model.CapabilityFailed || rows[0].Scope != provider.ScopeWorkspace {
+			t.Fatalf("the surviving row is %q at scope %q, want failed at the workspace scope",
+				rows[0].State, rows[0].Scope)
+		}
+	})
+
 	t.Run("a required provider's unit failure publishes nothing", func(t *testing.T) {
 		before, err := f.store.ActiveGeneration(ctx, f.c.repo)
 		if err != nil {
