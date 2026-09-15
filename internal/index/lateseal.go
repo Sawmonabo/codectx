@@ -616,7 +616,8 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, StartedAt: started, CompletedAt: c.now()}, true, nil
+		Runs: g.runs, RunsOmitted: g.runsTotal - int64(len(g.runs)),
+		StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
 // attach fills the publication generation: the reused members, the sealed
