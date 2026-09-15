@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -98,6 +99,22 @@ type worker struct {
 	bytesOut int64
 	started  time.Time
 	timer    *time.Timer
+}
+
+// pprofDirEnv is the one variable a parser worker inherits, and only when the
+// operator set it on the parent. A worker otherwise runs with an empty
+// environment by construction, which is what keeps a parse from depending on
+// anything but the bytes it is sent; the exception exists because a profile of
+// the parse itself cannot be collected any other way -- a worker takes no
+// arguments of its own -- and it is inert unless the variable is set.
+const pprofDirEnv = "CODECTX_PPROF_DIR"
+
+// workerEnv is the child environment: empty, or the profiling directory alone.
+func workerEnv() []string {
+	if dir := os.Getenv(pprofDirEnv); dir != "" {
+		return []string{pprofDirEnv + "=" + dir}
+	}
+	return nil
 }
 
 func newPool(runner *process.Runner, cmd WorkerCommand, dir string, max int, idleTTL, parseTTL time.Duration, memory int64) *pool {
@@ -273,7 +290,7 @@ func (p *pool) close() {
 // whatever happens here.
 func (p *pool) start(ctx context.Context, w *worker) error {
 	spec := process.Spec{
-		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir,
+		Path: p.cmd.Path, Args: p.cmd.Args, Dir: p.dir, Env: workerEnv(),
 		Stdin: w.childIn, MaxStdinBytes: workerStdinBudget,
 		Stdout: w.childOut, MaxStdoutBytes: workerStdoutBudget, MaxStderrBytes: workerStderrBytes,
 		Timeout: workerLifetime, Grace: workerGrace, MemoryReservationBytes: p.memory,

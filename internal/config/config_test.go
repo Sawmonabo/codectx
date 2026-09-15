@@ -265,3 +265,31 @@ func TestTraversalPolicyCarriesEveryTraversalBound(t *testing.T) {
 		t.Errorf("the default traversal policy carries bounds %+v, want every one unlimited (0)", d)
 	}
 }
+
+// storage.synchronous decides whether every store commit fsyncs the
+// write-ahead log, so the default it resolves to is a durability promise and an
+// unrecognized spelling must be refused at load time rather than silently
+// mapped onto one of the two modes (docs/adr/ADR-0004-wal-synchronous-mode.md).
+func TestStorageSynchronous(t *testing.T) {
+	cfg, err := loadFixture(t, "", "")
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	if cfg.Storage.Synchronous != SynchronousNormal {
+		t.Fatalf("default storage.synchronous = %q, want %q", cfg.Storage.Synchronous, SynchronousNormal)
+	}
+	if cfg, err = loadFixture(t, "[storage]\nsynchronous = \"full\"\n", ""); err != nil {
+		t.Fatalf("load full: %v", err)
+	}
+	if cfg.Storage.Synchronous != SynchronousFull {
+		t.Fatalf("storage.synchronous = %q, want %q", cfg.Storage.Synchronous, SynchronousFull)
+	}
+	_, err = loadFixture(t, "[storage]\nsynchronous = \"off\"\n", "")
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeConfigInvalid {
+		t.Fatalf("synchronous = off: got %v, want CTX_CONFIG_INVALID", err)
+	}
+	if want := `storage.synchronous is "off"; use "normal" or "full"`; typed.Message != want {
+		t.Fatalf("message = %q, want %q", typed.Message, want)
+	}
+}

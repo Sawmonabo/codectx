@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -102,10 +103,82 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 }
 
 // Check runs the integrity checks Section 12.1 reserves for initialization,
-// doctor and recovery: quick_check, foreign_key_check and, when deep, the FTS5
-// external-content integrity check. It never runs per query.
+// doctor and recovery.
+//
+// It is two different checks, because the expensive one is O(database bytes)
+// and an ordinary `doctor` may not pay it: on a 1.9 GB index `quick_check`
+// alone costs 30 s cold and ~4.5 s of CPU warm, which made the one command an
+// operator runs on a sick workspace the slowest command in the product.
+//
+//   - shallow (deep == false): the constant-cost header reads -- page size and
+//     page count, the schema fingerprint row, and that the journal is still the
+//     write-ahead log this store requires. These catch a database that is not
+//     this schema, was truncated below its own header, or lost its WAL mode;
+//     they do NOT walk a single page of content, and the caller must report the
+//     content walk as unverified rather than as passed.
+//   - deep (deep == true): everything shallow checks, then `quick_check`, the
+//     foreign key check and the full-text index walk -- the complete pass.
+//
+// Both run on the reader pool (`s.read`), never `s.write`: an integrity walk
+// reads, and taking the writer for it serialised `doctor` against any running
+// indexer for the whole walk. The one exception is the FTS5 `integrity-check`
+// command, which is spelled as an INSERT and is therefore refused by the
+// readers' `query_only=ON`; it takes the writer for that statement alone, and
+// only under deep.
 func (s *Store) Check(ctx context.Context, deep bool) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
+	if err := s.checkHeader(ctx); err != nil {
+		return err
+	}
+	if !deep {
+		return nil
+	}
+	return s.checkContent(ctx)
+}
+
+// checkHeader is the constant-cost half of Check: header pragmas, the schema
+// fingerprint and the journal mode. Nothing here is a function of how much the
+// database holds.
+func (s *Store) checkHeader(ctx context.Context) error {
+	return s.read(ctx, func(tx *sql.Tx) error {
+		var pageSize, pageCount int64
+		if err := tx.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+			return wrap("page_size", err)
+		}
+		if err := tx.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return wrap("page_count", err)
+		}
+		if pageSize <= 0 || pageCount <= 0 {
+			return corrupt("database header reports %d pages of %d bytes", pageCount, pageSize)
+		}
+		var version int
+		var fingerprint string
+		if err := tx.QueryRowContext(ctx, `SELECT version, fingerprint FROM schema_meta WHERE singleton = 1`).Scan(&version, &fingerprint); err != nil {
+			return &model.Error{Code: model.CodeSchemaMismatch,
+				Message:     "this database carries no readable schema_meta row",
+				Details:     map[string]string{"path": s.path},
+				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+		}
+		if version != schemaVersion || fingerprint != Fingerprint {
+			return &model.Error{Code: model.CodeSchemaMismatch,
+				Message:     "database schema fingerprint " + fingerprint + " does not match this binary's schema " + Fingerprint,
+				Details:     map[string]string{"path": s.path},
+				Remediation: "run `codectx index --rebuild` to create a new cache; the existing database is left untouched"}
+		}
+		var journal string
+		if err := tx.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err != nil {
+			return wrap("journal_mode", err)
+		}
+		if !strings.EqualFold(journal, "wal") {
+			return corrupt("database journal mode is %s, not the write-ahead log this store requires", journal)
+		}
+		return nil
+	})
+}
+
+// checkContent is the O(database bytes) half: quick_check, the foreign key
+// check and the full-text index walk. Only --deep reaches it.
+func (s *Store) checkContent(ctx context.Context) error {
+	err := s.read(ctx, func(tx *sql.Tx) error {
 		var result string
 		if err := tx.QueryRowContext(ctx, `PRAGMA quick_check(1)`).Scan(&result); err != nil {
 			return wrap("quick_check", err)
@@ -120,22 +193,30 @@ func (s *Store) Check(ctx context.Context, deep bool) error {
 		if violations != 0 {
 			return corrupt("%d foreign key violations", violations)
 		}
-		if deep {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
-				return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index disagrees with its content table: " + err.Error(),
-					Remediation: "rebuild the cache with index --rebuild"}
-			}
-			// integrity-check walks the content table into the index; it does not
-			// report index entries whose content row is gone. The vocabulary table
-			// enumerates every indexed instance, so a stale document shows up here.
-			var stale int64
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.rowid = v.doc)`).Scan(&stale); err != nil {
-				return wrap("search_vocab", err)
-			}
-			if stale != 0 {
-				return &model.Error{Code: model.CodeStorageCorrupt, Message: fmt.Sprintf("search index holds %d term instances for documents that no longer exist", stale),
-					Remediation: "rebuild the cache with index --rebuild"}
-			}
+		// integrity-check walks the content table into the index; it does not
+		// report index entries whose content row is gone. The vocabulary table
+		// enumerates every indexed instance, so a stale document shows up here.
+		var stale int64
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.rowid = v.doc)`).Scan(&stale); err != nil {
+			return wrap("search_vocab", err)
+		}
+		if stale != 0 {
+			return &model.Error{Code: model.CodeStorageCorrupt, Message: fmt.Sprintf("search index holds %d term instances for documents that no longer exist", stale),
+				Remediation: "rebuild the cache with index --rebuild"}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// FTS5's integrity-check is spelled as an INSERT into the virtual table, so
+	// the readers' query_only=ON refuses it. It is a read in every other sense
+	// and writes nothing; it is the only statement of this check that needs the
+	// writer, and it holds it only for its own duration.
+	return s.write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(search_fts) VALUES('integrity-check')`); err != nil {
+			return &model.Error{Code: model.CodeStorageCorrupt, Message: "search index disagrees with its content table: " + err.Error(),
+				Remediation: "rebuild the cache with index --rebuild"}
 		}
 		return nil
 	})
@@ -222,3 +303,19 @@ func (s *Store) MaintainWAL(ctx context.Context) (walBytes int64, backpressure b
 
 // isNoRows reports a missing row without leaking database/sql to callers.
 func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+// StoreSizes reports the on-disk database and write-ahead-log sizes without
+// running a query. It is what a shallow `doctor` reads instead of Stats, whose
+// row counts are O(rows) per table.
+func (s *Store) StoreSizes(ctx context.Context) (databaseBytes, walBytes int64, err error) {
+	if err = ctx.Err(); err != nil {
+		return 0, 0, wrap("store sizes", err)
+	}
+	if databaseBytes, err = fileSize(s.path, false); err != nil {
+		return 0, 0, err
+	}
+	if walBytes, err = s.walBytes(); err != nil {
+		return 0, 0, err
+	}
+	return databaseBytes, walBytes, nil
+}

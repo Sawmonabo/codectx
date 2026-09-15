@@ -168,7 +168,11 @@ type Builder struct {
 	// the typed failure. No production code sets it; a sleep-based race would
 	// be flaky and a filesystem hook does not exist.
 	afterCapture func(rel string)
-	notes        Notes
+	// onBatch receives the capture's CAS batch when it is opened. It exists
+	// for exactly one caller: the durability-barrier test, which installs the
+	// batch's sync hook. No production code sets it.
+	onBatch func(*Batch)
+	notes   Notes
 }
 
 // Notes returns the observations of the most recent Build.
@@ -211,8 +215,17 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 		return model.Snapshot{}, err
 	}
 	defer st.Close()
+	// One batch for the whole capture, including its recapture passes: blobs
+	// are staged as they are read and made durable once, below, immediately
+	// before the snapshot that names them is committed. Discard clears the
+	// temporaries of any capture that ends without reaching that barrier.
+	batch := b.CAS.NewBatch()
+	defer batch.Discard()
+	if b.onBatch != nil {
+		b.onBatch(batch)
+	}
 
-	c := &capture{b: b, st: st}
+	c := &capture{b: b, st: st, batch: batch}
 	head, err := c.enumerateGit(ctx)
 	if err != nil {
 		return model.Snapshot{}, typed(err)
@@ -253,6 +266,13 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	snap, err := c.header(ctx, head)
 	if err != nil {
 		return model.Snapshot{}, err
+	}
+	// The durability barrier of Section 10.3: every blob the manifest below
+	// names is on disk, and so is every directory entry naming one, before the
+	// snapshot that names them exists. A crash before this point leaves
+	// temporaries the startup sweep removes and no snapshot at all.
+	if err := batch.Barrier(ctx); err != nil {
+		return model.Snapshot{}, typed(err)
 	}
 	err = b.Store.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
 		return st.eachManifest(ctx, func(r row) error { return yield(b.fileVersion(r)) })
@@ -318,6 +338,9 @@ func (b *Builder) fileVersion(r row) model.FileVersion {
 type capture struct {
 	b  *Builder
 	st *staging
+	// batch stages every blob this capture retains. It spans the recapture
+	// passes, so a file read twice is staged twice and published once.
+	batch *Batch
 	// hookErr holds the first staging failure raised inside a walk hook,
 	// which can only answer with a bool.
 	hookErr error
@@ -487,7 +510,7 @@ func (c *capture) captureFile(ctx context.Context, f workspace.File, r row, stat
 	}
 	defer file.Close()
 	sniff := &headSniffer{r: file}
-	rec, err := b.CAS.Put(ctx, sniff)
+	rec, err := c.batch.Put(ctx, sniff)
 	if err != nil {
 		return err
 	}

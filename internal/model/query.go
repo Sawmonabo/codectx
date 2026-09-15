@@ -329,6 +329,30 @@ type SearchHit struct {
 	Range           *SourceRange `json:"range,omitempty"`
 	OccurrenceCount int64        `json:"occurrence_count"`
 	Reasons         []string     `json:"reasons,omitempty"`
+	// UnresolvedFields names the fields of THIS hit that could not be
+	// resolved, against the typed reason each failed with. It is the search
+	// counterpart of the truncated-fields map a stored record carries: a hit
+	// whose `range` is absent because the content store no longer holds the
+	// blob says so, instead of presenting a missing range as "this hit has no
+	// position" or costing the caller every other hit in the answer. The key
+	// set is fixed by this package (SearchHitFieldRange today), so the map is
+	// bounded by the code rather than by the repository.
+	UnresolvedFields map[string]string `json:"unresolved_fields,omitempty"`
+}
+
+// SearchHitFieldRange is the reserved UnresolvedFields key for SearchHit.Range.
+// A hit carrying it has a nil Range and the reason it stayed nil.
+const SearchHitFieldRange = "range"
+
+// MarkUnresolved records that one field of the hit could not be resolved and
+// why. It is the only writer of UnresolvedFields: a caller that assigned the
+// map directly would be one unbounded reason away from writing a provider's
+// error text onto the wire.
+func (h *SearchHit) MarkUnresolved(field, reason string) {
+	if h.UnresolvedFields == nil {
+		h.UnresolvedFields = make(map[string]string, 1)
+	}
+	h.UnresolvedFields[field] = truncateUTF8(reason, MaxDetailBytes)
 }
 
 // Validate enforces the hit's bounds; reasons are bounded because Section 14.3
@@ -368,6 +392,20 @@ func (h SearchHit) Validate() error {
 	}
 	if err := boundStrings("search_hit.reasons", h.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
+	}
+	// The same wire bound Error.Details and CapabilityState.Details carry: the
+	// map names fields of one hit, so it is small by construction and this
+	// rejects a producer defect rather than limiting any work.
+	if err := boundCount("search_hit.unresolved_fields", len(h.UnresolvedFields), MaxErrorDetails); err != nil {
+		return err
+	}
+	for k, v := range h.UnresolvedFields {
+		if err := requireField("search_hit.unresolved_fields key", k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := boundField("search_hit.unresolved_fields["+k+"]", v, MaxDetailBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }
