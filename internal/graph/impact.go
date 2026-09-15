@@ -781,8 +781,16 @@ func beginImpactQuery(ctx context.Context, e *Engine) (context.Context, time.Tim
 	// One clock: the deadline is measured on the ENGINE clock, the same one the
 	// walk budget compares against, and it is returned so the caller reuses this
 	// instant instead of recomputing a later one after the gate wait.
-	deadline := e.now().Add(e.limits.QueryTimeout)
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	// A request with no deadline of any kind (query_timeout 0, no caller
+	// deadline) runs unbounded: a zero instant here would be a deadline that
+	// has already passed, which refuses every query instead of running it.
+	deadline, bounded := e.queryDeadline(ctx)
+	var cancel context.CancelFunc
+	if bounded {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	if e.gate == nil {
 		return ctx, deadline, cancel, nil
 	}

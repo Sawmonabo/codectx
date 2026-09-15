@@ -681,13 +681,20 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// past the request deadline is the resource limit the caller must see, and
 	// every adjacency round trip below runs under Section 3's per-request
 	// deadline rather than only being checked between expansion steps.
-	deadline := e.now().Add(e.limits.QueryTimeout)
+	deadline, bounded := e.queryDeadline(ctx)
 	// The caller's own context, kept aside: a page the deadline ended still has
 	// to be DELIVERED -- its endpoints hydrated and its continuation minted --
 	// and both of those run after the walk's deadline has passed. See the
 	// finish context below.
 	parent := ctx
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	var cancel context.CancelFunc
+	if bounded {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	} else {
+		// No deadline of any kind: the walk runs until it finishes, its work
+		// budgets stop it, or the caller cancels.
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {
@@ -824,15 +831,23 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// Delivering a deadline-stopped page needs a live context: `ctx` is past
 	// its deadline by construction, so hydrating the endpoints and writing the
 	// continuation spool on it would fail with the very CTX_QUERY_DEADLINE this
-	// stop exists to replace. The grace runs on the CALLER's context, so a
-	// caller-set deadline still bounds it, and it is the same query_timeout the
-	// walk had -- delivery is bounded work (one batched node read of at most a
-	// page of endpoints, one spool write), not more walking.
+	// stop exists to replace. It runs DETACHED from the caller's context, the
+	// way every other delivery step does (deliverCtx in impact.go): the page's
+	// contents are already decided, so a deadline or a cancellation landing
+	// here would not truncate the answer, it would delete rows the walk
+	// admitted with no notice and no cursor that hands them back. The grace is
+	// the configured query_timeout, and query_timeout 0 -- no wall clock --
+	// leaves it unbounded, because delivery is bounded work by construction
+	// (one batched node read of at most a page of endpoints, one spool write)
+	// and not more walking.
 	finish := ctx
 	if b.deadlineHit {
-		var cancelFinish context.CancelFunc
-		finish, cancelFinish = context.WithTimeout(parent, e.limits.QueryTimeout)
-		defer cancelFinish()
+		finish = context.WithoutCancel(parent)
+		if e.limits.QueryTimeout > 0 {
+			var cancelFinish context.CancelFunc
+			finish, cancelFinish = context.WithTimeout(finish, e.limits.QueryTimeout)
+			defer cancelFinish()
+		}
 	}
 
 	ids := make([]model.NodeID, 0, len(endpoints))
