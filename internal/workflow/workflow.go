@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -145,10 +146,13 @@ type Limits struct {
 	// MaxObservationReferences bounds the references on one observation
 	// (model.MaxObservationReferences).
 	MaxObservationReferences int
-	// MaxCapsuleBytes bounds the serialized capsule (context.max_capsule_bytes).
-	// The store enforces the same bound; this is the value the service builds
-	// against so an over-budget capsule fails before the write.
-	MaxCapsuleBytes int64
+	// MaxCapsuleBytes is the CALLER's budget for the serialized capsule
+	// (context.max_capsule_bytes). It is unlimited by default and a request may
+	// raise it: a capsule is reported as over budget only because the caller
+	// asked for a ceiling, never because the repository is large. The store
+	// enforces its own wire bound; this is the value the service builds against
+	// so an over-budget capsule is reported before the write.
+	MaxCapsuleBytes config.Limit
 	// QueryTimeout is the per-request deadline (resources.query_timeout).
 	QueryTimeout time.Duration
 	// AllowExploratoryWaiverConsolidation permits verify_open ->
@@ -205,7 +209,9 @@ func New(o Options) (*Service, error) {
 
 // checkLimits rejects a Limits that cannot bound a request. Zero on a request
 // field means the configured default, so a zero default means "unlimited",
-// which Section 20.2 forbids.
+// which Section 20.2 forbids for the page, reference and deadline bounds below.
+// MaxCapsuleBytes is deliberately absent: it is a config.Limit whose zero is
+// the documented "no caller ceiling", not a missing bound.
 func checkLimits(l Limits) error {
 	for _, b := range []struct {
 		name  string
@@ -213,7 +219,6 @@ func checkLimits(l Limits) error {
 	}{
 		{"max_page_items", int64(l.MaxPageItems)},
 		{"max_observation_references", int64(l.MaxObservationReferences)},
-		{"max_capsule_bytes", l.MaxCapsuleBytes},
 		{"query_timeout", int64(l.QueryTimeout)},
 	} {
 		if b.value <= 0 {

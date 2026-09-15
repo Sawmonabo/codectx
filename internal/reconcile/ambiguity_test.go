@@ -1,0 +1,79 @@
+package reconcile_test
+
+import (
+	"context"
+	"fmt"
+	"testing"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/reconcile"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+)
+
+// aliasesFor returns n distinct stored aliases in canonical-key order.
+type fixedAliases []sqlite.StoredAlias
+
+func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ string, limit int) ([]sqlite.StoredAlias, error) {
+	if limit < len(f) {
+		return f[:limit], nil
+	}
+	return f, nil
+}
+
+// TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit protects the
+// scale-posture rule that a repository property never fails an analysis unit.
+//
+// Failure mode it guards: a native key aliased to more identities than
+// model.MaxAmbiguousCandidates used to return CTX_PROVIDER_OUTPUT_INVALID, so
+// one heavily overloaded symbol name refused the whole dependency output — the
+// unit produced nothing, not even the facts that had no ambiguity at all. The
+// alias lookup's own page size is the only bound; the resolver keeps every
+// alternative it returned so no may_refer_to edge is silently lost.
+func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing.T) {
+	const n = sqlite.MaxAliasLookup // more than MaxAmbiguousCandidates+1
+	if n <= model.MaxAmbiguousCandidates+1 {
+		t.Fatalf("fixture is not over the old refusal threshold: %d", n)
+	}
+	var store fixedAliases
+	for i := 0; i < n; i++ {
+		id := model.NodeID(fmt.Sprintf("%064x", i+1))
+		store = append(store, sqlite.StoredAlias{NodeID: id, Kind: model.NodeFunction,
+			CanonicalKey: fmt.Sprintf("go|pkg|Sym|%03d", i)})
+	}
+	repo := model.RepositoryID(fmt.Sprintf("%064x", 0xabc))
+	unit := model.UnitID(fmt.Sprintf("%064x", 0xdef))
+	r, err := reconcile.New(store, repo, []model.UnitID{unit})
+	if err != nil {
+		t.Fatalf("build the resolver: %v", err)
+	}
+	res, err := r.Resolve(context.Background(), model.NodeCandidate{
+		ProviderID: "decl", ScopeKey: "pkg", NativeKey: "Sym", Kind: model.NodeFunction,
+		Name: "Sym", QualifiedName: "pkg.Sym", FileID: model.FileID(fmt.Sprintf("%064x", 7)),
+		ContentHash: fmt.Sprintf("%064x", 8),
+		Range:       &model.SourceRange{Start: model.Position{Byte: 0, Line: 1}, End: model.Position{Byte: 1, Line: 1}},
+	})
+	if err != nil {
+		t.Fatalf("%d equally supported identities failed the unit: %v", n, err)
+	}
+	if got, want := len(res.Ambiguous), n-1; got != want {
+		t.Fatalf("resolution retained %d alternatives, want all %d: an alternative was dropped silently", got, want)
+	}
+	if res.Basis != model.MatchNativeKey {
+		t.Fatalf("basis %q, want %q", res.Basis, model.MatchNativeKey)
+	}
+}
+
+// TestAResolverOverManyDependenciesIsBuilt protects the same rule on the other
+// row-20 site: model.MaxDependenciesPerUnit is the page size for reading a
+// unit's dependencies back, never a reason to refuse an aggregate target that
+// legitimately depends on more units than that.
+func TestAResolverOverManyDependenciesIsBuilt(t *testing.T) {
+	deps := make([]model.UnitID, 0, model.MaxDependenciesPerUnit+1)
+	for i := 0; i < model.MaxDependenciesPerUnit+1; i++ {
+		deps = append(deps, model.UnitID(fmt.Sprintf("%064x", i+1)))
+	}
+	repo := model.RepositoryID(fmt.Sprintf("%064x", 0xabc))
+	if _, err := reconcile.New(fixedAliases(nil), repo, deps); err != nil {
+		t.Fatalf("a resolver over %d dependencies was refused: %v", len(deps), err)
+	}
+}
