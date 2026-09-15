@@ -58,17 +58,18 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 		return model.IndexStatus{}, err
 	}
 	states = composedStates(states, c.opts.States)
-	states, omitted := boundStates(states, c.log)
+	states, aggregated := boundStates(states, c.log)
 	coherence, warnings, err := c.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	if omitted > 0 {
-		// Section 18.2: a truncated report shows what it omitted. A renderer
-		// prints what it is handed, so the count has to be in the result.
-		warnings = append(warnings, "the capability report holds more than its bound of "+
-			strconv.Itoa(model.MaxCapabilityStates)+" rows; "+strconv.Itoa(omitted)+
-			" of the least severe were omitted")
+	if aggregated {
+		// Section 18.2: a report that aggregated says so. Nothing was omitted
+		// -- every row still names its capability and the number of scopes it
+		// speaks for -- but a reader must know the scope keys are exemplars.
+		warnings = append(warnings, "the capability report holds more than "+
+			strconv.Itoa(model.MaxCapabilityStates)+" rows and was aggregated per provider "+
+			"capability; every row carries the number of scopes it stands for and none was omitted")
 	}
 	st := model.IndexStatus{Binding: binding, Health: healthOf(states), Coherence: coherence,
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
@@ -394,7 +395,7 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 // per-scope carry rows are collapsed per provider capability before anything is
 // dropped, because a stale capability with an aggregate distance is still an
 // honest stale answer while a truncated list silently loses one.
-func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, int) {
+func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 	out := make([]model.CapabilityState, 0, len(r.order)+len(r.failures)+len(r.carried))
 	for _, key := range r.order {
 		out = append(out, r.rows[key])
@@ -428,7 +429,8 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 		carried = collapseCarried(carried)
 	}
 	out = append(out, carried...)
-	return boundStates(out, log)
+	rows, _ := boundStates(out, log)
+	return rows
 }
 
 // foldToPrimaryKey brings the assembled list inside the one row per
@@ -483,6 +485,43 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 	return out
 }
 
+// foldCollapsed is foldToPrimaryKey for the far side of collapseScopes, where
+// it must also SUM the counts of the rows it merges.
+//
+// The distinction matters and is not cosmetic. Before the collapse, two rows
+// on one primary key are two assertions about the same scope -- a
+// composition-time row meeting a stored one, say -- and summing their `scopes`
+// would count one scope twice. After it, collapseScopes has keyed by provider
+// capability AND state, written a `scopes` detail on every row it emits and
+// rewritten each to the workspace scope; the rows that now collide therefore
+// stand for DISJOINT scope sets, and keeping only the survivor's count reports
+// a smaller set than the row represents while the report claims nothing was
+// omitted. An under-count with no flag is exactly what the count exists to
+// prevent, so here, and only here, the counts add.
+func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
+	at := make(map[string]int, len(rows))
+	out := make([]model.CapabilityState, 0, len(rows))
+	for _, c := range rows {
+		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
+		i, ok := at[key]
+		if !ok {
+			at[key] = len(out)
+			out = append(out, c)
+			continue
+		}
+		scopes := countDetail(out[i]) + countDetail(c)
+		units := atoiDetail(out[i], "units_failed") + atoiDetail(c, "units_failed")
+		if severityRank(c.State) < severityRank(out[i].State) {
+			out[i] = c
+		}
+		out[i] = out[i].WithDetail("scopes", strconv.Itoa(scopes))
+		if units > 0 {
+			out[i] = out[i].WithDetail("units_failed", strconv.Itoa(units))
+		}
+	}
+	return out
+}
+
 // boundStates brings an assembled capability list inside
 // model.MaxCapabilityStates and reports how many rows it had to omit. It is
 // the one place the bound is applied: the indexing path calls it through
@@ -502,32 +541,21 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 // failures and carries, which are appended last, and keep the fresh rows:
 // Section 13.3 allows a report to under-claim and never to over-claim.
 // Truncation only removes rows, so the folded key stays closed.
-func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, int) {
+func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, bool) {
+	before := len(out)
 	out = foldToPrimaryKey(out)
 	if len(out) > model.MaxCapabilityStates {
-		out = foldToPrimaryKey(collapseScopes(out))
+		// Past the reporting threshold the list is aggregated per provider
+		// capability -- a lossless view, because every fold carries the count
+		// of the scopes it stands for -- and never cut. A row dropped off the
+		// tail was unrecoverable; an aggregated one still names its capability,
+		// its worst state and how many scopes it speaks for.
+		out = foldCollapsed(collapseScopes(out))
+		log.Info("the capability report was aggregated per provider capability", "component", component,
+			"rows_in", before, "rows_out", len(out), "threshold", model.MaxCapabilityStates)
+		return out, true
 	}
-	if len(out) <= model.MaxCapabilityStates {
-		return out, 0
-	}
-	// The order is total, so which rows survive is a function of the set and
-	// not of the order the unit workers happened to report in.
-	slices.SortStableFunc(out, func(a, b model.CapabilityState) int {
-		if r := severityRank(a.State) - severityRank(b.State); r != 0 {
-			return r
-		}
-		if a.ProviderID != b.ProviderID {
-			return compareString(a.ProviderID, b.ProviderID)
-		}
-		if a.Capability != b.Capability {
-			return compareString(a.Capability, b.Capability)
-		}
-		return compareString(string(a.State), string(b.State))
-	})
-	omitted := len(out) - model.MaxCapabilityStates
-	log.Warn("the capability report exceeded its bound and was truncated", "component", component,
-		"rows", len(out), "limit", model.MaxCapabilityStates, "omitted", omitted)
-	return out[:model.MaxCapabilityStates], omitted
+	return out, false
 }
 
 // severityRank orders capability states by how much a reader must act on them.

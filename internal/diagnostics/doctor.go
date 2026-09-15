@@ -183,9 +183,10 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 	// The state is reduced BEFORE the list is bounded: a failing check that
 	// fell off the end of an over-long list must still fail the report.
 	state := aggregate(checks)
-	if len(checks) > model.MaxCapabilityStates {
-		checks = checks[:model.MaxCapabilityStates]
-	}
+	// No clamp. The check list is enumerated above -- it is a function of the
+	// code, not of the repository -- and a silent `checks[:256]` dropped the
+	// toolchain checks appended last with no omitted count and no warning,
+	// which is exactly the shape a diagnostic report may not have.
 	report := model.DoctorReport{
 		Build: s.opts.Build,
 		Deep:  req.Deep,

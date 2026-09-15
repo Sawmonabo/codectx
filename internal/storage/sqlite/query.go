@@ -618,12 +618,18 @@ func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 	return fv, nil
 }
 
-// Capabilities returns the generation's stored capability report.
+// Capabilities returns the generation's stored capability report -- every row
+// of it. The bare `LIMIT 256` this once carried silently dropped rows off the
+// tail of a large generation's report, and QueryMeta.Completeness is derived
+// from what this returns on every answer, so the drop made every answer
+// over-claim. The scan streams in one read transaction under the primary key's
+// order; peak is one row, and the returned slice is the report the caller asked
+// for.
 func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	var out []model.CapabilityState
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT provider_id, capability, scope_key, state, diagnostic_code, details_json FROM generation_capabilities
-			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key LIMIT ?`, r.gen, model.MaxCapabilityStates)
+			WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, r.gen)
 		if err != nil {
 			return wrap("generation_capabilities", err)
 		}
