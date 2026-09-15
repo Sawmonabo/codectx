@@ -457,6 +457,17 @@ func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byt
 	return nil, err
 }
 
+// atRequestBound is the parent's half of the per-file record bound, read off
+// the SAME request field the worker reads. The check exists to stop a
+// misbehaving child from making the parent buffer more than a healthy one would
+// send, so it must never be stricter than what the worker was told: a parent
+// holding its own constant would kill a healthy worker's output the moment the
+// operator raised the limit. A zero bound is unlimited and the check is a
+// no-op, which is the shipped default.
+func atRequestBound(req wire.Request, have int) bool {
+	return req.MaxRecordsPerFile != 0 && uint64(have) >= uint64(req.MaxRecordsPerFile)
+}
+
 func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, error) {
 	if err := wire.WriteJSON(w.in, wire.KindRequest, req, wire.MaxFactFrameBytes); err != nil {
 		return nil, err
@@ -478,7 +489,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &d); err != nil {
 				return nil, err
 			}
-			if len(ex.decls) >= wire.MaxDeclsPerFile {
+			if atRequestBound(req, len(ex.decls)) {
 				return nil, errors.New("worker exceeded the declaration bound")
 			}
 			ex.decls = append(ex.decls, d)
@@ -487,7 +498,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &i); err != nil {
 				return nil, err
 			}
-			if len(ex.imports) >= wire.MaxImportsPerFile {
+			if atRequestBound(req, len(ex.imports)) {
 				return nil, errors.New("worker exceeded the import bound")
 			}
 			ex.imports = append(ex.imports, i)
@@ -496,7 +507,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &r); err != nil {
 				return nil, err
 			}
-			if len(ex.refs) >= wire.MaxRefsPerFile {
+			if atRequestBound(req, len(ex.refs)) {
 				return nil, errors.New("worker exceeded the reference bound")
 			}
 			ex.refs = append(ex.refs, r)

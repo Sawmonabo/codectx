@@ -10,17 +10,18 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 )
 
-// Per-file record bounds are wire's; a file that exceeds one is reported
-// truncated and the parent marks its structural coverage partial.
-const (
-	maxDecls   = wire.MaxDeclsPerFile
-	maxImports = wire.MaxImportsPerFile
-	maxRefs    = wire.MaxRefsPerFile
-	// parseChunkBytes bounds each copy the binding makes of the source while
-	// the parser reads it (readUTF8 copies whatever the callback returns into
-	// a C string kept until the parse ends).
-	parseChunkBytes = 64 << 10
-)
+// parseChunkBytes bounds each copy the binding makes of the source while the
+// parser reads it (readUTF8 copies whatever the callback returns into a C
+// string kept until the parse ends).
+const parseChunkBytes = 64 << 10
+
+// atRecordBound reports whether a per-file record set has reached the bound the
+// request carries. A zero bound -- the default -- is unlimited, so the file
+// yields what it yields; only a value the operator set can stop it, and a file
+// it stops is reported truncated.
+func atRecordBound(max uint32, have int) bool {
+	return max != 0 && uint64(have) >= uint64(max)
+}
 
 type span struct{ start, end uint }
 
@@ -79,6 +80,9 @@ type extraction struct {
 	exportRanges map[span]bool
 	exportNames  map[string]bool
 	truncated    bool
+	// maxRecords is the request's MaxRecordsPerFile, the one per-file record
+	// bound; 0 is unlimited.
+	maxRecords uint32
 }
 
 // kindRank orders the kinds two patterns may assign to the same declaration
@@ -176,7 +180,7 @@ func (e *extraction) addDecl(kind string, node ts.Node, caps map[string][]ts.Nod
 	key := span{node.StartByte(), node.EndByte()}
 	byName := e.decls[key]
 	if byName == nil {
-		if len(e.decls) >= maxDecls {
+		if atRecordBound(e.maxRecords, len(e.decls)) {
 			e.truncated = true
 			return
 		}
@@ -196,7 +200,7 @@ func (e *extraction) addImport(node ts.Node, caps map[string][]ts.Node) {
 	key := span{node.StartByte(), node.EndByte()}
 	rec := e.imports[key]
 	if rec == nil {
-		if len(e.imports) >= maxImports {
+		if atRecordBound(e.maxRecords, len(e.imports)) {
 			e.truncated = true
 			return
 		}
@@ -217,7 +221,7 @@ func (e *extraction) addRef(kind string, node ts.Node, name []ts.Node, qualifier
 	if len(name) == 0 {
 		return
 	}
-	if len(e.refs) >= maxRefs {
+	if atRecordBound(e.maxRecords, len(e.refs)) {
 		e.truncated = true
 		return
 	}

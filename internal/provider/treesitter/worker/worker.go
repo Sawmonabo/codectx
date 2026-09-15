@@ -159,7 +159,7 @@ func (w *state) serve(out io.Writer, req wire.Request, src []byte) error {
 	defer tree.Close()
 	root := tree.RootNode()
 	em := &emitter{w: out}
-	ex := &extraction{g: g, l: l, path: req.Path, src: src}
+	ex := &extraction{g: g, l: l, path: req.Path, src: src, maxRecords: req.MaxRecordsPerFile}
 	if err := ex.run(query, root, em); err != nil {
 		return err
 	}

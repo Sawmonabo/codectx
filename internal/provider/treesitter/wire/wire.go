@@ -53,14 +53,7 @@ const (
 	headerBytes       = 5
 )
 
-// Per-file record bounds, applied by the worker when it extracts and by the
-// parent when it reads, so a misbehaving child can never make the parent
-// buffer more than a healthy one would send. A file that reaches one is
-// reported truncated and its structural coverage is partial.
 const (
-	MaxDeclsPerFile   = 20000
-	MaxImportsPerFile = 4000
-	MaxRefsPerFile    = 60000
 	// MaxQualifierBytes bounds Ref.Qualifier. A call's receiver is an
 	// arbitrary expression -- `a.b(x).c(y).Scan(&v)` has a receiver hundreds
 	// of bytes long -- so the worker reports a qualifier only when it is a
@@ -84,6 +77,23 @@ type Request struct {
 	Language    string `json:"language"`
 	Path        string `json:"path"`
 	SourceBytes uint32 `json:"source_bytes"`
+	// MaxRecordsPerFile is providers.tree_sitter.max_records_per_file: how
+	// many declarations, imports or references (each counted separately) the
+	// user wants one file to yield. 0 -- the default -- is unlimited.
+	//
+	// It replaces three hard-coded ceilings of 20000, 4000 and 60000 that the
+	// worker and the parent each held a copy of. A generated file names what it
+	// names, and what it yields is bounded by its own size, which
+	// workspace.max_parse_file_bytes already bounds, so an unlimited value
+	// costs one file's heap and never the repository's.
+	//
+	// It travels on the request precisely so the worker and the parent read the
+	// SAME number: the parent's check exists to stop a misbehaving child from
+	// making it buffer more than a healthy one would send, and a parent holding
+	// its own constant would kill a healthy worker's output the moment the
+	// operator raised the limit. A file that reaches it is reported truncated
+	// through Done.Truncated and its structural coverage is partial.
+	MaxRecordsPerFile uint32 `json:"max_records_per_file,omitempty"`
 }
 
 // Decl is one declaration. Offsets are byte offsets into the source; Parent

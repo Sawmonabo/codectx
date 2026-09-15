@@ -95,6 +95,7 @@ func (c Config) AnalysisConfigHash() string {
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxDependencies))
 	h.AddString(quoteLimit(c.Providers.Manifest.MaxEntries))
 	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxCalleeReferences))
+	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxRecordsPerFile))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
 	return h.Sum()
