@@ -92,7 +92,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// records survive the request that produced them.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes()); err != nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}

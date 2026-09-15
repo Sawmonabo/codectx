@@ -847,7 +847,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// out -- every node that ever reaches a frontier was added by the page
 		// that discovered it, so it is already in that page's own run.
 		if retain == nil {
-			if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes()); err != nil {
+			if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
 				return model.GraphResult{}, err
 			}
 		}
