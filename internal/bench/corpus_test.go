@@ -66,9 +66,22 @@ const corpusPrefix = "Ctxbench"
 // corpusSpec is the generator seam. Packages is the per-language package count;
 // Seed drives the deterministic filler sizes, so a spec is a workload, not a
 // coin flip.
+//
+// Helpers and HelperLines are the per-file SHAPE, and they exist because
+// Section 23.1 pins the reference fixture by lines and bytes as well as by
+// files: 10,000 files of the original ~0.5 KiB filler is a quarter of the
+// line count and a fourteenth of the byte count the reference workload names,
+// so a measurement over it describes a much smaller corpus than the one the
+// budgets were written for. Helpers is the number of generated function
+// bodies per source file and HelperLines the statement lines in each; when
+// Helpers is zero the generator keeps its original shape -- a handful of
+// one-line helpers whose count is drawn from Seed -- which is what the tiny,
+// small-real and >200-file specs are measured and fingerprinted at.
 type corpusSpec struct {
-	Packages int
-	Seed     int64
+	Packages    int
+	Seed        int64
+	Helpers     int
+	HelperLines int
 }
 
 // corpusTiny is sized for the parity rows: large enough to carry every language
@@ -92,16 +105,11 @@ func generateCorpus(t testing.TB, dir string, spec corpusSpec) {
 			t.Fatal(err)
 		}
 	}
-	filler := func(n int, line func(i int) string) string {
-		var b strings.Builder
-		for i := range n {
-			b.WriteString(line(i))
-		}
-		return b.String()
-	}
-
 	for p := range spec.Packages {
 		id := fmt.Sprintf("%02d", p)
+		// The draw happens whichever shape is generated: a spec that asks for
+		// the wide shape must not shift the filler sizes of the specs that do
+		// not, and those are fingerprinted.
 		fill := 2 + rng.Intn(4)
 		// Each language gets its own symbol infix. Sharing a name across
 		// languages makes workspace-symbol resolution answer with one node per
@@ -128,10 +136,7 @@ func %[2]sRun%[1]s() string {
 	s := &%[2]sStore%[1]s{%[2]sName: "%[1]s"}
 	return s.%[2]sLoad%[1]s()
 }
-%[3]s`, id, goP, filler(fill, func(i int) string {
-			return fmt.Sprintf("\n// %sNote%s%d documents a generated helper.\nfunc %sHelper%s%d() int { return %d }\n",
-				goP, id, i, goP, id, i, i)
-		})))
+%[3]s`, id, goP, goFiller(spec, fill, goP, id)))
 
 		write(filepath.Join("src", "py", "ctxbench_"+id+".py"), fmt.Sprintf(`"""Generated Python package %[1]s."""
 
@@ -143,9 +148,7 @@ class %[2]sStore%[1]s:
 
 def %[2]sRun%[1]s():
     return %[2]sStore%[1]s().%[2]sLoad%[1]s()
-%[3]s`, id, pyP, filler(fill, func(i int) string {
-			return fmt.Sprintf("\n\ndef %sHelper%s%d():\n    return %d\n", pyP, id, i, i)
-		})))
+%[3]s`, id, pyP, pyFiller(spec, fill, pyP, id)))
 
 		write(filepath.Join("src", "ts", "ctxbench_"+id+".ts"), fmt.Sprintf(`// Generated TypeScript package %[1]s.
 
@@ -158,9 +161,7 @@ export class %[2]sStore%[1]s {
 export function %[2]sRun%[1]s(): string {
   return new %[2]sStore%[1]s().%[2]sLoad%[1]s();
 }
-%[3]s`, id, tsP, filler(fill, func(i int) string {
-			return fmt.Sprintf("\nexport function %sHelper%s%d(): number {\n  return %d;\n}\n", tsP, id, i, i)
-		})))
+%[3]s`, id, tsP, tsFiller(spec, fill, tsP, id)))
 	}
 
 	// The high-fanout case Section 23.1 asks for: one symbol that calls every
@@ -183,6 +184,98 @@ export function %[2]sRun%[1]s(): string {
 	write("go.mod", "module example.com/ctxbench\n\ngo 1.27\n")
 	write("package.json", "{\n  \"name\": \"ctxbench\",\n  \"version\": \"0.0.0\",\n  \"private\": true\n}\n")
 	write("README.md", "# ctxbench\n\nGenerated benchmark corpus. Fixed content, fixed layout, no network.\n")
+}
+
+// --- the two filler shapes --------------------------------------------------
+//
+// Every generated source file ends in filler, and the filler is what makes a
+// spec's line and byte counts what they are. There are two shapes:
+//
+//   - the NARROW shape (spec.Helpers == 0): n one-line helpers, n drawn from
+//     the seed. It is what corpusTiny, corpusSmallReal and corpusOver200Files
+//     are generated at, so it is frozen -- the parity fingerprint and the
+//     >200-file session shape are both measured over it.
+//   - the WIDE shape (spec.Helpers > 0): spec.Helpers function bodies per
+//     file, each spec.HelperLines statements long, with the line widths real
+//     source has. It exists so corpusReference can reach Section 23.1's
+//     reference workload -- ~1M lines over ~80 MiB -- at the file count the
+//     section pins.
+//
+// Both shapes are deterministic: given a spec, the bytes are fixed.
+
+// narrowFiller renders n one-line helpers through line.
+func narrowFiller(n int, line func(i int) string) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString(line(i))
+	}
+	return b.String()
+}
+
+// goFiller renders one Go file's filler in the shape spec asks for.
+func goFiller(spec corpusSpec, fill int, goP, id string) string {
+	if spec.Helpers == 0 {
+		return narrowFiller(fill, func(i int) string {
+			return fmt.Sprintf("\n// %sNote%s%d documents a generated helper.\nfunc %sHelper%s%d() int { return %d }\n",
+				goP, id, i, goP, id, i, i)
+		})
+	}
+	var b strings.Builder
+	for i := range spec.Helpers {
+		fmt.Fprintf(&b, "\n// %[1]sNote%[2]s%[3]d documents one generated helper: the seed it folds, "+
+			"the label it carries and the total it returns.\n"+
+			"func %[1]sHelper%[2]s%[3]d(seed int, label string) (int, string) {\n\ttotal := seed\n",
+			goP, id, i)
+		for step := range spec.HelperLines {
+			fmt.Fprintf(&b, "\ttotal = total*%[1]d + (seed+%[2]d)%%97 // step %[2]d of the generated body, "+
+				"repeated verbatim by every file in this corpus\n", 3+step%7, step)
+		}
+		b.WriteString("\treturn total, label\n}\n")
+	}
+	return b.String()
+}
+
+// pyFiller renders one Python file's filler in the shape spec asks for.
+func pyFiller(spec corpusSpec, fill int, pyP, id string) string {
+	if spec.Helpers == 0 {
+		return narrowFiller(fill, func(i int) string {
+			return fmt.Sprintf("\n\ndef %sHelper%s%d():\n    return %d\n", pyP, id, i, i)
+		})
+	}
+	var b strings.Builder
+	for i := range spec.Helpers {
+		fmt.Fprintf(&b, "\n\ndef %[1]sHelper%[2]s%[3]d(seed, label):\n"+
+			"    \"\"\"%[1]sHelper%[2]s%[3]d folds its seed and returns it beside the label it was called with.\"\"\"\n"+
+			"    total = seed\n", pyP, id, i)
+		for step := range spec.HelperLines {
+			fmt.Fprintf(&b, "    total = total * %[1]d + (seed + %[2]d) %%%% 97  # step %[2]d of the generated body, "+
+				"repeated verbatim by every file\n", 3+step%7, step)
+		}
+		b.WriteString("    return total, label\n")
+	}
+	return b.String()
+}
+
+// tsFiller renders one TypeScript file's filler in the shape spec asks for.
+func tsFiller(spec corpusSpec, fill int, tsP, id string) string {
+	if spec.Helpers == 0 {
+		return narrowFiller(fill, func(i int) string {
+			return fmt.Sprintf("\nexport function %sHelper%s%d(): number {\n  return %d;\n}\n", tsP, id, i, i)
+		})
+	}
+	var b strings.Builder
+	for i := range spec.Helpers {
+		fmt.Fprintf(&b, "\n// %[1]sNote%[2]s%[3]d documents one generated helper: the seed it folds, "+
+			"the label it carries and the total it returns.\n"+
+			"export function %[1]sHelper%[2]s%[3]d(seed: number, label: string): [number, string] {\n"+
+			"  let total = seed;\n", tsP, id, i)
+		for step := range spec.HelperLines {
+			fmt.Fprintf(&b, "  total = total * %[1]d + ((seed + %[2]d) %%%% 97); // step %[2]d of the generated body, "+
+				"repeated verbatim by every file\n", 3+step%7, step)
+		}
+		b.WriteString("  return [total, label];\n}\n")
+	}
+	return b.String()
 }
 
 // openCorpus indexes dir as a workspace and returns the opened services. The
