@@ -5,7 +5,11 @@ package model
 // importing the other, and without any package importing a provider's native
 // handles (Sections 7.1, 11.1).
 
-import "maps"
+import (
+	"maps"
+	"slices"
+	"strconv"
+)
 
 // InvalidationScope is the unit granularity a provider reprocesses. A file-local
 // provider reprocesses only changed files; a package or workspace provider
@@ -259,6 +263,51 @@ func (s UnitSpec) Validate() error {
 // the size of the repository.
 const MaxCapabilityDetails = MaxErrorDetails
 
+// The reserved capability detail keys are the report fold's own bookkeeping:
+// they are assertions about the FOLD (how many scopes a row stands for, how
+// many units failed behind it, which merged values were cut, how many provider
+// details did not fit), not particulars a provider published. They are never
+// evicted to make room for a provider detail, because dropping one silently
+// falsifies the report -- a lost `scopes` under-counts the scopes a row speaks
+// for, and a lost `details_truncated` or `details_omitted` publishes a clipped
+// or incomplete detail map as if it were whole.
+const (
+	// DetailScopes counts the scopes one folded row stands for.
+	DetailScopes = "scopes"
+	// DetailUnitsFailed counts the units that failed behind one row.
+	DetailUnitsFailed = "units_failed"
+	// DetailDetailsTruncated names the detail values that were cut to fit
+	// MaxDetailBytes.
+	DetailDetailsTruncated = "details_truncated"
+	// DetailDetailsOmitted counts the provider details WithDetail dropped
+	// because the map was full.
+	DetailDetailsOmitted = "details_omitted"
+)
+
+// reservedCapabilityDetails is the set the constants above name. It is an
+// array so its length is a compile-time constant: the provider budget below is
+// derived from it, and a fifth reserved key must move that budget in the same
+// edit that adds the key.
+var reservedCapabilityDetails = [...]string{
+	DetailScopes,
+	DetailUnitsFailed,
+	DetailDetailsTruncated,
+	DetailDetailsOmitted,
+}
+
+// ReservedCapabilityDetail reports whether key is one the report fold owns.
+// A provider that writes one of these keys is writing the fold's bookkeeping,
+// not its own particulars; the fold's own writes go through the same door and
+// are the reason the key is guaranteed room.
+func ReservedCapabilityDetail(key string) bool {
+	return slices.Contains(reservedCapabilityDetails[:], key)
+}
+
+// MaxProviderCapabilityDetails is how many details a PROVIDER may contribute.
+// The reserved keys hold back the remainder of MaxCapabilityDetails so the
+// fold can always write them, whatever a provider filled the map with.
+const MaxProviderCapabilityDetails = MaxCapabilityDetails - len(reservedCapabilityDetails)
+
 // CapabilityState reports one provider capability at one scope. The machine
 // reason code is kept separate from user-readable remediation (Section 13.3).
 // Details carries the machine-readable particulars of a state that is not
@@ -277,8 +326,15 @@ type CapabilityState struct {
 // WithDetail returns the state with one bounded diagnostic pair added, so a
 // publisher can build a row in one expression. Values are truncated to
 // MaxDetailBytes and the map is capped at MaxCapabilityDetails entries; an
-// empty key and an overflowing new key are both dropped, so a detail map never
-// grows without bound and never carries a keyless value.
+// empty key is dropped, so a detail map never grows without bound and never
+// carries a keyless value.
+//
+// A provider detail that does not fit the MaxProviderCapabilityDetails budget
+// is dropped AND counted in DetailDetailsOmitted, so a reader is never handed a
+// silently short detail map. A reserved key (ReservedCapabilityDetail) is
+// always admitted: the budget holds room back for exactly those keys, so the
+// fold's own bookkeeping -- including this omission count and the truncation
+// flag -- can never be the thing that is evicted.
 //
 // The map is copied rather than written through. CapabilityState is a value
 // type that lives in slices and is copied freely, and Details is a reference:
@@ -290,14 +346,32 @@ func (c CapabilityState) WithDetail(key, value string) CapabilityState {
 	if key == "" {
 		return c
 	}
-	if _, replacing := c.Details[key]; !replacing && len(c.Details) >= MaxCapabilityDetails {
-		return c
+	if _, replacing := c.Details[key]; !replacing && !ReservedCapabilityDetail(key) &&
+		c.providerDetails() >= MaxProviderCapabilityDetails {
+		// The dropped key is counted, not swallowed. This recurses exactly
+		// once: DetailDetailsOmitted is reserved, so the branch above cannot
+		// be taken for it.
+		omitted, _ := strconv.Atoi(c.Details[DetailDetailsOmitted])
+		return c.WithDetail(DetailDetailsOmitted, strconv.Itoa(omitted+1))
 	}
 	details := make(map[string]string, len(c.Details)+1)
 	maps.Copy(details, c.Details)
 	details[key] = TruncateDetail(value)
 	c.Details = details
 	return c
+}
+
+// providerDetails counts the details a provider contributed, which is what the
+// MaxProviderCapabilityDetails budget bounds; the reserved keys are held back
+// from that budget rather than charged to it.
+func (c CapabilityState) providerDetails() int {
+	n := 0
+	for k := range c.Details {
+		if !ReservedCapabilityDetail(k) {
+			n++
+		}
+	}
+	return n
 }
 
 // Validate enforces the generation_capabilities constraints.

@@ -83,7 +83,7 @@ func (r ImpactResult) Validate() error {
 	if err := r.Meta.Validate(); err != nil {
 		return err
 	}
-	if err := boundCount("impact_result.entries", len(r.Entries), MaxRecordsPerResult); err != nil {
+	if err := boundPage("impact_result.entries", len(r.Entries)); err != nil {
 		return err
 	}
 	for _, e := range r.Entries {
@@ -91,7 +91,7 @@ func (r ImpactResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("impact_result.packages", len(r.Packages), MaxRecordsPerResult); err != nil {
+	if err := boundPage("impact_result.packages", len(r.Packages)); err != nil {
 		return err
 	}
 	for _, p := range r.Packages {
