@@ -119,7 +119,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			return state, nil
 		}
 		if scratch == nil {
-			if scratch, err = newVisitedScratch(e.scratchDir()); err != nil {
+			if scratch, err = newVisitedScratch(e.walkScratchDir()); err != nil {
 				return walkState{}, err
 			}
 			carried = chainVisited(outerVisited(o.Resume), scratch.stream)
@@ -250,12 +250,12 @@ func scratchErr(err error) error {
 	return &model.Error{Code: model.CodeInternal, Message: "graph: the walk scratch file: " + err.Error()}
 }
 
-// scratchDir is where this request's scratch file and sort runs spill: the
+// walkScratchDir is where this request's scratch file and sort runs spill: the
 // spool store's own sort directory, so a query's temporary files sit in one
 // place (pagination.Spools.SortDir states why sort runs are not charged against
 // the continuation byte budget). An engine with no spool store has no
 // continuations either and falls back to the process temp directory.
-func (e *Engine) scratchDir() string {
+func (e *Engine) walkScratchDir() string {
 	if e.spools != nil {
 		return e.spools.SortDir()
 	}
@@ -273,7 +273,7 @@ func (e *Engine) scratchDir() string {
 // Owned by lane P-b.
 func (e *Engine) rankImpact(ctx context.Context,
 	emit func(add func(impactRecord) error) error) (*pagination.SortedRun[impactRecord], error) {
-	dir, runBytes := e.scratchDir(), pagination.SortRunBytes(e.limits.FrontierBytes)
+	dir, runBytes := e.walkScratchDir(), pagination.SortRunBytes(e.limits.FrontierBytes)
 	pass1, err := pagination.NewExternalSort(dir, "graph-impact-fold-", 0,
 		encodeImpactRecord, decodeImpactRecord, lessByNode)
 	if err != nil {
