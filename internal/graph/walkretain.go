@@ -893,7 +893,7 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 	if n > model.MaxRelationsPerPath+1 {
 		return frontierState{}, levelCorrupt("an admitted state carries a route longer than a servable path")
 	}
-	fs.Route = make([]RelRef, 0, n)
+	// Nil, not empty, for a routeless state: see decodeLevelRecord.
 	for i := uint64(0); i < n; i++ {
 		fs.Route = append(fs.Route, RelRef(d.uvarint()))
 	}

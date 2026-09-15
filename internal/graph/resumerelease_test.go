@@ -25,9 +25,9 @@ import (
 //	the retry of a busy page was refused: CTX_CURSOR_INVALID
 //
 // It is injected on the PACKED reader rather than on the delivery adjacency:
-// the walk reads structure through GraphReader, so a failure on
-// Adjacency.Edges is a failure on a port the resumed page never calls and the
-// case would prove nothing.
+// the walk reads structure through GraphReader, so a failure on a delivery
+// method is a failure on a port the resumed page never calls and the case
+// would prove nothing.
 type busyOnceReader struct {
 	GraphReader
 	fail bool

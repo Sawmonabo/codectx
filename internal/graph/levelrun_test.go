@@ -54,8 +54,6 @@ func TestLevelRecordCodecRoundTripsEveryField(t *testing.T) {
 		RelID:   model.RelationID("00000000000000000000000000000000000000000000000000000000000000cc"),
 	}
 	assertNoZeroLevelField(t, "levelRecord", reflect.ValueOf(full))
-	assertNoZeroLevelField(t, "levelRecord.Owner", reflect.ValueOf(full.Owner))
-	assertNoZeroLevelField(t, "levelRecord.Edge", reflect.ValueOf(full.Edge))
 
 	for _, tc := range []struct {
 		name string
@@ -70,9 +68,6 @@ func TestLevelRecordCodecRoundTripsEveryField(t *testing.T) {
 			got, err := decodeLevelRecord(encodeLevelRecord(tc.in))
 			if err != nil {
 				t.Fatalf("decode: %v", err)
-			}
-			if tc.in.Owner.Route == nil && len(got.Owner.Route) == 0 {
-				got.Owner.Route = nil
 			}
 			if !reflect.DeepEqual(got, tc.in) {
 				t.Fatalf("round trip changed the record:\n got %+v\nwant %+v", got, tc.in)
@@ -120,11 +115,15 @@ func TestLevelRecordCodecRoundTripsEveryField(t *testing.T) {
 	}
 }
 
+// assertNoZeroLevelField fails when any field of v, at any depth, is still its
+// zero value, which is how the fixture above stays exhaustive as the record and
+// the structs inside it grow.
 func assertNoZeroLevelField(t *testing.T, path string, v reflect.Value) {
 	t.Helper()
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Type().Field(i)
 		if v.Field(i).Kind() == reflect.Struct {
+			assertNoZeroLevelField(t, path+"."+f.Name, v.Field(i))
 			continue
 		}
 		if v.Field(i).IsZero() {

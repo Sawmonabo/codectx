@@ -99,7 +99,10 @@ func decodeLevelRecord(b []byte) (levelRecord, error) {
 		if routeLen > model.MaxRelationsPerPath+1 {
 			return levelRecord{}, levelCorrupt("a level record carries a route longer than a servable path")
 		}
-		r.Owner.Route = make([]RelRef, 0, routeLen)
+		// A routeless state -- the seed level's shape -- comes back with a NIL
+		// route, not an empty one: the two are the same set of relations but
+		// not the same value, and a resumed frontier is compared against one
+		// the walk built in heap.
 		for i := uint64(0); i < routeLen; i++ {
 			r.Owner.Route = append(r.Owner.Route, RelRef(d.uvarint()))
 		}
@@ -352,7 +355,7 @@ func (c *levelCollector) finishSpilled(ctx context.Context, out *retainFile) err
 	}
 	defer sorter.Close()
 	if c.ceiling > 0 {
-		sorter = sorter.WithRunBytes(c.ceiling, func(r levelRecord) int64 {
+		sorter.WithRunBytes(c.ceiling, func(r levelRecord) int64 {
 			return retainFrameBytes + int64(len(encodeLevelRecord(r)))
 		})
 	}

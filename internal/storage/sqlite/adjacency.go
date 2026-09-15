@@ -112,10 +112,9 @@ func kindMarks(b *binder, kinds []model.RelationKind) (string, error) {
 // by relation id, in one round trip. It is the batched form of Relations: the
 // traversal calls it once per frontier, never once per node.
 //
-// The two semantics graph.Adjacency.Edges freezes hold here: an empty kinds
-// slice is "no kind filter", not "no rows", and a non-positive limit is a
-// typed argument error rather than an unbounded read. limit above
-// model.MaxPageItems is clamped to it.
+// Two semantics hold here: an empty kinds slice is "no kind filter", not "no
+// rows", and a non-positive limit is a typed argument error rather than an
+// unbounded read. limit above model.MaxPageItems is clamped to it.
 func (r *PinnedReader) EdgesBatch(ctx context.Context, nodes []model.NodeID, direction model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	query, args, err := r.edgesBatchQuery(ctx, nodes, direction, kinds, after, limit)

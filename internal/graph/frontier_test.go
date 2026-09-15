@@ -1262,13 +1262,13 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 }
 
 // slowReader is slowAdjacency's counterpart on the PACKED reader, and it is
-// where the fixture clock now advances: the walk reads structure through
-// GraphReader, so a clock driven by Adjacency.Edges never moved at all and
-// every deadline case silently became a case with no deadline.
+// where the fixture clock advances: the walk reads structure through
+// GraphReader, so a clock driven by a delivery read never moves at all and
+// every deadline case would silently be a case with no deadline.
 //
-// One packed scan covers a whole level, where the old reader made one round
-// trip per node chunk per keyset page of at most model.MaxPageItems rows, plus
-// the empty page that ended the keyset loop. A clock that ticked once per scan
+// One packed scan covers a whole level, where a keyset reader makes one round
+// trip per node chunk per page of at most model.MaxPageItems rows, plus the
+// empty page that ends the loop. A clock that ticked once per scan
 // would therefore be far coarser than the one these cases were calibrated
 // against, so a "round trip" here is one scan, one per adjacencyBatch entries
 // it delivers, and one for the scan's end -- the same granularity the old port
