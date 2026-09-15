@@ -182,7 +182,7 @@ is on this machine and is it still intact".
 codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
 codectx tools prefetch [--all | --for-repo PATH | NAME...] [--json]
                                                        # install ahead of time
-codectx tools verify [--json]                          # rehash every installed entry against the lock
+codectx tools verify [--json]                          # rehash every installed entry, and list what the lock does not name
 codectx tools gc [--json]                              # remove versions the current lock does not name
 ```
 
@@ -191,7 +191,14 @@ presence of its executable, and never rehashes, so it stays usable for a store
 holding the 1.8 GB engine. Each entry is reported in one of five states —
 `installed`, `available` (pinned but not fetched yet), `unsupported_platform`
 (the lock carries no payload here, which is honest absence and not a failure),
-`override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
+`override` (a `[tools.override.<name>]` replaces it) or `corrupt`. `verify`
+adds a sixth, `unlisted`: a payload directory the store holds that no lock entry
+names — a superseded entry a binary upgrade left behind, or a directory
+something else wrote. It carries no version and no digest, because nothing in
+this binary pins it. When a report has no installed entry at all, the human
+output says so on its last line and names `codectx tools prefetch`: verifying
+verifies what is installed, so an empty store is `ok` and exit 0, and the
+state counts alone would read as a clean bill of health.
 
 `prefetch` requires one of `--all`, `--for-repo PATH` or explicit names, so a
 bare invocation cannot start a multi-gigabyte download by accident. A name the
@@ -213,6 +220,12 @@ and nothing below the root is walked, so the work is bounded by the number of
 markers plus the entries of one directory rather than by the size of the
 repository. A root that selects nothing is an argument error rather than a
 silent no-op.
+
+`prefetch` also removes every payload directory the lock does not name — the
+`unlisted` rows of `verify`. Its post-condition is a store holding what this
+binary pins, and bytes no lock entry vouches for are not part of that. It leaves
+superseded **versions** of pinned tools alone; reclaiming those is `gc`'s job,
+because another workspace may still be resolving one.
 
 The root is the whole of what the command can see, and that is the planner's
 answer for two of the three providers but not the third:
