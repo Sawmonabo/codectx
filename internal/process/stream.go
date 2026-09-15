@@ -33,6 +33,15 @@ type streamPipe struct {
 	limitHit  chan struct{}
 	limitOnce sync.Once
 
+	// progress counts every byte the drain has read from the pipe, whether it
+	// was delivered, discarded past the limit, or written to a caller's sink.
+	// It is the stall detector's evidence that the child is alive, so it must
+	// count raw reads: delivered stops advancing once the limit is reached, and
+	// a stream pointed at io.Discard delivers nothing anyone can observe. It is
+	// atomic because the watchdog reads it while the drain runs; every other
+	// field here stays drain-only.
+	progress atomic.Int64
+
 	// delivered and truncated are written only by drain and read only after it
 	// has finished.
 	delivered int64
@@ -65,6 +74,7 @@ func (p *streamPipe) drain() {
 	for {
 		n, err := p.r.Read(buf)
 		if n > 0 {
+			p.progress.Add(int64(n))
 			remaining := p.limit - p.delivered
 			if remaining > 0 {
 				take := int64(n)
@@ -114,6 +124,10 @@ func (p *streamPipe) captured() ([]byte, int64) {
 }
 
 func (p *streamPipe) limited() bool { return p.truncated }
+
+// progressed reports the raw bytes read from the pipe so far. It is safe to
+// call while the drain is running, which is the only reason it exists.
+func (p *streamPipe) progressed() int64 { return p.progress.Load() }
 
 func (p *streamPipe) err() error { return p.failure }
 

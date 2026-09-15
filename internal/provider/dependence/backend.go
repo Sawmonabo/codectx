@@ -86,10 +86,12 @@ type ParseRequest struct {
 	// ExtraArgs is the neutral-option allowlist for a crash-confirmation
 	// rerun. It is empty on the first attempt.
 	ExtraArgs []string
-	// ReservationBytes is what the runner admits this child against and
-	// Timeout bounds it.
+	// ReservationBytes is what the runner admits this child against, Timeout
+	// bounds it (zero meaning no wall clock) and StallTimeout terminates it if
+	// it makes no observable progress for that long.
 	ReservationBytes int64
 	Timeout          time.Duration
+	StallTimeout     time.Duration
 }
 
 // ExportRequest is one export step. Export scales with the graph rather than
@@ -100,6 +102,7 @@ type ExportRequest struct {
 	HeapCapBytes     int64
 	ReservationBytes int64
 	Timeout          time.Duration
+	StallTimeout     time.Duration
 }
 
 // Outcome is what the backend observed in neutral terms. Class is empty when

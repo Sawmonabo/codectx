@@ -74,7 +74,12 @@ type Options struct {
 	// run directories live under.
 	DataDir string
 	// Timeout bounds one whole unit: materialize, parse, export and import.
+	// Zero is no wall-clock bound; StallTimeout catches a wedged unit instead.
 	Timeout time.Duration
+	// StallTimeout is the progress-based hang detector applied to every child
+	// this provider starts (providers.dependence.stall_timeout). Zero disables
+	// it.
+	StallTimeout time.Duration
 	// CacheBytes is the parsed-graph cache budget; 0 disables the cache.
 	CacheBytes int64
 	// UnitMemoryFloorBytes is the smallest heap cap a unit is given, and
@@ -116,8 +121,8 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	if backend == nil || importer == nil {
 		return nil, invalid("the dependence provider needs an engine backend and an export importer")
 	}
-	if opts.Timeout <= 0 {
-		return nil, invalid("the dependence provider needs a positive unit timeout")
+	if opts.Timeout < 0 || opts.StallTimeout < 0 {
+		return nil, invalid("the dependence provider's unit timeout and stall timeout may not be negative")
 	}
 	if err := opts.Limits.Validate(); err != nil {
 		return nil, err
@@ -266,7 +271,16 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink provider.Sink,
 	opts ImportOptions) (Report, error) {
 
-	ctx, cancel := context.WithTimeout(ctx, p.opts.Timeout)
+	// A zero timeout is no wall clock: a monorepo unit is large, not wedged,
+	// and the stall detector on every child is what catches a wedged one. The
+	// cancel is still installed so the unit's children are torn down when the
+	// caller gives up.
+	var cancel context.CancelFunc
+	if p.opts.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, p.opts.Timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 
 	unit, plan, err := p.unitFor(ctx, req)
@@ -545,7 +559,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 		return Outcome{}, err
 	}
 	out, err := p.backend.Parse(ctx, ParseRequest{SourceDir: source, OutputPath: graph, Family: unit.Family,
-		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout})
+		HeapCapBytes: res.HeapCapBytes, ExtraArgs: extra, ReservationBytes: res.ParseBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -578,7 +592,7 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		return ExportOutcome{}, err
 	}
 	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
-		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout})
+		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 	if err != nil {
 		return ExportOutcome{}, err
 	}
@@ -692,7 +706,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 			return ImportReport{}, err
 		}
 		exp, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
-			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout})
+			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
 			return ImportReport{}, err
 		}
@@ -817,11 +831,13 @@ func backendFailure(o Outcome) string {
 
 // remaining is the time left on the unit's deadline, or a typed timeout when
 // too little is left to start a step. Starting an analyzer with a second to live
-// wastes the second and reports a timeout anyway.
+// wastes the second and reports a timeout anyway. A unit with no deadline is
+// the configured unlimited case: every step is started with no wall clock and
+// bounded by its stall detector instead.
 func remaining(ctx context.Context) (time.Duration, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return 0, internalErr("the dependence unit ran without a deadline")
+		return 0, nil
 	}
 	left := time.Until(deadline)
 	if left < minStepTimeout {

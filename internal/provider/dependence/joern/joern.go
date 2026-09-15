@@ -201,7 +201,7 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 	args = append(args, req.ExtraArgs...)
 	args = append(args, req.SourceDir, "--output", req.OutputPath)
 	return stepOutcome(b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout))
 }
 
 // Export writes the graph out as the single Neo4j CSV export the importer
@@ -219,7 +219,7 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 	args := append([]string{}, e.ExportArgv[1:]...)
 	args = append(args, req.GraphPath, "--repr=all", "--format=neo4jcsv", "--out", req.OutputDir)
 	outcome, err := stepOutcome(b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout))
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout))
 	if err != nil {
 		return dependence.ExportOutcome{}, err
 	}
@@ -256,13 +256,13 @@ func stepOutcome(res process.Result, err error) (dependence.Outcome, error) {
 // engine emits at WARN, and a host environment that raised the level would
 // silence a definition-cap skip into a silent loss of data dependence.
 func (b *Backend) run(ctx context.Context, e dependence.Engine, path string, args []string, dir string,
-	heapCap, reservation int64, timeout time.Duration) (process.Result, error) {
+	heapCap, reservation int64, timeout, stallTimeout time.Duration) (process.Result, error) {
 
 	env := append([]string{}, e.Env...)
 	env = append(env, "JAVA_OPTS=-Xmx"+strconv.FormatInt(max(heapCap, 1<<20)/(1<<20), 10)+"m", "SL_LOGGING_LEVEL=WARN")
 	return b.runner.Run(ctx, process.Spec{Path: path, Args: args, Dir: dir, Env: env,
 		Stdout: io.Discard, MaxStdoutBytes: maxStdoutBytes, MaxStderrBytes: maxStderrBytes,
-		Timeout: timeout, Grace: grace, MemoryReservationBytes: reservation})
+		Timeout: timeout, StallTimeout: stallTimeout, Grace: grace, MemoryReservationBytes: reservation})
 }
 
 // probe reports whether the export carries any method rows at all, and its
