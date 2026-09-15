@@ -326,17 +326,27 @@ func (src *capsuleSource) coverage(ctx context.Context, e *capsuleEmitter) error
 // artifact, so the reasons come from the store's own append-only
 // coverage_waivers rows -- never from the Waive request that echoed them -- and
 // arrive in the store's file-id order, which is the capsule's canonical order.
+//
+// It pages by keyset like coverage and scope rather than reading the list
+// whole, so a session with a large waiver count costs one page of heap at seal
+// time and not a session-sized slice.
 func (src *capsuleSource) waivers(ctx context.Context, e *capsuleEmitter) error {
-	out, err := src.svc.sessions.Waivers(ctx, src.rec.ID, src.rec.ActorID)
-	if err != nil {
-		return err
-	}
-	for _, w := range out {
-		if err := e.emit(w); err != nil {
+	var after model.FileID
+	for {
+		rows, err := src.svc.sessions.WaiversAfter(ctx, src.rec.ID, src.rec.ActorID, after, src.svc.limits.MaxPageItems)
+		if err != nil {
 			return err
 		}
+		if len(rows) == 0 {
+			return nil
+		}
+		for _, w := range rows {
+			if err := e.emit(w); err != nil {
+				return err
+			}
+		}
+		after = rows[len(rows)-1].FileID
 	}
-	return nil
 }
 
 // facts streams one fact-bearing observation kind. Section 17.3 records a fact
