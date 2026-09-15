@@ -785,12 +785,12 @@ func (c *Compiler) logger() *slog.Logger {
 // buildPlan overwrites it unconditionally (the value the total order and the
 // persisted entry read). PathAtRank and PathFinal are those two values.
 //
-// FileMissing is the fact buildPlan learns from a `meta` lookup miss
-// (budget.go:249-252). A streamed P-G holds no such map, so the record that
+// FileMissing is the fact the whole-set buildPlan learns from a `meta` lookup
+// miss (stream_parity_test.go:433-436). A streamed P-G holds no such map, so the record that
 // observed the miss carries it.
 //
 // A batch-local byID is equivalent to today's whole-set one because every
-// producer of an excluded candidate (seeds.go:60,100,191) sets neither NodeID
+// producer of an excluded candidate (seeds.go:82,114,212) sets neither NodeID
 // nor FileID: Excluded implies FileID == "", so no excluded candidate can be
 // hydrated by a file row another batch requested. hydrateFiles' write-back over
 // ALL candidates is nevertheless reproduced below rather than narrowed to the

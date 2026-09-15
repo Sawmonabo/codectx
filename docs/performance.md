@@ -349,11 +349,11 @@ spilled-run count is the thing that grows:
 1.45, 1.62, 2.17, 2.37, 3.24 — increasing, not constant: the local exponent at
 the top of the measured range (8 000 → 16 000) is log₂ 3.24 ≈ **1.70**. The
 cause is the ranked-impact continuation in `internal/graph`, not the context
-compile's own sorts. `Engine.serveRankedImpact` (internal/graph/impact.go:378)
+compile's own sorts. `Engine.serveRankedImpact` (internal/graph/impact.go:388)
 serves each later page by opening the ranked spool FROM THE START — a spool
 cannot seek — and then copying every record after the page into a fresh spool
-(`nextRankedCursor` → `spillRanked`, impact.go:463/515, feeding
-`rankedSpoolSections`, walkrun.go:682). Each page therefore costs O(records
+(`nextRankedCursor` → `spillRanked`, impact.go:470/522, feeding
+`rankedSpoolSections`, walkrun.go:582). Each page therefore costs O(records
 remaining), so a walk of N entries read to exhaustion at a 200-row page costs
 Θ(N²/400) record reads and writes. A CPU profile of the 500/1 000/2 000 and
 4 000/8 000/16 000 runs attributes 0.69 s of the 1.13 s spent in
@@ -391,11 +391,11 @@ go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
 go test ./internal/context -run 'TestTheSeedSinkPeaks|TestACompileSortHolds' -count=1 -v
 CODECTX_SCALE_PROOF=1 go test ./internal/context \
-  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 40m
+  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 30m
 ```
 
 The two `internal/context` lines produce Section 3.3: the first its measured
-rows, the second the compile-level row that is still owed.
+rows, the second the compile-level rows of the same table.
 
 That block produces every row of Section 3 except three. Rows 9 and 13 need a
 cold index of the reference corpus, and row 16 needs a real workspace; both are
