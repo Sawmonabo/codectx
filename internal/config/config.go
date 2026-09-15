@@ -251,11 +251,12 @@ type Providers struct {
 }
 
 // Manifest configures the build-metadata and documentation provider of
-// Section 11.2. Both bounds are how much of one manifest the user wants
-// indexed; neither has a default, because how many dependencies a manifest
-// declares is a property of the repository. A manifest is parsed as a whole
-// file whose size workspace.max_parse_file_bytes already bounds, so an
-// unlimited list bound costs one file's heap, never the repository's.
+// Section 11.2. All four bounds are how much of one manifest the user wants
+// indexed -- two over the lists it declares, two over the parse that reads
+// them -- and none has a default, because how much a manifest declares is a
+// property of the repository. A manifest is parsed as a whole file whose size
+// workspace.max_parse_file_bytes already bounds, so leaving all four
+// unlimited costs one file's heap, never the repository's.
 type Manifest struct {
 	// MaxDependencies is how many dependencies the user wants one manifest to
 	// declare. Unlimited by default; a user-set value that is crossed cuts
