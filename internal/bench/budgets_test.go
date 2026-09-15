@@ -67,13 +67,14 @@ import (
 var corpusSmallReal = corpusSpec{Packages: 40, Seed: 2101}
 
 // corpusOver200Files is obligation 7's shape and nothing else: 364 files. The
-// number that has to clear the 200-record page is the count of files the
-// SESSION requires, not the count in the repository, and a plan over this
-// generator selects roughly three fifths of the tree -- 214 files yielded a
-// 131-file session, which would have exercised nothing. This repository cannot
-// prove the clamp either, for the same reason, which is why the shape is
-// generated rather than borrowed.
-var corpusOver200Files = corpusSpec{Packages: 70, Seed: 2102}
+// count that has to clear the 200-record page is the SESSION's file count, not
+// the repository's, and neither one plan nor one repository size reaches it --
+// a plan over this generator saturates at ~161 files however large the tree is
+// (lane T21-L2), so the session is grown through `context include` instead. The
+// repository still has to be large enough to hold a 200-file session with room
+// above it, which this repository and the 214-file shape are not: 3*120+4 files
+// leave the gate clear of its own fixture's ceiling.
+var corpusOver200Files = corpusSpec{Packages: 120, Seed: 2102}
 
 // corpusReference is the Section 23.1 reference fixture: 10,000 files. It is
 // the VERIFY lane's workload, never a lane's -- the cold-index row alone has a
@@ -821,31 +822,168 @@ func TestLowMemoryProfile(t *testing.T) {
 //
 // Failure mode it protects: a large session's status reads as complete when it
 // was truncated, so an actor consolidates on a coverage picture that is missing
-// files nobody told it about.
+// files nobody told it about. Store.Coverage runs its limit through pageLimit,
+// which SILENTLY clamps anything above model.MaxPageItems instead of rejecting
+// it, so a Status that asked for the ceiling could never see the probe record
+// that proves there is another page -- every file past the first 200 would
+// vanish with no cursor and no truncation notice.
 //
-// IT IS NOT MET, and the skip says so rather than passing. What was measured,
-// so the next lane does not repeat it: the count that has to clear the
-// 200-record page is the SESSION's required files, and a plan over this
-// generator saturates well below it however large the repository is --
-// 131 required at 214 repository files, 152 at 364, 161 at 724, 158 at 1204,
-// with context.default_max_files raised to 400 and the slice budget raised to
-// match. Widening the seed set does not move it either: the scope walk reaches
-// one symbol per package and stops, and adding 63 disjoint Python file paths as
-// seeds took the session from 161 to 163, because a path seed resolves a file
-// but no symbol (the wave-e VF2 F2 finding) and does not become required on its
-// own. What remains is to grow the required set through the session itself --
-// `context include` over further manifests -- which is a workflow route this
-// lane does not own the budget to build. The shape below is still the one the
-// row needs; the session over it is what is missing.
+// What the row counts, and why. The clamp governs the SESSION FILE count, not
+// the required-full count: Store.Coverage pages session_files with no
+// requirement predicate, while SessionStatus.RequiredFiles is
+// coverageSummarySQL's required_full-only aggregate. Both are logged below;
+// only the paged total is gated.
+//
+// How the session gets past 200. A single plan cannot do it -- lane T21-L2
+// measured a plan over this generator saturating at ~161 files (131 required at
+// 214 repository files, 152 at 364, 161 at 724, 158 at 1204), because the scope
+// walk reaches one symbol per package and stops, and a path seed resolves a
+// file but no symbol. The session itself is what grows: `context include`
+// recompiles over further seeds under the session's own budget and unions the
+// result into session_files (sessionFilesSQL is INSERT OR IGNORE), so disjoint
+// batches of per-package symbols accumulate. That is the route this row takes.
 func TestSessionStatusClamp(t *testing.T) {
 	if testing.Short() {
 		t.Skip("synthetic >200-file session; run without -short")
 	}
+	ctx := context.Background()
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	generateCorpus(t, repo, corpusOver200Files)
 	t.Logf("shape: %d packages -> %d files (seed %d)",
 		corpusOver200Files.Packages, 3*corpusOver200Files.Packages+4, corpusOver200Files.Seed)
-	t.Skip("UNMET obligation 7: a plan over the generated corpus saturates at ~161 required files " +
-		"(measured at 214/364/724/1204 repository files), so the >200-record page is never reached; " +
-		"reaching it needs the session grown through `context include`, not a larger corpus")
+
+	// Its own workspace, not the shared fixture: that one is corpusSmallReal
+	// (124 files) and cannot hold a 200-file session at all. Unlike the shared
+	// fixture this workspace does not outlive the row, so its close IS
+	// registered -- the lock and the handle are released here.
+	svc, _, closeWorkspace := openWorkspace(t, ctx, repo, filepath.Join(t.TempDir(), "home"), "")
+	t.Cleanup(closeWorkspace)
+
+	// One symbol per package per language -- the widest disjoint seed set the
+	// corpus offers, one per source file. The names are constructed from the
+	// generator's own naming rule rather than discovered: a workspace-symbol
+	// query cannot enumerate them, because the prefix tier matches the
+	// PACKAGE-QUALIFIED name (search/exact.go) and one bounded page could not
+	// carry 3*120 symbols in any case. The first name is resolved below so a
+	// generator whose naming drifted fails here and not as a mystery shortfall.
+	var seeds []string
+	for p := range corpusOver200Files.Packages {
+		for _, infix := range []string{"Go", "Py", "Ts"} {
+			seeds = append(seeds, fmt.Sprintf("%s%sRun%02d", corpusPrefix, infix, p))
+		}
+	}
+	probe, err := svc.Symbol(ctx, model.SymbolRequest{Query: seeds[0],
+		Operation: model.SymbolWorkspaceSymbols, SemanticSource: model.SemanticCanonical})
+	if err != nil {
+		t.Fatalf("workspace symbols %q: %v", seeds[0], err)
+	}
+	if len(probe.Items) == 0 {
+		t.Fatalf("the corpus produced no symbol named %q, so the seed set names nothing", seeds[0])
+	}
+
+	// The session's own budget, raised once at plan time because include.go
+	// compiles every later manifest under the CURRENT manifest's budget: a
+	// planBudget-sized ceiling (200 files) would refuse with CTX_MINIMUM_BUDGET
+	// exactly as the session approached the page it exists to exercise.
+	budget := model.Budget{MaxFiles: 500, MaxSlices: 128,
+		MaxBytes: planBudget.MaxBytes, MaxEstimatedTokens: planBudget.MaxEstimatedTokens}
+	// Batches are disjoint and small: sessionFilesSQL is INSERT OR IGNORE, so a
+	// repeated package adds nothing, and one batch's walk must stay inside the
+	// budget above.
+	const batch = 24
+	actor := fmt.Sprintf("clamp-%d", os.Getpid())
+	var plan model.PlanResult
+	var status model.SessionStatus
+	plan, status, err = svc.Plan(ctx, model.PlanRequest{ActorID: actor,
+		Context: model.ContextRequest{Task: "exercise the >200-file session status page",
+			Seeds: seeds[:batch], Phase: model.PhaseSweep, Budget: budget}})
+	if err != nil {
+		t.Fatalf("context plan: %v", err)
+	}
+	session := model.SessionRequest{SessionID: plan.SessionID, ActorID: actor}
+	total := countCoverage(t, ctx, svc, session)
+	t.Logf("plan over %d seeds: %d session files, %d required", batch, total, status.RequiredFiles)
+
+	// Grown until BOTH counts clear the page: the gate is on the session file
+	// count, which is what Store.Coverage pages and statusLimit governs, but
+	// carrying the required-full count past 200 as well means the row exercises
+	// the clamp over a session that is oversized by either reading of it.
+	grown := func() bool { return total > model.MaxPageItems && int(status.RequiredFiles) > model.MaxPageItems }
+	for from := batch; from < len(seeds) && !grown(); from += batch {
+		to := min(from+batch, len(seeds))
+		status, err = svc.Include(ctx, model.IncludeRequest{SessionID: plan.SessionID, ActorID: actor,
+			Seeds: seeds[from:to], ExpectedVersion: status.StateVersion})
+		if err != nil {
+			t.Fatalf("context include [%d:%d]: %v", from, to, err)
+		}
+		total = countCoverage(t, ctx, svc, session)
+		t.Logf("after include [%d:%d]: %d session files, %d required, scope version %d",
+			from, to, total, status.RequiredFiles, status.ScopeVersion)
+	}
+	if !grown() {
+		t.Fatalf("the session grew to %d files (%d required) over %d seeds, which never clears the %d-record page",
+			total, status.RequiredFiles, len(seeds), model.MaxPageItems)
+	}
+
+	// The two halves of the invariant, on the first page of a session that is
+	// larger than the page: the clamp is APPLIED (the page stays strictly under
+	// the ceiling, which is what leaves room for the probe record) and it is
+	// REPORTED (a cursor the caller can actually continue from).
+	page, _, err := svc.SessionStatus(ctx, session, model.PageRequest{})
+	if err != nil {
+		t.Fatalf("context status: %v", err)
+	}
+	if len(page.Items) >= model.MaxPageItems {
+		t.Errorf("the first page of a %d-file session carries %d records; the clamp must keep it under %d "+
+			"so the probe record can prove there is another page", total, len(page.Items), model.MaxPageItems)
+	}
+	if page.Meta.NextCursor == "" {
+		t.Fatalf("the first page of a %d-file session carries %d records and no cursor (truncated=%v, reason=%q): "+
+			"the remaining files are unreachable and nothing said so",
+			total, len(page.Items), page.Meta.Truncated, page.Meta.TruncationReason)
+	}
+	t.Logf("clamp: %d-file session, first page %d records, cursor issued; required %d",
+		total, len(page.Items), status.RequiredFiles)
+}
+
+// countCoverage walks every page of a session's coverage and returns the record
+// count. The walk is bounded: a cursor that never terminates is itself the
+// silent-loss failure this row exists to catch, so it is reported rather than
+// looped on.
+func countCoverage(t *testing.T, ctx context.Context, svc *app.Services, req model.SessionRequest) int {
+	t.Helper()
+	const maxPages = 16
+	total, cursor := 0, ""
+	for page := 0; ; page++ {
+		if page == maxPages {
+			t.Fatalf("session coverage did not end in %d pages (%d records so far)", maxPages, total)
+		}
+		got, _, err := svc.SessionStatus(ctx, req, model.PageRequest{Cursor: cursor})
+		if err != nil {
+			t.Fatalf("context status page %d: %v", page, err)
+		}
+		total += len(got.Items)
+		if got.Meta.Truncated {
+			t.Fatalf("session coverage page %d is truncated with no way to continue: %s",
+				page, got.Meta.TruncationReason)
+		}
+		if got.Meta.NextCursor == "" {
+			// A last page that fills the ceiling exactly is the silent loss
+			// this row exists to catch: the store clamps a limit above
+			// model.MaxPageItems instead of rejecting it, so a full page with
+			// no cursor cannot be distinguished from a complete one and any
+			// further file is unreachable with nothing said about it.
+			if len(got.Items) >= model.MaxPageItems {
+				t.Fatalf("coverage page %d carries the full %d-record ceiling and no cursor, so it cannot be "+
+					"continued; %d records read", page, model.MaxPageItems, total)
+			}
+			return total
+		}
+		cursor = got.Meta.NextCursor
+	}
 }
 
 // --- the published benchmarks ----------------------------------------------
