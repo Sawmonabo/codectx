@@ -154,7 +154,12 @@ The grace window is `retention.blob_grace`, a bounded duration defaulting to
 `24h`. It trades disk against the cost of losing bytes an in-flight answer still
 cites; shortening it reclaims sooner and narrows that safety margin. A
 non-positive value is refused by configuration validation, so the window can be
-tuned but never switched off.
+tuned but never switched off. It doubles as the cadence of the collector's CAS
+orphan sweep: that sweep walks every bucket of the content-addressed store, so
+it runs at most once per window instead of on every published generation. The
+cadence delays the walk, it never bounds it -- each run reclaims every orphan
+past the window, and a data directory whose last-sweep stamp is missing or
+unreadable sweeps on the next pass.
 
 ### What is *not* collected automatically
 
