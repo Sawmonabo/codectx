@@ -58,15 +58,17 @@ func New(t *testing.T, files map[string]string) *Harness {
 	dir := t.TempDir()
 	repoDir := filepath.Join(dir, "repo")
 	dataDir := filepath.Join(dir, "data")
-	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { store.Close() })
 	cas, err := snapshot.OpenCAS(snapshot.CASDir(dataDir))
 	if err != nil {
 		t.Fatalf("OpenCAS: %v", err)
 	}
+	// The store re-indexes carried lexical documents through the content
+	// store's range reader: the database keeps no body (ADR-0003 §2.1).
+	store, err := sqlite.Open(ctx, filepath.Join(dataDir, "codectx.db"), sqlite.Options{Content: cas})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
 	pool, err := provider.NewPool(4 * Limits.BatchBytes)
 	if err != nil {
 		t.Fatal(err)

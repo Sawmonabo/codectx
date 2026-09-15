@@ -678,8 +678,10 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 }
 
 // PutSearchUnits stores lexical documents and their FTS index rows in the same
-// transaction. The FTS insert is explicit: the external-content table is never
-// maintained by cascade or by row counts (Section 12.2).
+// transaction. The FTS insert is explicit: search_fts is contentless
+// (ADR-0003 §2.1), so nothing maintains it by cascade or by row counts and the
+// body text reaches the index from this document and nowhere else -- the
+// database keeps no second copy of it (Section 12.2).
 //
 // token_count is computed here with the index's own unicode61 tokenizer over
 // exactly the columns search_fts indexes, so the Section 12.4 length
@@ -706,8 +708,8 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	var inserted int64
 	err = w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count)
+				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
@@ -728,7 +730,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 					}
 				}
 				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
-					int64(d.Bytes.Start), int64(d.Bytes.End), d.Body, tokenCounts[i])
+					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i])
 				if err != nil {
 					return err
 				}
