@@ -68,11 +68,13 @@ var searchColumns = map[string]SearchColumn{
 // No body appears because none is stored (ADR-0003 §2.1): Section 14.2 forbids
 // source bodies in generic results, and a body would also dominate the memory
 // one hydrated page costs.
-const searchDocumentColumns = `su.rowid, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
+const searchDocumentColumns = `su.doc_id, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
 	su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count`
 
 // visibleDocument restricts a search_units alias to the pinned generation
-// without joining units. It is the EXISTS form Match already uses: the planner
+// without joining units. It is also what keeps a doc_id single-valued: a
+// posting shared along a carry chain has one row per unit of that chain, and
+// only one of them is a member of any generation. It is the EXISTS form Match already uses: the planner
 // then drives the query from its own most selective index (the FTS index, the
 // files unique index, the vocabulary) and probes membership per candidate,
 // instead of walking every unit of the generation first.
@@ -210,7 +212,7 @@ func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([
 	// One statement for every term: a per-term round trip would be N+1 against
 	// the vocabulary, which is the largest table a query touches.
 	query := `SELECT v.term, count(DISTINCT v.doc) FROM search_vocab v
-		JOIN search_units su ON su.rowid = v.doc
+		JOIN search_units su ON su.doc_id = v.doc
 		WHERE v.term IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su") + `GROUP BY v.term`
 	counts := make(map[string]int64, len(terms))
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
@@ -259,7 +261,7 @@ func (r *PinnedReader) TermOccurrences(ctx context.Context, term string, after i
 	// frequent term costs one sort per page: measured at 41 pages / 105 ms for
 	// df 7796 on the proof store, against a 10 s query timeout.
 	query := `SELECT v.doc, v.col, v.offset FROM search_vocab v
-		JOIN search_units su ON su.rowid = v.doc
+		JOIN search_units su ON su.doc_id = v.doc
 		WHERE v.term = ?2 AND v.doc > ?3` + r.visibleDocument("su") + `ORDER BY v.doc, v.col, v.offset`
 	var out []TermOccurrence
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
@@ -325,7 +327,7 @@ func (r *PinnedReader) SearchDocuments(ctx context.Context, rowids []int64) ([]S
 	}
 	query := `SELECT ` + searchDocumentColumns + ` FROM search_units su
 		LEFT JOIN node_ids ni ON ni.id = su.node_id
-		WHERE su.rowid IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su")
+		WHERE su.doc_id IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su")
 	byRowID := make(map[int64]SearchDocument, len(rowids))
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, query, args...)

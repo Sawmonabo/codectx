@@ -109,8 +109,9 @@ func (s *Store) Recover(ctx context.Context, now time.Time) error {
 // index is internally consistent, not that it agrees with a stored copy of the
 // text -- there is no stored copy, and the text's own authority is the content
 // store, which verifies every block digest on read. Document membership is
-// still checked both ways: the FTS rowid space is search_units.rowid, and the
-// vocabulary scan below reports any indexed document whose row is gone.
+// still checked both ways: a posting is named by search_units.doc_id -- which a
+// delta carry-over shares along a carry chain, so several rows may name one --
+// and the vocabulary scan below reports any indexed document no row names.
 func (s *Store) Check(ctx context.Context, deep bool) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var result string
@@ -133,10 +134,11 @@ func (s *Store) Check(ctx context.Context, deep bool) error {
 					Remediation: "rebuild the cache with index --rebuild"}
 			}
 			// integrity-check inspects only the index's own structures; it cannot
-			// report index entries whose search_units row is gone. The vocabulary table
+			// report index entries no search_units row names. The vocabulary table
 			// enumerates every indexed instance, so a stale document shows up here.
+			// idx_search_doc serves the probe.
 			var stale int64
-			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.rowid = v.doc)`).Scan(&stale); err != nil {
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_vocab v WHERE NOT EXISTS (SELECT 1 FROM search_units su WHERE su.doc_id = v.doc)`).Scan(&stale); err != nil {
 				return wrap("search_vocab", err)
 			}
 			if stale != 0 {
