@@ -84,13 +84,10 @@ type checkpointScalars struct {
 	ScopeComplete    bool                    `json:"scope_complete"`
 	ReasonsDropped   int64                   `json:"reasons_dropped,omitempty"`
 	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
-	// AttrsComplete is P-C's edge-scan verdict. It is carried rather than
-	// recomputed because P-C does not run again on the resumed call.
-	AttrsComplete bool `json:"attrs_complete,omitempty"`
 }
 
 // checkpointVersion is the on-disk shape of a compile's continuation state.
-const checkpointVersion = 1
+const checkpointVersion = 2
 
 // checkpointFile is state.json's name inside the state directory. It does not
 // collide with pagination's own header file, which the adoption writes beside
@@ -222,10 +219,10 @@ func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T)
 // The restored sort is registered with the compile's sort area, so the merged
 // output is removed on every exit path exactly as a freshly computed run is.
 func restoreRun[T any](s *compileSorts, dir, name string, runs []string,
-	compare func(a, b T) int,
+	compare func(a, b T) int, sizeOf func(T) int64,
 ) (*pagination.SortedRun[T], error) {
-	sorter, err := restoreSort(s, dir, name, runs, compare)
-	if err != nil || sorter == nil {
+	sorter, err := restoreSort(s, dir, name, runs, compare, sizeOf)
+	if err != nil {
 		return nil, err
 	}
 	return sortedRun(s, sorter)
@@ -235,13 +232,16 @@ func restoreRun[T any](s *compileSorts, dir, name string, runs []string,
 // resuming pass drives to completion itself. The caller re-attaches the exact
 // fold the interrupted sort carried, with WithFold, before handing it on.
 //
-// An empty run list answers a nil sort, which is the round trip of a carry slot
-// that was not live at the checkpointed boundary.
+// An empty run list answers an EMPTY sort and never a nil one. A stream that
+// held no record spills no run, so "no files" is the honest encoding of an
+// empty stream -- and pagination.SortedRun.Each reads a nil run as an empty one
+// without complaint (extsort.go:662), so answering nil here would turn a
+// restore that lost a stream into a plan that is silently short of it.
 func restoreSort[T any](s *compileSorts, dir, name string, runs []string,
-	compare func(a, b T) int,
+	compare func(a, b T) int, sizeOf func(T) int64,
 ) (*pagination.ExternalSort[T], error) {
 	if len(runs) == 0 {
-		return nil, nil
+		return newSort(s, "restored-"+name, compare, sizeOf)
 	}
 	abs, err := absoluteRuns(dir, runs)
 	if err != nil {
@@ -316,30 +316,247 @@ func moveRuns(dir, name string, runs []string) ([]string, error) {
 // The Compile-side half of ruling C7: WHEN a compile stops, what it writes at
 // that boundary, and how the call after it comes back.
 //
-// There is exactly ONE checkpointed boundary, between P-F and P-G. It is the
-// boundary where the expansion, the ranking and every stream the budget half
-// reads are complete, where nothing has been persisted, and where the carry is
-// three already-merged, already-folded sorted runs plus a bounded scalar
-// record. A deadline at any other boundary still ends the call as the error it
-// was before ruling C7: the compiler never checks a deadline at a boundary it
-// cannot checkpoint, because a stop it cannot resume is a lost compile and not
-// a continuation.
-
-// checkpointPassBudget is the pass index the boundary's checkpoint records and
-// a resuming call re-enters at: the budget half, P-G.
-const checkpointPassBudget = 7
-
-// stream names inside a checkpoint. They are the state file's keys, so they are
-// constants rather than literals at two call sites.
+// EVERY pass boundary is a checkpoint. A compile that runs out of deadline
+// between any two passes persists what the passes it finished produced, records
+// the index of the first unfinished pass and answers a continuation cursor; the
+// next call restores exactly those streams and re-enters the pipeline there. A
+// deadline is therefore never a lost compile, whichever pass it lands behind --
+// which is the whole of ruling C7 and not the single boundary C-D3 could reach.
+//
+// The pass indices are the plan's P-A..P-I in order. A checkpoint's Pass is the
+// FIRST UNFINISHED pass, so the boundary behind P-A is passHydrate and the last
+// boundary a compile can stop at is passEmit: P-I finishes the plan in the call
+// that runs it, so there is no boundary behind it.
 const (
-	streamRanked = "ranked"
-	streamPaths  = "kept-path"
-	streamHops   = "kept-hop"
+	passIngest     = 1 // P-A
+	passHydrate    = 2 // P-B
+	passAttributes = 3 // P-C
+	passRoutes     = 4 // P-D
+	passCentrality = 5 // P-E
+	passBoosts     = 6 // P-F
+	passMeasure    = 7 // P-G
+	passPack       = 8 // P-H
+	passEmit       = 9 // P-I
 )
 
+// stream names inside a checkpoint. They are the state file's keys, so they are
+// constants rather than literals at the checkpoint and restore call sites.
+const (
+	streamCands     = "cands"
+	streamHydrated  = "hydrated"
+	streamRoutes    = "route-path"
+	streamHops      = "route-hop"
+	streamScored    = "scored"
+	streamCounts    = "pkg-count"
+	streamKeptPaths = "kept-path"
+	streamKeptHops  = "kept-hop"
+	streamEdges     = "pkg-edge"
+	streamRanked    = "ranked"
+	streamByFile    = "by-file"
+	streamGroups    = "groups"
+	streamExcluded  = "excluded"
+	streamMeasPaths = "measured-path"
+	streamMeasHops  = "measured-hop"
+	streamVerdicts  = "verdicts"
+)
+
+// passStreams answers the streams a checkpoint taken at boundary `pass` carries
+// -- exactly the live carry the pass named there reads, and nothing else.
+//
+// It is ONE table driving both directions: the checkpoint writes exactly these
+// names and refuses a slot the boundary should have live but does not, and the
+// restore requires exactly these names to be present. Without it a state file
+// that lost a stream would restore a nil run, which pagination.SortedRun.Each
+// reads as an EMPTY stream without complaint -- a wrong plan with no error, the
+// same failure class this file's header warns about for a divergent fold.
+//
+// An unknown pass answers no streams, which the caller reports as a boundary
+// this build does not resume.
+func passStreams(pass int) []string {
+	switch pass {
+	case passHydrate:
+		return []string{streamCands, streamRoutes, streamHops}
+	case passAttributes:
+		return []string{streamCands, streamHydrated, streamRoutes, streamHops}
+	case passRoutes:
+		return []string{streamHydrated, streamRoutes, streamHops}
+	case passCentrality:
+		return []string{streamScored, streamKeptPaths, streamKeptHops, streamEdges}
+	case passBoosts:
+		return []string{streamScored, streamCounts, streamKeptPaths, streamKeptHops}
+	case passMeasure:
+		return []string{streamRanked, streamKeptPaths, streamKeptHops}
+	case passPack:
+		return []string{streamByFile, streamGroups, streamExcluded, streamMeasPaths, streamMeasHops}
+	case passEmit:
+		return []string{streamByFile, streamGroups, streamExcluded, streamMeasPaths, streamMeasHops,
+			streamVerdicts}
+	default:
+		return nil
+	}
+}
+
+// missingStream is the internal refusal of a boundary whose carry is not what
+// passStreams says it is. It is an invariant of this package and not a data
+// condition, so it is CTX_INTERNAL rather than an expired continuation.
+func missingStream(name string) error {
+	return &model.Error{Code: model.CodeInternal,
+		Message: "context checkpoint: the boundary has no " + name + " stream"}
+}
+
+// cpRun is checkpointRun with the boundary's own liveness check: a stream
+// passStreams lists must be live, because an absent one and an EMPTY one both
+// checkpoint as no files and only this check tells them apart.
+func cpRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T],
+	compare func(a, b T) int, sizeOf func(T) int64,
+) ([]string, error) {
+	if run == nil {
+		return nil, missingStream(name)
+	}
+	return checkpointRun(dir, name, runBytes, run, compare, sizeOf)
+}
+
+// checkpointStream persists ONE named stream of st into dir. The two-class rule
+// at the top of this file is applied here, at the call site, which is why this
+// is a switch over names rather than a loop over an interface: streamEdges is
+// the compile's one PRE-fold carry and is the only case that uses
+// checkpointSort.
+func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]string, error) {
+	switch name {
+	case streamCands:
+		return cpRun(dir, name, runBytes, st.cands, lessCandSeq, sizeOfCand)
+	case streamHydrated:
+		return cpRun(dir, name, runBytes, st.hydrated, lessCandSeq, sizeOfCand)
+	case streamRoutes:
+		return cpRun(dir, name, runBytes, st.paths, lessPathSeq, sizeOfPath)
+	case streamHops:
+		return cpRun(dir, name, runBytes, st.hops, lessHopSeq, sizeOfHop)
+	case streamScored:
+		return cpRun(dir, name, runBytes, st.scored, lessScoredPkg, sizeOfScored)
+	case streamCounts:
+		return cpRun(dir, name, runBytes, st.counts, lessPkg, sizeOfPkgCount)
+	case streamKeptPaths:
+		return cpRun(dir, name, runBytes, st.keptPaths, lessPathSeq, sizeOfPath)
+	case streamKeptHops:
+		return cpRun(dir, name, runBytes, st.keptHops, lessHopSeq, sizeOfHop)
+	case streamEdges:
+		// The one PRE-fold carry: P-D has finished writing it but P-E has not
+		// merged it, so it is detached as it stands and restored with
+		// foldPkgEdgeDistinct re-attached.
+		if st.edges == nil {
+			return nil, missingStream(name)
+		}
+		return checkpointSort(dir, name, st.edges)
+	case streamRanked:
+		return cpRun(dir, name, runBytes, st.ranked, lessRank, sizeOfCand)
+	case streamByFile:
+		return cpRun(dir, name, runBytes, st.measuredRun(name), lessFileIndex, sizeOfCand)
+	case streamGroups:
+		if st.measured == nil {
+			return nil, missingStream(name)
+		}
+		return cpRun(dir, name, runBytes, st.measured.Groups, lessGroupIndex, sizeOfGroup)
+	case streamExcluded:
+		return cpRun(dir, name, runBytes, st.measuredRun(name), lessCandSeq, sizeOfCand)
+	case streamMeasPaths:
+		if st.measured == nil {
+			return nil, missingStream(name)
+		}
+		return cpRun(dir, name, runBytes, st.measured.Paths, lessPathSeq, sizeOfPath)
+	case streamMeasHops:
+		if st.measured == nil {
+			return nil, missingStream(name)
+		}
+		return cpRun(dir, name, runBytes, st.measured.Hops, lessHopSeq, sizeOfHop)
+	case streamVerdicts:
+		if st.packed == nil {
+			return nil, missingStream(name)
+		}
+		return cpRun(dir, name, runBytes, st.packed.Verdicts, lessVerdict, sizeOfVerdict)
+	default:
+		return nil, missingStream(name)
+	}
+}
+
+// measuredRun answers one of the two candRec streams of a measured plan, or nil
+// when P-G has not run: the two share a record type, so one helper serves both
+// and cpRun's own nil check reports the absent measurement.
+func (st *compileState) measuredRun(name string) *pagination.SortedRun[candRec] {
+	if st.measured == nil {
+		return nil
+	}
+	if name == streamByFile {
+		return st.measured.ByFile
+	}
+	return st.measured.Excluded
+}
+
+// restoreStream adopts ONE named stream back into st. It mirrors
+// checkpointStream case for case; streamEdges is the one that re-attaches its
+// fold, because it is the one that was checkpointed PRE-fold.
+func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []string) error {
+	var err error
+	switch name {
+	case streamCands:
+		st.cands, err = restoreRun(s, dir, name, files, lessCandSeq, sizeOfCand)
+	case streamHydrated:
+		st.hydrated, err = restoreRun(s, dir, name, files, lessCandSeq, sizeOfCand)
+	case streamRoutes:
+		st.paths, err = restoreRun(s, dir, name, files, lessPathSeq, sizeOfPath)
+	case streamHops:
+		st.hops, err = restoreRun(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamScored:
+		st.scored, err = restoreRun(s, dir, name, files, lessScoredPkg, sizeOfScored)
+	case streamCounts:
+		st.counts, err = restoreRun(s, dir, name, files, lessPkg, sizeOfPkgCount)
+	case streamKeptPaths:
+		st.keptPaths, err = restoreRun(s, dir, name, files, lessPathSeq, sizeOfPath)
+	case streamKeptHops:
+		st.keptHops, err = restoreRun(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamEdges:
+		var sorter *pagination.ExternalSort[pkgEdgeRec]
+		sorter, err = restoreSort(s, dir, name, files, lessPkgEdge, sizeOfPkgEdge)
+		if err == nil {
+			// Re-attached, and this is the line the whole two-class rule is
+			// about: without it P-E counts a (package, relation) pair once per
+			// route that reached it and every centrality boost inflates.
+			st.edges = sorter.WithFold(foldPkgEdgeDistinct)
+		}
+	case streamRanked:
+		st.ranked, err = restoreRun(s, dir, name, files, lessRank, sizeOfCand)
+	case streamByFile:
+		st.ensureMeasured().ByFile, err = restoreRun(s, dir, name, files, lessFileIndex, sizeOfCand)
+	case streamGroups:
+		st.ensureMeasured().Groups, err = restoreRun(s, dir, name, files, lessGroupIndex, sizeOfGroup)
+	case streamExcluded:
+		st.ensureMeasured().Excluded, err = restoreRun(s, dir, name, files, lessCandSeq, sizeOfCand)
+	case streamMeasPaths:
+		st.ensureMeasured().Paths, err = restoreRun(s, dir, name, files, lessPathSeq, sizeOfPath)
+	case streamMeasHops:
+		st.ensureMeasured().Hops, err = restoreRun(s, dir, name, files, lessHopSeq, sizeOfHop)
+	case streamVerdicts:
+		var run *pagination.SortedRun[packVerdict]
+		run, err = restoreRun(s, dir, name, files, lessVerdict, sizeOfVerdict)
+		if err == nil {
+			st.packed = &packedPlan{Verdicts: run}
+		}
+	default:
+		return missingStream(name)
+	}
+	return err
+}
+
+// ensureMeasured opens the measured carry the back-half boundaries restore into.
+func (st *compileState) ensureMeasured() *measuredPlan {
+	if st.measured == nil {
+		st.measured = &measuredPlan{}
+	}
+	return st.measured
+}
+
 // deadlineReached reports whether ctx has nothing left to spend. It is checked
-// only at a checkpointed boundary, where a true answer means "stop and
-// continue" rather than "fail".
+// at every pass boundary, where a true answer means "stop and continue" rather
+// than "fail".
 //
 // The question is asked of the COMPILER'S clock (Options.Now, the same one the
 // manifest is stamped from) and not of time.Now, so that "the deadline fired at
@@ -369,6 +586,11 @@ type resumedHalf struct {
 // state file's own pass and request hash are re-checked against the token's:
 // the two are written at the same instant, and a disagreement means the
 // directory is not the one the token was minted for.
+//
+// ANY pass boundary is accepted: passStreams is what decides whether this build
+// knows the boundary, and a pass it has no stream table for is an expired
+// continuation rather than a compile failure, exactly as a state file from
+// another build is.
 func (c *Compiler) openResumed(ctx context.Context, token string, b model.Binding, requestHash string) (*resumedHalf, error) {
 	cur, dir, err := c.resumeState(ctx, token, b, requestHash)
 	if err != nil {
@@ -381,89 +603,87 @@ func (c *Compiler) openResumed(ctx context.Context, token string, b model.Bindin
 	if st.Pass != cur.Pass || st.RequestHash != requestHash {
 		return nil, cursorExpired("the continuation state does not belong to this cursor")
 	}
-	if st.Pass != checkpointPassBudget {
+	if len(passStreams(st.Pass)) == 0 {
 		return nil, cursorExpired("the continuation state was written at a boundary this build does not resume")
 	}
 	return &resumedHalf{Cursor: cur, Dir: dir, State: st}, nil
 }
 
-// checkpointHalf writes the P-F boundary's carry into a fresh state directory
-// beside the compile's runs, hands it to the spool store under a fresh
-// cursor-owned lease and answers the signed token.
+// checkpointAt writes the carry live at st's boundary into a fresh state
+// directory beside the compile's runs, hands it to the spool store under a
+// fresh cursor-owned lease and answers the signed token.
 //
 // The directory is staged in the sort area so adoption is an O(1)
 // same-filesystem rename, and the state file is written LAST so a directory a
 // cursor names always carries the runs it names.
-//
-// All three streams are the ALREADY-SORTED, already-folded class, so they are
-// restored with their comparator and no fold: see the two-class rule at the top
-// of this file.
-func (c *Compiler) checkpointHalf(ctx context.Context, b model.Binding, requestHash string,
-	ranked rankedStreams, scoped scopeResult, scopeComplete bool,
+func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHash string,
+	st *compileState,
 ) (string, error) {
 	if !c.continuationsAvailable() {
 		// No continuation is on offer, so the deadline is what it always was.
 		return "", contextErr(ctx, context.DeadlineExceeded)
+	}
+	names := passStreams(st.pass)
+	if len(names) == 0 {
+		return "", &model.Error{Code: model.CodeInternal,
+			Message: "context checkpoint: no carry is defined for this pass boundary"}
 	}
 	dir, err := os.MkdirTemp(c.sortDir, "ctx-state-")
 	if err != nil {
 		return "", &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
 	}
 	runBytes := pagination.SortRunBytes(int64(c.cfg.Resources.QueryMemoryBytes))
-	st := checkpointState{
-		Pass:        checkpointPassBudget,
+	state := checkpointState{
+		Pass:        st.pass,
 		RequestHash: requestHash,
-		Streams:     map[string][]string{},
+		Streams:     make(map[string][]string, len(names)),
 		Scalars: checkpointScalars{
-			Completeness:     scoped.Completeness,
-			ScopeComplete:    scopeComplete,
-			ReasonsDropped:   scoped.ReasonsDropped,
-			ReasonsTruncated: scoped.ReasonsTruncated,
+			Completeness:     st.scope.Completeness,
+			ScopeComplete:    st.scopeComplete,
+			ReasonsDropped:   st.scope.ReasonsDropped,
+			ReasonsTruncated: st.scope.ReasonsTruncated,
 		},
 	}
 	fail := func(err error) (string, error) {
 		_ = os.RemoveAll(dir)
 		return "", err
 	}
-	if st.Streams[streamRanked], err = checkpointRun(dir, streamRanked, runBytes, ranked.Ranked, lessRank, sizeOfCand); err != nil {
+	for _, name := range names {
+		files, ferr := st.checkpointStream(dir, name, runBytes)
+		if ferr != nil {
+			return fail(ferr)
+		}
+		state.Streams[name] = files
+	}
+	if err := writeCheckpointState(dir, state); err != nil {
 		return fail(err)
 	}
-	if st.Streams[streamPaths], err = checkpointRun(dir, streamPaths, runBytes, ranked.Paths, lessPathSeq, sizeOfPath); err != nil {
-		return fail(err)
-	}
-	if st.Streams[streamHops], err = checkpointRun(dir, streamHops, runBytes, ranked.Hops, lessHopSeq, sizeOfHop); err != nil {
-		return fail(err)
-	}
-	if err := writeCheckpointState(dir, st); err != nil {
-		return fail(err)
-	}
-	return c.nextStateCursor(ctx, b, requestHash, st.Pass, dir)
+	return c.nextStateCursor(ctx, b, requestHash, state.Pass, dir)
 }
 
-// restoreHalf adopts a checkpoint's three streams into this call's sort area
-// and answers them together with the scope carry the budget half and the
-// manifest header read, exactly as frontHalf would have produced them.
-func (c *Compiler) restoreHalf(s *compileSorts, r *resumedHalf) (rankedStreams, scopeResult, bool, error) {
-	fail := func(err error) (rankedStreams, scopeResult, bool, error) {
-		return rankedStreams{}, scopeResult{}, false, err
+// restoreAt adopts a checkpoint's streams into this call's sort area and its
+// scalars into st, so the pipeline re-enters at the recorded pass with exactly
+// the carry the interrupted call had there.
+func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) error {
+	names := passStreams(r.State.Pass)
+	if len(names) == 0 {
+		return cursorExpired("the continuation state was written at a boundary this build does not resume")
 	}
-	rankedRun, err := restoreRun(s, r.Dir, streamRanked, r.State.Streams[streamRanked], lessRank)
-	if err != nil {
-		return fail(err)
+	for _, name := range names {
+		files, ok := r.State.Streams[name]
+		if !ok {
+			return cursorExpired("the continuation state is missing its " + name + " stream")
+		}
+		if err := st.restoreStream(s, r.Dir, name, files); err != nil {
+			return err
+		}
 	}
-	paths, err := restoreRun(s, r.Dir, streamPaths, r.State.Streams[streamPaths], lessPathSeq)
-	if err != nil {
-		return fail(err)
-	}
-	hops, err := restoreRun(s, r.Dir, streamHops, r.State.Streams[streamHops], lessHopSeq)
-	if err != nil {
-		return fail(err)
-	}
-	scoped := scopeResult{
+	st.pass = r.State.Pass
+	st.scope = scopeResult{
 		Completeness:     r.State.Scalars.Completeness,
 		ReasonsDropped:   r.State.Scalars.ReasonsDropped,
 		ReasonsTruncated: r.State.Scalars.ReasonsTruncated,
 	}
-	return rankedStreams{Ranked: rankedRun, Paths: paths, Hops: hops}, scoped,
-		r.State.Scalars.ScopeComplete, nil
+	st.scopeComplete = r.State.Scalars.ScopeComplete
+	return nil
 }

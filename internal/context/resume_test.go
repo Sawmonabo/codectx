@@ -89,7 +89,7 @@ func TestCheckpointedRunRestoresIdenticallyAfterSpilling(t *testing.T) {
 		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))
 	}
 
-	restored, err := restoreRun(sorts, stateDir, "pkg-count", files, lessPkg)
+	restored, err := restoreRun(sorts, stateDir, "pkg-count", files, lessPkg, sizeOfPkgCount)
 	if err != nil {
 		t.Fatalf("restoreRun: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestCheckpointedSortKeepsItsFoldAcrossTheInterruption(t *testing.T) {
 		}
 	}
 
-	adopted, err := restoreSort(sorts, stateDir, "pkg-edge", files, lessPkgEdge)
+	adopted, err := restoreSort(sorts, stateDir, "pkg-edge", files, lessPkgEdge, sizeOfPkgEdge)
 	if err != nil {
 		t.Fatalf("restoreSort: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestCheckpointedSortKeepsItsFoldAcrossTheInterruption(t *testing.T) {
 func TestCheckpointStateRefusesAnEscapingRunName(t *testing.T) {
 	sorts, stateDir := resumeArea(t)
 	for _, name := range []string{"../escape", "sub/run", "/abs/run", ""} {
-		if _, err := restoreSort(sorts, stateDir, "x", []string{name}, lessPkg); err == nil {
+		if _, err := restoreSort(sorts, stateDir, "x", []string{name}, lessPkg, sizeOfPkgCount); err == nil {
 			t.Fatalf("run name %q was accepted", name)
 		}
 	}
