@@ -2128,8 +2128,10 @@ func newTwoOffsetFixture(t *testing.T, loserStart, winnerStart uint64) *twoOffse
 // rows, fails rather than coincidentally agreeing.
 //
 // Mutation: order the distinct predicate in storage/sqlite/search.go by
-// start_byte instead of the precedence keys and the hit is served at byte 20;
-// drop the predicate and two hits come back for one node.
+// start_byte instead of the precedence keys, or drop the predicate entirely --
+// either way the hit is served at byte 20. (Dropping it still serves ONE hit:
+// the ranked set folds by node identity, which is why the count assertion
+// alone would not have caught the wrong offset.)
 func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
 	const loser, winner = 20, 100
 	f := newTwoOffsetFixture(t, loser, winner)
