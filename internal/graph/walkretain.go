@@ -152,8 +152,13 @@ type retainedWalk struct {
 	owned bool
 	// chunkSize overrides frontierChunk. It is zero outside tests.
 	chunkSize int
-	entries   *retainFile
-	pairs     *retainFile
+	// crashInAdmit ends a level transition between choosing what to admit and
+	// writing admitted.<level>, which is the window the order of effects exists
+	// to survive. It is the only way to reach that state, because the code
+	// never leaves it behind on purpose, and it is false outside tests.
+	crashInAdmit bool
+	entries      *retainFile
+	pairs        *retainFile
 }
 
 // openRetainedWalk names a fresh retained input under parent. Nothing is
@@ -903,6 +908,10 @@ func decodeFrontierState(b []byte) (frontierState, error) {
 	return fs, nil
 }
 
+// errAdmitCrash is the injected end of a level transition. It never escapes a
+// test: nothing in the walk sets crashInAdmit.
+var errAdmitCrash = internalErr("graph: the level transition was cut short")
+
 // admitState is the state the winning record of a neighbour group admits: one
 // hop past its owner, at its owner's cost plus the edge's kind cost, with the
 // admitting relation appended to the owner's route.
@@ -1044,6 +1053,9 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 	}
 	if err := admit(); err != nil {
 		return 0, err
+	}
+	if w.crashInAdmit {
+		return 0, errAdmitCrash
 	}
 
 	run, err := sorter.Sorted()

@@ -330,6 +330,27 @@ func TestAdmitLevelCommitsTheCheapestRouteAndRedoesIdempotently(t *testing.T) {
 		}
 	}
 
+	// A transition cut between choosing what to admit and writing
+	// admitted.<level> must leave NOTHING behind: the redo below has to make
+	// the same two admissions. Setting the bits before the file is written
+	// loses them -- the redo finds no file, tests bits that are already set,
+	// admits nothing and rebuilds an empty frontier.
+	crashed := newLevelWalk(t, 0)
+	crashed.crashInAdmit = true
+	if _, err := crashed.admitLevel(context.Background(), s, 1, costs); !errors.Is(err, errAdmitCrash) {
+		t.Fatalf("the injected crash returned %v, want the transition to be cut short", err)
+	}
+	crashed.crashInAdmit = false
+	if got, err := crashed.admitLevel(context.Background(), s, 1, costs); err != nil || got != 2 {
+		t.Fatalf("the redo after a cut transition admitted %d nodes (%v), want 2", got, err)
+	}
+	for _, ref := range []NodeRef{500, 600} {
+		on, err := crashed.testFrontier(ref)
+		if err != nil || !on {
+			t.Fatalf("after the cut transition testFrontier(%d) = %v, %v: the level was lost", ref, on, err)
+		}
+	}
+
 	// The redo: the admitted file is already there, and re-running the
 	// transition must admit nothing twice and rebuild the same frontier.
 	redo, err := w.admitLevel(context.Background(), s, 1, costs)
