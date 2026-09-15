@@ -422,9 +422,12 @@ func (r Resolution) Validate() error {
 	if err := requireField("resolution.canonical_key", r.CanonicalKey, MaxNativeKeyBytes); err != nil {
 		return err
 	}
-	if err := boundCount("resolution.ambiguous", len(r.Ambiguous), MaxAmbiguousCandidates); err != nil {
-		return err
-	}
+	// The ambiguous list carries no count bound. A native key aliased to more
+	// equally supported identities than MaxAmbiguousCandidates is a property of
+	// the repository, not an invalid resolution, and refusing it here made the
+	// resolver refuse the provider's whole output instead. The list is bounded
+	// in the only place a bound belongs -- the alias lookup's own page size in
+	// storage -- so nothing unbounded reaches this validator.
 	for i, id := range r.Ambiguous {
 		if err := requireID(indexed("resolution.ambiguous", i), string(id)); err != nil {
 			return err
