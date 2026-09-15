@@ -69,7 +69,12 @@ const (
 // layout is refused rather than read under this one's assumptions; the
 // traversal cursor version is bumped with it, so a token naming such a
 // directory never reaches here.
-const bitsetVersion = 1
+//
+// Version 2 is the surrogate walk's layout: the directory holds a set per
+// NAMED file (visited.bits for nodes, emitted.bits for relations) where
+// version 1 held the single visited set of the run-and-merge walk, and both
+// are now bounded by the generation's declared maximum surrogate.
+const bitsetVersion = 2
 
 // bitsetManifest is the O(1) state a resumed page reads: the population count
 // and nothing per-page, so a page's own write never grows with the page number.
@@ -98,12 +103,12 @@ type pagedBitset struct {
 	// silently extending the file: the cursor fence exists to make that
 	// impossible, and a bitset that quietly accepted one would hide the breach.
 	//
-	// ZERO means the set has no declared upper bound. Only the RELATION set is
-	// opened that way, because the frozen GraphReader port publishes MaxNode
-	// and no relation counterpart; the generation fence on the cursor is then
-	// the only thing standing between the file and a foreign surrogate, which
-	// is why this is called out here rather than left implicit.
-	limit NodeRef
+	// ZERO means the set has no declared upper bound. Both sets a walk opens
+	// declare one -- MaxNode for the nodes, MaxRelation for the relations --
+	// so the range check is the FIRST guard against a surrogate from another
+	// generation and the cursor's fence is the second. Zero survives only for
+	// a generation that genuinely carries no surrogate of that kind.
+	limit uint64
 
 	pages map[int64]*list.Element // page index -> element holding *bitsetPage
 	lru   *list.List              // most recently used at the front
@@ -122,7 +127,7 @@ type pagedBitset struct {
 // adopting the count an earlier page left when it is. maxNode sizes the address
 // space; nothing is allocated for it, because the file is extended lazily by
 // the first write into a region.
-func openBitset(dir, name string, maxRef NodeRef, probe *heapProbe) (*pagedBitset, error) {
+func openBitset(dir, name string, maxRef uint64, probe *heapProbe) (*pagedBitset, error) {
 	path := filepath.Join(dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -255,10 +260,10 @@ func (b *pagedBitset) sync() error {
 
 // inRange refuses a surrogate the pinned generation does not carry.
 func (b *pagedBitset) inRange(ref uint64) error {
-	if b.limit == 0 || ref <= uint64(b.limit) {
+	if b.limit == 0 || ref <= b.limit {
 		return nil
 	}
-	return internalErr("graph: the visited bitset was handed a node surrogate outside the pinned generation")
+	return internalErr("graph: the " + b.name + " set was handed a surrogate outside the pinned generation")
 }
 
 // locate maps a surrogate to its page, the byte inside that page and its bit.
