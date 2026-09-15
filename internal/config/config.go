@@ -507,6 +507,16 @@ type Context struct {
 	// the task names is examined; a user-set value that a task exceeds is
 	// reported as a named exclusion on the manifest, never applied silently.
 	MaxSeeds Limit `toml:"max_seeds"`
+	// MaxStartNodes bounds how many of the discovered seeds become roots of the
+	// Section 15.2 boundary walk. Unlimited by default, so every resolvable
+	// seed a task names is walked from; a user-set value that a task exceeds
+	// leaves the seeds past it unwalked and says so, with the dropped count, as
+	// a named exclusion on the manifest.
+	//
+	// The set is never chunked across several walks to honour a cut: each walk
+	// ranks its own page, so two half-width walks would answer two local
+	// rankings rather than the one global order a caller reads.
+	MaxStartNodes Limit `toml:"max_start_nodes"`
 }
 
 // Coverage is the source-read chunking and receipt policy.
@@ -679,6 +689,7 @@ func Defaults() Config {
 			StrictReadGate:                      true,
 			AllowExploratoryWaiverConsolidation: false,
 			MaxSeeds:                            Unlimited,
+			MaxStartNodes:                       Unlimited,
 		},
 		Coverage: Coverage{
 			ChunkBytes:                     65536,
