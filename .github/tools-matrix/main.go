@@ -16,10 +16,10 @@
 //
 //   - The index check is a byte-level presence check on the document paths, not
 //     a protobuf parse. The wire format is the SCIP provider's own test surface.
-//   - The five language servers are exercised only as far as an identity
-//     invocation reaches: gopls, clangd and typescript-language-server print a
-//     version, while pyright and jdtls speak nothing but LSP over stdio and are
-//     proved here only to the extent that their payloads install and verify.
+//   - The language servers are exercised only as far as an identity
+//     invocation reaches: gopls, clangd, ty and typescript-language-server
+//     print a version, while jdtls speaks nothing but LSP over stdio and is
+//     proved here only to the extent that its payload installs and verifies.
 //     A real initialize/shutdown handshake belongs to the LSP provider.
 //
 // The argv of each indexer is the product's own: every run below is built by
@@ -152,10 +152,11 @@ var engineFrontends = []struct {
 }
 
 // serverIdentity is the subset of managed language servers that answer an
-// identity invocation. pyright and jdtls speak only LSP and are deliberately
-// absent; see the package comment.
+// identity invocation. jdtls speaks only LSP and is deliberately absent; see
+// the package comment.
 var serverIdentity = map[string][]string{
 	"gopls":                      {"version"},
+	"ty":                         {"--version"},
 	"clangd":                     {"--version"},
 	"typescript-language-server": {"--version"},
 }

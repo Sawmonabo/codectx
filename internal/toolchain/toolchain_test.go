@@ -507,6 +507,20 @@ func TestUnpublishedOrAlteredStoreIsInvisibleAndRepaired(t *testing.T) {
 			if len(damaged) != 1 || damaged[0].State != StateCorrupt {
 				t.Fatalf("verify = %+v, want one corrupt entry", damaged)
 			}
+			// Failure mode: the two digests `tools verify` prints are both
+			// read from the lock, so the "installed" column repeats what this
+			// binary pins and a damaged or absent store renders exactly like a
+			// healthy one. The operator is then told the store was checked
+			// when nothing on disk was ever hashed. The pinned digest is known
+			// for every supported platform; the installed one exists only when
+			// the bytes were read.
+			if damaged[0].EntrySHA256 == "" {
+				t.Fatalf("a corrupt entry must still report the digest the lock pins: %+v", damaged[0])
+			}
+			if damaged[0].InstalledSHA256 != "" {
+				t.Fatalf("a corrupt entry reported an installed digest %q; nothing on disk hashed to it",
+					damaged[0].InstalledSHA256)
+			}
 
 			repaired, err := r.Resolve(t.Context(), testTool)
 			if err != nil {
@@ -525,8 +539,17 @@ func TestUnpublishedOrAlteredStoreIsInvisibleAndRepaired(t *testing.T) {
 			if repairedReport[0].State != StateInstalled {
 				t.Fatalf("state after repair = %q, want %q", repairedReport[0].State, StateInstalled)
 			}
-			if got := r.Status(t.Context()); got[0].State != StateInstalled || got[0].Languages[0] != "go" {
+			if repairedReport[0].InstalledSHA256 != repairedReport[0].EntrySHA256 {
+				t.Fatalf("installed digest %q does not match the pinned %q after repair",
+					repairedReport[0].InstalledSHA256, repairedReport[0].EntrySHA256)
+			}
+			got := r.Status(t.Context())
+			if got[0].State != StateInstalled || got[0].Languages[0] != "go" {
 				t.Fatalf("status after repair = %+v", got)
+			}
+			// Status does not rehash, so it must not claim a disk digest.
+			if got[0].InstalledSHA256 != "" {
+				t.Fatalf("status reported an installed digest %q without rehashing", got[0].InstalledSHA256)
 			}
 		})
 	}

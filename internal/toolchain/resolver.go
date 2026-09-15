@@ -147,6 +147,14 @@ type Status struct {
 	State         State
 	Languages     []string
 	Detail        string
+	// EntrySHA256 is the digest the lock pins for this platform's entry
+	// executable, and InstalledSHA256 the digest the store's own bytes hash to.
+	// Only Verify fills the second one -- Status does not rehash -- and it is
+	// empty for an entry that is not installed. They are reported separately,
+	// never collapsed into one "digest" field: a report that prints the pinned
+	// digest twice tells an operator a store was checked when nothing was read.
+	EntrySHA256     string
+	InstalledSHA256 string
 }
 
 // Resolver hands out runnable tools. It is safe for concurrent use: it holds no
@@ -596,8 +604,12 @@ func (r *Resolver) report(ctx context.Context, rehash bool) ([]Status, error) {
 				s.Detail = "the lock carries no payload for " + r.platform.Key()
 				break
 			}
-			_, state, detail, err := r.inspect(name, e, p, rehash)
-			s.State, s.Detail = state, detail
+			// The pinned digest is known for every supported platform; the
+			// installed one is whatever the bytes on disk hash to, and
+			// inspect reports it only when it rehashed them.
+			s.EntrySHA256 = e.entryDigest(p)
+			hash, state, detail, err := r.inspect(name, e, p, rehash)
+			s.State, s.Detail, s.InstalledSHA256 = state, detail, hash
 			if err != nil {
 				s.State, s.Detail = StateCorrupt, "the store could not be inspected"
 				errs = append(errs, err)

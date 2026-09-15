@@ -872,7 +872,7 @@ LSP provides on-demand document/workspace symbols, definition, references, imple
 
 The LSP client owns Content-Length framing, initialize/initialized and shutdown/exit lifecycle, bounded outstanding requests, out-of-order responses, cancellation, document synchronization, and negotiated position encoding. LSP lifecycle is distinct from the MCP 2026 protocol. Treat server-initiated requests explicitly: return supported bounded read-only configuration, otherwise a protocol error; never perform `workspace/applyEdit`, run project commands, or follow external URIs. Validate returned ranges and locations against the materialization. [7](#ref-7)
 
-The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `pyright`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the dependence provider. The complete advertised live-query feature set remains available as a labeled overlay.
+The manager starts managed servers lazily, caps concurrent servers and overlay bytes, expires idle state, and shares one existing process runner. Profiles cover `gopls`, `rust-analyzer`, `ty`, `typescript-language-server`, `clangd`, and `jdtls`; each is a lock entry of Section 11.7 and needs no user configuration. Overlay facts carry server/version/input hashes and `language_server` precision, remain separate from immutable canonical context planning, and disappear without corruption when the server stops. Persistence of LSP facts is not a second V1 indexing path; canonical enrichment already exists through SCIP and the dependence provider. The complete advertised live-query feature set remains available as a labeled overlay.
 
 <a id="116-dependence-provider"></a>
 ### 11.6 Dependence Provider
@@ -929,7 +929,7 @@ A user installs codectx and every supported language works at its best available
 | `scip-clang` | indexer | c, cpp | — | `sourcegraph/scip-clang` release binaries | linux and darwin only; Windows uses `clangd` for precise C/C++ |
 | `gopls` | server | go | — | built at release time from `golang.org/x/tools/gopls` at the pinned version | all six |
 | `typescript-language-server` | server | typescript, tsx, javascript | node | npm `typescript-language-server` with `typescript` | all six |
-| `pyright` | server | python | node | npm `pyright` | all six |
+| `ty` | server | python | — | upstream static binary | all six |
 | `clangd` | server | c, cpp | — | `clangd/clangd` release archives | as published upstream |
 | `jdtls` | server | java | jdk | `download.eclipse.org/jdtls/milestones` tarball | all six |
 | `joern` | cpg (backend of the `dependence` provider) | all nine languages; Rust requires `cargo` on the allowlisted PATH | jdk | `joernio/joern` per-platform `joern-cli` archives (astgen helpers bundled) | all six (upstream publishes linux amd64/arm64, macOS amd64/arm64, windows amd64/arm64) |

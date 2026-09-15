@@ -86,6 +86,12 @@ type StoreSizer interface {
 // backend's product name.
 type ToolchainReporter interface {
 	Statuses(ctx context.Context) ([]toolchain.Status, error)
+	// Selected names the lock entries the repository at root selects -- the
+	// same answer `codectx tools prefetch --for-repo` installs. An empty list
+	// is an answer (a root that selects no pinned tool), not a failure. The
+	// doctor reports only these entries, so an operator is never told to
+	// install a payload their repository will not run.
+	Selected(ctx context.Context, root string) ([]string, error)
 }
 
 // WorkspaceProber answers the questions about the filesystem that neither the
