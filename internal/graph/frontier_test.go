@@ -244,34 +244,27 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 }
 
 // TestImpactAndPackageDepsResumeAcrossPages is the R3 proof for the two
-// endpoints that had no continuation at all: impact and the package rollup used
-// to walk the WHOLE reachable subgraph on one page, holding every admitted edge
-// and every affected node in impactAccumulator.byNode/order/edges, and then
-// minted either a ranked-tail spool (impact) or nothing (the rollup). Both now
-// run the same page-bounded, spooled, cursor-resumable walk a traversal runs:
-// the accumulator stops at the page's item bound and the frontier plus the
-// cumulative admitted set go to the continuation spool.
+// endpoints that had no honest continuation: impact and the package rollup used
+// to walk the whole reachable subgraph on one page, holding every admitted edge
+// and every affected node in heap, and then ranked whatever chunk the page had
+// read. Both now run ruling P2's shape -- the request that mints the answer
+// walks to COMPLETION, streams every admitted edge into a disk-backed sort,
+// ranks the whole answer once, serves the first page and spools the globally
+// ranked remainder behind the `r` cursor.
 //
-// What the union of pages preserves, and what this asserts:
-//   - the rollup's PairCount and EvidenceCount SUM, per pair, to the whole-walk
-//     totals -- every edge is admitted on exactly one page, so the aggregate is
-//     split across pages rather than lost;
-//   - impact's affected-node SET is exactly the whole-walk set.
+// What that makes provable, and what this asserts for BOTH lists of BOTH
+// endpoints: the pages CONCATENATE to the single-shot answer -- same records,
+// same global order, each exactly once -- rather than merely covering the same
+// set. A page-ranked answer satisfies set equality and fails every assertion
+// below.
 //
-// What it deliberately does not assert is entry identity: a node admitted on an
-// early page is reported again if a later page's frontier reaches it, because
-// the accumulator is page-scoped by construction while the admitted set lives on
-// the spool. That is the cost of a page-bounded aggregate and it is documented
-// on walkImpact.
-//
-// Mutation proof (each fails this test):
-//   - drop the `len(a.edges) >= a.pageItems` stop in impactAccumulator.Visit and
-//     the walk is single-shot again: no page fills, sawPageFull is false;
-//   - drop `Resume: resume` from either expand call and the resumed page
-//     restarts from the seeds, so the pair counts sum to more than the whole
-//     walk's and the same edges are counted twice;
-//   - drop the continueWalk call in either endpoint and the pages stop after the
-//     first, so the union is a strict subset of the whole-walk answer.
+// Mutation proofs (each fails this test):
+//   - drop pass 2 of the rank (return pass 1's folded run from rankImpact or
+//     rankPairs): the pages carry the identity order, not the ranked one;
+//   - drop `.WithFold(foldImpact)` from pass 1: a node reached by two edges is
+//     listed twice, so the pages hold more records than the single-shot answer;
+//   - drop `.WithFold(foldPair)` from the pair sort: the pair counts are 1 each
+//     instead of the whole walk's sums.
 func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 	f := newGraphFixture(t)
 	engine := func(t *testing.T, pageItems int) *Engine {
@@ -287,7 +280,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		}
 		limits := fixtureLimits()
 		// Unlimited depth, visited and edge budgets: this row isolates the page
-		// item bound as the thing that ends a page.
+		// bound as the thing that ends a page.
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = pageItems
 		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
@@ -298,10 +291,13 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		return e
 	}
 	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
-	// A page bound far above the fixture's edge count is the single-shot answer
-	// the pages are compared against.
+	// A page bound far above the fixture's record count is the single-shot
+	// answer the pages are compared against.
 	const wholePage = 100000
-	const pageItems = 5
+	// Two: small enough that BOTH of impact's lists -- the affected entities
+	// and the package pairs the same walk rolled up -- span several pages of the
+	// fixture, which is what makes the order assertions below load-bearing.
+	const pageItems = 2
 
 	t.Run("package dependencies", func(t *testing.T) {
 		req := model.GraphRequest{GenerationID: 1, Start: seeds,
@@ -314,14 +310,14 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			t.Fatalf("the ground truth must be one complete answer, got truncated=%v reason=%q",
 				whole.Meta.Truncated, whole.Meta.TruncationReason)
 		}
-		if len(whole.Items) == 0 {
-			t.Fatal("the whole-walk rollup found no package pairs; the proof would be vacuous")
+		if len(whole.Items) <= pageItems {
+			t.Fatalf("the whole-walk rollup found %d pair(s); the proof needs more than one page of %d",
+				len(whole.Items), pageItems)
 		}
 
-		type pair struct{ from, to model.NodeID }
-		summed := map[pair]model.PackageEdge{}
+		var concatenated []model.PackageEdge
 		paged := engine(t, pageItems)
-		pages, sawPageFull := 0, false
+		pages := 0
 		for {
 			pages++
 			if pages > 200 {
@@ -331,41 +327,28 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("page %d: %v", pages, err)
 			}
-			if res.Meta.TruncationReason == reasonPageFull {
-				sawPageFull = true
-				if res.Meta.NextCursor == "" {
-					t.Fatalf("page %d filled its page with no continuation: the frontier is unreachable", pages)
-				}
+			if len(res.Items) > pageItems {
+				t.Fatalf("page %d served %d pairs over a page bound of %d", pages, len(res.Items), pageItems)
 			}
-			for _, item := range res.Items {
-				k := pair{item.FromNodeID, item.ToNodeID}
-				acc := summed[k]
-				acc.FromNodeID, acc.ToNodeID = item.FromNodeID, item.ToNodeID
-				acc.FromPath, acc.ToPath = item.FromPath, item.ToPath
-				acc.PairCount += item.PairCount
-				acc.EvidenceCount += item.EvidenceCount
-				summed[k] = acc
-			}
+			concatenated = append(concatenated, res.Items...)
 			if res.Meta.NextCursor == "" {
 				break
 			}
 			req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
 			req.GenerationID = 0
 		}
-		if !sawPageFull {
-			t.Fatal("no page stopped on its item bound; the proof did not exercise the bound it names")
+		if pages < 2 {
+			t.Fatalf("the paged rollup answered in %d page(s); the proof needs a continuation to consume", pages)
 		}
-		if len(summed) != len(whole.Items) {
-			t.Fatalf("the pages aggregated %d distinct pairs, the whole walk %d", len(summed), len(whole.Items))
+		// ORDER and identity, not set equality: every pair once, in the
+		// single-shot rank, with the whole walk's exact counts.
+		if len(concatenated) != len(whole.Items) {
+			t.Fatalf("the pages carried %d pair(s), the single-shot answer %d: a pair is duplicated or missing",
+				len(concatenated), len(whole.Items))
 		}
-		for _, want := range whole.Items {
-			got, ok := summed[pair{want.FromNodeID, want.ToNodeID}]
-			if !ok {
-				t.Fatalf("pair %s -> %s is in the whole-walk rollup but no page carried it", want.FromPath, want.ToPath)
-			}
-			if got.PairCount != want.PairCount || got.EvidenceCount != want.EvidenceCount {
-				t.Errorf("pair %s -> %s summed to (%d edges, %d evidence) across pages, want the whole walk's (%d, %d)",
-					want.FromPath, want.ToPath, got.PairCount, got.EvidenceCount, want.PairCount, want.EvidenceCount)
+		for i, want := range whole.Items {
+			if concatenated[i] != want {
+				t.Fatalf("at rank %d the pages carry %+v, the single-shot answer %+v", i, concatenated[i], want)
 			}
 		}
 	})
@@ -387,16 +370,14 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		if whole.Meta.NextCursor != "" {
 			t.Fatal("the ground truth must be one complete answer")
 		}
-		if len(whole.Entries) == 0 {
-			t.Fatal("the whole-walk impact found no affected entities; the proof would be vacuous")
-		}
-		wholeSet := map[model.NodeID]bool{}
-		for _, entry := range whole.Entries {
-			wholeSet[entry.NodeID] = true
+		if len(whole.Entries) <= pageItems || len(whole.Packages) == 0 {
+			t.Fatalf("the whole-walk impact found %d entr(ies) and %d package pair(s); the proof needs more than one page of %d entries and at least one pair",
+				len(whole.Entries), len(whole.Packages), pageItems)
 		}
 
 		paged := engine(t, pageItems)
-		seen := map[model.NodeID]bool{}
+		var entries []model.ImpactEntry
+		var packages []model.PackageEdge
 		pages := 0
 		for {
 			pages++
@@ -410,13 +391,12 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			if err := res.Validate(); err != nil {
 				t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
 			}
-			if len(res.Entries) > pageItems {
-				t.Fatalf("page %d served %d entries over a page bound of %d: the accumulator is not page-bounded",
-					pages, len(res.Entries), pageItems)
+			if len(res.Entries) > pageItems || len(res.Packages) > pageItems {
+				t.Fatalf("page %d served %d entries and %d pairs over a page bound of %d",
+					pages, len(res.Entries), len(res.Packages), pageItems)
 			}
-			for _, entry := range res.Entries {
-				seen[entry.NodeID] = true
-			}
+			entries = append(entries, res.Entries...)
+			packages = append(packages, res.Packages...)
 			if res.Meta.NextCursor == "" {
 				break
 			}
@@ -424,21 +404,35 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			req.GenerationID = 0
 		}
 		if pages < 2 {
-			// The truncation REASON cannot carry this assertion: the fixture's
-			// generation has deferred dependence units, and markTruncated keeps
-			// the first reason, so reasonDependence is reported in place of the
-			// page stop. A second page existing at all is the observable that
-			// the page bound and the continuation both worked.
 			t.Fatalf("the paged impact answered in %d page(s); the proof needs a continuation to consume", pages)
 		}
-		for id := range wholeSet {
-			if !seen[id] {
-				t.Errorf("node %s is affected in the whole-walk answer but no page reported it", id)
-			}
+		// BOTH lists concatenate to the single-shot answer in the single-shot
+		// order. Uniqueness is implied and asserted separately, because a
+		// duplicate is the specific defect ruling P2 removes.
+		if len(entries) != len(whole.Entries) {
+			t.Fatalf("the pages served %d affected entit(ies), the single-shot answer %d: an entity is duplicated or missing",
+				len(entries), len(whole.Entries))
 		}
-		for id := range seen {
-			if !wholeSet[id] {
-				t.Errorf("node %s was reported by a page but is not in the whole-walk answer", id)
+		seen := map[model.NodeID]bool{}
+		for i, want := range whole.Entries {
+			if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+				entries[i].Depth != want.Depth || entries[i].Direction != want.Direction {
+				t.Fatalf("at rank %d the pages report %s (score %d, depth %d, %s), the single-shot answer %s (score %d, depth %d, %s)",
+					i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth, entries[i].Direction,
+					want.NodeID, want.ScoreMicros, want.Depth, want.Direction)
+			}
+			if seen[entries[i].NodeID] {
+				t.Fatalf("node %s is listed twice across the pages", entries[i].NodeID)
+			}
+			seen[entries[i].NodeID] = true
+		}
+		if len(packages) != len(whole.Packages) {
+			t.Fatalf("the pages carried %d package pair(s), the single-shot answer %d",
+				len(packages), len(whole.Packages))
+		}
+		for i, want := range whole.Packages {
+			if packages[i] != want {
+				t.Fatalf("at rank %d the pages carry the pair %+v, the single-shot answer %+v", i, packages[i], want)
 			}
 		}
 	})

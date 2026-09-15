@@ -119,6 +119,14 @@ type traversalCursor struct {
 	RankOffset int   `json:"rank_offset,omitempty"`
 	RankServed int64 `json:"rank_served,omitempty"`
 	RankTotal  int64 `json:"rank_total,omitempty"`
+	// PairServed and PairTotal are the same two facts for the SECOND ranked
+	// list an impact answer carries, its package rollup. One result has room
+	// for one cursor, so the two lists are paged together behind it: a
+	// continuation is minted while EITHER list has records left, and each page
+	// takes at most the page limit from each. They are zero on the endpoints
+	// that rank a single list.
+	PairServed int64 `json:"pair_served,omitempty"`
+	PairTotal  int64 `json:"pair_total,omitempty"`
 	// Visited and Edges are CUMULATIVE across every page of this traversal.
 	Visited   int64     `json:"visited"`
 	Edges     int64     `json:"edges"`
@@ -175,7 +183,8 @@ func (c traversalCursor) validate() error {
 // a walk resume into a ranked spool or the reverse.
 func (c traversalCursor) validateRanked() error {
 	if !c.Ranked {
-		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 {
+		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 ||
+			c.PairServed != 0 || c.PairTotal != 0 {
 			return cursorInvalid("a walk continuation carries a ranked position")
 		}
 		return nil
@@ -189,7 +198,11 @@ func (c traversalCursor) validateRanked() error {
 	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
 		return cursorInvalid("cursor carries a negative ranked position")
 	}
-	if c.RankServed > c.RankTotal || int64(c.RankOffset) > c.RankTotal {
+	if c.PairServed < 0 || c.PairTotal < 0 {
+		return cursorInvalid("cursor carries a negative ranked position")
+	}
+	if c.RankServed > c.RankTotal || int64(c.RankOffset) > c.RankTotal ||
+		c.PairServed > c.PairTotal {
 		return cursorInvalid("cursor continues past the end of the ranked answer")
 	}
 	return nil
@@ -271,17 +284,35 @@ const (
 	spoolRecordRanked   = "r"
 )
 
-// rankedHeader is the leading record of a ranked-tail spool: the marker above
-// and the size of the whole ranked answer, so a continuation can disclose the
-// total without counting the spool it is about to stream.
+// rankedHeader is the leading record of a ranked-tail spool: the marker above,
+// the size of the whole ranked answer -- so a continuation can disclose the
+// total without counting the spool it is about to stream -- and how many
+// records of each SECTION this particular spool holds.
+//
+// A spool has one section for the endpoints that serve a single ranked list
+// (the package rollup's pairs), and two for impact, whose one answer carries a
+// ranked entity list AND a ranked package list and must page both under the
+// one cursor a result has room for. The layout is
+// [header][Count entity records][PairCount pair records], so Count is the only
+// thing a reader needs in order to tell one section's records from the other's;
+// nothing is inferred from a record's own bytes.
 type rankedHeader struct {
 	Kind  string `json:"k"`
 	Total int64  `json:"total"`
+	// Count is how many records of the FIRST section this spool holds, and
+	// PairCount how many of the second. Both are spool facts; Total and
+	// PairTotal are answer facts.
+	Count     int   `json:"count,omitempty"`
+	PairTotal int64 `json:"pair_total,omitempty"`
+	PairCount int   `json:"pair_count,omitempty"`
 }
 
-// encodeRankedHeader renders that record.
-func encodeRankedHeader(total int64) ([]byte, error) {
-	b, err := json.Marshal(rankedHeader{Kind: spoolRecordRanked, Total: total})
+// encodeRankedHeader renders that record. The marker is set here rather than
+// taken from the caller, so no caller can write a header this build's reader
+// would then refuse.
+func encodeRankedHeader(h rankedHeader) ([]byte, error) {
+	h.Kind = spoolRecordRanked
+	b, err := json.Marshal(h)
 	if err != nil {
 		return nil, &model.Error{Code: model.CodeInternal,
 			Message: "continuation state encoding: " + err.Error()}
@@ -294,7 +325,8 @@ func encodeRankedHeader(total int64) ([]byte, error) {
 // shape this build guessed at.
 func decodeRankedHeader(record []byte) (rankedHeader, error) {
 	var h rankedHeader
-	if err := json.Unmarshal(record, &h); err != nil || h.Kind != spoolRecordRanked || h.Total < 0 {
+	if err := json.Unmarshal(record, &h); err != nil || h.Kind != spoolRecordRanked ||
+		h.Total < 0 || h.Count < 0 || h.PairTotal < 0 || h.PairCount < 0 {
 		return rankedHeader{}, cursorInvalid("the cursor names a result page this build cannot replay")
 	}
 	return h, nil
