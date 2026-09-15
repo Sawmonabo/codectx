@@ -2,12 +2,14 @@ package search
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
-	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -55,37 +57,6 @@ func (a ranked) less(b ranked) bool {
 	return a.SearchKey < b.SearchKey
 }
 
-// scored is a ranked candidate with the bounded ranking reasons that survive
-// deduplication. Reasons live beside ranked rather than inside it because the
-// frozen struct is sized for 2000 entries under the query memory ceiling.
-type scored struct {
-	ranked
-	Reasons []string
-}
-
-// collector deduplicates candidates as they arrive and bounds the distinct
-// result set. Section 14.4 orders deduplication BEFORE paging, so folding
-// cannot happen after a page boundary has already been drawn; and because a
-// fold can change a survivor's tier and score, the whole set is ordered once
-// at the end rather than maintained as a partial order while it mutates.
-//
-// There is no bound on the number of distinct keys. The set is sized by the
-// ANSWER (one entry per distinct result the query actually has), not by the
-// repository: the lexical tier emits each document once and the exact tiers are
-// themselves page-bounded, so this is not a repository-sized heap structure.
-// The tail of the ordered set is written to the disk-backed spool and served by
-// a continuation cursor, so a large answer costs one page of wire bytes and one
-// spool frame at a time -- refusing a new distinct key past 2000 discarded the
-// tail of the corpus instead.
-type collector struct {
-	index     map[string]int
-	items     []scored
-	truncated bool
-	reason    string
-}
-
-func newCollector() *collector { return &collector{index: make(map[string]int)} }
-
 // dedupKey is the digest §4 deduplication key: the node id when the candidate
 // has one, else its file and start byte. Within one generation a path names
 // exactly one file (model.NewFileID hashes the repository and the path), so
@@ -96,35 +67,6 @@ func dedupKey(r ranked) string {
 		return "node\x00" + string(r.NodeID)
 	}
 	return "file\x00" + r.Path + "\x00" + strconv.FormatUint(r.StartByte, 10)
-}
-
-// add folds one candidate into the set. A repeat of a key folds into the entry
-// already held; a new key is always admitted.
-func (c *collector) add(r ranked, reasons ...string) {
-	key := dedupKey(r)
-	if i, ok := c.index[key]; ok {
-		c.items[i] = fold(c.items[i], scored{ranked: r, Reasons: reasons})
-		return
-	}
-	c.index[key] = len(c.items)
-	c.items = append(c.items, scored{ranked: r, Reasons: boundReasons(nil, reasons)})
-}
-
-// fold merges two candidates for the same entity. The survivor is whichever
-// sorts first, so it keeps the LOWEST tier rank seen (tier rank is less's
-// first key). Its ScoreMicros is the highest of the two: digest §4 zeroes the
-// exact tiers "unless the document also matched lexically, keeping that
-// score", and the lexical score is the non-zero one. Occurrences sum, and the
-// reasons of both sides survive up to the Section 14.3 bound.
-func fold(a, b scored) scored {
-	keep := a
-	if b.ranked.less(a.ranked) {
-		keep = b
-	}
-	keep.ScoreMicros = max(a.ScoreMicros, b.ScoreMicros)
-	keep.Occurrences = a.Occurrences + b.Occurrences
-	keep.Reasons = boundReasons(a.Reasons, b.Reasons)
-	return keep
 }
 
 // boundReasons appends the unique reasons of add to have, truncating each to
@@ -147,14 +89,184 @@ func boundReasons(have []string, add []string) []string {
 	return out
 }
 
-// results orders the deduplicated set by the full Section 14.2 chain. The
-// order is total (SearchKey is unique), so sort.SliceStable is not needed to
-// make it deterministic.
-func (c *collector) results() []scored {
-	out := slices.Clone(c.items)
-	sort.Slice(out, func(i, j int) bool { return out[i].ranked.less(out[j].ranked) })
-	return out
+// scored is a ranked candidate together with everything needed to serve it:
+// the bounded ranking reasons that survive deduplication, the hit as it will
+// be served, and the byte interval its source range is hydrated from.
+//
+// The servable facts travel WITH the candidate rather than in a side map keyed
+// by dedupKey. That map was one entry per distinct result, held for the whole
+// answer -- the largest heap structure of a wide query -- and the external sort
+// below cannot bound the ranking without also bounding it.
+type scored struct {
+	ranked
+	Reasons []string         `json:"reasons,omitempty"`
+	Hit     model.SearchHit  `json:"hit"`
+	Span    *model.ByteRange `json:"span,omitempty"`
 }
+
+// collector deduplicates candidates as they arrive and orders the distinct
+// result set. Section 14.4 orders deduplication BEFORE paging, so folding
+// cannot happen after a page boundary has already been drawn; and because a
+// fold can change a survivor's tier and score, the whole set is ordered once
+// at the end rather than maintained as a partial order while it mutates.
+//
+// Neither the number of distinct keys nor the number of candidates is bounded,
+// and neither is held in heap. Candidates stream into a disk-backed external
+// sort whose working set is the run budget derived from
+// resources.query_memory_bytes plus a capped merge fan-in, so peak RSS is a
+// function of that admission and not of how many matches the query has. A
+// one-character qualified_name_prefix that range-scans a corpus-sized slice of
+// node_ids (H-L5b concern 2) therefore costs disk, not heap.
+//
+// TWO PASSES ARE NECESSARY, not a shortcut. fold sets ScoreMicros = max(a, b)
+// and score is less's second key, so a fold MOVES its survivor's rank: two
+// records with one deduplication key can sit arbitrarily far apart in rank
+// order and folding equal-ranked neighbours would be wrong. Pass 1 sorts by
+// the deduplication key and folds; pass 2 sorts the folded stream by rank with
+// no fold.
+type collector struct {
+	dir       string
+	runBytes  int64
+	dedup     *pagination.ExternalSort[scored]
+	truncated bool
+	reason    string
+	// peak is the largest in-memory working set either pass held. It is the
+	// structural memory invariant: it must stay within the envelope the run
+	// budget and the merge fan-in define however many candidates arrive, which
+	// total allocation volume (which grows with the input even for a perfect
+	// external sort) could never show.
+	peak int
+}
+
+// newCollector opens the deduplication pass. dir is where runs spill (the
+// spool directory, so a query's temporary files live in one place) and
+// runBytes is the in-memory run budget, derived by the caller from
+// resources.query_memory_bytes.
+func newCollector(dir string, runBytes int64) (*collector, error) {
+	c := &collector{dir: dir, runBytes: runBytes}
+	sorter, err := c.newSort("searchdedup-",
+		func(a, b scored) int { return strings.Compare(dedupKey(a.ranked), dedupKey(b.ranked)) })
+	if err != nil {
+		return nil, err
+	}
+	c.dedup = sorter.WithFold(foldScored)
+	return c, nil
+}
+
+// newSort opens one pass of the two-pass sort with the shared codec and
+// budget. The codec is JSON: these records never leave the process, and a
+// codec that cannot drift from the struct beats the bytes a packed one saves.
+func (c *collector) newSort(prefix string, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
+	sorter, err := pagination.NewExternalSort(c.dir, prefix, 0,
+		func(v scored) ([]byte, error) {
+			b, err := json.Marshal(v)
+			if err != nil {
+				return nil, &model.Error{Code: model.CodeInternal, Message: "search: encoding a candidate: " + err.Error()}
+			}
+			return b, nil
+		},
+		func(b []byte) (scored, error) {
+			var v scored
+			if err := json.Unmarshal(b, &v); err != nil {
+				return scored{}, &model.Error{Code: model.CodeStorageCorrupt, Message: "search: a spilled candidate is not readable"}
+			}
+			return v, nil
+		}, compare)
+	if err != nil {
+		return nil, err
+	}
+	return sorter.WithRunBytes(c.runBytes, sizeOfScored), nil
+}
+
+// sizeOfScored charges one buffered candidate against the run budget: its
+// variable-length strings plus a fixed allowance for the struct, the pointers
+// and the reasons slice. It is an estimate by construction -- the record is
+// encoded only when the run spills -- and it errs high.
+func sizeOfScored(v scored) int64 {
+	n := len(v.Path) + len(v.SearchKey) + len(v.NodeID) + len(v.Hit.Path) + len(v.Hit.Name) +
+		len(v.Hit.QualifiedName) + len(v.Hit.Signature) + len(v.Hit.FileID)
+	for _, r := range v.Reasons {
+		n += len(r) + 16
+	}
+	return int64(n) + 256
+}
+
+// add folds one candidate into the set. A repeat of a key folds into the
+// entry already held; a new key is always admitted.
+func (c *collector) add(r ranked, f hitFacts, reasons ...string) error {
+	return c.dedup.Add(scored{ranked: r, Reasons: boundReasons(nil, reasons), Hit: f.hit, Span: f.span})
+}
+
+// Close releases the deduplication pass's spill files.
+func (c *collector) Close() error { return c.dedup.Close() }
+
+// fold merges two candidates for the same entity. The survivor is whichever
+// sorts first, so it keeps the LOWEST tier rank seen (tier rank is less's
+// first key). Its ScoreMicros is the highest of the two: digest §4 zeroes the
+// exact tiers "unless the document also matched lexically, keeping that
+// score", and the lexical score is the non-zero one. Occurrences sum, and the
+// reasons of both sides survive up to the Section 14.3 bound.
+//
+// The SERVABLE facts come from the left side always: every candidate under one
+// key describes the same entity, and the first writer wins exactly as the side
+// map it replaces did. a is the accumulated left because the external sort
+// folds a key's arrivals left to right in arrival order.
+func fold(a, b scored) scored {
+	keep := a
+	if b.ranked.less(a.ranked) {
+		keep = b
+	}
+	keep.ScoreMicros = max(a.ScoreMicros, b.ScoreMicros)
+	keep.Occurrences = a.Occurrences + b.Occurrences
+	keep.Reasons = boundReasons(a.Reasons, b.Reasons)
+	keep.Hit, keep.Span = a.Hit, a.Span
+	return keep
+}
+
+// foldScored adapts fold to the sort's fold signature. It cannot fail: every
+// part of the fold is total.
+func foldScored(a, b scored) (scored, error) { return fold(a, b), nil }
+
+// results ends the deduplication pass and orders the distinct set by the full
+// Section 14.2 chain. The order is total (SearchKey is unique within a
+// deduplication key), so no stable sort is needed to make it deterministic.
+//
+// The answer is a re-iterable sorted run on disk, not a slice: the caller
+// streams one page out of it and streams the remainder straight into the
+// continuation spool, so no part of the flow ever holds the whole answer.
+// Close the run; the collector's own pass is released by Close.
+func (c *collector) results() (*pagination.SortedRun[scored], error) {
+	deduped, err := c.dedup.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer deduped.Close()
+	byRank, err := c.newSort("searchrank-", func(a, b scored) int {
+		switch {
+		case a.ranked.less(b.ranked):
+			return -1
+		case b.ranked.less(a.ranked):
+			return 1
+		}
+		return 0
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer byRank.Close()
+	if err := deduped.Each(byRank.Add); err != nil {
+		return nil, err
+	}
+	run, err := byRank.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	c.peak = max(c.dedup.PeakLiveRecords(), byRank.PeakLiveRecords())
+	return run, nil
+}
+
+// peakLiveRecords reports that high-water mark.
+func (c *collector) peakLiveRecords() int { return c.peak }
 
 // truncation reports whether the candidate set was bounded away and why, for
 // QueryMeta.Truncated / TruncationReason.

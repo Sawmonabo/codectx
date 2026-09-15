@@ -161,8 +161,8 @@ type spoolMeta struct {
 // (offset-carrying cursors, once Cursor is unfrozen); what must never happen
 // is a silent failure, so exhausting the budget is Spools.reserve's typed
 // CTX_RESOURCE_LIMIT and it is returned from here unchanged.
-func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, hits []model.SearchHit) (string, error) {
-	if len(hits) == 0 {
+func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, tail func(func(model.SearchHit) error) error) (string, error) {
+	if tail == nil {
 		return "", nil
 	}
 	if spools == nil {
@@ -175,22 +175,24 @@ func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, h
 	if err != nil {
 		return "", err
 	}
+	// The hits are streamed from the caller rather than taken as a slice: the
+	// tail of a wide answer is exactly the thing that must not be held in heap,
+	// and building a []any of it here would put it back.
 	meta.Spool = spoolMetaMarker
-	records := make([]any, 0, len(hits)+1)
-	records = append(records, meta)
-	for _, h := range hits {
-		records = append(records, h)
-	}
-	for _, r := range records {
-		record, err := json.Marshal(r)
+	append1 := func(v any) error {
+		record, err := json.Marshal(v)
 		if err != nil {
-			releaseSpool(spools, sp)
-			return "", &model.Error{Code: model.CodeInternal, Message: "search: spooling a result: " + err.Error()}
+			return &model.Error{Code: model.CodeInternal, Message: "search: spooling a result: " + err.Error()}
 		}
-		if err := sp.Append(record); err != nil {
-			releaseSpool(spools, sp)
-			return "", err
-		}
+		return sp.Append(record)
+	}
+	if err := append1(meta); err != nil {
+		releaseSpool(spools, sp)
+		return "", err
+	}
+	if err := tail(func(h model.SearchHit) error { return append1(h) }); err != nil {
+		releaseSpool(spools, sp)
+		return "", err
 	}
 	if err := sp.Close(); err != nil {
 		spools.Release(sp.ID())
