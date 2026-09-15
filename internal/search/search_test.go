@@ -280,6 +280,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		// FX-C13b rows
 		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierBound},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
+		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 	}
 	f := newFixture(t)
@@ -1043,6 +1044,43 @@ func legPathTierBound(t *testing.T, _ *fixture) {
 	if len(out) != 3 || full {
 		t.Fatalf("pathCandidates(kind filter) served %d candidates, truncated=%t; want 3 and false: the filter runs over the keyset, not over one bounded read",
 			len(out), full)
+	}
+}
+
+// legSpoolExhaustionEndsThePage proves the class-D refusal is gone: when the
+// shared spool byte budget cannot hold the tail of an answer, the hits already
+// in hand are still served. Before, spoolNext's error propagated out of Search
+// and page 1 failed because the page after it could not be written.
+//
+// The budget is set to one byte, so Create's header alone exhausts it and no
+// continuation can be minted for a corpus that certainly has one.
+//
+// Mutation: restore `return empty, err` in the spoolNext branch and Search
+// fails here instead of answering.
+func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
+	full, err := pagination.NewSpools(filepath.Join(t.TempDir(), "spools"), 1, f.store)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	opts := f.opts
+	opts.Spools = full
+	s := newService(t, opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	page, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a full spool failed page 1 instead of ending it: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("page 1 served %d hits, want the 1 it had in hand", len(page.Items))
+	}
+	if page.Meta.NextCursor != "" {
+		t.Error("an answer whose tail could not be spooled still minted a continuation")
+	}
+	if !page.Meta.Truncated {
+		t.Fatal("an answer that dropped its tail did not report itself truncated")
+	}
+	if !strings.Contains(page.Meta.TruncationReason, "spool") {
+		t.Errorf("truncation reason = %q, want the dropped tail named", page.Meta.TruncationReason)
 	}
 }
 

@@ -226,10 +226,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		switch {
 		case err == nil:
 		case pagination.IsBudgetExhausted(err):
+			// This reason OVERWRITES whatever a tier reported. A tier's
+			// truncation says the candidate set was bounded; this one says a
+			// named number of already-ranked hits were thrown away and there is
+			// no continuation to reach them. Reporting only the tier would hide
+			// exactly the drop the posture forbids.
 			meta.Truncated, meta.NextCursor = true, ""
-			if meta.TruncationReason == "" {
-				meta.TruncationReason = truncationSpoolBudgetFull
-			}
+			meta.TruncationReason = spoolBudgetFullReason(len(rest))
 			s.log.Warn("a search answer was cut short by the spool disk budget", "component", "search",
 				"generation_id", int64(binding.GenerationID), "dropped_hits", len(rest))
 		default:
@@ -528,10 +531,15 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // that filled its per-tier bound. Storage clamps a page to
 // model.MaxPageItems, so a full tier means there were more candidates than one
 // answer can carry.
-// truncationSpoolBudgetFull is the reason a caller sees when the hits of this
-// page were served but the remainder could not be written to the query spool.
-const truncationSpoolBudgetFull = "the shared query spool ran out of disk budget before the rest of this answer could be written; " +
-	"retry after outstanding cursors expire, or raise resources.max_temp_bytes"
+// spoolBudgetFullReason is the reason a caller sees when the hits of this page
+// were served but the remainder could not be written to the query spool. It
+// names the number of hits that were dropped, which is the fact a caller needs
+// to decide whether to narrow the query or to wait and retry.
+func spoolBudgetFullReason(dropped int) string {
+	return "the shared query spool ran out of disk budget, so " + strconv.Itoa(dropped) +
+		" further ranked hits were dropped and this answer has no continuation; " +
+		"retry after outstanding cursors expire, or raise resources.max_temp_bytes"
+}
 
 const truncationExactTierFull = "an exact or prefix tier returned its maximum number of candidates; narrow the query or add a filter"
 
