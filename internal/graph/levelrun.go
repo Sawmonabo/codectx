@@ -275,6 +275,19 @@ func (c *levelCollector) spill() error {
 	return nil
 }
 
+// persist puts the whole collected run on disk and commits it. A COLLECTING
+// continuation is minted from it, so the byte count it carries has to name
+// bytes that are there: a resident run the cursor reported as zero would
+// resume the level with everything the scan had already delivered dropped.
+func (c *levelCollector) persist() error {
+	if c.raw == nil {
+		if err := c.spill(); err != nil {
+			return err
+		}
+	}
+	return c.raw.close()
+}
+
 // records is how many records this level holds.
 func (c *levelCollector) records() int64 { return c.count }
 

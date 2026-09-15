@@ -144,6 +144,23 @@ type traversalCursor struct {
 	// It is a position in ONE generation's packed adjacency. The generation
 	// fence on this cursor is what keeps it from being applied to another.
 	LevelPos EdgePos `json:"level_pos,omitempty"`
+	// Level is the BFS level the walk stopped in and LevelState which of the
+	// level's two states it was in (traverse.go). Together with the position
+	// fields they are the whole of what a walk continuation resumes: the
+	// frontier is the admitted file of the level before it, inside the retained
+	// directory, so no frontier ever travels in a token or a spool.
+	Level      int        `json:"level,omitempty"`
+	LevelState levelState `json:"level_state,omitempty"`
+	// RawBytes is the committed length of a COLLECTING level's run, which the
+	// resumed request truncates that run back to before it scans on. It travels
+	// with LevelPos: the two name one position, the bytes already collected and
+	// the entry the scan had not delivered.
+	RawBytes int64 `json:"raw_bytes,omitempty"`
+	// LevelOffset is where a SERVING level resumes: the byte offset of the
+	// first record of the sorted level the issuing page did not take. A page is
+	// therefore a seek and its own records, never a replay of the level behind
+	// it.
+	LevelOffset int64 `json:"level_offset,omitempty"`
 	// LastOwner and LastKey are the keyset position of the endpoints that page
 	// a LIST rather than walk it -- the workspace overview, which reads nodes
 	// in canonical order and has no frontier at all. The WALK vocabulary no
@@ -252,11 +269,46 @@ func (c traversalCursor) validate() error {
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
 	}
+	if err := c.validateLevel(); err != nil {
+		return err
+	}
 	if err := c.validateRanked(); err != nil {
 		return err
 	}
 	if c.ExpiresAt.IsZero() {
 		return cursorInvalid("cursor has no expiry")
+	}
+	return nil
+}
+
+// validateLevel enforces the level vocabulary: a walk continuation names a
+// level and one of its two states, and each state carries only its own
+// position. A token mixing the two would resume a collect from a serving
+// offset, or serve a level the transition never wrote.
+func (c traversalCursor) validateLevel() error {
+	if c.LevelState == "" {
+		if c.Level != 0 || c.RawBytes != 0 || c.LevelOffset != 0 || !c.LevelPos.IsZero() {
+			return cursorInvalid("cursor carries a level position without a level state")
+		}
+		return nil
+	}
+	if c.Level < 1 {
+		return cursorInvalid("cursor names no level to resume")
+	}
+	if c.RawBytes < 0 || c.LevelOffset < 0 {
+		return cursorInvalid("cursor carries a negative level position")
+	}
+	switch c.LevelState {
+	case levelCollecting:
+		if c.LevelOffset != 0 {
+			return cursorInvalid("a collecting level carries a serving offset")
+		}
+	case levelServing:
+		if c.RawBytes != 0 || !c.LevelPos.IsZero() {
+			return cursorInvalid("a serving level carries a collecting position")
+		}
+	default:
+		return cursorInvalid("cursor names no level state this build serves")
 	}
 	return nil
 }
@@ -285,6 +337,13 @@ func (c traversalCursor) validateRanked() error {
 			// never reads.
 			return cursorInvalid("a walk continuation names a result spool")
 		}
+		if !c.WalkDone && c.LevelState == "" {
+			// A walk continuation resumes a LEVEL. A token without one names a
+			// retained directory and no position in it, so the resumed walk
+			// would start again at level 1 and re-read every level the pages
+			// behind it already served.
+			return cursorInvalid("a walk continuation names no level to resume")
+		}
 		if c.RetainID == "" {
 			// Every walk continuation keeps its frontier and its cumulative
 			// admitted-node set in the retained state directory, so a token
@@ -301,7 +360,7 @@ func (c traversalCursor) validateRanked() error {
 			if c.RetainID == "" {
 				return cursorInvalid("a completed walk names no retained input")
 			}
-			if c.SpoolID != "" || !c.LevelPos.IsZero() || c.LastKey != "" {
+			if c.SpoolID != "" || !c.LevelPos.IsZero() || c.LastKey != "" || c.LevelState != "" {
 				return cursorInvalid("a completed walk carries a frontier to resume")
 			}
 		}
@@ -315,7 +374,7 @@ func (c traversalCursor) validateRanked() error {
 	if c.SpoolID == "" {
 		return cursorInvalid("a ranked continuation names no result spool")
 	}
-	if !c.LevelPos.IsZero() || c.LastOwner != "" || c.LastKey != "" {
+	if !c.LevelPos.IsZero() || c.LastOwner != "" || c.LastKey != "" || c.LevelState != "" {
 		return cursorInvalid("a ranked continuation carries a traversal position")
 	}
 	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
@@ -501,9 +560,8 @@ func decodeRankedHeader(record []byte) (rankedHeader, error) {
 // seeded with what the earlier pages already spent, the frontier they stopped
 // at and the nodes they already admitted.
 type resumeState struct {
-	Cursor   traversalCursor
-	Budget   *budget
-	Frontier []frontierState
+	Cursor traversalCursor
+	Budget *budget
 	// Retain is the retained state the earlier pages appended to, reopened for
 	// append: the cumulative visited set of every walk, and the pass-1 input of
 	// the two ranking endpoints.
@@ -522,21 +580,19 @@ type continuation struct {
 	QueryHash string
 	Depth     int
 	LevelPos  EdgePos
+	// Level, LevelState, RawBytes and LevelOffset are where the walk stopped
+	// inside its level pipeline, and More says it stopped with work in front of
+	// it. They are the walk vocabulary; a keyset endpoint leaves them zero.
+	Level       int
+	LevelState  levelState
+	RawBytes    int64
+	LevelOffset int64
+	More        bool
 	// LastOwner and LastKey are the keyset position of an endpoint that pages a
 	// LIST rather than walking it (the workspace overview). A walk leaves them
 	// empty and carries LevelPos instead.
 	LastOwner model.NodeID
 	LastKey   model.RelationID
-	// Frontier is where the walk stopped: the level being expanded plus the
-	// next level as far as it was built. It is bounded by the page and the
-	// frontier ceiling, never by the walk.
-	//
-	// It is NOT spilled here. The walk itself committed it to the retained
-	// level file as each level closed, BEFORE marking that level's bits, which
-	// is what makes a page cut between the two writes recoverable. Copying it
-	// into a spool at mint time would write it a second time and open a window
-	// in which the two disagreed.
-	Frontier []frontierState
 	// Retain is the state this page appended to, handed over for the store to
 	// adopt (walkretain.go): the cumulative visited set every walk keeps, and
 	// the pass-1 input the two ranking endpoints add to it.
@@ -628,20 +684,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		if s.Retain, err = e.reopenWalkState(dir, c.RetainID); err != nil {
 			return nil, err
 		}
-		// ADOPTION. The frontier is the retained level file, and re-applying
-		// its records' surrogates to the bitset repairs a page that was cut
-		// between spooling a level and marking its bits. It is idempotent: the
-		// set counts bit TRANSITIONS, so a bit that was already there leaves
-		// the disclosed visited_count alone.
-		if s.Frontier, err = s.Retain.adopt(); err != nil {
-			return nil, err
-		}
-		if e.probe != nil {
-			// Every record this resume DECODES. The invariant the test reads it
-			// for: it is a function of the frontier the page stopped at, never
-			// of the cumulative set behind it.
-			e.probe.ResumeRecords += int64(len(s.Frontier))
-		}
+		// There is nothing to adopt: the level transition COMMITTED every
+		// level as it closed -- admitted states, then visited bits, then the
+		// frontier bits -- so the directory this resume opened is already the
+		// state the walk stopped in. What the resumed walk reads out of it is
+		// the admitted file of ONE level, streamed in chunks (walkretain.go),
+		// never the cumulative set behind it.
 	}
 	// There is no spool replay left on the walk vocabulary: validateRanked
 	// refuses a walk continuation that names a spool at all. Everything the
@@ -764,7 +812,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// when the depth bound is reached (reported, not resumed) or when the
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
-	resumesWalk := len(c.Frontier) > 0 || c.LastKey != "" || c.WalkDone
+	resumesWalk := c.More || c.LastKey != "" || c.WalkDone
 	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
@@ -774,7 +822,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// holds; with retention disabled none of them can, so the answer stops here
 	// rather than resuming without them. A pure keyset continuation carries its
 	// whole position in the token and needs neither.
-	needsRetain := len(c.Frontier) > 0 || c.WalkDone
+	needsRetain := c.More || c.WalkDone
 	if needsRetain && (c.Retain == nil || e.spools == nil) {
 		return "", nil
 	}
@@ -799,6 +847,10 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		QueryHash:    c.QueryHash,
 		LeaseID:      lease.ID,
 		LevelPos:     c.LevelPos,
+		Level:        c.Level,
+		LevelState:   c.LevelState,
+		RawBytes:     c.RawBytes,
+		LevelOffset:  c.LevelOffset,
 		LastOwner:    c.LastOwner,
 		LastKey:      c.LastKey,
 		Depth:        c.Depth,

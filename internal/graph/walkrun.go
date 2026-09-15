@@ -75,7 +75,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			return walkState{}, err
 		}
 		switch {
-		case len(state.Frontier) == 0 || state.DepthLimited:
+		case !state.More || state.DepthLimited:
 			// Exhausted, or stopped at the user-set depth bound -- the one stop
 			// that is an answer-level truncation rather than an internal page
 			// boundary, and the one expand refuses to resume.
@@ -101,7 +101,6 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 		// work budgets is returned, so the next link expands rather than
 		// stopping on a budget the previous link exhausted.
 		o.Budget.pageVisited, o.Budget.pageEdges = 0, 0
-		o.Budget.frontierHit = false
 		if err := checkWalk(ctx, o.Budget); err != nil {
 			// The deadline can fall between links, where expand never saw it.
 			// Handled here rather than by deadlineStop, whose "this page
@@ -113,18 +112,19 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			o.Budget.deadlineHit = true
 			return state, nil
 		}
-		// Each link COMMITTED its own levels as it closed them -- records to
-		// the retained level file, then bits -- so there is nothing to copy
+		// Each link COMMITTED its own levels as it closed them -- the admitted
+		// states, then the bits that mark them -- so there is nothing to copy
 		// forward here. The next link resumes from this one exactly as a signed
-		// continuation would: same frontier, same scan position, same
+		// continuation would: same level, same state, same position in it, same
 		// cumulative sets, with the signer, the lease and the store handover
 		// left out, because nothing here outlives the request.
 		o.Resume = &resumeState{
-			Cursor:   traversalCursor{Depth: state.Depth, LevelPos: state.LevelPos},
-			Budget:   o.Budget,
-			Frontier: state.Frontier,
-			Retain:   o.Retain,
-			Release:  func() {},
+			Cursor: traversalCursor{Level: state.Level, LevelState: state.LevelState,
+				LevelPos: state.LevelPos, RawBytes: state.RawBytes,
+				LevelOffset: state.LevelOffset},
+			Budget:  o.Budget,
+			Retain:  o.Retain,
+			Release: func() {},
 		}
 		// Seeds are not re-entered on a resume; expand reads the frontier
 		// instead. Passing them again would be harmless but misleading.

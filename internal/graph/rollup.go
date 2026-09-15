@@ -148,7 +148,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}
-	if b.deadlineHit && len(state.Frontier) > 0 {
+	if b.deadlineHit && state.More {
 		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
@@ -171,10 +171,6 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	switch {
 	case acc != nil && acc.reason != "":
 		markTruncated(&meta, acc.reason)
-	case b.frontierHit:
-		// The rollup summarises the edges the walk read; a level the frontier
-		// budget cut short must not read as the whole neighbourhood.
-		markTruncated(&meta, reasonFrontierBytes)
 	case state.DepthLimited:
 		markTruncated(&meta, reasonDepth)
 	}
