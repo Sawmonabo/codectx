@@ -186,25 +186,80 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 	})
 
 	t.Run("both visits outgoing then incoming per owner", func(t *testing.T) {
-		got := scan(t, g, []graph.NodeRef{refs[Hub]}, model.DirectionBoth, nil)
-		out := expected(Hub, true, nil)
-		in := expected(Hub, false, nil)
-		assertEdgesOrdered(t, got, append(append([]edge{}, out...), in...))
+		// Asserted STRUCTURALLY, on the surrogates the reader delivered, not
+		// against a precomputed order: the port sorts each list by neighbour
+		// SURROGATE, and an implementation is free to assign surrogates in an
+		// order that is not the canonical-id order, so a canonical-id oracle
+		// would fail a correct reader.
+		raw := scanRaw(t, g, []graph.NodeRef{refs[Hub]}, model.DirectionBoth, nil)
+		split := len(raw)
+		for i, e := range raw {
+			if !e.Outgoing {
+				split = i
+				break
+			}
+		}
+		for _, e := range raw[split:] {
+			if e.Outgoing {
+				t.Fatalf("an outgoing entry follows an incoming one: DirectionBoth must visit the "+
+					"owner's whole outgoing list and only then its incoming one, got %+v", raw)
+			}
+		}
+		assertBlockAscends(t, raw[:split])
+		assertBlockAscends(t, raw[split:])
+		assertEdges(t, canonicalAll(t, g, raw),
+			append(expected(Hub, true, nil), expected(Hub, false, nil)...))
 	})
 
 	t.Run("several owners are visited in ref order", func(t *testing.T) {
 		owners := []graph.NodeRef{refs[Hub], refs[Leaf]}
 		slices.Sort(owners)
-		got := scan(t, g, owners, model.DirectionOutgoing, nil)
-		ids, err := g.NodeIDs(ctx, owners)
+		raw := scanRaw(t, g, owners, model.DirectionOutgoing, nil)
+		var prev graph.NodeRef
+		for _, e := range raw {
+			if e.Owner < prev {
+				t.Fatalf("owner %d delivered after %d; owners are visited in ascending ref order so "+
+					"the offset and edge parts are touched sequentially", e.Owner, prev)
+			}
+			prev = e.Owner
+		}
+		assertEdges(t, canonicalAll(t, g, raw),
+			append(expected(Hub, true, nil), expected(Leaf, true, nil)...))
+	})
+
+	t.Run("a position is stable whatever kinds a later scan asks for", func(t *testing.T) {
+		// EdgePos.Index counts STORED entries, before kind filtering. A reader
+		// that counts DELIVERED entries instead reports a filtered index, and
+		// the next page -- which the walk may run with different kind codes --
+		// resumes in the wrong place: entries repeat or vanish. This is the
+		// clause the cursor payload depends on, so it is tested directly.
+		full := scan(t, g, []graph.NodeRef{refs[Hub]}, model.DirectionOutgoing, nil)
+		if len(full) < 2 {
+			t.Fatalf("fixture degenerated: hub has %d outgoing entries", len(full))
+		}
+		last := full[len(full)-1]
+		for _, e := range full[:len(full)-1] {
+			if e.Kind == last.Kind {
+				t.Fatalf("fixture degenerated: kind %s is not unique in hub's outgoing list", last.Kind)
+			}
+		}
+		code, ok := g.Kinds().Code(last.Kind)
+		if !ok {
+			t.Fatalf("Kinds().Code(%s) missing", last.Kind)
+		}
+		pos, err := g.Neighbours(ctx, []graph.NodeRef{refs[Hub]}, model.DirectionOutgoing,
+			[]graph.KindCode{code}, graph.EdgePos{}, func(graph.Edge) error { return graph.ErrStopScan })
 		if err != nil {
 			t.Fatal(err)
 		}
-		var want []edge
-		for _, id := range ids {
-			want = append(want, expected(id, true, nil)...)
+		var rest []edge
+		if _, err := g.Neighbours(ctx, []graph.NodeRef{refs[Hub]}, model.DirectionOutgoing, nil, pos,
+			func(e graph.Edge) error { rest = append(rest, canonical(t, g, e)); return nil }); err != nil {
+			t.Fatal(err)
 		}
-		assertEdgesOrdered(t, got, want)
+		// The stopped entry is the LAST stored entry, so an unfiltered resume
+		// from its position delivers exactly it.
+		assertEdgesOrdered(t, rest, full[len(full)-1:])
 	})
 
 	t.Run("a node with no edges yields none", func(t *testing.T) {
@@ -383,12 +438,46 @@ func resolveAll(t *testing.T, g graph.GraphReader, ids []model.NodeID) map[model
 func scan(t *testing.T, g graph.GraphReader, refs []graph.NodeRef, dir model.Direction,
 	kinds []graph.KindCode) []edge {
 	t.Helper()
-	var out []edge
+	return canonicalAll(t, g, scanRaw(t, g, refs, dir, kinds))
+}
+
+// scanRaw keeps the delivered entries as the reader produced them, surrogates
+// and all, for the assertions that are about ORDER: order is a property of the
+// surrogates, which no two implementations need agree on.
+func scanRaw(t *testing.T, g graph.GraphReader, refs []graph.NodeRef, dir model.Direction,
+	kinds []graph.KindCode) []graph.Edge {
+	t.Helper()
+	var out []graph.Edge
 	if _, err := g.Neighbours(context.Background(), refs, dir, kinds, graph.EdgePos{},
-		func(e graph.Edge) error { out = append(out, canonical(t, g, e)); return nil }); err != nil {
+		func(e graph.Edge) error { out = append(out, e); return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func canonicalAll(t *testing.T, g graph.GraphReader, raw []graph.Edge) []edge {
+	t.Helper()
+	out := make([]edge, 0, len(raw))
+	for _, e := range raw {
+		out = append(out, canonical(t, g, e))
+	}
+	return out
+}
+
+// assertBlockAscends checks one owner-and-direction block: neighbour
+// surrogates never go backwards inside it. It is deliberately per BLOCK,
+// because DirectionBoth concatenates two lists and the join between them is
+// the one place the sequence legitimately drops back.
+func assertBlockAscends(t *testing.T, block []graph.Edge) {
+	t.Helper()
+	var prev graph.NodeRef
+	for _, e := range block {
+		if e.Neighbour < prev {
+			t.Fatalf("neighbour %d delivered after %d inside one list; a list must ascend",
+				e.Neighbour, prev)
+		}
+		prev = e.Neighbour
+	}
 }
 
 // canonical rewrites a delivered entry into canonical ids so two
@@ -488,6 +577,10 @@ func compareEdge(a, b edge) int {
 // the reader delivered: within one owner's list the neighbour surrogates never
 // go backwards, which is what lets a walk touch offset and edge parts
 // sequentially instead of seeking.
+//
+// It resets per OWNER, so it is valid for a single-direction scan only. Use
+// assertBlockAscends for DirectionBoth, whose two concatenated lists each
+// ascend on their own.
 func assertAscending(t *testing.T, g graph.GraphReader, ctx context.Context, refs []graph.NodeRef,
 	dir model.Direction, kinds []graph.KindCode) {
 	t.Helper()
