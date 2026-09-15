@@ -84,27 +84,64 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		return res, nil
 	}
 
-	// The search state is a private scratch file for the life of this request
-	// and is removed with it, whatever happened.
+	maxDepth := pathBound(req.MaxDepth, e.limits.Depth())
+	// The query hash binds a continuation to this exact normalized search, so a
+	// cursor presented to a differently filtered or differently depth-bounded
+	// one is CTX_CURSOR_INVALID rather than a silently repinned answer.
+	queryHash := pathQueryHash(kinds, req.From, req.To, maxDepth.Int())
+	var resume *pathResume
+	if req.Page.Cursor != "" {
+		resume, err = e.resumePath(ctx, req.Page.Cursor, queryHash)
+		if err != nil {
+			return model.PathResult{}, err
+		}
+		// The consumed continuation's retention outlives the search: the state
+		// directory IS the search, and when this page also ends early it is
+		// adopted under a fresh lease before this release runs. Deferring it
+		// here -- not at the end of the happy path -- is what keeps an error
+		// return from pinning a generation for the whole cursor TTL.
+		defer resume.Release()
+	}
+
+	// The search state is a private scratch file. A fresh search owns it for
+	// the life of this request and it is removed with the request, whatever
+	// happened; a page that ends early hands it to the spool store instead
+	// (nextPathCursor), and detach is what makes the close below a no-op.
 	// Uncancellable: a scratch write that stops halfway because the deadline
 	// landed between two statements would fail the request instead of
 	// truncating the answer. w.checkDeadline is the only stop.
 	scCtx := context.WithoutCancel(ctx)
-	sc, err := openPathScratch(scCtx, e.scratchDir())
+	var sc *pathScratch
+	if resume != nil {
+		sc, err = reopenPathScratch(scCtx, resume.Dir)
+	} else {
+		sc, err = openPathScratch(scCtx, e.scratchDir())
+	}
 	if err != nil {
 		return model.PathResult{}, err
 	}
 	defer sc.close()
 
 	w := &pathWalk{
-		adjacency:     e.adjacency,
-		kinds:         kinds,
-		maxDepth:      pathBound(req.MaxDepth, e.limits.Depth()),
+		adjacency: e.adjacency,
+		kinds:     kinds,
+		maxDepth:  maxDepth,
+		// Both work budgets are PER-PAGE, the traversal precedent: a page that
+		// spends one ends there and returns a continuation, and the next page
+		// carries on with a refilled allowance. The cumulative spend is carried
+		// by the cursor and reported on the answer, so no page resets it.
 		maxVisited:    pathBound(req.MaxVisited, e.limits.Visited()),
 		maxEdges:      e.limits.Edges(),
 		frontierBytes: e.limits.FrontierBytes,
+		resumed:       resume != nil,
 		sc:            sc,
 		scCtx:         scCtx,
+	}
+	if resume != nil {
+		// By ASSIGNMENT, so presenting one page's cursor twice neither resets
+		// the counters nor doubles them.
+		w.visited, w.spent = resume.Cursor.Visited, resume.Cursor.Edges
+		w.bucketCost, w.lastSettled = resume.Cursor.BucketCost, resume.Cursor.LastNode
 	}
 	if err := w.run(ctx, req.From, req.To); err != nil {
 		return model.PathResult{}, err
@@ -125,6 +162,16 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		}
 		if capped {
 			pathTruncate(&res.Meta, pathReasonRoutes)
+		}
+	}
+	// A page that ended on a budget rather than on the answer owes a
+	// continuation: the deadline and the two work budgets end the PAGE, never
+	// the search. It is minted AFTER the routes are enumerated, because
+	// detaching the state directory closes the database they are read from.
+	if w.resumable() {
+		res.Meta.NextCursor, err = e.nextPathCursor(ctx, sc, queryHash, w)
+		if err != nil {
+			return model.PathResult{}, err
 		}
 	}
 	// Budget exhaustion is reported whether or not a route was found: a route
@@ -279,14 +326,35 @@ type pathWalk struct {
 	// is not a scale limit: it decides how much of a bucket is read at a time,
 	// not how much of the graph the search may cover.
 	frontierBytes int64
-	sc            *pathScratch
+	// resumed marks a search continuing from state a previous page retained.
+	resumed bool
+	sc      *pathScratch
 	// scCtx drives every scratch statement. It is the request context with its
 	// cancellation removed, so the deadline ends the search at a checkDeadline
 	// and never in the middle of a write to the state file.
 	scCtx context.Context
 
+	// visited and spent are CUMULATIVE across every page of this search: the
+	// cursor carries them and the answer reports them. pageVisited and
+	// pageEdges are THIS page's own spend, and they are what maxVisited and
+	// maxEdges are compared against -- the traversal precedent (traverse.go's
+	// visit): the two bounds are per-page work budgets that END A PAGE with a
+	// continuation, not ceilings that end the search.
 	visited int64
 	spent   int64
+
+	pageVisited int64
+	pageEdges   int64
+	// bucketCost and lastSettled are the resume position: the cost bucket the
+	// page stopped in and the last node it finished with inside it. A resumed
+	// page re-reads that bucket from after lastSettled, so the groups it never
+	// reached are still there to settle.
+	bucketCost  int64
+	lastSettled model.NodeID
+	// expandAfter is the keyset position inside the batch of pending nodes
+	// whose edges are being read, mirrored into the scratch so a resumed page
+	// does not re-read -- and re-charge -- edges an earlier page already spent.
+	expandAfter model.RelationID
 	// peakChunkBytes is the high-water mark of one chunk, the structural
 	// memory assertion a test reads: it must stay inside the frontier budget
 	// (plus the one group that budget is allowed to overshoot for) however
@@ -306,12 +374,26 @@ type pathWalk struct {
 // and expanded in an earlier bucket, and the target's tied-parent set is
 // therefore already complete.
 func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
-	// The source is seeded as a parentless bucket-0 row, so the phase loop
-	// below has exactly one shape: every node, source included, is settled out
-	// of a bucket.
-	if err := w.sc.exec(w.scCtx, `INSERT INTO bucket(cost, node, rel, frm, kind, depth) VALUES(0, ?, '', '', '', 0)`,
-		string(from)); err != nil {
+	if !w.resumed {
+		// The source is seeded as a parentless bucket-0 row, so the phase loop
+		// below has exactly one shape: every node, source included, is settled
+		// out of a bucket.
+		if err := w.sc.exec(w.scCtx, `INSERT INTO bucket(cost, node, rel, frm, kind, depth) VALUES(0, ?, '', '', '', 0)`,
+			string(from)); err != nil {
+			return err
+		}
+	} else if err := w.loadProgress(); err != nil {
 		return err
+	}
+	// A resumed page drains what the page before it settled but did not finish
+	// expanding BEFORE it reads a bucket. Those nodes are already in `settled`,
+	// so re-reading their bucket rows would skip them as stale and their
+	// outgoing edges would never be read at all.
+	if err := w.drain(ctx); err != nil {
+		return err
+	}
+	if w.stopped() {
+		return nil
 	}
 	for {
 		if stop, err := w.checkDeadline(ctx); stop || err != nil {
@@ -325,30 +407,36 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 		if !found {
 			return nil // the reachable set is exhausted: the target is unreachable
 		}
-		last := model.NodeID("")
+		// A new phase restarts the resume position: lastSettled names a node
+		// inside bucketCost and means nothing in any other bucket.
+		if cost != w.bucketCost {
+			w.bucketCost, w.lastSettled = cost, ""
+		}
 		for {
 			if stop, err := w.checkDeadline(ctx); stop || err != nil {
 				return err
 			}
-			chunk, more, err := w.readChunk(cost, last)
+			chunk, more, err := w.readChunk(cost, w.lastSettled)
 			if err != nil {
 				return err
 			}
 			if len(chunk) == 0 {
 				break
 			}
-			last = chunk[len(chunk)-1].node
 			settled, err := w.settle(ctx, cost, to, chunk)
 			if err != nil {
 				return err
 			}
-			if w.visitedHit || w.targetSettled {
-				return nil
-			}
-			if err := w.expand(ctx, cost, settled); err != nil {
+			if err := w.markPending(settled); err != nil {
 				return err
 			}
-			if w.edgesHit {
+			if w.stopped() {
+				return nil
+			}
+			if err := w.drain(ctx); err != nil {
+				return err
+			}
+			if w.stopped() {
 				return nil
 			}
 			if !more {
@@ -362,6 +450,56 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 			return err
 		}
 	}
+}
+
+// stopped reports that the page is over: the answer is found, or one of the
+// three page budgets ran out. Each of the latter mints a continuation.
+func (w *pathWalk) stopped() bool {
+	return w.targetSettled || w.deadlineHit || w.visitedHit || w.edgesHit
+}
+
+// resumable reports that the search has work left and the page ended on a
+// budget rather than on the answer, which is exactly when a continuation is
+// owed. A depth-pruned search is NOT resumable: the depth bound is part of the
+// query the cursor is bound to, so a page minted for it could only resume a
+// search already past it.
+func (w *pathWalk) resumable() bool {
+	return !w.targetSettled && (w.deadlineHit || w.visitedHit || w.edgesHit)
+}
+
+// loadProgress restores what the previous page left in the state file: the
+// expansion keyset position and the depth-pruned disclosure.
+func (w *pathWalk) loadProgress() error {
+	var after string
+	var pruned int
+	if _, err := w.sc.row(w.scCtx, `SELECT expand_after, depth_pruned FROM progress WHERE k = 0`,
+		nil, &after, &pruned); err != nil {
+		return err
+	}
+	w.expandAfter = model.RelationID(after)
+	w.depthPruned = pruned != 0
+	return nil
+}
+
+// saveProgress writes it back. It is called on every edge page and at every
+// stop, so no page ever loses more than the batch page it was inside.
+func (w *pathWalk) saveProgress() error {
+	pruned := 0
+	if w.depthPruned {
+		pruned = 1
+	}
+	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ? WHERE k = 0`,
+		string(w.expandAfter), pruned)
+}
+
+// markPending records the nodes settled here as owing an expansion.
+func (w *pathWalk) markPending(nodes []model.NodeID) error {
+	for _, n := range nodes {
+		if err := w.sc.exec(w.scCtx, `INSERT OR IGNORE INTO pending(node) VALUES(?)`, string(n)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkDeadline reports that the walk must stop. A caller who cancelled the
@@ -468,9 +606,17 @@ func (w *pathWalk) settle(ctx context.Context, cost int64, to model.NodeID, chun
 			return nil, err
 		}
 		if stale {
+			// A superseded relaxation is finished with, so the resume position
+			// advances past it: a continuation must not re-read it forever.
+			w.lastSettled = g.node
 			continue
 		}
-		if atBound(w.maxVisited, int(w.visited)) {
+		// Compared against THIS page's spend, not the search's: the bound is a
+		// per-page work budget that ends the page with a continuation. The test
+		// is on the spend this group would take the page to, and it runs BEFORE
+		// the group is settled, so the resume position still names the group
+		// before it and nothing is skipped.
+		if w.maxVisited.Exceeded(w.pageVisited + 1) {
 			w.visitedHit = true
 			return out, nil
 		}
@@ -479,6 +625,8 @@ func (w *pathWalk) settle(ctx context.Context, cost int64, to model.NodeID, chun
 			return nil, err
 		}
 		w.visited++
+		w.pageVisited++
+		w.lastSettled = g.node
 		for _, p := range g.parents {
 			if err := w.sc.exec(w.scCtx, `INSERT OR IGNORE INTO parent(node, rel, frm, kind) VALUES(?, ?, ?, ?)`,
 				string(g.node), string(p.rel), string(p.from), string(p.kind)); err != nil {
@@ -494,6 +642,9 @@ func (w *pathWalk) settle(ctx context.Context, cost int64, to model.NodeID, chun
 			// allows; the answer is then the cheapest route WITHIN the depth
 			// bound, and that is reported as truncation.
 			w.depthPruned = true
+			if err := w.saveProgress(); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		out = append(out, g.node)
@@ -501,55 +652,102 @@ func (w *pathWalk) settle(ctx context.Context, cost int64, to model.NodeID, chun
 	return out, nil
 }
 
-// expand reads every outgoing edge of the settled nodes in keyset-paged round
-// trips and writes each relaxation into its cost bucket. Nothing is kept in
-// heap between batches: the bucket table is the priority queue.
-func (w *pathWalk) expand(ctx context.Context, cost int64, nodes []model.NodeID) error {
-	for start := 0; start < len(nodes); start += adjacencyBatch {
+// drain expands every node that has been settled but not yet expanded, in
+// keyset-paged round trips, writing each relaxation into its cost bucket.
+// Nothing is kept in heap between batches: the pending table is the work queue
+// and the bucket table is the priority queue.
+//
+// A node leaves `pending` only once its whole edge walk is done, and the walk's
+// own keyset position is saved after every page, so a page that stops here
+// resumes at the edge after the last one it charged -- it neither loses edges
+// nor pays for them twice.
+func (w *pathWalk) drain(ctx context.Context) error {
+	for {
 		if stop, err := w.checkDeadline(ctx); stop || err != nil {
 			return err
 		}
-		end := min(start+adjacencyBatch, len(nodes))
-		batch := nodes[start:end]
-		depths := make(map[model.NodeID]int, len(batch))
-		for _, n := range batch {
-			var d int
-			if _, err := w.sc.row(w.scCtx, `SELECT depth FROM settled WHERE node = ?`, []any{string(n)}, &d); err != nil {
-				return err
-			}
-			depths[n] = d
+		batch, dists, depths, err := w.takePending()
+		if err != nil {
+			return err
 		}
-		var after model.RelationID
+		if len(batch) == 0 {
+			return nil
+		}
 		for {
-			rels, err := w.adjacency.Edges(ctx, batch, model.DirectionOutgoing, w.kinds, after, adjacencyBatch)
+			rels, err := w.adjacency.Edges(ctx, batch, model.DirectionOutgoing, w.kinds, w.expandAfter, adjacencyBatch)
 			if err != nil {
 				return err
 			}
 			// Only an empty page ends the keyset walk: the reader clamps the
 			// requested limit down to model.MaxPageItems, so a short page is
-			// the normal case rather than the end of the edges. It ends THIS
-			// batch's walk, never the expansion: the batches after it still
-			// have their own edges to read.
+			// the normal case rather than the end of the edges.
 			if len(rels) == 0 {
 				break
 			}
 			for _, r := range rels {
-				after = r.ID
-				w.spent++
-				if w.maxEdges.Exceeded(w.spent) {
+				// The bound is checked BEFORE the edge is consumed, so the
+				// saved keyset position still names the last edge this page
+				// actually charged and relaxed.
+				if w.maxEdges.Exceeded(w.pageEdges + 1) {
 					w.edgesHit = true
-					return nil
+					return w.saveProgress()
 				}
+				w.expandAfter = r.ID
+				w.spent++
+				w.pageEdges++
 				if err := w.sc.exec(w.scCtx,
 					`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
-					cost+Cost(r.Kind), string(r.To), string(r.ID), string(r.From), string(r.Kind),
+					dists[r.From]+Cost(r.Kind), string(r.To), string(r.ID), string(r.From), string(r.Kind),
 					depths[r.From]+1); err != nil {
 					return err
 				}
 			}
+			if err := w.saveProgress(); err != nil {
+				return err
+			}
+			if stop, err := w.checkDeadline(ctx); stop || err != nil {
+				return err
+			}
+		}
+		// The batch is fully expanded: its nodes owe nothing more, and the next
+		// batch starts its own keyset walk from the beginning.
+		for _, n := range batch {
+			if err := w.sc.exec(w.scCtx, `DELETE FROM pending WHERE node = ?`, string(n)); err != nil {
+				return err
+			}
+		}
+		w.expandAfter = ""
+		if err := w.saveProgress(); err != nil {
+			return err
 		}
 	}
-	return nil
+}
+
+// takePending reads the next batch of unexpanded nodes with the settled
+// distance and depth each relaxation is measured from. The batch is read in
+// node order and bounded by adjacencyBatch, so peak heap here is one batch.
+func (w *pathWalk) takePending() ([]model.NodeID, map[model.NodeID]int64, map[model.NodeID]int, error) {
+	var batch []model.NodeID
+	dists := map[model.NodeID]int64{}
+	depths := map[model.NodeID]int{}
+	err := w.sc.each(w.scCtx, `SELECT p.node, s.dist, s.depth FROM pending p JOIN settled s ON s.node = p.node
+		ORDER BY p.node LIMIT ?`, []any{adjacencyBatch},
+		func(scan func(...any) error) error {
+			var node string
+			var dist int64
+			var depth int
+			if err := scan(&node, &dist, &depth); err != nil {
+				return internalErr("path scratch read: " + err.Error())
+			}
+			batch = append(batch, model.NodeID(node))
+			dists[model.NodeID(node)] = dist
+			depths[model.NodeID(node)] = depth
+			return nil
+		})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return batch, dists, depths, nil
 }
 
 // markReach records every node from which some shortest route still continues
