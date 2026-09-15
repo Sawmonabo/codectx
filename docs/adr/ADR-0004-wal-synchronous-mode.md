@@ -55,11 +55,15 @@ make a rolled-back tail specifically harmless rather than merely cheap:
 - **Content blobs are ordered before the commit that names them.** Blob content is synced as a group
   before the commit that publishes a manifest referencing it, so the durable ordering "content
   first, then the row that names it" holds. A rolled-back generation commit can therefore only leave
-  **orphan blobs** — content nothing references — which is exactly the state the retention sweep
-  already exists to reclaim. It cannot leave a manifest pointing at content that is not there.
+  **orphan blobs** — content on disk that no row names — which the retention collector's CAS sweep
+  reclaims: each pass walks every bucket of the store in bounded chunks, asks the index which of the
+  hashes it holds a row for, and removes those it does not, once they are older than the
+  `retention.blob_grace` window (the same window the row-side grace protocol uses, so an object
+  published seconds before a commit that has not landed yet is never taken). It cannot leave a
+  manifest pointing at content that is not there.
 
 The worst outcome of a power loss under NORMAL is: the workspace is one generation behind, plus some
-orphan blobs the next sweep removes. That is indistinguishable from the power loss having happened a
+orphan blobs a later sweep removes. That is indistinguishable from the power loss having happened a
 few seconds earlier, which no setting can prevent.
 
 A new configuration key `storage.synchronous` (`"normal"` | `"full"`, default `"normal"`) lets an
@@ -111,7 +115,8 @@ is addressed below.
 ### Consequences and trade-offs accepted
 
 Accepted: after a power loss or hard reset, an index may be missing its most recent commits, and the
-store may hold orphan blobs until the next retention sweep. Not accepted, and not affected:
+store may hold orphan blobs until a retention pass at least `retention.blob_grace` after they were
+written sweeps them. Not accepted, and not affected:
 corruption (impossible in WAL mode at NORMAL), a half-published generation (activation is atomic),
 a manifest naming absent content (content is ordered first), or any loss following an application
 crash or a normal process kill (durable regardless of this setting [S1]).
