@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -52,8 +51,11 @@ func runCheck(ctx context.Context) error {
 		for _, d := range differing {
 			logf("DIFFERS %s", d)
 		}
-		return fmt.Errorf("%d of %d lock entries do not match what is published:\n\t%s",
-			len(differing), checked+int64(len(differing)), strings.Join(differing, "\n\t"))
+		// A count, not a repeat: every entry was named on its own DIFFERS line
+		// above, and printing each one twice makes a six-platform re-pin read
+		// as twelve failures.
+		return fmt.Errorf("%d of %d lock entries do not match what is published; see the DIFFERS lines above",
+			len(differing), checked+int64(len(differing)))
 	}
 	return runtimeInstallCheck(ctx, lock, only, filtered)
 }
