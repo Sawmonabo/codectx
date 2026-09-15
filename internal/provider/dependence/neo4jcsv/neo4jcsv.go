@@ -215,6 +215,14 @@ type Report struct {
 	// carries model.MaxEvidencePerFact of them. The fact is still published;
 	// the count is what keeps that truncation from being silent.
 	ClippedEvidence int
+	// TruncatedFields counts, by field name, the descriptive storage values
+	// this import cut to their model ceiling before writing them: name,
+	// qualified_name, signature and evidence detail. The model accepts an
+	// oversize storage field, so the cut is this producer's to make; the count
+	// is what keeps it from being silent. Identity fields are never cut — an
+	// entity whose native key or scope key is over its ceiling is counted in
+	// DroppedMethods instead.
+	TruncatedFields map[string]int
 	// UnknownRows is the total rows of unmapped labels, including the labels
 	// past the maxUnknownLabels distinct names UnknownLabels can name.
 	UnknownRows uint64
@@ -243,7 +251,7 @@ type Report struct {
 // published. The sink receives records in reference order: every node fact
 // before the aliases and relations that name its identity.
 func Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts Options) (Report, error) {
-	rep := Report{UnknownLabels: map[string]int{}}
+	rep := Report{UnknownLabels: map[string]int{}, TruncatedFields: map[string]int{}}
 	if err := opts.validate(); err != nil {
 		return rep, err
 	}
@@ -319,6 +327,9 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	rep.Keys = fresh
 	for label, n := range sc.unknown {
 		rep.UnknownLabels[label] = int(n)
+	}
+	for field, n := range e.truncatedFields {
+		rep.TruncatedFields[field] = n
 	}
 	return rep, nil
 }

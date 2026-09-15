@@ -31,6 +31,10 @@ type counts struct {
 	// relKey is the fact key list the import published for one relation,
 	// under edgeID(from, kind, to). Only a keyed put carries it.
 	relKey map[string][]string
+	// sig is the signature each published node carried, by node name, so a
+	// test can read what actually reached the sink rather than what the
+	// export held.
+	sig map[string]string
 }
 
 // edgeID names one published edge independently of the run that published it.
@@ -53,6 +57,7 @@ func (r recorder) PutNodes(ctx context.Context, f []model.NodeFact) error {
 func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys [][]string) error {
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
+		r.c.sig[n.Node.Name] = n.Node.Signature
 	}
 	if d, ok := r.Sink.(provider.DeltaSink); ok {
 		return d.PutKeyedNodes(ctx, f, keys)
@@ -96,7 +101,8 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 	files, paths := readSource(t, src)
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
+		sig: map[string]string{}}
 	var rep neo4jcsv.Report
 	var importErr error
 	p := providertest.Func{
@@ -305,6 +311,41 @@ func TestImportRefusesMalformedExport(t *testing.T) {
 	})
 }
 
+// TestOversizeDescriptiveFieldIsCutNotDropped proves the producer half of the
+// storage-field contract. The model accepts an oversize storage field, so a
+// field over its ceiling that is not cut here reaches the sink whole and a
+// page of hits carries an unbounded response. A descriptive field is therefore
+// cut to its ceiling and counted by name; the declaration is still published,
+// because a clipped signature answers more than a dropped declaration does.
+// Identity fields keep the opposite rule and are proven by the dropped-path
+// case above.
+func TestOversizeDescriptiveFieldIsCutNotDropped(t *testing.T) {
+	const oversize = model.MaxSignatureBytes + 1000
+	dir := copyExport(t, filepath.Join("testdata", "c"), func(name string, data []byte) []byte {
+		if name != "nodes_METHOD_data.csv" {
+			return data
+		}
+		// SIGNATURE is the last column; run's is the only non-empty one.
+		return bytes.Replace(data, []byte(`"void(S*,int*,int)"`),
+			[]byte(strings.Repeat("x", oversize)), 1)
+	})
+	rep, c, _, err := run(t, filepath.Join("testdata", "src", "c"), dir, neo4jcsv.Options{Language: "c"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	got, ok := c.sig["run"]
+	if !ok {
+		t.Fatalf("the declaration with the oversize signature was not published at all; published %v", c.sig)
+	}
+	if len(got) != model.MaxSignatureBytes {
+		t.Fatalf("published signature is %d bytes, want it cut to the %d-byte ceiling",
+			len(got), model.MaxSignatureBytes)
+	}
+	if n := rep.TruncatedFields["signature"]; n != 1 {
+		t.Fatalf("TruncatedFields[signature] = %d, want 1: the cut must be counted, not silent", n)
+	}
+}
+
 // TestImportDelta proves the refresh contract: two imports of one export
 // produce the same key set, and an import of the edited unit against the
 // previous key set reports exactly the keys that changed and publishes only
@@ -424,7 +465,8 @@ func TestSubdividedUnitAdmitsRepeatedIdentities(t *testing.T) {
 	export := filepath.Join("testdata", "gofix")
 	h := providertest.New(t, files)
 	c := counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
-		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{}}
+		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
+		sig: map[string]string{}}
 	var part [2]struct{ nodes, aliases int }
 	nodesSoFar := func() int {
 		n := 0
