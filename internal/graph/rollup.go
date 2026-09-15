@@ -234,9 +234,11 @@ func (e *Engine) serveRankedPairs(ctx context.Context, c traversalCursor, b *bud
 	// rather than "no cursor was minted", because a renewal or signing failure
 	// also mints no cursor and must leave this cursor adoptable.
 	complete := false
+	// Delivery, for serveRankedImpact's reason.
+	ctx = deliverCtx(ctx)
 	defer func() {
 		if terminalOutcome(err) && complete {
-			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+			e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 		}
 	}()
 	tail := rankedTail{SpoolID: c.SpoolID, LeaseID: c.LeaseID,
