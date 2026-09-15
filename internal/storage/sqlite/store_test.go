@@ -36,11 +36,12 @@ var _ retention.BlobStore = (*store.Store)(nil)
 // fixture is the smallest repository that can exercise unit reuse: two files,
 // one unit per file, one node with evidence and one search document per unit.
 type fixture struct {
-	t     *testing.T
-	ctx   context.Context
-	s     *store.Store
-	repo  model.RepositoryID
-	files map[string]fileFixture
+	t       *testing.T
+	ctx     context.Context
+	s       *store.Store
+	content fixtureContent
+	repo    model.RepositoryID
+	files   map[string]fileFixture
 }
 
 type fileFixture struct {
@@ -57,15 +58,34 @@ const (
 	actorID         = "agent-1"
 )
 
+// fixtureContent is the content store's range reader for these fixtures. The
+// database keeps no source body (ADR-0003 §2.1), so a carry-over resolves each
+// carried document's text through this reader, as the CAS serves it in
+// production; a range outside the blob is the integrity failure it would be
+// there, not an empty document.
+type fixtureContent struct{ byHash map[string][]byte }
+
+func (c fixtureContent) ReadRange(_ context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
+	b, ok := c.byHash[rec.Hash]
+	if !ok {
+		return nil, fmt.Errorf("fixture content store has no blob %s", rec.Hash)
+	}
+	if r.End > uint64(len(b)) || r.Start > r.End {
+		return nil, fmt.Errorf("range %d-%d is outside blob %s (%d bytes)", r.Start, r.End, rec.Hash, len(b))
+	}
+	return b[r.Start:r.End], nil
+}
+
 func newFixture(t *testing.T, dbPath string) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, store.Options{})
+	content := fixtureContent{byHash: map[string][]byte{}}
+	s, err := store.Open(ctx, dbPath, store.Options{Content: content})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	f := &fixture{t: t, ctx: ctx, s: s, repo: model.RepositoryID(model.H("test-repo", "1")), files: map[string]fileFixture{}}
+	f := &fixture{t: t, ctx: ctx, s: s, content: content, repo: model.RepositoryID(model.H("test-repo", "1")), files: map[string]fileFixture{}}
 	if err := s.EnsureRepository(ctx, f.repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
 	}
@@ -86,6 +106,7 @@ func (f *fixture) file(path string, content string) fileFixture {
 	if err := f.s.PutBlob(f.ctx, rec); err != nil {
 		f.t.Fatalf("PutBlob(%s): %v", path, err)
 	}
+	f.content.byHash[ff.hash] = ff.content
 	f.files[path] = ff
 	return ff
 }
@@ -1379,7 +1400,7 @@ var factColumns = []struct{ table, cols string }{
 	{"relation_facts", "relation_id"},
 	{"fact_keys", "coalesce(node_id, 0), coalesce(relation_id, 0), fact_key"},
 	{"native_aliases", "scope_key_id, native_key_id, node_id"},
-	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
+	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, token_count"},
 	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
 }
 

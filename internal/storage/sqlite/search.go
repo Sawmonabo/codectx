@@ -17,7 +17,9 @@ const (
 	ColumnQualifiedName SearchColumn = "qualified_name"
 	ColumnSignature     SearchColumn = "signature"
 	ColumnPath          SearchColumn = "path"
-	ColumnBody          SearchColumn = "body"
+	// ColumnBody is an indexed column of search_fts; it is not a stored
+	// column of search_units, which keeps no copy of the source text.
+	ColumnBody SearchColumn = "body"
 )
 
 // MaxTermOffsets bounds the offsets one TermOccurrence carries.
@@ -34,8 +36,9 @@ type TermOccurrence struct {
 	Truncated bool
 }
 
-// SearchDocument is a visible lexical document WITHOUT its body: Section 14.2
-// forbids source bodies in generic results. Ranking and hydration use it.
+// SearchDocument is a visible lexical document without its body: Section 14.2
+// forbids source bodies in generic results, and the database stores no body to
+// return (ADR-0003 §2.1). Ranking and hydration use it.
 type SearchDocument struct {
 	RowID         int64
 	ID            string
@@ -61,9 +64,10 @@ var searchColumns = map[string]SearchColumn{
 	string(ColumnBody):          ColumnBody,
 }
 
-// searchDocumentColumns is every search_units column except body: Section 14.2
-// forbids source bodies in generic results, and a body would also dominate the
-// memory one hydrated page costs.
+// searchDocumentColumns is every search_units column a hydrated page needs.
+// No body appears because none is stored (ADR-0003 §2.1): Section 14.2 forbids
+// source bodies in generic results, and a body would also dominate the memory
+// one hydrated page costs.
 const searchDocumentColumns = `su.rowid, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
 	su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count`
 

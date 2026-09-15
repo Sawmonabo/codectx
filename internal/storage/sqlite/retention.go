@@ -329,7 +329,7 @@ func (s *Store) generationBytes(ctx context.Context, gen int64, exclusive bool) 
 			FROM fact_keys WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(name AS BLOB)) + length(cast(qualified_name AS BLOB))
-			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB)) + length(cast(body AS BLOB))), 0)
+			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB))), 0)
 			FROM search_units WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(payload)), 0) FROM unit_delta_state WHERE unit_id IN (SELECT id FROM ex))`
 	cte := members

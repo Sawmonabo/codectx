@@ -481,8 +481,12 @@ func lexicalShape(tb testing.TB, dataDir string) string {
 	}
 	defer db.Close()
 	var units, maxRowID, tokens, bytes int64
+	// The documents keep no stored body (ADR-0003 §2.1), so the source extent
+	// they cover stands in for its bytes: a delete-and-reinsert rewrite moves
+	// the rowids, which is what this shape exists to see, and a reparse that
+	// re-cut the documents would move the extent.
 	row := db.QueryRow(`SELECT count(*), coalesce(max(rowid), 0), coalesce(sum(token_count), 0),
-		coalesce(sum(length(body)), 0) FROM search_units`)
+		coalesce(sum(end_byte - start_byte), 0) FROM search_units`)
 	if err := row.Scan(&units, &maxRowID, &tokens, &bytes); err != nil {
 		tb.Fatalf("read the lexical tables: %v", err)
 	}
