@@ -71,6 +71,9 @@ type builder struct {
 	// callee-reference bound, and declaration or call-site keys over
 	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
 	dropped int
+	// evidenceClip is the effective per-fact evidence bound (Options
+	// MaxEvidencePerFact); 0 means the model's record ceiling.
+	evidenceClip int
 
 	// maxCallees is tree_sitter.max_callee_references, the bound on the
 	// distinct callee reference nodes this file may mint: the callees no
@@ -728,11 +731,23 @@ func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey
 	if !ok {
 		return
 	}
-	if len(b.nodes[i].Evidence) >= model.MaxEvidencePerFact {
+	if b.evidenceFull(len(b.nodes[i].Evidence)) {
 		b.dropped++
 		return
 	}
 	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(b.nodes[i].Node.ID, "", rng, nativeKey, ""))
+}
+
+// evidenceFull reports whether a fact already carries every occurrence this
+// run may publish for it. A zero clip is the unset index.max_evidence_per_fact
+// and resolves to the model's record ceiling: no configuration means every
+// occurrence the record tolerates, never none.
+func (b *builder) evidenceFull(n int) bool {
+	clip := b.evidenceClip
+	if clip <= 0 {
+		clip = model.MaxEvidencePerFact
+	}
+	return n >= clip
 }
 
 // ambiguous retains the equally supported identities a resolution reported
@@ -753,7 +768,7 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 		b.rels[id] = f
 		b.relOrder = append(b.relOrder, id)
 	}
-	if len(f.Evidence) >= model.MaxEvidencePerFact {
+	if b.evidenceFull(len(f.Evidence)) {
 		b.dropped++
 		return
 	}

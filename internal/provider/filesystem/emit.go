@@ -109,16 +109,26 @@ type Emitter struct {
 	bytes        uint64
 	states       []model.CapabilityState
 
+	// clip is the effective per-fact evidence bound this unit emits under:
+	// the operator's index.max_evidence_per_fact, or the model's record
+	// ceiling when they set none.
+	clip int
+
 	// clipped counts evidence occurrences dropped because the fact already
-	// carries model.MaxEvidencePerFact of them. The fact itself is still
+	// carries clip of them. The fact itself is still
 	// published; the count is what keeps that truncation from being silent,
 	// and Result publishes it on every capability state of the unit.
 	clipped int
 }
 
-// NewEmitter binds an emitter to the unit and the file it indexes.
-func NewEmitter(req provider.UnitRequest, sink provider.Sink, file model.FileVersion) *Emitter {
-	return &Emitter{req: req, sink: sink, file: file, seenNode: map[model.NodeID]int{}, seenRel: map[model.RelationID]int{}, seenSearch: map[string]bool{}}
+// NewEmitter binds an emitter to the unit and the file it indexes. clip is the
+// effective per-fact evidence bound; 0 selects the model's record ceiling,
+// which is what an unset index.max_evidence_per_fact means.
+func NewEmitter(req provider.UnitRequest, sink provider.Sink, file model.FileVersion, clip int) *Emitter {
+	if clip <= 0 {
+		clip = model.MaxEvidencePerFact
+	}
+	return &Emitter{req: req, sink: sink, file: file, clip: clip, seenNode: map[model.NodeID]int{}, seenRel: map[model.RelationID]int{}, seenSearch: map[string]bool{}}
 }
 
 // File is the unit's input file.
@@ -319,7 +329,7 @@ func (e *Emitter) appendEvidence(list []model.Evidence, ev model.Evidence) []mod
 			return list
 		}
 	}
-	if len(list) >= model.MaxEvidencePerFact {
+	if len(list) >= e.clip {
 		e.clipped++
 		return list
 	}

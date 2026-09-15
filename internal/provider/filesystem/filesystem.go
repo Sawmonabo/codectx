@@ -54,6 +54,11 @@ type Options struct {
 	// ones and each exclusion is reported on the search capability, naming
 	// the limit that excluded it.
 	MaxSearchFileBytes config.Limit
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 }
 
 // Provider is the filesystem provider.
@@ -92,7 +97,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if fv.Path != rel {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeInternal, Message: "snapshot returned a different path than the unit scope names"}
 	}
-	e := NewEmitter(req, sink, fv)
+	e := NewEmitter(req, sink, fv, p.opts.MaxEvidencePerFact)
 	cls := Classify(rel)
 
 	// The head is read before any fact is emitted so the binary decision can

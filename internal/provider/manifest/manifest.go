@@ -98,6 +98,11 @@ type Options struct {
 	// user-set value that is crossed publishes what parsed before it and is
 	// reported with the element count.
 	MaxXMLElements config.Limit
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 }
 
 // Provider is the manifest provider.
@@ -167,7 +172,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	defer rc.Close()
-	e := filesystem.NewEmitter(req, sink, fv)
+	e := filesystem.NewEmitter(req, sink, fv, p.opts.MaxEvidencePerFact)
 	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) {
 		e.Capability(capability, model.CapabilityUnavailable, model.CodeResourceLimit)
 		return e.Result(), nil

@@ -450,13 +450,15 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 
-	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes})
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes,
+		MaxEvidencePerFact: evidenceClip(cfg)})
 	if err != nil {
 		return nil, err
 	}
 	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
 		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries,
-		MaxTOMLLines: cfg.Providers.Manifest.MaxTOMLLines, MaxXMLElements: cfg.Providers.Manifest.MaxXMLElements})
+		MaxTOMLLines: cfg.Providers.Manifest.MaxTOMLLines, MaxXMLElements: cfg.Providers.Manifest.MaxXMLElements,
+		MaxEvidencePerFact: evidenceClip(cfg)})
 	if err != nil {
 		return nil, err
 	}
@@ -467,6 +469,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
+		MaxEvidencePerFact:  evidenceClip(cfg),
 		WorkerMemoryBytes:   parserWorkerReservationBytes,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,
@@ -485,6 +488,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Timeout:      cfg.Providers.SCIP.Timeout.Std(),
 		StallTimeout: cfg.Providers.SCIP.StallTimeout.Std(),
 		WorkDir:      scipWorkDir,
+		// The clip the whole process emits under, so a SCIP edge and a
+		// tree-sitter node of the same run keep the same number of
+		// occurrences.
+		MaxEvidencePerFact: evidenceClip(cfg),
 		// MaxRecordBytes is deliberately absent: it is the wire reader's
 		// pre-allocation ceiling, product code rather than configuration, and
 		// taking it from an unlimited resources key would silently clamp it.
@@ -657,6 +664,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
 				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
+				MaxEvidencePerFact:     evidenceClip(s.cfg),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
