@@ -50,9 +50,8 @@ func (u *unit) goMod(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(f.Require) > MaxDependencies {
-		f.Require = f.Require[:MaxDependencies]
-		u.overBound()
+	if u.cut(BoundDependencies, u.deps, int64(len(f.Require))) {
+		f.Require = f.Require[:u.deps.Int()]
 	}
 	for _, r := range f.Require {
 		if err := u.edge(ctx, mod, model.RelDependsOn, ecosystemGo, r.Mod.Path, languageGo, KindRuntime, r.Mod.Version, u.lineOf(r.Syntax),
@@ -74,9 +73,8 @@ func (u *unit) goMod(ctx context.Context) error {
 // goReplacements emits `configures` edges for replace directives: the module
 // (or workspace) redirects the old module to a path or another version.
 func (u *unit) goReplacements(ctx context.Context, from model.Node, replaces []*modfile.Replace) error {
-	if len(replaces) > MaxEntries {
-		replaces = replaces[:MaxEntries]
-		u.overBound()
+	if u.cut(BoundEntries, u.entries, int64(len(replaces))) {
+		replaces = replaces[:u.entries.Int()]
 	}
 	for _, r := range replaces {
 		target := r.New.Path
@@ -91,9 +89,8 @@ func (u *unit) goReplacements(ctx context.Context, from model.Node, replaces []*
 }
 
 func boundedExcludes(list []*modfile.Exclude, u *unit) []*modfile.Exclude {
-	if len(list) > MaxEntries {
-		u.overBound()
-		return list[:MaxEntries]
+	if u.cut(BoundEntries, u.entries, int64(len(list))) {
+		return list[:u.entries.Int()]
 	}
 	return list
 }
@@ -120,9 +117,8 @@ func (u *unit) goWork(ctx context.Context) error {
 		return err
 	}
 	uses := f.Use
-	if len(uses) > MaxEntries {
-		uses = uses[:MaxEntries]
-		u.overBound()
+	if u.cut(BoundEntries, u.entries, int64(len(uses))) {
+		uses = uses[:u.entries.Int()]
 	}
 	for _, use := range uses {
 		rng := u.lineOf(use.Syntax)

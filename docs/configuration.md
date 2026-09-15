@@ -70,6 +70,8 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
   | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes` |
+  | `[providers.tree_sitter]` | `max_callee_references` |
+  | `[providers.manifest]` | `max_dependencies`, `max_entries` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
 
@@ -281,6 +283,7 @@ directories and network posture are product code, not configuration.
 | `tree_sitter.enabled` | `true` | user | Structural parsing with the grammars bundled in this binary. It runs as a private subcommand of this same binary, so there is no external executable to approve. |
 | `tree_sitter.languages` | `["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]` | project | Languages to parse. |
 | `tree_sitter.worker_idle_ttl` | `"60s"` | user | Idle time before a parser worker is stopped. |
+| `tree_sitter.max_callee_references` | `0` (unlimited) | user | How many distinct cross-file callee names one file may mint nodes for — the callees that are not declarations of that file. Unlimited by default: a generated or minified file names what it names, and the count is bounded by the file itself, whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory rather than the repository's. A set value mints no further placeholder node past the bound; each such call is counted and the file's `structure` capability is reported partial with `CTX_COVERAGE_INCOMPLETE`. |
 | `scip.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
 | `scip.timeout` | `"0s"` (no limit) | user | Wall-clock deadline for one SCIP indexer run. `0` by default: a monorepo's import is slow, not broken, and a deadline that fails an analysis unit refuses a repository for its size. |
 | `scip.stall_timeout` | `"5m"` | user | Hang detector, not a size limit. How long a subprocess may make **no progress at all** — no stdout, no stderr, no CPU, no growth of its output file — before the unit fails with reason `stalled` and is reported. Finite by default: a wedged process makes no progress however large the repository. |
@@ -307,6 +310,8 @@ directories and network posture are product code, not configuration.
 | `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (roughly 10× the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
 | `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
 | `dependence.max_export_files` | `0` (unlimited) | user | How many entries one analysis export directory may hold. Unlimited by default: the file count follows the export's label vocabulary rather than the repository, and the directory is read one entry at a time. A set value is the only thing that refuses an import here, with `CTX_RESOURCE_LIMIT` naming this key. |
+| `manifest.max_dependencies` | `0` (unlimited) | user | How many dependencies you want one manifest file to declare. Unlimited by default: a `go.mod`, `package.json` or `pom.xml` declares what the repository declares. A set value cuts the list at the bound and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_dependencies` as the count that crossed it against this value. A manifest is one file whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory, never the repository's. |
+| `manifest.max_entries` | `0` (unlimited) | user | The same contract for the other lists one manifest declares: modules, replaced and excluded modules, workspace members and Maven properties, and a Markdown document's headings and source links. Crossing it is reported as `max_entries` on that file's capability row. |
 
 ### Timeouts here are hang detectors, not size limits
 
