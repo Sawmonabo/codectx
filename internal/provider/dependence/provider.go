@@ -337,6 +337,11 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	// refused: the fact carries the clipped value, and the row says which
 	// fields were clipped and how many values each cut covered.
 	pub.TruncatedFields = report.TruncatedFields
+	// Evidence occurrences the import removed under the user's own
+	// index.max_evidence_per_fact. The facts were published; what the clip
+	// took off them is disclosed on the capability, not only in the line
+	// logged below.
+	pub.ClippedEvidence = int(report.ClippedEvidence)
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
