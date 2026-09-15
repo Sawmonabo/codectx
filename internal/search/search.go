@@ -317,20 +317,23 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 	c := newCollector()
 	facts := make(map[string]hitFacts)
 
-	// The exact tiers first: their bound is model.MaxPageItems because storage
-	// clamps any larger request to it (pageLimit), so asking for more would be
-	// a bound this code believes and the database does not.
-	exact, exactFull, err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems)
-	if err != nil {
+	// The exact tiers first. model.MaxPageItems is the READ size of one keyset
+	// step -- storage clamps any larger request to it (pageLimit), so asking for
+	// more would be a bound this code believes and the database does not -- and
+	// no longer a bound on how many candidates a tier may yield. Candidates are
+	// streamed into the collector, so the whole tier result never materialises
+	// as a slice; the collector's ranked set and its spool tail own the bound.
+	if err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
+		func(e exactHit) error {
+			r, ok := exactRanked(e)
+			if !ok || !filter.keep(e.Path) {
+				return nil
+			}
+			record(facts, r, exactHitOf(e))
+			c.add(r, reasonFor(e.Tier))
+			return nil
+		}); err != nil {
 		return nil, false, "", err
-	}
-	for _, e := range exact {
-		r, ok := exactRanked(e)
-		if !ok || !filter.keep(e.Path) {
-			continue
-		}
-		record(facts, r, exactHitOf(e))
-		c.add(r, reasonFor(e.Tier))
 	}
 
 	outcome, err := s.lexicalCandidates(ctx, reader, req, filter, c, facts)
@@ -341,9 +344,6 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 	truncated, reason := c.truncation()
 	if !truncated && outcome.Truncated {
 		truncated, reason = true, outcome.Reason
-	}
-	if !truncated && exactFull {
-		truncated, reason = true, truncationExactTierFull
 	}
 
 	items := c.results()
@@ -527,10 +527,6 @@ func exactHitOf(e exactHit) hitFacts {
 // caller would see a hit ranked above a scoring one with nothing saying why.
 func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + " tier" }
 
-// truncationExactTierFull is the QueryMeta.TruncationReason for a symbol tier
-// that filled its per-tier bound. Storage clamps a page to
-// model.MaxPageItems, so a full tier means there were more candidates than one
-// answer can carry.
 // spoolBudgetFullReason is the reason a caller sees when the hits of this page
 // were served but the remainder could not be written to the query spool. It
 // names the number of hits that were dropped, which is the fact a caller needs
@@ -540,8 +536,6 @@ func spoolBudgetFullReason(dropped int) string {
 		" further ranked hits were dropped and this answer has no continuation; " +
 		"retry after outstanding cursors expire, or raise resources.max_temp_bytes"
 }
-
-const truncationExactTierFull = "an exact or prefix tier returned its maximum number of candidates; narrow the query or add a filter"
 
 // hitFilter is SearchRequest.Languages and .Paths, applied uniformly to every
 // tier -- including the lexical candidates, before they are scored -- so the
