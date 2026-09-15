@@ -435,7 +435,10 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 	cursor := ""
 	for {
 		impact, err := eng.Impact(ctx, model.ImpactRequest{
-			GenerationID: gen,
+			// The generation is pinned by the cursor on a continuation, and
+			// naming both is refused: a cursor already carries the generation
+			// its first page was answered from.
+			GenerationID: pinnedGeneration(gen, cursor),
 			Start:        start,
 			Relations:    scopeRelations,
 			Direction:    model.DirectionBoth,
@@ -492,6 +495,17 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 		out.Scope.ScopeComplete = false
 	}
 	return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
+}
+
+// pinnedGeneration is the generation a walk request carries: the pinned one on
+// the first page and none on a continuation, because a cursor already pins the
+// generation its walk was answered from and naming both is refused
+// (PageRequest.ValidatePinned).
+func pinnedGeneration(gen model.GenerationID, cursor string) model.GenerationID {
+	if cursor != "" {
+		return 0
+	}
+	return gen
 }
 
 // finishIngest drains the dedupe survivors into the output sort, materializes

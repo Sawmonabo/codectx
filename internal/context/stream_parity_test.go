@@ -208,7 +208,10 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 	cursor := ""
 	for {
 		impact, err := eng.Impact(ctx, model.ImpactRequest{
-			GenerationID: gen,
+			// The generation is pinned by the cursor on a continuation, and
+			// naming both is refused: a cursor already carries the generation
+			// its first page was answered from.
+			GenerationID: pinnedGeneration(gen, cursor),
 			Start:        start,
 			Relations:    scopeRelations,
 			// Both directions: a caller reaches the seed through an incoming edge

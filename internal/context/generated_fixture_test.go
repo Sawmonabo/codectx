@@ -161,11 +161,12 @@ func TestTheGeneratedFixtureCanDiscriminateTheStreamedPasses(t *testing.T) {
 	//     would leave routes untyped here; over the shared fixture's four
 	//     wanted relations it could not.
 	full := compileGenerated(t, fx, generatedFullBudget)
-	if len(full.entries) < 150 {
-		t.Errorf("the unbounded compile produced %d entries; the fan-out is not reaching the packer", len(full.entries))
+	if len(full.entries) < 300 {
+		t.Errorf("the unbounded compile produced %d entries, want at least 300; the walk is not being read to "+
+			"exhaustion, or the fan-out is not reaching the packer", len(full.entries))
 	}
-	if len(full.wanted) < 150 {
-		t.Errorf("the entries name %d distinct relations on retained routes, want at least 150; "+
+	if len(full.wanted) < 250 {
+		t.Errorf("the entries name %d distinct relations on retained routes, want at least 250; "+
 			"below this the unlimited edge scan of ruling C8 has no input that one page would truncate",
 			len(full.wanted))
 	}
