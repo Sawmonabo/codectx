@@ -32,7 +32,13 @@ type lexicalSource interface {
 // to catch. *sqlite.PostingSession and *sqlite.OccurrenceStream satisfy them
 // through readerPostings below.
 type postingSession interface {
+	// TermOccurrences carries offsets and serves the phrase path, which needs
+	// them to test adjacency. TermCounts serves every other term from the
+	// generation's packed term statistics (ADR-0007 Decision 1), where the
+	// counts the scorer sums are already folded per document and visibility is
+	// already resolved.
 	TermOccurrences(ctx context.Context, term string) (occurrenceStream, error)
+	TermCounts(ctx context.Context, term string) (occurrenceStream, error)
 	Close() error
 }
 
@@ -57,12 +63,21 @@ func (r readerPostings) OpenPostings(ctx context.Context) (postingSession, error
 	return storedPostings{session}, nil
 }
 
-// storedPostings re-types PostingSession.TermOccurrences the same way.
+// storedPostings re-types PostingSession's two stream constructors the same way.
 type storedPostings struct{ *sqlite.PostingSession }
 
 // TermOccurrences opens one term's stream as the interface spells it.
 func (p storedPostings) TermOccurrences(ctx context.Context, term string) (occurrenceStream, error) {
 	stream, err := p.PostingSession.TermOccurrences(ctx, term)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
+}
+
+// TermCounts opens one term's packed stream as the interface spells it.
+func (p storedPostings) TermCounts(ctx context.Context, term string) (occurrenceStream, error) {
+	stream, err := p.PostingSession.TermCounts(ctx, term)
 	if err != nil {
 		return nil, err
 	}
@@ -493,7 +508,14 @@ func newTermStream(ctx context.Context, session postingSession, t lexicalTerm) (
 		live:    make([]bool, len(t.tokens)),
 	}
 	for i, tok := range t.tokens {
-		stream, err := session.TermOccurrences(ctx, tok)
+		// A phrase tests adjacency and needs the offsets only the live path
+		// carries; a single token needs counts, which the packed statistics
+		// already hold per document.
+		open := session.TermCounts
+		if t.phrase() {
+			open = session.TermOccurrences
+		}
+		stream, err := open(ctx, tok)
 		if err != nil {
 			s.close()
 			return nil, err
