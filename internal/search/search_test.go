@@ -293,6 +293,9 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_continuation_copies_its_tail_spool_to_spool", legSpoolToSpoolIsReentrant},
 		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
+
+		// FX-H-U rows
+		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -1108,6 +1111,15 @@ func (s *stubExact) NodesInFile(_ context.Context, file model.FileID, afterStart
 	return out, nil
 }
 
+// DistinctNodesInFile serves the same rows: every synthetic declaration here
+// has its own node id, so the one-row-per-node reading and the every-offset
+// reading coincide. The distinction is storage's, and the leg that proves it
+// lives beside the SQL.
+func (s *stubExact) DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64,
+	after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	return s.NodesInFile(ctx, file, afterStart, after, limit)
+}
+
 func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
 	return nil, nil
 }
@@ -1217,6 +1229,13 @@ func (s *stubWideExact) NodesInFile(_ context.Context, file model.FileID, afterS
 		}
 	}
 	return out, nil
+}
+
+// DistinctNodesInFile coincides with NodesInFile for the same reason as
+// stubExact's: one synthetic declaration per node id.
+func (s *stubWideExact) DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64,
+	after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	return s.NodesInFile(ctx, file, afterStart, after, limit)
 }
 
 func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
@@ -1871,5 +1890,98 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 	if !reflect.DeepEqual(got, want[skip:]) {
 		t.Fatalf("the streamed tail is %d hits and the run past the skip is %d; across %d chunk flushes "+
 			"they must be the same hits in the same order", len(got), len(want)-skip, wide/model.MaxPageItems)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FX-H-U legs.
+// ---------------------------------------------------------------------------
+
+// stubFileReader answers File for any id by SYNTHESIZING the version, so a walk
+// over 200 000 distinct files costs the stub nothing: a pre-built map of them
+// would be the heap the leg below measures. Nothing else on the read surface is
+// exercised, and the methods that are not say so rather than returning
+// plausible empty answers.
+type stubFileReader struct{ reads int }
+
+func (s *stubFileReader) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
+	s.reads++
+	return model.FileVersion{ID: id, Path: "pkg/" + string(id) + ".go"}, nil
+}
+
+func (s *stubFileReader) Node(context.Context, model.NodeID) (sqlite.StoredNode, error) {
+	return sqlite.StoredNode{}, errors.New("not used")
+}
+
+func (s *stubFileReader) FileByPath(context.Context, string) (model.FileID, error) {
+	return "", errors.New("not used")
+}
+
+func (s *stubFileReader) NodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) DistinctNodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+// legPathResolverHoldsOnePage proves the exact tiers' path cache is bounded by
+// the READ PAGE and not by the answer: the resolver used to memoize one entry
+// per distinct file of the whole request, so a symbol query spanning a
+// repository's files cost that much heap for the life of the request.
+//
+// Every path is still served -- the count below is the answer, and an evicted
+// entry costs one more File read, which is the whole trade.
+//
+// Mutation: restore the unbounded map (keep every entry, never evict) and the
+// ten-fold input moves the live set by ~24 MiB, failing the bound.
+func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
+	const page = 1000
+	resolve := func(n int) uint64 {
+		t.Helper()
+		p := newPathResolver(&stubFileReader{}, page)
+		var held uint64
+		for i := range n {
+			got, err := p.path(context.Background(), model.FileID(fmt.Sprintf("f%08d", i)))
+			if err != nil {
+				t.Fatalf("path(%d): %v", i, err)
+			}
+			if got == "" {
+				t.Fatalf("file %d resolved to no path", i)
+			}
+			if i == n-1 {
+				var m runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&m)
+				held = m.HeapAlloc
+			}
+		}
+		return held
+	}
+	small := resolve(20_000)
+	large := resolve(200_000)
+	if large > small+(1<<20) {
+		t.Fatalf("the path resolver held %d heap bytes over 20000 distinct files and %d over 200000; "+
+			"its working set is one read page, not the answer's file count", small, large)
+	}
+	t.Logf("path-resolver live set: 20000 files %d bytes, 200000 files %d bytes", small, large)
+
+	// The cache is a read-amplification knob, never a bound on the answer: a
+	// repeat within the page is served from the cache, and one past it is
+	// re-read rather than dropped.
+	warm := &stubFileReader{}
+	p := newPathResolver(warm, 2)
+	for _, id := range []model.FileID{"a", "b", "a", "c", "b"} {
+		if _, err := p.path(context.Background(), id); err != nil {
+			t.Fatalf("path(%s): %v", id, err)
+		}
+	}
+	if warm.reads != 4 {
+		t.Fatalf("a 2-entry cache made %d File reads over a,b,a,c,b; want 4: the repeat inside the "+
+			"cache is served from it and the evicted one is re-read", warm.reads)
 	}
 }

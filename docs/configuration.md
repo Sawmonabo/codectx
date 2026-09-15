@@ -218,6 +218,7 @@ All **user** trust.
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
 | `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |
+| `synchronous` | `"normal"` | SQLite synchronous mode of the single **writer** connection: `"normal"` or `"full"`. Any other value is refused with `storage.synchronous is "..."; use "normal" or "full"`. The store is rebuildable derived data and the database runs in WAL mode, where `"normal"` is safe from corruption and always consistent -- a power loss or hard reset can only roll back the most recent commits, leaving the previous generation active and some orphan blobs the retention sweep reclaims. `"full"` additionally fsyncs the write-ahead log after **every** commit, which buys durability of those last commits across a power loss and nothing else: transactions are durable across an application crash either way. Measured at ~10 ms per commit against ~0.11 ms on ext4, so `"full"` is materially slower to index. Readers are unaffected; they never write. See [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md). |
 
 ### The data directory
 
@@ -397,14 +398,17 @@ following the cursor reaches the same nodes an unbounded walk would. The
 pages of one walk, so a caller still sees the total the walk has spent, and a
 replayed cursor neither resets nor doubles it.
 
-Two stops are not resumable, and both say so rather than pretending otherwise.
+One stop is not resumable, and it says so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
-out of depth is reported truncated with no continuation. And `impact` — with the
-package rollup that answers on the same terms — performs its whole walk on the
-first request and then serves a spooled, globally ranked answer, so for it the
-two budgets are **answer-level** bounds measured against the walk's cumulative
-spend: exhausting one ends that walk, the answer is truncated with the reason,
-and every later page repeats the same flag and reason.
+out of depth is reported truncated with no continuation. `path` keeps its search
+state across pages, so a page that spends its work budget ends there with a
+continuation and the next page carries on; its memory budget never truncates
+anything. And `impact` — with the package rollup that answers on the same terms
+— performs its whole walk on the first request and then serves a spooled,
+globally ranked answer, so for it the two budgets are **answer-level** bounds
+measured against the walk's cumulative spend: exhausting one ends that walk, the
+answer is truncated with the reason, and every later page repeats the same flag
+and reason.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.

@@ -327,8 +327,11 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // refuses an `r` record through its default branch, so a ranked spool can never
 // be replayed as a frontier, and readRankedHeader refuses an `f` or `v` one.
 //
-// "p" is reserved for the ShortestPath continuation (lane P-d) and is not
-// implemented here.
+// "p" is the ShortestPath continuation's discriminator. It names no spool
+// RECORD -- a path search retains its whole external-memory state as a
+// directory rather than as a record stream (pathcursor.go) -- so it appears
+// here, in the one vocabulary block, purely so no two continuation shapes can
+// ever claim the same marker. pathCursor.validate is what reads it.
 //
 // The older ranked vocabulary of payload version 1 ("a", "e", "p", "c") is
 // gone and is not revived: it spooled a per-page chunk, which is the shape
@@ -337,6 +340,7 @@ const (
 	spoolRecordFrontier = "f"
 	spoolRecordVisited  = "v"
 	spoolRecordRanked   = "r"
+	spoolRecordPath     = "p"
 )
 
 // rankedHeader is the leading record of a ranked-tail spool: the marker above,

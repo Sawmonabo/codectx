@@ -126,6 +126,93 @@ func NewExternalSort[T any](dir, prefix string, bufRecords int,
 		compare: compare, bufN: bufRecords, buf: make([]T, 0, bufRecords)}, nil
 }
 
+// AdoptRuns opens a sort that CONTINUES an earlier, interrupted one: the runs
+// that sort had already spilled (its Detach return) become this sort's first
+// runs, and every record Added afterwards spills into runs that follow them.
+// Sorted then merges the adopted runs together with the new ones.
+//
+// It exists because a producer bounded by a page deadline -- the graph impact
+// rank pass, (*Engine).rankImpact in internal/graph/impactrank.go, whose
+// deadline contract is stated above runWalkToCompletion in that file -- must be
+// able to stop mid-sort and resume on the next page without re-sorting the
+// whole spooled sequence. The continuation carries the run paths in its
+// server-side state; the cursor names that state and never the paths.
+//
+// What it guarantees, and what the caller must hold up:
+//
+//   - ORDER. The adopted runs keep their arrival order and precede every run
+//     spilled after adoption, so the merge's run-index tie-break -- and with it
+//     the fold, which runs exactly once left to right over the fully ordered
+//     stream (WithFold) -- produces byte-identical output to one uninterrupted
+//     sort of the same arrival sequence.
+//   - CODEC AND ORDER FUNCTIONS. dir, prefix, encode, decode and compare must
+//     be the ones the interrupted sort used, and the fold, if it had one, must
+//     be re-applied with WithFold. A divergent comparator merges without error
+//     into an answer that is not sorted, and nothing here can detect that.
+//   - OWNERSHIP. This sort now owns the adopted files: Sorted removes them with
+//     its own runs, and so does Close. The interrupted sort released them in
+//     Detach and must not remove them.
+//   - MEMORY. Unchanged. Adopted runs are opened only by the merge, so peak
+//     live records is still the run buffer or MaxSortFanIn, never the length of
+//     the sequence however many pages it took to build.
+//   - Len counts only what is Added here; see Len.
+//
+// Each adopted path must name a readable file, and no path may repeat -- a
+// repeat would merge one run's records twice. Either is a typed error rather
+// than a quietly short or doubled answer. A record inside an adopted run is
+// guarded on read by the same per-record ceiling every run file is (runReader).
+func AdoptRuns[T any](dir, prefix string, bufRecords int, runs []string,
+	encode func(T) ([]byte, error), decode func([]byte) (T, error), compare func(a, b T) int,
+) (*ExternalSort[T], error) {
+	s, err := NewExternalSort(dir, prefix, bufRecords, encode, decode, compare)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(runs))
+	for _, name := range runs {
+		if name == "" {
+			return nil, internalErr("external sort: an adopted run has no path")
+		}
+		if _, dup := seen[name]; dup {
+			return nil, internalErr("external sort: an adopted run is named twice")
+		}
+		seen[name] = struct{}{}
+		if _, err := os.Stat(name); err != nil {
+			return nil, internalErr("external sort adopted run: " + err.Error())
+		}
+	}
+	s.runs = slices.Clone(runs)
+	return s, nil
+}
+
+// Detach ends this sort WITHOUT producing an answer and hands its spilled runs
+// to whoever will resume them through AdoptRuns. It is the interruption half of
+// that constructor: a producer stopped by a page deadline calls it, persists
+// the returned paths in its continuation state, and the next page adopts them.
+//
+// The pending run buffer is spilled first, so the returned runs hold every
+// record Added -- a deadline never costs the records that had not reached a run
+// file yet.
+//
+// OWNERSHIP MOVES with the paths: this sort no longer removes them, so the
+// caller's deferred Close is safe and the resumed sort (or, if the caller
+// abandons the continuation, the caller itself) is what removes them. The sort
+// is finished afterwards: a later Add or Sorted fails rather than answering the
+// subset that is left.
+func (s *ExternalSort[T]) Detach() ([]string, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if err := s.spill(); err != nil {
+		return nil, err
+	}
+	runs := s.runs
+	s.runs = nil
+	s.buf, s.bufBytes = nil, 0
+	s.err = internalErr("this external sort was detached; its runs belong to the sort that adopts them")
+	return runs, nil
+}
+
 // WithFold sets the fold that collapses records the comparator reports as
 // equal, and returns s so a caller can chain it onto the constructor.
 //
@@ -193,7 +280,11 @@ func (s *ExternalSort[T]) Add(v T) error {
 	return s.spill()
 }
 
-// Len is how many records have been added.
+// Len is how many records have been added TO THIS SORT. A sort that adopted
+// the runs of an interrupted one (AdoptRuns) does not count their records: it
+// would have to read them to learn the number, and a count taken from the
+// caller instead is a number that can be wrong. The authoritative total of the
+// whole answer is SortedRun.Len, which the merge counts after the fold.
 func (s *ExternalSort[T]) Len() int64 { return s.count }
 
 // spill sorts the run buffer and writes it out as one sorted run.

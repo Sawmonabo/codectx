@@ -49,21 +49,42 @@ inside one canonical relation is **one relation and two occurrences**. Each item
 is one occurrence and carries the precision class, file and byte range of the
 evidence row behind it.
 
+**One unreadable blob costs one hit, not the answer.** A `search` hit's `range`
+is resolved by reading the file's bytes out of the content store. When the store
+no longer holds them — the blob is missing, a read comes back short, a block
+digest does not verify, or the snapshot no longer retains the row — that hit
+comes back with no `range` and an `unresolved_fields` object naming the field
+that could not be resolved against the typed reason it failed with:
+
+```json
+{ "path": "pkg/gone.go", "tier": "lexical_fts",
+  "unresolved_fields": { "range": "CTX_SOURCE_INTEGRITY: blob is missing from the content-addressed store" } }
+```
+
+Every other hit on the page keeps its real range. The field is absent from a hit
+that resolved normally, so a missing `range` is never ambiguous: either the hit
+says why it is missing, or the hit carries one. This applies to the content
+store alone. A document that claims bytes past the file it names is a corrupt
+index, not a clamped range, and still fails the query with
+`CTX_ARGUMENT_INVALID`; a cancelled query or an exhausted deadline still fails
+as itself rather than arriving as a complete answer with per-hit footnotes. Run
+`codectx doctor --deep` to verify the content store when hits carry this flag.
+
 ## Flags
 
 | Flag | Commands | Meaning |
 |---|---|---|
 | `--repo` | all | Workspace root to answer from. |
-| `--generation` | all | Answer from this generation instead of the active one. On every command but `path`, which issues no continuation, it is not combinable with `--cursor`. |
+| `--generation` | all | Answer from this generation instead of the active one. It is not combinable with `--cursor`: a cursor already pins its generation. |
 | `--timeout` | all | Deadline for this invocation. Zero leaves the configured query deadline in charge. |
-| `--limit` | all but `path` | Items in one page. |
-| `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
+| `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
+| `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` and `impact`, which each walk once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
 
-**`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
-`callees` and `impact` print a `next` token when more remains. On `callers` and
+**Every graph command issues a continuation.** `search`, `symbol`, `refs`, `callers`,
+`callees`, `path` and `impact` print a `next` token when more remains. On `callers` and
 `callees` a continuation resumes the walk itself, from the frontier the previous
 page persisted, with a fresh per-page work allowance; the `walked` counts it
 reports stay cumulative across the pages of the one walk, so replaying a cursor
@@ -112,10 +133,15 @@ the request, not on the heap, so peak heap is one node-aligned slice of the
 current bucket — `resources.query_memory_bytes` — plus that database's fixed
 page cache, and never a function of the reachable set. Crossing that number
 costs another slice and nothing else: there is no memory truncation reason, and
-a `path` answer is never shortened because the search ran out of heap. `path` is
-not paged at all — it declares neither flag, and its `--visited` and depth
-budgets, which are the only things that can still truncate it, are spent by the
-one search it runs.
+a `path` answer is never shortened because the search ran out of heap. A `path` page ends on the
+deadline or on the per-page `--visited` budget with a cursor: the search's whole
+state — settled set, parent DAG, cost buckets and the nodes it has settled but
+not yet expanded — is retained under the cursor's own lease and reopened by the
+next page, which carries on settling buckets rather than starting again. The
+answer is exact once the final page arrives; the depth bound is the one stop
+that is reported rather than resumed, because it is part of the query the cursor
+is bound to. A retained search is reclaimed when its lease expires, like any
+other continuation state.
 
 **Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
 `--depth`, `--visited` or `--edges` takes the configured bound, and a positive

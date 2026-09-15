@@ -296,3 +296,29 @@ capability skipped, which labels it could not map. Keys are emitted in
 ascending order, so the stored text, and therefore the digest folded into the
 generation's `AnalysisKey`, is a function of the pairs and never of the order a
 publisher added them.
+
+## Durability after a power loss
+
+The database runs in WAL mode and its single writer connection runs at
+`synchronous = normal` by default (`storage.synchronous`; set `"full"` to
+fsync the write-ahead log after every commit instead). WAL mode at NORMAL is
+safe from corruption and always consistent: a power loss or hard reset can
+never leave a database that does not open, only one whose most recent commits
+have rolled back. Durability across an *application* crash — a panic, a kill,
+a failed process — does not depend on this setting at all and is unaffected.
+
+What a rolled-back tail can cost is bounded by two properties of the store.
+Generation activation is a single commit, so a generation is either visible or
+it is not; a crash can leave the previous generation active, never a partly
+published one. And a blob's content reaches the disk before the commit that
+names it, so the only inconsistency a rolled-back commit can produce is a blob
+that nothing references — an orphan, which is exactly what the retention sweep
+already reclaims, never a manifest pointing at content that is not there.
+
+So the worst case is: the workspace is one generation stale and holds some
+unreferenced blobs until the next sweep. Both are repaired by re-running the
+index, which the store is built to do cheaply, because everything in it is
+derived from the repository's own bytes. `storage.synchronous = "full"` buys
+back durability of those last commits at roughly 10 ms of fsync per commit;
+[ADR-0004](adr/ADR-0004-wal-synchronous-mode.md) records why that is not the
+default.

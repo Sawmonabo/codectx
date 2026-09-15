@@ -209,6 +209,15 @@ type Resources struct {
 	MaxProviderRecordBytes    Limit    `toml:"max_provider_record_bytes"`
 }
 
+// The two accepted spellings of storage.synchronous. They are the whole set:
+// SQLite's OFF and EXTRA are deliberately not offered. OFF gives up the
+// corruption-free guarantee WAL+NORMAL provides, and EXTRA only adds a
+// directory fsync for rollback-journal transactions the store never runs.
+const (
+	SynchronousNormal = "normal"
+	SynchronousFull   = "full"
+)
+
 // Storage is the SQLite and data-directory policy.
 type Storage struct {
 	// DataDir is always absolute after Load: the empty default is resolved to
@@ -223,6 +232,14 @@ type Storage struct {
 	WALHighWaterBytes      int64    `toml:"wal_high_water_bytes"`
 	ClosedSessionRetention Duration `toml:"closed_session_retention"`
 	QueryCursorTTL         Duration `toml:"query_cursor_ttl"`
+	// Synchronous is the SQLite synchronous mode of the single writer
+	// connection: "normal" (the default) or "full". The store is rebuildable
+	// derived data and the database runs in WAL mode, where NORMAL is
+	// corruption-free -- a power loss can only roll back the most recent
+	// commits -- so the per-commit WAL fsync FULL costs is not bought back by
+	// any promise codectx makes. Set "full" to keep it anyway. Readers are
+	// unaffected: they are query_only and never write. See docs/adr/ADR-0004.
+	Synchronous string `toml:"synchronous"`
 }
 
 // Retention configures the process-level collector (internal/retention): the
@@ -601,6 +618,7 @@ func Defaults() Config {
 			WALHighWaterBytes:      67108864,
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),
 			QueryCursorTTL:         Duration(15 * time.Minute),
+			Synchronous:            SynchronousNormal,
 		},
 		Retention: Retention{
 			BlobGrace: Duration(24 * time.Hour),
