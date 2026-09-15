@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Phase is the context-compilation phase. Only sweep and verify can open a new
 // session; consolidate is compiled by the workflow service for an existing
@@ -353,6 +356,20 @@ type ContextManifest struct {
 	ScopeComplete  bool              `json:"scope_complete"`
 	EstimateMethod string            `json:"estimate_method"`
 	CreatedAt      time.Time         `json:"created_at"`
+	// Notices are the compile's non-fatal disclosures, the same contract
+	// QueryMeta.Notices carries on the query surfaces: a request that asked for
+	// a bound the configuration resolves differently reports "requested N,
+	// effective M" here rather than being silently clamped, and a field the
+	// compile had to truncate names the count it truncated here rather than
+	// shortening an explanation without saying so.
+	//
+	// They are NOT part of CanonicalHash and are not persisted: the hash
+	// identifies the PLAN, and two compiles of one generation that differ only
+	// in the bounds the operator configured are the same plan. A manifest
+	// re-read from storage therefore carries no notices, and Compile re-emits
+	// the configuration-derived ones on the reuse path so the caller that
+	// asked is still told.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Validate enforces the context_manifests constraints.
@@ -389,6 +406,19 @@ func (m ContextManifest) Validate() error {
 	}
 	if err := requireField("manifest.estimate_method", m.EstimateMethod, MaxIdentifierBytes); err != nil {
 		return err
+	}
+	// Bounded per notice, not in total -- the QueryMeta.Notices rule: the count
+	// is a function of how many bounds the request met, and an aggregate cap
+	// would be the silent disclosure drop these notices exist to prevent. The
+	// producers pass every notice through TruncateField, so this bound reports
+	// a producer defect rather than refusing a legitimate compile.
+	for i, note := range m.Notices {
+		if strings.TrimSpace(note) == "" {
+			return invalid("manifest.notices[%d] is empty", i)
+		}
+		if err := boundField("manifest.notices", note, MaxReasonBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }

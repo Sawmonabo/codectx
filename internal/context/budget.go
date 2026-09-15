@@ -121,14 +121,15 @@ const sizeIterations = 8
 // file's real cost, which is what groupByFile and sliceOrdinals both do.
 //
 // Source bytes are never loaded; model.FileVersion.Size is the only input.
-func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, error) {
+func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEntry, int64, error) {
 	var wire int64
 	if chargeSource {
 		var err error
 		if wire, err = wireEncodedBytes(c.SizeBytes); err != nil {
-			return model.ContextEntry{}, err
+			return model.ContextEntry{}, 0, err
 		}
 	}
+	paths, clipped := evidencePaths(c.Paths)
 	e := model.ContextEntry{
 		Ordinal:       ordinal,
 		NodeID:        c.NodeID,
@@ -136,24 +137,24 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 		Requirement:   c.Requirement,
 		ScoreMicros:   c.ScoreMicros,
 		Reasons:       c.Reasons,
-		EvidencePaths: evidencePaths(c.Paths),
+		EvidencePaths: paths,
 	}
 	for i := 0; i < sizeIterations; i++ {
 		meta, err := serializedBytes(e)
 		if err != nil {
-			return model.ContextEntry{}, err
+			return model.ContextEntry{}, 0, err
 		}
 		bytes := wire + meta
 		tokens, err := estimateTokens(bytes)
 		if err != nil {
-			return model.ContextEntry{}, err
+			return model.ContextEntry{}, 0, err
 		}
 		if e.EstimatedBytes == bytes && e.EstimatedTokens == tokens {
-			return e, nil
+			return e, clipped, nil
 		}
 		e.EstimatedBytes, e.EstimatedTokens = bytes, tokens
 	}
-	return model.ContextEntry{}, &model.Error{Code: model.CodeInternal,
+	return model.ContextEntry{}, 0, &model.Error{Code: model.CodeInternal,
 		Message: "the measured entry size did not settle; it would be a guess rather than a measurement"}
 }
 
@@ -166,11 +167,15 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 // model.ContextEntry.Validate no longer refuses the entry on that count, so a
 // second clip at 3 would discard routes the operator asked to keep after the
 // lane that honoured the setting had produced them. Only the per-path relation
-// list keeps model.MaxRelationsPerPath, which Validate does still enforce.
-func evidencePaths(paths []model.RelationPath) [][]model.RelationID {
+// list keeps model.MaxRelationsPerPath, which Validate does still enforce -- and
+// the cut is now counted and returned, so a route the manifest stores shorter
+// than the route the walk found is disclosed as a manifest notice instead of
+// being a silent edit of the evidence.
+func evidencePaths(paths []model.RelationPath) ([][]model.RelationID, int64) {
 	if len(paths) == 0 {
-		return nil
+		return nil, 0
 	}
+	var clipped int64
 	out := make([][]model.RelationID, 0, len(paths))
 	for _, p := range paths {
 		if len(p.Relations) == 0 {
@@ -179,13 +184,14 @@ func evidencePaths(paths []model.RelationPath) [][]model.RelationID {
 		rel := p.Relations
 		if len(rel) > model.MaxRelationsPerPath {
 			rel = rel[:model.MaxRelationsPerPath]
+			clipped++
 		}
 		out = append(out, append([]model.RelationID(nil), rel...))
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, clipped
 	}
-	return out
+	return out, clipped
 }
 
 // plan is the Section 15.4 result: entries in Section 15.3 tie-break order with
@@ -196,6 +202,12 @@ type plan struct {
 	Entries  []model.ContextEntry
 	Slices   []model.ContextSlice
 	Excluded []model.ExcludedContextEntry
+	// RelationsClipped counts the routes whose relation list evidencePaths had
+	// to cut to model.MaxRelationsPerPath across the SELECTED entries. It is a
+	// count, not a per-entry list, for the reason scopeResult's two counters
+	// are: the compiler turns it into one manifest notice, so a shortened route
+	// never reads as the whole route.
+	RelationsClipped int64
 }
 
 // buildPlan sizes, selects, orders and packs cands under b.
@@ -268,7 +280,11 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 	// overfilled.
 	provisional := make([]model.ContextEntry, len(sized))
 	for i, c := range sized {
-		e, err := measureEntry(c, i, charged[c.FileID] == i)
+		// The clip count is taken from phase two, not here: phase one measures
+		// every candidate including the ones selection drops, so counting both
+		// passes would double every selected entry and count entries the
+		// manifest never carries.
+		e, _, err := measureEntry(c, i, charged[c.FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
@@ -297,10 +313,11 @@ func buildPlan(cands []candidate, files []model.FileVersion, b resolvedBudget) (
 			continue
 		}
 		ordinal := len(out.Entries)
-		e, err := measureEntry(sized[i], ordinal, charged[sized[i].FileID] == i)
+		e, clipped, err := measureEntry(sized[i], ordinal, charged[sized[i].FileID] == i)
 		if err != nil {
 			return plan{}, err
 		}
+		out.RelationsClipped += clipped
 		final[i] = ordinal
 		out.Entries = append(out.Entries, e)
 	}

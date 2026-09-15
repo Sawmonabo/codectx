@@ -1708,6 +1708,29 @@ func writePlanResult(b *strings.Builder, result model.PlanResult) {
 		m.SliceCount, plural(m.SliceCount, "slice", "slices"))
 	fmt.Fprintf(b, "budget      %d tokens, %d bytes, %d files, %d slices (0 is the configured default)\n",
 		m.Budget.MaxEstimatedTokens, m.Budget.MaxBytes, m.Budget.MaxFiles, m.Budget.MaxSlices)
+	writeManifestNotices(b, m.Notices)
+}
+
+// writeManifestNotices prints the compile's non-fatal disclosures -- a page
+// size the configuration asked for and could not have, and the counts of the
+// explanation cuts the compile applied.
+//
+// They are printed on the text path and not only in JSON because an operator
+// reading a plan in a terminal is exactly the reader who needs to know the
+// explanation is shorter than the walk that produced it. A notice is not a
+// failure, so it does not change the exit status; it is labelled "notice"
+// rather than "warning" for that reason, beside the "warning" the session
+// block uses for a superseded snapshot.
+func writeManifestNotices(b *strings.Builder, notices []string) {
+	for _, note := range notices {
+		if strings.TrimSpace(note) == "" {
+			continue
+		}
+		// Printed whole, not through tableCell: a notice that says what the
+		// compile could not carry must not itself be clipped. This is the
+		// shape emitQuery already uses for meta.Notices.
+		fmt.Fprintf(b, "notice      %s\n", note)
+	}
 }
 
 // writeContextPage renders one page of whichever manifest projection was asked
