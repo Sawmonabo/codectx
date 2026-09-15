@@ -451,8 +451,13 @@ func (m ContextManifest) Validate() error {
 // session id, because a partial plan is never persisted and no session may bind
 // to one -- which is exactly what the exactly-one-of rule in Validate enforces.
 type PlanResult struct {
-	Manifest  ContextManifest `json:"manifest"`
-	SessionID SessionID       `json:"session_id"`
+	// omitzero / omitempty: on the truncated shape these two are absent from
+	// the wire rather than encoded as an all-zero manifest object and a blank
+	// session id, which a client would read as a plan that selected nothing
+	// inside a session it may now use. They are always present on the finished
+	// shape, where Validate requires both.
+	Manifest  ContextManifest `json:"manifest,omitzero"`
+	SessionID SessionID       `json:"session_id,omitempty"`
 	ActorID   string          `json:"actor_id"`
 
 	// Truncated says this call stopped at a pass boundary and compiled no
@@ -480,7 +485,10 @@ func (r PlanResult) Validate() error {
 		if !r.Truncated {
 			return invalid("plan_result carries a continuation cursor without truncated")
 		}
-		if err := requireField("plan_result.truncation_reason", r.TruncationReason, MaxIdentifierBytes); err != nil {
+		// MaxReasonBytes, the same bound meta.truncation_reason carries: the
+		// vocabulary is the same one QueryMeta reports truncation with, and one
+		// wire type should not spell the same reason two lengths.
+		if err := requireField("plan_result.truncation_reason", r.TruncationReason, MaxReasonBytes); err != nil {
 			return err
 		}
 		if err := requireField("plan_result.next_cursor", r.NextCursor, MaxTokenBytes); err != nil {
