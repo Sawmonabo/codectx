@@ -138,19 +138,24 @@ func TestBindingCarriesTheServerReportAndEncoding(t *testing.T) {
 		return b.ProviderVersion, b.InputDigest
 	}
 
-	// The reporting server at utf-8: the label is what the server said, not the
-	// pinned version.
-	reportingVersion, reportingDigest := open(t, "utf-8", false)
+	// Each case changes exactly one of the two, so a digest that stopped
+	// folding in either one is caught by its own comparison rather than
+	// masked by the other.
+	reportingVersion, utf8Digest := open(t, "utf-8", false)
 	if reportingVersion != "1.2.3" {
 		t.Fatalf("provider_version = %q, want the reported 1.2.3", reportingVersion)
 	}
-	// The same payload, same snapshot content, reporting nothing at utf-16 --
-	// the shape of the server this one replaced.
-	silentVersion, silentDigest := open(t, "utf-16", true)
+	// Same server report, different negotiated encoding.
+	if _, utf16Digest := open(t, "utf-16", false); utf16Digest == utf8Digest {
+		t.Fatalf("input digest %q is unchanged across a different position encoding", utf8Digest)
+	}
+	// Same encoding, no server report -- the shape of the server this one
+	// replaced, which fell back to the version the lock pinned.
+	silentVersion, silentDigest := open(t, "utf-8", true)
 	if silentVersion != "pinned-9.9.9" {
 		t.Fatalf("provider_version = %q, want the pinned fallback", silentVersion)
 	}
-	if reportingDigest == silentDigest {
-		t.Fatalf("input digest %q is unchanged across a different server report and encoding", reportingDigest)
+	if silentDigest == utf8Digest {
+		t.Fatalf("input digest %q is unchanged across a different server report", utf8Digest)
 	}
 }
