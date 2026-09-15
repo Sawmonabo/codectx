@@ -3,11 +3,13 @@ package context
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // The streamed budget passes (P-G, P-H, P-I) exist to produce byte-for-byte the
@@ -331,6 +333,41 @@ func partsOf(p plan) planParts {
 func (c *Compiler) persistPlan(ctx context.Context, b model.Binding, req model.ContextRequest,
 	budget model.Budget, p plan, completeness []model.CapabilityState,
 	scopeComplete bool) (model.ContextManifest, error) {
-	return c.persistManifest(ctx, b, req, budget, partsOf(p), p.Entries, p.Excluded,
+	run, release, err := excludedRun(p.Excluded)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	defer release()
+	return c.persistManifest(ctx, b, req, budget, partsOf(p), p.Entries, run,
 		completeness, scopeComplete)
+}
+
+// excludedRun spools a whole-set plan's exclusions into the sorted run
+// persistManifest now takes. The reference pipeline's tests build a `plan`
+// with its exclusions in heap; production never does, so the adapter lives
+// here and not in the package.
+func excludedRun(xs []model.ExcludedContextEntry) (*pagination.SortedRun[model.ExcludedContextEntry], func(), error) {
+	dir, err := os.MkdirTemp("", "ctx-excl-")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	release := func() { os.RemoveAll(dir) }
+	sorter, err := pagination.NewExternalSort(dir, "excluded-", 0,
+		encodeRecord[model.ExcludedContextEntry], decodeRecord[model.ExcludedContextEntry], lessExcludedOrdinal)
+	if err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	for _, x := range xs {
+		if err := sorter.Add(x); err != nil {
+			release()
+			return nil, func() {}, err
+		}
+	}
+	run, err := sorter.Sorted()
+	if err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	return run, release, nil
 }
