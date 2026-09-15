@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -342,7 +343,7 @@ func (p *PostingSession) TermOccurrences(ctx context.Context, term string) (*Occ
 	if err != nil {
 		return nil, wrap("search_vocab", err)
 	}
-	return &OccurrenceStream{term: term, rows: rows}, nil
+	return &OccurrenceStream{term: term, rows: rows, engine: p.r.s.Version}, nil
 }
 
 // OccurrenceStream pulls one term's posting list in page-sized refills from a
@@ -360,6 +361,9 @@ type OccurrenceStream struct {
 	// prev is the last row scanned, for the emission-order check.
 	prev    rawOccurrence
 	started bool
+	// engine is sqlite_version() as observed at open, named in the order
+	// violation so an operator can tell an engine change from a damaged index.
+	engine string
 }
 
 // rawOccurrence is one (document, column, offset) instance row.
@@ -445,14 +449,35 @@ func (s *OccurrenceStream) scan(ctx context.Context) (bool, error) {
 	if s.started {
 		switch {
 		case row.doc < s.prev.doc:
-			return false, corrupt("search_vocab emitted term %q at document %d after document %d", s.term, row.doc, s.prev.doc)
+			return false, s.orderViolation("emitted term %q at document %d after document %d",
+				s.term, row.doc, s.prev.doc)
 		case row.doc == s.prev.doc && row.column == s.prev.column && row.offset <= s.prev.offset:
-			return false, corrupt("search_vocab emitted term %q at offset %d after offset %d in document %d column %q",
+			return false, s.orderViolation("emitted term %q at offset %d after offset %d in document %d column %q",
 				s.term, row.offset, s.prev.offset, row.doc, col)
 		}
 	}
 	s.started, s.prev, s.head, s.have = true, row, row, true
 	return true, nil
+}
+
+// orderViolation is the typed refusal the emission-order check raises. It
+// carries a Remediation of its own rather than the bare corrupt() helper,
+// because this guard has TWO causes and only one of them is a damaged index:
+// fts5vocab does not contract doclist order, so an engine whose emission order
+// changed would trip it on a perfectly good store, and the re-index the bare
+// CTX_STORAGE_CORRUPT message invites would not fix that. The engine version
+// observed at open is named so an operator can tell the two apart.
+func (s *OccurrenceStream) orderViolation(format string, args ...any) *model.Error {
+	engine := s.engine
+	if engine == "" {
+		engine = "unknown"
+	}
+	return &model.Error{Code: model.CodeStorageCorrupt,
+		Message: "search_vocab " + fmt.Sprintf(format, args...),
+		Remediation: "the search index may be damaged, or the embedded SQLite engine (" + engine +
+			") may order this term's postings differently than the index was built under; " +
+			"re-index the repository with `codectx index --repo <path>`, and if the same error " +
+			"returns on the fresh index, report it with that engine version"}
 }
 
 // appendInstance folds one instance row into the current document's groups.

@@ -207,7 +207,7 @@ which is exact. No edge can be dropped by it. The filter is sized from the cumul
 the cursor already carries and clamped to an eighth of the frontier memory ceiling, so peak heap is a
 function of that configured ceiling, not of the walk; past the clamp it simply grows denser (more
 false positives, more merge-joins), never refusing or truncating. Probes are the two-hash
-construction of [S33].
+construction of [S35].
 
 *Re-deriving the frontier per page from a keyset scan under the pinned generation*, avoiding a spool
 altogether, as mature search systems do with a point-in-time view and `search_after` [S14],
@@ -951,16 +951,16 @@ per level rather than per node (§2.2).
 [S32] Mehlhorn, K. and Meyer, U., *External-memory breadth-first search with sublinear I/O*, ESA
 2002 — a bounded front in memory with the bulk outside it; the semi-external shape adopted (§2.2).
 
-[S33] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
-filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
-construction (§2.2).
-
 [S33] Knuth, D. E., *The Art of Computer Programming*, vol. 3, §5.4.1 — replacement selection and
 bounded merge order; the classical statement of the lever recorded but not taken (§2.3).
 
 [S34] https://pkg.go.dev/net/http/httptrace#WithClientTrace — a request-scoped observation collector
 carried on the context rather than through every function signature; the precedent for reporting a
 clamp without changing two dozen reader signatures (§2.1).
+
+[S35] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
+filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
+construction (§2.2).
 
 ---
 
