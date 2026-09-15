@@ -271,6 +271,12 @@ func (s *ExternalSort[T]) writeRecord(w *bufio.Writer, v T) error {
 // files are removed. Close the result to remove that file.
 //
 // Add must not be called afterwards.
+//
+// On the ERROR path the run files are not always removed: a failure before the
+// merge (spill, collapse, output creation) leaves the spilled runs on disk, so
+// the caller keeps its obligation to Close this sort whether Sorted succeeded
+// or failed. Every caller already defers Close, and that is the contract, not
+// an accident: Sorted owns removal only on the path that consumed the runs.
 func (s *ExternalSort[T]) Sorted() (*SortedRun[T], error) {
 	if s.err != nil {
 		return nil, s.err

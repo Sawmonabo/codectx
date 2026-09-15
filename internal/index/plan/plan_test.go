@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"os"
 	"runtime"
 	"slices"
 	"testing"
@@ -86,9 +87,24 @@ func TestExternalMergeReproducesTheInHeapInputOrder(t *testing.T) {
 // Peak heap must not grow with the number of inputs. Two sorts an order of
 // magnitude apart are held against each other: the in-heap slice they replaced
 // grew linearly, so a regression to one shows up as a ~10x ratio here.
+//
+// The heap delta alone is not sufficient evidence, because a sort that never
+// spilled would also hold a flat heap for the wrong reason. Each measurement
+// therefore also counts the files the sort left behind: it must have spilled
+// (more than the merged output alone would leave) while the sort is alive, and
+// the merged run must be the ONLY file left once the merge is done -- the run
+// files are removed by Sorted, not at Close.
 func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 	measure := func(n int) uint64 {
-		sorter, err := pagination.NewExternalSort(t.TempDir(), "plan-inputs-", 4096,
+		dir := t.TempDir()
+		files := func() int {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			return len(entries)
+		}
+		sorter, err := pagination.NewExternalSort(dir, "plan-inputs-", 4096,
 			encodeInput, decodeInput, compareInput)
 		if err != nil {
 			t.Fatalf("NewExternalSort: %v", err)
@@ -99,11 +115,19 @@ func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 				t.Fatalf("Add: %v", err)
 			}
 		}
+		if spilled := files(); spilled < 2 {
+			t.Fatalf("a %d-input sort left %d run files before the merge; it never spilled, "+
+				"so a flat heap here would prove nothing", n, spilled)
+		}
 		run, err := sorter.Sorted()
 		if err != nil {
 			t.Fatalf("Sorted: %v", err)
 		}
 		defer func() { _ = run.Close() }()
+		if left := files(); left != 1 {
+			t.Fatalf("%d files remain after the merge of %d inputs, want only the merged run: "+
+				"a run file that survives Sorted is disk held for the life of the plan", left, n)
+		}
 		var m runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&m)
