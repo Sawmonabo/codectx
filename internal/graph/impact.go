@@ -131,6 +131,16 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 
 	b := &budget{deadline: deadline, now: e.now}
 	var resume *resumeState
+	// stalled is set only by the walkStalled path below. That page ends the
+	// answer TERMINALLY with no cursor of its own, so the cursor the caller is
+	// still holding is the whole remedy the reason offers -- and a fresh
+	// request gets a fresh deadline (beginImpactQuery), so a warm read really
+	// can advance where this one could not. Releasing the state on that path
+	// destroyed it and made the documented remedy cost the walk from its seed.
+	// It is an explicit flag rather than "no cursor was minted", because the
+	// exhausted, fully served answer mints no cursor either and that state is
+	// genuinely finished; same shape as serveRankedImpact's complete.
+	stalled := false
 	if req.Page.Cursor != "" {
 		c, rb, err := e.verifyContinuation(req.Page.Cursor, impactEndpoint, queryHash, deadline)
 		if err != nil {
@@ -156,7 +166,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// request answered CTX_CURSOR_INVALID and every page behind it was
 		// lost. The state stays adoptable and expires with its own lease TTL.
 		defer func() {
-			if terminalOutcome(err) {
+			if terminalOutcome(err) && !stalled {
 				resume.Release()
 			}
 		}()
@@ -248,6 +258,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// forward, so the request that finishes the walk ranks all of them.
 		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
 			// No continuation: it would be the one this request was given.
+			// That cursor stays ADOPTABLE for the rest of its lease, which is
+			// what makes the reason's remedy -- present it again under a
+			// longer resources.query_timeout -- resume the walk instead of
+			// restarting it from the seed.
+			stalled = true
 			markTruncated(&meta, reasonDeadlineStalled)
 			answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 				Notices: answer.Notices, Completeness: meta.Completeness}
@@ -642,6 +657,20 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 	resume *resumeState, retain *retainedWalk) (string, error) {
 	if len(state.Frontier) == 0 || state.DepthLimited {
 		return "", nil
+	}
+	if state.LevelBoundary {
+		// The deadline stopped BETWEEN levels: the frontier this cursor carries
+		// has not been read at all, so the keyset position the accumulator last
+		// emitted belongs to the level already finished. Carried into the next
+		// level it is a filter, not a resume point -- levelEdges drops every row
+		// whose owner sorts below it (traverse.go states the rule) -- and those
+		// rows are dropped SILENTLY, with the nodes already marked visited by
+		// the leg that admitted them, so no later page can reach them either.
+		// Measured before this: an 8-mid fixture cut at its first level boundary
+		// served 38 of 56 entities, untruncated. traverse.go:821 and
+		// walkrun.go:152 apply the same rule to the traversal endpoint and to a
+		// walk's internal links; this is the cross-request half of it.
+		lastOwner, lastKey = "", ""
 	}
 	// The cumulative admitted set is NOT materialized here and NOT copied
 	// forward: only the nodes THIS page admitted are, appended to the retained
