@@ -156,6 +156,7 @@ func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
 	if err != nil {
 		errs = append(errs, err)
 	}
+	report.OrphanSweepRan = due
 	if due {
 		swept, err := c.opts.Objects.SweepOrphans(ctx, c.opts.Blobs.KnownBlobs, now, window, limit)
 		report.OrphanObjectsSwept += swept
