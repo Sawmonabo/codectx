@@ -382,6 +382,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if childMemory <= 0 {
 		childMemory = unobservedChildMemoryBudget
 	}
+	// resources.max_temp_bytes is passed through UNCLAMPED, including its
+	// unlimited default of 0: the runner reads a non-positive disk budget as
+	// unlimited and admits every reservation, so the default never refuses a
+	// child at admission. Only a value the operator set refuses one, and it
+	// says so with resources.max_temp_bytes named in the error.
 	shared, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     maxInt(1, cfg.Resources.MaxConcurrentHeavy) + sharedRunnerHeadroom,
 		MemoryBudgetBytes: childMemory,
