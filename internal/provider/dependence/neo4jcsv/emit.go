@@ -34,6 +34,26 @@ type emitter struct {
 	noRange                   int // located facts whose coordinates did not verify
 	unresolved                int // assignment targets published as may_refer_to
 	clipped                   int // evidence rows over MaxEvidencePerFact
+	// truncatedFields counts, by field name, the descriptive storage values
+	// this import cut to their model ceiling before writing them to the sink.
+	// The model accepts an oversize storage field, so the cut is the
+	// producer's to make and the count is what keeps it from being silent.
+	truncatedFields map[string]int
+}
+
+// cut bounds one descriptive storage field and records the cut by field name.
+// Identity fields (ids, paths, scope and native keys) are never cut here: a
+// shortened join key names a different thing, so an oversize one drops the
+// entity instead.
+func (e *emitter) cut(field, value string, max int) string {
+	bounded, original := model.TruncateField(value, max)
+	if original > len(bounded) {
+		if e.truncatedFields == nil {
+			e.truncatedFields = map[string]int{}
+		}
+		e.truncatedFields[field]++
+	}
+	return bounded
 }
 
 // stageFiles records the pinned snapshot manifest so an engine FILENAME can be
@@ -464,7 +484,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		name = it.canonical
 	}
 	if name == "" {
-		name = truncate(it.code, model.MaxNameBytes)
+		name = e.cut("name", it.code, model.MaxNameBytes)
 	}
 	qualified := it.fullName
 	if qualified == "" && it.ownerFullName != "" && name != "" && it.kind != kindUnresolved {
@@ -484,14 +504,25 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	if it.relPath != "" && it.kind != kindUnresolved {
 		scope = "file:" + it.relPath
 	}
-	if name == "" || len(name) > model.MaxNameBytes || len(qualified) > model.MaxQualifiedNameBytes ||
-		len(it.signature) > model.MaxSignatureBytes || len(native) > model.MaxNativeKeyBytes ||
-		len(scope) > model.MaxScopeKeyBytes {
+	// Only the identity half still refuses the entity. native and scope are
+	// join keys — a shortened one merges this entity with nothing, or with the
+	// wrong thing — and they are derived from the untruncated name and
+	// qualified name above, so the cuts below must come after they are minted.
+	if name == "" || len(native) > model.MaxNativeKeyBytes || len(scope) > model.MaxScopeKeyBytes {
 		e.dropped++
 		return e.sc.exec(ctx, `UPDATE loc SET ok = 0 WHERE id = ?`, it.id)
 	}
+	// The three descriptive fields are cut to their ceiling and counted, into
+	// the candidate only: a clipped name or signature still answers most of
+	// what a reader asks of it, where dropping the declaration answers
+	// nothing. The local name and qualified name stay whole below, because
+	// they are read there as key material — the fact key and the evidence
+	// native key — which a cut would silently re-mint.
 	cand := model.NodeCandidate{ProviderID: ProviderID, ScopeKey: scope, NativeKey: native, Kind: kind,
-		Name: name, QualifiedName: qualified, Signature: it.signature, Language: e.language}
+		Name:      e.cut("name", name, model.MaxNameBytes),
+		Signature: e.cut("signature", it.signature, model.MaxSignatureBytes),
+		Language:  e.language}
+	cand.QualifiedName = e.cut("qualified_name", qualified, model.MaxQualifiedNameBytes)
 	evFile, evHash, evRange := model.FileID(it.fileID), it.hash, parseRange(it.rng)
 	if it.relPath != "" && it.kind != kindUnresolved {
 		// A located declaration keys on its exact declaration range, which is
@@ -646,7 +677,8 @@ func (e *emitter) evidence(node model.NodeID, rel model.RelationID, file model.F
 	}
 	ev := model.Evidence{UnitID: e.opts.Unit.ID, ProviderID: e.opts.Unit.ProviderID, ProviderVersion: e.opts.Unit.ProviderVersion,
 		OriginRunID: e.opts.Run, NodeID: node, RelationID: rel, Precision: model.PrecisionStaticAnalysis,
-		FileID: file, ContentHash: hash, Range: rng, NativeKey: nativeKey, Detail: truncate(detail, model.MaxDetailBytes)}
+		FileID: file, ContentHash: hash, Range: rng, NativeKey: nativeKey,
+		Detail: e.cut("detail", detail, model.MaxDetailBytes)}
 	ev.ID = model.NewEvidenceID(ev)
 	return ev
 }
