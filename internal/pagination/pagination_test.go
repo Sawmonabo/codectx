@@ -98,7 +98,7 @@ type leaseTable struct {
 	expiry map[string]time.Time
 }
 
-func (l *leaseTable) AcquireLease(_ context.Context, lease model.Lease) error {
+func (l *leaseTable) AcquireLease(_ context.Context, lease model.Lease, _ string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.expiry[lease.ID] = lease.ExpiresAt
@@ -148,7 +148,7 @@ func TestSpoolsFollowTheirLease(t *testing.T) {
 		t.Fatalf("NewSpools: %v", err)
 	}
 	lease := model.Lease{ID: model.H("lease", "s"), GenerationID: 7, OwnerKind: model.LeaseQuery, ExpiresAt: now.Add(time.Minute)}
-	if err := leases.AcquireLease(ctx, lease); err != nil {
+	if err := leases.AcquireLease(ctx, lease, ""); err != nil {
 		t.Fatal(err)
 	}
 	cursor := pagination.Cursor{Endpoint: "graph", GenerationID: 7, AnalysisKey: model.AnalysisKey(model.H("analysis", "a")),

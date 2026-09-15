@@ -17,6 +17,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/retention"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	_ "modernc.org/sqlite"
 )
@@ -25,6 +26,12 @@ import (
 // production package imports the other; this assertion is the only place the
 // two meet, so a drift in either signature fails compilation here.
 var _ pagination.LeaseStore = (*store.Store)(nil)
+
+// The same assertion for the Section 10.4 grace protocol: retention declares
+// the three phases it drives, this store implements them, and neither package
+// imports the other. A signature that drifts fails compilation here rather
+// than at composition.
+var _ retention.BlobStore = (*store.Store)(nil)
 
 // fixture is the smallest repository that can exercise unit reuse: two files,
 // one unit per file, one node with evidence and one search document per unit.
@@ -549,6 +556,43 @@ func TestStorePublicationScenario(t *testing.T) {
 	if _, err := f.s.OpenSession(ctx, open); err != nil {
 		t.Fatalf("OpenSession: %v", err)
 	}
+	// Phase: a session's retention lease lives and dies with the session.
+	//
+	// The failure mode is silent and unbounded: OpenSession is idempotent, so a
+	// retried plan returns the session that already exists, and an acquire that
+	// minted a second lease each time would pin the generation under lease ids
+	// nobody holds -- every retry adding one, none of them ever released. The
+	// other half is the close: a session that ends must stop pinning, or a
+	// generation no reader can reach still refuses collection for the rest of
+	// the lease TTL.
+	retried := model.SessionOpen{ID: model.SessionID(model.H("session", "retried")), ActorID: actorID,
+		OpenRequestHash: model.H("open"), ManifestID: manifest.ID, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	if _, err := f.s.OpenSession(ctx, retried); err != nil {
+		t.Fatalf("OpenSession(retried): %v", err)
+	}
+	beforeLease := f.stats().Leases
+	sessionLease := func(tag string) model.Lease {
+		return model.Lease{ID: model.H("lease", tag), GenerationID: manifest.Binding.GenerationID,
+			OwnerKind: model.LeaseSession, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	}
+	if err := f.s.AcquireLease(ctx, sessionLease("open"), string(retried.ID)); err != nil {
+		t.Fatalf("AcquireLease(session): %v", err)
+	}
+	err = f.s.AcquireLease(ctx, sessionLease("reopen"), string(retried.ID))
+	if !store.OwnerLeaseConflict(err) {
+		t.Fatalf("a second lease for one session was accepted (err = %v); an idempotent re-open must leave the one lease it already holds", err)
+	}
+	if live := f.stats().Leases; live != beforeLease+1 {
+		t.Fatalf("re-opening the session left %d leases, want %d; a retried open must not pin the generation twice", live, beforeLease+1)
+	}
+	if _, err := f.s.AdvanceSession(ctx, model.AdvanceRequest{SessionID: retried.ID, ActorID: actorID,
+		Target: model.StateClosed, ExpectedVersion: 1}); err != nil {
+		t.Fatalf("AdvanceSession(closed): %v", err)
+	}
+	if live := f.stats().Leases; live != beforeLease {
+		t.Fatalf("closing the session left %d leases, want %d; a closed session must stop pinning its generation", live, beforeLease)
+	}
+
 	// Phase: cross-snapshot FK. A session pinned to snap2 cannot record a
 	// chunk issued for snap1's bytes of b.go, and no other actor can issue
 	// chunks into this session at all.
@@ -991,7 +1035,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// An expired lease is exactly the kind of leftover only the collection
 	// tail removes; Recover must run that tail, not just fail the generation.
 	expired := model.Lease{ID: model.H("lease", "expired"), GenerationID: genStale, OwnerKind: model.LeaseQuery, ExpiresAt: time.Now().Add(-time.Hour).UTC()}
-	if err := f.s.AcquireLease(ctx, expired); err != nil {
+	if err := f.s.AcquireLease(ctx, expired, ""); err != nil {
 		t.Fatalf("AcquireLease: %v", err)
 	}
 	beforeRecover := f.stats()
@@ -1027,24 +1071,48 @@ func TestStorePublicationScenario(t *testing.T) {
 	// Phase: a blob demoted to trash by the grace protocol is restored when
 	// capture publishes the same content again; otherwise a snapshot could
 	// name a blob that collection is about to remove.
+	//
+	// L3a row (b). The restore keeps the demoted row's blob_blocks and
+	// line_checkpoints -- that is why the grace protocol deletes the blobs row
+	// and lets the cascade take them, never the other way round. A restore
+	// that produced a ready blob with no blocks reads as present everywhere
+	// and fails only on the first ReadRange, i.e. missing source that looks
+	// retained. The restore must also clear the grace timestamp: a ready blob
+	// is never mid-grace, the blobs CHECK refuses one that is, and a stale
+	// stamp would measure the next grace window from the wrong instant.
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	hashRaw, _ := model.DecodeID(c.hash)
-	if _, err := raw.Exec(`UPDATE blobs SET state = 'trash' WHERE hash = ?`, hashRaw); err != nil {
+	if _, err := raw.Exec(`UPDATE blobs SET state = 'trash', trashed_at = '2026-01-02T03:04:05Z' WHERE hash = ?`, hashRaw); err != nil {
 		t.Fatal(err)
+	}
+	blocksBefore, linesBefore := blobRowCounts(t, raw, hashRaw)
+	if blocksBefore == 0 || linesBefore == 0 {
+		t.Fatalf("fixture blob has no blocks (%d) or checkpoints (%d) to protect", blocksBefore, linesBefore)
 	}
 	raw.Close()
 	f2 := newFixture(t, dbPath)
 	f2.file(c.path, string(c.content))
+	if _, err := f2.s.Blob(ctx, c.hash); err != nil {
+		t.Fatalf("restored blob is not servable: %v", err)
+	}
 	if err := f2.s.Close(); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ = sql.Open("sqlite", dbPath)
 	var state string
-	if err := raw.QueryRow(`SELECT state FROM blobs WHERE hash = ?`, hashRaw).Scan(&state); err != nil || state != "ready" {
+	var trashedAt sql.NullString
+	if err := raw.QueryRow(`SELECT state, trashed_at FROM blobs WHERE hash = ?`, hashRaw).Scan(&state, &trashedAt); err != nil || state != "ready" {
 		t.Fatalf("re-put blob state = %q %v, want ready", state, err)
+	}
+	if trashedAt.Valid {
+		t.Fatalf("restored blob still carries trashed_at = %q; a ready blob is never mid-grace", trashedAt.String)
+	}
+	if blocks, lines := blobRowCounts(t, raw, hashRaw); blocks != blocksBefore || lines != linesBefore {
+		t.Fatalf("restore left %d blocks and %d checkpoints, want the demoted row's %d and %d kept",
+			blocks, lines, blocksBefore, linesBefore)
 	}
 
 	// Phase: schema fingerprint mismatch fails closed. A tampered fingerprint
@@ -1779,5 +1847,124 @@ func TestActivateCapabilityDetails(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Details["skipped_methods"] != "hover" || got[0].Details["unsupported_labels"] != "7" {
 		t.Errorf("capability details did not round-trip: %+v", got)
+	}
+}
+
+// blobRowCounts reports how many blob_blocks and line_checkpoints rows the
+// blob still owns. Both cascade from blobs(hash), so a nonzero count after a
+// state change proves the integrity metadata a read verifies against survived.
+func blobRowCounts(t *testing.T, raw *sql.DB, hash []byte) (blocks, lines int) {
+	t.Helper()
+	if err := raw.QueryRow(`SELECT count(*) FROM blob_blocks WHERE blob_hash = ?`, hash).Scan(&blocks); err != nil {
+		t.Fatalf("blob_blocks: %v", err)
+	}
+	if err := raw.QueryRow(`SELECT count(*) FROM line_checkpoints WHERE blob_hash = ?`, hash).Scan(&lines); err != nil {
+		t.Fatalf("line_checkpoints: %v", err)
+	}
+	return blocks, lines
+}
+
+// L3a row (a). The Section 10.4 grace protocol deletes a blob only after a
+// further reachability check made inside the deleting transaction. A blob that
+// becomes referenced again after it was trashed -- an open session's manifest,
+// a unit input written while the collector was between phases -- must be
+// restored to 'ready' with its grace timestamp cleared, not deleted. The
+// failure mode this protects is the worst one collection has: GC deleting
+// source that a reader is about to be served, which surfaces as a missing blob
+// long after the pass that caused it. A blob that stays unreferenced is
+// deleted in the same call, so "not deleted" here is not vacuous.
+func TestBlobGraceProtocol(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codectx.db")
+	f := newFixture(t, dbPath)
+	kept := f.file("pkg/kept.go", "package pkg\nfunc Kept() {}\n")
+	revived := f.file("pkg/revived.go", "package pkg\nfunc Revived() {}\n")
+	doomed := f.file("pkg/doomed.go", "package pkg\nfunc Doomed() {}\n")
+	snap := f.snapshot("one", kept)
+
+	now := time.Now().UTC()
+	quarantined, err := f.s.QuarantineBlobs(ctx, now, 16)
+	if err != nil {
+		t.Fatalf("QuarantineBlobs: %v", err)
+	}
+	if quarantined != 2 {
+		t.Fatalf("quarantined %d blobs, want the two the manifest does not name", quarantined)
+	}
+	trashed, restored, err := f.s.TrashBlobs(ctx, 16)
+	if err != nil {
+		t.Fatalf("TrashBlobs: %v", err)
+	}
+	if trashed != 2 || restored != 0 {
+		t.Fatalf("TrashBlobs trashed %d restored %d, want 2 and 0", trashed, restored)
+	}
+	if _, err := f.s.Blob(ctx, kept.hash); err != nil {
+		t.Fatalf("the blob the manifest names was demoted: %v", err)
+	}
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reference reappears while the blob sits in trash. It is written
+	// directly because the store's own paths refuse it by design: PutSnapshot
+	// only accepts a blob that is already 'ready', which is exactly why the
+	// recheck below is the last line of defence rather than the first.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapRaw, _ := model.DecodeID(string(snap.ID))
+	repoRaw, _ := model.DecodeID(string(f.repo))
+	fileRaw, _ := model.DecodeID(string(revived.id))
+	revivedRaw, _ := model.DecodeID(revived.hash)
+	doomedRaw, _ := model.DecodeID(doomed.hash)
+	if _, err := raw.Exec(`INSERT OR IGNORE INTO files(id, repository_id, path) VALUES(?, ?, ?)`,
+		fileRaw, repoRaw, revived.path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO snapshot_files(snapshot_id, file_id, status, content_hash, size_bytes,
+		git_object_id, language, executable) VALUES(?, ?, 'tracked', ?, ?, '', 'go', 0)`,
+		snapRaw, fileRaw, revivedRaw, int64(len(revived.content))); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	f2 := newFixture(t, dbPath)
+	deleted, restored, err := f2.s.CollectBlobs(ctx, now.Add(time.Minute), 16)
+	if err != nil {
+		t.Fatalf("CollectBlobs: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != doomed.hash {
+		t.Fatalf("CollectBlobs deleted %v, want only the blob nothing references", deleted)
+	}
+	if restored != 1 {
+		t.Fatalf("CollectBlobs restored %d blobs, want the one referenced again", restored)
+	}
+	rec, err := f2.s.Blob(ctx, revived.hash)
+	if err != nil {
+		t.Fatalf("a blob referenced again was not restored to a servable state: %v", err)
+	}
+	if len(rec.BlockDigests) == 0 || len(rec.LineCheckpoints) == 0 {
+		t.Fatalf("restored blob lost its integrity metadata: %+v", rec)
+	}
+	if err := f2.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ = sql.Open("sqlite", dbPath)
+	defer raw.Close()
+	var state string
+	var trashedAt sql.NullString
+	if err := raw.QueryRow(`SELECT state, trashed_at FROM blobs WHERE hash = ?`, revivedRaw).Scan(&state, &trashedAt); err != nil {
+		t.Fatalf("revived blob row: %v", err)
+	}
+	if state != "ready" || trashedAt.Valid {
+		t.Fatalf("revived blob is state=%q trashed_at=%v, want ready with no grace timestamp", state, trashedAt)
+	}
+	var rows int
+	if err := raw.QueryRow(`SELECT count(*) FROM blobs WHERE hash = ?`, doomedRaw).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("deleted blob still has %d rows (%v)", rows, err)
+	}
+	if blocks, lines := blobRowCounts(t, raw, doomedRaw); blocks != 0 || lines != 0 {
+		t.Fatalf("deleting the blobs row left %d blocks and %d checkpoints behind", blocks, lines)
 	}
 }

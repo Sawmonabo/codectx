@@ -53,8 +53,8 @@ func newMCPCommand(build model.BuildInfo) *cobra.Command {
 // diagnostic AND every refusal this command emits goes to stderr, including the
 // --json failure envelope for a pre-server rejection such as a busy workspace.
 // Section 18.2's envelope is written to the root command's output stream, so
-// RunE redirects that stream to stderr rather than letting a machine-readable
-// refusal land on the channel the protocol owns.
+// claimProtocolStdout redirects that stream to stderr rather than letting a
+// machine-readable refusal land on the channel the protocol owns.
 func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -66,19 +66,17 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			"startup instead of being waited on forever.\n\n" +
 			"Results and errors travel as MCP tool answers on the protocol " +
 			"stream; logs and startup failures go to stderr.",
-		Args:          cobra.NoArgs,
+		Args: func(cmd *cobra.Command, args []string) error {
+			// Cobra validates the positional arguments after it has parsed the
+			// flags and before any Run hook, so this is the earliest point on
+			// the path that survives flag parsing. Claiming stdout here rather
+			// than inside RunE covers the argument rejection too.
+			claimProtocolStdout(cmd)
+			return cobra.NoArgs(cmd, args)
+		},
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// stdout is the protocol's for the rest of this process. Execute
-			// writes the Section 18.2 failure envelope to the ROOT command's
-			// output stream, not this one, so the redirect has to be on the
-			// root: a --json rejection here -- a bad --repo, a workspace
-			// another writer holds -- otherwise emits a JSON object on the
-			// channel the SDK is about to frame. It is set before the first
-			// thing that can fail so every refusal on this path is covered.
-			cmd.Root().SetOut(cmd.ErrOrStderr())
-
 			repo, err := repoFlagValue(cmd)
 			if err != nil {
 				return err
@@ -115,13 +113,12 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
 			svc := ws.Services()
 			server, err := mcpserver.New(mcpserver.Options{
-				Index:    svc,
-				Explore:  svc,
-				Context:  svc,
-				Diagnose: svc,
-				Config:   cfg,
-				Build:    build,
-				Logger:   log,
+				Index:   svc,
+				Explore: svc,
+				Context: svc,
+				Config:  cfg,
+				Build:   build,
+				Logger:  log,
 			})
 			if err != nil {
 				return err
@@ -129,6 +126,24 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			return serveMCP(cmd.Context(), ws, server, log, watch)
 		},
 	}
+	// A flag Cobra could not parse never reaches Args or RunE -- it is
+	// refused inside ParseFlags -- so the claim has to be made from the flag
+	// error hook as well. Without it `codectx mcp serve --bogus --json` writes
+	// its refusal envelope to stdout, the one channel this command may not
+	// write a byte of its own to. The typed rejection is the root's
+	// (root.go, SetFlagErrorFunc) restated verbatim rather than varied:
+	// setting a hook on this command REPLACES the inherited one instead of
+	// wrapping it, and a divergence here would type one command's flag
+	// refusals differently from every other command's.
+	//
+	// `--help` is unaffected: Cobra answers the help flag before Args runs, so
+	// help still renders on stdout, which is what an operator asked for and
+	// not a refusal on a stream the protocol owns. The `mcp` parent needs
+	// neither hook -- it frames no protocol stream.
+	cmd.SetFlagErrorFunc(func(c *cobra.Command, err error) error {
+		claimProtocolStdout(c)
+		return &model.Error{Code: model.CodeArgumentInvalid, Message: err.Error()}
+	})
 	addRepoFlag(cmd)
 	// The flag name is the one `index` and `watch` already use: "keep refreshing
 	// as the workspace changes" is one question, and a second spelling of it
@@ -136,6 +151,16 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().Bool(indexWatchFlag, false,
 		"refresh the index as the workspace changes for the life of the session; defaults to the mcp.watch setting, which is on unless the configuration turns it off")
 	return cmd
+}
+
+// claimProtocolStdout hands the root command's output stream to stderr for the
+// rest of this invocation. Execute writes the Section 18.2 failure envelope to
+// the ROOT command's stream, not this command's, so the redirect has to be on
+// the root: a --json rejection on this path -- an unparsable flag, a stray
+// positional argument, a bad --repo, a workspace another writer holds --
+// otherwise emits a JSON object on the channel the SDK is about to frame.
+func claimProtocolStdout(cmd *cobra.Command) {
+	cmd.Root().SetOut(cmd.ErrOrStderr())
 }
 
 // serveMCP runs the session: the optional watch loop beside the server, both

@@ -351,11 +351,14 @@ func wrap(op string, err error) error {
 	}
 	var se *sqlite.Error
 	if errors.As(err, &se) {
+		if outOfSpace(se.Code()) {
+			return &model.Error{Code: model.CodeDiskFull,
+				Message:     "database write failed: the filesystem could not grow the database or its write-ahead log",
+				Remediation: "free space under the data directory; if it has space, the filesystem rejected the write and the data directory may need to move"}
+		}
 		switch se.Code() & 0xff {
 		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
 			return &model.Error{Code: model.CodeWorkspaceBusy, Message: "database is busy: " + op, Retryable: true}
-		case sqlite3.SQLITE_FULL:
-			return &model.Error{Code: model.CodeDiskFull, Message: "database write failed: disk full"}
 		case sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB:
 			return &model.Error{Code: model.CodeStorageCorrupt, Message: "database is not readable: " + se.Error(),
 				Remediation: "run codectx doctor --deep; rebuild the cache with index --rebuild if it reports corruption"}
@@ -364,6 +367,38 @@ func wrap(op string, err error) error {
 		}
 	}
 	return internal(op + ": " + err.Error())
+}
+
+// outOfSpace reports whether an extended result code says the filesystem had no
+// room for a write. SQLITE_FULL is the obvious one and was the only one mapped;
+// it is not the one a full disk usually produces. Growing the -shm file of the
+// write-ahead index raises SQLITE_IOERR_SHMSIZE (4874) and growing the database
+// or the log itself raises the write/sync/truncate members of the same family,
+// whose PRIMARY code is SQLITE_IOERR (10) -- so a switch on `code & 0xff` sees
+// only SQLITE_IOERR, matches no arm, and reports CTX_INTERNAL for a disk that
+// is simply full (proved on a filled tmpfs: connect failed with 4874).
+//
+// The full extended code is therefore tested, and only the members a space
+// exhaustion actually raises are listed: SQLITE_IOERR_READ, _CORRUPTFS, _DATA
+// and the locking members must keep falling through to their own families,
+// because a read failure or a corrupt filesystem is not a full one. These
+// members can also be raised by failing hardware, which is why the remediation
+// names both causes rather than asserting the disk is full.
+func outOfSpace(code int) bool {
+	switch code {
+	case sqlite3.SQLITE_FULL,
+		sqlite3.SQLITE_IOERR_WRITE,
+		sqlite3.SQLITE_IOERR_FSYNC,
+		sqlite3.SQLITE_IOERR_DIR_FSYNC,
+		sqlite3.SQLITE_IOERR_TRUNCATE,
+		sqlite3.SQLITE_IOERR_SHMSIZE,
+		sqlite3.SQLITE_IOERR_SHMMAP:
+		return true
+	}
+	// SQLITE_FULL carries extended members of its own (SQLITE_FULL is 13; the
+	// primary code is what a non-extended build reports), so the primary code
+	// is tested too rather than only the exact constant.
+	return code&0xff == sqlite3.SQLITE_FULL
 }
 
 // idBlob decodes a public hex identifier to the 32 bytes SQLite stores.

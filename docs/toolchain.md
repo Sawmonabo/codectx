@@ -275,6 +275,46 @@ tool that cannot be resolved is a provider that cannot run), except
 `CTX_TOOL_OVERRIDE_INVALID`, which is exit 3 because it is a configuration error
 the user fixes in their own file.
 
+## Offline hosts and bundle archives
+
+Two supported ways to run with no network at all, and one rule that governs
+both: **codectx never fetches anything the embedded lock does not name**, so
+"offline" is a refusal path, not a best-effort degradation.
+
+**A bundle archive** (`codectx-bundle_<version>_<os>_<arch>.tar.gz`) carries the
+binary with the tool store already populated for that one platform. Install it,
+point `[tools] cache_dir` at the unpacked store, and nothing ever dials out.
+Each bundle is built natively for its own target, so one host cannot produce
+another platform's bundle.
+
+**A slim archive plus a prefetch** does the same in two steps on a host that
+does have a network at install time:
+
+```bash
+codectx tools prefetch --all   # every lock entry for THIS platform
+codectx tools verify           # rehash the store against the lock
+# then, in the user configuration file:
+#   [tools]
+#   offline = true
+```
+
+`prefetch --all` installs every entry the lock carries **for this platform**;
+there is no target flag, for the same reason there is no cross-built bundle.
+`--for-repo PATH` narrows it to what that repository's root actually selects,
+which is usually a much smaller store.
+
+With `[tools] offline = true` every fetch becomes a typed refusal that opens no
+socket. A tool already in the store still runs, so an offline host is fully
+functional for every entry it holds and honestly unavailable for the rest —
+`codectx tools status` names which is which, and `codectx doctor --offline`
+reports the offline-policy checks. What that report says is what those checks
+found; the flag itself asserts nothing about the installation.
+
+`[tools] mirror` is the third option, for a host that has a network but not the
+publishers': it relocates bytes and never changes which bytes are accepted,
+because the digests stay the lock's. See
+[Configuration](configuration.md#tools--the-managed-analyzer-toolchain).
+
 ## Host dependencies
 
 Three host programs are not pinned and are not installed, because they are the

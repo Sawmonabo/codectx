@@ -133,6 +133,44 @@ type Runner struct {
 	mu         sync.Mutex
 	memoryUsed int64
 	diskUsed   int64
+	// live counts the children that have been started and whose run has not
+	// returned. It is not the admission count: a run that is admitted and then
+	// fails before exec has no process, and reporting one would describe memory
+	// and descendants that do not exist. Section 23's live-subprocess figure is
+	// what is running, not what was allowed to try. Its window is exactly the
+	// window in which the run holds an admission slot, so the two accounts
+	// cannot disagree -- including the one case where a child outlives the run
+	// (it could not be killed), which the run reports as an error and which
+	// this counter, like the slot, stops holding.
+	live int64
+}
+
+// LiveSubprocesses reports how many children this runner has started whose run
+// has not yet returned. It is the Section 23 figure, and diagnostics consumes
+// it through a one-method interface.
+func (r *Runner) LiveSubprocesses() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.live
+}
+
+// startedChild records a live child and returns the function that records its
+// exit. It is called immediately after a successful start, and its result is
+// deferred there, so every later failure -- a tree control that cannot hold the
+// child, a timeout, a cancelled context, an output limit, a child that exits
+// non-zero or one that is never reaped -- unwinds the counter on the way out. A
+// counter that only decremented on a successful run would make a report claim
+// more live children after every failure, until it claimed a machine full of
+// processes that had all exited.
+func (r *Runner) startedChild() func() {
+	r.mu.Lock()
+	r.live++
+	r.mu.Unlock()
+	return func() {
+		r.mu.Lock()
+		r.live--
+		r.mu.Unlock()
+	}
 }
 
 // NewRunner returns a runner bound by limits.
@@ -294,6 +332,8 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	if err := cmd.Start(); err != nil {
 		return result, unavailable("%s could not be started: %v", filepath.Base(spec.Path), err)
 	}
+	exited := r.startedChild()
+	defer exited()
 	if err := job.started(cmd); err != nil {
 		// The child is outside the tree control that failed, so stopping the
 		// group or job would reach nothing. It is killed directly, which is

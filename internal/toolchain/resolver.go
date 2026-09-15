@@ -292,6 +292,38 @@ func (r *Resolver) PinnedFingerprint(name string) (string, error) {
 	return t.Fingerprint(), nil
 }
 
+// PinnedFingerprints reports, for every lock entry whose payload identity the
+// lock actually pins, that entry's FingerprintDigest -- the last path component
+// of the private work directory internal/provider/lsp names after a payload
+// identity (see FingerprintDigest above).
+//
+// It is the oracle internal/retention's data-directory reclaim needs: without a
+// name -> digest map that pass cannot tell a retired payload directory from the
+// live one, and it declines to remove anything. The digest, not Fingerprint(),
+// is what it returns, because the digest is what the directory is named after;
+// returning the rendered fingerprint would make every comparison miss and the
+// pass would delete the running server's tree.
+//
+// A name whose identity the lock cannot pin -- a user override, or an entry
+// with no payload for this platform -- is OMITTED rather than mapped to an
+// empty digest. Both still run and still own a work directory, so absence has
+// to mean "nothing is known about this name, leave it alone", which is exactly
+// the contract retention.ToolPins states. Inserting an empty string would make
+// every directory under that name mismatch and be reclaimed.
+//
+// The map is freshly allocated per call and is the caller's.
+func (r *Resolver) PinnedFingerprints() map[string]string {
+	pins := make(map[string]string, len(r.lock.Tools))
+	for name := range r.lock.Tools {
+		t, err := r.pinned(name)
+		if err != nil {
+			continue
+		}
+		pins[name] = t.FingerprintDigest()
+	}
+	return pins
+}
+
 // pinned builds the identity half of a resolved Tool from lock data. It runs
 // compose, rather than reproducing its four launcher shapes, because the shape
 // decides which executable's digest becomes Tool.Checksum -- the entry's for a

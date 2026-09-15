@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -580,6 +581,69 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 	})
 
+	t.Run("one provider capability publishes one row per scope key", func(t *testing.T) {
+		// Failure mode: generation_capabilities is keyed (generation,
+		// provider, capability, scope_key) with no state column, while the
+		// report keys its rows by state as well. A provider capability that
+		// reaches the publication with a sibling unit's fresh row folded to
+		// the workspace scope, a workspace-scoped partial degradation, a
+		// failed unit and a carried workspace scope publishes four rows under
+		// one primary key: the insert is rejected and `codectx index` exits on
+		// a constraint error instead of publishing the degraded generation.
+		r := newCapabilityReport()
+		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+			Scope: "pkg:go:", State: model.CapabilityFresh})
+		r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+			Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
+			DiagnosticCode: model.CodeProviderOutputInvalid})
+		r.addCarried(scip.ID, "references", provider.ScopeWorkspace, 1, 2)
+		r.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+		states, _ := r.finish(f.c.log)
+		var rows []model.CapabilityState
+		for _, s := range states {
+			if s.ProviderID == scip.ID && s.Capability == "references" {
+				rows = append(rows, s)
+			}
+		}
+		if len(rows) != 1 {
+			t.Fatalf("one provider capability published %d rows for one scope key: %+v", len(rows), rows)
+		}
+		// Under-claim, never over-claim: the most severe row is the survivor.
+		if rows[0].State != model.CapabilityFailed || rows[0].Scope != provider.ScopeWorkspace {
+			t.Fatalf("the surviving row is %q at scope %q, want failed at the workspace scope",
+				rows[0].State, rows[0].Scope)
+		}
+
+		// Above model.MaxCapabilityStates the bound collapses per-scope rows
+		// by provider capability AND state and rewrites every fold to the
+		// workspace scope, which regenerates the same duplicate key on the far
+		// side of the fold above: the partial fold and the failure fold both
+		// land at the workspace scope. A repository with a few hundred
+		// degraded scopes reaches this, so the key must be closed after the
+		// collapse and not only before it.
+		big := newCapabilityReport()
+		for i := range model.MaxCapabilityStates + 44 {
+			big.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+				Scope:          "pkg:go:" + strconv.Itoa(i),
+				State:          model.CapabilityPartial,
+				DiagnosticCode: model.CodeProviderOutputInvalid})
+		}
+		big.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+		bounded, _ := big.finish(f.c.log)
+		seen := map[string]int{}
+		for _, s := range bounded {
+			seen[s.ProviderID+"\x00"+s.Capability+"\x00"+s.Scope]++
+		}
+		for key, n := range seen {
+			if n > 1 {
+				t.Fatalf("the bound published %d rows for primary key %q: %+v", n, key, bounded)
+			}
+		}
+		if len(bounded) != 1 || bounded[0].State != model.CapabilityFailed {
+			t.Fatalf("the bounded report is %+v, want one failed row for the capability", bounded)
+		}
+	})
+
 	t.Run("a required provider's unit failure publishes nothing", func(t *testing.T) {
 		before, err := f.store.ActiveGeneration(ctx, f.c.repo)
 		if err != nil {
@@ -838,5 +902,27 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	}
 	if p.Units != 2 || p.Position != 2 {
 		t.Fatalf("a promoted unit behind the one in flight is %d units at position %d, want 2 at 2", p.Units, p.Position)
+	}
+}
+
+// A supplied index whose path resolves to nothing must still be recorded
+// against the published generation. An unresolved path plans no unit, so the
+// row is the only surviving evidence that tells it apart from a run that
+// supplied no index at all -- the distinction doctor's supplied_index check
+// exists to report, and the one that was unobservable before this record.
+func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
+	f := newFixture(t, map[string]string{"a.go": "package a\n"})
+	f.c.opts.SuppliedIndexes = []SuppliedIndex{{
+		Path: "missing.scip", ProviderID: "scip", ScopeKey: "import:missing.scip"}}
+	res, err := f.c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	rows, err := f.store.SuppliedIndexes(f.ctx, res.Binding.GenerationID)
+	if err != nil {
+		t.Fatalf("SuppliedIndexes: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Path != "missing.scip" || rows[0].Resolved {
+		t.Fatalf("supplied index record = %+v, want one unresolved missing.scip", rows)
 	}
 }

@@ -197,6 +197,31 @@ func indexOf(rec model.BlobRecord) source.Index {
 	return idx
 }
 
+// Remove deletes the published object for hash. It is the Section 10.4 grace
+// protocol's last step and its only caller: internal/retention removes the
+// object only after the store has already deleted the blobs row inside a
+// transaction that rechecked reachability, so an object reaching here is
+// unreachable through the index.
+//
+// An object that is already gone is not an error. The rows are the authority
+// on what exists, the deletion is idempotent by design, and a crash between
+// the row delete and this call must not make every later collection pass fail
+// on the same leftover.
+//
+// It exists here rather than in internal/retention because c.path is the one
+// derivation of an object's location; rebuilding <data>/cas/<hh>/<hash> in the
+// collector would be a second copy of the layout that can drift from this one.
+func (c *CAS) Remove(hash string) error {
+	p, err := c.path(hash)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return ioError("CAS remove", err)
+	}
+	return nil
+}
+
 // Open streams the blob described by rec, verifying each 64-KiB block digest
 // as it passes and the whole-file digest and size at end of file. A mismatch
 // is CTX_SOURCE_INTEGRITY at the offending block, before any later byte is

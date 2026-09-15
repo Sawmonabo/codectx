@@ -177,3 +177,49 @@ func (s *Store) Blob(ctx context.Context, hash string) (model.BlobRecord, error)
 	}
 	return rec, nil
 }
+
+// maxBlobSample bounds one content-addressed-storage probe. A diagnostic
+// sample is a spot check, not an audit: Section 22 forbids an ordinary
+// `doctor` from scanning a table, so the probe reads a bounded prefix of the
+// ready blobs and verifies those, and a deep call widens the sample rather
+// than removing the bound.
+const maxBlobSample = 256
+
+// blobSampleQuery reads the lowest ready blob hashes in primary-key order, so
+// one workspace samples the same objects on every call and a failure is
+// reproducible rather than a different blob each time.
+const blobSampleQuery = `SELECT hash FROM blobs WHERE state = 'ready' ORDER BY hash LIMIT ?`
+
+// SampleBlobs reports up to limit retained blob hashes. It is the hash source
+// the Section 22 content-addressed-storage check needs: Blob verifies a hash
+// the caller already holds, and nothing else lists them. The result is bounded
+// by maxBlobSample however large limit is, so no caller can turn a diagnostic
+// probe into a full table scan.
+func (s *Store) SampleBlobs(ctx context.Context, limit int) ([]string, error) {
+	if limit < 1 {
+		return nil, invalid("blob sample limit is %d, want at least 1", limit)
+	}
+	if limit > maxBlobSample {
+		limit = maxBlobSample
+	}
+	out := make([]string, 0, limit)
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, blobSampleQuery, limit)
+		if err != nil {
+			return wrap("blobs", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return wrap("blobs", err)
+			}
+			out = append(out, idHex(raw))
+		}
+		return wrap("blobs", rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

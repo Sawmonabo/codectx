@@ -93,7 +93,12 @@ type Options struct {
 	// and publish, and Section 13.2 gives that to exactly one cross-process
 	// owner.
 	Lock *snapshot.WorkspaceLock
-	Pool *provider.Pool
+	// Collector is the process-level reclaim pass, scheduled from the same
+	// post-activation points as retention-by-ref because that is the one moment
+	// this process holds both locks the pass requires. It may be nil; see the
+	// Collector interface in retention.go.
+	Collector Collector
+	Pool      *provider.Pool
 	// Watcher, when non-nil, is the notification source Watch drives: its
 	// debounced batches become refreshes and its Coverage() is what status
 	// reports. nil keeps the periodic-only behaviour, whose coverage is
@@ -107,8 +112,28 @@ type Options struct {
 	// see is never the row that truncation drops and never pushes the
 	// published list past its own contract.
 	States []model.CapabilityState
-	Logger *slog.Logger
-	Now    func() time.Time
+	// SuppliedIndexes are the already-built indexes this run was handed --
+	// today the `--scip-index` path. The coordinator records each one against
+	// every generation it publishes, whether or not the path resolved, because
+	// an unresolved path plans no unit and leaves nothing else behind: without
+	// the record, a typo and a run that supplied no index at all are the same
+	// observation, and the first ships a repository with no imported symbols.
+	SuppliedIndexes []SuppliedIndex
+	Logger          *slog.Logger
+	Now             func() time.Time
+}
+
+// SuppliedIndex is one supplied index as the composition root resolved it: the
+// root-relative path the user named, plus the provider and scope key that path
+// becomes if it is importable.
+//
+// The provider and scope key are supplied rather than derived here because the
+// scope-key spelling belongs to the provider that reads it, and internal/index
+// must not import one provider to spell another's scope.
+type SuppliedIndex struct {
+	Path       string
+	ProviderID string
+	ScopeKey   string
 }
 
 // Pending is the typed answer a query gets for a capability whose dependence
@@ -324,6 +349,9 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 	}
 	c.watch.enter(c.opts.Watcher)
 	defer c.watch.leave()
+	// Evaluated now and deferred as its result: the beat starts here and the
+	// withdrawal it returns runs when this watch ends.
+	defer c.beatHeartbeat(ctx)()
 	if c.opts.Watcher != nil {
 		return c.watchNotified(ctx, emit)
 	}
@@ -363,6 +391,81 @@ func (c *Coordinator) watchNotified(ctx context.Context, emit func(model.IndexRe
 	return err
 }
 
+// watchHeartbeatInterval is how often a running watch republishes its row, and
+// watchHeartbeatTTL is the deadline it writes into that row. The TTL is three
+// intervals, so two lost or slow writes do not make a live watch read as dead.
+//
+// Both are fixed here rather than derived from reconcile_interval, because the
+// row must stay refreshed on a workspace that reconciles hourly, and because
+// deriving the window in the reader would make liveness depend on the reader's
+// configuration matching the writer's. They are deliberately short: the window
+// in which a watch that died without clearing its row still reads as live is
+// exactly the TTL, and nothing else shortens it.
+const (
+	watchHeartbeatInterval = 10 * time.Second
+	watchHeartbeatTTL      = 30 * time.Second
+)
+
+// beatHeartbeat publishes this watch's heartbeat and keeps republishing it
+// until the returned stop function runs, which withdraws the row.
+//
+// Withdrawing on the way out is what makes a deliberate `Ctrl-C` immediate: a
+// row left behind is fresh for a further TTL and would report a watch that is
+// no longer running as live coverage. Expiry remains the answer for a process
+// that died without reaching here, which is why the writer states a deadline at
+// all -- no pid probe is portable or race-free enough to be the death signal.
+func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
+	c.publishHeartbeat(ctx)
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		t := time.NewTicker(watchHeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+				c.publishHeartbeat(ctx)
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+		// ctx is already cancelled on the ordinary exit path, so the
+		// withdrawal gets a fresh deadline of its own; without one the delete
+		// would be refused by the very cancellation it is reacting to.
+		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), watchHeartbeatInterval)
+		defer cancel()
+		if err := c.opts.Store.ClearWatchHeartbeat(clearCtx, c.repo); err != nil {
+			logTyped(c.log, "the watch heartbeat could not be withdrawn; another process will report this watch as running until it expires",
+				err, "component", component, "repository_id", string(c.repo))
+		}
+	}
+}
+
+// publishHeartbeat writes one heartbeat row. A failure is logged and never ends
+// the watch: the watch itself is still reconciling this workspace, and the row
+// is how another process reports on it. The row then expires, so a reader is
+// told the coverage is unknown rather than shown a figure that stopped moving.
+func (c *Coordinator) publishHeartbeat(ctx context.Context) {
+	lastPass, pending := c.watch.heartbeat()
+	err := c.opts.Store.RecordWatchHeartbeat(ctx, c.repo, sqlite.WatchHeartbeat{
+		WriterPID:     os.Getpid(),
+		LastPassAt:    lastPass,
+		PendingEvents: pending,
+		ExpiresAt:     c.now().Add(watchHeartbeatTTL),
+	})
+	if err != nil && ctx.Err() == nil {
+		logTyped(c.log, "the watch heartbeat could not be published; another process cannot report on this watch",
+			err, "component", component, "repository_id", string(c.repo))
+	}
+}
+
 // reconcile runs one watch-driven refresh. A failed reconciliation is not the
 // end of the watch: the prior generation is still published and the next batch
 // or tick tries again.
@@ -376,6 +479,11 @@ func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(m
 		return model.IndexResult{}, false
 	}
 	c.watch.reconciledAt(c.now())
+	// Republished on the pass rather than only on the timer: the pass is what
+	// changes the two figures the row carries, and a reader that arrives right
+	// after a burst of edits must see the pending count that burst produced,
+	// not the one from up to a heartbeat interval ago.
+	c.publishHeartbeat(ctx)
 	if emit != nil {
 		emit(res)
 	}
