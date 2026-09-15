@@ -104,8 +104,14 @@ const (
 // symbolInfo is one decoded SymbolInformation.
 type symbolInfo struct {
 	symbol, displayName, signature string
-	kind                           int32
-	relationships                  []relationship
+	// signatureCut is the ORIGINAL encoded byte length of a signature the
+	// field ceiling shortened, and 0 when nothing was cut. It cannot come
+	// from model.TruncateField's second result the way treesitter/facts.go
+	// derives it: the decoder never holds the whole value, so the length is
+	// taken from the wire, which is the only place it exists.
+	signatureCut  int64
+	kind          int32
+	relationships []relationship
 }
 
 // document is the summary the walker reports when a Document record ends:
@@ -600,10 +606,9 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 			if err != nil {
 				return s, false, err
 			}
-			var dropped bool
-			if s.signature, dropped, err = decodeSignature(sig); err != nil {
+			if s.signature, s.signatureCut, err = decodeSignature(sig); err != nil {
 				return s, false, err
-			} else if dropped {
+			} else if s.signatureCut > 0 {
 				drops.dropField(boundSignature)
 			}
 		case field == fieldSymbolInfoRelationships && wt == wireBytes:
@@ -645,42 +650,52 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 	return s, false, nil
 }
 
-// decodeSignature reads Signature.text, bounded at the signature ceiling;
-// a longer signature is dropped rather than truncated into a wrong one.
-// The second result reports that the text was dropped for exceeding the
-// signature bound, which the caller counts as a field drop.
-func decodeSignature(r *reader) (string, bool, error) {
+// decodeSignature reads Signature.text, bounded at the signature ceiling. A
+// longer signature is TRUNCATED and flagged, not discarded: a 4 096-byte
+// prefix of a signature answers most questions about the symbol, and this
+// producer yielding nothing where treesitter/facts.go:220 yields a prefix was
+// the whole of F26. Only the prefix is ever read, so a signature of any size
+// costs the ceiling and not itself.
+//
+// The second result is the ORIGINAL encoded length when the text was cut, and
+// 0 when it was not; the caller records it on the symbol and counts one field
+// truncation.
+func decodeSignature(r *reader) (string, int64, error) {
 	var text string
-	var dropped bool
+	var cut int64
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
 		if field != fieldSignatureText || wt != wireBytes {
 			if err := r.skip(wt); err != nil {
-				return "", false, err
+				return "", 0, err
 			}
 			continue
 		}
 		n, err := r.length()
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
-		if n > int64(model.MaxSignatureBytes) {
-			if err := r.discardSub(n); err != nil {
-				return "", false, err
-			}
-			dropped = true
-			continue
+		keep := n
+		if max := int64(model.MaxSignatureBytes); n > max {
+			keep, cut = max, n
 		}
-		buf, err := r.bytes(n, n, boundSignature, nil)
+		buf, err := r.bytes(keep, keep, boundSignature, nil)
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
-		text = string(buf)
+		if keep < n {
+			if err := r.discardSub(n - keep); err != nil {
+				return "", 0, err
+			}
+		}
+		// The prefix is cut at a byte offset, so the last rune of it may be
+		// half a UTF-8 sequence; TruncateField is what removes it.
+		text, _ = model.TruncateField(string(buf), model.MaxSignatureBytes)
 	}
-	return text, dropped, nil
+	return text, cut, nil
 }
 
 // The second result reports that the relationship was DROPPED: its symbol was
