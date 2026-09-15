@@ -645,11 +645,14 @@ func Defaults() Config {
 			MinFreeDiskBytes:          1073741824,
 			MaxMetadataResponseBytes:  262144,
 			MaxSourceResponseBytes:    7340032,
-			QueryTimeout:              Duration(10 * time.Second),
-			MaxQueryTextBytes:         8192,
-			MaxQueryTerms:             Unlimited,
-			MaxPageItems:              200,
-			MaxProviderRecordBytes:    Unlimited,
+			// QueryTimeout is 0: a call that carries no deadline of its own runs
+			// to the complete answer. Only a user-set value ends a page early,
+			// and then with a cursor, never an error.
+			QueryTimeout:           0,
+			MaxQueryTextBytes:      8192,
+			MaxQueryTerms:          Unlimited,
+			MaxPageItems:           200,
+			MaxProviderRecordBytes: Unlimited,
 		},
 		Storage: Storage{
 			DataDir:                "",

@@ -146,7 +146,6 @@ func (c Config) validate() error {
 		{"index.watch_debounce", c.Index.WatchDebounce},
 		{"index.reconcile_interval", c.Index.ReconcileInterval},
 		{"index.capture_retry_deadline", c.Index.CaptureRetryDeadline},
-		{"resources.query_timeout", c.Resources.QueryTimeout},
 		{"storage.busy_timeout", c.Storage.BusyTimeout},
 		{"storage.closed_session_retention", c.Storage.ClosedSessionRetention},
 		{"storage.query_cursor_ttl", c.Storage.QueryCursorTTL},
@@ -163,13 +162,16 @@ func (c Config) validate() error {
 			return configInvalid("%s is %s; a duration must be positive", d.key, d.v)
 		}
 	}
-	// The two analysis timeouts are the exception: 0 means no wall-clock limit,
-	// because a deadline that fails an analysis unit refuses a repository for
-	// being large. The stall timeouts above are what catch a wedged subprocess.
+	// The query deadline and the two analysis timeouts are the exception: 0
+	// means no wall-clock limit. A query that carries no deadline runs to the
+	// complete answer, and a deadline that fails an analysis unit would refuse a
+	// repository for being large. The stall timeouts above are what catch a
+	// wedged subprocess.
 	for _, d := range []struct {
 		key string
 		v   Duration
 	}{
+		{"resources.query_timeout", c.Resources.QueryTimeout},
 		{"providers.scip.timeout", c.Providers.SCIP.Timeout},
 		{"providers.dependence.timeout", c.Providers.Dependence.Timeout},
 	} {

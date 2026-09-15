@@ -26,7 +26,7 @@ func (s *Service) Include(ctx context.Context, req model.IncludeRequest) (model.
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	// The request is validated, so the actor is non-empty and Session applies

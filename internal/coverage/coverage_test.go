@@ -622,6 +622,20 @@ func (b blockingSessions) Session(ctx context.Context, id model.SessionID, actor
 	}
 }
 
+// deadlineSessions records whether the context the service handed down carried
+// a deadline, and answers immediately so the row costs no wall clock. It embeds
+// the fake for the same reason blockingSessions does.
+type deadlineSessions struct {
+	*fakeStore
+	deadline *bool
+}
+
+func (d deadlineSessions) Session(ctx context.Context, id model.SessionID, actor string) (sqlite.SessionRecord, error) {
+	_, ok := ctx.Deadline()
+	*d.deadline = ok
+	return d.fakeStore.Session(ctx, id, actor)
+}
+
 // --- the fake source --------------------------------------------------------
 
 // fakeSource reproduces snapshot.View.Read: it rejects a range past the file
@@ -1293,6 +1307,56 @@ var scenarios = []scenario{
 		}); !errors.As(err, &typedErr) || typedErr.Code != model.CodeCoverageIncomplete {
 			t.Fatalf("a %q acknowledgment over 7 of the %d bytes of %s returned %v; want %s",
 				model.AcknowledgeFile, len(f.data), f.path, err, model.CodeCoverageIncomplete)
+		}
+	}},
+
+	// resources.query_timeout is unlimited by DEFAULT and is a default, never a
+	// ceiling. Both halves were broken here: every endpoint wrapped its request
+	// in context.WithTimeout unconditionally, so the shipped zero minted
+	// `now + 0` -- an instant already past, which refuses every request instead
+	// of running it unbounded -- and a caller who set a longer deadline of their
+	// own had it silently cut back to the configured default. The row asserts
+	// at the seam where it is decidable, the context the service hands the
+	// store, so it needs no wall clock at all.
+	//
+	// Mutation: restore context.WithTimeout(ctx, s.limits.QueryTimeout) in
+	// Read, Next, OpenSession or Status in place of model.QueryDeadline and the
+	// zero-timeout leg fails with a deadline the request never asked for.
+	{"read/an unbounded read carries no deadline and a caller's own is kept", func(t *testing.T, h *harness) {
+		read := func(l Limits, ctx context.Context) bool {
+			installed := false
+			svc := &Service{
+				sessions: deadlineSessions{h.store, &installed},
+				open:     func(context.Context, model.SnapshotID) (Source, error) { return h.src, nil },
+				signer:   h.sign, limits: l,
+				now: func() time.Time { return h.now },
+			}
+			if _, err := svc.Read(ctx, model.ReadChunkRequest{
+				SessionID: sessionA, ActorID: actorA, FileID: model.FileID(hexID(0x21)),
+			}); err != nil {
+				t.Fatalf("Read: %v", err)
+			}
+			return installed
+		}
+		limits := fixtureLimits()
+		limits.QueryTimeout = 0
+		if read(limits, context.Background()) {
+			t.Fatal("query_timeout 0 means NO deadline, yet the read ran under one: " +
+				"`now + 0` is an instant already past and would refuse every request")
+		}
+
+		// A caller's own deadline is the request's, and a positive configured
+		// value must not narrow it. A minute is far beyond anything this
+		// package would install, so the two are distinguishable.
+		limits = fixtureLimits()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		before, _ := ctx.Deadline()
+		if !read(limits, ctx) {
+			t.Fatal("the caller's deadline was dropped")
+		}
+		if after, _ := ctx.Deadline(); !after.Equal(before) {
+			t.Fatalf("the caller's deadline moved from %s to %s: query_timeout is a ceiling", before, after)
 		}
 	}},
 

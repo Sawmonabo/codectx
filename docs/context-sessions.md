@@ -53,8 +53,9 @@ exclusion naming the key and the value.
 
 ### A plan that runs out of query deadline continues, it does not fail
 
-A large repository can exhaust `resources.query_timeout` before the compile
-finishes. That is not the end of the answer: the compile ends the **pass** it is
+`resources.query_timeout` is unlimited by default, so an unbounded compile of a
+large repository returns the whole plan. If you set one — that key, or
+`--timeout` — the compile can exhaust it before it finishes. That is not the end of the answer: the compile ends the **pass** it is
 in, persists nothing, opens no session, and returns
 
 ```

@@ -446,3 +446,67 @@ derived from the repository's own bytes. `storage.synchronous = "full"` buys
 back durability of those last commits at roughly 10 ms of fsync per commit;
 [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md) records why that is not the
 default.
+
+## The packed per-generation adjacency
+
+A generation publishes, beside its facts, a packed form of its own graph, and
+every traversal reads structure from that and from nothing else
+([ADR-0005](adr/ADR-0005-graph-traversal-layout.md), Decision 1). It is derived
+from facts that are already sealed, so it is neither a fact nor an identity: it
+carries no provider version and no analysis fingerprint, and it is dropped with
+the generation it describes.
+
+It exists because reading structure from the relation b-tree costs a random
+descent per frontier node and a visibility sub-query per candidate edge, and
+both costs grow with the repository while the answer does not. Resolving
+visibility once, at publication, and scanning a packed array instead turns the
+per-page cost into a sequential read.
+
+**The two tables.** `generation_graph` carries one row per generation: the
+largest node and relation surrogate, the node and edge counts, the relation-kind
+and node-kind dictionaries, and the layout version. `generation_graph_parts`
+carries the bytes, one row per chunk of one stream, keyed by generation, stream
+name and a 0-based part number whose parts concatenate to the stream. Both
+cascade from `generations`, so collecting a generation collects its graph.
+
+The header row is written **last**, after every part. Its presence is therefore
+the commit marker: a reader that finds it is guaranteed every part behind it,
+and a half-written graph is indistinguishable from no graph at all.
+
+**The streams.** Per direction there are two: an offsets directory of one 64-bit
+little-endian entry per node surrogate, and an edge stream. A node's list starts
+at its own offset and ends at the next node's, so a node with no edges has two
+equal offsets; one extra entry past the largest surrogate holds the stream
+length, which removes the last node's special case. Each list is sorted by
+neighbour surrogate and encoded as a variable-length delta of the neighbour, a
+variable-length relation surrogate and a one-byte relation-kind code.
+
+Four fixed-width arrays sit beside them, indexed the same way: each node's kind
+code, its container surrogate, and the source size of a file node, and each
+relation's evidence count. Zero is "absent" in all four, so a surrogate the
+generation does not carry costs one zeroed entry and never a lookup. The
+container is the node itself when the node is a container kind, otherwise the
+`contains` parent of a container kind with the **lowest canonical id** — the
+32-byte identity, never the surrogate, so the attribution is a fact of the ids
+and not of the order the repository happened to be indexed in.
+
+Parts are a fixed size except the last of each stream, which makes locating a
+byte pure arithmetic. A list may straddle a boundary and the reader stitches it.
+The part sizes and the reader's window are internal layout constants, not
+settings: a larger repository yields more parts, and nothing is ever refused,
+skipped or truncated because of them.
+
+**The build** runs inside activation, before the active pointer flips and in the
+same transaction, so a generation is never published without the structure its
+readers expect and a failed build fails the activation. It first materialises
+the generation's visible relation and node surrogates, then streams two ordered
+scans of the relation dictionary, one per direction, emitting each offset as the
+scan passes its node and flushing each part as it fills. The scans run in the
+index order the dictionary already provides and each node's list is re-sorted by
+neighbour in memory, one list at a time, so neither scan sorts the relation set
+and the working set is one part plus one list rather than the graph. The side
+arrays come from one ordered pass over the generation's node facts, merged
+against one ordered pass of the container claims, and one aggregate over
+evidence. The build logs its own start and end, so its share of an indexing run
+can be read off without inferring it from the total.
+

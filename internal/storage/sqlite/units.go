@@ -1400,6 +1400,14 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 			FROM generation_capabilities WHERE generation_id = ? ORDER BY provider_id, capability, scope_key`, g.id); err != nil {
 			return err
 		}
+		// The packed adjacency is built HERE, before the active pointer flips
+		// and inside the same transaction, so a generation is never published
+		// without the structure every traversal reads (ADR-0005 Decision 1) and
+		// a failed build fails the activation instead of leaving a half-graph.
+		if err := buildGraph(ctx, tx, g.id); err != nil {
+			return err
+		}
+
 		snapshotID := model.SnapshotID(idHex(g.snapshot))
 		key := model.NewAnalysisKey(snapshotID, Fingerprint, membership.Sum(), capsHash.Sum(), normalizationVersion, g.semantic)
 		keyRaw, _ := model.DecodeID(string(key))

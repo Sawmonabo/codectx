@@ -290,8 +290,8 @@ func assertSamePlan(t *testing.T, at int, got CompileResult, want model.ContextM
 //
 // Its base is the real clock, deliberately. compile bounds itself with
 // context.WithTimeout, whose deadline is a real instant, so a clock based
-// anywhere else could never be compared with it; jumping by MORE than
-// resources.query_timeout (10s) and far LESS than storage.query_cursor_ttl
+// anywhere else could never be compared with it; jumping by MORE than the
+// query_timeout the row sets (10s) and far LESS than storage.query_cursor_ttl
 // (15m) is what makes "the deadline has passed, the cursor has not" the state
 // at the boundary, deterministically and without any sleep.
 type boundaryClock struct {
@@ -346,6 +346,13 @@ func TestTheDeadlineBranchWalksEveryBoundaryAndStoresNoManifest(t *testing.T) {
 	}
 
 	fx := newContextFixture(t)
+	// resources.query_timeout is unlimited by default -- a compile nobody
+	// bounded returns the COMPLETE plan -- so the deadline branch under test
+	// only exists for an operator who SET a bound. This row is that operator.
+	// The value is the one boundaryClock is built around: more than its
+	// halted jump of a minute would never expire, and it must stay far below
+	// storage.query_cursor_ttl so the cursor outlives the deadline.
+	fx.Cfg.Resources.QueryTimeout = config.Duration(10 * time.Second)
 	clock := newBoundaryClock()
 	c, spools := pagedCompiler(t, fx, clock.now, clock.halt)
 	// The identity is computable without compiling, which is what lets each

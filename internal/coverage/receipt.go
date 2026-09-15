@@ -159,7 +159,7 @@ func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest)
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
