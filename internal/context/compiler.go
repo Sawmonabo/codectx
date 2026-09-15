@@ -315,10 +315,10 @@ func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedRe
 	}
 
 	limit := c.pageLimit()
-	budget := c.cfg.Context.MaxGraphEdges
-	if budget <= 0 {
-		budget = model.MaxPageItems
-	}
+	// An unlimited edge bound is not a zero-sized scan: L2 replaces this whole
+	// hydration budget with the resumable frontier, and until then an absent
+	// bound falls back to the page size it already used for a 0 value.
+	budget := int(c.cfg.Context.MaxGraphEdges.ValueOr(model.MaxPageItems))
 	scanned := 0
 	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
 		batch := nodes[start:min(start+limit, len(nodes))]

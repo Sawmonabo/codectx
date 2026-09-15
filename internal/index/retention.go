@@ -31,8 +31,8 @@ import (
 // on the next pass. It is logged with its diagnostic code so it cannot be
 // silent.
 func (c *Coordinator) retain(ctx context.Context) {
-	policy := sqlite.RetentionPolicy{RetainRefs: c.opts.Config.Index.RetainRefs,
-		MaxRetainedBytes: c.opts.Config.Index.MaxRetainedBytes}
+	policy := sqlite.RetentionPolicy{RetainRefs: c.opts.Config.Index.RetainRefs.Int(),
+		MaxRetainedBytes: c.opts.Config.Index.MaxRetainedBytes.Value()}
 	// The sweep must finish even when the caller's context is already ending:
 	// a half-swept store is the one state retention must not leave behind.
 	report, err := c.opts.Store.RetainByRef(context.WithoutCancel(ctx), c.repo, policy, c.now())

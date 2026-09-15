@@ -146,10 +146,10 @@ func morePathsReason(more int64) []string {
 // manifest that PutManifest rejects.
 func (c *Compiler) reasonPathLimit() int {
 	limit := c.cfg.Context.MaxReasonPathsPerEntry
-	if limit <= 0 || limit > model.MaxReasonPathsPerEntry {
+	if limit.IsUnlimited() || limit.Int() > model.MaxReasonPathsPerEntry {
 		return model.MaxReasonPathsPerEntry
 	}
-	return limit
+	return limit.Int()
 }
 
 // resolvePrecision maps every relation on every candidate route to its edge

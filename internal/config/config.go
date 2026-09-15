@@ -73,8 +73,12 @@ func (e *Enablement) UnmarshalTOML(v any) error {
 }
 
 // Duration is a TOML duration written in Go's syntax ("250ms", "45m"). A
-// duration is never zero or negative: Section 20.2 forbids a zero setting that
-// means unlimited.
+// duration is never negative. Almost every duration must also be positive; the
+// exceptions are the two analysis timeouts (providers.scip.timeout and
+// providers.dependence.timeout), where 0 means no wall-clock limit at all,
+// because a deadline that fails an analysis unit is a scale refusal wearing a
+// deadline's clothes. A hung subprocess is caught by the stall timeouts
+// instead, which detect absence of progress rather than duration of work.
 type Duration time.Duration
 
 // UnmarshalText parses the Go duration spelling used throughout Section 20.1.
@@ -117,9 +121,9 @@ type Workspace struct {
 	IncludeUntracked   bool  `toml:"include_untracked"`
 	IndexGenerated     bool  `toml:"index_generated"`
 	IndexVendor        bool  `toml:"index_vendor"`
-	MaxFiles           int64 `toml:"max_files"`
-	MaxParseFileBytes  int64 `toml:"max_parse_file_bytes"`
-	MaxSearchFileBytes int64 `toml:"max_search_file_bytes"`
+	MaxFiles           Limit `toml:"max_files"`
+	MaxParseFileBytes  Limit `toml:"max_parse_file_bytes"`
+	MaxSearchFileBytes Limit `toml:"max_search_file_bytes"`
 }
 
 // Index is operational scheduling policy: none of it is a semantic input.
@@ -139,13 +143,15 @@ type Index struct {
 	// RetainRefs is retention by ref, not by snapshot count (Section 12.4):
 	// the results of the last N distinct refs the user actually indexed stay
 	// on disk, so switching A -> B -> C -> A finds A's units and reuses them
-	// without a run. The minimum is 1, which retains the active ref alone.
-	RetainRefs int `toml:"retain_refs"`
+	// without a run. It keeps a finite default because a generation is
+	// reconstructible by re-indexing, so evicting one is lifecycle retention
+	// and not a dropped row; 0 retains every ref, matching MaxRetainedBytes.
+	RetainRefs Limit `toml:"retain_refs"`
 	// MaxRetainedBytes is the second setting where 0 is meaningful: the
 	// retained store has no default size limit, so 0 leaves retention governed
 	// by RetainRefs alone. A user-set value evicts least-recently-used refs
 	// first and never the active one.
-	MaxRetainedBytes int64 `toml:"max_retained_bytes"`
+	MaxRetainedBytes Limit `toml:"max_retained_bytes"`
 }
 
 // Resources is the memory, concurrency, disk and response policy.
@@ -162,9 +168,9 @@ type Resources struct {
 	MaxSourceResponseBytes    int64    `toml:"max_source_response_bytes"`
 	QueryTimeout              Duration `toml:"query_timeout"`
 	MaxQueryTextBytes         int      `toml:"max_query_text_bytes"`
-	MaxQueryTerms             int      `toml:"max_query_terms"`
+	MaxQueryTerms             Limit    `toml:"max_query_terms"`
 	MaxPageItems              int      `toml:"max_page_items"`
-	MaxProviderRecordBytes    int64    `toml:"max_provider_record_bytes"`
+	MaxProviderRecordBytes    Limit    `toml:"max_provider_record_bytes"`
 }
 
 // Storage is the SQLite and data-directory policy.
@@ -219,7 +225,15 @@ type TreeSitter struct {
 // SCIP configures the external index importer.
 type SCIP struct {
 	Enabled Enablement `toml:"enabled"`
-	Timeout Duration   `toml:"timeout"`
+	// Timeout bounds one whole import. 0, the default, means no wall-clock
+	// limit: a monorepo's import is slow, not broken.
+	Timeout Duration `toml:"timeout"`
+	// StallTimeout is a hang detector, not a size limit. It is how long the
+	// runner tolerates a subprocess making no progress at all -- no stdout, no
+	// stderr, no CPU, no growth of its output file -- before failing the unit
+	// with reason `stalled` and reporting it. It is finite by default because
+	// a wedged process makes no progress no matter how large the repository.
+	StallTimeout Duration `toml:"stall_timeout"`
 }
 
 // LSP configures the snapshot-qualified working-tree overlay.
@@ -232,7 +246,7 @@ type LSP struct {
 	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
 	// pinned bytes cached for coordinate conversion, and the bytes sent to and
 	// received from a server over its lifetime.
-	MaxOverlayBytes int64 `toml:"max_overlay_bytes"`
+	MaxOverlayBytes Limit `toml:"max_overlay_bytes"`
 }
 
 // Dependence configures the control-dependence, data-dependence and fallback
@@ -245,8 +259,12 @@ type Dependence struct {
 	// dependence fact promotes its units and is answered `pending` until they
 	// seal. true blocks the index on those units; false disables the provider.
 	Enabled Enablement `toml:"enabled"`
-	// Timeout bounds one whole unit.
+	// Timeout bounds one whole unit. 0, the default, means no wall-clock
+	// limit; StallTimeout is what catches a wedged unit.
 	Timeout Duration `toml:"timeout"`
+	// StallTimeout is the same progress-based hang detector SCIP.StallTimeout
+	// describes, applied to one dependence unit.
+	StallTimeout Duration `toml:"stall_timeout"`
 	// CacheBytes budgets the per-unit parsed-graph cache under the private
 	// data directory. That cache is what makes an unchanged unit cost nothing
 	// on refresh, so it has its own budget rather than sharing the query cache.
@@ -316,12 +334,12 @@ type Context struct {
 	DefaultMaxBytes        int64  `toml:"default_max_bytes"`
 	DefaultMaxFiles        int    `toml:"default_max_files"`
 	MaxSlices              int    `toml:"max_slices"`
-	MaxGraphDepth          int    `toml:"max_graph_depth"`
-	MaxVisitedNodes        int    `toml:"max_visited_nodes"`
-	MaxGraphEdges          int    `toml:"max_graph_edges"`
-	MaxReasonPathsPerEntry int    `toml:"max_reason_paths_per_entry"`
-	MaxManifestBytes       int64  `toml:"max_manifest_bytes"`
-	MaxCapsuleBytes        int64  `toml:"max_capsule_bytes"`
+	MaxGraphDepth          Limit  `toml:"max_graph_depth"`
+	MaxVisitedNodes        Limit  `toml:"max_visited_nodes"`
+	MaxGraphEdges          Limit  `toml:"max_graph_edges"`
+	MaxReasonPathsPerEntry Limit  `toml:"max_reason_paths_per_entry"`
+	MaxManifestBytes       Limit  `toml:"max_manifest_bytes"`
+	MaxCapsuleBytes        Limit  `toml:"max_capsule_bytes"`
 	StrictReadGate         bool   `toml:"strict_read_gate"`
 	// AllowExploratoryWaiverConsolidation is user-only and never weakens strict
 	// read readiness (Section 20.2).
@@ -334,7 +352,7 @@ type Coverage struct {
 	MaxChunkBytes                  int64    `toml:"max_chunk_bytes"`
 	SessionTTL                     Duration `toml:"session_ttl"`
 	MaxReceiptsPerConfirmation     int      `toml:"max_receipts_per_confirmation"`
-	MaxUnconfirmedChunksPerSession int      `toml:"max_unconfirmed_chunks_per_session"`
+	MaxUnconfirmedChunksPerSession Limit    `toml:"max_unconfirmed_chunks_per_session"`
 }
 
 // MCP is the server transport policy.
@@ -356,7 +374,7 @@ func (c Config) TraversalPolicy() workspace.Policy {
 		IndexVendor:      c.Workspace.IndexVendor,
 		IndexGenerated:   c.Workspace.IndexGenerated,
 		IncludeUntracked: c.Workspace.IncludeUntracked,
-		MaxFiles:         c.Workspace.MaxFiles,
+		MaxFiles:         c.Workspace.MaxFiles.Value(),
 		DataDir:          c.Storage.DataDir,
 	}
 }
@@ -371,9 +389,9 @@ func Defaults() Config {
 			IncludeUntracked:   true,
 			IndexGenerated:     false,
 			IndexVendor:        false,
-			MaxFiles:           250000,
-			MaxParseFileBytes:  5242880,
-			MaxSearchFileBytes: 26214400,
+			MaxFiles:           Unlimited,
+			MaxParseFileBytes:  Unlimited,
+			MaxSearchFileBytes: Unlimited,
 		},
 		Index: Index{
 			Workers:           0,
@@ -401,9 +419,9 @@ func Defaults() Config {
 			MaxSourceResponseBytes:    7340032,
 			QueryTimeout:              Duration(10 * time.Second),
 			MaxQueryTextBytes:         8192,
-			MaxQueryTerms:             32,
+			MaxQueryTerms:             Unlimited,
 			MaxPageItems:              200,
-			MaxProviderRecordBytes:    4194304,
+			MaxProviderRecordBytes:    Unlimited,
 		},
 		Storage: Storage{
 			DataDir:                "",
@@ -431,18 +449,19 @@ func Defaults() Config {
 				Languages:     []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
 				WorkerIdleTTL: Duration(60 * time.Second),
 			},
-			SCIP: SCIP{Enabled: Auto, Timeout: Duration(20 * time.Minute)},
+			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute)},
 			LSP: LSP{
 				Enabled:                Auto,
 				RequestTimeout:         Duration(15 * time.Second),
 				MaxServers:             1,
 				MaxOutstandingRequests: 8,
 				IdleTTL:                Duration(60 * time.Second),
-				MaxOverlayBytes:        536870912,
+				MaxOverlayBytes:        Unlimited,
 			},
 			Dependence: Dependence{
 				Enabled:                Auto,
-				Timeout:                Duration(45 * time.Minute),
+				Timeout:                0,
+				StallTimeout:           Duration(5 * time.Minute),
 				CacheBytes:             4294967296,
 				UnitMemoryFloorBytes:   805306368,
 				UnitMemoryCeilingBytes: 0,
@@ -454,12 +473,12 @@ func Defaults() Config {
 			DefaultMaxBytes:                     524288,
 			DefaultMaxFiles:                     200,
 			MaxSlices:                           16,
-			MaxGraphDepth:                       3,
-			MaxVisitedNodes:                     50000,
-			MaxGraphEdges:                       100000,
-			MaxReasonPathsPerEntry:              3,
-			MaxManifestBytes:                    8388608,
-			MaxCapsuleBytes:                     8388608,
+			MaxGraphDepth:                       Unlimited,
+			MaxVisitedNodes:                     Unlimited,
+			MaxGraphEdges:                       Unlimited,
+			MaxReasonPathsPerEntry:              Unlimited,
+			MaxManifestBytes:                    Unlimited,
+			MaxCapsuleBytes:                     Unlimited,
 			StrictReadGate:                      true,
 			AllowExploratoryWaiverConsolidation: false,
 		},
@@ -468,7 +487,7 @@ func Defaults() Config {
 			MaxChunkBytes:                  1048576,
 			SessionTTL:                     Duration(24 * time.Hour),
 			MaxReceiptsPerConfirmation:     16,
-			MaxUnconfirmedChunksPerSession: 64,
+			MaxUnconfirmedChunksPerSession: Unlimited,
 		},
 		MCP: MCP{Transport: "stdio", Watch: true},
 	}
@@ -482,6 +501,11 @@ func trustRequired(format string, args ...any) *model.Error {
 	return (&model.Error{Code: model.CodeTrustRequired, Message: fmt.Sprintf(format, args...)}).
 		WithRemediation("Move the setting to the user configuration file, which is outside the repository and not written by the code being analyzed.")
 }
+
+// quoteLimit renders a bound as a fingerprint component. An unlimited bound has
+// exactly one spelling, so `0` and "unlimited" hash identically and neither
+// collides with any finite value.
+func quoteLimit(l Limit) string { return l.String() }
 
 // quoteInt renders a number as a fingerprint component.
 func quoteInt(v int64) string { return strconv.FormatInt(v, 10) }

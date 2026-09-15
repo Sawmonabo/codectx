@@ -180,11 +180,11 @@ func applyProjectKey(cfg, scratch *Config, key string) error {
 	case "workspace.index_vendor":
 		cfg.Workspace.IndexVendor = scratch.Workspace.IndexVendor
 	case "workspace.max_files":
-		return lowerOnly(key, &cfg.Workspace.MaxFiles, scratch.Workspace.MaxFiles)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxFiles, scratch.Workspace.MaxFiles)
 	case "workspace.max_parse_file_bytes":
-		return lowerOnly(key, &cfg.Workspace.MaxParseFileBytes, scratch.Workspace.MaxParseFileBytes)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxParseFileBytes, scratch.Workspace.MaxParseFileBytes)
 	case "workspace.max_search_file_bytes":
-		return lowerOnly(key, &cfg.Workspace.MaxSearchFileBytes, scratch.Workspace.MaxSearchFileBytes)
+		return lowerOnlyLimit(key, &cfg.Workspace.MaxSearchFileBytes, scratch.Workspace.MaxSearchFileBytes)
 	case "providers.tree_sitter.languages":
 		cfg.Providers.TreeSitter.Languages = scratch.Providers.TreeSitter.Languages
 	case "context.default_phase":
@@ -208,7 +208,9 @@ func applyProjectKey(cfg, scratch *Config, key string) error {
 	return nil
 }
 
-// lowerOnly applies a project value only when it narrows the effective limit.
+// lowerOnly applies a project value only when it narrows the effective caller
+// budget. It is for the plain positive settings; a bound uses lowerOnlyLimit,
+// where 0 does not mean "the smallest possible value".
 func lowerOnly(key string, current *int64, proposed int64) error {
 	if proposed > *current {
 		return trustRequired("%s raises %q from %d to %d; a project file may only lower a limit",
@@ -216,6 +218,21 @@ func lowerOnly(key string, current *int64, proposed int64) error {
 	}
 	*current = proposed
 	return nil
+}
+
+// lowerOnlyLimit is lowerOnly over the unlimited-aware ordering. Unlimited is
+// the TOP of the lattice, not the bottom: a project file naming any finite
+// bound against an unlimited one is narrowing what this tool does to the
+// repository, which is exactly what a project file is allowed to do. Only the
+// reverse -- proposing unlimited, or a larger finite bound, over a finite one
+// -- raises a ceiling the user set, and that is the escalation.
+func lowerOnlyLimit(key string, current *Limit, proposed Limit) error {
+	if current.IsUnlimited() || (!proposed.IsUnlimited() && proposed <= *current) {
+		*current = proposed
+		return nil
+	}
+	return trustRequired("%s raises %q from %s to %s; a project file may only lower a limit",
+		ProjectConfigName, key, *current, proposed)
 }
 
 // decodeFile decodes path into v, merging only the fields the file actually
