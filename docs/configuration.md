@@ -385,7 +385,8 @@ budget excludes is named in the manifest with its reason.
 `max_graph_depth`, `max_visited_nodes` and `max_graph_edges` bound graph
 expansion, and all three are unlimited by default.
 
-`max_visited_nodes` and `max_graph_edges` are **per-page work budgets, not
+On the paged traversals — `callers` and `callees` — `max_visited_nodes` and
+`max_graph_edges` are **per-page work budgets, not
 cumulative ceilings on a walk**. A page spends its own allowance; a page that
 exhausts one stops there, reports the reason that stopped it (`visited node
 budget exhausted` or `edge budget exhausted`) and mints a continuation cursor,
@@ -398,10 +399,12 @@ replayed cursor neither resets nor doubles it.
 
 Two stops are not resumable, and both say so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
-out of depth is reported truncated with no continuation. And `impact` performs
-its whole walk on the first page and then serves a spooled ranked tail, so a
-per-page budget it exhausts ends that one walk: the answer is truncated with
-the reason, and every later page repeats the same flag and reason.
+out of depth is reported truncated with no continuation. And `impact` — with the
+package rollup that answers on the same terms — performs its whole walk on the
+first request and then serves a spooled, globally ranked answer, so for it the
+two budgets are **answer-level** bounds measured against the walk's cumulative
+spend: exhausting one ends that walk, the answer is truncated with the reason,
+and every later page repeats the same flag and reason.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.

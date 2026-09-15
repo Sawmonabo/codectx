@@ -260,8 +260,13 @@ with the graph. The cost side is real and stated for the verification lane: one 
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
 released only after the fresh one is written. The two callers that used to expand a whole walk in
-one request now have the same treatment: impact is a spooled, cursor-resumable continuation and the
-rollup's containment read is keyset-paged, so neither ranks or aggregates a whole walk in memory.
+one request keep the walk-to-completion their answers need, and pay for it on disk rather than in
+heap: impact and the package rollup stream every admitted edge into external sorts, rank the whole
+answer once, serve one page and spool the globally ranked remainder behind a cursor, with the
+rollup's containment read keyset-paged per batch. Neither ranks or aggregates a whole walk in
+memory, and neither loses the global order to do it: the pages concatenate to the single-shot
+answer, each record exactly once. Peak on this path gains the two sorts' run buffers and merge
+fan-in — a function of the query memory admission, not of the reachable set.
 
 ### 2.3 External merge for the planner, with byte-identical order
 
@@ -748,6 +753,13 @@ duplicates an existing assertion.
   metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
   is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
   the single-observation path reads the same configured limit the aggregate path does.
+- **A deadline that lands mid-RANK, after the walk completed, has no continuation.** An impact or
+  package-rollup request whose time runs out while its external sort is running reports the deadline
+  and offers no cursor: the sort primitive has no adopt-existing-runs constructor, so the spilled
+  runs cannot be re-entered on a later page. The walk itself is resumable and unaffected; the remedy
+  today is to re-run the query or raise the query timeout. Closing it is a Minor — give the external
+  sort a constructor that adopts the runs a previous request spilled — and it is the only stop on
+  these two endpoints that returns truncated with no cursor.
 - **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
   walk holds its settled set, distances, depths and cached edges for the length of the walk, and
   unlike a breadth-first frontier that state cannot spill, because a search resumed from a
