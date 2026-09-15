@@ -17,3 +17,4 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | [ADR-0002](ADR-0002-storage-identities.md) | Storage identities: integer surrogates and interned keys | Accepted, 2026-09-14 |
 | [ADR-0003](ADR-0003-storage-tier2.md) | Storage tier 2: the lexical and provenance tiers, and the gate | Proposed, 2026-09-15 |
 | [ADR-0004](ADR-0004-wal-synchronous-mode.md) | WAL synchronous mode | Accepted, 2026-09-15 |
+| [ADR-0005](ADR-0005-graph-traversal-layout.md) | Graph traversal layout: packed per-generation adjacency, surrogate walk, bitset visited set | Accepted, 2026-09-15 |
