@@ -115,7 +115,9 @@ func stallProgress(outPipe, errPipe *streamPipe, sampler *treeSampler, progressF
 //
 // It is not monotonic in the strict sense -- a tool that rewrites its output
 // can shrink it -- but the watchdog compares the sum for equality, not for
-// growth, so any change at all is progress.
+// growth, so any change at all is progress. The one shape that hides is a
+// shrink that exactly cancels another signal's advance within one poll; it
+// costs a single poll, because the next one sees a different sum.
 func progressBytes(paths []string) int64 {
 	var total int64
 	for _, path := range paths {

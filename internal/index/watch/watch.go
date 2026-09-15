@@ -503,7 +503,10 @@ func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map
 		if want[dir] {
 			return nil
 		}
-		if w.opts.MaxWatchedDirs.Exceeded(int64(len(want))) {
+		// The question is whether admitting THIS directory would cross the
+		// bound, so the set holds exactly the configured number, root
+		// included -- not one more.
+		if w.opts.MaxWatchedDirs.Exceeded(int64(len(want)) + 1) {
 			overLimit = true
 			return errWatchSetFull
 		}
