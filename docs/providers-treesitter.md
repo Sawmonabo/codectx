@@ -182,7 +182,7 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 | `references` | enclosing declaration → type declaration | a type reference to a class/struct/interface/enum declared in this file; a type this file does not declare gets no placeholder |
 | `may_refer_to` | declaration → alias alternative | the resolver returned an ambiguous alias match |
 
-Occurrences past `MaxEvidencePerFact` (64) on one relation or node are
+Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
 silently. The unresolved callees one file may mint are bounded the same way: at
 most 2000 distinct placeholders, after which a cross-file call is counted, not
@@ -285,7 +285,7 @@ frame at the `SourceBytes` the request declared, itself at most
 
 The frame cap does not bound the sink record a frame becomes; the parent's own
 bounds do. The largest fact the parent can build is one node or relation
-carrying `MaxEvidencePerFact` (64) evidence rows of roughly 620 bytes of
+carrying `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) evidence rows of roughly 620 bytes of
 identifiers and positions plus a native key of at most `MaxNativeKeyBytes`
 (2048): about 167 KiB, well under the 4 MiB `max_provider_record_bytes` a sink
 is configured with. Facts are handed to the sink in slices of at most 1000

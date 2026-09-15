@@ -41,7 +41,7 @@ const (
 // Bounds. MaxFactFrameBytes is the per-record cap the parent enforces on
 // every frame from the child. It does not bound the sink record a frame
 // becomes; the bound that does is the parent's own: the largest fact it can
-// build is one node or relation carrying MaxEvidencePerFact (64) evidence
+// build is one node or relation carrying MaxEvidencePerFact (65536, or the user-set clip) evidence
 // rows of about 620 bytes of identifiers and positions plus a native key of
 // at most MaxNativeKeyBytes (2048), so about 167 KiB, well under the 4 MiB
 // max_provider_record_bytes a sink is configured with. MaxSourceBytes is the
