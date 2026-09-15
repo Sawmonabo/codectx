@@ -75,6 +75,9 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 	if err := s.collectUnreachableUnits(ctx); err != nil {
 		return err
 	}
+	if err := s.collectUnreferencedScopeKeys(ctx); err != nil {
+		return err
+	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM provider_runs WHERE generation_id IS NULL
 			AND NOT EXISTS (SELECT 1 FROM units u WHERE u.origin_run_id = provider_runs.id)`); err != nil {
@@ -128,6 +131,52 @@ func (s *Store) collectUnreachableUnits(ctx context.Context) error {
 		AND NOT EXISTS (SELECT 1 FROM unit_dependencies ud WHERE ud.dependency_id = u.id) LIMIT ?2`, 0)
 }
 
+// collectUnreferencedScopeKeys deletes the S-3 scope-key dictionary rows that
+// no alias names any more. A dictionary row outlives every unit that referred
+// to it -- deleteUnit removes the alias rows, never the interned string -- so
+// without this pass a store that is rebuilt repeatedly accumulates scope keys
+// that nothing can reach.
+//
+// The pass is a keyset over scope_keys.id in gcBatchUnits-sized transactions:
+// the heap holds one cursor, never the dictionary, and a pass that cannot
+// finish drains over the next collection. Each candidate's reachability is one
+// indexed probe -- idx_alias_lookup leads with scope_key_id -- which is also
+// the index SQLite uses to enforce native_aliases' foreign key onto this row,
+// so the delete costs the same lookup twice rather than a scan.
+//
+// The cursor advances past the whole batch whether or not its rows were
+// deleted, so a dictionary of live keys is walked once per pass instead of
+// re-examining the same surviving prefix forever.
+//
+// native_keys has no counterpart here on purpose: see the lane report. Its two
+// child keys (native_aliases.native_key_id, evidence.native_key_id) are
+// unindexed, so the identical statement degrades to a full scan of evidence
+// per candidate. Sweeping it needs an index decision that is not this lane's.
+func (s *Store) collectUnreferencedScopeKeys(ctx context.Context) error {
+	var after int64
+	for {
+		var last int64
+		err := s.write(ctx, func(tx *sql.Tx) error {
+			if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM
+				(SELECT id FROM scope_keys WHERE id > ?1 ORDER BY id LIMIT ?2)`,
+				after, gcBatchUnits).Scan(&last); err != nil {
+				return wrap("scope_keys", err)
+			}
+			if last == 0 {
+				return nil
+			}
+			_, err := tx.ExecContext(ctx, `DELETE FROM scope_keys WHERE id > ?1 AND id <= ?2
+				AND NOT EXISTS (SELECT 1 FROM native_aliases na WHERE na.scope_key_id = scope_keys.id)`,
+				after, last)
+			return wrap("scope_keys", err)
+		})
+		if err != nil || last == 0 {
+			return err
+		}
+		after = last
+	}
+}
+
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
 // (bound ?1 = arg, ?2 = batch size) and deletes them through deleteUnit, one
 // transaction per batch, until the query returns nothing.
@@ -175,8 +224,13 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 // transaction rather than silently shrinking a retained generation.
 func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error {
 	steps := []string{
-		`CREATE TEMP TABLE IF NOT EXISTS gc_nodes(id BLOB PRIMARY KEY) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS gc_relations(id BLOB PRIMARY KEY) WITHOUT ROWID`,
+		// The candidate sets hold node_ids.id / relation_ids.id surrogates, so
+		// an INTEGER PRIMARY KEY is the temp table's own rowid: the set costs
+		// one varint per candidate instead of a 32-byte BLOB key, and the
+		// `id IN (SELECT id FROM gc_nodes)` probe below resolves through the
+		// rowid rather than a WITHOUT ROWID b-tree lookup.
+		`CREATE TEMP TABLE IF NOT EXISTS gc_nodes(id INTEGER PRIMARY KEY)`,
+		`CREATE TEMP TABLE IF NOT EXISTS gc_relations(id INTEGER PRIMARY KEY)`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM node_facts WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM native_aliases WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,

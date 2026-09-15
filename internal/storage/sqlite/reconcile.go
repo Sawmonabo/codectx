@@ -91,12 +91,20 @@ func (s *Store) LookupAliases(ctx context.Context, units []model.UnitID, scopeKe
 	seen := make(map[model.NodeID]bool)
 	var out []StoredAlias
 	err := s.read(ctx, func(tx *sql.Tx) error {
+		// The dictionaries are RESOLVED here, never created: this is a read
+		// transaction, and a key no unit has ever published is aliased to
+		// nothing, which is the same empty answer the old TEXT predicate gave.
+		// That is why this path does not consume the interner.
+		scopeRef, nativeRef, err := internedPair(ctx, tx, scopeKey, nativeKey)
+		if err != nil || scopeRef == noRef || nativeRef == noRef {
+			return err
+		}
 		for lo := 0; lo < len(keys); lo += aliasUnitChunk {
 			hi := lo + aliasUnitChunk
 			if hi > len(keys) {
 				hi = len(keys)
 			}
-			if err := s.aliasChunk(ctx, tx, keys[lo:hi], scopeKey, nativeKey, batch, seen, &out); err != nil {
+			if err := s.aliasChunk(ctx, tx, keys[lo:hi], scopeRef, nativeRef, batch, seen, &out); err != nil {
 				return err
 			}
 		}
@@ -117,21 +125,33 @@ func (s *Store) LookupAliases(ctx context.Context, units []model.UnitID, scopeKe
 }
 
 // aliasChunk pages one statement's worth of units by keyset on
-// (canonical_key, id) -- the same pair the statement orders by, as a row value,
-// because a keyset on canonical_key alone would skip every identity that ties
-// on it, which is precisely the ambiguity this lookup exists to report.
-func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scopeKey, nativeKey string,
+// (canonical_key, canonical) -- the same pair the statement orders by, as a row
+// value, because a keyset on canonical_key alone would skip every identity that
+// ties on it, which is precisely the ambiguity this lookup exists to report.
+//
+// The cursor carries the CANONICAL node id, never node_ids.id: the surrogate is
+// meaningful only inside one database file and only until the next rebuild
+// (ids.go), so ordering or resuming on it would make the answer depend on write
+// order -- the one thing Section 9.4 forbids this lookup to do. canonical_key
+// is now a BLOB(32) rather than its lowercase hex TEXT, and hex is a
+// monotone encoding, so memcmp over the raw bytes yields byte-for-byte the
+// order the hex column yielded; the exported CanonicalKey stays hex TEXT.
+//
+// scopeKey/nativeKey are resolved to their dictionary rows by the caller and
+// passed as surrogates, so this statement still probes idx_alias_lookup on its
+// leading columns.
+func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scopeRef, nativeRef int64,
 	batch int, seen map[model.NodeID]bool, out *[]StoredAlias) error {
 	marks := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
-	query := `SELECT DISTINCT ni.canonical_key, ni.id, ni.kind FROM native_aliases na
+	query := `SELECT DISTINCT ni.canonical_key, ni.canonical, ni.kind FROM native_aliases na
 		JOIN units u ON u.id = na.unit_id JOIN node_ids ni ON ni.id = na.node_id
-		WHERE na.scope_key = ? AND na.native_key = ? AND u.state = 'sealed' AND u.unit_key IN (` + marks + `)
-		AND (ni.canonical_key, ni.id) > (?, ?)
-		ORDER BY ni.canonical_key, ni.id LIMIT ?`
-	afterKey, afterID := "", []byte{}
+		WHERE na.scope_key_id = ? AND na.native_key_id = ? AND u.state = 'sealed' AND u.unit_key IN (` + marks + `)
+		AND (ni.canonical_key, ni.canonical) > (?, ?)
+		ORDER BY ni.canonical_key, ni.canonical LIMIT ?`
+	afterKey, afterID := []byte{}, []byte{}
 	for {
 		args := make([]any, 0, len(keys)+5)
-		args = append(args, scopeKey, nativeKey)
+		args = append(args, scopeRef, nativeRef)
 		for _, k := range keys {
 			args = append(args, k)
 		}
@@ -143,13 +163,14 @@ func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scope
 		n := 0
 		for rows.Next() {
 			var a StoredAlias
-			var id []byte
-			if err := rows.Scan(&a.CanonicalKey, &id, &a.Kind); err != nil {
+			var key, id []byte
+			if err := rows.Scan(&key, &id, &a.Kind); err != nil {
 				rows.Close()
 				return wrap("native_aliases", err)
 			}
+			a.CanonicalKey = idHex(key)
 			a.NodeID = model.NodeID(idHex(id))
-			afterKey, afterID = a.CanonicalKey, id
+			afterKey, afterID = key, id
 			n++
 			if seen[a.NodeID] {
 				continue
@@ -166,4 +187,27 @@ func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scope
 			return nil
 		}
 	}
+}
+
+// internedPair resolves a scope key and a native key to their S-3 dictionary
+// surrogates inside a read transaction. A key with no dictionary row yields
+// noRef, which every caller reads as "aliased to nothing" -- the dictionaries
+// are written only by the unit writer, so an unseen key genuinely has no alias.
+func internedPair(ctx context.Context, tx *sql.Tx, scopeKey, nativeKey string) (scope, native int64, err error) {
+	lookup := func(table, key string) (int64, error) {
+		var id int64
+		err := tx.QueryRowContext(ctx, `SELECT id FROM `+table+` WHERE key = ?`, key).Scan(&id)
+		if isNoRows(err) {
+			return noRef, nil
+		}
+		if err != nil {
+			return noRef, wrap(table, err)
+		}
+		return id, nil
+	}
+	if scope, err = lookup("scope_keys", scopeKey); err != nil || scope == noRef {
+		return noRef, noRef, err
+	}
+	native, err = lookup("native_keys", nativeKey)
+	return scope, native, err
 }
