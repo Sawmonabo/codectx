@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -454,6 +455,168 @@ func (c *CAS) Remove(hash string) error {
 		return ioError("CAS remove", err)
 	}
 	return nil
+}
+
+// SweepOrphans removes published objects that no blobs row names: content that
+// reached the disk and whose naming commit never landed, which is the exact
+// state a rolled-back generation tail (ADR-0004 Decision 1) and a crashed
+// capture leave behind. It is the Section 10.4 collector's second reclaim, the
+// counterpart of Remove: Remove deletes an object whose row the grace protocol
+// just deleted, this deletes an object that never had a row at all.
+//
+// known reports which of a batch of hashes the index still holds a blobs row
+// for, in ANY state -- quarantined and trashed rows are mid-grace, not orphans.
+// It is a bare func rather than a named interface so internal/retention can
+// declare this method structurally without importing this package. Its result
+// is a SET: a hash present in the map is named, and absence means no row. An
+// error from it aborts the chunk without removing anything, because an empty
+// answer read as "nothing is named" would delete the whole store.
+//
+// grace is the safety margin for the publish-before-commit window: Put and
+// Batch.Barrier make an object durable BEFORE the commit that names it, so an
+// object younger than the grace may be a publication whose commit has not
+// landed yet. The lock order in internal/retention (the workspace lock and the
+// indexing mutex) is what excludes an indexing run from overlapping a pass;
+// the mtime grace is the second line for the publishers that lock order does
+// not cover -- Repair publishes outside the workspace lock -- and for a
+// writer some later caller adds. Repair's own objects are additionally
+// row-backed, so known already keeps them. The window is measured from first
+// publication: the dedup path (checkExisting) deliberately leaves an existing
+// object's mtime alone, so a re-published object does not restart its grace.
+//
+// batch bounds MEMORY, never work: the walk visits every bucket and every
+// entry in it, reading one directory chunk and asking one known() batch at a
+// time, so peak is a chunk plus its answer rather than the size of the store.
+// Nothing is truncated and no pass leaves a known orphan behind for a later
+// one -- except an entry a concurrent removal moved past the readdir cursor,
+// which the next pass sees, which is why this is written as an idempotent
+// re-walk rather than relying on any readdir-during-unlink guarantee.
+//
+// It returns how many objects it removed. An object that cannot be removed is
+// joined into the error with the rest rather than aborting the walk: it is a
+// leftover file, not lost source.
+func (c *CAS) SweepOrphans(ctx context.Context, known func(context.Context, []string) (map[string]struct{}, error),
+	now time.Time, grace time.Duration, batch int) (int64, error) {
+	if batch <= 0 {
+		batch = defaultOrphanBatch
+	}
+	buckets, err := os.ReadDir(c.dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, ioError("CAS sweep", err)
+	}
+	var removed int64
+	var errs []error
+	for _, b := range buckets {
+		// Only the two-hex-digit buckets path derives are objects. <cas>/tmp is
+		// snapshot.Sweep's to reclaim and holds the temporaries a live batch is
+		// still filling; widening this filter would delete them mid-publication.
+		if !b.IsDir() || !isBucketName(b.Name()) {
+			continue
+		}
+		n, err := c.sweepBucket(ctx, filepath.Join(c.dir, b.Name()), known, now, grace, batch)
+		removed += n
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return removed, errors.Join(append(errs, err)...)
+			}
+			errs = append(errs, err)
+		}
+	}
+	return removed, errors.Join(errs...)
+}
+
+// defaultOrphanBatch is the chunk SweepOrphans holds in memory when the caller
+// states none. Like retention's own batch limit it is a working-set size, not a
+// bound on how much the pass reclaims.
+const defaultOrphanBatch = 200
+
+// isBucketName reports whether name is one of the 256 two-lowercase-hex-digit
+// bucket directories CAS.path derives.
+func isBucketName(name string) bool {
+	if len(name) != 2 {
+		return false
+	}
+	for i := 0; i < 2; i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// sweepBucket walks one bucket in ReadDir chunks. Emptied buckets are left in
+// place: removing one races a concurrent publication that has just created it
+// and is about to link into it.
+func (c *CAS) sweepBucket(ctx context.Context, dir string, known func(context.Context, []string) (map[string]struct{}, error),
+	now time.Time, grace time.Duration, batch int) (int64, error) {
+	d, err := os.Open(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, ioError("CAS sweep", err)
+	}
+	defer d.Close()
+	var removed int64
+	var errs []error
+	for {
+		if err := ctx.Err(); err != nil {
+			return removed, errors.Join(append(errs, model.Canceled(err))...)
+		}
+		ents, err := d.ReadDir(batch)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return removed, errors.Join(append(errs, ioError("CAS sweep", err))...)
+		}
+		candidates := make([]string, 0, len(ents))
+		for _, e := range ents {
+			// A name path never derives is not this sweep's to judge, and a
+			// directory inside a bucket is not an object.
+			if e.IsDir() || !model.ValidHexID(e.Name()) {
+				continue
+			}
+			info, statErr := e.Info()
+			if statErr != nil {
+				if errors.Is(statErr, fs.ErrNotExist) {
+					continue
+				}
+				errs = append(errs, ioError("CAS sweep", statErr))
+				continue
+			}
+			// Younger than the grace: a publication whose naming commit may
+			// still be in flight. Dropping this check is what makes the sweep
+			// delete content a generation is about to reference.
+			if info.ModTime().Add(grace).After(now) {
+				continue
+			}
+			candidates = append(candidates, e.Name())
+		}
+		if len(candidates) > 0 {
+			named, kerr := known(ctx, candidates)
+			if kerr != nil {
+				// No removal on an unreadable answer: an empty set read as
+				// "nothing is named" would take the whole bucket.
+				return removed, errors.Join(append(errs, kerr)...)
+			}
+			for _, hash := range candidates {
+				if _, ok := named[hash]; ok {
+					continue
+				}
+				if err := c.Remove(hash); err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				removed++
+			}
+		}
+		if errors.Is(err, io.EOF) || len(ents) == 0 {
+			break
+		}
+	}
+	return removed, errors.Join(errs...)
 }
 
 // Open streams the blob described by rec, verifying each 64-KiB block digest

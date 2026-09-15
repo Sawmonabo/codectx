@@ -364,3 +364,58 @@ func (s *Store) CollectBlobs(ctx context.Context, deadline time.Time, limit int)
 	}
 	return deleted, restored, nil
 }
+
+// knownBlobsChunk bounds one IN(...) list so the statement stays inside
+// SQLite's host-parameter ceiling whatever batch the caller walks in. It is a
+// statement shape, not a bound on the work: KnownBlobs answers for every hash
+// it is given, one chunk at a time.
+const knownBlobsChunk = 500
+
+// KnownBlobs reports which of hashes the index still holds a blobs row for, as
+// a set: a hash present in the result is named by the store, and absence means
+// no row exists. It is the oracle (*snapshot.CAS).SweepOrphans asks before
+// removing a published object, so the direction of an error matters -- a
+// partial answer must never reach the sweep, and this returns nothing but a
+// complete set or an error.
+//
+// No state filter: 'quarantined' and 'trash' rows are blobs mid-grace-protocol,
+// whose objects that protocol deletes after its own reachability recheck. Only
+// a file with no row at all is an orphan.
+func (s *Store) KnownBlobs(ctx context.Context, hashes []string) (map[string]struct{}, error) {
+	known := make(map[string]struct{}, len(hashes))
+	for start := 0; start < len(hashes); start += knownBlobsChunk {
+		chunk := hashes[start:min(start+knownBlobsChunk, len(hashes))]
+		args := make([]any, 0, len(chunk))
+		placeholders := make([]byte, 0, len(chunk)*2)
+		for _, h := range chunk {
+			raw, err := idBlob("content_hash", h)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, raw)
+			if len(placeholders) > 0 {
+				placeholders = append(placeholders, ',')
+			}
+			placeholders = append(placeholders, '?')
+		}
+		err := s.read(ctx, func(tx *sql.Tx) error {
+			rows, err := tx.QueryContext(ctx, `SELECT hash FROM blobs WHERE hash IN (`+string(placeholders)+`)`, args...)
+			if err != nil {
+				return wrap("blobs", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var raw []byte
+				if err := rows.Scan(&raw); err != nil {
+					return wrap("blobs", err)
+				}
+				known[idHex(raw)] = struct{}{}
+			}
+			return wrap("blobs", rows.Err())
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return known, nil
+}

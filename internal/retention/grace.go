@@ -43,6 +43,11 @@ type BlobStore interface {
 	// because the grace window is measured from the quarantine stamp and
 	// rewriting that stamp would restart the window on every pass.
 	TrashBlobs(ctx context.Context, limit int) (trashed, restored int64, err error)
+	// KnownBlobs reports which of hashes the store still holds a blobs row
+	// for, in any state, as a set: absence from the result means no row. It
+	// is not a grace phase but the oracle the orphan sweep below asks, and it
+	// lives on this interface because *sqlite.Store answers it.
+	KnownBlobs(ctx context.Context, hashes []string) (map[string]struct{}, error)
 	// CollectBlobs deletes up to limit blobs trashed at or before deadline
 	// that a recheck in the deleting transaction still finds unreferenced,
 	// returning their hashes so their CAS objects can go; a trashed blob
@@ -59,6 +64,15 @@ type BlobStore interface {
 // error` reusing c.path, and internal/app hands the CAS in as Options.Objects.
 type ObjectStore interface {
 	Remove(hash string) error
+	// SweepOrphans removes published objects no blobs row names -- content a
+	// rolled-back or crashed capture left behind, which Remove's grace
+	// protocol never sees because it only ever had a file and never a row.
+	// known is BlobStore.KnownBlobs, passed as a bare func so this package
+	// states the seam without importing internal/snapshot; grace is the
+	// resolved blob grace window, and batch bounds the sweep's working set,
+	// not how much it reclaims.
+	SweepOrphans(ctx context.Context, known func(context.Context, []string) (map[string]struct{}, error),
+		now time.Time, grace time.Duration, batch int) (int64, error)
 }
 
 // grace runs one pass of the three phases in order and adds what it reclaimed
@@ -110,6 +124,18 @@ func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
 		if err := c.opts.Objects.Remove(hash); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// The objects the phases above never see: content published to the CAS by a
+	// capture whose naming commit never landed. The grace protocol cannot reach
+	// them because it walks rows, and these files have none. The same window
+	// guards them -- an object younger than it may be a publication whose
+	// commit is still in flight -- and the sweep re-walks every bucket each
+	// pass, so the batch is a working-set size and not a cap on the reclaim.
+	swept, err := c.opts.Objects.SweepOrphans(ctx, c.opts.Blobs.KnownBlobs, now, window, limit)
+	report.OrphanObjectsSwept += swept
+	if err != nil {
+		errs = append(errs, err)
 	}
 	return report, errors.Join(errs...)
 }

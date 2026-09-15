@@ -34,6 +34,52 @@ func TestRetention(t *testing.T) {
 
 var scenarios = []scenario{
 	// L3a rows
+	{
+		// Failure mode: the orphan sweep is wired with a window of its own --
+		// zero, or the raw config value the grace phases already rescued --
+		// and it then removes content published seconds ago whose naming
+		// commit has not landed yet, or never runs because its count is
+		// dropped on the floor. The resolved window and the batch reaching the
+		// sweep, and its count reaching the Report an operator reads, are what
+		// make the CAS half of Section 10.4 a reclaim rather than a call.
+		name: "the orphan sweep is driven with the resolved grace window and its count is reported",
+		run: func(t *testing.T) {
+			objects := &fakeObjects{swept: 5}
+			blobs := &fakeBlobs{}
+			c := newTestCollector(t, Options{Blobs: blobs, Objects: objects,
+				Config: RetentionConfig{GraceWindow: 6 * time.Hour, BatchLimit: 9}})
+			report, err := c.grace(context.Background(), Report{})
+			if err != nil {
+				t.Fatalf("grace: %v", err)
+			}
+			if objects.grace != 6*time.Hour || objects.batch != 9 {
+				t.Errorf("sweep window %v batch %d, want the configured 6h and 9", objects.grace, objects.batch)
+			}
+			if report.OrphanObjectsSwept != 5 {
+				t.Errorf("Report.OrphanObjectsSwept %d, want the 5 the sweep reclaimed", report.OrphanObjectsSwept)
+			}
+			if objects.oracle == nil {
+				t.Fatal("the sweep was handed no oracle; it would then read every object as unnamed")
+			}
+			// A collector built without a window must not hand the sweep a
+			// zero one: every object on disk is then past its grace.
+			// Built through New rather than the helper, which supplies a
+			// window of its own and would hide the fallback.
+			zero := &fakeObjects{}
+			c, err = New(Options{Sessions: &fakeSessions{}, Spools: &fakeSpools{}, Snapshot: &fakeSnapshots{},
+				Tools: &fakeTools{}, Blobs: blobs, Objects: zero,
+				Config: RetentionConfig{DataDir: t.TempDir(), BatchLimit: 9}})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if _, err := c.grace(context.Background(), Report{}); err != nil {
+				t.Fatalf("grace: %v", err)
+			}
+			if zero.grace != defaultGraceWindow {
+				t.Errorf("sweep window %v for an unconfigured collector, want the %v fallback", zero.grace, defaultGraceWindow)
+			}
+		},
+	},
 	// L3b rows
 	{
 		// Failure mode: pruning runs before expiry, or with a retention window
@@ -218,11 +264,29 @@ func (f *fakeBlobs) CollectBlobs(context.Context, time.Time, int) ([]string, int
 	return f.deleted, 0, f.err
 }
 
+func (f *fakeBlobs) KnownBlobs(context.Context, []string) (map[string]struct{}, error) {
+	return nil, f.err
+}
+
 type fakeObjects struct {
 	err error
+	// swept is what the orphan sweep reports, and grace/batch record the
+	// window and working set it was actually given.
+	swept int64
+	grace time.Duration
+	batch int
+	// oracle is the func the collector handed over, so a row can prove the
+	// sweep was wired to the store's own KnownBlobs rather than to nothing.
+	oracle func(context.Context, []string) (map[string]struct{}, error)
 }
 
 func (f *fakeObjects) Remove(string) error { return f.err }
+
+func (f *fakeObjects) SweepOrphans(_ context.Context, known func(context.Context, []string) (map[string]struct{}, error),
+	_ time.Time, grace time.Duration, batch int) (int64, error) {
+	f.oracle, f.grace, f.batch = known, grace, batch
+	return f.swept, f.err
+}
 
 // newTestCollector builds a Collector over the fakes with a fixed clock and a
 // temporary data directory. A row replaces the dependency it drives.
