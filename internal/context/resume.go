@@ -57,9 +57,6 @@ import (
 // lease, generation and query checks are the spool's own (Spools.OpenDir) and
 // are deliberately NOT duplicated here.
 type checkpointState struct {
-	// Version fences the on-disk shape. A directory written by a different
-	// build is refused rather than decoded into a plan.
-	Version int `json:"v"`
 	// Pass is the index of the FIRST UNFINISHED pass: the compile resumes by
 	// running it, and every pass below it is represented by the streams here.
 	Pass int `json:"pass"`
@@ -102,9 +99,6 @@ type checkpointScalars struct {
 	Stalls int `json:"walk_stalls,omitempty"`
 }
 
-// checkpointVersion is the on-disk shape of a compile's continuation state.
-const checkpointVersion = 2
-
 // checkpointFile is state.json's name inside the state directory. It does not
 // collide with pagination's own header file, which the adoption writes beside
 // it.
@@ -115,7 +109,6 @@ const checkpointFile = "compile-state.json"
 // always carries the runs it names: a resume never meets a half-written
 // checkpoint and has no partial-state case to handle.
 func writeCheckpointState(dir string, st checkpointState) error {
-	st.Version = checkpointVersion
 	b, err := json.Marshal(st)
 	if err != nil {
 		return &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
@@ -126,11 +119,16 @@ func writeCheckpointState(dir string, st checkpointState) error {
 	return nil
 }
 
-// readCheckpointState reads and version-checks the state file in dir. A
-// directory whose state file is missing, unreadable or of another version is
-// reported as an expired continuation and never as a compile failure: the
-// caller's recourse is identical either way (compile again without a cursor),
-// and a stale directory is an ordinary consequence of the sweep.
+// readCheckpointState reads the state file in dir. A directory whose state file
+// is missing or unreadable is reported as an expired continuation and never as
+// a compile failure: the caller's recourse is identical either way (compile
+// again without a cursor), and a stale directory is an ordinary consequence of
+// the sweep.
+//
+// The state carries no version of its own. It is reachable only through the
+// signed context cursor, whose contextCursorVersion is the one wire fence for
+// this token; a second number here would be a shape a build could disagree with
+// only after the cursor that names the directory had already been accepted.
 func readCheckpointState(dir string) (checkpointState, error) {
 	b, err := os.ReadFile(filepath.Join(dir, checkpointFile))
 	if err != nil {
@@ -139,9 +137,6 @@ func readCheckpointState(dir string) (checkpointState, error) {
 	var st checkpointState
 	if err := json.Unmarshal(b, &st); err != nil {
 		return checkpointState{}, cursorExpired("the continuation state has expired or was released")
-	}
-	if st.Version != checkpointVersion {
-		return checkpointState{}, cursorExpired("the continuation state was written by another build")
 	}
 	return st, nil
 }

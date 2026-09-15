@@ -210,7 +210,7 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if got.Pass != 4 || got.RequestHash != "sha256:abc" || got.Version != checkpointVersion ||
+	if got.Pass != 4 || got.RequestHash != "sha256:abc" ||
 		got.Scalars.ReasonsDropped != 7 || !got.Scalars.ScopeComplete ||
 		len(got.Streams["ranked"]) != 1 {
 		t.Fatalf("state round-tripped as %+v", got)
