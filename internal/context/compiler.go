@@ -22,6 +22,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -349,6 +350,108 @@ func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader
 		}
 	}
 	return out, nil
+}
+
+// hydrateStream is pass P-B: hydrateFiles as a stream. It reads the candidate
+// spool in pageLimit() batches, resolves each batch's distinct file ids through
+// ONE FilesByID, writes SizeBytes, Status, both path values (ruling C3) and the
+// snapshot-absent flag onto each record, and re-emits it in seq order. The
+// accumulating `out []model.FileVersion` and `byID` of hydrateFiles go away;
+// the held set is one batch of records plus one page of file rows.
+//
+// The two path writes are the two today's pipeline performs and ruling C3
+// keeps apart: hydrateFiles fills Path only when the candidate carries none
+// (the value ranking reads for packageOf, centrality and its boost reason) and
+// buildPlan overwrites it unconditionally (the value the total order and the
+// persisted entry read). PathAtRank and PathFinal are those two values.
+//
+// FileMissing is the fact buildPlan learns from a `meta` lookup miss
+// (budget.go:249-252). A streamed P-G holds no such map, so the record that
+// observed the miss carries it.
+//
+// A batch-local byID is equivalent to today's whole-set one because every
+// producer of an excluded candidate (seeds.go:60,100,191) sets neither NodeID
+// nor FileID: Excluded implies FileID == "", so no excluded candidate can be
+// hydrated by a file row another batch requested. hydrateFiles' write-back over
+// ALL candidates is nevertheless reproduced below rather than narrowed to the
+// eligible ones, so the equivalence is a property of the seed producers and not
+// something this pass has baked in.
+func (c *Compiler) hydrateStream(ctx context.Context, reader *sqlite.PinnedReader,
+	s *compileSorts, in *pagination.SortedRun[candRec]) (*pagination.SortedRun[candRec], error) {
+	if reader == nil {
+		return nil, argumentInvalid("a streamed hydration requires a pinned reader")
+	}
+	if in == nil {
+		return nil, argumentInvalid("a streamed hydration requires the candidate spool")
+	}
+	out, err := newSort[candRec](s, "hydrate", lessCandSeq, sizeOfCand)
+	if err != nil {
+		return nil, err
+	}
+	limit := c.pageLimit()
+	batch := make([]candRec, 0, limit)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		// The eligible set is hydrateFiles' own: a candidate with no file, and
+		// an excluded one, are not read for.
+		ids := make([]model.FileID, 0, len(batch))
+		seen := make(map[model.FileID]struct{}, len(batch))
+		for _, r := range batch {
+			if r.FileID == "" || r.Excluded != "" {
+				continue
+			}
+			if _, dup := seen[r.FileID]; dup {
+				continue
+			}
+			seen[r.FileID] = struct{}{}
+			ids = append(ids, r.FileID)
+		}
+		byID := make(map[model.FileID]model.FileVersion, len(ids))
+		if len(ids) > 0 {
+			page, err := reader.FilesByID(ctx, ids)
+			if err != nil {
+				return err
+			}
+			for _, fv := range page {
+				byID[fv.ID] = fv
+			}
+		}
+		for _, r := range batch {
+			if fv, ok := byID[r.FileID]; ok {
+				r.SizeBytes, r.Status = fv.Size, fv.Status
+				r.PathFinal = fv.Path
+				if r.PathAtRank == "" {
+					r.PathAtRank = fv.Path
+				}
+			} else if r.FileID != "" && r.Excluded == "" {
+				r.FileMissing = true
+			}
+			if err := out.Add(r); err != nil {
+				return err
+			}
+		}
+		batch = batch[:0]
+		return nil
+	}
+	if err := in.Each(func(r candRec) error {
+		batch = append(batch, r)
+		if len(batch) < limit {
+			return nil
+		}
+		return flush()
+	}); err != nil {
+		return nil, err
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	run, err := out.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	return trackRun(s, run), nil
 }
 
 // relationsOnPaths reads the relation kind of every edge the expansion admitted
