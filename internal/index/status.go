@@ -400,13 +400,28 @@ func mergeDetailValue(key, a, b string) (value string, truncated bool) {
 			return strconv.Itoa(x + y), false
 		}
 	}
-	bounded, original := model.TruncateField(joinDetailValues(a, b), model.MaxDetailBytes)
-	return bounded, original > len(bounded)
+	return joinDetailValues(a, b)
 }
 
 // joinDetailValues unions two multi-valued details: the values are deduped and
 // sorted, so the result is the same whichever row the fold merged into.
-func joinDetailValues(a, b string) string {
+//
+// A union that does not fit model.MaxDetailBytes is cut between values, never
+// inside one, and always at the same place: what is kept is the longest sorted
+// prefix of the whole set that fits. Cutting at a byte offset would publish
+// half a reason code that the next fold would then split out and carry as a
+// reason of its own, and the surviving set would depend on the order the
+// concurrent unit workers folded in -- and these details fold into the
+// AnalysisKey, where two identical runs must key identically. Dropping whole
+// values from the tail of the sorted set is order-independent, because adding
+// a value can only move the cut earlier and anything already dropped would
+// have been dropped again.
+//
+// A single value wider than the bound has no whole-value prefix to keep; it is
+// cut to fit so the detail still says something. Every value reaching here
+// came through WithDetail, which bounds it, so this is a floor rather than a
+// path a caller can reach.
+func joinDetailValues(a, b string) (value string, truncated bool) {
 	parts := make([]string, 0, 8)
 	for _, v := range []string{a, b} {
 		for _, part := range strings.Split(v, detailSeparator) {
@@ -416,7 +431,27 @@ func joinDetailValues(a, b string) string {
 		}
 	}
 	slices.Sort(parts)
-	return strings.Join(slices.Compact(parts), detailSeparator)
+	parts = slices.Compact(parts)
+	var joined strings.Builder
+	for _, part := range parts {
+		width := len(part)
+		if joined.Len() > 0 {
+			width += len(detailSeparator)
+		}
+		if joined.Len()+width > model.MaxDetailBytes {
+			truncated = true
+			break
+		}
+		if joined.Len() > 0 {
+			joined.WriteString(detailSeparator)
+		}
+		joined.WriteString(part)
+	}
+	if joined.Len() == 0 && len(parts) > 0 {
+		bounded, _ := model.TruncateField(parts[0], model.MaxDetailBytes)
+		return bounded, true
+	}
+	return joined.String(), truncated
 }
 
 // countDetail reads the scope count a folded row carries; a row folded for the

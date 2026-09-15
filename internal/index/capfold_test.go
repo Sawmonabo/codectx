@@ -3,7 +3,9 @@ package index
 import (
 	"io"
 	"log/slog"
+	"maps"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -121,5 +123,65 @@ func TestCapabilityFoldKeepsDegradationDetails(t *testing.T) {
 	}
 	if got, ok := fresh.Details[scopeKeyDetail]; ok {
 		t.Fatalf("the fresh row kept scope_key=%q; the fold rewrote it to the workspace scope", got)
+	}
+}
+
+// TestCapabilityFoldMergesInOrderIndependently protects the determinism the
+// merged details are published under. They fold into details_json and from
+// there into the AnalysisKey, while the rows themselves come from unit workers
+// that run concurrently: two identical runs whose units finished in a
+// different order must key identically. The union only stays a function of the
+// set if a union too wide for model.MaxDetailBytes is cut between values --
+// cutting at a byte offset leaves a fragment that the next fold carries as a
+// value of its own, and which fragment that is depends on which row folded
+// first.
+//
+// Mutation proof: cut the union with
+// `model.TruncateField(strings.Join(parts, detailSeparator), model.MaxDetailBytes)`
+// instead of dropping whole values, and the reverse-order maps differ on
+// `reason`.
+func TestCapabilityFoldMergesInOrderIndependently(t *testing.T) {
+	t.Parallel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	wide := func(prefix string) string {
+		reasons := make([]string, 0, 30)
+		for i := range 30 {
+			reasons = append(reasons, prefix+"_reason_"+strconv.Itoa(100+i)+"_of_a_widely_degraded_unit")
+		}
+		return strings.Join(reasons, ",")
+	}
+	first := model.CapabilityState{ProviderID: scip.ID, Capability: "references", Scope: "pkg:go:a",
+		State: model.CapabilityPartial, DiagnosticCode: model.CodeResourceLimit,
+		Details: map[string]string{"reason": wide("alpha")}}
+	second := first
+	second.Details = map[string]string{"reason": wide("omega")}
+
+	merged := func(rows ...model.CapabilityState) model.CapabilityState {
+		r := newCapabilityReport()
+		for _, row := range rows {
+			r.add(row)
+		}
+		out := r.finish(log)
+		if len(out) != 1 {
+			t.Fatalf("the report published %d rows, want one: %+v", len(out), out)
+		}
+		return out[0]
+	}
+	forward, reverse := merged(first, second), merged(second, first)
+	if !maps.Equal(forward.Details, reverse.Details) {
+		t.Fatalf("the fold published %v folding forward and %v folding in reverse; the merge must be a function of the set",
+			forward.Details, reverse.Details)
+	}
+	if got := forward.Details[truncatedDetail]; got != "reason" {
+		t.Fatalf("the fold reports details_truncated=%q, want %q: the cut list is published as if it were whole", got, "reason")
+	}
+	if got := len(forward.Details["reason"]); got > model.MaxDetailBytes {
+		t.Fatalf("the merged reason is %d bytes, want at most %d", got, model.MaxDetailBytes)
+	}
+	for _, value := range strings.Split(forward.Details["reason"], ",") {
+		if !strings.HasSuffix(value, "_of_a_widely_degraded_unit") {
+			t.Fatalf("the merged reason carries the fragment %q; the cut split a value", value)
+		}
 	}
 }
