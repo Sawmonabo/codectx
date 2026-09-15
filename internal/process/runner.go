@@ -131,7 +131,8 @@ type Result struct {
 	// exiting, which is the normal outcome of a forced termination.
 	Signaled bool
 	// PeakTreeBytes is the highest summed resident set size observed over the
-	// whole process tree while it ran, sampled every treeSampleInterval. It is
+	// whole process tree while it ran, sampled at most treeSampleInterval
+	// apart, and more often where a short StallTimeout polls faster. It is
 	// the tree sum at one instant, never a sum of per-process historical peaks
 	// reached at different instants (Section 22), and it is what the memory
 	// governor reports as the observed figure (Section 11.6).
