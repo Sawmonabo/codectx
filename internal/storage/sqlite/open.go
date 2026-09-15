@@ -69,6 +69,39 @@ func synchronousPragma(mode string) (pragma, error) {
 		mode, config.SynchronousNormal, config.SynchronousFull)
 }
 
+// SynchronousMode reads `PRAGMA synchronous` back from the WRITER connection
+// and reports it in the configuration's own spelling. It is the writer's
+// because the writer is the only connection whose mode is a choice: readers are
+// pinned to FULL above, so asking a reader would report FULL for every
+// workspace and say nothing about the durability the operator configured.
+//
+// It exists so a diagnostic can report the LIVE mode rather than echo the
+// configured one. The two cannot drift while a store is open -- every pooled
+// connection has its pragma set read back before it joins the pool -- but a
+// check that reports what the configuration says has verified nothing, and
+// ADR-0004 Decision 1a asks an operator to be able to read this mode back.
+//
+// A mode the mapping does not know is reported as the raw pragma value rather
+// than guessed at or failed: this is a diagnostic read, and an unexpected
+// number is itself the answer.
+func (s *Store) SynchronousMode(ctx context.Context) (string, error) {
+	var raw string
+	if err := s.writer.QueryRowContext(ctx, `PRAGMA synchronous`).Scan(&raw); err != nil {
+		return "", wrap("read the synchronous mode", err)
+	}
+	switch raw {
+	case "0":
+		return "off", nil
+	case "1":
+		return config.SynchronousNormal, nil
+	case "2":
+		return config.SynchronousFull, nil
+	case "3":
+		return "extra", nil
+	}
+	return raw, nil
+}
+
 func (o Options) withDefaults() Options {
 	if o.BusyTimeout <= 0 {
 		o.BusyTimeout = 5 * time.Second
