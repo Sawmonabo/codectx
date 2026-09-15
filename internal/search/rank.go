@@ -3,7 +3,6 @@ package search
 import (
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"slices"
 	"strconv"
@@ -16,9 +15,9 @@ import (
 
 // ranked is one candidate in the external sort's record: the Section 14.2 sort
 // tuple, the rowid that hydrates it, and the folded occurrence count. Nothing
-// else -- carrying name/qualified name/signature on every candidate would size
-// the sort's run buffer by the widest symbol in the corpus, and
-// SearchDocuments exists to hydrate one chunk instead. Ordering compares only
+// else -- carrying name/qualified name/signature on the ORDERING tuple would
+// size every comparison by the widest symbol in the corpus; the servable facts
+// ride alongside on scored instead. Ordering compares only
 // integers and exact strings; no float reaches a comparison (digest §4).
 type ranked struct {
 	Tier        model.SearchTier
@@ -150,9 +149,9 @@ func boundReasons(have []string, add []string) []string {
 // below cannot bound the ranking without also bounding it.
 type scored struct {
 	ranked
-	Reasons []string         `json:"reasons,omitempty"`
-	Hit     model.SearchHit  `json:"hit"`
-	Span    *model.ByteRange `json:"span,omitempty"`
+	Reasons []string
+	Hit     model.SearchHit
+	Span    *model.ByteRange
 	// Folded is the highest ScoreMicros seen under this candidate's
 	// deduplication key so far. It is kept SEPARATE from ranked.ScoreMicros
 	// on purpose: ranked.ScoreMicros stays the candidate's OWN score for the
@@ -161,7 +160,7 @@ type scored struct {
 	// minimum over the group instead of a left-to-right reduction whose
 	// result depends on arrival order. results() promotes Folded into
 	// ScoreMicros once the pass is closed, before the set is ordered by rank.
-	Folded int64 `json:"folded_score,omitempty"`
+	Folded int64
 }
 
 // collector deduplicates candidates as they arrive and orders the distinct
@@ -219,24 +218,11 @@ func newCollector(dir string, runBytes int64) (*collector, error) {
 }
 
 // newSort opens one pass of the two-pass sort with the shared codec and
-// budget. The codec is JSON: these records never leave the process, and a
-// codec that cannot drift from the struct beats the bytes a packed one saves.
+// budget. ExternalSort takes the codec as a parameter, so the packed candidate
+// format in codec.go is supplied here and no other caller of the sort is
+// affected.
 func (c *collector) newSort(prefix string, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
-	sorter, err := pagination.NewExternalSort(c.dir, prefix, 0,
-		func(v scored) ([]byte, error) {
-			b, err := json.Marshal(v)
-			if err != nil {
-				return nil, &model.Error{Code: model.CodeInternal, Message: "search: encoding a candidate: " + err.Error()}
-			}
-			return b, nil
-		},
-		func(b []byte) (scored, error) {
-			var v scored
-			if err := json.Unmarshal(b, &v); err != nil {
-				return scored{}, &model.Error{Code: model.CodeStorageCorrupt, Message: "search: a spilled candidate is not readable"}
-			}
-			return v, nil
-		}, compare)
+	sorter, err := pagination.NewExternalSort(c.dir, prefix, 0, encodeScored, decodeScored, compare)
 	if err != nil {
 		return nil, err
 	}

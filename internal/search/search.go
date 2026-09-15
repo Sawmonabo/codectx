@@ -613,63 +613,34 @@ func (s *Service) hydrateNodes(ctx context.Context, reader *sqlite.PinnedReader,
 	return nil
 }
 
-// lexicalCandidates streams the lexical tier into the collector, hydrating the
-// candidate documents in batches because the tier emits rowids and the sort
-// tuple needs a path, a start byte and an identity.
+// lexicalCandidates streams the lexical tier into the collector. The tier
+// emits the search document it scored, so the sort tuple's path, start byte
+// and identity -- and the servable facts -- come out of the read the tier had
+// already paid for. There is no second hydration pass and no pending batch
+// here: the candidate is consumed on arrival, in the order the tier emits it.
 func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
 	filter hitFilter, c *collector) (lexicalOutcome, error) {
-	pending := make([]lexicalHit, 0, model.MaxPageItems)
-	flush := func() error {
-		if len(pending) == 0 {
+	return s.lexical.search(ctx, readerPostings{reader}, reader.Binding().AnalysisKey, req.Query, func(h lexicalHit) error {
+		d := h.Doc
+		// The filters run HERE and not inside the tier: the tier's scoring
+		// pass is what observes a document whose term offsets overflowed, and
+		// that lower-bound flag belongs to the answer's meta whether or not
+		// the document survives a path or kind filter.
+		if !filter.keep(d.Path) || !matchesKinds(d.Kind, req.Kinds) {
 			return nil
 		}
-		rowids := make([]int64, len(pending))
-		for i, h := range pending {
-			rowids[i] = h.RowID
-		}
-		docs, err := reader.SearchDocuments(ctx, rowids)
-		if err != nil {
-			return err
-		}
-		byRowID := make(map[int64]sqlite.SearchDocument, len(docs))
-		for _, d := range docs {
-			byRowID[d.RowID] = d
-		}
-		for _, h := range pending {
-			d, ok := byRowID[h.RowID]
-			// SearchDocuments omits rowids that are not visible; a candidate
-			// with no document has no path to filter and no identity to fold.
-			if !ok || !filter.keep(d.Path) || !matchesKinds(d.Kind, req.Kinds) {
-				continue
-			}
-			r := ranked{Tier: model.TierLexicalFTS, ScoreMicros: h.ScoreMicros, Path: d.Path,
-				StartByte: d.Bytes.Start, NodeID: d.NodeID, SearchKey: d.ID, RowID: d.RowID,
-				// One per lexical DOCUMENT, so several documents of one node
-				// fold to that many occurrences (digest §4). The matched term
-				// instances inside a document are the score's business, not
-				// the occurrence count's.
-				Occurrences: 1}
-			bytes := d.Bytes
-			if err := c.add(r, hitFacts{span: &bytes, hit: model.SearchHit{NodeID: d.NodeID, FileID: d.FileID,
-				Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature}},
-				reasonFor(model.TierLexicalFTS)); err != nil {
-				return err
-			}
-		}
-		pending = pending[:0]
-		return nil
-	}
-	outcome, err := s.lexical.search(ctx, readerPostings{reader}, reader.Binding().AnalysisKey, req.Query, func(h lexicalHit) error {
-		pending = append(pending, h)
-		if len(pending) < model.MaxPageItems {
-			return nil
-		}
-		return flush()
+		r := ranked{Tier: model.TierLexicalFTS, ScoreMicros: h.ScoreMicros, Path: d.Path,
+			StartByte: d.Bytes.Start, NodeID: d.NodeID, SearchKey: d.ID, RowID: d.RowID,
+			// One per lexical DOCUMENT, so several documents of one node
+			// fold to that many occurrences (digest §4). The matched term
+			// instances inside a document are the score's business, not
+			// the occurrence count's.
+			Occurrences: 1}
+		bytes := d.Bytes
+		return c.add(r, hitFacts{span: &bytes, hit: model.SearchHit{NodeID: d.NodeID, FileID: d.FileID,
+			Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature}},
+			reasonFor(model.TierLexicalFTS))
 	})
-	if err != nil {
-		return outcome, err
-	}
-	return outcome, flush()
 }
 
 // exactRanked builds the sort tuple of one exact-tier candidate. Digest §4/Q6

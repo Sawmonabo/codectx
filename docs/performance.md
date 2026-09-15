@@ -222,20 +222,49 @@ answer -- every hit past the page was read out of the CAS, block-hash
 verified and scanned for line and column positions on its way into the
 continuation spool. Hydration is now paid by the page that serves a hit.
 
-| Query | First page before | First page after |
-|---|---|---|
-| `search function` | 4.17 s | **1.71 s** |
-| `search Meteor` | 4.94 s | **2.10 s** |
-| `search return` | 1.49 s | **0.79 s** |
-| `search user` | 0.87 s | **0.40 s** |
-| `search createAccount` (6 hits) | 0.08 s | 0.11 s |
-| continuation page 2 | 0.17 s | 0.20 s |
+Two further costs have since been taken out of the ranking itself. The
+lexical tier read every column of a candidate page to get its token count
+and then threw the row away, so the ranker re-read the identical page for
+path, kind, name and identity: one read per page now carries both. And the
+two-pass external sort that deduplicates and orders the candidate set
+encoded every candidate as JSON; a packed, fixed-order codec replaced it.
 
-Pages 1 to 3 are byte-identical before and after: the set, the global
-ranking and every served field are unchanged, because hydration is a pure
-function of a file and a byte interval over the pinned generation. The
-residual on the two widest terms is candidate scoring and the external sort
-of the whole match set, not hydration.
+| Query | Before hydration fix | After hydration fix | After one read + packed sort |
+|---|---|---|---|
+| `search function` | 4.17 s | 1.71 s | **1.27 s** |
+| `search Meteor` | 4.94 s | 2.10 s | **1.18 s** |
+| `search return` | 1.49 s | 0.79 s | **0.60 s** |
+| `search user` | 0.87 s | 0.40 s | **0.38 s** |
+| `search createAccount` (6 hits) | 0.08 s | 0.11 s | **0.14 s** |
+| continuation page 2 | 0.17 s | 0.20 s | not re-measured |
+
+Warm, median of three, default config, same store and same battery in every
+column. `createAccount` matches six hits and never reaches the ranking work
+these two changes touch; its three runs spread 0.11-0.17 s, so its column is
+run-to-run noise on a query that is already two orders of magnitude inside
+the target. Peak RSS is unchanged within noise (32-125 MB across the five
+terms); the ranking fold holds one candidate page less than it did.
+
+Every page of every one of the five queries is byte-identical before and
+after -- each was paged to completion and the ordered item sequence
+compared byte for byte (30 022 items over 151 pages for `function`, 44 448
+over 223 for `Meteor`), together with each page's meta minus `next_cursor`,
+whose per-run lease id and expiry can never match across processes. The set,
+the global ranking, every served field, every reason and every page boundary
+are unchanged.
+
+`function` and `Meteor` still miss the 1 s first-page target. What is left
+is measured, and it is not addressable inside the search package: of the
+1.27 s `function` profile, 0.33 s is the posting-list walk that scores each
+candidate, 0.18 s the per-term document frequencies, 0.16 s the candidate
+page read, 0.09 s the match page and 0.09 s the corpus statistics -- all of
+it stepping the index, and none of it absorbed by the tier's statistics
+cache, which a one-shot process always starts cold -- and 0.21 s the
+two-pass external sort. The two
+schema-level alternatives that would touch the posting walk (pushing the
+ranking function down into the index, and a persisted per-term index) were
+measured earlier and rejected: neither can reproduce the served ranking
+byte for byte.
 
 ## 4. Misses, skips and unproven platforms
 
