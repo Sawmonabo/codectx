@@ -310,7 +310,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		WALHighWaterBytes: cfg.Storage.WALHighWaterBytes,
 		BatchRecords:      cfg.Index.BatchRecords,
 		BatchBytes:        cfg.Index.BatchBytes,
-		MaxJSONBytes:      cfg.Context.MaxManifestBytes,
+		MaxJSONBytes:      cfg.Context.MaxManifestBytes.Value(),
 	}); err != nil {
 		return nil, err
 	}
@@ -429,18 +429,18 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 
-	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes})
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes.Value()})
 	if err != nil {
 		return nil, err
 	}
-	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes})
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes.Value()})
 	if err != nil {
 		return nil, err
 	}
 	if s.ts, err = treesitter.New(treesitter.Options{
 		Languages:         cfg.Providers.TreeSitter.Languages,
 		MaxWorkers:        parserWorkers,
-		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
+		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes.Value(),
 		WorkerIdleTTL:     cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		WorkerMemoryBytes: parserWorkerReservationBytes,
 		Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
@@ -481,7 +481,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
 		RequestTimeout:         cfg.Providers.LSP.RequestTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
-		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
+		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes.Value(),
 	}); err != nil {
 		return nil, err
 	}
@@ -616,7 +616,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
-					MaxRecordBytes: s.cfg.Resources.MaxProviderRecordBytes,
+					MaxRecordBytes: s.cfg.Resources.MaxProviderRecordBytes.Value(),
 				},
 			})
 			if err == nil {
@@ -874,7 +874,7 @@ func workflowLimits(cfg config.Config) workflow.Limits {
 	return workflow.Limits{
 		MaxPageItems:                        cfg.Resources.MaxPageItems,
 		MaxObservationReferences:            model.MaxObservationReferences,
-		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
+		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes.Value(),
 		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
 		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,
 	}
@@ -1016,7 +1016,7 @@ func coverageLimits(cfg config.Config) coverage.Limits {
 		MaxSourceResponseBytes:         cfg.Resources.MaxSourceResponseBytes,
 		MaxMetadataResponseBytes:       cfg.Resources.MaxMetadataResponseBytes,
 		MaxReceiptsPerConfirmation:     cfg.Coverage.MaxReceiptsPerConfirmation,
-		MaxUnconfirmedChunksPerSession: cfg.Coverage.MaxUnconfirmedChunksPerSession,
+		MaxUnconfirmedChunksPerSession: cfg.Coverage.MaxUnconfirmedChunksPerSession.Int(),
 		MaxPageItems:                   cfg.Resources.MaxPageItems,
 		SessionTTL:                     cfg.Coverage.SessionTTL.Std(),
 		QueryTimeout:                   cfg.Resources.QueryTimeout.Std(),

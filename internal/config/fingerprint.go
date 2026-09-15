@@ -17,6 +17,12 @@ const (
 	domainWorkspaceKey   = "workspace-key-v1"
 )
 
+// The domains keep their v1 suffix through the unlimited-defaults change: the
+// SET of components each fingerprint covers is unchanged, only the value of
+// some of them and the spelling an absent bound renders to. That is a
+// configuration change like any other, which is exactly what these hashes exist
+// to detect; a new domain would instead declare the old hashes uninterpretable.
+
 // SourcePolicyHash is the source eligibility and byte policy that feeds
 // SnapshotID: exactly the settings that decide which files are captured. An
 // analysis admission limit is deliberately absent, because raising it must not
@@ -27,7 +33,7 @@ func (c Config) SourcePolicyHash() string {
 		quoteBool(c.Workspace.IncludeUntracked),
 		quoteBool(c.Workspace.IndexGenerated),
 		quoteBool(c.Workspace.IndexVendor),
-		quoteInt(c.Workspace.MaxFiles),
+		quoteLimit(c.Workspace.MaxFiles),
 		// The toggles above select built-in classification lists, so the lists
 		// themselves are policy: a build shipping a different one captures a
 		// different set of files from the same bytes.
@@ -45,8 +51,8 @@ func (c Config) SourcePolicyHash() string {
 // excluded: they change how the work is scheduled, never what it concludes.
 func (c Config) AnalysisConfigHash() string {
 	h := model.NewHasher(domainAnalysisConfig)
-	h.AddString(quoteInt(c.Workspace.MaxParseFileBytes))
-	h.AddString(quoteInt(c.Workspace.MaxSearchFileBytes))
+	h.AddString(quoteLimit(c.Workspace.MaxParseFileBytes))
+	h.AddString(quoteLimit(c.Workspace.MaxSearchFileBytes))
 	h.AddString(quoteBool(c.Providers.TreeSitter.Enabled))
 	// The language list is a set: two files differing only in its order select
 	// the same grammars and must not invalidate every unit.
@@ -72,12 +78,12 @@ func (c Config) ContextPolicyHash() string {
 		quoteInt(c.Context.DefaultMaxBytes),
 		quoteInt(int64(c.Context.DefaultMaxFiles)),
 		quoteInt(int64(c.Context.MaxSlices)),
-		quoteInt(int64(c.Context.MaxGraphDepth)),
-		quoteInt(int64(c.Context.MaxVisitedNodes)),
-		quoteInt(int64(c.Context.MaxGraphEdges)),
-		quoteInt(int64(c.Context.MaxReasonPathsPerEntry)),
-		quoteInt(c.Context.MaxManifestBytes),
-		quoteInt(c.Context.MaxCapsuleBytes),
+		quoteLimit(c.Context.MaxGraphDepth),
+		quoteLimit(c.Context.MaxVisitedNodes),
+		quoteLimit(c.Context.MaxGraphEdges),
+		quoteLimit(c.Context.MaxReasonPathsPerEntry),
+		quoteLimit(c.Context.MaxManifestBytes),
+		quoteLimit(c.Context.MaxCapsuleBytes),
 		quoteBool(c.Context.StrictReadGate),
 		quoteBool(c.Context.AllowExploratoryWaiverConsolidation),
 	)

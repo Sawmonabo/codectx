@@ -196,7 +196,7 @@ func New(o Options) (*Coordinator, error) {
 		return nil, invalid("the workspace is a Git repository but no git executable is available")
 	}
 	limits := provider.Limits{BatchRecords: o.Config.Index.BatchRecords, BatchBytes: o.Config.Index.BatchBytes,
-		MaxRecordBytes: o.Config.Resources.MaxProviderRecordBytes}
+		MaxRecordBytes: o.Config.Resources.MaxProviderRecordBytes.Value()}
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}

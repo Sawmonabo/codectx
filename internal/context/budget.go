@@ -45,7 +45,7 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		MaxSlices: pick(b.MaxSlices, cfg.MaxSlices),
 		// Not pick64: no budget field offers a stored-manifest cap, so the
 		// configured value is the only one.
-		MaxManifestBytes: cfg.MaxManifestBytes,
+		MaxManifestBytes: cfg.MaxManifestBytes.Value(),
 	}
 	for _, f := range []struct {
 		key   string
