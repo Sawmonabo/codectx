@@ -174,7 +174,11 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 		{NodeID: "n-cut", FileID: "aaa", Path: "internal/order/ports.go",
 			Requirement: model.RequirementFull, ScoreMicros: 2_000_000,
 			Excluded: "the seed cut dropped this identity"},
-		{FileID: "zzz", Path: "internal/order/service.go", Requirement: model.RequirementFull,
+		// A REQUIRED survivor whose pre-set path differs from its snapshot path.
+		// A group's path is the one its lowest-ranked member carries, and it is
+		// what the minimum-budget refusal names as missing, so this is where
+		// reading PathAtRank instead of PathFinal (C3) becomes visible.
+		{FileID: "zzz", Path: "internal/order/service_moved.go", Requirement: model.RequirementFull,
 			Origin: originExplicitSeed, ScoreMicros: 1_130_000, Reasons: []string{"named by the task"}},
 		{NodeID: "n-service-place", FileID: "zzz", Path: "internal/order/service.go",
 			Requirement: model.RequirementSymbol, Origin: originQualified, StartByte: 120,
@@ -183,7 +187,12 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 			Requirement: model.RequirementRecommended, Origin: originExpansion, Depth: 1,
 			ScoreMicros: 415_000, MorePaths: 2,
 			Paths: []model.RelationPath{{Relations: long, CostUnits: 9}}},
-		{NodeID: "n-ports", FileID: "aaa", Path: "internal/order/ports.go",
+		// A survivor whose pre-set path differs from its snapshot path: ruling
+		// C3 keeps both, and every choice below reads PathFinal -- the value
+		// buildPlan's unconditional overwrite leaves -- for the total order,
+		// the measured entry and the group's path. A fixture where the two
+		// agreed would let PathAtRank pass everywhere.
+		{NodeID: "n-ports", FileID: "aaa", Path: "internal/order/ports_moved.go",
 			Requirement: model.RequirementOptional, Origin: originLexical, ScoreMicros: 10_000},
 		// The other two pre-sort exclusion classes, in ingest order.
 		{NodeID: "n-nofile", Path: "unresolved.go", Requirement: model.RequirementOptional},
@@ -283,4 +292,28 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The four records the budget passes add are encoded only when a sort SPILLS,
+// and a parity fixture small enough to run in seconds never does: ExternalSort
+// answers a run that fit its buffer from the buffer itself. A mistyped or
+// missing struct tag would therefore pass the whole suite and first surface on
+// a repository large enough to spill -- exactly the case this wave exists for.
+// The round trip is asserted directly instead, as C-L0 asserts it for its own.
+func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
+	cand := candRec{Seq: 7, Index: 3, NodeID: "n1", FileID: "f1", PathAtRank: "a.go",
+		PathFinal: "b.go", Requirement: model.RequirementSymbol, Origin: originExpansion,
+		Depth: 2, StartByte: 40, ScoreMicros: 900_000, SizeBytes: 4096,
+		Status: model.FileTracked, Reasons: []string{"reached by one import"},
+		MorePaths: 2, FileMissing: true}
+	roundTrip(t, "sizedRec", sizedRec{Cand: cand, Charged: true})
+	roundTrip(t, "sizedRec zero", sizedRec{})
+	roundTrip(t, "keepRec", keepRec{Cand: cand, Charged: true, Slice: 2, MinIndex: 3})
+	roundTrip(t, "keepRec zero", keepRec{})
+	roundTrip(t, "dropRec", dropRec{Cand: cand, MinIndex: 3, Reason: dropFileLimit})
+	roundTrip(t, "dropRec zero", dropRec{})
+	roundTrip(t, "packVerdict kept",
+		packVerdict{Decision: decisionRec{FileID: "f1", Keep: true, SliceIndex: 2}, MinIndex: 3})
+	roundTrip(t, "packVerdict dropped",
+		packVerdict{Decision: decisionRec{FileID: "f1"}, MinIndex: 3, Reason: dropOversized})
 }
