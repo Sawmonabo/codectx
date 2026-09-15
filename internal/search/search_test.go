@@ -325,41 +325,83 @@ func rankedOf(tier model.SearchTier, score int64, path string, start uint64, nod
 		NodeID: node, SearchKey: key, Occurrences: 1}
 }
 
+// scoredOf wraps a sort tuple as the record the served order compares, with
+// the served facts a real candidate carries.
+func scoredOf(r ranked, kind model.NodeKind, name string, end uint64) scored {
+	return scored{ranked: r, Folded: r.ScoreMicros, Span: &model.ByteRange{Start: r.StartByte, End: end},
+		Hit: model.SearchHit{NodeID: r.NodeID, Path: r.Path, Kind: kind, Name: name}}
+}
+
 // legLessChain proves the full Section 14.2 chain, one key at a time. A
 // dropped or reordered key would silently reorder results for identical
-// inputs, which is the determinism guarantee Section 14.2 sells.
+// inputs, which is the determinism guarantee Section 14.2 sells. The keys
+// after start byte are the content keys that make the order independent of
+// WHERE the tree was indexed: end byte, kind, name, qualified name and
+// signature all precede the root-dependent NodeID and SearchKey.
 func legLessChain(t *testing.T, _ *fixture) {
-	base := rankedOf(model.TierExactName, 100, "b", 10, "n2", "k2")
+	baseR := rankedOf(model.TierExactName, 100, "b", 10, "n2", "k2")
+	base := scoredOf(baseR, model.NodeFunction, "m2", 20)
 	cases := []struct {
 		key   string
-		lower ranked
+		lower scored
 	}{
-		{"tier", rankedOf(model.TierExactPath, 0, "b", 10, "n2", "k2")},
-		{"score", rankedOf(model.TierExactName, 101, "b", 10, "n2", "k2")},
-		{"path", rankedOf(model.TierExactName, 100, "a", 10, "n2", "k2")},
-		{"start_byte", rankedOf(model.TierExactName, 100, "b", 9, "n2", "k2")},
-		{"node_id", rankedOf(model.TierExactName, 100, "b", 10, "n1", "k2")},
-		{"search_key", rankedOf(model.TierExactName, 100, "b", 10, "n2", "k1")},
+		{"tier", scoredOf(rankedOf(model.TierExactPath, 0, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"score", scoredOf(rankedOf(model.TierExactName, 101, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"path", scoredOf(rankedOf(model.TierExactName, 100, "a", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"start_byte", scoredOf(rankedOf(model.TierExactName, 100, "b", 9, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"end_byte", scoredOf(baseR, model.NodeFunction, "m2", 19)},
+		{"kind", scoredOf(baseR, model.NodeDocument, "m2", 20)},
+		{"name", scoredOf(baseR, model.NodeFunction, "m1", 20)},
+		{"qualified_name", withQName(scoredOf(baseR, model.NodeFunction, "m2", 20), "q1")},
+		{"signature", withSignature(scoredOf(baseR, model.NodeFunction, "m2", 20), "s1")},
+		{"node_id", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n1", "k2"), model.NodeFunction, "m2", 20)},
+		{"search_key", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n2", "k1"), model.NodeFunction, "m2", 20)},
+	}
+	// The base carries a qualified name and a signature so the two cases that
+	// isolate those keys have something to sort below.
+	base = withSignature(withQName(base, "q2"), "s2")
+	for i := range cases {
+		if cases[i].key != "qualified_name" && cases[i].key != "signature" {
+			cases[i].lower = withSignature(withQName(cases[i].lower, "q2"), "s2")
+		}
+		if cases[i].key == "qualified_name" {
+			cases[i].lower = withSignature(cases[i].lower, "s2")
+		}
+		if cases[i].key == "signature" {
+			cases[i].lower = withQName(cases[i].lower, "q2")
+		}
 	}
 	for _, c := range cases {
-		if !c.lower.less(base) {
+		if cmpScored(c.lower, base) >= 0 {
 			t.Errorf("%s: want the %s-lower candidate to sort first", c.key, c.key)
 		}
-		if base.less(c.lower) {
+		if cmpScored(base, c.lower) <= 0 {
 			t.Errorf("%s: the order is not antisymmetric", c.key)
 		}
 	}
 	// A tier with a worse score still outranks a better-scoring later tier:
 	// tier is the FIRST key, not a tiebreak after score.
-	exact := rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9")
-	lexical := rankedOf(model.TierLexicalFTS, 9_999_999, "a", 0, "n0", "k0")
-	if !exact.less(lexical) {
+	exact := scoredOf(rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9"), model.NodeFunction, "m9", 100)
+	lexical := scoredOf(rankedOf(model.TierLexicalFTS, 9_999_999, "a", 0, "n0", "k0"), model.NodeFunction, "m0", 1)
+	if cmpScored(exact, lexical) >= 0 {
 		t.Error("a zero-scored exact hit must outrank a high-scoring lexical hit")
 	}
-	if base.less(base) {
-		t.Error("less must be irreflexive")
+	if cmpScored(base, base) != 0 {
+		t.Error("the order must be reflexive-equal on one record")
+	}
+	// A candidate with no span sorts below one that has one, and the order
+	// stays total either way.
+	noSpan := scoredOf(baseR, model.NodeFunction, "m2", 20)
+	noSpan.Span = nil
+	if cmpScored(noSpan, base) >= 0 {
+		t.Error("a candidate without a span must sort before one that has an end byte")
 	}
 }
+
+// withQName and withSignature set the served fields the tail of the order
+// compares, which scoredOf leaves empty.
+func withQName(s scored, q string) scored     { s.Hit.QualifiedName = q; return s }
+func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
 
 // legQuantization proves the one float boundary. Ranking compares int64 only;
 // a drifting or truncating quantizer would make two releases disagree on the
@@ -478,7 +520,9 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 	if len(got) != distinct {
 		t.Fatalf("results = %d, want every one of the %d distinct hits", len(got), distinct)
 	}
-	sort.Slice(oracle, func(i, j int) bool { return oracle[i].less(oracle[j]) })
+	sort.Slice(oracle, func(i, j int) bool {
+		return cmpScored(scored{ranked: oracle[i]}, scored{ranked: oracle[j]}) < 0
+	})
 	for i := range oracle {
 		if got[i].ranked != oracle[i] {
 			t.Fatalf("hit %d = %+v, want %+v (rank order differs from the oracle)", i, got[i].ranked, oracle[i])
