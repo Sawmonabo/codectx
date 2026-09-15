@@ -146,7 +146,9 @@ func (s *ExternalSort[T]) WithFold(fold func(a, b T) (T, error)) *ExternalSort[T
 // needs this: a record count alone bounds the heap only when every record is
 // the same size. Callers derive runBytes with SortRunBytes.
 //
-// A budget below minSortRunBytes is raised to it rather than refused.
+// A budget below minSortRunBytes is raised to it rather than refused. A nil
+// sizeOf leaves the byte budget OFF and the record count the only bound, which
+// is the right answer for a caller whose records are all one size.
 func (s *ExternalSort[T]) WithRunBytes(runBytes int64, sizeOf func(T) int64) *ExternalSort[T] {
 	if sizeOf == nil {
 		return s

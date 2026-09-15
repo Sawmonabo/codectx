@@ -270,6 +270,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
 		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
 		{"rank/the_ranked_set_is_bounded_by_its_run_budget", legRankedSetIsBoundedByItsRunBudget},
+		{"cursor/a_streamed_continuation_walk_reproduces_the_whole_answer", legStreamedWalkParity},
 		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
 		{"rank/range_hydration_reads_a_bounded_window", legRangeHydration},
 		{"cursor/query_hash_binds_the_query_and_its_filters", legQueryHash},
@@ -1265,5 +1266,53 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, _ *fixture) {
 	const envelope = 4096
 	if large > envelope {
 		t.Fatalf("live record high-water was %d at 200000 candidates, over the %d-record envelope", large, envelope)
+	}
+}
+
+// legStreamedWalkParity proves the streamed tail is the same answer, in the
+// same order, as the unpaginated one. rank no longer materialises the answer:
+// the first page is drained from the ranked run and the remainder is streamed
+// into the continuation spool by tailOf, which is the one path with no other
+// assertion over it. A tail that skipped, repeated or reordered a record --
+// an off-by-one in its skip, or a chunk flush that dropped its buffer --
+// would show up here and nowhere else.
+//
+// The three-document corpus reaches one chunk, not many: the chunk boundary of
+// tailOf is model.MaxPageItems and this walks two hits. What is pinned here is
+// the skip, the flush and the ordering; the multi-chunk arm is covered only by
+// the bounded-run-budget leg's 200 000 records at the collector level.
+func legStreamedWalkParity(t *testing.T, f *fixture) {
+	s := newService(t, f.opts)
+	whole, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
+	if err != nil {
+		t.Fatalf("Search(one page): %v", err)
+	}
+	if len(whole.Items) < 2 {
+		t.Fatalf("the corpus answers %d hits; the walk below needs at least 2", len(whole.Items))
+	}
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	var walked []model.SearchHit
+	for page := 0; ; page++ {
+		if page > len(whole.Items) {
+			t.Fatalf("the continuation walk did not end after %d pages", page)
+		}
+		got, err := s.Search(f.ctx, req)
+		if err != nil {
+			t.Fatalf("Search(page %d): %v", page+1, err)
+		}
+		walked = append(walked, got.Items...)
+		if got.Meta.NextCursor == "" {
+			break
+		}
+		req.Page.Cursor = got.Meta.NextCursor
+	}
+	if len(walked) != len(whole.Items) {
+		t.Fatalf("the walk served %d hits, want the %d the whole answer holds", len(walked), len(whole.Items))
+	}
+	for i := range whole.Items {
+		if walked[i].NodeID != whole.Items[i].NodeID || walked[i].Path != whole.Items[i].Path ||
+			walked[i].ScoreMicros != whole.Items[i].ScoreMicros || walked[i].OccurrenceCount != whole.Items[i].OccurrenceCount {
+			t.Fatalf("walked hit %d = %+v, want %+v", i, walked[i], whole.Items[i])
+		}
 	}
 }
