@@ -51,7 +51,7 @@ type HostSamplerOptions struct {
 // Reaching it neither fails the sample nor hides it: the figure is the bytes
 // actually walked, reported as a floor, and the sampler says so in the log
 // with the entry count it stopped at. A floor is strictly more useful than the
-// absent figure this used to produce -- pressure against
+// no figure at all -- pressure against
 // resources.max_temp_bytes is actionable as soon as the floor crosses it --
 // and the log line is what keeps the floor from being read as the whole.
 const maxWalkedEntries = 200000

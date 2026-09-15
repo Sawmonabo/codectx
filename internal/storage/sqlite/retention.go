@@ -317,8 +317,7 @@ func (s *Store) countUnits(ctx context.Context, repoRaw []byte) (int64, error) {
 // back to the dictionary: a dictionary row is shared by every generation that
 // ever used the key, so charging its bytes to one generation would both
 // over-count what that generation holds and claim as reclaimable bytes that
-// deleting it cannot free. The figures this returns are smaller than before the
-// interning for exactly the reason the store is smaller.
+// deleting it cannot free.
 //
 // With exclusive set it counts only the units no other generation selects —
 // exactly the units that become collectable when this generation is deleted,

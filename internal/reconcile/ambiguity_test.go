@@ -23,16 +23,16 @@ func (f fixedAliases) LookupAliases(_ context.Context, _ []model.UnitID, _, _ st
 // TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit protects the
 // scale-posture rule that a repository property never fails an analysis unit.
 //
-// Failure mode it guards: a native key aliased to more identities than
-// model.MaxAmbiguousCandidates used to return CTX_PROVIDER_OUTPUT_INVALID, so
-// one heavily overloaded symbol name refused the whole dependency output — the
-// unit produced nothing, not even the facts that had no ambiguity at all. The
+// Mutation that fails it: return CTX_PROVIDER_OUTPUT_INVALID for a native key
+// aliased to more identities than model.MaxAmbiguousCandidates. One heavily
+// overloaded symbol name then refuses the whole dependency output — the unit
+// produces nothing, not even the facts that had no ambiguity at all. The
 // alias lookup's own page size is the only bound; the resolver keeps every
 // alternative it returned so no may_refer_to edge is silently lost.
 func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing.T) {
 	const n = sqlite.MaxAliasLookup // more than MaxAmbiguousCandidates+1
 	if n <= model.MaxAmbiguousCandidates+1 {
-		t.Fatalf("fixture is not over the old refusal threshold: %d", n)
+		t.Fatalf("fixture is not over the ambiguity threshold: %d", n)
 	}
 	var store fixedAliases
 	for i := 0; i < n; i++ {

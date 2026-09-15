@@ -21,8 +21,8 @@ const (
 )
 
 // queryHashDomain versions the cursor preimage. Changing the preimage without
-// changing this would let a cursor minted by the old shape resume under the
-// new one against a differently-filtered candidate set.
+// changing this would let a cursor minted under one preimage resume under
+// another against a differently-filtered candidate set.
 const queryHashDomain = "codectx.search.v1"
 
 // filterSep joins the values of one filter group. It cannot occur inside a
