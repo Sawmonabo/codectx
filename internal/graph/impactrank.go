@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -356,42 +355,6 @@ func errNotImplemented(op string) error {
 		Message: "graph: this operation is not implemented in this build"}).WithDetail("operation", op)
 }
 
-// runWalkToCompletion expands seeds until the walk is EXHAUSTED, not until a
-// page is full, calling visit once per admitted edge exactly as expand does.
-//
-// It is the seam ruling P2 requires: the request that mints the answer must
-// see every admitted edge before anything is ranked, and the page-bounded
-// expand cannot. Internally it chains expand's own continuation -- the spooled
-// resumable frontier -- IN PROCESS, without minting or verifying a signed
-// token per internal page, so peak heap stays a function of one internal
-// page's frontier and never of the reachable set.
-//
-// The query deadline ends a PAGE and never the answer (ruling P3): a deadline
-// reached mid-walk returns the walkState the walk had built, with its frontier
-// intact for the caller to persist into the `f` cursor, and a nil error.
-//
-// Owned by lane P-b.
-func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) (walkState, error) {
-	_, _, _, _ = ctx, seeds, o, visit
-	return walkState{}, errNotImplemented("graph.run_walk_to_completion")
-}
-
-// rankImpact folds and orders every record the completed walk admitted, and
-// returns the whole ranked answer as a re-iterable sorted run on disk.
-//
-// emit is called once and streams the walk's records in; it is a callback
-// rather than a slice because the point of the pass is that no caller ever
-// holds the answer. Pass 1 keys lessByNode and folds foldImpact, pass 2 keys
-// lessByRank and does not fold. Close the returned run.
-//
-// Owned by lane P-b.
-func (e *Engine) rankImpact(ctx context.Context,
-	emit func(add func(impactRecord) error) error) (*pagination.SortedRun[impactRecord], error) {
-	_, _ = ctx, emit
-	return nil, errNotImplemented("graph.rank_impact")
-}
-
 // rankPairs is the same two passes over the package rollup (ruling P4): pass 1
 // keys lessByPairKey and folds foldPair, so the counts it reports are exact
 // sums over the whole walk rather than over one page; pass 2 keys lessByPair,
@@ -402,22 +365,4 @@ func (e *Engine) rankPairs(ctx context.Context,
 	emit func(add func(pairRecord) error) error) (*pagination.SortedRun[pairRecord], error) {
 	_, _ = ctx, emit
 	return nil, errNotImplemented("graph.rank_pairs")
-}
-
-// servePage reads at most limit records out of the spool tail names, starting
-// at tail.Offset, and returns them with the handle the NEXT page continues
-// from. The records after the page are copied straight into a fresh spool, so
-// neither the page nor the continuation ever holds the remainder in heap.
-//
-// c is the binding the spool was written under and now the clock the lease is
-// checked against, exactly as pagination.Spools.Open takes them. decode is the
-// record codec -- decodeImpactRecord or decodePairRecord -- which is what lets
-// one page reader serve both ranked answers; the two can never be crossed,
-// because a cursor is bound to the endpoint that issued it.
-//
-// Owned by lane P-INT.
-func servePage[T any](ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time,
-	tail rankedTail, limit int, decode func([]byte) (T, error)) ([]T, rankedTail, error) {
-	_, _, _, _, _, _, _ = ctx, spools, c, now, tail, limit, decode
-	return nil, rankedTail{}, errNotImplemented("graph.serve_ranked_page")
 }

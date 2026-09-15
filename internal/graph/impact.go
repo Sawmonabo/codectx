@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // Impact answers Section 14.3: which entities may be affected by a change to
@@ -89,23 +91,29 @@ type impactAnswer struct {
 	Packages     []model.PackageEdge
 }
 
-// walkImpact is ONE page of the impact walk: a page-bounded expansion over the
-// allowlist, the ranking pass, hydration and the rollup, followed by the
-// continuation the next page resumes from.
+// walkImpact answers ONE page of an impact query, but never with a partial
+// walk: ruling P2 says the request that MINTS the answer runs the expansion to
+// completion, streams every admitted edge into a disk-backed sort, ranks the
+// whole affected set once, serves the first page and spools the globally
+// ranked remainder behind a cursor. Later pages read that spool and walk
+// nothing.
 //
-// It is the same spooled, cursor-resumable continuation a traversal has, and
-// for the same reason: the accumulator below holds at most `limit` admitted
-// edges -- and therefore at most `limit` affected nodes -- so its heap is a
-// function of the page, never of the reachable subgraph. What outlives the page
-// is the frontier and the cumulative admitted-node set, and both live in the
-// continuation spool rather than in memory (see cursor.go and visited.go).
+// What that buys, and what the page-bounded predecessor could not give: the
+// union of the pages is exactly the single-shot answer, in exactly the
+// single-shot ORDER, with every node reported once. A node reached again from
+// a later frontier used to be listed a second time with that page's reasons,
+// because the accumulator was page-scoped; it is now one record that pass 1
+// folds.
 //
-// The trade this makes is explicit: each page ranks its OWN chunk, so the pages
-// together enumerate exactly the affected-node set the former single-shot
-// answer did, but the rank order is per page and a node reached again from a
-// later page's frontier is reported again with that page's reasons. Ranking the
-// whole reachable set in one order needs the whole set in one place, which is
-// the heap this fix exists to remove.
+// Peak heap is unchanged in KIND and bounded by the same things it always was:
+// one internal page's frontier (Limits.FrontierBytes), the sort's run buffer
+// (a quarter of the query memory admission) plus its merge fan-in, and one
+// served page. None of the three is a function of the reachable set.
+//
+// The two ways this still ends early are both pages, never answers: the query
+// deadline (ruling P3) mints the `f` walk continuation with no entries at all
+// and the next request carries the walk on, and the user-set depth bound is
+// reported as truncation with the ranked answer it did reach.
 func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
 	maxDepth config.Limit, limit int, queryHash string,
 	deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, string, error) {
@@ -125,6 +133,15 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	b := &budget{deadline: deadline, now: e.now}
 	var resume *resumeState
 	if req.Page.Cursor != "" {
+		c, rb, err := e.verifyContinuation(req.Page.Cursor, impactEndpoint, queryHash, deadline)
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+		if c.Ranked {
+			// The walk is over and the order is settled: this page is a read of
+			// the ranked spool and expands nothing.
+			return e.serveRankedImpact(ctx, c, rb, limit, answer, meta)
+		}
 		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, impactEndpoint, queryHash, deadline)
 		if err != nil {
 			return answer, nil, nil, "", err
@@ -141,21 +158,62 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	maxVisited, visitedNotice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())
 	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
 	answer.Notices = appendNotice(appendNotice(answer.Notices, visitedNotice), edgeNotice)
-	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges, limit)
-	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
-		Direction:     req.Direction,
-		Kinds:         kinds,
-		MaxDepth:      maxDepth,
-		Budget:        b,
-		BatchSize:     adjacencyBatch,
-		FrontierBytes: e.limits.FrontierBytes,
-		Resume:        resume,
-	}, acc.Visit)
-	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+
+	var (
+		acc   *impactAccumulator
+		state walkState
+	)
+	// ONE streamed pass: the sort's emit callback drives the walk, so no record
+	// is held between the edge that produced it and the run buffer it lands in.
+	ranked, rankErr := e.rankImpact(ctx, func(add func(impactRecord) error) error {
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, 0, add)
+		var walkErr error
+		// pageItems 0: see impactAccumulator.pageItems. The walk is bounded by
+		// the frontier byte ceiling and the per-page work budgets, which
+		// runWalkToCompletion returns at every internal boundary, and it ends
+		// only when the frontier is empty, the depth bound is reached or the
+		// deadline passes.
+		state, walkErr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
+			Direction:     req.Direction,
+			Kinds:         kinds,
+			MaxDepth:      maxDepth,
+			Budget:        b,
+			BatchSize:     adjacencyBatch,
+			FrontierBytes: e.limits.FrontierBytes,
+			Resume:        resume,
+		}, acc.Visit)
+		return walkErr
+	})
+	if state.ReleaseCarried != nil {
+		// After the continuation below has been spilled: the spill is what
+		// reads the carried stream.
+		defer state.ReleaseCarried()
+	}
+	if err := impactPhaseError(ctx, rankErr, &meta); err != nil {
 		return answer, nil, nil, "", err
+	}
+	if ranked != nil {
+		defer ranked.Close()
+	}
+	if b.deadlineHit && len(state.Frontier) > 0 {
+		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
+		// ranked and nothing is served -- ranking a walk that is still running
+		// would publish an order the next page contradicts -- and the walk
+		// continuation carries the frontier forward.
+		markTruncated(&meta, reasonDeadline)
+		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state, acc.lastOwner, acc.lastKey, resume)
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+		answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
+			Notices: answer.Notices, Completeness: meta.Completeness}
+		return answer, nil, b, next, nil
 	}
 	switch {
 	case acc.reason != "":
+		// The LAST link's stop, and so the one that ended the answer: an
+		// internal boundary's reason is cleared by the first edge the next link
+		// admits (impactAccumulator.Visit).
 		markTruncated(&meta, acc.reason)
 	case b.frontierHit:
 		// A level the frontier budget cut short is truncation the caller must
@@ -167,10 +225,102 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDepth)
 	}
 
-	entries := acc.Entries(e.limits.ReasonPaths())
-	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
-	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
+	entries, nextCursor, err := e.serveRankedRun(ctx, ranked, queryHash, b, limit, &answer, &meta)
+	if err != nil {
 		return answer, nil, nil, "", err
+	}
+	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
+		return answer, nil, nil, "", err
+	}
+	packages, rollupErr := e.rollupPackages(ctx, acc.Relations(), &meta)
+	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
+		return answer, nil, nil, "", err
+	}
+	answer = impactAnswer{Truncated: meta.Truncated, Reason: meta.TruncationReason,
+		Notices: answer.Notices, Completeness: meta.Completeness, Packages: packages}
+	return answer, entries, b, nextCursor, nil
+}
+
+// serveRankedRun serves the FIRST page off the freshly ranked run and spools
+// everything after it behind a ranked continuation.
+func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[impactRecord], queryHash string,
+	b *budget, limit int, answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, string, error) {
+	page := make([]impactRecord, 0, limit)
+	if err := run.Each(func(r impactRecord) error {
+		if err := ctx.Err(); err != nil {
+			return typedContextError(ctx, err)
+		}
+		page = append(page, r)
+		if len(page) == limit {
+			return errStopExpansion
+		}
+		return nil
+	}); err != nil && !errors.Is(err, errStopExpansion) {
+		return nil, "", err
+	}
+	entries, err := e.impactPage(ctx, page, answer, meta)
+	if err != nil {
+		return nil, "", err
+	}
+	if int64(len(page)) >= run.Len() {
+		return entries, "", nil
+	}
+	next, err := e.nextRankedCursor(ctx, b, queryHash, run.Len(), int64(len(page)),
+		rankedRunTail(ctx, run, len(page), encodeImpactRecord))
+	return entries, next, err
+}
+
+// serveRankedImpact serves a LATER page: it reads the ranked spool the previous
+// page left, copies what follows this page into a fresh one, and reports the
+// answer-level facts the first page settled.
+func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *budget, limit int,
+	answer impactAnswer, meta model.QueryMeta) (impactAnswer, []model.ImpactEntry, *budget, string, error) {
+	// The consumed spool is released only after the page is built: the copy
+	// below reads it.
+	defer e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+	tail := rankedTail{SpoolID: c.SpoolID, LeaseID: c.LeaseID,
+		Offset: c.RankOffset, Served: c.RankServed, Total: c.RankTotal}
+	page, rest, err := servePage(ctx, e.spools, c.spoolCursor(), e.now(), tail, limit, decodeImpactRecord)
+	if err != nil {
+		return answer, nil, nil, "", err
+	}
+	entries, err := e.impactPage(ctx, page, &answer, &meta)
+	if err != nil {
+		return answer, nil, nil, "", err
+	}
+	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
+		return answer, nil, nil, "", err
+	}
+	var next string
+	if !rest.done() {
+		next, err = e.nextRankedCursor(ctx, b, c.QueryHash, rest.Total, rest.Served,
+			rankedSpoolTail(ctx, e.spools, c.spoolCursor(), e.now(), rest.Offset))
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+	}
+	answer.Completeness = meta.Completeness
+	answer.Truncated, answer.Reason = meta.Truncated, meta.TruncationReason
+	return answer, entries, b, next, nil
+}
+
+// impactPage projects one page of ranked records into served entries and
+// hydrates them. The records arrive in ruling P1's order and stay in it.
+func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *impactAnswer,
+	meta *model.QueryMeta) ([]model.ImpactEntry, error) {
+	reasonPaths := e.limits.ReasonPaths()
+	entries := make([]model.ImpactEntry, 0, len(page))
+	for _, r := range page {
+		entry := model.ImpactEntry{NodeID: r.NodeID, Direction: r.Direction, Depth: r.Depth,
+			ScoreMicros: r.scoreMicros(), Reasons: r.Reasons}
+		if len(r.Route) > 0 && len(r.Route) <= model.MaxRelationsPerPath && !reasonPaths.Exceeded(1) {
+			entry.Paths = []model.RelationPath{{Relations: r.Route, CostUnits: r.Cost}}
+		}
+		entries = append(entries, entry)
+	}
+	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
+	if err := impactPhaseError(ctx, hydrateErr, meta); err != nil {
+		return nil, err
 	}
 	if unhydratable > 0 {
 		// An entry the pinned generation cannot hydrate is still a node the
@@ -181,21 +331,79 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			fmt.Sprintf("impact: %d affected node(s) were reached but could not be hydrated from the pinned generation and are not listed",
 				unhydratable))
 	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
-		return answer, nil, nil, "", err
+	return entries, nil
+}
+
+// nextRankedCursor writes the ranked remainder to a FRESH spool -- one spool per
+// page, the rule cursor.go states -- and signs the cursor that names it.
+//
+// served is how many records of the whole ranked answer the pages up to and
+// including this one have handed back, so the continuation's RankOffset is
+// always zero: the new spool BEGINS at the next record.
+func (e *Engine) nextRankedCursor(ctx context.Context, b *budget, queryHash string,
+	total, served int64, tail func(func([]byte) error) error) (string, error) {
+	if e.signer == nil || e.leases == nil || e.spools == nil {
+		// No continuation machinery: the answer stops with this page and says
+		// so, exactly as a walk that cannot spill its frontier does.
+		return "", nil
 	}
-	packages, rollupErr := e.rollupPackages(ctx, acc.Relations(), &meta)
-	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
-		return answer, nil, nil, "", err
-	}
-	nextCursor, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state, acc.lastOwner, acc.lastKey, resume)
+	binding := e.adjacency.Binding()
+	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
 	if err != nil {
-		return answer, nil, nil, "", err
+		return "", err
 	}
-	notices := answer.Notices
-	answer = impactAnswer{Truncated: meta.Truncated, Reason: meta.TruncationReason,
-		Notices: notices, Completeness: meta.Completeness, Packages: packages}
-	return answer, entries, b, nextCursor, nil
+	next := traversalCursor{
+		Version: traversalCursorVersion, Endpoint: impactEndpoint,
+		GenerationID: binding.GenerationID, AnalysisKey: binding.AnalysisKey,
+		QueryHash: queryHash, LeaseID: lease.ID, Ranked: true,
+		RankServed: served, RankTotal: total,
+		Visited: b.visited, Edges: b.edges,
+		ExpiresAt: e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
+	}
+	id, err := e.spillRanked(next, total, tail)
+	if err != nil {
+		return "", e.releaseLease(ctx, lease.ID, err)
+	}
+	next.SpoolID = id
+	if err := next.validate(); err != nil {
+		e.releaseConsumed(ctx, id, "")
+		return "", e.releaseLease(ctx, lease.ID, err)
+	}
+	payload, err := json.Marshal(next)
+	if err != nil {
+		e.releaseConsumed(ctx, id, "")
+		return "", e.releaseLease(ctx, lease.ID,
+			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
+	}
+	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	if err != nil {
+		e.releaseConsumed(ctx, id, "")
+		return "", e.releaseLease(ctx, lease.ID, err)
+	}
+	return token, nil
+}
+
+// spillRanked writes the ranked header and then every record tail streams, one
+// at a time, so the remainder of the answer is never in heap.
+func (e *Engine) spillRanked(next traversalCursor, total int64, tail func(func([]byte) error) error) (string, error) {
+	sp, err := e.spools.Create(next.spoolCursor())
+	if err != nil {
+		return "", err
+	}
+	header, err := encodeRankedHeader(total)
+	if err != nil {
+		return "", e.releaseSpool(sp, err)
+	}
+	if err := sp.Append(header); err != nil {
+		return "", e.releaseSpool(sp, err)
+	}
+	if err := tail(sp.Append); err != nil {
+		return "", e.releaseSpool(sp, err)
+	}
+	if err := sp.Close(); err != nil {
+		return "", e.releaseSpool(sp, err)
+	}
+	return sp.ID(), nil
 }
 
 // continueWalk mints the continuation for a page-bounded impact or
@@ -313,20 +521,6 @@ func markTruncated(meta *model.QueryMeta, reason string) {
 	meta.TruncationReason = reason
 }
 
-// impactNode is one affected entity as the walk found it: the cheapest route
-// that reached it, the direction that route walked, and the reasons every edge
-// that touched it contributes.
-type impactNode struct {
-	id        model.NodeID
-	depth     int
-	cost      int64
-	direction model.Direction
-	via       model.RelationID
-	parent    model.NodeID
-	reasons   []string
-	seen      map[string]bool
-}
-
 // impactAccumulator collects one walk. Each node is admitted once -- which is
 // what keeps a cycle (a -> b -> c -> a) from producing two entries for the same
 // symbol -- while every later edge that reaches an already-admitted node still
@@ -336,18 +530,25 @@ type impactNode struct {
 // does not know those caps, because only the caller can compare the cumulative,
 // cursor-carried spend in budget against the bounds the request resolved.
 type impactAccumulator struct {
-	seeds      []model.NodeID
-	isSeed     map[model.NodeID]bool
-	byNode     map[model.NodeID]*impactNode
-	order      []model.NodeID
+	seeds  []model.NodeID
+	isSeed map[model.NodeID]bool
+	// emit streams one record per ADMITTED EDGE straight into the ranking
+	// sort. There is no byNode map and no order slice any more: ruling P2 runs
+	// the walk to completion, so both would have been sized by the reachable
+	// set rather than by the page, and the per-node merge they used to do is
+	// foldImpact's job inside pass 1 of the sort.
+	emit       func(impactRecord) error
 	edges      []model.Relation
 	budget     *budget
 	maxVisited config.Limit
 	maxEdges   config.Limit
-	// pageItems is the page's item bound. It is what makes byNode, order and
-	// edges page-sized rather than walk-sized: the accumulator stops the
-	// expansion once it holds this many admitted edges, and since a node is
-	// admitted only by an edge, order and byNode can never exceed it either.
+	// pageItems is the page's item bound, and ZERO turns it off. It is off for
+	// an impact walk under ruling P2: that walk runs to completion and the
+	// SERVED page is cut from the ranked answer afterwards, so stopping the
+	// expansion at the page's item count would end the walk at the first page
+	// and rank a fraction of the blast radius as though it were all of it. The
+	// package rollup still sets it, and for it the bound still makes edges
+	// page-sized.
 	pageItems int
 	reason    string
 	// lastOwner and lastKey are the keyset position the continuation resumes
@@ -358,10 +559,10 @@ type impactAccumulator struct {
 }
 
 func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges config.Limit,
-	pageItems int) *impactAccumulator {
+	pageItems int, emit func(impactRecord) error) *impactAccumulator {
 	a := &impactAccumulator{
 		isSeed:     make(map[model.NodeID]bool, len(start)),
-		byNode:     map[model.NodeID]*impactNode{},
+		emit:       emit,
 		budget:     b,
 		maxVisited: maxVisited,
 		maxEdges:   maxEdges,
@@ -394,7 +595,7 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 	case a.maxVisited.Exceeded(a.budget.pageVisited + 1):
 		a.reason = reasonVisitedBudget
 		return errStopExpansion
-	case len(a.edges) >= a.pageItems:
+	case a.pageItems > 0 && len(a.edges) >= a.pageItems:
 		// The page item bound, exactly as a traversal applies it
 		// (traverse.go's `len(relations) >= maxItems`): it ends THIS page, and
 		// the caller mints the continuation the next one resumes from. It is
@@ -402,6 +603,13 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 		a.reason = reasonPageFull
 		return errStopExpansion
 	}
+	// An admitted edge clears the last stop reason. Under ruling P2 one impact
+	// answer chains several expand calls, and each internal boundary that ends
+	// on a per-page work budget sets a reason the NEXT link then works past; a
+	// reason that survived the link that overtook it would report a truncation
+	// that did not happen. What is left at the end is the reason of the last
+	// link, which is the only one that stopped the answer.
+	a.reason = ""
 	a.edges = append(a.edges, rel)
 	// The keyset position a continuation resumes from.
 	a.lastOwner, a.lastKey = state.Node, rel.ID
@@ -412,29 +620,27 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 	}
 	direction := impactEdgeDirection(state.Node, rel)
 	depth := state.Depth + 1
-	reason := impactReason(rel.Kind, direction, depth)
-	entry, ok := a.byNode[reached]
-	if !ok {
-		entry = &impactNode{
-			id: reached, depth: depth, cost: state.Cost + Cost(rel.Kind),
-			direction: direction, via: rel.ID, parent: state.Node,
-			seen: map[string]bool{},
-		}
-		a.byNode[reached] = entry
-		a.order = append(a.order, reached)
+	// One record per admitted edge, not per node. Two edges reaching the same
+	// node produce two records with the same NodeID, and pass 1 of the sort
+	// folds them with foldImpact -- which reproduces exactly what the old
+	// per-node merge did (cheapest route wins, an incoming direction is sticky,
+	// the reasons are the deduplicated union), without a map whose size was the
+	// reachable set.
+	if a.emit == nil {
+		// The package rollup rides on the same walk but reads only the edges;
+		// it has no record sort to stream into.
+		return nil
 	}
-	if direction == model.DirectionIncoming {
-		// A node reachable both ways under DirectionBoth is reported as
-		// incoming: "may need modification" is the stronger claim, and leaving
-		// it to whichever edge the walk saw first would make the Section 14.3
-		// discriminator depend on frontier order.
-		entry.direction = model.DirectionIncoming
-	}
-	if !entry.seen[reason] && len(entry.reasons) < model.MaxReasonsPerEntry {
-		entry.seen[reason] = true
-		entry.reasons = append(entry.reasons, reason)
-	}
-	return nil
+	return a.emit(impactRecord{
+		NodeID:    reached,
+		Depth:     depth,
+		Cost:      state.Cost + Cost(rel.Kind),
+		Direction: direction,
+		Via:       rel.ID,
+		Parent:    state.Node,
+		Route:     appendRoute(state.Route, rel.ID),
+		Reasons:   []string{impactReason(rel.Kind, direction, depth)},
+	})
 }
 
 // impactEdgeDirection is the Section 14.3 discriminator, read off the frontier
@@ -473,82 +679,6 @@ func impactReason(kind model.RelationKind, dir model.Direction, depth int) strin
 // the same walk.
 func (a *impactAccumulator) Relations() []model.Relation { return a.edges }
 
-// Entries ranks the affected entities. ScoreMicros is integer arithmetic over
-// the frozen cost table -- 1_000_000 / (1 + cost) -- so a cheaper, more direct
-// route always outranks a longer one and no float ever enters the ordering.
-// The order is (ScoreMicros desc, Depth asc, Name asc, NodeID asc); Name is
-// filled during hydration, so ties settle on NodeID here and stay stable.
-//
-// reasonPaths is context.max_reason_paths_per_entry. The accumulator records
-// ONE parent per admitted node -- the edge that first reached it, which is the
-// edge the entry's reason names -- so there is exactly one route to
-// reconstruct, and every loadable setting admits it: a positive bound is at
-// least one, and zero is UNLIMITED under the config.Limit convention, not
-// "none". There is deliberately no spelling that suppresses the route here --
-// a negative is a wiring defect, not a way to ask for zero paths -- because an
-// impact entry's single route is the evidence for the reason it already
-// reports, and an entry whose reason nothing backs is what Section 14.3
-// rejects.
-// Enumerating alternate routes would mean keeping every parent of every node
-// for the whole walk, which is the frontier blow-up MaxVisited exists to
-// prevent; `path` is the command that answers "the equal-cost routes", and it
-// is where this key bounds a count greater than one. docs/queries.md states
-// the split.
-func (a *impactAccumulator) Entries(reasonPaths config.Limit) []model.ImpactEntry {
-	entries := make([]model.ImpactEntry, 0, len(a.order))
-	for _, id := range a.order {
-		n := a.byNode[id]
-		entry := model.ImpactEntry{
-			NodeID:      n.id,
-			Direction:   n.direction,
-			Depth:       n.depth,
-			ScoreMicros: 1_000_000 / (1 + n.cost),
-			Reasons:     n.reasons,
-		}
-		if p, ok := a.path(n); ok && !reasonPaths.Exceeded(1) {
-			entry.Paths = []model.RelationPath{p}
-		}
-		entries = append(entries, entry)
-	}
-	sort.SliceStable(entries, func(i, j int) bool {
-		x, y := entries[i], entries[j]
-		if x.ScoreMicros != y.ScoreMicros {
-			return x.ScoreMicros > y.ScoreMicros
-		}
-		if x.Depth != y.Depth {
-			return x.Depth < y.Depth
-		}
-		return x.NodeID < y.NodeID
-	})
-	return entries
-}
-
-// path reconstructs the route that admitted n by walking the parent chain back
-// to a seed. Each node records its parent once, on first admission, so the
-// chain is a tree and a cycle in the graph cannot make it loop; the length cap
-// bounds it even if a future walk changed that.
-func (a *impactAccumulator) path(n *impactNode) (model.RelationPath, bool) {
-	relations := make([]model.RelationID, 0, n.depth+1)
-	for cur := n; cur != nil; {
-		relations = append(relations, cur.via)
-		if len(relations) > model.MaxRelationsPerPath {
-			return model.RelationPath{}, false
-		}
-		if a.isSeed[cur.parent] {
-			break
-		}
-		next, ok := a.byNode[cur.parent]
-		if !ok {
-			return model.RelationPath{}, false
-		}
-		cur = next
-	}
-	for i, j := 0, len(relations)-1; i < j; i, j = i+1, j-1 {
-		relations[i], relations[j] = relations[j], relations[i]
-	}
-	return model.RelationPath{Relations: relations, CostUnits: n.cost}, true
-}
-
 // hydrateImpactEntries fills the kind, file and path an entry reports, in
 // batched round trips rather than one lookup per entry. A node the pinned
 // generation cannot hydrate cannot be listed: reporting it without its kind
@@ -577,20 +707,12 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		entry.Name = clipTo(n.QualifiedName, model.MaxQualifiedNameBytes)
 		out = append(out, entry)
 	}
-	// Name participates in the tie-break, so it is applied once it is known.
-	sort.SliceStable(out, func(i, j int) bool {
-		x, y := out[i], out[j]
-		if x.ScoreMicros != y.ScoreMicros {
-			return x.ScoreMicros > y.ScoreMicros
-		}
-		if x.Depth != y.Depth {
-			return x.Depth < y.Depth
-		}
-		if x.Name != y.Name {
-			return x.Name < y.Name
-		}
-		return x.NodeID < y.NodeID
-	})
+	// The page arrives ALREADY ordered, by ruling P1's (ScoreMicros desc,
+	// Depth asc, NodeID asc), which the ranking pass applied over the whole
+	// answer. The Name tie-break that used to be re-applied here is gone with
+	// that ruling: Name is known only after hydration, so re-sorting a page by
+	// it would reorder one page of a globally ordered answer and no two pages
+	// would agree on where a record belongs.
 	return out, dropped, nil
 }
 

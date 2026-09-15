@@ -296,6 +296,11 @@ type spoolRecord struct {
 	Depth int              `json:"d,omitempty"`
 	Cost  int64            `json:"c,omitempty"`
 	Via   model.RelationID `json:"v,omitempty"`
+	// Route is the frontier record's parent chain (graph.go). It is spilled
+	// because an impact answer resumed from this spool must still be able to
+	// report the path that reached each affected node, and the chain cannot be
+	// rebuilt from a frontier alone.
+	Route []model.RelationID `json:"rt,omitempty"`
 }
 
 // resumeState is what a continuation restores: the decoded cursor, a budget
@@ -421,7 +426,7 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		}
 		switch r.Kind {
 		case spoolRecordFrontier:
-			s.Frontier = append(s.Frontier, frontierState{Depth: r.Depth, Cost: r.Cost, Node: r.Node, Via: r.Via})
+			s.Frontier = append(s.Frontier, frontierState{Depth: r.Depth, Cost: r.Cost, Node: r.Node, Via: r.Via, Route: r.Route})
 		case spoolRecordVisited:
 			// Deliberately not accumulated: the cumulative set stays on disk
 			// and is streamed by s.Visited below.
@@ -591,7 +596,7 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 	frontierNodes := make(map[model.NodeID]struct{}, len(c.Frontier))
 	for _, fs := range c.Frontier {
 		if err := appendRecord(spoolRecord{Kind: spoolRecordFrontier, Node: fs.Node,
-			Depth: fs.Depth, Cost: fs.Cost, Via: fs.Via}); err != nil {
+			Depth: fs.Depth, Cost: fs.Cost, Via: fs.Via, Route: fs.Route}); err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
 		frontierNodes[fs.Node] = struct{}{}
