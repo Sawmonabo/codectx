@@ -260,7 +260,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return answer, nil, nil, "", err
 		}
 	}
-	if b.deadlineHit && len(state.Frontier) > 0 {
+	if b.deadlineHit && state.More {
 		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
@@ -293,10 +293,6 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// internal boundary's reason is cleared by the first edge the next link
 		// admits (impactAccumulator.Visit).
 		markTruncated(&meta, acc.reason)
-	case b.frontierHit:
-		// A level the frontier budget cut short is truncation the caller must
-		// see: the ranking below is over the edges that were read, not all of them.
-		markTruncated(&meta, reasonFrontierBytes)
 	case state.DepthLimited:
 		// Nodes at the depth bound were admitted but never expanded; an impact
 		// answer that stopped there is not the whole blast radius.
@@ -692,27 +688,30 @@ func (e *Engine) spillRanked(next traversalCursor, h rankedHeader,
 // leg that exhausts the walk ranks the whole of it.
 func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHash string,
 	state walkState, retain *retainedWalk) (string, error) {
-	if len(state.Frontier) == 0 || state.DepthLimited {
+	if !state.More || state.DepthLimited {
 		return "", nil
 	}
-	// Nothing of the walk is materialized or copied here. The frontier is
-	// already in the retained level file, the admitted nodes are already bits
-	// beside it, and the token names the directory rather than a copy of what
-	// is in it.
+	// Nothing of the walk is materialized or copied here. The frontier is the
+	// admitted file of the level before the one the walk stopped in, the
+	// admitted nodes are already bits beside it, and the token names the
+	// directory rather than a copy of what is in it.
 	return e.nextTraversalCursor(ctx, b, continuation{
-		Endpoint:  endpoint,
-		QueryHash: queryHash,
-		Depth:     state.Depth,
-		LevelPos:  state.LevelPos,
-		Frontier:  state.Frontier,
-		Retain:    retain,
+		Endpoint:    endpoint,
+		QueryHash:   queryHash,
+		Level:       state.Level,
+		LevelState:  state.LevelState,
+		LevelPos:    state.LevelPos,
+		RawBytes:    state.RawBytes,
+		LevelOffset: state.LevelOffset,
+		More:        state.More,
+		Retain:      retain,
 	})
 }
 
 // walkStalled reports that this page ended on the deadline having made NO
 // progress: it admitted no edge and no node, and the continuation it is about
-// to mint names the same frontier and the same keyset position as the one it
-// was handed. Minting it would hand the caller back the cursor they arrived
+// to mint names the same level, the same level state and the same position in
+// it as the one it was handed. Minting it would hand the caller back the cursor they arrived
 // with, and a client that follows the chain pages forever without ever
 // reaching a new edge -- observed as a visited_count frozen for thousands of
 // pages when every page's first adjacency read already ran past the deadline.
@@ -732,8 +731,10 @@ func walkStalled(b *budget, state walkState, resume *resumeState) bool {
 	if resume == nil || b.pageEdges != 0 || b.pageVisited != 0 {
 		return false
 	}
-	return len(state.Frontier) == len(resume.Frontier) &&
-		state.LevelPos == resume.Cursor.LevelPos
+	c := resume.Cursor
+	return state.Level == c.Level && state.LevelState == c.LevelState &&
+		state.LevelPos == c.LevelPos && state.RawBytes == c.RawBytes &&
+		state.LevelOffset == c.LevelOffset
 }
 
 // continueRank mints ruling P7's continuation: the walk is EXHAUSTED and the
