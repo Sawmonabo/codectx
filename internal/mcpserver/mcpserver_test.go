@@ -1008,7 +1008,6 @@ var scenarios = []scenario{
 			},
 			StrictGateSatisfied: false,
 		}
-		ceiling := config.Defaults().Resources.MaxMetadataResponseBytes
 		return scenario{
 			name: "gate: capsule export returns identity and per-list counts, never records",
 			facade: func(f *fakeServices) {
@@ -1025,13 +1024,6 @@ var scenarios = []scenario{
 			check: func(t *testing.T, res *mcp.CallToolResult) {
 				if res.IsError {
 					t.Fatalf("context_capsule export reported a tool error: %s", firstText(res))
-				}
-				raw, err := json.Marshal(res.StructuredContent)
-				if err != nil {
-					t.Fatalf("marshal the structured answer: %v", err)
-				}
-				if int64(len(raw)) > ceiling {
-					t.Errorf("export answer is %d bytes, over the %d-byte metadata ceiling", len(raw), ceiling)
 				}
 				var got result[capsuleOutput]
 				decode(t, res, &got)

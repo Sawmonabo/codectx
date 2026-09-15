@@ -240,7 +240,7 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 	unitKey, _ := model.DecodeID(string(build.Spec.ID))
 	runRaw, _ := model.DecodeID(string(build.OriginRunID))
 	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen,
-		ids: newInterner(s.opts), nodes: newRefCache(s.opts.BatchRecords)}
+		ids: newInterner(s.opts), nodes: newRefCache(max(s.opts.BatchRecords, internCacheFloor))}
 	var snapshot []byte
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
@@ -861,9 +861,9 @@ func (w *UnitWriter) nodeRef(ctx context.Context, tx *sql.Tx, id model.NodeID) (
 }
 
 // endBatch drops every cached surrogate. It runs at the end of each provider
-// batch and of each carry-over, so the writer's live set is a function of the
-// configured batch size and never of how many distinct identities or interned
-// strings a repository holds.
+// batch, so the writer's live set is a function of the configured batch size
+// and never of how many distinct identities or interned strings a repository
+// holds.
 func (w *UnitWriter) endBatch() {
 	w.ids.reset()
 	w.nodes.reset()

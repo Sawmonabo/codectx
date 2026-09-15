@@ -288,10 +288,17 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 // default. Entries that name no node (a file pulled in whole) contribute
 // nothing and are excluded here rather than skipped by the caller.
 //
-// node_id is not indexed on context_entries (the primary key is
-// (manifest_id, ordinal)), so SQLite satisfies the DISTINCT and the ORDER BY
-// from a temporary b-tree over one manifest's entries. That cost is the
-// database's, not the process heap's, and it is bounded by the manifest.
+// The rows carry node_ids.id surrogates, which are storage-internal and
+// meaningless outside this database file, so the page is both ordered and
+// keyset on the CANONICAL 32-byte id reached through node_ids: the caller
+// (workflow's capsule scope collector) feeds the last id it received back as
+// `after`, and a cursor must carry a canonical identity. node_id is not
+// indexed on context_entries (the primary key is (manifest_id, ordinal)) and
+// the ordering column lives in the joined dictionary, so SQLite satisfies the
+// DISTINCT and the ORDER BY from a temporary b-tree over one manifest's
+// entries, each row's canonical fetched by the node_ids integer primary key.
+// That cost is the database's, not the process heap's, and it is bounded by
+// the manifest.
 func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
 	after model.NodeID, limit int) ([]model.NodeID, error) {
 	raw, err := idBlob("manifest_id", string(id))
@@ -299,8 +306,11 @@ func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
 		return nil, err
 	}
 	// An empty cursor must admit the lowest node id, and a zero-length blob
-	// sorts below every real identifier, so it is the natural "before the
-	// first row" sentinel.
+	// sorts below every real 32-byte canonical identifier, so it is the
+	// natural "before the first row" sentinel for the canonical column this
+	// keyset compares against. (It is NOT a sentinel for the INTEGER
+	// surrogate: SQLite orders every integer below every blob, so comparing
+	// the surrogate against it excludes every row.)
 	afterRaw := []byte{}
 	if after != "" {
 		if afterRaw, err = idBlob("after", string(after)); err != nil {
@@ -310,8 +320,10 @@ func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
 	limit = pageLimit(ctx, limit)
 	var out []model.NodeID
 	err = s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT node_id FROM context_entries
-			WHERE manifest_id = ? AND node_id IS NOT NULL AND node_id > ? ORDER BY node_id LIMIT ?`,
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ni.canonical FROM context_entries ce
+			JOIN node_ids ni ON ni.id = ce.node_id
+			WHERE ce.manifest_id = ? AND ce.node_id IS NOT NULL AND ni.canonical > ?
+			ORDER BY ni.canonical LIMIT ?`,
 			raw, afterRaw, limit)
 		if err != nil {
 			return wrap("context_entries", err)
@@ -338,8 +350,13 @@ func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterO
 	limit = pageLimit(ctx, limit)
 	var out []model.ContextEntry
 	err = s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT ordinal, node_id, file_id, requirement, score_micros, estimated_bytes, estimated_tokens, reasons_json, evidence_paths_json
-			FROM context_entries WHERE manifest_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?`, raw, afterOrdinal, limit)
+		// context_entries.node_id is a node_ids.id surrogate; the entry that
+		// leaves this package must name the canonical identity, so the read
+		// hydrates it through the dictionary. LEFT JOIN because an entry that
+		// pulls a whole file in names no node.
+		rows, err := tx.QueryContext(ctx, `SELECT ce.ordinal, ni.canonical, ce.file_id, ce.requirement, ce.score_micros, ce.estimated_bytes, ce.estimated_tokens, ce.reasons_json, ce.evidence_paths_json
+			FROM context_entries ce LEFT JOIN node_ids ni ON ni.id = ce.node_id
+			WHERE ce.manifest_id = ? AND ce.ordinal > ? ORDER BY ce.ordinal LIMIT ?`, raw, afterOrdinal, limit)
 		if err != nil {
 			return wrap("context_entries", err)
 		}
