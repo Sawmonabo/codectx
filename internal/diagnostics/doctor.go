@@ -596,14 +596,14 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 			// remediation beside it tells the operator to do.
 			c.Detail = st.Name + " " + st.Version + " is pinned by the lock but not installed"
 			c.Code = model.CodeProviderUnavailable
-			c.Remediation = "run codectx tools install to fetch the payloads this lock names"
+			c.Remediation = "run codectx tools prefetch --for-repo . to install what this repository needs"
 		case toolchain.StateUnsupportedPlatform:
 			c.State = model.CheckUnavailable
 			c.Detail = st.Name + " publishes no payload for this platform"
 		case toolchain.StateCorrupt:
 			c.State = model.CheckFail
 			c.Code = model.CodeToolCorrupt
-			c.Remediation = "run codectx tools gc and then codectx tools install to reinstall this payload"
+			c.Remediation = "run codectx tools gc and then codectx tools prefetch --for-repo . to reinstall this payload"
 		}
 		out = append(out, c)
 	}
