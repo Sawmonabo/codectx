@@ -125,12 +125,24 @@ type StoredEvidence struct {
 	Bytes    *model.ByteRange
 }
 
+// nodeRefByCanonical and relationRefByCanonical resolve a public 32-byte
+// canonical id to its storage-internal surrogate inside the statement itself.
+// A reader never holds a surrogate: it hands SQLite the canonical id it was
+// given and lets the dictionary's UNIQUE(canonical) autoindex turn it into the
+// rowid the fact tables are keyed by, so the outer predicate stays an indexed
+// probe on node_ids.id / relation_ids.from_node_id and friends. The aliases are
+// deliberately nx/rx so the subquery can never shadow an outer ni/ri.
+const (
+	nodeRefByCanonical     = `(SELECT nx.id FROM node_ids nx WHERE nx.canonical = ?)`
+	relationRefByCanonical = `(SELECT rx.id FROM relation_ids rx WHERE rx.canonical = ?)`
+)
+
 // visible restricts a fact table alias to units selected by this generation.
 func (r *PinnedReader) visible(alias string) string {
 	return ` JOIN generation_units gu ON gu.unit_id = ` + alias + `.unit_id AND gu.generation_id = ?1 JOIN units u ON u.id = gu.unit_id `
 }
 
-const nodeColumns = `nf.node_id, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
+const nodeColumns = `ni.canonical, ni.kind, nf.language, nf.name, nf.qualified_name, nf.signature, nf.file_id, ui.content_hash,
 	nf.start_byte, nf.end_byte, nf.metadata_json, u.unit_key, u.source_binding`
 
 // nodeOrder is the Section 9.4 attribute precedence as far as storage can
@@ -178,7 +190,7 @@ func (r *PinnedReader) Node(ctx context.Context, id model.NodeID) (StoredNode, e
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		row := tx.QueryRowContext(ctx, `SELECT `+nodeColumns+` FROM node_facts nf`+r.visible("nf")+
 			`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-			WHERE nf.node_id = ?2`+nodeOrder+` LIMIT 1`, r.gen, raw)
+			WHERE ni.canonical = ?2`+nodeOrder+` LIMIT 1`, r.gen, raw)
 		var err error
 		n, err = scanNode(row)
 		if isNoRows(err) {
@@ -244,13 +256,13 @@ func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.Node
 		where = append(where, "ni.kind IN ("+strings.Join(marks, ",")+")")
 	}
 	if afterRaw != nil {
-		where = append(where, "nf.node_id > ?")
+		where = append(where, "ni.canonical > ?")
 		args = append(args, afterRaw)
 	}
 	args = append(args, limit)
 	query := `SELECT ` + nodeColumns + ` FROM node_facts nf` + r.visible("nf") +
 		`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY nf.node_id, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
+		WHERE ` + strings.Join(where, " AND ") + ` ORDER BY ni.canonical, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key LIMIT ?`
 	var out []StoredNode
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, query, args...)
@@ -325,7 +337,7 @@ func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
 	}
 	where := "ni.kind IN (" + strings.Join(marks, ",") + ")"
 	if afterRaw != nil {
-		where += " AND nf.node_id > " + b.mark(afterRaw)
+		where += " AND ni.canonical > " + b.mark(afterRaw)
 	}
 	limitMark := b.mark(pageLimit(ctx, limit))
 	query := `SELECT ` + nodeBatchOuterColumns + ` FROM (
@@ -377,13 +389,13 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 	var where []string
 	switch direction {
 	case model.DirectionOutgoing:
-		where = append(where, "ri.from_node_id = ?")
+		where = append(where, "ri.from_node_id = "+nodeRefByCanonical)
 		args = append(args, nodeRaw)
 	case model.DirectionIncoming:
-		where = append(where, "ri.to_node_id = ?")
+		where = append(where, "ri.to_node_id = "+nodeRefByCanonical)
 		args = append(args, nodeRaw)
 	default:
-		where = append(where, "(ri.from_node_id = ? OR ri.to_node_id = ?)")
+		where = append(where, "(ri.from_node_id = "+nodeRefByCanonical+" OR ri.to_node_id = "+nodeRefByCanonical+")")
 		args = append(args, nodeRaw, nodeRaw)
 	}
 	if len(kinds) > 0 {
@@ -398,14 +410,20 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 		where = append(where, "ri.kind IN ("+strings.Join(marks, ",")+")")
 	}
 	if afterRaw != nil {
-		where = append(where, "ri.id > ?")
+		// The keyset carries the canonical RelationID, never relation_ids.id:
+		// a surrogate is meaningful only inside one store and one rebuild, so a
+		// cursor that carried it would decode to a different edge after a
+		// reindex (scale-posture-plan.md 3d).
+		where = append(where, "ri.canonical > ?")
 		args = append(args, afterRaw)
 	}
 	args = append(args, limit)
 	var out []model.Relation
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ri.id, ri.from_node_id, ri.kind, ri.to_node_id FROM relation_facts rf`+r.visible("rf")+
-			`JOIN relation_ids ri ON ri.id = rf.relation_id WHERE `+strings.Join(where, " AND ")+` ORDER BY ri.id LIMIT ?`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT ri.canonical, fn.canonical, ri.kind, tn.canonical FROM relation_facts rf`+r.visible("rf")+
+			`JOIN relation_ids ri ON ri.id = rf.relation_id
+			JOIN node_ids fn ON fn.id = ri.from_node_id JOIN node_ids tn ON tn.id = ri.to_node_id
+			WHERE `+strings.Join(where, " AND ")+` ORDER BY ri.canonical LIMIT ?`, args...)
 		if err != nil {
 			return wrap("relation_facts", err)
 		}
@@ -442,13 +460,13 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 		if err != nil {
 			return nil, err
 		}
-		subject, args = "e.node_id = ?", append(args, raw)
+		subject, args = "e.node_id = "+nodeRefByCanonical, append(args, raw)
 	} else {
 		raw, err := idBlob("relation_id", string(relation))
 		if err != nil {
 			return nil, err
 		}
-		subject, args = "e.relation_id = ?", append(args, raw)
+		subject, args = "e.relation_id = "+relationRefByCanonical, append(args, raw)
 	}
 	if afterRaw != nil {
 		subject += " AND e.id > ?"
@@ -457,9 +475,11 @@ func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation
 	args = append(args, limit)
 	var out []StoredEvidence
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT e.id, u.unit_key, u.provider_id, u.provider_version, u.origin_run_id, e.node_id, e.relation_id, e.precision,
-			e.file_id, ui.content_hash, e.start_byte, e.end_byte, e.native_key, e.detail FROM evidence e`+r.visible("e")+
-			`LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id WHERE `+subject+` ORDER BY e.id LIMIT ?`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT e.id, u.unit_key, u.provider_id, u.provider_version, u.origin_run_id, en.canonical, er.canonical, e.precision,
+			e.file_id, ui.content_hash, e.start_byte, e.end_byte, nk.key, e.detail FROM evidence e`+r.visible("e")+
+			`JOIN native_keys nk ON nk.id = e.native_key_id
+			LEFT JOIN node_ids en ON en.id = e.node_id LEFT JOIN relation_ids er ON er.id = e.relation_id
+			LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id WHERE `+subject+` ORDER BY e.id LIMIT ?`, args...)
 		if err != nil {
 			return wrap("evidence", err)
 		}
@@ -721,8 +741,9 @@ func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.Searc
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		var key, node, file []byte
 		var start, end int64
-		err := tx.QueryRowContext(ctx, `SELECT su.search_key, su.node_id, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
-			su.start_byte, su.end_byte, su.body, su.token_count FROM search_units su`+r.visible("su")+` WHERE su.rowid = ?2`, r.gen, rowid).
+		err := tx.QueryRowContext(ctx, `SELECT su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
+			su.start_byte, su.end_byte, su.body, su.token_count FROM search_units su`+r.visible("su")+
+			`LEFT JOIN node_ids ni ON ni.id = su.node_id WHERE su.rowid = ?2`, r.gen, rowid).
 			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.Body, &d.TokenCount)
 		if isNoRows(err) {
 			return invalid("search document %d is not visible in generation %d", rowid, r.gen)
