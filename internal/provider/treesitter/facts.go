@@ -93,6 +93,11 @@ type declFact struct {
 	// a stored value and is published as its own attribute, never merged
 	// with a result page's transient truncation flag.
 	truncated map[string]int
+
+	// body is the search document's text: the attached documentation and the
+	// signature, composed and bounded once at extraction so a cut is recorded
+	// in truncated before the node's metadata is built.
+	body string
 }
 
 // truncate bounds one of this declaration's fields and records the cut.
@@ -227,6 +232,12 @@ func (b *builder) validateDecls() error {
 			}
 			f.doc = f.truncate("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
 		}
+		// The search body is composed and bounded here, not in searchUnit,
+		// because the node's metadata is built before searchUnit runs: a cut
+		// made later would never reach truncated_fields. A doc and a
+		// signature each at their own ceiling compose to more than one body
+		// holds, so this bound really does cut and must disclose it.
+		f.body = f.truncate("body", searchBody(f.doc, f.sig), maxDocBytes)
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
 	}
@@ -565,7 +576,16 @@ func (b *builder) refs() error {
 			}
 			callee = res.Node.ID
 			b.putRelation(from, model.RelCalls, callee, rng, key, resolution)
-			for _, t := range targets[:min(len(targets), model.MaxAmbiguousCandidates)] {
+			kept := min(len(targets), model.MaxAmbiguousCandidates)
+			if kept < len(targets) {
+				// The candidate list is cut to the model's ambiguity bound.
+				// Each candidate past it is a `may_refer_to` edge this file
+				// should have published and did not, so it is counted like
+				// every other loss and the file reports partial rather than
+				// claiming complete structural coverage.
+				b.dropped += len(targets) - kept
+			}
+			for _, t := range targets[:kept] {
 				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
 		}
@@ -743,11 +763,7 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 // attached documentation, never the body (Section 11.2 stores bodies once, in
 // the filesystem unit).
 func (b *builder) searchUnit(d *declFact) model.SearchUnit {
-	body := d.sig
-	if d.doc != "" {
-		body = d.doc + "\n" + d.sig
-	}
-	body = bound(body, maxDocBytes)
+	body := d.body
 	return model.SearchUnit{
 		ID: model.H(searchDomain, string(b.fv.ID), string(d.res.Node.ID)), NodeID: d.res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 		Kind: d.res.Node.Kind, Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
@@ -866,4 +882,14 @@ func lastPathSegment(p string) string {
 		return "."
 	}
 	return bound(p, model.MaxNameBytes)
+}
+
+// searchBody composes a declaration's search text: its attached documentation
+// above its signature, or the signature alone when it has none. The caller
+// bounds the result through declFact.truncate so a cut is flagged.
+func searchBody(doc, sig string) string {
+	if doc == "" {
+		return sig
+	}
+	return doc + "\n" + sig
 }
