@@ -94,25 +94,28 @@ operation `n` times. Latency rows report **p95 over the stated sample count**;
 memory rows report the sampled peak of the **whole process tree** (parent plus
 parser workers), read by the Task 20 host sampler.
 
-`internal/bench` contains no production code. It holds `doc.go`,
-`plateau_test.go` (whose `TestMain` makes the test binary the parser worker, so
-`app.OpenWorkspace` can spawn parsers through `os.Executable`),
-`corpus_test.go` (generator, the frozen Section 23.2 budget constants, the
-fingerprint-parity rows and the corpora manifest rows) and `budgets_test.go`
-(`TestResourceBudgets` and the published `Benchmark*` functions). Selectors are
-by function name, not by file:
+### What one parser worker costs
 
-```bash
-go test ./internal/bench -run TestResourceBudgets -count=1
-go test ./internal/bench -run '^$' -bench . -benchmem -count=5
-```
+`index.max_parser_workers` is a CONCURRENCY ceiling, not a resident cost: the
+pool starts no process until a unit demands one and reaps an idle worker after
+`tree_sitter.worker_idle_ttl`, so a process that parses nothing holds no worker
+(`TestPoolLazyAndReaped`), and the number alive at any moment is the concurrent
+parse demand rather than the ceiling. What one live worker costs was measured on
+the measuring host from `/proc/<pid>/smaps_rollup`, on a worker that had sent its
+hello and parsed nothing: **18.2 MiB RSS, 9.4 MiB PSS**.
 
-Every row names the failure mode it protects, and a row is accepted only when a
-one-line mutation makes it fail. The mutation proof for the budget table is that
-tightening a row's target makes the row fail **with the measured number**:
-`budgetExactQueryP95` set to one microsecond produced
-`BUDGET MISSED: p95 790µs over 50 samples (target 1µs)`, and reverting restored
-the pass below.
+A parse adds nothing lasting **for the file's size** — the worker closes each
+tree as the file is finished — so the figure does not grow with the largest file
+in the repository. It is not flat in the number of LANGUAGES a worker has served:
+`state.parsers` and `state.queries` hold one parser and one compiled query per
+language until the worker exits, and the figure above is a worker holding none of
+them. The rest is the binary's mapped pages and the Go runtime.
+
+The resident bound is therefore **live workers x ~18 MiB RSS and up**. RSS is
+what the tree-peak rows sum, and it double counts: every worker is a
+re-execution of the same binary, so the MARGINAL cost of one more worker is the
+~9.4 MiB PSS figure and a summed-RSS bound overstates a large ceiling by roughly
+a factor of two.
 
 ## 3. Section 23.2 — measured against target
 
