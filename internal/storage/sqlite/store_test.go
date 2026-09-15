@@ -247,6 +247,36 @@ func (f *fixture) indexedTokens(doc model.SearchUnit) int64 {
 	return n
 }
 
+// capsuleSource is a model.CapsuleListSource over an in-memory record set. The
+// seal walks each list more than once -- to count it, to hash it and to write
+// it -- so the source re-walks from the first record every time it is called,
+// which is exactly what the interface requires of a real one.
+type capsuleSource map[model.CapsuleList][]any
+
+func (src capsuleSource) Rows(_ context.Context, list model.CapsuleList, yield func(model.CapsuleRow) error) error {
+	for i, record := range src[list] {
+		row, err := model.NewCapsuleRow(list, int64(i), record)
+		if err != nil {
+			return err
+		}
+		if err := yield(row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// counts is the counting pass the seal would make: the capsule carries these
+// instead of the records, and PutCapsule refuses a list that writes a different
+// number.
+func (src capsuleSource) counts() model.CapsuleCounts {
+	var c model.CapsuleCounts
+	for list, records := range src {
+		c.Set(list, int64(len(records)))
+	}
+	return c
+}
+
 func wantCode(t *testing.T, err error, code string) {
 	t.Helper()
 	var typed *model.Error
@@ -791,10 +821,64 @@ func TestStorePublicationScenario(t *testing.T) {
 	// has nothing to consolidate yet.
 	capsule := model.Capsule{SessionID: open.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
 		ScopeVersion: 1, CanonicalHash: model.H("capsule"), CreatedAt: time.Now().UTC()}
-	if _, err := f.s.PutCapsule(ctx, capsule); err == nil {
+	if _, err := f.s.PutCapsule(ctx, capsule, capsuleSource{}); err == nil {
 		t.Fatal("PutCapsule stored a capsule for a session that is not in consolidate_open")
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
+	}
+	// Phase: the capsule's records are rows, not a blob. A sealed capsule
+	// carries counts only, so the records reach the reader exclusively through
+	// the keyset-paged CapsuleRows; the failure mode this guards is a page that
+	// restarts its list -- from a cursor naming no row, or from an ordinal it
+	// re-reads -- which returns a partial answer that reads as a complete one.
+	sealing := model.SessionOpen{ID: model.SessionID(model.H("session", "capsule")), ActorID: actorID,
+		OpenRequestHash: model.H("open"), ManifestID: manifest.ID, ExpiresAt: time.Now().Add(time.Hour).UTC()}
+	if _, err := f.s.OpenSession(ctx, sealing); err != nil {
+		t.Fatalf("OpenSession(sealing): %v", err)
+	}
+	for version, target := range []model.WorkflowState{model.StateVerifyOpen, model.StateConsolidateOpen} {
+		if _, err := f.s.AdvanceSession(ctx, model.AdvanceRequest{SessionID: sealing.ID, ActorID: actorID,
+			Target: target, ExpectedVersion: version + 1}); err != nil {
+			t.Fatalf("AdvanceSession(%s): %v", target, err)
+		}
+	}
+	scope := capsuleSource{model.CapsuleListScope: {
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "a"))},
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "b"))},
+		model.CapsuleScopeNode{NodeID: model.NodeID(model.H("node", "c"))},
+	}}
+	sealed := model.Capsule{SessionID: sealing.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
+		ScopeVersion: 1, Counts: scope.counts(), CanonicalHash: model.H("capsule", "sealed"), CreatedAt: time.Now().UTC()}
+	if _, err := f.s.PutCapsule(ctx, sealed, scope); err != nil {
+		t.Fatalf("PutCapsule(sealing): %v", err)
+	}
+	var walked []string
+	for cursor := ""; ; {
+		page, err := f.s.CapsuleRows(ctx, sealing.ID, actorID, model.CapsuleListScope, cursor, 2)
+		if err != nil {
+			t.Fatalf("CapsuleRows(after %q): %v", cursor, err)
+		}
+		if len(page) == 0 {
+			t.Fatalf("CapsuleRows returned an empty page after %q; the caller's count says where the list ends", cursor)
+		}
+		for _, row := range page {
+			if row.Ordinal != int64(len(walked)) {
+				t.Fatalf("capsule scope row arrived at ordinal %d, want %d; a keyset page never restarts its list", row.Ordinal, len(walked))
+			}
+			walked = append(walked, row.Key)
+		}
+		cursor = page[len(page)-1].Key
+		if int64(len(walked)) >= sealed.Counts.Of(model.CapsuleListScope) {
+			break
+		}
+	}
+	if len(walked) != 3 {
+		t.Fatalf("paging the capsule's scope list read %d records, want the 3 that were sealed", len(walked))
+	}
+	if _, err := f.s.CapsuleRows(ctx, sealing.ID, actorID, model.CapsuleListScope, "not-a-row", 2); err == nil {
+		t.Fatal("CapsuleRows accepted a cursor naming no record; a continuation must never restart the list")
+	} else {
+		wantCode(t, err, model.CodeCursorInvalid)
 	}
 	// Phase: lexical statistics are generation-local (Section 14.4). A BM25
 	// score is a function of df and the document facts of the pinned

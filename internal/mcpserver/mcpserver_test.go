@@ -968,33 +968,18 @@ var scenarios = []scenario{
 		},
 	},
 	func() scenario {
-		// Failure mode: view="export" ships the capsule body. A capsule is
-		// bounded by context.max_capsule_bytes at 8 MiB while this tool
-		// answers under resources.max_metadata_response_bytes at 256 KiB, so
-		// returning model.Capsule whole would blow the response bound and
-		// spill stored facts, observations and coverage the six paged views
-		// exist to serve. The row proves both halves at once: the body the
-		// facade returns does NOT fit the ceiling, and the projection does,
-		// carrying counts instead of records.
+		// Failure mode: view="export" answers with capsule RECORDS. A sealed
+		// capsule now carries only identity and its eight per-list counts --
+		// the records are rows read one keyset page at a time -- so the failure
+		// this row still guards is the projection: an export that omits a
+		// list's count, or that also returns a page, makes a caller believe it
+		// has been told how much the capsule holds when it has not.
 		//
 		// The row is a closure so the fixture capsule is shared by facade and
 		// check without a package-level helper another lane would collide on.
-		const sentinel = "sentinel-content-hash-no-capsule-record-may-ship"
 		sessionID := model.SessionID(strings.Repeat("a", 64))
 		manifestHash := strings.Repeat("d", 64)
 		canonicalHash := strings.Repeat("e", 64)
-		coverage := make([]model.FileCoverage, 2000)
-		for i := range coverage {
-			coverage[i] = model.FileCoverage{
-				FileID:         "file-with-a-realistically-long-identifier",
-				ContentHash:    strings.Repeat("c", 64),
-				Size:           4096,
-				ConfirmedBytes: 4096,
-				Requirement:    model.RequirementFull,
-				State:          model.CoverageFullServed,
-			}
-		}
-		coverage[0].ContentHash = sentinel
 		capsule := model.Capsule{
 			SessionID: sessionID,
 			ActorID:   "actor-1",
@@ -1006,17 +991,15 @@ var scenarios = []scenario{
 			ManifestHash:  manifestHash,
 			CanonicalHash: canonicalHash,
 			ScopeVersion:  3,
-			Scope:         []model.NodeID{model.NodeID(strings.Repeat("3", 64)), model.NodeID(strings.Repeat("4", 64))},
-			Coverage:      coverage,
-			Waivers: []model.WaiverRecord{{
-				SessionID: sessionID, ActorID: "actor-1",
-				FileID: model.FileID(strings.Repeat("b", 64)), Reason: "vendored",
-			}},
+			Counts: model.CapsuleCounts{
+				Scope: 2, AcceptedFacts: 7, RejectedFacts: 1, Contradictions: 3,
+				Unresolved: 4, ScopeReviewIDs: 5, Coverage: 2000, Waivers: 1,
+			},
 			StrictGateSatisfied: false,
 		}
 		ceiling := config.Defaults().Resources.MaxMetadataResponseBytes
 		return scenario{
-			name: "gate: capsule export returns canonical metadata under the response ceiling",
+			name: "gate: capsule export returns identity and per-list counts, never records",
 			facade: func(f *fakeServices) {
 				f.exportFn = func(_ context.Context, _ model.SessionRequest) (model.Capsule, error) {
 					return capsule, nil
@@ -1029,14 +1012,6 @@ var scenarios = []scenario{
 				Page: model.PageRequest{Limit: 50},
 			},
 			check: func(t *testing.T, res *mcp.CallToolResult) {
-				body, err := json.Marshal(capsule)
-				if err != nil {
-					t.Fatalf("marshal the fixture capsule: %v", err)
-				}
-				if int64(len(body)) <= ceiling {
-					t.Fatalf("fixture capsule is %d bytes, which already fits the %d-byte ceiling; the row proves nothing",
-						len(body), ceiling)
-				}
 				if res.IsError {
 					t.Fatalf("context_capsule export reported a tool error: %s", firstText(res))
 				}
@@ -1046,9 +1021,6 @@ var scenarios = []scenario{
 				}
 				if int64(len(raw)) > ceiling {
 					t.Errorf("export answer is %d bytes, over the %d-byte metadata ceiling", len(raw), ceiling)
-				}
-				if strings.Contains(string(raw), sentinel) {
-					t.Errorf("export answer carries a capsule record; it must carry metadata only")
 				}
 				var got result[capsuleOutput]
 				decode(t, res, &got)
@@ -1063,8 +1035,12 @@ var scenarios = []scenario{
 					e.ScopeVersion != 3 || e.Binding.GenerationID != 42 || e.StrictGateSatisfied {
 					t.Errorf("export = %+v, want the capsule's canonical metadata", *e)
 				}
-				if e.Counts["coverage"] != len(coverage) || e.Counts["waivers"] != 1 || e.Counts["scope"] != 2 {
-					t.Errorf("counts = %v, want the capsule's per-section lengths", e.Counts)
+				// Every one of the eight lists a caller may page must be
+				// counted here, at the count the capsule sealed.
+				for _, list := range model.CapsuleListOrder {
+					if e.Counts[string(list)] != capsule.Counts.Of(list) {
+						t.Errorf("counts[%s] = %d, want %d", list, e.Counts[string(list)], capsule.Counts.Of(list))
+					}
 				}
 			},
 		}
