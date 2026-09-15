@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/pagination"
 
@@ -428,4 +429,136 @@ func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
 	if v.has("n-0300") {
 		t.Fatal("a node no block holds was reported as already admitted")
 	}
+}
+
+// resumeSpooledWalk drives a real paged walk over the convergent fixture for
+// `pages` pages and reopens the continuation the last one minted through the
+// production resume, so a test can read exactly what the next page would.
+func resumeSpooledWalk(t *testing.T, pages int) *resumeState {
+	t.Helper()
+	a := newConvergentAdjacency()
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 8
+	e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	kinds := []model.RelationKind{model.RelCalls}
+	start := []model.NodeID{fixtureNodeID("c-00")}
+	req := model.GraphRequest{GenerationID: 1, Start: start,
+		Direction: model.DirectionOutgoing, Relations: kinds}
+	cursor := ""
+	for page := 1; page <= pages; page++ {
+		res, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if res.Meta.NextCursor == "" {
+			t.Fatalf("page %d ended the walk; this proof needs a continuation over a spooled visited set", page)
+		}
+		cursor = res.Meta.NextCursor
+		req = model.GraphRequest{Start: start, Direction: model.DirectionOutgoing,
+			Relations: kinds, Page: model.PageRequest{Cursor: cursor}}
+	}
+	queryHash := traversalQueryHash(model.DirectionOutgoing, kinds, start, 0, limits.MaxPageItems)
+	s, err := e.resumeTraversal(context.Background(), cursor, neighborsEndpoint, queryHash,
+		time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resume the continuation: %v", err)
+	}
+	t.Cleanup(s.Release)
+	return s
+}
+
+// TestSpilledVisitedSectionIsAscending is the A4 proof. The membership sweep is
+// a MERGE-JOIN over the spool's visited section (visited.go warm), so that
+// section's ascending order is a correctness invariant, not a tidiness one: a
+// record out of order makes the join advance past a candidate it could have
+// answered and report a node the walk HAS admitted as absent -- the cross-page
+// RE-ADMISSION cursor v3 exists to prevent, and the same entity listed twice.
+//
+// Nothing tested the order. The section is produced by spill's two-way merge of
+// the carried stream with this page's own contribution (drainBelow /
+// writeVisited in cursor.go), and the walk below interleaves them: the pages
+// admit hash-spelled ids, so page 2's own admissions sort among page 1's.
+//
+// Mutation (drainBelow's loop body made a no-op): the section is emitted
+// carried-first, the assertion below fails at the first descending key, and
+// TestSpooledVisitedSetAnswersACrossPageRevisit then reports the re-admission
+// that order exists to prevent.
+func TestSpilledVisitedSectionIsAscending(t *testing.T) {
+	// Three pages, so the cursor under test names a spool written by a spill
+	// that MERGED -- page 2 carried page 1's section forward under its own.
+	s := resumeSpooledWalk(t, 3)
+	var prev model.NodeID
+	n := 0
+	if err := s.Visited(context.Background(), func(id model.NodeID) error {
+		if n > 0 && id <= prev {
+			return fmt.Errorf("the spooled visited section is not ascending: %s follows %s. "+
+				"The merge-join that answers membership would advance past a candidate an earlier "+
+				"record answers, report an admitted node absent, and re-admit it on a later page", id, prev)
+		}
+		prev, n = id, n+1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("the section held %d records; an order invariant needs at least two", n)
+	}
+	t.Logf("the merged visited section holds %d ascending records", n)
+}
+
+// TestResumePopulatesTheMembershipSummaryFromTheSpool is the A16 proof. The
+// filter is the only thing standing between a chain-shaped page and levels x
+// |visited| record decodes, and it is built in ONE place: the resume replay
+// that already decodes every spool record to rebuild the frontier
+// (resumeTraversal). Every other test in this file hands `c.filter` a filter it
+// built by hand, so a one-sided edit -- the replay stops calling add, or starts
+// summarising the frontier records instead of the visited section -- is a
+// silent false negative that no assertion here would catch: the walk stays
+// CORRECT (a filter miss only costs a sweep) and simply gets slow again.
+//
+// So this drives a real paged walk and then opens its continuation through the
+// production resume, asserting that the summary describes exactly the stream
+// the same resume hands the walk.
+//
+// Mutation (`s.Filter.add(r.Node)` deleted from resumeTraversal): every node the
+// stream replays is reported absent by the summary, which is the assertion
+// below.
+func TestResumePopulatesTheMembershipSummaryFromTheSpool(t *testing.T) {
+	// Two pages, so the cursor under test names a spool whose visited SECTION
+	// is non-empty: page 1 spills the nodes it admitted, page 2 merges its own
+	// into them. A summary over an empty stream would satisfy the loop below
+	// vacuously, which is what the count guards.
+	s := resumeSpooledWalk(t, 2)
+	if s.Filter == nil {
+		t.Fatal("the resume built no membership summary; every level of the next page would sweep the whole spool")
+	}
+	replayed := 0
+	if err := s.Visited(context.Background(), func(id model.NodeID) error {
+		replayed++
+		if !s.Filter.mayHold(id) {
+			return fmt.Errorf("the summary reports node %s absent, but the resume's own stream replays it: "+
+				"a false negative makes a level skip the sweep that answers it, and the node is admitted twice", id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if replayed == 0 {
+		t.Fatal("the continuation replayed no visited nodes; the assertion above would be vacuous")
+	}
+	t.Logf("the resume summarised %d spooled visited nodes", replayed)
 }
