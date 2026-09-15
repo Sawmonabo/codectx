@@ -133,7 +133,10 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	// ten-times-slower build turns into a walk that cannot advance at all.
 	ref := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, 10*time.Minute)
 	start := time.Now()
-	want := drainImpact(t, ref, req, "reference")
+	want, stalledRef := drainImpact(t, ref, req, "reference")
+	if stalledRef {
+		t.Fatalf("the reference walk stalled under a ten-minute budget")
+	}
 	budget := time.Since(start) / 6
 	if len(want) == 0 {
 		t.Fatalf("reference answer is empty; the fixture proves nothing")
@@ -146,8 +149,25 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	// deadline lands inside a read on every page and the walk needs several --
 	// while every page still advances, which is the condition under which a
 	// continuation, not the terminal stalled reason, is the right answer.
-	e := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, budget)
-	got := drainImpact(t, e, req, "deadline-split")
+	//
+	// A budget so small that a page cannot advance at all is a LEGITIMATE
+	// outcome -- the engine reports reasonDeadlineStalled with no cursor, and
+	// the real binary does exactly that on r3 under a 2s budget -- but it
+	// serves nothing, so the union assertion below would have no answer to
+	// compare. Rather than tolerate it and assert less, the budget is raised
+	// and the chain re-run: the invariant stays the full one, and the case
+	// stops depending on how loaded the machine is.
+	var got []model.NodeID
+	for attempt, stalled := 0, true; stalled; attempt++ {
+		if attempt == 3 {
+			t.Fatalf("no page could advance at %v per request", budget)
+		}
+		if attempt > 0 {
+			budget *= 4
+		}
+		e := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, budget)
+		got, stalled = drainImpact(t, e, req, "deadline-split")
+	}
 
 	if len(got) != len(want) {
 		t.Fatalf("deadline-split answer has %d entries, the reference has %d", len(got), len(want))
@@ -164,7 +184,10 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 // in served order, failing on the three shapes the invariant forbids: an error
 // instead of a page, a truncated page with no continuation, and an entity
 // served twice.
-func drainImpact(t *testing.T, e *Engine, req func(string) model.ImpactRequest, label string) []model.NodeID {
+// It reports whether the chain ended on the terminal stalled reason instead of
+// running to exhaustion; the caller decides what that means for its assertion.
+func drainImpact(t *testing.T, e *Engine, req func(string) model.ImpactRequest,
+	label string) ([]model.NodeID, bool) {
 	t.Helper()
 	const pageCap = 2000
 	var (
@@ -189,10 +212,17 @@ func drainImpact(t *testing.T, e *Engine, req func(string) model.ImpactRequest, 
 		}
 		if res.Meta.NextCursor == "" {
 			if res.Meta.Truncated {
-				t.Fatalf("%s page %d: truncated (%s) with no continuation",
-					label, page, res.Meta.TruncationReason)
+				// The ONE truncation allowed to end a chain without a
+				// continuation: the page could not advance, so the cursor it
+				// would mint is the one the caller already holds and stays
+				// adoptable. Any other truncation here is a lost remainder.
+				if res.Meta.TruncationReason != reasonDeadlineStalled {
+					t.Fatalf("%s page %d: truncated (%s) with no continuation",
+						label, page, res.Meta.TruncationReason)
+				}
+				return order, true
 			}
-			return order
+			return order, false
 		}
 		next = res.Meta.NextCursor
 	}
