@@ -40,9 +40,21 @@ import (
 //   - walkStalled's call site deleted in impact.go (the deadline checked, and a
 //     continuation minted, before the page's first admission): the no-progress
 //     case pages to the cap and fails.
-//   - walkrun.go's internal-leg append deleted (`o.Visited.appendRun`): the
-//     progress case re-admits nodes an earlier REQUEST already reported and
-//     visited_count overshoots the fixture's node count.
+//   - rankedSpoolHeader made to stream the whole spool instead of stopping after
+//     the header record: the chain reads 880 380 800 bytes of an 8 716 646 byte
+//     spool over 102 pages and (1c) fails.
+//   - walkrun.go's internal-leg append deleted (`o.Visited.appendRun` given nil):
+//     NOT detected here, and this is a real gap rather than a slack assertion.
+//     The whole walk of this fixture completes inside request ONE -- page 1
+//     admits all 20 101 nodes and serves none, and pages 2..102 are pure
+//     ranked-tail reads that walk nothing -- so re-admission inside a request is
+//     prevented by the in-memory visitedSet the legs share, not by the run the
+//     append persists. Deleting the append drops page 1's appended bytes from
+//     2 473 737 to 921 552 and leaves visited_count at 20 101 and the page union
+//     unchanged, because no later REQUEST ever sweeps the persisted set for
+//     admission. The cross-request half of (d) therefore needs a fixture with at
+//     least three deadline-split legs in which a later REQUEST reaches a node an
+//     earlier one admitted; it is not proven by this test and is not claimed.
 func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 	// 100 mid nodes, 200 leaves each: 20 100 admitted nodes over three levels.
 	const mids, fanOut = 100, 200
