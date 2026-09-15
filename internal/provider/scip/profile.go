@@ -439,7 +439,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	_, err = p.runner.Run(ctx, process.Spec{
 		Path: path, Args: args, Dir: mat.Root(), Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
-		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace,
+		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
 	})
 	if err != nil {

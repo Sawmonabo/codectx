@@ -153,6 +153,13 @@ type Index struct {
 	// by RetainRefs alone. A user-set value evicts least-recently-used refs
 	// first and never the active one.
 	MaxRetainedBytes Limit `toml:"max_retained_bytes"`
+	// WatchMaxDirectories is how many directories one watcher may watch.
+	// Unlimited by default: a repository's directory count is a property of
+	// the repository, and the host's own notification limit is the real
+	// ceiling -- reaching it is refused by the host and reported as incomplete
+	// coverage. A user-set value stops the watch set at that many directories
+	// and reports coverage incomplete with the reason, never silently.
+	WatchMaxDirectories Limit `toml:"watch_max_directories"`
 }
 
 // Resources is the memory, concurrency, disk and response policy.
@@ -301,6 +308,13 @@ type Dependence struct {
 	// exceeding it is reported on the unit's capability rows with the derived
 	// count and this bound.
 	MaxDerivedRows Limit `toml:"max_derived_rows"`
+	// MaxExportFiles is how many entries the user allows in one analysis
+	// export directory before the import refuses it. Unlimited by default: the
+	// count is a property of the export's label vocabulary rather than of the
+	// repository, and the directory is read one entry at a time. A user-set
+	// value is the only thing that refuses an import here, and the refusal
+	// names this key.
+	MaxExportFiles Limit `toml:"max_export_files"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -440,6 +454,8 @@ func Defaults() Config {
 			ReconcileInterval: Duration(30 * time.Second),
 			RetainRefs:        8,
 			MaxRetainedBytes:  0,
+			// Unlimited: only a user-set bound stops the watch set.
+			WatchMaxDirectories: Unlimited,
 		},
 		Resources: Resources{
 			BaseMemoryBudgetBytes:     805306368,
@@ -503,6 +519,7 @@ func Defaults() Config {
 				MaxUnitsPerFamily:      Unlimited,
 				MaxStagedRows:          Unlimited,
 				MaxDerivedRows:         Unlimited,
+				MaxExportFiles:         Unlimited,
 			},
 		},
 		Context: Context{
