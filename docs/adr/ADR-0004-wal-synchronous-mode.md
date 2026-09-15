@@ -120,6 +120,35 @@ The setting is operational, not semantic: it changes how a result is written, ne
 is. It is therefore deliberately excluded from the source-policy, analysis-config and context-policy
 fingerprints — changing it must not invalidate a single stored unit.
 
+## Decision 1a — session and receipt state is covered by the same default, and the window is stated
+
+Decision 1's justification — "the store is rebuildable derived data" — is true of the index and is
+**not** true of everything the store holds. Sessions, source receipts and read confirmations
+(`internal/storage/sqlite/state.go`) are a record of what an actor did, not a function of the
+repository's bytes; nothing can recompute them. There is one writer connection
+(`internal/storage/sqlite/open.go`), so `storage.synchronous` applies store-wide and NORMAL covers
+these rows too. That was not argued for in Decision 1, so it is decided here.
+
+**Decision: session and receipt writes run under the same setting, and the guarantee is stated
+rather than implied.** The exact window: a receipt or confirmation commit is durable against an
+application crash or a normal process kill immediately (that never depended on this setting), and
+durable against a **power loss or hard reset** only once the write-ahead log has been synced — which
+under NORMAL happens at the next checkpoint (`storage.wal_high_water_bytes`, 64 MiB by default, or
+the writer's passive checkpoint) or at a clean close, not at the commit. Between the commit and that
+point, a power loss can roll the commit back.
+
+**Why that is acceptable.** The failure direction is fail-closed: a rolled-back receipt row **loses**
+an attestation, it never fabricates one. An acknowledgement echoing a receipt whose row is gone is
+refused as `CTX_CURSOR_INVALID` — the same refusal an expired receipt already gets — and the actor
+re-reads and acknowledges again. A protocol that could silently *gain* a confirmation nobody made
+would not be acceptable on these terms; losing one that the actor can redo is. The alternative,
+syncing around the confirmation commit (a pinned writer connection raising `PRAGMA synchronous` for
+that transaction, or an explicit `wal_checkpoint` after it), buys a narrower window at the cost of a
+second durability mode inside one connection and an fsync on a query-path write; it is not taken
+here, and an operator who needs it has the one setting that already covers these rows:
+`storage.synchronous = "full"`, which makes every commit — index and receipt alike — durable at
+commit.
+
 ## Decision 2 — checkpoint settings are reported, not changed
 
 The brief asked whether checkpoint frequency contributes to the commit stream and whether a one-line

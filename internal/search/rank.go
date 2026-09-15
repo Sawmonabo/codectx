@@ -389,10 +389,17 @@ func (h *hydrator) hydrate(ctx context.Context, file model.FileID, span model.By
 	if err != nil {
 		return nil, err
 	}
-	if span.End > uint64(rec.Size) {
+	// Both halves are refused here, and BOTH are needed: an inverted span
+	// (Start > End) whose End is inside the file would otherwise reach
+	// positionAt with an offset the window loop can never advance to -- the
+	// window clamps at rec.Size while w.At() stays below Start, so the loop
+	// computes an empty window, passes the length check and spins forever.
+	// A typed refusal is what this used to return and what it owes.
+	if span.End > uint64(rec.Size) || span.Start > span.End {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "search: a search document ends at byte " + strconv.FormatUint(span.End, 10) +
-				" past the " + strconv.FormatInt(rec.Size, 10) + "-byte file it names"}
+			Message: "search: a search document spans bytes " + strconv.FormatUint(span.Start, 10) +
+				" to " + strconv.FormatUint(span.End, 10) + ", which is not an interval inside the " +
+				strconv.FormatInt(rec.Size, 10) + "-byte file it names"}
 	}
 	idx := checkpointIndex(rec)
 	start, w, err := h.positionAt(ctx, rec, idx, nil, span.Start)
@@ -473,6 +480,19 @@ func (h *hydrator) positionAt(ctx context.Context, rec model.BlobRecord, idx sou
 		read, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: offset, End: offset + 1})
 		if err != nil {
 			return model.Position{}, nil, err
+		}
+		// Length-checked for the same reason the window read above is, and on
+		// the COMMON path: this branch is taken whenever the walk landed
+		// exactly on the offset, which is every hit at a checkpointed line
+		// start. A short read here would hand PositionAt an empty lookahead,
+		// silently skipping the UTF-8 continuation-byte rejection instead of
+		// faulting the store that no longer holds the blob it recorded.
+		if len(read) != 1 {
+			return model.Position{}, nil, &model.Error{Code: model.CodeSourceIntegrity,
+				Message: "search: the content store returned " + strconv.Itoa(len(read)) +
+					" of the 1 byte at offset " + strconv.FormatUint(offset, 10) +
+					" of a " + strconv.FormatInt(rec.Size, 10) + "-byte blob",
+				Remediation: "run `codectx doctor --deep` to verify the content store"}
 		}
 		next = read
 	}
