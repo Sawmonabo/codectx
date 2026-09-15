@@ -74,6 +74,11 @@ type Gate interface {
 // serve, so a caller that does not page or gate need not supply a fake.
 type Options struct {
 	Adjacency Adjacency
+	// Reader is the packed per-generation adjacency every traversal reads
+	// structure through (ADR-0005). It is optional until the walk, rollup,
+	// overview, references and path endpoints have moved onto it; then it
+	// becomes the only structural read and Adjacency keeps delivery only.
+	Reader GraphReader
 	// Promoter is nil in report mode, where the coordinator is not writable.
 	Promoter Promoter
 	// Signer is nil when continuations are not offered; a request that asks to
@@ -147,6 +152,7 @@ func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPath
 // owned here.
 type Engine struct {
 	adjacency Adjacency
+	reader    GraphReader
 	promoter  Promoter
 	signer    *pagination.Signer
 	spools    *pagination.Spools
@@ -235,6 +241,7 @@ func New(o Options) (*Engine, error) {
 	}
 	return &Engine{
 		adjacency: o.Adjacency,
+		reader:    o.Reader,
 		promoter:  o.Promoter,
 		signer:    o.Signer,
 		spools:    o.Spools,
