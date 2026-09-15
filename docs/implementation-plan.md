@@ -555,6 +555,7 @@ const (
     NodeDependency    NodeKind = "dependency"
     NodeConfiguration NodeKind = "configuration"
     NodeDocument      NodeKind = "document"
+    NodeSection       NodeKind = "section"
     NodeEndpoint      NodeKind = "endpoint"
     NodeDatabaseEntity NodeKind = "database_entity"
 )

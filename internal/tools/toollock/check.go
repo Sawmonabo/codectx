@@ -41,7 +41,37 @@ func runCheck(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var checked, bytesRead int64
+	checked, bytesRead, differing := checkAll(ctx, lock, only, filtered, checkPayload)
+	logf("verified %d payloads, %d bytes", checked, bytesRead)
+	if len(differing) > 0 {
+		// Every differing entry, not the first one. A release gate that stops
+		// at the first mismatch makes a re-pin of six platforms take six runs
+		// of a job that re-downloads gigabytes, and hides from whoever reads
+		// the failure whether one payload moved or all of them did.
+		for _, d := range differing {
+			logf("DIFFERS %s", d)
+		}
+		// A count, not a repeat: every entry was named on its own DIFFERS line
+		// above, and printing each one twice makes a six-platform re-pin read
+		// as twelve failures.
+		return fmt.Errorf("%d of %d lock entries do not match what is published; see the DIFFERS lines above",
+			len(differing), checked+int64(len(differing)))
+	}
+	return runtimeInstallCheck(ctx, lock, only, filtered)
+}
+
+// checkAll digests every selected entry of the lock and returns how many
+// matched, how many bytes they held, and one line per entry that did not.
+//
+// check is a parameter rather than a direct call so the accumulation is
+// exercisable without the network; runCheck always passes checkPayload.
+//
+// A transport failure is accumulated like a digest difference. The caller asked
+// which entries the lock no longer describes, and an entry whose payload could
+// not be fetched at all is one of them; failing fast on it would hide every
+// entry behind it, which is the whole defect this loop exists to fix.
+func checkAll(ctx context.Context, lock Lock, only map[string]bool, filtered bool,
+	check func(context.Context, Entry, Payload) error) (checked, bytesRead int64, differing []string) {
 	for _, name := range lock.Names() {
 		if filtered && !only[name] {
 			continue
@@ -53,8 +83,9 @@ func runCheck(ctx context.Context) error {
 				continue
 			}
 			start := time.Now()
-			if err := checkPayload(ctx, e, p); err != nil {
-				return fmt.Errorf("%s/%s: %w", name, plat, err)
+			if err := check(ctx, e, p); err != nil {
+				differing = append(differing, fmt.Sprintf("%s/%s: %v", name, plat, err))
+				continue
 			}
 			checked++
 			bytesRead += p.Size
@@ -62,8 +93,7 @@ func runCheck(ctx context.Context) error {
 				name, plat, filepath.Base(p.URL), p.SHA256, p.Size, p.Entry, time.Since(start).Round(time.Second))
 		}
 	}
-	logf("verified %d payloads, %d bytes", checked, bytesRead)
-	return runtimeInstallCheck(ctx, lock, only, filtered)
+	return checked, bytesRead, differing
 }
 
 // runtimeInstallCheck installs every entry the running platform carries through
