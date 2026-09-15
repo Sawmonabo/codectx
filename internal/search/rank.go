@@ -1,6 +1,7 @@
 package search
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -379,17 +380,39 @@ func (h *hydrator) hydrate(ctx context.Context, file model.FileID, span model.By
 }
 
 // positionAt converts one byte offset to a line and byte column, reading only
-// from the nearest checkpoint at or before it. A checkpoint interval wider
-// than maxRangeWindowBytes (one line longer than the whole interval) is a
-// typed resource limit: serving a position from a truncated window would
-// report a wrong line, and Section 14.2 promises linked source positions, not
-// plausible ones.
+// from the nearest line boundary at or before it.
+//
+// A checkpoint interval wider than maxRangeWindowBytes used to be a typed
+// CTX_RESOURCE_LIMIT, which failed the WHOLE answer -- observed on a real
+// repository as `search` refusing every hit because one file's checkpoints did
+// not reach byte 1.7 M. A generation whose blob records carry sparse (or no)
+// checkpoints is exactly the input the scale posture says must still be
+// served, so the gap is now WALKED instead of refused: one window is read at a
+// time and the anchor advances to the LAST line boundary inside it, which
+// keeps the invariant source.NewCursorAt requires (a window that begins on a
+// line boundary) while the peak stays one window however far the nearest
+// checkpoint is. Nothing is approximated -- the position is still counted by
+// the one position implementation, over a window that starts on a line start.
+//
+// The single case the walk cannot shorten is a LINE longer than one window --
+// a minified bundle. There is no line boundary to advance to, so the final
+// read is bounded by that line instead of by the window. That is a read this
+// answer was asked for, and one line of one file is not a repository-sized
+// structure; refusing it would fail the answer for the shape of someone's
+// source.
 func (h *hydrator) positionAt(ctx context.Context, rec model.BlobRecord, idx source.Index, offset uint64) (model.Position, error) {
 	cp := idx.CheckpointFor(offset)
-	if offset-cp.Byte > maxRangeWindowBytes {
-		return model.Position{}, &model.Error{Code: model.CodeResourceLimit,
-			Message:     "search: resolving a source position at byte " + strconv.FormatUint(offset, 10) + " would read past the bounded window",
-			Remediation: "re-index the file so its line checkpoints cover it"}
+	for offset-cp.Byte > maxRangeWindowBytes {
+		window, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: cp.Byte, End: cp.Byte + maxRangeWindowBytes})
+		if err != nil {
+			return model.Position{}, err
+		}
+		last := bytes.LastIndexByte(window, '\n')
+		if last < 0 {
+			break
+		}
+		cp = source.Checkpoint{Byte: cp.Byte + uint64(last) + 1,
+			Line: cp.Line + uint32(bytes.Count(window, []byte{'\n'}))}
 	}
 	data, err := h.content.ReadRange(ctx, rec, model.ByteRange{Start: cp.Byte, End: offset})
 	if err != nil {
