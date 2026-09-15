@@ -199,7 +199,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	if int64(len(items)) < run.Len() {
 		header := rankedHeader{Total: run.Len(), Count: int(run.Len()) - len(items)}
 		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, packageDepsEndpoint, queryHash, header,
-			int64(len(items)), 0, rankedRunTail(ctx, run, len(items), encodePairRecord)); err != nil {
+			int64(len(items)), 0, &meta, rankedRunTail(ctx, run, len(items), encodePairRecord)); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}
@@ -227,7 +227,7 @@ func (e *Engine) serveRankedPairs(ctx context.Context, c traversalCursor, b *bud
 	if !rest.done() {
 		header := rankedHeader{Total: rest.Total, Count: int(rest.Total - rest.Served)}
 		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header,
-			rest.Served, 0, rankedSpoolTail(ctx, e.spools, c.spoolCursor(), e.now(), rest.Offset)); err != nil {
+			rest.Served, 0, &meta, rankedSpoolTail(ctx, e.spools, c.spoolCursor(), e.now(), rest.Offset)); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}
