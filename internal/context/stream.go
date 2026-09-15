@@ -18,6 +18,7 @@ package context
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -1317,3 +1318,134 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 	}
 	return out, nil
 }
+
+// ---------------------------------------------------------------------------
+// runCursor -- the pull side of a merge join (P-C, P-D and the budget passes)
+// ---------------------------------------------------------------------------
+
+// runCursor turns pagination.SortedRun's push walk into a pull cursor, so a
+// merge join can advance one sorted side while the other side is driven by
+// something that cannot be inverted -- a paged store read, or another run's
+// own walk.
+//
+// P-C needs exactly that twice. The edge scan advances through the wanted
+// relation ids as the store hands back ascending keyset pages, and it must be
+// able to stop mid-run when the scan's budget ends; the attribute join advances
+// through the resolved attributes as the hop run is walked. Re-walking the
+// sorted run from the start for each page instead would make the scan quadratic
+// in the number of pages, which is the "complete but slow" outcome §5 exists to
+// prevent.
+//
+// The producer is a goroutine because SortedRun.Each owns the read loop. It is
+// bounded and joined: the channel is unbuffered so the producer is never more
+// than one record ahead (the cursor holds O(1) records, never a run), and Close
+// stops it with a sentinel and waits, so no walk outlives the pass that opened
+// it even when the pass returns early on an error.
+type runCursor[T any] struct {
+	ch     chan T
+	stopCh chan struct{}
+	done   chan error
+
+	cur     T
+	ok      bool
+	index   int64
+	failure error
+	closed  bool
+}
+
+// errCursorStopped ends the producer's walk when the consumer closes early. It
+// never escapes: Close swallows exactly this error and reports any other.
+var errCursorStopped = errors.New("the sorted-run cursor was closed before its run was consumed")
+
+func newRunCursor[T any](run *pagination.SortedRun[T]) *runCursor[T] {
+	c := &runCursor[T]{ch: make(chan T), stopCh: make(chan struct{}), done: make(chan error, 1), index: -1}
+	go func() {
+		err := run.Each(func(v T) error {
+			select {
+			case c.ch <- v:
+				return nil
+			case <-c.stopCh:
+				return errCursorStopped
+			}
+		})
+		close(c.ch)
+		c.done <- err
+	}()
+	// The cursor is positioned on its first record before it is handed out: a
+	// merge join reads `cur`/`ok` directly, and a seeking reader would take the
+	// same step itself on its first call.
+	c.advance()
+	return c
+}
+
+// next advances the cursor one record, reporting whether one was read.
+func (c *runCursor[T]) next() bool {
+	if c.failure != nil || c.closed {
+		return false
+	}
+	v, ok := <-c.ch
+	if !ok {
+		c.ok = false
+		return false
+	}
+	c.cur, c.ok = v, true
+	c.index++
+	return true
+}
+
+// seek advances the cursor to the first record that is not less than the key
+// and reports it when it is equal, together with its ordinal in the run.
+//
+// The key sequence must be non-decreasing, which is what makes this a merge
+// join and not a lookup: the cursor never rewinds, so the whole join costs one
+// walk of each side.
+func (c *runCursor[T]) seek(key T, compare func(a, b T) int) (int64, bool) {
+	for {
+		if !c.ok && !c.next() {
+			return 0, false
+		}
+		cmp := compare(c.cur, key)
+		if cmp > 0 {
+			return 0, false
+		}
+		if cmp == 0 {
+			return c.index, true
+		}
+		c.ok = false
+	}
+}
+
+// Close stops the producer and returns the walk's error. It is idempotent and
+// always joins, so a pass that returns early leaves no goroutine reading a run
+// the compile is about to remove.
+func (c *runCursor[T]) Close() error {
+	if c.closed {
+		return c.failure
+	}
+	c.closed = true
+	close(c.stopCh)
+	for range c.ch { //nolint:revive // drain so the producer can finish and report
+	}
+	err := <-c.done
+	if err != nil && !errors.Is(err, errCursorStopped) {
+		c.failure = err
+	}
+	return c.failure
+}
+
+// stop releases the cursor from a defer, where the walk's error is read back
+// through err() instead. It is Close without the error return.
+func (c *runCursor[T]) stop() { _ = c.Close() }
+
+// advance steps the cursor one record, the spelling the budget passes' merge
+// joins use. It is next under another name: those joins test the cursor's `ok`
+// rather than the step's own result.
+func (c *runCursor[T]) advance() { c.next() }
+
+// err reports the walk's failure, so a join loop that ended because its cursor
+// could not advance can tell an exhausted run from a failed read.
+func (c *runCursor[T]) err() error { return c.failure }
+
+// errStopRun ends a pulled walk early. It never escapes the helper that raises
+// it: pullRun swallows exactly this sentinel and reports any other error.
+var errStopRun = errors.New("context: sorted run walk stopped")

@@ -161,20 +161,6 @@ func candidatesOver(r *recordingReader, nodes []model.NodeID, hopsPerPath int) [
 	return out
 }
 
-func openSorts(t *testing.T) *compileSorts {
-	t.Helper()
-	s, err := newCompileSorts(config.Config{}, t.TempDir())
-	if err != nil {
-		t.Fatalf("sort area: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
-			t.Fatalf("release sort area: %v", err)
-		}
-	})
-	return s
-}
-
 // TestPassCReadLogMatchesWholeSet is the parity proof of P-C: on every shape
 // that terminates the edge scan differently -- nothing wanted, an early exit
 // once every relation is typed, an unmatchable relation that runs the node list
@@ -230,7 +216,7 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 			}
 
 			streamReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
-			s := openSorts(t)
+			s := openSorts(t, config.Config{})
 			candRun, hopRun := spoolCandidates(t, s, cands)
 			got, err := c.passCRelationAttributes(ctx, s, streamReader, hopRun, candRun)
 			if err != nil {
@@ -305,7 +291,7 @@ func assertHopAttributes(t *testing.T, got, source *pagination.SortedRun[hopRec]
 // repeat across candidates.
 func TestPassEMatchesCentralityMap(t *testing.T) {
 	ctx := context.Background()
-	s := openSorts(t)
+	s := openSorts(t, config.Config{})
 	edges, err := newSort[pkgEdgeRec](s, "test-pkg-edge", lessPkgEdge, sizeOfPkgEdge)
 	if err != nil {
 		t.Fatalf("edge sort: %v", err)
