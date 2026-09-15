@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -36,6 +37,10 @@ type chunker struct {
 	start    uint64
 	eof      bool
 	consumed uint64
+	// scratch holds the sanitized copy of a chunk that is not valid UTF-8.
+	// It is reused across chunks, so a file of such chunks costs one extra
+	// window, not one per chunk.
+	scratch []byte
 }
 
 // newChunker primes the window so the caller can sniff the head before any
@@ -65,33 +70,54 @@ func (c *chunker) fill() error {
 	return nil
 }
 
-// each emits every chunk of the file through emit. It returns the number of
-// chunks skipped because their bytes were not UTF-8 text: those bytes are
-// still served losslessly by source reads, but a lexical index of them
-// would misrepresent the source.
-func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) error) (skipped int, err error) {
+// lossy counts what sanitizeUTF8 had to substitute so the unit can disclose
+// it: how many chunks carried bytes that are not UTF-8 under any reading, and
+// how many bytes were substituted across those chunks. Bytes is counted per
+// emitted chunk, so a byte that falls in the overlap two chunks share is
+// counted in both -- it is a measure of the substitution done, not of the
+// distinct bytes of the file.
+type lossy struct {
+	Chunks int
+	Bytes  int
+}
+
+// each emits every chunk of the file through emit. Every byte of the file is
+// covered by the chunks it emits: a chunk whose bytes are not valid UTF-8 is
+// still indexed, with the offending bytes substituted by sanitizeUTF8, and the
+// substitution is counted in the returned lossy so the unit can report it. No
+// content is left out -- the original bytes also remain served losslessly (as
+// base64) by source reads.
+func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) error) (lost lossy, err error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return skipped, model.Canceled(err)
+			return lost, model.Canceled(err)
 		}
 		window := c.buf[:c.filled]
 		chunk, err := source.PlanChunk(window, c.start, c.size, uint32(ChunkBytes))
 		if err != nil {
-			return skipped, err
+			return lost, err
 		}
 		if chunk.Range.End == chunk.Range.Start {
-			return skipped, nil
+			return lost, nil
 		}
+		// body stays a slice of the window: overlap and the carry below read
+		// it, and the next chunk's boundary rules are stated over the file's
+		// own bytes. A chunk that is not valid UTF-8 is indexed from a
+		// sanitized copy held in scratch instead.
 		body := window[:chunk.Range.End-chunk.Range.Start]
-		if chunk.Encoding == model.EncodingUTF8 {
-			if err := emit(chunk.Range, body); err != nil {
-				return skipped, err
-			}
-		} else {
-			skipped++
+		text := body
+		if chunk.Encoding != model.EncodingUTF8 {
+			var substituted int
+			c.scratch, substituted = sanitizeUTF8(c.scratch, body)
+			text = c.scratch
+			lost.Chunks++
+			lost.Bytes += substituted
+		}
+		if err := emit(chunk.Range, text); err != nil {
+			return lost, err
 		}
 		if chunk.NextOffset == nil {
-			return skipped, nil
+			return lost, nil
 		}
 		keep := 0
 		if !chunk.PartialLine {
@@ -102,7 +128,7 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 		c.filled = copy(c.buf, c.buf[drop:c.filled])
 		c.start = next
 		if err := c.fill(); err != nil {
-			return skipped, err
+			return lost, err
 		}
 	}
 }
@@ -133,6 +159,40 @@ func overlap(body []byte) int {
 		return 0
 	}
 	return ov
+}
+
+// sanitizeUTF8 returns a valid-UTF-8 copy of src in which every byte that is
+// not part of a well-formed UTF-8 sequence is replaced, byte for byte, by a
+// space, along with how many bytes were replaced. dst is reused as the buffer.
+//
+// The substitution is byte-for-byte, not U+FFFD, for two reasons. A search
+// document's body is bounded at model.MaxSearchBodyBytes, which is exactly
+// ChunkBytes, so any expanding transcode would turn a full chunk holding one
+// bad byte into a record storage refuses -- the same content loss this
+// replaced, relocated. And keeping the length equal to the chunk's byte range
+// means the body's offsets remain the file's offsets: model.SearchUnit.Bytes
+// describes exactly the bytes the body stands for. A space is the neutral
+// substitute: the replaced bytes are text in no encoding the index claims to
+// read, and a space can only separate tokens, never join two into one that the
+// file does not contain.
+func sanitizeUTF8(dst, src []byte) ([]byte, int) {
+	dst = append(dst[:0], src...)
+	substituted := 0
+	for i := 0; i < len(dst); {
+		if dst[i] < utf8.RuneSelf {
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRune(dst[i:])
+		if r == utf8.RuneError && size <= 1 {
+			dst[i] = ' '
+			substituted++
+			i++
+			continue
+		}
+		i += size
+	}
+	return dst, substituted
 }
 
 // looksBinary applies the NUL heuristic to a file's head.
