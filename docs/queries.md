@@ -175,13 +175,24 @@ budget there, and a page that spends it ends with `next` rather than an answer.
 Following that cursor resumes the same search from the state it kept, so the
 routes it finally reports are the ones an unbounded search would report. The
 query deadline behaves the same way on `path` — the page ends, the cursor
-carries on. Only `--depth` truncates a `path` answer outright, because depth is
-part of the query a cursor is bound to. Truncation is always reported together
-with whatever routes were found — never as "no path exists", which is reserved
-for a target that is genuinely unreachable, and never because the search
-exceeded a memory ceiling.
+carries on — and so does the engine's edge bound, which `path` registers no
+flag for: it reports `edge budget exhausted` and mints a cursor. Only `--depth`
+truncates a `path` answer outright, because depth is part of the query a cursor
+is bound to. Truncation is always reported together with whatever routes were
+found — never as "no path exists", which is reserved for a target that is
+genuinely unreachable, and never because the search exceeded a memory ceiling.
 
-The query deadline ends a page and not an answer: a walk that runs out of time
+**When a temp budget you set cannot hold a continuation.** The state the next
+page resumes from — a walk's frontier spool, a `path` search's retained scratch
+— is charged against `resources.max_temp_bytes`, which is unlimited by default.
+If you set that budget and a page's continuation state does not fit it, the
+request is REFUSED with `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`,
+rather than returning a short answer under whichever work-budget reason happened
+to be marked. Retrying frees no bytes: raise the budget, or narrow the query
+with `--depth`, `--visited` or `--edges` so the walk finishes within one page.
+
+On every command but `path`, the query deadline ends a page and not an answer:
+a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
 next request carries on from, rather than failing with `CTX_QUERY_DEADLINE`, so a
 slow answer is never served as a complete one and never lost either. This holds
@@ -190,7 +201,15 @@ edge: an `impact` or package-rollup request keeps its walk — the frontier it h
 reached and every entity it had already admitted — so the page is empty,
 reported as truncated, and its cursor carries the walk on. A deadline that lands
 after that walk finished but during the ranking keeps the same walk and mints
-the same kind of cursor; the next request ranks it and serves page 1. A capability that is still building is reported as an unavailable row plus a
+the same kind of cursor; the next request ranks it and serves page 1.
+
+`path` keeps the same contract by its own mechanism: a deadline that lands
+inside the search truncates the page with `the query deadline was reached before
+the path search completed` and mints a cursor over the retained search state, so
+the next request carries on settling buckets. A `path` request never fails with
+`CTX_QUERY_DEADLINE`.
+
+A capability that is still building is reported as an unavailable row plus a
 warning, so an incomplete answer never reads as a complete one.
 
 ## Configuration these commands read

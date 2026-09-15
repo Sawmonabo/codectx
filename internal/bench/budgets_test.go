@@ -642,7 +642,15 @@ var budgetRows = []budgetRow{
 		}},
 	{name: "idle-mcp-rss", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIdleMCPRSSBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
-			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo)
+			// IDLE means idle. `mcp.watch` is on by default, so a server
+			// started plainly spends its first seconds running the initial
+			// refresh -- parser workers and all -- and a window opened at
+			// process start sampled that STARTUP peak, not the resting
+			// session. The row is the resting one, so the watcher is off for
+			// it (`--watch=false`) and the window opens only after the session
+			// has settled. The refresh peak is row 10's subject, measured
+			// there under `index --full`.
+			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo, "--watch=false")
 			cmd.Env = execEnv(f.execHome)
 			// A server with no stdin producer would see EOF and exit before it
 			// could be sampled, so the pipe is held open and closed to stop it.
@@ -653,10 +661,17 @@ var budgetRows = []budgetRow{
 			if err := cmd.Start(); err != nil {
 				t.Fatalf("start mcp serve: %v", err)
 			}
-			peak := treePeak(t, func() { time.Sleep(2 * time.Second) })
+			// Settle: opening the workspace and standing the server up is
+			// startup, not idle, so it happens outside the sampled window.
+			time.Sleep(idleMCPSettle)
+			peak := treePeak(t, func() { time.Sleep(idleMCPSample) })
 			_ = stdin.Close()
-			_ = cmd.Wait()
-			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes)
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("mcp serve exited non-zero (%v)", err)
+			}
+			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes) +
+				fmt.Sprintf(" (resting session: watcher off, sampled over %s after a %s settle)",
+					idleMCPSample, idleMCPSettle)
 		}},
 	{name: "interactive-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetInteractivePeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {

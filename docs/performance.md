@@ -137,12 +137,22 @@ percentile over `n` samples.
 | 8 | No-change refresh: no parser work, no FTS body rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
 | 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS — re-measured after the external-merge planner and batched provider sinks landed (earlier: 2 min 56.3 s / 912.6 MiB) |
 | 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** at small-real scale; **145.3 MiB** on the corrected reference corpus (sampled at 250 ms and 50 ms, two cold runs within 0.1 MiB) | PASS — the earlier 912.6 MiB at reference scale was measured before the planner's external merge sort and the batched provider sinks |
-| 11 | Idle MCP RSS | 128 MiB | **61.5 MiB** | PASS |
+| 11 | Idle MCP RSS | 128 MiB | **64.0 MiB** | PASS — re-measured under the corrected semantics (see below); the earlier 61.5 MiB was a startup-window sample |
 | 12 | Interactive process-tree peak | 256 MiB | **60.5 MiB** | PASS |
 | 13 | Base storage vs eligible source bytes | 3.5× | **16.10×** on the corrected reference corpus: 1 385 729 099 stored over 86 064 203 eligible source bytes (db 1 299 664 896 + wal 0 + CAS 86 064 203; **CAS alone = 1.00×**). Earlier, on the undersized ~570 B/file corpus: 75.00× / 73.86×; 149.0× at small-real scale | **MISS by 4.6×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
 | 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
+
+Row 11 measures a RESTING session, which is what "idle" claims. It used to open
+its sampling window at process start with `mcp.watch` at its default, so the
+window covered the initial refresh and its parser workers — a startup peak
+reported under an idle label, and a default `max_parser_workers` was once
+reverted on the strength of it. The row now starts the session with
+`--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
+the server at rest: workspace open, no refresh running. The refresh peak is row
+10's subject and is measured there under `index --full`. The 128 MiB target is
+unchanged.
 
 Row 15's two counts are the recorded run's, not a fixed point: plan selection
 order among equally scored candidates is not bit-stable at this scale, and a
