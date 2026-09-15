@@ -203,7 +203,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// single-shot order, with no pair listed twice.
 	if int64(len(items)) < run.Len() {
 		header := rankedHeader{Total: run.Len(), Count: int(run.Len()) - len(items)}
-		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, packageDepsEndpoint, queryHash, header,
+		if meta.NextCursor, err = e.spillRankedCursor(ctx, b, packageDepsEndpoint, queryHash, header,
 			int64(len(items)), 0, &meta, rankedRunTail(ctx, run, len(items), encodePairRecord)); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
@@ -211,28 +211,36 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	return validatedPairPage(meta, items)
 }
 
-// serveRankedPairs serves a LATER page of a package-dependency answer: it reads
-// the ranked pair spool the previous page left, copies what follows this page
-// into a fresh one, and walks nothing.
+// serveRankedPairs serves a LATER page of a package-dependency answer: it seeks
+// to this cursor's byte offset in the spool the FIRST page wrote, reads at most
+// one page out of it, and walks nothing.
 func (e *Engine) serveRankedPairs(ctx context.Context, c traversalCursor, b *budget, limit int,
-	meta model.QueryMeta) (model.Page[model.PackageEdge], error) {
-	// The consumed spool is released only after the page is built: the copy
-	// below reads it.
-	defer e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+	meta model.QueryMeta) (_ model.Page[model.PackageEdge], err error) {
+	// The spool and its lease are released when the ANSWER ends, not when a
+	// page does: every later page reads the same spool. complete is explicit
+	// rather than "no cursor was minted", because a renewal or signing failure
+	// also mints no cursor and must leave this cursor adoptable.
+	complete := false
+	defer func() {
+		if terminalOutcome(err) && complete {
+			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+		}
+	}()
 	tail := rankedTail{SpoolID: c.SpoolID, LeaseID: c.LeaseID,
 		Offset: c.RankOffset, Served: c.RankServed, Total: c.RankTotal}
-	records, rest, err := servePage(ctx, e.spools, c.spoolCursor(), e.now(), tail, limit, decodePairRecord)
+	records, rest, read, err := servePage(ctx, e.spools, c.spoolCursor(), e.now(), tail, limit, decodePairRecord)
 	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
+	e.recordSpoolRead(read)
 	items := make([]model.PackageEdge, 0, len(records))
 	for _, r := range records {
 		items = append(items, r.edge())
 	}
-	if !rest.done() {
-		header := rankedHeader{Total: rest.Total, Count: int(rest.Total - rest.Served)}
-		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header,
-			rest.Served, 0, &meta, rankedSpoolTail(ctx, e.spools, c.spoolCursor(), e.now(), rest.Offset)); err != nil {
+	complete = rest.done()
+	if !complete {
+		if meta.NextCursor, err = e.continueRankedCursor(ctx, b, c,
+			rest.Served, 0, rest.Offset, c.PairOffset, &meta); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}

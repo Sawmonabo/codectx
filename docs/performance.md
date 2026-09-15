@@ -348,20 +348,28 @@ spilled-run count is the thing that grows:
 **The compile is superlinear, and where.** The per-doubling wall ratios are
 1.45, 1.62, 2.17, 2.37, 3.24 — increasing, not constant: the local exponent at
 the top of the measured range (8 000 → 16 000) is log₂ 3.24 ≈ **1.70**. The
-cause is the ranked-impact continuation in `internal/graph`, not the context
-compile's own sorts. `Engine.serveRankedImpact` (internal/graph/impact.go:378)
-serves each later page by opening the ranked spool FROM THE START — a spool
-cannot seek — and then copying every record after the page into a fresh spool
-(`nextRankedCursor` → `spillRanked`, impact.go:463/515, feeding
-`rankedSpoolSections`, walkrun.go:682). Each page therefore costs O(records
-remaining), so a walk of N entries read to exhaustion at a 200-row page costs
-Θ(N²/400) record reads and writes. A CPU profile of the 500/1 000/2 000 and
-4 000/8 000/16 000 runs attributes 0.69 s of the 1.13 s spent in
-`Engine.walkImpact` to `serveRankedImpact`, of which 0.55 s is
-`pagination.Spools.Open` — the re-read and the re-copy — and that share rises
-with N. The fix belongs to the graph endpoint (a resumable read offset that
-does not rewrite the remainder) and is tracked there; nothing in
-`internal/context` is quadratic.
+cause WAS the ranked-impact continuation in `internal/graph`, not the context
+compile's own sorts. `Engine.serveRankedImpact` served each later page by
+opening the ranked spool FROM THE START and then copying every record after the
+page into a fresh spool, so each page cost O(records remaining) and a walk of N
+entries read to exhaustion at a 200-row page cost Θ(N²/400) record reads and
+writes. A CPU profile of the 500/1 000/2 000 and 4 000/8 000/16 000 runs
+attributed 0.69 s of the 1.13 s spent in `Engine.walkImpact` to
+`serveRankedImpact`, of which 0.55 s was `pagination.Spools.Open` — the re-read
+and the re-copy — and that share rose with N. Nothing in `internal/context` is
+quadratic.
+
+That continuation is now O(page) per page: the spool is written once, by the
+page that settles the order, and every later page seeks to the byte offsets its
+cursor carries and reads only its own page (`pagination.Spools.OpenAt`,
+`RankOffset`/`PairOffset`, cursor payload version 6). Measured on the
+20 101-node deadline-split fixture at 200 rows a page
+(`graph.TestADeadlineSplitWalkAlwaysAdvances`), spool bytes read per page are
+flat at 88 046 on pages 3, 50 and 100 and nothing is written after the spill,
+where the per-page latency used to FALL with the shrinking remainder — 18.9 ms
+at page 3, 10.7 ms at page 50, 1.9 ms at page 100 — and is now ~0.39 ms
+throughout. The exponent above is the "before" figure and has not been
+re-measured.
 
 **What the fixture costs, and why it is not the product.** Publishing the
 fixture dominates the test's wall clock: at 16 000 leaves it is 74.3 s of the

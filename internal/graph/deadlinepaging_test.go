@@ -40,9 +40,21 @@ import (
 //   - walkStalled's call site deleted in impact.go (the deadline checked, and a
 //     continuation minted, before the page's first admission): the no-progress
 //     case pages to the cap and fails.
-//   - walkrun.go's internal-leg append deleted (`o.Visited.appendRun`): the
-//     progress case re-admits nodes an earlier REQUEST already reported and
-//     visited_count overshoots the fixture's node count.
+//   - rankedSpoolHeader made to stream the whole spool instead of stopping after
+//     the header record: the chain reads 880 380 800 bytes of an 8 716 646 byte
+//     spool over 102 pages and (1c) fails.
+//   - walkrun.go's internal-leg append deleted (`o.Visited.appendRun` given nil):
+//     NOT detected here, and this is a real gap rather than a slack assertion.
+//     The whole walk of this fixture completes inside request ONE -- page 1
+//     admits all 20 101 nodes and serves none, and pages 2..102 are pure
+//     ranked-tail reads that walk nothing -- so re-admission inside a request is
+//     prevented by the in-memory visitedSet the legs share, not by the run the
+//     append persists. Deleting the append drops page 1's appended bytes from
+//     2 473 737 to 921 552 and leaves visited_count at 20 101 and the page union
+//     unchanged, because no later REQUEST ever sweeps the persisted set for
+//     admission. The cross-request half of (d) therefore needs a fixture with at
+//     least three deadline-split legs in which a later REQUEST reaches a node an
+//     earlier one admitted; it is not proven by this test and is not claimed.
 func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 	// 100 mid nodes, 200 leaves each: 20 100 admitted nodes over three levels.
 	const mids, fanOut = 100, 200
@@ -120,16 +132,20 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 			page            int
 			resumeRecords   int64
 			visitedBytes    int64
+			spoolRead       int64
+			spoolWritten    int64
 			latency         time.Duration
 			served, visited int64
 		}
 		var (
-			samples  []sample
-			entries  []model.ImpactEntry
-			maxSeen  int64
-			req      = base
-			lastRec  int64
-			lastByte int64
+			samples   []sample
+			entries   []model.ImpactEntry
+			maxSeen   int64
+			req       = base
+			lastRec   int64
+			lastByte  int64
+			lastRead  int64
+			lastWrite int64
 		)
 		for pages := 1; ; pages++ {
 			if pages > pageCap {
@@ -152,8 +168,10 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 			}
 			samples = append(samples, sample{page: pages,
 				resumeRecords: probe.ResumeRecords - lastRec, visitedBytes: probe.VisitedBytes - lastByte,
+				spoolRead: probe.SpoolBytesRead - lastRead, spoolWritten: probe.SpoolBytesWritten - lastWrite,
 				latency: elapsed, served: int64(len(res.Entries)), visited: res.VisitedCount})
 			lastRec, lastByte = probe.ResumeRecords, probe.VisitedBytes
+			lastRead, lastWrite = probe.SpoolBytesRead, probe.SpoolBytesWritten
 			entries = append(entries, res.Entries...)
 			if res.Meta.NextCursor == "" {
 				break
@@ -219,10 +237,44 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 				probe.ResumeRecords, resumed, maxSeen)
 		}
 
+		// (1c): the RANKED tail is read-once, not copied forward. The ranking
+		// is settled by the page that spills it, so every page after that one
+		// must write nothing and read only its own page out of the one spool.
+		// A build that copies the remainder into a fresh spool per page reads
+		// -- and writes -- the whole unserved remainder on every page, which is
+		// the falling per-page latency this measurement replaced and a
+		// quadratic walk to completion.
+		var ranked int
+		for _, s := range samples {
+			if s.spoolWritten == 0 && s.spoolRead == 0 {
+				continue
+			}
+			if ranked++; ranked == 1 {
+				// The page that SPILLS the remainder writes it once; that is
+				// the one page whose cost is the whole tail.
+				continue
+			}
+			if s.spoolWritten != 0 {
+				t.Fatalf("page %d rewrote %d byte(s) of the ranked spool: the ranking is settled, so a "+
+					"page after the spill must copy nothing", s.page, s.spoolWritten)
+			}
+		}
+		if ranked < 3 {
+			t.Fatalf("only %d page(s) touched the ranked spool: a per-page bound over them proves nothing", ranked)
+		}
+		// The whole chain reads the spool about ONCE: its bytes, plus the O(1)
+		// header record each page reads to check the spool's kind. A
+		// remainder-copying build reads it once per page instead.
+		if bound := probe.SpoolBytesWritten + int64(len(samples))*1024; probe.SpoolBytesRead > bound {
+			t.Fatalf("the chain read %d byte(s) of a %d-byte ranked spool over %d pages (bound %d): "+
+				"a page is reading the remainder behind it, not its own page",
+				probe.SpoolBytesRead, probe.SpoolBytesWritten, len(samples), bound)
+		}
+
 		for _, s := range samples {
 			if s.page <= 3 || s.page%50 == 0 || s.page == len(samples) {
-				t.Logf("page %3d: resume records %5d, visited bytes appended %7d, served %3d, visited %6d, latency %v",
-					s.page, s.resumeRecords, s.visitedBytes, s.served, s.visited, s.latency)
+				t.Logf("page %3d: resume records %5d, visited bytes appended %7d, spool bytes read %8d written %8d, served %3d, visited %6d, latency %v",
+					s.page, s.resumeRecords, s.visitedBytes, s.spoolRead, s.spoolWritten, s.served, s.visited, s.latency)
 			}
 		}
 		assertNoRetainedState(t, spoolDir)
