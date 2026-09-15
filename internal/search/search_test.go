@@ -842,6 +842,36 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 		t.Error("hydration accepted a span count that does not match its hits")
 	}
 
+	// VF4(a): a blob whose line checkpoints do NOT reach the hit. On a real
+	// repository this failed the WHOLE answer with CTX_RESOURCE_LIMIT ("would
+	// read past the bounded window") because one file's checkpoints stopped
+	// short of byte 1.7 M. The gap is walked a window at a time instead, so
+	// the position is still exact and the peak is still one window.
+	sparseFile := model.NewFileID("repo", "pkg/sparse.go")
+	sparseRec := rec
+	sparseRec.LineCheckpoints = nil // not one checkpoint past byte 0
+	sh := newHydrator(
+		stubFiles{sparseFile: {ID: sparseFile, Path: "pkg/sparse.go", ContentHash: sparseRec.Hash, Size: sparseRec.Size}},
+		stubBlobs{sparseRec.Hash: sparseRec},
+		&countingCAS{cas: cas})
+	sparseCounter := sh.content.(*countingCAS)
+	sparseHits := []model.SearchHit{{FileID: sparseFile, Path: "pkg/sparse.go", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	if err := sh.hydratePage(ctx, sparseHits, []model.ByteRange{span}); err != nil {
+		t.Fatalf("hydratePage over a file with no checkpoints: %v: a sparse checkpoint index must "+
+			"degrade to more reads, never to a failed answer", err)
+	}
+	if sparseHits[0].Range == nil || *sparseHits[0].Range != want {
+		t.Fatalf("the walked position is %+v, want the checkpointed answer %+v", sparseHits[0].Range, want)
+	}
+	if sparseCounter.bytes < uint64(span.Start) {
+		t.Fatalf("the walk read %d bytes to reach byte %d; it cannot have covered the gap",
+			sparseCounter.bytes, span.Start)
+	}
+	if sparseCounter.reads < 2 {
+		t.Fatalf("the walk took %d reads over a %d-byte gap with a %d-byte window; it is not walking it",
+			sparseCounter.reads, span.Start, maxRangeWindowBytes)
+	}
+
 	// Cancellation and deadline are different answers (digest §6).
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
