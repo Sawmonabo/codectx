@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -103,15 +104,19 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	}
 	defer done()
 
-	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
-	maxDepth := resolveBound(req.Depth, e.limits.MaxDepth)
+	limit, limitNotice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
+	// Depth goes through resolveLimit, not resolveBound: an unlimited
+	// configured depth read as the integer 0 would climb exactly one level and
+	// say nothing about it, and a request narrowed by the configuration is
+	// disclosed rather than silently clamped.
+	maxDepth, depthNotice := resolveLimit("max_depth", req.Depth, e.limits.Depth())
 	// The cursor is bound to the normalized query the way every traversal
 	// cursor is: a token issued for one depth or page size is refused by
 	// another rather than silently answering a different question. This
 	// endpoint reads one fixed containment vocabulary and has no seeds, so
 	// those two components are the constant and the empty list.
 	queryHash := traversalQueryHash(model.DirectionOutgoing,
-		overviewRelationKinds(), nil, maxDepth, limit)
+		overviewRelationKinds(), nil, maxDepth.Int(), limit)
 
 	b := &budget{deadline: deadline, now: e.now}
 	var after model.NodeID
@@ -136,6 +141,7 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	}
 
 	meta := model.QueryMeta{Binding: e.adjacency.Binding()}
+	meta.Notices = appendNotice(appendNotice(meta.Notices, depthNotice), limitNotice)
 	// The deferred flag is discarded deliberately: it reports that a
 	// DEPENDENCE-only kind was asked for while its units are still building,
 	// and both kinds this map counts are canonical ones no provider defers. The
@@ -239,9 +245,16 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 //
 // A container whose chain is still climbing after maxDepth levels is absent
 // from the returned depths, which is how the caller drops it: it sits deeper
-// than the request asked for. The level bound is also what makes a containment
-// cycle finite rather than a hang.
-func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxDepth int,
+// than the request asked for.
+//
+// A containment CYCLE is ended by the per-chain ancestor set, not by the level
+// bound, because the level bound is now unlimited by default and a cycle under
+// an unlimited bound is a hang rather than a short answer. A chain that climbs
+// back to an ancestor it has already passed can never reach a root, so it is
+// dropped exactly as an over-deep one is. The set holds one node identity per
+// level actually climbed, per container on THIS page, so its peak is a
+// function of the page size and the real chain depth.
+func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxDepth config.Limit,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]model.NodeID, map[model.NodeID]int, error) {
 	parents := make(map[model.NodeID]model.NodeID, len(ids))
 	depths := make(map[model.NodeID]int, len(ids))
@@ -251,7 +264,12 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 		depths[id] = 0
 		climbing[id] = id
 	}
-	for level := 0; level <= maxDepth && len(climbing) > 0; level++ {
+	seen := make(map[model.NodeID]map[model.NodeID]struct{}, len(ids))
+	for _, id := range ids {
+		seen[id] = map[model.NodeID]struct{}{id: {}}
+	}
+	cyclic := make(map[model.NodeID]struct{})
+	for level := 0; !maxDepth.Exceeded(int64(level)) && len(climbing) > 0; level++ {
 		frontier := make([]model.NodeID, 0, len(climbing))
 		for _, anc := range climbing {
 			frontier = append(frontier, anc)
@@ -266,6 +284,11 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 			if !ok {
 				continue // anc is a root; this chain is complete
 			}
+			if _, repeated := seen[id][parent]; repeated {
+				cyclic[id] = struct{}{}
+				continue
+			}
+			seen[id][parent] = struct{}{}
 			if level == 0 {
 				parents[id] = parent
 			}
@@ -274,8 +297,13 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 		}
 		climbing = next
 	}
-	// Whatever is still climbing is deeper than the request asked for.
+	// Whatever is still climbing is deeper than the request asked for, and a
+	// chain that closed a cycle has no root to reach at any depth.
 	for id := range climbing {
+		delete(depths, id)
+		delete(parents, id)
+	}
+	for id := range cyclic {
 		delete(depths, id)
 		delete(parents, id)
 	}
@@ -300,8 +328,13 @@ func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 	candidates := map[model.NodeID][]model.NodeID{}
 	lookup := make([]model.NodeID, 0, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
+		remaining, exhausted := containmentBudget(b, e.limits)
+		if exhausted {
+			markTruncated(meta, reasonEdgeBudget)
+			break
+		}
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, containmentBudget(b, e.limits))
+			[]model.RelationKind{model.RelContains}, remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -354,8 +387,14 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget) (map[model.NodeID]containerCounts, error) {
 	out := make(map[model.NodeID]containerCounts, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
+		remaining, exhausted := containmentBudget(b, e.limits)
+		if exhausted {
+			return nil, (&model.Error{Code: model.CodeResourceLimit,
+				Message:     "this generation holds more containment edges under one page of containers than a repository map may read, so its per-container counts cannot be measured",
+				Remediation: "narrow the request scope"}).WithDetail("limit", "edges")
+		}
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing,
-			overviewRelationKinds(), containmentBudget(b, e.limits))
+			overviewRelationKinds(), remaining)
 		if err != nil {
 			return nil, err
 		}
@@ -402,12 +441,21 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 // The whole page shares one allowance, so a single pathological container
 // cannot make one answer read more adjacency than a walk of the same size
 // would have been allowed to.
-func containmentBudget(b *budget, limits Limits) int64 {
-	left := int64(limits.MaxEdges) - b.edges
-	if left < 0 {
-		return 0
+// An unlimited edge allowance has no remainder to compute: the zero Limit means
+// "no bound", so subtracting the edges already spent from it and handing the
+// result on as a numeric budget would refuse the very first batch.
+//
+// exhausted is reported separately from the remainder because a remainder of
+// zero and an unlimited bound are the same integer and the opposite instruction.
+func containmentBudget(b *budget, limits Limits) (remaining config.Limit, exhausted bool) {
+	if limits.Edges().IsUnlimited() {
+		return config.Unlimited, false
 	}
-	return left
+	left := int64(limits.MaxEdges) - b.edges
+	if left <= 0 {
+		return config.Unlimited, true
+	}
+	return config.Limit(left), false
 }
 
 // containerLabels is the operator-facing path and name of one container.
