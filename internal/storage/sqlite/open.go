@@ -23,9 +23,9 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Options are the numeric storage settings of Section 20.1 `[storage]` plus the
-// `[index]` batch bounds the store enforces on unit writes. Zero selects the
-// documented default; no value means unlimited.
+// Options are the storage settings of Section 20.1 `[storage]` plus the
+// `[index]` batch bounds the store enforces on unit writes. For the numeric
+// settings zero selects the documented default; no value means unlimited.
 type Options struct {
 	BusyTimeout       time.Duration // busy_timeout, default 5s
 	ReadConnections   int           // read_connections, default 2
@@ -38,6 +38,29 @@ type Options struct {
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
 	MaxJSONBytes int64
+	// Synchronous is the synchronous mode of the WRITER connection:
+	// "normal" (the default, and what config.SynchronousNormal spells) or
+	// "full". Readers are pinned to FULL regardless -- they are query_only
+	// and never write, so the mode is behaviourally inert for them, and
+	// pinning it keeps every pooled connection's pragma set verified.
+	// An empty value selects the default; an unrecognized value fails Open.
+	// See docs/adr/ADR-0004-wal-synchronous-mode.md.
+	Synchronous string
+}
+
+// synchronousPragma pairs the value the DSN applies with the value reading
+// `PRAGMA synchronous` back must report, so the two halves cannot drift.
+// The unknown case fails closed: the store never picks a durability mode the
+// operator did not ask for. The match is exact, matching the configuration
+// validator, so the two layers accept the same set of spellings.
+func synchronousPragma(mode string) (pragma, error) {
+	switch mode {
+	case "normal":
+		return pragma{"synchronous", "NORMAL", "1"}, nil
+	case "full":
+		return pragma{"synchronous", "FULL", "2"}, nil
+	}
+	return pragma{}, invalid("storage.synchronous is %q; use %q or %q", mode, "normal", "full")
 }
 
 func (o Options) withDefaults() Options {
@@ -64,6 +87,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.MaxJSONBytes <= 0 {
 		o.MaxJSONBytes = 8 << 20
+	}
+	if o.Synchronous == "" {
+		o.Synchronous = "normal"
 	}
 	return o
 }
@@ -116,12 +142,20 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"busy_timeout", busy, busy},
 		{"foreign_keys", "ON", "1"},
 		{"journal_mode", "WAL", "wal"},
-		{"synchronous", "FULL", "2"},
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
 	}
-	writerPragmas := slices.Concat(common, []pragma{{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
+	// The writer is the only connection whose synchronous mode is a choice,
+	// because it is the only connection that commits. Readers keep FULL.
+	writerSync, err := synchronousPragma(opts.Synchronous)
+	if err != nil {
+		return nil, err
+	}
+	writerPragmas := slices.Concat(common, []pragma{
+		writerSync,
+		{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
 	readerPragmas := slices.Concat(common, []pragma{
+		{"synchronous", "FULL", "2"},
 		{"cache_size", "-" + strconv.Itoa(opts.ReaderCacheKiB), "-" + strconv.Itoa(opts.ReaderCacheKiB)},
 		{"query_only", "ON", "1"}})
 
