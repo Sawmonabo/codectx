@@ -216,7 +216,8 @@ func (b *builder) validateDecls() error {
 		if _, err := b.rangeOf(d.Start, d.SigEnd); err != nil {
 			return err
 		}
-		f := declFact{Decl: d, kind: kind, rng: rng, sig: collapse(string(b.src[d.Start:d.SigEnd]), model.MaxSignatureBytes)}
+		f := declFact{Decl: d, kind: kind, rng: rng}
+		f.sig = f.truncate("signature", collapse(string(b.src[d.Start:d.SigEnd])), model.MaxSignatureBytes)
 		f.Name = f.truncate("name", d.Name, model.MaxNameBytes)
 		f.Qualified = f.truncate("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
 		f.Impl = f.truncate("receiver", d.Impl, model.MaxNameBytes)
@@ -224,7 +225,7 @@ func (b *builder) validateDecls() error {
 			if _, err := b.rangeOf(d.DocStart, d.DocEnd); err != nil {
 				return err
 			}
-			f.doc = cleanDoc(string(b.src[d.DocStart:d.DocEnd]))
+			f.doc = f.truncate("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
 		}
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
@@ -800,8 +801,11 @@ func putChunked[T any](ctx context.Context, items []T, put func(context.Context,
 }
 
 // collapse trims s, folds runs of whitespace into one space and bounds it.
-func collapse(s string, max int) string {
-	return bound(strings.Join(strings.Fields(s), " "), max)
+// collapse folds a declaration's signature bytes onto one line. It does not
+// bound the result: the caller truncates through declFact.truncate, so a cut
+// signature is flagged in truncated_fields rather than shortened in silence.
+func collapse(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // cleanDoc strips comment syntax from an attached comment or docstring and
@@ -829,7 +833,10 @@ func cleanDoc(s string) string {
 	for len(out) > 0 && out[len(out)-1] == "" {
 		out = out[:len(out)-1]
 	}
-	return bound(strings.Join(out, "\n"), maxDocBytes)
+	// Unbounded: the caller truncates through declFact.truncate so the cut is
+	// counted. Bounding here is what made an over-long docstring vanish
+	// silently.
+	return strings.Join(out, "\n")
 }
 
 // bound truncates s to at most max bytes on a rune boundary.
