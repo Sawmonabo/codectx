@@ -193,6 +193,12 @@ const (
 	// rather than a field of the answer record because a rollup bounded only
 	// by MaxRecordsPerResult can exceed the spool's per-record byte bound.
 	spoolRecordPackage = "p"
+	// spoolRecordCapability is one row of the generation's capability report,
+	// individual for the same reason a rollup pair is: a report may legally
+	// carry model.MaxCapabilityStates rows, each with a scope key, a
+	// diagnostic code and up to MaxCapabilityDetails bounded details, which is
+	// several megabytes against the spool's per-record byte bound.
+	spoolRecordCapability = "c"
 )
 
 // spoolRecord is one spilled record. The field names are short because the
