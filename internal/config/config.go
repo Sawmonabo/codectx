@@ -240,6 +240,14 @@ type TreeSitter struct {
 	Enabled       bool     `toml:"enabled"`
 	Languages     []string `toml:"languages"`
 	WorkerIdleTTL Duration `toml:"worker_idle_ttl"`
+	// MaxCalleeReferences is how many distinct cross-file callee names the
+	// user wants one file to mint nodes for. Unlimited by default: a
+	// generated file names what it names, and the count is bounded by the
+	// file, whose size workspace.max_parse_file_bytes already bounds, so an
+	// unlimited bound costs one file's heap and never the repository's. A
+	// user-set value that is crossed counts every call past it into the
+	// file's dropped count and reports the file partial.
+	MaxCalleeReferences Limit `toml:"max_callee_references"`
 }
 
 // SCIP configures the external index importer.
@@ -499,9 +507,10 @@ func Defaults() Config {
 		},
 		Providers: Providers{
 			TreeSitter: TreeSitter{
-				Enabled:       true,
-				Languages:     []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
-				WorkerIdleTTL: Duration(60 * time.Second),
+				Enabled:             true,
+				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
+				WorkerIdleTTL:       Duration(60 * time.Second),
+				MaxCalleeReferences: Unlimited,
 			},
 			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute)},
 			LSP: LSP{

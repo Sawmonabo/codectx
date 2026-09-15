@@ -97,6 +97,7 @@ func (c Config) validate() error {
 		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
 		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
 		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
+		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 	} {
 		if p.v < 0 {

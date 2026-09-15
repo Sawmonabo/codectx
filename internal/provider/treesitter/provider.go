@@ -64,6 +64,11 @@ type Options struct {
 	// WorkerIdleTTL is tree_sitter.worker_idle_ttl: how long an idle worker
 	// is kept before it is stopped.
 	WorkerIdleTTL time.Duration
+	// MaxCalleeReferences is tree_sitter.max_callee_references: how many
+	// distinct cross-file callee names one file may mint nodes for. Unlimited
+	// by default; past a user-set bound the call is counted into the file's
+	// dropped count and the file reports partial.
+	MaxCalleeReferences config.Limit
 	// ParseTimeout bounds one parse; a worker past it is killed and the unit
 	// is CTX_PROVIDER_TIMEOUT.
 	ParseTimeout time.Duration
@@ -228,7 +233,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
-	b := &builder{ctx: ctx, req: req, fv: fv, lang: l, src: src, cur: source.NewCursor(src), ex: ex}
+	b := &builder{ctx: ctx, req: req, fv: fv, lang: l, src: src, cur: source.NewCursor(src), ex: ex,
+		maxCallees: p.opts.MaxCalleeReferences}
 	if err := b.build(); err != nil {
 		return model.ProviderResult{}, err
 	}
