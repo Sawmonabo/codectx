@@ -16,7 +16,7 @@ func TestAVisitedBitsetCountsOnlyTheBitsItTurnsOn(t *testing.T) {
 	dir := t.TempDir()
 	level := []NodeRef{3, 9, 4096, 70_000}
 
-	set, err := openBitset(dir, bitsetNodeFile, 100_000, nil)
+	set, err := openBitset(existingDir(dir), bitsetNodeFile, 100_000, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestAVisitedBitsetCountsOnlyTheBitsItTurnsOn(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	resumed, err := openBitset(dir, bitsetNodeFile, 100_000, nil)
+	resumed, err := openBitset(existingDir(dir), bitsetNodeFile, 100_000, nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 	}
 	maxNode := refs[len(refs)-1]
 
-	set, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
+	set, err := openBitset(existingDir(dir), bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	resumed, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
+	resumed, err := openBitset(existingDir(dir), bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 // An unsorted level is merely slow -- it thrashes the cache instead of walking
 // it forward once -- and nothing downstream would ever report it.
 func TestAVisitedBitsetRefusesRefsItCannotHold(t *testing.T) {
-	set, err := openBitset(t.TempDir(), bitsetNodeFile, 64, nil)
+	set, err := openBitset(existingDir(t.TempDir()), bitsetNodeFile, 64, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
