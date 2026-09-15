@@ -46,8 +46,11 @@ func WithPageClamps(ctx context.Context) (context.Context, *PageClamps) {
 // record notes one clamp, deduplicated: a keyset walk calls the same reader
 // once per page and the actor needs the fact, not the repetition.
 func (c *PageClamps) record(requested, effective int) {
-	note := fmt.Sprintf("a page bound was clamped: requested %d, effective %d (the wire ceiling is %d; "+
-		"continue with the cursor to read the rest)", requested, effective, model.MaxPageItems)
+	c.add(fmt.Sprintf("a page bound was clamped: requested %d, effective %d (the wire ceiling is %d; "+
+		"continue with the cursor to read the rest)", requested, effective, model.MaxPageItems))
+}
+
+func (c *PageClamps) add(note string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, seen := c.notes[note]; seen {
@@ -55,6 +58,21 @@ func (c *PageClamps) record(requested, effective int) {
 	}
 	c.notes[note] = struct{}{}
 	c.order = append(c.order, note)
+}
+
+// recordUnbounded notes a request that named no bound of its own and was served
+// at the wire ceiling. It is recorded only where the caller's zero is a USER
+// setting that means unlimited -- the edge batch limit -- and not at the many
+// internal sites that pass 0 simply because they never had a page bound to
+// pass, where it would be noise rather than news.
+func recordUnbounded(ctx context.Context, effective int) {
+	c, ok := ctx.Value(pageClampKey{}).(*PageClamps)
+	if !ok {
+		return
+	}
+	note := fmt.Sprintf("a page bound was resolved: requested unlimited, effective %d "+
+		"(the wire ceiling; continue with the cursor to read the rest)", effective)
+	c.add(note)
 }
 
 // Notices is what was clamped, in the order it was first observed. It is empty

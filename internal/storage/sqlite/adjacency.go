@@ -153,6 +153,12 @@ func (r *PinnedReader) edgesBatchQuery(ctx context.Context, nodes []model.NodeID
 	// A zero limit is "no caller-side bound", which pageLimit resolves to the
 	// page size the storage layer serves anyway. Refusing it made 0 mean
 	// "broken" in the one place the rest of the tree now reads as "unlimited".
+	// Here the zero comes from a user-facing edge batch setting, so the
+	// resolution is REPORTED: a caller that asked for unlimited edges and was
+	// served one page must be able to tell that from the end of the answer.
+	if limit == 0 {
+		recordUnbounded(ctx, model.MaxPageItems)
+	}
 	limit = pageLimit(ctx, limit)
 	if !direction.Valid() {
 		return "", nil, invalid("direction %q is not a known direction", direction)
