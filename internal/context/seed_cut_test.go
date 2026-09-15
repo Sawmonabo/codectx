@@ -33,6 +33,18 @@ func TestTheSeedCutSurvivesIntoAValidManifestExclusion(t *testing.T) {
 		t.Fatalf("two steps sharing an origin produced %d exclusion rows, want one per step", len(s.Excluded))
 	}
 
+	// Row 20's other half: a step that stopped at a PAGE boundary rather than
+	// at MaxSeeds is a different bound and must be disclosed separately, with
+	// the continuation cursor, so the caller knows the read is resumable.
+	s.notePageEnd(originLexical, "the lexical matches of the task text", "cursor-1")
+	s.notePageEnd(originLexical, "the lexical matches of the task text", "cursor-1")
+	if len(s.Excluded) != 3 {
+		t.Fatalf("a page end produced %d rows in total, want one more than the two cut rows", len(s.Excluded))
+	}
+	if !strings.Contains(s.Excluded[2].Excluded, "cursor-1") {
+		t.Fatalf("the page-end reason %q does not carry the continuation cursor", s.Excluded[2].Excluded)
+	}
+
 	p, err := buildPlan(s.Excluded, nil, resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8})
 	if err != nil {
 		t.Fatalf("budgeting the cut row failed: %v", err)
