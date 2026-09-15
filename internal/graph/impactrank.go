@@ -365,14 +365,19 @@ func (e *Engine) rankPairs(ctx context.Context,
 	}
 	byKey = byKey.WithFold(foldPair)
 	defer byKey.Close()
+	// pairStopAfter is the TEST hook that cuts this phase, and it is the ONLY
+	// stop this fold takes. It deliberately does NOT check ctx: unlike the two
+	// impact passes, the pair ranking keeps no resumable progress -- it
+	// re-sorts the whole retained pair input on every request -- so a deadline
+	// reported here would mint a rank continuation that redoes the same work
+	// and expires in the same place, and the caller would page forever without
+	// ever reaching a record. The deadline is taken between the two pair passes
+	// instead, below, where the request is abandoned rather than continued.
 	added := 0
 	if err := emit(func(r pairRecord) error {
-		// The same deadline report the impact ranking makes, for the same
-		// reason: this pass folds the whole retained pair input, so a request
-		// that ran out of time must stop here rather than pay for it, and
-		// `pairs == nil` is ruling P7's branch that mints the continuation.
-		if err := e.rankInterrupted(ctx, added, e.pairStopAfter); err != nil {
-			return err
+		if e.pairStopAfter > 0 && added >= e.pairStopAfter {
+			return &model.Error{Code: model.CodeQueryDeadline,
+				Message: "graph: the query deadline reached the package-pair ranking"}
 		}
 		added++
 		return byKey.Add(r)
