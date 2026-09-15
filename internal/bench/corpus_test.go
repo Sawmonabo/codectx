@@ -80,7 +80,7 @@ var corpusTiny = corpusSpec{Packages: 4, Seed: 21}
 // at spec's scale into dir: Go, Python and TypeScript sources that share
 // corpusPrefix, a manifest per ecosystem, a documentation file, and one
 // high-fanout Go file that calls every generated package.
-func generateCorpus(t *testing.T, dir string, spec corpusSpec) {
+func generateCorpus(t testing.TB, dir string, spec corpusSpec) {
 	t.Helper()
 	rng := rand.New(rand.NewSource(spec.Seed))
 	write := func(rel, body string) {
