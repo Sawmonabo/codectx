@@ -296,6 +296,10 @@ func TestSearchRankingScenario(t *testing.T) {
 
 		// FX-H-U rows
 		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
+
+		// FX-H-X1 rows
+		{"fix/a_two_offset_node_is_served_at_the_precedence_winner",
+			legTwoOffsetNodeServesThePrecedenceWinner},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -1983,5 +1987,167 @@ func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
 	if warm.reads != 4 {
 		t.Fatalf("a 2-entry cache made %d File reads over a,b,a,c,b; want 4: the repeat inside the "+
 			"cache is served from it and the evicted one is re-read", warm.reads)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FX-H-X1 legs.
+// ---------------------------------------------------------------------------
+
+// twoOffsetFixture is a second activated generation holding ONE file with ONE
+// node that two units disagree about: the unverified unit declares it at byte
+// 20, the verified one -- the Section 9.4 precedence winner -- at byte 100.
+// node_facts is keyed (unit_id, node_id), so two units is the only way one file
+// can carry a node at two offsets.
+//
+// It is built apart from the ranking corpus on purpose: fixtureDocs is the one
+// corpus every Task 13 leg asserts against, and a second declaration of one of
+// its nodes would move the answers those legs pin. No search units are
+// published here, so no lexical tier answers and the hit count below is exactly
+// what the exact_path tier emitted.
+type twoOffsetFixture struct {
+	ctx  context.Context
+	opts Options
+	path string
+}
+
+// newTwoOffsetFixture publishes that generation and returns the service options
+// over it. winner is the offset of the precedence winner's declaration.
+func newTwoOffsetFixture(t *testing.T, loserStart, winnerStart uint64) *twoOffsetFixture {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := sqlite.Open(ctx, filepath.Join(dir, "codectx.db"), sqlite.Options{})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	repo := model.RepositoryID(model.H("two-offset-fixture", "1"))
+	if err := st.EnsureRepository(ctx, repo, "/repo"); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+	cas, err := snapshot.OpenCAS(filepath.Join(dir, "cas"))
+	if err != nil {
+		t.Fatalf("OpenCAS: %v", err)
+	}
+	// The body comfortably outruns the winner's offset: a span the blob cannot
+	// hold is reported as an unresolved Range, which would fail this leg for a
+	// reason that is not the one it guards.
+	body := "package pkg\n" + strings.Repeat("// padding\n", 40)
+	rec, err := cas.Put(ctx, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("CAS.Put: %v", err)
+	}
+	if err := st.PutBlob(ctx, rec); err != nil {
+		t.Fatalf("PutBlob: %v", err)
+	}
+	const path = "pkg/twice.go"
+	fileID := model.NewFileID(repo, path)
+	fv := model.FileVersion{ID: fileID, Path: path, Status: model.FileTracked,
+		Size: int64(len(body)), ContentHash: rec.Hash, Language: "go"}
+	manifest := model.H("two-offset-manifest")
+	snap := model.Snapshot{ID: model.NewSnapshotID(repo, "", model.H("policy"), manifest), RepositoryID: repo,
+		CaptureConsistency: model.CaptureValidated, SourcePolicyHash: model.H("policy"), FileCount: 1,
+		ManifestHash: manifest, SourceBytes: uint64(len(body)), CreatedAt: time.Now().UTC()}
+	err = st.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error { return yield(fv) })
+	if err != nil {
+		t.Fatalf("PutSnapshot: %v", err)
+	}
+	gen, err := st.BeginGeneration(ctx, repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration: %v", err)
+	}
+	run, err := st.BeginProviderRun(ctx, gen, fixtureProviderID, fixtureProviderVersion)
+	if err != nil {
+		t.Fatalf("BeginProviderRun: %v", err)
+	}
+
+	const name = "Twice"
+	key := model.CanonicalNodeKey(path, name)
+	nodeID := model.NewNodeID(repo, model.NodeFunction, key)
+	declare := func(scope string, binding model.SourceBinding, start uint64) {
+		t.Helper()
+		input := model.UnitInput{FileID: fileID, ContentHash: rec.Hash}
+		h := model.NewUnitInputHasher()
+		if err := h.Add(input); err != nil {
+			t.Fatalf("UnitInputHasher.Add: %v", err)
+		}
+		spec := model.UnitSpec{ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
+			ScopeKey: scope, InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
+		spec.ID = model.NewUnitID(spec, fixtureConfigHash)
+		build := model.UnitBuild{Spec: spec, AnalysisConfigHash: fixtureConfigHash, OriginRunID: run,
+			SourceBinding: binding}
+		w, err := st.BeginUnit(ctx, gen, build,
+			func(yield func(model.UnitInput) error) error { return yield(input) })
+		if err != nil {
+			t.Fatalf("BeginUnit(%s): %v", scope, err)
+		}
+		rng := &model.SourceRange{Start: model.Position{Byte: start, Line: 1},
+			End: model.Position{Byte: start + 10, Line: 1, Column: 10}}
+		ev := model.Evidence{UnitID: w.UnitID(), ProviderID: fixtureProviderID,
+			ProviderVersion: fixtureProviderVersion, OriginRunID: run, NodeID: nodeID,
+			Precision: model.PrecisionSyntax, FileID: fileID, ContentHash: rec.Hash, Range: rng}
+		ev.ID = model.NewEvidenceID(ev)
+		node := model.Node{ID: nodeID, Kind: model.NodeFunction, Language: "go", Name: name,
+			QualifiedName: "pkg." + name, FileID: fileID, ContentHash: rec.Hash, Range: rng}
+		if err := w.PutNodes(ctx, []model.NodeFact{{Node: node, CanonicalKey: key,
+			Evidence: []model.Evidence{ev}}}); err != nil {
+			t.Fatalf("PutNodes(%s): %v", scope, err)
+		}
+		if err := st.SealUnit(ctx, w); err != nil {
+			t.Fatalf("SealUnit(%s): %v", scope, err)
+		}
+	}
+	declare("scope-loose", model.SourceBindingUnverified, loserStart)
+	declare("scope-strict", model.SourceBindingVerified, winnerStart)
+
+	if _, err := st.Activate(ctx, gen, 0, model.HealthFresh,
+		[]model.CapabilityState{{ProviderID: fixtureProviderID, Capability: "structure", Scope: "workspace",
+			State: model.CapabilityFresh}}, "norm-v1"); err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	signer, err := pagination.OpenSigner(dir)
+	if err != nil {
+		t.Fatalf("OpenSigner: %v", err)
+	}
+	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, st)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	return &twoOffsetFixture{ctx: ctx, path: path, opts: Options{Store: st, Repo: repo, Signer: signer,
+		Spools: spools, Leases: pagination.NewLeases(st, pagination.DefaultCursorTTL), Content: cas,
+		Resources: config.Defaults().Resources, CursorTTL: pagination.DefaultCursorTTL,
+		Now: func() time.Time { return time.Now().UTC() }}}
+}
+
+// legTwoOffsetNodeServesThePrecedenceWinner proves the served answer, not just
+// the storage read: a node two units declare at two offsets reaches search ONCE
+// and at the offset the Section 9.4 precedence order picks -- the same range
+// Nodes reports for that identity. The winner is the HIGHER offset here, so a
+// rule that took the first declaration in document order, or that emitted both
+// rows, fails rather than coincidentally agreeing.
+//
+// Mutation: order the distinct predicate in storage/sqlite/search.go by
+// start_byte instead of the precedence keys and the hit is served at byte 20;
+// drop the predicate and two hits come back for one node.
+func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
+	const loser, winner = 20, 100
+	f := newTwoOffsetFixture(t, loser, winner)
+	s := newService(t, f.opts)
+	page, err := s.Search(f.ctx, model.SearchRequest{Query: f.path, Page: model.PageRequest{Limit: 10}})
+	if err != nil {
+		t.Fatalf("Search(%s): %v", f.path, err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("the file's one node, declared by two units, was served %d times: a retrieval tier "+
+			"emits a node identity once (%+v)", len(page.Items), page.Items)
+	}
+	hit := page.Items[0]
+	if hit.Range == nil {
+		t.Fatalf("the served hit carries no source range: %+v", hit)
+	}
+	if hit.Range.Start.Byte != winner {
+		t.Fatalf("the hit is served at byte %d, want the precedence winner's %d; the winner is the LATER "+
+			"declaration, so serving %d is the first-declaration reading", hit.Range.Start.Byte, winner, loser)
 	}
 }
