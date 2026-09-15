@@ -80,6 +80,12 @@ type Budget struct {
 	// hold a larger manifest may raise the configured value, and zero takes the
 	// configured one. Refusing to compile because a deployment default was
 	// smaller than the caller's real window is a scale refusal.
+	//
+	// BudgetUnlimited (-1) is the caller's explicit "no manifest ceiling". It
+	// is spelled apart from zero because zero already means "take the
+	// configured value", so a caller under a finite deployment default has no
+	// other way to raise the budget all the way -- and a caller budget a
+	// request cannot raise to unlimited is still a scale refusal.
 	MaxManifestBytes int64 `json:"max_manifest_bytes,omitempty"`
 }
 
@@ -96,14 +102,22 @@ func (b Budget) Validate() error {
 		{"budget.max_bytes", b.MaxBytes},
 		{"budget.max_files", int64(b.MaxFiles)},
 		{"budget.max_slices", int64(b.MaxSlices)},
-		{"budget.max_manifest_bytes", b.MaxManifestBytes},
 	} {
 		if err := requireNonNegative(f.field, f.value); err != nil {
 			return err
 		}
 	}
+	// max_manifest_bytes is the one budget field that admits BudgetUnlimited;
+	// anything below it is still a negative bound.
+	if b.MaxManifestBytes < BudgetUnlimited {
+		return requireNonNegative("budget.max_manifest_bytes", b.MaxManifestBytes)
+	}
 	return nil
 }
+
+// BudgetUnlimited is the request-side spelling of "no ceiling" for a budget
+// field whose zero already means "take the configured value".
+const BudgetUnlimited int64 = -1
 
 // ContextRequest is the semantic input to compilation. Its normalized form is
 // part of manifest identity, so it carries no operational field.
