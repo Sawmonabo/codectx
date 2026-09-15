@@ -228,6 +228,12 @@ differently, and both are load-bearing:
   and it is not `fail`. A check that was skipped because you did not pass
   `--deep` has `state: "unverified"` -- also not `pass`.
 
+`status` also reports a completeness table: the capability state of each
+provider that produced the sealed units of the active generation. The
+query-time working-tree overlay has **no row in it, by design** -- it seals
+nothing and reports its state per query instead; [the overlay
+page](providers-lsp.md) says what to read ahead of a query.
+
 If you see `0` where you expected a figure, it is a measurement of zero — file
 it as a bug rather than assuming the platform does not support it.
 

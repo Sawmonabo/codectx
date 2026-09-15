@@ -1926,3 +1926,67 @@ func TestCompileHonoursCallerDeadline(t *testing.T) {
 		t.Fatalf("Compile under a caller deadline of one hour: %v; the configured default was applied as a ceiling", err)
 	}
 }
+
+// TestEveryNodeKindHasAScopeRequirement pins the kind -> requirement map of
+// baseRequirement against the whole Section 9.1 vocabulary.
+//
+// The failure mode it protects: a kind the map does not name falls through to
+// RequirementOptional, so a boundary that IS part of the answer is published
+// as one the actor need never read. That is exactly what happened to
+// model.NodeSection -- Markdown headings became section nodes and the map still
+// named only document, so every heading reached through a relation was demoted
+// to optional and dropped out of recommended reading with nothing said. A kind
+// added to model.NodeKind.Valid without a decision here fails this table.
+func TestEveryNodeKindHasAScopeRequirement(t *testing.T) {
+	want := map[model.NodeKind]model.Requirement{
+		// Containers are not read: they are addresses, and their members carry
+		// the requirement.
+		model.NodeRepository: model.RequirementOptional,
+		model.NodeDirectory:  model.RequirementOptional,
+
+		model.NodeFile:          model.RequirementFull,
+		model.NodeInterface:     model.RequirementFull,
+		model.NodeClass:         model.RequirementFull,
+		model.NodeStruct:        model.RequirementFull,
+		model.NodeEnum:          model.RequirementFull,
+		model.NodeTest:          model.RequirementFull,
+		model.NodeConfiguration: model.RequirementFull,
+
+		model.NodeFunction:       model.RequirementSymbol,
+		model.NodeMethod:         model.RequirementSymbol,
+		model.NodeField:          model.RequirementSymbol,
+		model.NodeVariable:       model.RequirementSymbol,
+		model.NodeConstant:       model.RequirementSymbol,
+		model.NodeEndpoint:       model.RequirementSymbol,
+		model.NodeDatabaseEntity: model.RequirementSymbol,
+
+		model.NodeDocument:    model.RequirementRecommended,
+		model.NodeSection:     model.RequirementRecommended,
+		model.NodePackage:     model.RequirementRecommended,
+		model.NodeModule:      model.RequirementRecommended,
+		model.NodeNamespace:   model.RequirementRecommended,
+		model.NodeDependency:  model.RequirementRecommended,
+		model.NodeBuildTarget: model.RequirementRecommended,
+	}
+	for kind, req := range want {
+		if !kind.Valid() {
+			t.Errorf("%q is not a valid node kind; this table has drifted from the vocabulary", kind)
+			continue
+		}
+		if got := baseRequirement(kind); got != req {
+			t.Errorf("baseRequirement(%q) = %q, want %q", kind, got, req)
+		}
+	}
+	for _, kind := range []model.NodeKind{
+		model.NodeRepository, model.NodeDirectory, model.NodeFile, model.NodePackage,
+		model.NodeModule, model.NodeNamespace, model.NodeFunction, model.NodeMethod,
+		model.NodeClass, model.NodeInterface, model.NodeStruct, model.NodeEnum,
+		model.NodeField, model.NodeVariable, model.NodeConstant, model.NodeTest,
+		model.NodeBuildTarget, model.NodeDependency, model.NodeConfiguration,
+		model.NodeDocument, model.NodeSection, model.NodeEndpoint, model.NodeDatabaseEntity,
+	} {
+		if _, ok := want[kind]; !ok {
+			t.Errorf("node kind %q has no decided scope requirement: it would be served as optional", kind)
+		}
+	}
+}

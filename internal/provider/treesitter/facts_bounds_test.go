@@ -80,8 +80,8 @@ func TestEvidenceClipIsAttributedNotFoldedIntoDropped(t *testing.T) {
 		t.Fatalf("dropped = %d, want 0: a clip is not one of the other bounds", b.dropped)
 	}
 	state, bounded := b.bounds(model.CapabilityState{State: model.CapabilityFresh})
-	if got := state.Details[detailEvidenceClipped]; got != "3" {
-		t.Fatalf("%s detail is %q, want %q", detailEvidenceClipped, got, "3")
+	if got := state.Details[model.DetailEvidenceClipped]; got != "3" {
+		t.Fatalf("%s detail is %q, want %q", model.DetailEvidenceClipped, got, "3")
 	}
 	if !bounded {
 		t.Fatal("a file whose only bound was the evidence clip must still report partial")
