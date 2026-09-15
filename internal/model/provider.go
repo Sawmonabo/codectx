@@ -295,6 +295,13 @@ var reservedCapabilityDetails = [...]string{
 	DetailDetailsOmitted,
 }
 
+// DetailEvidenceClipped is the capability detail key under which a provider
+// discloses occurrences cut by the per-fact evidence bound. It is NOT a
+// reserved fold key -- it is a particular the provider publishes -- but it is
+// spelled once here because more than one provider applies the same bound, and
+// two spellings of it would read as two different bounds to an operator.
+const DetailEvidenceClipped = "evidence_clipped"
+
 // ReservedCapabilityDetail reports whether key is one the report fold owns.
 // A provider that writes one of these keys is writing the fold's bookkeeping,
 // not its own particulars; the fold's own writes go through the same door and

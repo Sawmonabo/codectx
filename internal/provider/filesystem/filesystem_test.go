@@ -278,7 +278,7 @@ func TestEvidenceClipIsHonouredAndDisclosed(t *testing.T) {
 			if got := len(rec.facts[0].Evidence); got != tc.wantEvidence {
 				t.Errorf("fact carries %d evidence occurrences, want %d", got, tc.wantEvidence)
 			}
-			got := e.Result().Capabilities[0].Details["evidence_clipped"]
+			got := e.Result().Capabilities[0].Details[model.DetailEvidenceClipped]
 			if got != tc.wantDisclosure {
 				t.Errorf("evidence_clipped detail is %q, want %q", got, tc.wantDisclosure)
 			}
