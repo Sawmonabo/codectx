@@ -206,6 +206,13 @@ type fakeStore struct {
 	chunks   map[string]*fakeChunk
 	nextID   int
 
+	// leases is the pagination.LeaseStore side of the fixture. The service now
+	// requires a lease store at composition (a coverage session that pins
+	// nothing cannot continue its status pages), so the fixture has to hold
+	// real leases rather than a nil one.
+	leases map[string]model.Lease
+	owners map[string]string
+
 	// confirmCalls counts ConfirmChunks calls. Storage refuses a foreign
 	// chunk too, so a row that only checks the returned code cannot tell the
 	// service's own session/actor/snapshot cross-check from the store's: the
@@ -734,7 +741,8 @@ func newHarness(t *testing.T) *harness {
 			return src, nil
 		},
 		Signer: signer, Limits: fixtureLimits(),
-		Now: func() time.Time { return h.now },
+		Leases: pagination.NewLeases(store, time.Hour),
+		Now:    func() time.Time { return h.now },
 	})
 	if err != nil {
 		t.Fatalf("build coverage service: %v", err)
@@ -1334,6 +1342,48 @@ var scenarios = []scenario{
 				item.FileID, item.Path, want.path)
 		}
 	}},
+}
+
+// AcquireLease, RenewLease, ReleaseLease and LeaseExpiry make the fixture a
+// pagination.LeaseStore: one live lease per owner, refusing a second.
+func (f *fakeStore) AcquireLease(_ context.Context, lease model.Lease, ownerRef string) error {
+	if f.leases == nil {
+		f.leases, f.owners = map[string]model.Lease{}, map[string]string{}
+	}
+	if ownerRef != "" {
+		if id, ok := f.owners[ownerRef]; ok {
+			if _, live := f.leases[id]; live {
+				return (&model.Error{Code: model.CodeVersionConflict,
+					Message: "owner already holds a lease"}).WithDetail("conflict", "owner_lease")
+			}
+		}
+		f.owners[ownerRef] = lease.ID
+	}
+	f.leases[lease.ID] = lease
+	return nil
+}
+
+func (f *fakeStore) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
+	l, ok := f.leases[id]
+	if !ok {
+		return typed(model.CodeCursorInvalid, "lease is not live")
+	}
+	l.ExpiresAt = expiresAt
+	f.leases[id] = l
+	return nil
+}
+
+func (f *fakeStore) ReleaseLease(_ context.Context, id string) error {
+	delete(f.leases, id)
+	return nil
+}
+
+func (f *fakeStore) LeaseExpiry(_ context.Context, id string) (time.Time, error) {
+	l, ok := f.leases[id]
+	if !ok {
+		return time.Time{}, typed(model.CodeCursorInvalid, "lease is not live")
+	}
+	return l.ExpiresAt, nil
 }
 
 func TestCoverage(t *testing.T) {

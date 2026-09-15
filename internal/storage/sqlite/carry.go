@@ -111,7 +111,7 @@ type CarriedUnit struct {
 // generation, well past any single page. Page until a short page arrives.
 func (s *Store) CarriedUnits(ctx context.Context, gen model.GenerationID,
 	afterProviderID, afterScopeKey string, limit int) ([]CarriedUnit, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if len(afterProviderID) > model.MaxIdentifierBytes {
 		return nil, invalid("after_provider_id is %d bytes, limit %d", len(afterProviderID), model.MaxIdentifierBytes)
 	}
