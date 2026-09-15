@@ -222,7 +222,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		reason    string
 		// tail streams the hits after this page into the continuation spool.
 		// restN is how many there are, which the spool-budget reason names.
-		tail  func(func(model.SearchHit) error) error
+		tail  func(func(spooledHit) error) error
 		restN int
 	)
 	if req.Page.Cursor != "" {
@@ -230,7 +230,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		var meta spoolMeta
-		if meta, hits, restN, err = readSpool(ctx, s.spools, cursor, now, limit); err != nil {
+		var spooled []spooledHit
+		if meta, spooled, restN, err = readSpool(ctx, s.spools, cursor, now, limit); err != nil {
+			return empty, err
+		}
+		// The source ranges of THIS page are read here, not when the spool was
+		// written: a spooled hit carries the byte interval it hydrates from.
+		if hits, err = s.hydratedSpool(ctx, reader, spooled); err != nil {
 			return empty, err
 		}
 		// The answer-level truncation the FIRST page computed. A continuation
@@ -257,7 +263,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		if restN = int(run.Len()) - len(hits); restN > 0 {
-			tail = s.tailOf(ctx, reader, run, len(hits))
+			tail = tailOf(ctx, run, len(hits))
 		}
 	}
 
@@ -319,7 +325,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 // continuation whose lease is gone is refused by the spool store and leaves
 // the generation free for retention to collect. The lease expires with the
 // cursor, so nothing here pins a generation for longer than the token lives.
-func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, tail func(func(model.SearchHit) error) error) (string, error) {
+func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, tail func(func(spooledHit) error) error) (string, error) {
 	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
 	if err != nil {
 		return "", err
@@ -498,6 +504,26 @@ func (s *Service) hydrated(ctx context.Context, reader *sqlite.PinnedReader, chu
 	return hits, nil
 }
 
+// hydratedSpool fills the source ranges of one page replayed from a spool. It
+// is hydrated's counterpart for the records tailOf wrote unhydrated: the hit
+// is already servable, only its Range is missing.
+func (s *Service) hydratedSpool(ctx context.Context, reader *sqlite.PinnedReader, chunk []spooledHit) ([]model.SearchHit, error) {
+	hits := make([]model.SearchHit, 0, len(chunk))
+	spans := make([]model.ByteRange, 0, len(chunk))
+	located := make([]int, 0, len(chunk))
+	for _, it := range chunk {
+		if it.Span != nil {
+			located = append(located, len(hits))
+			spans = append(spans, *it.Span)
+		}
+		hits = append(hits, it.Hit)
+	}
+	if err := s.hydrate(ctx, reader, hits, located, spans); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
 // servableHit projects a ranked candidate into the hit that is served.
 func servableHit(it scored) model.SearchHit {
 	hit := it.Hit
@@ -510,52 +536,33 @@ func servableHit(it scored) model.SearchHit {
 	return hit
 }
 
-// tailOf streams the hits after the first page, hydrated one chunk at a time,
-// so the continuation spool is written without the answer's tail ever being
-// held in heap.
+// tailOf streams the hits after the first page into the continuation spool,
+// one at a time, so the answer's tail is never held in heap.
+//
+// It hydrates NOTHING. A spooled hit carries the byte interval it will be
+// hydrated from, and the page that finally serves it hydrates only itself, so
+// a first page no longer pays the CAS read, the block-hash verification and
+// the line/column scan of every hit it is not serving. The served bytes are
+// identical: hydration is a pure function of (file, interval) over the pinned
+// generation the continuation lease holds open.
 //
 // It is ONE walk of the run. A file-backed sorted run reopens its file and
 // decodes from the first record on every walk, so a chunk loop that re-walked
 // it per chunk would cost a quadratic number of decodes and would surface on a
 // wide answer as a query-deadline failure -- on exactly the query this streams
 // for.
-func (s *Service) tailOf(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], skip int) func(func(model.SearchHit) error) error {
-	return func(yield func(model.SearchHit) error) error {
+func tailOf(ctx context.Context, run *pagination.SortedRun[scored], skip int) func(func(spooledHit) error) error {
+	return func(yield func(spooledHit) error) error {
 		at := 0
-		chunk := make([]scored, 0, model.MaxPageItems)
-		flush := func() error {
-			if len(chunk) == 0 {
-				return nil
-			}
-			hits, err := s.hydrated(ctx, reader, chunk)
-			if err != nil {
-				return err
-			}
-			chunk = chunk[:0]
-			for _, h := range hits {
-				if err := yield(h); err != nil {
-					return err
-				}
-			}
-			return nil
-		}
-		err := run.Each(func(it scored) error {
+		return run.Each(func(it scored) error {
 			if err := ctx.Err(); err != nil {
 				return contextErr(err)
 			}
 			if at++; at <= skip {
 				return nil
 			}
-			chunk = append(chunk, it)
-			if len(chunk) < model.MaxPageItems {
-				return nil
-			}
-			return flush()
+			return yield(spooledHit{Hit: servableHit(it), Span: it.Span})
 		})
-		if err != nil {
-			return err
-		}
-		return flush()
 	}
 }
 
