@@ -58,6 +58,25 @@ type relationReader interface {
 // the streamed pass is proved against: a copy in a test file could drift from
 // the code that shipped, and then the proof would compare the stream to a
 // fiction.
+// edgeScanBudget answers the edge scan's stop condition: how many rows the
+// scan may read, and whether that bound exists at all.
+//
+// context.max_graph_edges is Unlimited by default, and reading an absent bound
+// as model.MaxPageItems (which is what ValueOr did here) made the default
+// stricter than any value a user could type: a scope wanting more relations
+// than one page carries stopped after 200 rows, left most of its routes
+// untyped and reported scope_complete=false. An unlimited bound now means what
+// it says -- the scan pages the keyset to exhaustion. The page WIDTH is
+// unchanged and is not a ceiling: it is the lossless keyset page the reader is
+// asked for, and the scan keeps asking for the next one.
+func (c *Compiler) edgeScanBudget() (int, bool) {
+	l := c.cfg.Context.MaxGraphEdges
+	if l.IsUnlimited() {
+		return 0, false
+	}
+	return l.Int(), true
+}
+
 func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relationReader,
 	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
 	wanted := map[model.RelationID]struct{}{}
@@ -84,7 +103,7 @@ func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relation
 	}
 
 	limit := c.pageLimit()
-	budget := int(c.cfg.Context.MaxGraphEdges.ValueOr(model.MaxPageItems))
+	budget, bounded := c.edgeScanBudget()
 	scanned := 0
 	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
 		batch := nodes[start:min(start+limit, len(nodes))]
@@ -101,11 +120,11 @@ func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relation
 				after = rel.ID
 			}
 			scanned += len(page)
-			if len(page) < limit || scanned >= budget {
+			if len(page) < limit || (bounded && scanned >= budget) {
 				break
 			}
 		}
-		if scanned >= budget {
+		if bounded && scanned >= budget {
 			break
 		}
 	}
@@ -372,9 +391,7 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, reader relationReader,
 	wantedRun *pagination.SortedRun[hopRec], nodes *pagination.SortedRun[nodeRec],
 	wanted int64, attrs *pagination.ExternalSort[relAttrRec]) (int64, error) {
 	limit := c.pageLimit()
-	// An unlimited edge bound is not a zero-sized scan: an absent bound falls
-	// back to the page size relationsOnPaths already used for a 0 value.
-	budget := int(c.cfg.Context.MaxGraphEdges.ValueOr(model.MaxPageItems))
+	budget, bounded := c.edgeScanBudget()
 	seen := newBitset(wanted)
 	scanned := 0
 
@@ -404,14 +421,14 @@ func (c *Compiler) scanEdgeKinds(ctx context.Context, reader relationReader,
 				after = rel.ID
 			}
 			scanned += len(page)
-			if len(page) < limit || scanned >= budget {
+			if len(page) < limit || (bounded && scanned >= budget) {
 				break
 			}
 		}
 		if err := cursor.Close(); err != nil {
 			return err
 		}
-		if scanned >= budget {
+		if bounded && scanned >= budget {
 			stopped = true
 		}
 		batch = batch[:0]

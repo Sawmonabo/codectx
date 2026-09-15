@@ -183,6 +183,10 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 		{name: "paged within a node batch", nodes: 12, edges: 6, hops: 4, pageItems: 2, budget: config.Unlimited},
 		{name: "edge budget cuts the scan", nodes: 20, edges: 6, hops: 4, pageItems: 3, budget: config.Limit(7)},
 		{name: "an unmatchable relation", nodes: 8, edges: 3, hops: 2, pageItems: 4, budget: config.Unlimited, unmatched: true},
+		// Ruling C8: more wanted relations than one keyset page carries. Both
+		// sides must page to exhaustion under an unlimited bound.
+		{name: "more wanted relations than one page", nodes: 60, edges: 6, hops: 4,
+			pageItems: model.MaxPageItems, budget: config.Unlimited},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -338,5 +342,79 @@ func TestPassEMatchesCentralityMap(t *testing.T) {
 	}
 	if !sort.StringsAreSorted(order) {
 		t.Errorf("counts must be emitted in package order for P-F's merge join, got %v", order)
+	}
+}
+
+// TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound is ruling C8's proof.
+//
+// context.max_graph_edges is Unlimited by default, and the edge scan read that
+// absent bound as model.MaxPageItems: a scope naming more than one page of
+// relations stopped after 200 rows, left the rest untyped and reported an
+// incomplete scope -- a default that refused work, on exactly the repositories
+// this compiler serves. The page WIDTH is still one page; what changed is that
+// the scan keeps asking for the next one.
+//
+// Restoring `ValueOr(model.MaxPageItems)` at either scan site fails this.
+func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
+	ctx := context.Background()
+	const nodes, edgesPerNode, hops = 60, 6, 4
+	fixture := relationFixture(t, nodes, edgesPerNode)
+	ids := make([]model.NodeID, 0, nodes)
+	for n := 0; n < nodes; n++ {
+		ids = append(ids, model.NodeID(fmt.Sprintf("n%03d", n)))
+	}
+	cands := candidatesOver(fixture, ids, hops)
+	wanted := map[model.RelationID]struct{}{}
+	for _, cand := range cands {
+		for _, p := range cand.Paths {
+			for _, rel := range p.Relations {
+				wanted[rel] = struct{}{}
+			}
+		}
+	}
+	if len(wanted) <= model.MaxPageItems {
+		t.Fatalf("the fixture must want more than one page of relations, got %d", len(wanted))
+	}
+
+	c := testCompiler(model.MaxPageItems, config.Unlimited)
+	refReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
+	relations, complete, err := c.relationsOnPathsWholeSet(ctx, refReader, cands)
+	if err != nil {
+		t.Fatalf("whole-set edge scan: %v", err)
+	}
+	if !complete || len(relations) != len(wanted) {
+		t.Fatalf("whole-set scan typed %d of %d wanted relations (complete=%v)", len(relations), len(wanted), complete)
+	}
+
+	s := openSorts(t, config.Config{})
+	streamReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
+	candRun, hopRun := spoolCandidates(t, s, cands)
+	got, err := c.passCRelationAttributes(ctx, s, streamReader, hopRun, candRun)
+	if err != nil {
+		t.Fatalf("streamed P-C: %v", err)
+	}
+	if !got.Complete {
+		t.Fatalf("the streamed scan reported an incomplete scope under an unlimited edge bound")
+	}
+	typed := map[model.RelationID]struct{}{}
+	if err := got.Hops.Each(func(h hopRec) error {
+		if h.Kind != "" {
+			typed[h.RelationID] = struct{}{}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk hops: %v", err)
+	}
+	if len(typed) != len(wanted) {
+		t.Fatalf("the streamed scan typed %d of %d wanted relations", len(typed), len(wanted))
+	}
+
+	// A user-set bound is still obeyed: only an explicit limit cuts the scan.
+	bounded := testCompiler(model.MaxPageItems, config.Limit(model.MaxPageItems))
+	cut := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
+	if _, boundedComplete, err := bounded.relationsOnPathsWholeSet(ctx, cut, cands); err != nil {
+		t.Fatalf("bounded edge scan: %v", err)
+	} else if boundedComplete {
+		t.Fatalf("a user-set max_graph_edges of %d must cut this scan", model.MaxPageItems)
 	}
 }
