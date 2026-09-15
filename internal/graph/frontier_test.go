@@ -218,6 +218,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		Start:     []model.NodeID{fixtureNodeID("n-a")},
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 	seen := map[model.RelationID]int{}
+	var order []model.RelationID
 	for page := 1; ; page++ {
 		if page > 500 {
 			t.Fatalf("the walk did not terminate after %d pages with %d edges seen", page-1, len(seen))
@@ -228,6 +229,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		}
 		for _, rel := range res.Relations {
 			seen[rel.ID]++
+			order = append(order, rel.ID)
 		}
 		if res.Meta.NextCursor == "" {
 			break
@@ -241,6 +243,39 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 	for id, n := range seen {
 		if n != 1 {
 			t.Errorf("relation %s was returned %d times, want exactly once", id, n)
+		}
+	}
+
+	// D15: the ceiling is an internal page boundary, so the pages it forces
+	// must CONCATENATE to the answer a ceiling that never binds returns --
+	// same edges, same (depth asc, NodeID asc, RelationID asc) order, none
+	// dropped, none reordered. Exactly-once alone passes both a walk that
+	// silently drops what a mid-chunk cut never read and a fix that resumes
+	// mid-chunk and emits one level's owners out of order; this does not.
+	limits.FrontierBytes = 32 << 20
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	ref, err := whole.Neighbors(context.Background(), model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("unbounded-ceiling walk: %v", err)
+	}
+	if ref.Meta.NextCursor != "" || ref.Meta.Truncated {
+		t.Fatalf("the reference walk is paged (%v) or truncated (%q)",
+			ref.Meta.NextCursor != "", ref.Meta.TruncationReason)
+	}
+	if len(order) != len(ref.Relations) {
+		t.Fatalf("the one-byte ceiling served %d edge(s), a ceiling that never binds %d: the ceiling changed the set",
+			len(order), len(ref.Relations))
+	}
+	for i, want := range ref.Relations {
+		if order[i] != want.ID {
+			t.Fatalf("at position %d the spilled pages carry %s, the unbounded-ceiling walk %s: the ceiling changed the order",
+				i, order[i], want.ID)
 		}
 	}
 }
@@ -890,7 +925,7 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 	clock := time.Now()
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
-		trigger: 5, jump: 2 * time.Minute, fired: &fired}
+		trigger: 6, jump: 2 * time.Minute, fired: &fired}
 	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
@@ -973,6 +1008,106 @@ func assertNoRetainedState(t *testing.T, dir string) {
 		if strings.HasPrefix(e.Name(), "spool-") {
 			t.Errorf("the fully served answer left continuation state behind: %s (directory=%v)",
 				e.Name(), e.IsDir())
+		}
+	}
+}
+
+// TestFrontierCeilingDoesNotShrinkTheImpactAnswer is D15: the blast radius a
+// request reports must be a function of the GRAPH, never of the memory ceiling
+// the walk was given. Limits.FrontierBytes is an internal page boundary --
+// runWalkToCompletion chains through it -- so a smaller ceiling may cost more
+// internal links, more round trips and more disk, and must cost not one entity.
+//
+// It did. A node chunk is keyset-paged by relation id while the emission order
+// is (owner asc, relation asc), so a chunk of several owners cut in the middle
+// by the byte ceiling kept a NON-prefix of that order; the continuation's
+// keyset skip then dropped every row it had not read that sorted below the cut,
+// and the walk ended with every truncation flag clear. Measured on this
+// fixture: 16 KiB -> 52 entries, 64 KiB -> 154, 256 KiB -> 306, all reporting
+// Truncated=false. A ceiling that quietly returns a sixth of the answer and
+// calls it complete is worse than one that refuses.
+//
+// The table is load-bearing: a single ceiling can pass under a fix that only
+// happens to work at one size, and it was the graduated 52/154/306 that made
+// the defect legible in the first place.
+//
+// Mutation (restore the defect): in levelEdges, replace the multi-owner
+// rollback and single-node re-read with `break chunks` -- FAIL at 16 KiB with
+// 52 entries against the baseline's 306.
+func TestFrontierCeilingDoesNotShrinkTheImpactAnswer(t *testing.T) {
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	run := func(t *testing.T, frontierBytes int64) model.ImpactResult {
+		t.Helper()
+		f := newGraphFixture(t)
+		signer, err := pagination.OpenSigner(t.TempDir())
+		if err != nil {
+			t.Fatalf("open signer: %v", err)
+		}
+		store := newFixtureLeases()
+		spools, err := pagination.NewSpools(t.TempDir(), 64<<20, store)
+		if err != nil {
+			t.Fatalf("new spools: %v", err)
+		}
+		limits := fixtureLimits()
+		// Unlimited depth, visited and edge budgets, and a page bound above the
+		// fixture's record count: the frontier ceiling is the ONLY thing that
+		// differs between the rows of this table.
+		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+		limits.MaxPageItems = 100000
+		limits.FrontierBytes = frontierBytes
+		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		res, err := e.Impact(context.Background(), model.ImpactRequest{GenerationID: 1,
+			Start: seeds, Direction: model.DirectionOutgoing,
+			Relations: []model.RelationKind{model.RelCalls}})
+		if err != nil {
+			t.Fatalf("frontier ceiling %d bytes: %v", frontierBytes, err)
+		}
+		return res
+	}
+
+	// A ceiling far above the whole level: the walk never spills, so this is
+	// the answer the graph alone decides.
+	all := run(t, 32<<20)
+	if len(all.Entries) == 0 || all.Meta.Truncated || all.Meta.NextCursor != "" {
+		t.Fatalf("baseline is empty (%d), truncated (%q) or paged (%v)",
+			len(all.Entries), all.Meta.TruncationReason, all.Meta.NextCursor != "")
+	}
+	for _, frontierBytes := range []int64{16 << 10, 64 << 10, 256 << 10} {
+		res := run(t, frontierBytes)
+		if res.Meta.Truncated {
+			t.Errorf("ceiling %d: the answer is truncated (%q); a frontier byte ceiling is an internal page boundary, not an answer-level bound",
+				frontierBytes, res.Meta.TruncationReason)
+		}
+		if len(res.Entries) != len(all.Entries) {
+			t.Fatalf("ceiling %d: %d affected entit(ies), the unbounded-ceiling walk %d: the ceiling shrank the answer",
+				frontierBytes, len(res.Entries), len(all.Entries))
+		}
+		seen := map[model.NodeID]bool{}
+		for i, want := range all.Entries {
+			got := res.Entries[i]
+			if got.NodeID != want.NodeID || got.ScoreMicros != want.ScoreMicros || got.Depth != want.Depth {
+				t.Fatalf("ceiling %d: at rank %d %s (score %d, depth %d), the unbounded-ceiling walk %s (score %d, depth %d)",
+					frontierBytes, i, got.NodeID, got.ScoreMicros, got.Depth,
+					want.NodeID, want.ScoreMicros, want.Depth)
+			}
+			if seen[got.NodeID] {
+				t.Fatalf("ceiling %d: node %s is listed twice", frontierBytes, got.NodeID)
+			}
+			seen[got.NodeID] = true
+		}
+		if len(res.Packages) != len(all.Packages) {
+			t.Fatalf("ceiling %d: %d package pair(s), the unbounded-ceiling walk %d",
+				frontierBytes, len(res.Packages), len(all.Packages))
+		}
+		for i, want := range all.Packages {
+			if res.Packages[i] != want {
+				t.Fatalf("ceiling %d: at rank %d %+v, the unbounded-ceiling walk %+v",
+					frontierBytes, i, res.Packages[i], want)
+			}
 		}
 	}
 }

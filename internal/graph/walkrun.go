@@ -90,14 +90,6 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 		}
 		state.Carried, state.ReleaseCarried = carried, release
 		switch {
-		case o.Budget.edges == spent:
-			// The link admitted nothing, so the next one would admit nothing
-			// either: the visitor is refusing every row on an ANSWER-level
-			// bound it carries itself (impactAccumulator's max_edges and
-			// max_visited), which no internal boundary can return. Chaining on
-			// would spin forever over the same frontier. The frontier is
-			// returned standing, and the caller reports the visitor's reason.
-			return state, nil
 		case len(state.Frontier) == 0 || state.DepthLimited:
 			// Exhausted, or stopped at the user-set depth bound -- the one stop
 			// that is an answer-level truncation rather than an internal page
@@ -107,6 +99,17 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			// Ruling P3: out of time with the walk unfinished. The frontier
 			// this state carries becomes the `f` continuation and the next
 			// request carries the walk on; nothing is ranked or served here.
+			return state, nil
+		case o.Budget.edges == spent:
+			// Checked LAST: a link that admitted nothing because the CLOCK cut it
+			// short is the case above, and it is resumable. Only a link the
+			// visitor starved with time left is an answer-level stop.
+			// The link admitted nothing, so the next one would admit nothing
+			// either: the visitor is refusing every row on an ANSWER-level
+			// bound it carries itself (impactAccumulator's max_edges and
+			// max_visited), which no internal boundary can return. Chaining on
+			// would spin forever over the same frontier. The frontier is
+			// returned standing, and the caller reports the visitor's reason.
 			return state, nil
 		}
 		// An internal page boundary. Everything it spent against the per-page

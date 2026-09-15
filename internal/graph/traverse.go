@@ -336,6 +336,29 @@ type edgeRow struct {
 // skipOwner/skipKey, when set, are a resumed page's keyset position: every row
 // at or before (skipOwner, skipKey) in the frozen emission order belongs to an
 // earlier page and is dropped before it costs a frontier byte.
+//
+// That keyset resume is only sound if what the previous read KEPT was a true
+// prefix of the frozen order -- otherwise the rows it never read that sort
+// BELOW its last admitted row are dropped here and never seen again, which is
+// a walk silently shrinking under a memory ceiling rather than spilling under
+// it. A node chunk is keyset-paged by RELATION id, not by (owner, relation),
+// so a chunk of several owners cut in the middle keeps exactly such a
+// non-prefix. Two facts make an honest cut available anyway:
+//
+//   - CHUNK boundaries are frozen-order boundaries. `nodes` is ascending and
+//     chunks are contiguous, so every row a chunk collects is owned by one of
+//     its own nodes: an edge with both ends on the frontier is attributed to
+//     the LOWER id, which lies in the earlier chunk and is collected there.
+//     A cut after a completed chunk is therefore a prefix.
+//   - a SINGLE-node chunk has one owner, so relation order is the frozen order
+//     within it and a mid-chunk cut is a prefix too.
+//
+// So the ceiling cuts only at those two places. When it binds inside a chunk of
+// several owners, that chunk's rows are rolled back -- rows, bytes and the
+// collected-relation set alike -- and its node range is re-read one node at a
+// time until the ceiling binds again, which it must, on a boundary that is now
+// exact. The re-read costs round trips only for the one chunk a spill lands in,
+// and only for as many of its nodes as the remaining budget holds.
 func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level map[model.NodeID]frontierState,
 	o expandOptions, batch int, admittedRel map[model.RelationID]bool,
 	skipOwner model.NodeID, skipKey model.RelationID) ([]edgeRow, error) {
@@ -347,36 +370,37 @@ func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level ma
 	// loop treats a short page as "read on", so asking for the node-chunk size
 	// would cost nothing but an extra round trip -- and it would make the
 	// storage layer record a page-bound resolution on EVERY traversal answer,
-	// turning a disclosure that exists for real news into noise.
+	// turning a disclosure that exists for real news into noise. It is derived
+	// from the ORIGINAL batch, so the single-node re-read above keeps the same
+	// wire page and does not turn into one round trip per edge.
 	rowLimit := batch
 	if rowLimit > model.MaxPageItems {
 		rowLimit = model.MaxPageItems
 	}
 	collected := map[model.RelationID]bool{}
-chunks:
-	for start := 0; start < len(nodes); start += batch {
-		end := start + batch
-		if end > len(nodes) {
-			end = len(nodes)
-		}
-		chunk := nodes[start:end]
+
+	// readChunk reads one contiguous node range to exhaustion, appending its
+	// rows. It reports whether the read was CUT short -- by the frontier byte
+	// ceiling or by the deadline, which the budget flags tell apart -- rather
+	// than having reached the end of the range's edges.
+	readChunk := func(chunk []model.NodeID) (bool, error) {
 		after := model.RelationID("")
 		for {
 			if err := checkWalk(ctx, o.Budget); err != nil {
 				if !deadlineStop(err, o) {
-					return nil, err
+					return false, err
 				}
 				// The page ran out of time mid-level. The rows read so far are
-				// facts and are kept; the caller stops after this level and
-				// mints a continuation, and the resumed page re-reads the level
-				// from the keyset position, so no edge is lost and none is read
-				// twice -- the frontier-byte spill below, reached by the clock.
+				// facts and are kept when the cut is on an exact boundary; the
+				// caller stops after this level and mints a continuation, and
+				// the resumed page re-reads the level from the keyset position,
+				// so no edge is lost and none is read twice.
 				o.Budget.deadlineHit = true
-				break chunks
+				return true, nil
 			}
 			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, rowLimit)
 			if err != nil {
-				return nil, err
+				return false, err
 			}
 			for _, rel := range page {
 				if admittedRel[rel.ID] || collected[rel.ID] {
@@ -409,7 +433,7 @@ chunks:
 					// exceeding the byte bound by at most one row -- which is the
 					// same trade every other per-page budget here makes.
 					o.Budget.frontierHit = true
-					break chunks
+					return true, nil
 				}
 				spent += edgeRowBytes(row)
 				collected[rel.ID] = true
@@ -425,6 +449,56 @@ chunks:
 			// the keyset walk; the advance below is what makes the next one
 			// reachable.
 			after = page[len(page)-1].ID
+		}
+		return false, nil
+	}
+	// rollback undoes an inexact cut: the rows, the bytes AND the collected
+	// relation ids, which the re-read must be allowed to collect again or it
+	// would skip them as duplicates and lose exactly what this fix restores.
+	rollback := func(markRows int, markSpent int64) {
+		for _, r := range rows[markRows:] {
+			delete(collected, r.rel.ID)
+		}
+		rows, spent = rows[:markRows], markSpent
+	}
+
+chunks:
+	for start := 0; start < len(nodes); start += batch {
+		end := start + batch
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		markRows, markSpent := len(rows), spent
+		cut, err := readChunk(nodes[start:end])
+		if err != nil {
+			return nil, err
+		}
+		if !cut {
+			continue
+		}
+		if end-start == 1 {
+			// One owner: relation order is the frozen order, so the cut is a
+			// prefix and the keyset position resumes it exactly.
+			break chunks
+		}
+		rollback(markRows, markSpent)
+		if o.Budget.deadlineHit {
+			// Out of time: there is none to spend re-reading. Dropping this
+			// chunk's partial rows costs the next page a re-read of the range
+			// and loses nothing -- a level whose every row was rolled back
+			// carries no keyset position at all (walkState.LevelBoundary).
+			break chunks
+		}
+		// The ceiling bound inside a chunk of several owners. Re-read the range
+		// one owner at a time so it binds on an exact boundary instead.
+		o.Budget.frontierHit = false
+		for i := start; i < end; i++ {
+			if cut, err = readChunk(nodes[i : i+1]); err != nil {
+				return nil, err
+			}
+			if cut {
+				break chunks
+			}
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
