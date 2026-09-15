@@ -36,10 +36,12 @@ type Sampler interface {
 // does not import internal/storage/sqlite (see doc.go); the composition root
 // adapts it.
 type StoreReader interface {
-	// Check runs the Section 12.1 integrity checks. deep adds the expensive
-	// FTS5 external-content check, and an ordinary doctor call must pass
-	// false: Section 22's last line forbids a full database scan on an
-	// ordinary command.
+	// Check runs the Section 12.1 integrity checks. With deep false it reads
+	// the database header, the schema fingerprint and the journal mode and
+	// nothing else; deep adds quick_check, the foreign key check and the FTS5
+	// external-content check, each of which walks the whole database. An
+	// ordinary doctor call must pass false: Section 22's last line forbids a
+	// full database scan on an ordinary command.
 	Check(ctx context.Context, deep bool) error
 	// Stats reports row counts and the on-disk database and WAL sizes.
 	Stats(ctx context.Context) (StoreStats, error)
@@ -66,6 +68,16 @@ type StoreStats struct {
 	Sessions      int64
 	DatabaseBytes int64
 	WALBytes      int64
+}
+
+// StoreSizer reports only the on-disk sizes -- two file stats, no query. It is
+// an optional interface beside StoreReader because StoreReader is frozen, and
+// it exists so a shallow doctor can still report database and write-ahead-log
+// bytes (and warn on a WAL past its high-water mark) without paying for Stats,
+// whose eleven `count(*)` scans are O(rows). A store that does not implement it
+// reports the accounting sizes as unavailable rather than as zero.
+type StoreSizer interface {
+	StoreSizes(ctx context.Context) (databaseBytes, walBytes int64, err error)
 }
 
 // ToolchainReporter reports one status per lock entry. The lock entry name is

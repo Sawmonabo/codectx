@@ -159,14 +159,24 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 	// report can disagree with each other, and the accounting figures an
 	// operator is shown must be the same ones the retention sample reasoned
 	// about.
-	stats, statsErr := s.opts.Store.Stats(ctx)
+	//
+	// It is read only under --deep. Stats is eleven `count(*)` scans, one per
+	// table, and node_facts, relation_facts and evidence are the largest tables
+	// this product writes: on a large repository that is a second whole-database
+	// walk beside the integrity one, on a command Section 22 forbids scanning.
+	// Shallow reports the sizes it can stat and marks the counts unverified.
+	var stats StoreStats
+	var statsErr error
+	if req.Deep {
+		stats, statsErr = s.opts.Store.Stats(ctx)
+	}
 	checks := make([]model.DoctorCheck, 0, 24)
 	checks = append(checks,
 		s.checkBuild(),
 		s.checkDataDirectory(ctx),
 		s.checkFreeDisk(ctx),
 		s.checkStorage(ctx, req.Deep),
-		s.checkAccounting(stats, statsErr),
+		s.checkAccounting(ctx, req.Deep, stats, statsErr),
 	)
 	active, generationCheck := s.checkActive(ctx)
 	checks = append(checks,
@@ -296,26 +306,48 @@ func (s *Service) checkFreeDisk(ctx context.Context) model.DoctorCheck {
 	return model.DoctorCheck{Name: checkFreeDisk, State: model.CheckPass, Detail: bytesPhrase(int64(*free)) + " free under the data directory"}
 }
 
-// checkStorage runs the integrity checks. deep is passed straight through: the
-// store's own contract is that an ordinary pass is quick_check plus the foreign
-// key check, and the full-text index walk happens only when deep is set.
+// checkStorage runs the integrity checks. deep is passed straight through, and
+// it decides which check this row reports: shallow reads the database header,
+// the schema fingerprint and the journal mode -- all constant cost -- while
+// quick_check, the foreign key check and the full-text index walk are O(database
+// bytes) and belong to --deep alone.
+//
+// A shallow pass is therefore reported `unverified`, never `pass`. The row is
+// still emitted with the flag that verifies it: nothing is dropped from the
+// report, and an operator is never told the database passed a check this run did
+// not run. A shallow FAILURE is a real failure -- a fingerprint mismatch or a
+// truncated header is decided without reading a page of content.
 func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck {
 	if err := s.opts.Store.Check(ctx, deep); err != nil {
 		return failure(checkStorageIntegrity, err)
 	}
-	detail := "the index database passed its quick integrity and referential checks"
-	if deep {
-		detail = "the index database passed its full integrity checks, including the search index"
+	if !deep {
+		return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckUnverified,
+			Detail: "the index database header, page count, schema fingerprint and write-ahead-log mode read back; " +
+				"the integrity and referential checks walk the whole database and were " + shallowUnverified,
+			Remediation: shallowRemediation}
 	}
-	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass, Detail: detail}
+	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass,
+		Detail: "the index database passed its full integrity checks, including the search index"}
 }
+
+// shallowUnverified is the one phrase every check skipped by shallow mode ends
+// with, and shallowRemediation the one remediation beside it. They are declared
+// once so an operator and a script see the same wording whichever check skipped.
+const (
+	shallowUnverified  = "not verified in shallow mode; run doctor --deep"
+	shallowRemediation = "run codectx doctor --deep to verify this check"
+)
 
 // checkAccounting reports the bounded row counts and file sizes, and warns when
 // the write-ahead log has grown past its high-water mark: a WAL that never
 // checkpoints is how a workspace runs a disk out of space while every
 // individual operation still succeeds. The lease and session counts are the
 // retention figures Section 22 asks for -- they are counts, never identities.
-func (s *Service) checkAccounting(stats StoreStats, err error) model.DoctorCheck {
+func (s *Service) checkAccounting(ctx context.Context, deep bool, stats StoreStats, err error) model.DoctorCheck {
+	if !deep {
+		return s.checkAccountingShallow(ctx)
+	}
 	if err != nil {
 		return failure(checkStorageAccount, err)
 	}
@@ -332,6 +364,36 @@ func (s *Service) checkAccounting(stats StoreStats, err error) model.DoctorCheck
 			Remediation: "the write-ahead log is past its high-water mark; run an index or refresh to checkpoint it"}
 	}
 	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckPass, Detail: detail}
+}
+
+// checkAccountingShallow reports what accounting costs nothing: the two file
+// sizes, and the write-ahead-log high-water warning that is the one actionable
+// fact in this check. The row counts are O(rows) and are reported unverified.
+//
+// The WAL warning is deliberately NOT suppressed by shallow mode. A WAL that
+// never checkpoints fills a disk while every operation still succeeds, and it is
+// decided by a file stat; withholding it until --deep would hide the cheapest
+// real finding this command has behind the most expensive flag.
+func (s *Service) checkAccountingShallow(ctx context.Context) model.DoctorCheck {
+	sizer, ok := s.opts.Store.(StoreSizer)
+	if !ok {
+		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckUnavailable,
+			Detail: "this build's store reader reports no on-disk sizes without a full row count, so no accounting figure could be read"}
+	}
+	dbBytes, walBytes, err := sizer.StoreSizes(ctx)
+	if err != nil {
+		return failure(checkStorageAccount, err)
+	}
+	detail := "database " + bytesPhrase(dbBytes) + ", write-ahead log " + bytesPhrase(walBytes) +
+		"; the generation, unit, blob, lease and session counts are " + shallowUnverified
+	if high := s.opts.Config.Storage.WALHighWaterBytes; high > 0 && walBytes > high {
+		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckWarn,
+			Detail:      detail,
+			Code:        model.CodeResourceLimit,
+			Remediation: "the write-ahead log is past its high-water mark; run an index or refresh to checkpoint it"}
+	}
+	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckUnverified,
+		Detail: detail, Remediation: shallowRemediation}
 }
 
 // checkActive resolves the active generation pointer and returns it, so the
@@ -376,13 +438,22 @@ func (s *Service) checkCAS(ctx context.Context, deep bool, stats StoreStats, sta
 		// all quarantined or in trash returns nothing here, and reporting
 		// that as "nothing to verify" would read as a healthy empty
 		// workspace, so the accounting count decides which it is.
-		if statsErr == nil && stats.Blobs > 0 {
-			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
-				Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
-				Code:        model.CodeSourceIntegrity,
-				Remediation: "rebuild the cache with codectx index --rebuild"}
+		if deep {
+			if statsErr == nil && stats.Blobs > 0 {
+				return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
+					Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
+					Code:        model.CodeSourceIntegrity,
+					Remediation: "rebuild the cache with codectx index --rebuild"}
+			}
+			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckPass, Detail: "no source is retained yet, so there was nothing to verify"}
 		}
-		return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckPass, Detail: "no source is retained yet, so there was nothing to verify"}
+		// Telling the two apart needs the retained-object count, which is one
+		// of the O(rows) figures shallow mode does not read. "Nothing to
+		// verify" and "every retained object is unreadable" look identical
+		// from here, and reporting the reassuring one would be a guess.
+		return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckUnverified,
+			Detail:      "no retained object was listed in a readable state; whether that is an empty workspace or an unreadable one is " + shallowUnverified,
+			Remediation: shallowRemediation}
 	}
 	for _, h := range hashes {
 		if _, err := s.opts.Store.Blob(ctx, h); err != nil {

@@ -58,13 +58,20 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 			"blocks, bundled grammar availability, managed toolchain status per lock entry, " +
 			"orphan temporary state and session and lease retention.\n\n" +
 			"Each check carries its own state, reason code and remediation, and a metric " +
-			"this host cannot measure is reported as unavailable rather than as zero. A " +
+			"this host cannot measure is reported as unavailable rather than as zero, and a " +
+			"check this run deliberately skipped is reported as unverified rather than as " +
+			"passed. A " +
 			"workspace that cannot be opened is itself reported as a failing check, so this " +
 			"command answers on exactly the installations it exists to diagnose.\n\n" +
 			"The repository is named as a positional path, or with --repo, and naming it " +
 			"both ways is refused rather than resolved to one of them.\n\n" +
-			"--deep additionally runs the expensive integrity and parser smoke checks; no " +
-			"full database scan happens without it. --offline asks for the offline-policy " +
+			"Without --deep the checks that walk the whole database are not run: the " +
+			"database integrity and referential checks, the row-count accounting and the " +
+			"retained-object sample are each reported as a check in state unverified, " +
+			"naming --deep as what verifies them. The header, page count, schema " +
+			"fingerprint, write-ahead-log mode and size are still read and can still fail " +
+			"the report. --deep runs those checks in full; no full database scan happens " +
+			"without it. --offline asks for the offline-policy " +
 			"checks, and what the report says is what those checks found -- the flag itself " +
 			"asserts nothing about this installation.",
 		Args:          cobra.MaximumNArgs(1),
@@ -78,7 +85,7 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().Bool(doctorOfflineFlag, false,
 		"include the offline-policy checks in the report")
 	cmd.Flags().Bool(doctorDeepFlag, false,
-		"also run the expensive integrity and parser smoke checks, which an ordinary run never does")
+		"also run the whole-database checks an ordinary run reports as unverified: database integrity, referential integrity, the search index, the row-count accounting and a wider retained-object sample")
 	return cmd
 }
 
@@ -214,7 +221,7 @@ func writeDoctorReport(w io.Writer, r model.DoctorReport) error {
 func checkSummary(counts map[model.CheckState]int) string {
 	parts := make([]string, 0, len(counts))
 	for _, state := range []model.CheckState{model.CheckPass, model.CheckWarn,
-		model.CheckFail, model.CheckUnavailable} {
+		model.CheckFail, model.CheckUnavailable, model.CheckUnverified} {
 		if n := counts[state]; n > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", n, state))
 		}

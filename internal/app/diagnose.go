@@ -63,6 +63,12 @@ func (r storeReader) Stats(ctx context.Context) (diagnostics.StoreStats, error) 
 // it on the reader it was handed.
 var _ diagnostics.StoreReader = storeReader{}
 
+// StoreSizes is forwarded by the embedded *sqlite.Store. The assertion is what
+// keeps a shallow doctor's accounting row a real measurement: without it a
+// signature drift would leave the optional interface unsatisfied and the check
+// permanently `unavailable`, with nothing failing to compile.
+var _ diagnostics.StoreSizer = storeReader{}
+
 // SuppliedIndexes restates (*sqlite.Store).SuppliedIndexes in the doctor's own
 // vocabulary, for the same reason Stats does: internal/diagnostics must not
 // import a storage package, so the two structurally identical types meet here.
