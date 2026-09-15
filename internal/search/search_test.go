@@ -278,7 +278,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
 
 		// FX-C13b rows
-		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierBound},
+		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierLossless},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
@@ -665,7 +665,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	// The answer-level metadata the first page computed travels with the
 	// remainder: a continuation reads its hits from the spool and has nothing
 	// of its own to recompute truncation from.
-	answer := spoolMeta{Truncated: true, TruncationReason: truncationExactTierFull}
+	answer := spoolMeta{Truncated: true, TruncationReason: testTruncationReason}
 	id, err := spoolHits(f.opts.Spools, c, answer, want)
 	if err != nil {
 		t.Fatalf("spoolHits: %v", err)
@@ -689,9 +689,9 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("readSpool replayed %+v, want %+v", got, want)
 	}
-	if !meta.Truncated || meta.TruncationReason != truncationExactTierFull {
+	if !meta.Truncated || meta.TruncationReason != testTruncationReason {
 		t.Fatalf("readSpool replayed truncation (%t, %q), want the first page's (true, %q)",
-			meta.Truncated, meta.TruncationReason, truncationExactTierFull)
+			meta.Truncated, meta.TruncationReason, testTruncationReason)
 	}
 
 	// A spool bound to another query is not this cursor's continuation.
@@ -1008,17 +1008,25 @@ func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int)
 	return nil, nil
 }
 
-// legPathTierBound proves the exact_path tier both announces its overflow and
-// applies the kind filter across the whole keyset rather than to one bounded
-// read. Serving five of eight candidates as a complete answer, or answering
-// "nothing here" for a file whose three functions sit past the bound, are both
+// testTruncationReason is an arbitrary answer-level truncation reason used to
+// prove a spool meta record round-trips it; the reason's text is not the
+// invariant under test.
+const testTruncationReason = "a traversal budget was exhausted"
+
+// legPathTierLossless proves the exact_path tier drops nothing: it walks the
+// whole keyset and emits every kept candidate, with the read page size bounding
+// only one round trip. Serving five of eight candidates -- or answering
+// "nothing here" for a file whose three functions sit past one page -- are both
 // the silent drop Section 14.3 forbids.
-func legPathTierBound(t *testing.T, _ *fixture) {
-	const limit = 5
+//
+// Mutation: restore the per-tier bound (stop emitting once page candidates have
+// been kept) and the unfiltered case comes back with 5 instead of 8.
+func legPathTierLossless(t *testing.T, _ *fixture) {
+	const page = 5
 	stub := &stubExact{file: model.FileID(model.H("stub-file")), path: "pkg/wide.go"}
 	for i := range 8 {
 		kind := model.NodeVariable
-		if i >= limit {
+		if i >= page {
 			kind = model.NodeFunction
 		}
 		id := model.NodeID(model.H("stub-node", strconv.Itoa(i)))
@@ -1027,23 +1035,21 @@ func legPathTierBound(t *testing.T, _ *fixture) {
 			Bytes: &model.ByteRange{Start: uint64(i * 10), End: uint64(i*10 + 1)},
 		})
 	}
-
-	out, full, err := pathCandidates(context.Background(), stub, stub.path, nil, limit)
-	if err != nil {
-		t.Fatalf("pathCandidates(unfiltered): %v", err)
+	collect := func(kinds []model.NodeKind) []exactHit {
+		t.Helper()
+		var out []exactHit
+		if err := pathCandidates(context.Background(), stub, stub.path, kinds, page,
+			func(h exactHit) error { out = append(out, h); return nil }); err != nil {
+			t.Fatalf("pathCandidates: %v", err)
+		}
+		return out
 	}
-	if len(out) != limit || !full {
-		t.Fatalf("pathCandidates(unfiltered) served %d candidates, truncated=%t; want %d and true: three of the eight were dropped",
-			len(out), full, limit)
+	if out := collect(nil); len(out) != 8 {
+		t.Fatalf("pathCandidates(unfiltered) served %d of the file's 8 candidates; the tier walks the whole keyset", len(out))
 	}
-
-	out, full, err = pathCandidates(context.Background(), stub, stub.path, []model.NodeKind{model.NodeFunction}, limit)
-	if err != nil {
-		t.Fatalf("pathCandidates(kind filter): %v", err)
-	}
-	if len(out) != 3 || full {
-		t.Fatalf("pathCandidates(kind filter) served %d candidates, truncated=%t; want 3 and false: the filter runs over the keyset, not over one bounded read",
-			len(out), full)
+	if out := collect([]model.NodeKind{model.NodeFunction}); len(out) != 3 {
+		t.Fatalf("pathCandidates(kind filter) served %d candidates; want 3: the filter runs over the keyset, not over one bounded read",
+			len(out))
 	}
 }
 
@@ -1128,7 +1134,7 @@ func legContinuationTruncation(t *testing.T, f *fixture) {
 	}
 	now := time.Now().UTC()
 	c := newCursor(endpointSearch, f.binding, lease.ID, searchQueryHash(req), now.Add(time.Minute))
-	id, err := spoolHits(f.opts.Spools, c, spoolMeta{Truncated: true, TruncationReason: truncationExactTierFull}, second.Items)
+	id, err := spoolHits(f.opts.Spools, c, spoolMeta{Truncated: true, TruncationReason: testTruncationReason}, second.Items)
 	if err != nil {
 		t.Fatalf("spoolHits: %v", err)
 	}
@@ -1142,9 +1148,9 @@ func legContinuationTruncation(t *testing.T, f *fixture) {
 	if err != nil {
 		t.Fatalf("Search(truncated continuation): %v", err)
 	}
-	if !page.Meta.Truncated || page.Meta.TruncationReason != truncationExactTierFull {
+	if !page.Meta.Truncated || page.Meta.TruncationReason != testTruncationReason {
 		t.Fatalf("the continuation reports (%t, %q), want the first page's (true, %q)",
-			page.Meta.Truncated, page.Meta.TruncationReason, truncationExactTierFull)
+			page.Meta.Truncated, page.Meta.TruncationReason, testTruncationReason)
 	}
 }
 

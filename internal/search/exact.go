@@ -136,64 +136,60 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 // pathCandidates is tier 0: the query read as a root-relative path, resolved to
 // a file, then that file's visible nodes in document order. A query that is not
 // a path, or names no visible file, yields no candidates rather than an error —
-// the symbol tiers answer the same query. The second return reports that the
-// file had more KEPT candidates than limit.
+// the symbol tiers answer the same query.
 //
 // It pages NodesInFile on its (start_byte, node_id) keyset rather than issuing
 // one bounded read, because storage takes no kind filter (search.go:109) and so
-// applies the bound BEFORE the filter: a single read of limit nodes would
-// answer "0 hits, not truncated" for a file whose matching declarations all sit
-// past node limit. It reads one candidate past the bound to tell a full answer
-// from a truncated one without claiming truncation it has not seen, and returns
-// at most limit.
-func pathCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, bool, error) {
+// applies the bound BEFORE the filter: a single read of page nodes would answer
+// "0 hits" for a file whose matching declarations all sit past node page.
+//
+// page is the READ size, not a bound on the answer: the walk runs the keyset to
+// its end and emits every kept candidate. A file's declarations are not dropped
+// because they sit past an arbitrary 200, which is the class-E truncation the
+// scale posture removes; the ranked set and its disk-backed spool own the global
+// bound instead.
+func pathCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
+	page int, emit func(exactHit) error) error {
 	normalized, ok := normalizeQueryPath(query)
 	if !ok {
-		return nil, false, nil
+		return nil
 	}
 	file, err := r.FileByPath(ctx, normalized)
 	if err != nil {
 		var typed *model.Error
 		if errors.As(err, &typed) && typed.Code == model.CodeArgumentInvalid {
-			return nil, false, nil
+			return nil
 		}
-		return nil, false, err
+		return err
 	}
-	out := make([]exactHit, 0, limit)
 	var afterStart int64
 	var after model.NodeID
-	for len(out) <= limit {
-		// The page size is the caller's bound, which storage clamps to at most
-		// model.MaxPageItems (query.go:283); asking for more would be a bound
-		// this code believes and the database does not, and the loop would
-		// then end on the first page.
-		nodes, err := r.NodesInFile(ctx, file, afterStart, after, limit)
+	for {
+		// The page size is the caller's read bound, which storage clamps to at
+		// most model.MaxPageItems (query.go:291); asking for more would be a
+		// bound this code believes and the database does not, and the walk
+		// would then end on the first page.
+		nodes, err := r.NodesInFile(ctx, file, afterStart, after, page)
 		if err != nil {
-			return nil, false, err
+			return err
 		}
 		if len(nodes) == 0 {
-			break
+			// An empty page is the end of the file's keyset. Only an empty one
+			// ends the walk: NodesInFile can return a short page while the
+			// keyset continues, and `after` advances strictly on every
+			// non-empty page, so this terminates.
+			return nil
 		}
 		for _, n := range nodes {
 			afterStart, after = nodeStartByte(n), n.Node.ID
 			if !matchesKinds(n.Node.Kind, kinds) {
 				continue
 			}
-			out = append(out, exactHit{Tier: model.TierExactPath, Path: normalized, Node: n})
-			if len(out) > limit {
-				break
+			if err := emit(exactHit{Tier: model.TierExactPath, Path: normalized, Node: n}); err != nil {
+				return err
 			}
 		}
-		if len(nodes) < limit {
-			// A short page is the end of the file's keyset, so nothing was
-			// dropped and the answer for this tier is complete.
-			break
-		}
 	}
-	if len(out) > limit {
-		return out[:limit], true, nil
-	}
-	return out, false, nil
 }
 
 // nodeStartByte is the offset NodesInFile pages on. A node with no byte range
@@ -222,11 +218,19 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 }
 
 // exactCandidates runs all four non-lexical tiers for one search query and
-// returns their candidates in tier order, each already carrying its path. A
-// node that matches more than one tier appears once, at its most specific tier.
-// limit bounds each tier, so the result holds at most 4*limit candidates; the
-// caller's heap and dedup own the global bound. The second return reports that
-// some tier filled that bound, which the caller turns into QueryMeta.Truncated.
+// emits their candidates in tier order, each already carrying its path. A node
+// that matches more than one tier is emitted once, at its most specific tier.
+//
+// page is the READ size for one keyset step, not a bound on the answer: every
+// tier is walked to the end of its keyset and nothing is dropped, so there is no
+// per-tier truncation left to report. The caller's ranked set and its
+// disk-backed spool own the global bound.
+//
+// Peak heap here is one page of stored nodes plus `seen`, which holds one
+// model.NodeID per distinct candidate across all five tiers. `seen` is therefore
+// answer-sized, not repository-sized -- a tier only yields nodes its filter
+// matched -- and it is the cost of the cross-tier "most specific tier wins"
+// rule, which cannot be decided from a streamed page alone.
 //
 // Every candidate scores 0 (digest §4, Q6): tier rank, not score, separates the
 // exact tiers, and a candidate that also matched lexically keeps that score when
@@ -238,15 +242,15 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 // one, and this package's digest does not say what a Paths entry means (the only
 // precedent, model.FileSelection.Paths, is an exact file list). The caller owns
 // those two filters.
-func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind, limit int) ([]exactHit, bool, error) {
+func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
+	page int, emit func(exactHit) error) error {
 	paths := newPathResolver(r)
-	out, full, err := pathCandidates(ctx, r, query, kinds, limit)
-	if err != nil {
-		return nil, false, err
-	}
-	seen := make(map[model.NodeID]struct{}, len(out))
-	for _, hit := range out {
+	seen := map[model.NodeID]struct{}{}
+	if err := pathCandidates(ctx, r, query, kinds, page, func(hit exactHit) error {
 		seen[hit.Node.Node.ID] = struct{}{}
+		return emit(hit)
+	}); err != nil {
+		return err
 	}
 	for _, tier := range exactTiers {
 		// One row per node: where several units publish the same node fact,
@@ -258,7 +262,7 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		// clause would be added here only if a leg showed a nil-valued row
 		// winning.
 		filter := nodeFilterFor(tier, query, kinds)
-		after, kept := model.NodeID(""), 0
+		after := model.NodeID("")
 		// The tier is walked on its keyset, not read once. Nodes applies its
 		// SQL LIMIT to node_facts rows and only then collapses the duplicate
 		// node_id rows the Section 9.4 precedence order leaves behind
@@ -267,10 +271,10 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 		// rows: a deduped count can neither end the walk nor decide whether
 		// the tier had more. Only an EMPTY page ends it, and `after` advances
 		// strictly on every non-empty one, so it terminates.
-		for kept < limit {
-			nodes, err := r.Nodes(ctx, filter, after, limit)
+		for {
+			nodes, err := r.Nodes(ctx, filter, after, page)
 			if err != nil {
-				return nil, false, err
+				return err
 			}
 			if len(nodes) == 0 {
 				break
@@ -282,26 +286,14 @@ func exactCandidates(ctx context.Context, r exactReader, query string, kinds []m
 				}
 				p, err := paths.path(ctx, n.Node.FileID)
 				if err != nil {
-					return nil, false, err
+					return err
 				}
 				seen[n.Node.ID] = struct{}{}
-				out = append(out, exactHit{Tier: tier, Path: p, Node: n})
-				if kept++; kept == limit {
-					break
+				if err := emit(exactHit{Tier: tier, Path: p, Node: n}); err != nil {
+					return err
 				}
 			}
 		}
-		if kept == limit {
-			// A tier that filled its bound had more to give only if the keyset
-			// really does continue past it. Section 14.3 forbids dropping the
-			// rest silently, so one follow-up read -- not a deduped count --
-			// decides whether the caller reports the answer as truncated.
-			more, err := r.Nodes(ctx, filter, after, 1)
-			if err != nil {
-				return nil, false, err
-			}
-			full = full || len(more) > 0
-		}
 	}
-	return out, full, nil
+	return nil
 }
