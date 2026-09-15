@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -34,6 +35,14 @@ func pagedCompiler(t *testing.T, fx *contextFixture, now func() time.Time, relea
 	if err != nil {
 		t.Fatalf("NewSpools: %v", err)
 	}
+	// ONE engine for every leg of a continued compile, not one per call: a
+	// graph walk's own cursor is signed by the engine that minted it, and
+	// scopeEngine opens a fresh signer in a fresh directory each time it is
+	// called, so a per-call engine refuses the walk cursor a mid-walk
+	// continuation carries. fx.Rels, as intCompiler wires it: an adjacency with
+	// no edges walks nothing, and a parity row over it would compare two plans
+	// that never ran a walk.
+	eng := fx.scopeEngine(fx.Rels, fixtureCapabilities)
 	c, err := New(Options{
 		Store:  fx.Store,
 		Repo:   fx.Repo,
@@ -42,7 +51,7 @@ func pagedCompiler(t *testing.T, fx *contextFixture, now func() time.Time, relea
 			if release == nil {
 				release = func() error { return nil }
 			}
-			return fx.scopeEngine(nil, fixtureCapabilities), release, nil
+			return eng, release, nil
 		},
 		Config: fx.Cfg,
 		Now:    now,
@@ -160,6 +169,14 @@ func TestAContinuationRefusesAnotherRequest(t *testing.T) {
 // itself, so the production path is not assumed anywhere.
 func checkpointAtBoundary(t *testing.T, c *Compiler, fx *contextFixture, req model.ContextRequest, at int) string {
 	t.Helper()
+	token, _ := haltAtBoundary(t, c, fx, req, at)
+	return token
+}
+
+// haltAtBoundary is checkpointAtBoundary with the halted state handed back,
+// for the rows that assert WHERE inside a pass the halt landed.
+func haltAtBoundary(t *testing.T, c *Compiler, fx *contextFixture, req model.ContextRequest, at int) (string, *compileState) {
+	t.Helper()
 	reader, err := c.store.PinGeneration(fx.ctx, c.repo, 0, c.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {
 		t.Fatalf("PinGeneration: %v", err)
@@ -194,7 +211,7 @@ func checkpointAtBoundary(t *testing.T, c *Compiler, fx *contextFixture, req mod
 	if next == "" {
 		t.Fatalf("boundary %d minted no continuation token", at)
 	}
-	return next
+	return next, st
 }
 
 // EVERY pass boundary is a checkpoint, and a compile stopped at any of them
@@ -455,4 +472,105 @@ func TestTheRestoredEdgeSortStillFoldsDistinctPairs(t *testing.T) {
 		t.Fatalf("the restored edge stream holds %d record(s), want the 2 distinct pairs: "+
 			"the checkpoint lost foldPkgEdgeDistinct and P-E would over-count every package", got)
 	}
+}
+
+// A plan deadline that fires while P-A is RUNNING -- between two pages of the
+// graph walk, not behind the pass -- ends the pass with a continuation and
+// never a lost compile (ruling C7, finding B1). P-A is one pass over a walk
+// that spans many pages, so before this the one boundary it could stop at was
+// the one behind it, and a deadline inside it threw the whole walk away.
+//
+// The generated fixture is the one that can show it: it admits over three
+// hundred entities and model.MaxPageItems is 200, so the walk is genuinely
+// multi-page and the in-walk halt is reachable. st.pass staying AT passIngest
+// is what says the halt landed inside the pass -- a halt at the boundary behind
+// P-A would have advanced it to passHydrate -- and the live walk cursor says
+// the walk was still running when it did.
+//
+// The resumed plan is then asserted byte-identical to the uninterrupted one:
+// assertSamePlan compares model.ContextManifest.CanonicalHash, which IS the
+// fold of the plan's canonical projection (entry ordinals, slices, exclusions),
+// over an equal header and an equal notice list.
+func TestADeadlineInsideTheGraphWalkResumesIntoTheUninterruptedPlan(t *testing.T) {
+	t.Parallel()
+	req := generatedRequest(generatedFullBudget)
+	ref := newGeneratedFixture(t)
+	want, err := intCompiler(t, ref, ref.Now).Compile(ref.ctx, req)
+	if err != nil {
+		t.Fatalf("the uninterrupted compile failed: %v", err)
+	}
+	if want.EntryCount == 0 {
+		t.Fatalf("the reference plan selected nothing; every assertion below would pass over an empty plan")
+	}
+
+	fx := newGeneratedFixture(t)
+	c, spools := pagedCompiler(t, fx, fx.Now, nil)
+	token, st := haltAtBoundary(t, c, fx, req, passIngest)
+	if st.ingest == nil {
+		t.Fatalf("the halt at passIngest carried no seed sink; the walk's four pre-fold sorts are not in the checkpoint")
+	}
+	if st.ingest.cursor == "" {
+		t.Fatalf("the halt at passIngest carried no walk cursor; it ended the walk rather than suspending it")
+	}
+	if st.ingest.seq == 0 || len(st.ingest.start) == 0 {
+		t.Fatalf("the halt carried seq=%d over %d root(s); the continuation cannot reproduce the walk from that",
+			st.ingest.seq, len(st.ingest.start))
+	}
+
+	got, err := c.CompilePage(fx.ctx, req, token)
+	if err != nil {
+		t.Fatalf("resuming a walk suspended mid-page failed: %v", err)
+	}
+	assertSamePlan(t, passIngest, got, want)
+
+	live, err := spools.Sweep(fx.ctx, fx.Now())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("the consumed mid-walk continuation left %d live byte(s) in the spool store, want 0", live)
+	}
+}
+
+// A USER-SET graph bound that truncates the walk must still leave the resumed
+// plan incomplete. This is the one coincidence the mid-walk halt could hide:
+// P-A deliberately does not narrow ScopeComplete on the page it halts on --
+// that page's truncation is this compile's own deadline, which the continuation
+// answers -- and a page that carries a user bound's truncation AND arrives
+// exactly when the halt fires would lose the verdict if the continuation never
+// re-reported the bound.
+//
+// context.max_visited_nodes is set between one page (200) and the generated
+// fixture's fan-out (over 300),
+// so every leg of the walk meets the bound, and the row asserts the resumed
+// plan is the bounded uninterrupted plan -- scope_complete=false included,
+// which assertSamePlan compares.
+func TestAUserGraphBoundSurvivesAMidWalkContinuation(t *testing.T) {
+	t.Parallel()
+	req := generatedRequest(generatedFullBudget)
+	bound := func(fx *contextFixture) { fx.Cfg.Context.MaxVisitedNodes = config.Limit(250) }
+
+	ref := newGeneratedFixture(t)
+	bound(ref)
+	want, err := intCompiler(t, ref, ref.Now).Compile(ref.ctx, req)
+	if err != nil {
+		t.Fatalf("the bounded uninterrupted compile failed: %v", err)
+	}
+	if want.ScopeComplete {
+		t.Fatalf("the bounded compile reported a complete scope; max_visited_nodes did not cut the walk, " +
+			"so this row would assert nothing about a bound surviving a continuation")
+	}
+
+	fx := newGeneratedFixture(t)
+	bound(fx)
+	c, _ := pagedCompiler(t, fx, fx.Now, nil)
+	token, st := haltAtBoundary(t, c, fx, req, passIngest)
+	if st.ingest == nil || st.ingest.cursor == "" {
+		t.Fatalf("the bounded walk did not suspend mid-page; the coincidence this row is about is unreachable")
+	}
+	got, err := c.CompilePage(fx.ctx, req, token)
+	if err != nil {
+		t.Fatalf("resuming the bounded walk failed: %v", err)
+	}
+	assertSamePlan(t, passIngest, got, want)
 }

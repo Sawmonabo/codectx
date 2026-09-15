@@ -409,6 +409,14 @@ type compileState struct {
 	measured *measuredPlan
 	packed   *packedPlan
 
+	// ingest is P-A's live sink, and is set ONLY while the walk is halted
+	// mid-pass: a deadline that fires between two of graph.Impact's pages ends
+	// P-A here, and this is the carry the passIngest boundary checkpoints (its
+	// four pre-fold sorts, the walk's cursor, the root list and the arrival
+	// counter). Every other boundary leaves it nil, because the pass that
+	// produced it has finished.
+	ingest *seedIngest
+
 	// scope is the expansion verdict WITHOUT its Candidates slice, and
 	// scopeComplete the write-once-false flag P-A and P-C narrow. Both are
 	// bounded by something other than the repository, so they travel in the
@@ -441,7 +449,13 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 	stop func(pass int) bool,
 ) error {
 	stages := []compileStage{
-		{passIngest, func() error { return c.stageIngest(ctx, reader, gen, req, sorts, st) }},
+		{passIngest, func() error {
+			// P-A's own halt is the pass-boundary predicate asked at P-A's
+			// index, so a deadline inside the walk and a deadline behind it
+			// mint the identical continuation, and a non-paging compile (which
+			// has no continuation on offer) never halts inside the walk either.
+			return c.stageIngest(ctx, reader, gen, req, sorts, st, func() bool { return stop(passIngest) })
+		}},
 		{passHydrate, func() error { return c.stageHydrate(ctx, reader, sorts, st) }},
 		{passAttributes, func() error { return c.stageAttributes(ctx, reader, sorts, st) }},
 		{passRoutes, func() error { return c.stageRouteScoring(ctx, sorts, st) }},
@@ -456,6 +470,13 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 		}
 		if err := stage.run(); err != nil {
 			return err
+		}
+		if st.halted {
+			// The stop landed INSIDE the pass -- P-A asks it between the walk's
+			// pages -- so the pass is not finished and st.pass must stay ON it:
+			// the continuation re-enters this same stage with the carry the
+			// stage left on st.
+			return nil
 		}
 		// Recorded BEFORE the stop is asked: the pass is finished, so the
 		// boundary behind it is the one a checkpoint names.
@@ -477,27 +498,41 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 // answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit boundary, and
 // it can only decide that if it sees the exclusions.
 func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sorts *compileSorts, st *compileState,
+	req model.ContextRequest, sorts *compileSorts, st *compileState, stop func() bool,
 ) error {
-	// The sink is opened BEFORE discovery: ruling C10 makes seed extraction a
-	// producer that pushes into this compile's sorts, so nothing between the
-	// two holds a seed slice.
-	ingest, err := c.newSeedIngest(sorts)
-	if err != nil {
-		return err
-	}
-	seeds, err := c.extractSeeds(ctx, reader, gen, req, ingest)
-	if err != nil {
-		return contextErr(ctx, err)
-	}
-	// The exclusions follow every candidate, which is the admission order the
-	// whole pipeline has always replayed (candidates, then exclusions) and the
-	// order the manifest's exclusion projection is ordinalled in.
-	for i := range seeds.Excluded {
-		if err := ingest.Admit(seeds.Excluded[i]); err != nil {
+	ingest := st.ingest
+	if ingest == nil {
+		// The sink is opened BEFORE discovery: ruling C10 makes seed extraction a
+		// producer that pushes into this compile's sorts, so nothing between the
+		// two holds a seed slice.
+		var err error
+		if ingest, err = c.newSeedIngest(sorts); err != nil {
+			return err
+		}
+		seeds, err := c.extractSeeds(ctx, reader, gen, req, ingest)
+		if err != nil {
 			return contextErr(ctx, err)
 		}
+		// The exclusions follow every candidate, which is the admission order the
+		// whole pipeline has always replayed (candidates, then exclusions) and the
+		// order the manifest's exclusion projection is ordinalled in.
+		for i := range seeds.Excluded {
+			if err := ingest.Admit(seeds.Excluded[i]); err != nil {
+				return contextErr(ctx, err)
+			}
+		}
+		// Folded into the sink's own verdict here rather than combined with it
+		// at the tail: ScopeComplete is write-once-false, so the two spellings
+		// answer the same thing, and this one is the only one a continuation
+		// can carry -- the resumed call never re-runs discovery and so never
+		// sees seeds.Unresolved again.
+		if seeds.Unresolved {
+			ingest.scope.ScopeComplete = false
+		}
 	}
+	// Re-read on every leg of the walk, resumed or not: dropping caps on the
+	// continuation would move Completeness, and with it ScopeComplete and the
+	// manifest header.
 	caps, err := reader.Capabilities(ctx)
 	if err != nil {
 		return contextErr(ctx, err)
@@ -508,13 +543,26 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	defer release()
 
-	in, err := c.passAIngest(ctx, ingest, engine, gen, caps)
+	in, halted, err := c.passAIngest(ctx, ingest, engine, gen, caps, stop)
 	if err != nil {
 		return contextErr(ctx, err)
 	}
+	if halted {
+		// The walk stopped between two pages. The sink itself is the carry --
+		// its four pre-fold sorts, its arrival counter, its root list and the
+		// walk's cursor -- and the scalars are copied out here because
+		// checkpointAt reads them from st: the tail below never ran, so
+		// nothing else would have set them.
+		st.ingest = ingest
+		st.scope = ingest.scope
+		st.scopeComplete = ingest.scope.ScopeComplete
+		st.halted = true
+		return nil
+	}
+	st.ingest = nil
 	st.cands, st.paths, st.hops = in.Cands, in.Paths, in.Hops
 	st.scope = in.Scope
-	st.scopeComplete = in.Scope.ScopeComplete && !seeds.Unresolved
+	st.scopeComplete = in.Scope.ScopeComplete
 	return nil
 }
 
