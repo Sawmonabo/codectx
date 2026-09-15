@@ -32,8 +32,11 @@ func TestTheCallersDeadlineIsTheRequestsDeadline(t *testing.T) {
 		// run reports whether the answer was cut short by the deadline, and how
 		// many records it carried.
 		run func(t *testing.T, e *Engine, ctx context.Context) (limited bool, size int)
+		// cancel runs the same operation and returns the error code it answered
+		// a canceled caller with.
+		cancel func(e *Engine, ctx context.Context) error
 	}{
-		{"impact", func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
+		{name: "impact", run: func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
 			res, err := e.Impact(ctx, model.ImpactRequest{GenerationID: 1,
 				Start:     []model.NodeID{fixtureNodeID("n-a")},
 				Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
@@ -41,8 +44,13 @@ func TestTheCallersDeadlineIsTheRequestsDeadline(t *testing.T) {
 				return deadlineError(t, err), 0
 			}
 			return res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline, len(res.Entries)
+		}, cancel: func(e *Engine, ctx context.Context) error {
+			_, err := e.Impact(ctx, model.ImpactRequest{GenerationID: 1,
+				Start:     []model.NodeID{fixtureNodeID("n-a")},
+				Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+			return err
 		}},
-		{"neighbors", func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
+		{name: "neighbors", run: func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
 			res, err := e.Neighbors(ctx, model.GraphRequest{GenerationID: 1,
 				Start:     []model.NodeID{fixtureNodeID("n-a")},
 				Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
@@ -50,8 +58,13 @@ func TestTheCallersDeadlineIsTheRequestsDeadline(t *testing.T) {
 				return deadlineError(t, err), 0
 			}
 			return res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline, len(res.Relations)
+		}, cancel: func(e *Engine, ctx context.Context) error {
+			_, err := e.Neighbors(ctx, model.GraphRequest{GenerationID: 1,
+				Start:     []model.NodeID{fixtureNodeID("n-a")},
+				Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+			return err
 		}},
-		{"references", func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
+		{name: "references", run: func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
 			page, err := e.References(ctx, model.ReferenceRequest{GenerationID: 1,
 				NodeID:         fixtureNodeID("n-b"),
 				Operation:      model.ReferenceReferences,
@@ -60,8 +73,14 @@ func TestTheCallersDeadlineIsTheRequestsDeadline(t *testing.T) {
 				return deadlineError(t, err), 0
 			}
 			return page.Meta.Truncated && page.Meta.TruncationReason == reasonDeadline, len(page.Items)
+		}, cancel: func(e *Engine, ctx context.Context) error {
+			_, err := e.References(ctx, model.ReferenceRequest{GenerationID: 1,
+				NodeID:         fixtureNodeID("n-b"),
+				Operation:      model.ReferenceReferences,
+				SemanticSource: model.SemanticCanonical})
+			return err
 		}},
-		{"path", func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
+		{name: "path", run: func(t *testing.T, e *Engine, ctx context.Context) (bool, int) {
 			res, err := e.ShortestPath(ctx, model.PathRequest{GenerationID: 1,
 				From: fixtureNodeID("n-a"), To: fixtureNodeID("n-z"),
 				Relations: []model.RelationKind{model.RelCalls}})
@@ -69,22 +88,41 @@ func TestTheCallersDeadlineIsTheRequestsDeadline(t *testing.T) {
 				return deadlineError(t, err), 0
 			}
 			return res.Meta.Truncated, len(res.Paths)
+		}, cancel: func(e *Engine, ctx context.Context) error {
+			_, err := e.ShortestPath(ctx, model.PathRequest{GenerationID: 1,
+				From: fixtureNodeID("n-a"), To: fixtureNodeID("n-z"),
+				Relations: []model.RelationKind{model.RelCalls}})
+			return err
 		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// No caller deadline: the configured default applies, measured on
 			// the engine clock, and it has already passed.
-			e, _ := callerDeadlineEngine(t)
+			e := callerDeadlineEngine(t, fixtureLimits().QueryTimeout)
 			limited, size := tc.run(t, e, context.Background())
 			if !limited {
 				t.Fatalf("with no caller deadline the configured query_timeout did not bound the "+
 					"request: it answered %d record(s) untruncated", size)
 			}
 
+			// query_timeout 0 is NO deadline, and it is the shipped default:
+			// the same query, the same stale clock, no caller deadline, and it
+			// must run to a complete answer rather than be refused by an
+			// instant that has already passed.
+			e = callerDeadlineEngine(t, 0)
+			limited, size = tc.run(t, e, context.Background())
+			if limited {
+				t.Fatalf("query_timeout 0 means NO deadline, yet the request was cut short: " +
+					"`now + 0` is being applied as a deadline that has already passed")
+			}
+			if size == 0 {
+				t.Fatalf("the unbounded request answered nothing")
+			}
+
 			// The same query, with the deadline the caller set. It is longer
 			// than query_timeout, and it is the one that must apply.
-			e, _ = callerDeadlineEngine(t)
+			e = callerDeadlineEngine(t, fixtureLimits().QueryTimeout)
 			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Minute))
 			defer cancel()
 			limited, size = tc.run(t, e, ctx)
@@ -117,9 +155,10 @@ func deadlineError(t *testing.T, err error) bool {
 }
 
 // callerDeadlineEngine builds an engine whose clock is frozen an hour in the
-// past over an adjacency that honours the context, so a deadline derived from
-// query_timeout is already expired and one taken from the caller is not.
-func callerDeadlineEngine(t *testing.T) (*Engine, *ctxAdjacency) {
+// past over an adjacency that honours the context, so a deadline derived from a
+// POSITIVE query_timeout is already expired while one taken from the caller --
+// or no deadline at all -- is not. timeout 0 is the no-deadline case.
+func callerDeadlineEngine(t *testing.T, timeout time.Duration) *Engine {
 	t.Helper()
 	adj := &ctxAdjacency{graphFixture: newGraphFixture(t)}
 	signer, err := pagination.OpenSigner(t.TempDir())
@@ -133,6 +172,7 @@ func callerDeadlineEngine(t *testing.T) (*Engine, *ctxAdjacency) {
 	}
 	limits := fixtureLimits()
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.QueryTimeout = timeout
 	past := time.Now().Add(-time.Hour)
 	e, err := New(Options{Adjacency: adj, Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
@@ -140,5 +180,5 @@ func callerDeadlineEngine(t *testing.T) (*Engine, *ctxAdjacency) {
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
-	return e, adj
+	return e
 }

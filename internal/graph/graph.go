@@ -116,9 +116,12 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
-// MaxPageItems, QueryTimeout, CursorTTL and FrontierBytes stay strictly
-// positive: a page with no item ceiling is a wire-security bound (class B), not
-// a scale bound, and a frontier with no byte ceiling has no heap bound at all.
+// MaxPageItems, CursorTTL and FrontierBytes stay strictly positive: a page with
+// no item ceiling is a wire-security bound (class B), not a scale bound, and a
+// frontier with no byte ceiling has no heap bound at all. QueryTimeout does
+// NOT: 0 is NO deadline, and that is the default -- a wall clock that ends work
+// is exactly the kind of shipped bound that refuses a large repository for
+// being large.
 type Limits struct {
 	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
 	QueryTimeout, CursorTTL                                      time.Duration
@@ -210,13 +213,21 @@ func New(o Options) (*Engine, error) {
 		// already refuses 0 at config load as a reservation, so this is the
 		// engine-side half of the same rule.
 		{"frontier_bytes", o.Limits.FrontierBytes},
-		{"query_timeout", int64(o.Limits.QueryTimeout)},
+		// query_timeout is NOT in this list: 0 means NO deadline, which is the
+		// scale posture's default. It is the one bound here that ends WORK
+		// rather than bounding memory or a wire record, so a shipped value for
+		// it would refuse a large repository for being large. A negative one is
+		// still a wiring defect and is refused below.
 		{"cursor_ttl", int64(o.Limits.CursorTTL)},
 	} {
 		if b.value <= 0 {
 			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
 				Message: "graph engine limit must be positive"}).WithDetail("limit", b.field)
 		}
+	}
+	if o.Limits.QueryTimeout < 0 {
+		return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+			Message: "graph engine limit must not be negative"}).WithDetail("limit", "query_timeout")
 	}
 	now := o.Now
 	if now == nil {
@@ -289,11 +300,22 @@ func appendRoute(parent []model.RelationID, via model.RelationID) []model.Relati
 // same clock the walk budget compares against. A caller-set deadline is a real
 // instant, so a fixture that drives the engine clock must derive the deadline
 // it passes in from that clock or the two are not comparable.
-func (e *Engine) queryDeadline(ctx context.Context) time.Time {
+//
+// The second return is whether the request has a deadline AT ALL: with
+// query_timeout 0 and a caller that set none, it has none, and `now + 0` -- an
+// instant that has already passed -- would refuse every query instead of
+// running it unbounded. Cancellation is then the only stop, and it preserves
+// the page and the cursor exactly as a deadline does (isDeadline's siblings in
+// the walk: a canceled walk returns its standing frontier and the continuation
+// is minted detached).
+func (e *Engine) queryDeadline(ctx context.Context) (time.Time, bool) {
 	if deadline, ok := ctx.Deadline(); ok {
-		return deadline
+		return deadline, true
 	}
-	return e.now().Add(e.limits.QueryTimeout)
+	if e.limits.QueryTimeout <= 0 {
+		return time.Time{}, false
+	}
+	return e.now().Add(e.limits.QueryTimeout), true
 }
 
 // budget is the cumulative, cursor-carried work allowance of one traversal. It
