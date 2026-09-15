@@ -477,6 +477,27 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 			continue
 		}
 		if err := stage.run(); err != nil {
+			// A user-set deadline that fires INSIDE P-B..P-H is a boundary
+			// event, not a lost compile (ruling C7). Every pass below the cut
+			// one is finished and its carry is on st, and st.pass already NAMES
+			// that boundary -- it advances only after a pass completes -- so
+			// halting here mints exactly the continuation the stop predicate
+			// would have minted one pass earlier. Re-running the cut pass on
+			// the next call is correct: no pass below P-I publishes anything.
+			//
+			// stop is the gate rather than the deadline itself, for the reason
+			// the doc comment gives: once the deadline has fired the production
+			// predicate reduces to "may this call page at all", so a compile
+			// with no continuation on offer still reports the deadline.
+			//
+			// P-A is excluded. It asks stop between its own pages and records
+			// its place only at that halt (scope.go), so an error escaping it
+			// leaves the walk mid-page with a cursor that would replay every
+			// page already appended -- state no continuation can resume PAST.
+			if st.pass > passIngest && isQueryDeadline(ctx, err) && stop(st.pass) {
+				st.halted = true
+				return nil
+			}
 			return err
 		}
 		if st.halted {
@@ -1156,6 +1177,17 @@ func scopeIncomplete(detail string) *model.Error {
 // argumentInvalid reports a structurally invalid request or option.
 func argumentInvalid(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
+}
+
+// isQueryDeadline reports whether err is this call's query deadline, in either
+// spelling: the typed answer contextErr already made of it, or the bare context
+// error a dependency below that mapping returns.
+func isQueryDeadline(ctx context.Context, err error) bool {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return typed.Code == model.CodeQueryDeadline
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
 }
 
 // contextErr classifies a failed call against ctx: a deadline and a

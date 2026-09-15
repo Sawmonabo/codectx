@@ -12,35 +12,24 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// stallingAdjacency is the fixture's edge source with a clock the walk reads,
-// stepped past the engine's query deadline on the FIRST round trip. That is the
-// one shape no fixture in this package could produce before: a page the
-// deadline cuts before the walk can advance at all, which graph.Impact answers
-// truncated with NO continuation and NO entry (its cursor would be the one the
-// request already carried, so it deliberately withholds it).
-type stallingAdjacency struct {
-	graph.Adjacency
-	clock *time.Time
-	calls *int
-	jump  time.Duration
-	// after is how many round trips run at the frozen clock before every one
-	// after them steps past the deadline. The opening page must reach a real
-	// keyset position -- a page that never advanced at all is exhaustion, not
-	// a stall -- and no page after it may advance.
-	after int
-}
-
-// stallingReader is the same stall on the PACKED reader, which is the port the
-// walk reads structure through: a clock advanced only by Adjacency.Edges never
-// moved once the walk moved off it, so the stall this case exists for never
-// happened. One packed scan covers a whole level where the old port made one
-// round trip per node chunk, so the clock is charged per SCAN here -- the
-// opening page still reaches a position before any page after it stalls.
+// stallingReader is the packed reader -- the port the walk reads structure
+// through -- with a clock the walk reads, stepped past the engine's query
+// deadline once `after` scans have run. That is the shape no other fixture in
+// this package produces: a page the deadline cuts before the walk can advance,
+// which graph.Impact answers truncated with NO continuation and NO entry (its
+// cursor would be the one the request already carried, so it deliberately
+// withholds it). One packed scan covers a whole level, so the clock is charged
+// per SCAN: the opening page still reaches a position before any page after it
+// stalls.
 type stallingReader struct {
 	graph.GraphReader
 	clock *time.Time
 	calls *int
 	jump  time.Duration
+	// after is how many scans run at the frozen clock before every one after
+	// them steps past the deadline. The opening page must reach a real
+	// position -- a page that never advanced at all is exhaustion, not a stall
+	// -- and no page after it may advance.
 	after int
 }
 
@@ -51,15 +40,6 @@ func (r stallingReader) Neighbours(ctx stdcontext.Context, refs []graph.NodeRef,
 		*r.clock = r.clock.Add(r.jump)
 	}
 	return r.GraphReader.Neighbours(ctx, refs, dir, kinds, from, fn)
-}
-
-func (a stallingAdjacency) Edges(ctx stdcontext.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	*a.calls++
-	if *a.calls > a.after {
-		*a.clock = a.clock.Add(a.jump)
-	}
-	return a.Adjacency.Edges(ctx, nodes, dir, kinds, after, limit)
 }
 
 // TestAStalledWalkPageEndsThePassAndIsReIssuedOnce pins the stalled-page branch
@@ -154,8 +134,8 @@ func TestAStalledWalkPageEndsThePassAndIsReIssuedOnce(t *testing.T) {
 	}
 }
 
-// stalledScopeEngine is contextFixture.scopeEngine wired to a clock the
-// adjacency steps, which scopeEngine deliberately does not offer: it passes the
+// stalledScopeEngine is contextFixture.scopeEngine wired to a clock the packed
+// reader steps, which scopeEngine deliberately does not offer: it passes the
 // real clock so that its own rows are not cut by a frozen instant. The limits
 // are the fixture's, so the walk under test is the walk production runs.
 func stalledScopeEngine(t *testing.T, fx *contextFixture, rels []model.Relation,
@@ -181,7 +161,7 @@ func stalledScopeEngine(t *testing.T, fx *contextFixture, rels []model.Relation,
 		t.Fatalf("NewSpools: %v", err)
 	}
 	eng, err := graph.New(graph.Options{
-		Adjacency: stallingAdjacency{Adjacency: inner, clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
+		Adjacency: inner,
 		Reader:    stallingReader{GraphReader: scopeMemoryGraph(inner), clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
 		Signer:    signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),

@@ -271,13 +271,13 @@ func (c *collector) Close() error { return c.dedup.Close() }
 //
 // The SERVABLE facts travel with the survivor -- they are not taken from the
 // left side. Two candidates under one deduplication key do NOT always describe
-// the same servable entity: every Markdown heading of a file carries that
-// file's document node as its NodeID (internal/provider/manifest/markdown.go),
-// so a whole file's headings fold into one key while differing in name, range
-// and score. Serving the left side's facts served whichever heading the
-// lexical walk reached first, which is doc_id order -- and a delta re-index
-// carries doc_ids forward while a fresh index assigns them anew, so the same
-// tree answered with different rows depending on how it had been indexed.
+// the same servable entity: the key groups them, it does not promise they
+// agree on name, range or score. Taking the left side's facts serves whichever
+// member the lexical walk reaches first, which is doc_id order -- and a delta
+// re-index carries doc_ids forward while a fresh index assigns them anew, so
+// one tree answers with different rows depending on how it was indexed. The
+// rule therefore holds for ANY key whose members differ in the facts served,
+// not for one provider's shape.
 func fold(a, b scored) scored {
 	keep, other := a, b
 	if cmpScored(b, a) < 0 {

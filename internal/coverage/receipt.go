@@ -154,13 +154,19 @@ func (s *Service) confirmReceipts(ctx context.Context, rec sqlite.SessionRecord,
 // model.SessionStatus from workflow.Service.Status after this returns, so what
 // the caller sees is the coverage this call just granted, judged by the one
 // readiness evaluator.
-func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest) error {
+func (s *Service) Acknowledge(ctx context.Context, req model.AcknowledgeRequest) (err error) {
 	if err := req.Validate(); err != nil {
 		return err
 	}
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage acknowledge", err) }()
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {

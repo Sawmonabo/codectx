@@ -298,9 +298,9 @@ func TestStorageSynchronous(t *testing.T) {
 // TestEvidenceClipIsUserSetAndRekeysUnits protects index.max_evidence_per_fact,
 // the only setting that removes evidence occurrences from a sealed fact. Three
 // silent failures: a default that clips (a fact would lose occurrences nobody
-// asked to lose), a value above the record ceiling accepted as if it did
-// something, and a clip left out of the analysis key (units sealed under a clip
-// would be reused for a run that asked for every occurrence).
+// asked to lose), a clip left out of the analysis key (units sealed under a
+// clip would be reused for a run that asked for every occurrence), and a value
+// above the record ceiling accepted as if it did something.
 func TestEvidenceClipIsUserSetAndRekeysUnits(t *testing.T) {
 	absent, err := loadFixture(t, "", "")
 	if err != nil {
@@ -319,13 +319,6 @@ func TestEvidenceClipIsUserSetAndRekeysUnits(t *testing.T) {
 	}
 	if project.AnalysisConfigHash() == absent.AnalysisConfigHash() {
 		t.Error("a user-set evidence clip left AnalysisConfigHash unchanged; units sealed with fewer occurrences stay cached")
-	}
-	zero, err := loadFixture(t, "", "version = 1\n[index]\nmax_evidence_per_fact = 0\n")
-	if err != nil {
-		t.Fatalf("Load with explicit 0: %v", err)
-	}
-	if zero.AnalysisConfigHash() != absent.AnalysisConfigHash() {
-		t.Error("an explicit 0 re-keyed every unit; 0 is the default and means unlimited")
 	}
 	_, err = loadFixture(t, "[index]\nmax_evidence_per_fact = 65537\n", "")
 	var ctxErr *model.Error

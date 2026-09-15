@@ -1669,36 +1669,6 @@ func (a *scopeAdjacency) Capabilities(stdcontext.Context) ([]model.CapabilitySta
 	return a.caps, nil
 }
 
-// Edges is keyset-ordered by relation id after `after`, exactly as the port
-// documents; an empty kinds slice means every kind.
-func (a *scopeAdjacency) Edges(_ stdcontext.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	want := make(map[model.NodeID]bool, len(nodes))
-	for _, n := range nodes {
-		want[n] = true
-	}
-	allowed := make(map[model.RelationKind]bool, len(kinds))
-	for _, k := range kinds {
-		allowed[k] = true
-	}
-	out := make([]model.Relation, 0, limit)
-	for _, r := range a.relations {
-		if r.ID <= after || (len(kinds) > 0 && !allowed[r.Kind]) {
-			continue
-		}
-		touches := (dir == model.DirectionOutgoing && want[r.From]) ||
-			(dir == model.DirectionIncoming && want[r.To]) ||
-			(dir == model.DirectionBoth && (want[r.From] || want[r.To]))
-		if !touches {
-			continue
-		}
-		if out = append(out, r); len(out) == limit {
-			break
-		}
-	}
-	return out, nil
-}
-
 func (a *scopeAdjacency) NodesByID(_ stdcontext.Context, ids []model.NodeID) ([]model.Node, error) {
 	out := make([]model.Node, 0, len(ids))
 	for _, id := range ids {
@@ -2005,5 +1975,70 @@ func TestEveryNodeKindHasAScopeRequirement(t *testing.T) {
 		if _, ok := want[kind]; !ok {
 			t.Errorf("node kind %q has no decided scope requirement: it would be served as optional", kind)
 		}
+	}
+}
+
+// TestASecondConsecutiveStalledWalkPageEndsTheAnswer bounds the re-issue the
+// stalled-page branch offers (scope.go, `if stalled { next = cursor }`).
+//
+// The failure mode: a stalled page mints the cursor the request arrived with,
+// byte for byte. That is the right answer ONCE -- the page is re-issued rather
+// than read as exhaustion -- but the count that makes it "once" has to survive
+// the continuation, because each call sees only its own pages. With the count
+// held in a local, a walk whose page cannot complete inside the deadline hands
+// back the same non-advancing token to every request that presents it and the
+// caller never receives an answer. The second consecutive stall must therefore
+// end the walk with an incomplete scope instead of minting again.
+//
+// The second call here is what a continuation is: expandScopeStream re-enters
+// the page loop from the sink's own cursor, stall count and `started`, which is
+// exactly the state resumedIngest rebuilds from the checkpoint scalars.
+//
+// Mutation: delete the `in.stalls > 1` break, and the second call halts and
+// mints the same cursor a third time.
+func TestASecondConsecutiveStalledWalkPageEndsTheAnswer(t *testing.T) {
+	fx := newContextFixture(t)
+	seed := fx.seedOf(fx.Specs[0].path)
+	rels := []model.Relation{fx.edge(fx.Specs[0].path, model.RelCalls, fx.Specs[1].path)}
+	clock := time.Now()
+	calls := 0
+	eng := stalledScopeEngine(t, fx, rels, &clock, &calls, 1)
+
+	sorts := openSorts(t, fx.Cfg)
+	c := &Compiler{cfg: fx.Cfg}
+	ingest, err := c.newSeedIngest(sorts)
+	if err != nil {
+		t.Fatalf("newSeedIngest: %v", err)
+	}
+	if err := ingest.Admit(seed); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	asked := 0
+	_, halted, err := c.passAIngest(fx.ctx, ingest, eng, fx.Gen, fixtureCapabilities,
+		func() bool { asked++; return asked > 1 })
+	if err != nil {
+		t.Fatalf("the first call failed: %v", err)
+	}
+	if !halted || ingest.stalls != 1 {
+		t.Fatalf("the first stalled page ended with halted=%v stalls=%d, want a halt carrying one stall",
+			halted, ingest.stalls)
+	}
+	stalledAt := ingest.cursor
+
+	got, halted, err := c.passAIngest(fx.ctx, ingest, eng, fx.Gen, fixtureCapabilities,
+		func() bool { return true })
+	if err != nil {
+		t.Fatalf("the continuation failed: %v", err)
+	}
+	if halted {
+		t.Fatalf("the second consecutive stalled page halted again and re-minted %q; nothing bounds how "+
+			"often a caller may be handed a cursor that cannot advance", stalledAt)
+	}
+	if got == nil {
+		t.Fatal("the bounded walk ended the pass without folding its sorts, so it published no scope at all")
+	}
+	if ingest.scope.ScopeComplete {
+		t.Fatal("the walk ended on a stall and reported a COMPLETE scope; the fraction the deadline " +
+			"reached would be served as the whole")
 	}
 }
