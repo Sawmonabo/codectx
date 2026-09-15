@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/wire"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
@@ -43,5 +45,45 @@ func TestOverlongDeclarationNamesAreTruncatedNotRefused(t *testing.T) {
 	// 2048-byte prefix do not collide into one node.
 	if key := b.identityKey(&d); key == d.Qualified || !strings.HasPrefix(key, "decl:f@gen/api.go:") {
 		t.Fatalf("identity key %q is the truncated qualified name", key)
+	}
+}
+
+// TestEvidenceClipIsAttributedNotFoldedIntoDropped pins the disclosure of the
+// per-fact evidence clip. Failure mode it protects: an operator who set
+// index.max_evidence_per_fact sees only a generic partial count and cannot
+// tell how much of it their own clip caused -- or, if the clip were simply
+// taken out of that count, sees no partial state at all and believes the file
+// carries every occurrence. Counting a clipped occurrence in dropped again
+// makes this fail.
+func TestEvidenceClipIsAttributedNotFoldedIntoDropped(t *testing.T) {
+	b := &builder{
+		req:    provider.UnitRequest{Unit: model.UnitSpec{ProviderID: lang.ProviderID}},
+		fv:     model.FileVersion{Path: "a.go"},
+		nodeAt: map[model.NodeID]int{},
+		rels:   map[model.RelationID]*model.RelationFact{},
+		// A user clip of 2: a fact keeps two occurrences, the rest are cut.
+		evidenceClip: 2,
+	}
+	const id model.NodeID = "n1"
+	b.nodes = append(b.nodes, model.NodeFact{Node: model.Node{ID: id}, Evidence: []model.Evidence{b.evidence(id, "", nil, "", "")}})
+	b.nodeAt[id] = 0
+	for i := 0; i < 4; i++ { // 1 stored + 4 offered = 5 occurrences, clip 2
+		b.addEvidence(id, nil, "")
+	}
+	if got := len(b.nodes[0].Evidence); got != 2 {
+		t.Fatalf("fact kept %d occurrences, want the configured clip of 2", got)
+	}
+	if b.clipped != 3 {
+		t.Fatalf("clipped = %d, want the 3 occurrences past the clip", b.clipped)
+	}
+	if b.dropped != 0 {
+		t.Fatalf("dropped = %d, want 0: a clip is not one of the other bounds", b.dropped)
+	}
+	state, bounded := b.bounds(model.CapabilityState{State: model.CapabilityFresh})
+	if got := state.Details[detailEvidenceClipped]; got != "3" {
+		t.Fatalf("%s detail is %q, want %q", detailEvidenceClipped, got, "3")
+	}
+	if !bounded {
+		t.Fatal("a file whose only bound was the evidence clip must still report partial")
 	}
 }
