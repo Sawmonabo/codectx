@@ -76,7 +76,7 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 |---|---|---|
 | `--repo` | all | Workspace root to answer from. |
 | `--generation` | all | Answer from this generation instead of the active one. It is not combinable with `--cursor`: a cursor already pins its generation. |
-| `--timeout` | all | Deadline for this invocation. Zero leaves the configured query deadline in charge. |
+| `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is becoming unlimited, so a command you do not bound answers in full. `codectx context plan` and the MCP tools honour that today; `search`, `symbol` and the graph walks still apply the configured value to their own inner deadline and will follow. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it, because that key is a default and never a ceiling — and a bounded call ends with a continuation cursor rather than an answer. Zero asks for no deadline of its own and leaves the configured value in charge. |
 | `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
 | `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
@@ -114,9 +114,12 @@ package-dependency rollup answers on identical terms from its own endpoint.
 `visited_count` and `edge_count` are cumulative and grow across the pages of one
 answer.
 
-**What the query deadline does to that.** `resources.query_timeout` ends a page,
-never the answer — with one exception, the third case below, which ends the
-answer and says so. There are three outcomes.
+**What a query deadline does to that, when you set one.** The intent is that
+there is none by default — `resources.query_timeout` is becoming unlimited — so
+an unbounded `impact` request answers over the whole walk. A deadline you do set — through `--timeout`, or by giving
+that key a positive value — ends a page, never the answer, with one exception,
+the third case below, which ends the answer and says so. There are three
+outcomes.
 
 *Mid-walk.* A deadline reached while the walk is still running returns a page
 with **no entries at all**, `truncation_reason` `query deadline reached` and a
@@ -183,7 +186,14 @@ with `graph depth budget exhausted` and no continuation. `impact` walks once for
 the whole answer, so a `--visited` or `--edges` allowance it spends truncates
 that answer, reports the same reason and offers no continuation — the ranked
 pages that follow are what is left of a walk that stopped, not a walk to be
-resumed.
+resumed. Say that plainly: `--visited N` is **your** bound, and an `impact`
+answer that spends it is the truncated answer for the nodes the walk had
+admitted, disclosed as `truncated` with that reason rather than served as a
+whole one. Once the bounded walk ends and ranking begins, the cursor an
+`impact` page offers is the ranked **tail of that bounded set** — the rest of
+what was admitted, in the one global order — and never a continuation of the
+walk past `N`. The default, `0`, sets no bound: the walk runs to exhaustion and
+its pages concatenate to the whole answer.
 
 `path` is the third shape, and it is neither of those. It declares no `--limit`
 because a route set is bounded by the reason-path cap rather than paged into
@@ -241,7 +251,7 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
 | `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
-| `resources.query_timeout` | The per-request deadline the walk runs under. |
+| `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Becoming unlimited, so an unbounded walk answers in full. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
 | `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills to the continuation spool, the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
@@ -284,6 +294,34 @@ the live continuation spools the budget does cover.
 
 A compile under the run budget never touches disk: the sort spills only once its
 run buffer fills, so a small task is still two in-memory sorts.
+
+### A deadline you set ends the pass, not the compile
+
+`codectx context plan` compiles the whole plan when nothing bounds it: with
+`resources.query_timeout` unlimited, a call you do not bound returns the
+manifest and opens the session, with no cursor to follow.
+
+If you do bound one — `--timeout`, or a positive `resources.query_timeout` — it
+carries the same contract the graph commands do. A compile that reaches that
+deadline stops at the boundary of the pass it is in, persists that boundary's
+streams, and answers `truncated` with
+`truncation_reason deadline` and a continuation token instead of failing with
+`CTX_QUERY_DEADLINE`. No manifest is persisted and no session is opened for a
+truncated plan, so there is nothing partial for a later reader to mistake for an
+answer.
+
+Present that token back as `--cursor`, with every other flag unchanged, and the
+compile resumes at the first unfinished pass — inside the scope walk it resumes
+from the walk's own continuation, not from the seeds. The plan the chain finally
+returns is byte-for-byte the plan one uninterrupted compile would have returned:
+the same manifest identity, the same entries and slices in the same order, the
+same receipts. The token lives for `storage.query_cursor_ttl`; past that the
+continuation state is reclaimed and the compile has to be re-run.
+
+The same contract is what an MCP client gets, on the same terms: unbounded by
+default, and a continuation only when the client's own request carries a
+deadline. The continuation is a property of the plan request, not of the command
+line.
 
 The plan a compile persists follows the same rule. Its entries and slices are
 bounded by the budget you asked for -- your own declared window -- and are
