@@ -63,6 +63,14 @@ func (c Config) AnalysisConfigHash() string {
 		h.AddString(lang)
 	}
 	h.AddString(c.Providers.SCIP.Enabled.String())
+	// The two SCIP bounds that change which facts are emitted: a user-set
+	// value leaves a document's source unread or a file out of the private
+	// materialization, exactly as workspace.max_parse_file_bytes above does.
+	// The other five providers.scip bounds are reporting thresholds that cut
+	// nothing, so they are deliberately absent: adjusting one must not
+	// invalidate an index.
+	h.AddString(quoteLimit(c.Providers.SCIP.MaxSourceFileBytes))
+	h.AddString(quoteLimit(c.Providers.SCIP.MaxMaterializeBytes))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
 	return h.Sum()
