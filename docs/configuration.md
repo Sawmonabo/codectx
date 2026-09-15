@@ -365,7 +365,7 @@ cloud or AI credential fields in core.
 | `max_reason_paths_per_entry` | `0` (unlimited) | user | Explanation paths stored per entry. |
 | `max_manifest_bytes` | `0` (unlimited) | user | Largest manifest. Unlimited by default; a compile is never refused for the size of its plan. |
 | `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule, by bytes. Unlimited by default. It is not the only thing that bounds a capsule today — see [The one remaining default cap](#the-one-remaining-default-cap) below. |
-| `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
+| `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. It is the switch for that one readiness precondition. With it set to `false` the shortfall no longer shuts the gate at precondition 3 — the remaining preconditions are still evaluated and reported — but it buys no strict claim either: nothing confirmed the coverage, so the session is reported **neither ready nor strict**, the sealed capsule records `strict_gate_satisfied` false, and the answer's reason carries `strict_read_gate=disabled` instead of naming files the configuration excused, so a reader can tell an unconfirmed read from a confirmed one. Changing it changes the context-policy fingerprint, so a cached context answer compiled under the other setting is invalidated rather than reused. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 
 The context compiler binds them as follows. The three `default_*` budgets and

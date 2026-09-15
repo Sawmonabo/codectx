@@ -907,6 +907,9 @@ func workflowLimits(cfg config.Config) workflow.Limits {
 		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
 		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
 		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,
+		// Inverted deliberately: context.strict_read_gate defaults to true, and
+		// the service's zero value must be the enforcing one.
+		StrictReadGateDisabled: !cfg.Context.StrictReadGate,
 	}
 }
 
