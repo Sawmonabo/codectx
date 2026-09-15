@@ -2,6 +2,7 @@ package search
 
 import (
 	"cmp"
+	"container/heap"
 	"context"
 	"errors"
 	"slices"
@@ -208,7 +209,7 @@ type collector struct {
 // resources.query_memory_bytes.
 func newCollector(dir string, runBytes int64) (*collector, error) {
 	c := &collector{dir: dir, runBytes: runBytes}
-	sorter, err := c.newSort("searchdedup-",
+	sorter, err := newScoredSort(dir, "searchdedup-", runBytes,
 		func(a, b scored) int { return strings.Compare(dedupKey(a.ranked), dedupKey(b.ranked)) })
 	if err != nil {
 		return nil, err
@@ -217,16 +218,18 @@ func newCollector(dir string, runBytes int64) (*collector, error) {
 	return c, nil
 }
 
-// newSort opens one pass of the two-pass sort with the shared codec and
-// budget. ExternalSort takes the codec as a parameter, so the packed candidate
-// format in codec.go is supplied here and no other caller of the sort is
-// affected.
-func (c *collector) newSort(prefix string, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
-	sorter, err := pagination.NewExternalSort(c.dir, prefix, 0, encodeScored, decodeScored, compare)
+// newScoredSort opens one disk-backed pass over candidates with the shared
+// codec and run budget. ExternalSort takes the codec as a parameter, so the
+// packed candidate format in codec.go is supplied here and no other caller of
+// the sort is affected. Both passes that exist go through it: the
+// deduplication pass of the first request, and the ranking sort a
+// continuation runs once over the raw candidate spool (ADR-0007 Decision 3).
+func newScoredSort(dir, prefix string, runBytes int64, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
+	sorter, err := pagination.NewExternalSort(dir, prefix, 0, encodeScored, decodeScored, compare)
 	if err != nil {
 		return nil, err
 	}
-	return sorter.WithRunBytes(c.runBytes, sizeOfScored), nil
+	return sorter.WithRunBytes(runBytes, sizeOfScored), nil
 }
 
 // sizeOfScored charges one buffered candidate against the run budget: its
@@ -305,39 +308,81 @@ func mergeReasons(a, b []string) []string {
 // part of the fold is total.
 func foldScored(a, b scored) (scored, error) { return fold(a, b), nil }
 
-// results ends the deduplication pass and orders the distinct set by the full
-// Section 14.2 chain. The order is total (SearchKey is unique within a
-// deduplication key), so no stable sort is needed to make it deterministic.
+// deduped ends the deduplication pass and answers the distinct candidate set
+// as a re-iterable sorted run on disk, in DEDUPLICATION-KEY order.
 //
-// The answer is a re-iterable sorted run on disk, not a slice: the caller
-// streams one page out of it and streams the remainder straight into the
-// continuation spool, so no part of the flow ever holds the whole answer.
+// It no longer ranks. ADR-0007 Decision 3 moves the rank order off the first
+// page's critical path: the caller streams this run once, selects the page
+// through a bounded heap under cmpScored and lays the same records into the
+// raw continuation spool, and the external sort by rank runs at most once,
+// on the first continuation, over that spool. A first page that is the whole
+// answer therefore pays no ranking sort and writes no spool at all.
+//
+// A survivor's folded score is final once this pass is closed; promoting it
+// into ScoreMicros is the caller's first act on every record it takes out of
+// this run, because that promoted score is cmpScored's second key and the
+// value the raw spool must carry.
+//
 // Close the run; the collector's own pass is released by Close.
-func (c *collector) results() (*pagination.SortedRun[scored], error) {
-	deduped, err := c.dedup.Sorted()
+func (c *collector) deduped() (*pagination.SortedRun[scored], error) {
+	run, err := c.dedup.Sorted()
 	if err != nil {
 		return nil, err
 	}
-	defer deduped.Close()
-	byRank, err := c.newSort("searchrank-", cmpScored)
-	if err != nil {
-		return nil, err
-	}
-	defer byRank.Close()
-	// The deduplication pass is closed, so a survivor's folded score is final
-	// and becomes the score it is ranked and served with.
-	if err := deduped.Each(func(v scored) error {
-		v.ScoreMicros = v.Folded
-		return byRank.Add(v)
-	}); err != nil {
-		return nil, err
-	}
-	run, err := byRank.Sorted()
-	if err != nil {
-		return nil, err
-	}
-	c.peak = max(c.dedup.PeakLiveRecords(), byRank.PeakLiveRecords())
+	c.peak = c.dedup.PeakLiveRecords()
 	return run, nil
+}
+
+// pageHeap selects the first page out of an unordered candidate stream: a
+// bounded heap of one page plus one entry, ordered by cmpScored itself, which
+// is the SAME total order the continuation's external sort applies. One
+// comparator is what makes the heap's page the sorted run's first page by
+// construction rather than by coincidence (ADR-0007 Decision 3).
+//
+// Less inverts cmpScored, so the root is the candidate that sorts LAST and is
+// the one an overflowing offer evicts. Memory is the page bound, never the
+// match count; this is a selection, not a top-k cap, because every candidate
+// is also spooled and served.
+type pageHeap struct {
+	items []scored
+	limit int
+}
+
+func (h *pageHeap) Len() int           { return len(h.items) }
+func (h *pageHeap) Less(i, j int) bool { return cmpScored(h.items[i], h.items[j]) > 0 }
+func (h *pageHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *pageHeap) Push(x any)         { h.items = append(h.items, x.(scored)) }
+
+func (h *pageHeap) Pop() any {
+	last := h.items[len(h.items)-1]
+	h.items = h.items[:len(h.items)-1]
+	return last
+}
+
+// offer admits one candidate and evicts the worst held once the heap would
+// hold more than one page plus one entry. The plus one is what lets the caller
+// recognize, on the arrival that first overflows the page, that the heap holds
+// EXACTLY the candidates seen so far -- the moment it can open the raw spool
+// and lay them all into it without a second walk of the candidate set.
+func (h *pageHeap) offer(v scored) {
+	heap.Push(h, v)
+	if len(h.items) > h.limit+1 {
+		heap.Pop(h)
+	}
+}
+
+// full reports whether the heap holds more candidates than one page.
+func (h *pageHeap) full() bool { return len(h.items) > h.limit }
+
+// page is the first page in served order: the held candidates ordered by
+// cmpScored, cut to the page bound.
+func (h *pageHeap) page() []scored {
+	out := slices.Clone(h.items)
+	slices.SortFunc(out, cmpScored)
+	if len(out) > h.limit {
+		out = out[:h.limit]
+	}
+	return out
 }
 
 // peakLiveRecords reports that high-water mark.
