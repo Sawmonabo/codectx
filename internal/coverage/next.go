@@ -23,13 +23,19 @@ import (
 // pages ordinals ascending and stops at the first entry that is not
 // required_full. It never sorts and never re-ranks; re-deriving an order here
 // would be a second ranking implementation.
-func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.NextContextItem, error) {
+func (s *Service) Next(ctx context.Context, req model.SessionRequest) (_ model.NextContextItem, err error) {
 	if err := req.Validate(); err != nil {
 		return model.NextContextItem{}, err
 	}
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage next", err) }()
 
 	// Gate the actor before anything else: Store.Session skips its actor check
 	// on an empty actor, and UnconfirmedChunks below takes no actor at all.
