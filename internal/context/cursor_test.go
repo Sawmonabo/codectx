@@ -537,6 +537,85 @@ func TestADeadlineInsideTheGraphWalkResumesIntoTheUninterruptedPlan(t *testing.T
 	if live != 0 {
 		t.Fatalf("the consumed mid-walk continuation left %d live byte(s) in the spool store, want 0", live)
 	}
+
+	// The same claim for the seven passes BELOW P-A. P-A is the only stage that
+	// is handed the stop predicate, so a deadline that fires while P-B..P-H is
+	// running surfaces as that stage's own error rather than as a halt, and
+	// runPasses returned it -- discarding every pass the call had finished.
+	// This arm drives P-B: the compile is advanced to the boundary behind it,
+	// then the stage is run against an ALREADY-EXPIRED context, which is the
+	// deadline in its sharpest form. The call must halt at that boundary, mint
+	// a continuation, and resume into the identical plan.
+	t.Run("inside P-B", func(t *testing.T) {
+		fx := newGeneratedFixture(t)
+		c, spools := pagedCompiler(t, fx, fx.Now, nil)
+		token, st := haltInsidePass(t, c, fx, req, passHydrate)
+		if st.pass != passHydrate {
+			t.Fatalf("the halt recorded pass %d, want the boundary %d behind the cut pass", st.pass, passHydrate)
+		}
+		got, err := c.CompilePage(fx.ctx, req, token)
+		if err != nil {
+			t.Fatalf("resuming a compile the deadline cut inside P-B failed: %v", err)
+		}
+		assertSamePlan(t, passHydrate, got, want)
+		live, err := spools.Sweep(fx.ctx, fx.Now())
+		if err != nil {
+			t.Fatalf("Sweep: %v", err)
+		}
+		if live != 0 {
+			t.Fatalf("the consumed continuation left %d live byte(s) in the spool store, want 0", live)
+		}
+	})
+}
+
+// haltInsidePass advances a fresh compile to the boundary behind pass `at` and
+// then runs pass `at` itself against an expired context, returning the
+// continuation the deadline arm mints and the state it minted from.
+func haltInsidePass(t *testing.T, c *Compiler, fx *contextFixture, req model.ContextRequest, at int) (string, *compileState) {
+	t.Helper()
+	reader, err := c.store.PinGeneration(fx.ctx, c.repo, 0, c.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	defer reader.Close()
+	binding := reader.Binding()
+	id, _ := manifestIdentity(binding, req, c.cfg)
+	st := &compileState{pass: passIngest}
+	sorts, err := newCompileSorts(c.cfg, c.sortDir)
+	if err != nil {
+		t.Fatalf("newCompileSorts: %v", err)
+	}
+	defer sorts.Close()
+	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		t.Fatalf("resolveBudget: %v", err)
+	}
+	if err := c.runPasses(fx.ctx, reader, binding.GenerationID, req, sorts, resolved, st,
+		func(pass int) bool { return pass == at }); err != nil {
+		t.Fatalf("the passes before boundary %d failed: %v", at, err)
+	}
+	if !st.halted || st.pass != at {
+		t.Fatalf("the pipeline ran to pass %d (halted=%v), want boundary %d", st.pass, st.halted, at)
+	}
+	st.halted = false
+
+	expired, cancel := stdcontext.WithDeadline(fx.ctx, fx.Now().Add(-time.Second))
+	defer cancel()
+	if err := c.runPasses(expired, reader, binding.GenerationID, req, sorts, resolved, st,
+		func(int) bool { return true }); err != nil {
+		t.Fatalf("a deadline inside pass %d lost the compile: %v", at, err)
+	}
+	if !st.halted {
+		t.Fatalf("a deadline inside pass %d neither halted nor failed; the compile ran on past its deadline", at)
+	}
+	next, err := c.checkpointAt(fx.ctx, binding, string(id), st)
+	if err != nil {
+		t.Fatalf("checkpointAt pass %d: %v", at, err)
+	}
+	if next == "" {
+		t.Fatalf("the deadline inside pass %d minted no continuation token", at)
+	}
+	return next, st
 }
 
 // A USER-SET graph bound that truncates the walk must still leave the resumed
