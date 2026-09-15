@@ -813,8 +813,11 @@ func TestOverLimitFieldsAreDroppedAndCounted(t *testing.T) {
 	if d["decode_drop_reason"] == "" {
 		t.Fatalf("the capability row names no reason for the drops: %v", d)
 	}
-	if rep.Result.Capabilities[0].DiagnosticCode != model.CodeResourceLimit &&
-		rep.Result.Capabilities[0].State != model.CapabilityPartial {
-		t.Fatalf("a run that dropped records reported %+v; it must be partial under a resource-limit reason", rep.Result.Capabilities[0])
+	// The state must be partial; the diagnostic code is whichever reason
+	// degraded the unit FIRST, and an unverified binding outranks a resource
+	// limit by design (`degrade`). Pinning the resource-limit code here would
+	// assert the ordering, not the drop.
+	if c := rep.Result.Capabilities[0]; c.State != model.CapabilityPartial || c.DiagnosticCode == "" {
+		t.Fatalf("a run that dropped records reported %+v; it must be partial under a named reason", c)
 	}
 }
