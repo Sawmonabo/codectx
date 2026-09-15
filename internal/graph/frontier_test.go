@@ -2,9 +2,11 @@ package graph
 
 import (
 	"context"
-	"github.com/Sawmonabo/codectx/internal/config"
+	"fmt"
+	"sort"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -507,5 +509,119 @@ func TestContainmentReadEndsOnTheEmptyPage(t *testing.T) {
 					read, done, tc.wantRead, tc.wantDone)
 			}
 		})
+	}
+}
+
+// widePackageCount is the affected-package fan-out of the VF1/VF2 shape. It is
+// deliberately above model.MaxRecordsPerResult so a single-shot answer would
+// carry more package pairs than one result may hold.
+const widePackageCount = model.MaxRecordsPerResult + 284
+
+// TestImpactPagesPastTheResultRecordCap is VF1 and VF2 from the real-repository
+// verification. On a 4019-file repository `impact --depth 0 --visited 0
+// --edges 0` was REFUSED on page 1 -- `impact_result.packages has 1284
+// entries, limit 1000` -- because the whole walk's rollup was built into one
+// result; on another repository the same walk silently stopped at exactly 1000
+// affected entities with truncation_reason "affected entity record limit
+// reached", no next_cursor, and visited/edge counters frozen across five
+// pages, so the rest of the blast radius was unreachable at any page size.
+//
+// The record cap is a per-PAGE bound, not a ceiling on the answer: the walk
+// stops at the page's item bound and mints a continuation, so neither list can
+// reach the cap and no page can report "record limit" with no cursor at all.
+//
+// Mutation: restore the single-shot walk (the `len(a.edges) >= a.pageItems`
+// stop in impactAccumulator.Visit) and page 1 fails its own contract with
+// CTX_ARGUMENT_INVALID, which is the refusal this row reproduces.
+func TestImpactPagesPastTheResultRecordCap(t *testing.T) {
+	f := newGraphFixture(t)
+	seed := fixtureNodeID("vf-seed")
+	seedPkg := fixtureNodeID("vf-pkg-seed")
+	addNode := func(id model.NodeID, kind model.NodeKind, name string) {
+		f.nodes[id] = model.Node{ID: id, Kind: kind, Name: name, QualifiedName: name,
+			Language: "go", SemanticSource: model.SemanticCanonical}
+	}
+	addRel := func(kind model.RelationKind, from, to model.NodeID) {
+		f.relations = append(f.relations, model.Relation{
+			ID: fixtureRelationID(len(f.relations)), Kind: kind, From: from, To: to})
+	}
+	addNode(seed, model.NodeFunction, "vf-seed")
+	addNode(seedPkg, model.NodePackage, "vf-pkg-seed")
+	addRel(model.RelContains, seedPkg, seed)
+	for i := 0; i < widePackageCount; i++ {
+		callee := fixtureNodeID(fmt.Sprintf("vf-callee-%d", i))
+		pkg := fixtureNodeID(fmt.Sprintf("vf-pkg-%04d", i))
+		addNode(callee, model.NodeFunction, fmt.Sprintf("vf-callee-%d", i))
+		addNode(pkg, model.NodePackage, fmt.Sprintf("vf-pkg-%04d", i))
+		addRel(model.RelCalls, seed, callee)
+		addRel(model.RelContains, pkg, callee)
+	}
+	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
+
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 32<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	// The refused invocation's own bounds: every count budget unlimited.
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	req := model.ImpactRequest{GenerationID: 1, Start: []model.NodeID{seed},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+	type pair struct{ from, to model.NodeID }
+	pkgs := map[pair]bool{}
+	entries := map[model.NodeID]bool{}
+	pages := 0
+	for {
+		pages++
+		if pages > 200 {
+			t.Fatalf("the paged impact did not terminate after %d pages", pages-1)
+		}
+		res, err := e.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		// The refusal VF1 reproduces is exactly this contract check.
+		if err := res.Validate(); err != nil {
+			t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
+		}
+		if len(res.Packages) > limits.MaxPageItems || len(res.Entries) > limits.MaxPageItems {
+			t.Fatalf("page %d carried %d entries and %d package pairs over a page bound of %d",
+				pages, len(res.Entries), len(res.Packages), limits.MaxPageItems)
+		}
+		if res.Meta.NextCursor == "" && len(pkgs)+len(res.Packages) < widePackageCount {
+			// VF2: a page that leaves affected packages unserved and offers no
+			// continuation makes the rest of the blast radius unreachable.
+			t.Fatalf("page %d served the last of %d package pair(s) with no continuation (truncated=%v reason=%q)",
+				pages, len(pkgs)+len(res.Packages), res.Meta.Truncated, res.Meta.TruncationReason)
+		}
+		for _, p := range res.Packages {
+			pkgs[pair{p.FromNodeID, p.ToNodeID}] = true
+		}
+		for _, entry := range res.Entries {
+			entries[entry.NodeID] = true
+		}
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if len(pkgs) != widePackageCount {
+		t.Errorf("the pages aggregated %d distinct package pairs, want the whole walk's %d",
+			len(pkgs), widePackageCount)
+	}
+	if len(entries) != widePackageCount {
+		t.Errorf("the pages served %d distinct affected entities, want %d", len(entries), widePackageCount)
 	}
 }
