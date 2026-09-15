@@ -375,11 +375,11 @@ func legQuantization(t *testing.T, _ *fixture) {
 // paging (or not at all) would serve one node twice inside one page and
 // understate its occurrence count.
 func legDedupFolds(t *testing.T, _ *fixture) {
-	c := newCollector()
-	c.add(rankedOf(model.TierLexicalFTS, 4_200_000, "pkg/alpha.go", 0, "node-a", "doc-a1"), "lexical_fts match")
-	c.add(rankedOf(model.TierExactName, 0, "pkg/alpha.go", 0, "node-a", "doc-a2"), "exact_name match")
-	c.add(rankedOf(model.TierLexicalFTS, 1_000_000, "pkg/beta.go", 0, "node-b", "doc-b1"), "lexical_fts match")
-	got := c.results()
+	c := collectorFor(t)
+	add(t, c, rankedOf(model.TierLexicalFTS, 4_200_000, "pkg/alpha.go", 0, "node-a", "doc-a1"), "lexical_fts match")
+	add(t, c, rankedOf(model.TierExactName, 0, "pkg/alpha.go", 0, "node-a", "doc-a2"), "exact_name match")
+	add(t, c, rankedOf(model.TierLexicalFTS, 1_000_000, "pkg/beta.go", 0, "node-b", "doc-b1"), "lexical_fts match")
+	got := resultsOf(t, c)
 	if len(got) != 2 {
 		t.Fatalf("results = %d hits, want 2 after deduplication", len(got))
 	}
@@ -411,12 +411,12 @@ func legDedupFolds(t *testing.T, _ *fixture) {
 // keying only on NodeID would fold every bodiless chunk of every file into one
 // hit.
 func legDedupFileKey(t *testing.T, _ *fixture) {
-	c := newCollector()
-	c.add(rankedOf(model.TierLexicalFTS, 3, "pkg/alpha.go", 0, "", "doc-1"))
-	c.add(rankedOf(model.TierLexicalFTS, 5, "pkg/alpha.go", 0, "", "doc-2"))
-	c.add(rankedOf(model.TierLexicalFTS, 7, "pkg/alpha.go", 64, "", "doc-3"))
-	c.add(rankedOf(model.TierLexicalFTS, 9, "pkg/beta.go", 0, "", "doc-4"))
-	got := c.results()
+	c := collectorFor(t)
+	add(t, c, rankedOf(model.TierLexicalFTS, 3, "pkg/alpha.go", 0, "", "doc-1"))
+	add(t, c, rankedOf(model.TierLexicalFTS, 5, "pkg/alpha.go", 0, "", "doc-2"))
+	add(t, c, rankedOf(model.TierLexicalFTS, 7, "pkg/alpha.go", 64, "", "doc-3"))
+	add(t, c, rankedOf(model.TierLexicalFTS, 9, "pkg/beta.go", 0, "", "doc-4"))
+	got := resultsOf(t, c)
 	if len(got) != 3 {
 		t.Fatalf("results = %d hits, want 3: (path,start) separates chunks, and folds only the pair that shares one", len(got))
 	}
@@ -442,7 +442,7 @@ func legDedupFileKey(t *testing.T, _ *fixture) {
 func legRankedSetLossless(t *testing.T, _ *fixture) {
 	const distinct = 5000
 	oracle := make([]ranked, 0, distinct)
-	c := newCollector()
+	c := collectorFor(t)
 	// A stride coprime with distinct offers the candidates in an order that
 	// shares no prefix with the ranked order, so a collector that silently
 	// kept only a prefix of what it was offered cannot pass.
@@ -451,12 +451,12 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 		r := rankedOf(model.TierLexicalFTS, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
 			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n))
 		oracle = append(oracle, r)
-		c.add(r, "lexical")
+		add(t, c, r, "lexical")
 	}
 	if truncated, reason := c.truncation(); truncated {
 		t.Fatalf("a %d-result answer reported itself truncated: %s", distinct, reason)
 	}
-	got := c.results()
+	got := resultsOf(t, c)
 	if len(got) != distinct {
 		t.Fatalf("results = %d, want every one of the %d distinct hits", len(got), distinct)
 	}
@@ -467,9 +467,15 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 		}
 	}
 	// A repeat of a key still folds rather than entering twice, at any size.
-	c.add(oracle[0], "exact")
-	if again := c.results(); len(again) != distinct {
-		t.Fatalf("a repeated key grew the set to %d, want %d", len(again), distinct)
+	again := collectorFor(t)
+	for i := range distinct {
+		n := (i * 2237) % distinct
+		add(t, again, rankedOf(model.TierLexicalFTS, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
+			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n)), "lexical")
+	}
+	add(t, again, oracle[0], "exact")
+	if got := resultsOf(t, again); len(got) != distinct {
+		t.Fatalf("a repeated key grew the set to %d, want %d", len(got), distinct)
 	}
 }
 
@@ -477,12 +483,12 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 // A folded hit with nine reasons, or one reason of a megabyte, fails
 // model.SearchHit.Validate and takes the whole page down.
 func legReasonBounds(t *testing.T, _ *fixture) {
-	c := newCollector()
+	c := collectorFor(t)
 	long := strings.Repeat("x", model.MaxReasonBytes+64)
 	for i := range model.MaxReasonsPerEntry + 4 {
-		c.add(rankedOf(model.TierLexicalFTS, 1, "p", 0, "n", "k"), "reason "+strconv.Itoa(i), long, "reason 0")
+		add(t, c, rankedOf(model.TierLexicalFTS, 1, "p", 0, "n", "k"), "reason "+strconv.Itoa(i), long, "reason 0")
 	}
-	got := c.results()[0]
+	got := resultsOf(t, c)[0]
 	if len(got.Reasons) != model.MaxReasonsPerEntry {
 		t.Fatalf("Reasons = %d entries, want the bound %d", len(got.Reasons), model.MaxReasonsPerEntry)
 	}
@@ -666,7 +672,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	// remainder: a continuation reads its hits from the spool and has nothing
 	// of its own to recompute truncation from.
 	answer := spoolMeta{Truncated: true, TruncationReason: testTruncationReason}
-	id, err := spoolHits(f.opts.Spools, c, answer, want)
+	id, err := spoolHits(f.opts.Spools, c, answer, sliceTail(want))
 	if err != nil {
 		t.Fatalf("spoolHits: %v", err)
 	}
@@ -1134,7 +1140,7 @@ func legContinuationTruncation(t *testing.T, f *fixture) {
 	}
 	now := time.Now().UTC()
 	c := newCursor(endpointSearch, f.binding, lease.ID, searchQueryHash(req), now.Add(time.Minute))
-	id, err := spoolHits(f.opts.Spools, c, spoolMeta{Truncated: true, TruncationReason: testTruncationReason}, second.Items)
+	id, err := spoolHits(f.opts.Spools, c, spoolMeta{Truncated: true, TruncationReason: testTruncationReason}, sliceTail(second.Items))
 	if err != nil {
 		t.Fatalf("spoolHits: %v", err)
 	}
@@ -1172,4 +1178,42 @@ func legSymbolByCanonicalID(t *testing.T, f *fixture) {
 	if page.Meta.NextCursor != "" {
 		t.Error("the canonical-id tier minted a continuation for a single-node answer")
 	}
+}
+
+// collectorFor opens a ranking collector whose external sort spills under the
+// test's own directory. The run budget is the floor, so these legs exercise
+// the spilling path rather than the buffer-only one.
+func collectorFor(t *testing.T) *collector {
+	t.Helper()
+	c, err := newCollector(t.TempDir(), 0)
+	if err != nil {
+		t.Fatalf("opening a collector: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	return c
+}
+
+// add offers one candidate with no servable facts, which the ranking legs do
+// not read.
+func add(t *testing.T, c *collector, r ranked, reasons ...string) {
+	t.Helper()
+	if err := c.add(r, hitFacts{}, reasons...); err != nil {
+		t.Fatalf("adding a candidate: %v", err)
+	}
+}
+
+// resultsOf drains the ordered run into a slice so a leg can index it. The
+// production path streams it instead; nothing outside a test holds it whole.
+func resultsOf(t *testing.T, c *collector) []scored {
+	t.Helper()
+	run, err := c.results()
+	if err != nil {
+		t.Fatalf("ordering the candidate set: %v", err)
+	}
+	t.Cleanup(func() { run.Close() })
+	var out []scored
+	if err := run.Each(func(v scored) error { out = append(out, v); return nil }); err != nil {
+		t.Fatalf("reading the ordered set: %v", err)
+	}
+	return out
 }
