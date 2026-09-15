@@ -165,6 +165,10 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
+	// Every storage read this answer makes resolves its page bound against the
+	// wire ceiling; a request the storage layer served at a different size than
+	// it was asked for is reported on the answer rather than applied silently.
+	ctx, clamps := sqlite.WithPageClamps(ctx)
 	now := s.now()
 	hash := searchQueryHash(req)
 
@@ -210,7 +214,8 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if len(hits) > limit {
 		hits, rest = hits[:limit], hits[limit:]
 	}
-	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason}
+	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason,
+		Notices: clamps.Notices()}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}

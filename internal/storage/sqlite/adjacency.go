@@ -118,7 +118,7 @@ func kindMarks(b *binder, kinds []model.RelationKind) (string, error) {
 // model.MaxPageItems is clamped to it.
 func (r *PinnedReader) EdgesBatch(ctx context.Context, nodes []model.NodeID, direction model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	query, args, err := r.edgesBatchQuery(nodes, direction, kinds, after, limit)
+	query, args, err := r.edgesBatchQuery(ctx, nodes, direction, kinds, after, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +145,7 @@ func (r *PinnedReader) EdgesBatch(ctx context.Context, nodes []model.NodeID, dir
 
 // edgesBatchQuery builds the statement EdgesBatch runs. It is separate so the
 // query plan can be asserted against exactly the SQL that ships.
-func (r *PinnedReader) edgesBatchQuery(nodes []model.NodeID, direction model.Direction,
+func (r *PinnedReader) edgesBatchQuery(ctx context.Context, nodes []model.NodeID, direction model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) (string, []any, error) {
 	if limit < 0 {
 		return "", nil, invalid("edge batch limit cannot be negative")
@@ -153,7 +153,7 @@ func (r *PinnedReader) edgesBatchQuery(nodes []model.NodeID, direction model.Dir
 	// A zero limit is "no caller-side bound", which pageLimit resolves to the
 	// page size the storage layer serves anyway. Refusing it made 0 mean
 	// "broken" in the one place the rest of the tree now reads as "unlimited".
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if !direction.Valid() {
 		return "", nil, invalid("direction %q is not a known direction", direction)
 	}
@@ -296,7 +296,7 @@ const evidenceBatchOuterColumns = `id, unit_key, provider_id, provider_version, 
 // internal hydration cap rather than a frozen request field, so zero takes the
 // model.MaxPageItems default the rest of the reader uses.
 func (r *PinnedReader) EvidenceBatch(ctx context.Context, relations []model.RelationID, perRelation int) (map[model.RelationID][]StoredEvidence, error) {
-	query, args, err := r.evidenceBatchQuery(relations, perRelation)
+	query, args, err := r.evidenceBatchQuery(ctx, relations, perRelation)
 	if err != nil {
 		return nil, err
 	}
@@ -324,8 +324,8 @@ func (r *PinnedReader) EvidenceBatch(ctx context.Context, relations []model.Rela
 
 // evidenceBatchQuery builds the statement EvidenceBatch runs, separately so the
 // query plan can be asserted against exactly the SQL that ships.
-func (r *PinnedReader) evidenceBatchQuery(relations []model.RelationID, perRelation int) (string, []any, error) {
-	perRelation = pageLimit(perRelation)
+func (r *PinnedReader) evidenceBatchQuery(ctx context.Context, relations []model.RelationID, perRelation int) (string, []any, error) {
+	perRelation = pageLimit(ctx, perRelation)
 	raw := make([]string, len(relations))
 	for i, id := range relations {
 		raw[i] = string(id)

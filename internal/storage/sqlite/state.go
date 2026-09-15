@@ -282,7 +282,7 @@ func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterO
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ContextEntry
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT ordinal, node_id, file_id, requirement, score_micros, estimated_bytes, estimated_tokens, reasons_json, evidence_paths_json
@@ -320,7 +320,7 @@ func (s *Store) ManifestSlices(ctx context.Context, id model.ManifestID, afterIn
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ContextSlice
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT slice_index, estimated_bytes, estimated_tokens FROM context_slices WHERE manifest_id = ? AND slice_index > ? ORDER BY slice_index LIMIT ?`, raw, afterIndex, limit)
@@ -368,7 +368,7 @@ func (s *Store) ManifestExcluded(ctx context.Context, id model.ManifestID, after
 	if err != nil {
 		return nil, err
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []model.ExcludedContextEntry
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT ordinal, reference_json, reason FROM excluded_context_entries WHERE manifest_id = ? AND ordinal > ? ORDER BY ordinal LIMIT ?`, raw, afterOrdinal, limit)
@@ -818,7 +818,7 @@ func mergeServedRange(ctx context.Context, tx *sql.Tx, session, file, hash []byt
 // A nonempty file is full_served only when the union is exactly [0,size); an
 // empty file requires a confirmed zero-length EOF receipt.
 func (s *Store) Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -995,7 +995,7 @@ func (s *Store) PutObservation(ctx context.Context, o model.Observation) error {
 // one scope version (zero means every version).
 func (s *Store) Observations(ctx context.Context, session model.SessionID, actor string, kind model.ObservationKind, scopeVersion int,
 	after model.ObservationID, limit int) ([]model.Observation, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -1121,7 +1121,7 @@ func (s *Store) Capsule(ctx context.Context, session model.SessionID, actor stri
 // batch, and reports how many it closed. Closing stops mutations; the audit
 // artifacts stay until PruneSessions.
 func (s *Store) ExpireSessions(ctx context.Context, now time.Time, limit int) (int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var n int64
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `UPDATE read_sessions SET workflow_state = 'closed', closed_at = ?, state_version = state_version + 1
@@ -1140,7 +1140,7 @@ func (s *Store) ExpireSessions(ctx context.Context, now time.Time, limit int) (i
 // than retention, in one bounded batch. Their chunks, ranges, observations and
 // capsules cascade; their manifests become collectable with their generation.
 func (s *Store) PruneSessions(ctx context.Context, now time.Time, retention time.Duration, limit int) (int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if retention < 0 {
 		return 0, invalid("closed-session retention must not be negative")
 	}

@@ -88,7 +88,7 @@ func (s *Store) SnapshotFile(ctx context.Context, id model.SnapshotID, file mode
 // walk emits and the manifest hash folds, so a page boundary never reorders or
 // repeats a row. limit is capped at model.MaxPageItems.
 func (s *Store) SnapshotFiles(ctx context.Context, id model.SnapshotID, afterPath string, limit int) ([]model.FileVersion, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	snapRaw, err := idBlob("snapshot.id", string(id))
 	if err != nil {
 		return nil, err
