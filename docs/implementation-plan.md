@@ -951,7 +951,7 @@ Use one private SQLite database per workspace with `modernc.org/sqlite` v1.58.0 
 ```sql
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
+PRAGMA synchronous = NORMAL;   -- writer default; storage.synchronous = "full" restores FULL (ADR-0004)
 PRAGMA busy_timeout = 5000;
 PRAGMA temp_store = FILE;
 PRAGMA mmap_size = 0;
@@ -2039,6 +2039,7 @@ reader_cache_kib = 4096
 wal_high_water_bytes = 67108864
 closed_session_retention = "7d"
 query_cursor_ttl = "15m"
+synchronous = "normal"          # WAL writer sync mode; "full" opts back into per-commit fsync (ADR-0004)
 
 [tools]
 # Managed analyzer toolchain (Section 11.7). Nothing here is required.
