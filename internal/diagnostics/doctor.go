@@ -524,8 +524,12 @@ func (s *Service) checkTemporary(ctx context.Context) model.DoctorCheck {
 			Code:        model.CodeResourceLimit,
 			Remediation: "run codectx index or refresh to reclaim abandoned staging state, or raise resources.max_temp_bytes"}
 	}
+	ceiling := "unlimited"
+	if want > 0 {
+		ceiling = bytesPhrase(want)
+	}
 	return model.DoctorCheck{Name: checkTemporaryState, State: model.CheckPass,
-		Detail: bytesPhrase(int64(*report.TempBytes)) + " of temporary state"}
+		Detail: bytesPhrase(int64(*report.TempBytes)) + " of temporary state, against a configured ceiling of " + ceiling}
 }
 
 // checkToolchain reports one check per lock entry, named by the entry. A tool

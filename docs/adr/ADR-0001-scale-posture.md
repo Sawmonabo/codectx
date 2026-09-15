@@ -799,14 +799,17 @@ duplicates an existing assertion.
   today is to re-run the query or raise the query timeout. Closing it is a Minor — give the external
   sort a constructor that adopts the runs a previous request spilled — and it is the only stop on
   these two endpoints that returns truncated with no cursor.
-- **`resources.max_temp_bytes` still defaults to 4 GiB, and a paged walk still re-copies its
-  cumulative visited set.** Two rulings are accepted and only partly landed. (a) The temporary-byte
-  budget is a bound nobody set, so it must default to unlimited like every other count or size
-  bound; the spool store now reads a non-positive cap as unlimited (it refuses no write and keeps
-  the accounting the resource envelope reports), but the configuration default, the
-  `max_temp_bytes > min_free_disk_bytes` validation and the process runners' disk admission still
-  require a positive value, so flipping the default is a follow-up. `min_free_disk_bytes` stays as
-  it is: it protects the host's free space rather than capping work. (b) A walk page writes a FRESH
+- **`resources.max_temp_bytes` defaults to unlimited; a paged walk still re-copies its
+  cumulative visited set.** Two rulings are accepted; the first has landed and the second has not.
+  (a) LANDED. The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
+  every other count or size bound: the spool store reads a non-positive cap as unlimited (it
+  refuses no write and keeps the accounting the resource envelope reports), the configuration
+  default is `0`, the `max_temp_bytes > min_free_disk_bytes` validation is one-sided and applies
+  only to a value the operator set, and the process runners read a non-positive disk budget as
+  unlimited rather than refusing construction -- a value that IS set still refuses a run up front,
+  with a typed `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`. `min_free_disk_bytes` stays
+  as it is: it protects the host's free space rather than capping work, and it is still enforced
+  against actual free space under an unlimited temporary budget. (b) OPEN. A walk page writes a FRESH
   continuation spool holding the WHOLE cumulative visited set -- the previous page's visited section
   is streamed record by record into the new spool -- and the resume decodes that same section again
   to rebuild the frontier and the membership summary. Both are O(visited) per page, which is the
@@ -821,7 +824,26 @@ duplicates an existing assertion.
   page (`AdoptDir` measures the directory and reserves it again while the previous reservation is
   released only afterwards), so the shared budget holds roughly twice the cumulative retained bytes
   at every page boundary -- append-only runs alone do not fix that, the reservation has to become
-  incremental.
+  incremental. The carrier is settled: `retainedWalk` (`internal/graph/walkretain.go`) is an owned
+  type that already travels through the impact and rollup endpoints as an opaque pointer, is
+  created unconditionally on both, is reopened for append on every resume and is carried forward by
+  rename, so the run files and the persisted filter belong inside its directory and need no change
+  to the endpoints themselves; the neighbours endpoint builds its own continuation in
+  `traverse.go` and can create its own. `spill` must then IGNORE `continuation.Carried` whenever a
+  persisted run store exists, which is what keeps `impact.go`'s `Carried: resume.Visited` correct
+  and unedited. One hop is missing and is the blocker: `runWalkToCompletion` receives neither the
+  retained walk nor any other persistent handle (`expandOptions` is built at `impact.go:206` and
+  `rollup.go:105`), so the internal links' admissions cannot reach the persisted runs without one
+  new field on `expandOptions` set at those two call sites.
+- **An impact or rollup continuation drops the nodes its INTERNAL links admitted.**
+  `runWalkToCompletion` chains several `expand` calls inside one request and records the earlier
+  links' admitted nodes in `walkState.Carried` (`walkrun.go:91`), but `continueWalk`
+  (`impact.go:557-560`) builds the continuation with `Carried: resume.Visited` -- the OUTER
+  cursor's stream -- and nothing ever reads `walkState.Carried`; only `ReleaseCarried` is used. A
+  walk that crosses an internal boundary and then mints a cursor therefore forgets every node the
+  earlier links admitted, and the next page re-admits them: the same entity is reported on two
+  pages. The append-only design above removes it as a side effect, because the links would append
+  to the persisted runs directly.
 - **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
   walk holds its settled set, distances, depths and cached edges for the length of the walk, and
   unlike a breadth-first frontier that state cannot spill, because a search resumed from a

@@ -194,7 +194,7 @@ All **user** trust.
 | `max_concurrent_queries` | `4` | Concurrent queries. |
 | `max_concurrent_graph_queries` | `2` | Concurrent graph queries; must not exceed `max_concurrent_queries`. |
 | `max_concurrent_heavy_analyzers` | `1` | Concurrent heavy analyzer runs. |
-| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
+| `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
@@ -543,7 +543,7 @@ relationships that must hold:
 - `resources.max_concurrent_graph_queries` ≤ `resources.max_concurrent_queries`.
 - `max_concurrent_queries × query_memory_bytes` + `cache_bytes` + `queue_bytes`
   ≤ `resources.base_memory_budget_bytes`.
-- `resources.max_temp_bytes` > `resources.min_free_disk_bytes`.
+- `resources.max_temp_bytes` > `resources.min_free_disk_bytes`, when `max_temp_bytes` is set at all (`0` is unlimited and has nothing to exceed).
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when
   the bound on the right is set. There is nothing to exceed in an unlimited one.

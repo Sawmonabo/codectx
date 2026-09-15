@@ -217,9 +217,20 @@ func (r *Runner) startedChild() func() {
 
 // NewRunner returns a runner bound by limits.
 func NewRunner(limits Limits) (*Runner, error) {
-	if limits.MaxConcurrent <= 0 || limits.MemoryBudgetBytes <= 0 || limits.DiskBudgetBytes <= 0 {
-		return nil, resourceLimit("runner limits are concurrency %d, memory %d and disk %d; every bound must be positive",
-			limits.MaxConcurrent, limits.MemoryBudgetBytes, limits.DiskBudgetBytes)
+	if limits.MaxConcurrent <= 0 || limits.MemoryBudgetBytes <= 0 {
+		return nil, resourceLimit("runner limits are concurrency %d and memory %d; both reservations must be positive",
+			limits.MaxConcurrent, limits.MemoryBudgetBytes)
+	}
+	// DiskBudgetBytes is a BOUND and not a reservation: it carries
+	// resources.max_temp_bytes, whose default is unlimited, so a non-positive
+	// value admits every run's disk reservation rather than refusing the
+	// runner outright. Concurrency and memory stay reservations -- they size
+	// the machine the children are given, and a zero-sized one is broken
+	// rather than unbounded. Nothing here is the host-safety floor: free space
+	// is checked against resources.min_free_disk_bytes, which is untouched by
+	// an unlimited temporary budget.
+	if limits.DiskBudgetBytes < 0 {
+		return nil, resourceLimit("runner disk budget is %d; use 0 for unlimited", limits.DiskBudgetBytes)
 	}
 	return &Runner{limits: limits}, nil
 }
@@ -327,9 +338,15 @@ func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 		return nil, resourceLimit("the run reserves %d bytes of memory, over the runner budget of %d",
 			spec.MemoryReservationBytes, r.limits.MemoryBudgetBytes)
 	}
-	if spec.DiskReservationBytes > r.limits.DiskBudgetBytes {
-		return nil, resourceLimit("the run reserves %d bytes of disk, over the runner budget of %d",
-			spec.DiskReservationBytes, r.limits.DiskBudgetBytes)
+	// An unlimited disk budget has nothing to exceed, so the reservation is
+	// admitted and only accounted; a user-set one still refuses up front, which
+	// is the only way a run is rejected for disk.
+	if r.limits.DiskBudgetBytes > 0 && spec.DiskReservationBytes > r.limits.DiskBudgetBytes {
+		return nil, (&model.Error{Code: model.CodeResourceLimit,
+			Message: fmt.Sprintf("the run reserves %d bytes of disk, over the runner budget of %d",
+				spec.DiskReservationBytes, r.limits.DiskBudgetBytes),
+			Remediation: "raise resources.max_temp_bytes, or set it to 0 for unlimited",
+		}).WithDetail("limit", "resources.max_temp_bytes")
 	}
 	w := &admission{mem: spec.MemoryReservationBytes, disk: spec.DiskReservationBytes, ready: make(chan struct{})}
 	r.mu.Lock()
@@ -366,7 +383,7 @@ func (r *Runner) promote() {
 		w := e.Value.(*admission)
 		if r.running >= r.limits.MaxConcurrent ||
 			r.memoryUsed+w.mem > r.limits.MemoryBudgetBytes ||
-			r.diskUsed+w.disk > r.limits.DiskBudgetBytes {
+			(r.limits.DiskBudgetBytes > 0 && r.diskUsed+w.disk > r.limits.DiskBudgetBytes) {
 			return
 		}
 		r.running++
