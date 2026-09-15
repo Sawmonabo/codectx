@@ -303,6 +303,8 @@ cloud or AI credential fields in core.
 | `max_reason_paths_per_entry` | `0` (unlimited) | user | Explanation paths stored per entry. |
 | `max_manifest_bytes` | `0` (unlimited) | user | Largest manifest. Unlimited by default; a compile is never refused for the size of its plan. |
 | `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule. |
+| `max_capsule_records_per_list` | `0` (unlimited) | user | Records one sealed capsule list may hold. Unlimited by default; a completion is never refused for the number of observations a session recorded. A ceiling you set refuses the seal and names this key and the count reached — it never truncates a list. |
+| `max_capsule_coverage_files` | `0` (unlimited) | user | The same bound for the capsule's `coverage` list alone, which grows with the session's pinned file set rather than with what the actor observed. |
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 

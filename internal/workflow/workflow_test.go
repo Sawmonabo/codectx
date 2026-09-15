@@ -13,7 +13,6 @@ package workflow
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"sort"
@@ -589,9 +588,8 @@ type fakeSession struct {
 	obs     []model.Observation
 	waivers []model.WaiverRecord
 	capsule *model.Capsule
-	// rows are the sealed capsule's records, in list order, exactly as the
-	// real store's context_capsule_rows holds them: the capsule itself carries
-	// counts only, so this is the sole place a sealed record can be read back.
+	// rows is what PutCapsule streamed out of the sealing source, per list, in
+	// the order it streamed them -- the fake's context_capsule_rows.
 	rows map[model.CapsuleList][]model.CapsuleRow
 }
 
@@ -619,6 +617,11 @@ type fakeStore struct {
 	// compileErr and validateErr let a lane drive the failure paths without a
 	// second fake.
 	compileErr, validateErr error
+	// walks counts, per capsule list, how many times the SESSION STORE was
+	// walked for that list. The seal makes exactly three bounded passes over
+	// the source (count, hash, write) and retains no list between them, so a
+	// source that memoised a pass would drop this to one.
+	walks map[model.CapsuleList]int
 }
 
 var (
@@ -737,6 +740,18 @@ func code(err error) string {
 	return ""
 }
 
+// capsuleListOfKind is which capsule list an observation kind feeds, so a walk
+// of the session's observations can be attributed to the list the seal was
+// streaming. Coverage and waivers have no kind and are counted at their own
+// reads.
+var capsuleListOfKind = map[model.ObservationKind]model.CapsuleList{
+	model.ObservationAcceptFact:    model.CapsuleListAcceptedFacts,
+	model.ObservationRejectFact:    model.CapsuleListRejectedFacts,
+	model.ObservationContradiction: model.CapsuleListContradictions,
+	model.ObservationUnresolved:    model.CapsuleListUnresolved,
+	model.ObservationScopeReview:   model.CapsuleListScopeReviewIDs,
+}
+
 func newFakeStore() *fakeStore {
 	binding := model.Binding{
 		RepositoryID: model.RepositoryID(fixtureID("repo")),
@@ -769,6 +784,7 @@ func newFakeStore() *fakeStore {
 			served: []model.ByteRange{{Start: 0, End: 0}}},
 	}
 	s := &fakeStore{
+		walks:     map[model.CapsuleList]int{},
 		sessions:  map[model.SessionID]*fakeSession{},
 		manifests: map[model.ManifestID]model.ContextManifest{fixtureManifest: manifest},
 		entries:   map[model.ManifestID][]model.ContextEntry{},
@@ -991,6 +1007,11 @@ func (s *fakeStore) Observations(_ context.Context, session model.SessionID, act
 	kind model.ObservationKind, scopeVersion int, after model.ObservationID, limit int) ([]model.Observation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if after == "" {
+		if list, ok := capsuleListOfKind[kind]; ok {
+			s.walks[list]++
+		}
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
@@ -1019,105 +1040,99 @@ func (s *fakeStore) Observations(_ context.Context, session model.SessionID, act
 	return out, err
 }
 
-// PutCapsule stores the capsule and, in the same step, the records its source
-// streams -- the real store writes both inside one transaction, so a fake that
-// stored the capsule without its rows would let a test observe a capsule whose
-// records cannot be read.
 func (s *fakeStore) PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	fs, err := s.lookup(c.SessionID, c.ActorID)
 	if err != nil {
 		return model.Capsule{}, err
 	}
 	if fs.capsule != nil {
-		// session_id is the primary key: the first capsule is the capsule, and
-		// it comes back unchanged with its original timestamp.
-		return *fs.capsule, nil
+		// session_id is the primary key: the first capsule is the capsule, it
+		// comes back unchanged with its original timestamp, and no row is
+		// written a second time.
+		stored := *fs.capsule
+		s.mu.Unlock()
+		return stored, nil
 	}
 	if fs.rec.State != model.StateConsolidateOpen {
+		s.mu.Unlock()
 		return model.Capsule{}, &model.Error{Code: model.CodeVersionConflict,
 			Message: "a capsule is sealed only while consolidate is open"}
 	}
 	if c.Binding != fs.rec.Binding {
+		s.mu.Unlock()
 		return model.Capsule{}, &model.Error{Code: model.CodeSessionSuperseded,
 			Message: "the capsule is bound to another generation"}
 	}
 	if err := c.Validate(); err != nil {
+		s.mu.Unlock()
 		return model.Capsule{}, err
 	}
-	if src == nil {
-		return model.Capsule{}, &model.Error{Code: model.CodeInternal, Message: "the seal named no record source"}
-	}
+	s.mu.Unlock()
+	// The rows are streamed OUTSIDE the lock: the source reads this same store
+	// back, exactly as the real seal's third pass re-walks the session.
 	rows := make(map[model.CapsuleList][]model.CapsuleRow, len(model.CapsuleListOrder))
 	for _, list := range model.CapsuleListOrder {
-		var written int64
-		err := src.Rows(ctx, list, func(row model.CapsuleRow) error {
+		if err := src.Rows(ctx, list, func(row model.CapsuleRow) error {
 			if err := row.Validate(); err != nil {
 				return err
 			}
-			if row.Ordinal != written {
-				return &model.Error{Code: model.CodeInternal,
-					Message: "the " + string(list) + " list skipped an ordinal"}
-			}
-			written++
-			// The elem the seal hashed is dropped exactly as a stored row drops
-			// it: a record read back is data, never a digest contribution.
-			rows[list] = append(rows[list], model.CapsuleRow{
-				List: row.List, Ordinal: row.Ordinal, Key: row.Key, JSON: row.JSON})
+			rows[list] = append(rows[list], row)
 			return nil
-		})
-		if err != nil {
+		}); err != nil {
 			return model.Capsule{}, err
 		}
-		if written != c.Counts.Of(list) {
+		if int64(len(rows[list])) != c.Counts.Of(list) {
 			return model.Capsule{}, &model.Error{Code: model.CodeInternal,
-				Message: "the " + string(list) + " list wrote a different number of records than its sealed count"}
+				Message: "the sealed " + string(list) + " count does not match the rows written"}
 		}
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	stored := c
 	fs.capsule = &stored
 	fs.rows = rows
 	return stored, nil
 }
 
-// CapsuleRows is the keyset page the real store serves: after names a row's own
-// key, a cursor naming no row is refused rather than restarting the list, and
-// the caller decides from the capsule's count where the list ends.
+// CapsuleRows pages one sealed list by keyset on the row key, refusing a cursor
+// that names no row rather than silently restarting the list.
 func (s *fakeStore) CapsuleRows(_ context.Context, session model.SessionID, actor string,
 	list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fs, err := s.lookup(session, actor)
-	if err != nil {
+	if fs == nil {
 		return nil, err
 	}
 	if fs.capsule == nil {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "session has no capsule"}
+		return nil, &model.Error{Code: model.CodeArgumentInvalid,
+			Message: "this session has sealed no capsule"}
 	}
-	if !list.Valid() {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "not a capsule list"}
-	}
-	if limit <= 0 {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "a page size of zero reads nothing"}
-	}
-	rows := fs.rows[list]
+	all := fs.rows[list]
 	start := 0
 	if after != "" {
 		start = -1
-		for i, row := range rows {
+		for i, row := range all {
 			if row.Key == after {
 				start = i + 1
 				break
 			}
 		}
 		if start < 0 {
-			return nil, &model.Error{Code: model.CodeCursorInvalid,
-				Message: "cursor names no record in this capsule projection"}
+			return nil, (&model.Error{Code: model.CodeCursorInvalid,
+				Message: "cursor names no record in this capsule projection"}).
+				WithDetail("endpoint", "context_capsule")
 		}
 	}
-	end := min(start+limit, len(rows))
-	return append([]model.CapsuleRow(nil), rows[start:end]...), nil
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	end := start + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return append([]model.CapsuleRow(nil), all[start:end]...), err
 }
 
 func (s *fakeStore) Capsule(_ context.Context, session model.SessionID, actor string) (model.Capsule, error) {
@@ -1138,6 +1153,9 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	after model.FileID, limit int) ([]model.FileCoverage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if after == "" {
+		s.walks[model.CapsuleListCoverage]++
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
@@ -1170,6 +1188,7 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.walks[model.CapsuleListWaivers]++
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
@@ -1242,6 +1261,43 @@ func (s *fakeStore) ManifestEntries(_ context.Context, id model.ManifestID, afte
 			continue
 		}
 		out = append(out, e)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ManifestScopeNodes answers the DISTINCT node ids in node-id order, which is
+// what the real store derives in SQL. The fake deduplicates and sorts here so a
+// service that expected the seal to do it in Go would fail on a manifest whose
+// entries repeat a node or arrive out of order.
+func (s *fakeStore) ManifestScopeNodes(_ context.Context, id model.ManifestID,
+	after model.NodeID, limit int) ([]model.NodeID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if after == "" {
+		s.walks[model.CapsuleListScope]++
+	}
+	seen := make(map[model.NodeID]bool)
+	var ids []model.NodeID
+	for _, e := range s.entries[id] {
+		if e.NodeID == "" || seen[e.NodeID] {
+			continue
+		}
+		seen[e.NodeID] = true
+		ids = append(ids, e.NodeID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	out := make([]model.NodeID, 0, limit)
+	for _, n := range ids {
+		if n <= after {
+			continue
+		}
+		out = append(out, n)
 		if len(out) == limit {
 			break
 		}
@@ -1376,16 +1432,9 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	later := fixtureNow.Add(72 * time.Hour)
 	restamped := first
 	restamped.CreatedAt = later
-	// Re-hashing needs the SEAL's record source, not the stored rows: a row read
-	// back is data and is refused by the digest, which is what stops a capsule
-	// from being re-identified out of its own storage.
-	src, err := h.svc.capsuleRecords(ctx, rec, g)
+	got, err := model.CapsuleCanonicalHash(ctx, restamped, &capsuleSource{svc: h.svc, rec: rec})
 	if err != nil {
-		t.Fatalf("rebuild the sealed capsule's record source: %v", err)
-	}
-	got, err := model.CapsuleCanonicalHash(ctx, restamped, src)
-	if err != nil {
-		t.Fatalf("re-hash the restamped capsule: %v", err)
+		t.Fatalf("re-derive the capsule identity: %v", err)
 	}
 	if got != first.CanonicalHash {
 		t.Fatalf("the canonical hash moved with CreatedAt: %s before, %s after", first.CanonicalHash, got)
@@ -1452,25 +1501,26 @@ func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
 	if err != nil {
 		t.Fatalf("seal a capsule for a waived session: %v", err)
 	}
-	if n := c.Counts.Of(model.CapsuleListWaivers); n != 1 {
-		t.Fatalf("the sealed capsule counts %d waivers; the session recorded 1", n)
+	if c.Counts.Waivers != 1 {
+		t.Fatalf("the sealed capsule counts %d waivers; the session recorded 1", c.Counts.Waivers)
 	}
-	// The records are rows: the capsule counts them and the paged reader is the
-	// only way back to them, so the read-back goes through it.
-	rows, err := h.store.CapsuleRows(ctx, fixtureSession, fixtureActor, model.CapsuleListWaivers, "", 10)
+	// The reason lives in the sealed ROW, not in the capsule blob, so the
+	// assertion has to read the projection an operator would.
+	page, err := h.svc.Capsule(ctx, model.CapsuleRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor, View: model.CapsuleViewWaivers,
+	})
 	if err != nil {
 		t.Fatalf("page the sealed capsule's waivers: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("paging the capsule's waivers read %d records; the session recorded 1", len(rows))
+	if len(page.Waivers) != 1 {
+		t.Fatalf("the waivers projection returned %d records; the capsule counts 1", len(page.Waivers))
 	}
-	var got model.WaiverRecord
-	if err := json.Unmarshal(rows[0].JSON, &got); err != nil {
-		t.Fatalf("decode the sealed waiver: %v", err)
-	}
-	if got.FileID != fileWaived || got.Reason != "vendored generated code" {
+	if got := page.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
 		t.Fatalf("the capsule carries waiver %s/%q, not the stored %s/%q",
 			got.FileID, got.Reason, fileWaived, "vendored generated code")
+	}
+	if page.Meta.NextCursor != "" {
+		t.Fatalf("a one-record projection offered a continuation %q, so a reader would fetch an empty page", page.Meta.NextCursor)
 	}
 }
 
