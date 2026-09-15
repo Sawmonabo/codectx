@@ -171,7 +171,8 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			// standing frontier becomes the continuation, exactly as a spent
 			// page budget's does.
 			o.Budget.deadlineHit = true
-			return walkState{Depth: depth, Frontier: frontier, Admitted: admitted}, nil
+			return walkState{Depth: depth, Frontier: frontier, Admitted: admitted,
+				LevelBoundary: true}, nil
 		}
 		level := make(map[model.NodeID]frontierState, len(frontier))
 		nodes := make([]model.NodeID, 0, len(frontier))
@@ -274,6 +275,13 @@ type walkState struct {
 	// Admitted is the cumulative admitted-node set. Only its bounded front is
 	// in heap; the remainder is the continuation spool (visited.go).
 	Admitted *visitedSet
+	// LevelBoundary records that the walk stopped BETWEEN levels rather than
+	// inside one: the level in Frontier has not been read at all yet. The
+	// keyset position the page last emitted belongs to the level BEFORE it, so
+	// a continuation must not carry it -- applied to the new level it would
+	// silently drop every row whose owner sorts below that node. Only the
+	// deadline stops here; every other stop is mid-level by construction.
+	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
 	//
@@ -714,6 +722,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// The depth bound is the single exception, and DepthLimited on walkState
 	// carries the reason: it is part of the query hash the cursor is bound to,
 	// so a continuation minted for it could only resume a walk already past it.
+	if state.LevelBoundary {
+		// The stop was between levels: the emitted keyset position belongs to
+		// the level already finished, so the continuation starts the frontier's
+		// own level from its beginning.
+		lastOwner, lastKey = "", ""
+	}
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
 		// The cumulative set is NOT materialized into a slice here: only the
