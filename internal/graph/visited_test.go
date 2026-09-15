@@ -271,18 +271,28 @@ func TestSpooledVisitedSetAnswersACrossPageRevisit(t *testing.T) {
 	}
 }
 
-// TestWarmStopsWhenEveryCandidateIsAnswered is the F29 proof. The membership
-// sweep is one sequential pass over the cumulative spool per level, and levels
-// per page are bounded only by the page item ceiling, so a sweep that always
-// runs to the end of the spool costs O(levels x |visited|) per page. It now
-// ends at the last candidate it was looking for.
+// TestWarmStopsWhenEveryCandidateIsAnswered is the F29 proof, extended by the
+// S4 fix. The membership sweep is one sequential pass over the cumulative
+// spool per level, and levels per page are bounded only by the page item
+// ceiling, so a sweep that always runs to the end of the spool costs
+// O(levels x |visited|) per page. Two things now bound it: the sweep ends at
+// the last candidate it was looking for, and a candidate the page's membership
+// summary proves absent never starts a sweep at all.
 //
-// Mutation (`return errWarmComplete` deleted from warm's callback): the read
-// count below becomes the whole set.
+// The second is the one that matters, and the second half of this test is the
+// S4 proof: a CHAIN -- which is what a call chain is -- reaches freshly
+// admitted nodes at every level, so no early exit can fire and every level
+// used to read the whole spool. Each record the stream delivers is one
+// json.Unmarshal in the real stream (cursor.go), so the count below is an
+// honest proxy for spool record decodes.
+//
+// Mutations: deleting `return errWarmComplete` from warm's callback makes the
+// first count the whole set; deleting the `v.filter.mayHold` guard makes the
+// chain count levels x size (4 000 000 here), which is the regression.
 func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 	const size = 1000
 	read := 0
-	v := newVisitedSet(func(ctx context.Context, fn func(model.NodeID) error) error {
+	spool := func(_ context.Context, fn func(model.NodeID) error) error {
 		for i := 0; i < size; i++ {
 			read++
 			if err := fn(model.NodeID(fmt.Sprintf("n-%04d", i))); err != nil {
@@ -290,7 +300,8 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 			}
 		}
 		return nil
-	})
+	}
+	v := newVisitedSet(spool)
 	// One candidate, early in the spool: the sweep must stop at it.
 	if err := v.warm(context.Background(), []model.NodeID{"n-0002"}); err != nil {
 		t.Fatalf("warm: %v", err)
@@ -301,8 +312,8 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 	if read != 3 {
 		t.Fatalf("the sweep read %d of %d records to answer one candidate at position 3; want 3", read, size)
 	}
-	// A candidate the spool does not hold is still a full pass: the pass IS
-	// the answer, so this is the bound, not a regression.
+	// A candidate the spool does not hold is a full pass with no summary: the
+	// pass IS the answer. This is the cost the filter below removes.
 	read = 0
 	if err := v.warm(context.Background(), []model.NodeID{"n-absent"}); err != nil {
 		t.Fatalf("warm: %v", err)
@@ -310,5 +321,57 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 	if v.has("n-absent") || read != size {
 		t.Fatalf("an unanswerable candidate read %d records and has=%v; want a full pass and false",
 			read, v.has("n-absent"))
+	}
+
+	// The S4 case: a chain-shaped page over a 20 000-node cumulative set,
+	// one page of 200 levels, one freshly reached node per level.
+	const chainNodes, levels = 20_000, 200
+	chainRead := 0
+	chain := func(_ context.Context, fn func(model.NodeID) error) error {
+		for i := 0; i < chainNodes; i++ {
+			chainRead++
+			if err := fn(syntheticID(i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	filter := newVisitedFilter(chainNodes, int64(chainNodes*visitedFilterBitsPerNode/8))
+	if filter == nil {
+		t.Fatal("no membership summary was built for a 20 000-node walk")
+	}
+	for i := 0; i < chainNodes; i++ {
+		filter.add(syntheticID(i))
+	}
+	c := newVisitedSet(chain)
+	c.filter = filter
+	for l := 0; l < levels; l++ {
+		// Fresh at every level: these ids are past the end of the spooled set,
+		// exactly as a call chain's next hop is.
+		fresh := syntheticID(chainNodes + l)
+		if err := c.warm(context.Background(), []model.NodeID{fresh}); err != nil {
+			t.Fatalf("warm level %d: %v", l, err)
+		}
+		if c.has(fresh) {
+			t.Fatalf("level %d: a node no page admitted was reported as already admitted", l)
+		}
+		c.add(fresh)
+	}
+	// Before the summary: levels x chainNodes = 4 000 000 decodes for this one
+	// page. The summary proves each candidate absent from heap, so the spool is
+	// never opened. A handful of false positives would be correct but slower;
+	// at sixteen bits per node they do not appear at this size.
+	t.Logf("chain page: %d levels over a %d-node spooled set read %d records (was %d)",
+		levels, chainNodes, chainRead, levels*chainNodes)
+	if chainRead > levels {
+		t.Fatalf("a chain-shaped page of %d levels read %d spool records over a %d-node set; the membership summary must answer a freshly reached node without a sweep",
+			levels, chainRead, chainNodes)
+	}
+	// The summary may never turn a node the spool HOLDS into a miss: a false
+	// negative would re-admit a node an earlier page already emitted.
+	for i := 0; i < chainNodes; i += 997 {
+		if !filter.mayHold(syntheticID(i)) {
+			t.Fatalf("the membership summary lost node %d: a Bloom filter has no false negatives", i)
+		}
 	}
 }
