@@ -17,3 +17,6 @@ func SetEdgePartBytes(n int) func() {
 // streams, exported so the query-plan test asserts the SQL that ships.
 func OutgoingEdgeQuery() string { return outgoingEdgeQuery() }
 func IncomingEdgeQuery() string { return incomingEdgeQuery() }
+
+// EvidenceCountQuery is the build's third ordered scan.
+func EvidenceCountQuery() string { return evidenceCountQuery() }

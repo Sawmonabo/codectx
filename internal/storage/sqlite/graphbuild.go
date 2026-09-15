@@ -250,6 +250,20 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 		JOIN generation_units gu ON gu.unit_id = rf.unit_id AND gu.generation_id = ?`, gen); err != nil {
 		return wrap("tmp_graph_rel", err)
 	}
+	// The generation's member units are materialised the same way, and for the
+	// same reason: the evidence count below has to visit every evidence row of
+	// every member unit, and asking the planner to reach generation_units per
+	// row makes it drive the scan from that table -- 20 000 random index probes
+	// into a multi-million-row table, then a temp b-tree to put the groups back
+	// in relation order. Against the membership as a temp primary key the scan
+	// is an ordered covering walk with two integer probes per row.
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_unit(id INTEGER PRIMARY KEY)`); err != nil {
+		return wrap("tmp_graph_unit", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO tmp_graph_unit(id)
+		SELECT unit_id FROM generation_units WHERE generation_id = ?`, gen); err != nil {
+		return wrap("tmp_graph_unit", err)
+	}
 	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_node(id INTEGER PRIMARY KEY)`); err != nil {
 		return wrap("tmp_graph_node", err)
 	}
@@ -306,7 +320,7 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 }
 
 func dropGraphTemp(ctx context.Context, tx *sql.Tx) error {
-	for _, name := range []string{"tmp_graph_rel", "tmp_graph_node"} {
+	for _, name := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit"} {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+name); err != nil {
 			return wrap(name, err)
 		}
@@ -584,14 +598,31 @@ func buildNodeArrays(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64,
 	return sizes.closeAt(maxNode)
 }
 
+// evidenceCountQuery reads the per-relation occurrence count as ONE ordered
+// covering walk of idx_evidence_relation, which is both the group order and the
+// output order, so the pass builds no temporary b-tree and reads the evidence
+// index once end to end instead of probing it per member unit.
+//
+// The index is pinned rather than left to the planner. Statistics are rewritten
+// after every publication, so by the second generation sqlite_stat1 describes
+// evidence and the temp tables do not; without the pin the planner is free to
+// re-choose the driving table between one generation and the next, and the
+// alternative it reaches for -- membership first, then a per-unit probe -- is
+// the plan whose cost grows with the evidence of the whole generation rather
+// than with its size, and which cost 85 s of a 103 s build on the reference
+// repository against 1.6 s here.
+func evidenceCountQuery() string {
+	return `SELECT e.relation_id, count(*) FROM evidence e INDEXED BY idx_evidence_relation
+		JOIN tmp_graph_rel t ON t.id = e.relation_id
+		JOIN tmp_graph_unit gu ON gu.id = e.unit_id
+		GROUP BY e.relation_id ORDER BY e.relation_id`
+}
+
 // buildEvidenceCounts streams the per-relation occurrence count. A relation
 // visible in the generation is backed by at least one occurrence in a member
 // unit, so a zero here means "not a relation of this generation".
 func buildEvidenceCounts(ctx context.Context, tx *sql.Tx, gen int64, maxRelation uint64) error {
-	rows, err := tx.QueryContext(ctx, `SELECT e.relation_id, count(*) FROM evidence e
-		JOIN tmp_graph_rel t ON t.id = e.relation_id
-		JOIN generation_units gu ON gu.unit_id = e.unit_id AND gu.generation_id = ?
-		GROUP BY e.relation_id ORDER BY e.relation_id`, gen)
+	rows, err := tx.QueryContext(ctx, evidenceCountQuery())
 	if err != nil {
 		return wrap("evidence", err)
 	}
