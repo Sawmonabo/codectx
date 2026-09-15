@@ -74,8 +74,10 @@ func nullRelation(r relRef) any {
 //     is an LRU whose capacity is a batch-sized constant; a miss costs one
 //     indexed lookup, never a re-scan. reset() is called at each batch boundary
 //     by the writer so that peak RSS is a function of batch size alone.
-//   - A canonical id of the wrong length, or an empty interned string, is a
+//   - A canonical id of the wrong length, or an empty scope key, is a
 //     programming error the implementation reports as an error, never a panic.
+//     An empty NATIVE key is valid: model.Evidence.NativeKey is optional and
+//     evidence.native_key_id is NOT NULL, so unlocated evidence interns "".
 //
 // Implemented by lane S4. Consumed by S1 (writer: units.go, delta.go, carry.go)
 // and S3 (sweep: gc.go, retention.go, reconcile.go, snapshots.go). S2 (reader:

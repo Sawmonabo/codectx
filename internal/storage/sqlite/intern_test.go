@@ -191,8 +191,10 @@ func TestInternerRejectsMalformedInput(t *testing.T) {
 	if _, err := in.scopeKey(ctx, tx, ""); err == nil {
 		t.Fatal("scopeKey accepted an empty key")
 	}
-	if _, err := in.nativeKey(ctx, tx, ""); err == nil {
-		t.Fatal("nativeKey accepted an empty key")
+	// An empty native key is valid: unlocated evidence carries no native key
+	// and evidence.native_key_id is NOT NULL, so "" must intern to one id.
+	if _, err := in.nativeKey(ctx, tx, ""); err != nil {
+		t.Fatalf("nativeKey refused the empty key that unlocated evidence interns: %v", err)
 	}
 	ref, err := in.node(ctx, tx, id, "function", good)
 	if err != nil {

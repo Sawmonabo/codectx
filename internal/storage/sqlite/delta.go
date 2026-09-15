@@ -370,11 +370,15 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 		return err
 	}
 
-	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key, native_key, node_id)
-		SELECT ?3, na.scope_key, na.native_key, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
-			AND na.scope_key NOT IN (SELECT scope_key FROM cx_carry_scopes)
+	// The replaced scope keys arrive as text and the alias rows carry scope
+	// surrogates (S-3), so the exclusion is resolved through scope_keys. A
+	// replaced scope that was never interned matches no row, which is the same
+	// outcome the text comparison had.
+	if n, err = exec("native_aliases", `INSERT INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id)
+		SELECT ?3, na.scope_key_id, na.native_key_id, na.node_id FROM native_aliases na WHERE na.unit_id = ?1
+			AND na.scope_key_id NOT IN (SELECT sk.id FROM scope_keys sk JOIN cx_carry_scopes c ON c.scope_key = sk.key)
 			AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = na.node_id)
-		ON CONFLICT(unit_id, scope_key, native_key, node_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
+		ON CONFLICT(unit_id, scope_key_id, native_key_id, node_id) DO NOTHING`, prevRow, indexArg, w.rowID); err != nil {
 		return err
 	}
 	stats.Aliases = n
@@ -433,7 +437,7 @@ const carryEvidencePage = 2000
 // already proved is this unit's declared hash for that file.
 func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, stats *CarryOverStats) error {
 	ins, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id,
-		start_byte, end_byte, native_key, detail, content_hash_bound)
+		start_byte, end_byte, native_key_id, detail, content_hash_bound)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
 		return wrap("evidence", err)
@@ -465,12 +469,14 @@ func (w *UnitWriter) copyEvidence(ctx context.Context, tx *sql.Tx, prevRow int64
 			}
 			e.ID = model.NewEvidenceID(e)
 			idRaw, _ := model.DecodeID(string(e.ID))
-			nodeRaw, _ := optionalBlob("evidence.node_id", string(e.NodeID))
-			relRaw, _ := optionalBlob("evidence.relation_id", string(e.RelationID))
 			fileRaw, _ := optionalBlob("evidence.file_id", string(e.FileID))
 			start, end := rangeBytes(e.Range)
-			res, err := ins.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw,
-				start, end, e.NativeKey, e.Detail, boolInt(row.bound))
+			// The surrogates are rebound as read: node_ids, relation_ids and
+			// native_keys are database-wide dictionaries, so the predecessor's
+			// refs are already this unit's refs and re-resolving them would
+			// only repeat the lookup the page already did.
+			res, err := ins.ExecContext(ctx, idRaw, w.rowID, nullNode(row.node), nullRelation(row.rel), string(e.Precision), fileRaw,
+				start, end, int64(row.native), e.Detail, boolInt(row.bound))
 			if err != nil {
 				return wrap("evidence", err)
 			}
@@ -490,6 +496,13 @@ type carriedEvidence struct {
 	evidence model.Evidence
 	bound    bool
 	raw      []byte
+	// node, rel and native are the stored surrogates, carried alongside the
+	// canonical values the re-derivation of the evidence id needs: the hash is
+	// a function of the canonical identity (Section 9.3), the row is a function
+	// of the surrogate, and the copy needs both.
+	node   nodeRef
+	rel    relRef
+	native nativeRef
 }
 
 // readEvidencePage reads one keyset page of the previous unit's surviving
@@ -497,9 +510,13 @@ type carriedEvidence struct {
 // A row is surviving when its bucket is inherited and the fact it supports is
 // already a fact of this unit.
 func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow int64, replaceIndexLevel bool, after []byte) ([]carriedEvidence, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.node_id, e.relation_id, e.precision, e.file_id,
-		e.start_byte, e.end_byte, e.native_key, e.detail, e.content_hash_bound
-		FROM evidence e WHERE e.unit_id = ?1 AND e.id > ?4
+	rows, err := tx.QueryContext(ctx, `SELECT e.id, e.node_id, ni.canonical, e.relation_id, ri.canonical, e.precision, e.file_id,
+		e.start_byte, e.end_byte, e.native_key_id, nk.key, e.detail, e.content_hash_bound
+		FROM evidence e
+		LEFT JOIN node_ids ni ON ni.id = e.node_id
+		LEFT JOIN relation_ids ri ON ri.id = e.relation_id
+		JOIN native_keys nk ON nk.id = e.native_key_id
+		WHERE e.unit_id = ?1 AND e.id > ?4
 			AND `+fmt.Sprintf(bucketSurvives, "e")+`
 			AND ((e.node_id IS NOT NULL AND EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = e.node_id))
 			  OR (e.relation_id IS NOT NULL AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.unit_id = ?3 AND rf.relation_id = e.relation_id)))
@@ -511,15 +528,20 @@ func (w *UnitWriter) readEvidencePage(ctx context.Context, tx *sql.Tx, prevRow i
 	page := make([]carriedEvidence, 0, carryEvidencePage)
 	for rows.Next() {
 		var id, node, relation, file []byte
+		var nodeRow, relRow sql.NullInt64
 		var start, end sql.NullInt64
+		var native int64
 		var bound int
 		var row carriedEvidence
-		if err := rows.Scan(&id, &node, &relation, &row.evidence.Precision, &file, &start, &end,
-			&row.evidence.NativeKey, &row.evidence.Detail, &bound); err != nil {
+		if err := rows.Scan(&id, &nodeRow, &node, &relRow, &relation, &row.evidence.Precision, &file, &start, &end,
+			&native, &row.evidence.NativeKey, &row.evidence.Detail, &bound); err != nil {
 			return nil, wrap("evidence", err)
 		}
 		row.raw = id
 		row.bound = bound == 1
+		row.node = nodeRef(nodeRow.Int64)
+		row.rel = relRef(relRow.Int64)
+		row.native = nativeRef(native)
 		row.evidence.NodeID = model.NodeID(optionalHex(node))
 		row.evidence.RelationID = model.RelationID(optionalHex(relation))
 		row.evidence.FileID = model.FileID(optionalHex(file))

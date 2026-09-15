@@ -176,20 +176,25 @@ func (in *dbInterner) relation(ctx context.Context, tx *sql.Tx, id model.Relatio
 }
 
 func (in *dbInterner) scopeKey(ctx context.Context, tx *sql.Tx, key string) (scopeRef, error) {
-	ref, err := in.stringKey(ctx, tx, scopeKeyTag, "scope key", "scope_keys", key)
+	ref, err := in.stringKey(ctx, tx, scopeKeyTag, "scope key", "scope_keys", key, false)
 	return scopeRef(ref), err
 }
 
+// nativeKey accepts the empty string: model.Evidence.NativeKey is optional and
+// evidence.native_key_id is NOT NULL, so unlocated evidence interns the empty
+// key like any other. A scope key stays non-empty (model.NativeAlias.Validate
+// requires it), which is why the check lives in scopeKey's caller path only.
 func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (nativeRef, error) {
-	ref, err := in.stringKey(ctx, tx, nativeKeyTag, "native key", "native_keys", key)
+	ref, err := in.stringKey(ctx, tx, nativeKeyTag, "native key", "native_keys", key, true)
 	return nativeRef(ref), err
 }
 
 // stringKey resolves one S-3 dictionary string. The two dictionaries have
 // identical shape (id INTEGER PRIMARY KEY, key TEXT UNIQUE) and share one
-// bounded cache keyed by (table tag, string).
-func (in *dbInterner) stringKey(ctx context.Context, tx *sql.Tx, tag byte, field, table, key string) (int64, error) {
-	if key == "" {
+// bounded cache keyed by (table tag, string). allowEmpty is true only for the
+// native-key dictionary.
+func (in *dbInterner) stringKey(ctx context.Context, tx *sql.Tx, tag byte, field, table, key string, allowEmpty bool) (int64, error) {
+	if key == "" && !allowEmpty {
 		return noRef, invalid("%s: must not be empty", field)
 	}
 	cacheKey := string(tag) + key

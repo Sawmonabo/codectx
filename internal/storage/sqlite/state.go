@@ -130,7 +130,8 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			idRaw, g.id, snapRaw, string(m.Phase), m.RequestHash, m.PolicyVersion, string(requestJSON), string(header), m.CanonicalHash, formatTime(m.CreatedAt)); err != nil {
 			return wrap("context_manifests", err)
 		}
-		nodeVisible, err := tx.PrepareContext(ctx, `SELECT 1 FROM node_facts nf JOIN generation_units gu ON gu.unit_id = nf.unit_id WHERE gu.generation_id = ? AND nf.node_id = ? LIMIT 1`)
+		nodeVisible, err := tx.PrepareContext(ctx, `SELECT ni.id FROM node_ids ni JOIN node_facts nf ON nf.node_id = ni.id
+			JOIN generation_units gu ON gu.unit_id = nf.unit_id WHERE gu.generation_id = ? AND ni.canonical = ? LIMIT 1`)
 		if err != nil {
 			return wrap("node_facts", err)
 		}
@@ -149,9 +150,10 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		for _, e := range entries {
 			nodeRaw, _ := optionalBlob("node_id", string(e.NodeID))
 			fileRaw, _ := optionalBlob("file_id", string(e.FileID))
+			var node nodeRef
 			var one int
 			if nodeRaw != nil {
-				if err := nodeVisible.QueryRowContext(ctx, g.id, nodeRaw).Scan(&one); err != nil {
+				if err := nodeVisible.QueryRowContext(ctx, g.id, nodeRaw).Scan(&node); err != nil {
 					if isNoRows(err) {
 						return &model.Error{Code: model.CodeScopeIncomplete, Message: fmt.Sprintf("manifest entry %d names a node that is not visible in generation %d", e.Ordinal, g.id)}
 					}
@@ -173,7 +175,7 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			if e.EvidencePaths != nil {
 				paths, _ = json.Marshal(e.EvidencePaths)
 			}
-			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nodeRaw, fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), string(paths)); err != nil {
+			if _, err := entry.ExecContext(ctx, idRaw, e.Ordinal, nullNode(node), fileRaw, string(e.Requirement), e.ScoreMicros, e.EstimatedBytes, e.EstimatedTokens, string(reasons), string(paths)); err != nil {
 				return wrap("context_entries", err)
 			}
 		}
