@@ -846,6 +846,11 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 		return err
 	}
 	if !cached {
+		// No cache owns the handle (this writer is outside a provider batch),
+		// so this call prepares and finalises its own.
+		if stmt, err = tx.PrepareContext(ctx, insert); err != nil {
+			return err
+		}
 		defer stmt.Close()
 	}
 	for _, e := range list {
