@@ -59,7 +59,11 @@ type limits struct {
 	// graph additionally bounds the traversal tools, which are the expensive
 	// ones. A traversal holds a slot in both.
 	graph chan struct{}
-	// timeout is the per-call deadline every tool handler runs under.
+	// timeout is the per-call deadline a tool handler runs under when neither
+	// the client's request nor the configuration asks for something else. Zero
+	// is "no deadline", which is what resources.query_timeout defaults to: the
+	// answer is complete or it is nothing, never a page the client has to tune
+	// a bound to get past.
 	timeout time.Duration
 }
 
@@ -79,7 +83,10 @@ func newLimits(cfg config.Config) (limits, error) {
 		{"resources.max_concurrent_queries", int64(r.MaxConcurrentQueries)},
 		{"resources.max_concurrent_graph_queries", int64(r.MaxConcurrentGraphQueries)},
 		{"resources.max_page_items", int64(r.MaxPageItems)},
-		{"resources.query_timeout", int64(r.QueryTimeout)},
+		// resources.query_timeout is deliberately absent: zero is its
+		// "unlimited" spelling and its default, and a tool call that carries no
+		// deadline of its own is meant to return the COMPLETE answer rather
+		// than a page the client has to tune a timeout to get past.
 	} {
 		if b.v <= 0 {
 			return limits{}, &model.Error{
@@ -171,7 +178,15 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			// wait as well as the handler: time spent waiting for a slot is time
 			// the caller is waiting, and a gate that could be queued on without
 			// a deadline is the unbounded wait Section 6 forbids.
-			ctx, cancel := context.WithTimeout(ctx, s.limits.timeout)
+			// resources.query_timeout is the DEFAULT deadline and not a
+			// ceiling: a client whose request already carries one has said how
+			// long the call may run, and context.WithTimeout would silently
+			// take the smaller of the two, expiring a raised budget at the
+			// configured default. Zero is "no deadline", the default: a tool
+			// call answers in full rather than handing back a continuation the
+			// client never asked for.
+			var cancel context.CancelFunc
+			ctx, cancel = model.QueryDeadline(ctx, s.limits.timeout)
 			defer cancel()
 
 			release, failed := s.limits.acquire(ctx, call.Params.Name)

@@ -66,7 +66,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   |---|---|
   | `[workspace]` | `max_files`, `max_parse_file_bytes`, `max_search_file_bytes` |
   | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone), `watch_max_directories`, `max_evidence_per_fact` |
-  | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
+  | `[resources]` | `query_timeout`, `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
   | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_start_nodes`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
@@ -201,7 +201,7 @@ All **user** trust.
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
-| `query_timeout` | `"10s"` | Deadline for one query. `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page; exceeding it is `CTX_QUERY_DEADLINE`, an explicit incomplete answer, never a persisted complete one. `--timeout` on those commands narrows it further and never widens it. |
+| `query_timeout` | `0` (unlimited) | Deadline for one query. **Unlimited by default: a call you do not bound returns the complete answer**, with nothing to tune and no continuation to follow. Set a positive value and it becomes the default deadline for calls that carry none of their own — `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page, and `codectx context plan` ends the pass it is in with a continuation cursor. `--timeout` on the command line, or a deadline an MCP client attaches to its request, sets the deadline for that one call instead, above this value as readily as below it. |
 | `max_query_text_bytes` | `8192` | Largest query text. |
 | `max_query_terms` | `0` (unlimited) | Most terms in one query. Unlimited by default; a value you set refuses the query with the term count, never silently drops terms. Query text is tokenized with the index's own tokenizer, and a quoted phrase counts as one term. |
 | `max_page_items` | `200` | Largest page, and the bound `--limit` is clamped to, for `codectx search` and `codectx symbol` as well as the graph commands: lowering it lowers the pages they serve. The candidate bound each retrieval tier of `codectx search` is read to stays the `200` ceiling, so narrowing the page never narrows what was ranked; a tier that fills that bound makes the answer report `truncated` with a reason rather than silently serving a short page, and every continuation of that answer repeats the same `truncated` flag and reason. |

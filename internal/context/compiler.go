@@ -186,11 +186,19 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	if err := req.Validate(); err != nil {
 		return CompileResult{}, err
 	}
-	if timeout := c.cfg.Resources.QueryTimeout.Std(); timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
+	// resources.query_timeout is the DEFAULT deadline, never a ceiling: a
+	// caller that already carries one (the operator's `--timeout`, an MCP
+	// client's own budget) has said how long this call may run, and
+	// context.WithTimeout would silently take the smaller of the two -- so a
+	// raised deadline would expire at the configured default and report the
+	// compile as out of time when the operator had granted it more.
+	//
+	// Zero is "no deadline", and it is the default: a compile nobody bounded
+	// runs to a COMPLETE plan. The checkpoint-and-continue path below is what
+	// happens when somebody sets a bound, not the ordinary way to get a plan.
+	var cancel context.CancelFunc
+	ctx, cancel = model.QueryDeadline(ctx, c.cfg.Resources.QueryTimeout.Std())
+	defer cancel()
 
 	reader, err := c.store.PinGeneration(ctx, c.repo, req.GenerationID, c.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {

@@ -1,5 +1,10 @@
 package model
 
+import (
+	"context"
+	"time"
+)
+
 // PageRequest is the shared pagination input. A supplied cursor already selects
 // its pinned generation, so a request that also names a generation or changes a
 // filter is rejected rather than silently repinned (Sections 14.1, 14.4).
@@ -950,4 +955,33 @@ func (i OverviewItem) Validate() error {
 		return err
 	}
 	return nil
+}
+
+// QueryDeadline installs the configured per-request deadline on ctx and returns
+// the context to run the request under, plus the cancel that releases it.
+//
+// resources.query_timeout is a DEFAULT and never a ceiling, and its default is
+// zero, which means NO deadline at all. Two rules follow, and this helper is
+// the single place the services that answer queries spell them:
+//
+//   - A ctx that ALREADY carries a deadline -- the operator's `--timeout`, an
+//     MCP client's own budget -- keeps it untouched, whether it is shorter or
+//     longer than the configured value. context.WithTimeout would silently take
+//     the smaller of the two, so a raised budget would expire at the configured
+//     default and report the call as out of time at a fraction of the time the
+//     caller granted it.
+//   - A non-positive timeout installs nothing. `now + 0` is an instant that has
+//     already passed, so applying it would refuse every request rather than run
+//     it unbounded, and an unbounded call is what returns the COMPLETE answer.
+//     Cancellation remains the caller's stop in that case.
+//
+// The returned cancel is always non-nil and is always safe to defer.
+func QueryDeadline(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }

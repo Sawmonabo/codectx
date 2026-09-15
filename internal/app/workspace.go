@@ -171,8 +171,17 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 	if w.s.lock != nil {
 		promote = promoter{coord: w.coord}
 	}
+	// The packed per-generation adjacency is the structure every traversal
+	// reads (ADR-0005); it is opened on the same pinned generation, so the
+	// engine's structural and delivery reads describe one instant.
+	packed, err := sqlite.NewGraphReader(ctx, reader)
+	if err != nil {
+		reader.Close()
+		return nil, nil, err
+	}
 	engine, err := graph.New(graph.Options{
 		Adjacency: adjacency{reader: reader},
+		Reader:    packed,
 		Promoter:  promote,
 		Signer:    w.s.signer,
 		Spools:    w.s.spools,
