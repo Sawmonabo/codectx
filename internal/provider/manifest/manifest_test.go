@@ -323,7 +323,7 @@ func (c *capture) render(t *testing.T, states map[string]model.CapabilityState) 
 }
 
 const expected = `
-capability filesystem search file:assets/logo.bin unavailable CTX_PROVIDER_UNAVAILABLE
+capability filesystem search file:assets/logo.bin unavailable CTX_BINARY_CONTENT
 capability manifest manifests file:broken/Cargo.toml failed CTX_ARGUMENT_INVALID
 node configuration cargo:workspace:Cargo.toml lang=rust located {"workspace_members":["crates/*"]}
 node configuration go:work:go.work lang=go located {"go":"1.27"}

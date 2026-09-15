@@ -10,16 +10,21 @@ import (
 // internal/cli maps them to the Section 18.2 exit-code table. They live here
 // because the model package is the only package every other one may import.
 const (
-	CodeWorkspaceNotFound       = "CTX_WORKSPACE_NOT_FOUND"
-	CodeConfigInvalid           = "CTX_CONFIG_INVALID"
-	CodeTrustRequired           = "CTX_TRUST_REQUIRED"
-	CodePathEscape              = "CTX_PATH_ESCAPE"
-	CodeSchemaMismatch          = "CTX_SCHEMA_MISMATCH"
-	CodeSnapshotUnstable        = "CTX_SNAPSHOT_UNSTABLE"
-	CodeSnapshotChanged         = "CTX_SNAPSHOT_CHANGED"
-	CodeSourceIntegrity         = "CTX_SOURCE_INTEGRITY"
-	CodeNoActiveGeneration      = "CTX_NO_ACTIVE_GENERATION"
-	CodeProviderUnavailable     = "CTX_PROVIDER_UNAVAILABLE"
+	CodeWorkspaceNotFound   = "CTX_WORKSPACE_NOT_FOUND"
+	CodeConfigInvalid       = "CTX_CONFIG_INVALID"
+	CodeTrustRequired       = "CTX_TRUST_REQUIRED"
+	CodePathEscape          = "CTX_PATH_ESCAPE"
+	CodeSchemaMismatch      = "CTX_SCHEMA_MISMATCH"
+	CodeSnapshotUnstable    = "CTX_SNAPSHOT_UNSTABLE"
+	CodeSnapshotChanged     = "CTX_SNAPSHOT_CHANGED"
+	CodeSourceIntegrity     = "CTX_SOURCE_INTEGRITY"
+	CodeNoActiveGeneration  = "CTX_NO_ACTIVE_GENERATION"
+	CodeProviderUnavailable = "CTX_PROVIDER_UNAVAILABLE"
+	// CodeBinaryContent is content that is not text at all, so a capability
+	// that only has meaning over text has nothing to report for it. It is
+	// honest absence of a lexical view, not a provider that could not run,
+	// which is why it is its own family and not a reuse of the one above.
+	CodeBinaryContent           = "CTX_BINARY_CONTENT"
 	CodeProviderOutputInvalid   = "CTX_PROVIDER_OUTPUT_INVALID"
 	CodeProviderTimeout         = "CTX_PROVIDER_TIMEOUT"
 	CodeSourceBindingUnverified = "CTX_SOURCE_BINDING_UNVERIFIED"
