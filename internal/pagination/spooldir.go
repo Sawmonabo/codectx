@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -113,8 +114,19 @@ func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
 	// The header file is part of what dirBytes measured, so the reservation is
 	// corrected by the difference between the header being replaced and the one
 	// replacing it rather than by re-measuring after the write.
+	// A header that is ABSENT is a real state -- the caller may re-adopt a
+	// directory nothing has stamped yet -- and it is the only read failure this
+	// may absorb. Any other one (a permission fault, a short read, an I/O
+	// error) leaves the previous frame's length unknown, and treating it as
+	// absent over-charges the reservation by the whole new frame and, on a
+	// failed rename below, decides wrongly between restoring a header and
+	// removing one. The re-adoption fails instead, which is the state the
+	// caller can retry from: nothing has been transferred or written yet.
 	prev, prevErr := os.ReadFile(filepath.Join(from, spoolDirHeader))
 	if prevErr != nil {
+		if !errors.Is(prevErr, fs.ErrNotExist) {
+			return "", internalErr("spool adopt: " + prevErr.Error())
+		}
 		prev = nil
 	}
 	size, err := dirBytes(from)
