@@ -79,11 +79,11 @@ func nullRelation(r relRef) any {
 //     An empty NATIVE key is valid: model.Evidence.NativeKey is optional and
 //     evidence.native_key_id is NOT NULL, so unlocated evidence interns "".
 //
-// Implemented by lane S4. Consumed by S1 (writer: units.go, delta.go, carry.go)
-// and S3 (sweep: gc.go, retention.go, reconcile.go, snapshots.go). S2 (reader:
-// query.go, search.go, adjacency.go, context.go) does NOT use the interner --
-// it joins outward through node_ids/relation_ids/scope_keys/native_keys and
-// hydrates canonical ids at the response boundary only.
+// The writers (units.go, delta.go, carry.go) and the sweep (gc.go,
+// retention.go, reconcile.go, snapshots.go) resolve through this interface. The
+// readers (query.go, search.go, adjacency.go, context.go) do NOT: they join
+// outward through node_ids/relation_ids/scope_keys/native_keys and hydrate
+// canonical ids at the response boundary only.
 type interner interface {
 	// node resolves model.NodeID -> node_ids.id, inserting (canonical, kind,
 	// canonical_key) when absent. canonicalKey is the raw 32 bytes, not hex:
