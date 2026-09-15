@@ -46,7 +46,6 @@ const (
 	MaxRelationsPerPath        = 64 // edges retained in one explanation path
 	MaxAmbiguousCandidates     = 16 // Section 9.4 bounded may_refer_to candidates
 	MaxCapabilityStates        = 256
-	MaxObservationReferences   = 64
 	MaxReceiptsPerConfirmation = 16 // Section 20.1 coverage.max_receipts_per_confirmation
 	// MaxCoverageFilesPerCapsule is a structural ceiling only: a capsule may
 	// honestly record coverage for every file a context session could touch, and
