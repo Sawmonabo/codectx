@@ -115,14 +115,31 @@ package-dependency rollup answers on identical terms from its own endpoint.
 answer.
 
 **What the query deadline does to that.** `resources.query_timeout` ends a page,
-never the answer. A deadline reached while the walk is still running returns a
-page with **no entries at all**, `truncation_reason` `query deadline reached`
-and a cursor that carries the walk's own frontier: the next request continues
-the walk from where it stopped, and once the walk completes the pages come from
-the ranked spool as above. A deadline that lands after the walk finished but
-while the ranking is still running is reported the same way but has no
-continuation to offer — the sort cannot yet be resumed from its spilled runs —
-so re-run the query, or raise `resources.query_timeout`.
+never the answer — with one exception, the third case below, which ends the
+answer and says so. There are three outcomes.
+
+*Mid-walk.* A deadline reached while the walk is still running returns a page
+with **no entries at all**, `truncation_reason` `query deadline reached` and a
+cursor that carries the walk's own frontier: the next request continues the walk
+from where it stopped, and once the walk completes the pages come from the
+ranked spool as above.
+
+*Mid-ranking.* A deadline that lands after the walk finished but while the
+ranking is still running is reported the same way, and its cursor resumes the
+interrupted sort itself: the runs the ranking had already spilled are adopted by
+the next request rather than re-sorted, so the answer is the one the
+uninterrupted query would have given, in the same order.
+
+*Stalled.* A resumed page whose every adjacency read already ran past the
+deadline admits nothing, and the continuation it could mint is the one it was
+handed. Rather than hand a client a chain that pages forever without reaching a
+new edge, that page ends the answer: `truncation_reason` `query deadline reached
+before the walk could advance`, and **no cursor**. The remedy is to present the
+same cursor you already hold again — that state is left adoptable, so the walk
+carries on from where it stopped rather than from the seed — under a larger
+`resources.query_timeout`. Do it within `resources.cursor_ttl`, which is what
+that state lives on; past it the cursor answers `CTX_CURSOR_INVALID` and the
+query has to be re-run.
 
 **`path` returns the provably cheapest route, whatever the graph's size.** Its
 search is an external-memory Dijkstra: every relation cost is an integer of at
