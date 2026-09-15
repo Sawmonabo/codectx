@@ -112,8 +112,28 @@ type Options struct {
 	// see is never the row that truncation drops and never pushes the
 	// published list past its own contract.
 	States []model.CapabilityState
-	Logger *slog.Logger
-	Now    func() time.Time
+	// SuppliedIndexes are the already-built indexes this run was handed --
+	// today the `--scip-index` path. The coordinator records each one against
+	// every generation it publishes, whether or not the path resolved, because
+	// an unresolved path plans no unit and leaves nothing else behind: without
+	// the record, a typo and a run that supplied no index at all are the same
+	// observation, and the first ships a repository with no imported symbols.
+	SuppliedIndexes []SuppliedIndex
+	Logger          *slog.Logger
+	Now             func() time.Time
+}
+
+// SuppliedIndex is one supplied index as the composition root resolved it: the
+// root-relative path the user named, plus the provider and scope key that path
+// becomes if it is importable.
+//
+// The provider and scope key are supplied rather than derived here because the
+// scope-key spelling belongs to the provider that reads it, and internal/index
+// must not import one provider to spell another's scope.
+type SuppliedIndex struct {
+	Path       string
+	ProviderID string
+	ScopeKey   string
 }
 
 // Pending is the typed answer a query gets for a capability whose dependence
