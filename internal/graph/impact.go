@@ -375,31 +375,49 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		Total: run.Len(), Count: int(run.Len()) - len(page),
 		PairTotal: pairRun.Len(), PairCount: int(pairRun.Len()) - len(pairPage),
 	}
-	next, err := e.nextRankedCursor(ctx, b, impactEndpoint, queryHash, header,
+	next, err := e.spillRankedCursor(ctx, b, impactEndpoint, queryHash, header,
 		int64(len(page)), int64(len(pairPage)), meta,
-		chainTails(rankedRunTail(ctx, run, len(page), encodeImpactRecord),
-			rankedRunTail(ctx, pairRun, len(pairPage), encodePairRecord)))
+		rankedRunTail(ctx, run, len(page), encodeImpactRecord),
+		rankedRunTail(ctx, pairRun, len(pairPage), encodePairRecord))
 	return entries, next, err
 }
 
-// serveRankedImpact serves a LATER page: it reads the ranked spool the previous
-// page left, copies what follows this page into a fresh one, and reports the
-// answer-level facts the first page settled.
+// serveRankedImpact serves a LATER page: it seeks to this cursor's two byte
+// offsets in the spool the FIRST page wrote, reads at most one page out of each
+// section, and reports the answer-level facts the first page settled. Nothing
+// is copied forward, so the page costs its own page.
 func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *budget, limit int,
 	answer impactAnswer, meta model.QueryMeta) (_ impactAnswer, _ []model.ImpactEntry, _ *budget, _ string, err error) {
-	// The consumed spool is released only after the page is built (the copy
-	// below reads it) and only on a TERMINAL outcome: a retryable failure --
-	// a busy store, a transient read -- leaves this cursor adoptable so the
-	// caller can present it again instead of losing the ranked remainder.
+	// The spool and its lease are released when the ANSWER ends, not when a
+	// page does: every later page reads the same spool, so releasing it on a
+	// page that still has a remainder would destroy the rest of the answer.
+	// complete is explicit rather than "no cursor was minted", because a
+	// renewal, signing or marshal failure also mints no cursor and must leave
+	// this cursor adoptable so the caller can present it again.
+	complete := false
 	defer func() {
-		if terminalOutcome(err) {
+		if terminalOutcome(err) && complete {
 			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
 		}
 	}()
-	page, pairPage, h, err := serveRankedSections(ctx, e.spools, c.spoolCursor(), e.now(), limit)
+	if e.spools == nil {
+		return answer, nil, nil, "", cursorInvalid("continuation state has expired or was released")
+	}
+	h, _, read, err := rankedSpoolHeader(ctx, e.spools, c.spoolCursor(), e.now())
 	if err != nil {
 		return answer, nil, nil, "", err
 	}
+	rankLeft, pairLeft := c.RankTotal-c.RankServed, c.PairTotal-c.PairServed
+	if err := h.checkAgainst(rankLeft, pairLeft); err != nil {
+		return answer, nil, nil, "", err
+	}
+	page, pairPage, endRank, endPair, sectionBytes, err := serveRankedSections(ctx, e.spools,
+		c.spoolCursor(), e.now(), c.RankOffset, c.PairOffset,
+		pageWant(limit, rankLeft), pageWant(limit, pairLeft))
+	if err != nil {
+		return answer, nil, nil, "", err
+	}
+	e.recordSpoolRead(read + sectionBytes)
 	answer.Packages = make([]model.PackageEdge, 0, len(pairPage))
 	for _, r := range pairPage {
 		answer.Packages = append(answer.Packages, r.edge())
@@ -415,13 +433,9 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	// Served counts records CONSUMED FROM THE SPOOL rather than entries handed
 	// back, so a hydration drop cannot end the answer a record early.
 	served, pairServed := c.RankServed+int64(len(page)), c.PairServed+int64(len(pairPage))
-	if served < h.Total || pairServed < h.PairTotal {
-		header := rankedHeader{
-			Total: h.Total, Count: h.Count - len(page),
-			PairTotal: h.PairTotal, PairCount: h.PairCount - len(pairPage),
-		}
-		next, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header, served, pairServed, &meta,
-			rankedSpoolSections(ctx, e.spools, c.spoolCursor(), e.now(), h, len(page), len(pairPage)))
+	complete = served >= c.RankTotal && pairServed >= c.PairTotal
+	if !complete {
+		next, err = e.continueRankedCursor(ctx, b, c, served, pairServed, endRank, endPair, &meta)
 		if err != nil {
 			return answer, nil, nil, "", err
 		}
@@ -429,6 +443,19 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	answer.Completeness = meta.Completeness
 	answer.Truncated, answer.Reason = meta.Truncated, meta.TruncationReason
 	return answer, entries, b, next, nil
+}
+
+// pageWant is how many records of one ranked section a page takes: its limit,
+// or everything that is left when that is less. A section with nothing left is
+// not read at all.
+func pageWant(limit int, left int64) int {
+	if int64(limit) > left {
+		if left < 0 {
+			return 0
+		}
+		return int(left)
+	}
+	return limit
 }
 
 // impactPage projects one page of ranked records into served entries and
@@ -461,23 +488,17 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 	return entries, nil
 }
 
-// nextRankedCursor writes the ranked remainder to a FRESH spool -- one spool per
-// page, the rule cursor.go states -- and signs the cursor that names it.
+// spillRankedCursor writes the ranked remainder of the FIRST page into ONE
+// spool -- the two sorted runs laid down in section order -- and signs the
+// cursor that names it and the byte offset each section begins at.
 //
 // served is how many records of the whole ranked answer the pages up to and
-// including this one have handed back, so the continuation's RankOffset is
-// always zero: the new spool BEGINS at the next record.
-func (e *Engine) nextRankedCursor(ctx context.Context, b *budget, endpoint, queryHash string,
+// including this one have handed back. Every later page reuses this spool and
+// this lease; only this one creates them.
+func (e *Engine) spillRankedCursor(ctx context.Context, b *budget, endpoint, queryHash string,
 	header rankedHeader, served, pairServed int64, meta *model.QueryMeta,
-	tail func(func([]byte) error) error) (string, error) {
-	if e.signer == nil || e.leases == nil || e.spools == nil {
-		// No continuation machinery: the answer stops with this page and SAYS
-		// so, exactly as a walk that cannot spill its frontier does. It is only
-		// reached with a ranked remainder still unserved -- both callers check
-		// that first -- so the stop always cuts the answer, and returning an
-		// empty token alone left the caller reading a complete-looking page of
-		// a longer ranking. Marking it is what makes the cut visible.
-		markTruncated(meta, reasonNoContinuation)
+	tails ...func(func([]byte) error) error) (string, error) {
+	if !e.canContinue(meta) {
 		return "", nil
 	}
 	binding := e.adjacency.Binding()
@@ -494,22 +515,12 @@ func (e *Engine) nextRankedCursor(ctx context.Context, b *budget, endpoint, quer
 		Visited: b.visited, Edges: b.edges,
 		ExpiresAt: e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
-	id, err := e.spillRanked(next, header, tail)
+	id, rankOff, pairOff, err := e.spillRanked(next, header, tails...)
 	if err != nil {
 		return "", e.releaseLease(ctx, lease.ID, err)
 	}
-	next.SpoolID = id
-	if err := next.validate(); err != nil {
-		e.releaseConsumed(ctx, id, "")
-		return "", e.releaseLease(ctx, lease.ID, err)
-	}
-	payload, err := json.Marshal(next)
-	if err != nil {
-		e.releaseConsumed(ctx, id, "")
-		return "", e.releaseLease(ctx, lease.ID,
-			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
-	}
-	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+	next.SpoolID, next.RankOffset, next.PairOffset = id, rankOff, pairOff
+	token, err := e.signRanked(next)
 	if err != nil {
 		e.releaseConsumed(ctx, id, "")
 		return "", e.releaseLease(ctx, lease.ID, err)
@@ -517,27 +528,94 @@ func (e *Engine) nextRankedCursor(ctx context.Context, b *budget, endpoint, quer
 	return token, nil
 }
 
-// spillRanked writes the ranked header and then every record tail streams, one
-// at a time, so the remainder of the answer is never in heap.
-func (e *Engine) spillRanked(next traversalCursor, h rankedHeader, tail func(func([]byte) error) error) (string, error) {
+// continueRankedCursor mints the cursor for the page after a LATER page. It
+// names the SAME spool and the SAME lease -- renewed, because the spool's
+// liveness is its lease's (pagination.Spools.OpenAt) and the answer is not over
+// -- and carries the byte offsets the page it follows stopped at. It writes
+// nothing: that is what makes a ranked page O(page) rather than O(remaining).
+func (e *Engine) continueRankedCursor(ctx context.Context, b *budget, c traversalCursor,
+	served, pairServed, rankOff, pairOff int64, meta *model.QueryMeta) (string, error) {
+	if !e.canContinue(meta) {
+		return "", nil
+	}
+	if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
+		return "", err
+	}
+	next := c
+	next.Version = traversalCursorVersion
+	next.RankServed, next.PairServed = served, pairServed
+	next.RankOffset, next.PairOffset = rankOff, pairOff
+	next.Visited, next.Edges = b.visited, b.edges
+	next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	return e.signRanked(next)
+}
+
+// canContinue reports whether this engine can mint a ranked continuation at
+// all. Without a signer, a lease store or a spool store the answer stops with
+// this page and SAYS so, exactly as a walk that cannot spill its frontier does.
+// It is only consulted with a ranked remainder still unserved -- every caller
+// checks that first -- so the stop always cuts the answer, and returning an
+// empty token alone left the caller reading a complete-looking page of a longer
+// ranking. Marking it is what makes the cut visible.
+func (e *Engine) canContinue(meta *model.QueryMeta) bool {
+	if e.signer == nil || e.leases == nil || e.spools == nil {
+		markTruncated(meta, reasonNoContinuation)
+		return false
+	}
+	return true
+}
+
+// signRanked validates and signs a ranked continuation payload. It does NOT
+// release the spool on failure: the spool outlives the page now, and the caller
+// that created it is the only one that may take it back.
+func (e *Engine) signRanked(next traversalCursor) (string, error) {
+	if err := next.validate(); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(next)
+	if err != nil {
+		return "", &model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()}
+	}
+	return e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
+}
+
+// spillRanked writes the ranked header and then every record each tail streams,
+// one at a time, so the remainder of the answer is never in heap. It reports
+// the spool id and the byte offset each SECTION begins at: the sections are
+// laid down in order and the writer's own position between them is what places
+// the second one, so no reader ever has to count records to find it.
+func (e *Engine) spillRanked(next traversalCursor, h rankedHeader,
+	tails ...func(func([]byte) error) error) (string, int64, int64, error) {
 	sp, err := e.spools.Create(next.spoolCursor())
 	if err != nil {
-		return "", err
+		return "", 0, 0, err
 	}
 	header, err := encodeRankedHeader(h)
 	if err != nil {
-		return "", e.releaseSpool(sp, err)
+		return "", 0, 0, e.releaseSpool(sp, err)
 	}
 	if err := sp.Append(header); err != nil {
-		return "", e.releaseSpool(sp, err)
+		return "", 0, 0, e.releaseSpool(sp, err)
 	}
-	if err := tail(sp.Append); err != nil {
-		return "", e.releaseSpool(sp, err)
+	// offsets[0] is where the first section's records begin; each later entry
+	// is where the next section does.
+	offsets := make([]int64, 0, len(tails)+1)
+	for _, tail := range tails {
+		offsets = append(offsets, sp.Written())
+		if err := tail(sp.Append); err != nil {
+			return "", 0, 0, e.releaseSpool(sp, err)
+		}
 	}
+	offsets = append(offsets, sp.Written())
 	if err := sp.Close(); err != nil {
-		return "", e.releaseSpool(sp, err)
+		return "", 0, 0, e.releaseSpool(sp, err)
 	}
-	return sp.ID(), nil
+	e.recordSpoolWritten(sp.Written())
+	pairOff := offsets[len(offsets)-1]
+	if len(offsets) > 1 {
+		pairOff = offsets[1]
+	}
+	return sp.ID(), offsets[0], pairOff, nil
 }
 
 // continueWalk mints the continuation for a page-bounded impact or
