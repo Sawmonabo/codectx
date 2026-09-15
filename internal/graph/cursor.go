@@ -44,7 +44,14 @@ import (
 // replay, and resuming it would serve an empty continuation instead of the rest
 // of the answer. It is refused as CTX_CURSOR_INVALID, which a caller re-runs
 // the query for, rather than answered short.
-const traversalCursorVersion = 2
+//
+// Version 3 orders the spool's visited section by NodeID. Membership is a
+// MERGE-JOIN over that order now (visited.go), and a merge-join over a
+// version-2 spool -- whose visited records are in admission order -- would
+// walk past a node the spool holds and report it absent. That is a
+// cross-page RE-ADMISSION: the node would be emitted on two pages. The
+// version is what refuses such a token instead of answering it wrong.
+const traversalCursorVersion = 3
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -236,13 +243,15 @@ type continuation struct {
 	Depth     int
 	LastOwner model.NodeID
 	LastKey   model.RelationID
-	// Frontier is where the walk stopped, and Visited the nodes THIS page
-	// admitted -- bounded by the page, never by the walk.
+	// Frontier is where the walk stopped, and Visited the nodes this page must
+	// contribute to the fresh spool's visited section, ascending: what it
+	// admitted itself plus the frontier it resumed. Both are bounded by the
+	// page and the frontier ceiling, never by the walk.
 	Frontier []frontierState
 	Visited  []model.NodeID
-	// Carried streams the cumulative set the earlier pages admitted, off the
-	// spool they wrote. spill copies it forward without materializing it, so a
-	// walk of any size costs one spool block of heap here.
+	// Carried streams the visited SECTION of the spool the earlier pages
+	// wrote, ascending. spill merges it with Visited without materializing it,
+	// so a walk of any size costs one spool block of heap here.
 	Carried visitedStream
 }
 
@@ -346,10 +355,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		default:
 			return cursorInvalid("continuation state is not readable")
 		}
-		// Every record's node, whatever its kind, is a node s.Visited replays,
-		// so the summary must hold it: the filter and the stream describe
-		// exactly the same set.
-		s.Filter.add(r.Node)
+		// The summary describes exactly what s.Visited replays -- the visited
+		// section -- so a miss is a proof the stream holds nothing. A frontier
+		// record's node is answered from the front instead.
+		if r.Kind == spoolRecordVisited {
+			s.Filter.add(r.Node)
+		}
 		return nil
 	})
 	if err != nil {
@@ -371,8 +382,17 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 				return cursorInvalid("continuation state is not readable")
 			}
 			switch r.Kind {
-			case spoolRecordFrontier, spoolRecordVisited:
+			case spoolRecordVisited:
+				// The visited SECTION only, and it is written in ascending
+				// NodeID order (spill below), which is what lets warm()
+				// merge-join against it. The frontier records ahead of it are
+				// deliberately skipped: their nodes are carried in heap by the
+				// page that resumes them (visited.go carry), so replaying them
+				// here would both break the order and answer what the front
+				// already answers.
 				return fn(r.Node)
+			case spoolRecordFrontier:
+				return nil
 			}
 			return cursorInvalid("continuation state is not readable")
 		})
@@ -518,25 +538,57 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 		}
 		frontierNodes[fs.Node] = struct{}{}
 	}
-	// The cumulative set the earlier pages admitted is copied STREAM to
-	// STREAM: one record in flight, never the whole set. Every carried record
-	// is written as a visited record whatever kind it had -- a node that was
-	// on the previous page's FRONTIER is not on this one's, and copying its
-	// kind forward would resurrect a stale frontier on the next replay.
+	// The visited section follows the frontier records and is written in
+	// ASCENDING NodeID order, which is what makes membership a merge-join with
+	// an early exit instead of a scan (visited.go). It is produced by a two-way
+	// merge of the carried stream -- already ascending, because the page that
+	// wrote it ran this same merge -- with this page's own ascending
+	// contribution: one record in flight, never the whole set, so a walk of any
+	// size costs one spool block of heap here.
+	//
+	// A node that is on THIS page's frontier is skipped: its frontier record
+	// already marks it visited, and writing it twice would spend the shared
+	// spool budget for nothing. Equal keys are emitted once for the same
+	// reason -- the two sources are disjoint by construction, so this is a
+	// guard, not a correction.
+	var (
+		pending  = c.Visited
+		lastNode model.NodeID
+		haveLast bool
+	)
 	writeVisited := func(n model.NodeID) error {
-		// A frontier record already marks its node visited; writing it twice
-		// would spend the shared spool budget for nothing.
 		if _, ok := frontierNodes[n]; ok {
 			return nil
 		}
+		if haveLast && n == lastNode {
+			return nil
+		}
+		lastNode, haveLast = n, true
 		return appendRecord(spoolRecord{Kind: spoolRecordVisited, Node: n})
 	}
+	// drainBelow emits every pending node that sorts before n, which is what
+	// keeps the merged output ascending.
+	drainBelow := func(n model.NodeID) error {
+		for len(pending) > 0 && pending[0] < n {
+			if err := writeVisited(pending[0]); err != nil {
+				return err
+			}
+			pending = pending[1:]
+		}
+		return nil
+	}
 	if c.Carried != nil {
-		if err := c.Carried(ctx, writeVisited); err != nil {
+		err := c.Carried(ctx, func(n model.NodeID) error {
+			if err := drainBelow(n); err != nil {
+				return err
+			}
+			return writeVisited(n)
+		})
+		if err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
 	}
-	for _, n := range c.Visited {
+	for _, n := range pending {
 		if err := writeVisited(n); err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
