@@ -482,7 +482,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		MaxOutstandingRequests: cfg.Providers.LSP.MaxOutstandingRequests,
 		RequestTimeout:         cfg.Providers.LSP.RequestTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
-		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes.Value(),
+		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
 	}); err != nil {
 		return nil, err
 	}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -55,9 +56,16 @@ type conn struct {
 	maxFrame int64
 	handler  serverRequestHandler
 
-	writeMu  sync.Mutex
-	written  int64
-	maxWrite int64
+	writeMu sync.Mutex
+	// written counts the bytes sent inside the current window, and windowStart
+	// is when that window opened. The budget is rolling rather than a lifetime
+	// total: a session that lives for hours legitimately sends more bytes than
+	// any one window, and charging them against one cap ended a healthy server
+	// mid-flight. A flood still trips it, because a flood is bytes per unit of
+	// time. Zero maxWrite is no budget at all, which is the default.
+	written     int64
+	windowStart time.Time
+	maxWrite    int64
 
 	slots chan struct{}
 
@@ -294,9 +302,14 @@ func (c *conn) forget(id int64) bool {
 	return ok
 }
 
+// writeWindow is the period the rolling send budget is measured over. It is
+// long enough that one burst of requests is charged together and short enough
+// that a session is never ended for bytes it sent minutes ago.
+const writeWindow = time.Minute
+
 // write frames and sends one message under the writer lock, charging it
-// against the lifetime byte cap. Exceeding the cap fails the connection: a
-// truncated frame would leave the server mid-message.
+// against the rolling send budget. Exceeding the budget fails the connection:
+// a truncated frame would leave the server mid-message.
 //
 // An outgoing message over the frame bound is refused before the lock and
 // before the accounting: nothing was written, so the stream is still intact.
@@ -318,13 +331,20 @@ func (c *conn) write(msg message) error {
 	if err := c.failed(); err != nil {
 		return err
 	}
-	if c.written+int64(len(payload))+64 > c.maxWrite {
-		err := resourceLimit("the language server has been sent %d bytes; the %d-byte overlay bound is reached", c.written, c.maxWrite).
-			WithDetail("limit", "max_overlay_bytes")
-		c.fail(err)
-		return err
+	if c.maxWrite > 0 {
+		now := time.Now()
+		if c.windowStart.IsZero() || now.Sub(c.windowStart) >= writeWindow {
+			c.windowStart, c.written = now, 0
+		}
+		if c.written+int64(len(payload))+64 > c.maxWrite {
+			err := resourceLimit("the language server has been sent %d bytes within %s; the %d-byte overlay bound is reached",
+				c.written, writeWindow, c.maxWrite).
+				WithDetail("limit", "max_overlay_bytes")
+			c.fail(err)
+			return err
+		}
+		c.written += int64(len(payload))
 	}
-	c.written += int64(len(payload))
 	return writeFrame(c.writer, payload)
 }
 
