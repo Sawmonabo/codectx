@@ -218,12 +218,7 @@ func compileGenerated(t *testing.T, fx *contextFixture, b model.Budget) compiled
 	}
 	out := compiled{wanted: map[model.RelationID]bool{}, reasons: map[string]bool{},
 		byNode: map[model.NodeID]bool{}}
-	if out.entries, err = fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0); err != nil {
-		t.Fatalf("ManifestEntries: %v", err)
-	}
-	if out.excluded, err = fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0); err != nil {
-		t.Fatalf("ManifestExcluded: %v", err)
-	}
+	out.entries, _, out.excluded = readBackManifest(t, fx, m.ID)
 	for _, e := range out.entries {
 		out.byNode[e.NodeID] = true
 		for _, r := range e.Reasons {
