@@ -131,6 +131,17 @@ func (t toolchainReporter) Statuses(ctx context.Context) ([]toolchain.Status, er
 	return t.r.Status(ctx), nil
 }
 
+// Selected forwards to SelectedTools, the one implementation of the repository
+// -> lock entry mapping. `codectx tools prefetch --for-repo` reaches it through
+// internal/cli; the doctor reaches it here, because internal/diagnostics must
+// not import a command package. Neither side owns a second copy.
+func (t toolchainReporter) Selected(ctx context.Context, root string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, model.Canceled(err)
+	}
+	return SelectedTools(root)
+}
+
 // workspaceProber answers the two filesystem questions neither the store nor
 // the tool store can. It is a value with no state: the directory is the
 // caller's argument, so one prober serves the data directory and the workspace
