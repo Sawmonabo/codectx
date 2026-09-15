@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -161,15 +160,15 @@ func TestRankedSpoolHeaderIsNotAWalkRecord(t *testing.T) {
 	if h.Kind != spoolRecordRanked || h.Total != 42 || h.Count != 7 || h.PairTotal != 9 || h.PairCount != 3 {
 		t.Fatalf("ranked header round trip: %+v", h)
 	}
-	// A frontier record must not read as a ranked header: the two spool shapes
-	// hold different things, and replaying one as the other serves a wrong
-	// page rather than an error.
-	walk, err := json.Marshal(spoolRecord{Kind: spoolRecordFrontier, Node: "n1", Depth: 2})
+	// A RECORD must not read as a ranked header: the spool's first frame says
+	// how many records follow it, and replaying a record as that frame serves a
+	// wrong page rather than an error.
+	record, err := encodePairRecord(pairRecord{FromNodeID: "a", ToNodeID: "b", PairCount: 2})
 	if err != nil {
-		t.Fatalf("encoding a frontier record: %v", err)
+		t.Fatalf("encoding a pair record: %v", err)
 	}
-	if _, err := decodeRankedHeader(walk); err == nil {
-		t.Fatal("a frontier record was accepted as a ranked spool header")
+	if _, err := decodeRankedHeader(record); err == nil {
+		t.Fatal("a spooled record was accepted as a ranked spool header")
 	}
 }
 
