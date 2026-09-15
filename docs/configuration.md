@@ -71,7 +71,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
   | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_capsule_records_per_list`, `max_capsule_coverage_files`, `max_seeds` |
   | `[providers.tree_sitter]` | `max_callee_references` |
-  | `[providers.manifest]` | `max_dependencies`, `max_entries` |
+  | `[providers.manifest]` | `max_dependencies`, `max_entries`, `max_toml_lines`, `max_xml_elements` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
 
@@ -179,7 +179,7 @@ it concludes. All are **user** trust.
 | `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. `0` retains every ref, matching `max_retained_bytes`. This keeps a finite default because a generation is reconstructible by re-indexing, so evicting one is lifecycle retention rather than a dropped row. |
 | `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
 | `watch_max_directories` | `0` (unlimited) | How many directories one watcher may watch. Unlimited by default: a repository's directory count is a property of the repository, and the host's own notification limit is the real ceiling — reaching that is refused by the host and reported as incomplete watch coverage with a reason. A set value stops the watch set at that many directories and reports coverage incomplete, never silently. |
-| `capture_max_retries` | `0` | Validation passes of a snapshot capture that may find the worktree changed under them before the capture is declared unstable. `0` (unlimited) is the default: a retry count that refuses a busy monorepo would be a scale refusal. Attempts are reported on the capture either way. |
+| `capture_max_retries` | `0` (unlimited) | Validation passes of a snapshot capture that may find the worktree changed under them before the capture is declared unstable. `0` (unlimited) is the default: a retry count that refuses a busy monorepo would be a scale refusal. Attempts are reported on the capture either way. |
 | `capture_retry_deadline` | `"10m"` | Wall clock for the whole validated capture. Finite by design, and not a size bound: with `capture_max_retries` unlimited this is the only thing that ends a capture of a worktree that never quiesces. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
@@ -314,6 +314,8 @@ directories and network posture are product code, not configuration.
 | `dependence.max_export_files` | `0` (unlimited) | user | How many entries one analysis export directory may hold. Unlimited by default: the file count follows the export's label vocabulary rather than the repository, and the directory is read one entry at a time. A set value is the only thing that refuses an import here, with `CTX_RESOURCE_LIMIT` naming this key. |
 | `manifest.max_dependencies` | `0` (unlimited) | user | How many dependencies you want one manifest file to declare. Unlimited by default: a `go.mod`, `package.json` or `pom.xml` declares what the repository declares. A set value cuts the list at the bound and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_dependencies` as the count that crossed it against this value. A manifest is one file whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory, never the repository's. |
 | `manifest.max_entries` | `0` (unlimited) | user | The same contract for the other lists one manifest declares: modules, replaced and excluded modules, workspace members and Maven properties, and a Markdown document's headings and source links. Crossing it is reported as `max_entries` on that file's capability row. |
+| `manifest.max_toml_lines` | `0` (unlimited) | user | How many lines of one TOML manifest (`Cargo.toml`, `pyproject.toml`) the evidence-range line scan places. Unlimited by default: how many lines a manifest has is a property of the repository. A set value stops the scan at that line — facts declared before it keep their exact byte ranges and only facts past it carry evidence without a range, never a guessed one — and marks that file's capability row partial with `CTX_RESOURCE_LIMIT`, carrying `max_toml_lines` as the file's line count against this value. |
+| `manifest.max_xml_elements` | `0` (unlimited) | user | How many XML elements of one `pom.xml` the token walk reads. Unlimited by default. A set value stops the walk there and publishes what parsed cleanly before it — the file is partial with `CTX_RESOURCE_LIMIT` and `max_xml_elements`, never reported malformed, because a large POM is large and not invalid. |
 
 ### Timeouts here are hang detectors, not size limits
 

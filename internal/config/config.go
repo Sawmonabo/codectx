@@ -266,6 +266,18 @@ type Manifest struct {
 	// excluded modules, workspace members, properties, and a document's
 	// headings and links.
 	MaxEntries Limit `toml:"max_entries"`
+	// MaxTOMLLines is how many lines of one TOML manifest the user wants the
+	// evidence-range line scan to place. Unlimited by default. A user-set
+	// value that is crossed stops the scan there: the facts whose lines the
+	// scan did place keep their exact ranges and only the facts past the
+	// bound carry evidence without one, and the cut is reported with the
+	// line count that crossed it.
+	MaxTOMLLines Limit `toml:"max_toml_lines"`
+	// MaxXMLElements is the same contract for the token stream of one POM:
+	// unlimited by default, and a user-set value that is crossed stops the
+	// parse there and reports the cut with the element count, publishing
+	// what parsed cleanly before it rather than calling the file malformed.
+	MaxXMLElements Limit `toml:"max_xml_elements"`
 }
 
 // TreeSitter configures the bundled structural provider. It runs as a private
@@ -639,7 +651,8 @@ func Defaults() Config {
 				MaxDerivedRows:         Unlimited,
 				MaxExportFiles:         Unlimited,
 			},
-			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited},
+			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited,
+				MaxTOMLLines: Unlimited, MaxXMLElements: Unlimited},
 		},
 		Context: Context{
 			DefaultPhase:                        "sweep",

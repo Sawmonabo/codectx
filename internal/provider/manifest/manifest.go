@@ -60,9 +60,11 @@ const (
 const (
 	BoundDependencies = "max_dependencies"
 	BoundEntries      = "max_entries" // modules, members, headings, links, properties
-	// BoundXMLElements and BoundTOMLLines are parser ceilings, not user-set
-	// list bounds: they bound the token stream and the line layout before
-	// either can be allocated. They cut rather than refuse, and say so.
+	// BoundXMLElements and BoundTOMLLines bound the parse itself rather than
+	// one of the manifest's lists: the POM token stream and the TOML line
+	// layout. Both are user-set keys, unlimited by default like the two
+	// above, and both cut rather than refuse -- what parsed before the bound
+	// is published, and the count that crossed it is reported.
 	BoundXMLElements = "max_xml_elements"
 	BoundTOMLLines   = "max_toml_lines"
 )
@@ -83,6 +85,16 @@ type Options struct {
 	// MaxEntries is providers.manifest.max_entries, the same contract for a
 	// manifest's modules, members, headings, links and properties.
 	MaxEntries config.Limit
+	// MaxTOMLLines is providers.manifest.max_toml_lines: how many lines of a
+	// TOML manifest the evidence-range scan places. Unlimited by default; a
+	// user-set value that is crossed leaves only the facts past that line
+	// without a range, and is reported with the line count.
+	MaxTOMLLines config.Limit
+	// MaxXMLElements is providers.manifest.max_xml_elements: how many
+	// elements of a POM the token walk reads. Unlimited by default; a
+	// user-set value that is crossed publishes what parsed before it and is
+	// reported with the element count.
+	MaxXMLElements config.Limit
 }
 
 // Provider is the manifest provider.
@@ -166,7 +178,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	e.AddBytes(uint64(len(data)))
 	u := &unit{e: e, data: data, cursor: source.NewCursor(data), capability: capability, state: model.CapabilityFresh,
-		deps: p.opts.MaxDependencies, entries: p.opts.MaxEntries}
+		deps: p.opts.MaxDependencies, entries: p.opts.MaxEntries,
+		tomlLines: p.opts.MaxTOMLLines, xmlElements: p.opts.MaxXMLElements}
 	switch cls.Format {
 	case filesystem.FormatGoMod:
 		err = u.goMod(ctx)
@@ -213,10 +226,12 @@ type unit struct {
 	state      model.CapabilityStateValue
 	code       string
 
-	// deps and entries are the unit's configured list bounds, and over holds
-	// one capability detail per bound this unit cut, keyed by bound name.
-	deps, entries config.Limit
-	over          map[string]string
+	// deps and entries are the unit's configured list bounds, tomlLines and
+	// xmlElements its configured parse bounds, and over holds one capability
+	// detail per bound this unit cut, keyed by bound name.
+	deps, entries          config.Limit
+	tomlLines, xmlElements config.Limit
+	over                   map[string]string
 	// seen is the largest count recorded against each bound. Several
 	// independent lists share one bound name, so without it the last list to
 	// cross would overwrite a larger crossing and the unit would under-report
