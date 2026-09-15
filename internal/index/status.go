@@ -474,26 +474,50 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
 		if i, ok := at[key]; ok {
-			// The loser's aggregate counts are carried into the survivor.
-			// Both rows stand for a set of scopes, and a fold that kept only
-			// the winner's `scopes` reported a smaller set than it represents
-			// while claiming nothing was omitted -- an under-count with no
-			// flag is the one thing the count exists to prevent.
-			scopes := countDetail(out[i]) + countDetail(c)
-			units := atoiDetail(out[i], "units_failed") + atoiDetail(c, "units_failed")
 			if severityRank(c.State) < severityRank(out[i].State) {
 				out[i] = c
-			}
-			if scopes > 1 {
-				out[i] = out[i].WithDetail("scopes", strconv.Itoa(scopes))
-			}
-			if units > 0 {
-				out[i] = out[i].WithDetail("units_failed", strconv.Itoa(units))
 			}
 			continue
 		}
 		at[key] = len(out)
 		out = append(out, c)
+	}
+	return out
+}
+
+// foldCollapsed is foldToPrimaryKey for the far side of collapseScopes, where
+// it must also SUM the counts of the rows it merges.
+//
+// The distinction matters and is not cosmetic. Before the collapse, two rows
+// on one primary key are two assertions about the same scope -- a
+// composition-time row meeting a stored one, say -- and summing their `scopes`
+// would count one scope twice. After it, collapseScopes has keyed by provider
+// capability AND state, written a `scopes` detail on every row it emits and
+// rewritten each to the workspace scope; the rows that now collide therefore
+// stand for DISJOINT scope sets, and keeping only the survivor's count reports
+// a smaller set than the row represents while the report claims nothing was
+// omitted. An under-count with no flag is exactly what the count exists to
+// prevent, so here, and only here, the counts add.
+func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
+	at := make(map[string]int, len(rows))
+	out := make([]model.CapabilityState, 0, len(rows))
+	for _, c := range rows {
+		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
+		i, ok := at[key]
+		if !ok {
+			at[key] = len(out)
+			out = append(out, c)
+			continue
+		}
+		scopes := countDetail(out[i]) + countDetail(c)
+		units := atoiDetail(out[i], "units_failed") + atoiDetail(c, "units_failed")
+		if severityRank(c.State) < severityRank(out[i].State) {
+			out[i] = c
+		}
+		out[i] = out[i].WithDetail("scopes", strconv.Itoa(scopes))
+		if units > 0 {
+			out[i] = out[i].WithDetail("units_failed", strconv.Itoa(units))
+		}
 	}
 	return out
 }
@@ -526,7 +550,7 @@ func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.Capabil
 		// of the scopes it stands for -- and never cut. A row dropped off the
 		// tail was unrecoverable; an aggregated one still names its capability,
 		// its worst state and how many scopes it speaks for.
-		out = foldToPrimaryKey(collapseScopes(out))
+		out = foldCollapsed(collapseScopes(out))
 		log.Info("the capability report was aggregated per provider capability", "component", component,
 			"rows_in", before, "rows_out", len(out), "threshold", model.MaxCapabilityStates)
 		return out, true
