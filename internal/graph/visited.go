@@ -30,21 +30,32 @@ import (
 //     each level. Bounded by Limits.FrontierBytes, the same ceiling that
 //     bounds the level's edge rows.
 //
-// Membership against the spooled remainder is answered in BATCH, one level at
-// a time (the external-memory BFS duplicate-elimination of Munagala and Ranade,
+// Membership against the spooled remainder is answered in two steps, and
+// neither is a scan of the whole set.
+//
+// First, a Bloom filter over that remainder (visitedFilter, below) is built
+// once per page while the resume replay is already decoding every spool record
+// to rebuild the frontier. A filter has no false negatives, so a miss PROVES
+// the spool cannot hold the node and the level never opens it. That is exactly
+// the pathological case: a chain -- and a call chain is one -- reaches freshly
+// admitted nodes at every level, so the old scan could never exit early and a
+// page paid one full pass per level, up to max_page_items of them.
+//
+// Second, what the filter cannot rule out is answered in BATCH, one level at a
+// time (the external-memory BFS duplicate-elimination of Munagala and Ranade,
 // "I/O-complexity of graph algorithms", SODA 1999: sort the level's candidates
-// and sweep the visited set once, instead of seeking per node). The spool is
-// a forward-only stream, so a per-node probe would be a full scan per node;
-// one scan per LEVEL is what keeps the I/O the same order the spool copy
-// already costs, and the scan stops as soon as the level's last candidate is
-// answered rather than always running to the end of the spool. Levels per page are bounded by the page item ceiling, because
-// a level that yields no row ends the walk and one that yields rows spends
-// page items.
+// and sweep the visited set once, instead of seeking per node). The spool's
+// visited section is itself written in ascending NodeID order, so that sweep is
+// a MERGE-JOIN that ends at the first key past the largest candidate rather
+// than at the end of the set. Levels per page are bounded by the page item
+// ceiling, because a level that yields no row ends the walk and one that yields
+// rows spends page items.
 //
 // Sources consulted: Munagala/Ranade (SODA 1999) for the level-batched
 // duplicate elimination; Mehlhorn/Meyer, "External-memory breadth-first search
 // with sublinear I/O" (ESA 2002) for why the semi-external variant keeps only
-// a bounded front in RAM.
+// a bounded front in RAM; Kirsch/Mitzenmacher (ESA 2006) for the two-hash
+// filter probes.
 
 // visitedStream replays every node of the spooled cumulative set, in the order
 // the spool holds them. It is nil on the first page of a walk, where the whole
@@ -134,12 +145,13 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 		// Every candidate was answered from heap: the level costs no I/O.
 		return nil
 	}
-	// The sweep ENDS as soon as every candidate is answered: a level whose
-	// neighbours were all admitted earlier costs the prefix of the spool that
-	// holds them, not the whole cumulative set. Only the unanswered remainder
-	// costs a full pass, and that is the case where a full pass is the answer
-	// ("none of these was admitted"), so no scan reads further than the fact it
-	// is looking for.
+	// The sweep is a MERGE-JOIN, not a scan: the spool's visited section is
+	// written in ascending NodeID order (cursor.go spill), so the candidates
+	// are sorted once and answered in one ordered pass that ENDS at the first
+	// key past the largest of them. A level whose candidates are all new --
+	// the chain-shaped level the filter above already answers from heap --
+	// therefore costs a prefix of the spool even when a false positive sends
+	// it here, instead of a pass to the end.
 	//
 	// Batching SEVERAL levels into one sweep -- the other half of the finding
 	// -- is not available to a BFS: level n+1's candidates are the neighbours
@@ -147,21 +159,27 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 	// has already answered. Supplying them would mean reading level n+1's edges
 	// before level n was admitted, which is a second pass over the edge rows
 	// and a second frontier in heap -- strictly worse than the pass it saves.
-	found := 0
+	sorted := make([]model.NodeID, 0, len(want))
+	for id := range want {
+		sorted = append(sorted, id)
+	}
+	sortNodeIDs(sorted)
+	next := 0
 	err := v.stream(ctx, func(id model.NodeID) error {
-		if _, ok := want[id]; !ok {
-			return nil
+		for next < len(sorted) && sorted[next] < id {
+			// No record can answer this candidate any more: the stream is
+			// ascending and has passed it.
+			next++
 		}
-		if _, seen := v.probed[id]; seen {
-			// The spool may hold a node twice (a carried record and the
-			// visited record the issuing page wrote); counting it twice would
-			// end the sweep before every candidate was answered.
-			return nil
-		}
-		v.probed[id] = struct{}{}
-		found++
-		if found == len(want) {
+		if next >= len(sorted) {
 			return errWarmComplete
+		}
+		if sorted[next] == id {
+			v.probed[id] = struct{}{}
+			next++
+			if next >= len(sorted) {
+				return errWarmComplete
+			}
 		}
 		return nil
 	})
@@ -172,22 +190,35 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 }
 
 // errWarmComplete ends a membership sweep that has answered every candidate it
-// was given. It never leaves warm: the stream is a forward-only replay with no
-// state of its own beyond the open spool, which the caller closes either way,
-// so stopping early is indistinguishable from reaching the end.
+// was given, or has passed the last key that could still answer one. It never
+// leaves warm: the stream is a forward-only replay with no state of its own
+// beyond the open spool, which the caller closes either way, so stopping early
+// is indistinguishable from reaching the end.
 var errWarmComplete = errors.New("membership sweep answered every candidate")
 
-// newlyAdmitted is what this page must append to the fresh spool, in the frozen
-// NodeID order. The carried nodes are deliberately absent: they are copied
-// forward from the previous spool instead, so no node is written twice.
-func (v *visitedSet) newlyAdmitted() []model.NodeID {
-	out := make([]model.NodeID, 0, len(v.added))
+// spillable is what this page must contribute to the fresh spool's visited
+// SECTION, ascending: the nodes it admitted itself, plus the frontier it
+// resumed. The carried nodes belong here because the stream that copies the
+// previous spool forward replays that spool's visited section only -- its
+// frontier records are answered from this page's front instead (cursor.go), so
+// nothing else would carry them forward. Both halves are bounded by the page
+// and by the frontier ceiling, never by the walk, and the previous visited
+// section stays on disk.
+func (v *visitedSet) spillable() []model.NodeID {
+	out := make([]model.NodeID, 0, len(v.added)+len(v.carried))
 	for id := range v.added {
+		out = append(out, id)
+	}
+	for id := range v.carried {
 		out = append(out, id)
 	}
 	sortNodeIDs(out)
 	return out
 }
+
+// newlyAdmitted is the name the paging endpoints call spillable by. It is kept
+// so the impact and rollup continuations compile unchanged.
+func (v *visitedSet) newlyAdmitted() []model.NodeID { return v.spillable() }
 
 // sortNodeIDs puts node ids in the frozen ascending order the spool and the
 // emission order share.
