@@ -9,7 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // Truncation reasons. Each names the exact bound that stopped the walk, so a
@@ -563,7 +563,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// the wire ceiling; a read served at a size other than the one asked for is
 	// reported on the answer rather than applied silently. Only the observation
 	// sink is imported, never the store: facts still come through Adjacency.
-	ctx, clamps := sqlite.WithPageClamps(ctx)
+	ctx, clamps := pagination.WithPageClamps(ctx)
 	if len(kinds) == 0 {
 		kinds = DefaultRelations()
 	}
