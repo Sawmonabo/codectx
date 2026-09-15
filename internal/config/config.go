@@ -278,6 +278,20 @@ type Dependence struct {
 	// minus a safety margin. There is no default memory ceiling, and only a
 	// non-zero value here may reject a unit before it runs.
 	UnitMemoryCeilingBytes int64 `toml:"unit_memory_ceiling_bytes"`
+	// MaxUnitsPerFamily is how many projects of one language family the user
+	// wants a plan to hold. Unlimited by default: a monorepo's project count
+	// is a property of the repository, not something the product refuses on
+	// the user's behalf. A user-set value never drops a project and never
+	// refuses the plan -- exceeding it is reported on the family's capability
+	// rows, naming the family, the project count and this bound.
+	MaxUnitsPerFamily Limit `toml:"max_units_per_family"`
+	// MaxStagedRows is how many rows the user wants one unit's import to
+	// stage. Unlimited by default: staging is an on-disk, keyset-paged
+	// database, so the row count bounds disk rather than heap. A user-set
+	// value never fails the unit and never stops the import -- exceeding it is
+	// reported on the unit's capability rows with the staged count and this
+	// bound.
+	MaxStagedRows Limit `toml:"max_staged_rows"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -465,6 +479,8 @@ func Defaults() Config {
 				CacheBytes:             4294967296,
 				UnitMemoryFloorBytes:   805306368,
 				UnitMemoryCeilingBytes: 0,
+				MaxUnitsPerFamily:      Unlimited,
+				MaxStagedRows:          Unlimited,
 			},
 		},
 		Context: Context{
