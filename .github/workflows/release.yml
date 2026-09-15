@@ -1,0 +1,429 @@
+# The Section 24 release: one tag produces the six per-target archives, the six
+# pre-populated bundle archives, the SBOM, the license inventory, the installer
+# and a checksums file that names every one of them.
+#
+# Three deliberate shapes, each of which a reviewer can check against Section 24
+# and Section 29:
+#
+#  1. No release framework. Section 29 forbids building one and there is nothing
+#     to adopt that survives our constraint: Tree-sitter is CGo, so every target
+#     needs its own native toolchain and its own runner anyway. What is left is
+#     tar, zip, sha256sum and an upload, which is written here directly.
+#  2. Every leg is native. `codectx tools prefetch --all` installs what the lock
+#     carries for *this* platform (internal/cli/tools.go), so a bundle can only
+#     be built on a machine of its own OS and architecture. No leg sets GOOS or
+#     GOARCH away from its runner, and each leg asserts that before it builds.
+#  3. The toolchain gate is not re-run here. tools-matrix.yml downloads roughly
+#     2.6 GB per platform; the release requires that it has already passed for
+#     the exact commit being tagged instead of paying for it again.
+#
+# Every bash step works in relative paths under the checkout. $GITHUB_WORKSPACE
+# is spelled with backslashes on the Windows runners and bash cannot use it
+# directly; it is normalized only where an absolute path is unavoidable, which
+# is the tool store written into the TOML configuration file.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Read-only by default; the one job that needs more asks for it.
+permissions:
+  contents: read
+
+concurrency:
+  # Two runs publishing the same tag would race on the release assets.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pin the toolchain exactly; the release never downloads a different one.
+  GOTOOLCHAIN: go1.27.1
+  GO_VERSION: "1.27.1"
+  # The SBOM generator, pinned by version and verified by digest before it is
+  # executed -- the same rule internal/toolchain applies to analyzer payloads.
+  # The digest is of syft_<version>_linux_amd64.tar.gz, the only build this
+  # workflow runs: the SBOM is produced once, in the publish job.
+  SYFT_VERSION: "1.51.1"
+  SYFT_LINUX_AMD64_SHA256: "8fcb33017a0dc1058298c923c436d19dfa68ae93968e0b423248542e3afb9fc3"
+
+jobs:
+  gate:
+    name: Toolchain gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Listing workflow runs is not covered by contents:read.
+      actions: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      sha: ${{ steps.identity.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve the released version and commit
+        id: identity
+        run: |
+          set -eu
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          case "$version" in
+            "" | *[!0-9A-Za-z.+-]*)
+              echo "tag $tag does not yield a usable version string" >&2
+              exit 1
+              ;;
+          esac
+          # github.sha is the tag object for an annotated tag, which would never
+          # match a workflow run's head_sha. HEAD after checkout is the commit
+          # either way.
+          sha="$(git rev-parse HEAD)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "releasing $version from $sha"
+
+      # tools-matrix.yml runs on dispatch, weekly, and on pushes/PRs that touch
+      # the lock or the toolchain runtime -- not on every commit. So a tag cut
+      # from a commit that never touched those paths legitimately has no run,
+      # and this gate blocks until one exists for that exact commit. The query
+      # filters on head_sha and on nothing else, and that is what lets the
+      # fallback work: dispatching the matrix against the tag records the
+      # dispatched ref's commit as head_sha, so a workflow_dispatch run counts
+      # exactly as a push run does. The failure message below is the whole
+      # recovery procedure; no re-tag is needed.
+      - name: Require a successful toolchain matrix run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          set -eu
+          runs="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/tools-matrix.yml/runs?head_sha=$SHA&per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | length')"
+          if [ "$runs" -eq 0 ]; then
+            echo "No successful \"Tools matrix\" run exists for $SHA." >&2
+            echo "Every claimed target must have an actual analyzer smoke run behind it (Section 24)," >&2
+            echo "and this release will not re-download 2.6 GB per platform to produce one." >&2
+            echo "" >&2
+            echo "To unblock: run the \"Tools matrix\" workflow manually against $GITHUB_REF_NAME" >&2
+            echo "(Actions -> Tools matrix -> Run workflow -> select the tag), wait for all three" >&2
+            echo "platforms to pass, then re-run all jobs of this release run. Do not re-tag." >&2
+            exit 1
+          fi
+          echo "successful Tools matrix runs for $SHA: $runs"
+
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: gate
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One target failing must not hide the state of the other five.
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm }
+          # macOS 13 and 14 are retired; macos-15-intel is the current x64
+          # image and plain macos-15 is the arm64 one.
+          - { goos: darwin, goarch: amd64, runner: macos-15-intel }
+          - { goos: darwin, goarch: arm64, runner: macos-15 }
+          - { goos: windows, goarch: amd64, runner: windows-latest }
+          - { goos: windows, goarch: arm64, runner: windows-11-arm }
+    # The bundle step installs every payload the lock carries for this platform.
+    timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      COMMIT: ${{ needs.gate.outputs.sha }}
+      TARGET: ${{ matrix.goos }}_${{ matrix.goarch }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+
+      # Tree-sitter's bindings are native, so Section 24 forbids claiming
+      # CGO_ENABLED=0 portability: each archive is built by the toolchain of the
+      # platform it is named for. That only holds if the runner really is that
+      # platform, so the assumption is asserted rather than trusted.
+      - name: Assert this runner is the target, not a cross-compile host
+        run: |
+          set -eu
+          host_os="$(go env GOHOSTOS)"
+          host_arch="$(go env GOHOSTARCH)"
+          if [ "$host_os" != "${{ matrix.goos }}" ] || [ "$host_arch" != "${{ matrix.goarch }}" ]; then
+            echo "runner is $host_os/$host_arch but this leg is named ${{ matrix.goos }}/${{ matrix.goarch }}" >&2
+            echo "a cross-built bundle cannot be produced: tools prefetch --all installs this platform only" >&2
+            exit 1
+          fi
+          echo "native leg on $host_os/$host_arch"
+
+      # -trimpath and the two -X values are the whole of the build identity:
+      # internal/model/build.go embeds no wall-clock timestamp and none is added
+      # here, so the same commit rebuilds byte for byte (Section 24).
+      - name: Build the release binary
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -eu
+          exe="$(go env GOEXE)"
+          go build -trimpath \
+            -ldflags "-X github.com/Sawmonabo/codectx/internal/model.version=$VERSION -X github.com/Sawmonabo/codectx/internal/model.commit=$COMMIT" \
+            -o "./bin/codectx$exe" ./cmd/codectx
+          echo "CODECTX=./bin/codectx$exe" >> "$GITHUB_ENV"
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+
+      - name: Confirm the binary reports the released identity
+        run: |
+          set -eu
+          "$CODECTX" version --json
+          reported="$("$CODECTX" version --json | jq -r '.data.version')"
+          if [ "$reported" != "$VERSION" ]; then
+            echo "binary reports version $reported, the tag says $VERSION" >&2
+            exit 1
+          fi
+
+      # Section 24's archive payload: the binary, LICENSE/NOTICE, the documented
+      # default configuration and shell completions. The grammars are compiled
+      # into the binary, so there is no separate grammar directory to ship. The
+      # binary sits at the archive root, so an installer needs no assumption
+      # about a leading directory.
+      - name: Stage the archive payload
+        run: |
+          set -eu
+          rm -rf stage dist
+          mkdir -p stage/slim/completions dist
+          cp "$CODECTX" "stage/slim/codectx$EXE"
+          cp LICENSE NOTICE .codectx.toml.example stage/slim/
+          for sh in bash zsh fish powershell; do
+            "$CODECTX" completion "$sh" > "stage/slim/completions/codectx.$sh"
+          done
+          ls -R stage/slim
+
+      - name: Archive (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          tar -czf "dist/codectx_${VERSION}_${TARGET}.tar.gz" -C stage/slim .
+          ls -l dist
+
+      # Compress-Archive ships with Windows PowerShell on every Windows runner,
+      # including the arm64 image, so the zip Section 24 names for this platform
+      # needs nothing installed.
+      - name: Archive (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # -Force on Get-ChildItem, because a wildcard path would skip
+          # .codectx.toml.example, which the tar legs do ship.
+          $items = Get-ChildItem -Force stage/slim | Select-Object -ExpandProperty FullName
+          Compress-Archive -Path $items -DestinationPath "dist/codectx_${env:VERSION}_${env:TARGET}.zip" -Force
+          Get-ChildItem dist
+
+      # tools.cache_dir is user-level configuration, so it is written to the user
+      # configuration file rather than passed as a flag -- the same shape
+      # tools-matrix.yml uses. A fresh store per leg is the point: the bundle
+      # must hold exactly what the lock pins and nothing a previous step left.
+      - name: Point a fresh tool store at this workspace
+        run: |
+          set -eu
+          slash() { printf '%s\n' "${1//\\//}"; }
+          rm -rf .tools
+          mkdir -p .tools
+          store="$(slash "$GITHUB_WORKSPACE")/.tools"
+          # os.UserConfigDir reads %AppData% on Windows; %LocalAppData% is
+          # os.UserCacheDir's variable, and writing there would leave
+          # config.Load reading nothing and the prefetch installing into the
+          # default per-workspace store instead.
+          case "$RUNNER_OS" in
+            Windows) config_home="$(slash "$APPDATA")" ;;
+            macOS)   config_home="$HOME/Library/Application Support" ;;
+            *)       config_home="${XDG_CONFIG_HOME:-$HOME/.config}" ;;
+          esac
+          if [ -z "$config_home" ]; then
+            echo "no user configuration directory for $RUNNER_OS" >&2
+            exit 1
+          fi
+          mkdir -p "$config_home/codectx"
+          printf '[tools]\ncache_dir = "%s"\n' "$store" > "$config_home/codectx/config.toml"
+          cat "$config_home/codectx/config.toml"
+
+      - name: Populate the bundle store
+        run: |
+          set -eu
+          "$CODECTX" tools prefetch --all
+          "$CODECTX" tools verify
+          "$CODECTX" tools status
+
+      # The bundle archive is the slim payload plus the populated store, so the
+      # binary is still at the archive root and the store is the one directory
+      # beside it. Section 24: this archive never touches the network on first
+      # use.
+      - name: Archive the bundle
+        run: |
+          set -eu
+          rm -rf stage/bundle
+          mkdir -p stage/bundle
+          cp -R stage/slim/. stage/bundle/
+          cp -R .tools stage/bundle/tools
+          tar -czf "dist/codectx-bundle_${VERSION}_${TARGET}.tar.gz" -C stage/bundle .
+          ls -l dist
+
+      - name: Upload this target's assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: assets-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating the release and uploading its assets.
+      contents: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Collect every target's assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: assets-*
+          merge-multiple: true
+          path: dist
+
+      # install.sh and THIRD_PARTY_LICENSES.md are Section 24 assets that live
+      # in the repository rather than being produced by a build leg. A release
+      # missing either one is incomplete, so their absence stops the release
+      # here instead of publishing a partial asset list.
+      - name: Add the repository-sourced assets
+        run: |
+          set -eu
+          for f in install.sh THIRD_PARTY_LICENSES.md; do
+            if [ ! -f "$f" ]; then
+              echo "$f is a Section 24 release asset and is missing from the repository" >&2
+              exit 1
+            fi
+            cp "$f" dist/
+          done
+          chmod +x dist/install.sh
+
+      # Pinned by version and verified by digest before it is executed: the
+      # archive is checked against SYFT_LINUX_AMD64_SHA256 rather than trusted
+      # because it came from a release page. Section 29 points at adopting
+      # pinned existing tooling for the SBOM rather than writing one.
+      - name: Install the pinned SBOM generator
+        run: |
+          set -eu
+          url="https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/syft.tar.gz "$url"
+          echo "$SYFT_LINUX_AMD64_SHA256  /tmp/syft.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/syftbin
+          tar -xzf /tmp/syft.tar.gz -C /tmp/syftbin syft
+          /tmp/syftbin/syft version
+
+      # Section 24 requires the SBOM to include the native grammar assets, which
+      # is why the scan root is assembled rather than pointed at the module
+      # graph: every target's binary contributes its own Go module inventory,
+      # and the linux/amd64 bundle store contributes the pinned analyzer
+      # payloads and their native assets. The lock pins one version per tool
+      # across platforms, so one store is the inventory for all of them;
+      # unpacking six multi-gigabyte stores would add time and no components.
+      - name: Assemble the SBOM scan root
+        run: |
+          set -eu
+          rm -rf sbom-root
+          mkdir -p sbom-root/binaries sbom-root/tool-store
+          for a in "dist/codectx_${VERSION}"_*.tar.gz; do
+            d="sbom-root/binaries/$(basename "$a" .tar.gz)"
+            mkdir -p "$d"
+            tar -xzf "$a" -C "$d"
+          done
+          for a in "dist/codectx_${VERSION}"_*.zip; do
+            d="sbom-root/binaries/$(basename "$a" .zip)"
+            mkdir -p "$d"
+            unzip -q "$a" -d "$d"
+          done
+          tar -xzf "dist/codectx-bundle_${VERSION}_linux_amd64.tar.gz" -C sbom-root/tool-store ./tools
+          du -sh sbom-root/binaries sbom-root/tool-store
+
+      # Written outside dist and moved in, so the generator never scans its own
+      # output and so the checksums step below still covers it.
+      - name: Generate the SBOM
+        run: |
+          set -eu
+          # Without an explicit name and version, a directory scan derives the
+          # document identity from the scan path, which is a runner temp path.
+          /tmp/syftbin/syft scan dir:sbom-root \
+            --source-name codectx --source-version "$VERSION" \
+            --output spdx-json=sbom.spdx.json
+          mv sbom.spdx.json dist/sbom.spdx.json
+          # Six bundle archives and an unpacked store are co-resident on this
+          # runner until the upload; the scan tree is the one part that can be
+          # released early, so it is.
+          rm -rf sbom-root
+          jq -r '"SPDX \(.spdxVersion), \(.packages | length) packages"' dist/sbom.spdx.json
+
+      # One checksums file, produced once, on one host, by one implementation --
+      # never per leg, which would mix sha256sum and shasum output shapes. Bare
+      # basenames, so an installer can match an asset name directly, and
+      # checksums.txt is the one asset it cannot name.
+      - name: Aggregate checksums
+        working-directory: dist
+        run: |
+          set -eu
+          # The asset list is frozen before checksums.txt is created: a shell
+          # redirection truncates its target before the command on the left of
+          # it runs, so listing straight into the file would make checksums.txt
+          # an asset that hashes itself and never verifies.
+          rm -f checksums.txt
+          find . -maxdepth 1 -type f -printf '%f\n' | sort > ../assets.txt
+          while IFS= read -r asset; do
+            sha256sum "$asset"
+          done < ../assets.txt > checksums.txt
+          sha256sum -c checksums.txt
+          cat checksums.txt
+
+      # Section 24 lists macOS amd64 and arm64 as supported targets and this
+      # workflow builds both on their own runners. But no macOS build or
+      # analyzer smoke of this product has ever been reproduced anywhere except
+      # a GitHub-hosted runner, so a successful darwin leg here is the only
+      # evidence that exists for those two targets -- weaker than the linux and
+      # Windows legs, which are additionally reproduced on developer hardware.
+      # Recording that difference in the run summary is what keeps an unproven
+      # platform from reading as a proven one.
+      - name: Record platform proof status
+        run: |
+          set -eu
+          {
+            echo "## Release $VERSION"
+            echo ""
+            echo "| Target | Evidence |"
+            echo "|---|---|"
+            for t in linux_amd64 linux_arm64 windows_amd64 windows_arm64; do
+              echo "| $t | built and version-checked on its own runner in this run |"
+            done
+            for t in darwin_amd64 darwin_arm64; do
+              echo "| $t | UNPROVEN PLATFORM: built on a macOS runner in this run, never reproduced off-runner. This run is the only evidence for it. |"
+            done
+            echo ""
+            echo "Toolchain gate: a successful \`Tools matrix\` run exists for \`${{ needs.gate.outputs.sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$VERSION" \
+            --generate-notes \
+            --verify-tag \
+            dist/*
