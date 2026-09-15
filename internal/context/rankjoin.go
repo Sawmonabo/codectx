@@ -1,7 +1,7 @@
-// This file is C-STREAM pass P-C (relation attributes) and pass P-E
-// (walk-local centrality) of .superpowers/sdd/implementation-plan/C-STREAM-plan.md,
-// plus the two whole-set functions they replace, moved here so that the
-// streaming form and the form it must reproduce sit side by side.
+// This file holds pass P-C (relation attributes) and pass P-E (walk-local
+// centrality) of the context compiler, plus the two whole-set functions they
+// reproduce, so that the streaming form and the form it must match sit side by
+// side.
 //
 // Both passes exist to delete a candidate-sized map. relationsOnPaths holds
 // `wanted` (every relation id on every retained route) and `out` (the relation

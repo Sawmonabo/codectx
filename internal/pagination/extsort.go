@@ -205,7 +205,7 @@ func AdoptRuns[T any](dir, prefix string, bufRecords int, runs []string,
 // record Added -- a deadline never costs the records that had not reached a run
 // file yet.
 //
-// OWNERSHIP MOVES with the paths: this sort no longer removes them, so the
+// OWNERSHIP MOVES with the paths: this sort does not remove them, so the
 // caller's deferred Close is safe and the resumed sort (or, if the caller
 // abandons the continuation, the caller itself) is what removes them. The sort
 // is finished afterwards: a later Add or Sorted fails rather than answering the

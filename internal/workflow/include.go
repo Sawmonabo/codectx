@@ -22,12 +22,18 @@ const includeTask = "context include"
 // session_manifests and retains same-hash coverage. It never deletes an
 // observation -- the prior scope review stops satisfying readiness because the
 // scope version moved, not because anything was removed. Owned by L2.
-func (s *Service) Include(ctx context.Context, req model.IncludeRequest) (model.SessionStatus, error) {
+func (s *Service) Include(ctx context.Context, req model.IncludeRequest) (_ model.SessionStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "workflow include", err) }()
 
 	// The request is validated, so the actor is non-empty and Session applies
 	// its actor, expiry and lifecycle checks. An include is a mutation: an

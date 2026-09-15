@@ -13,7 +13,7 @@ import (
 // required-full coverage plus a current-scope review for verify -> consolidate
 // (or recorded waivers with allow_exploratory_waiver_consolidation), and
 // capsule-before-complete ordering. Owned by L1.
-func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (model.WorkflowStatus, model.SessionStatus, error) {
+func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (_ model.WorkflowStatus, _ model.SessionStatus, err error) {
 	var (
 		noTransition model.WorkflowStatus
 		noStatus     model.SessionStatus
@@ -24,6 +24,12 @@ func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (model.
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "workflow advance", err) }()
 
 	rec, applied, err := s.transition(ctx, req)
 	if err != nil {
@@ -53,7 +59,7 @@ func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (model.
 // expressed as AdvanceRequest{Target: StateClosed}: there is no CloseSession on
 // the store and no edge out of complete, so closing a completed session is
 // CTX_VERSION_CONFLICT. Owned by L1.
-func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedVersion int) (model.WorkflowStatus, error) {
+func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedVersion int) (_ model.WorkflowStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.WorkflowStatus{}, err
 	}
@@ -72,6 +78,12 @@ func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedV
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "workflow close", err) }()
 
 	_, applied, err := s.transition(ctx, advance)
 	if err != nil {

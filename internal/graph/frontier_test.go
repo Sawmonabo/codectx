@@ -657,25 +657,6 @@ type slowAdjacency struct {
 	stallAfter int
 }
 
-func (s slowAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	*s.calls++
-	switch {
-	case s.stallAfter > 0:
-		if *s.calls > s.stallAfter {
-			*s.clock = s.clock.Add(s.jump)
-		}
-	case s.every > 0:
-		if *s.calls%s.every == 0 {
-			*s.clock = s.clock.Add(s.jump)
-		}
-	case !*s.fired && *s.calls >= s.trigger:
-		*s.fired = true
-		*s.clock = s.clock.Add(s.jump)
-	}
-	return s.graphFixture.Edges(ctx, nodes, dir, kinds, after, limit)
-}
-
 // TestDeadlineEndsThePageNotTheAnswer is the F8 proof. Ruling Q4 makes
 // query_timeout end a PAGE, not an answer: a walk that runs out of time with
 // edges already admitted must return them, say so, and hand back a cursor --
@@ -1281,13 +1262,13 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 }
 
 // slowReader is slowAdjacency's counterpart on the PACKED reader, and it is
-// where the fixture clock now advances: the walk reads structure through
-// GraphReader, so a clock driven by Adjacency.Edges never moved at all and
-// every deadline case silently became a case with no deadline.
+// where the fixture clock advances: the walk reads structure through
+// GraphReader, so a clock driven by a delivery read never moves at all and
+// every deadline case would silently be a case with no deadline.
 //
-// One packed scan covers a whole level, where the old reader made one round
-// trip per node chunk per keyset page of at most model.MaxPageItems rows, plus
-// the empty page that ended the keyset loop. A clock that ticked once per scan
+// One packed scan covers a whole level, where a keyset reader makes one round
+// trip per node chunk per page of at most model.MaxPageItems rows, plus the
+// empty page that ends the loop. A clock that ticked once per scan
 // would therefore be far coarser than the one these cases were calibrated
 // against, so a "round trip" here is one scan, one per adjacencyBatch entries
 // it delivers, and one for the scan's end -- the same granularity the old port

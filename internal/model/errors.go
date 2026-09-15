@@ -121,6 +121,49 @@ func invalid(format string, args ...any) *Error {
 	return &Error{Code: CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
 }
 
+// DeadlineKey names the two settings that install a query deadline, for the
+// detail of every CTX_QUERY_DEADLINE a bounded surface returns. The operator
+// who set one is the only one who can see this error, so the error says which
+// knob to move.
+const DeadlineKey = "resources.query_timeout / --timeout"
+
+// QueryDeadlineExceeded types an expired query deadline on a surface whose
+// answer is ONE bounded read or one mutation: there is nothing to resume past,
+// so the honest answer is the deadline itself, naming the setting that set it.
+// A surface that accumulates work across passes or pages mints a continuation
+// cursor instead and never reaches this.
+//
+// op names the request. err is joined so errors.Is still finds
+// context.DeadlineExceeded below the typed code.
+func QueryDeadlineExceeded(op string, err error) error {
+	typed := (&Error{Code: CodeQueryDeadline, Retryable: true,
+		Message:     "the " + op + " request did not finish within its query deadline",
+		Remediation: "raise or clear the query deadline, or narrow the request"}).
+		WithDetail("deadline", DeadlineKey)
+	if err == nil {
+		return typed
+	}
+	return errors.Join(typed, err)
+}
+
+// ClassifyQueryDeadline converts an expired deadline into the typed answer
+// above and returns every other error unchanged, so a typed *Error from a
+// dependency survives. It reads ctx as well as err, because a store call may
+// report a deadline as a bare driver error.
+func ClassifyQueryDeadline(ctx context.Context, op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return QueryDeadlineExceeded(op, err)
+	}
+	return err
+}
+
 // Canceled types work the caller stopped: a CTX_CANCELED error joined with the
 // context error, so errors.Is still distinguishes a deadline from a
 // cancellation while errors.As finds the typed code. Section 22 requires that

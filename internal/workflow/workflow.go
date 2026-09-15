@@ -202,7 +202,7 @@ type Limits struct {
 	// field can never silently relax the gate.
 	//
 	// When it is set, readiness precondition 3 -- every required file fully
-	// served to this actor at the pinned hashes -- no longer shuts the gate.
+	// served to this actor at the pinned hashes -- does not shut the gate.
 	// The shortfall is not forgiven, it is reported: the gate records that the
 	// read was left unconfirmed, its reason names the configuration, and Strict
 	// -- and therefore the capsule's StrictGateSatisfied, which is taken

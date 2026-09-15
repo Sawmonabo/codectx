@@ -182,7 +182,7 @@ func scaleEngine(t *testing.T, reader GraphReader) *Engine {
 		t.Fatalf("new spools: %v", err)
 	}
 	e, err := New(Options{
-		Adjacency: memAdjacency{MemoryGraph: reader.(*MemoryGraph)},
+		Adjacency: reader.(*MemoryGraph),
 		Reader:    reader,
 		Signer:    signer,
 		Spools:    spools,
@@ -199,14 +199,4 @@ func scaleEngine(t *testing.T, reader GraphReader) *Engine {
 		t.Fatalf("new engine: %v", err)
 	}
 	return e
-}
-
-// memAdjacency is the DELIVERY half of the port, which the walk no longer
-// reads structure through: New still requires an Adjacency, and hydration is
-// all this fixture asks of it.
-type memAdjacency struct{ *MemoryGraph }
-
-func (memAdjacency) Edges(context.Context, []model.NodeID, model.Direction,
-	[]model.RelationKind, model.RelationID, int) ([]model.Relation, error) {
-	return nil, nil
 }

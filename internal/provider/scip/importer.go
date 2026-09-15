@@ -1397,6 +1397,13 @@ func (im *importer) result() model.ProviderResult {
 		if crossed != "" {
 			cs = cs.WithDetail(detailLimitsExceeded, crossed)
 		}
+		// Occurrences cut past a relation's evidence bound. The degradation
+		// alone says only that something was cut; the shared clip key names
+		// the bound and the count, so an operator reads one spelling of this
+		// cut across every provider that can make it.
+		if im.truncatedEdges > 0 {
+			cs = cs.WithDetail(model.DetailEvidenceClipped, strconv.FormatInt(im.truncatedEdges, 10))
+		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}
 	return r
@@ -1411,6 +1418,6 @@ func (im *importer) report() Report {
 		Result: im.result(), Delta: im.delta, Manifest: im.manifest,
 		OutsideRoot: im.outsideRoot, DuplicatePaths: im.duplicatePaths, Skipped: im.skippedDocs,
 		SkippedOccurrences: im.skippedOccurrences, SkippedCallsiteAliases: im.skippedAliases,
-		TruncatedEdgeOccurrences: im.truncatedEdges, AssumedPositionEncoding: im.assumedEncoding,
+		AssumedPositionEncoding: im.assumedEncoding,
 	}
 }

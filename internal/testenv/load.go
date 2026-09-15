@@ -54,6 +54,13 @@ func parseLoadavg(contents string) (float64, error) {
 
 // overloaded is the threshold decision, separated from the file read so it can
 // be exercised without a host in a particular state.
+//
+// One quarter of the CPU count is derived from the two observations this
+// repository has of its own host, a 16-CPU machine: a wall-clock ratio proof
+// flaked at a one-minute load of 6.4, and the quiet run that measured the
+// ratios stood at 3.73. The threshold must therefore lie in (3.73, 6.4] --
+// 16/4 = 4.0 does, 16/2 = 8.0 admits the flake and makes the guard a no-op on
+// exactly the host it exists for.
 func overloaded(load float64, cpus int) bool {
-	return load > float64(cpus)/2
+	return load > float64(cpus)/4
 }
