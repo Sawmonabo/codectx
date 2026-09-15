@@ -1099,6 +1099,13 @@ func TestGraphScenarios(t *testing.T) {
 						t.Fatalf("page %d carried %d rollup pairs, want the answer's %d",
 							pages, len(res.Packages), len(whole.Packages))
 					}
+					// The capability report is answer-level too, and a
+					// continuation reads no facts: a page that dropped it would
+					// report a degraded generation as a complete one.
+					if len(res.Meta.Completeness) != len(whole.Meta.Completeness) {
+						t.Fatalf("page %d carried %d completeness rows, want the answer's %d",
+							pages, len(res.Meta.Completeness), len(whole.Meta.Completeness))
+					}
 					if res.Meta.NextCursor == "" {
 						break
 					}

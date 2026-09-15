@@ -104,13 +104,16 @@ const impactEndpoint = "graph.impact"
 // and would drop the deferred-capability disclosure and the rollup the first
 // page computed.
 //
-// Packages ride as their own spool records: a rollup is bounded only by
-// MaxRecordsPerResult, and a thousand pairs in one record can exceed the
-// spool's per-record byte bound.
+// Packages and Completeness ride as their own spool records, so the leading
+// record holds only the two small fields: a rollup is bounded only by
+// MaxRecordsPerResult, and a capability report by model.MaxCapabilityStates
+// rows of a bounded but far from small size, so either list in one record can
+// exceed the spool's per-record byte bound and turn a legal answer into a
+// resource-limit refusal on the page that spills it.
 type impactAnswer struct {
 	Truncated    bool                    `json:"t,omitempty"`
 	Reason       string                  `json:"r,omitempty"`
-	Completeness []model.CapabilityState `json:"c,omitempty"`
+	Completeness []model.CapabilityState `json:"-"`
 	Packages     []model.PackageEdge     `json:"-"`
 }
 
@@ -223,6 +226,16 @@ func (e *Engine) resumeImpact(ctx context.Context, token, queryHash string,
 			}
 			entries = append(entries, entry)
 			return nil
+		case r.Kind == spoolRecordCapability:
+			if len(answer.Completeness) >= model.MaxCapabilityStates {
+				return impactCompletenessTooLarge()
+			}
+			var row model.CapabilityState
+			if err := json.Unmarshal(r.Payload, &row); err != nil {
+				return cursorInvalid("continuation state is not readable")
+			}
+			answer.Completeness = append(answer.Completeness, row)
+			return nil
 		case r.Kind == spoolRecordPackage:
 			if len(answer.Packages) >= model.MaxRecordsPerResult {
 				return impactStateTooLarge()
@@ -263,6 +276,16 @@ func impactStateTooLarge() error {
 		Remediation: "restart the query with a narrower scope"}).WithDetail("limit", "max_records_per_result")
 }
 
+// impactCompletenessTooLarge is the typed refusal for a spool carrying more
+// capability rows than a report may hold. The bound is the one the stored
+// report the walking page copied was already validated against
+// (model.MaxCapabilityStates), so only a corrupt or tampered spool reaches it.
+func impactCompletenessTooLarge() error {
+	return (&model.Error{Code: model.CodeResourceLimit,
+		Message:     "continuation state exceeds the capability report bound",
+		Remediation: "restart the query"}).WithDetail("limit", "max_capability_states")
+}
+
 // spoolImpact spills the answer-level record, the ranked tail and the rollup
 // into a fresh spool and signs the cursor naming it. It returns an empty token
 // with no error when no continuation can be offered -- no signer, no spool
@@ -271,7 +294,7 @@ func impactStateTooLarge() error {
 // same contract as running out of page items.
 func (e *Engine) spoolImpact(ctx context.Context, b *budget, queryHash string, answer impactAnswer,
 	rest []model.ImpactEntry) (string, error) {
-	records := make([]spoolRecord, 0, len(rest)+len(answer.Packages)+1)
+	records := make([]spoolRecord, 0, len(rest)+len(answer.Packages)+len(answer.Completeness)+1)
 	leading, err := encodeSpoolRecord(spoolRecordAnswer, answer)
 	if err != nil {
 		return "", err
@@ -286,6 +309,13 @@ func (e *Engine) spoolImpact(ctx context.Context, b *budget, queryHash string, a
 	}
 	for _, pkg := range answer.Packages {
 		r, err := encodeSpoolRecord(spoolRecordPackage, pkg)
+		if err != nil {
+			return "", err
+		}
+		records = append(records, r)
+	}
+	for _, c := range answer.Completeness {
+		r, err := encodeSpoolRecord(spoolRecordCapability, c)
 		if err != nil {
 			return "", err
 		}

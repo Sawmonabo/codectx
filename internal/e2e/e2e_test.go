@@ -171,6 +171,25 @@ func (s *sandbox) run(t *testing.T, args ...string) (envelope, int) {
 	return env, code
 }
 
+// runText execs one codectx command WITHOUT --json and returns what it wrote to
+// stdout: the human rendering, which is what row (d) is about.
+//
+// sandbox.run cannot serve this row. It pins --json by design, because every
+// other row asserts on the Section 18.2 envelope; the human renderers are a
+// separate output path with separate code, and the wave-F gap this row closes
+// is precisely that nothing had ever executed them against a populated capsule.
+func (s *sandbox) runText(t *testing.T, args ...string) string {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(binary, append(args, "--repo", s.Repo)...)
+	cmd.Env = s.Environ
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("codectx %v: %v\nstdout:\n%s\nstderr:\n%s", args, err, stdout.String(), stderr.String())
+	}
+	return stdout.String()
+}
+
 // data decodes a successful envelope's payload. A failed envelope is a test
 // failure here rather than a silent zero value, so a row that expected an
 // answer never compares two empty pages and passes.
@@ -788,25 +807,6 @@ func repoState(t *testing.T, dir string) string {
 		t.Fatalf("walk the repository: %v", err)
 	}
 	return state.String()
-}
-
-// runText execs one codectx command WITHOUT --json and returns what it wrote to
-// stdout: the human rendering, which is what row (d) is about.
-//
-// sandbox.run cannot serve this row. It pins --json by design, because every
-// other row asserts on the Section 18.2 envelope; the human renderers are a
-// separate output path with separate code, and the wave-F gap this row closes
-// is precisely that nothing had ever executed them against a populated capsule.
-func (s *sandbox) runText(t *testing.T, args ...string) string {
-	t.Helper()
-	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(binary, append(args, "--repo", s.Repo)...)
-	cmd.Env = s.Environ
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("codectx %v: %v\nstdout:\n%s\nstderr:\n%s", args, err, stdout.String(), stderr.String())
-	}
-	return stdout.String()
 }
 
 // --- The CLI boundary --------------------------------------------------------

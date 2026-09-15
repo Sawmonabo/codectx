@@ -26,13 +26,48 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
+// benchRoot is this test binary's scratch root: the shared budget fixture, the
+// corpus it is generated into and the release binary built to measure it all
+// live under it, and nothing else in the package writes outside it or a
+// t.TempDir.
+//
+// It carries the process id because more than one bench test binary can be
+// live at once -- `go test ./...` beside a targeted rerun of this package, a
+// CI stage beside a developer's shell -- and over a fixed path whichever
+// started second would clear the corpus out from under the first's remaining
+// rows. That is exactly the failure the wave-g VERIFY run saw: rows late in
+// the Section 23.2 table refused with CTX_PATH_ESCAPE because the repository
+// they were measuring had been removed mid-run.
+//
+// Its lifetime is TestMain's rather than any row's: the fixture deliberately
+// outlives the test or benchmark that happens to build it (see fixture), so no
+// t.Cleanup may own it. It is cleared on entry -- a pid can be reused after a
+// crashed run -- and released after the last row returns.
+var benchRoot = filepath.Join(os.TempDir(), fmt.Sprintf("codectx-bench-l2-%d", os.Getpid()))
+
 // TestMain makes this test binary the parser worker, as the codectx binary
-// is in production (ruling R8-1).
+// is in production (ruling R8-1), and owns benchRoot's lifetime.
 func TestMain(m *testing.M) {
+	// A parser worker returns here: it runs no row, so it must never create or
+	// release the root its parent is measuring against.
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
 		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
 	}
-	os.Exit(m.Run())
+	if err := os.RemoveAll(benchRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "clear the bench root %s: %v\n", benchRoot, err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(benchRoot, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "create the bench root %s: %v\n", benchRoot, err)
+		os.Exit(1)
+	}
+	code := m.Run()
+	// os.Exit skips deferred calls, so the release is written out here: a run
+	// leaves no tree behind, and repeated runs never accumulate.
+	if err := os.RemoveAll(benchRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "release the bench root %s: %v\n", benchRoot, err)
+	}
+	os.Exit(code)
 }
 
 // Plateau parameters. The warm-up excludes the parses during which the
