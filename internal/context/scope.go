@@ -109,8 +109,11 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 		model.NodeConstant, model.NodeEndpoint, model.NodeDatabaseEntity:
 		// A caller, a callee or a state owner is required, at its own symbol.
 		return model.RequirementSymbol
-	case model.NodeDocument, model.NodePackage, model.NodeModule, model.NodeNamespace,
-		model.NodeDependency, model.NodeBuildTarget:
+	case model.NodeDocument, model.NodeSection, model.NodePackage, model.NodeModule,
+		model.NodeNamespace, model.NodeDependency, model.NodeBuildTarget:
+		// A section is a heading inside a document and carries the same weight
+		// as the document it is part of: prose that explains the code is
+		// recommended reading, never binding.
 		return model.RequirementRecommended
 	}
 	// An unknown kind informs rather than binds: it is never silently required.
