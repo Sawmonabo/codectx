@@ -1218,7 +1218,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		// generation that carries it, so the fold is paid once per unit
 		// version, in the parallel seal phase, instead of once per activation
 		// over the whole store (ADR-0007 Decision 1 as amended).
-		if err := buildUnitLexical(ctx, tx, w.rowID, w.carriedFrom); err != nil {
+		if err := buildUnitLexical(ctx, tx, s, w.rowID, w.carriedFrom); err != nil {
 			return err
 		}
 		if err := exec1(ctx, tx, conflict("unit %s is no longer building", w.build.Spec.ID),
@@ -1450,7 +1450,7 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		// The packed term statistics follow the adjacency, under the same rule
 		// and in the same transaction (ADR-0007 Decision 1): a generation is
 		// never published without the structure every lexical query reads.
-		if err := buildLexical(ctx, tx, g.id); err != nil {
+		if err := buildLexical(ctx, tx, s, g.id); err != nil {
 			return err
 		}
 

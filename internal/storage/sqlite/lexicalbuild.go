@@ -173,7 +173,12 @@ type lexSource struct {
 // predecessor's document ids, so the predecessor's own packed list is the only
 // place their instances can be read from -- the index is contentless and no
 // row of this database can reproduce the text they were indexed with.
-func buildUnitLexical(ctx context.Context, tx *sql.Tx, unitRow, carriedFrom int64) error {
+func buildUnitLexical(ctx context.Context, tx *sql.Tx, s *Store, unitRow, carriedFrom int64) error {
+	started := time.Now()
+	defer func() {
+		s.sealFold.Add(int64(time.Since(started)))
+		s.sealFoldUnits.Add(1)
+	}()
 	docs, tokens, err := writeUnitDocuments(ctx, tx, unitRow)
 	if err != nil {
 		return err
@@ -353,7 +358,7 @@ func foldUnitVocabulary(ctx context.Context, tx *sql.Tx, unitRow int64, out part
 // every lexical query reads. It runs inside Activate's transaction, after the
 // packed adjacency and before the active pointer flips, so a generation is
 // published only with the structure and a failed merge fails the activation.
-func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
+func buildLexical(ctx context.Context, tx *sql.Tx, s *Store, gen int64) error {
 	// ADR-0007 holds this pass to 5 % of the index wall clock, and a delta
 	// activation to three times the packed adjacency's build. That bound is
 	// only checkable if the operator can see the pass on its own, so its start
@@ -371,6 +376,11 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 		slog.Default().Info("packed lexical build finished",
 			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
 			"terms", terms, "documents", docs, "merge_passes", passes,
+			// What the seal phase spent folding the unit lists this merge
+			// consumed, summed over this store's units so far: the merge's
+			// cost is only half of what ADR-0007 budgets.
+			"seal_fold_ms", (time.Duration(s.sealFold.Load()) * time.Nanosecond).Milliseconds(),
+			"seal_fold_units", s.sealFoldUnits.Load(),
 			// Signed: a build that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.

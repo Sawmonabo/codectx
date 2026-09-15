@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -156,6 +157,15 @@ type Store struct {
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
 	SourceID string
+
+	// sealFold accumulates what the per-unit lexical folds of this store have
+	// cost, in nanoseconds, and over how many units. The folds run in the
+	// parallel seal phase, so no single one of them is a share of anything;
+	// the activation that merges them reports the total beside its own, which
+	// is what makes the ADR-0007 budget checkable from an ordinary index log
+	// without a line per unit.
+	sealFold      atomic.Int64
+	sealFoldUnits atomic.Int64
 }
 
 // timeLayout is fixed width so stored timestamps compare correctly as text.
