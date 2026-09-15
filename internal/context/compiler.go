@@ -739,26 +739,6 @@ const (
 	originExpansion
 )
 
-// less is the total Section 15.3 order: requirement rank, descending
-// ScoreMicros, normalized path, start byte, entity id.
-func (a candidate) less(b candidate) bool {
-	if ra, rb := requirementRank(a.Requirement), requirementRank(b.Requirement); ra != rb {
-		return ra < rb
-	}
-	if a.ScoreMicros != b.ScoreMicros {
-		return a.ScoreMicros > b.ScoreMicros
-	}
-	if a.Path != b.Path {
-		return a.Path < b.Path
-	}
-	if a.StartByte != b.StartByte {
-		return a.StartByte < b.StartByte
-	}
-	// The last key is unique, so the order is total. A node identity wins over
-	// the file identity: a file-level candidate carries no NodeID.
-	return a.entityID() < b.entityID()
-}
-
 // entityID is the final, unique tie-break key: the node identity when the
 // candidate names one, else the file identity.
 func (a candidate) entityID() string {
