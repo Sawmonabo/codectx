@@ -2,7 +2,7 @@ package graph
 
 import (
 	"context"
-	"encoding/json"
+	"slices"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -330,25 +330,54 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 // exactly that reason.
 func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]model.NodeID, error) {
-	candidates := map[model.NodeID][]model.NodeID{}
-	lookup := make([]model.NodeID, 0, len(ids))
-	for _, batch := range impactChunkNodes(ids) {
+	reader, err := e.consumerReader()
+	if err != nil {
+		return nil, err
+	}
+	contains, ok := reader.Kinds().Code(model.RelContains)
+	if !ok {
+		// The generation seals no containment at all, so nothing has a parent.
+		// That is an answer, not a failure: the map still lists its containers,
+		// each at depth 0.
+		return map[model.NodeID]model.NodeID{}, nil
+	}
+	// best is the lowest-canonical-id container parent found so far, per child
+	// surrogate. Its bound is the batch, not the fan-out: a candidate is folded
+	// into it as the scan delivers it and no candidate list is kept.
+	best := map[NodeRef]model.NodeID{}
+	// The child of a containment edge is the node the scan OWNS, so the
+	// candidate is the neighbour; both its kind and its canonical id are needed
+	// to apply the tie-break, and both come from one batched side-array read
+	// per chunk of candidates rather than one hydration per candidate.
+	for _, chunk := range chunkRefs(sortedRefs(ctx, reader, ids)) {
 		remaining, exhausted := containmentBudget(b, e.limits)
 		if exhausted {
 			markTruncated(meta, reasonEdgeBudget)
 			break
 		}
-		// Streamed, not collected: each containment row is folded into the
-		// candidate list of the node it names as it arrives, so the heap here
-		// is one adjacency page plus the candidate and lookup lists the map is
-		// built from -- never the whole containment fan-out of a batch on top
-		// of them.
-		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, remaining,
-			func(r model.Relation) error {
-				b.edges++
-				candidates[r.To] = append(candidates[r.To], r.From)
-				lookup = append(lookup, r.From)
+		complete, err := scanNeighbours(ctx, reader, chunk, model.DirectionIncoming,
+			[]KindCode{contains}, remaining, b, func(owners, candidates []NodeRef) error {
+				kinds, err := reader.NodeKinds(ctx, candidates)
+				if err != nil {
+					return err
+				}
+				cids, err := reader.NodeIDs(ctx, candidates)
+				if err != nil {
+					return err
+				}
+				for i := range candidates {
+					if !isOverviewContainer(kinds[i]) || cids[i] == "" {
+						continue
+					}
+					// Several containers can claim one node -- a file sits in a
+					// directory and in a package -- so the LOWEST canonical id
+					// wins, the tie-break the rollup's container side array
+					// applies, so the map is reproducible from the facts rather
+					// than from the order the adjacency returned them in.
+					if cur, seen := best[owners[i]]; !seen || cids[i] < cur {
+						best[owners[i]] = cids[i]
+					}
+				}
 				return nil
 			})
 		if err != nil {
@@ -358,27 +387,119 @@ func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 			markTruncated(meta, reasonEdgeBudget)
 		}
 	}
-	nodes, err := e.nodesByID(ctx, lookup)
+	out := make(map[model.NodeID]model.NodeID, len(ids))
+	refs, err := reader.Resolve(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[model.NodeID]model.NodeID, len(ids))
-	for _, id := range ids {
-		var best model.NodeID
-		for _, cand := range candidates[id] {
-			n, ok := nodes[cand]
-			if !ok || !isOverviewContainer(n.Kind) {
-				continue
-			}
-			if best == "" || n.ID < best {
-				best = n.ID
-			}
-		}
-		if best != "" {
-			out[id] = best
+	for i, id := range ids {
+		if parent, ok := best[refs[i]]; ok {
+			out[id] = parent
 		}
 	}
 	return out, nil
+}
+
+// sortedRefs resolves ids to surrogates and returns them ascending and
+// duplicate-free, dropping any id the generation does not publish. That is
+// GraphReader.Neighbours' precondition, and it is enforced here rather than
+// assumed: an unsorted or repeated frontier yields a silently wrong page --
+// an edge delivered twice, or one skipped by the resume position -- instead of
+// an error.
+//
+// A resolution failure yields no refs; the caller's own read of the reader
+// surfaces the error, and every caller here resolves again for its own output
+// map, so a swallowed failure cannot reach an answer as "this container holds
+// nothing".
+func sortedRefs(ctx context.Context, reader GraphReader, ids []model.NodeID) []NodeRef {
+	refs, err := reader.Resolve(ctx, ids)
+	if err != nil {
+		return nil
+	}
+	out := make([]NodeRef, 0, len(refs))
+	for _, ref := range refs {
+		if ref != 0 {
+			out = append(out, ref)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// chunkRefs splits an ascending ref list into scan-sized chunks, so the
+// working set of one containment scan is a function of adjacencyBatch and
+// never of the page.
+func chunkRefs(refs []NodeRef) [][]NodeRef {
+	var out [][]NodeRef
+	for len(refs) > adjacencyBatch {
+		out = append(out, refs[:adjacencyBatch])
+		refs = refs[adjacencyBatch:]
+	}
+	if len(refs) > 0 {
+		out = append(out, refs)
+	}
+	return out
+}
+
+// scanNeighbours streams one chunk's packed adjacency and hands it to fn in
+// batches of at most adjacencyBatch entries, as two aligned slices: the owner
+// of each entry and its neighbour. Batching is what lets a consumer read the
+// side arrays of a whole batch of neighbours in one indexed read instead of
+// one per entry, which is the whole point of the packed layout.
+//
+// maxEdges is the allowance LEFT of the page's cumulative edge budget; every
+// delivered entry is charged to b. It reports whether the scan COMPLETED: a
+// scan whose allowance is spent exactly as the entries run out is complete,
+// and only an allowance that still has an entry standing in front of it is
+// not. A caller turns an incomplete scan into the truncation its own answer
+// requires -- the map omits the containers it could not measure -- rather than
+// publishing a half-read count.
+func scanNeighbours(ctx context.Context, reader GraphReader, chunk []NodeRef,
+	direction model.Direction, kinds []KindCode, maxEdges config.Limit, b *budget,
+	fn func(owners, neighbours []NodeRef) error) (bool, error) {
+	owners := make([]NodeRef, 0, adjacencyBatch)
+	neighbours := make([]NodeRef, 0, adjacencyBatch)
+	flush := func() error {
+		if len(owners) == 0 {
+			return nil
+		}
+		if err := fn(owners, neighbours); err != nil {
+			return err
+		}
+		owners, neighbours = owners[:0], neighbours[:0]
+		return nil
+	}
+	var read int64
+	complete := true
+	var ferr error
+	if _, err := reader.Neighbours(ctx, chunk, direction, kinds, EdgePos{}, func(e Edge) error {
+		if maxEdges.Exceeded(read + 1) {
+			// The allowance is spent and an entry is still standing: that, and
+			// only that, is an incomplete read.
+			complete = false
+			return ErrStopScan
+		}
+		read++
+		b.edges++
+		owners = append(owners, e.Owner)
+		neighbours = append(neighbours, e.Neighbour)
+		if len(owners) < adjacencyBatch {
+			return nil
+		}
+		if ferr = flush(); ferr != nil {
+			return ErrStopScan
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if ferr != nil {
+		return false, ferr
+	}
+	if err := flush(); err != nil {
+		return false, err
+	}
+	return complete, nil
 }
 
 // containerCounts is what one container directly holds.
@@ -397,26 +518,59 @@ type containerCounts struct{ files, symbols, bytes int64 }
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts,
 	map[model.NodeID]bool, error) {
+	reader, err := e.consumerReader()
+	if err != nil {
+		return nil, nil, err
+	}
 	out := make(map[model.NodeID]containerCounts, len(ids))
 	unmeasured := map[model.NodeID]bool{}
-	// cut marks every container of a batch whose containment read the edge
-	// bound stopped, and discloses the bound once. Those containers are omitted
-	// from the map: an omitted container is a missing measurement, which the
-	// caller can see and page past, while a half-counted one is a wrong
-	// measurement it cannot tell from a small container.
+	refs, err := reader.Resolve(ctx, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	// byRef is how a scan's owner surrogate becomes the canonical id the
+	// answer is keyed by. A container the generation does not publish resolves
+	// to the zero surrogate and simply owns no entries.
+	byRef := make(map[NodeRef]model.NodeID, len(ids))
+	for i, id := range ids {
+		if refs[i] != 0 {
+			byRef[refs[i]] = id
+		}
+	}
+	kinds := make([]KindCode, 0, len(overviewRelationKinds()))
+	for _, k := range overviewRelationKinds() {
+		if code, ok := reader.Kinds().Code(k); ok {
+			kinds = append(kinds, code)
+		}
+	}
+	if len(kinds) == 0 {
+		// The generation seals none of the containment vocabulary, so every
+		// container on the page directly holds nothing. That is a measured
+		// zero, not an unmeasured container.
+		return out, unmeasured, nil
+	}
+	// cut marks every container of a chunk whose containment read the edge
+	// bound stopped, and discloses the bound once. Those containers are
+	// omitted from the map: an omitted container is a missing measurement,
+	// which the caller can see and page past, while a half-counted one is a
+	// wrong measurement it cannot tell from a small container.
 	disclosed := false
-	cut := func(batch []model.NodeID) {
-		for _, id := range batch {
+	cut := func(chunk []NodeRef) {
+		for _, ref := range chunk {
+			id, ok := byRef[ref]
+			if !ok {
+				continue
+			}
 			unmeasured[id] = true
-			// Retract whatever chunks of this batch were already counted: a
+			// Retract whatever entries of this chunk were already counted: a
 			// half-counted container is a wrong measurement, and the caller
 			// cannot tell one from a small container.
 			delete(out, id)
 		}
 		markTruncated(meta, reasonEdgeBudget)
 		if disclosed {
-			// One bound, one disclosure: a map whose every batch was cut must
-			// not repeat the same notice once per batch.
+			// One bound, one disclosure: a map whose every chunk was cut must
+			// not repeat the same notice once per chunk.
 			return
 		}
 		disclosed = true
@@ -424,76 +578,61 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 			"max_graph_edges: the configured edge bound stopped a containment read, so the "+
 				"containers it covered are omitted from this page rather than counted in part")
 	}
-	for _, batch := range impactChunkNodes(ids) {
+	for _, chunk := range chunkRefs(sortedRefs(ctx, reader, ids)) {
 		remaining, exhausted := containmentBudget(b, e.limits)
 		if exhausted {
-			cut(batch)
+			cut(chunk)
 			continue
 		}
-		// Streamed in hydration-sized chunks rather than collected whole: the
-		// containment rows of a batch of containers are the page's largest
-		// intermediate, and nothing here needs a row once its child has been
-		// counted. Peak is one chunk of rows plus that chunk's hydrated nodes,
-		// whatever the fan-out of the batch.
-		chunk := make([]model.Relation, 0, adjacencyBatch)
-		flush := func() error {
-			if len(chunk) == 0 {
+		// The counts come from the generation's node-kind and source-byte side
+		// arrays, read once per batch of children. Nothing is hydrated: the
+		// old map read a whole model.Node per child to look at two fields of
+		// it, which is what made its second page refuse at the deadline
+		// (ADR-0005).
+		complete, err := scanNeighbours(ctx, reader, chunk, model.DirectionOutgoing,
+			kinds, remaining, b, func(owners, children []NodeRef) error {
+				childKinds, err := reader.NodeKinds(ctx, children)
+				if err != nil {
+					return err
+				}
+				bytes, err := reader.SourceBytes(ctx, children)
+				if err != nil {
+					return err
+				}
+				for i, owner := range owners {
+					id, ok := byRef[owner]
+					if !ok {
+						continue
+					}
+					counts := out[id]
+					switch {
+					case childKinds[i] == model.NodeFile:
+						counts.files++
+						counts.bytes += bytes[i]
+					case isOverviewContainer(childKinds[i]):
+						// A nested container is structure, not a symbol; it
+						// appears in the map as its own item with its own
+						// counts.
+					case childKinds[i] == "":
+						// A child the generation publishes no kind for is not
+						// counted: an aggregate must rest on facts this answer
+						// could actually read.
+					default:
+						counts.symbols++
+					}
+					out[id] = counts
+				}
 				return nil
-			}
-			children := make([]model.NodeID, 0, len(chunk))
-			for _, r := range chunk {
-				children = append(children, r.To)
-			}
-			nodes, err := e.nodesByID(ctx, children)
-			if err != nil {
-				return err
-			}
-			for _, r := range chunk {
-				child, ok := nodes[r.To]
-				if !ok {
-					// A child that is not visible in this generation is not
-					// counted: an aggregate must rest on facts this answer
-					// could actually read.
-					continue
-				}
-				counts := out[r.From]
-				switch {
-				case child.Kind == model.NodeFile:
-					counts.files++
-					counts.bytes += nodeSourceBytes(child)
-				case isOverviewContainer(child.Kind):
-					// A nested container is structure, not a symbol; it appears
-					// in the map as its own item with its own counts.
-				default:
-					counts.symbols++
-				}
-				out[r.From] = counts
-			}
-			chunk = chunk[:0]
-			return nil
-		}
-		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionOutgoing,
-			overviewRelationKinds(), remaining,
-			func(r model.Relation) error {
-				b.edges++
-				chunk = append(chunk, r)
-				if len(chunk) < adjacencyBatch {
-					return nil
-				}
-				return flush()
 			})
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := flush(); err != nil {
-			return nil, nil, err
-		}
 		if !complete {
-			// The chunks already counted for this batch are a partial count of
-			// its containers, which is the one thing this map may not publish,
-			// so cut retracts them along with marking the batch unmeasured.
-			cut(batch)
-			continue
+			// The entries already counted for this chunk are a partial count
+			// of its containers, which is the one thing this map may not
+			// publish, so cut retracts them along with marking the chunk
+			// unmeasured.
+			cut(chunk)
 		}
 	}
 	return out, unmeasured, nil
@@ -572,24 +711,4 @@ func isOverviewContainer(k model.NodeKind) bool {
 		return true
 	}
 	return false
-}
-
-// nodeSourceBytes is the size a file node carries in its typed metadata, which
-// is the only byte fact the graph port exposes: the filesystem provider records
-// it there when it emits the node (internal/provider/filesystem, "size").
-//
-// A node whose metadata carries no size contributes nothing rather than a
-// guess, and a negative or unreadable one is treated the same way: an
-// over-reported byte total is a wrong measurement, not a missing one.
-func nodeSourceBytes(n model.Node) int64 {
-	if len(n.Metadata) == 0 {
-		return 0
-	}
-	var meta struct {
-		Size int64 `json:"size"`
-	}
-	if err := json.Unmarshal(n.Metadata, &meta); err != nil || meta.Size < 0 {
-		return 0
-	}
-	return meta.Size
 }

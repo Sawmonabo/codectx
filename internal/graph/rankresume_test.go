@@ -189,7 +189,7 @@ func rankResumeEngine(t *testing.T, f *graphFixture, stopAfter int) (*Engine, st
 	limits.MaxPageItems = 100000
 	limits.QueryTimeout = time.Minute
 	limits.FrontierBytes = 32 << 20
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)

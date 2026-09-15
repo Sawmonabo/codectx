@@ -160,7 +160,8 @@ func deadlineError(t *testing.T, err error) bool {
 // or no deadline at all -- is not. timeout 0 is the no-deadline case.
 func callerDeadlineEngine(t *testing.T, timeout time.Duration) *Engine {
 	t.Helper()
-	adj := &ctxAdjacency{graphFixture: newGraphFixture(t)}
+	f := newGraphFixture(t)
+	adj := &ctxAdjacency{graphFixture: f}
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
 		t.Fatalf("open signer: %v", err)
@@ -174,7 +175,7 @@ func callerDeadlineEngine(t *testing.T, timeout time.Duration) *Engine {
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 	limits.QueryTimeout = timeout
 	past := time.Now().Add(-time.Hour)
-	e, err := New(Options{Adjacency: adj, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: adj, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return past }})
 	if err != nil {

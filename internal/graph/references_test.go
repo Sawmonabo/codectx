@@ -21,7 +21,7 @@ func TestReferencePageBoundIsDisclosedNotClamped(t *testing.T) {
 	f := newGraphFixture(t)
 	limits := fixtureLimits()
 	limits.MaxPageItems = 5
-	e, err := New(Options{Adjacency: f, Limits: limits})
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -66,6 +66,14 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	if len(kinds) == 0 {
 		kinds = DefaultRelations()
 	}
+	// The empty direction is the outgoing default: every caller that predates
+	// the field asked for exactly that, and normalizing here -- rather than at
+	// each of the two places the direction is read -- is what keeps the query
+	// hash and the walk agreeing on one spelling.
+	direction := req.Direction
+	if direction == "" {
+		direction = model.DirectionOutgoing
+	}
 
 	res = model.PathResult{Meta: model.QueryMeta{Binding: e.adjacency.Binding()}}
 	// The same disclosure the traversal entries make, from the same place: a
@@ -93,7 +101,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// The query hash binds a continuation to this exact normalized search, so a
 	// cursor presented to a differently filtered or differently depth-bounded
 	// one is CTX_CURSOR_INVALID rather than a silently repinned answer.
-	queryHash := pathQueryHash(kinds, req.From, req.To, maxDepth.Int())
+	queryHash := pathQueryHash(kinds, direction, req.From, req.To, maxDepth.Int())
 	var resume *pathResume
 	if req.Page.Cursor != "" {
 		resume, err = e.resumePath(ctx, req.Page.Cursor, queryHash)
@@ -165,6 +173,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	w := &pathWalk{
 		adjacency: e.adjacency,
 		kinds:     kinds,
+		direction: direction,
 		maxDepth:  maxDepth,
 		// Both work budgets are PER-PAGE, the traversal precedent: a page that
 		// spends one ends there and returns a continuation, and the next page
@@ -354,6 +363,12 @@ type pathParent struct {
 type pathWalk struct {
 	adjacency Adjacency
 	kinds     []model.RelationKind
+	// direction is the orientation the search relaxes edges in, already
+	// normalized by ShortestPath, so it is never the empty value here. It is
+	// part of the continuation's query hash: a cursor presented to a search
+	// walking the other way would resume a settled set that means nothing in
+	// the new orientation.
+	direction model.Direction
 	maxDepth  config.Limit
 	// maxVisited and maxEdges are the walk's work budgets, resolved the way
 	// every other bound here is: the request may narrow the configured limit,
@@ -714,7 +729,7 @@ func (w *pathWalk) drain(ctx context.Context) error {
 			return nil
 		}
 		for {
-			rels, err := w.adjacency.Edges(ctx, batch, model.DirectionOutgoing, w.kinds, w.expandAfter, adjacencyBatch)
+			rels, err := w.adjacency.Edges(ctx, batch, w.direction, w.kinds, w.expandAfter, adjacencyBatch)
 			if err != nil {
 				return err
 			}
@@ -735,10 +750,28 @@ func (w *pathWalk) drain(ctx context.Context) error {
 				w.expandAfter = r.ID
 				w.spent++
 				w.pageEdges++
+				// Which endpoint the search CAME FROM depends on the
+				// direction: outgoing relaxes from the edge's from-node to its
+				// to-node, incoming the other way, and DirectionBoth takes
+				// whichever endpoint this batch settled. An edge whose settled
+				// endpoint is ambiguous -- a self-loop, or both endpoints
+				// settled in this batch -- relaxes from the from-node, which is
+				// the orientation the edge itself states.
+				from, to := r.From, r.To
+				if w.direction == model.DirectionIncoming ||
+					(w.direction == model.DirectionBoth && !settledHere(dists, r.From)) {
+					from, to = r.To, r.From
+				}
+				if _, ok := dists[from]; !ok {
+					// Neither endpoint is in this batch: the reader returned an
+					// edge that touches none of the nodes being expanded, which
+					// is nothing this search can relax.
+					continue
+				}
 				if err := w.sc.exec(w.scCtx,
 					`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
-					dists[r.From]+Cost(r.Kind), string(r.To), string(r.ID), string(r.From), string(r.Kind),
-					depths[r.From]+1); err != nil {
+					dists[from]+Cost(r.Kind), string(to), string(r.ID), string(from), string(r.Kind),
+					depths[from]+1); err != nil {
 					return err
 				}
 			}
@@ -761,6 +794,14 @@ func (w *pathWalk) drain(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// settledHere reports whether this batch settled the node, which is how a
+// DirectionBoth relaxation tells the endpoint the search reached from the one
+// it is reaching.
+func settledHere(dists map[model.NodeID]int64, id model.NodeID) bool {
+	_, ok := dists[id]
+	return ok
 }
 
 // takePending reads the next batch of unexpanded nodes with the settled

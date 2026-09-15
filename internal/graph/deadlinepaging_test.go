@@ -93,7 +93,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		Start:     []model.NodeID{fixtureNodeID("bound-seed")},
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
-	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -122,16 +122,22 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 	t.Run("progress", func(t *testing.T) {
 		clock := time.Now()
 		calls, fired := 0, false
-		// The clock passes the deadline on the 512th round trip of each page:
+		// The clock passes the deadline on the 200th round trip of each page:
 		// the counter is reset below before every request, so each page reads a
-		// five hundred and eleven batches -- more than the widest level of this
+		// hundred and ninety-nine batches -- more than the widest level of this
 		// fixture needs -- before its own fresh deadline expires. A jump on a
 		// page's FIRST read is the no-progress case below -- a different
 		// assertion, because such a page cannot advance at all.
+		//
+		// It was 512 while the package rollup resolved its containers by
+		// WALKING containment: those round trips are gone now that the rollup
+		// reads the generation's container side array (ADR-0005), so a page no
+		// longer reaches five hundred reads and the deadline that splits this
+		// walk has to be counted against what the walk itself reads.
 		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
-			jump: 2 * time.Minute, fired: &fired, every: 512}
+			jump: 2 * time.Minute, fired: &fired, every: 200}
 		probe := &heapProbe{}
-		paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 			Now: func() time.Time { return clock }})
 		if err != nil {
@@ -298,7 +304,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		// reach an edge: the walk cannot advance and must say so.
 		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 			jump: 2 * time.Minute, fired: &fired, every: 1}
-		paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 			Now: func() time.Time { return clock }})
 		if err != nil {
@@ -418,7 +424,7 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 	// no page after it can reach an edge at all.
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
-	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -480,7 +486,7 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 	// dropped, so the named-return defer's terminalOutcome(nil) releases the
 	// retained walk and its lease -- `resume: CTX_CURSOR_INVALID: continuation
 	// state has expired or was released`.
-	warm, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	warm, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -524,7 +530,7 @@ func unboundedImpactCount(t *testing.T, f *graphFixture, signer *pagination.Sign
 	if err != nil {
 		t.Fatalf("new spools: %v", err)
 	}
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -611,7 +617,7 @@ func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
-	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -635,7 +641,7 @@ func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 
 	// The rest of the walk, read by a reader that does not run past the
 	// deadline, must reach the whole answer.
-	warm, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	warm, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {

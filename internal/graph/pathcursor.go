@@ -122,7 +122,8 @@ func (c pathCursor) spoolCursor() pagination.Cursor {
 // The visited and edge bounds are deliberately NOT part of it. They are
 // per-page work budgets, exactly as they are for a traversal, and a caller that
 // asks the next page for less work must not be refused for it.
-func pathQueryHash(kinds []model.RelationKind, from, to model.NodeID, maxDepth int) string {
+func pathQueryHash(kinds []model.RelationKind, direction model.Direction,
+	from, to model.NodeID, maxDepth int) string {
 	sorted := make([]string, len(kinds))
 	for i, k := range kinds {
 		sorted[i] = string(k)
@@ -130,6 +131,7 @@ func pathQueryHash(kinds []model.RelationKind, from, to model.NodeID, maxDepth i
 	sort.Strings(sorted)
 	h := model.NewHasher(queryHashDomain)
 	h.AddString(pathEndpoint)
+	h.AddString(string(direction))
 	h.AddString(string(from))
 	h.AddString(string(to))
 	h.AddString(strconv.Itoa(maxDepth))

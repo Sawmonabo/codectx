@@ -68,7 +68,7 @@ func TestAWalkWritesItsVisitedSetOnce(t *testing.T) {
 	limits.FrontierBytes = 64 << 10
 
 	probe := &heapProbe{}
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -157,7 +157,7 @@ func TestANeighboursPageAppendsOnlyItsOwnAdmissions(t *testing.T) {
 	limits.FrontierBytes = 64 << 10
 
 	probe := &heapProbe{}
-	e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: a, Reader: a.reader(), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -287,7 +287,7 @@ func TestASmallPageNeighboursWalkReachesEveryNode(t *testing.T) {
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = limit
 		limits.QueryTimeout = 10 * time.Minute
-		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
