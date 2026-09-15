@@ -163,7 +163,15 @@ never of the kinds.
 | `Cargo.toml` | BurntSushi/toml; ranges from a bounded line scan | `package` (or `configuration` for a virtual workspace manifest); a `[package]` field written `{ workspace = true }` is listed in `inherited` and not resolved | `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` and their `[target.*]` forms → `runtime`/`dev`/`build`; `optional = true` → `optional`; `{ workspace = true }` → `inherited: workspace`, requirement unresolved; `[workspace.dependencies]` → `depends_on` with `declared: workspace` |
 | `pyproject.toml` | BurntSushi/toml; per-requirement ranges are the quoted string inside the located array | `package`; `dynamic` fields are metadata and never invented | PEP 621 `dependencies` → `runtime`; `optional-dependencies` → `optional` with `extra`; PEP 735 `dependency-groups` → `dev` with `group`; `build-system.requires` → `build`; Poetry tables → `runtime`/`dev` |
 | `pom.xml` | streaming `encoding/xml` tokens with depth (32), element (200k) and text (4 KiB) bounds | `package` `maven:group:artifact`; a missing `groupId`/`version` is taken from `<parent>` and listed in `inherited`; `<properties>` are metadata | `<dependency>` scope `compile`/`runtime` → `runtime`, `test` → `test`, `provided`/`system`/`import` → `build`, `<optional>true` → `optional`; `<parent>` → `depends_on` kind `build`, `role: parent`; `<dependencyManagement>` → `configures` with `managed`; `<modules>` → `builds` the module directory; `${property}` references stay literal with `unresolved: property`; only the direct children of a `<dependency>`/`<parent>` set its coordinates, so a `<exclusions><exclusion><groupId>` describes the exclusion and is not indexed |
-| Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact) | ATX headings → name-only search documents of the document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+| Markdown (and ADRs) | bounded line scanner (R7-3) | the `document` node (idempotent with the filesystem fact), and one `section` node per ATX heading | each heading → a `section` node the document `contains`, named by the heading text and qualified `<path>#<trail>` (the enclosing heading path, joined ` > `), located at the heading line, with its own name-only search document; links and reference definitions whose destination is a workspace path → `documents` to the file or directory, precision `heuristic`; fenced code is skipped; URLs and fragments are not paths |
+
+A heading is its own entity, not a label on the file. Each one gets a
+`section` node, so a query that matches thirty headings of one document answers
+with thirty hits at thirty ranges instead of folding them onto the document.
+Identity is the heading trail rather than a byte offset, so inserting a
+paragraph does not re-key the sections below it; a heading repeated verbatim
+under the same parent takes an ordinal suffix (`…#Guide > Usage~2`) so the
+repeat stays a second section rather than converging on the first.
 
 A Maven child both **inherits its identity from** `<parent>` (a missing
 `groupId` or `version` is taken from it and the field is listed in the node's
