@@ -473,11 +473,15 @@ func emitQuery[T any](cmd *cobra.Command, build model.BuildInfo, args []string, 
 }
 
 // queryWarnings is the bounded set of notes about work the answer does not
-// cover: the truncation the engine reported, and every capability it could not
-// read. Both reach the operator on both output paths -- an answer that is not
-// exhaustive and does not say so is the failure Section 13.3 names.
+// cover: the truncation the engine reported, every capability it could not
+// read, and every notice about a request the engine resolved differently from
+// what was asked (a page bound clamped to the wire ceiling, say). All three
+// reach the operator on both output paths -- an answer that is not exhaustive,
+// or not the answer that was asked for, and does not say so is the failure
+// Section 13.3 names.
 func queryWarnings(meta model.QueryMeta) []string {
 	var warnings []string
+	warnings = append(warnings, meta.Notices...)
 	if meta.Truncated {
 		reason := meta.TruncationReason
 		if reason == "" {

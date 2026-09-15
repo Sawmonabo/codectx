@@ -120,11 +120,12 @@ var _ Sessions = (*sqlite.Store)(nil)
 // *sqlite.Store, *snapshot.CAS and config.Config out of this package.
 type SourceOpener func(ctx context.Context, snap model.SnapshotID) (Source, error)
 
-// Options composes the service. Sessions, OpenSource, Signer and every Limits
-// bound are required: the composition root builds this eagerly when a workspace
-// opens, so a missing one is a wiring defect that must fail there rather than
-// per request. Leases and Logger are the two exceptions New tolerates -- see
-// New for what a nil one costs.
+// Options composes the service. Sessions, OpenSource, Signer, Leases and every
+// Limits bound are required: the composition root builds this eagerly when a
+// workspace opens, so a missing one is a wiring defect that must fail there
+// rather than per request. Logger is the one exception New tolerates; a nil
+// Leases is refused, because without it a session pins nothing and no status
+// page past the first is reachable.
 type Options struct {
 	Sessions   Sessions
 	OpenSource SourceOpener

@@ -62,9 +62,17 @@ type SpoolHeader struct {
 const (
 	spoolVersion = 1
 	spoolPrefix  = "spool-"
-	// maxSpoolRecordBytes bounds one record so a reader never allocates from
-	// an unbounded length prefix.
-	maxSpoolRecordBytes = 1 << 20
+	// maxSpoolChunkBytes bounds one FRAME so a reader never allocates from an
+	// unbounded length prefix. A record larger than this is split across
+	// continuation frames (see writeFrame) rather than refused: a search hit
+	// is JSON, so truncating it corrupts it, and refusing it would fail the
+	// whole query over one large record.
+	maxSpoolChunkBytes = 1 << 20
+	// frameContinues is the high bit of the 4-byte length prefix, set on every
+	// chunk of a record that has another chunk after it. The remaining 31 bits
+	// carry the chunk length, which maxSpoolChunkBytes bounds far below that.
+	frameContinues  = uint32(1) << 31
+	frameLengthMask = frameContinues - 1
 	// headerlessGrace is how long a spool file may exist without a readable
 	// header before a sweep treats it as a crashed Create. A live Create
 	// syncs its header before returning, so this covers only the window
@@ -183,6 +191,10 @@ type Spool struct {
 	file    *os.File
 	w       *bufio.Writer
 	written int64
+	// pending is what the record currently being written has put in the
+	// buffer, so a fault part way through a chunked record returns only the
+	// reservation the record did not use.
+	pending int64
 }
 
 // Create allocates a spool for cursor c. The header is written, flushed and
@@ -235,34 +247,80 @@ func (sp *Spool) discard() {
 // ID is the spool identifier a cursor carries.
 func (sp *Spool) ID() string { return sp.header.SpoolID }
 
-// Append writes one record. Exceeding the remaining budget is a typed limit,
-// never a silent truncation.
+// Append writes one record, split across continuation frames when it exceeds
+// one frame. No record size is refused: the only limit is the shared byte
+// budget, and exceeding that is a typed limit, never a silent truncation.
+//
+// A record is admitted against the shared budget whole or not at all: the whole
+// chain is reserved before any of it is written, so a record the budget cannot
+// hold leaves nothing behind. A reader that meets a half-written chain -- which
+// only a disk fault can produce -- reports corruption rather than serving a
+// truncated record.
 func (sp *Spool) Append(record []byte) error {
 	if sp.w == nil {
 		return internalErr("spool is not open for writing")
 	}
-	if len(record) > maxSpoolRecordBytes {
-		return &model.Error{Code: model.CodeResourceLimit, Message: "spool record exceeds the record size bound"}
-	}
 	return sp.writeFrame(record)
 }
 
+// writeFrame emits p as one or more frames. Every chunk but the last is
+// exactly maxSpoolChunkBytes and carries frameContinues, which is what lets a
+// reader bound each allocation and detect a chain that ends early.
+//
+// The WHOLE chain is reserved against the shared budget before any of it is
+// written, which is what makes the record atomic against the budget: a record
+// the budget cannot hold is refused before a byte of it exists, rather than
+// leaving a continued chunk with no successor behind. A write fault mid-chain
+// still leaves a partial chain, but its bytes are unreserved and the spool is
+// discarded by its caller, exactly as before chunking.
 func (sp *Spool) writeFrame(p []byte) error {
-	need := int64(4 + len(p))
+	chunks := int64(len(p))/maxSpoolChunkBytes + 1
+	if len(p) > 0 && len(p)%maxSpoolChunkBytes == 0 {
+		// An exact multiple needs no extra short chunk.
+		chunks--
+	}
+	need := int64(len(p)) + 4*chunks
 	if err := sp.owner.reserve(sp.header.SpoolID, need); err != nil {
 		return err
 	}
-	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(p)))
-	if _, err := sp.w.Write(length[:]); err != nil {
-		sp.owner.unreserve(sp.header.SpoolID, need)
-		return internalErr("spool write: " + err.Error())
-	}
-	if _, err := sp.w.Write(p); err != nil {
-		sp.owner.unreserve(sp.header.SpoolID, need)
-		return internalErr("spool write: " + err.Error())
+	// An empty record is one empty frame, so a reader sees it rather than
+	// nothing; the loop below would emit no frame at all for it.
+	for first := true; first || len(p) > 0; first = false {
+		chunk := p
+		more := false
+		if len(chunk) > maxSpoolChunkBytes {
+			chunk, more = chunk[:maxSpoolChunkBytes], true
+		}
+		if err := sp.writeChunk(chunk, more); err != nil {
+			sp.owner.unreserve(sp.header.SpoolID, need-sp.pending)
+			sp.pending = 0
+			return err
+		}
+		p = p[len(chunk):]
 	}
 	sp.written += need
+	sp.pending = 0
+	return nil
+}
+
+// writeChunk emits one frame against the reservation writeFrame already took.
+// pending tracks what this record has actually written, so a fault mid-chain
+// returns only the reservation for the bytes that never reached the buffer.
+func (sp *Spool) writeChunk(p []byte, more bool) error {
+	header := uint32(len(p))
+	if more {
+		header |= frameContinues
+	}
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], header)
+	if _, err := sp.w.Write(length[:]); err != nil {
+		return internalErr("spool write: " + err.Error())
+	}
+	sp.pending += 4
+	if _, err := sp.w.Write(p); err != nil {
+		return internalErr("spool write: " + err.Error())
+	}
+	sp.pending += int64(len(p))
 	return nil
 }
 
@@ -307,7 +365,7 @@ func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(reco
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)
-	h, err := readHeader(r)
+	h, err := readHeader(r, s.maxBytes)
 	if err != nil {
 		return err
 	}
@@ -323,7 +381,7 @@ func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(reco
 		return cursorInvalid("continuation state has expired")
 	}
 	for {
-		rec, err := readFrame(r)
+		rec, err := readFrame(r, s.maxBytes)
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -338,8 +396,8 @@ func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(reco
 
 // readHeader reads and validates the first frame. A file that ends before a
 // header is a typed corruption, never a bare io.EOF leaking to the caller.
-func readHeader(r *bufio.Reader) (SpoolHeader, error) {
-	head, err := readFrame(r)
+func readHeader(r *bufio.Reader, max int64) (SpoolHeader, error) {
+	head, err := readFrame(r, max)
 	if errors.Is(err, io.EOF) {
 		return SpoolHeader{}, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool has no header"}
 	}
@@ -353,24 +411,51 @@ func readHeader(r *bufio.Reader) (SpoolHeader, error) {
 	return h, nil
 }
 
-// readFrame returns io.EOF only at a clean frame boundary.
-func readFrame(r *bufio.Reader) ([]byte, error) {
-	var length [4]byte
-	if _, err := io.ReadFull(r, length[:]); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, io.EOF
+// readFrame reassembles one record from its chain of frames. It returns io.EOF
+// only at a clean RECORD boundary: a chain that ends mid-record is corruption,
+// not the end of the file, because treating it as the end would silently drop
+// the tail of an answer.
+//
+// max bounds the assembled record. Chunking removes the per-frame ceiling as a
+// record ceiling, so the assembler needs one of its own or a corrupt length
+// chain allocates without limit; the honest ceiling is the spool's whole byte
+// budget, since no record can exceed what the budget admitted when it was
+// written. Each individual allocation is still bounded by maxSpoolChunkBytes.
+func readFrame(r *bufio.Reader, max int64) ([]byte, error) {
+	var rec []byte
+	for {
+		var length [4]byte
+		if _, err := io.ReadFull(r, length[:]); err != nil {
+			if errors.Is(err, io.EOF) && rec == nil {
+				return nil, io.EOF
+			}
+			return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool is truncated"}
 		}
-		return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool is truncated"}
+		header := binary.BigEndian.Uint32(length[:])
+		more := header&frameContinues != 0
+		n := header & frameLengthMask
+		if n > maxSpoolChunkBytes {
+			return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool frame length exceeds its bound"}
+		}
+		// Only the LAST chunk of a record may be short. Requiring every
+		// continued chunk to be full is what makes the assembled length grow
+		// by a fixed step, so a corrupt chain cannot loop forever on empty
+		// continued frames.
+		if more && n != maxSpoolChunkBytes {
+			return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool record chunk is short but claims a continuation"}
+		}
+		if int64(len(rec))+int64(n) > max {
+			return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool record exceeds the spool byte budget"}
+		}
+		chunk := make([]byte, n)
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool is truncated"}
+		}
+		rec = append(rec, chunk...)
+		if !more {
+			return rec, nil
+		}
 	}
-	n := binary.BigEndian.Uint32(length[:])
-	if n > maxSpoolRecordBytes {
-		return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool record length exceeds its bound"}
-	}
-	rec := make([]byte, n)
-	if _, err := io.ReadFull(r, rec); err != nil {
-		return nil, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool is truncated"}
-	}
-	return rec, nil
 }
 
 // Release removes one spool once its cursor chain ends or its lease is
@@ -432,7 +517,7 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 			}
 			return 0, internalErr("spool sweep: " + err.Error())
 		}
-		h, ok := spoolHeader(path)
+		h, ok := s.spoolHeader(path)
 		dead := false
 		if !ok {
 			// No header yet: a Create in progress within the grace window is
@@ -479,13 +564,13 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 	return liveBytes, errors.Join(errs...)
 }
 
-func spoolHeader(path string) (SpoolHeader, bool) {
+func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
 	f, err := os.Open(path)
 	if err != nil {
 		return SpoolHeader{}, false
 	}
 	defer f.Close()
-	h, err := readHeader(bufio.NewReader(f))
+	h, err := readHeader(bufio.NewReader(f), s.maxBytes)
 	return h, err == nil
 }
 

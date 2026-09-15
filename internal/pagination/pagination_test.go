@@ -1,6 +1,7 @@
 package pagination_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -221,5 +222,69 @@ func TestSpoolsFollowTheirLease(t *testing.T) {
 	}
 	if live, err := spools.Sweep(ctx, now); err != nil || live != 0 {
 		t.Fatalf("Sweep after release = %d live bytes %v, want every spool of the released lease removed", live, err)
+	}
+}
+
+// TestSpoolRecordsChunkAcrossFrames protects the one rule that decides whether a
+// large answer is servable at all: no record size is refused.
+//
+// Failure mode: a single search hit above the frame bound (a long qualified name
+// with a wide source range, say) fails the WHOLE query with a resource limit
+// instead of being split across continuation frames -- the class-D refusal the
+// scale posture forbids. The record here is deliberately larger than one frame
+// and not a multiple of it, so both the full continued chunks and the short last
+// chunk are exercised, and it is read back byte for byte.
+func TestSpoolRecordsChunkAcrossFrames(t *testing.T) {
+	ctx := context.Background()
+	leases := &leaseTable{expiry: map[string]time.Time{}}
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	spools, err := pagination.NewSpools(t.TempDir(), 16<<20, leases)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	lease := model.Lease{ID: model.H("lease", "chunk"), GenerationID: 9, OwnerKind: model.LeaseQuery, ExpiresAt: now.Add(time.Hour)}
+	if err := leases.AcquireLease(ctx, lease, ""); err != nil {
+		t.Fatal(err)
+	}
+	cursor := pagination.Cursor{Endpoint: "search", GenerationID: 9, AnalysisKey: model.AnalysisKey(model.H("analysis", "c")),
+		QueryHash: model.H("query", "c"), LeaseID: lease.ID, ExpiresAt: lease.ExpiresAt}
+	sp, err := spools.Create(cursor)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cursor.SpoolID = sp.ID()
+	if err := leases.AcquireLease(ctx, lease, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	big := make([]byte, (1<<20)*2+7919)
+	for i := range big {
+		big[i] = byte(i % 251)
+	}
+	if err := sp.Append(big); err != nil {
+		t.Fatalf("a record larger than one frame was refused instead of chunked: %v", err)
+	}
+	if err := sp.Append([]byte("after")); err != nil {
+		t.Fatalf("Append after a chunked record: %v", err)
+	}
+	if err := sp.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var got [][]byte
+	if err := spools.Open(ctx, cursor, now, func(rec []byte) error {
+		got = append(got, append([]byte(nil), rec...))
+		return nil
+	}); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("a chunked record read back as %d records; the chain must reassemble into exactly one", len(got))
+	}
+	if !bytes.Equal(got[0], big) {
+		t.Fatalf("the reassembled record is %d bytes and not equal to the %d written", len(got[0]), len(big))
+	}
+	if string(got[1]) != "after" {
+		t.Fatalf("the record after a chunked one read back as %q", got[1])
 	}
 }

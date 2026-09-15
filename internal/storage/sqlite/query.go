@@ -202,7 +202,7 @@ type NodeFilter struct {
 // node: when several units publish the same node the precedence order picks
 // one. limit is capped at model.MaxPageItems.
 func (r *PinnedReader) Nodes(ctx context.Context, f NodeFilter, after model.NodeID, limit int) ([]StoredNode, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	predicates := 0
 	for _, p := range []string{f.Name, f.QualifiedName, f.QualifiedPrefix} {
 		if p != "" {
@@ -288,13 +288,6 @@ func prefixUpperBound(prefix string) string {
 	return prefix + "\xff"
 }
 
-func pageLimit(limit int) int {
-	if limit <= 0 || limit > model.MaxPageItems {
-		return model.MaxPageItems
-	}
-	return limit
-}
-
 // Containers pages the visible CONTAINER nodes of the pinned generation by
 // keyset on node_id, restricted to kinds. It is the repository map's
 // enumeration: Nodes above demands exactly one of name, qualified name or
@@ -334,7 +327,7 @@ func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
 	if afterRaw != nil {
 		where += " AND nf.node_id > " + b.mark(afterRaw)
 	}
-	limitMark := b.mark(pageLimit(limit))
+	limitMark := b.mark(pageLimit(ctx, limit))
 	query := `SELECT ` + nodeBatchOuterColumns + ` FROM (
 		SELECT ` + nodeBatchColumns + `, ` + nodePrecedence + ` FROM node_facts nf
 		JOIN units u ON u.id = nf.unit_id
@@ -365,7 +358,7 @@ func (r *PinnedReader) Containers(ctx context.Context, kinds []model.NodeKind,
 // relation_id. Reverse traversal uses the indexed target column.
 func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, direction model.Direction, kinds []model.RelationKind,
 	after model.RelationID, limit int) ([]model.Relation, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	nodeRaw, err := idBlob("node_id", string(node))
 	if err != nil {
 		return nil, err
@@ -434,7 +427,7 @@ func (r *PinnedReader) Relations(ctx context.Context, node model.NodeID, directi
 // Evidence pages the visible evidence for one node or one relation, keyset on
 // evidence id. Exactly one subject must be given.
 func (r *PinnedReader) Evidence(ctx context.Context, node model.NodeID, relation model.RelationID, after model.EvidenceID, limit int) ([]StoredEvidence, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if (node == "") == (relation == "") {
 		return nil, invalid("evidence lookup needs exactly one of node_id or relation_id")
 	}
@@ -524,7 +517,7 @@ func (r *PinnedReader) File(ctx context.Context, id model.FileID) (model.FileVer
 // Files pages the pinned manifest by keyset on file_id. This is the one
 // paginated source of truth for public file listings (Section 10.1).
 func (r *PinnedReader) Files(ctx context.Context, after model.FileID, limit int) ([]model.FileVersion, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -569,7 +562,7 @@ func (r *PinnedReader) ChangedFiles(ctx context.Context, after model.FileID,
 	if len(statuses) == 0 {
 		return nil, nil
 	}
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	afterRaw, err := optionalBlob("after", string(after))
 	if err != nil {
 		return nil, err
@@ -673,7 +666,7 @@ func (r *PinnedReader) SearchStats(ctx context.Context) (documents, tokens int64
 
 // SearchUnitRowIDs pages the visible search document rowids by keyset.
 func (r *PinnedReader) SearchUnitRowIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	var out []int64
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT su.rowid FROM search_units su`+r.visible("su")+` WHERE su.rowid > ?2 ORDER BY su.rowid LIMIT ?3`, r.gen, after, limit)
@@ -697,7 +690,7 @@ func (r *PinnedReader) SearchUnitRowIDs(ctx context.Context, after int64, limit 
 // keyset by rowid. The caller owns query encoding: pass an expression built by
 // the literal-text encoder, never raw user text (Section 14.2).
 func (r *PinnedReader) Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if strings.TrimSpace(expression) == "" || len(expression) > model.MaxQueryTextBytes*2 {
 		return nil, invalid("fts expression is empty or exceeds its bound")
 	}

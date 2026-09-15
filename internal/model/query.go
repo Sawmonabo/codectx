@@ -126,11 +126,11 @@ func (m QueryMeta) Validate() error {
 	// many bounds the caller asked to raise, which is small and bounded by the
 	// request shape, while an aggregate cap would be exactly the report-row
 	// drop this contract exists to prevent.
-	for _, n := range m.Notices {
-		if n == "" {
-			return invalid("meta.notices carries an empty notice")
+	for i, note := range m.Notices {
+		if note == "" {
+			return invalid("meta.notices[%d] is empty", i)
 		}
-		if err := boundField("meta.notices", n, MaxReasonBytes); err != nil {
+		if err := boundField("meta.notices", note, MaxReasonBytes); err != nil {
 			return err
 		}
 	}
