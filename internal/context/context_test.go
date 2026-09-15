@@ -1545,11 +1545,11 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 	}
 	sort.Slice(adj.relations, func(i, j int) bool { return adj.relations[i].ID < adj.relations[j].ID })
 	eng, err := graph.New(graph.Options{Adjacency: adj, Limits: graph.Limits{
-		MaxDepth:       f.Cfg.Context.MaxGraphDepth,
-		MaxVisited:     f.Cfg.Context.MaxVisitedNodes,
-		MaxEdges:       f.Cfg.Context.MaxGraphEdges,
+		MaxDepth:       f.Cfg.Context.MaxGraphDepth.Int(),
+		MaxVisited:     f.Cfg.Context.MaxVisitedNodes.Int(),
+		MaxEdges:       f.Cfg.Context.MaxGraphEdges.Int(),
 		MaxPageItems:   f.Cfg.Resources.MaxPageItems,
-		MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry,
+		MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry.Int(),
 		QueryTimeout:   f.Cfg.Resources.QueryTimeout.Std(),
 		CursorTTL:      f.Cfg.Storage.QueryCursorTTL.Std(),
 		FrontierBytes:  f.Cfg.Resources.QueryMemoryBytes,

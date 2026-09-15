@@ -93,8 +93,21 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeTrustRequired,
 		},
 		{
+			// Against the unlimited default this file would be NARROWING, which
+			// a project may do; the escalation is only against a ceiling the
+			// user actually set, so the case has to set one.
 			name:     "project raises a ceiling it may only lower",
+			user:     "[workspace]\nmax_files = 1000\n",
 			project:  "[workspace]\nmax_files = 500000\n",
+			wantCode: model.CodeTrustRequired,
+		},
+		{
+			// Unlimited is the TOP of the lattice: proposing it over a finite
+			// user ceiling removes the ceiling, which is an escalation even
+			// though the proposed number is the smaller one.
+			name:     "project proposes unlimited over a finite user ceiling",
+			user:     "[workspace]\nmax_files = 1000\n",
+			project:  "[workspace]\nmax_files = \"unlimited\"\n",
 			wantCode: model.CodeTrustRequired,
 		},
 		{
@@ -129,10 +142,19 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// Retention is by ref: 0 retained refs would prune the results the
-			// active ref is being served from.
-			name:     "retain_refs 0 is rejected",
-			user:     "[index]\nretain_refs = 0\n",
+			// Retention is by ref, and 0 is "keep every ref" now, matching
+			// index.max_retained_bytes. Only a negative value is refused: it is
+			// not a third meaning.
+			name:     "a negative bound is rejected",
+			user:     "[index]\nretain_refs = -1\n",
+			wantCode: model.CodeConfigInvalid,
+		},
+		{
+			// A reservation is not a bound. 0 records per batch is a broken
+			// reservation, not an unbounded one, so it stays refused -- this is
+			// what keeps the `< 0` rule for bounds from leaking into sizing.
+			name:     "a zero reservation is rejected",
+			user:     "[index]\nbatch_records = 0\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
@@ -203,7 +225,7 @@ func TestFingerprintsCoverEligibilityInputs(t *testing.T) {
 		quoteBool(cfg.Workspace.IncludeUntracked),
 		quoteBool(cfg.Workspace.IndexGenerated),
 		quoteBool(cfg.Workspace.IndexVendor),
-		quoteInt(cfg.Workspace.MaxFiles),
+		quoteInt(cfg.Workspace.MaxFiles.Value()),
 	)
 	if cfg.SourcePolicyHash() == bare {
 		t.Error("SourcePolicyHash covers only the configured toggles; the built-in exclusion lists are not an input")
