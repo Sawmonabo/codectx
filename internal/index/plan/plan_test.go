@@ -292,3 +292,51 @@ func errOrder(at int, got, want string) error {
 	return &model.Error{Code: model.CodeInternal,
 		Message: "the plan streamed unit " + itoa(at) + " as " + got + ", want " + want}
 }
+
+// A provider's units must reach the executor as ONE contiguous stretch, in
+// Selection.Active order. build opens a group when a provider's first unit
+// arrives and drains it on the provider change, so a sequence that splits one
+// provider across two stretches makes it open a second group for the same
+// provider -- and storage refuses a unit whose declared dependency is not yet
+// sealed. The streamed file units and the in-heap semantic units come from two
+// different places, so their interleave is where that can go wrong.
+func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.T) {
+	sorter, err := pagination.NewExternalSort(t.TempDir(), "plan-units-", 8,
+		encodeUnit, decodeUnit, compareUnit)
+	if err != nil {
+		t.Fatalf("NewExternalSort: %v", err)
+	}
+	t.Cleanup(func() { _ = sorter.Close() })
+	// Positions 0 and 2 are file-invalidated providers, 1 and 3 semantic. The
+	// records are added out of position order, so only the sort key can put
+	// them back.
+	for _, order := range []int{2, 0, 2, 0, 2} {
+		rec := unitAt(len(t.Name()) + order)
+		rec.Order, rec.Seq = order, int64(sorter.Len())
+		rec.ScopeKey = "file:p" + itoa(order) + "/n" + itoa(int(rec.Seq)) + ".go"
+		if err := sorter.Add(rec); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	run, err := sorter.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	t.Cleanup(func() { _ = run.Close() })
+	sem := func(id, scope string) Unit { return Unit{ProviderID: id, ScopeKey: scope} }
+	slots := [][]Unit{nil, {sem("scip", "pkg:a"), sem("scip", "pkg:b")}, nil, {sem("dep", "proj:r")}}
+
+	var got []string
+	if err := unitSequence(run, slots)(func(u Unit) error {
+		got = append(got, u.ScopeKey)
+		return nil
+	}); err != nil {
+		t.Fatalf("walking the sequence: %v", err)
+	}
+	want := []string{"file:p0/n1.go", "file:p0/n3.go", "pkg:a", "pkg:b",
+		"file:p2/n0.go", "file:p2/n2.go", "file:p2/n4.go", "proj:r"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("the plan streamed %v, want %v: each provider's units must be one contiguous "+
+			"stretch, in Selection.Active order", got, want)
+	}
+}

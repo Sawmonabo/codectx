@@ -744,10 +744,19 @@ func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) fun
 			return nil
 		}
 		if err := run.Each(func(rec fileUnitRecord) error {
-			if rec.Order < len(slots) {
-				if err := flush(rec.Order); err != nil {
-					return err
-				}
+			if rec.Order >= len(slots) {
+				// Unreachable: every record is keyed by providerOrder, which
+				// is a position in the very slice slots was sized from. It is
+				// a typed refusal and not a skipped flush because skipping one
+				// would move that provider's semantic units silently to the
+				// tail -- a reordering, which is the one thing this sequence
+				// exists to preserve.
+				return internalErr("the plan's unit run names provider position " +
+					strconv.Itoa(rec.Order) + ", past the " + strconv.Itoa(len(slots)) +
+					" active providers it was planned against")
+			}
+			if err := flush(rec.Order); err != nil {
+				return err
 			}
 			return yield(rec.unit())
 		}); err != nil {
