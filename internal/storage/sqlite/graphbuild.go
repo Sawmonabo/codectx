@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -204,6 +206,16 @@ type packedEdge struct {
 // transaction, before the active pointer flips, so a generation is published
 // only with its graph and a failed build fails the activation.
 func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
+	// The build is the one sequential pass activation adds, and ADR-0005 holds
+	// it to 5 % of the index wall clock. That bound is only checkable if the
+	// operator can see the pass on its own, so its start and end are logged
+	// rather than hidden inside the activation's total.
+	started := time.Now()
+	slog.Default().Info("packed adjacency build started", "generation", gen)
+	defer func() {
+		slog.Default().Info("packed adjacency build finished",
+			"generation", gen, "duration_ms", time.Since(started).Milliseconds())
+	}()
 	if err := dropGraphTemp(ctx, tx); err != nil {
 		return err
 	}
