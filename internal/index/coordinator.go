@@ -180,6 +180,10 @@ type Coordinator struct {
 	// watch is what this coordinator's own reconciliation loop knows about
 	// watch coverage; Status projects it.
 	watch watchState
+	// retention is what the last retention sweep did; Status projects it, so a
+	// sweep that never finishes is a reported degradation and not only a log
+	// line (retentionState in retention.go).
+	retention retentionState
 }
 
 // New validates the dependencies and builds the coordinator. It creates the
