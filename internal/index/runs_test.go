@@ -15,8 +15,14 @@ import (
 // with more provider runs than one response may carry published a list that
 // silently claimed to be the whole of it.
 //
-// Mutation proof: delete either `g.runsTotal++` in generation.go and
-// RunsOmitted reports 0 (or an under-count) against the expected 5.
+// It asserts what the generation PUBLISHES -- model.IndexResult.RunsOmitted as
+// generation.publish fills it, through the same runsPage the publish site uses
+// -- and never recomputes the subtraction itself: a test that recomputed it
+// would pass with the published field hard-wired to 0, which is exactly the
+// silence it exists to catch.
+//
+// Mutation proof: delete either `g.runsTotal++` in generation.go, or return a
+// constant 0 from runsPage, and RunsOmitted reports 0 against the expected 5.
 func TestRunsOmittedCountsEveryRunPastTheCeiling(t *testing.T) {
 	t.Parallel()
 	const extra = 5
@@ -28,7 +34,13 @@ func TestRunsOmittedCountsEveryRunPastTheCeiling(t *testing.T) {
 	if len(g.runs) != model.MaxRecordsPerResult {
 		t.Fatalf("the run page holds %d runs, want the %d-run ceiling", len(g.runs), model.MaxRecordsPerResult)
 	}
-	if got := g.runsTotal - int64(len(g.runs)); got != extra {
-		t.Fatalf("RunsOmitted would be %d, want %d: runs past the ceiling are dropped in silence", got, extra)
+	runs, omitted := g.runsPage()
+	res := model.IndexResult{Runs: runs, RunsOmitted: omitted}
+	if len(res.Runs) != model.MaxRecordsPerResult {
+		t.Fatalf("the published run list holds %d runs, want the %d-run page", len(res.Runs), model.MaxRecordsPerResult)
+	}
+	if res.RunsOmitted != extra {
+		t.Fatalf("the published RunsOmitted is %d, want %d: runs past the ceiling are dropped in silence",
+			res.RunsOmitted, extra)
 	}
 }

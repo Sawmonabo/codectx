@@ -212,11 +212,22 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	// readiness, and ruling Q9 makes the background tick run it even when no
 	// query ever asks.
 	g.c.late.enqueue(g, deferred)
+	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, RunsOmitted: g.runsTotal - int64(len(g.runs)),
+		Runs: runs, RunsOmitted: omitted,
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
+}
+
+// runsPage is the run list the result publishes and the number of runs that
+// did not fit it. Runs is a wire-sized page -- at most model.MaxRecordsPerResult
+// summaries -- and a generation with more runs than that must say so rather
+// than serve a short list as the whole of it. It is a method and not two
+// expressions at the publish site so the honesty of the count is reachable by
+// a test without rebuilding a generation's whole publish path.
+func (g *generation) runsPage() ([]model.ProviderResult, int64) {
+	return g.runs, g.runsTotal - int64(len(g.runs))
 }
 
 // attachReused makes every unit the plan proved identical a member of this

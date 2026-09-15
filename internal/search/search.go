@@ -140,15 +140,29 @@ func (s *Service) Close() error { return nil }
 // which Section 20.1 fixes as the configured maximum, never "unlimited"; a
 // request above it is clamped to it, so lowering the key really does lower the
 // pages this service serves rather than only the model ceiling.
-func (s *Service) pageLimit(limit int) int {
+//
+// It also answers the NOTICE that clamp owes the caller. model.PageRequest
+// refuses a limit above model.MaxPageItems outright, so the storage layer's
+// own clamp collector can never fire on this path -- every read below asks for
+// exactly the wire ceiling. The reachable silent clamp is this one: an
+// operator who lowers resources.max_page_items has every request above it
+// served short, and a caller that cannot tell a clamped page from the end of
+// an answer is the silence the scale posture forbids. The answer carries the
+// notice and, as always, a cursor to read the rest.
+func (s *Service) pageLimit(limit int) (int, string) {
 	maximum := s.maxPage
 	if maximum <= 0 || maximum > model.MaxPageItems {
 		maximum = model.MaxPageItems
 	}
-	if limit <= 0 || limit > maximum {
-		return maximum
+	if limit <= 0 {
+		return maximum, ""
 	}
-	return limit
+	if limit > maximum {
+		return maximum, "a page bound was clamped: requested " + strconv.Itoa(limit) +
+			", effective " + strconv.Itoa(maximum) +
+			" (the configured resources.max_page_items; continue with the cursor to read the rest)"
+	}
+	return limit, ""
 }
 
 // Search answers the lexical + exact discovery endpoint, paging through a
@@ -192,7 +206,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	defer reader.Close()
 	binding := reader.Binding()
 
-	limit := s.pageLimit(req.Page.Limit)
+	limit, clampNotice := s.pageLimit(req.Page.Limit)
 	var (
 		hits      []model.SearchHit
 		truncated bool
@@ -237,6 +251,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 
 	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason,
 		Notices: clamps.Notices()}
+	if clampNotice != "" {
+		meta.Notices = append(meta.Notices, clampNotice)
+	}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
@@ -334,11 +351,13 @@ type hitFacts struct {
 // rank runs every tier for one request, folds the candidates and returns the
 // whole ranked answer with its source ranges hydrated.
 //
-// The full answer is hydrated, not just the first page, because every hit that
-// is not served now is spooled and will be served by a continuation that has
-// no byte intervals left to hydrate from -- a spool record is a SearchHit.
-// Hydration is therefore paid once per distinct result (at most maxRankedHits)
-// rather than once per page.
+// The whole answer is hydrated, not just the first page, because every hit
+// that is not served now is spooled and will be served by a continuation that
+// has no byte intervals left to hydrate from -- a spool record is a SearchHit.
+// Hydration is therefore paid once per distinct result, but never for the
+// whole answer at once: it is paid ONE CHUNK AT A TIME, in pageFrom for the
+// page that is served and in tailOf for the remainder as it streams into the
+// continuation spool.
 func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest, filter hitFilter) (*pagination.SortedRun[scored], bool, string, error) {
 	c, err := newCollector(s.spools.SortDir(), s.runBytes)
 	if err != nil {
@@ -729,7 +748,8 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 		}
 	}
 
-	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, s.pageLimit(req.Page.Limit))
+	limit, clampNotice := s.pageLimit(req.Page.Limit)
+	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, limit)
 	if err != nil {
 		return empty, err
 	}
@@ -737,6 +757,9 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 		return empty, err
 	}
 	meta := model.QueryMeta{Binding: binding}
+	if clampNotice != "" {
+		meta.Notices = append(meta.Notices, clampNotice)
+	}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
