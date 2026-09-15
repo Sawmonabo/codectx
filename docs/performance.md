@@ -94,6 +94,28 @@ operation `n` times. Latency rows report **p95 over the stated sample count**;
 memory rows report the sampled peak of the **whole process tree** (parent plus
 parser workers), read by the Task 20 host sampler.
 
+### What one parser worker costs
+
+`index.max_parser_workers` is a CONCURRENCY ceiling, not a resident cost: the
+pool starts no process until a unit demands one and reaps an idle worker after
+`tree_sitter.worker_idle_ttl`, so a process that parses nothing holds no worker
+(`TestPoolLazyAndReaped`). What a worker that IS alive costs was measured
+directly on the measuring host, from `/proc/<pid>/smaps_rollup`:
+
+| Worker state | RSS | PSS |
+|---|---|---|
+| started, hello sent, zero parses | 18.2 MiB | 9.4 MiB |
+| after parsing the small-real corpus | 16.2 MiB (mean over 8) | — |
+
+A parse adds nothing lasting — the worker closes each tree as the file is
+finished — so the figure does not grow with the largest file, and the cost is
+the binary's mapped pages plus the Go runtime rather than held syntax. The
+resident bound is therefore **live workers x ~18 MiB RSS**, where live workers
+is the concurrent parse demand, never more than the ceiling. RSS is what the
+tree-peak rows sum, and it double counts: every worker is a re-execution of the
+same binary, so the MARGINAL cost of one more worker is the ~9.4 MiB PSS figure
+and the summed-RSS bound overstates a large ceiling by roughly a factor of two.
+
 `internal/bench` contains no production code. It holds `doc.go`,
 `plateau_test.go` (whose `TestMain` makes the test binary the parser worker, so
 `app.OpenWorkspace` can spawn parsers through `os.Executable`),

@@ -333,3 +333,81 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 	}
 	return strconv.Itoa(i+1) + "-" + strconv.Itoa(i+len(token))
 }
+
+// TestPoolLazyAndReaped pins the two lifetime properties an idle server's
+// footprint rests on, and that nothing else asserts: the pool starts NO
+// worker process until a unit demands one, and an idle worker is reaped by
+// its TTL rather than held until Close.
+//
+// They are what makes index.max_parser_workers a concurrency CEILING and not
+// a resident cost: a worker process costs ~18 MiB of resident set on its own
+// (PERF-4 measured it; the binary's mapped pages dominate and a parse adds
+// nothing lasting, the tree being closed per file), so a pool that spawned
+// its ceiling eagerly, or never reaped, would charge ceiling x 18 MiB to
+// every process that holds a provider -- an MCP server serving queries most
+// of all. TestResourceBudgets/idle-mcp-rss is the end-to-end figure; this is
+// the invariant underneath it.
+//
+// Failure mode: pre-warming the pool in New, or dropping expire's stop, both
+// leave every product test passing and the idle footprint multiplied.
+func TestPoolLazyAndReaped(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exe, err = filepath.EvalSymlinks(exe); err != nil {
+		t.Fatal(err)
+	}
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 4, MemoryBudgetBytes: 4 << 30, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const idleTTL = 500 * time.Millisecond
+	p, err := treesitter.New(treesitter.Options{
+		MaxWorkers: 2, WorkerIdleTTL: idleTTL, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
+		Runner: runner, WorkDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	if s := p.Stats(); s.Processes != 0 || s.WorkersStarted != 0 {
+		t.Fatalf("a provider that has been asked for nothing holds %+v; it must start no worker until a unit demands one", s)
+	}
+
+	const file = "sample.go"
+	src, err := os.ReadFile(filepath.Join("testdata", file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{file: string(src)}
+	h := providertest.New(t, files)
+	u := h.Plan(t, p, treesitter.ScopePrefix+file, []string{file})
+	cap := &capture{UnitOutput: h.Begin(t, u, []string{file})}
+	if _, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool); err != nil {
+		t.Fatalf("RunUnit: %v", err)
+	}
+	if s := p.Stats(); s.WorkersStarted == 0 || s.Processes > 2 {
+		t.Fatalf("after one unit %+v; want a worker started on demand and no more than the ceiling alive", s)
+	}
+
+	// The reaper is a timer, so the wait is a poll with a generous ceiling
+	// rather than a single sleep of the TTL: a loaded host may fire it late,
+	// and a test that failed on that would be flaky rather than strict.
+	deadline := time.Now().Add(30 * idleTTL)
+	for {
+		s := p.Stats()
+		if s.Processes == 0 {
+			if s.WorkersExited != s.WorkersStarted {
+				t.Fatalf("no worker is live but %d started and %d exited", s.WorkersStarted, s.WorkersExited)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after %s idle %+v; the idle TTL must return the pool to the parent-only footprint without Close", 30*idleTTL, s)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
