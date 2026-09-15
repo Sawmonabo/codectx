@@ -291,8 +291,8 @@ func (e *emitter) resolveTarget(ctx context.Context, a argument, depth int) (str
 // TYPE_DECL does not, so it is stripped before the lookup.
 //
 // The lookup is a single primary-key read of the members map project()
-// materialized. It used to be a three-table join executed once per
-// field-access write site, over an unindexed m.name.
+// materialized, rather than a three-table join over an unindexed m.name run
+// once per field-access write site.
 func (e *emitter) memberOf(ctx context.Context, typeFullName, field string) (string, error) {
 	t := strings.Trim(strings.TrimPrefix(typeFullName, "&mut "), "*& ")
 	if t == "" || t == "ANY" || field == "" {

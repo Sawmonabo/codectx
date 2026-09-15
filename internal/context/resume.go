@@ -179,9 +179,9 @@ func checkpointRun[T any](dir, name string, runBytes int64, run *pagination.Sort
 // so the detached runs hold every record added.
 //
 // OWNERSHIP MOVES to the state directory, which is what the interrupted sort
-// wants: its own deferred Close no longer removes these files (Detach clears
-// its run list), and the lease that owns the directory is what reclaims them if
-// the continuation is never resumed.
+// wants: its own deferred Close does not remove these files (Detach clears its
+// run list), and the lease that owns the directory is what reclaims them if the
+// continuation is never resumed.
 //
 // The detached files are written wherever the sort was rooted, which is the
 // compile's sort area, so they are MOVED into dir here. Both are inside the

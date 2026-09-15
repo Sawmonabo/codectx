@@ -266,11 +266,11 @@ func overlaySymbolNodes(symbols []lsp.Symbol) []model.Node {
 			Name: sym.Name,
 			// Detail is the server's own description of the symbol, which is
 			// its signature where the server provides one. It is passed
-			// through, never synthesized. The drop this used to describe is
-			// unreachable now: internal/provider/lsp bounds every Symbol
-			// field in its one constructor and records the cut in
-			// truncated_fields, so a detail arriving here is already within
-			// the bound and overlayBounded passes it through unchanged. It
+			// through, never synthesized. No drop is reachable here:
+			// internal/provider/lsp bounds every Symbol field in its one
+			// constructor and records the cut in truncated_fields, so a
+			// detail arriving here is already within the bound and
+			// overlayBounded passes it through unchanged. It
 			// stays as the defensive floor for a detail no constructor
 			// bounded, and would drop rather than truncate there, because a
 			// truncated signature with nothing recording the cut is a

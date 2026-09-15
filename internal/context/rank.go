@@ -59,9 +59,9 @@ func morePathsReason(more int64) []string {
 
 // reasonPathLimit is the configured cap on stored explanation paths per entry.
 //
-// It no longer clamps. model.MaxReasonPathsPerEntry is a report threshold, not
-// a wire ceiling, so a configured value ABOVE it is honoured rather than
-// silently replaced by the smaller one -- the class-G shape this wave removes.
+// It does NOT clamp. model.MaxReasonPathsPerEntry is a report threshold, not a
+// wire ceiling, so a configured value ABOVE it is honoured rather than silently
+// replaced by the smaller one.
 // The returned value keeps the config.Limit convention: zero is unlimited, and
 // scoreRoutes stores every admissible route for it. What an entry still cannot
 // enumerate is disclosed by MorePaths, so a bounded explanation never reads as

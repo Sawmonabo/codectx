@@ -124,7 +124,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// Precondition 3 -- read completeness for this actor, this session, these
 	// pinned hashes. context.strict_read_gate (user-level, default true) is the
 	// operator's switch for exactly this precondition: with it off the
-	// shortfall no longer shuts the gate, but it is recorded rather than
+	// shortfall does not shut the gate, but it is recorded rather than
 	// forgiven, so the reason below names the configuration and the strict
 	// claim at the end of this function is withheld.
 	if !e.ReadComplete {

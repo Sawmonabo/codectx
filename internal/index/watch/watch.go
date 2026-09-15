@@ -136,8 +136,8 @@ func New(o Options) (*Watcher, error) {
 	// tree with none of the capture's exclusions applied is what this refuses.
 	// DataDir is the field the check reads: Config.TraversalPolicy always fills
 	// it and snapshot.Builder.validate already requires it to be absolute, so
-	// it is present in every real policy. MaxFiles no longer serves: with
-	// unlimited the default, a real policy's MaxFiles is zero.
+	// it is present in every real policy. MaxFiles cannot serve as the check:
+	// with unlimited the default, a real policy's MaxFiles is zero.
 	if o.Policy.DataDir == "" {
 		return nil, invalid("the watcher needs the capture's traversal policy, not a zero value")
 	}
@@ -384,9 +384,9 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 				}
 				if overflow {
 					// The collapse frees the accumulated list on purpose: the
-					// batch no longer claims anything about individual paths,
-					// so retaining them would be memory held for a claim that
-					// is no longer made.
+					// collapsed batch claims nothing about individual paths,
+					// so retaining them would be memory held for a claim
+					// nobody makes.
 					pending = make(map[string]struct{})
 					pendingBytes = 0
 					w.setPending(0)
