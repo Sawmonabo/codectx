@@ -75,7 +75,13 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		batch = adjacencyBatch
 	}
 
-	admittedNode := make(map[model.NodeID]bool, len(seeds))
+	// The cumulative admitted-node set. Its heap footprint is the bounded
+	// front of visitedSet, never the walk: the authoritative set is the
+	// continuation spool the resume streams from.
+	admitted := newVisitedSet(nil)
+	if o.Resume != nil {
+		admitted.stream = o.Resume.Visited
+	}
 	// A relation is admitted at most once for the whole walk: a cycle, an
 	// overlapping batch or a DirectionBoth edge whose two endpoints are both on
 	// the frontier must not be counted or emitted twice.
@@ -93,10 +99,10 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		// Seeds enter at depth 0 in request order, de-duplicated, then sorted by
 		// NodeID: the frozen (depth asc, NodeID asc) order starts here.
 		for _, s := range seeds {
-			if s == "" || admittedNode[s] {
+			if s == "" || admitted.has(s) {
 				continue
 			}
-			admittedNode[s] = true
+			admitted.add(s)
 			frontier = append(frontier, frontierState{Node: s})
 		}
 		o.Budget.visited += int64(len(frontier))
@@ -104,10 +110,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	} else {
 		// A resume never re-enters the seeds: they are already in the visited
 		// set the issuing page spooled, and re-admitting them would spend the
-		// cumulative visited budget a second time for the same nodes.
-		for n := range o.Resume.Visited {
-			admittedNode[n] = true
-		}
+		// cumulative visited budget a second time for the same nodes. That set
+		// is NOT materialized here -- it is streamed from the spool one level
+		// at a time; only the resumed frontier's own nodes enter the front.
 		depth = o.Resume.Cursor.Depth
 		skipOwner, skipKey = o.Resume.Cursor.LastOwner, o.Resume.Cursor.LastKey
 		for _, fs := range o.Resume.Frontier {
@@ -126,6 +131,7 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			if fs.Via != "" {
 				admittedRel[fs.Via] = true
 			}
+			admitted.carry(fs.Node)
 		}
 		sort.Slice(carry, func(i, j int) bool { return carry[i].Node < carry[j].Node })
 	}
@@ -157,6 +163,17 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		// it did read are facts -- but the walk stops after it rather than
 		// expanding a level it knows is incomplete.
 
+		// One sequential pass over the spooled cumulative set answers the
+		// whole level's membership questions at once; see visited.go for why
+		// a per-node probe over a forward-only spool is not affordable.
+		candidates := make([]model.NodeID, 0, len(rows))
+		for _, row := range rows {
+			candidates = append(candidates, row.neighbor)
+		}
+		if err := admitted.warm(ctx, candidates); err != nil {
+			return walkState{}, err
+		}
+
 		next := carry
 		carry = nil
 		for _, row := range rows {
@@ -169,17 +186,17 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 					stopped := make([]frontierState, 0, len(frontier)+len(next))
 					stopped = append(stopped, frontier...)
 					stopped = append(stopped, next...)
-					return walkState{Depth: depth, Frontier: stopped, Admitted: admittedNode}, nil
+					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
 				}
 				return walkState{}, err
 			}
 			admittedRel[row.rel.ID] = true
 			o.Budget.edges++
 			o.Budget.pageEdges++
-			if admittedNode[row.neighbor] {
+			if admitted.has(row.neighbor) {
 				continue
 			}
-			admittedNode[row.neighbor] = true
+			admitted.add(row.neighbor)
 			o.Budget.visited++
 			o.Budget.pageVisited++
 			next = append(next, frontierState{
@@ -199,7 +216,7 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			stopped := make([]frontierState, 0, len(frontier)+len(next))
 			stopped = append(stopped, frontier...)
 			stopped = append(stopped, next...)
-			return walkState{Depth: depth, Frontier: stopped, Admitted: admittedNode}, nil
+			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
@@ -210,9 +227,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	// caller must be told about. Reporting it is the whole of row 14 -- see
 	// DepthLimited for why no continuation is minted for it.
 	if len(frontier) > 0 {
-		return walkState{Depth: depth, Frontier: frontier, Admitted: admittedNode, DepthLimited: true}, nil
+		return walkState{Depth: depth, Frontier: frontier, Admitted: admitted, DepthLimited: true}, nil
 	}
-	return walkState{Depth: depth, Admitted: admittedNode}, nil
+	return walkState{Depth: depth, Admitted: admitted}, nil
 }
 
 // walkState is where a walk stopped. A page that stopped on its item limit
@@ -225,8 +242,9 @@ type walkState struct {
 	// built. Each record carries its own depth, so a resumed walk measures
 	// MaxDepth from the original seeds rather than from its own frontier.
 	Frontier []frontierState
-	// Admitted is every node the walk has admitted, cumulative across pages.
-	Admitted map[model.NodeID]bool
+	// Admitted is the cumulative admitted-node set. Only its bounded front is
+	// in heap; the remainder is the continuation spool (visited.go).
+	Admitted *visitedSet
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
 	//
@@ -530,6 +548,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		if err != nil {
 			return model.GraphResult{}, err
 		}
+		// The consumed continuation's spool and lease outlive the walk: the
+		// membership probes and the spill that copies the cumulative set
+		// forward both read from that spool. Deferring the release here -- not
+		// at the end of the happy path -- is what keeps an error return from
+		// leaking a spool and a lease for the whole cursor TTL.
+		defer resume.Release()
 		// The resumed budget carries the earlier pages' cumulative spend by
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
@@ -615,11 +639,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// so a continuation minted for it could only resume a walk already past it.
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
-		visited := make([]model.NodeID, 0, len(state.Admitted))
-		for id := range state.Admitted {
-			visited = append(visited, id)
+		// The cumulative set is NOT materialized into a slice here: only the
+		// nodes THIS page admitted are, and the rest is copied spool to spool.
+		var carried visitedStream
+		if resume != nil {
+			carried = resume.Visited
 		}
-		sort.Slice(visited, func(i, j int) bool { return visited[i] < visited[j] })
 		nextCursor, err = e.nextTraversalCursor(ctx, b, continuation{
 			Endpoint:  endpoint,
 			QueryHash: queryHash,
@@ -627,7 +652,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			LastOwner: lastOwner,
 			LastKey:   lastKey,
 			Frontier:  state.Frontier,
-			Visited:   visited,
+			Visited:   state.Admitted.newlyAdmitted(),
+			Carried:   carried,
 		})
 		if err != nil {
 			return model.GraphResult{}, err
