@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1433,7 +1435,12 @@ func newContextExportCommand(build model.BuildInfo) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "export <session-id>",
 		Short: "Write the whole sealed capsule to a file",
-		Long: "Writes the session's capsule, whole, to the file named by --output.\n\n" +
+		Long: "Writes the session's capsule, whole, to the file named by --output: its identity and\n" +
+			"per-list record counts under \"capsule\", and every record of all eight lists -- the six\n" +
+			"\"codectx context capsule\" pages plus scope and scope_review_ids -- under \"records\".\n\n" +
+			"The records are streamed a page at a time, so a capsule is never refused or truncated for\n" +
+			"the size of the session it records, and the file is removed rather than left short if any\n" +
+			"list streams fewer records than the seal counted.\n\n" +
 			"It writes only that file and it refuses to overwrite an existing one: a capsule is the " +
 			"durable record a later session replays, and silently replacing a file -- a source file " +
 			"above all -- would destroy work on the strength of a mistyped path. Choose another path, " +
@@ -1471,16 +1478,23 @@ func newContextExportCommand(build model.BuildInfo) *cobra.Command {
 			if _, err := os.Lstat(output); err == nil {
 				return errOutputExists()
 			}
+			// The capsule and the file are produced inside ONE service call:
+			// the records are rows read a page at a time, so the writer must
+			// hold an open workspace while it streams rather than be handed a
+			// whole capsule to encode. Nothing is buffered between them.
 			var capsule model.Capsule
+			var written int64
 			if err := runService(cmd, openForReport(), func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 				var err error
-				capsule, err = svc.Export(ctx, req)
+				if capsule, err = svc.Export(ctx, req); err != nil {
+					return err
+				}
+				written, err = writeCapsuleFile(output, capsule,
+					func(list model.CapsuleList, after string) ([]model.CapsuleRow, string, error) {
+						return svc.CapsuleRows(ctx, req, list, after, 0)
+					})
 				return err
 			}); err != nil {
-				return err
-			}
-			written, err := writeCapsuleFile(output, capsule)
-			if err != nil {
 				return err
 			}
 			return emitContext(cmd, build, args, contextExport{Output: output, Bytes: written, Capsule: capsuleSummary(capsule)},
@@ -1525,13 +1539,32 @@ func capsuleSummary(c model.Capsule) capsuleIdentity {
 	}
 }
 
-// writeCapsuleFile writes the capsule and reports how many bytes reached disk.
-// O_EXCL is the refusal: it is the only check that cannot lose a race with
-// another writer between a stat and a create, which matters precisely because
-// the file this command must never clobber may be a source file. A failed write
-// removes the partial file rather than leaving something that looks like a
-// capsule but is half of one.
-func writeCapsuleFile(path string, capsule model.Capsule) (int64, error) {
+// capsuleRowPager reads one keyset page of one sealed capsule list and returns
+// the cursor that continues it, empty when the list is exhausted. It is the
+// facade's CapsuleRows narrowed to what the writer below needs, so the writer
+// is exercised against a fixture without a workspace.
+type capsuleRowPager func(list model.CapsuleList, after string) ([]model.CapsuleRow, string, error)
+
+// writeCapsuleFile writes the whole capsule -- its identity, its per-list counts
+// and every record of every list -- and reports how many bytes reached disk.
+//
+// The records are STREAMED. A sealed capsule keeps counts in its blob and its
+// records as durable rows, so the file is assembled page by page straight onto
+// the encoder: the records resident in this process are one page's worth
+// whatever the session recorded, and a capsule is never refused for the size of
+// the repository it describes.
+//
+// Every list is counted as it is written and checked against the count the seal
+// pinned. A list that streams short is a bodyless or truncated export, which is
+// worse than no file at all -- the artifact a later session replays would be
+// silently incomplete -- so it removes the partial file and fails.
+//
+// O_EXCL is the refusal of an existing path: it is the only check that cannot
+// lose a race with another writer between a stat and a create, which matters
+// precisely because the file this command must never clobber may be a source
+// file. A failed write removes the partial file rather than leaving something
+// that looks like a capsule but is half of one.
+func writeCapsuleFile(path string, capsule model.Capsule, pager capsuleRowPager) (int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if os.IsExist(err) {
@@ -1541,20 +1574,117 @@ func writeCapsuleFile(path string, capsule model.Capsule) (int64, error) {
 			Message: "failed to create the capsule file: " + clip(err.Error(), model.MaxDetailBytes)}
 	}
 	counter := &countingWriter{w: f}
-	encErr := json.NewEncoder(counter).Encode(capsule)
-	closeErr := f.Close()
-	if encErr == nil && closeErr == nil {
-		return counter.n, nil
+	buf := bufio.NewWriter(counter)
+	writeErr := streamCapsule(buf, capsule, pager)
+	if writeErr == nil {
+		writeErr = buf.Flush()
 	}
-	reason := closeErr
-	if encErr != nil {
-		reason = encErr
+	closeErr := f.Close()
+	if writeErr == nil && closeErr == nil {
+		return counter.n, nil
 	}
 	// The path was created by this command, so removing it destroys nothing the
 	// operator had.
 	_ = os.Remove(path)
+	if writeErr != nil {
+		// A refusal this function raised itself (a list that streamed short)
+		// already carries its own code and remediation and is reported as it
+		// stands; only an I/O failure is wrapped.
+		var typed *model.Error
+		if errors.As(writeErr, &typed) {
+			return 0, typed
+		}
+		closeErr = writeErr
+	}
 	return 0, &model.Error{Code: model.CodeInternal,
-		Message: "failed to write the capsule file: " + clip(reason.Error(), model.MaxDetailBytes)}
+		Message: "failed to write the capsule file: " + clip(closeErr.Error(), model.MaxDetailBytes)}
+}
+
+// streamCapsule encodes the capsule document: the sealed record under
+// "capsule", then every list under "records", each streamed page by page in
+// model.CapsuleListOrder. The eight lists are written whole -- the six the
+// `capsule` command pages plus scope and scope_review_ids, which have no view
+// spelling and which only this file carries.
+func streamCapsule(w *bufio.Writer, capsule model.Capsule, pager capsuleRowPager) error {
+	identity, err := json.Marshal(capsule)
+	if err != nil {
+		return &model.Error{Code: model.CodeInternal,
+			Message: "the capsule could not be serialized: " + clip(err.Error(), model.MaxDetailBytes)}
+	}
+	if _, err := w.WriteString(`{"capsule":`); err != nil {
+		return err
+	}
+	if _, err := w.Write(identity); err != nil {
+		return err
+	}
+	if _, err := w.WriteString(`,"records":{`); err != nil {
+		return err
+	}
+	for i, list := range model.CapsuleListOrder {
+		separator := ","
+		if i == 0 {
+			separator = ""
+		}
+		if _, err := fmt.Fprintf(w, `%s%q:[`, separator, string(list)); err != nil {
+			return err
+		}
+		written, err := streamCapsuleList(w, list, pager)
+		if err != nil {
+			return err
+		}
+		if _, err := w.WriteString("]"); err != nil {
+			return err
+		}
+		if sealed := capsule.Counts.Of(list); written != sealed {
+			return (&model.Error{Code: model.CodeInternal,
+				Message: "the exported capsule's " + string(list) + " list is incomplete",
+				Details: map[string]string{
+					"list":            string(list),
+					"records_sealed":  strconv.FormatInt(sealed, 10),
+					"records_written": strconv.FormatInt(written, 10),
+				}}).
+				WithRemediation("re-run the export; a capsule file is never written with fewer records than the seal counted")
+		}
+	}
+	if _, err := w.WriteString("}}\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// streamCapsuleList writes one list's records and reports how many it wrote.
+//
+// The walk ends on an empty continuation, and a cursor that does not advance is
+// refused rather than followed: a wrong continuation rule would otherwise turn
+// a whole-capsule export into a file that grows until the disk is full.
+func streamCapsuleList(w *bufio.Writer, list model.CapsuleList, pager capsuleRowPager) (int64, error) {
+	var written int64
+	var cursor string
+	for {
+		rows, next, err := pager(list, cursor)
+		if err != nil {
+			return written, err
+		}
+		for _, row := range rows {
+			if written > 0 {
+				if _, err := w.WriteString(","); err != nil {
+					return written, err
+				}
+			}
+			if _, err := w.Write(row.JSON); err != nil {
+				return written, err
+			}
+			written++
+		}
+		if next == "" {
+			return written, nil
+		}
+		if next == cursor {
+			return written, &model.Error{Code: model.CodeInternal,
+				Message: "the capsule's " + string(list) + " list returned a continuation that does not advance"}
+		}
+		cursor = next
+	}
 }
 
 // screenCapsuleOutput refuses a --output path that lands inside the repository

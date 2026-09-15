@@ -87,4 +87,4 @@ traversal with a cursor for every stop and the visited set off the heap (§2.2);
 the planner with byte-identical order (§2.3); a lossless ranked set with a spooled tail (§2.4);
 field bounds that truncate and flag (§2.5); progress-based stall detection and waiting admission
 (§2.6); reports that drop nothing (§2.7); the storage redesign, accepted and scheduled (§2.8); and
-capsule pagination, accepted and scheduled, which is the one known remaining default cap (§2.9).
+capsule pagination, accepted and since landed, which was the one known remaining default cap (§2.9).
