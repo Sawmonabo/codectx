@@ -652,7 +652,7 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 		pending = pending[:0]
 		return nil
 	}
-	outcome, err := s.lexical.search(ctx, reader, reader.Binding().AnalysisKey, req.Query, func(h lexicalHit) error {
+	outcome, err := s.lexical.search(ctx, readerPostings{reader}, reader.Binding().AnalysisKey, req.Query, func(h lexicalHit) error {
 		pending = append(pending, h)
 		if len(pending) < model.MaxPageItems {
 			return nil

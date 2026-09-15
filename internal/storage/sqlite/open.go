@@ -101,6 +101,7 @@ type Store struct {
 	opts      Options
 	writer    *sql.DB
 	readers   *sql.DB
+	postings  *sql.DB
 	tokenizer *sql.DB
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
@@ -176,10 +177,22 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		s.writer.Close()
 		return nil, err
 	}
+	// Posting streams hold one read transaction open for the whole candidate
+	// walk of a query. They get their own pool so that holding one can never
+	// starve the short reads (Match, SearchDocuments) the same query issues
+	// while the stream is open, which on the shared reader pool would be a
+	// deadlock as soon as two queries ran at once.
+	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)
+	if err != nil {
+		s.readers.Close()
+		s.writer.Close()
+		return nil, err
+	}
 	// The tokenizer database holds no data; it exists so query text can be
 	// split with the exact unicode61 tokenizer search_fts uses (Section 12.4).
 	s.tokenizer, err = openPool("", nil, "deferred", 1)
 	if err != nil {
+		s.postings.Close()
 		s.readers.Close()
 		s.writer.Close()
 		return nil, err
@@ -296,7 +309,7 @@ func (s *Store) checkEngine(ctx context.Context) error {
 // Close releases every pool. It is safe to call once.
 func (s *Store) Close() error {
 	var first error
-	for _, db := range []*sql.DB{s.tokenizer, s.readers, s.writer} {
+	for _, db := range []*sql.DB{s.tokenizer, s.postings, s.readers, s.writer} {
 		if db == nil {
 			continue
 		}
