@@ -17,20 +17,17 @@ import (
 // is among the last retain_refs worked on, and every unit a retained
 // generation selects is retained with it.
 
-// maxRetainRefs bounds the configured ref window. Retention walks one query
-// per retained ref, so the window is a finite loop bound, not an open number.
-const maxRetainRefs = 1024
-
 // maxSweptGenerations bounds one retention pass. A pass runs at activation, so
 // a backlog drains over calls rather than turning one pass into an unbounded
 // deletion loop.
 const maxSweptGenerations = model.MaxRecordsPerResult
 
-// RetentionPolicy is the user-set retention window of Section 20.1.
-// MaxRetainedBytes is the second setting where 0 is meaningful: the retained
-// store has no default size limit, so 0 leaves retention governed by
-// RetainRefs alone. A nonzero value evicts least-recently-used refs first and
-// never the active generation's ref.
+// RetentionPolicy is the user-set retention window of Section 20.1. Both
+// settings spell 0 as "unlimited", exactly as the `retain_refs` and
+// `max_retained_bytes` configuration keys document it: 0 refs retains every
+// ref the repository has ever activated, and 0 bytes leaves retention governed
+// by RetainRefs alone. A nonzero MaxRetainedBytes evicts least-recently-used
+// refs first and never the active generation's ref.
 type RetentionPolicy struct {
 	RetainRefs       int
 	MaxRetainedBytes int64
@@ -43,6 +40,15 @@ type RetentionPolicy struct {
 // policy from a caller rather than from configuration, so the semantics travel
 // as these two methods rather than as a hand-rolled `== 0` at each comparison.
 func (p RetentionPolicy) bytesBounded() bool { return p.MaxRetainedBytes > 0 }
+
+// refsBounded and refWindow are the same spelling for RetainRefs. A window of
+// 0 is the documented "retain every ref": the ranking query then runs with no
+// LIMIT and keeps every ref the repository has activated. One query per
+// retained ref is a cost, not a correctness bound, so nothing here caps the
+// window a user set.
+func (p RetentionPolicy) refsBounded() bool { return p.RetainRefs > 0 }
+
+func (p RetentionPolicy) refWindow() int { return p.RetainRefs }
 
 func (p RetentionPolicy) overRetained(total int64) bool {
 	return p.bytesBounded() && total > p.MaxRetainedBytes
@@ -74,7 +80,8 @@ type RetentionReport struct {
 }
 
 // RetainByRef applies the policy to repo and reports what it did. It keeps the
-// most recent generation of each of the last p.RetainRefs distinct refs, and
+// most recent generation of each of the last p.RetainRefs distinct refs (every
+// ref, when the window is the unlimited 0), and
 // when p.MaxRetainedBytes is set evicts the least recently used of those refs
 // until the accounted retained size fits, never evicting the active
 // generation's ref and never touching a staging generation (Recover owns
@@ -89,8 +96,8 @@ func (s *Store) RetainByRef(ctx context.Context, repo model.RepositoryID, p Rete
 	if err != nil {
 		return RetentionReport{}, err
 	}
-	if p.RetainRefs < 1 || p.RetainRefs > maxRetainRefs {
-		return RetentionReport{}, invalid("retain_refs must be between 1 and %d", maxRetainRefs)
+	if p.RetainRefs < 0 {
+		return RetentionReport{}, invalid("retain_refs must not be negative")
 	}
 	if p.MaxRetainedBytes < 0 {
 		return RetentionReport{}, invalid("max_retained_bytes must not be negative")
@@ -184,7 +191,8 @@ type retainedRef struct {
 
 // keepByRef ranks the repository's refs by the most recent generation each was
 // activated for, keeps the newest generation of the first p.RetainRefs of
-// them, and then, when p.MaxRetainedBytes is set, drops the least recently
+// them (all of them when the window is unlimited), and then, when
+// p.MaxRetainedBytes is set, drops the least recently
 // used of those until the accounted retained size fits. That size is what the
 // store is holding, so it counts every unit a retained generation selects,
 // including units it shares with another retained generation. The active
@@ -193,11 +201,19 @@ type retainedRef struct {
 // by generation id, so two generations published in the same clock tick still
 // order deterministically.
 func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p RetentionPolicy) ([]retainedRef, error) {
+	// An unlimited window drops the LIMIT clause rather than passing a
+	// stand-in row count: a large sentinel would be a hidden cap on a setting
+	// the user spelled as unlimited.
+	const rank = `SELECT ref FROM generations
+			WHERE repository_id = ? AND status IN ('active','superseded') AND activated_at IS NOT NULL
+			GROUP BY ref ORDER BY max(activated_at) DESC, max(id) DESC`
+	query, args := rank, []any{repoRaw}
+	if p.refsBounded() {
+		query, args = rank+` LIMIT ?`, []any{repoRaw, p.refWindow()}
+	}
 	var kept []retainedRef
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT ref FROM generations
-			WHERE repository_id = ? AND status IN ('active','superseded') AND activated_at IS NOT NULL
-			GROUP BY ref ORDER BY max(activated_at) DESC, max(id) DESC LIMIT ?`, repoRaw, p.RetainRefs)
+		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return wrap("generations", err)
 		}

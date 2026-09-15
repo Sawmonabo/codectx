@@ -286,12 +286,20 @@ const (
 	// Section 22 requires an unavailable metric be reported as unavailable,
 	// never as zero.
 	CheckUnavailable CheckState = "unavailable"
+	// CheckUnverified records a check this run deliberately did not perform
+	// because performing it walks the whole database. It is not `unavailable`:
+	// the check is available on this host and on this build, it was skipped by
+	// the mode the operator chose, and its detail names the flag that runs it.
+	// Collapsing the two would tell an operator a verifiable fact is
+	// unmeasurable. Like `unavailable` it does not degrade the report state --
+	// a skipped check is not a defect.
+	CheckUnverified CheckState = "unverified"
 )
 
 // Valid reports whether s is a known wire spelling.
 func (s CheckState) Valid() bool {
 	switch s {
-	case CheckPass, CheckWarn, CheckFail, CheckUnavailable:
+	case CheckPass, CheckWarn, CheckFail, CheckUnavailable, CheckUnverified:
 		return true
 	}
 	return false

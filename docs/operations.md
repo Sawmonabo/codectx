@@ -10,7 +10,7 @@ is in [the threat model](threat-model.md).
 ```
 codectx doctor          # human summary
 codectx doctor --json   # one machine-stable envelope
-codectx doctor --deep   # adds the expensive integrity and parser smoke checks
+codectx doctor --deep   # runs the whole-database checks an ordinary run reports unverified
 codectx doctor --offline
 ```
 
@@ -23,11 +23,33 @@ report carries the build identity, the flags it ran under and an overall state.
 | `pass` | Checked, and healthy. |
 | `warn` | Checked, degraded, still serving. Act before it becomes `fail`. |
 | `fail` | Checked, and this workspace cannot serve correctly until it is fixed. |
-| `unavailable` | **Not checked here.** The check or metric could not be measured on this platform or in this mode. It is never reported as a passing check and never as a zero measurement. |
+| `unavailable` | **Not checked here.** The check or metric could not be measured on this platform or on this build. It is never reported as a passing check and never as a zero measurement. |
+| `unverified` | **Not checked here either, but only because you did not ask.** The check is available; it walks the whole database, so an ordinary run skips it and says so. Its detail ends `not verified in shallow mode; run doctor --deep`. Like `unavailable` it does not degrade the overall state. |
 
-`doctor` is cheap by default: no version, status or search command performs a
-full database scan. The expensive integrity and parser smoke checks run only
-when you ask for them with `--deep`.
+`doctor` is cheap by default, and that is enforced by which checks run. An
+ordinary run reads the database header, page count, schema fingerprint,
+write-ahead-log mode and the two file sizes -- all constant cost, all still able
+to fail the report. Two checks walk the whole database and are therefore
+reported `unverified` until you pass `--deep`:
+
+| Check | What `--deep` verifies |
+|---|---|
+| `storage_integrity` | `quick_check`, the foreign key check and the full-text index walk |
+| `storage_accounting` | the generation, unit, blob, lease and session row counts. The database and write-ahead-log **sizes are still reported without `--deep`**, and so is the warning that the log is past its high-water mark -- that is a file stat, and it is the cheapest real finding this command has. |
+
+A third, `source_retention`, is a bounded sample either way -- four objects
+ordinarily, sixty-four under `--deep` -- and it reports `pass` on what it
+sampled. It is `unverified` in one case only: the sample came back empty, and
+telling "nothing is retained here" from "every retained object is unreadable"
+needs the retained-object count, which is one of the row counts an ordinary run
+does not read. Neither is claimed.
+
+Nothing is dropped from the report: every skipped check still appears as a row,
+in state `unverified`, naming `--deep` as what verifies it. On a 55 MB index the
+walk costs 296 ms against 0.24 ms for the header reads, and it grows with the
+database; on a multi-gigabyte index it is tens of seconds.
+
+The parser smoke checks are also `--deep` only.
 
 ### What is checked
 
@@ -193,7 +215,8 @@ differently, and both are load-bearing:
   the JSON entirely**. A field that *is* present with the value `0` is a real
   measurement of zero.
 - In `doctor`, an unmeasured check has `state: "unavailable"`. It is not `pass`
-  and it is not `fail`.
+  and it is not `fail`. A check that was skipped because you did not pass
+  `--deep` has `state: "unverified"` -- also not `pass`.
 
 If you see `0` where you expected a figure, it is a measurement of zero — file
 it as a bug rather than assuming the platform does not support it.

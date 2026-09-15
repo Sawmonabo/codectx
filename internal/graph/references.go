@@ -7,7 +7,6 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
-	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // referenceEndpoint binds a reference continuation to this operation, so
@@ -168,7 +167,7 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	//
 	// Only the observation sink is imported here, never the store: the engine
 	// still reads facts through its own Adjacency port.
-	ctx, clamps := sqlite.WithPageClamps(ctx)
+	ctx, clamps := pagination.WithPageClamps(ctx)
 	var notices []string
 
 	queryHash := referenceQueryHash(req.NodeID, req.Operation)

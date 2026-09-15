@@ -505,18 +505,24 @@ func dependenceUnitID(t *testing.T, files map[string]string) model.UnitID {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, u := range p.Units {
-		if u.ScopeKey != rootScope {
-			continue
+	var found model.UnitID
+	if err := p.Units(func(u plan.Unit) error {
+		if u.ScopeKey != rootScope || found != "" {
+			return nil
 		}
 		spec, err := u.Spec(cfg.AnalysisConfigHash())
 		if err != nil {
-			t.Fatal(err)
+			return err
 		}
-		return spec.ID
+		found = spec.ID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("the planner planned no %s unit", rootScope)
-	return ""
+	if found == "" {
+		t.Fatalf("the planner planned no %s unit", rootScope)
+	}
+	return found
 }
 
 // edited is files with one path's content replaced. It copies, because the

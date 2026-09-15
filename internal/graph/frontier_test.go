@@ -627,67 +627,6 @@ func TestImpactPagesPastTheResultRecordCap(t *testing.T) {
 	}
 }
 
-// TestPathWalkStateIsBoundedByTheMemoryBudget is the path half of R3.
-// pathWalk's dist, depth, settled and cached edges grew with the REACHABLE SET;
-// the finite default visited and edge budgets were the only thing bounding
-// them, and with those unlimited by default nothing was. They are now charged
-// against Limits.FrontierBytes (resources.query_memory_bytes).
-//
-// Unlike the BFS frontier this state cannot spill -- a Dijkstra resumed from a
-// persisted frontier also needs its settled distances, and ShortestPath has no
-// continuation to carry them -- so the ceiling is REPORTED with whatever was
-// found, never raised as an error and never returned as "no path exists".
-//
-// Mutation: make charge never set memoryHit (drop the `w.bytes > w.maxBytes`
-// test) and the truncation assertion below fails -- the walk runs the whole
-// reachable set with nothing bounding its four maps.
-func TestPathWalkStateIsBoundedByTheMemoryBudget(t *testing.T) {
-	f := newGraphFixture(t)
-	req := model.PathRequest{GenerationID: 1,
-		From: fixtureNodeID("n-a"), To: fixtureNodeID("n-unreachable"),
-		Relations: []model.RelationKind{model.RelCalls}}
-
-	limits := fixtureLimits()
-	// Every count bound unlimited: this row isolates the memory ceiling.
-	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
-	unbounded, err := New(Options{Adjacency: f, Limits: limits})
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
-	}
-	whole, err := unbounded.ShortestPath(context.Background(), req)
-	if err != nil {
-		t.Fatalf("unbounded path: %v", err)
-	}
-	if whole.Meta.Truncated {
-		t.Fatalf("the unbounded search must run to completion, got %q", whole.Meta.TruncationReason)
-	}
-	if whole.VisitedCount < 10 {
-		t.Fatalf("the unbounded search settled %d node(s); the proof needs a walk larger than the budget it sets",
-			whole.VisitedCount)
-	}
-
-	// A ceiling well under what the unbounded walk held.
-	limits.FrontierBytes = 4096
-	bounded, err := New(Options{Adjacency: f, Limits: limits})
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
-	}
-	res, err := bounded.ShortestPath(context.Background(), req)
-	if err != nil {
-		t.Fatalf("bounded path: %v", err)
-	}
-	if !res.Meta.Truncated || res.Meta.TruncationReason != pathReasonMemory {
-		t.Fatalf("the memory ceiling was crossed but the answer reports truncated=%v reason=%q, want %q",
-			res.Meta.Truncated, res.Meta.TruncationReason, pathReasonMemory)
-	}
-	if res.VisitedCount >= whole.VisitedCount {
-		t.Fatalf("the bounded search settled %d node(s), the unbounded one %d: the ceiling bounded nothing",
-			res.VisitedCount, whole.VisitedCount)
-	}
-	// frontier_bytes is a memory ceiling and is strictly positive (F30), so
-	// there is no zero-means-unlimited leg for it: the walk is always charged.
-}
-
 // slowAdjacency is the fixture reader with a clock attached: after `trigger`
 // Edges round trips it pushes the shared clock past the engine's deadline,
 // ONCE. That is what makes the deadline arrive at a point the test chooses --

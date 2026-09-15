@@ -182,7 +182,9 @@ non-empty frontier, not only for "the page is full". Visited-node and edge budge
 cumulative ceilings on a whole walk and become **per-page work budgets**. The frontier spills to
 the existing per-query spool when it exceeds its byte budget, and continues on the next page
 instead of stopping. The cumulative visited set leaves the heap entirely: it lives in the
-continuation spool, and membership is answered **per level in one sequential sweep**, not per node.
+continuation spool, and membership is answered **per level**, not per node: first against a Bloom
+filter over that spool built during the resume replay that already decodes it, then — only for what
+the filter cannot rule out — by a **merge-join** against the spool's NodeID-ordered visited section.
 
 **Alternatives considered.**
 
@@ -192,11 +194,20 @@ is a content hash, not an ordinal, so there is no dense integer id space for a b
 A bitmap would first require assigning dense ids, which is a storage change of its own. The
 rejection is recorded because the idea is attractive enough to be re-proposed.
 
-*A blocked Bloom filter in front of the spool.* Rejected: a filter accelerates *negatives*, and the
-level-batched sweep already answers a whole level in one pass. It would add a false-positive path —
-and here a node wrongly reported as already admitted is an **edge silently dropped**, the exact
-class-G defect this wave exists to remove — in exchange for no bound the design did not already
-have.
+*A blocked Bloom filter in front of the spool.* First rejected, then **adopted** — the rejection
+reasoned that a filter accelerates *negatives* while the level-batched sweep already answers a whole
+level in one pass, and that a node wrongly reported as already admitted is an **edge silently
+dropped**. Both halves were wrong for this walk. The sweep is one pass per LEVEL, and its early exit
+fires only once every candidate has been *found*, so a chain — which is what a call chain is — reaches
+freshly admitted nodes at every level, never satisfies it, and pays a full pass per level: at
+reference scale (a ~200 000-node cumulative set, up to 200 levels in one page) 4 × 10⁷ record decodes
+per page against 2 × 10⁵ for one pass. And the filter answers only *misses*, which have no false
+positives to be wrong about: a hit is not an admission, it merely falls through to the merge-join,
+which is exact. No edge can be dropped by it. The filter is sized from the cumulative admitted count
+the cursor already carries and clamped to an eighth of the frontier memory ceiling, so peak heap is a
+function of that configured ceiling, not of the walk; past the clamp it simply grows denser (more
+false positives, more merge-joins), never refusing or truncating. Probes are the two-hash
+construction of [S33].
 
 *Re-deriving the frontier per page from a keyset scan under the pinned generation*, avoiding a spool
 altogether, as mature search systems do with a point-in-time view and `search_after` [S14],
@@ -207,7 +218,8 @@ introducing a second continuation mechanism.
 
 *Per-node membership probes against the spool.* Rejected on cost: the spool is forward-only, so a
 per-node probe is a full scan per node. Level-batched duplicate elimination is the published shape
-for exactly this problem [S31], and keeping a bounded front in RAM while the bulk lives outside it
+for exactly this problem [S31], and ordering the spooled set by NodeID is what turns that batch from
+a scan into a merge-join that stops at the first key past the level's largest candidate, and keeping a bounded front in RAM while the bulk lives outside it
 is semi-external breadth-first search as described in the literature [S32][S7][S9]. Designs that
 scan the whole edge set per iteration are the wrong family here [S8]: the frontier is small
 relative to the graph, and edge I/O should be issued only for it.
@@ -247,9 +259,9 @@ level's probe answers plus one page of relations plus one spool record in flight
 with the graph. The cost side is real and stated for the verification lane: one spool sweep per
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
-released only after the fresh one is written. Two callers that expand a whole walk in one request
-(impact and rollup) are still walk-sized by construction, because they rank or aggregate the whole
-walk in memory; that is ranked-spool work, not frontier work, and it is open.
+released only after the fresh one is written. The two callers that used to expand a whole walk in
+one request now have the same treatment: impact is a spooled, cursor-resumable continuation and the
+rollup's containment read is keyset-paged, so neither ranks or aggregates a whole walk in memory.
 
 ### 2.3 External merge for the planner, with byte-identical order
 
@@ -373,11 +385,11 @@ proportion to the answer or to the range scan: two sort passes (deduplicate and 
 one page and a streamed spool tail, so peak heap on this path is the run budget plus the merge fan-in's
 blocks plus one page, independent of the match count. Measured live-record high-water mark: 190
 records at 20 000 candidates and 189 at 200 000; the mutation that removes the run budget raises it
-to the match count (20 000 and 65 536) and the assertion fails. Two residuals are named rather than
-claimed: a continuation page still materialises the whole spooled tail it was handed before
-re-spooling the remainder (the fix is to read one page and stream the rest into the next spool), and
-per-request sort runs are not charged to the temporary-bytes reservation, though they live under the
-same spool directory and are counted as real disk by the sweeper.
+to the match count (20 000 and 65 536) and the assertion fails. One residual is named rather than
+claimed: per-request sort runs are not charged to the temporary-bytes reservation, though they live
+under the same spool directory and are counted as real disk by the sweeper. The continuation page
+that once materialised the whole spooled tail before re-spooling the remainder is closed: a
+continuation now allocates one page and streams the rest into the next spool.
 
 ### 2.5 Field bounds truncate and flag
 
@@ -744,26 +756,26 @@ duplicates an existing assertion.
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
 - **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
   external sort primitive (§2.4), so peak heap on this path is the sort run buffer plus the merge
-  fan-in's blocks plus one page, independent of the match count. The two residuals §2.4 names are
-  the ones that stand: a continuation page still materialises the whole spooled tail it was handed
-  before re-spooling the remainder, and per-request sort runs are not charged to the temporary-byte
-  reservation, though they live under the same spool directory and the sweeper counts them as real
-  disk.
-- **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).
-- Smaller residuals are recorded at their sites: an undisclosed cut on a joined documentation body,
-  and a clamp notice that is recorded but still has no reader on the context and adjacency query
-  paths -- neither of them builds the answer metadata the notice would travel on, so carrying it
-  needs a field on the context manifest and an installation at the graph engine's own metadata
-  sites. The provider-side derived-row refusal is closed. The observation-reference count is a
-  user-set bound at the service boundary but the wire contract still refuses more than 64 references
-  on a single observation, so the aggregate path is unlimited and the single-observation path is
-  not.
-- **The traversal reads that unlimited defaults have now unbounded in heap**: the repository map's
-  containment read accumulates one page of containers' children in one slice, and the shortest-path
-  walk holds its settled set, distances and read edges for the walk. The finite defaults used to
-  bound all four; the page bound now covers only the containers, not the children. Each needs the
-  same treatment the ranked set got -- a keyset-paged containment read and a spilled frontier --
-  and until then their peak is a function of one container's fan-out rather than of a page.
+  fan-in's blocks plus one page, independent of the match count. The one residual §2.4 names is the
+  one that stands: per-request sort runs are not charged to the temporary-byte reservation, though
+  they live under the same spool directory and the sweeper counts them as real disk.
+- The smaller residuals this document recorded at their sites are **closed**, each with a reader.
+  The cut on a joined documentation body is disclosed: the composed search body is bounded through
+  the declaration's own truncation helper, which records the field and its original length. The
+  clamp notice now travels: the context manifest carries a notices field that the compile installs
+  on the manifest it returns, and the graph engine installs the same disclosure at its own query
+  metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
+  is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
+  the single-observation path reads the same configured limit the aggregate path does.
+- **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
+  walk holds its settled set, distances, depths and cached edges for the length of the walk, and
+  unlike a breadth-first frontier that state cannot spill, because a search resumed from a
+  persisted frontier would also need its settled distances. It is bounded instead by the query
+  memory budget: every map and queue entry is charged against `resources.query_memory_bytes`
+  (`frontier_bytes`) with a deliberate over-estimate, and crossing it truncates the answer with the
+  memory reason and the cheapest routes found so far rather than running on. The repository map's
+  containment read is closed -- it is keyset-paged now, so its peak is a page and not a container's
+  fan-out.
 
 ### 3.4 What verification on real repositories must show
 
@@ -906,6 +918,10 @@ per level rather than per node (§2.2).
 
 [S32] Mehlhorn, K. and Meyer, U., *External-memory breadth-first search with sublinear I/O*, ESA
 2002 — a bounded front in memory with the bulk outside it; the semi-external shape adopted (§2.2).
+
+[S33] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
+filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
+construction (§2.2).
 
 [S33] Knuth, D. E., *The Art of Computer Programming*, vol. 3, §5.4.1 — replacement selection and
 bounded merge order; the classical statement of the lever recorded but not taken (§2.3).

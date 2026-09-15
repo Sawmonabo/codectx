@@ -551,21 +551,24 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	// Every sealed unit must be the unit this plan derives for its scope. If
 	// it is not, the snapshot or the configuration moved under the background
 	// work and the unit is not this generation's answer; nothing is published.
-	for _, u := range p.Units {
+	if err := p.Units(func(u plan.Unit) error {
 		key := plan.Key(u.ProviderID, u.ScopeKey)
 		want, ok := replacing[key]
 		if !ok {
-			continue
+			return nil
 		}
 		spec, err := u.Spec(c.cfgHash)
 		if err != nil {
-			return model.IndexResult{}, false, err
+			return err
 		}
 		if spec.ID != want {
 			c.log.Info("a deferred unit no longer matches the plan for its scope; it is not published",
 				"component", component, "provider_id", u.ProviderID, "scope_key", u.ScopeKey)
 			delete(replacing, key)
 		}
+		return nil
+	}); err != nil {
+		return model.IndexResult{}, false, err
 	}
 	if len(replacing) == 0 {
 		return model.IndexResult{}, false, nil
@@ -585,7 +588,9 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	var health model.GenerationHealth
 	err = l.attach(ctx, g, replacing)
 	if err == nil {
-		g.coverage()
+		err = g.coverage()
+	}
+	if err == nil {
 		states = g.caps.finish(c.log)
 		health = healthOf(states)
 		// The publication generation is a new row, so it carries none of the

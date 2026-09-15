@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"reflect"
@@ -282,6 +283,8 @@ func TestSearchRankingScenario(t *testing.T) {
 
 		// FX-C13b rows
 		{"fix/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
+		{"fix/exact_tiers_hold_one_read_page", legExactTiersHoldOnePage},
+		{"fix/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
@@ -290,6 +293,9 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_continuation_copies_its_tail_spool_to_spool", legSpoolToSpoolIsReentrant},
 		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
+
+		// FX-H-U rows
+		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -756,11 +762,16 @@ type countingCAS struct {
 	cas   *snapshot.CAS
 	reads int
 	bytes uint64
+	// maxRead is the largest single call. The CAS refuses a call over
+	// model.MaxRawChunkBytes, so this is the invariant that keeps hydration
+	// off that ceiling however long the span it resolves.
+	maxRead uint64
 }
 
 func (c *countingCAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
 	c.reads++
 	c.bytes += r.End - r.Start
+	c.maxRead = max(c.maxRead, r.End-r.Start)
 	return c.cas.ReadRange(ctx, rec, r)
 }
 
@@ -871,6 +882,55 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 	if sparseCounter.reads < 2 {
 		t.Fatalf("the walk took %d reads over a %d-byte gap with a %d-byte window; it is not walking it",
 			sparseCounter.reads, span.Start, maxRangeWindowBytes)
+	}
+
+	if counter.maxRead > maxRangeWindowBytes {
+		t.Errorf("one hydration read pulled %d bytes, over the %d-byte window", counter.maxRead, maxRangeWindowBytes)
+	}
+
+	// SV2: a file that is ONE LINE of megabytes -- a minified bundle, a
+	// generated data file. No line checkpoint can exist inside it, so
+	// resolving a hit 4.5 MiB in used to ask the CAS for that whole span in
+	// one call and failed the WHOLE answer with CTX_RESOURCE_LIMIT ("byte
+	// range spans 4292608 bytes, over the 1048576-byte read ceiling").
+	head := "// generated -- do not edit\n"
+	longTarget := "func café() string { return foo(bar) }"
+	lead := 4608000 - len(head) // the hit sits 4.5 MiB into the single line
+	longLine := head + strings.Repeat("x", lead) + longTarget + strings.Repeat("y", 1<<19) + "\n"
+	longRec, err := cas.Put(ctx, strings.NewReader(longLine))
+	if err != nil {
+		t.Fatalf("Put(long line): %v", err)
+	}
+	longSpan := model.ByteRange{Start: uint64(len(head) + lead), End: uint64(len(head) + lead + len(longTarget))}
+	if gap := longSpan.Start - checkpointIndex(longRec).CheckpointFor(longSpan.Start).Byte; gap <= model.MaxRawChunkBytes {
+		t.Fatalf("the nearest checkpoint is %d bytes back; the fixture no longer exercises a span over the read ceiling", gap)
+	}
+	lh := newHydrator(
+		stubFiles{file: {ID: file, Path: "web/bundle.min.js", ContentHash: longRec.Hash, Size: longRec.Size}},
+		stubBlobs{longRec.Hash: longRec},
+		&countingCAS{cas: cas})
+	longCounter := lh.content.(*countingCAS)
+	longHits := []model.SearchHit{{FileID: file, Path: "web/bundle.min.js", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	if err := lh.hydratePage(ctx, longHits, []model.ByteRange{longSpan}); err != nil {
+		t.Fatalf("hydratePage over a %d-byte line: %v: a long line must cost more reads, never a failed answer",
+			len(longLine), err)
+	}
+	wantLong := model.SourceRange{
+		Start: model.Position{Byte: longSpan.Start, Line: 2, Column: uint32(lead)},
+		End:   model.Position{Byte: longSpan.End, Line: 2, Column: uint32(lead + len(longTarget))},
+	}
+	if longHits[0].Range == nil || *longHits[0].Range != wantLong {
+		t.Fatalf("the streamed position is %+v, want %+v", longHits[0].Range, wantLong)
+	}
+	if longCounter.maxRead > maxRangeWindowBytes {
+		t.Errorf("one read pulled %d bytes over a %d-byte span: the span is not being streamed",
+			longCounter.maxRead, longSpan.End-longSpan.Start)
+	}
+	// The end endpoint continues the walk that resolved the start: the whole
+	// resolution reads the span once, not once per endpoint.
+	if longCounter.bytes > longSpan.End+2*maxRangeWindowBytes {
+		t.Errorf("resolving both endpoints read %d bytes to reach byte %d: the walk is restarting",
+			longCounter.bytes, longSpan.End)
 	}
 
 	// Cancellation and deadline are different answers (digest §6).
@@ -1051,6 +1111,15 @@ func (s *stubExact) NodesInFile(_ context.Context, file model.FileID, afterStart
 	return out, nil
 }
 
+// DistinctNodesInFile serves the same rows: every synthetic declaration here
+// has its own node id, so the one-row-per-node reading and the every-offset
+// reading coincide. The distinction is storage's, and the leg that proves it
+// lives beside the SQL.
+func (s *stubExact) DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64,
+	after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	return s.NodesInFile(ctx, file, afterStart, after, limit)
+}
+
 func (s *stubExact) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
 	return nil, nil
 }
@@ -1085,7 +1154,7 @@ func legPathTierLossless(t *testing.T, _ *fixture) {
 	collect := func(kinds []model.NodeKind) []exactHit {
 		t.Helper()
 		var out []exactHit
-		if err := pathCandidates(context.Background(), stub, stub.path, kinds, page,
+		if _, err := pathCandidates(context.Background(), stub, stub.path, kinds, page,
 			func(h exactHit) error { out = append(out, h); return nil }); err != nil {
 			t.Fatalf("pathCandidates: %v", err)
 		}
@@ -1097,6 +1166,191 @@ func legPathTierLossless(t *testing.T, _ *fixture) {
 	if out := collect([]model.NodeKind{model.NodeFunction}); len(out) != 3 {
 		t.Fatalf("pathCandidates(kind filter) served %d candidates; want 3: the filter runs over the keyset, not over one bounded read",
 			len(out))
+	}
+}
+
+// stubWideExact serves the three symbol tiers of one query over a synthetic
+// corpus of n declarations, honouring the NodeFilter exactly as storage does so
+// the tier predicates exact.go relies on hold. The nodes are SYNTHESIZED per
+// page from the keyset rather than held in a slice: a stub that materialized
+// 200 000 of them would itself be the heap the leg below measures.
+//
+// Every node is named "Widget" and qualified "Widget.mN", so the
+// exact_qualified_name tier matches none, qualified_name_prefix matches all of
+// them, and exact_name matches all of them but is superseded by the prefix
+// tier -- the cross-tier rule under test.
+type stubWideExact struct {
+	n    int
+	file model.FileID
+	path string
+}
+
+func (s *stubWideExact) node(i int) sqlite.StoredNode {
+	return sqlite.StoredNode{
+		Node: model.Node{ID: model.NodeID(fmt.Sprintf("n%08d", i)), Kind: model.NodeFunction,
+			Name: "Widget", QualifiedName: "Widget.m" + strconv.Itoa(i), FileID: s.file},
+		Bytes: &model.ByteRange{Start: uint64(i), End: uint64(i) + 1},
+	}
+}
+
+func (s *stubWideExact) Node(context.Context, model.NodeID) (sqlite.StoredNode, error) {
+	return sqlite.StoredNode{}, errors.New("not used")
+}
+
+func (s *stubWideExact) FileByPath(_ context.Context, path string) (model.FileID, error) {
+	if path != s.path {
+		return "", &model.Error{Code: model.CodeArgumentInvalid, Message: "no such file"}
+	}
+	return s.file, nil
+}
+
+func (s *stubWideExact) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
+	return model.FileVersion{ID: id, Path: s.path}, nil
+}
+
+// NodesInFile pages the same synthetic declarations on the (start_byte,
+// node_id) keyset, so the exact_path tier walks the file the symbol tiers also
+// match -- the overlap the tier-0 predicate decides.
+func (s *stubWideExact) NodesInFile(_ context.Context, file model.FileID, afterStart int64,
+	after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	if file != s.file {
+		return nil, nil
+	}
+	var out []sqlite.StoredNode
+	for i := range s.n {
+		n := s.node(i)
+		start := nodeStartByte(n)
+		if start < afterStart || (start == afterStart && n.Node.ID <= after) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// DistinctNodesInFile coincides with NodesInFile for the same reason as
+// stubExact's: one synthetic declaration per node id.
+func (s *stubWideExact) DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64,
+	after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	return s.NodesInFile(ctx, file, afterStart, after, limit)
+}
+
+func (s *stubWideExact) Nodes(_ context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error) {
+	match := func(n sqlite.StoredNode) bool {
+		switch {
+		case f.QualifiedName != "":
+			return n.Node.QualifiedName == f.QualifiedName
+		case f.QualifiedPrefix != "":
+			return strings.HasPrefix(n.Node.QualifiedName, f.QualifiedPrefix)
+		default:
+			return n.Node.Name == f.Name
+		}
+	}
+	// The keyset resumes at the successor of `after`, which the fixed-width
+	// id encodes; rescanning from zero on every page would make the leg's cost
+	// quadratic in a corpus it walks 200 000 nodes of.
+	first := 0
+	if after != "" {
+		i, err := strconv.Atoi(strings.TrimPrefix(string(after), "n"))
+		if err != nil {
+			return nil, err
+		}
+		first = i + 1
+	}
+	var out []sqlite.StoredNode
+	for i := first; i < s.n; i++ {
+		n := s.node(i)
+		if !match(n) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) == limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// legExactTiersHoldOnePage proves the exact tiers carry no candidate-sized heap
+// structure: the `seen` set that decided the cross-tier "most specific tier
+// wins" rule held one model.NodeID per distinct candidate, so a wide
+// qualified_name_prefix scan cost heap proportional to the match count. The
+// rule is now two predicates over the candidate in hand, and the working set is
+// one read page however many candidates the tier yields.
+//
+// The heap is sampled at the LAST candidate, while anything the walk accumulated
+// is still reachable; the answer itself is counted and discarded, so what the
+// sample sees is the walk's own working set.
+//
+// Mutation: restore the map (`seen[n.Node.ID] = struct{}{}` beside a duplicate
+// test) and the ten-fold input moves the live set by ~19 MiB, failing the bound.
+func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
+	walk := func(n int) (int, uint64) {
+		t.Helper()
+		stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "pkg/wide.go"}
+		var held uint64
+		count := 0
+		if err := exactCandidates(context.Background(), stub, "Widget", nil, 1000,
+			func(exactHit) error {
+				count++
+				if count == n {
+					var m runtime.MemStats
+					runtime.GC()
+					runtime.ReadMemStats(&m)
+					held = m.HeapAlloc
+				}
+				return nil
+			}); err != nil {
+			t.Fatalf("exactCandidates(%d): %v", n, err)
+		}
+		return count, held
+	}
+	// Correctness first: every node matches both the prefix tier and the
+	// exact_name tier, and each must be emitted ONCE -- the duplicate the set
+	// used to suppress is suppressed by supersededByLowerTier instead.
+	small, smallHeap := walk(20_000)
+	if small != 20_000 {
+		t.Fatalf("a 20000-declaration prefix tier emitted %d candidates, want each exactly once", small)
+	}
+	large, largeHeap := walk(200_000)
+	if large != 200_000 {
+		t.Fatalf("a 200000-declaration prefix tier emitted %d candidates, want each exactly once", large)
+	}
+	// A ten-fold input must not move the live set: the walk holds one read
+	// page, not one entry per candidate.
+	if largeHeap > smallHeap+(1<<20) {
+		t.Fatalf("the exact tiers held %d heap bytes over 20000 candidates and %d over 200000; "+
+			"the working set of the tiers is one read page, not the candidate count", smallHeap, largeHeap)
+	}
+	t.Logf("exact-tier live set: 20000 candidates %d bytes, 200000 candidates %d bytes", smallHeap, largeHeap)
+}
+
+// legExactPathTierOwnsItsFile proves the predicate that replaced the tier-0
+// half of the removed `seen` set: when the query is BOTH a path and a symbol
+// name, every declaration of that file is emitted once, by the exact_path tier
+// that outranks the symbol tiers, and the symbol tiers do not emit it again.
+//
+// Mutation: drop the `n.Node.FileID == pathFile` clause from exactCandidates
+// and the prefix tier re-emits all 500, doubling the count.
+func legExactPathTierOwnsItsFile(t *testing.T, _ *fixture) {
+	const n = 500
+	// The query resolves as a path AND matches the symbol tiers' filters.
+	stub := &stubWideExact{n: n, file: model.FileID(model.H("wide-file")), path: "Widget"}
+	byTier := map[model.SearchTier]int{}
+	if err := exactCandidates(context.Background(), stub, stub.path, nil, 100,
+		func(h exactHit) error { byTier[h.Tier]++; return nil }); err != nil {
+		t.Fatalf("exactCandidates: %v", err)
+	}
+	if got := byTier[model.TierExactPath]; got != n {
+		t.Fatalf("the exact_path tier emitted %d of the file's %d declarations, want all of them", got, n)
+	}
+	if total := byTier[model.TierExactPath] + byTier[model.TierQualifiedNamePrefix] +
+		byTier[model.TierExactName] + byTier[model.TierExactQualifiedName]; total != n {
+		t.Fatalf("the exact tiers emitted %d candidates for %d declarations: a node of the walked file "+
+			"must not be emitted again by a symbol tier (%v)", total, n, byTier)
 	}
 }
 
@@ -1636,5 +1890,98 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 	if !reflect.DeepEqual(got, want[skip:]) {
 		t.Fatalf("the streamed tail is %d hits and the run past the skip is %d; across %d chunk flushes "+
 			"they must be the same hits in the same order", len(got), len(want)-skip, wide/model.MaxPageItems)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FX-H-U legs.
+// ---------------------------------------------------------------------------
+
+// stubFileReader answers File for any id by SYNTHESIZING the version, so a walk
+// over 200 000 distinct files costs the stub nothing: a pre-built map of them
+// would be the heap the leg below measures. Nothing else on the read surface is
+// exercised, and the methods that are not say so rather than returning
+// plausible empty answers.
+type stubFileReader struct{ reads int }
+
+func (s *stubFileReader) File(_ context.Context, id model.FileID) (model.FileVersion, error) {
+	s.reads++
+	return model.FileVersion{ID: id, Path: "pkg/" + string(id) + ".go"}, nil
+}
+
+func (s *stubFileReader) Node(context.Context, model.NodeID) (sqlite.StoredNode, error) {
+	return sqlite.StoredNode{}, errors.New("not used")
+}
+
+func (s *stubFileReader) FileByPath(context.Context, string) (model.FileID, error) {
+	return "", errors.New("not used")
+}
+
+func (s *stubFileReader) NodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) DistinctNodesInFile(context.Context, model.FileID, int64, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+func (s *stubFileReader) Nodes(context.Context, sqlite.NodeFilter, model.NodeID, int) ([]sqlite.StoredNode, error) {
+	return nil, errors.New("not used")
+}
+
+// legPathResolverHoldsOnePage proves the exact tiers' path cache is bounded by
+// the READ PAGE and not by the answer: the resolver used to memoize one entry
+// per distinct file of the whole request, so a symbol query spanning a
+// repository's files cost that much heap for the life of the request.
+//
+// Every path is still served -- the count below is the answer, and an evicted
+// entry costs one more File read, which is the whole trade.
+//
+// Mutation: restore the unbounded map (keep every entry, never evict) and the
+// ten-fold input moves the live set by ~24 MiB, failing the bound.
+func legPathResolverHoldsOnePage(t *testing.T, _ *fixture) {
+	const page = 1000
+	resolve := func(n int) uint64 {
+		t.Helper()
+		p := newPathResolver(&stubFileReader{}, page)
+		var held uint64
+		for i := range n {
+			got, err := p.path(context.Background(), model.FileID(fmt.Sprintf("f%08d", i)))
+			if err != nil {
+				t.Fatalf("path(%d): %v", i, err)
+			}
+			if got == "" {
+				t.Fatalf("file %d resolved to no path", i)
+			}
+			if i == n-1 {
+				var m runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&m)
+				held = m.HeapAlloc
+			}
+		}
+		return held
+	}
+	small := resolve(20_000)
+	large := resolve(200_000)
+	if large > small+(1<<20) {
+		t.Fatalf("the path resolver held %d heap bytes over 20000 distinct files and %d over 200000; "+
+			"its working set is one read page, not the answer's file count", small, large)
+	}
+	t.Logf("path-resolver live set: 20000 files %d bytes, 200000 files %d bytes", small, large)
+
+	// The cache is a read-amplification knob, never a bound on the answer: a
+	// repeat within the page is served from the cache, and one past it is
+	// re-read rather than dropped.
+	warm := &stubFileReader{}
+	p := newPathResolver(warm, 2)
+	for _, id := range []model.FileID{"a", "b", "a", "c", "b"} {
+		if _, err := p.path(context.Background(), id); err != nil {
+			t.Fatalf("path(%s): %v", id, err)
+		}
+	}
+	if warm.reads != 4 {
+		t.Fatalf("a 2-entry cache made %d File reads over a,b,a,c,b; want 4: the repeat inside the "+
+			"cache is served from it and the evicted one is re-read", warm.reads)
 	}
 }

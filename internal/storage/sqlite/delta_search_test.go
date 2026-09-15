@@ -44,15 +44,39 @@ func lexicalAnswer(t *testing.T, f *fixture, gen model.GenerationID, terms []str
 		// Match pages by the document id, which a carried document keeps and a
 		// freshly indexed one mints; the ANSWER must not depend on either, so
 		// the tuples are compared in the rank tie-break order, not in id order.
+		// One posting session per term: the reader serves a term's whole
+		// instance list from a single held statement now, so the stream is
+		// drained once here and the per-document rows are picked out of it.
+		sess, err := r.OpenPostings(f.ctx)
+		if err != nil {
+			t.Fatalf("OpenPostings: %v", err)
+		}
+		stream, err := sess.TermOccurrences(f.ctx, term)
+		if err != nil {
+			t.Fatalf("TermOccurrences(%q): %v", term, err)
+		}
+		var occ []store.TermOccurrence
+		for {
+			page, err := stream.Next(f.ctx, 100)
+			if err != nil {
+				t.Fatalf("TermOccurrences(%q) next: %v", term, err)
+			}
+			if page == nil {
+				break
+			}
+			occ = append(occ, page...)
+		}
+		if err := stream.Close(); err != nil {
+			t.Fatalf("stream close: %v", err)
+		}
+		if err := sess.Close(); err != nil {
+			t.Fatalf("session close: %v", err)
+		}
 		var lines []string
 		for _, id := range ids {
 			d, err := r.SearchUnit(f.ctx, id)
 			if err != nil {
 				t.Fatalf("SearchUnit(%d): %v", id, err)
-			}
-			occ, err := r.TermOccurrences(f.ctx, term, id-1, 100)
-			if err != nil {
-				t.Fatalf("TermOccurrences(%q): %v", term, err)
 			}
 			var cols []string
 			for _, o := range occ {
@@ -154,7 +178,7 @@ func TestDeltaCarriesTheTextItIndexed(t *testing.T) {
 	if full != delta {
 		t.Errorf("a delta answers differently from a full index of the same tree.\nfull:\n%s\ndelta:\n%s", full, delta)
 	}
-	// Every read above resolves a document by doc_id, and TermOccurrences does
+	// Every read above resolves a document by doc_id, and the posting stream does
 	// not deduplicate, so a generation that saw one doc_id twice would
 	// double-count offsets and hydrate an arbitrary one of the rows. Two facts
 	// in two files keep that from happening -- CarryOver refuses a predecessor

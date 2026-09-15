@@ -173,17 +173,53 @@ complete.
 <data>/cas/<hh>/<sha256>   published immutable blobs (0400)
 ```
 
-`CAS.Put` streams a file through `source.BuildIndex`, which computes the
+A put streams a file through `source.BuildIndex`, which computes the
 whole-file SHA-256, one digest per 64-KiB block and sparse line checkpoints in
 the same pass, while the bytes are written to a private temporary file. The
 file is fsynced, made read-only and published with `os.Link` to a name derived
 only from the validated digest; an object already present is kept (its size is
-checked), never replaced. Where hard links are unavailable a rename is used
-only while the target is absent; a publisher racing into that window replaces
-the object with byte-identical content, which no reader can observe. The
-bucket directory is fsynced on Unix; on Windows there is no directory fsync
-and NTFS journaling is what makes the new name durable — this is the
-documented platform difference.
+checked), never replaced — and needs no sync, because it is already durable.
+Where hard links are unavailable a rename is used only while the target is
+absent; a publisher racing into that window replaces the object with
+byte-identical content, which no reader can observe. The bucket directory is
+fsynced on Unix; on Windows there is no directory fsync and NTFS journaling is
+what makes the new name durable — this is the documented platform difference.
+
+### One durability barrier per capture
+
+What Section 10.3 requires is that everything a published snapshot names is on
+disk before that snapshot is visible, not that each blob is durable the instant
+it is written. Syncing per blob costs two journal commits each — the file and
+its bucket directory — which on a repository of a few thousand files is the
+single largest cost of an index, and the parent process spends the run parked
+in the filesystem's journal rather than reading or parsing.
+
+A capture therefore opens one `CAS.NewBatch` and stages every blob into it. A
+staged blob's bytes are written to `cas/tmp/put-*` and its descriptor held
+open; when the sync window fills, the group is fsynced concurrently (a
+journalling filesystem folds concurrent fsyncs into shared commits, which is
+the whole saving), each temporary is then made read-only and linked into its
+bucket, and the descriptors are closed. `Batch.Barrier`, called immediately
+before `PutSnapshot` commits, flushes whatever is still staged and then fsyncs
+each bucket directory the batch touched once — at most 256, one per two-hex
+prefix, instead of one per blob.
+
+Publication happens after the fsync, never before, and that is what keeps a
+crash recoverable: an interrupted capture leaves nothing in the buckets, only
+temporaries that `Sweep` removes. A bucket entry whose bytes had not reached
+the disk would survive a crash as a short file and fail every later capture of
+the same content as an integrity error. Content the capture meets twice inside
+one window is written once and synced once, and content an earlier generation
+already published is not written at all.
+
+The window and its fsync parallelism are derived from the CPU count and the
+process descriptor limit; there is no configuration key, because neither bounds
+how much work a batch accepts. Every blob staged is synced before `Barrier`
+returns; the window bounds only how many are synced *at once*, so peak
+descriptors and peak memory are a function of the window and never of the
+number of files captured. `Repair` keeps the single-blob `CAS.Put`, which
+syncs and publishes before it returns: it writes into a manifest that is
+already committed, so there is no later barrier for it to order against.
 
 Unpublished temporaries live under `cas/tmp/put-*`. A capture writes them
 under the workspace lock. `Sweep` removes whatever is there, so a `Repair`

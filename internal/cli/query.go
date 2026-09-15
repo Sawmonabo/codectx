@@ -247,8 +247,11 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"An exhausted --depth, --visited or --timeout is reported as truncation together with " +
 			"whatever routes were found; it is never reported as \"no path exists\". A target that " +
 			"is genuinely unreachable returns no routes and is not marked truncated.\n\n" +
-			"This command takes no --limit, --cursor or --edges: a route set is bounded by the " +
-			"reason-path cap, not paged.\n\n" + nameArgumentHelp,
+			"A page ends on --timeout or on the --visited budget with a continuation cursor; the " +
+			"search state is kept, and following the cursor carries the same search on until it " +
+			"reaches the target. The answer is exact once the final page arrives.\n\n" +
+			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
+			"cap, not paged.\n\n" + nameArgumentHelp,
 		Args:          cobra.ExactArgs(2),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -268,6 +271,10 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			page, err := pageRequest(cmd)
+			if err != nil {
+				return err
+			}
 			var result model.PathResult
 			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
@@ -280,6 +287,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 					To:           nodes[1],
 					MaxDepth:     depth,
 					MaxVisited:   visited,
+					Page:         page,
 				})
 				return err
 			}); err != nil {
@@ -294,6 +302,9 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 	}
 	addQueryFlags(cmd, false)
 	addTraversalFlags(cmd, false, false)
+	// A path search IS resumable now: a page that spends its deadline or its
+	// visited budget keeps its state and prints the token that continues it.
+	addCursorFlag(cmd)
 	return cmd
 }
 

@@ -831,8 +831,10 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// A generation whose only planned unit for this provider is deferred holds
 	// no member for it: the unit seals into a later publication.
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
-		plan: plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}}}
-	g.coverage()
+		plan: plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})}}
+	if err := g.coverage(); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
 	published := g.caps.finish(f.c.log)
 	for _, s := range published {
 		if s.ProviderID != d.ID {
@@ -848,9 +850,11 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 
 	// The same unit, once the publication generation attaches it, is coverage.
 	g = &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
-		plan:   plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}},
+		plan:   plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
-	g.coverage()
+	if err := g.coverage(); err != nil {
+		t.Fatalf("coverage: %v", err)
+	}
 	published = g.caps.finish(f.c.log)
 	for _, s := range published {
 		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
@@ -902,4 +906,11 @@ func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 	if len(rows) != 1 || rows[0].Path != "missing.scip" || rows[0].Resolved {
 		t.Fatalf("supplied index record = %+v, want one unresolved missing.scip", rows)
 	}
+}
+
+// oneUnit is a hand-built plan.Plan's unit sequence. Plan.Units is a sequence
+// and not a slice because plan.Build streams it from a spilled run; a test
+// that assembles a plan by hand supplies the same shape over one unit.
+func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
+	return func(yield func(plan.Unit) error) error { return yield(u) }
 }

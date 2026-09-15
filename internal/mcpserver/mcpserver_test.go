@@ -358,7 +358,7 @@ var toolSchemas = map[string][]string{
 	"codectx_references":          {"node_id", "operation", "semantic_source", "page"},
 	"codectx_callers":             {"start", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_callees":             {"start", "max_depth", "max_visited", "max_edges", "page"},
-	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited"},
+	"codectx_dependency_path":     {"from", "to", "max_depth", "max_visited", "page"},
 	"codectx_impact":              {"start", "direction", "max_depth", "max_visited", "max_edges", "page"},
 	"codectx_context_plan":        {"context", "actor_id"},
 	"codectx_context_status":      {"session_id", "actor_id", "page"},

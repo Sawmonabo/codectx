@@ -38,7 +38,36 @@ import (
 // instance a pagination.Cursor token, whose JSON has no such field -- decodes
 // to zero and is rejected, so the two token shapes can never be interchanged
 // even though both are signed with pagination.PurposeCursor.
-const traversalCursorVersion = 1
+//
+// Version 2 retires the ranked spool vocabulary: a version-1 token issued by an
+// impact page that spilled a ranked tail names a spool this build cannot
+// replay, and resuming it would serve an empty continuation instead of the rest
+// of the answer. It is refused as CTX_CURSOR_INVALID, which a caller re-runs
+// the query for, rather than answered short.
+//
+// Version 3 also reintroduces a ranked spool vocabulary -- a different one: ruling P2's ranked tail, where the walk
+// has already run to completion and the spool holds the globally RANKED
+// remainder of the answer rather than a per-page chunk.
+//
+// The version is bumped even though the ranked fields below are purely
+// additive -- a version-2 token would decode with Ranked false and route to the
+// walk replay perfectly well -- because what an impact or rollup continuation
+// MEANS changed, and nothing in a token's shape distinguishes the two
+// contracts. A version-2 impact cursor was minted by a page that ranked its own
+// chunk and left the walk unfinished; resuming it here would finish the walk
+// and rank only what is left, so the caller would receive one answer ordered
+// two different ways and never be told. The version is therefore the only
+// honest refusal. It ends in-flight neighbours and traversal cursors too, which
+// is accepted: a cursor is short-lived, and CTX_CURSOR_INVALID's remedy is to
+// re-run the query, which returns the whole answer under one contract.
+//
+// Version 3 additionally orders the spool's visited section by NodeID. Membership is a
+// MERGE-JOIN over that order now (visited.go), and a merge-join over a
+// version-2 spool -- whose visited records are in admission order -- would
+// walk past a node the spool holds and report it absent. That is a
+// cross-page RE-ADMISSION: the node would be emitted on two pages. The
+// version is what refuses such a token instead of answering it wrong.
+const traversalCursorVersion = 3
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -76,6 +105,20 @@ type traversalCursor struct {
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
+	// Ranked marks the ranked-tail continuation of ruling P2: the walk is over,
+	// the answer is globally ordered, and SpoolID names the records ranked
+	// after the page that minted this token. It is an explicit discriminator
+	// rather than an inference from the other fields, because the two
+	// vocabularies -- a walk to resume and an order to continue -- are read by
+	// different code and must never be fed each other's spool.
+	Ranked bool `json:"ranked,omitempty"`
+	// RankOffset is how many records of that spool the next page skips, and
+	// RankServed/RankTotal the cumulative answer facts the page discloses.
+	// An offset is carried instead of a sort key because Spools.Open streams
+	// from the start and cannot seek; see rankedTail (impactrank.go).
+	RankOffset int   `json:"rank_offset,omitempty"`
+	RankServed int64 `json:"rank_served,omitempty"`
+	RankTotal  int64 `json:"rank_total,omitempty"`
 	// Visited and Edges are CUMULATIVE across every page of this traversal.
 	Visited   int64     `json:"visited"`
 	Edges     int64     `json:"edges"`
@@ -117,8 +160,37 @@ func (c traversalCursor) validate() error {
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
 	}
+	if err := c.validateRanked(); err != nil {
+		return err
+	}
 	if c.ExpiresAt.IsZero() {
 		return cursorInvalid("cursor has no expiry")
+	}
+	return nil
+}
+
+// validateRanked enforces the ruling P2 half of the payload: the ranked fields
+// are meaningful only on a ranked continuation and meaningless -- and so
+// refused -- on a walk one, which is what keeps a tampered token from steering
+// a walk resume into a ranked spool or the reverse.
+func (c traversalCursor) validateRanked() error {
+	if !c.Ranked {
+		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 {
+			return cursorInvalid("a walk continuation carries a ranked position")
+		}
+		return nil
+	}
+	if c.SpoolID == "" {
+		return cursorInvalid("a ranked continuation names no result spool")
+	}
+	if c.LastOwner != "" || c.LastKey != "" {
+		return cursorInvalid("a ranked continuation carries a traversal keyset position")
+	}
+	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
+		return cursorInvalid("cursor carries a negative ranked position")
+	}
+	if c.RankServed > c.RankTotal || int64(c.RankOffset) > c.RankTotal {
+		return cursorInvalid("cursor continues past the end of the ranked answer")
 	}
 	return nil
 }
@@ -173,56 +245,73 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 	return h.Sum()
 }
 
-// The kinds of record a page spills. The first two are a traversal's: the
-// frontier it stopped at, and the nodes it already admitted (which a resumed
-// page must not admit again). The last three are a RANKED page's: impact ranks
-// its whole walk and cuts the ranked list, so its continuation replays the tail
-// it already computed instead of resuming a frontier.
+// The kinds of record a page spills, and the whole vocabulary: the frontier a
+// page stopped at, and the nodes it already admitted (which a resumed page must
+// not admit again). Every paged endpoint -- neighbours, impact and the package
+// rollup alike -- resumes a WALK, so there is one vocabulary and one replay.
 //
-// The two vocabularies are disjoint and each replay accepts only its own, so a
-// traversal cursor can never be resumed over a ranked spool, or the reverse.
+// Ruling P2 adds a THIRD kind, and one spool shape that is not a walk at all.
+// An impact or rollup request runs its walk to completion, ranks the whole
+// answer, serves the first page and spools the globally ranked remainder; that
+// spool's leading record is `r`, and every record after it is a bare ranked
+// record (impactrank.go's codec), not one of these envelopes. The marker is
+// what makes the two spool shapes self-identifying: the traversal replay below
+// refuses an `r` record through its default branch, so a ranked spool can never
+// be replayed as a frontier, and readRankedHeader refuses an `f` or `v` one.
+//
+// "p" is the ShortestPath continuation's discriminator. It names no spool
+// RECORD -- a path search retains its whole external-memory state as a
+// directory rather than as a record stream (pathcursor.go) -- so it appears
+// here, in the one vocabulary block, purely so no two continuation shapes can
+// ever claim the same marker. pathCursor.validate is what reads it.
+//
+// The older ranked vocabulary of payload version 1 ("a", "e", "p", "c") is
+// gone and is not revived: it spooled a per-page chunk, which is the shape
+// ruling P2 replaces.
 const (
 	spoolRecordFrontier = "f"
 	spoolRecordVisited  = "v"
-	// spoolRecordAnswer is the LEADING record of a ranked spool: the
-	// answer-level facts every page must report identically.
-	spoolRecordAnswer = "a"
-	// spoolRecordEntry is one ranked impact entry, in rank order.
-	spoolRecordEntry = "e"
-	// spoolRecordPackage is one rollup pair. The pairs are individual records
-	// rather than a field of the answer record because a rollup bounded only
-	// by MaxRecordsPerResult can exceed the spool's per-record byte bound.
-	spoolRecordPackage = "p"
-	// spoolRecordCapability is one row of the generation's capability report,
-	// individual for the same reason a rollup pair is: a report may legally
-	// carry model.MaxCapabilityStates rows, each with a scope key, a
-	// diagnostic code and up to MaxCapabilityDetails bounded details, which is
-	// several megabytes against the spool's per-record byte bound.
-	spoolRecordCapability = "c"
+	spoolRecordRanked   = "r"
+	spoolRecordPath     = "p"
 )
+
+// rankedHeader is the leading record of a ranked-tail spool: the marker above
+// and the size of the whole ranked answer, so a continuation can disclose the
+// total without counting the spool it is about to stream.
+type rankedHeader struct {
+	Kind  string `json:"k"`
+	Total int64  `json:"total"`
+}
+
+// encodeRankedHeader renders that record.
+func encodeRankedHeader(total int64) ([]byte, error) {
+	b, err := json.Marshal(rankedHeader{Kind: spoolRecordRanked, Total: total})
+	if err != nil {
+		return nil, &model.Error{Code: model.CodeInternal,
+			Message: "continuation state encoding: " + err.Error()}
+	}
+	return b, nil
+}
+
+// decodeRankedHeader reads it back. A record that is not this build's ranked
+// header is CTX_CURSOR_INVALID rather than a page served from a spool whose
+// shape this build guessed at.
+func decodeRankedHeader(record []byte) (rankedHeader, error) {
+	var h rankedHeader
+	if err := json.Unmarshal(record, &h); err != nil || h.Kind != spoolRecordRanked || h.Total < 0 {
+		return rankedHeader{}, cursorInvalid("the cursor names a result page this build cannot replay")
+	}
+	return h, nil
+}
 
 // spoolRecord is one spilled record. The field names are short because the
 // spool byte budget is shared across every live continuation in the process.
-// A traversal record uses the node fields; a ranked record carries its own
-// already-encoded value in Payload, so adding a ranked kind does not widen the
-// struct every traversal record pays for.
 type spoolRecord struct {
-	Kind    string           `json:"k"`
-	Node    model.NodeID     `json:"n,omitempty"`
-	Depth   int              `json:"d,omitempty"`
-	Cost    int64            `json:"c,omitempty"`
-	Via     model.RelationID `json:"v,omitempty"`
-	Payload json.RawMessage  `json:"p,omitempty"`
-}
-
-// encodeSpoolRecord builds one ranked record around its payload.
-func encodeSpoolRecord(kind string, payload any) (spoolRecord, error) {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return spoolRecord{}, &model.Error{Code: model.CodeInternal,
-			Message: "continuation state encoding: " + err.Error()}
-	}
-	return spoolRecord{Kind: kind, Payload: encoded}, nil
+	Kind  string           `json:"k"`
+	Node  model.NodeID     `json:"n,omitempty"`
+	Depth int              `json:"d,omitempty"`
+	Cost  int64            `json:"c,omitempty"`
+	Via   model.RelationID `json:"v,omitempty"`
 }
 
 // resumeState is what a continuation restores: the decoded cursor, a budget
@@ -232,11 +321,18 @@ type resumeState struct {
 	Cursor   traversalCursor
 	Budget   *budget
 	Frontier []frontierState
-	// Visited streams the nodes the earlier pages admitted, straight off their
-	// spool. It is a STREAM and not a map because the cumulative set is sized
+	// Visited streams the VISITED SECTION of the spool the earlier pages
+	// wrote, ascending by NodeID: every node they admitted except the frontier
+	// they stopped at, which Frontier above already carries into this page's
+	// front. It is a STREAM and not a map because the cumulative set is sized
 	// by the walk: materializing it here was the last repository-sized heap
 	// structure on the traversal path (visited.go).
 	Visited visitedStream
+	// Filter summarizes the nodes Visited will replay. It is built during the
+	// replay below -- which already decodes every record to rebuild the
+	// frontier -- so it costs no extra I/O, and it lets a level whose
+	// candidates are all freshly reached skip the stream entirely.
+	Filter *visitedFilter
 	// Release ends the replayed continuation's spool and lease. The caller
 	// defers it: the spool must outlive the walk, because both the membership
 	// probes and the next page's spill read from it.
@@ -251,20 +347,16 @@ type continuation struct {
 	Depth     int
 	LastOwner model.NodeID
 	LastKey   model.RelationID
-	// Frontier is where the walk stopped, and Visited the nodes THIS page
-	// admitted -- bounded by the page, never by the walk.
+	// Frontier is where the walk stopped, and Visited the nodes this page must
+	// contribute to the fresh spool's visited section, ascending: what it
+	// admitted itself plus the frontier it resumed. Both are bounded by the
+	// page and the frontier ceiling, never by the walk.
 	Frontier []frontierState
 	Visited  []model.NodeID
-	// Carried streams the cumulative set the earlier pages admitted, off the
-	// spool they wrote. spill copies it forward without materializing it, so a
-	// walk of any size costs one spool block of heap here.
+	// Carried streams the visited SECTION of the spool the earlier pages
+	// wrote, ascending. spill merges it with Visited without materializing it,
+	// so a walk of any size costs one spool block of heap here.
 	Carried visitedStream
-	// Records is the already-built state of a RANKED page -- the answer-level
-	// record, the ranked tail and the rollup pairs impact spills. A traversal
-	// leaves a frontier instead and sets none of these; a ranked page leaves
-	// records instead and has no frontier. Exactly one of the two is populated,
-	// which is what keeps the two replay vocabularies disjoint.
-	Records []spoolRecord
 }
 
 // verifyContinuation is the half of a resume every paging endpoint shares: it
@@ -347,6 +439,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	// against the other refused the third page of any walk whose budget it was
 	// working correctly. A tampered or oversized spool is caught by the byte
 	// budget, which is also what keeps peak heap a function of page size.
+	// The membership summary is sized from the cumulative admitted count the
+	// cursor already carries and clamped to a fraction of the walk's own memory
+	// ceiling, so a walk of any size costs a bounded number of filter bytes; a
+	// walk past the clamp gets a denser filter (more false positives, more
+	// sweeps), never a refusal or a truncation.
+	s.Filter = newVisitedFilter(c.Visited, e.limits.FrontierBytes/visitedFilterBudgetShare)
 	err = e.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
 		var r spoolRecord
 		if err := json.Unmarshal(record, &r); err != nil {
@@ -360,6 +458,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 			// and is streamed by s.Visited below.
 		default:
 			return cursorInvalid("continuation state is not readable")
+		}
+		// The summary describes exactly what s.Visited replays -- the visited
+		// section -- so a miss is a proof the stream holds nothing. A frontier
+		// record's node is answered from the front instead.
+		if r.Kind == spoolRecordVisited {
+			s.Filter.add(r.Node)
 		}
 		return nil
 	})
@@ -382,8 +486,17 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 				return cursorInvalid("continuation state is not readable")
 			}
 			switch r.Kind {
-			case spoolRecordFrontier, spoolRecordVisited:
+			case spoolRecordVisited:
+				// The visited SECTION only, and it is written in ascending
+				// NodeID order (spill below), which is what lets warm()
+				// merge-join against it. The frontier records ahead of it are
+				// deliberately skipped: their nodes are carried in heap by the
+				// page that resumes them (visited.go carry), so replaying them
+				// here would both break the order and answer what the front
+				// already answers.
 				return fn(r.Node)
+			case spoolRecordFrontier:
+				return nil
 			}
 			return cursorInvalid("continuation state is not readable")
 		})
@@ -432,15 +545,14 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
 	resumesWalk := len(c.Frontier) > 0 || c.LastKey != ""
-	if !resumesWalk && len(c.Records) == 0 {
+	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
 	}
-	// A frontier, an already-admitted visited set or a ranked tail has to
-	// survive the response, and all three live in the spool; with spilling
-	// disabled none can, so the answer stops here rather than resuming without
-	// them.
-	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0 || len(c.Records) > 0
+	// A frontier or an already-admitted visited set has to survive the
+	// response, and both live in the spool; with spilling disabled neither can,
+	// so the answer stops here rather than resuming without them.
+	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0
 	if needsSpool && e.spools == nil {
 		return "", nil
 	}
@@ -522,11 +634,6 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 		}
 		return sp.Append(encoded)
 	}
-	for _, r := range c.Records {
-		if err := appendRecord(r); err != nil {
-			return "", e.releaseSpool(sp, err)
-		}
-	}
 	frontierNodes := make(map[model.NodeID]struct{}, len(c.Frontier))
 	for _, fs := range c.Frontier {
 		if err := appendRecord(spoolRecord{Kind: spoolRecordFrontier, Node: fs.Node,
@@ -535,25 +642,57 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 		}
 		frontierNodes[fs.Node] = struct{}{}
 	}
-	// The cumulative set the earlier pages admitted is copied STREAM to
-	// STREAM: one record in flight, never the whole set. Every carried record
-	// is written as a visited record whatever kind it had -- a node that was
-	// on the previous page's FRONTIER is not on this one's, and copying its
-	// kind forward would resurrect a stale frontier on the next replay.
+	// The visited section follows the frontier records and is written in
+	// ASCENDING NodeID order, which is what makes membership a merge-join with
+	// an early exit instead of a scan (visited.go). It is produced by a two-way
+	// merge of the carried stream -- already ascending, because the page that
+	// wrote it ran this same merge -- with this page's own ascending
+	// contribution: one record in flight, never the whole set, so a walk of any
+	// size costs one spool block of heap here.
+	//
+	// A node that is on THIS page's frontier is skipped: its frontier record
+	// already marks it visited, and writing it twice would spend the shared
+	// spool budget for nothing. Equal keys are emitted once for the same
+	// reason -- the two sources are disjoint by construction, so this is a
+	// guard, not a correction.
+	var (
+		pending  = c.Visited
+		lastNode model.NodeID
+		haveLast bool
+	)
 	writeVisited := func(n model.NodeID) error {
-		// A frontier record already marks its node visited; writing it twice
-		// would spend the shared spool budget for nothing.
 		if _, ok := frontierNodes[n]; ok {
 			return nil
 		}
+		if haveLast && n == lastNode {
+			return nil
+		}
+		lastNode, haveLast = n, true
 		return appendRecord(spoolRecord{Kind: spoolRecordVisited, Node: n})
 	}
+	// drainBelow emits every pending node that sorts before n, which is what
+	// keeps the merged output ascending.
+	drainBelow := func(n model.NodeID) error {
+		for len(pending) > 0 && pending[0] < n {
+			if err := writeVisited(pending[0]); err != nil {
+				return err
+			}
+			pending = pending[1:]
+		}
+		return nil
+	}
 	if c.Carried != nil {
-		if err := c.Carried(ctx, writeVisited); err != nil {
+		err := c.Carried(ctx, func(n model.NodeID) error {
+			if err := drainBelow(n); err != nil {
+				return err
+			}
+			return writeVisited(n)
+		})
+		if err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
 	}
-	for _, n := range c.Visited {
+	for _, n := range pending {
 		if err := writeVisited(n); err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
