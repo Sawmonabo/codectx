@@ -269,6 +269,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
 		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
 		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
+		{"rank/the_ranked_set_is_bounded_by_its_run_budget", legRankedSetIsBoundedByItsRunBudget},
 		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
 		{"rank/range_hydration_reads_a_bounded_window", legRangeHydration},
 		{"cursor/query_hash_binds_the_query_and_its_filters", legQueryHash},
@@ -1216,4 +1217,53 @@ func resultsOf(t *testing.T, c *collector) []scored {
 		t.Fatalf("reading the ordered set: %v", err)
 	}
 	return out
+}
+
+// legRankedSetIsBoundedByItsRunBudget proves the ranked set is sized by the
+// query memory admission and not by the number of matches. A one-character
+// qualified_name_prefix range-scans a corpus-sized slice of node_ids and every
+// match enters this set (H-L5b concern 2); at 200 000 matches the former
+// map-plus-slice collector held 200 000 entries plus 200 000 servable hits.
+//
+// The assertion is the sort's live-record high-water mark, which is
+// deterministic and input-independent: it must be IDENTICAL at 20 000 and at
+// 200 000 candidates and within the envelope the run budget and the merge
+// fan-in define.
+//
+// Mutation: drop the byte budget so a run is unbounded (WithRunBytes's sizeOf
+// nil-guard, or a runBytes larger than the input) and the high-water mark
+// becomes the match count at both sizes.
+func legRankedSetIsBoundedByItsRunBudget(t *testing.T, _ *fixture) {
+	peakAt := func(n int) int {
+		c := collectorFor(t)
+		for i := range n {
+			// A stride coprime with n offers the candidates in an order that
+			// shares no prefix with either sort order, so every run spills a
+			// scattered key range and the merge is a real one.
+			k := (i * 2237) % n
+			add(t, c, rankedOf(model.TierLexicalFTS, int64(k), "pkg/f"+strconv.Itoa(k%97)+".go", uint64(k),
+				model.NodeID("n"+strconv.Itoa(k)), "k"+strconv.Itoa(k)), "lexical")
+		}
+		got := resultsOf(t, c)
+		if len(got) != n {
+			t.Fatalf("%d candidates ranked to %d results, want all of them", n, len(got))
+		}
+		return c.peakLiveRecords()
+	}
+	small, large := peakAt(20_000), peakAt(200_000)
+	// A ten-fold input must not move the high-water mark at all beyond the
+	// merge fan-in: the run budget is a BYTE budget, so the record count one
+	// run holds varies by a few with the length of the keys that happen to
+	// fill it, but it cannot track the input.
+	if large > small+pagination.MaxSortFanIn {
+		t.Fatalf("live record high-water was %d at 20000 candidates and %d at 200000; the working set must not grow with the match count",
+			small, large)
+	}
+	// The envelope: one run buffer of the floored budget, whose records this
+	// leg makes about 300 bytes each, plus one record per open run in the
+	// merge. A generous ceiling still fails instantly on an unbounded run.
+	const envelope = 4096
+	if large > envelope {
+		t.Fatalf("live record high-water was %d at 200000 candidates, over the %d-record envelope", large, envelope)
+	}
 }

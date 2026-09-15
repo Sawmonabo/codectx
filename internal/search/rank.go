@@ -130,6 +130,12 @@ type collector struct {
 	dedup     *pagination.ExternalSort[scored]
 	truncated bool
 	reason    string
+	// peak is the largest in-memory working set either pass held. It is the
+	// structural memory invariant: it must stay within the envelope the run
+	// budget and the merge fan-in define however many candidates arrive, which
+	// total allocation volume (which grows with the input even for a perfect
+	// external sort) could never show.
+	peak int
 }
 
 // newCollector opens the deduplication pass. dir is where runs spill (the
@@ -251,8 +257,16 @@ func (c *collector) results() (*pagination.SortedRun[scored], error) {
 	if err := deduped.Each(byRank.Add); err != nil {
 		return nil, err
 	}
-	return byRank.Sorted()
+	run, err := byRank.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	c.peak = max(c.dedup.PeakLiveRecords(), byRank.PeakLiveRecords())
+	return run, nil
 }
+
+// peakLiveRecords reports that high-water mark.
+func (c *collector) peakLiveRecords() int { return c.peak }
 
 // truncation reports whether the candidate set was bounded away and why, for
 // QueryMeta.Truncated / TruncationReason.
