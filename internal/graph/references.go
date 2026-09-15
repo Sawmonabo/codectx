@@ -124,9 +124,8 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 		// No traversal, no gate and no deadline: the answer is the disclosure
 		// itself, and running the canonical walk anyway would be the silent
 		// substitution Section 11.6 forbids. The page still validates before it
-		// leaves -- this is the one return path that used to skip it, and an
-		// unavailability disclosure is no more exempt from its own contract
-		// than an answer is.
+		// leaves: an unavailability disclosure is no more exempt from its own
+		// contract than an answer is.
 		page = model.Page[model.ReferenceOccurrence]{
 			Meta: model.QueryMeta{
 				Binding: binding,
@@ -378,9 +377,8 @@ func (c referenceCursor) validate() error {
 		return cursorInvalid("cursor does not name an analysis key")
 	}
 	if !model.ValidHexID(c.SpoolID) {
-		// The inversion of the old rejection: this endpoint used to produce no
-		// spool at all and refused a token that named one. It now produces
-		// nothing else, and a token without one names no position to resume at.
+		// Every continuation this endpoint mints names the spool its next page
+		// seeks into, so a token without one names no position to resume at.
 		return cursorInvalid("a reference continuation names no result spool")
 	}
 	if c.Offset < 0 || c.Served < 0 || c.Total < 0 {
@@ -458,7 +456,7 @@ func (e *Engine) resumeReferences(req model.ReferenceRequest, queryHash string) 
 // this generation's facts or this symbol's order. Resuming against a different
 // generation would page through facts the first page never saw, and resuming
 // against a different node or operation would seek to an offset in a list that
-// no longer means anything -- both silently skip references.
+// means something else -- both silently skip references.
 func (e *Engine) checkReferenceCursor(c referenceCursor, queryHash string) error {
 	b := e.adjacency.Binding()
 	if c.GenerationID != b.GenerationID || c.AnalysisKey != b.AnalysisKey {

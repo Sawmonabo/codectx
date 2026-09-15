@@ -125,10 +125,10 @@ func TestResumableFrontierCompletesAcrossPages(t *testing.T) {
 	}
 }
 
-// TestDepthBoundIsReportedNotSilent is the row-14 proof. A walk that ran out of
-// depth with nodes still unexpanded used to fall out of the loop with
-// Truncated=false and no reason at all: a partial answer that read as a whole
-// one. It now reports reasonDepth, and offers no continuation -- see
+// TestDepthBoundIsReportedNotSilent is the row-14 proof. The failure mode: a
+// walk that runs out of depth with nodes still unexpanded falls out of the loop
+// with Truncated=false and no reason at all -- a partial answer that reads as a
+// whole one. It reports reasonDepth, and offers no continuation -- see
 // walkState.DepthLimited for why one would be a cursor chain that never ends.
 //
 // Mutation: delete the `state.DepthLimited` branch in traverse and Truncated
@@ -485,8 +485,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		// The rank KEY, not merely agreement with a single-shot run of the same
 		// build: comparing the pages against a baseline the same code produced
 		// cannot see an order that is wrong in both. Ruling P1 freezes
-		// (ScoreMicros desc, Depth asc, NodeID asc), with Name no longer a
-		// tie-break.
+		// (ScoreMicros desc, Depth asc, NodeID asc); Name is not a tie-break.
 		for i := 1; i < len(entries); i++ {
 			prev, cur := entries[i-1], entries[i]
 			ordered := prev.ScoreMicros > cur.ScoreMicros ||
@@ -1172,12 +1171,12 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 
 // TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget is SK8. Under a small
 // shared continuation budget an impact walk split across many deadline pages
-// eventually cannot hand its retained pass-1 input to the spool store. That
-// used to return an empty token and a NIL error (`retain` degraded a budget
-// refusal into `("", nil)` and nextTraversalCursor passed it through), so the
-// answer ended mid-walk with `truncated:true`, `truncation_reason:"query
+// eventually cannot hand its retained pass-1 input to the spool store. The
+// failure mode: an empty token and a NIL error (`retain` degrading a budget
+// refusal into `("", nil)` and nextTraversalCursor passing it through), so the
+// answer ends mid-walk with `truncated:true`, `truncation_reason:"query
 // deadline reached"`, `next_cursor:null` and exit 0 -- 17% of an answer
-// presented as a whole one, under a reason that named a bound which was not the
+// presented as a whole one, under a reason that names a bound which was not the
 // one that stopped it. Soaking r3 under `resources.query_timeout="2s"` hit it
 // at page 131 of a 761-page walk.
 //

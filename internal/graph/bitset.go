@@ -97,10 +97,10 @@ type pagedBitset struct {
 	// impossible, and a bitset that quietly accepted one would hide the breach.
 	//
 	// ZERO means the set has no declared upper bound. Both sets a walk opens
-	// declare one -- MaxNode for the nodes, MaxRelation for the relations --
-	// so the range check is the FIRST guard against a surrogate from another
-	// generation and the cursor's fence is the second. Zero survives only for
-	// a generation that genuinely carries no surrogate of that kind.
+	// declare one -- the reader's MaxNode -- so the range check is the FIRST
+	// guard against a surrogate from another generation and the cursor's fence
+	// is the second. Zero survives only for a generation that genuinely
+	// carries no surrogate of that kind.
 	limit uint64
 
 	pages map[int64]*list.Element // page index -> element holding *bitsetPage

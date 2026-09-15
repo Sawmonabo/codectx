@@ -125,10 +125,14 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 		if err != nil {
 			return model.Page[model.OverviewItem]{}, err
 		}
-		// The keyset position is the last container the issuing page listed;
-		// the cumulative edge budget rides along, so paging the whole map
-		// cannot cost more adjacency reads than one walk of it.
-		after, b = c.LastOwner, resumed
+		// The enumeration position is the last container the issuing page
+		// listed, carried as the reader's own surrogate; the cumulative edge
+		// budget rides along, so paging the whole map cannot cost more
+		// adjacency reads than one walk of it.
+		b = resumed
+		if after, err = e.containerAfter(ctx, c.LastNode); err != nil {
+			return model.Page[model.OverviewItem]{}, err
+		}
 		// The continuation is consumed here, at the point its state is in
 		// memory, exactly as resumeTraversal consumes a pure keyset one: this
 		// endpoint mints a lease per page and spills no spool, so holding the
@@ -211,16 +215,14 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	// dropped by the depth filter do not change that: the keyset is the
 	// enumeration, not the filtered page.
 	if len(containers) == limit {
+		last, err := e.containerPosition(ctx, ids[len(ids)-1])
+		if err != nil {
+			return model.Page[model.OverviewItem]{}, err
+		}
 		token, err := e.nextTraversalCursor(ctx, b, continuation{
 			Endpoint:  overviewEndpoint,
 			QueryHash: queryHash,
-			LastOwner: ids[len(ids)-1],
-			// The frozen payload keeps a keyset position as an (owner, key)
-			// PAIR and rejects a half-formed one. This endpoint's keyset is a
-			// single container NodeID -- it pages over nodes, not over the
-			// edges of one node -- so the same id rides in both halves and
-			// only LastOwner is ever read back.
-			LastKey: model.RelationID(ids[len(ids)-1]),
+			LastNode:  last,
 		})
 		if err != nil {
 			return model.Page[model.OverviewItem]{}, err
@@ -241,6 +243,59 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 		}
 	}
 	return page, nil
+}
+
+// containerPosition is the reader position a continuation carries for the last
+// container a page listed. The enumeration itself is ordered by canonical id --
+// surrogates are assigned in intern order and say nothing about it -- so the
+// position is resolved at MINT time and named back at resume time; what travels
+// in the token is the generation-local surrogate every other traversal position
+// is written in, and the cursor's generation fence covers it.
+//
+// It runs on a context DETACHED from the request deadline for the reason
+// nextTraversalCursor does (cursor.go): minting is the LAST thing a page that
+// ran out of time does, so charged against the expired context this read would
+// fail with the context's own error and a page the engine had decided to
+// continue would come back with nothing to resume from. It is one batched
+// primary-key read of a single id, not another enumeration.
+func (e *Engine) containerPosition(ctx context.Context, id model.NodeID) (NodeRef, error) {
+	ctx = context.WithoutCancel(ctx)
+	reader, err := e.consumerReader()
+	if err != nil {
+		return 0, err
+	}
+	refs, err := reader.Resolve(ctx, []model.NodeID{id})
+	if err != nil {
+		return 0, err
+	}
+	if len(refs) != 1 || refs[0] == 0 {
+		// The enumeration listed it from this same pinned generation, so a
+		// reader that cannot resolve it disagrees with itself.
+		return 0, internalErr("graph: the packed reader does not carry a container the map just listed")
+	}
+	return refs[0], nil
+}
+
+// containerAfter names the container a continuation resumes after. A surrogate
+// the pinned generation does not carry is a token from another generation that
+// the fence let through, which is a refusal and never an enumeration from the
+// beginning: restarting would serve the first page again as the second.
+func (e *Engine) containerAfter(ctx context.Context, ref NodeRef) (model.NodeID, error) {
+	if ref == 0 {
+		return "", nil
+	}
+	reader, err := e.consumerReader()
+	if err != nil {
+		return "", err
+	}
+	ids, err := reader.NodeIDs(ctx, []NodeRef{ref})
+	if err != nil {
+		return "", err
+	}
+	if len(ids) != 1 || ids[0] == "" {
+		return "", cursorInvalid("cursor names a container this generation does not carry")
+	}
+	return ids[0], nil
 }
 
 // containerAncestry resolves the immediate container parent and the containment
