@@ -976,10 +976,10 @@ func rekeyRoutes(ctx context.Context, s *compileSorts, remap *pagination.Externa
 			}
 			hopCursor.advance()
 		}
-		if err := pathCursor.err2(); err != nil {
+		if err := pathCursor.err(); err != nil {
 			return err
 		}
-		return hopCursor.err2()
+		return hopCursor.err()
 	}); err != nil {
 		return nil, nil, err
 	}
@@ -1051,7 +1051,7 @@ func (c *Compiler) passIEmit(ctx context.Context, s *compileSorts, m *measuredPl
 		for verdicts.ok && verdicts.cur.Decision.FileID < r.FileID {
 			verdicts.advance()
 		}
-		if err := verdicts.err2(); err != nil {
+		if err := verdicts.err(); err != nil {
 			return err
 		}
 		if !verdicts.ok || verdicts.cur.Decision.FileID != r.FileID {
