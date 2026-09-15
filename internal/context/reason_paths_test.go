@@ -102,7 +102,7 @@ func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
 	c := &Compiler{}
 	c.cfg.Resources.MaxPageItems = model.MaxPageItems + 500
 	notices := c.manifestNotices(scopeResult{ReasonsDropped: dropped, ReasonsTruncated: truncated},
-		plan{RelationsClipped: 3})
+		planParts{RelationsClipped: 3})
 	if len(notices) != 4 {
 		t.Fatalf("the compile disclosed %d notices %q, want one per cut", len(notices), notices)
 	}
@@ -123,7 +123,7 @@ func TestBoundedExplanationsReachTheManifestNotices(t *testing.T) {
 		}
 	}
 	// A compile under no raised bound and no cut discloses nothing.
-	if n := (&Compiler{}).manifestNotices(scopeResult{}, plan{}); len(n) != 0 {
+	if n := (&Compiler{}).manifestNotices(scopeResult{}, planParts{}); len(n) != 0 {
 		t.Fatalf("an unbounded compile disclosed %q", n)
 	}
 }

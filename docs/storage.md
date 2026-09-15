@@ -434,11 +434,13 @@ Generation activation is a single commit, so a generation is either visible or
 it is not; a crash can leave the previous generation active, never a partly
 published one. And a blob's content reaches the disk before the commit that
 names it, so the only inconsistency a rolled-back commit can produce is a blob
-that nothing references — an orphan, which is exactly what the retention sweep
-already reclaims, never a manifest pointing at content that is not there.
+that nothing references — an orphan, which the retention collector reclaims: its
+CAS sweep walks the store in bounded chunks and removes every object no blobs
+row names once it is older than the `retention.blob_grace` window, never a
+manifest pointing at content that is not there.
 
 So the worst case is: the workspace is one generation stale and holds some
-unreferenced blobs until the next sweep. Both are repaired by re-running the
+unreferenced blobs until a sweep a grace window later. Both are repaired by re-running the
 index, which the store is built to do cheaply, because everything in it is
 derived from the repository's own bytes. `storage.synchronous = "full"` buys
 back durability of those last commits at roughly 10 ms of fsync per commit;

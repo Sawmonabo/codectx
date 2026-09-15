@@ -300,7 +300,10 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			})
 		},
 	}
-	addQueryFlags(cmd, false)
+	// cursored: `path` declares --cursor below, so its --generation help must
+	// carry the same "not combinable with --cursor" refusal every other
+	// cursored command states and docs/queries.md documents unconditionally.
+	addQueryFlags(cmd, true)
 	addTraversalFlags(cmd, false, false)
 	// A path search IS resumable now: a page that spends its deadline or its
 	// visited budget keeps its state and prints the token that continues it.

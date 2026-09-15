@@ -17,6 +17,18 @@ import (
 // versioned workflow state are the explicitly mutable rows, and every
 // transition is a compare-and-swap on state_version in one transaction.
 
+// ExcludedEntries is a manifest's exclusion projection as a push sequence: it
+// yields every excluded entry in ordinal order and returns the first error
+// yield reported, or its own read failure, unchanged.
+//
+// It must be RESTARTABLE -- callable more than once, yielding the identical
+// sequence each time -- because the compiler folds the canonical manifest hash
+// over the same exclusions it then writes, and a one-shot cursor would hash a
+// sequence and persist an empty one. A sorted run over a spooled projection
+// satisfies this; a channel drained by the first caller does not. A nil
+// sequence is a manifest with no exclusions.
+type ExcludedEntries func(yield func(model.ExcludedContextEntry) error) error
+
 // PutManifest stores an immutable compiled manifest: header, ordered entries,
 // slices and exclusions in one transaction. Every entry's node must be visible
 // in the manifest's generation and every file must be in its snapshot.
@@ -28,8 +40,16 @@ import (
 // descending within a rank. The workflow walks those ordinals directly, so an
 // order this method accepted and never checked would be a defect visible only
 // one task later.
+//
+// Exclusions arrive as a SEQUENCE and not as a slice. An entry list is bounded
+// by the compile's resolved budget -- the caller's own declared window -- but
+// the exclusion list is bounded only by the repository, so materializing it
+// here would put a repository-sized slice in heap for the length of the
+// transaction. Rows are validated and inserted one at a time as the sequence
+// yields them, against a prepared statement inside the manifest's single
+// transaction, so peak heap is one row however many were excluded.
 func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, requestJSON []byte,
-	entries []model.ContextEntry, slices []model.ContextSlice, excluded []model.ExcludedContextEntry) error {
+	entries []model.ContextEntry, slices []model.ContextSlice, excluded ExcludedEntries) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
@@ -76,14 +96,6 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 		}
 		if sl.Index != i {
 			return invalid("manifest slices must be ordered 0..n-1; slice %d has index %d", i, sl.Index)
-		}
-	}
-	for i, x := range excluded {
-		if err := x.Validate(); err != nil {
-			return err
-		}
-		if x.Ordinal != i {
-			return invalid("excluded entries must be ordered 0..n-1; entry %d has ordinal %d", i, x.Ordinal)
 		}
 	}
 	idRaw, _ := model.DecodeID(string(m.ID))
@@ -204,10 +216,28 @@ func (s *Store) PutManifest(ctx context.Context, m model.ContextManifest, reques
 			return wrap("excluded_context_entries", err)
 		}
 		defer excl.Close()
-		for _, x := range excluded {
-			ref, _ := json.Marshal(x.Reference)
-			if _, err := excl.ExecContext(ctx, idRaw, x.Ordinal, string(ref), x.Reason); err != nil {
-				return wrap("excluded_context_entries", err)
+		// The ordinal check the slice form ran up front runs HERE instead,
+		// against a counter rather than a length: the same rule (exclusions are
+		// ordered 0..n-1), enforced at the row that breaks it, without holding
+		// the rows to count them first. A sequence that yields nothing is a
+		// manifest with no exclusions, which is legal.
+		if excluded != nil {
+			ordinal := 0
+			if err := excluded(func(x model.ExcludedContextEntry) error {
+				if err := x.Validate(); err != nil {
+					return err
+				}
+				if x.Ordinal != ordinal {
+					return invalid("excluded entries must be ordered 0..n-1; entry %d has ordinal %d", ordinal, x.Ordinal)
+				}
+				ordinal++
+				ref, _ := json.Marshal(x.Reference)
+				if _, err := excl.ExecContext(ctx, idRaw, x.Ordinal, string(ref), x.Reason); err != nil {
+					return wrap("excluded_context_entries", err)
+				}
+				return nil
+			}); err != nil {
+				return err
 			}
 		}
 		return nil

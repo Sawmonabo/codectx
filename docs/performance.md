@@ -137,12 +137,22 @@ percentile over `n` samples.
 | 8 | No-change refresh: no parser work, no FTS body rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
 | 9 | Cold base index of the reference fixture | 3 min | **1 min 32.1 s** over 10 000 files / 1 052 933 lines / 86 064 203 B (the corrected Section 23.1 size); process-tree peak **145.3 MiB** | PASS — re-measured after the external-merge planner and batched provider sinks landed (earlier: 2 min 56.3 s / 912.6 MiB) |
 | 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** at small-real scale; **145.3 MiB** on the corrected reference corpus (sampled at 250 ms and 50 ms, two cold runs within 0.1 MiB) | PASS — the earlier 912.6 MiB at reference scale was measured before the planner's external merge sort and the batched provider sinks |
-| 11 | Idle MCP RSS | 128 MiB | **61.5 MiB** | PASS |
+| 11 | Idle MCP RSS | 128 MiB | **64.0 MiB** | PASS — re-measured under the corrected semantics (see below); the earlier 61.5 MiB was a startup-window sample |
 | 12 | Interactive process-tree peak | 256 MiB | **60.5 MiB** | PASS |
 | 13 | Base storage vs eligible source bytes | 3.5× | **16.10×** on the corrected reference corpus: 1 385 729 099 stored over 86 064 203 eligible source bytes (db 1 299 664 896 + wal 0 + CAS 86 064 203; **CAS alone = 1.00×**). Earlier, on the undersized ~570 B/file corpus: 75.00× / 73.86×; 149.0× at small-real scale | **MISS by 4.6×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
 | 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
 | 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
+
+Row 11 measures a RESTING session, which is what "idle" claims. It used to open
+its sampling window at process start with `mcp.watch` at its default, so the
+window covered the initial refresh and its parser workers — a startup peak
+reported under an idle label, and a default `max_parser_workers` was once
+reverted on the strength of it. The row now starts the session with
+`--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
+the server at rest: workspace open, no refresh running. The refresh peak is row
+10's subject and is measured there under `index --full`. The 128 MiB target is
+unchanged.
 
 Row 15's two counts are the recorded run's, not a fixed point: plan selection
 order among equally scored candidates is not bit-stable at this scale, and a
@@ -286,6 +296,99 @@ Two rules bind the interpretation:
   investigation and a written explanation, even when the absolute budget is
   still met.
 
+### 3.3 The context compile's memory: what the peak is a function of
+
+The streamed context compile claims that its live working set is the sort run
+buffer and not the repository. Two measurements on the host of Section 1, both
+from `internal/context`:
+
+| What was pushed | Records | Peak live records per sort | Heap in use, live, after the push | Spilled runs |
+|---|---|---|---|---|
+| Seed push sink (ruling C10), 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
+| Seed push sink, 50 000 entities offered twice | 100 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +144 KiB | seed sorts spill |
+| One compile sort at the primitive's floor run budget | 20 000 | 401 (~2× the run budget in bytes, the record that triggers the spill included) | — | 50 |
+
+Ten times the seeds, the same peak per sort and the same order of live bytes:
+the sink holds one run buffer whatever discovery finds. Both rows come from
+`TestTheSeedSinkPeaksOnTheRunBufferAtEitherSeedCount`; the third is
+`TestACompileSortHoldsItsRunBudgetAndSpills`. Each figure is asserted by the
+test that produced it, so a regression fails rather than being noticed here.
+
+**The whole-compile scale curve.** `TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale`
+publishes a fan-out fixture of N leaf entities, compiles it, and pages the
+persisted manifest back. Publication is timed separately from the compile: it is
+the fixture's cost and never the product's. The compile column below was taken
+under the DEFAULT admission (`resources.query_memory_bytes`, 32 MiB), where a
+sort of a few tens of thousands of these records never fills its 8 MiB run
+buffer and nothing spills; the peak/spill column comes from the committed proof,
+which sets a 1 MiB admission so both sizes are past the spill threshold, since
+"the peak is the run buffer" is only a claim once the buffer binds.
+
+| N (leaves) | Fixture publish | Compile | Page latency, persisted manifest (200 rows/page) |
+|---|---|---|---|
+| 500 | — | 105 ms | 0.27–0.56 ms |
+| 1 000 | — | 152 ms | 0.50–0.62 ms |
+| 2 000 | — | 247 ms | 0.52–0.70 ms |
+| 4 000 | — | 536 ms | 0.57–1.22 ms |
+| 8 000 | — | 1.272 s | 0.51–1.61 ms |
+| 16 000 | — | 4.116 s | 0.48–1.64 ms |
+| 2 000 (1 MiB admission) | 2.8 s | 469 ms | 0.48–0.88 ms |
+| 4 000 (1 MiB admission) | 6.8 s | 849 ms | 0.45–1.07 ms |
+
+Page latency is FLAT across the whole range — a page of the persisted plan costs
+about half a millisecond whether the plan holds 509 rows or 16 009 — which is the
+paging claim. The peak, at the 1 MiB admission, is likewise flat while the
+spilled-run count is the thing that grows:
+
+| N (leaves) | `scope-cand` / `scope-entity` peak | Spilled runs |
+|---|---|---|
+| 2 000 | 774 records | 3 |
+| 4 000 | 774 records | 6 |
+
+**The compile is superlinear, and where.** The per-doubling wall ratios are
+1.45, 1.62, 2.17, 2.37, 3.24 — increasing, not constant: the local exponent at
+the top of the measured range (8 000 → 16 000) is log₂ 3.24 ≈ **1.70**. The
+cause WAS the ranked-impact continuation in `internal/graph`, not the context
+compile's own sorts. `Engine.serveRankedImpact` served each later page by
+opening the ranked spool FROM THE START and then copying every record after the
+page into a fresh spool, so each page cost O(records remaining) and a walk of N
+entries read to exhaustion at a 200-row page cost Θ(N²/400) record reads and
+writes. A CPU profile of the 500/1 000/2 000 and 4 000/8 000/16 000 runs
+attributed 0.69 s of the 1.13 s spent in `Engine.walkImpact` to
+`serveRankedImpact`, of which 0.55 s was `pagination.Spools.Open` — the re-read
+and the re-copy — and that share rose with N. Nothing in `internal/context` is
+quadratic.
+
+That continuation is now O(page) per page: the spool is written once, by the
+page that settles the order, and every later page seeks to the byte offsets its
+cursor carries and reads only its own page (`pagination.Spools.OpenAt`,
+`RankOffset`/`PairOffset`, cursor payload version 6). Measured on the
+20 101-node deadline-split fixture at 200 rows a page
+(`graph.TestADeadlineSplitWalkAlwaysAdvances`), spool bytes read per page are
+flat at 88 046 on pages 3, 50 and 100 and nothing is written after the spill,
+where the per-page latency used to FALL with the shrinking remainder — 18.9 ms
+at page 3, 10.7 ms at page 50, 1.9 ms at page 100 — and is now ~0.39 ms
+throughout. The exponent above is the "before" figure and has not been
+re-measured.
+
+**What the fixture costs, and why it is not the product.** Publishing the
+fixture dominates the test's wall clock: at 16 000 leaves it is 74.3 s of the
+82.7 s of CPU the test spends, almost all of it in
+`storage/sqlite.(*Store).SealUnit` under `contextFixture.sealRelations` (44.2 s)
+and `sealUnit` (26.9 s), with `_sqlite3BtreeIndexMoveto` alone at 39.0 s. This
+is what C-FIX2 recorded as "the compile had not finished after twelve minutes":
+`t.Logf` output is buffered until the test ends, so the publication of two
+fixtures was indistinguishable from a hung compile. The compile at 16 000 leaves
+is 4.1 s.
+
+Reproduce with:
+
+```bash
+CODECTX_SCALE_PROOF=1 go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+CODECTX_SCALE_PROOF=1 CODECTX_SCALE_LEAVES=2000,4000,8000 \
+  go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+```
+
 ## 7. Reproducing this page
 
 ```bash
@@ -294,7 +397,13 @@ go test ./internal/bench -run TestResourceBudgets -count=1
 go test ./internal/bench -run TestSessionStatusClamp -count=1 -v
 go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
+go test ./internal/context -run 'TestTheSeedSinkPeaks|TestACompileSortHolds' -count=1 -v
+CODECTX_SCALE_PROOF=1 go test ./internal/context \
+  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 30m
 ```
+
+The two `internal/context` lines produce Section 3.3: the first its measured
+rows, the second the compile-level rows of the same table.
 
 That block produces every row of Section 3 except three. Rows 9 and 13 need a
 cold index of the reference corpus, and row 16 needs a real workspace; both are

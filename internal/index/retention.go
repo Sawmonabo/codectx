@@ -95,7 +95,8 @@ func (c *Coordinator) collect(ctx context.Context) {
 		"sessions_expired", report.SessionsExpired, "sessions_pruned", report.SessionsPruned,
 		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
 		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
-		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored)
+		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
+		"orphan_objects_swept", report.OrphanObjectsSwept)
 }
 
 // retentionState is what this coordinator knows about its own last retention

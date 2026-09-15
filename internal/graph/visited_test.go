@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/pagination"
 
@@ -99,10 +100,10 @@ func TestVisitedSetHeapIsBoundedByTheFrontNotTheWalk(t *testing.T) {
 		t.Fatalf("the visited set held %d bytes of heap for a %d-node walk; the front must be bounded by the page (bound %d bytes)",
 			grew, syntheticNodes, bound)
 	}
-	// The front is what the next spill writes, and it must be only this page's
-	// own admissions -- never the cumulative set, which is copied spool to
-	// spool instead.
-	if got := len(set.newlyAdmitted()); got > levels*perLevel {
+	// The front is what this page appends to the run store, and it must be
+	// only this page's own admissions -- never the cumulative set, every
+	// earlier page's run of which stays where that page wrote it.
+	if got := len(set.addedNodes()); got > levels*perLevel {
 		t.Fatalf("the page offered %d newly admitted nodes; it admitted at most %d", got, levels*perLevel)
 	}
 }
@@ -128,6 +129,24 @@ type convergentAdjacency struct {
 const convergentChain = 60
 
 func newConvergentAdjacency() *convergentAdjacency {
+	return newConvergentAdjacencyOfLength(convergentChain)
+}
+
+// newConvergentAdjacencyOfLength is the same shape at a chosen length, so a
+// measurement that reads a per-page figure at a named page can make the walk
+// long enough to reach it.
+func newConvergentAdjacencyOfLength(links int) *convergentAdjacency {
+	return newBackEdgeAdjacency(links, 0)
+}
+
+// newBackEdgeAdjacency is that shape WIDENED: every chain link also calls
+// `width` leaves of its own, so a level is wide enough to spill the frontier
+// ceiling and split ONE request into several internal legs, while the shared
+// sink every link calls is still admitted at level 1 and expanded at level 2 --
+// long off the frontier by the time the deeper levels reach it again. A width
+// of zero is the plain convergent chain, which is what the constructor above
+// asks for.
+func newBackEdgeAdjacency(links, width int) *convergentAdjacency {
 	a := &convergentAdjacency{
 		binding: model.Binding{
 			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
@@ -148,18 +167,23 @@ func newConvergentAdjacency() *convergentAdjacency {
 		a.rels = append(a.rels, model.Relation{ID: fixtureRelationID(len(a.rels) + 1),
 			From: from, To: to, Kind: model.RelCalls})
 	}
-	prev := add("c-00")
-	for i := 1; i < convergentChain; i++ {
-		next := add(fmt.Sprintf("c-%02d", i))
+	prev := add("c-0000")
+	for i := 1; i < links; i++ {
+		next := add(fmt.Sprintf("c-%04d", i))
 		edge(prev, next)
 		edge(prev, sink)
+		for j := 0; j < width; j++ {
+			edge(prev, add(fmt.Sprintf("w-%04d-%03d", i-1, j)))
+		}
 		prev = next
 	}
 	edge(prev, sink)
+	for j := 0; j < width; j++ {
+		edge(prev, add(fmt.Sprintf("w-%04d-%03d", links-1, j)))
+	}
 	edge(sink, terminal)
 	return a
 }
-
 func (a *convergentAdjacency) Edges(_ context.Context, nodes []model.NodeID, _ model.Direction,
 	_ []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	want := map[model.NodeID]bool{}
@@ -225,7 +249,7 @@ func TestSpooledVisitedSetAnswersACrossPageRevisit(t *testing.T) {
 		}
 		return e
 	}
-	req := model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("c-00")},
+	req := model.GraphRequest{GenerationID: 1, Start: []model.NodeID{fixtureNodeID("c-0000")},
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
 	whole, err := engine(t, 2000).Neighbors(context.Background(), req)
@@ -336,12 +360,14 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 		}
 		return nil
 	}
-	filter := newVisitedFilter(chainNodes, int64(chainNodes*visitedFilterBitsPerNode/8))
+	// Sixteen bits per node of the cumulative set, the density the store's
+	// frozen geometry is budgeted at (visitedstore.go).
+	filter := newFrozenVisitedFilter(chainNodes*16, visitedFilterProbes)
 	if filter == nil {
 		t.Fatal("no membership summary was built for a 20 000-node walk")
 	}
 	for i := 0; i < chainNodes; i++ {
-		filter.add(syntheticID(i))
+		filter.addWords(syntheticID(i), nil)
 	}
 	c := newVisitedSet(chain)
 	c.filter = filter
@@ -374,4 +400,197 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 			t.Fatalf("the membership summary lost node %d: a Bloom filter has no false negatives", i)
 		}
 	}
+}
+
+// TestWarmAnswersAStreamOfSeveralAscendingRuns is the Defect B proof. The
+// cumulative set warm sweeps is a CONCATENATION of ascending runs, not one
+// ascending sequence: every leg of the walk appends one run of its own
+// admissions to the retained run store (visitedstore.go) and nothing merges
+// them. A merge-join that assumed one global order advanced past a
+// candidate answered by an EARLIER block and then stopped at the first block
+// that ran past the largest candidate, reporting a node the walk had already
+// admitted as absent -- re-admitting it on a later page and reporting the same
+// entity twice.
+//
+// The blocks below are written by the production writer in the order the
+// production walk writes them: a second link whose admissions sort below the
+// first link's is ordinary (the walk admits whatever the graph reaches next),
+// and it is what makes the stream non-monotonic.
+//
+// Mutation (`next = 0` on a descending key deleted, or `errWarmComplete`
+// returned on `next >= len(sorted)` again): the first candidate below is
+// reported absent, which is the assertion this test leads with.
+func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
+	store, err := openVisitedStore(t.TempDir(), 0, nil)
+	if err != nil {
+		t.Fatalf("open visited store: %v", err)
+	}
+	defer store.close()
+	// Link 1 admitted the high ids, link 2 the low ones. Each run is
+	// ascending; the stream is not.
+	if _, err := store.appendRun([]model.NodeID{"n-0500", "n-0600"}); err != nil {
+		t.Fatalf("append link 1: %v", err)
+	}
+	if _, err := store.appendRun([]model.NodeID{"n-0100", "n-0200"}); err != nil {
+		t.Fatalf("append link 2: %v", err)
+	}
+	v := newVisitedSet(store.stream)
+	// Both candidates were admitted; the sweep must answer both. n-0100 is the
+	// one the single-order join loses: n-0500 answers the larger candidate and
+	// leaves the join past it, and the pass used to end there.
+	if err := v.warm(context.Background(), []model.NodeID{"n-0100", "n-0600"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	for _, id := range []model.NodeID{"n-0100", "n-0600"} {
+		if !v.has(id) {
+			t.Fatalf("node %s was admitted by the walk but the sweep reported it absent: it would be admitted again and reported twice", id)
+		}
+	}
+	// A node no run holds is still absent: the run-aware join must not turn
+	// a restart into a false positive.
+	if err := v.warm(context.Background(), []model.NodeID{"n-0300"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if v.has("n-0300") {
+		t.Fatal("a node no run holds was reported as already admitted")
+	}
+}
+
+// resumeSpooledWalk drives a real paged walk over the convergent fixture for
+// `pages` pages and reopens the continuation the last one minted through the
+// production resume, so a test can read exactly what the next page would.
+func resumeSpooledWalk(t *testing.T, pages int) *resumeState {
+	t.Helper()
+	a := newConvergentAdjacency()
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 8
+	e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	kinds := []model.RelationKind{model.RelCalls}
+	start := []model.NodeID{fixtureNodeID("c-0000")}
+	req := model.GraphRequest{GenerationID: 1, Start: start,
+		Direction: model.DirectionOutgoing, Relations: kinds}
+	cursor := ""
+	for page := 1; page <= pages; page++ {
+		res, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		if res.Meta.NextCursor == "" {
+			t.Fatalf("page %d ended the walk; this proof needs a continuation over a spooled visited set", page)
+		}
+		cursor = res.Meta.NextCursor
+		req = model.GraphRequest{Start: start, Direction: model.DirectionOutgoing,
+			Relations: kinds, Page: model.PageRequest{Cursor: cursor}}
+	}
+	queryHash := traversalQueryHash(model.DirectionOutgoing, kinds, start, 0, limits.MaxPageItems)
+	s, err := e.resumeTraversal(context.Background(), cursor, neighborsEndpoint, queryHash,
+		time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("resume the continuation: %v", err)
+	}
+	t.Cleanup(s.Release)
+	return s
+}
+
+// TestTheRetainedVisitedRunsAreAscending is the A4 proof, carried over to the
+// append-only store. The membership sweep is a MERGE-JOIN over the cumulative
+// set (visited.go warm), and it reads that set for what it is: a CONCATENATION
+// of ascending runs, one per page, where a key below its predecessor starts the
+// next run and restarts the join at the smallest unanswered candidate. Both
+// halves are correctness invariants, not tidiness ones. A run that is not
+// ascending makes the join advance past a candidate it could have answered and
+// report a node the walk HAS admitted as absent -- a cross-page RE-ADMISSION,
+// the same entity listed twice. More runs than pages means the store took ids
+// out of order, which costs the join a restart per stray key.
+//
+// Mutation (visitedstore.go appendRun given its ids reversed, or cursor.go
+// handing it an unsorted slice): the run under the stray key is descending and
+// the first assertion fails; the run count passes the second.
+func TestTheRetainedVisitedRunsAreAscending(t *testing.T) {
+	// Three pages, so the store under test holds several runs: each page
+	// appended its OWN admissions and copied nothing forward.
+	const pages = 3
+	s := resumeSpooledWalk(t, pages)
+	var prev model.NodeID
+	runs, n := 0, 0
+	if err := s.Visited(context.Background(), func(id model.NodeID) error {
+		switch {
+		case n == 0 || id < prev:
+			runs++
+		case id == prev:
+			return fmt.Errorf("the retained runs repeat node %s: a run is a page's own "+
+				"admissions, and a node two pages both admitted is the re-admission "+
+				"the store exists to prevent", id)
+		}
+		prev, n = id, n+1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 {
+		t.Fatalf("the runs held %d record(s); an order invariant needs at least two", n)
+	}
+	if runs > pages {
+		t.Fatalf("the store holds %d ascending run(s) over %d page(s); a page appends ONE run, "+
+			"so more of them means ids were appended out of order and the merge-join restarts "+
+			"on every stray key", runs, pages)
+	}
+	t.Logf("%d retained record(s) in %d ascending run(s)", n, runs)
+}
+
+// TestResumePopulatesTheMembershipSummaryFromTheSpool is the A16 proof. The
+// filter is the only thing standing between a chain-shaped page and levels x
+// |visited| record decodes, and it is built in ONE place: the resume replay
+// that already decodes every spool record to rebuild the frontier
+// (resumeTraversal). Every other test in this file hands `c.filter` a filter it
+// built by hand, so a one-sided edit -- the replay stops calling add, or starts
+// summarising the frontier records instead of the visited section -- is a
+// silent false negative that no assertion here would catch: the walk stays
+// CORRECT (a filter miss only costs a sweep) and simply gets slow again.
+//
+// So this drives a real paged walk and then opens its continuation through the
+// production resume, asserting that the summary describes exactly the stream
+// the same resume hands the walk.
+//
+// Mutation (`s.Filter.add(r.Node)` deleted from resumeTraversal): every node the
+// stream replays is reported absent by the summary, which is the assertion
+// below.
+func TestResumePopulatesTheMembershipSummaryFromTheSpool(t *testing.T) {
+	// Two pages, so the cursor under test names a spool whose visited SECTION
+	// is non-empty: page 1 spills the nodes it admitted, page 2 merges its own
+	// into them. A summary over an empty stream would satisfy the loop below
+	// vacuously, which is what the count guards.
+	s := resumeSpooledWalk(t, 2)
+	if s.Filter == nil {
+		t.Fatal("the resume built no membership summary; every level of the next page would sweep the whole spool")
+	}
+	replayed := 0
+	if err := s.Visited(context.Background(), func(id model.NodeID) error {
+		replayed++
+		if !s.Filter.mayHold(id) {
+			return fmt.Errorf("the summary reports node %s absent, but the resume's own stream replays it: "+
+				"a false negative makes a level skip the sweep that answers it, and the node is admitted twice", id)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if replayed == 0 {
+		t.Fatal("the continuation replayed no visited nodes; the assertion above would be vacuous")
+	}
+	t.Logf("the resume summarised %d spooled visited nodes", replayed)
 }

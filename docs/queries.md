@@ -80,35 +80,66 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 | `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
 | `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept (its memory budget never truncates anything); on `impact` it ends the page and mints a continuation. |
-| `--edges` | `callers`, `callees`, `impact` | Relations one page may admit. On `callers` and `callees` this is a per-page budget on the same terms as `--visited`; on `impact` it is a per-page budget too. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
+| `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
 
 **Every graph command issues a continuation.** `search`, `symbol`, `refs`, `callers`,
 `callees`, `path` and `impact` print a `next` token when more remains. On `callers` and
 `callees` a continuation resumes the walk itself, from the frontier the previous
 page persisted, with a fresh per-page work allowance; the `walked` counts it
 reports stay cumulative across the pages of the one walk, so replaying a cursor
-neither resets nor doubles them. `impact` resumes the walk itself as well, but its pages carry a different
-contract. Impact answers one page of the walk at a time. Each page ranks its own
-chunk of the affected set and carries the package rollup over that chunk's
-edges; `next_cursor` resumes the walk from the frontier the page stopped at. The
-pages together enumerate exactly the affected-entity set a single unbounded walk
-would, and a package pair's `pair_count` and `evidence_count` sum across pages to
-the whole-walk totals, but the ranking is per page and an entity reached again
-from a later page's frontier is listed again with that page's reasons.
-`visited_count` and `edge_count` are cumulative and grow across the pages of one
-answer. The same paragraph applies to the package-dependency rollup, which pages
-on identical terms; it has no CLI, app-facade or MCP surface today, so its
-continuation is reachable only from the engine API.
+neither resets nor doubles them. `impact` carries a different contract: **its first page pays for the whole
+walk.** The request that mints an impact answer expands until the walk is
+exhausted, streams every admitted edge into a disk-backed sort, ranks the whole
+affected set once, serves the first page and spools the globally ranked
+remainder behind the continuation. Later pages read that spool and walk nothing,
+which is why page 1 is the slow one and every page after it is a file read.
 
-**Known defect, under remediation — the per-page ranking above is not the
-intended contract.** Ranking each page over its own chunk, and listing an entity
-again when a later page's frontier reaches it, are consequences of taking the
-whole-walk accumulator off the heap, not a behaviour chosen for callers. The
-intended contract is the one a single unbounded walk gives: one globally ranked,
-deduplicated sequence paged without reordering or repetition. Until that lands,
-treat the paragraph above as a description of current behaviour rather than as a
-guarantee to build on.
+What that buys is the contract a single unbounded walk gives, and it is what
+`impact` now guarantees: the pages **concatenate** to the single-shot answer —
+the same entities, in the same global order, each listed exactly once. An entity
+reached again from a later frontier is one record, not two; the cheapest route
+to it wins, and the reasons of every edge that touched it are merged into that
+one entry. The order is `score_micros` descending, then `depth` ascending, then
+`node_id` ascending. **`name` is no longer a tie-break** — it is known only
+after hydration, so ranking on it would have reordered one page of a globally
+ordered answer.
+
+An impact answer carries two ranked lists, the affected entities and the package
+rollup over every edge the walk admitted, and one `next_cursor` pages both: each
+page takes up to `--limit` from each list, and the cursor is offered while
+either list has records left. A pair's `pair_count` and `evidence_count` are
+exact totals for the whole walk, not per-page fragments to be summed. The
+package-dependency rollup answers on identical terms from its own endpoint.
+`visited_count` and `edge_count` are cumulative and grow across the pages of one
+answer.
+
+**What the query deadline does to that.** `resources.query_timeout` ends a page,
+never the answer — with one exception, the third case below, which ends the
+answer and says so. There are three outcomes.
+
+*Mid-walk.* A deadline reached while the walk is still running returns a page
+with **no entries at all**, `truncation_reason` `query deadline reached` and a
+cursor that carries the walk's own frontier: the next request continues the walk
+from where it stopped, and once the walk completes the pages come from the
+ranked spool as above.
+
+*Mid-ranking.* A deadline that lands after the walk finished but while the
+ranking is still running is reported the same way, and its cursor resumes the
+interrupted sort itself: the runs the ranking had already spilled are adopted by
+the next request rather than re-sorted, so the answer is the one the
+uninterrupted query would have given, in the same order.
+
+*Stalled.* A resumed page whose every adjacency read already ran past the
+deadline admits nothing, and the continuation it could mint is the one it was
+handed. Rather than hand a client a chain that pages forever without reaching a
+new edge, that page ends the answer: `truncation_reason` `query deadline reached
+before the walk could advance`, and **no cursor**. The remedy is to present the
+same cursor you already hold again — that state is left adoptable, so the walk
+carries on from where it stopped rather than from the seed — under a larger
+`resources.query_timeout`. Do it within `resources.cursor_ttl`, which is what
+that state lives on; past it the cursor answers `CTX_CURSOR_INVALID` and the
+query has to be re-run.
 
 **`path` returns the provably cheapest route, whatever the graph's size.** Its
 search is an external-memory Dijkstra: every relation cost is an integer of at
@@ -137,7 +168,7 @@ so, in a notice reading `requested N, effective M`, rather than silently
 tightened. The configured bounds themselves default to unlimited.
 
 **Bounded per page, unlimited in total, user-set limits reported.**
-`--visited` and `--edges` are per-page work budgets. On `callers` and `callees`,
+On `callers` and `callees` `--visited` and `--edges` are per-page work budgets:
 a page that exhausts one stops there, reports the reason (`visited node budget
 exhausted`, `edge budget exhausted`) and mints a continuation cursor; following
 that cursor reaches the same nodes an unbounded walk would, so a budget you set
@@ -148,17 +179,54 @@ next page carries on from where it stopped.
 
 Two stops end an answer rather than a page, and both say so. `--depth` is part
 of the query a cursor is bound to, so a walk that ran out of depth is truncated
-with `graph depth budget exhausted` and no continuation. `impact` no longer walks once: a per-page
-budget it exhausts ends that page and mints a continuation, on the same terms as
-`callers` and `callees`. `path` is not
-paged at all and its visited, edge and depth budgets truncate the one search it
-runs; it reports truncation together with whatever routes it found — never as
-"no path exists", which is reserved for a target that is genuinely unreachable,
-and never because the search exceeded a memory ceiling.
+with `graph depth budget exhausted` and no continuation. `impact` walks once for
+the whole answer, so a `--visited` or `--edges` allowance it spends truncates
+that answer, reports the same reason and offers no continuation — the ranked
+pages that follow are what is left of a walk that stopped, not a walk to be
+resumed.
 
-The query deadline is not a work budget and is not resumable: a walk that
-exceeds it fails the request with `CTX_QUERY_DEADLINE` rather than returning a
-short page, so a slow answer is never served as a complete one. A capability that is still building is reported as an unavailable row plus a
+`path` is the third shape, and it is neither of those. It declares no `--limit`
+because a route set is bounded by the reason-path cap rather than paged into
+items, but the **search** behind it is paged: `--visited` is a per-page work
+budget there, and a page that spends it ends with `next` rather than an answer.
+Following that cursor resumes the same search from the state it kept, so the
+routes it finally reports are the ones an unbounded search would report. The
+query deadline behaves the same way on `path` — the page ends, the cursor
+carries on — and so does the engine's edge bound, which `path` registers no
+flag for: it reports `edge budget exhausted` and mints a cursor. Only `--depth`
+truncates a `path` answer outright, because depth is part of the query a cursor
+is bound to. Truncation is always reported together with whatever routes were
+found — never as "no path exists", which is reserved for a target that is
+genuinely unreachable, and never because the search exceeded a memory ceiling.
+
+**When a temp budget you set cannot hold a continuation.** The state the next
+page resumes from — a walk's frontier spool, a `path` search's retained scratch
+— is charged against `resources.max_temp_bytes`, which is unlimited by default.
+If you set that budget and a page's continuation state does not fit it, the
+request is REFUSED with `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`,
+rather than returning a short answer under whichever work-budget reason happened
+to be marked. Retrying frees no bytes: raise the budget, or narrow the query
+with `--depth`, `--visited` or `--edges` so the walk finishes within one page.
+
+On every command but `path`, the query deadline ends a page and not an answer:
+a walk that runs out of time
+returns what it has, reports `query deadline reached` and hands back a cursor the
+next request carries on from, rather than failing with `CTX_QUERY_DEADLINE`, so a
+slow answer is never served as a complete one and never lost either. This holds
+for every deadline, including one that lands before the page has read a single
+edge: an `impact` or package-rollup request keeps its walk — the frontier it had
+reached and every entity it had already admitted — so the page is empty,
+reported as truncated, and its cursor carries the walk on. A deadline that lands
+after that walk finished but during the ranking keeps the same walk and mints
+the same kind of cursor; the next request ranks it and serves page 1.
+
+`path` keeps the same contract by its own mechanism: a deadline that lands
+inside the search truncates the page with `the query deadline was reached before
+the path search completed` and mints a cursor over the retained search state, so
+the next request carries on settling buckets. A `path` request never fails with
+`CTX_QUERY_DEADLINE`.
+
+A capability that is still building is reported as an unavailable row plus a
 warning, so an incomplete answer never reads as a complete one.
 
 ## Configuration these commands read
@@ -169,8 +237,8 @@ where the workspace is composed, and handed to it.
 | Key | Effect here |
 |---|---|
 | `context.max_graph_depth` | Default and ceiling for `--depth`. Unlimited by default. |
-| `context.max_visited_nodes` | Default and ceiling for `--visited`, per page. Unlimited by default. |
-| `context.max_graph_edges` | Default and ceiling for `--edges`, per page. Unlimited by default. |
+| `context.max_visited_nodes` | Default and ceiling for `--visited`. Unlimited by default. |
+| `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
 | `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
@@ -197,18 +265,68 @@ It reads these further keys:
 | `context.default_max_files` | The distinct selected files a zero `budget.max_files` resolves to, across the whole plan. |
 | `context.max_slices` | The slice count a zero `budget.max_slices` resolves to. |
 
+### A compile is a stream, not a whole-set pass
+
+A compile runs as a pipeline of sorted streams joined by merge: seeds and the
+required scope, file hydration, relation attributes, route scoring, per-package
+centrality, boosts, measurement, packing and emission. No stage holds a
+structure sized by the candidate count. Every stage sorts through the same
+external sort `search` uses, so its in-memory run budget is the quarter share of
+`resources.query_memory_bytes` described above and peak heap is a function of
+that number and of the resolved budget, never of how wide the task's scope is.
+
+Run files are written under the workspace's spool directory and removed on every
+exit path, including the error paths. Like the sort runs `search` writes, they
+are not charged against `resources.max_temp_bytes`: a run set is sized by the
+candidate count, and charging it would let that budget refuse a wide task
+outright. Size the directory for the widest compile you expect in addition to
+the live continuation spools the budget does cover.
+
+A compile under the run budget never touches disk: the sort spills only once its
+run buffer fills, so a small task is still two in-memory sorts.
+
+The plan a compile persists follows the same rule. Its entries and slices are
+bounded by the budget you asked for -- your own declared window -- and are
+written from it. Its **exclusion list is not**: a plan that keeps forty entries
+can exclude every other candidate in the repository, so the exclusions are
+spooled as the emission pass produces them and streamed into the manifest
+transaction row by row, in the order `--view excluded` reads them back. Writing
+a manifest therefore costs one exclusion row of memory, not all of them, however
+many candidates the budget turned away.
+
 A zero budget field means "use the configured default", never "unlimited", and a
 configured default that resolves to zero or less is rejected rather than
 disabling the bound. A budget that cannot hold the required scope is
 `CTX_MINIMUM_BUDGET` carrying the floor (`min_bytes`, `min_estimated_tokens`,
 `min_slices`, `min_files`, `missing`): required files are never demoted, split
-into misleading independently complete slices, or dropped to fit.
+into misleading independently complete slices, or dropped to fit. `missing`
+names the required paths that do not fit and ends with `… and N more` when
+there are more of them than the detail field carries, so the count is always
+whole even where the list is not.
+
+`context.max_start_nodes` bounds how many discovered seeds become roots of the
+boundary walk and is unlimited by default, so a task naming hundreds of
+resolvable identities is walked from all of them. A value you set leaves the
+seeds past it unwalked, and the manifest carries an exclusion row naming the
+limit and how many roots did not start. See
+[Configuration](configuration.md#context--context-compiler).
 
 `resources.max_page_items` bounds every batch the compile issues — seed
 resolution, file hydration, the edge read behind per-edge precision and the
 evidence batch — and `resources.query_timeout` is the deadline around the whole
-compile. A deadline or a cancellation returns an explicit incomplete answer
-(`CTX_QUERY_DEADLINE` / `CTX_CANCELED`) and persists no manifest.
+compile. A deadline or a cancellation persists no manifest. A **cancellation**
+is an explicit incomplete answer (`CTX_CANCELED`); a **deadline** ends the pass
+the compile is in rather than the answer, and `context plan` returns
+`truncated = deadline` with a `next_cursor` you present back as `--cursor` to
+resume at the first unfinished pass. This includes a deadline that fires while
+the required-scope graph walk is still running: the pass ends with the walk's
+place in hand and the continuation carries it on from there, so no leg of the
+walk is ever thrown away. The plan the final call returns is the one
+an uninterrupted compile would have produced. See
+[Context sessions](context-sessions.md#a-plan-that-runs-out-of-query-deadline-continues-it-does-not-fail).
+`CTX_QUERY_DEADLINE` is still raised for the compile callers that have no
+continuation to hand back, such as the workflow service's own consolidate
+compile.
 
 See [Configuration](configuration.md) for the full tables.
 

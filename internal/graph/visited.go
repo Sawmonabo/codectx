@@ -145,13 +145,23 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 		// Every candidate was answered from heap: the level costs no I/O.
 		return nil
 	}
-	// The sweep is a MERGE-JOIN, not a scan: the spool's visited section is
-	// written in ascending NodeID order (cursor.go spill), so the candidates
-	// are sorted once and answered in one ordered pass that ENDS at the first
-	// key past the largest of them. A level whose candidates are all new --
-	// the chain-shaped level the filter above already answers from heap --
-	// therefore costs a prefix of the spool even when a false positive sends
-	// it here, instead of a pass to the end.
+	// The sweep is a MERGE-JOIN, not a scan: the candidates are sorted once and
+	// answered in one ordered pass over the stream, which skips past every
+	// candidate the stream has already gone by instead of probing for it.
+	//
+	// The stream is a CONCATENATION of ascending blocks, not one ascending
+	// sequence: a cursor's spool is written in ascending NodeID order, but a
+	// walk chained in process appends one ascending block per internal link and
+	// a resumed walk replays the cursor's spool and then those blocks
+	// (walkrun.go). A join that assumed one global order would advance past a
+	// candidate in the first block and never look back, reporting a node the
+	// walk HAS admitted as absent -- re-admitting it on a later page and
+	// reporting the same entity twice. So a key below its predecessor is read
+	// for what it is, the start of the next ascending run, and the join
+	// restarts at the smallest unanswered candidate. Per run the cost is the
+	// merge-join's; the pass ends early only when every candidate is answered,
+	// because a run that has passed the largest candidate says nothing about
+	// the runs that follow it.
 	//
 	// Batching SEVERAL levels into one sweep -- the other half of the finding
 	// -- is not available to a BFS: level n+1's candidates are the neighbours
@@ -164,20 +174,28 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 		sorted = append(sorted, id)
 	}
 	sortNodeIDs(sorted)
-	next := 0
+	next, found, started := 0, 0, false
+	var prev model.NodeID
 	err := v.stream(ctx, func(id model.NodeID) error {
+		if !started || id < prev {
+			next = 0
+		}
+		prev, started = id, true
 		for next < len(sorted) && sorted[next] < id {
-			// No record can answer this candidate any more: the stream is
-			// ascending and has passed it.
+			// No record of THIS run can answer this candidate any more: the run
+			// is ascending and has passed it.
 			next++
 		}
 		if next >= len(sorted) {
-			return errWarmComplete
+			return nil
 		}
 		if sorted[next] == id {
-			v.probed[id] = struct{}{}
+			if _, seen := v.probed[id]; !seen {
+				v.probed[id] = struct{}{}
+				found++
+			}
 			next++
-			if next >= len(sorted) {
+			if found == len(sorted) {
 				return errWarmComplete
 			}
 		}
@@ -196,29 +214,22 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 // is indistinguishable from reaching the end.
 var errWarmComplete = errors.New("membership sweep answered every candidate")
 
-// spillable is what this page must contribute to the fresh spool's visited
-// SECTION, ascending: the nodes it admitted itself, plus the frontier it
-// resumed. The carried nodes belong here because the stream that copies the
-// previous spool forward replays that spool's visited section only -- its
-// frontier records are answered from this page's front instead (cursor.go), so
-// nothing else would carry them forward. Both halves are bounded by the page
-// and by the frontier ceiling, never by the walk, and the previous visited
-// section stays on disk.
-func (v *visitedSet) spillable() []model.NodeID {
-	out := make([]model.NodeID, 0, len(v.added)+len(v.carried))
+// addedNodes is this leg's OWN admissions, ascending, and nothing else. It is
+// what the append-only run store takes (visitedstore.go): the resumed frontier
+// carried in v.carried belongs to an earlier leg's run already, so including it
+// would write the same node a second time for no answer it can change.
+//
+// Every node that ever reaches a frontier passes through add -- a seed at
+// entry, a neighbour at the moment it is admitted (traverse.go) -- so the runs
+// taken leg by leg hold the whole cumulative set with nothing left out.
+func (v *visitedSet) addedNodes() []model.NodeID {
+	out := make([]model.NodeID, 0, len(v.added))
 	for id := range v.added {
-		out = append(out, id)
-	}
-	for id := range v.carried {
 		out = append(out, id)
 	}
 	sortNodeIDs(out)
 	return out
 }
-
-// newlyAdmitted is the name the paging endpoints call spillable by. It is kept
-// so the impact and rollup continuations compile unchanged.
-func (v *visitedSet) newlyAdmitted() []model.NodeID { return v.spillable() }
 
 // sortNodeIDs puts node ids in the frozen ascending order the spool and the
 // emission order share.
@@ -254,49 +265,59 @@ type visitedFilter struct {
 	k    uint32 // probes per key
 }
 
-// visitedFilterBitsPerNode is the target filter density. Sixteen bits per node
-// puts the false-positive rate near 1 in 2 000 at k=11, which turns a level of
-// fresh nodes into zero sweeps rather than one per level; it costs two bytes
-// per admitted node, against the ~70 bytes a node already costs on the spool.
-const visitedFilterBitsPerNode = 16
-
 // visitedFilterBudgetShare is the fraction of Limits.FrontierBytes the filter
 // may claim. The frontier ceiling is the walk's own memory budget, so taking an
 // eighth of it keeps the summary strictly smaller than the level it summarizes
-// while leaving the frontier the bytes it was given.
+// while leaving the frontier the bytes it was given. The share is spent in
+// full, because the geometry is frozen when the walk's first page creates the
+// filter and the size of the walk is not known then.
 const visitedFilterBudgetShare = 8
 
-// newVisitedFilter sizes a filter for estimate nodes within maxBytes of heap.
-// It returns nil when there is nothing to summarize or no budget to do it in;
-// a nil filter answers "may hold" for everything, which is the same behaviour
-// as having no filter at all.
-func newVisitedFilter(estimate, maxBytes int64) *visitedFilter {
-	if estimate <= 0 || maxBytes <= 0 {
-		return nil
+// visitedFilterBytes is what a walk's persisted membership summary may claim:
+// its share of the frontier ceiling, and never more than the same share of the
+// shared continuation byte budget the retained directory is charged against.
+//
+// The second clamp exists because the summary is an ACCELERATOR and not state
+// any answer depends on: a miss proves the runs cannot hold a node, a hit costs
+// a sweep, and a filter of zero bits is simply no information -- every level
+// merge-joins the runs instead. Sizing it at a fixed share of a frontier
+// ceiling that may be far larger than the whole temp budget would make a
+// workspace with a tight resources.max_temp_bytes unable to page a walk AT ALL,
+// which is a refusal bought for a speed-up. A denser summary is the honest
+// trade: more false positives, more sweeps, the same answer.
+func (e *Engine) visitedFilterBytes() int64 {
+	want := e.limits.FrontierBytes / visitedFilterBudgetShare
+	if e.spools == nil {
+		return want
 	}
-	words := (estimate*visitedFilterBitsPerNode + 63) / 64
-	if max := maxBytes / 8; words > max {
-		words = max
+	// Zero is the store's spelling of UNLIMITED, where nothing clamps.
+	if budget := e.spools.ByteBudget(); budget > 0 {
+		if share := budget / visitedFilterBudgetShare; share < want {
+			return share
+		}
 	}
-	if words <= 0 {
-		return nil
-	}
-	f := &visitedFilter{bits: make([]uint64, words), m: uint64(words) * 64}
-	// k = ln2 * m/n, clamped: one probe is the floor, and past sixteen the
-	// probes cost more than the false positives they remove.
-	k := (f.m * 693) / (uint64(estimate) * 1000)
-	if k < 1 {
-		k = 1
-	}
-	if k > 16 {
-		k = 16
-	}
-	f.k = uint32(k)
-	return f
+	return want
 }
 
-// add records that the spooled set holds id.
-func (f *visitedFilter) add(id model.NodeID) {
+// newFrozenVisitedFilter builds a filter of exactly bits bits and k probes.
+// Both are the manifest's frozen geometry (visitedstore.go): a filter re-sized
+// between pages would answer "absent" for a node whose bits were set under the
+// old size, and a false negative here is a node the walk has admitted being
+// admitted again on a later page. bits is a multiple of 64 and k is positive;
+// a zero bit count means there was no budget for a summary at all, which a nil
+// filter already expresses.
+func newFrozenVisitedFilter(bits uint64, k uint32) *visitedFilter {
+	if bits == 0 || k == 0 {
+		return nil
+	}
+	return &visitedFilter{bits: make([]uint64, bits/64), m: bits, k: k}
+}
+
+// addWords records that the retained set holds id and, when dirty is non-nil,
+// names every WORD the probes changed. The persisted filter is a fixed-size
+// file written in place, so a page rewrites those words alone rather than the
+// whole summary (visitedstore.go).
+func (f *visitedFilter) addWords(id model.NodeID, dirty map[uint64]struct{}) {
 	if f == nil {
 		return
 	}
@@ -304,6 +325,9 @@ func (f *visitedFilter) add(id model.NodeID) {
 	for i := uint32(0); i < f.k; i++ {
 		b := (h1 + uint64(i)*h2) % f.m
 		f.bits[b/64] |= 1 << (b % 64)
+		if dirty != nil {
+			dirty[b/64] = struct{}{}
+		}
 	}
 }
 

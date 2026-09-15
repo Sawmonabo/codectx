@@ -69,7 +69,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_start_nodes`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
   | `[providers.tree_sitter]` | `max_callee_references`, `max_records_per_file` |
   | `[providers.manifest]` | `max_dependencies`, `max_entries`, `max_toml_lines`, `max_xml_elements` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
@@ -194,7 +194,7 @@ All **user** trust.
 | `max_concurrent_queries` | `4` | Concurrent queries. |
 | `max_concurrent_graph_queries` | `2` | Concurrent graph queries; must not exceed `max_concurrent_queries`. |
 | `max_concurrent_heavy_analyzers` | `1` | Concurrent heavy analyzer runs. |
-| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
+| `max_temp_bytes` | `0` (unlimited) | Temporary bytes across materializations. Unlimited by default, so no default setting refuses a large repository's temporary work; a value you set must exceed `min_free_disk_bytes`, which stays the host-safety floor and is enforced against actual free space either way. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
@@ -218,7 +218,7 @@ All **user** trust.
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
 | `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |
-| `synchronous` | `"normal"` | SQLite synchronous mode of the single **writer** connection: `"normal"` or `"full"`. Any other value is refused with `storage.synchronous is "..."; use "normal" or "full"`. The store is rebuildable derived data and the database runs in WAL mode, where `"normal"` is safe from corruption and always consistent -- a power loss or hard reset can only roll back the most recent commits, leaving the previous generation active and some orphan blobs the retention sweep reclaims. `"full"` additionally fsyncs the write-ahead log after **every** commit, which buys durability of those last commits across a power loss and nothing else: transactions are durable across an application crash either way. Measured at ~10 ms per commit against ~0.11 ms on ext4, so `"full"` is materially slower to index. Readers are unaffected; they never write. See [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md). |
+| `synchronous` | `"normal"` | SQLite synchronous mode of the single **writer** connection: `"normal"` or `"full"`. Any other value is refused with `storage.synchronous is "..."; use "normal" or "full"`. The store is rebuildable derived data and the database runs in WAL mode, where `"normal"` is safe from corruption and always consistent -- a power loss or hard reset can only roll back the most recent commits, leaving the previous generation active and some orphan blobs the retention collector's CAS sweep reclaims once they are older than `retention.blob_grace`. `"full"` additionally fsyncs the write-ahead log after **every** commit, which buys durability of those last commits across a power loss and nothing else: transactions are durable across an application crash either way. Measured at ~10 ms per commit against ~0.11 ms on ext4, so `"full"` is materially slower to index. Readers are unaffected; they never write. See [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md). |
 
 ### The data directory
 
@@ -244,7 +244,7 @@ All **user** trust.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `blob_grace` | `"24h"` | How long a blob that nothing references waits, once trashed, before the collector rechecks reachability and deletes its row and its content-addressed object. It is the safety margin that protects a reader which pinned a generation in the instant the manifest naming a blob went away, not a throughput knob: shortening it narrows that protection, lengthening it only delays reclaim. Must be positive — a zero window would delete an object in the same pass that trashed it. |
+| `blob_grace` | `"24h"` | How long a blob that nothing references waits, once trashed, before the collector rechecks reachability and deletes its row and its content-addressed object. It is the safety margin that protects a reader which pinned a generation in the instant the manifest naming a blob went away, not a throughput knob: shortening it narrows that protection, lengthening it only delays reclaim. Must be positive — a zero window would delete an object in the same pass that trashed it. The same window governs the collector's CAS sweep of **orphan** objects — content on disk that no row names at all, left by a capture whose commit never landed: a published object is only removed once it is older than this, because content reaches the disk before the commit that names it. The window is also that sweep's **cadence**: the CAS walk runs at most once per window rather than on every published generation, since an orphan is held this long before it may be removed anyway. It is a schedule, not a cap -- each run still walks the whole store and reclaims every orphan it finds. |
 
 ## `[tools]` — the managed analyzer toolchain
 
@@ -376,6 +376,7 @@ cloud or AI credential fields in core.
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. It is the switch for that one readiness precondition. With it set to `false` the shortfall no longer shuts the gate at precondition 3 — the remaining preconditions are still evaluated and reported — but it buys no strict claim either: nothing confirmed the coverage, so the session is reported **neither ready nor strict**, the sealed capsule records `strict_gate_satisfied` false, and the answer's reason carries `strict_read_gate=disabled` instead of naming files the configuration excused, so a reader can tell an unconfirmed read from a confirmed one. Changing it changes the context-policy fingerprint, so a cached context answer compiled under the other setting is invalidated rather than reused. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 | `max_seeds` | `0` (unlimited) | user | Identities seed discovery examines before it stops. Unlimited by default, so every identity a task names is examined; a task that exceeds a value you set is reported as a named exclusion on the manifest, never cut silently. |
+| `max_start_nodes` | `0` (unlimited) | user | Discovered seeds that become roots of the boundary walk. Unlimited by default, so every resolvable seed a task names is walked from; seeds past a value you set are left unwalked and reported as a named exclusion carrying the dropped count, never cut silently. |
 
 The context compiler binds them as follows. The three `default_*` budgets and
 `max_slices` are what a **zero** field of a request's budget resolves to. They
@@ -390,7 +391,8 @@ budget excludes is named in the manifest with its reason.
 `max_graph_depth`, `max_visited_nodes` and `max_graph_edges` bound graph
 expansion, and all three are unlimited by default.
 
-`max_visited_nodes` and `max_graph_edges` are **per-page work budgets, not
+On the paged traversals — `callers` and `callees` — `max_visited_nodes` and
+`max_graph_edges` are **per-page work budgets, not
 cumulative ceilings on a walk**. A page spends its own allowance; a page that
 exhausts one stops there, reports the reason that stopped it (`visited node
 budget exhausted` or `edge budget exhausted`) and mints a continuation cursor,
@@ -401,15 +403,64 @@ following the cursor reaches the same nodes an unbounded walk would. The
 pages of one walk, so a caller still sees the total the walk has spent, and a
 replayed cursor neither resets nor doubles it.
 
+`impact` spends those two budgets on different terms, and an operator setting
+them should know which. It walks **once for the whole answer** and then ranks
+what the walk admitted, so `max_visited_nodes` and `max_graph_edges` are
+answer-level bounds there: spending one truncates that answer and is reported,
+rather than ending a page. What the pages then serve is the finished ranking —
+one globally ordered list, `score_micros` descending, then `depth` ascending,
+then `node_id` ascending, with each entity listed **exactly once** no matter how
+many frontiers reached it (the cheapest route wins and the reasons of every edge
+that touched it are merged into that one entry). Paging does not re-rank: a page
+is a window on the one global order, never a chunk ranked against itself, so no
+entity is re-listed under a later page and none is reordered by where the page
+boundary fell. The cost shape follows from that — the **first** page pays for
+the whole walk and the ranking, and the pages after it are reads of the ranked
+result. A query deadline reached during either ends the page rather than the
+answer: the request comes back with `query deadline reached` and a cursor that
+carries the walk or the ranking on, so an unfinished `impact` is never served as
+a complete one. `docs/queries.md` states the same contract from the query side.
+
+`max_graph_edges` is read in one more place: the context compiler's scan that
+resolves the **kind** of every relation a selection's explanation routes name.
+That scan pages the store by keyset, one page of `resources.max_page_items`
+rows at a time, and under the unlimited default it pages **to exhaustion** --
+the page width is how much is read at once, never how much is read in total.
+Only a value you set stops it early, and a scan a set value cut reports the
+scope incomplete (`scope_complete=false`) rather than typing part of the graph
+silently.
+
 One stop is not resumable, and it says so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
-out of depth is reported truncated with no continuation. `impact` is bounded on
-the same terms as `callers` and `callees`: a per-page budget it exhausts ends
-that page, reports the reason and mints a continuation, and the next page
-resumes the walk from the persisted frontier.
+out of depth is reported truncated with no continuation. `path` keeps its search
+state across pages, so a page that spends its work budget ends there with a
+continuation and the next page carries on; its memory budget never truncates
+anything. And `impact` — with the package rollup that answers on the same terms
+— performs its whole walk on the first request and then serves a spooled,
+globally ranked answer, so for it the two budgets are **answer-level** bounds
+measured against the walk's cumulative spend: exhausting one ends that walk, the
+answer is truncated with the reason, and every later page repeats the same flag
+and reason.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.
+
+`max_start_nodes` bounds how many of the seeds that survive discovery become
+roots of the Section 15.2 boundary walk, and is unlimited by default: every
+resolvable seed is walked from. Setting it leaves the seeds past it unexplored,
+and the manifest carries one exclusion row naming the limit and the number of
+roots that did not start — the overflow is never quietly re-walked as a second
+request, because one walk ranks its boundaries globally and a second walk would
+answer its own local ranking instead of extending the first one's order.
+
+One residual bound stands behind the unlimited default: a single traversal
+request's start list is validated against a structural wire ceiling of 250000
+node ids, which applies to externally supplied `impact` and `graph` requests and
+also to the request the compiler issues for its own walk. It is far wider than
+the seed set one task can produce — the task text is clipped to a fixed byte
+bound and each identity it names resolves through one page of declarations — so
+it does not cut a compile in practice; a start list that reached it would be
+reported, never trimmed.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What
@@ -507,7 +558,7 @@ relationships that must hold:
 - `resources.max_concurrent_graph_queries` ≤ `resources.max_concurrent_queries`.
 - `max_concurrent_queries × query_memory_bytes` + `cache_bytes` + `queue_bytes`
   ≤ `resources.base_memory_budget_bytes`.
-- `resources.max_temp_bytes` > `resources.min_free_disk_bytes`.
+- `resources.max_temp_bytes` > `resources.min_free_disk_bytes`, when `max_temp_bytes` is set at all (`0` is unlimited and has nothing to exceed).
 - `context.default_max_files` ≤ `workspace.max_files`, and
   `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when
   the bound on the right is set. There is nothing to exceed in an unlimited one.

@@ -384,6 +384,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if childMemory <= 0 {
 		childMemory = unobservedChildMemoryBudget
 	}
+	// resources.max_temp_bytes is passed through UNCLAMPED, including its
+	// unlimited default of 0: the runner reads a non-positive disk budget as
+	// unlimited and admits every reservation, so the default never refuses a
+	// child at admission. Only a value the operator set refuses one, and it
+	// says so with resources.max_temp_bytes named in the error.
 	shared, err := process.NewRunner(process.Limits{
 		MaxConcurrent:     maxInt(1, cfg.Resources.MaxConcurrentHeavy) + sharedRunnerHeadroom,
 		MemoryBudgetBytes: childMemory,
@@ -825,7 +830,8 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 		"sessions_expired", report.SessionsExpired, "sessions_pruned", report.SessionsPruned,
 		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
 		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
-		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored)
+		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
+		"orphan_objects_swept", report.OrphanObjectsSwept)
 	return nil
 }
 
@@ -1032,6 +1038,15 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Config: s.cfg,
 		Now:    time.Now,
 		Logger: s.logger,
+		// The compile's external-sort runs live beside the query spools, under
+		// the same resources.max_temp_bytes area the workspace already sweeps
+		// and reports (ruling C5'), and SortDir is derived from the same store
+		// rather than named twice. The spool store also holds the leased state
+		// directory a deadline-interrupted compile continues from (ruling C7),
+		// which is why the signer and the lease store come with it.
+		Spools: s.spools,
+		Signer: s.signer,
+		Leases: s.leases,
 	})
 	if err != nil {
 		return err

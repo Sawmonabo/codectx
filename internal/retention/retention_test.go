@@ -34,6 +34,52 @@ func TestRetention(t *testing.T) {
 
 var scenarios = []scenario{
 	// L3a rows
+	{
+		// Failure mode: the orphan sweep is wired with a window of its own --
+		// zero, or the raw config value the grace phases already rescued --
+		// and it then removes content published seconds ago whose naming
+		// commit has not landed yet, or never runs because its count is
+		// dropped on the floor. The resolved window and the batch reaching the
+		// sweep, and its count reaching the Report an operator reads, are what
+		// make the CAS half of Section 10.4 a reclaim rather than a call.
+		name: "the orphan sweep is driven with the resolved grace window and its count is reported",
+		run: func(t *testing.T) {
+			objects := &fakeObjects{swept: 5}
+			blobs := &fakeBlobs{}
+			c := newTestCollector(t, Options{Blobs: blobs, Objects: objects,
+				Config: RetentionConfig{GraceWindow: 6 * time.Hour, BatchLimit: 9}})
+			report, err := c.grace(context.Background(), Report{})
+			if err != nil {
+				t.Fatalf("grace: %v", err)
+			}
+			if objects.grace != 6*time.Hour || objects.batch != 9 {
+				t.Errorf("sweep window %v batch %d, want the configured 6h and 9", objects.grace, objects.batch)
+			}
+			if report.OrphanObjectsSwept != 5 {
+				t.Errorf("Report.OrphanObjectsSwept %d, want the 5 the sweep reclaimed", report.OrphanObjectsSwept)
+			}
+			if objects.oracle == nil {
+				t.Fatal("the sweep was handed no oracle; it would then read every object as unnamed")
+			}
+			// A collector built without a window must not hand the sweep a
+			// zero one: every object on disk is then past its grace.
+			// Built through New rather than the helper, which supplies a
+			// window of its own and would hide the fallback.
+			zero := &fakeObjects{}
+			c, err = New(Options{Sessions: &fakeSessions{}, Spools: &fakeSpools{}, Snapshot: &fakeSnapshots{},
+				Tools: &fakeTools{}, Blobs: blobs, Objects: zero,
+				Config: RetentionConfig{DataDir: t.TempDir(), BatchLimit: 9}})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if _, err := c.grace(context.Background(), Report{}); err != nil {
+				t.Fatalf("grace: %v", err)
+			}
+			if zero.grace != defaultGraceWindow {
+				t.Errorf("sweep window %v for an unconfigured collector, want the %v fallback", zero.grace, defaultGraceWindow)
+			}
+		},
+	},
 	// L3b rows
 	{
 		// Failure mode: pruning runs before expiry, or with a retention window
@@ -134,6 +180,76 @@ var scenarios = []scenario{
 			}
 		},
 	},
+	// FX-H-X1 rows
+	{
+		// Failure mode: the CAS orphan sweep walks all 256 buckets and every
+		// object in them, and a collection pass runs after EVERY activation --
+		// so an incremental refresh of one file paid for a full walk of the
+		// store, under the workspace lock and the indexing mutex. It is gated
+		// to once per blob-grace window, and both directions of that gate are
+		// invariants: a second pass inside the window must NOT re-walk, and a
+		// pass after the window must, or the cadence would be a cap and
+		// orphans would never be reclaimed at all.
+		name: "the orphan sweep runs once per grace window, and still runs after it",
+		run: func(t *testing.T) {
+			const window = time.Hour
+			base := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+			now := base
+			objects := &fakeObjects{swept: 3}
+			dataDir := t.TempDir()
+			c := newTestCollector(t, Options{Objects: objects,
+				Config: RetentionConfig{DataDir: dataDir, GraceWindow: window},
+				Now:    func() time.Time { return now }})
+
+			report, err := c.grace(context.Background(), Report{})
+			if err != nil {
+				t.Fatalf("first pass: %v", err)
+			}
+			now = base.Add(window / 2)
+			report, err = c.grace(context.Background(), report)
+			if err != nil {
+				t.Fatalf("second pass: %v", err)
+			}
+			if objects.calls != 1 {
+				t.Fatalf("two activations inside one %v grace window walked the whole store %d times, want 1",
+					window, objects.calls)
+			}
+			if report.OrphanObjectsSwept != 3 {
+				t.Fatalf("the pass that did sweep reported %d objects, want the 3 it reclaimed",
+					report.OrphanObjectsSwept)
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, orphanSweepPath)); err != nil {
+				t.Fatalf("the sweep recorded no stamp, so the gate has nothing to read next pass: %v", err)
+			}
+
+			// Past the window the sweep runs again: the cadence delays work,
+			// it never drops it.
+			now = base.Add(window + time.Second)
+			report, err = c.grace(context.Background(), report)
+			if err != nil {
+				t.Fatalf("third pass: %v", err)
+			}
+			if objects.calls != 2 {
+				t.Fatalf("a pass %v after the last sweep ran %d sweeps, want a second one: the cadence "+
+					"must delay the walk, not cancel it", window+time.Second, objects.calls)
+			}
+			if report.OrphanObjectsSwept != 6 {
+				t.Fatalf("the second sweep's %d objects did not reach the report", report.OrphanObjectsSwept)
+			}
+
+			// A clock stepped backwards leaves a stamp in the future, which a
+			// plain "now - stamp < window" test reads as "not due" for an
+			// unbounded time. The gate never fails closed.
+			now = base.Add(-24 * time.Hour)
+			if _, err := c.grace(context.Background(), Report{}); err != nil {
+				t.Fatalf("pass under a backwards clock: %v", err)
+			}
+			if objects.calls != 3 {
+				t.Fatalf("a stamp dated in the future disabled the sweep (%d calls): the gate must sweep "+
+					"on any stamp it cannot trust", objects.calls)
+			}
+		},
+	},
 }
 
 // --- deterministic fakes for the frozen interfaces --------------------------
@@ -218,11 +334,33 @@ func (f *fakeBlobs) CollectBlobs(context.Context, time.Time, int) ([]string, int
 	return f.deleted, 0, f.err
 }
 
+func (f *fakeBlobs) KnownBlobs(context.Context, []string) (map[string]struct{}, error) {
+	return nil, f.err
+}
+
 type fakeObjects struct {
 	err error
+	// swept is what the orphan sweep reports, and grace/batch record the
+	// window and working set it was actually given.
+	swept int64
+	// calls counts the sweeps, which is what a cadence row reads: the sweep
+	// walks the whole store, so how OFTEN it runs is an invariant of its own.
+	calls int
+	grace time.Duration
+	batch int
+	// oracle is the func the collector handed over, so a row can prove the
+	// sweep was wired to the store's own KnownBlobs rather than to nothing.
+	oracle func(context.Context, []string) (map[string]struct{}, error)
 }
 
 func (f *fakeObjects) Remove(string) error { return f.err }
+
+func (f *fakeObjects) SweepOrphans(_ context.Context, known func(context.Context, []string) (map[string]struct{}, error),
+	_ time.Time, grace time.Duration, batch int) (int64, error) {
+	f.oracle, f.grace, f.batch = known, grace, batch
+	f.calls++
+	return f.swept, f.err
+}
 
 // newTestCollector builds a Collector over the fakes with a fixed clock and a
 // temporary data directory. A row replaces the dependency it drives.

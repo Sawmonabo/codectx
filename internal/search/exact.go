@@ -76,7 +76,9 @@ func supersededByLowerTier(tier model.SearchTier, n sqlite.StoredNode, query str
 	case model.TierQualifiedNamePrefix:
 		return n.Node.QualifiedName == query
 	case model.TierExactName:
-		return n.Node.QualifiedName == query || strings.HasPrefix(n.Node.QualifiedName, query)
+		// HasPrefix alone: an exact equality is a prefix of itself, so a
+		// separate equality clause stated the same rule twice.
+		return strings.HasPrefix(n.Node.QualifiedName, query)
 	}
 	return false
 }

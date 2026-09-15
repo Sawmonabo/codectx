@@ -154,7 +154,12 @@ The grace window is `retention.blob_grace`, a bounded duration defaulting to
 `24h`. It trades disk against the cost of losing bytes an in-flight answer still
 cites; shortening it reclaims sooner and narrows that safety margin. A
 non-positive value is refused by configuration validation, so the window can be
-tuned but never switched off.
+tuned but never switched off. It doubles as the cadence of the collector's CAS
+orphan sweep: that sweep walks every bucket of the content-addressed store, so
+it runs at most once per window instead of on every published generation. The
+cadence delays the walk, it never bounds it -- each run reclaims every orphan
+past the window, and a data directory whose last-sweep stamp is missing or
+unreadable sweeps on the next pass.
 
 ### What is *not* collected automatically
 
@@ -173,8 +178,13 @@ Free space is checked against `resources.min_free_disk_bytes` (default
 source an open session is reading** — degrading an answer is not an acceptable
 way to free space.
 
-Temporary bytes across materializations and spools are separately capped by
-`resources.max_temp_bytes`, which must exceed `resources.min_free_disk_bytes`.
+Temporary bytes across materializations and spools are bounded by
+`resources.max_temp_bytes`, which is **unlimited by default** (`0`): nothing
+refuses a walk, a materialization or a continuation until you set it. A value
+you DO set must exceed `resources.min_free_disk_bytes`, and it refuses a run up
+front with `CTX_RESOURCE_LIMIT` naming the key. `min_free_disk_bytes` is
+enforced against actual free space either way -- it protects the host's space
+rather than capping work.
 
 In order, when you are short on space:
 

@@ -41,7 +41,6 @@ func (c Config) validate() error {
 		{"resources.max_concurrent_queries", int64(c.Resources.MaxConcurrentQueries)},
 		{"resources.max_concurrent_graph_queries", int64(c.Resources.MaxConcurrentGraphQueries)},
 		{"resources.max_concurrent_heavy_analyzers", int64(c.Resources.MaxConcurrentHeavy)},
-		{"resources.max_temp_bytes", c.Resources.MaxTempBytes},
 		{"resources.min_free_disk_bytes", c.Resources.MinFreeDiskBytes},
 		{"resources.max_metadata_response_bytes", c.Resources.MaxMetadataResponseBytes},
 		{"resources.max_source_response_bytes", c.Resources.MaxSourceResponseBytes},
@@ -95,6 +94,7 @@ func (c Config) validate() error {
 		{"context.max_capsule_records_per_list", c.Context.MaxCapsuleRecordsPerList},
 		{"context.max_capsule_coverage_files", c.Context.MaxCapsuleCoverageFiles},
 		{"context.max_seeds", c.Context.MaxSeeds},
+		{"context.max_start_nodes", c.Context.MaxStartNodes},
 		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
 		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
 		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
@@ -283,7 +283,16 @@ func (c Config) validateBudgets() error {
 		return configInvalid("query, cache and queue reservations need %d bytes, over resources.base_memory_budget_bytes %d",
 			baseline, c.Resources.BaseMemoryBudgetBytes)
 	}
-	if c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
+	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
+	// and is the default, a negative value is rejected, and the pairing against
+	// the free-space reserve is one-sided -- an unlimited temporary budget has
+	// nothing to exceed. The free-space reserve itself is unaffected: it is the
+	// host-safety floor and is still enforced against actual free space, so an
+	// unlimited temporary budget never lets the workspace fill the disk.
+	if c.Resources.MaxTempBytes < 0 {
+		return configInvalid("resources.max_temp_bytes is %d; use 0 for unlimited", c.Resources.MaxTempBytes)
+	}
+	if c.Resources.MaxTempBytes > 0 && c.Resources.MaxTempBytes <= c.Resources.MinFreeDiskBytes {
 		return configInvalid("resources.max_temp_bytes %d does not exceed the free-space reserve resources.min_free_disk_bytes %d; temporary work would always be refused",
 			c.Resources.MaxTempBytes, c.Resources.MinFreeDiskBytes)
 	}
