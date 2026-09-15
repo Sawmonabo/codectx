@@ -11,7 +11,9 @@ import (
 // waiverFixtureCount is the waiver population the page-bound row seals. It is a
 // whole multiple of the fixture service's MaxPageItems so the expected call
 // count is exact rather than a ceiling, and it is far larger than one page so a
-// whole-list read cannot hide inside the page bound.
+// whole-list read cannot hide inside the page bound. The figure is the wave-H
+// audit's own: it walks the loop across ~100 pages, which is what a session-
+// sized answer would have had to hold.
 const waiverFixtureCount = 20000
 
 // TestCapsuleWaiversAreReadOnePageAtATime protects wave-H audit item S5: the
@@ -95,9 +97,13 @@ func TestCapsuleWaiversAreReadOnePageAtATime(t *testing.T) {
 // stores hold byte-identical observations under identical ids; what is left to
 // get wrong is the order the capsule emits them in.
 //
-// Deleting the sort.Slice over the relation ids in capsuleSource.facts fails
-// this row: the two capsules then carry the same facts in opposite order under
-// different row ordinals, and the streamed identity diverges.
+// What this row EARNS is the per-observation half: deleting the sort.Slice over
+// the relation ids in capsuleSource.facts fails it, because the two capsules
+// then carry the same facts in opposite order under different row ordinals and
+// the streamed identity diverges. The cross-observation half is carried by the
+// store's ORDER BY id, which fakeStore.Observations mirrors -- permuting
+// arrival is what makes the fixture honest about how records reach the store,
+// not an assertion over capsuleSource.
 func TestCapsuleFactOrderIsIndependentOfArrivalOrder(t *testing.T) {
 	ctx := context.Background()
 	g := gate{ReadComplete: true, Ready: true, Strict: true, ScopeComplete: true}
