@@ -94,9 +94,11 @@ facts on a 604-file cut of the same generator). Because the cost is per identity
 source byte, the ratio moves with the corpus while the per-symbol number does not — which is why
 the per-symbol number, not the ratio, became the primary regression metric.
 
-The same reference-scale run recorded the other open miss: an indexing **process-tree peak of
-912.6 MiB against a 768 MiB envelope**, with the cold index itself passing at 2 m 56 s against a
-3 min target.
+The same reference-scale run recorded a second miss at the time: an indexing process-tree peak of
+912.6 MiB against a 768 MiB envelope, with the cold index itself passing at 2 m 56 s against a
+3 min target. Re-measured after the planner's external merge sort and the batched provider sinks
+landed, the same corpus indexes in 1 m 32 s with a **145.3 MiB** process-tree peak (two cold runs,
+250 ms and 50 ms sampling, within 0.1 MiB of each other), so that miss is closed.
 
 ---
 
@@ -711,10 +713,9 @@ duplicates an existing assertion.
 ### 3.3 What is still open
 
 - **The capsule's coverage ceiling** is the one known remaining default cap (§2.9).
-- **Two reference-scale misses** stand: the indexing process-tree peak at **912.6 MiB against a
-  768 MiB envelope**, and storage at **16.10× against 3.5×**. The first is to be re-measured now
-  that the planner's external merge and the batched provider sinks have landed; if it still
-  exceeds, a profiling pass owns it. The second is the storage wave's to close (§2.8).
+- **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage wave's to
+  close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
+  the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
 - **Search heap** is proportional to the answer and, for a short prefix query, to the range scan
   (§2.4). The external sorter that fixes it exists but is not yet wired.
 - **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).

@@ -71,9 +71,11 @@ for about 100 B of content, one secondary index costs the same 117 B/row and a s
 an un-checkpointed log, page size and fill, evidence fan-out and carried membership were each
 measured and ruled out.
 
-The same reference-scale run recorded the other open miss: an indexing process-tree peak of
-**912.6 MiB against a 768 MiB envelope**, with the cold index itself passing at 2 m 56 s against a
-3 min target.
+The same reference-scale run recorded a second miss at the time: an indexing process-tree peak of
+912.6 MiB against a 768 MiB envelope, with the cold index itself passing at 2 m 56 s against a
+3 min target. Re-measured after the planner's external merge sort and the batched provider sinks
+landed, the same corpus indexes in 1 m 32 s with a **145.3 MiB** process-tree peak (two cold runs,
+250 ms and 50 ms sampling, within 0.1 MiB of each other), so that miss is closed.
 
 ## Where each decision landed
 
