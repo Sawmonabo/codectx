@@ -110,7 +110,7 @@ var scenarios = []scenario{
 			if ordinary.statCalls != 0 {
 				t.Fatalf("an ordinary doctor made %d Stats calls; the row counts are O(rows) and belong to --deep", ordinary.statCalls)
 			}
-			for _, name := range []string{checkStorageIntegrity, checkStorageAccount, checkSourceRetention} {
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount} {
 				got := checkNamed(t, rep, name)
 				if got.State != model.CheckUnverified {
 					t.Fatalf("%s state is %q, want %q", name, got.State, model.CheckUnverified)
@@ -131,7 +131,28 @@ var scenarios = []scenario{
 			if deep.statCalls != 1 {
 				t.Fatalf("a deep doctor made %d Stats calls, want exactly 1", deep.statCalls)
 			}
-			for _, name := range []string{checkStorageIntegrity, checkStorageAccount, checkSourceRetention} {
+
+			// The retained-object check is a bounded sample either way, so it
+			// reports what it sampled and is `unverified` in exactly one case:
+			// an empty sample, which without the retained-object count cannot
+			// be told from a store whose every object is unreadable. Documenting
+			// it as a deep-only walk would be wrong, and only a populated
+			// fixture catches that -- the empty one above passes either way.
+			if got := checkNamed(t, rep, checkSourceRetention); got.State != model.CheckUnverified {
+				t.Fatalf("source_retention on an empty sample is %q, want %q", got.State, model.CheckUnverified)
+			}
+			populated := &fakeStore{hashes: []string{"a", "b"}}
+			popRep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: populated}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("ordinary Doctor on a populated store: %v", err)
+			}
+			if got := checkNamed(t, popRep, checkSourceRetention); got.State != model.CheckPass {
+				t.Fatalf("source_retention state is %q on a store whose sample verified, want %q", got.State, model.CheckPass)
+			}
+			if populated.statCalls != 0 {
+				t.Fatalf("the populated ordinary doctor made %d Stats calls, want 0", populated.statCalls)
+			}
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount} {
 				if got := checkNamed(t, deepRep, name); got.State != model.CheckPass {
 					t.Fatalf("deep %s state is %q, want %q", name, got.State, model.CheckPass)
 				}
@@ -407,6 +428,9 @@ type fakeStore struct {
 	// asked for, so a row can prove --deep widens it.
 	supplied    []SuppliedIndex
 	sampleLimit int
+	// hashes is what SampleBlobs reports. Nil is the ordinary fixture (an
+	// empty store); a row that needs a populated one sets it.
+	hashes []string
 	// heartbeat is the watch heartbeat the store holds, absent when nil.
 	heartbeat *WatchHeartbeat
 }
@@ -416,7 +440,10 @@ type fakeStore struct {
 // legitimate state, and the rows that care assert on sampleLimit.
 func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) {
 	f.sampleLimit = limit
-	return nil, f.err
+	if len(f.hashes) > limit {
+		return f.hashes[:limit], f.err
+	}
+	return f.hashes, f.err
 }
 
 // SuppliedIndexes is the optional supplied-index probe (L1).
