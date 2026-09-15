@@ -135,6 +135,13 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	return s, nil
 }
 
+// ByteBudget is the shared continuation byte budget, or zero when this store
+// is UNLIMITED. It is read by callers that size a piece of continuation state
+// they can make smaller rather than be refused for -- an accelerator, such as
+// a membership summary, whose size is a choice and never a correctness
+// property. The budget is fixed at construction, so this needs no lock.
+func (s *Spools) ByteBudget() int64 { return s.maxBytes }
+
 // reserve claims n bytes of the shared budget for spool id or fails without
 // claiming any.
 func (s *Spools) reserve(id string, n int64) error {

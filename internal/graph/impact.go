@@ -177,7 +177,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// the WHOLE retained input once the walk is exhausted.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir(), e.limits.FrontierBytes/visitedFilterBudgetShare); err != nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes()); err != nil {
 			return answer, nil, nil, "", err
 		}
 	}

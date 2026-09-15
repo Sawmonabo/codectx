@@ -100,10 +100,10 @@ func TestVisitedSetHeapIsBoundedByTheFrontNotTheWalk(t *testing.T) {
 		t.Fatalf("the visited set held %d bytes of heap for a %d-node walk; the front must be bounded by the page (bound %d bytes)",
 			grew, syntheticNodes, bound)
 	}
-	// The front is what the next spill writes, and it must be only this page's
-	// own admissions -- never the cumulative set, which is copied spool to
-	// spool instead.
-	if got := len(set.newlyAdmitted()); got > levels*perLevel {
+	// The front is what this page appends to the run store, and it must be
+	// only this page's own admissions -- never the cumulative set, every
+	// earlier page's run of which stays where that page wrote it.
+	if got := len(set.addedNodes()); got > levels*perLevel {
 		t.Fatalf("the page offered %d newly admitted nodes; it admitted at most %d", got, levels*perLevel)
 	}
 }
@@ -337,7 +337,9 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 		}
 		return nil
 	}
-	filter := newFrozenVisitedFilter(spoolFilterBits(chainNodes, chainNodes*2), visitedFilterProbes)
+	// Sixteen bits per node of the cumulative set, the density the store's
+	// frozen geometry is budgeted at (visitedstore.go).
+	filter := newFrozenVisitedFilter(chainNodes*16, visitedFilterProbes)
 	if filter == nil {
 		t.Fatal("no membership summary was built for a 20 000-node walk")
 	}
@@ -481,33 +483,35 @@ func resumeSpooledWalk(t *testing.T, pages int) *resumeState {
 	return s
 }
 
-// TestSpilledVisitedSectionIsAscending is the A4 proof. The membership sweep is
-// a MERGE-JOIN over the spool's visited section (visited.go warm), so that
-// section's ascending order is a correctness invariant, not a tidiness one: a
-// record out of order makes the join advance past a candidate it could have
-// answered and report a node the walk HAS admitted as absent -- the cross-page
-// RE-ADMISSION cursor v3 exists to prevent, and the same entity listed twice.
+// TestTheRetainedVisitedRunsAreAscending is the A4 proof, carried over to the
+// append-only store. The membership sweep is a MERGE-JOIN over the cumulative
+// set (visited.go warm), and it reads that set for what it is: a CONCATENATION
+// of ascending runs, one per page, where a key below its predecessor starts the
+// next run and restarts the join at the smallest unanswered candidate. Both
+// halves are correctness invariants, not tidiness ones. A run that is not
+// ascending makes the join advance past a candidate it could have answered and
+// report a node the walk HAS admitted as absent -- a cross-page RE-ADMISSION,
+// the same entity listed twice. More runs than pages means the store took ids
+// out of order, which costs the join a restart per stray key.
 //
-// Nothing tested the order. The section is produced by spill's two-way merge of
-// the carried stream with this page's own contribution (drainBelow /
-// writeVisited in cursor.go), and the walk below interleaves them: the pages
-// admit hash-spelled ids, so page 2's own admissions sort among page 1's.
-//
-// Mutation (drainBelow's loop body made a no-op): the section is emitted
-// carried-first, the assertion below fails at the first descending key, and
-// TestSpooledVisitedSetAnswersACrossPageRevisit then reports the re-admission
-// that order exists to prevent.
-func TestSpilledVisitedSectionIsAscending(t *testing.T) {
-	// Three pages, so the cursor under test names a spool written by a spill
-	// that MERGED -- page 2 carried page 1's section forward under its own.
-	s := resumeSpooledWalk(t, 3)
+// Mutation (visitedstore.go appendRun given its ids reversed, or cursor.go
+// handing it an unsorted slice): the run under the stray key is descending and
+// the first assertion fails; the run count passes the second.
+func TestTheRetainedVisitedRunsAreAscending(t *testing.T) {
+	// Three pages, so the store under test holds several runs: each page
+	// appended its OWN admissions and copied nothing forward.
+	const pages = 3
+	s := resumeSpooledWalk(t, pages)
 	var prev model.NodeID
-	n := 0
+	runs, n := 0, 0
 	if err := s.Visited(context.Background(), func(id model.NodeID) error {
-		if n > 0 && id <= prev {
-			return fmt.Errorf("the spooled visited section is not ascending: %s follows %s. "+
-				"The merge-join that answers membership would advance past a candidate an earlier "+
-				"record answers, report an admitted node absent, and re-admit it on a later page", id, prev)
+		switch {
+		case n == 0 || id < prev:
+			runs++
+		case id == prev:
+			return fmt.Errorf("the retained runs repeat node %s: a run is a page's own "+
+				"admissions, and a node two pages both admitted is the re-admission "+
+				"the store exists to prevent", id)
 		}
 		prev, n = id, n+1
 		return nil
@@ -515,9 +519,14 @@ func TestSpilledVisitedSectionIsAscending(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n < 2 {
-		t.Fatalf("the section held %d records; an order invariant needs at least two", n)
+		t.Fatalf("the runs held %d record(s); an order invariant needs at least two", n)
 	}
-	t.Logf("the merged visited section holds %d ascending records", n)
+	if runs > pages {
+		t.Fatalf("the store holds %d ascending run(s) over %d page(s); a page appends ONE run, "+
+			"so more of them means ids were appended out of order and the merge-join restarts "+
+			"on every stray key", runs, pages)
+	}
+	t.Logf("%d retained record(s) in %d ascending run(s)", n, runs)
 }
 
 // TestResumePopulatesTheMembershipSummaryFromTheSpool is the A16 proof. The
