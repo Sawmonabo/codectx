@@ -416,6 +416,12 @@ type extraction struct {
 	imports []wire.Import
 	refs    []wire.Ref
 	done    wire.Done
+	// overflow records that the parent stopped buffering a record set at the
+	// request's bound. It is folded into done.Truncated, which provider.go
+	// turns into a partial structure capability: a child that sends past the
+	// bound is not a reason to fail the file, and failing it would turn a
+	// user-set bound into a refusal.
+	overflow bool
 }
 
 // perFileError is a worker error frame: the file failed, the worker did not.
@@ -457,6 +463,19 @@ func (p *pool) parse(ctx context.Context, w *worker, req wire.Request, src []byt
 	return nil, err
 }
 
+// atRequestBound is the parent's half of the per-file record bound, read off
+// the SAME request field the worker reads. The check exists to stop a
+// misbehaving child from making the parent buffer more than a healthy one would
+// send, so it must never be stricter than what the worker was told: a parent
+// holding its own constant would kill a healthy worker's output the moment the
+// operator raised the limit. A zero bound is unlimited and the check is a
+// no-op, which is the shipped default. Reaching it drops the frame and flags
+// the file truncated rather than failing the unit: the bound is the operator's
+// and crossing it is a short answer, not a protocol fault.
+func atRequestBound(req wire.Request, have int) bool {
+	return req.MaxRecordsPerFile != 0 && uint64(have) >= req.MaxRecordsPerFile
+}
+
 func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, error) {
 	if err := wire.WriteJSON(w.in, wire.KindRequest, req, wire.MaxFactFrameBytes); err != nil {
 		return nil, err
@@ -478,8 +497,9 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &d); err != nil {
 				return nil, err
 			}
-			if len(ex.decls) >= wire.MaxDeclsPerFile {
-				return nil, errors.New("worker exceeded the declaration bound")
+			if atRequestBound(req, len(ex.decls)) {
+				ex.overflow = true
+				continue
 			}
 			ex.decls = append(ex.decls, d)
 		case wire.KindImport:
@@ -487,8 +507,9 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &i); err != nil {
 				return nil, err
 			}
-			if len(ex.imports) >= wire.MaxImportsPerFile {
-				return nil, errors.New("worker exceeded the import bound")
+			if atRequestBound(req, len(ex.imports)) {
+				ex.overflow = true
+				continue
 			}
 			ex.imports = append(ex.imports, i)
 		case wire.KindRef:
@@ -496,14 +517,16 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 			if err := json.Unmarshal(payload, &r); err != nil {
 				return nil, err
 			}
-			if len(ex.refs) >= wire.MaxRefsPerFile {
-				return nil, errors.New("worker exceeded the reference bound")
+			if atRequestBound(req, len(ex.refs)) {
+				ex.overflow = true
+				continue
 			}
 			ex.refs = append(ex.refs, r)
 		case wire.KindDone:
 			if err := json.Unmarshal(payload, &ex.done); err != nil {
 				return nil, err
 			}
+			ex.done.Truncated = ex.done.Truncated || ex.overflow
 			w.rss.Store(ex.done.RSSBytes)
 			return ex, nil
 		case wire.KindError:

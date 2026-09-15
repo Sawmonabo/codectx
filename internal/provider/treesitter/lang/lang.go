@@ -27,7 +27,7 @@ const ProviderID = "treesitter"
 
 // extractionVersion changes whenever the worker's extraction logic changes
 // the facts it emits for the same source and query pack.
-const extractionVersion = "2"
+const extractionVersion = "3"
 
 //go:embed queries/*.scm
 var queryFS embed.FS

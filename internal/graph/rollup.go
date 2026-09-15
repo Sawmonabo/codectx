@@ -90,7 +90,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		markTruncated(&meta, reasonDepth)
 	}
 
-	items, rollupErr := e.rollupPackages(ctx, acc.Relations())
+	items, rollupErr := e.rollupPackages(ctx, acc.Relations(), &meta)
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
@@ -131,7 +131,8 @@ const packageDepsEndpoint = "graph.package_dependencies"
 // depending on itself is not a dependency, and reporting it would drown the
 // real cross-package pairs. An edge with no resolvable container is dropped
 // rather than attributed to a guessed package.
-func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation) ([]model.PackageEdge, error) {
+func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation,
+	meta *model.QueryMeta) ([]model.PackageEdge, error) {
 	if len(relations) == 0 {
 		return nil, nil
 	}
@@ -141,7 +142,7 @@ func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation)
 		endpoints = append(endpoints, r.From, r.To)
 		relationIDs = append(relationIDs, r.ID)
 	}
-	containers, err := e.containerPackages(ctx, endpoints)
+	containers, err := e.containerPackages(ctx, endpoints, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -202,18 +203,58 @@ func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation)
 // containerPackages maps each node to the package or module node that contains
 // it, in bounded batched round trips. A node that is itself a container maps to
 // itself, so a package-level edge rolls up to the pair it already names.
-func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map[model.NodeID]model.Node, error) {
+//
+// The containment read is bounded by the CONFIGURED edge allowance, which is
+// unlimited by default, so the shipped configuration reads every containment
+// edge a batch has. It used to be bounded by a hard-coded sixteen containers
+// per node: a graph that legitimately claimed a node from more containers than
+// that refused the whole rollup on a default configuration, which is a scale
+// refusal rather than a policy the operator chose.
+//
+// A user-set allowance that stops a batch's read OMITS that batch's nodes from
+// the map and discloses the bound once, the shape containerContents already
+// uses. Omission is what the old refusal was protecting: a node whose candidate
+// list is half-read would be attributed to the wrong package, not merely to
+// fewer, and an unattributed endpoint drops its edge from the rollup -- the
+// same treatment rollupPackages already gives an endpoint with no container at
+// all. The pairs that remain are therefore measured pairs, and the answer says
+// it is not the whole rollup.
+func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID,
+	meta *model.QueryMeta) (map[model.NodeID]model.Node, error) {
 	ids = dedupeNodes(append([]model.NodeID(nil), ids...))
 	candidates := map[model.NodeID][]model.NodeID{}
 	var lookup []model.NodeID
 	lookup = append(lookup, ids...)
+	// unattributed is the set cut has dropped. A node in it must not be
+	// resolved from the candidates a LATER batch happens to add for it, so the
+	// resolution loop below skips it outright.
+	unattributed := map[model.NodeID]bool{}
+	// cut drops every candidate a stopped batch collected -- a half-read
+	// candidate list is a wrong attribution, not a short one -- and discloses
+	// the bound once however many batches it stops.
+	disclosed := false
+	cut := func(batch []model.NodeID) {
+		for _, id := range batch {
+			delete(candidates, id)
+			unattributed[id] = true
+		}
+		markTruncated(meta, reasonEdgeBudget)
+		if disclosed {
+			return
+		}
+		disclosed = true
+		meta.Notices = appendNotice(meta.Notices,
+			"max_graph_edges: the configured edge bound stopped a containment read, so the "+
+				"relations of the nodes it covered are omitted from this rollup rather than "+
+				"attributed to a partly-read container")
+	}
 	for _, batch := range impactChunkNodes(ids) {
 		// Streaming, not a slice: each containment row is folded into the
 		// candidate list of the node it contains as it arrives, so the heap
 		// here is one adjacency page plus the candidates themselves, never the
 		// whole containment fan-out of the batch.
 		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, config.Limit(int64(len(batch))*maxContainersPerNode),
+			[]model.RelationKind{model.RelContains}, e.limits.Edges(),
 			func(r model.Relation) error {
 				candidates[r.To] = append(candidates[r.To], r.From)
 				lookup = append(lookup, r.From)
@@ -223,13 +264,7 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 			return nil, err
 		}
 		if !complete {
-			// A rollup cannot disclose truncation: its callers hand it a
-			// relation list and take a pair list back. Refusing loudly is the
-			// only honest answer left -- a rollup built on half the containment
-			// would attribute edges to the wrong packages, not merely to fewer.
-			return nil, (&model.Error{Code: model.CodeResourceLimit,
-				Message:     "this generation contains more containment edges for one batch of nodes than a rollup may read",
-				Remediation: "narrow the request scope"}).WithDetail("limit", "containers_per_node")
+			cut(batch)
 		}
 	}
 	nodes, err := e.nodesByID(ctx, lookup)
@@ -238,6 +273,9 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	}
 	out := make(map[model.NodeID]model.Node, len(ids))
 	for _, id := range ids {
+		if unattributed[id] {
+			continue
+		}
 		if n, ok := nodes[id]; ok && isContainerKind(n.Kind) {
 			out[id] = n
 			continue
@@ -263,51 +301,9 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	return out, nil
 }
 
-// maxContainersPerNode bounds how many containers one node may be read as
-// belonging to. A node legitimately sits in several -- a file is in a directory
-// and in a package -- but a graph in which one node is claimed by sixteen is
-// pathological, and an unbounded "read until done" is exactly how such a graph
-// becomes an unbounded query.
-//
-// It replaces a flat page ceiling that did not scale with the batch: sixteen
-// clamped pages carry 3200 containment rows whatever the batch size, so a batch
-// of 256 nodes silently stopped at twelve containers per node while a batch of
-// four was allowed eight hundred. The budget below is per node, so a batch
-// reads what its own size needs and the loop still has an explicit finite
-// bound.
-const maxContainersPerNode = 16
-
-// containsEdges reads the containment edges of one batch of nodes in direction,
-// keyset-paged by RelationID, up to maxEdges rows.
-//
-// kinds is the containment vocabulary the caller counts over, and it is a
-// parameter rather than a constant because the two callers mean different
-// things by "contained": a rollup and an ancestry climb ask which CONTAINER
-// holds a node, which only `contains` answers, while the repository map counts
-// what a container holds and a top-level declaration hangs off its module with
-// `defines` (see overviewRelationKinds).
-//
-// It reports whether the read COMPLETED. The caller decides what an incomplete
-// containment read means for its answer -- both a rollup and the repository
-// map's counts refuse -- because the one thing neither may do is report a
-// partial containment as the whole of it: a package that silently loses half
-// its members reads as a smaller package, not as an incomplete answer.
-func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
-	direction model.Direction, kinds []model.RelationKind, maxEdges config.Limit) ([]model.Relation, bool, error) {
-	var out []model.Relation
-	complete, err := e.streamContainsEdges(ctx, batch, direction, kinds, maxEdges,
-		func(r model.Relation) error {
-			out = append(out, r)
-			return nil
-		})
-	if err != nil {
-		return nil, false, err
-	}
-	return out, complete, nil
-}
-
-// streamContainsEdges is the same keyset-paged containment read, delivered one
-// ROW at a time. It holds one adjacency page -- adjacencyBatch rows -- and never
+// streamContainsEdges reads the containment edges of one batch of nodes in
+// direction, keyset-paged by RelationID and delivered one ROW at a time, up to
+// maxEdges rows. It holds one adjacency page -- adjacencyBatch rows -- and never
 // the whole containment fan-out of a batch of containers, so a caller that only
 // needs to fold each row (a rollup keeps one candidate list per node; the
 // repository map keeps one counter per container) pays a page of heap rather

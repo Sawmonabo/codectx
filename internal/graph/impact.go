@@ -184,7 +184,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
 		return answer, nil, nil, "", err
 	}
-	packages, rollupErr := e.rollupPackages(ctx, acc.Relations())
+	packages, rollupErr := e.rollupPackages(ctx, acc.Relations(), &meta)
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return answer, nil, nil, "", err
 	}

@@ -1,4 +1,4 @@
-package sqlite
+package pagination
 
 import (
 	"context"
@@ -8,8 +8,8 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// PageClamps collects every page bound this storage layer resolved differently
-// from what its caller asked for, so the clamp reaches the actor as
+// PageClamps collects every page bound a reader resolved differently from what
+// its caller asked for, so the clamp reaches the actor as
 // "requested N, effective M" instead of happening silently.
 //
 // The clamp itself is legitimate (class A: model.MaxPageItems is a hard wire
@@ -19,8 +19,16 @@ import (
 // end of the answer -- and since the edge batch limit became "0 = no caller
 // bound", a zero now resolves to 200 here where it used to be a loud refusal.
 //
+// It lives here, beside the cursors and spools the "continue with the cursor"
+// half of its message points at, rather than in the storage package that
+// records into it: the query engine and the context compiler drain a collector
+// into their answer's notices, and a package that must not depend on the store
+// to report a clamp would otherwise have to import it for this type alone.
+// storage/sqlite records into it and re-exports the two names its callers
+// already use.
+//
 // It travels on the context rather than through every reader signature. Two
-// dozen reader methods on PinnedReader return rows only, and threading an
+// dozen reader methods on the pinned reader return rows only, and threading an
 // out-parameter through all of them (and through their callers in the context
 // compiler, the graph engine and the app layer) would be a far larger change
 // than the observation is worth. Carrying an out-of-band observation sink on the
@@ -60,12 +68,12 @@ func (c *PageClamps) add(note string) {
 	c.order = append(c.order, note)
 }
 
-// recordUnbounded notes a request that named no bound of its own and was served
+// RecordUnbounded notes a request that named no bound of its own and was served
 // at the wire ceiling. It is recorded only where the caller's zero is a USER
 // setting that means unlimited -- the edge batch limit -- and not at the many
 // internal sites that pass 0 simply because they never had a page bound to
 // pass, where it would be noise rather than news.
-func recordUnbounded(ctx context.Context, effective int) {
+func RecordUnbounded(ctx context.Context, effective int) {
 	c, ok := ctx.Value(pageClampKey{}).(*PageClamps)
 	if !ok {
 		return
@@ -83,12 +91,12 @@ func (c *PageClamps) Notices() []string {
 	return append([]string(nil), c.order...)
 }
 
-// pageLimit resolves a requested page size against the wire ceiling and reports
+// PageLimit resolves a requested page size against the wire ceiling and reports
 // the resolution to the context's collector when the two differ. A request of 0
 // is "no caller-side bound" and resolves to the ceiling; that is a resolution,
 // not a clamp of a number the caller chose, so only a positive request above the
 // ceiling is reported.
-func pageLimit(ctx context.Context, limit int) int {
+func PageLimit(ctx context.Context, limit int) int {
 	if limit <= 0 || limit > model.MaxPageItems {
 		if limit > model.MaxPageItems {
 			if c, ok := ctx.Value(pageClampKey{}).(*PageClamps); ok {

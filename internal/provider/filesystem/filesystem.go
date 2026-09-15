@@ -24,7 +24,7 @@ import (
 // Provider identity and capabilities.
 const (
 	ID      = "filesystem"
-	Version = "1"
+	Version = "2"
 
 	// CapabilityStructure is the repository/directory/file graph.
 	CapabilityStructure = "structure"

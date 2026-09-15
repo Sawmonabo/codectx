@@ -102,6 +102,7 @@ func (c Config) validate() error {
 		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
 		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
 		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
+		{"providers.tree_sitter.max_records_per_file", c.Providers.TreeSitter.MaxRecordsPerFile},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
 		{"workspace.max_depth", c.Workspace.MaxDepth},
