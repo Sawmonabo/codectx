@@ -520,8 +520,8 @@ func TestGraphScenarios(t *testing.T) {
 		},
 
 		{
-			// The keyset loops ask Adjacency.Edges for adjacencyBatch (256)
-			// rows, but the shipped reader clamps any limit above
+			// The keyset loops ask for adjacencyBatch (256) rows, but the
+			// shipped reader clamps any limit above
 			// model.MaxPageItems (200) down to it. A loop that ends on "the
 			// page came back shorter than I asked for" therefore ends after its
 			// FIRST page always, reads 200 of n-wide's 260 edges, and reports
@@ -1073,8 +1073,8 @@ func TestGraphScenarios(t *testing.T) {
 
 		// FX-C14c-PROOF row
 		{
-			// The last two keyset loops that ask Adjacency.Edges for
-			// adjacencyBatch (256) rows: rollup.go's containsEdges and
+			// The last two keyset loops that ask for adjacencyBatch (256)
+			// rows: rollup.go's containsEdges and
 			// references.go's referencePage. The reader clamps every request
 			// down to model.MaxPageItems (200), so "the page came back shorter
 			// than I asked for" is true of EVERY page, and a loop that ends on
