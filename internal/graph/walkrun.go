@@ -130,8 +130,12 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 		// store. Only its own: the frontier it resumed belongs to the run the
 		// previous link wrote. The store is flushed by the append, so the next
 		// link's membership sweep reads what this one just admitted.
-		if err := o.Visited.appendRun(state.Admitted.addedNodes()); err != nil {
+		grown, err := o.Visited.appendRun(state.Admitted.addedNodes())
+		if err != nil {
 			return walkState{}, err
+		}
+		if e.probe != nil {
+			e.probe.VisitedBytes += grown
 		}
 		// The next link resumes from this one exactly as a signed continuation
 		// would -- same frontier, same keyset position, same cumulative visited

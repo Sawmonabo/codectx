@@ -807,8 +807,12 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		// anything is handed over: a token minted over a store that had not yet
 		// taken them would resume a walk that believes it never admitted them
 		// and report every one of them a second time.
-		if err := store.appendRun(c.Visited); err != nil {
+		grown, err := store.appendRun(c.Visited)
+		if err != nil {
 			return "", e.releaseLease(ctx, lease.ID, err)
+		}
+		if e.probe != nil {
+			e.probe.VisitedBytes += grown
 		}
 	}
 	if c.Retain != nil {
