@@ -300,8 +300,9 @@ func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 	candidates := map[model.NodeID][]model.NodeID{}
 	lookup := make([]model.NodeID, 0, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
+		maxEdges, unlimited := containmentBudget(b, e.limits)
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, containmentBudget(b, e.limits))
+			[]model.RelationKind{model.RelContains}, maxEdges, unlimited)
 		if err != nil {
 			return nil, err
 		}
@@ -354,8 +355,9 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget) (map[model.NodeID]containerCounts, error) {
 	out := make(map[model.NodeID]containerCounts, len(ids))
 	for _, batch := range impactChunkNodes(ids) {
+		maxEdges, unlimited := containmentBudget(b, e.limits)
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing,
-			overviewRelationKinds(), containmentBudget(b, e.limits))
+			overviewRelationKinds(), maxEdges, unlimited)
 		if err != nil {
 			return nil, err
 		}
@@ -402,12 +404,21 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 // The whole page shares one allowance, so a single pathological container
 // cannot make one answer read more adjacency than a walk of the same size
 // would have been allowed to.
-func containmentBudget(b *budget, limits Limits) int64 {
+//
+// The allowance is a Section 20.1 bound, so the UNLIMITED case is returned as
+// its own flag rather than as a number. An unlimited bound reaches this
+// function as zero, and a zero remaining allowance is the one value that must
+// refuse: collapsing the two would turn "no configured edge limit" into "no
+// edges may be read", which refuses every repository map by default.
+func containmentBudget(b *budget, limits Limits) (maxEdges int64, unlimited bool) {
+	if limits.Edges().IsUnlimited() {
+		return 0, true
+	}
 	left := int64(limits.MaxEdges) - b.edges
 	if left < 0 {
-		return 0
+		return 0, false
 	}
-	return left
+	return left, false
 }
 
 // containerLabels is the operator-facing path and name of one container.
