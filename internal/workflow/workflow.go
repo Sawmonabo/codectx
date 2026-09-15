@@ -263,16 +263,9 @@ func New(o Options) (*Service, error) {
 // deadline" and is its default; only a negative one is a wiring defect, and it
 // is refused here because model.QueryDeadline would ignore it silently.
 func checkLimits(l Limits) error {
-	for _, b := range []struct {
-		name  string
-		value int64
-	}{
-		{"max_page_items", int64(l.MaxPageItems)},
-	} {
-		if b.value <= 0 {
-			return typedErrf(model.CodeInternal,
-				"workflow service was built with a non-positive %s bound", b.name)
-		}
+	if l.MaxPageItems <= 0 {
+		return typedErrf(model.CodeInternal,
+			"workflow service was built with a non-positive max_page_items bound")
 	}
 	if l.QueryTimeout < 0 {
 		return typedErrf(model.CodeInternal,

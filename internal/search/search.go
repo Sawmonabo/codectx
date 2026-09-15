@@ -192,8 +192,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	// search nobody bounded ranks every candidate, and a caller who set a
 	// deadline of their own keeps it (model.QueryDeadline). That search is the
 	// only unbounded part of this answer -- the tiers walk their keysets to
-	// the end -- and ruling Q4 says a deadline ends a PAGE, not an answer: the hits ranked before it are a real ordered prefix, and a query
-	// that returned nothing at all because it took too long to look is the
+	// the end -- and ruling Q4 says a deadline ends a PAGE, not an answer: the
+	// hits ranked before it are a real ordered prefix, and a query that
+	// returned nothing at all because it took too long to look is the
 	// refusal the scale posture forbids. Everything after the search (pinning,
 	// hydrating one page, writing the tail into the continuation spool) is
 	// work over a set already in hand, bounded by one page and one spool
