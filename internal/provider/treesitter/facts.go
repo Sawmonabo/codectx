@@ -744,20 +744,15 @@ func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey
 	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(b.nodes[i].Node.ID, "", rng, nativeKey, ""))
 }
 
-// detailEvidenceClipped is the capability detail key under which a per-fact
-// evidence clip is disclosed. It is the key the filesystem provider already
-// uses for the same bound, so one clip reads the same wherever it is applied.
-const detailEvidenceClipped = "evidence_clipped"
-
 // bounds folds this file's bound accounting into the capability state it is
-// reported on. The evidence clip is attributed under detailEvidenceClipped
-// instead of the generic dropped count, so an operator can tell a clip they
+// reported on. The evidence clip is attributed under
+// model.DetailEvidenceClipped instead of the generic dropped count, so an operator can tell a clip they
 // configured from any other bound; the bool reports whether any bound -- clip
 // or otherwise -- made this file's coverage partial, so attributing the clip
 // never costs the partial signal.
 func (b *builder) bounds(state model.CapabilityState) (model.CapabilityState, bool) {
 	if b.clipped > 0 {
-		state = state.WithDetail(detailEvidenceClipped, strconv.Itoa(b.clipped))
+		state = state.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(b.clipped))
 	}
 	return state, b.dropped > 0 || b.clipped > 0
 }
