@@ -107,7 +107,7 @@ func (r *PinnedReader) FileByPath(ctx context.Context, path string) (model.FileI
 // NodesInFile pages visible node facts declared in file, keyset on
 // (start_byte, node_id), through idx_nodes_file.
 func (r *PinnedReader) NodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]StoredNode, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	fileRaw, err := idBlob("file_id", string(file))
 	if err != nil {
 		return nil, err
@@ -237,7 +237,7 @@ func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([
 // TermOccurrences pages visible documents containing term, keyset on rowid,
 // one row per (document, column), ordered by (rowid, column).
 func (r *PinnedReader) TermOccurrences(ctx context.Context, term string, after int64, limit int) ([]TermOccurrence, error) {
-	limit = pageLimit(limit)
+	limit = pageLimit(ctx, limit)
 	if term == "" {
 		return nil, invalid("term must not be empty")
 	}

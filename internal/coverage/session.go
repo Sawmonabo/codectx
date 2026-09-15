@@ -243,6 +243,10 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 
 	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// statusLimit already keeps the request one record below the wire ceiling,
+	// so a clamp here would be a caller asking for more than the ceiling. It is
+	// reported rather than applied silently.
+	ctx, clamps := sqlite.WithPageClamps(ctx)
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil && !(expiredSession(err) && rec.ID != "") {
@@ -264,7 +268,7 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 		items = items[:limit]
 	}
 
-	meta := model.QueryMeta{Binding: rec.Binding}
+	meta := model.QueryMeta{Binding: rec.Binding, Notices: clamps.Notices()}
 	if more {
 		token, why, err := s.statusCursor(ctx, rec, items[len(items)-1].FileID)
 		if err != nil {

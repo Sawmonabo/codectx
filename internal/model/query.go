@@ -90,6 +90,12 @@ type QueryMeta struct {
 	Truncated        bool              `json:"truncated"`
 	TruncationReason string            `json:"truncation_reason,omitempty"`
 	NextCursor       string            `json:"next_cursor,omitempty"`
+	// Notices are facts about how the answer was produced that are not
+	// truncation: nothing was lost, but the actor asked for one thing and got
+	// another. A page bound resolved below what was requested is the first of
+	// them. They reach the operator on every output path; an unreported
+	// resolution is the silence the scale posture forbids.
+	Notices []string `json:"notices,omitempty"`
 	// Overlay is set only when the result came from the LSP overlay; a nil
 	// overlay means every record in the result is a canonical fact.
 	Overlay *OverlayBinding `json:"overlay,omitempty"`
@@ -112,6 +118,14 @@ func (m QueryMeta) Validate() error {
 	}
 	if err := boundField("meta.next_cursor", m.NextCursor, MaxTokenBytes); err != nil {
 		return err
+	}
+	for i, note := range m.Notices {
+		if note == "" {
+			return invalid("meta.notices[%d] is empty", i)
+		}
+		if err := boundField("meta.notices", note, MaxReasonBytes); err != nil {
+			return err
+		}
 	}
 	if m.Overlay != nil {
 		if err := m.Overlay.Validate(); err != nil {
