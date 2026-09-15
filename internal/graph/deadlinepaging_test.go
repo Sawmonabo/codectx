@@ -137,7 +137,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 			jump: 2 * time.Minute, fired: &fired, every: 200}
 		probe := &heapProbe{}
-		paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+		paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 			Now: func() time.Time { return clock }})
 		if err != nil {
@@ -304,7 +304,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		// reach an edge: the walk cannot advance and must say so.
 		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 			jump: 2 * time.Minute, fired: &fired, every: 1}
-		paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+		paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 			Now: func() time.Time { return clock }})
 		if err != nil {
@@ -424,7 +424,7 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 	// no page after it can reach an edge at all.
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
-	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -617,7 +617,7 @@ func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
-	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
