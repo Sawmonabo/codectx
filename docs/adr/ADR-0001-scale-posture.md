@@ -247,9 +247,9 @@ level's probe answers plus one page of relations plus one spool record in flight
 with the graph. The cost side is real and stated for the verification lane: one spool sweep per
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
-released only after the fresh one is written. Two callers that expand a whole walk in one request
-(impact and rollup) are still walk-sized by construction, because they rank or aggregate the whole
-walk in memory; that is ranked-spool work, not frontier work, and it is open.
+released only after the fresh one is written. The two callers that used to expand a whole walk in
+one request now have the same treatment: impact is a spooled, cursor-resumable continuation and the
+rollup's containment read is keyset-paged, so neither ranks or aggregates a whole walk in memory.
 
 ### 2.3 External merge for the planner, with byte-identical order
 
@@ -373,11 +373,11 @@ proportion to the answer or to the range scan: two sort passes (deduplicate and 
 one page and a streamed spool tail, so peak heap on this path is the run budget plus the merge fan-in's
 blocks plus one page, independent of the match count. Measured live-record high-water mark: 190
 records at 20 000 candidates and 189 at 200 000; the mutation that removes the run budget raises it
-to the match count (20 000 and 65 536) and the assertion fails. Two residuals are named rather than
-claimed: a continuation page still materialises the whole spooled tail it was handed before
-re-spooling the remainder (the fix is to read one page and stream the rest into the next spool), and
-per-request sort runs are not charged to the temporary-bytes reservation, though they live under the
-same spool directory and are counted as real disk by the sweeper.
+to the match count (20 000 and 65 536) and the assertion fails. One residual is named rather than
+claimed: per-request sort runs are not charged to the temporary-bytes reservation, though they live
+under the same spool directory and are counted as real disk by the sweeper. The continuation page
+that once materialised the whole spooled tail before re-spooling the remainder is closed: a
+continuation now allocates one page and streams the rest into the next spool.
 
 ### 2.5 Field bounds truncate and flag
 
@@ -725,26 +725,26 @@ duplicates an existing assertion.
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
 - **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
   external sort primitive (§2.4), so peak heap on this path is the sort run buffer plus the merge
-  fan-in's blocks plus one page, independent of the match count. The two residuals §2.4 names are
-  the ones that stand: a continuation page still materialises the whole spooled tail it was handed
-  before re-spooling the remainder, and per-request sort runs are not charged to the temporary-byte
-  reservation, though they live under the same spool directory and the sweeper counts them as real
-  disk.
-- **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).
-- Smaller residuals are recorded at their sites: an undisclosed cut on a joined documentation body,
-  and a clamp notice that is recorded but still has no reader on the context and adjacency query
-  paths -- neither of them builds the answer metadata the notice would travel on, so carrying it
-  needs a field on the context manifest and an installation at the graph engine's own metadata
-  sites. The provider-side derived-row refusal is closed. The observation-reference count is a
-  user-set bound at the service boundary but the wire contract still refuses more than 64 references
-  on a single observation, so the aggregate path is unlimited and the single-observation path is
-  not.
-- **The traversal reads that unlimited defaults have now unbounded in heap**: the repository map's
-  containment read accumulates one page of containers' children in one slice, and the shortest-path
-  walk holds its settled set, distances and read edges for the walk. The finite defaults used to
-  bound all four; the page bound now covers only the containers, not the children. Each needs the
-  same treatment the ranked set got -- a keyset-paged containment read and a spilled frontier --
-  and until then their peak is a function of one container's fan-out rather than of a page.
+  fan-in's blocks plus one page, independent of the match count. The one residual §2.4 names is the
+  one that stands: per-request sort runs are not charged to the temporary-byte reservation, though
+  they live under the same spool directory and the sweeper counts them as real disk.
+- The smaller residuals this document recorded at their sites are **closed**, each with a reader.
+  The cut on a joined documentation body is disclosed: the composed search body is bounded through
+  the declaration's own truncation helper, which records the field and its original length. The
+  clamp notice now travels: the context manifest carries a notices field that the compile installs
+  on the manifest it returns, and the graph engine installs the same disclosure at its own query
+  metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
+  is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
+  the single-observation path reads the same configured limit the aggregate path does.
+- **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
+  walk holds its settled set, distances, depths and cached edges for the length of the walk, and
+  unlike a breadth-first frontier that state cannot spill, because a search resumed from a
+  persisted frontier would also need its settled distances. It is bounded instead by the query
+  memory budget: every map and queue entry is charged against `resources.query_memory_bytes`
+  (`frontier_bytes`) with a deliberate over-estimate, and crossing it truncates the answer with the
+  memory reason and the cheapest routes found so far rather than running on. The repository map's
+  containment read is closed -- it is keyset-paged now, so its peak is a page and not a container's
+  fan-out.
 
 ### 3.4 What verification on real repositories must show
 

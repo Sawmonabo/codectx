@@ -2,7 +2,12 @@ package index
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -28,8 +33,10 @@ import (
 // retain sweeps the store to the configured policy. A retention failure never
 // fails the indexing run that just published: the generation is active, its
 // facts are correct, and the only consequence is disk that will be reclaimed
-// on the next pass. It is logged with its diagnostic code so it cannot be
-// silent.
+// on the next pass. It is logged with its diagnostic code AND recorded on the
+// coordinator, so `status` reports it: a log line alone is not a reader, and a
+// policy the store refuses would otherwise leave retention never sweeping with
+// nothing in the product saying so while the store grows.
 func (c *Coordinator) retain(ctx context.Context) {
 	policy := sqlite.RetentionPolicy{RetainRefs: c.opts.Config.Index.RetainRefs.Int(),
 		MaxRetainedBytes: c.opts.Config.Index.MaxRetainedBytes.Value()}
@@ -39,8 +46,10 @@ func (c *Coordinator) retain(ctx context.Context) {
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
 			"component", component, "repository_id", string(c.repo))
+		c.retention.record(err)
 		return
 	}
+	c.retention.clear()
 	c.log.Info("retention swept the store", "component", component, "repository_id", string(c.repo),
 		"refs_retained", report.RefsRetained, "generations_swept", report.GenerationsSwept,
 		"units_deleted", report.UnitsDeleted, "bytes_reclaimed", report.BytesReclaimed,
@@ -87,4 +96,50 @@ func (c *Coordinator) collect(ctx context.Context) {
 		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
 		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored)
+}
+
+// retentionState is what this coordinator knows about its own last retention
+// sweep, and Status projects it -- the same shape watchState has, and for the
+// same reason: retain may not fail the run that published, so the only way a
+// failed sweep reaches a user is a reported degradation. A refused policy is
+// the case that matters: it fails every pass identically, so the store grows
+// without bound while every generation publishes successfully.
+//
+// It is mutex-guarded because retain runs from two places (the publish path
+// and the late-seal tick) while Status reads from a caller's goroutine.
+type retentionState struct {
+	mu sync.Mutex
+	// failure is the rendered warning of the last sweep that did not finish,
+	// empty once a later sweep succeeded.
+	failure string
+}
+
+// record keeps the diagnostic of a sweep that did not finish.
+func (r *retentionState) record(err error) {
+	diagnostic := string(provider.CodeOf(err))
+	var typed *model.Error
+	if errors.As(err, &typed) && typed.Message != "" {
+		diagnostic = string(typed.Code) + ": " + typed.Message
+	}
+	note, _ := model.TruncateField(fmt.Sprintf("the last retention sweep did not finish (%s): the store keeps "+
+		"every generation retention would have reclaimed until a later pass succeeds", diagnostic), model.MaxReasonBytes)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failure = note
+}
+
+// clear forgets a recorded failure once a sweep has finished.
+func (r *retentionState) clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failure = ""
+}
+
+// project publishes the recorded failure as a status warning.
+func (r *retentionState) project(st *model.IndexStatus) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.failure != "" {
+		st.Warnings = append(st.Warnings, r.failure)
+	}
 }
