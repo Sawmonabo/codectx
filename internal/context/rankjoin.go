@@ -534,6 +534,11 @@ func (c *Compiler) passECentrality(ctx context.Context, s *compileSorts,
 // what the exact early exit costs, and the alternative -- paging every node
 // batch to exhaustion because the scan cannot tell it is finished -- costs
 // store reads instead, which is the more expensive resource.
+//
+// Ruling C11 accepts that trade with its bound named: the words are
+// distinct-retained-relations / 8 bytes, so 12.5 MB at 10^8 distinct retained
+// relations and 125 MB at 10^9. It is contiguous and pointer-free, which is
+// why it is the one f(walk) structure this wave keeps.
 type bitset struct {
 	words []uint64
 	count int64
