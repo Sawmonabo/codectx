@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -44,7 +45,12 @@ var (
 	actorA   = "actor-a"
 	actorB   = "actor-b"
 
-	fixtureBinding = model.Binding{RepositoryID: repoID, SnapshotID: snapshotID, GenerationID: 1}
+	// The analysis key is part of the binding a real session carries, and a
+	// status continuation cannot be minted without one (session.go statusCursor
+	// answers "not yet analysed" instead). A fixture without it silently turns
+	// every paged Status assertion into a single-page one.
+	fixtureBinding = model.Binding{RepositoryID: repoID, SnapshotID: snapshotID, GenerationID: 1,
+		AnalysisKey: model.AnalysisKey(hexID(0x77))}
 )
 
 // --- fixture files ----------------------------------------------------------
@@ -1340,6 +1346,80 @@ var scenarios = []scenario{
 		if want := h.file(item.FileID); item.Path != want.path {
 			t.Fatalf("next names file %s with path %q; the fixture declares it at %q",
 				item.FileID, item.Path, want.path)
+		}
+	}},
+
+	// F18: the status continuation itself. Every other row asks for one page,
+	// so nothing here ever presented a cursor back -- resumeStatus had no
+	// coverage at all in a wave whose binding ruling is cursor pagination.
+	// This walks the session's whole required scope at the narrowest and the
+	// widest page and asserts the two properties a continuation must have: a
+	// page that leaves records unserved says so (a cursor, or a truncation
+	// with its reason -- never a silent stop), and the records the walk yields
+	// are the unpaginated set exactly, in the same order, with no repeat and
+	// no drop.
+	{"status/pages to exhaustion and never stops silently", func(t *testing.T, h *harness) {
+		ctx := context.Background()
+		req := model.SessionRequest{SessionID: sessionA, ActorID: actorA}
+
+		// The reference set: the endpoint's own default page, followed to
+		// exhaustion. The first page is not the whole answer even at the
+		// default limit -- the store pages under it -- which is exactly why a
+		// walk that stops at the first page proves nothing.
+		var want []model.FileID
+		for cursor := ""; ; {
+			p, err := h.svc.Status(ctx, req, model.PageRequest{Cursor: cursor})
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			for _, it := range p.Items {
+				want = append(want, it.FileID)
+			}
+			if p.Meta.NextCursor == "" {
+				break
+			}
+			cursor = p.Meta.NextCursor
+		}
+		total := len(want)
+		if total < 2 {
+			t.Fatalf("the fixture session carries %d coverage records; a continuation cannot be exercised "+
+				"with fewer than two", total)
+		}
+
+		for _, limit := range []int{1, total} {
+			var got []model.FileID
+			seen := map[model.FileID]bool{}
+			cursor := ""
+			for page := 1; ; page++ {
+				p, err := h.svc.Status(ctx, req, model.PageRequest{Limit: limit, Cursor: cursor})
+				if err != nil {
+					t.Fatalf("status at limit %d, page %d: %v", limit, page, err)
+				}
+				for _, it := range p.Items {
+					if seen[it.FileID] {
+						t.Fatalf("status at limit %d re-served %s on page %d", limit, it.FileID, page)
+					}
+					seen[it.FileID] = true
+					got = append(got, it.FileID)
+				}
+				if len(got) < total && p.Meta.NextCursor == "" &&
+					!(p.Meta.Truncated && p.Meta.TruncationReason != "") {
+					t.Fatalf("status at limit %d stopped after %d of %d records with no cursor and no "+
+						"truncation reason: the remaining coverage is unreachable and the answer does not say so",
+						limit, len(got), total)
+				}
+				if p.Meta.NextCursor == "" {
+					break
+				}
+				cursor = p.Meta.NextCursor
+				if page > total+2 {
+					t.Fatalf("status at limit %d issued a cursor on page %d after serving %d of %d records",
+						limit, page, len(got), total)
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("status paged at limit %d yielded %v; the unpaginated answer is %v", limit, got, want)
+			}
 		}
 	}},
 }

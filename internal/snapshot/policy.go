@@ -10,22 +10,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// maxIgnoredRoots bounds the ignored-root set one traversal policy holds. It is
-// a product-owned structural bound, not a configuration knob: the set is the
-// outermost ignored paths of a worktree, which is small on any real repository
-// (this one has six), and the bound exists so a pathological tree is refused
-// rather than held.
-//
-// `git ls-files --others --ignored --directory` collapses only *wholly*
-// untracked ignored directories, so a directory holding a tracked file lists
-// its ignored untracked files one by one -- the ordinary shape of a checkout
-// with `*.o`, `*.class` or `*.pyc` next to tracked sources. A repository past
-// the bound therefore exists, and what TraversalPolicy does about it is
-// degrade: the exclusion is an optimisation and refusing to index at all is
-// not a proportionate answer to losing one. The set is never truncated, which
-// would silently admit some ignored trees and hide the loss.
-const maxIgnoredRoots = 65536
-
 // TraversalPolicy is the walk policy every component that traverses this
 // workspace starts from: the configured policy plus the Git exclusion the
 // repository itself defines, so provider detection, the notification watcher
@@ -61,8 +45,19 @@ func TraversalPolicy(ctx context.Context, base workspace.Policy, root workspace.
 	if !root.HasGit || g == nil {
 		return base, nil
 	}
+	// base.MaxIgnoredRoots (workspace.max_ignored_roots) bounds the set this
+	// holds; zero -- the default -- is unlimited, and git.ListIgnoredRoots
+	// reads zero the same way. The set is one entry per OUTERMOST ignored path
+	// and every lookup is a random-access ancestor probe, so it is resident by
+	// construction; a worktree whose ignored roots are genuinely numerous is
+	// still admitted rather than refused, which is why the default is no bound
+	// at all. `git ls-files --others --ignored --directory` collapses only
+	// *wholly* untracked ignored directories, so a directory holding a tracked
+	// file lists its ignored untracked files one by one -- the ordinary shape
+	// of a checkout with `*.o`, `*.class` or `*.pyc` next to tracked sources --
+	// which is why an operator may want a bound here at all.
 	ignored := make(map[string]bool, 16)
-	err := g.ListIgnoredRoots(ctx, root.Path, maxIgnoredRoots, func(p string) error {
+	err := g.ListIgnoredRoots(ctx, root.Path, base.MaxIgnoredRoots, func(p string) error {
 		ignored[p] = true
 		return nil
 	})
@@ -73,8 +68,8 @@ func TraversalPolicy(ctx context.Context, base workspace.Policy, root workspace.
 			// signature is the one every traversing component shares and
 			// none of them has a logger to give it; the composition root
 			// installs the process logger as that default.
-			slog.Default().Warn("this worktree has more ignored roots than the traversal policy holds; the ignored trees are walked rather than excluded",
-				"component", "snapshot", "max_ignored_roots", maxIgnoredRoots)
+			slog.Default().Warn("this worktree has more ignored roots than workspace.max_ignored_roots allows; the ignored trees are walked rather than excluded",
+				"component", "snapshot", "max_ignored_roots", base.MaxIgnoredRoots)
 			return base, nil
 		}
 		return workspace.Policy{}, err
