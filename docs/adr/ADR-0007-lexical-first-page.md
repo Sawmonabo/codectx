@@ -73,6 +73,47 @@ cost 47.9 s on the reference repository because it reused the read path's per-gr
 production fold is a streaming writer over a term-sorted scan and is bounded below by the 2.0 s bare
 scan. The build budget is 5 % of the index wall, the same budget the packed adjacency met at 1.4 %.
 
+### Decision 1, amended the same day: the packed form is sealed per unit and merged at activation
+
+The generation-level build was implemented and measured, and its trigger fired on the first
+measurement. On the reference repository the build took 46.15 s, 6.0 % of the 763.8 s index wall,
+and the cost is not the fold: it is the embedded engine delivering the vocabulary rows.
+
+| what is stepped, reference repository, 91 868 008 instances | wall | per instance |
+|---|---|---|
+| `count(*)` over the vocabulary, engine only, no rows delivered | 6.56 s | 0.071 µs |
+| one integer column per row through the database layer | 19.85 s | 0.216 µs |
+| term, document and column per row through the database layer | 45.51 s | 0.495 µs |
+| the same rows through the raw driver with one reused value slice | 37.94 s | 0.413 µs |
+| the production build (fold, bitmap, part writes) | 46.15 s | 0.502 µs |
+
+The build sits 0.6 s above the cost of merely receiving its rows, folding in SQL plans an unbounded
+sorter (`USE TEMP B-TREE FOR GROUP BY`), and the raw driver saves a sixth. Nothing on the pinned
+engine brings a whole-store row scan under the budget, and the scan would be paid again at every
+activation, including a one-file delta. So the shape changes and the format stays:
+
+- **At seal, per unit.** The unit's lexical documents are tokenised a second time into a temporary
+  index table with the same tokenizer and column set, so the terms are identical to the store-wide
+  index by construction; the temporary vocabulary, which holds only that unit's instances, is folded
+  into the unit's packed term list (term directory, term text, per-document column-ascending
+  `(column, count)` sequences, and the per-document attributes of Decision 2) and stored with the
+  unit. A unit's list is built once, in the parallel seal phase, and is reused by every generation
+  that carries the unit, exactly as its facts are.
+- **At activation, per generation.** The visible units' term lists are merged term by term (a batched
+  k-way merge whose memory is proportional to the batch, not to the unit count) into the generation
+  structure of the original Decision 1: the same three streams, the same parts, the same reader.
+  Visibility is resolved by construction, because only the generation's units are merged, and the
+  document frequency of a term is the sum of its per-unit document counts, since a document belongs
+  to exactly one unit of a generation.
+
+**Consequences.** Sealing tokenises each document twice; the second pass touches only that unit's
+rows, so its cost is spread across the seal workers and paid once per unit version. Activation
+becomes a streaming copy bounded by the packed bytes of the generation rather than by row delivery,
+and a delta activation does the same work as a full one on the packed streams only, with no row scan.
+The per-unit lists add their packed bytes to the store, reported in the change's measurement. The
+build budget stands at 5 % of index wall, and a delta activation must build the lexical structure in
+at most three times the packed adjacency's build on the same store.
+
 ## Decision 2 — rank on packed inputs, hydrate only the served page
 
 Candidate documents are ranked from the packed postings and the per-document attributes the filters
