@@ -165,6 +165,18 @@ type Limits struct {
 	SessionTTL, QueryTimeout, ReceiptTTL time.Duration
 }
 
+// unconfirmedCapped is the one place this package spells the
+// zero-means-unlimited comparison for MaxUnconfirmedChunksPerSession. It
+// mirrors config.Limit's own accessors exactly -- unlimited at zero, and a
+// session AT the bound has no allowance left, so the test is `>=` on what the
+// session already holds rather than `>` on what it would hold. The bound
+// travels as an int rather than as a config.Limit because this package imports
+// no configuration by design (see the package comment), so the semantics
+// travel as this method instead of as a hand-rolled `> 0` at each site.
+func (l Limits) unconfirmedCapped(outstanding int64) bool {
+	return l.MaxUnconfirmedChunksPerSession > 0 && outstanding >= int64(l.MaxUnconfirmedChunksPerSession)
+}
+
 // Service answers the six Section 16 operations. It is safe for concurrent use:
 // every field is read-only after New and all per-request state lives on the
 // stack of the call that made it.
