@@ -253,3 +253,62 @@ func columnOffset(content []byte, column uint32, enc ColumnEncoding) (int, error
 func invalid(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeArgumentInvalid, Message: fmt.Sprintf(format, args...)}
 }
+
+// Walker resolves one byte offset's line and byte column from a blob read in
+// chunks, for the caller that cannot hold the bytes between its anchor and the
+// offset at once.
+//
+// Cursor is the right shape when the window is small: it borrows the whole
+// window and answers repeatedly inside it. It cannot serve a window that does
+// not begin on a line boundary, and one line CAN be longer than any read
+// ceiling -- a minified bundle or a generated data file is a single line of
+// megabytes, and no line checkpoint exists inside it to anchor on. A Walker
+// keeps only the anchor (the current line and where it started) and consumes
+// the span one chunk at a time, so the peak is the chunk and the cost is
+// O(span) bytes read however far the nearest checkpoint is. The counting rules
+// are the same ones Cursor applies: lines are one-based, "\n" ends a line and
+// the "\r" of a CRLF belongs to the line it terminates, so a column is the
+// count of bytes since the last "\n".
+//
+// A Walker is single-use and moves only forward.
+type Walker struct {
+	// at is the file offset the walker has consumed up to.
+	at uint64
+	// line is the one-based line holding at, and lineStart the file offset of
+	// that line's first byte.
+	line      uint32
+	lineStart uint64
+}
+
+// NewWalker starts a walk at a checkpoint, whose Byte must be the first byte of
+// the one-based line Line -- exactly what Index.CheckpointFor returns.
+func NewWalker(cp Checkpoint) (*Walker, error) {
+	if cp.Line == 0 {
+		return nil, invalid("line numbers are one-based; a walk cannot start at line 0")
+	}
+	return &Walker{at: cp.Byte, line: cp.Line, lineStart: cp.Byte}, nil
+}
+
+// At reports the file offset the walk has reached: the offset the next chunk
+// must begin at, and the offset PositionAt describes.
+func (w *Walker) At() uint64 { return w.at }
+
+// Advance consumes the chunk of file bytes beginning at At().
+func (w *Walker) Advance(chunk []byte) {
+	if last := bytes.LastIndexByte(chunk, '\n'); last >= 0 {
+		w.line += uint32(bytes.Count(chunk, []byte{'\n'}))
+		w.lineStart = w.at + uint64(last) + 1
+	}
+	w.at += uint64(len(chunk))
+}
+
+// PositionAt reports the position of the offset the walk has reached. next
+// holds the file's bytes from that offset -- one byte is enough, and it is
+// empty at end of file -- so the offset is rejected inside a UTF-8 sequence
+// rather than served from the middle of a character, as Cursor.PositionAt does.
+func (w *Walker) PositionAt(next []byte) (model.Position, error) {
+	if len(next) > 0 && !utf8.RuneStart(next[0]) {
+		return model.Position{}, invalid("byte offset %d is inside a UTF-8 sequence", w.at)
+	}
+	return model.Position{Byte: w.at, Line: w.line, Column: uint32(w.at - w.lineStart)}, nil
+}
