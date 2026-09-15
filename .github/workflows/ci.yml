@@ -45,6 +45,9 @@ jobs:
       # the thing checked, not a grep of the source.
       - name: Only internal/toolchain may import net/http
         run: |
+          # The single quotes are the Go template's and awk's own; shellcheck
+          # reads their braces and $1 as shell it should have expanded.
+          # shellcheck disable=SC2016
           offenders="$(go list -deps -f '{{$p := .ImportPath}}{{range .Imports}}{{printf "%s %s\n" $p .}}{{end}}' ./cmd/codectx \
             | awk -v m="github.com/Sawmonabo/codectx/" \
                   '$2 == "net/http" && index($1, m) == 1 && $1 != m "internal/toolchain" { print $1 }')"
@@ -60,3 +63,225 @@ jobs:
 
       - name: Build
         run: go build -trimpath -o ./bin/codectx ./cmd/codectx
+
+  # Section 21's release test, run on every push: index, a query, a context
+  # plan and the MCP server over stdio, all with networking disabled, plus an
+  # audit of every connection the isolated process tree attempted.
+  #
+  # The bound on what a green run means is Section 21's own sentence: passing a
+  # network-disabled test demonstrates that tested workflow, it is not a
+  # universal proof about every installed third-party tool. Only the four
+  # workflows below are covered. A managed analyzer payload this job never
+  # executes -- every one of them, since the store here is deliberately empty
+  # -- is not covered by it.
+  #
+  # `needs: verify` is deliberate. The single-net/http-importer check already
+  # runs there against the shipped binary's dependency graph, and a second copy
+  # of it here would be a second thing to keep true.
+  offline:
+    name: Offline runtime
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          check-latest: false
+
+      - name: Install the socket auditor
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+          strace --version | head -1
+
+      # Everything the isolated step needs is fetched and built here, outside
+      # the namespace: the module cache is warmed, the binary is linked, and
+      # the tool store is created empty. `go` is never invoked inside the
+      # namespace -- with GOTOOLCHAIN pinned it is itself a download path, so
+      # the isolated step runs only ./bin/codectx.
+      #
+      # tools.offline is a user-level key: Section 20 forbids project
+      # configuration from setting anything under [tools], so the job writes
+      # the user configuration file, as the tools matrix does. XDG_CONFIG_HOME
+      # is written out rather than assumed, because the isolated step crosses a
+      # sudo boundary that resets the environment and has to hand the same
+      # directory back.
+      - name: Prepare every build dependency before isolation
+        run: |
+          go mod download
+          go build -trimpath -o ./bin/codectx ./cmd/codectx
+          store="$GITHUB_WORKSPACE/.tools"
+          config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+          mkdir -p "$store" "$config_home/codectx"
+          printf '[tools]\noffline = true\ncache_dir = "%s"\n' "$store" \
+            > "$config_home/codectx/config.toml"
+          cat "$config_home/codectx/config.toml"
+          {
+            echo "CODECTX=$GITHUB_WORKSPACE/bin/codectx"
+            echo "CODECTX_TOOL_STORE=$store"
+            echo "CODECTX_CONFIG_HOME=$config_home"
+            echo "GOMODCACHE=$(go env GOMODCACHE)"
+          } >> "$GITHUB_ENV"
+
+      # A tiny generated workspace, not this repository: the job proves the
+      # absence of network traffic, and indexing a large tree only makes it
+      # slower. Three languages keep more than one grammar on the path.
+      - name: Generate the workspace the isolated run indexes
+        run: |
+          repo="$RUNNER_TEMP/offline-fixture"
+          mkdir -p "$repo"
+          cat > "$repo/alpha.go" <<'GO'
+          package alpha
+
+          // Greet builds the greeting the sample tree shares across languages.
+          func Greet(name string) string { return "hello " + name }
+
+          func Main() string { return Greet("world") }
+          GO
+          cat > "$repo/beta.py" <<'PY'
+          def greet(name):
+              return "hello " + name
+
+
+          def main():
+              return greet("world")
+          PY
+          cat > "$repo/gamma.ts" <<'TS'
+          export function greet(name: string): string {
+            return "hello " + name;
+          }
+
+          export function main(): string {
+            return greet("world");
+          }
+          TS
+          git -C "$repo" init -q
+          git -C "$repo" add -A
+          git -C "$repo" -c user.name=ci -c user.email=ci@invalid commit -qm "offline fixture"
+          echo "CODECTX_FIXTURE=$repo" >> "$GITHUB_ENV"
+
+      # A file list with sizes, not a content hash of the module cache: the
+      # question is whether anything was added or rewritten, and the listing
+      # answers it in a second on a cache that is hundreds of megabytes.
+      - name: Record the tool store and module cache before isolation
+        run: |
+          shape() { find "$1" -type f -printf '%s %P\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -d' ' -f1; }
+          {
+            echo "STORE_SHAPE_BEFORE=$(shape "$CODECTX_TOOL_STORE")"
+            echo "GOMODCACHE_SHAPE_BEFORE=$(shape "$GOMODCACHE")"
+          } >> "$GITHUB_ENV"
+
+      # `sudo unshare -n` leaves the process tree with nothing but a down
+      # loopback; runuser hands the namespace back to the runner user, so git
+      # still owns the fixture it is asked to read and nothing in the workspace
+      # changes hands. sudo resets the environment, so every value the script
+      # needs is passed explicitly rather than inherited. strace runs inside
+      # and follows every child, which is what puts the parser workers and the
+      # MCP server under the audit and not just the launching process.
+      - name: Index, query, plan and serve MCP with networking disabled
+        run: |
+          steps="$RUNNER_TEMP/offline-steps.sh"
+          cat > "$steps" <<'SH'
+          #!/bin/sh
+          set -e
+          bin="$1"
+          repo="$2"
+          out="$3"
+          "$bin" index --repo "$repo" --json > /dev/null
+          "$bin" search greet --repo "$repo" --json > /dev/null
+          "$bin" context plan --repo "$repo" --actor offline-gate \
+            --task "offline runtime check" --phase sweep --seed greet --json > /dev/null
+          {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"offline-gate","version":"0"}}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+            # Closing this group closes the server's stdin and shuts it down,
+            # so wait for the answer rather than for a fixed number of
+            # seconds: a loaded runner would otherwise truncate the reply and
+            # fail the job for a timing reason, not a network one.
+            i=0
+            while [ "$i" -lt 100 ] && ! grep -q 'codectx_context_plan' "$out" 2>/dev/null; do
+              sleep 0.1
+              i=$((i + 1))
+            done
+          } | "$bin" mcp serve --repo "$repo" > "$out"
+          grep -q '"protocolVersion"' "$out"
+          grep -q 'codectx_context_plan' "$out"
+          SH
+          chmod +x "$steps"
+          sudo unshare -n runuser -u "$(id -un)" -- \
+            env XDG_CONFIG_HOME="$CODECTX_CONFIG_HOME" \
+            strace -f -e trace=connect -o "$RUNNER_TEMP/offline-audit.log" \
+            sh "$steps" "$CODECTX" "$CODECTX_FIXTURE" "$RUNNER_TEMP/mcp-stdio.json"
+
+      # AF_UNIX is a local pipe and AF_NETLINK is the kernel's own interface
+      # enumeration, which the Go runtime performs whether or not a network
+      # exists; neither leaves the machine. An AF_INET or AF_INET6 connect
+      # does, and one of those is a failure of this gate. The control at the
+      # end of the job is what shows this predicate still able to fire.
+      - name: Audit every connection the isolated run attempted
+        run: |
+          attempts="$(grep 'connect(' "$RUNNER_TEMP/offline-audit.log" | grep -E 'AF_INET6?' || true)"
+          if [ -n "$attempts" ]; then
+            echo "the isolated run attempted to reach the network:"
+            echo "$attempts"
+            exit 1
+          fi
+          total="$(grep -c 'connect(' "$RUNNER_TEMP/offline-audit.log" || true)"
+          echo "no AF_INET/AF_INET6 connect among ${total:-0} connect calls"
+
+      # The syscall audit and this check answer the same question from two
+      # directions, and this is the one that still holds on a runner where
+      # strace cannot attach. Tree-sitter grammars are compiled into the
+      # binary, so there is no grammar fetch path to catch here at all; what an
+      # unchanged empty store proves is that no analyzer payload arrived.
+      - name: Assert no module or grammar download during the isolated run
+        run: |
+          shape() { find "$1" -type f -printf '%s %P\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -d' ' -f1; }
+          if [ "$(shape "$CODECTX_TOOL_STORE")" != "$STORE_SHAPE_BEFORE" ]; then
+            echo "the tool store changed during the isolated run:"
+            find "$CODECTX_TOOL_STORE" -type f -printf '%s %P\n' | LC_ALL=C sort
+            exit 1
+          fi
+          if [ "$(shape "$GOMODCACHE")" != "$GOMODCACHE_SHAPE_BEFORE" ]; then
+            echo "the Go module cache changed during the isolated run"
+            exit 1
+          fi
+          echo "tool store and module cache unchanged"
+
+      # Without this the gate could pass because the audit never fires at all.
+      # The control runs OUTSIDE the namespace -- inside it would fail on the
+      # missing network rather than on the audit -- with fetching allowed, its
+      # own empty store, and tools.mirror pointing at a closed local port, so a
+      # real AF_INET connect is attempted, refused in microseconds, and no
+      # upstream is contacted and no byte is downloaded. `tools prefetch` is
+      # expected to fail here; the audit it produces is the result being
+      # checked. The user configuration file is rewritten, so this step is the
+      # last one that runs against it.
+      - name: Negative control - show the audit firing on a run that dials out
+        run: |
+          control_store="$RUNNER_TEMP/control-store"
+          mkdir -p "$control_store"
+          printf '[tools]\noffline = false\ncache_dir = "%s"\nmirror = "https://127.0.0.1:9/"\n' \
+            "$control_store" > "$CODECTX_CONFIG_HOME/codectx/config.toml"
+          strace -f -e trace=connect -o "$RUNNER_TEMP/control-audit.log" \
+            "$CODECTX" tools prefetch --all > /dev/null 2>&1 || true
+          attempts="$(grep 'connect(' "$RUNNER_TEMP/control-audit.log" | grep -cE 'AF_INET6?' || true)"
+          if [ "${attempts:-0}" -lt 1 ]; then
+            echo "the control recorded no AF_INET connect, so the audit above proves nothing"
+            exit 1
+          fi
+          echo "control recorded $attempts AF_INET/AF_INET6 connect calls"
+          grep 'connect(' "$RUNNER_TEMP/control-audit.log" | grep -E 'AF_INET6?' | head -3
+
+      - name: Upload the connection audits
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-audit
+          path: |
+            ${{ runner.temp }}/offline-audit.log
+            ${{ runner.temp }}/control-audit.log
+          if-no-files-found: warn
