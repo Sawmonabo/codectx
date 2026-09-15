@@ -59,6 +59,15 @@ const (
 // undivided key would let three independent consumers each believe they own it.
 // A query's spools are the smallest of the three claims -- one bounded page of
 // ranked records per live cursor -- so they take the smallest share.
+//
+// The divisor stays a DERIVATION and is deliberately not a `resources.spool_bytes`
+// key. A second key would let an operator set the three shares so they oversubscribe
+// the one budget `max_temp_bytes` exists to cap, which is the failure the single key
+// prevents; and the quantity an operator actually reasons about -- total temporary
+// disk -- is already settable. 8 is the share, not a cap on any one query: three
+// consumers (shared runner, parser runner, spools) claim the budget, the spools are
+// the smallest and shortest-lived claim, and the remaining headroom absorbs the two
+// process runners' bursts. To give queries more room, raise `resources.max_temp_bytes`.
 const spoolBudgetDivisor = 8
 
 // parserWorkerReservationBytes is what one tree-sitter worker is admitted

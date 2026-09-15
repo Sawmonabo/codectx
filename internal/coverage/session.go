@@ -68,10 +68,14 @@ func New(o Options) (*Service, error) {
 		log:      log,
 	}
 	if s.leases == nil {
-		// Both consequences are real and neither is recoverable per request, so
-		// the operator hears about it once at composition instead of never.
-		log.Warn("coverage sessions will not retain their generation and status pages will not continue",
-			"component", "coverage", "reason", "no retention leases were supplied")
+		// A service without leases cannot retain the generation a session is
+		// bound to and cannot issue a status continuation, so every coverage
+		// answer past the first page is silently unreachable and the blobs the
+		// session hands out may be collected under it. Neither is recoverable
+		// per request and neither is visible to the actor, so composition
+		// refuses rather than warning once and degrading forever.
+		return nil, typedErrf(model.CodeConfigInvalid,
+			"coverage requires a retention lease store: without one, sessions do not pin their generation and status pages cannot continue")
 	}
 	return s, nil
 }
@@ -213,9 +217,6 @@ func openRequestHash(req model.PlanRequest, manifest model.ManifestID) string {
 // refusal is this session already holding exactly what retain is asking for, so
 // it is the success case and not an error to report.
 func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
-	if s.leases == nil {
-		return nil
-	}
 	_, err := s.leases.AcquireFor(ctx, rec.Binding.GenerationID, rec.Binding.SnapshotID,
 		model.LeaseSession, string(rec.ID))
 	if sqlite.OwnerLeaseConflict(err) {
@@ -343,9 +344,6 @@ func (s *Service) resumeStatus(token string, rec sqlite.SessionRecord) (model.Fi
 func (s *Service) statusCursor(ctx context.Context, rec sqlite.SessionRecord, last model.FileID) (token, why string, err error) {
 	if last == "" {
 		return "", "", typedErrf(model.CodeInternal, "a status page ended without a keyset position")
-	}
-	if s.leases == nil {
-		return "", "this workspace does not retain coverage continuations", nil
 	}
 	if !model.ValidHexID(string(rec.Binding.AnalysisKey)) {
 		// The generation is still staging, so there is no analysis key to pin
