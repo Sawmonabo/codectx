@@ -2,8 +2,8 @@
 
 **Status:** Accepted, 2026-09-15 · **Informs:** ADR-0001 §2 (the page is the unit of memory), ADR-0003 §2.1
 (the lexical tier holds no second copy of the source), ADR-0005 (the packed-at-activation shape this
-record reuses) · **Inputs:** the four search profiling rounds recorded in the implementation ledger
-(QPERF-4, QPERF-5, QPERF-6) and the measurements reproduced below.
+record reuses) · **Inputs:** three search profiling rounds on the reference repository, whose
+measurements are reproduced in full in the measurement record at the end of this document.
 
 ## Context
 
@@ -110,7 +110,6 @@ plan test mutation-proved.
 
 ## Sources
 
-- QPERF-4, QPERF-5, QPERF-6 lane reports — `.superpowers/sdd/implementation-plan/QPERF-{4,5,6}-report.md` (the phase profiles, the identity proof, the rejected engine-side shortcuts).
 - ADR-0003 — Storage tier 2 — `docs/adr/ADR-0003-storage-tier2.md` (contentless lexical tier; why the postings are the only copy of the indexed text).
 - ADR-0005 — Graph traversal layout — `docs/adr/ADR-0005-graph-traversal-layout.md` (packed-at-activation parts, ranked pages served by byte offset).
 - SQLite FTS5 Extension, the fts5vocab virtual table module — https://www.sqlite.org/fts5.html#the_fts5vocab_virtual_table_module (the instance table the scan reads; why it offers no covering index).
@@ -118,3 +117,51 @@ plan test mutation-proved.
 - SQLite, The Query Optimizer Overview — https://www.sqlite.org/optoverview.html (correlated scalar subqueries and temporary b-trees for `DISTINCT`).
 - Vitter, External Memory Algorithms and Data Structures: Dealing with Massive Data — https://www.ittc.ku.edu/~jsv/Papers/Vit.IO_survey.pdf (external merge sort; why a single sorted run served by offset is the right shape for later pages).
 - Knuth, The Art of Computer Programming vol. 3, §5.2.3 (heapsort and selection with a bounded heap) — https://www-cs-faculty.stanford.edu/~knuth/taocp.html (the bounded heap serves exactly the first page of the same total order).
+
+## Measurement record
+
+Every number this record relies on, so that it stands alone. Reference repository: 13 223 files,
+522 939 613 source bytes, 279 164 visible lexical documents, 91 868 008 posting instances; index
+wall 763.8 s under the default configuration with every provider on; store 2.29 GB (database
+1.97 GB). Fixture: a 210-file repository with 5 279 documents and 260 020 instances. Queries warm,
+three runs after a discarded warm-up, page size 200.
+
+**Round 1 (consumer side).** Removing the per-page re-open of the posting scan and the by-rowid
+pending batch took `function` from 1.70 s to 1.27 s and `Meteor` from 2.11 s to 1.18 s; every page
+of `return` (41 pages, 8 020 items), `user` (35 pages, 6 904 items) and `createAccount` (1 page,
+6 items) was byte-identical before and after. Profile of `function` after the round: ranking 80 %
+of the process, of which the lexical tier 0.93 s (posting walk 0.33 s, document frequency 0.18 s,
+document hydration 0.16 s, match 0.09 s, statistics 0.09 s, emit 0.08 s) and the collector's
+external sort 0.21 s. Two engine-side shortcuts were rejected: pushing ranking into the index
+engine's own ranking function (a different scoring model: different inverse-document-frequency and
+saturation constants, no per-column weights) and a persisted index that reproduces the ranking (an
+approximation of the served order).
+
+**Round 2 (storage side).** Query plans of every statement the lexical tier issues: the posting
+scan is a virtual-table scan of the vocabulary joined per instance to the document row by
+`idx_search_doc` and, through a correlated scalar subquery, to the generation-visibility row by its
+covering unique index; document frequency is the same plan plus `USE TEMP B-TREE FOR count(DISTINCT)`;
+document statistics probe the visibility row once per visible document. One statement issued twice
+in one connection on the fixture: 2 163 rows, 6 539 page-cache hits, 56 misses cold and 0 warm,
+49 765 virtual-machine steps both times: 3.04 page lookups and 23 steps per instance, unchanged by
+warming. On the reference repository: bare instance scan 2.00 s (0.022 µs per instance); the same
+scan joined per instance 38.82 s (0.42 µs per instance), a 19.4× difference; postings for
+`function` / `meteor` / `return` / `user` step 180 428 / 67 385 / 131 472 / 41 408 rows in
+0.077 / 0.042 / 0.058 / 0.028 s; document frequency over the same rows (31 256 / 46 487 / 9 221 /
+7 650 documents) 0.085 / 0.046 / 0.067 / 0.026 s with a temporary b-tree each; statistics over
+279 164 documents 0.084 s.
+
+**Prototype of Decision 1.** Visibility resolved once into a document bitmap (fixture 5 279
+documents in 672 bytes; reference 279 164 documents in 34 904 bytes), then one bare instance scan
+folded into per-document column-ascending `(column, count)` sequences and per-term document
+frequencies: fixture 5 922 terms in 164 ms; reference 619 941 terms in 47.93 s using the read path's
+per-group fold. Identity against the live path, comparing the ordered sequence per document and the
+frequency: `function` 31 256 / 31 256 / 31 256, `meteor` 46 487 / 46 487 / 46 487, `return`
+9 221 / 9 221 / 9 221, `user` 7 650 / 7 650 / 7 650 (live documents / live frequency / packed
+frequency), zero mismatched documents on both stores.
+
+**Baseline first page, reference repository, default configuration:** `function` 1.240 / 1.272 /
+1.245 s at 99.6 MB peak RSS; `Meteor` 1.553 / 1.573 / 1.616 s at 103.3 MB; `return` 0.762 s,
+`user` 0.531 s, `createAccount` 0.270 s (medians) at 99.1 / 82.9 / 33.2 MB. Rescaling round 1's
+phase split per term, Decision 1 alone removes about 0.60 s from `function` (to about 0.65 s) and
+about 0.31 s from `Meteor` (to about 1.26 s), which is why Decisions 2 and 3 exist.

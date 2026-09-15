@@ -33,6 +33,11 @@ class present in 104 files [19 §2]:
 | pinned Python server (TypeScript-on-Node) | cold | 1.43 s | **2** | 267 MB | not advertised |
 | pinned Python server | after 15 s | 0.23 s | 138 | 290 MB | not advertised |
 | native Rust checker (`ty` 0.0.81) | **cold** | **0.21 s** | **136** | **168 MB** | advertised and answered |
+
+The settled 138 is [19 §2]'s one-off measurement and did not reproduce in the implementation lane:
+with the client the product uses, the pinned server returned 2 cold and 2 after 15, 40 and 60 s
+settle windows, so the decisive comparison is cold 2 versus cold 136 (`docs/providers-lsp.md`).
+The gap this decision rests on is wider than the row above, not narrower.
 | second native checker (`pyrefly` 1.3.1) | cold | 0.20 s | **2** | 487 MB | advertised |
 
 The ordering replicated on a 2 379-file repository. The pinned server's `references` walks only the
@@ -52,8 +57,10 @@ to tune. codectx is greenfield, so a lock entry is replaced, not migrated.
 
 The Python language-server entry of the lock is replaced by `ty`, pinned to an exact upstream
 release with the digests upstream publishes for all six platforms, run directly (no managed
-runtime), started with its server subcommand, with the same root markers and environment
-allowlist as before. `scip-python` stays exactly as pinned: it is the only SCIP emitter for Python,
+runtime), started with its server subcommand, with the replaced server's configuration marker
+(`pyrightconfig.json`) swapped for `ty.toml` in the python root-marker set and the same environment
+allowlist as before (amended 2026-09-15: the original text said the root markers were unchanged;
+the replaced server's configuration file names nothing to the new one). `scip-python` stays exactly as pinned: it is the only SCIP emitter for Python,
 and canonical Python facts are unchanged by this decision.
 
 **Alternatives considered.**
@@ -77,10 +84,11 @@ and canonical Python facts are unchanged by this decision.
 **Consequences and trade-offs accepted.** The chosen checker is pre-1.0 and warns that any two
 releases may differ incompatibly; the lock pins an exact version with upstream digests, so the
 product never sees an unreviewed change, and the cost is a faster pin-refresh cadence for this one
-entry, each refresh re-running the overlay verification table. Two answers differ by two results
-(138 versus 136) between the old and new server; the implementation lane adjudicates which two
-references are the disagreement before the swap lands, and records the answer in the verification
-table. After the swap Python gains the implementation request, the overlay's provider version comes
+entry, each refresh re-running the overlay verification table. Two answers appeared to differ by two results
+(138 versus 136) between the old and new server; the implementation lane could not reproduce the
+settled 138 at all -- the old server returned 2 cold and 2 after 15, 40 and 60 s -- so there is no
+second location set to diff against, and the verification table records that instead (amended
+2026-09-15). After the swap Python gains the implementation request, the overlay's provider version comes
 from the server's own report, and the negotiated position encoding becomes UTF-8; all three feed
 the overlay input digest, so previously cached Python overlay answers are correctly a different
 question. The managed Node runtime stays for the TypeScript server and two indexers.
@@ -109,7 +117,8 @@ recorded as the highest-value future tool change and is not a lane-sized task [1
 
 The overlay verification table in `docs/providers-lsp.md` re-run for Python with the new server:
 all seven requests answered; the cold `references` count on the 11 267-file repository equal to the
-settled count; the 138 versus 136 disagreement explained; `serverInfo` and `positionEncoding`
+settled count; the 138 versus 136 disagreement explained, or the settled 138 recorded as
+unreproducible with the product's own client; `serverInfo` and `positionEncoding`
 recorded; peak server RSS at or below the measured 168 MB. The lock passes the digest check against
 upstream sidecars for every platform key of the new entry.
 

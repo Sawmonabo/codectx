@@ -12,7 +12,7 @@ set -u
 
 G=${GPERF_ROOT:-$HOME/.cache/codectx-gperf}
 HUB=${HUB:-f45cf2a87b577955a189c1c4a4f252581ae66dd23a3635d3b9ff292fe692e33c}
-REPO=${REPO:-/home/sabossedgh/repos/r3}
+REPO=${REPO:?set REPO to the repository to profile (the reference run used the 13 223-file r3 checkout)}
 BIN=$G/codectx
 N=$1
 

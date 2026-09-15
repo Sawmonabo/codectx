@@ -583,3 +583,53 @@ func removeFile(t *testing.T, path string) {
 		t.Fatalf("remove: %v", err)
 	}
 }
+
+// TestUnlistedStorePayloadIsReportedAndRemoved protects the store's boundary:
+// every directory in it is an executable tree some run may pick up, and the
+// only thing that vouches for one is a lock entry naming it. A superseded entry
+// -- the replaced python server is the live case -- leaves its payload behind
+// on upgrade. If `verify` walks only the lock, it calls that store clean while
+// it holds an unvouched-for analyzer, and nothing short of `gc` ever reclaims
+// the bytes.
+func TestUnlistedStorePayloadIsReportedAndRemoved(t *testing.T) {
+	payload := goodPayload(t)
+	f := newFixture(t, payload)
+	r := f.resolver(t, false, nil)
+	if _, err := r.Resolve(t.Context(), testTool); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	stale := filepath.Join(StoreDir(f.dataDir), "pyright")
+	mkdirAll(t, filepath.Join(stale, "1.1.414"))
+
+	rows, err := r.Verify(t.Context())
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	var unlisted []Status
+	for _, row := range rows {
+		if row.State == StateUnlisted {
+			unlisted = append(unlisted, row)
+		}
+	}
+	if len(unlisted) != 1 || unlisted[0].Name != "pyright" {
+		t.Fatalf("verify = %+v, want one unlisted row for pyright", rows)
+	}
+	// An unlisted directory is not a lock entry, so it must carry neither a
+	// version nor a digest: a row that reported either would claim this binary
+	// pins something it does not.
+	if unlisted[0].Version != "" || unlisted[0].EntrySHA256 != "" || unlisted[0].InstalledSHA256 != "" {
+		t.Fatalf("an unlisted row claimed lock data: %+v", unlisted[0])
+	}
+
+	if err := r.Prefetch(t.Context(), []string{testTool}); err != nil {
+		t.Fatalf("prefetch: %v", err)
+	}
+	requireAbsent(t, stale, "the unlisted store payload")
+	after, err := r.Verify(t.Context())
+	if err != nil {
+		t.Fatalf("verify after prefetch: %v", err)
+	}
+	if len(after) != 1 || after[0].State != StateInstalled {
+		t.Fatalf("verify after prefetch = %+v, want only the installed lock entry", after)
+	}
+}

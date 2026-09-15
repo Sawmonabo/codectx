@@ -37,6 +37,9 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Tracked files reference no ignored or host-local paths
+        run: sh scripts/tracked-refs-check.sh
+
       # Section 11.7 makes internal/toolchain the product's single network
       # boundary: it fetches only URLs the embedded lock names, verifies every
       # byte against a pinned digest and refuses without dialing when

@@ -148,7 +148,7 @@ re-checked against the identity construction already published.
 | `964655bd…` (`joern-cli.zip`, SHA-256 verified locally) | 4.0.627 |
 
 The lock is the authority; this table is the human-readable index that
-`status`, `doctor` and the ledger's `ObservedVersion` strings resolve against.
+`status`, `doctor` and each provider's reported `ObservedVersion` resolve against.
 
 ## Units
 

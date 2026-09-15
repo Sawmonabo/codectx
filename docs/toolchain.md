@@ -182,7 +182,7 @@ is on this machine and is it still intact".
 codectx tools status [--repo PATH] [--json]            # every lock entry and what the store holds
 codectx tools prefetch [--all | --for-repo PATH | NAME...] [--json]
                                                        # install ahead of time
-codectx tools verify [--json]                          # rehash every installed entry against the lock
+codectx tools verify [--json]                          # rehash every installed entry, and list what the lock does not name
 codectx tools gc [--json]                              # remove versions the current lock does not name
 ```
 
@@ -191,7 +191,14 @@ presence of its executable, and never rehashes, so it stays usable for a store
 holding the 1.8 GB engine. Each entry is reported in one of five states —
 `installed`, `available` (pinned but not fetched yet), `unsupported_platform`
 (the lock carries no payload here, which is honest absence and not a failure),
-`override` (a `[tools.override.<name>]` replaces it) or `corrupt`.
+`override` (a `[tools.override.<name>]` replaces it) or `corrupt`. `verify`
+adds a sixth, `unlisted`: a payload directory the store holds that no lock entry
+names — a superseded entry a binary upgrade left behind, or a directory
+something else wrote. It carries no version and no digest, because nothing in
+this binary pins it. When a report has no installed entry at all, the human
+output says so on its last line and names `codectx tools prefetch`: verifying
+verifies what is installed, so an empty store is `ok` and exit 0, and the
+state counts alone would read as a clean bill of health.
 
 `prefetch` requires one of `--all`, `--for-repo PATH` or explicit names, so a
 bare invocation cannot start a multi-gigabyte download by accident. A name the
@@ -213,6 +220,12 @@ and nothing below the root is walked, so the work is bounded by the number of
 markers plus the entries of one directory rather than by the size of the
 repository. A root that selects nothing is an argument error rather than a
 silent no-op.
+
+`prefetch` also removes every payload directory the lock does not name — the
+`unlisted` rows of `verify`. Its post-condition is a store holding what this
+binary pins, and bytes no lock entry vouches for are not part of that. It leaves
+superseded **versions** of pinned tools alone; reclaiming those is `gc`'s job,
+because another workspace may still be resolving one.
 
 The root is the whole of what the command can see, and that is the planner's
 answer for two of the three providers but not the third:
@@ -442,9 +455,12 @@ upstream project re-uploaded the assets of an already-published release three
 hours after the lock had recorded their digests, and the lock — honest when it
 was written — was discovered to be stale only by a user's index refusing to
 fetch the analyzer mid-run. A gate that runs only when we change the lock cannot
-see a change upstream makes, so this one runs on a clock. It aborts at the first
-payload whose served bytes disagree, naming the entry and platform; re-pin that
-one entry with `-tools <name>`.
+see a change upstream makes, so this one runs on a clock. It checks every
+pinned payload and names each one it could not confirm -- served bytes that
+disagree, or a payload it could not fetch at all -- on its own `DIFFERS
+<tool>/<platform>` line, then exits once with the count; re-pin each tool named
+there with `-tools <name>`. One run reports the whole drift, so a re-upload that
+moved all six platform keys of an entry is one re-pin, not six re-runs.
 
 The same drift is visible **locally, without a network call**, in
 `codectx tools verify`: each row carries `lock:` — the digest this binary pins

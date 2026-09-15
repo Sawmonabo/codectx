@@ -553,8 +553,8 @@ CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
 -- index it replaces (delta.go:318 keySurvives). Three indexes become two.
 -- They are deliberately NOT partial: a partial index cannot serve the units
 -- ON DELETE CASCADE (DELETE FROM fact_keys WHERE unit_id = ?), which would then
--- degrade to a table scan. Both claims are proven by EXPLAIN QUERY PLAN in
--- I-S0-report.md. The target-less ON CONFLICT DO NOTHING at units.go:840 and
+-- degrade to a table scan. EXPLAIN QUERY PLAN shows both: the cascade and
+-- the (unit_id, <ref>) probe each SEARCH one of these indexes. The target-less ON CONFLICT DO NOTHING at units.go:840 and
 -- delta.go:365 binds to any unique index, so it keeps working unchanged.
 CREATE UNIQUE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id, fact_key);
 CREATE UNIQUE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id, fact_key);
