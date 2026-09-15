@@ -759,17 +759,6 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 	return c.hydrateStream(ctx, reader, s, in)
 }
 
-// passCRelationAttributes — §2 P-C, lane L2. Explodes the hop stream into a
-// sort under lessRelID; its deduplicated key stream is the distinct relation-id
-// order resolvePrecision already reads in. Precision walks that stream through
-// EvidenceBatch in pageLimit() batches; kind comes from the node scan, whose
-// every edge goes into a sort as a relAttrRec instead of into a map. foldRelAttr
-// merges the two, and the completeness verdict is the matched distinct count
-// against the wanted count -- today's len(out) == len(wanted).
-func (c *Compiler) passCRelationAttributes(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-C relation attributes")
-}
-
 // passDRouteScoring — §2 P-D, lane L3. Merge-joins the candidate stream with the
 // attributed hop stream on seq; a candidate's hops are contiguous under
 // lessHopSeq, so scoreRoutes and scorePath run unchanged on a working set of one
@@ -777,14 +766,6 @@ func (c *Compiler) passCRelationAttributes(ctx context.Context, s *compileSorts)
 // (pkg, relationID) to the centrality sort.
 func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts) error {
 	return errNotImplemented("P-D route scoring")
-}
-
-// passECentrality — §2 P-E, lane L2. Deduplicates the centrality sort under
-// lessPkgEdge with foldPkgEdgeDistinct and counts each package's distinct edges
-// into pkgCountRec: today's nested centrality map as a streaming aggregation,
-// still complete before any boost applies.
-func (c *Compiler) passECentrality(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-E centrality")
 }
 
 // passFBoosts — §2 P-F, lane L3. Sorts the ranked stream by package,
