@@ -1130,9 +1130,12 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 	if normalizationVersion == "" || len(normalizationVersion) > model.MaxIdentifierBytes {
 		return model.Binding{}, invalid("normalization version is required and bounded to %d bytes", model.MaxIdentifierBytes)
 	}
-	if len(capabilities) > model.MaxCapabilityStates {
-		return model.Binding{}, invalid("capability report has %d entries, limit %d", len(capabilities), model.MaxCapabilityStates)
-	}
+	// Activate validates the SHAPE of the capability report, never its length.
+	// A repository large enough to publish more rows than any one constant
+	// anticipated is still a repository whose generation must publish: refusing
+	// here made the index unpublishable at scale, which is the failure the
+	// unlimited-by-default posture exists to remove. The rows are inserted in
+	// batches below, so the count bounds disk, not heap.
 	for _, c := range capabilities {
 		if err := c.Validate(); err != nil {
 			return model.Binding{}, err

@@ -44,8 +44,13 @@ type IndexResult struct {
 	FilesParsed      int64            `json:"files_parsed"`
 	FilesCaptured    int64            `json:"files_captured"`
 	Runs             []ProviderResult `json:"runs"`
-	StartedAt        time.Time        `json:"started_at"`
-	CompletedAt      time.Time        `json:"completed_at"`
+	// RunsOmitted is how many runs this generation produced beyond the
+	// per-result ceiling Runs carries. Runs is a wire-sized page, not the
+	// total: a generation with more runs than one response may carry says so
+	// here instead of truncating in silence.
+	RunsOmitted int64     `json:"runs_omitted"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
 }
 
 // Validate enforces the result shape.
@@ -70,6 +75,7 @@ func (r IndexResult) Validate() error {
 		{"index_result.units_built", r.UnitsBuilt},
 		{"index_result.files_parsed", r.FilesParsed},
 		{"index_result.files_captured", r.FilesCaptured},
+		{"index_result.runs_omitted", r.RunsOmitted},
 	} {
 		if err := requireNonNegative(count.field, count.value); err != nil {
 			return err
@@ -341,9 +347,10 @@ func (r DoctorReport) Validate() error {
 	if !r.State.Valid() {
 		return invalid("doctor_report.state %q is not a known check state", truncateForMessage(string(r.State)))
 	}
-	if err := boundCount("doctor_report.checks", len(r.Checks), MaxCapabilityStates); err != nil {
-		return err
-	}
+	// The check list is not length-bounded. Doctor is the one command that must
+	// produce a report on a broken workspace, so a report that fails validation
+	// for being too long is the one outcome it may never have; the checks are
+	// enumerated by the code itself, not by repository size.
 	for _, c := range r.Checks {
 		if err := c.Validate(); err != nil {
 			return err
