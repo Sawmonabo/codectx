@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"sort"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -45,64 +46,124 @@ type StoredAlias struct {
 	CanonicalKey string
 }
 
-// MaxAliasLookup bounds one alias lookup: the primary identity, the bounded
-// ambiguous list a Resolution may carry, and one more row so the resolver can
-// tell "exactly at the bound" from "more than the bound" and refuse rather
-// than silently drop an equally supported identity. A lookup can never grow
-// with the number of aliases stored.
+// MaxAliasLookup is the BATCH size of one alias-lookup read, not a cap on the
+// answer. LookupAliases pages the matching identities with a keyset on the
+// ordering columns and returns every one of them, so a key aliased to more
+// identities than this costs more round trips and loses nothing. It keeps its
+// former value so a caller that passes it asks for the same batch it used to
+// ask for as a ceiling.
 const MaxAliasLookup = model.MaxAmbiguousCandidates + 2
 
-// LookupAliases returns the distinct identities that (scopeKey, nativeKey) is
+// aliasUnitChunk bounds the `IN (...)` fan-out of ONE statement. A lookup over
+// more dependency units than this is split across statements and the pages are
+// merged, so a unit with many dependencies is slower, never refused: the SQL
+// parameter budget is a query-shape bound (class B), not a scale bound.
+const aliasUnitChunk = model.MaxDependenciesPerUnit
+
+// LookupAliases returns every distinct identity that (scopeKey, nativeKey) is
 // aliased to by the given units, restricted to units that are sealed, ordered
-// by canonical key and then node id, and truncated at limit (at most
-// MaxAliasLookup). The result depends only on the alias rows of those sealed
-// immutable units, never on the order they were written.
-func (s *Store) LookupAliases(ctx context.Context, units []model.UnitID, scopeKey, nativeKey string, limit int) ([]StoredAlias, error) {
+// by canonical key and then node id. The result depends only on the alias rows
+// of those sealed immutable units, never on the order they were written.
+//
+// batch is the number of rows read per statement (<= 0 or over MaxAliasLookup
+// means MaxAliasLookup); it bounds the read, not the answer. The heap holds one
+// batch plus the distinct identities of the ONE key being resolved -- a
+// per-symbol population, never a repository-sized one -- which is what lets the
+// resolver page a truly ambiguous key instead of failing its analysis unit.
+func (s *Store) LookupAliases(ctx context.Context, units []model.UnitID, scopeKey, nativeKey string, batch int) ([]StoredAlias, error) {
 	if len(units) == 0 {
 		return nil, nil
-	}
-	if len(units) > model.MaxDependenciesPerUnit {
-		return nil, invalid("alias lookup names %d units, limit %d", len(units), model.MaxDependenciesPerUnit)
 	}
 	if scopeKey == "" || len(scopeKey) > model.MaxScopeKeyBytes || nativeKey == "" || len(nativeKey) > model.MaxNativeKeyBytes {
 		return nil, invalid("alias lookup needs a bounded, non-empty scope key and native key")
 	}
-	if limit <= 0 || limit > MaxAliasLookup {
-		limit = MaxAliasLookup
+	if batch <= 0 || batch > MaxAliasLookup {
+		batch = MaxAliasLookup
 	}
-	args := make([]any, 0, len(units)+3)
-	args = append(args, scopeKey, nativeKey)
-	marks := make([]string, 0, len(units))
+	keys := make([][]byte, 0, len(units))
 	for _, u := range units {
 		key, err := idBlob("unit_id", string(u))
 		if err != nil {
 			return nil, err
 		}
-		marks = append(marks, "?")
-		args = append(args, key)
+		keys = append(keys, key)
 	}
-	args = append(args, limit)
-	query := `SELECT DISTINCT ni.id, ni.kind, ni.canonical_key FROM native_aliases na
-		JOIN units u ON u.id = na.unit_id JOIN node_ids ni ON ni.id = na.node_id
-		WHERE na.scope_key = ? AND na.native_key = ? AND u.state = 'sealed' AND u.unit_key IN (` + strings.Join(marks, ",") + `)
-		ORDER BY ni.canonical_key, ni.id LIMIT ?`
+	seen := make(map[model.NodeID]bool)
 	var out []StoredAlias
 	err := s.read(ctx, func(tx *sql.Tx) error {
+		for lo := 0; lo < len(keys); lo += aliasUnitChunk {
+			hi := lo + aliasUnitChunk
+			if hi > len(keys) {
+				hi = len(keys)
+			}
+			if err := s.aliasChunk(ctx, tx, keys[lo:hi], scopeKey, nativeKey, batch, seen, &out); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// One chunk arrives ordered; several are merged, so the canonical order is
+	// restored once over the distinct identities of this key.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CanonicalKey != out[j].CanonicalKey {
+			return out[i].CanonicalKey < out[j].CanonicalKey
+		}
+		return out[i].NodeID < out[j].NodeID
+	})
+	return out, nil
+}
+
+// aliasChunk pages one statement's worth of units by keyset on
+// (canonical_key, id) -- the same pair the statement orders by, as a row value,
+// because a keyset on canonical_key alone would skip every identity that ties
+// on it, which is precisely the ambiguity this lookup exists to report.
+func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scopeKey, nativeKey string,
+	batch int, seen map[model.NodeID]bool, out *[]StoredAlias) error {
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(keys)), ",")
+	query := `SELECT DISTINCT ni.canonical_key, ni.id, ni.kind FROM native_aliases na
+		JOIN units u ON u.id = na.unit_id JOIN node_ids ni ON ni.id = na.node_id
+		WHERE na.scope_key = ? AND na.native_key = ? AND u.state = 'sealed' AND u.unit_key IN (` + marks + `)
+		AND (ni.canonical_key, ni.id) > (?, ?)
+		ORDER BY ni.canonical_key, ni.id LIMIT ?`
+	afterKey, afterID := "", []byte{}
+	for {
+		args := make([]any, 0, len(keys)+5)
+		args = append(args, scopeKey, nativeKey)
+		for _, k := range keys {
+			args = append(args, k)
+		}
+		args = append(args, afterKey, afterID, batch)
 		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			return wrap("native_aliases", err)
 		}
-		defer rows.Close()
+		n := 0
 		for rows.Next() {
 			var a StoredAlias
 			var id []byte
-			if err := rows.Scan(&id, &a.Kind, &a.CanonicalKey); err != nil {
+			if err := rows.Scan(&a.CanonicalKey, &id, &a.Kind); err != nil {
+				rows.Close()
 				return wrap("native_aliases", err)
 			}
 			a.NodeID = model.NodeID(idHex(id))
-			out = append(out, a)
+			afterKey, afterID = a.CanonicalKey, id
+			n++
+			if seen[a.NodeID] {
+				continue
+			}
+			seen[a.NodeID] = true
+			*out = append(*out, a)
 		}
-		return wrap("native_aliases", rows.Err())
-	})
-	return out, err
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return wrap("native_aliases", err)
+		}
+		rows.Close()
+		if n < batch {
+			return nil
+		}
+	}
 }
