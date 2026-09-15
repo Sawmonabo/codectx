@@ -468,16 +468,19 @@ func (s *Spools) Release(spoolID string) error {
 	return s.remove(spoolID)
 }
 
-// remove deletes spool id's file and returns its reservation. A removal
-// failure leaves the accounting untouched: the bytes are still on disk.
+// remove deletes spool id's file -- or, for state adopted with AdoptDir, its
+// whole directory -- and returns its reservation. A removal failure leaves the
+// accounting untouched: the bytes are still on disk.
 func (s *Spools) remove(id string) error {
 	path := filepath.Join(s.dir, spoolPrefix+id)
 	var size int64
 	if info, err := os.Stat(path); err == nil {
-		size = info.Size()
+		size = entryBytes(path, info)
 	}
-	err := os.Remove(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	// RemoveAll rather than Remove: a retained state directory is one entry of
+	// this store like any spool file, and leaving it behind would leak the
+	// whole search state of every page that ended early.
+	if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return internalErr("spool release: " + err.Error())
 	}
 	s.forget(id, size)
@@ -505,7 +508,11 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 	var errs []error
 	live := map[string]int64{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), spoolPrefix) {
+		// A directory is NOT skipped: AdoptDir retains externally built state
+		// under the same naming, and skipping it would leave a search's whole
+		// scratch on disk for every page that ended early -- its lease would
+		// expire and nothing would ever remove it.
+		if !strings.HasPrefix(e.Name(), spoolPrefix) {
 			continue
 		}
 		id := strings.TrimPrefix(e.Name(), spoolPrefix)
@@ -536,13 +543,13 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 			}
 		}
 		if dead {
-			if rerr := os.Remove(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			if rerr := os.RemoveAll(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 				errs = append(errs, internalErr("spool sweep: "+rerr.Error()))
-				live[id] = info.Size()
+				live[id] = entryBytes(path, info)
 			}
 			continue
 		}
-		live[id] = info.Size()
+		live[id] = entryBytes(path, info)
 	}
 	s.mu.Lock()
 	for id, r := range s.reserved {
@@ -564,7 +571,14 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 	return liveBytes, errors.Join(errs...)
 }
 
+// spoolHeader reads one store entry's header. A retained state directory keeps
+// it in a file inside itself, in the same frame shape a spool file's first
+// frame has, so one reader answers for both and a sweep learns a directory's
+// lease exactly as it learns a file's.
 func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		path = filepath.Join(path, spoolDirHeader)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return SpoolHeader{}, false
@@ -581,11 +595,11 @@ func (s *Spools) diskBytes() (int64, error) {
 	}
 	var used int64
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), spoolPrefix) {
+		if !strings.HasPrefix(e.Name(), spoolPrefix) {
 			continue
 		}
 		if info, err := e.Info(); err == nil {
-			used += info.Size()
+			used += entryBytes(filepath.Join(s.dir, e.Name()), info)
 		}
 	}
 	return used, nil
