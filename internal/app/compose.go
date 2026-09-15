@@ -831,7 +831,8 @@ func (s *stack) openCollector(ctx context.Context, recovering bool) error {
 		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
 		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
 		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored,
-		"orphan_objects_swept", report.OrphanObjectsSwept)
+		"orphan_objects_swept", report.OrphanObjectsSwept,
+		"orphan_sweep", report.OrphanSweepPhrase())
 	return nil
 }
 

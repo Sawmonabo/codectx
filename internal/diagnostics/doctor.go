@@ -325,13 +325,23 @@ func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck
 	if !deep {
 		return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckUnverified,
 			Detail: "the index database header, page count, schema fingerprint and write-ahead-log mode read back" +
-				s.synchronousPhrase() + "; the integrity and referential checks walk the whole database and were " +
+				s.synchronousPhrase(ctx) + "; the integrity and referential checks walk the whole database and were " +
 				shallowUnverified,
 			Remediation: shallowRemediation}
 	}
 	return model.DoctorCheck{Name: checkStorageIntegrity, State: model.CheckPass,
 		Detail: "the index database passed its full integrity checks, including the search index" +
-			s.synchronousPhrase()}
+			s.synchronousPhrase(ctx)}
+}
+
+// synchronousReader reads the durability mode the storage layer is actually
+// running in. Like blobSampler and captureReader it is an optional interface
+// beside the frozen StoreReader, so a reader that cannot answer makes the
+// storage row say what it knows -- the configured mode, named as configured --
+// instead of claiming a read-back it did not do. The composition root's adapter
+// forwards (*sqlite.Store).SynchronousMode.
+type synchronousReader interface {
+	SynchronousMode(ctx context.Context) (string, error)
 }
 
 // synchronousPhrase names the durability mode the storage layer is running in,
@@ -341,17 +351,27 @@ func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck
 // an operator has to be able to read back -- the same reason checkTemporary
 // echoes its configured ceiling.
 //
-// It reports the CONFIGURED mode, which is the live one by construction:
-// sqlite.Open switches on this same config value (A11), so there is no second
-// spelling the database could be running under, and an unset value is the same
-// `normal` sqlite.Options.withDefaults applies. Diagnostics reads no pragma of
-// its own because StoreReader is frozen and carries none.
-func (s *Service) synchronousPhrase() string {
-	mode := s.opts.Config.Storage.Synchronous
-	if mode == "" {
-		mode = config.SynchronousNormal
+// It READS the mode, from `PRAGMA synchronous` on the connection whose mode is
+// a choice, rather than echoing the configured value: echoing verifies nothing,
+// and "read back" is what the row claims. When the reader cannot answer -- an
+// adapter that does not forward it, or a pragma read that failed -- the phrase
+// falls back to the configured mode and says so in those words, because a row
+// that quietly reports configuration as measurement is the misreport this
+// closes.
+func (s *Service) synchronousPhrase(ctx context.Context) string {
+	configured := s.opts.Config.Storage.Synchronous
+	if configured == "" {
+		configured = config.SynchronousNormal
 	}
-	return " (storage.synchronous = " + mode + ")"
+	r, ok := s.opts.Store.(synchronousReader)
+	if !ok {
+		return " (storage.synchronous = " + configured + " as configured; this store cannot read the live mode back)"
+	}
+	live, err := r.SynchronousMode(ctx)
+	if err != nil || live == "" {
+		return " (storage.synchronous = " + configured + " as configured; the live mode could not be read back)"
+	}
+	return " (storage.synchronous reads back " + live + ")"
 }
 
 // shallowUnverified is the one phrase every check skipped by shallow mode ends
