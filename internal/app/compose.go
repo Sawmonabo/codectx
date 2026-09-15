@@ -1011,11 +1011,12 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 // kind of token.
 func coverageLimits(cfg config.Config) coverage.Limits {
 	return coverage.Limits{
-		ChunkBytes:                     cfg.Coverage.ChunkBytes,
-		MaxChunkBytes:                  cfg.Coverage.MaxChunkBytes,
-		MaxSourceResponseBytes:         cfg.Resources.MaxSourceResponseBytes,
-		MaxMetadataResponseBytes:       cfg.Resources.MaxMetadataResponseBytes,
-		MaxReceiptsPerConfirmation:     cfg.Coverage.MaxReceiptsPerConfirmation,
+		ChunkBytes:                 cfg.Coverage.ChunkBytes,
+		MaxChunkBytes:              cfg.Coverage.MaxChunkBytes,
+		MaxSourceResponseBytes:     cfg.Resources.MaxSourceResponseBytes,
+		MaxMetadataResponseBytes:   cfg.Resources.MaxMetadataResponseBytes,
+		MaxReceiptsPerConfirmation: cfg.Coverage.MaxReceiptsPerConfirmation,
+		// Zero survives as zero on purpose: coverage.Limits reads it as unlimited.
 		MaxUnconfirmedChunksPerSession: cfg.Coverage.MaxUnconfirmedChunksPerSession.Int(),
 		MaxPageItems:                   cfg.Resources.MaxPageItems,
 		SessionTTL:                     cfg.Coverage.SessionTTL.Std(),
