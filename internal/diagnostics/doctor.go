@@ -66,12 +66,16 @@ type SuppliedIndex struct {
 	Resolved bool
 }
 
-// suppliedIndexReader reports the supplied indexes recorded against a
-// generation. Like blobSampler it is optional: recording the path is the
-// producer half of this obligation and lands outside this package, so a store
-// that does not implement this yields an unavailable check with a reason
-// rather than a silent pass.
-type suppliedIndexReader interface {
+// SuppliedIndexReader reports the supplied indexes recorded against a
+// generation. Like blobSampler it is optional: a store that does not implement
+// it yields an unavailable check with a reason rather than a silent pass.
+//
+// It is the one optional probe interface exported from this package, because it
+// is the one whose adapter must convert rather than forward: a composition root
+// method with the right name and the wrong signature satisfies nothing, fails
+// no build and leaves the check permanently unavailable. Exported, the
+// composition root asserts it at compile time instead.
+type SuppliedIndexReader interface {
 	SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error)
 }
 
@@ -194,6 +198,15 @@ func (s *Service) checkBuild() model.DoctorCheck {
 // reading one entry is the whole of what a capture asks of the root, and a root
 // this process cannot read produces an empty capture that reads as a repository
 // with nothing in it.
+//
+// The readable probe is not the first gate the root passes. `workspace_open`
+// (cli/doctor.go) reports the os.OpenRoot at internal/workspace/workspace.go:92,
+// which already refuses a root this process cannot open at all -- a missing
+// directory or one whose permissions deny entry never reaches here. What is
+// left for this branch is the narrower case that open admits and listing does
+// not: a ReadDir that fails for a reason other than permission, such as an I/O
+// error or a filesystem that refuses to enumerate. The branch is live; it is
+// simply not the one that catches an unreadable repository root.
 func (s *Service) checkDataDirectory(ctx context.Context) model.DoctorCheck {
 	if err := s.opts.Workspace.Writable(ctx, s.opts.Config.Storage.DataDir); err != nil {
 		return failure(checkDataDirectory, err)
@@ -334,7 +347,7 @@ func (s *Service) checkCAS(ctx context.Context, deep bool, stats StoreStats, sta
 // a typo in `--scip-index` plans no unit, the command exits 0, and the
 // repository reads as fully indexed while its cross-file symbols are missing.
 func (s *Service) checkSuppliedIndex(ctx context.Context, active model.GenerationID) model.DoctorCheck {
-	reader, ok := s.opts.Store.(suppliedIndexReader)
+	reader, ok := s.opts.Store.(SuppliedIndexReader)
 	if !ok {
 		return model.DoctorCheck{Name: checkSuppliedIndex, State: model.CheckUnavailable,
 			Detail: "this build records no supplied-index path against a generation, so a path that resolved to nothing cannot be told from no path at all"}

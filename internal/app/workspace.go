@@ -11,6 +11,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -85,8 +86,13 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		Pool:      s.pool,
 		Watcher:   s.watcher,
 		States:    s.states,
-		Logger:    s.logger,
-		Now:       time.Now,
+		// The supplied `--scip-index` path reaches the SCIP provider at
+		// composition time and is invisible to the coordinator that writes the
+		// generation row, so it is handed over here as well. The scope key is
+		// spelled by the provider that reads it; internal/index only stores it.
+		SuppliedIndexes: suppliedIndexes(o.scipImport),
+		Logger:          s.logger,
+		Now:             time.Now,
 	})
 	if err != nil {
 		s.Close()
@@ -323,4 +329,16 @@ func ambiguousName(name string, candidates []sqlite.StoredNode) error {
 		WithDetail("name", name).
 		WithDetail("candidates", strconv.Itoa(len(candidates))).
 		WithRemediation(b.String())
+}
+
+// suppliedIndexes turns the composition-time `--scip-index` path into the
+// record the coordinator writes against each published generation. An empty
+// path is no supplied index and records nothing, which is the honest answer:
+// the record must distinguish "none supplied" from "supplied and unresolved",
+// so a run that supplied none must leave no row.
+func suppliedIndexes(scipImport string) []index.SuppliedIndex {
+	if scipImport == "" {
+		return nil
+	}
+	return []index.SuppliedIndex{{Path: scipImport, ProviderID: scip.ID, ScopeKey: scip.ImportScope(scipImport)}}
 }

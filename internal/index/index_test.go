@@ -874,3 +874,25 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		t.Fatalf("a promoted unit behind the one in flight is %d units at position %d, want 2 at 2", p.Units, p.Position)
 	}
 }
+
+// A supplied index whose path resolves to nothing must still be recorded
+// against the published generation. An unresolved path plans no unit, so the
+// row is the only surviving evidence that tells it apart from a run that
+// supplied no index at all -- the distinction doctor's supplied_index check
+// exists to report, and the one that was unobservable before this record.
+func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
+	f := newFixture(t, map[string]string{"a.go": "package a\n"})
+	f.c.opts.SuppliedIndexes = []SuppliedIndex{{
+		Path: "missing.scip", ProviderID: "scip", ScopeKey: "import:missing.scip"}}
+	res, err := f.c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	rows, err := f.store.SuppliedIndexes(f.ctx, res.Binding.GenerationID)
+	if err != nil {
+		t.Fatalf("SuppliedIndexes: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Path != "missing.scip" || rows[0].Resolved {
+		t.Fatalf("supplied index record = %+v, want one unresolved missing.scip", rows)
+	}
+}
