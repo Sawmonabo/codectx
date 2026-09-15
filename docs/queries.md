@@ -220,6 +220,35 @@ It reads these further keys:
 | `context.default_max_files` | The distinct selected files a zero `budget.max_files` resolves to, across the whole plan. |
 | `context.max_slices` | The slice count a zero `budget.max_slices` resolves to. |
 
+### A compile is a stream, not a whole-set pass
+
+A compile runs as a pipeline of sorted streams joined by merge: seeds and the
+required scope, file hydration, relation attributes, route scoring, per-package
+centrality, boosts, measurement, packing and emission. No stage holds a
+structure sized by the candidate count. Every stage sorts through the same
+external sort `search` uses, so its in-memory run budget is the quarter share of
+`resources.query_memory_bytes` described above and peak heap is a function of
+that number and of the resolved budget, never of how wide the task's scope is.
+
+Run files are written under the workspace's spool directory and removed on every
+exit path, including the error paths. Like the sort runs `search` writes, they
+are not charged against `resources.max_temp_bytes`: a run set is sized by the
+candidate count, and charging it would let that budget refuse a wide task
+outright. Size the directory for the widest compile you expect in addition to
+the live continuation spools the budget does cover.
+
+A compile under the run budget never touches disk: the sort spills only once its
+run buffer fills, so a small task is still two in-memory sorts.
+
+The plan a compile persists follows the same rule. Its entries and slices are
+bounded by the budget you asked for -- your own declared window -- and are
+written from it. Its **exclusion list is not**: a plan that keeps forty entries
+can exclude every other candidate in the repository, so the exclusions are
+spooled as the emission pass produces them and streamed into the manifest
+transaction row by row, in the order `--view excluded` reads them back. Writing
+a manifest therefore costs one exclusion row of memory, not all of them, however
+many candidates the budget turned away.
+
 A zero budget field means "use the configured default", never "unlimited", and a
 configured default that resolves to zero or less is rejected rather than
 disabling the bound. A budget that cannot hold the required scope is

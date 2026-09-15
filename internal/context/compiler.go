@@ -22,6 +22,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/search"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -37,6 +38,28 @@ type Options struct {
 	Config config.Config
 	Now    func() time.Time
 	Logger *slog.Logger
+	// Spools is the workspace's retained-state store. A compile that ends on
+	// its query deadline persists the streams a completed pass produced into a
+	// LEASED state directory here (Spools.AdoptDir) and answers a signed
+	// continuation cursor instead of a manifest; the next call reopens that
+	// directory through Spools.OpenDir and finishes the compile. It is
+	// optional: a workspace composed without it (or without Signer/Leases)
+	// offers no continuations and a deadline ends the answer as it did before.
+	Spools *pagination.Spools
+	// Signer signs and verifies the continuation cursor, under the shared
+	// pagination.PurposeCursor every other paged surface uses.
+	Signer *pagination.Signer
+	// Leases owns the retention lease a continuation's state directory is
+	// adopted under, so a continuation nobody resumes is reclaimed by the
+	// ordinary sweep rather than left behind.
+	Leases *pagination.Leases
+	// SortDir is where a compile writes its external-sort runs: the workspace's
+	// own spool area (pagination.Spools.SortDir), so a compile's temporary
+	// bytes are swept, reported and accounted under resources.max_temp_bytes
+	// exactly as a continuation spool is (ruling C5'). It is required, not
+	// defaulted: falling back to the process temporary directory would put run
+	// files where nothing reclaims them.
+	SortDir string
 }
 
 // GraphFactory opens a bounded engine over ONE explicit generation and returns
@@ -47,13 +70,17 @@ type GraphFactory func(ctx context.Context, gen model.GenerationID) (*graph.Engi
 
 // Compiler compiles deterministic context manifests. Safe for concurrent use.
 type Compiler struct {
-	store  *sqlite.Store
-	repo   model.RepositoryID
-	search *search.Service
-	graph  GraphFactory
-	cfg    config.Config
-	now    func() time.Time
-	log    *slog.Logger
+	store   *sqlite.Store
+	repo    model.RepositoryID
+	search  *search.Service
+	graph   GraphFactory
+	cfg     config.Config
+	now     func() time.Time
+	log     *slog.Logger
+	sortDir string
+	spools  *pagination.Spools
+	signer  *pagination.Signer
+	leases  *pagination.Leases
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -73,12 +100,23 @@ func New(o Options) (*Compiler, error) {
 	case o.Now == nil:
 		return nil, argumentInvalid("context compiler requires a clock")
 	}
+	// One sort area, named once. A composition that hands over the spool store
+	// takes its sort directory from it rather than repeating it, so a compile's
+	// run files and its continuation state can never land in two places.
+	if o.SortDir == "" && o.Spools != nil {
+		o.SortDir = o.Spools.SortDir()
+	}
+	switch {
+	case o.SortDir == "":
+		return nil, argumentInvalid("context compiler requires the workspace sort directory")
+	}
 	log := o.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Compiler{store: o.Store, repo: o.Repo, search: o.Search, graph: o.Graph,
-		cfg: o.Config, now: o.Now, log: log}, nil
+		cfg: o.Config, now: o.Now, log: log, sortDir: o.SortDir,
+		spools: o.Spools, signer: o.Signer, leases: o.Leases}, nil
 }
 
 // Compile produces the immutable manifest for req. It pins one generation for
@@ -94,11 +132,50 @@ func New(o Options) (*Compiler, error) {
 // budget runs last, where it may refuse a request but may never shrink the
 // required scope it was handed.
 func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
+	res, err := c.compile(ctx, req, "", false)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	return res.Manifest, nil
+}
+
+// CompileResult is one call of a CONTINUABLE compile: either the finished
+// manifest, or the report that this call ended on its query deadline at a pass
+// boundary together with the token the next call resumes from.
+//
+// The two are exclusive by construction. A truncated result carries the zero
+// manifest and nothing is persisted (Section 14.4): a partial plan is never
+// stored, so no later reader can mistake a continuation for an answer.
+type CompileResult struct {
+	Manifest         model.ContextManifest
+	Truncated        bool
+	TruncationReason string
+	NextCursor       string
+}
+
+// truncationDeadline is the only reason a compile ends at a pass boundary.
+const truncationDeadline = "deadline"
+
+// CompilePage compiles req, resuming from cursor when one is given, and ends at
+// a pass boundary rather than failing when the query deadline fires (ruling
+// C7). An empty cursor starts the compile from its first pass.
+//
+// A caller that presents no cursor and ignores NextCursor gets exactly what
+// Compile gives it, because Compile is this method with continuations switched
+// off: a workspace with no spool store, signer or lease store mints no token
+// and the deadline ends the answer as an error, unchanged.
+func (c *Compiler) CompilePage(ctx context.Context, req model.ContextRequest, cursor string) (CompileResult, error) {
+	return c.compile(ctx, req, cursor, true)
+}
+
+// compile is the whole pipeline. paging says whether this call may end at a
+// pass boundary with a continuation instead of raising the deadline.
+func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor string, paging bool) (CompileResult, error) {
 	if c == nil {
-		return model.ContextManifest{}, &model.Error{Code: model.CodeInternal, Message: "the context compiler was not composed"}
+		return CompileResult{}, &model.Error{Code: model.CodeInternal, Message: "the context compiler was not composed"}
 	}
 	if err := req.Validate(); err != nil {
-		return model.ContextManifest{}, err
+		return CompileResult{}, err
 	}
 	if timeout := c.cfg.Resources.QueryTimeout.Std(); timeout > 0 {
 		var cancel context.CancelFunc
@@ -108,7 +185,7 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 
 	reader, err := c.store.PinGeneration(ctx, c.repo, req.GenerationID, c.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
+		return CompileResult{}, contextErr(ctx, err)
 	}
 	// Opened first, so released last: the graph engine below reads through this
 	// same pinned generation, and a lease dropped under it would be a reader
@@ -117,22 +194,27 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	binding := reader.Binding()
 	gen := binding.GenerationID
 	if gen == 0 {
-		return model.ContextManifest{}, &model.Error{Code: model.CodeNoActiveGeneration,
+		return CompileResult{}, &model.Error{Code: model.CodeNoActiveGeneration,
 			Message: "no generation is active for this repository"}
 	}
 
 	// Section 15.1: a repeated request reuses the immutable manifest rather
 	// than recompiling it, and the identity is computable before any pass runs.
 	id, _ := manifestIdentity(binding, req, c.cfg)
+	// The manifest identity IS the continuation's request hash: it already
+	// folds the binding, the request and the configured bounds, so a token can
+	// never resume a different request and a configuration change between two
+	// calls ends the continuation rather than splicing two compiles.
+	requestHash := string(id)
 	if m, ok, err := c.reuseManifest(ctx, id); err != nil {
-		return model.ContextManifest{}, err
+		return CompileResult{}, err
 	} else if ok {
 		// Notices are not persisted (model.ContextManifest.Notices says why),
 		// so the reused header carries none. The configuration-derived one is
 		// re-emitted here: it is a fact about THIS request's bounds, and a
 		// caller who hit the reuse path asked for the same page size as the
 		// caller who compiled.
-		m.Notices = c.manifestNotices(scopeResult{}, plan{})
+		m.Notices = c.manifestNotices(scopeResult{}, planParts{})
 		if !m.ScopeComplete {
 			// The reused header knows its scope is partial but not how many
 			// candidates were excluded -- the count lives in the stored
@@ -145,69 +227,119 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 			// naming the surface that says why.
 			m.Notices = append(m.Notices, excludedViewNotice)
 		}
-		return m, nil
+		return CompileResult{Manifest: m}, nil
 	}
 
-	seeds, err := c.extractSeeds(ctx, reader, gen, req)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-	caps, err := reader.Capabilities(ctx)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-
-	engine, release, err := c.graph(ctx, gen)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-	defer release()
-
-	// An unresolved seed is carried INTO the expansion rather than around it:
-	// expandScope is what decides whether an unresolvable identity is the
-	// discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit
-	// boundary, and it can only decide that if it sees the exclusions.
-	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
-		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-	scopeComplete := scoped.ScopeComplete && !seeds.Unresolved
-
-	files, err := c.hydrateFiles(ctx, reader, scoped.Candidates)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-	relations, complete, err := c.relationsOnPaths(ctx, reader, scoped.Candidates)
-	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
-	}
-	if !complete {
-		// A route whose edges could not all be read is scored as inadmissible,
-		// which changes the ranking. Disclosing it keeps that from being a
-		// silent difference between two compiles of one generation.
-		scopeComplete = false
+	// A presented cursor is validated and its state opened BEFORE any sort is
+	// created, so a token this compile may not resume costs nothing.
+	var resumed *resumedHalf
+	if cursor != "" {
+		r, rerr := c.openResumed(ctx, cursor, binding, requestHash)
+		if rerr != nil {
+			return CompileResult{}, rerr
+		}
+		// The checkpoint's runs are ADOPTED by this call's sort area and
+		// consumed by the merge that reads them, so the retention ends with
+		// this call whether it finishes the plan or fails: a continuation is
+		// resumable once, exactly as a spooled page is.
+		defer c.releaseState(ctx, r.Cursor.StateID, r.Cursor.LeaseID)
+		resumed = r
 	}
 
-	ranked, err := c.rank(ctx, reader, scoped.Candidates, relations)
+	// The streamed pipeline's sort area. Every sort and sorted run below is
+	// registered with it, so ONE deferred release removes every run file on
+	// every exit path, error paths included (rulings C5/C5').
+	sorts, err := newCompileSorts(c.cfg, c.sortDir)
 	if err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
+		return CompileResult{}, err
 	}
+	defer func() {
+		if cerr := sorts.Close(); cerr != nil {
+			// The plan is already decided by the time this runs, so a failed
+			// removal must not fail a correct compile -- but it is real
+			// temporary disk this workspace stays charged for, so the operator
+			// hears about it instead of the sweeper discovering it later.
+			c.logger().Warn("a context compile could not release its sort runs",
+				"component", "context", "error", cerr)
+		}
+	}()
 
+	// The budget is resolved BEFORE the passes run. It is a property of the
+	// request, not of the plan, so a budget that cannot be resolved is reported
+	// without paying for an expansion whose result could never be admitted.
 	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
 	if err != nil {
-		return model.ContextManifest{}, err
+		return CompileResult{}, err
 	}
-	packed, err := buildPlan(ranked, files, resolved)
+
+	// P-A through P-F, or the checkpoint a previous call left instead of them.
+	var (
+		ranked        rankedStreams
+		scoped        scopeResult
+		scopeComplete bool
+	)
+	if resumed != nil {
+		ranked, scoped, scopeComplete, err = c.restoreHalf(sorts, resumed)
+		if err != nil {
+			return CompileResult{}, err
+		}
+	} else {
+		ranked, scoped, scopeComplete, err = c.frontHalf(ctx, reader, gen, req, sorts)
+		if err != nil {
+			return CompileResult{}, err
+		}
+		// The pass boundary ruling C7 names. Every stream the budget half reads
+		// is complete and nothing has been persisted, so this is where a
+		// compile that has run out of deadline can stop and be continued. The
+		// checkpoint is taken ONLY here, because this is the only boundary
+		// whose carry is persisted; a deadline anywhere else still ends the
+		// call as the error it was before.
+		if paging && deadlineReached(ctx) {
+			token, cerr := c.checkpointHalf(ctx, binding, requestHash, ranked, scoped, scopeComplete)
+			if cerr != nil {
+				return CompileResult{}, cerr
+			}
+			return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+		}
+	}
+
+	// P-G, P-H and P-I: what buildPlan did whole-set. Their errors are NOT
+	// reclassified through contextErr, because this is where CTX_MINIMUM_BUDGET
+	// is raised and a floor report must reach the caller as itself.
+	measured, err := c.passGMeasure(ctx, sorts, ranked)
 	if err != nil {
-		return model.ContextManifest{}, err
+		return CompileResult{}, err
+	}
+	packed, err := c.passHPack(ctx, sorts, measured, resolved)
+	if err != nil {
+		return CompileResult{}, err
+	}
+	// The exclusion projection is spooled, not collected. It is the one
+	// repository-sized list a compile produces, so P-I streams it into this
+	// sort and persistManifest replays the sorted run twice -- once to fold the
+	// canonical hash, once to write the rows -- instead of holding it. The sort
+	// is registered with the compile's area, so its run files are removed on
+	// every exit path with every other run, and it is opened here rather than
+	// inside P-I so that release order stays the area's single responsibility.
+	exclSort, err := newSort(sorts, "excluded", lessExcludedOrdinal, sizeOfExcluded)
+	if err != nil {
+		return CompileResult{}, err
+	}
+	sink := planBuffer{excluded: exclSort}
+	parts, err := c.passIEmit(ctx, sorts, measured, packed, resolved, &sink)
+	if err != nil {
+		return CompileResult{}, err
+	}
+	exclRun, err := sortedRun(sorts, exclSort)
+	if err != nil {
+		return CompileResult{}, err
 	}
 
 	// The deadline can fire inside ranking or budgeting without any call
 	// returning an error, and Section 14.4 forbids persisting a manifest that a
 	// cancelled compile produced: the answer is explicitly incomplete instead.
 	if err := ctx.Err(); err != nil {
-		return model.ContextManifest{}, contextErr(ctx, err)
+		return CompileResult{}, contextErr(ctx, err)
 	}
 
 	// The stored budget is the RESOLVED one: a persisted zero would read as
@@ -215,17 +347,191 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	// default" at compile time.
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	m, err := c.persistManifest(ctx, binding, req, stored, packed, scoped.Completeness, scopeComplete)
+	// exclRun is read INSIDE persistManifest, and the sort area's deferred
+	// release above is what removes it afterwards. That ordering is the reason
+	// the release is deferred in Compile rather than taken by whichever pass
+	// produced the run: the exclusion run outlives P-I and dies with the
+	// compile, not with the pass.
+	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, exclRun,
+		scoped.Completeness, scopeComplete)
 	if err != nil {
-		return model.ContextManifest{}, err
+		return CompileResult{}, err
 	}
 	// Set after persistence, deliberately: the notices describe how THIS
 	// compile was bounded, not what the plan is, and they are neither hashed
 	// nor stored.
-	m.Notices = c.manifestNotices(scoped, packed)
+	m.Notices = c.manifestNotices(scoped, parts)
 	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
-	return m, nil
+	return CompileResult{Manifest: m}, nil
+}
+
+// frontHalf runs P-A through P-F: ingest, hydrate, relation attributes, route
+// scoring, centrality and the boosts. Its answer is the three sorted streams
+// the budget half consumes, plus the scope carry a manifest header and its
+// notices are built from.
+//
+// It is a method of its own because it is exactly what a resumed compile does
+// NOT run: a continuation restores these three streams and this carry from its
+// checkpoint and enters the budget half directly. Keeping the boundary as a
+// function signature is what makes "the checkpoint holds everything the second
+// half reads" a thing the compiler checks rather than a comment.
+func (c *Compiler) frontHalf(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
+	req model.ContextRequest, sorts *compileSorts,
+) (rankedStreams, scopeResult, bool, error) {
+	seeds, err := c.extractSeeds(ctx, reader, gen, req)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+	caps, err := reader.Capabilities(ctx)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+
+	engine, release, err := c.graph(ctx, gen)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+	defer release()
+
+	// P-A ingest. An unresolved seed is carried INTO the expansion rather than
+	// around it: the expansion is what decides whether an unresolvable identity
+	// is the discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an
+	// explicit boundary, and it can only decide that if it sees the exclusions.
+	in, err := c.passAIngest(ctx, sorts, engine, gen,
+		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+	scopeComplete := in.Scope.ScopeComplete && !seeds.Unresolved
+
+	// P-B hydrate.
+	hydrated, err := c.passBHydrate(ctx, sorts, reader, in.Cands)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+
+	// P-C relation attributes, over the PRE-hydration spool and before any
+	// scoring: that is what relationsOnPaths reads today, and running it here
+	// keeps the edge-scan reads ahead of the evidence reads exactly as today's
+	// call order does. Both passes may read `in.Cands` because a sorted run is
+	// replayable until the sort area is released.
+	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, in.Hops, in.Cands)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+	if !attrs.Complete {
+		// A route whose edges could not all be read is scored as inadmissible,
+		// which changes the ranking. Disclosing it keeps that from being a
+		// silent difference between two compiles of one generation.
+		scopeComplete = false
+	}
+
+	// P-D route scoring. The edge sort folds a repeated (package, relation)
+	// pair at insertion because P-E counts DISTINCT edges per package; without
+	// the fold a package reached twice over one edge would over-count its
+	// centrality boost.
+	retainedPaths, err := newSort(sorts, "kept-path", lessPathSeq, sizeOfPath)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	retainedHops, err := newSort(sorts, "kept-hop", lessHopSeq, sizeOfHop)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	edges, err := newSort(sorts, "pkg-edge", lessPkgEdge, sizeOfPkgEdge)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	scored, err := c.passDRouteScoring(ctx, sorts, hydrated, in.Paths, attrs.Hops,
+		retainedPaths, retainedHops, edges.WithFold(foldPkgEdgeDistinct))
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+
+	// P-E centrality, complete before P-F applies a single boost.
+	counts, err := c.passECentrality(ctx, sorts, edges)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+
+	// P-F boosts. The ranked sort's comparator IS the Section 15.3 total order,
+	// so draining it is the reading order the plan is packed and stored in.
+	rankedSort, err := newSort(sorts, "ranked", lessRank, sizeOfCand)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	if err := c.passFBoosts(ctx, scored, counts, rankedSort); err != nil {
+		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	}
+	rankedRun, err := sortedRun(sorts, rankedSort)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	keptPaths, err := sortedRun(sorts, retainedPaths)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	keptHops, err := sortedRun(sorts, retainedHops)
+	if err != nil {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+
+	return rankedStreams{Ranked: rankedRun, Paths: keptPaths, Hops: keptHops}, in.Scope, scopeComplete, nil
+}
+
+// planBuffer is the compile's planSink: it collects the entries P-I emits so
+// the single-transaction Store.PutManifest can be handed them, and spools the
+// exclusions it emits so that method never sees a slice of them.
+//
+// The split is the memory class of each list. An entry list is bounded by the
+// RESOLVED budget -- the caller's own declared window, the same class ruling C4
+// already accepts for EntryOrdinals and the MaxSlices array -- so holding it is
+// a constant-factor extension of an accepted structure. The exclusion list is
+// the one C-STREAM-plan.md §1 names unbounded: it goes to the external sort,
+// whose peak live records are a function of the run budget and never of how
+// many candidates were excluded.
+type planBuffer struct {
+	entries []model.ContextEntry
+	// excluded is the spool P-I's exclusions stream into, in the ordinal order
+	// P-I assigns them (ruling C1). It is required: a nil sink here would drop
+	// every exclusion silently, which is the omission Section 15.4 forbids.
+	excluded *pagination.ExternalSort[model.ExcludedContextEntry]
+}
+
+func (b *planBuffer) Entry(e model.ContextEntry) error {
+	b.entries = append(b.entries, e)
+	return nil
+}
+
+func (b *planBuffer) Exclude(e model.ExcludedContextEntry) error {
+	if b.excluded == nil {
+		return &model.Error{Code: model.CodeInternal,
+			Message: "the compiled plan's exclusion spool was not opened"}
+	}
+	return b.excluded.Add(e)
+}
+
+// lessExcludedOrdinal orders the exclusion projection by the ordinal P-I
+// assigned, which IS ruling C1's sequence (pre-sort exclusions in expansion
+// order, then the packer's drops in group order). Ordinals are unique, so the
+// order is total and the sort is a spill-capable identity over an already
+// ordered stream rather than a re-ordering.
+func lessExcludedOrdinal(a, b model.ExcludedContextEntry) int {
+	switch {
+	case a.Ordinal < b.Ordinal:
+		return -1
+	case a.Ordinal > b.Ordinal:
+		return 1
+	}
+	return 0
+}
+
+// sizeOfExcluded charges one exclusion against the run budget: the two ids, the
+// path and the reason, plus the per-record overhead every other record pays.
+func sizeOfExcluded(x model.ExcludedContextEntry) int64 {
+	return int64(len(x.Reference.NodeID)+len(x.Reference.FileID)+len(x.Reference.Path)+len(x.Reason)) +
+		recordOverheadBytes
 }
 
 // manifestNotices is every non-fatal disclosure this compile owes the caller:
@@ -238,7 +544,7 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 //
 // An empty result is the honest answer that nothing was cut, and the field is
 // omitempty, so a compile under no bound reads exactly as it did before.
-func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
+func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []string {
 	var out []string
 	add := func(format string, args ...any) {
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
@@ -254,7 +560,7 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
 	if n := scoped.ReasonsTruncated; n > 0 {
 		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
 	}
-	if n := len(packed.Excluded); n > 0 {
+	if n := packed.Excluded; n > 0 {
 		// The manifest header carries no exclusion list -- exclusions are a
 		// paged projection, and embedding them would make the header
 		// repository-sized -- so scope_complete=false on its own leaves the
@@ -297,129 +603,106 @@ func (c *Compiler) logger() *slog.Logger {
 	return c.log
 }
 
-// hydrateFiles reads Size, Path and Status for every candidate's file in
-// bounded batches and writes them onto the candidates in place.
+// hydrateStream is pass P-B: hydrateFiles as a stream. It reads the candidate
+// spool in pageLimit() batches, resolves each batch's distinct file ids through
+// ONE FilesByID, writes SizeBytes, Status, both path values (ruling C3) and the
+// snapshot-absent flag onto each record, and re-emits it in seq order. The
+// accumulating `out []model.FileVersion` and `byID` of hydrateFiles go away;
+// the held set is one batch of records plus one page of file rows.
 //
-// It runs ONCE, before ranking: the Section 15.3 active-change boost reads
-// Status, and the Section 15.4 budget sizes an entry from Size, so a compile
-// that hydrated per pass would issue the same read twice and could observe two
-// different answers. The rows are returned as well as applied, so the budget
-// pass consumes exactly what ranking saw.
+// The two path writes are the two today's pipeline performs and ruling C3
+// keeps apart: hydrateFiles fills Path only when the candidate carries none
+// (the value ranking reads for packageOf, centrality and its boost reason) and
+// buildPlan overwrites it unconditionally (the value the total order and the
+// persisted entry read). PathAtRank and PathFinal are those two values.
 //
-// FilesByID omits an id the pinned snapshot does not hold and returns file_id
-// order rather than input order, so the result is indexed by id here and a
-// candidate whose file is invisible keeps a zero size, which buildPlan excludes
-// with that reason rather than sizing as empty.
-func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader,
-	cands []candidate) ([]model.FileVersion, error) {
-	seen := map[model.FileID]struct{}{}
-	ids := make([]model.FileID, 0, len(cands))
-	for _, cand := range cands {
-		if cand.FileID == "" || cand.Excluded != "" {
-			continue
-		}
-		if _, dup := seen[cand.FileID]; dup {
-			continue
-		}
-		seen[cand.FileID] = struct{}{}
-		ids = append(ids, cand.FileID)
+// FileMissing is the fact buildPlan learns from a `meta` lookup miss
+// (budget.go:249-252). A streamed P-G holds no such map, so the record that
+// observed the miss carries it.
+//
+// A batch-local byID is equivalent to today's whole-set one because every
+// producer of an excluded candidate (seeds.go:60,100,191) sets neither NodeID
+// nor FileID: Excluded implies FileID == "", so no excluded candidate can be
+// hydrated by a file row another batch requested. hydrateFiles' write-back over
+// ALL candidates is nevertheless reproduced below rather than narrowed to the
+// eligible ones, so the equivalence is a property of the seed producers and not
+// something this pass has baked in.
+func (c *Compiler) hydrateStream(ctx context.Context, reader *sqlite.PinnedReader,
+	s *compileSorts, in *pagination.SortedRun[candRec]) (*pagination.SortedRun[candRec], error) {
+	if reader == nil {
+		return nil, argumentInvalid("a streamed hydration requires a pinned reader")
+	}
+	if in == nil {
+		return nil, argumentInvalid("a streamed hydration requires the candidate spool")
+	}
+	out, err := newSort[candRec](s, "hydrate", lessCandSeq, sizeOfCand)
+	if err != nil {
+		return nil, err
 	}
 	limit := c.pageLimit()
-	out := make([]model.FileVersion, 0, len(ids))
-	for start := 0; start < len(ids); start += limit {
-		batch := ids[start:min(start+limit, len(ids))]
-		page, err := reader.FilesByID(ctx, batch)
-		if err != nil {
-			return nil, err
+	batch := make([]candRec, 0, limit)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-		out = append(out, page...)
-	}
-	byID := make(map[model.FileID]model.FileVersion, len(out))
-	for _, fv := range out {
-		byID[fv.ID] = fv
-	}
-	for i := range cands {
-		fv, ok := byID[cands[i].FileID]
-		if !ok {
-			continue
-		}
-		cands[i].SizeBytes, cands[i].Status = fv.Size, fv.Status
-		if cands[i].Path == "" {
-			cands[i].Path = fv.Path
-		}
-	}
-	return out, nil
-}
-
-// relationsOnPaths reads the relation kind of every edge the expansion admitted
-// onto a retained route, and reports whether it found all of them.
-//
-// A model.RelationPath stores relation ids only, graph.ImpactResult never
-// returns the relations it walked, and the pinned reader exposes no by-id
-// relation read -- adding one would be a second spelling of EdgesBatch. So the
-// edges are re-read here from the candidate node set, keyset-paged by relation
-// id and bounded by the same context.max_graph_edges the walk ran under, and
-// filtered to the ids the routes actually name.
-//
-// The completeness flag matters: ranking treats an edge it cannot type as
-// inadmissible, so stopping at the edge bound with ids still unfound changes
-// scores. The caller discloses that as an incomplete scope rather than letting
-// two compiles of one generation disagree in silence.
-func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedReader,
-	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
-	wanted := map[model.RelationID]struct{}{}
-	nodes := make([]model.NodeID, 0, len(cands))
-	seenNode := map[model.NodeID]struct{}{}
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, rel := range p.Relations {
-				wanted[rel] = struct{}{}
+		// The eligible set is hydrateFiles' own: a candidate with no file, and
+		// an excluded one, are not read for.
+		ids := make([]model.FileID, 0, len(batch))
+		seen := make(map[model.FileID]struct{}, len(batch))
+		for _, r := range batch {
+			if r.FileID == "" || r.Excluded != "" {
+				continue
 			}
+			if _, dup := seen[r.FileID]; dup {
+				continue
+			}
+			seen[r.FileID] = struct{}{}
+			ids = append(ids, r.FileID)
 		}
-		if cand.NodeID == "" {
-			continue
-		}
-		if _, dup := seenNode[cand.NodeID]; dup {
-			continue
-		}
-		seenNode[cand.NodeID] = struct{}{}
-		nodes = append(nodes, cand.NodeID)
-	}
-	out := make(map[model.RelationID]model.Relation, len(wanted))
-	if len(wanted) == 0 || len(nodes) == 0 {
-		return out, len(wanted) == 0, nil
-	}
-
-	limit := c.pageLimit()
-	// An unlimited edge bound is not a zero-sized scan: L2 replaces this whole
-	// hydration budget with the resumable frontier, and until then an absent
-	// bound falls back to the page size it already used for a 0 value.
-	budget := int(c.cfg.Context.MaxGraphEdges.ValueOr(model.MaxPageItems))
-	scanned := 0
-	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
-		batch := nodes[start:min(start+limit, len(nodes))]
-		var after model.RelationID
-		for len(out) < len(wanted) {
-			page, err := reader.EdgesBatch(ctx, batch, model.DirectionBoth, scopeRelations, after, limit)
+		byID := make(map[model.FileID]model.FileVersion, len(ids))
+		if len(ids) > 0 {
+			page, err := reader.FilesByID(ctx, ids)
 			if err != nil {
-				return nil, false, err
+				return err
 			}
-			for _, rel := range page {
-				if _, want := wanted[rel.ID]; want {
-					out[rel.ID] = rel
+			for _, fv := range page {
+				byID[fv.ID] = fv
+			}
+		}
+		for _, r := range batch {
+			if fv, ok := byID[r.FileID]; ok {
+				r.SizeBytes, r.Status = fv.Size, fv.Status
+				r.PathFinal = fv.Path
+				if r.PathAtRank == "" {
+					r.PathAtRank = fv.Path
 				}
-				after = rel.ID
+			} else if r.FileID != "" && r.Excluded == "" {
+				r.FileMissing = true
 			}
-			scanned += len(page)
-			if len(page) < limit || scanned >= budget {
-				break
+			if err := out.Add(r); err != nil {
+				return err
 			}
 		}
-		if scanned >= budget {
-			break
-		}
+		batch = batch[:0]
+		return nil
 	}
-	return out, len(out) == len(wanted), nil
+	if err := in.Each(func(r candRec) error {
+		batch = append(batch, r)
+		if len(batch) < limit {
+			return nil
+		}
+		return flush()
+	}); err != nil {
+		return nil, err
+	}
+	if err := flush(); err != nil {
+		return nil, err
+	}
+	run, err := out.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	return trackRun(s, run), nil
 }
 
 // candidate is the ONE intermediate record that crosses lane boundaries: seed

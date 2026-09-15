@@ -702,6 +702,45 @@ whole, the restored-refusal mutation, and the single-pass-hash mutation.
 
 ---
 
+### 2.10 The context compiler is a stream *(accepted; landed in part)*
+
+**Decision.** A compile no longer holds any structure sized by its candidate count. The whole-set
+passes — the admitted-candidate slice and its dedupe map, the hydrated file table, the relation and
+precision maps, the nested per-package centrality map, and the budget pass's five candidate-sized
+structures — become sorted streams joined by merge and reduced by streaming aggregation, over the
+same external sort the ranked search answer already uses. Peak heap is a function of that sort's run
+budget (the quarter share of `resources.query_memory_bytes`) and of the resolved budget, which is the
+caller's own declared window, and never of how wide the task's scope is. The plan is required to be
+byte-for-byte what the whole-set pipeline produced: the same entries, ordinals, slices, exclusions
+with their reasons, notices and canonical manifest hash.
+
+**Alternative rejected.** Bounding the candidate set instead. That is the shortcut this record exists
+to forbid: it would make a wide task return a narrower plan rather than the same plan more cheaply,
+and `scope_complete` would start reporting a ceiling rather than a fact about the repository.
+
+**Where the runs live.** Under the workspace's spool directory, removed on every exit path including
+the error paths, and — like the sort runs `search` writes — deliberately not charged against
+`resources.max_temp_bytes`, because a run set is sized by the candidate count and charging it would
+let that budget refuse a wide compile outright.
+
+**Open, with owners.**
+
+- *The exclusion list is still held in heap.* It is the one list this record's own analysis names as
+  unbounded — a plan may exclude every candidate it saw, with a reason each. It stays in heap only
+  because `Store.PutManifest` takes the plan as three slices in one transaction; streaming it needs a
+  row-at-a-time manifest writer in `internal/storage/sqlite`. The entry and slice lists are a
+  different class: both are bounded by the resolved budget. This is an open defect, not an accepted
+  trade-off.
+- *A deadline still ends the answer, not a pass.* A compile that exceeds `resources.query_timeout`
+  returns `CTX_QUERY_DEADLINE` with no manifest and no cursor, so a repository wide enough to outrun
+  the deadline has no route to a plan at all. The intended shape is the one every other long walk in
+  this record already has: the completed passes' sorted runs persist under a lease, the call returns a
+  continuation cursor with `truncation_reason=deadline`, the next call resumes at the first unfinished
+  pass, and the final call returns the identical plan.
+- *The whole-set pipeline is only half retired.* The two functions with no remaining production caller
+  have moved to the parity reference; the scope expansion, the ranking pass and the plan builder are
+  still compiled into the package and reachable, though nothing but tests calls them.
+
 ## 3. Consequences
 
 ### 3.1 What bounds peak memory now
