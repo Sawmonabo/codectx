@@ -21,12 +21,18 @@ const guaranteeLimit = "this readiness answer is point-in-time: re-check the gat
 // Status is the honest readiness answer for one session (Section 16.3). It is
 // revalidated per request, immediately before answering, and never cached.
 // Owned by L4.
-func (s *Service) Status(ctx context.Context, req model.SessionRequest) (model.SessionStatus, error) {
+func (s *Service) Status(ctx context.Context, req model.SessionRequest) (_ model.SessionStatus, err error) {
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "workflow status", err) }()
 	// Session returns a partially populated record beside CTX_SESSION_EXPIRED
 	// rather than swallowing it, and describing an expired session honestly --
 	// read complete for its historical snapshot, never ready -- is the whole
@@ -118,7 +124,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// Precondition 3 -- read completeness for this actor, this session, these
 	// pinned hashes. context.strict_read_gate (user-level, default true) is the
 	// operator's switch for exactly this precondition: with it off the
-	// shortfall no longer shuts the gate, but it is recorded rather than
+	// shortfall does not shut the gate, but it is recorded rather than
 	// forgiven, so the reason below names the configuration and the strict
 	// claim at the end of this function is withheld.
 	if !e.ReadComplete {

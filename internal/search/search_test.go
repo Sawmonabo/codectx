@@ -412,15 +412,15 @@ func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
 // delta carries doc ids forward, a fresh index assigns them anew -- so any
 // arrival-ordered choice makes the two indexes of one tree answer differently.
 //
-// The shape is the real one that broke: a Markdown file's headings all carry
-// that file's document node as their NodeID, so they share a deduplication key
-// while differing in name, range and score; and one group spans two tiers, the
-// case where folding the ACCUMULATED score made the survivor arrival-ordered.
+// The shape is the general one: several candidates share a deduplication key
+// while differing in name, range and score, and one group spans two tiers --
+// the case where folding the ACCUMULATED score makes the survivor
+// arrival-ordered.
 //
 // Mutation: restore `keep.Hit, keep.Span = a.Hit, a.Span` in fold, or compare
 // Folded instead of ScoreMicros in it, and this fails.
 func legFoldOrderIndependent(t *testing.T, _ *fixture) {
-	// Three headings of one Markdown file under the file's document node,
+	// Three candidates sharing one document node as their deduplication key,
 	// plus a two-tier group: an exact-name hit and a lexical hit of one node.
 	group := []scored{
 		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),

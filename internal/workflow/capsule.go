@@ -100,7 +100,7 @@ func decodeCapsuleRows[T any](rows []model.CapsuleRow) ([]T, error) {
 // Export returns the sealed capsule's identity and record counts for one
 // session.
 //
-// It no longer carries the records: they are rows, and a whole-capsule render
+// It does not carry the records: they are rows, and a whole-capsule render
 // streams them per list through Capsule. The byte budget below therefore
 // measures a small fixed record and stays as the caller's own ceiling.
 func (s *Service) Export(ctx context.Context, req model.SessionRequest) (model.Capsule, error) {

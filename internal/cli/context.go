@@ -57,7 +57,7 @@ const (
 // maxObservationInputBytes bounds what --input may read. It is a bound on ONE
 // local file the CLI decodes, not on how many references an observation may
 // carry: workflow.max_observation_references is the caller's own ceiling and is
-// unlimited by default, so the model no longer fixes a widest legal document.
+// unlimited by default, so the model fixes no widest legal document.
 // The bound exists so a file that is not an observation at all is refused at the
 // read rather than decoded.
 const maxObservationInputBytes = 1 << 20

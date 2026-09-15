@@ -66,8 +66,8 @@ type argPaths struct {
 	WorkDir string
 }
 
-// kindSpec is everything about one indexer that used to live in a user's
-// `[analyzers.<name>]` table and is now product code (Section 20.2): the lock
+// kindSpec is everything about one indexer, as product code rather than as a
+// user's `[analyzers.<name>]` table (Section 20.2): the lock
 // entry to resolve, the manifests that make a workspace a candidate, the exact
 // argument array, the parent environment variables the child may see, the
 // declared network posture, the runner reservations and the run's own bound.

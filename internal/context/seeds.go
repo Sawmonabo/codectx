@@ -427,7 +427,7 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 		if len(files) < pageSize {
 			// A short page is the exhausted working tree. A page that fills the
 			// limit exactly is NOT: the next read answers that, which is why an
-			// exact-boundary tree no longer reports the scope incomplete.
+			// exact-boundary tree does not report the scope incomplete.
 			return nil
 		}
 		last := files[len(files)-1].ID
@@ -547,7 +547,7 @@ func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 
 // add pushes a candidate to the sink in discovery order.
 //
-// It no longer deduplicates, and holds no `seen` map to do it with: the sink's
+// It does NOT deduplicate, and holds no `seen` map to do it with: the sink's
 // scope-seed sort folds the same key (the entity identity) with foldMinSeq over
 // a seq assigned in discovery order, so the earliest Section 15.2 step that
 // found an entity still keeps it -- the order of the steps IS the seed

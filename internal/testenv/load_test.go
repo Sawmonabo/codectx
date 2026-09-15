@@ -25,9 +25,13 @@ func TestTheLoadGuardRunsOnAQuietHost(t *testing.T) {
 		want bool
 	}{
 		{load: 0, cpus: 8, want: false},
-		{load: 3.9, cpus: 8, want: false},
-		{load: 4.1, cpus: 8, want: true},
-		{load: 6.4, cpus: 8, want: true}, // a host at 80 % of its cores
+		{load: 1.9, cpus: 8, want: false},
+		{load: 2.1, cpus: 8, want: true},
+		// Both endpoints are recorded observations of this repository's own
+		// 16-CPU host: the quiet run the ratios were measured on, and the load
+		// the flake this guard exists for was seen at.
+		{load: 3.73, cpus: 16, want: false},
+		{load: 6.4, cpus: 16, want: true},
 	} {
 		if got := overloaded(c.load, c.cpus); got != c.want {
 			t.Errorf("overloaded(%v, %d) = %v, want %v", c.load, c.cpus, got, c.want)
