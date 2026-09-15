@@ -205,11 +205,28 @@ jobs:
             # so wait for the answer rather than for a fixed number of
             # seconds: a loaded runner would otherwise truncate the reply and
             # fail the job for a timing reason, not a network one.
+            #
+            # grep on a file the redirection has not created yet exits 2,
+            # which is indistinguishable from "no match yet", so existence is
+            # waited for first and the pattern second. A wait that runs out is
+            # reported on stderr instead of falling through silently: stdout
+            # here is the server's stdin, and the two greps after the pipeline
+            # then fail the step with the log to explain why.
             i=0
-            while [ "$i" -lt 100 ] && ! grep -q 'codectx_context_plan' "$out" 2>/dev/null; do
+            while [ "$i" -lt 600 ] && [ ! -e "$out" ]; do
               sleep 0.1
               i=$((i + 1))
             done
+            if [ ! -e "$out" ]; then
+              echo "mcp serve never created $out within 60s" >&2
+            fi
+            while [ "$i" -lt 600 ] && ! grep -q 'codectx_context_plan' "$out" 2>/dev/null; do
+              sleep 0.1
+              i=$((i + 1))
+            done
+            if ! grep -q 'codectx_context_plan' "$out" 2>/dev/null; then
+              echo "mcp serve did not answer tools/list within 60s; closing stdin now truncates the reply" >&2
+            fi
           } | "$bin" mcp serve --repo "$repo" > "$out"
           grep -q '"protocolVersion"' "$out"
           grep -q 'codectx_context_plan' "$out"
