@@ -144,9 +144,16 @@ func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
 	}
 	if err := os.Rename(from, filepath.Join(s.dir, spoolPrefix+id)); err != nil {
 		// Put the directory back exactly as it was found: the accounting AND
-		// the binding prevID's cursor opens it by.
+		// the binding prevID's cursor opens it by. "As it was found" includes
+		// having had NO header -- the read above distinguishes that from a
+		// header it could not read -- because leaving the new id's frame on a
+		// directory that carried none is the same lost walk G6 closed: OpenDir
+		// would compare prevID against an id the caller was never given, and a
+		// retryable failure would have become a permanent one.
 		if prev != nil {
 			_ = replaceDirHeader(from, prev)
+		} else {
+			_ = os.Remove(filepath.Join(from, spoolDirHeader))
 		}
 		s.transferBack(id, prevID, delta)
 		return "", internalErr("spool adopt: " + err.Error())
