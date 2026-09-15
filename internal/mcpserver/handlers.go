@@ -141,31 +141,32 @@ type advanceOutput struct {
 }
 
 // capsuleOutput is exactly one of its two fields. The six model.CapsuleView
-// values return the bounded page; view="export" returns the metadata
-// projection.
+// values return one keyset page of that one list, whose next cursor travels in
+// the page's meta; view="export" returns the identity-and-counts projection.
 type capsuleOutput struct {
 	Page   *model.CapsulePage `json:"page,omitempty"`
 	Export *capsuleExport     `json:"export,omitempty"`
 }
 
 // capsuleExport is the canonical export METADATA projection and NEVER the
-// capsule body. A capsule is bounded by context.max_capsule_bytes at 8 MiB
-// against a resources.max_metadata_response_bytes ceiling of 256 KiB, so
-// returning model.Capsule whole over this tool could not honour the response
-// bound. Section 19.2's "bounded capsule page or canonical export metadata" is
-// this field set: identity, binding, both hashes, the scope version, the
-// strict-gate flag, per-section counts and the creation time — everything
-// needed to verify or fetch an export, and no capsule content.
+// capsule body. A sealed capsule's records are rows of their own and there is
+// no bound on how many a session may record, so returning them whole over this
+// tool could never honour the resources.max_metadata_response_bytes ceiling.
+// Section 19.2's "bounded capsule page or canonical export metadata" is this
+// field set: identity, binding, both hashes, the scope version, the strict-gate
+// flag, per-list counts and the creation time — everything needed to verify or
+// fetch an export, and no capsule content. The records are read a page at a
+// time through the tool's six view spellings and their cursors.
 type capsuleExport struct {
-	SessionID           model.SessionID `json:"session_id"`
-	ActorID             string          `json:"actor_id"`
-	Binding             model.Binding   `json:"binding"`
-	ManifestHash        string          `json:"manifest_hash"`
-	CanonicalHash       string          `json:"canonical_hash"`
-	ScopeVersion        int             `json:"scope_version"`
-	StrictGateSatisfied bool            `json:"strict_gate_satisfied"`
-	Counts              map[string]int  `json:"counts"`
-	CreatedAt           time.Time       `json:"created_at"`
+	SessionID           model.SessionID  `json:"session_id"`
+	ActorID             string           `json:"actor_id"`
+	Binding             model.Binding    `json:"binding"`
+	ManifestHash        string           `json:"manifest_hash"`
+	CanonicalHash       string           `json:"canonical_hash"`
+	ScopeVersion        int              `json:"scope_version"`
+	StrictGateSatisfied bool             `json:"strict_gate_satisfied"`
+	Counts              map[string]int64 `json:"counts"`
+	CreatedAt           time.Time        `json:"created_at"`
 }
 
 // closeInput carries the optimistic-concurrency version the facade's

@@ -13,6 +13,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sort"
@@ -588,6 +589,10 @@ type fakeSession struct {
 	obs     []model.Observation
 	waivers []model.WaiverRecord
 	capsule *model.Capsule
+	// rows are the sealed capsule's records, in list order, exactly as the
+	// real store's context_capsule_rows holds them: the capsule itself carries
+	// counts only, so this is the sole place a sealed record can be read back.
+	rows map[model.CapsuleList][]model.CapsuleRow
 }
 
 // fakeStore is the in-package Sessions, Compiler and Validator. It reproduces
@@ -1014,7 +1019,11 @@ func (s *fakeStore) Observations(_ context.Context, session model.SessionID, act
 	return out, err
 }
 
-func (s *fakeStore) PutCapsule(_ context.Context, c model.Capsule) (model.Capsule, error) {
+// PutCapsule stores the capsule and, in the same step, the records its source
+// streams -- the real store writes both inside one transaction, so a fake that
+// stored the capsule without its rows would let a test observe a capsule whose
+// records cannot be read.
+func (s *fakeStore) PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	fs, err := s.lookup(c.SessionID, c.ActorID)
@@ -1037,9 +1046,78 @@ func (s *fakeStore) PutCapsule(_ context.Context, c model.Capsule) (model.Capsul
 	if err := c.Validate(); err != nil {
 		return model.Capsule{}, err
 	}
+	if src == nil {
+		return model.Capsule{}, &model.Error{Code: model.CodeInternal, Message: "the seal named no record source"}
+	}
+	rows := make(map[model.CapsuleList][]model.CapsuleRow, len(model.CapsuleListOrder))
+	for _, list := range model.CapsuleListOrder {
+		var written int64
+		err := src.Rows(ctx, list, func(row model.CapsuleRow) error {
+			if err := row.Validate(); err != nil {
+				return err
+			}
+			if row.Ordinal != written {
+				return &model.Error{Code: model.CodeInternal,
+					Message: "the " + string(list) + " list skipped an ordinal"}
+			}
+			written++
+			// The elem the seal hashed is dropped exactly as a stored row drops
+			// it: a record read back is data, never a digest contribution.
+			rows[list] = append(rows[list], model.CapsuleRow{
+				List: row.List, Ordinal: row.Ordinal, Key: row.Key, JSON: row.JSON})
+			return nil
+		})
+		if err != nil {
+			return model.Capsule{}, err
+		}
+		if written != c.Counts.Of(list) {
+			return model.Capsule{}, &model.Error{Code: model.CodeInternal,
+				Message: "the " + string(list) + " list wrote a different number of records than its sealed count"}
+		}
+	}
 	stored := c
 	fs.capsule = &stored
+	fs.rows = rows
 	return stored, nil
+}
+
+// CapsuleRows is the keyset page the real store serves: after names a row's own
+// key, a cursor naming no row is refused rather than restarting the list, and
+// the caller decides from the capsule's count where the list ends.
+func (s *fakeStore) CapsuleRows(_ context.Context, session model.SessionID, actor string,
+	list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fs, err := s.lookup(session, actor)
+	if err != nil {
+		return nil, err
+	}
+	if fs.capsule == nil {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "session has no capsule"}
+	}
+	if !list.Valid() {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "not a capsule list"}
+	}
+	if limit <= 0 {
+		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "a page size of zero reads nothing"}
+	}
+	rows := fs.rows[list]
+	start := 0
+	if after != "" {
+		start = -1
+		for i, row := range rows {
+			if row.Key == after {
+				start = i + 1
+				break
+			}
+		}
+		if start < 0 {
+			return nil, &model.Error{Code: model.CodeCursorInvalid,
+				Message: "cursor names no record in this capsule projection"}
+		}
+	}
+	end := min(start+limit, len(rows))
+	return append([]model.CapsuleRow(nil), rows[start:end]...), nil
 }
 
 func (s *fakeStore) Capsule(_ context.Context, session model.SessionID, actor string) (model.Capsule, error) {
@@ -1298,7 +1376,18 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	later := fixtureNow.Add(72 * time.Hour)
 	restamped := first
 	restamped.CreatedAt = later
-	if got := canonicalCapsuleHash(restamped); got != first.CanonicalHash {
+	// Re-hashing needs the SEAL's record source, not the stored rows: a row read
+	// back is data and is refused by the digest, which is what stops a capsule
+	// from being re-identified out of its own storage.
+	src, err := h.svc.capsuleRecords(ctx, rec, g)
+	if err != nil {
+		t.Fatalf("rebuild the sealed capsule's record source: %v", err)
+	}
+	got, err := model.CapsuleCanonicalHash(ctx, restamped, src)
+	if err != nil {
+		t.Fatalf("re-hash the restamped capsule: %v", err)
+	}
+	if got != first.CanonicalHash {
 		t.Fatalf("the canonical hash moved with CreatedAt: %s before, %s after", first.CanonicalHash, got)
 	}
 
@@ -1363,10 +1452,23 @@ func capsuleCarriesStoredWaivers(t *testing.T, h *harness) {
 	if err != nil {
 		t.Fatalf("seal a capsule for a waived session: %v", err)
 	}
-	if len(c.Waivers) != 1 {
-		t.Fatalf("the sealed capsule carries %d waivers; the session recorded 1", len(c.Waivers))
+	if n := c.Counts.Of(model.CapsuleListWaivers); n != 1 {
+		t.Fatalf("the sealed capsule counts %d waivers; the session recorded 1", n)
 	}
-	if got := c.Waivers[0]; got.FileID != fileWaived || got.Reason != "vendored generated code" {
+	// The records are rows: the capsule counts them and the paged reader is the
+	// only way back to them, so the read-back goes through it.
+	rows, err := h.store.CapsuleRows(ctx, fixtureSession, fixtureActor, model.CapsuleListWaivers, "", 10)
+	if err != nil {
+		t.Fatalf("page the sealed capsule's waivers: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("paging the capsule's waivers read %d records; the session recorded 1", len(rows))
+	}
+	var got model.WaiverRecord
+	if err := json.Unmarshal(rows[0].JSON, &got); err != nil {
+		t.Fatalf("decode the sealed waiver: %v", err)
+	}
+	if got.FileID != fileWaived || got.Reason != "vendored generated code" {
 		t.Fatalf("the capsule carries waiver %s/%q, not the stored %s/%q",
 			got.FileID, got.Reason, fileWaived, "vendored generated code")
 	}
