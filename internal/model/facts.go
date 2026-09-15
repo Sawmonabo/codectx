@@ -26,6 +26,7 @@ const (
 	NodeDependency     NodeKind = "dependency"
 	NodeConfiguration  NodeKind = "configuration"
 	NodeDocument       NodeKind = "document"
+	NodeSection        NodeKind = "section"
 	NodeEndpoint       NodeKind = "endpoint"
 	NodeDatabaseEntity NodeKind = "database_entity"
 )
@@ -37,7 +38,7 @@ func (k NodeKind) Valid() bool {
 	case NodeRepository, NodeDirectory, NodeFile, NodePackage, NodeModule, NodeNamespace,
 		NodeFunction, NodeMethod, NodeClass, NodeInterface, NodeStruct, NodeEnum,
 		NodeField, NodeVariable, NodeConstant, NodeTest, NodeBuildTarget, NodeDependency,
-		NodeConfiguration, NodeDocument, NodeEndpoint, NodeDatabaseEntity:
+		NodeConfiguration, NodeDocument, NodeSection, NodeEndpoint, NodeDatabaseEntity:
 		return true
 	}
 	return false

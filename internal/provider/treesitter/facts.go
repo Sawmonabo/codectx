@@ -66,11 +66,17 @@ type builder struct {
 	relOrder []model.RelationID
 	aliases  []model.NativeAlias
 	search   []model.SearchUnit
-	// dropped counts what this file's bounds kept out of the facts:
-	// occurrences past the per-fact evidence bound, calls past the
-	// callee-reference bound, and declaration or call-site keys over
-	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
+	// dropped counts what this file's bounds kept out of the facts: calls
+	// past the callee-reference bound, and declaration or call-site keys
+	// over MaxNativeKeyBytes. Occurrences cut by the per-fact evidence clip
+	// are counted in clipped instead, so the operator can attribute them.
+	// Any of it makes the file's coverage partial.
 	dropped int
+	// clipped counts the evidence occurrences the per-fact clip kept out.
+	// It is disclosed on the file's capability as `evidence_clipped`, the
+	// same detail key the filesystem provider uses for the same bound, so a
+	// clip is attributable instead of folded into the generic dropped count.
+	clipped int
 	// evidenceClip is the effective per-fact evidence bound (Options
 	// MaxEvidencePerFact); 0 means the model's record ceiling.
 	evidenceClip int
@@ -732,10 +738,28 @@ func (b *builder) addEvidence(id model.NodeID, rng *model.SourceRange, nativeKey
 		return
 	}
 	if b.evidenceFull(len(b.nodes[i].Evidence)) {
-		b.dropped++
+		b.clipped++
 		return
 	}
 	b.nodes[i].Evidence = append(b.nodes[i].Evidence, b.evidence(b.nodes[i].Node.ID, "", rng, nativeKey, ""))
+}
+
+// detailEvidenceClipped is the capability detail key under which a per-fact
+// evidence clip is disclosed. It is the key the filesystem provider already
+// uses for the same bound, so one clip reads the same wherever it is applied.
+const detailEvidenceClipped = "evidence_clipped"
+
+// bounds folds this file's bound accounting into the capability state it is
+// reported on. The evidence clip is attributed under detailEvidenceClipped
+// instead of the generic dropped count, so an operator can tell a clip they
+// configured from any other bound; the bool reports whether any bound -- clip
+// or otherwise -- made this file's coverage partial, so attributing the clip
+// never costs the partial signal.
+func (b *builder) bounds(state model.CapabilityState) (model.CapabilityState, bool) {
+	if b.clipped > 0 {
+		state = state.WithDetail(detailEvidenceClipped, strconv.Itoa(b.clipped))
+	}
+	return state, b.dropped > 0 || b.clipped > 0
 }
 
 // evidenceFull reports whether a fact already carries every occurrence this
@@ -769,7 +793,7 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 		b.relOrder = append(b.relOrder, id)
 	}
 	if b.evidenceFull(len(f.Evidence)) {
-		b.dropped++
+		b.clipped++
 		return
 	}
 	f.Evidence = append(f.Evidence, b.evidence("", id, rng, nativeKey, detail))

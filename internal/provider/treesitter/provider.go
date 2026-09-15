@@ -255,7 +255,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	result.RecordsEmitted = records
-	if ex.done.SyntaxErrors || ex.done.Truncated || b.dropped > 0 {
+	state, bounded := b.bounds(state)
+	if ex.done.SyntaxErrors || ex.done.Truncated || bounded {
 		return finish(model.CapabilityPartial, model.CodeCoverageIncomplete)
 	}
 	return finish(model.CapabilityFresh, "")

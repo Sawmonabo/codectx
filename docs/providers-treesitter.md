@@ -184,7 +184,10 @@ Relations, all with `syntax` evidence carrying the exact byte range:
 
 Occurrences past `MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) on one relation or node are
 counted and the file's capability state becomes `partial`; nothing is dropped
-silently. The unresolved callees one file may mint are bounded the same way: at
+silently. That count is disclosed on its own, under the `evidence_clipped`
+capability detail -- the same key the filesystem provider reports the same
+bound with -- so an operator can tell how many occurrences their clip cut apart
+from every other bound this file reached. The unresolved callees one file may mint are bounded the same way: at
 most 2000 distinct placeholders, after which a cross-file call is counted, not
 minted, and the file is `partial`. Without that bound a generated or minified
 file with tens of thousands of distinct callee names would publish a node, a
@@ -203,7 +206,7 @@ recorded) with one `structure` capability state at the file's scope:
 | State | DiagnosticCode | Meaning |
 |---|---|---|
 | `fresh` | – | parsed without syntax errors, every record within bounds |
-| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was dropped, the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
+| `partial` | `CTX_COVERAGE_INCOMPLETE` | tree contains ERROR/MISSING nodes, a per-file record bound was reached, a record was over the frame cap, evidence past the per-fact bound was cut (counted under the `evidence_clipped` detail), the file reached the 2000 distinct unresolved-callee bound, or a declaration's cross-provider key was over `MaxNativeKeyBytes` and omitted |
 | `unavailable` | `CTX_RESOURCE_LIMIT` | file larger than `workspace.max_parse_file_bytes`; not streamed |
 | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` | not valid UTF-8, or no pinned grammar for the file |
 
