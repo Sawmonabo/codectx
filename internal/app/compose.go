@@ -453,12 +453,13 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// does not hold is still planned and fetched by the first unit that needs
 	// it; construction installs nothing either way.
 	sp, err := scip.New(ctx, scip.Options{
-		Import:   o.scipImport,
-		Manifest: o.scipManifest,
-		Resolver: s.resolver,
-		Runner:   shared,
-		Timeout:  cfg.Providers.SCIP.Timeout.Std(),
-		WorkDir:  scipWorkDir,
+		Import:       o.scipImport,
+		Manifest:     o.scipManifest,
+		Resolver:     s.resolver,
+		Runner:       shared,
+		Timeout:      cfg.Providers.SCIP.Timeout.Std(),
+		StallTimeout: cfg.Providers.SCIP.StallTimeout.Std(),
+		WorkDir:      scipWorkDir,
 	})
 	if err != nil {
 		return nil, err
@@ -610,6 +611,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 			p, err = dependence.New(backend, dependence.Options{
 				DataDir:                s.dataDir,
 				Timeout:                s.cfg.Providers.Dependence.Timeout.Std(),
+				StallTimeout:           s.cfg.Providers.Dependence.StallTimeout.Std(),
 				CacheBytes:             s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes:   s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,

@@ -62,10 +62,23 @@ type Spec struct {
 	Stderr         io.Writer
 	MaxStdoutBytes int64
 	MaxStderrBytes int64
-	// Timeout bounds the whole run. Grace is how long the process tree has to
-	// exit after a graceful stop before it is forced.
+	// Timeout bounds the whole run. Zero means no wall-clock bound: an
+	// analysis unit on a monorepo is large, not wedged, and a clock cannot
+	// tell the two apart. StallTimeout is what catches a wedged tree -- see
+	// below -- and Grace is how long the process tree has to exit after a
+	// graceful stop before it is forced.
 	Timeout time.Duration
 	Grace   time.Duration
+	// StallTimeout is a hang detector, not a size limit: how long the tree may
+	// make no observable progress at all before it is terminated with the stop
+	// reason "stalled". Progress is any byte read from stdout or stderr --
+	// counted before any output limit and whether or not the bytes are kept --
+	// and, where the platform can sample a running tree, any advance of its
+	// consumed CPU time. Zero disables the detector.
+	//
+	// It replaces the wall clock rather than supplementing it: however large
+	// the repository, a wedged process still makes no progress.
+	StallTimeout time.Duration
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
 	// native child can temporarily exceed a reservation, and only an OS control
@@ -228,8 +241,13 @@ func (s Spec) validate() error {
 			return invalidArgument("env[%d] is not a KEY=VALUE pair", i)
 		}
 	}
-	if s.Timeout <= 0 || s.Grace <= 0 {
-		return resourceLimit("timeout %s and grace %s must both be positive; an unbounded child is never admitted", s.Timeout, s.Grace)
+	if s.Timeout < 0 || s.StallTimeout < 0 {
+		return resourceLimit("timeout %s and stall timeout %s may not be negative; zero means no bound", s.Timeout, s.StallTimeout)
+	}
+	if s.Grace <= 0 {
+		// Grace is not a bound on the repository but the window a tree gets to
+		// exit once it has been asked to, so it is always finite.
+		return resourceLimit("grace %s must be positive", s.Grace)
 	}
 	if s.MaxStdoutBytes <= 0 || s.MaxStderrBytes <= 0 {
 		return resourceLimit("output limits are %d and %d; both must be positive", s.MaxStdoutBytes, s.MaxStderrBytes)
@@ -369,11 +387,22 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	go func() { defer drains.Done(); errPipe.drain() }()
 	go func() { drains.Wait(); close(drained) }()
 
-	timer := time.NewTimer(spec.Timeout)
-	defer timer.Stop()
+	// A zero timeout is no wall clock at all, and a nil channel blocks forever
+	// in a select -- which is exactly the wanted behaviour. A zero-length timer
+	// would instead fire immediately and kill every run.
+	var deadline <-chan time.Time
+	if spec.Timeout > 0 {
+		timer := time.NewTimer(spec.Timeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	// The watchdog is joined before this function returns, like the sampler:
+	// no goroutine this package starts outlives the run that started it.
+	watchdog := startStallWatchdog(spec.StallTimeout, outPipe, errPipe, sampler)
+	defer watchdog.stopWatching()
 
 	waiter := newWaiter(cmd)
-	reason, unreaped := waitForExit(ctx, timer.C, job, cmd, spec, outPipe, errPipe, waiter)
+	reason, unreaped := waitForExit(ctx, deadline, job, cmd, spec, outPipe, errPipe, watchdog, waiter)
 	var waitErr error
 	if !unreaped {
 		waitErr = waiter.wait()
@@ -407,7 +436,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// output while being torn down is still a cancelled run: Section 22
 	// requires cancellation not to be reported as a failure, and a Result that
 	// denied it would make the two disagree.
-	result.TimedOut = reason == stopTimeout
+	result.TimedOut = reason == stopTimeout || reason == stopStalled
 	result.Canceled = reason == stopCanceled
 
 	if unreaped {
@@ -428,6 +457,12 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
 	case stopTimeout:
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
+	case stopStalled:
+		// A stall is a timeout in kind -- the tree was terminated for making no
+		// progress -- so it reuses the typed code and is distinguished by the
+		// stop reason, which is what a caller reports.
+		return result, timedOut("%s made no progress for %s and was terminated", filepath.Base(spec.Path), spec.StallTimeout).
+			WithDetail("stop_reason", stopStalled.String())
 	case stopCanceled:
 		return result, model.Canceled(ctx.Err())
 	}
@@ -476,6 +511,7 @@ const (
 	stopCanceled
 	stopTimeout
 	stopOutputLimit
+	stopStalled
 )
 
 func (r stopReason) String() string {
@@ -486,6 +522,8 @@ func (r stopReason) String() string {
 		return "timeout"
 	case stopOutputLimit:
 		return "output_limit"
+	case stopStalled:
+		return "stalled"
 	default:
 		return "exited"
 	}
@@ -499,7 +537,7 @@ func (r stopReason) String() string {
 // uninterruptible kernel operation cannot be killed at all, and blocking on it
 // would hang the caller with no diagnosis.
 func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, cmd *exec.Cmd,
-	spec Spec, outPipe, errPipe *streamPipe, w *waiter) (stopReason, bool) {
+	spec Spec, outPipe, errPipe *streamPipe, watchdog *stallWatchdog, w *waiter) (stopReason, bool) {
 	var reason stopReason
 	select {
 	case <-w.exited:
@@ -512,6 +550,8 @@ func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, 
 		reason = stopOutputLimit
 	case <-errPipe.limitHit:
 		reason = stopOutputLimit
+	case <-watchdog.stalledC():
+		reason = stopStalled
 	}
 
 	// Graceful stop for the whole tree, then a forced one for whatever ignored
