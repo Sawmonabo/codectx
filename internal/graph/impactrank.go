@@ -346,16 +346,6 @@ type rankedTail struct {
 // this handle mints no continuation.
 func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total }
 
-// errNotImplemented marks the lane seams this freeze declares and does not
-// fill: runWalkToCompletion (lane P-b), rankImpact and rankPairs (P-b/P-c) and
-// servePage (P-INT). It is an internal error rather than a panic so a build
-// that wired one up early fails the request it was asked about instead of the
-// process.
-func errNotImplemented(op string) error {
-	return (&model.Error{Code: model.CodeInternal,
-		Message: "graph: this operation is not implemented in this build"}).WithDetail("operation", op)
-}
-
 // rankPairs is the same two passes over the package rollup (ruling P4): pass 1
 // keys lessByPairKey and folds foldPair, so the counts it reports are exact
 // sums over the whole walk rather than over one page; pass 2 keys lessByPair,
