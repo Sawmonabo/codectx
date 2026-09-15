@@ -212,6 +212,11 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 
 		next := carry
 		carry = nil
+		// How many of THIS level's rows the visitor has taken. A stop on the
+		// first of them is a stop at a level BOUNDARY however it was triggered:
+		// nothing here has advanced the keyset position, so the one the page
+		// carries still names the level before this one.
+		taken := 0
 		for _, row := range rows {
 			if err := visit(row.owner, row.rel); err != nil {
 				if errors.Is(err, errStopExpansion) {
@@ -222,10 +227,12 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 					stopped := make([]frontierState, 0, len(frontier)+len(next))
 					stopped = append(stopped, frontier...)
 					stopped = append(stopped, next...)
-					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
+					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
+						LevelBoundary: taken == 0}, nil
 				}
 				return walkState{}, err
 			}
+			taken++
 			admittedRel[row.rel.ID] = true
 			o.Budget.edges++
 			o.Budget.pageEdges++
@@ -291,11 +298,19 @@ type walkState struct {
 	// in heap; the remainder is the continuation spool (visited.go).
 	Admitted *visitedSet
 	// LevelBoundary records that the walk stopped BETWEEN levels rather than
-	// inside one: the level in Frontier has not been read at all yet. The
+	// inside one: no row of the level in Frontier has been taken yet. The
 	// keyset position the page last emitted belongs to the level BEFORE it, so
 	// a continuation must not carry it -- applied to the new level it would
-	// silently drop every row whose owner sorts below that node. Only the
-	// deadline stops here; every other stop is mid-level by construction.
+	// silently drop every row whose owner sorts below that node, and those rows
+	// are lost for good because their owners are already in the cumulative
+	// visited set.
+	//
+	// Two stops reach it. The deadline, which can trip on a level's first
+	// reader check. And the PAGE ITEM limit, which spends its last item on the
+	// previous level and stops the visitor on this level's very first row:
+	// measured on an owner-major fixture at page limits 1, 2, 4 and 8, a
+	// neighbours walk ended with 39 of 57 nodes visited, no truncation reason
+	// and no cursor.
 	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.

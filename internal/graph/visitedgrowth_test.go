@@ -240,3 +240,83 @@ func TestANeighboursPageAppendsOnlyItsOwnAdmissions(t *testing.T) {
 		}
 	}
 }
+
+// TestASmallPageNeighboursWalkReachesEveryNode is the page-limit half of the
+// level-boundary rule, and it is a silent-truncation proof.
+//
+// The page item limit can spend its last item on one level and stop the visitor
+// on the very FIRST row of the next. Nothing on that new level has advanced the
+// keyset position, so the continuation carries the previous level's -- and
+// levelEdges applies a carried position as a FILTER, dropping every row of the
+// new level whose owner sorts below it. Those owners are already in the
+// cumulative visited set, so no later page can reach them: the walk ends with
+// no cursor, no truncation reason, and a fraction of the graph. A short answer
+// presented as a whole one is the one failure the paging contract may not have.
+//
+// Measured before the fix, on this owner-major fixture (57 reachable nodes):
+//
+//	limit 1: 38 pages, visited 39, reason "", cursor false
+//	limit 2: 19 pages, visited 39, reason "", cursor false
+//	limit 4: 10 pages, visited 39, reason "", cursor false
+//	limit 8:  5 pages, visited 39, reason "", cursor false
+//
+// (limit 3 happened to reach 57 -- whether the loss occurs at all depends on
+// where the item limit falls relative to a level edge, which is why the case
+// sweeps several limits rather than picking one.)
+//
+// Mutation (applied, run, reverted in one command): expand's errStopExpansion
+// branch returning LevelBoundary:false as it did -- every limit but 3 fails
+// with the figures above.
+func TestASmallPageNeighboursWalkReachesEveryNode(t *testing.T) {
+	// 8 mids x 6 leaves plus the seed: 57 nodes the walk must visit, over a
+	// fixture whose reader is owner-major, so nothing here depends on the
+	// order a fixture happens to return rows in.
+	const want = 57
+	f := newReachableFixture(t, 8, 6)
+	for _, limit := range []int{1, 2, 3, 4, 8} {
+		signer, err := pagination.OpenSigner(t.TempDir())
+		if err != nil {
+			t.Fatalf("open signer: %v", err)
+		}
+		leases := newFixtureLeases()
+		spools, err := pagination.NewSpools(t.TempDir(), 0, leases)
+		if err != nil {
+			t.Fatalf("new spools: %v", err)
+		}
+		limits := fixtureLimits()
+		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+		limits.MaxPageItems = limit
+		limits.QueryTimeout = 10 * time.Minute
+		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+			Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		req := model.GraphRequest{GenerationID: 1,
+			Start:     []model.NodeID{fixtureNodeID("bound-seed")},
+			Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+		var res model.GraphResult
+		for pages := 1; ; pages++ {
+			if pages > 5000 {
+				t.Fatalf("limit %d: the walk did not terminate after %d pages", limit, pages-1)
+			}
+			res, err = e.Neighbors(context.Background(), req)
+			if err != nil {
+				t.Fatalf("limit %d page %d: %v", limit, pages, err)
+			}
+			if res.Meta.NextCursor == "" {
+				break
+			}
+			req.Page, req.GenerationID = model.PageRequest{Cursor: res.Meta.NextCursor}, 0
+		}
+		if res.VisitedCount != want {
+			t.Fatalf("at page limit %d the walk ended having visited %d of %d nodes, with "+
+				"truncation_reason %q and no cursor: a walk that stops short must say so",
+				limit, res.VisitedCount, want, res.Meta.TruncationReason)
+		}
+		if res.Meta.Truncated {
+			t.Fatalf("at page limit %d the complete walk reports truncation %q",
+				limit, res.Meta.TruncationReason)
+		}
+	}
+}
