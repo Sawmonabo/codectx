@@ -85,8 +85,9 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 		},
 	}
 	// The store a tools command reports on is the one the repository at --repo
-	// would resolve through, because the data directory is per workspace unless
-	// tools.cache_dir names a shared one.
+	// would resolve through. That is the shared machine-wide store unless the
+	// user pointed tools.cache_dir somewhere else, so --repo matters only for a
+	// host whose configuration varies by repository.
 	tools.PersistentFlags().String(toolsRepoFlag, ".", "repository whose resolved configuration selects the tool store")
 
 	status := &cobra.Command{

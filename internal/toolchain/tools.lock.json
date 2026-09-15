@@ -255,57 +255,57 @@
       "platforms": {
         "darwin_amd64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-x86_64.zip",
-          "sha256": "05619b23e6442cc88a18b51351444e8a68de9008dd32169113a38939042a510a",
-          "size": 1788168970,
+          "sha256": "d64b04ac064fae83519abf1953874f19bc6fe5db2988bd5e63c0ac2982047313",
+          "size": 1788168850,
           "entry": "joern-cli/joern-parse",
           "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
           "provenance": "upstream",
-          "upstream_digest": "sha512:82529f1e1c15f28986646d079b4799c1c0b5d205548ecb6ec75d3a83bb964454897ca2874521a3f23a1b785e6c15acd4ee865c69e870c267e0dabbf268fc2fc0"
+          "upstream_digest": "sha512:66df6519dccc738f7d3e97bbd02c4ba01dde823696dfff85f762c70013db460f268c3eee1856160d52f345f63d65bc6e5fc6406b129f26aeac65d997431fc808"
         },
         "darwin_arm64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-macos-arm64.zip",
-          "sha256": "307aa0fab71f585780bdce5234af2cd4fe1c98ee411184d9b3f75ed04613b7b5",
-          "size": 1782363428,
+          "sha256": "7981b5ca98b72e75775df49b4ab5a1b178b0bc356a17b69ea150bf1bc95abfe6",
+          "size": 1782363526,
           "entry": "joern-cli/joern-parse",
           "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
           "provenance": "upstream",
-          "upstream_digest": "sha512:d955cceef62db4d9d3dcbab81cc98c3f6cf4bceb71bcf6805e46adc6e986f83a0dc4ba985880353ed51348b462d44b09ea5d32e94514822bdf4134a323502c7b"
+          "upstream_digest": "sha512:7390e85475760d959a687767c448b174760bbca5032aa27855d750869610f85f861191b3dd6ac4909c17c7fc6aae38b0c49c05d879058efdd6af8f084cc30807"
         },
         "linux_amd64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-x86_64.zip",
-          "sha256": "964655bdffeea5564eb4ed37f58b640c42226b43aae792aeca5f0e02796e120f",
+          "sha256": "083528101fc5c8a802c652e50896c709b7162ed0e74729c3ad0ac3dee1b83cb0",
           "size": 1858298613,
           "entry": "joern-cli/joern-parse",
           "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
           "provenance": "upstream",
-          "upstream_digest": "sha512:9d82111631f6fc62a0280e20e40c84adb6875df295d1d50fa78a7b2913d00c1c83cfb7018911c45f1f203892185339633627745f8aaede02a2101b0e4d47bf3b"
+          "upstream_digest": "sha512:f4ecca6132b70a530c54aa30554172d5f17cd4856547667f4043d06027451da4a73b5ca2446a2a1b3f183d0247810db378941ae36e3cb8ba03fba715ae5d1b67"
         },
         "linux_arm64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-linux-arm64.zip",
-          "sha256": "6b181cba5be8da6bd22131eb4616da2a0eb36941ffe6b03981c5f54ab2fea198",
+          "sha256": "957baed63f6d9575822291616b89de7728ba56097eb2384d51927fb2d7d4d5ab",
           "size": 1855668243,
           "entry": "joern-cli/joern-parse",
           "entry_sha256": "93e88d1b810383e3b1bccc1350501129a28f1ae80a44c0a34179673fd76fd4cd",
           "provenance": "upstream",
-          "upstream_digest": "sha512:89a19b09e444b70266cbfb2cf12aab1b034c63c2d45217b2e3bbcc1d153906dc50a3649aeafec2eb67551865c29e30d6931d0489567bd8355ac606b10baced2c"
+          "upstream_digest": "sha512:cd5fa7fcc1dec27e43be1949cca7de946b1e214761f9e645a32438f7e850ee10e8fe16ced2dec2712cb171ed3204d76dca10df9d28b97a896af4c8391436430c"
         },
         "windows_amd64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-x86_64.zip",
-          "sha256": "ef15bdf9d5980e131573d9327cda3b02c9fbdfad6e6d9af2ec232233cb07cc60",
+          "sha256": "9ede70b1526d9df28e1b5906b8ef622d246b26118cb017f3c4976942129a21be",
           "size": 1809069240,
           "entry": "joern-cli/joern-parse.bat",
           "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
           "provenance": "upstream",
-          "upstream_digest": "sha512:4b158b39756669bdd1e8dc886f4107cdb50a63fb4c0ab8a705e5f305b51168cce0e0f2b8707ec73a554a4b5a25789425284d871ebb8d9fbfe8b986d190a84f04"
+          "upstream_digest": "sha512:768c287800b3d31301399c07cb9ae2c95ec7c4cfd2cb19486effef35d2be68a51ce4139912c9a4aac09e2a1be912d766243cb9599ac0c09e411dfd998447e285"
         },
         "windows_arm64": {
           "url": "https://github.com/joernio/joern/releases/download/v4.0.627/joern-cli-windows-arm64.zip",
-          "sha256": "b89ed4a68b594ba66ee520081132f1fc5af9bee329c6eae5b265a2c67b6634c4",
+          "sha256": "4b0ce42888a5695a18cd07b505150853cd8125f70bf861772b2aecd5469aab07",
           "size": 1803909501,
           "entry": "joern-cli/joern-parse.bat",
           "entry_sha256": "db35da2f77ce97036b52adec3fbe83323243d3745e4e1427f02eb152f328c368",
           "provenance": "upstream",
-          "upstream_digest": "sha512:2c95805da89d9156ca12dd864d7cdfbdb3ab3ebec42e66086dd9eebfaa26aa9e5529f2333c8c67408070b3d11fa2b7e967627559732704e57736c45704506b22"
+          "upstream_digest": "sha512:6472ee939ede652037102d6cd4935dc4d6d3868a90bf0fb65690f6bd2dc067e9d4b60cc47f8a03f2492b24fb9abd1848c919b5a6cdd6b6c7d147a07f41c7cfe0"
         }
       },
       "languages": [

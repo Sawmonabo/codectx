@@ -16,6 +16,9 @@
 #   --version <X.Y.Z|latest>  release to install (default: latest)
 #   --prefix <dir>            install directory (default: $HOME/.local/bin)
 #   --bundle                  install the offline bundle (binary + tool store)
+#   --no-tools                install only the binary; do not install the toolchain
+#   --tools-for-repo <dir>    install only the tools that repository needs
+#   --dry-run                 print what would be done; write nothing, fetch nothing
 #   -h, --help                print this help
 #
 # Environment:
@@ -28,6 +31,9 @@ ctx_releases_url="${CODECTX_INSTALL_BASE_URL:-https://github.com/Sawmonabo/codec
 ctx_version=latest
 ctx_prefix="${HOME:-}/.local/bin"
 ctx_bundle=no
+ctx_no_tools=no
+ctx_tools_for_repo=
+ctx_dry_run=no
 ctx_tmp=
 
 ctx_log() { printf '%s\n' "codectx: $1" >&2; }
@@ -54,7 +60,19 @@ Options:
   --version <X.Y.Z|latest>  release to install (default: latest)
   --prefix <dir>            install directory (default: $HOME/.local/bin)
   --bundle                  install the offline bundle (binary + tool store)
+  --no-tools                install only the binary; do not install the toolchain
+  --tools-for-repo <dir>    install only the tools that repository needs, instead
+                            of every pinned tool
+  --dry-run                 print what would be done; write nothing, fetch nothing
   -h, --help                print this help
+
+After the binary is installed and verified, the installer runs
+"codectx tools prefetch" so every pinned analyzer, language server and runtime
+is present before the first index. They land in one machine-wide store,
+$XDG_DATA_HOME/codectx/tools, shared by every repository on this host. The
+whole toolchain is several gigabytes; --tools-for-repo installs the subset one
+repository selects, and --no-tools skips it entirely (a later run installs each
+tool on demand).
 
 Environment:
   CODECTX_INSTALL_BASE_URL  releases base URL, for mirrors and testing
@@ -95,6 +113,23 @@ ctx_parse_args() {
 			ctx_bundle=yes
 			shift
 			;;
+		--no-tools)
+			ctx_no_tools=yes
+			shift
+			;;
+		--tools-for-repo)
+			[ "$#" -ge 2 ] || ctx_die "--tools-for-repo needs a value"
+			ctx_tools_for_repo="$2"
+			shift 2
+			;;
+		--tools-for-repo=*)
+			ctx_tools_for_repo="${1#--tools-for-repo=}"
+			shift
+			;;
+		--dry-run)
+			ctx_dry_run=yes
+			shift
+			;;
 		-h | --help)
 			ctx_usage
 			exit 0
@@ -105,6 +140,9 @@ ctx_parse_args() {
 		esac
 	done
 	[ -n "$ctx_prefix" ] || ctx_die "--prefix must not be empty"
+	if [ "$ctx_no_tools" = yes ] && [ -n "$ctx_tools_for_repo" ]; then
+		ctx_die "--no-tools skips the toolchain, so it cannot be combined with --tools-for-repo"
+	fi
 }
 
 # ctx_require_tools fails closed when a tool the verified path needs is absent,
@@ -216,10 +254,61 @@ Nothing was installed. Re-run, or report this release as corrupt."
 	ctx_log "SHA-256 verified: $ctx_expected"
 }
 
+# ctx_install_tools installs the pinned toolchain with the binary that was just
+# verified and copied, so the product works on its first index instead of
+# fetching gigabytes in the middle of one. The payloads land in the shared
+# machine-wide store the binary resolves by default, which is the same store the
+# bundle path populates.
+#
+# The prefetch streams one line per tool as it lands; that output is the log the
+# operator watches, so it is deliberately not captured or quieted.
+#
+# A failed prefetch does not un-install the binary and does not fail the script:
+# the binary is installed and correct, every tool is still installed on demand
+# by the first run that needs it, and turning a transient network fault into a
+# non-zero install would be a worse answer than saying which step to re-run.
+ctx_install_tools() {
+	if [ "$ctx_no_tools" = yes ]; then
+		ctx_log "skipping the toolchain (--no-tools); each tool installs on demand"
+		return 0
+	fi
+	if [ "$ctx_bundle" = yes ]; then
+		ctx_log "the bundle already carries every pinned tool; not fetching any"
+		return 0
+	fi
+	if [ -n "$ctx_tools_for_repo" ]; then
+		ctx_log "installing the pinned tools $ctx_tools_for_repo selects"
+		set -- tools prefetch --for-repo "$ctx_tools_for_repo"
+	else
+		ctx_log "installing every pinned tool (several gigabytes; --no-tools skips it)"
+		set -- tools prefetch --all
+	fi
+	if [ "$ctx_dry_run" = yes ]; then
+		ctx_log "dry run: would run $ctx_prefix/codectx $*"
+		return 0
+	fi
+	if "$ctx_prefix/codectx" "$@"; then
+		ctx_log "the pinned toolchain is installed"
+	else
+		ctx_log "the toolchain did not finish installing. The binary is installed and every tool is still fetched on demand; to retry now, run: codectx tools prefetch --all"
+	fi
+}
+
 ctx_main() {
 	ctx_parse_args "$@"
 	ctx_require_tools
 	ctx_detect_platform
+
+	# A dry run answers "what would this do here" without a network call and
+	# without touching the prefix, so it stops before the release is resolved:
+	# resolving "latest" is itself a request. It still reports the toolchain
+	# step, which is the part an operator sizing an install wants to see.
+	if [ "$ctx_dry_run" = yes ]; then
+		ctx_log "dry run: would install codectx $ctx_version for $ctx_os/$ctx_arch into $ctx_prefix"
+		ctx_install_tools
+		return 0
+	fi
+
 	ctx_resolve_version
 
 	ctx_tmp="$(mktemp -d)" || ctx_die "could not create a temporary directory"
@@ -264,13 +353,15 @@ ctx_main() {
 			ctx_die "could not copy the bundled tool store into $ctx_store_dir"
 		chmod 0700 "$ctx_store_dir"
 		ctx_log "installed the bundled tool store to $ctx_store_dir"
-		ctx_log "to use it offline, add to ${XDG_CONFIG_HOME:-${HOME:-}/.config}/codectx/config.toml:
+		ctx_log "that is the store codectx reads by default, so nothing needs configuring.
+To refuse every network fetch as well, add to ${XDG_CONFIG_HOME:-${HOME:-}/.config}/codectx/config.toml:
 
   [tools]
   offline = true
-  cache_dir = \"$ctx_store_dir\"
 "
 	fi
+
+	ctx_install_tools
 
 	case ":${PATH:-}:" in
 	*":$ctx_prefix:"*) ;;

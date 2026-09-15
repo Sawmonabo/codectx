@@ -33,6 +33,25 @@ platform, verifies its SHA-256 against the release's `checksums.txt` **before it
 extracts anything**, and installs into `~/.local/bin`. It fetches nothing that
 `checksums.txt` does not name.
 
+It then installs the pinned toolchain -- every analyzer, language server and
+runtime the product runs -- with the binary it just verified, so the first index
+of the first repository runs at full precision instead of stopping to download
+gigabytes. They land in one machine-wide store, `$XDG_DATA_HOME/codectx/tools`,
+shared by every repository on the host, so this happens once per machine and not
+once per checkout.
+
+The whole toolchain is several gigabytes. Two options narrow it:
+
+```sh
+# only the tools this repository's languages select
+curl -fsSL .../install.sh | sh -s -- --tools-for-repo .
+
+# binary only; each tool is then installed on demand by the first run that needs it
+curl -fsSL .../install.sh | sh -s -- --no-tools
+```
+
+`--dry-run` prints what an install would do without fetching or writing anything.
+
 ### Install a pinned version
 
 Pin the release in CI and anywhere a reproducible install matters:
@@ -43,10 +62,10 @@ curl -fsSL https://github.com/Sawmonabo/codectx/releases/download/v1.2.3/install
 ```
 
 `--bundle` installs the bundle archive instead — the same binary plus the managed
-tool store already populated for your platform. The script installs the store but
-does not edit your configuration: it prints the `[tools] offline` and
-`[tools] cache_dir` block to add, and until you add it the binary resolves tools
-under the per-workspace default store and may still fetch on first use. See
+tool store already populated for your platform, and no prefetch, since the
+payloads are already there. It unpacks the store into the shared location the
+binary reads by default, so nothing needs configuring. To refuse network fetches
+outright as well, add the `[tools] offline` line it prints. See
 [docs/toolchain.md](docs/toolchain.md#offline-hosts-and-bundle-archives).
 
 ### Download, inspect, then run

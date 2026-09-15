@@ -336,3 +336,57 @@ func TestEvidenceClipIsUserSetAndRekeysUnits(t *testing.T) {
 		t.Errorf("rejection does not name the key: %s", ctxErr.Message)
 	}
 }
+
+// TestToolStoreIsSharedByEveryWorkspace protects the product's "works off the
+// bat" posture: the managed toolchain is gigabytes of payloads that are
+// byte-identical for every checkout, so the store they land in must be one
+// machine-wide directory. A per-workspace default made every new repository
+// start with nothing installed and re-download the whole toolchain, which is
+// what this asserts can no longer happen.
+//
+// It also pins the path itself to the one the installer's bundle path writes,
+// because a bundle that populated a directory the product does not read would
+// be an offline install that still tries to dial out.
+func TestToolStoreIsSharedByEveryWorkspace(t *testing.T) {
+	base := t.TempDir()
+	data := filepath.Join(base, "data")
+	userDir := filepath.Join(base, "config")
+	mustMkdir(t, filepath.Join(userDir, appDirName))
+	userConfigDir = func() (string, error) { return userDir, nil }
+	userCacheDir = func() (string, error) { return filepath.Join(base, "cache"), nil }
+	userDataDir = func() (string, error) { return data, nil }
+	t.Cleanup(func() {
+		userConfigDir = os.UserConfigDir
+		userCacheDir = os.UserCacheDir
+		userDataDir = osUserDataDir
+	})
+
+	want := filepath.Join(data, appDirName, "tools")
+	first := filepath.Join(base, "repo-one")
+	second := filepath.Join(base, "repo-two")
+	mustMkdir(t, first)
+	mustMkdir(t, second)
+
+	one, err := Load(first)
+	if err != nil {
+		t.Fatalf("Load(repo-one): %v", err)
+	}
+	two, err := Load(second)
+	if err != nil {
+		t.Fatalf("Load(repo-two): %v", err)
+	}
+	if one.Tools.CacheDir != want || two.Tools.CacheDir != want {
+		t.Fatalf("tool store per workspace: repo-one %q, repo-two %q, want both %q",
+			one.Tools.CacheDir, two.Tools.CacheDir, want)
+	}
+	// The data directories must still differ, or the shared store would have
+	// been bought by making two checkouts share one index.
+	if one.Storage.DataDir == two.Storage.DataDir {
+		t.Fatalf("both workspaces resolved data directory %q; the store is shared, the index is not", one.Storage.DataDir)
+	}
+	// Nothing is created by resolution: a read-only command must not leave a
+	// store behind on a host that has never installed a payload.
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Fatalf("Load created the tool store: stat = %v, want not-exist", err)
+	}
+}
