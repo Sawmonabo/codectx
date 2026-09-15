@@ -618,7 +618,7 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		if err != nil {
 			return nil, err
 		}
-		if s.Retain, err = reopenRetainedWalk(dir, c.RetainID); err != nil {
+		if s.Retain, err = reopenRetainedWalk(dir, c.RetainID, e.probe); err != nil {
 			return nil, err
 		}
 		// The cumulative admitted set and its membership summary come from the
