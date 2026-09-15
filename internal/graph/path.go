@@ -4,8 +4,10 @@ import (
 	"container/heap"
 	"context"
 	"errors"
+	"math"
 	"sort"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -84,9 +86,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	w := &pathWalk{
 		adjacency:  e.adjacency,
 		kinds:      kinds,
-		maxDepth:   pathBound(req.MaxDepth, e.limits.MaxDepth),
-		maxVisited: int64(pathBound(req.MaxVisited, e.limits.MaxVisited)),
-		maxEdges:   int64(e.limits.MaxEdges),
+		maxDepth:   pathBound(req.MaxDepth, e.limits.Depth()),
+		maxVisited: int64(pathBound(req.MaxVisited, e.limits.Visited())),
+		maxEdges:   e.limits.Edges().ValueOr(math.MaxInt64),
 		dist:       map[model.NodeID]int64{},
 		depth:      map[model.NodeID]int{},
 		settled:    map[model.NodeID]bool{},
@@ -99,7 +101,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 	var routes [][]model.Relation
 	if w.settled[req.To] {
-		want := min(e.limits.MaxReasonPaths, model.MaxReasonPathsPerEntry)
+		// ValueOr before min: an unlimited bound is the top of the lattice, so
+		// it must fall back to the wire ceiling rather than min to zero routes.
+		want := min(int(e.limits.ReasonPaths().ValueOr(model.MaxReasonPathsPerEntry)), model.MaxReasonPathsPerEntry)
 		var capped bool
 		routes, capped = w.routes(req.From, req.To, want)
 		if capped {
@@ -150,9 +154,21 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 // pathBound resolves a request bound: zero means "the configured default", and
 // a request may only narrow the engine's limit, never widen it.
-func pathBound(requested, limit int) int {
-	if requested <= 0 || requested > limit {
-		return limit
+//
+// The configured bound is a Section 20.1 Limit, where zero is unlimited and
+// therefore the TOP of the lattice: it never narrows the request, and with no
+// request it is no bound at all. Read as a plain integer it would be the
+// bottom instead, and the walk's counters -- every one of them a `>=` against
+// this value -- would stop before their first edge. Unlimited resolves to the
+// largest representable count rather than to a flag because all three counters
+// are compared, never reported, and a flag on each would have to be threaded
+// through every comparison to say the same thing.
+func pathBound(requested int, limit config.Limit) int {
+	if requested <= 0 {
+		return int(limit.ValueOr(math.MaxInt))
+	}
+	if limit.Exceeded(int64(requested)) {
+		return limit.Int()
 	}
 	return requested
 }

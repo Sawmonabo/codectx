@@ -135,6 +135,11 @@ func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
 func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
 func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
 
+// ReasonPaths is the fourth: how many reason paths one entry may carry. It is
+// read the same way, because an unlimited bound spelled 0 read as a plain
+// integer is a request for no paths at all.
+func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPaths) }
+
 // Engine answers graph queries against one pinned generation. One Engine is
 // built per request, which is why the concurrency Gate is passed in rather than
 // owned here.
