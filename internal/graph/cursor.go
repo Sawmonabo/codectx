@@ -217,6 +217,11 @@ type resumeState struct {
 	// by the walk: materializing it here was the last repository-sized heap
 	// structure on the traversal path (visited.go).
 	Visited visitedStream
+	// Filter summarizes the nodes Visited will replay. It is built during the
+	// replay below -- which already decodes every record to rebuild the
+	// frontier -- so it costs no extra I/O, and it lets a level whose
+	// candidates are all freshly reached skip the stream entirely.
+	Filter *visitedFilter
 	// Release ends the replayed continuation's spool and lease. The caller
 	// defers it: the spool must outlive the walk, because both the membership
 	// probes and the next page's spill read from it.
@@ -321,6 +326,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	// against the other refused the third page of any walk whose budget it was
 	// working correctly. A tampered or oversized spool is caught by the byte
 	// budget, which is also what keeps peak heap a function of page size.
+	// The membership summary is sized from the cumulative admitted count the
+	// cursor already carries and clamped to a fraction of the walk's own memory
+	// ceiling, so a walk of any size costs a bounded number of filter bytes; a
+	// walk past the clamp gets a denser filter (more false positives, more
+	// sweeps), never a refusal or a truncation.
+	s.Filter = newVisitedFilter(c.Visited, e.limits.FrontierBytes/visitedFilterBudgetShare)
 	err = e.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
 		var r spoolRecord
 		if err := json.Unmarshal(record, &r); err != nil {
@@ -335,6 +346,10 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		default:
 			return cursorInvalid("continuation state is not readable")
 		}
+		// Every record's node, whatever its kind, is a node s.Visited replays,
+		// so the summary must hold it: the filter and the stream describe
+		// exactly the same set.
+		s.Filter.add(r.Node)
 		return nil
 	})
 	if err != nil {
