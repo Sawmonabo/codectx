@@ -31,7 +31,7 @@ func TestALevelCutBetweenRecordsAndBitsLosesNothingAndAdmitsNothingTwice(t *test
 		{Depth: 1, Cost: 2, Node: 12, Via: 5, Route: []RelRef{1, 5}},
 	}
 	dir := t.TempDir()
-	w, err := openRetainedWalk(dir, 64, &heapProbe{})
+	w, err := openRetainedWalk(dir, walkBounds{Node: 64, Relation: 64}, &heapProbe{})
 	if err != nil {
 		t.Fatalf("open retained walk: %v", err)
 	}
@@ -53,7 +53,7 @@ func TestALevelCutBetweenRecordsAndBitsLosesNothingAndAdmitsNothingTwice(t *test
 		t.Fatalf("close the cut walk: %v", err)
 	}
 
-	resumed, err := reopenRetainedWalk(w.dir, "", 64, &heapProbe{})
+	resumed, err := reopenRetainedWalk(w.dir, "", walkBounds{Node: 64, Relation: 64}, &heapProbe{})
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

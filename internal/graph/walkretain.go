@@ -98,10 +98,8 @@ type retainedWalk struct {
 	pairs   *retainFile
 }
 
-// openRetainedWalk creates a fresh retained input under parent. maxNode is the
-// pinned generation's largest node surrogate, which sizes the bitset's ADDRESS
-// space; nothing is allocated for it.
-func openRetainedWalk(parent string, maxNode NodeRef, probe *heapProbe) (*retainedWalk, error) {
+// openRetainedWalk creates a fresh retained input under parent.
+func openRetainedWalk(parent string, max walkBounds, probe *heapProbe) (*retainedWalk, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
 	}
@@ -114,7 +112,7 @@ func openRetainedWalk(parent string, maxNode NodeRef, probe *heapProbe) (*retain
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	if err = w.openSets(maxNode, probe); err != nil {
+	if err = w.openSets(max, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
@@ -123,29 +121,41 @@ func openRetainedWalk(parent string, maxNode NodeRef, probe *heapProbe) (*retain
 
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
-func reopenRetainedWalk(dir, prevID string, maxNode NodeRef, probe *heapProbe) (*retainedWalk, error) {
+func reopenRetainedWalk(dir, prevID string, max walkBounds, probe *heapProbe) (*retainedWalk, error) {
 	w := &retainedWalk{dir: dir, prevID: prevID}
 	if err := w.open(); err != nil {
 		return nil, err
 	}
-	if err := w.openSets(maxNode, probe); err != nil {
+	if err := w.openSets(max, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
 	return w, nil
 }
 
-// openSets opens the two cumulative sets this directory holds. The relation set
-// is opened UNBOUNDED because the frozen reader port publishes no maximum
-// relation surrogate; the cursor's generation fence is what keeps a foreign
-// surrogate out of it.
-func (w *retainedWalk) openSets(maxNode NodeRef, probe *heapProbe) error {
+// openSets opens the two cumulative sets this directory holds, each bounded by
+// the pinned generation's largest surrogate of its kind. A ref above either
+// bound came from another generation and is refused by RANGE before the
+// cursor's fence is ever consulted.
+func (w *retainedWalk) openSets(max walkBounds, probe *heapProbe) error {
 	var err error
-	if w.bits, err = openBitset(w.dir, bitsetNodeFile, maxNode, probe); err != nil {
+	if w.bits, err = openBitset(w.dir, bitsetNodeFile, uint64(max.Node), probe); err != nil {
 		return err
 	}
-	w.emitted, err = openBitset(w.dir, bitsetRelFile, 0, probe)
+	w.emitted, err = openBitset(w.dir, bitsetRelFile, uint64(max.Relation), probe)
 	return err
+}
+
+// walkBounds is the pinned generation's surrogate range. It sizes the two sets'
+// ADDRESS space; nothing is allocated for it.
+type walkBounds struct {
+	Node     NodeRef
+	Relation RelRef
+}
+
+// boundsOf reads that range off the reader the request is pinned to.
+func boundsOf(r GraphReader) walkBounds {
+	return walkBounds{Node: r.MaxNode(), Relation: r.MaxRelation()}
 }
 
 func (w *retainedWalk) open() error {
@@ -656,7 +666,7 @@ func (e *Engine) openWalkState() (*retainedWalk, error) {
 	if err != nil {
 		return nil, err
 	}
-	return openRetainedWalk(e.walkScratchDir(), reader.MaxNode(), e.probe)
+	return openRetainedWalk(e.walkScratchDir(), boundsOf(reader), e.probe)
 }
 
 // reopenWalkState reopens the retained walk a continuation names, through the
@@ -666,5 +676,5 @@ func (e *Engine) reopenWalkState(dir, prevID string) (*retainedWalk, error) {
 	if err != nil {
 		return nil, err
 	}
-	return reopenRetainedWalk(dir, prevID, reader.MaxNode(), e.probe)
+	return reopenRetainedWalk(dir, prevID, boundsOf(reader), e.probe)
 }

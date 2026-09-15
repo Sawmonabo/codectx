@@ -140,6 +140,38 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 		}
 	}
 
+	// MaxRelation bounds the walk's cumulative emitted-relation set exactly as
+	// MaxNode bounds its visited set. A reader that under-reports it would make
+	// the walk refuse a relation its own generation carries; one that reported
+	// a bound no relation reaches would leave the range check inert. Both are
+	// caught by asserting the EQUALITY against every relation the generation
+	// makes visible.
+	t.Run("MaxRelation is the largest visible relation surrogate", func(t *testing.T) {
+		owners := make([]graph.NodeRef, 0, g.MaxNode())
+		for ref := graph.NodeRef(1); ref <= g.MaxNode(); ref++ {
+			owners = append(owners, ref)
+		}
+		var largest graph.RelRef
+		if _, err := g.Neighbours(ctx, owners, model.DirectionBoth, nil, graph.EdgePos{},
+			func(e graph.Edge) error {
+				if e.Rel > largest {
+					largest = e.Rel
+				}
+				if e.Rel > g.MaxRelation() {
+					t.Fatalf("relation surrogate %d exceeds MaxRelation %d, so the emitted-relation "+
+						"set sized from MaxRelation would refuse an edge of this generation",
+						e.Rel, g.MaxRelation())
+				}
+				return nil
+			}); err != nil {
+			t.Fatalf("scan every owner: %v", err)
+		}
+		if largest != g.MaxRelation() {
+			t.Fatalf("MaxRelation = %d, but the largest relation any scan makes visible is %d",
+				g.MaxRelation(), largest)
+		}
+	})
+
 	t.Run("kind dictionary round-trips", func(t *testing.T) {
 		if _, ok := g.Kinds().Kind(0); ok {
 			t.Fatal("Kinds().Kind(0) resolved; code 0 must be unused so a zero value is never a kind")

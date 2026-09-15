@@ -75,7 +75,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 	}
 	maxNode := refs[len(refs)-1]
 
-	set, err := openBitset(dir, bitsetNodeFile, maxNode, nil)
+	set, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	resumed, err := openBitset(dir, bitsetNodeFile, maxNode, nil)
+	resumed, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
