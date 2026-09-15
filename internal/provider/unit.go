@@ -112,15 +112,21 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 
 // reportDegradations folds the sink's counted degradations into the unit's
 // capability rows, which is where a generation stores what a run had to give
-// up. The row's state is left alone: a bound that was reported rather than
-// enforced cost the answer nothing, so calling the capability partial would
-// claim a loss that did not happen -- the details say the record was larger
-// than the bound the user asked to be told about.
+// up.
 //
-// A provider that published no capability row at all has no other place to
-// carry this, so one fresh row per declared capability is synthesized; the
-// descriptor's list is the provider's own static declaration, so it is small
-// and does not grow with the repository.
+// A row this marks is partial, not fresh, and that is forced rather than
+// chosen: the generation's fold collapses every fresh row to one
+// workspace-scoped row and DISCARDS its details
+// (internal/index/status.go:269-272), so a degradation carried on a fresh row
+// reaches no caller at all. State is the only channel that survives the fold,
+// and silence is what the scale posture forbids outright. A row that is
+// already partial, failed or unavailable keeps the state and code it has:
+// those are more severe and their details already survive.
+//
+// A provider that published no capability row has no other place to carry
+// this, so one row per declared capability is synthesized; the descriptor's
+// list is the provider's own static declaration, so it is small and does not
+// grow with the repository.
 func reportDegradations(states []model.CapabilityState, degraded []Degradation, desc model.ProviderDescriptor, unit model.UnitSpec) []model.CapabilityState {
 	if len(degraded) == 0 {
 		return states
@@ -132,6 +138,12 @@ func reportDegradations(states []model.CapabilityState, degraded []Degradation, 
 		}
 	}
 	for i, st := range states {
+		if st.State == model.CapabilityFresh {
+			st.State = model.CapabilityPartial
+			if st.DiagnosticCode == "" {
+				st.DiagnosticCode = model.CodeResourceLimit
+			}
+		}
 		for _, d := range degraded {
 			st = st.WithDetail("over_"+d.Limit, strconv.FormatUint(d.Count, 10)).
 				WithDetail(d.Limit, strconv.FormatInt(d.Bound, 10)).
