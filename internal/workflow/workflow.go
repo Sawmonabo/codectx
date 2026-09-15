@@ -165,6 +165,19 @@ type Limits struct {
 	// default false). It never changes StrictGateSatisfied, which stays false
 	// whenever any waiver exists.
 	AllowExploratoryWaiverConsolidation bool
+	// StrictReadGateDisabled is context.strict_read_gate (user-level only,
+	// default TRUE) as this service reads it, inverted by the caller so that
+	// the zero value here is the enforcing one: a Limits built without this
+	// field can never silently relax the gate.
+	//
+	// When it is set, readiness precondition 3 -- every required file fully
+	// served to this actor at the pinned hashes -- no longer shuts the gate.
+	// The shortfall is not forgiven, it is reported: the gate records that the
+	// read was left unconfirmed, its reason names the configuration, and Strict
+	// -- and therefore the capsule's StrictGateSatisfied, which is taken
+	// straight from it -- stays false. A disabled gate never stamps a strict
+	// claim over a read nothing verified.
+	StrictReadGateDisabled bool
 }
 
 // Service is the Section 17 workflow service. Every field is read-only after
@@ -250,6 +263,13 @@ type gate struct {
 	// strict implementation readiness; Strict is the strict gate itself, which
 	// is false whenever any waiver exists.
 	ReadComplete, Ready, Strict, ScopeComplete bool
+	// ReadGateDisabled records that precondition 3 was skipped because
+	// Limits.StrictReadGateDisabled is set AND the read was in fact
+	// incomplete. It is what holds Strict -- and the capsule stamp taken from
+	// it -- false over an unconfirmed read, and it is why the reason names the
+	// configuration rather than telling the operator to read files the
+	// configuration excused.
+	ReadGateDisabled bool
 	// Superseded reports that a newer generation is active than the one this
 	// session pinned. It rides on the gate rather than beside it because Ready
 	// is defined in terms of it and every gate reader must see the same answer.
