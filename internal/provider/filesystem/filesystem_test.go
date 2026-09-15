@@ -217,3 +217,71 @@ func TestBinaryDecisionIsAProportion(t *testing.T) {
 		}
 	}
 }
+
+// factSink records the node facts a unit publishes while still persisting
+// them, so a test can assert how much evidence one fact actually carries.
+type factSink struct {
+	provider.UnitOutput
+	facts []model.NodeFact
+}
+
+func (f *factSink) PutNodes(ctx context.Context, facts []model.NodeFact) error {
+	f.facts = append(f.facts, facts...)
+	return f.UnitOutput.PutNodes(ctx, facts)
+}
+
+// TestEvidenceClipIsHonouredAndDisclosed protects the user-set evidence clip
+// on the emitter every file-scoped provider publishes through. Two silent
+// failures: a clip that is ignored stores occurrences the operator asked not to
+// keep, and a clip applied without the capability detail leaves an answer built
+// from these facts unable to say how much evidence it is missing. Unlimited
+// (the default) must keep every occurrence.
+func TestEvidenceClipIsHonouredAndDisclosed(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		clip           int
+		wantEvidence   int
+		wantDisclosure string
+	}{
+		{"user-set clip of 3", 3, 3, "2"},
+		{"unlimited keeps every occurrence", 0, 5, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := map[string]string{"cmd/app/main.go": "package main\n\nfunc main() {}\n"}
+			h := providertest.New(t, files)
+			p, err := filesystem.New(filesystem.Options{MaxEvidencePerFact: tc.clip})
+			if err != nil {
+				t.Fatal(err)
+			}
+			u := h.Plan(t, p, filesystem.ScopeKey("cmd/app/main.go"), []string{"cmd/app/main.go"})
+			rec := &factSink{UnitOutput: h.Begin(t, u, []string{"cmd/app/main.go"})}
+			fv := h.File(t, "cmd/app/main.go")
+			e := filesystem.NewEmitter(u.Request, rec, fv, tc.clip)
+			e.Capability(filesystem.CapabilityStructure, model.CapabilityFresh, "")
+			cand := model.NodeCandidate{ProviderID: "filesystem", ScopeKey: filesystem.ScopeKey("cmd/app/main.go"),
+				NativeKey: "main.go", Kind: model.NodeFile, Name: "main.go", FileID: fv.ID, ContentHash: fv.ContentHash}
+			// Five distinct occurrences of one identity: distinct ranges, so
+			// none of them is the duplicate the emitter drops for free.
+			for i := range 5 {
+				rng := &model.SourceRange{Start: model.Position{Byte: uint64(i), Line: 1},
+					End: model.Position{Byte: uint64(i) + 1, Line: 1, Column: 1}}
+				if _, err := e.Node(context.Background(), cand, filesystem.Attrs{Precision: model.PrecisionSyntax, Range: rng}); err != nil {
+					t.Fatalf("Node: %v", err)
+				}
+			}
+			if err := e.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if len(rec.facts) != 1 {
+				t.Fatalf("emitter published %d node facts, want 1", len(rec.facts))
+			}
+			if got := len(rec.facts[0].Evidence); got != tc.wantEvidence {
+				t.Errorf("fact carries %d evidence occurrences, want %d", got, tc.wantEvidence)
+			}
+			got := e.Result().Capabilities[0].Details["evidence_clipped"]
+			if got != tc.wantDisclosure {
+				t.Errorf("evidence_clipped detail is %q, want %q", got, tc.wantDisclosure)
+			}
+		})
+	}
+}

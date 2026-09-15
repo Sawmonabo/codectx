@@ -325,7 +325,11 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		BatchRecords:      cfg.Index.BatchRecords,
 		BatchBytes:        cfg.Index.BatchBytes,
 		MaxJSONBytes:      cfg.Context.MaxManifestBytes.Value(),
-		Synchronous:       cfg.Storage.Synchronous,
+		// Seal clips to the same number the providers emitted under, so the
+		// retained set does not depend on whether a unit was assembled fresh
+		// or merged from carried occurrences.
+		MaxEvidencePerFact: evidenceClip(cfg),
+		Synchronous:        cfg.Storage.Synchronous,
 	}); err != nil {
 		return nil, err
 	}
@@ -446,13 +450,15 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 
-	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes})
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes,
+		MaxEvidencePerFact: evidenceClip(cfg)})
 	if err != nil {
 		return nil, err
 	}
 	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
 		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries,
-		MaxTOMLLines: cfg.Providers.Manifest.MaxTOMLLines, MaxXMLElements: cfg.Providers.Manifest.MaxXMLElements})
+		MaxTOMLLines: cfg.Providers.Manifest.MaxTOMLLines, MaxXMLElements: cfg.Providers.Manifest.MaxXMLElements,
+		MaxEvidencePerFact: evidenceClip(cfg)})
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +469,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
+		MaxEvidencePerFact:  evidenceClip(cfg),
 		WorkerMemoryBytes:   parserWorkerReservationBytes,
 		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner:              parsers,
@@ -481,6 +488,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Timeout:      cfg.Providers.SCIP.Timeout.Std(),
 		StallTimeout: cfg.Providers.SCIP.StallTimeout.Std(),
 		WorkDir:      scipWorkDir,
+		// The clip the whole process emits under, so a SCIP edge and a
+		// tree-sitter node of the same run keep the same number of
+		// occurrences.
+		MaxEvidencePerFact: evidenceClip(cfg),
 		// MaxRecordBytes is deliberately absent: it is the wire reader's
 		// pre-allocation ceiling, product code rather than configuration, and
 		// taking it from an unlimited resources key would silently clamp it.
@@ -653,6 +664,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
 				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
 				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
+				MaxEvidencePerFact:     evidenceClip(s.cfg),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
@@ -1155,6 +1167,15 @@ func (s *stack) Close() error {
 // is the only thing that refuses a fetch, because a second resolver that
 // refused them regardless reported a payload that is merely not installed as a
 // payload the operator's own offline setting withheld.
+// evidenceClip is index.max_evidence_per_fact as the finite number every
+// producer and the seal compare against. Unlimited (the default) is the model's
+// record ceiling: a fact can never carry more occurrences than the record
+// tolerates, so "no clip" and "the ceiling" are the same instruction. Resolving
+// it once here is what keeps the providers and storage clipping to one number.
+func evidenceClip(cfg config.Config) int {
+	return int(cfg.Index.MaxEvidencePerFact.ValueOr(model.MaxEvidencePerFact))
+}
+
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
 	// directory is per workspace and the store under it is <data_dir>/tools,
