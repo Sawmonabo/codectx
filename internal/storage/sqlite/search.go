@@ -64,7 +64,7 @@ var searchColumns = map[string]SearchColumn{
 // searchDocumentColumns is every search_units column except body: Section 14.2
 // forbids source bodies in generic results, and a body would also dominate the
 // memory one hydrated page costs.
-const searchDocumentColumns = `su.rowid, su.search_key, su.node_id, su.file_id, su.path, su.kind, su.name,
+const searchDocumentColumns = `su.rowid, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
 	su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count`
 
 // visibleDocument restricts a search_units alias to the pinned generation
@@ -132,7 +132,10 @@ func (r *PinnedReader) NodesInFile(ctx context.Context, file model.FileID, after
 	keyset := ""
 	args := []any{r.gen, fileRaw}
 	if afterRaw != nil {
-		keyset = " AND (" + startKey + " > ?3 OR (" + startKey + " = ?3 AND nf.node_id > ?4))"
+		// ?4 is the canonical NodeID the cursor carries, matched against the
+		// dictionary column, never against node_facts.node_id -- that column is
+		// now a rebuild-local surrogate (scale-posture-plan.md 3d).
+		keyset = " AND (" + startKey + " > ?3 OR (" + startKey + " = ?3 AND ni.canonical > ?4))"
 		args = append(args, afterStart, afterRaw)
 	}
 	// Duplicate node ids at one offset are collapsed by the Section 9.4
@@ -144,7 +147,7 @@ func (r *PinnedReader) NodesInFile(ctx context.Context, file model.FileID, after
 	query := `SELECT ` + nodeColumns + ` FROM node_facts nf` + r.visible("nf") +
 		`JOIN node_ids ni ON ni.id = nf.node_id LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
 		WHERE nf.file_id = ?2` + keyset + `
-		ORDER BY ` + startKey + `, nf.node_id, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key`
+		ORDER BY ` + startKey + `, ni.canonical, CASE u.source_binding WHEN 'verified' THEN 0 ELSE 1 END, u.provider_id, u.unit_key`
 	var out []StoredNode
 	err = r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, query, args...)
@@ -317,6 +320,7 @@ func (r *PinnedReader) SearchDocuments(ctx context.Context, rowids []int64) ([]S
 		args = append(args, id)
 	}
 	query := `SELECT ` + searchDocumentColumns + ` FROM search_units su
+		LEFT JOIN node_ids ni ON ni.id = su.node_id
 		WHERE su.rowid IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su")
 	byRowID := make(map[int64]SearchDocument, len(rowids))
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
