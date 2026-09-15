@@ -318,7 +318,10 @@ compile. A deadline or a cancellation persists no manifest. A **cancellation**
 is an explicit incomplete answer (`CTX_CANCELED`); a **deadline** ends the pass
 the compile is in rather than the answer, and `context plan` returns
 `truncated = deadline` with a `next_cursor` you present back as `--cursor` to
-resume at the first unfinished pass. The plan the final call returns is the one
+resume at the first unfinished pass. This includes a deadline that fires while
+the required-scope graph walk is still running: the pass ends with the walk's
+place in hand and the continuation carries it on from there, so no leg of the
+walk is ever thrown away. The plan the final call returns is the one
 an uninterrupted compile would have produced. See
 [Context sessions](context-sessions.md#a-plan-that-runs-out-of-query-deadline-continues-it-does-not-fail).
 `CTX_QUERY_DEADLINE` is still raised for the compile callers that have no

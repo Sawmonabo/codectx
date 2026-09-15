@@ -83,6 +83,18 @@ type checkpointScalars struct {
 	ScopeComplete    bool                    `json:"scope_complete"`
 	ReasonsDropped   int64                   `json:"reasons_dropped,omitempty"`
 	ReasonsTruncated int64                   `json:"reasons_truncated,omitempty"`
+	// WalkCursor, WalkStart and Seq are the passIngest boundary's own carry:
+	// the graph walk's continuation, the root list every leg of the walk must
+	// repeat byte for byte (it is inside the walk's query hash) and the seed
+	// sink's arrival counter. They are empty at every other boundary.
+	//
+	// WalkStart is the one field here sized by the seed set rather than by a
+	// verdict, and it adds no memory class the pass does not already hold: P-A
+	// passes the identical slice to graph.Impact on every page, so a walk that
+	// can run at all can carry its own roots.
+	WalkCursor string         `json:"walk_cursor,omitempty"`
+	WalkStart  []model.NodeID `json:"walk_start,omitempty"`
+	Seq        int64          `json:"seq,omitempty"`
 }
 
 // checkpointVersion is the on-disk shape of a compile's continuation state.
@@ -334,6 +346,11 @@ const (
 // stream names inside a checkpoint. They are the state file's keys, so they are
 // constants rather than literals at the checkpoint and restore call sites.
 const (
+	streamSeedEntity = "seed-entity"
+	streamSeedCand   = "seed-cand"
+	streamSeedPath   = "seed-path"
+	streamSeedHop    = "seed-hop"
+
 	streamCands     = "cands"
 	streamHydrated  = "hydrated"
 	streamRoutes    = "route-path"
@@ -366,6 +383,12 @@ const (
 // this build does not resume.
 func passStreams(pass int) []string {
 	switch pass {
+	case passIngest:
+		// P-A halted INSIDE itself, between two pages of the graph walk: the
+		// carry is the sink's four PRE-fold sorts, none of them folded and none
+		// of them merged. seedSort is deliberately absent -- foldSeeds consumed
+		// it and nothing after it reads it, or `stages`, or `resolved`.
+		return []string{streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop}
 	case passHydrate:
 		return []string{streamCands, streamRoutes, streamHops}
 	case passAttributes:
@@ -408,6 +431,35 @@ func cpRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T]
 	return checkpointRun(dir, name, runBytes, run, compare, sizeOf)
 }
 
+// cpSort is checkpointSort with the boundary's own liveness check, the
+// pre-fold counterpart of cpRun: checkpointSort answers no files for a nil
+// sorter, which a restore would read as an empty stream rather than a lost one.
+func cpSort[T any](dir, name string, sorter *pagination.ExternalSort[T]) ([]string, error) {
+	if sorter == nil {
+		return nil, missingStream(name)
+	}
+	return checkpointSort(dir, name, sorter)
+}
+
+// checkpointIngest persists one of P-A's four pre-fold sorts. They live on the
+// halted seed sink rather than on st, because they are one pass's working set
+// and not a finished stream any later pass reads.
+func (st *compileState) checkpointIngest(dir, name string) ([]string, error) {
+	if st.ingest == nil {
+		return nil, missingStream(name)
+	}
+	switch name {
+	case streamSeedEntity:
+		return cpSort(dir, name, st.ingest.entitySort)
+	case streamSeedCand:
+		return cpSort(dir, name, st.ingest.candSort)
+	case streamSeedPath:
+		return cpSort(dir, name, st.ingest.pathSort)
+	default:
+		return cpSort(dir, name, st.ingest.hopSort)
+	}
+}
+
 // checkpointStream persists ONE named stream of st into dir. The two-class rule
 // at the top of this file is applied here, at the call site, which is why this
 // is a switch over names rather than a loop over an interface: streamEdges is
@@ -415,6 +467,8 @@ func cpRun[T any](dir, name string, runBytes int64, run *pagination.SortedRun[T]
 // checkpointSort.
 func (st *compileState) checkpointStream(dir, name string, runBytes int64) ([]string, error) {
 	switch name {
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
+		return st.checkpointIngest(dir, name)
 	case streamCands:
 		return cpRun(dir, name, runBytes, st.cands, lessCandSeq, sizeOfCand)
 	case streamHydrated:
@@ -489,6 +543,28 @@ func (st *compileState) measuredRun(name string) *pagination.SortedRun[candRec] 
 func (st *compileState) restoreStream(s *compileSorts, dir, name string, files []string) error {
 	var err error
 	switch name {
+	case streamSeedEntity, streamSeedCand, streamSeedPath, streamSeedHop:
+		if st.ingest == nil {
+			return missingStream(name)
+		}
+	}
+	switch name {
+	case streamSeedEntity:
+		// The seed/entity union fold, restored PRE-fold with the exact fold it
+		// was built with: without foldMinSeq a boundary the walk reaches twice
+		// stops collapsing onto its earliest arrival, and the continuation
+		// serves duplicates the uninterrupted walk never had.
+		var sorter *pagination.ExternalSort[candRec]
+		sorter, err = restoreSort(s, dir, name, files, lessEntityID, sizeOfCand)
+		if err == nil {
+			st.ingest.entitySort = sorter.WithFold(foldMinSeq)
+		}
+	case streamSeedCand:
+		st.ingest.candSort, err = restoreSort(s, dir, name, files, lessCandSeq, sizeOfCand)
+	case streamSeedPath:
+		st.ingest.pathSort, err = restoreSort(s, dir, name, files, lessPathSeq, sizeOfPath)
+	case streamSeedHop:
+		st.ingest.hopSort, err = restoreSort(s, dir, name, files, lessHopSeq, sizeOfHop)
 	case streamCands:
 		st.cands, err = restoreRun(s, dir, name, files, lessCandSeq, sizeOfCand)
 	case streamHydrated:
@@ -625,16 +701,22 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 		return "", &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
 	}
 	runBytes := pagination.SortRunBytes(int64(c.cfg.Resources.QueryMemoryBytes))
+	scalars := checkpointScalars{
+		Completeness:     st.scope.Completeness,
+		ScopeComplete:    st.scopeComplete,
+		ReasonsDropped:   st.scope.ReasonsDropped,
+		ReasonsTruncated: st.scope.ReasonsTruncated,
+	}
+	if st.ingest != nil {
+		scalars.WalkCursor = st.ingest.cursor
+		scalars.WalkStart = st.ingest.start
+		scalars.Seq = st.ingest.seq
+	}
 	state := checkpointState{
 		Pass:        st.pass,
 		RequestHash: requestHash,
 		Streams:     make(map[string][]string, len(names)),
-		Scalars: checkpointScalars{
-			Completeness:     st.scope.Completeness,
-			ScopeComplete:    st.scopeComplete,
-			ReasonsDropped:   st.scope.ReasonsDropped,
-			ReasonsTruncated: st.scope.ReasonsTruncated,
-		},
+		Scalars:     scalars,
 	}
 	fail := func(err error) (string, error) {
 		_ = os.RemoveAll(dir)
@@ -661,6 +743,13 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 	if len(names) == 0 {
 		return cursorExpired("the continuation state was written at a boundary this build does not resume")
 	}
+	if r.State.Pass == passIngest {
+		// The sink the four pre-fold sorts restore INTO. It is opened before
+		// the loop, empty of sorts, because restoreStream fills them one name
+		// at a time; seedSort, stages and resolved stay zero, which is exactly
+		// what the resumed walk reads of them.
+		st.ingest = c.resumedIngest(s, r.State.Scalars)
+	}
 	for _, name := range names {
 		files, ok := r.State.Streams[name]
 		if !ok {
@@ -678,4 +767,30 @@ func (c *Compiler) restoreAt(s *compileSorts, r *resumedHalf, st *compileState) 
 	}
 	st.scopeComplete = r.State.Scalars.ScopeComplete
 	return nil
+}
+
+// resumedIngest rebuilds P-A's seed sink from a passIngest checkpoint's
+// scalars, so the resumed walk re-enters expandScopeStream's page loop with the
+// place, the roots and the arrival counter the interrupted one left.
+//
+// started is true: foldSeeds has already run and cannot run again -- seedSort
+// was consumed by it and is not part of the carry -- and the root list it built
+// is restored verbatim because graph.Impact binds it into the walk's query hash.
+// The scope verdict is seeded from the checkpoint's write-once-false flag, so
+// an unresolved seed or a cut the first leg disclosed still narrows the plan.
+func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIngest {
+	return &seedIngest{
+		sorts:   s,
+		cfg:     c.cfg.Context,
+		seq:     sc.Seq,
+		start:   sc.WalkStart,
+		cursor:  sc.WalkCursor,
+		started: true,
+		scope: scopeResult{
+			Completeness:     sc.Completeness,
+			ScopeComplete:    sc.ScopeComplete,
+			ReasonsDropped:   sc.ReasonsDropped,
+			ReasonsTruncated: sc.ReasonsTruncated,
+		},
+	}
 }
