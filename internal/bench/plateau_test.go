@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/worker"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
@@ -198,6 +199,7 @@ func TestIncrementalReuse(t *testing.T) {
 	if testing.Short() {
 		t.Skip("incremental reuse benchmark; run without -short")
 	}
+	testenv.SkipIfLoaded(t)
 	const files = 400
 	ctx := context.Background()
 	dir := t.TempDir()
