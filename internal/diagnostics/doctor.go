@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -25,6 +27,8 @@ const (
 	checkSuppliedIndex    = "supplied_index"
 	checkAnalyzerRestrict = "analyzer_restriction"
 	checkTemporaryState   = "temporary_state"
+	checkBundledGrammars  = "bundled_grammars"
+	checkCaptureFreshness = "capture_freshness"
 	// checkToolchainPrefix prefixes one check per lock entry; the suffix is
 	// the entry name from tools.lock.json, which is what a managed tool is
 	// called everywhere else in this product.
@@ -71,6 +75,15 @@ type suppliedIndexReader interface {
 	SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error)
 }
 
+// captureReader reports when the capture behind a generation was taken -- the
+// snapshot's own creation time, not the generation's. Like blobSampler it is an
+// optional interface on the frozen StoreReader, so a reader that cannot answer
+// makes the freshness check `unavailable` with its reason instead of leaving
+// Section 22's "recent capture/freshness" silently unreported.
+type captureReader interface {
+	GenerationCapturedAt(ctx context.Context, gen model.GenerationID) (time.Time, error)
+}
+
 // Doctor runs the Section 22 check list.
 //
 // Two rules shape the whole function. First, a probe failure is a *check*, not
@@ -88,19 +101,26 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 	if err := req.Validate(); err != nil {
 		return model.DoctorReport{}, err
 	}
-	checks := make([]model.DoctorCheck, 0, 16)
+	// One Stats read serves both the checks that need it. Two reads in one
+	// report can disagree with each other, and the accounting figures an
+	// operator is shown must be the same ones the retention sample reasoned
+	// about.
+	stats, statsErr := s.opts.Store.Stats(ctx)
+	checks := make([]model.DoctorCheck, 0, 24)
 	checks = append(checks,
 		s.checkBuild(),
 		s.checkDataDirectory(ctx),
 		s.checkFreeDisk(ctx),
 		s.checkStorage(ctx, req.Deep),
-		s.checkAccounting(ctx),
+		s.checkAccounting(stats, statsErr),
 	)
 	active, generationCheck := s.checkActive(ctx)
 	checks = append(checks,
 		generationCheck,
-		s.checkCAS(ctx, req.Deep),
+		s.checkCaptureFreshness(ctx, active),
+		s.checkCAS(ctx, req.Deep, stats, statsErr),
 		s.checkSuppliedIndex(ctx, active),
+		s.checkGrammars(),
 		s.checkTemporary(ctx),
 		s.checkAnalyzerRestriction(),
 	)
@@ -163,14 +183,26 @@ func (s *Service) checkBuild() model.DoctorCheck {
 		Detail: "version " + s.opts.Build.Version + ", commit " + s.opts.Build.Commit + ", output schema " + s.opts.Build.SchemaVersion}
 }
 
-// checkDataDirectory proves the data directory is writable. The directory is
-// not named in the detail: it is a private absolute path, and Section 21 keeps
-// those out of ordinary output.
+// checkDataDirectory proves the two directories this command needs: the data
+// directory, which must be writable, and the workspace root, which must be
+// readable. Neither is named in the detail: both are private absolute paths,
+// and Section 21 keeps those out of ordinary output.
+//
+// The workspace is probed for reading only. Section 6 forbids this product
+// writing into the repository at all, so the create-and-remove proof the data
+// directory gets would itself be the defect if it were aimed at the workspace;
+// reading one entry is the whole of what a capture asks of the root, and a root
+// this process cannot read produces an empty capture that reads as a repository
+// with nothing in it.
 func (s *Service) checkDataDirectory(ctx context.Context) model.DoctorCheck {
 	if err := s.opts.Workspace.Writable(ctx, s.opts.Config.Storage.DataDir); err != nil {
 		return failure(checkDataDirectory, err)
 	}
-	return model.DoctorCheck{Name: checkDataDirectory, State: model.CheckPass, Detail: "the data directory is readable and writable"}
+	if err := s.opts.Workspace.Readable(ctx, s.opts.Root); err != nil {
+		return failure(checkDataDirectory, err)
+	}
+	return model.DoctorCheck{Name: checkDataDirectory, State: model.CheckPass,
+		Detail: "the data directory is readable and writable, and the workspace root is readable"}
 }
 
 // checkFreeDisk is the first and only reader of resources.min_free_disk_bytes:
@@ -218,8 +250,7 @@ func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck
 // checkpoints is how a workspace runs a disk out of space while every
 // individual operation still succeeds. The lease and session counts are the
 // retention figures Section 22 asks for -- they are counts, never identities.
-func (s *Service) checkAccounting(ctx context.Context) model.DoctorCheck {
-	stats, err := s.opts.Store.Stats(ctx)
+func (s *Service) checkAccounting(stats StoreStats, err error) model.DoctorCheck {
 	if err != nil {
 		return failure(checkStorageAccount, err)
 	}
@@ -261,7 +292,7 @@ func (s *Service) checkActive(ctx context.Context) (model.GenerationID, model.Do
 // or replaced content-addressed object is therefore still reported as sound by
 // this check, and saying otherwise would grant exactly the false readiness
 // Section 22 exists to prevent.
-func (s *Service) checkCAS(ctx context.Context, deep bool) model.DoctorCheck {
+func (s *Service) checkCAS(ctx context.Context, deep bool, stats StoreStats, statsErr error) model.DoctorCheck {
 	sampler, ok := s.opts.Store.(blobSampler)
 	if !ok {
 		return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckUnavailable,
@@ -280,7 +311,7 @@ func (s *Service) checkCAS(ctx context.Context, deep bool) model.DoctorCheck {
 		// all quarantined or in trash returns nothing here, and reporting
 		// that as "nothing to verify" would read as a healthy empty
 		// workspace, so the accounting count decides which it is.
-		if stats, err := s.opts.Store.Stats(ctx); err == nil && stats.Blobs > 0 {
+		if statsErr == nil && stats.Blobs > 0 {
 			return model.DoctorCheck{Name: checkSourceRetention, State: model.CheckWarn,
 				Detail:      "this workspace records " + strconv.FormatInt(stats.Blobs, 10) + " retained objects, none of them in a readable state",
 				Code:        model.CodeSourceIntegrity,
@@ -325,7 +356,7 @@ func (s *Service) checkSuppliedIndex(ctx context.Context, active model.Generatio
 	switch {
 	case len(unresolved) > 0:
 		return model.DoctorCheck{Name: checkSuppliedIndex, State: model.CheckFail,
-			Detail:      "this generation was built with a supplied index at " + joinPaths(unresolved) + ", which matched no file and imported nothing",
+			Detail:      "this generation was built with a supplied index at " + joinNames(unresolved) + ", which matched no file and imported nothing",
 			Code:        model.CodeScopeIncomplete,
 			Remediation: "check the --scip-index path against the repository root and index again; the path is root-relative"}
 	case len(supplied) > 0:
@@ -376,6 +407,11 @@ func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 		switch st.State {
 		case toolchain.StateAvailable:
 			c.State = model.CheckWarn
+			// StateAvailable means the lock names a payload for this platform
+			// that is not on disk. Rendering the state word into the detail
+			// read as "gopls 0.23.0 is available", the opposite of what the
+			// remediation beside it tells the operator to do.
+			c.Detail = st.Name + " " + st.Version + " is pinned by the lock but not installed"
 			c.Code = model.CodeProviderUnavailable
 			c.Remediation = "run codectx tools install to fetch the payloads this lock names"
 		case toolchain.StateUnsupportedPlatform:
@@ -451,12 +487,13 @@ func failure(name string, err error) model.DoctorCheck {
 	return c
 }
 
-// joinPaths renders a bounded list of root-relative paths. The list is bounded
-// by the number of supplied indexes a generation records, and the detail is
+// joinNames renders a bounded list of names -- root-relative supplied-index
+// paths, configured language tags -- into one detail. Both lists are bounded by
+// the configuration or the generation that produced them, and the detail is
 // bounded again by model.MaxDetailBytes in DoctorCheck.Validate.
-func joinPaths(paths []string) string {
-	out := paths[0]
-	for _, p := range paths[1:] {
+func joinNames(names []string) string {
+	out := names[0]
+	for _, p := range names[1:] {
 		out += ", " + p
 	}
 	return out
@@ -487,4 +524,84 @@ func bytesPhrase(n int64) string { return strconv.FormatInt(n, 10) + " bytes" }
 func (s *Service) checkAnalyzerRestriction() model.DoctorCheck {
 	return model.DoctorCheck{Name: checkAnalyzerRestrict, State: model.CheckUnavailable,
 		Detail: "whether an OS-level restriction confines the analyzer subprocesses is not measured on this platform, so this installation neither claims nor denies that one is active"}
+}
+
+// checkGrammars answers Section 22's bundled-grammar question: whether this
+// build carries a structural grammar for every language the workspace has
+// configured. It reads the pinned registry compiled into this binary, because
+// the question is about this binary -- a figure handed in by a caller could
+// describe a build that is not the one running.
+//
+// A configured language this build bundles no grammar for is a failure, not a
+// warning: every file of that language is walked, planned and then parsed by
+// nothing, and the repository reads as fully indexed with its structure
+// missing. The provider refuses the same configuration when an indexing run
+// composes it; this check is where an operator learns it before the run.
+func (s *Service) checkGrammars() model.DoctorCheck {
+	ts := s.opts.Config.Providers.TreeSitter
+	if !ts.Enabled {
+		return model.DoctorCheck{Name: checkBundledGrammars, State: model.CheckUnavailable,
+			Detail: "structural analysis is disabled in this workspace, so no bundled grammar is required"}
+	}
+	var missing []string
+	for _, name := range ts.Languages {
+		if _, ok := lang.Lookup(name); !ok {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return model.DoctorCheck{Name: checkBundledGrammars, State: model.CheckFail,
+			Detail:      "this build bundles no structural grammar for " + joinNames(missing),
+			Code:        model.CodeConfigInvalid,
+			Remediation: "remove the language from providers.tree_sitter.languages, or install a build that bundles it"}
+	}
+	return model.DoctorCheck{Name: checkBundledGrammars, State: model.CheckPass,
+		Detail: "this build bundles a structural grammar for each of the " + strconv.Itoa(len(ts.Languages)) +
+			" configured languages, out of " + strconv.Itoa(len(lang.All)) + " it carries"}
+}
+
+// checkCaptureFreshness reports how old the capture behind the published
+// generation is. Section 22 asks for recent capture/freshness and nothing else
+// reports it: the active-pointer check says a generation is serving queries,
+// which is equally true of one captured months ago, and an operator reading a
+// stale answer out of this workspace has no other place to learn that.
+//
+// It states the age and does not judge it. There is no configured staleness
+// bound in this product, and inventing one here would turn a measurement into a
+// policy no operator set -- the same reason checkAnalyzerRestriction reports
+// its question unmeasured rather than answering it.
+func (s *Service) checkCaptureFreshness(ctx context.Context, active model.GenerationID) model.DoctorCheck {
+	reader, ok := s.opts.Store.(captureReader)
+	if !ok {
+		return model.DoctorCheck{Name: checkCaptureFreshness, State: model.CheckUnavailable,
+			Detail: "this build's store reader reports no capture time for a generation, so the age of the served capture is unknown"}
+	}
+	if active == 0 {
+		return model.DoctorCheck{Name: checkCaptureFreshness, State: model.CheckUnavailable,
+			Detail: "no generation is published, so there is no capture to age"}
+	}
+	captured, err := reader.GenerationCapturedAt(ctx, active)
+	if err != nil {
+		return failure(checkCaptureFreshness, err)
+	}
+	return model.DoctorCheck{Name: checkCaptureFreshness, State: model.CheckPass,
+		Detail: "the capture this generation serves was taken " + agePhrase(s.opts.Now().Sub(captured)) + " ago"}
+}
+
+// agePhrase renders an elapsed duration for an operator. Whole minutes are the
+// finest unit a capture age is ever read at, and a negative age -- a capture
+// stamped ahead of this host's clock -- is reported as what it is rather than
+// as a large positive number.
+func agePhrase(d time.Duration) string {
+	if d < 0 {
+		return "-" + agePhrase(-d)
+	}
+	switch {
+	case d < time.Hour:
+		return strconv.FormatInt(int64(d/time.Minute), 10) + " minutes"
+	case d < 48*time.Hour:
+		return strconv.FormatInt(int64(d/time.Hour), 10) + " hours"
+	default:
+		return strconv.FormatInt(int64(d/(24*time.Hour)), 10) + " days"
+	}
 }
