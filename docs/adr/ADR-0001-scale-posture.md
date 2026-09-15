@@ -792,15 +792,14 @@ duplicates an existing assertion.
   metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
   is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
   the single-observation path reads the same configured limit the aggregate path does.
-- **A deadline that lands mid-RANK, after the walk completed, has no continuation.** An impact or
-  package-rollup request whose time runs out while its external sort is running reports the deadline
-  and offers no cursor: the sort primitive has no adopt-existing-runs constructor, so the spilled
-  runs cannot be re-entered on a later page. The walk itself is resumable and unaffected; the remedy
-  today is to re-run the query or raise the query timeout. Closing it is a Minor — give the external
-  sort a constructor that adopts the runs a previous request spilled — and it is the only stop on
-  these two endpoints that returns truncated with no cursor.
-- **`resources.max_temp_bytes` defaults to unlimited; a paged walk still re-copies its
-  cumulative visited set.** Two rulings are accepted; the first has landed and the second has not.
+- **A deadline that lands mid-RANK, after the walk completed, is CLOSED.** The external sort has an
+  adopt-existing-runs constructor (`pagination.AdoptRuns`), and `walkrun.go`'s `detachRankPass` hands
+  it the runs an interrupted ranking had already spilled -- moved into the retained state directory
+  -- and mints the `f` cursor over them. The next request re-enters those runs instead of re-sorting,
+  and the retained pass-1 input feeds whatever they do not yet hold. No stop on these two endpoints
+  returns truncated with no cursor.
+- **`resources.max_temp_bytes` defaults to unlimited; a paged walk no longer re-copies its
+  cumulative visited set.** Both rulings are accepted and both have LANDED.
   (a) LANDED. The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
   every other count or size bound: the spool store reads a non-positive cap as unlimited (it
   refuses no write and keeps the accounting the resource envelope reports), the configuration
@@ -809,50 +808,51 @@ duplicates an existing assertion.
   unlimited rather than refusing construction -- a value that IS set still refuses a run up front,
   with a typed `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`. `min_free_disk_bytes` stays
   as it is: it protects the host's free space rather than capping work, and it is still enforced
-  against actual free space under an unlimited temporary budget. (b) OPEN. A walk page writes a FRESH
+  against actual free space under an unlimited temporary budget. (b) LANDED. A walk page used to write a FRESH
   continuation spool holding the WHOLE cumulative visited set -- the previous page's visited section
   is streamed record by record into the new spool -- and the resume decodes that same section again
   to rebuild the frontier and the membership summary. Both are O(visited) per page, which is the
   measured linear growth in page latency (0.31 s/page over the first fifty pages of a real
-  repository walk, 2.20 s/page by page 400) and therefore a quadratic walk to completion. The state
-  a page keeps must become append-only -- one new ascending run per page plus a small manifest, the
-  concatenated-ascending-runs shape the membership merge-join already reads -- with the membership
-  summary persisted rather than rebuilt. Two constraints hold for whoever lands it: the filter's bit
-  count and probe count must be FROZEN at creation and carried in the manifest, because bits set
-  under one size and probed under another produce false negatives and therefore a cross-page
-  re-admission of the same entity; and the retained state directory is re-adopted whole on every
-  page (`AdoptDir` measures the directory and reserves it again while the previous reservation is
-  released only afterwards), so the shared budget holds roughly twice the cumulative retained bytes
-  at every page boundary -- append-only runs alone do not fix that, the reservation has to become
-  incremental. The carrier is settled: `retainedWalk` (`internal/graph/walkretain.go`) is an owned
-  type that already travels through the impact and rollup endpoints as an opaque pointer, is
-  created unconditionally on both, is reopened for append on every resume and is carried forward by
-  rename, so the run files and the persisted filter belong inside its directory and need no change
-  to the endpoints themselves; the neighbours endpoint builds its own continuation in
-  `traverse.go` and can create its own. `spill` must then IGNORE `continuation.Carried` whenever a
-  persisted run store exists, which is what keeps `impact.go`'s `Carried: resume.Visited` correct
-  and unedited. One hop is missing and is the blocker: `runWalkToCompletion` receives neither the
-  retained walk nor any other persistent handle (`expandOptions` is built at `impact.go:206` and
-  `rollup.go:105`), so the internal links' admissions cannot reach the persisted runs without one
-  new field on `expandOptions` set at those two call sites.
-- **An impact or rollup continuation drops the nodes its INTERNAL links admitted.**
-  `runWalkToCompletion` chains several `expand` calls inside one request and records the earlier
-  links' admitted nodes in `walkState.Carried` (`walkrun.go:91`), but `continueWalk`
-  (`impact.go:557-560`) builds the continuation with `Carried: resume.Visited` -- the OUTER
-  cursor's stream -- and nothing ever reads `walkState.Carried`; only `ReleaseCarried` is used. A
-  walk that crosses an internal boundary and then mints a cursor therefore forgets every node the
-  earlier links admitted, and the next page re-admits them: the same entity is reported on two
-  pages. The append-only design above removes it as a side effect, because the links would append
-  to the persisted runs directly.
-- **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
-  walk holds its settled set, distances, depths and cached edges for the length of the walk, and
-  unlike a breadth-first frontier that state cannot spill, because a search resumed from a
-  persisted frontier would also need its settled distances. It is bounded instead by the query
-  memory budget: every map and queue entry is charged against `resources.query_memory_bytes`
-  (`frontier_bytes`) with a deliberate over-estimate, and crossing it truncates the answer with the
-  memory reason and the cheapest routes found so far rather than running on. The repository map's
-  containment read is closed -- it is keyset-paged now, so its peak is a page and not a container's
-  fan-out.
+  repository walk, 2.20 s/page by page 400) and therefore a quadratic walk to completion.
+  The state a page keeps is append-only now: one ascending RUN per leg holding that leg's own
+  admissions, an O(1) manifest, and the membership summary persisted beside the runs rather than
+  rebuilt -- the concatenated-ascending-runs shape the membership merge-join already read. The
+  filter's bit count and probe count are FROZEN at creation and carried in the manifest, because
+  bits set under one geometry and probed under another produce false negatives and therefore a
+  cross-page re-admission of the same entity. The carrier is `retainedWalk`
+  (`internal/graph/walkretain.go`), which already travels through the impact and rollup endpoints,
+  is reopened for append on every resume and is carried forward by rename; `expandOptions.Visited`
+  is the hop that lets the INTERNAL links append to it directly, and `spill` skips the visited
+  section entirely whenever a run store exists. The retained directory is re-adopted incrementally
+  (`Spools.ReadoptDir` transfers the previous reservation inside one critical section and charges
+  only the delta), so the shared budget no longer holds two copies of the cumulative state at every
+  page boundary. The neighbours endpoint builds its own continuation in `traverse.go` and still
+  uses the spooled visited section; giving it a store of its own is the one piece outstanding.
+
+  **What it measures.** On a twenty-thousand-node walk split into many legs by the frontier
+  ceiling, the cumulative set grew by 2 398 281 bytes against a ceiling of 5 648 381 derived from
+  what the walk admitted, and the walk's `visited_count` is exactly the fixture's node count
+  (`graph.TestAWalkWritesItsVisitedSetOnce`); re-adoption charges the grown directory once rather
+  than twice (`pagination.TestReadoptingAGrownDirectoryChargesItOnce`). The "before" column is the
+  soak's own shape -- 0.31 s/page over the first fifty pages, 2.20 s/page by page 400 -- not a
+  re-measured build.
+
+  **Residual, by design.** The filter's geometry is frozen when the first page creates it, so past
+  roughly m/16 admitted nodes it saturates: `mayHold` answers true for everything and every level
+  falls back to the full merge-join. Correctness is intact -- a false positive costs a sweep, never
+  an answer -- and the remedy is a larger `resources.query_memory_bytes`, not a re-sized filter,
+  which would change the geometry the bits were set under.
+- **An impact or rollup continuation dropping the nodes its INTERNAL links admitted is CLOSED.**
+  `runWalkToCompletion` chains several `expand` calls inside one request, and the continuation it
+  minted used to carry only the OUTER cursor's stream, so a walk that crossed an internal boundary
+  forgot every node the earlier links admitted and the next page re-admitted them: the same entity
+  on two pages. The links now append their own admissions to the persisted runs through
+  `expandOptions.Visited`, and `walkState.Carried` and `ReleaseCarried` are gone.
+- **The shortest-path walk is external-memory** and truncates for no memory reason: its settled
+  set, distances and frontier live in a per-request SQLite scratch database under the retained
+  state directory (`path.go`, `pathscratch.go`), and a page that runs out of time mints the `p`
+  cursor over that scratch rather than ending the answer. The repository map's containment read is
+  closed too -- it is keyset-paged, so its peak is a page and not a container's fan-out.
 
 ### 3.4 What verification on real repositories must show
 
