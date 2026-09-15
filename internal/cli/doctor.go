@@ -126,6 +126,12 @@ func doctorReport(ctx context.Context, build model.BuildInfo, root string,
 // and is knowable without a workspace -- and exactly one check, failing, with
 // the typed code and remediation the open produced.
 //
+// An open failure that is NOT typed falls back to a generic detail rather than
+// the error's own text. Every other detail in a report is generated from a
+// typed code (internal/diagnostics/doctor.go), and an untyped error can carry
+// a path, a filesystem message or provider output -- the ordinary-log rule of
+// Section 21 applied to the one place a report can still leak.
+//
 // Deep and Offline are echoed from the request rather than asserted: no check
 // ran, so nothing here knows more than what was asked for, and claiming an
 // offline policy that was never resolved would be the "reports merely that the
@@ -133,11 +139,11 @@ func doctorReport(ctx context.Context, build model.BuildInfo, root string,
 func unopenableReport(build model.BuildInfo, req model.DoctorRequest, err error,
 	now time.Time) model.DoctorReport {
 	check := model.DoctorCheck{
-		Name:  doctorWorkspaceCheck,
-		State: model.CheckFail,
-		Code:  model.CodeInternal,
-		Detail: "the workspace could not be opened, so no further check could run: " +
-			clip(err.Error(), model.MaxDetailBytes/2),
+		Name:        doctorWorkspaceCheck,
+		State:       model.CheckFail,
+		Code:        model.CodeInternal,
+		Detail:      "the workspace could not be opened, so no further check could run",
+		Remediation: "re-run this command naming the repository path, and report it with that command if the failure persists",
 	}
 	var typed *model.Error
 	if errors.As(err, &typed) {

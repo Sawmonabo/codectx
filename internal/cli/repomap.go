@@ -29,7 +29,10 @@ func newRepoMapCommand(build model.BuildInfo) *cobra.Command {
 			"through the token the answer prints rather than truncated.\n\n" +
 			"--depth bounds how far down the container tree the map goes. The repository " +
 			"is named as a positional path, or with --repo, and naming it both ways is " +
-			"refused rather than resolved to one of them.",
+			"refused rather than resolved to one of them.\n\n" +
+			"A continuation is the whole question again: pass --cursor TOKEN alongside the " +
+			"same --depth and --limit the first page was asked with. A token is bound to " +
+			"the request that minted it, so a page asked with different ones is refused.",
 		Args:          cobra.MaximumNArgs(1),
 		SilenceErrors: true,
 		SilenceUsage:  true,
