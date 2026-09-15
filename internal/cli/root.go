@@ -51,6 +51,8 @@ func NewRoot(build model.BuildInfo, stdout, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newSearchCommand(build))
 	root.AddCommand(newSymbolCommand(build))
 	root.AddCommand(newMCPCommand(build))
+	root.AddCommand(newDoctorCommand(build))
+	root.AddCommand(newRepoMapCommand(build))
 	// The Section 18.1 query commands are built as a set so query.go never
 	// edits the command tree it belongs to.
 	for _, c := range newQueryCommands(build) {

@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 
+	"github.com/Sawmonabo/codectx/internal/retention"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -44,4 +45,46 @@ func (c *Coordinator) retain(ctx context.Context) {
 		"refs_retained", report.RefsRetained, "generations_swept", report.GenerationsSwept,
 		"units_deleted", report.UnitsDeleted, "bytes_reclaimed", report.BytesReclaimed,
 		"bytes_reclaimable", report.BytesReclaimable)
+}
+
+// Collector is the process-level reclaim pass this coordinator schedules. It is
+// the narrow shape of *retention.Collector: the collector owns the Section 10.4
+// blob grace protocol and is the one caller of the five sweep helpers that had
+// none, and the coordinator owns the only moment in the process at which both
+// locks the pass requires are already held.
+//
+// It may be nil. A coordinator built without one indexes exactly as before and
+// reclaims nothing on its own -- the composition root always supplies one, and
+// only a coordinator assembled in a test goes without.
+type Collector interface {
+	Collect(ctx context.Context) (retention.Report, error)
+}
+
+// collect runs one process-level collection pass. It is called from the same
+// post-activation points as retain and under the same two locks, for the same
+// reason: the pass ends in sweeps with no snapshot filter, and the window
+// between a capture being written and its generation referencing it is exactly
+// what those locks close.
+//
+// Like retain it never fails the run that just published -- the generation is
+// active and its facts are correct, and unreclaimed disk is reclaimed by the
+// next pass -- and like retain it finishes even when the caller's context is
+// already ending, because a half-collected store is the state this must not
+// leave behind. Its failure is logged with its diagnostic code so it cannot be
+// silent.
+func (c *Coordinator) collect(ctx context.Context) {
+	if c.opts.Collector == nil {
+		return
+	}
+	report, err := c.opts.Collector.Collect(context.WithoutCancel(ctx))
+	if err != nil {
+		logTyped(c.log, "the collection pass did not finish", err,
+			"component", component, "repository_id", string(c.repo))
+		return
+	}
+	c.log.Info("collection pass finished", "component", component, "repository_id", string(c.repo),
+		"sessions_expired", report.SessionsExpired, "sessions_pruned", report.SessionsPruned,
+		"spool_bytes_swept", report.SpoolBytesSwept, "tools_collected", report.ToolsCollected,
+		"blobs_quarantined", report.BlobsQuarantined, "blobs_trashed", report.BlobsTrashed,
+		"blobs_deleted", report.BlobsDeleted, "blobs_restored", report.BlobsRestored)
 }

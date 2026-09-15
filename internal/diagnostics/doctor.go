@@ -23,6 +23,7 @@ const (
 	checkActiveGeneration = "active_generation"
 	checkSourceRetention  = "source_retention"
 	checkSuppliedIndex    = "supplied_index"
+	checkAnalyzerRestrict = "analyzer_restriction"
 	checkTemporaryState   = "temporary_state"
 	// checkToolchainPrefix prefixes one check per lock entry; the suffix is
 	// the entry name from tools.lock.json, which is what a managed tool is
@@ -101,6 +102,7 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 		s.checkCAS(ctx, req.Deep),
 		s.checkSuppliedIndex(ctx, active),
 		s.checkTemporary(ctx),
+		s.checkAnalyzerRestriction(),
 	)
 	checks = append(checks, s.checkToolchain(ctx)...)
 	// The state is reduced BEFORE the list is bounded: a failing check that
@@ -114,10 +116,10 @@ func (s *Service) Doctor(ctx context.Context, req model.DoctorRequest) (model.Do
 		Deep:  req.Deep,
 		// Offline is echoed, not acted on. Doctor opens no socket: every
 		// probe it runs is local, and the toolchain report is the cheap
-		// local one that never fetches. Whether a real OS-level analyzer
-		// restriction is active is not visible through this seam -- that
-		// answer belongs to the command layer, which knows how the process
-		// was launched.
+		// local one that never fetches. Whether a real OS-level restriction
+		// confines the analyzers is answered by checkAnalyzerRestriction as
+		// its own check -- and answered `unavailable`, because nothing in this
+		// build measures it.
 		Offline:   req.Offline,
 		State:     state,
 		Checks:    checks,
@@ -465,3 +467,24 @@ func joinPaths(paths []string) string {
 // nobody, and a rounded "1.2 GiB" hides the difference between just over and
 // just under a configured bound, which is exactly what these checks report.
 func bytesPhrase(n int64) string { return strconv.FormatInt(n, 10) + " bytes" }
+
+// checkAnalyzerRestriction answers Section 21's question -- whether an
+// OS-level restriction confines the analyzer subprocesses this installation
+// launches -- and answers it `unavailable`.
+//
+// That is the whole point of the check, and it is deliberately not a silent
+// omission. Nothing in this build measures a sandbox, a seccomp filter, a job
+// object restriction or a container policy: the runners set process-group and
+// job-object lifetime control, which bounds what a child outlives, not what a
+// child may reach. `codectx doctor --offline` therefore reports the question as
+// asked and unmeasured rather than letting the flag read as an assertion that
+// the restriction is in force -- a false readiness claim of exactly the kind
+// Section 22 exists to prevent.
+//
+// It takes no context because it performs no probe. When a real measurement
+// lands it replaces this body and nothing else changes: the name, and the rule
+// that the report never claims enforcement it did not observe, are the contract.
+func (s *Service) checkAnalyzerRestriction() model.DoctorCheck {
+	return model.DoctorCheck{Name: checkAnalyzerRestrict, State: model.CheckUnavailable,
+		Detail: "whether an OS-level restriction confines the analyzer subprocesses is not measured on this platform, so this installation neither claims nor denies that one is active"}
+}
