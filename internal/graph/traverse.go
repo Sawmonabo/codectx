@@ -297,21 +297,6 @@ type walkState struct {
 	// silently drop every row whose owner sorts below that node. Only the
 	// deadline stops here; every other stop is mid-level by construction.
 	LevelBoundary bool
-	// Carried streams every node the walk admitted BEFORE the internal page
-	// this state came out of. It is set only by runWalkToCompletion, which
-	// chains several expand calls inside one request: the nodes the earlier
-	// links admitted are neither in Admitted.newlyAdmitted() (that is the last
-	// link's own additions) nor in the resumed cursor's spool (they did not
-	// exist when it was written), so a continuation minted without them would
-	// re-admit them on the next request and report the same entity twice.
-	//
-	// A single expand leaves it nil, and the caller then falls back to the
-	// resumed cursor's stream, which is the whole carried set in that case.
-	Carried visitedStream
-	// ReleaseCarried frees the scratch file Carried replays from. It is nil
-	// when there is none. The caller defers it AFTER the continuation has been
-	// spilled, because the spill is what reads the stream.
-	ReleaseCarried func()
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
 	//

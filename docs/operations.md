@@ -173,8 +173,13 @@ Free space is checked against `resources.min_free_disk_bytes` (default
 source an open session is reading** — degrading an answer is not an acceptable
 way to free space.
 
-Temporary bytes across materializations and spools are separately capped by
-`resources.max_temp_bytes`, which must exceed `resources.min_free_disk_bytes`.
+Temporary bytes across materializations and spools are bounded by
+`resources.max_temp_bytes`, which is **unlimited by default** (`0`): nothing
+refuses a walk, a materialization or a continuation until you set it. A value
+you DO set must exceed `resources.min_free_disk_bytes`, and it refuses a run up
+front with `CTX_RESOURCE_LIMIT` naming the key. `min_free_disk_bytes` is
+enforced against actual free space either way -- it protects the host's space
+rather than capping work.
 
 In order, when you are short on space:
 

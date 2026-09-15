@@ -58,6 +58,16 @@ const (
 // retainedWalk is one request's handle on that directory.
 type retainedWalk struct {
 	dir string
+	// prevID is the store id this directory was adopted under by the page that
+	// created or last extended it, empty for a directory this request created.
+	// The re-adoption that carries it to the next page charges only the bytes
+	// it GREW by, which is what keeps the shared budget from holding two copies
+	// of the cumulative state at every page boundary (cursor.go retain).
+	prevID string
+	// visited is the walk's cumulative admitted-node set, append-only
+	// (visitedstore.go). It lives here because this directory is already the
+	// state a walk continuation carries forward by rename.
+	visited *visitedStore
 	// owned marks a directory this request created and must remove itself if
 	// nothing adopts it. A directory REOPENED from the store is owned by the
 	// store, and is released through the consumed continuation instead --
@@ -68,8 +78,9 @@ type retainedWalk struct {
 	pairs   *retainFile
 }
 
-// openRetainedWalk creates a fresh retained input under parent.
-func openRetainedWalk(parent string) (*retainedWalk, error) {
+// openRetainedWalk creates a fresh retained input under parent. filterBytes is
+// the budget the cumulative set's membership summary is frozen at.
+func openRetainedWalk(parent string, filterBytes int64) (*retainedWalk, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
 	}
@@ -82,14 +93,23 @@ func openRetainedWalk(parent string) (*retainedWalk, error) {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	if w.visited, err = openVisitedStore(dir, filterBytes); err != nil {
+		w.discard()
+		return nil, err
+	}
 	return w, nil
 }
 
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
-func reopenRetainedWalk(dir string) (*retainedWalk, error) {
-	w := &retainedWalk{dir: dir}
+func reopenRetainedWalk(dir, prevID string) (*retainedWalk, error) {
+	w := &retainedWalk{dir: dir, prevID: prevID}
 	if err := w.open(); err != nil {
+		return nil, err
+	}
+	var err error
+	if w.visited, err = reopenVisitedStore(dir); err != nil {
+		w.discard()
 		return nil, err
 	}
 	return w, nil
@@ -173,6 +193,10 @@ func (w *retainedWalk) discard() {
 
 func (w *retainedWalk) close() error {
 	var first error
+	if w.visited != nil {
+		first = w.visited.close()
+		w.visited = nil
+	}
 	for _, f := range []*retainFile{w.entries, w.pairs} {
 		if f == nil {
 			continue
