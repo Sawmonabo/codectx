@@ -1182,10 +1182,17 @@ func TestE2EProductBoundary(t *testing.T) {
 	// `go test ./...` stayed green. The assertion is deliberately weak on the
 	// ROUTES -- the generated repository need not connect any two nodes -- and
 	// strong on the invocation: it must reach the workspace and answer.
+	//
+	// The loop below is the only place it runs, so "the body never executed"
+	// has to be a failure rather than a green test: an impact answer whose
+	// only entry is the seed would otherwise invoke `path` zero times and
+	// re-admit exactly the blind spot this leg exists to close.
+	ranPath := false
 	for _, entry := range whole.Entries {
 		if entry.NodeID == node {
 			continue
 		}
+		ranPath = true
 		pathEnv, pathCode := s.run(t, "path", string(node), string(entry.NodeID))
 		if !pathEnv.OK || pathCode != 0 {
 			t.Fatalf("`codectx path %s %s` failed (exit %d): %+v", node, entry.NodeID, pathCode, pathEnv.Error)
@@ -1200,6 +1207,10 @@ func TestE2EProductBoundary(t *testing.T) {
 			t.Fatal("`path --cursor` accepted a malformed token: the flag is not reaching the request")
 		}
 		break
+	}
+	if !ranPath {
+		t.Fatalf("`codectx path` never ran: the impact answer for %s holds %d entr(ies) and none of them "+
+			"is a second node, so the command's only end-to-end coverage silently did not execute", node, len(whole.Entries))
 	}
 
 	start := seed{Node: node, Relation: relation}
