@@ -132,16 +132,17 @@ serving. The `search` capability is reported per file:
 | Condition | State | Diagnostic |
 |---|---|---|
 | size over `workspace.max_search_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
-| NUL byte in the first 8000 bytes | `unavailable` | `CTX_PROVIDER_UNAVAILABLE` |
+| over 30% of the first 8000 bytes is not text, or they carry a run of 4 NULs | `unavailable` | `CTX_BINARY_CONTENT` |
 | some chunks were not UTF-8 text (skipped; source reads serve them as base64) | `partial` | `CTX_ARGUMENT_INVALID` |
 | otherwise | `fresh` | |
 
 The `structure` capability is always `fresh` for a unit that seals.
 
-`CTX_PROVIDER_UNAVAILABLE` for binary content is a reuse of an existing
-Section 22 family, because `internal/model` is frozen: the honest code would
-be a dedicated `CTX_BINARY_CONTENT`, which is the pending shared-model change;
-this provider does not invent a local code in the meantime.
+`CTX_BINARY_CONTENT` is its own Section 22 family rather than a reuse of
+`CTX_PROVIDER_UNAVAILABLE`: the provider ran and answered, and the answer is
+that the file is not text, so a lexical index has nothing to say about it.
+Reporting it as an unavailable provider would send an operator looking for a
+broken installation that does not exist.
 
 ## What `manifest` emits per file
 
