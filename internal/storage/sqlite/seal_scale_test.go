@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/testenv"
 )
 
 // publishOneUnit builds a single unit holding n node facts and n relation
@@ -107,6 +108,7 @@ func publishOneUnit(t *testing.T, n int) (time.Duration, int64) {
 // insert order random with respect to a hot index -- shows up here as a
 // per-fact cost that climbs with N, which is what the assertion forbids.
 func TestSealingOneUnitCostsFlatTimePerFact(t *testing.T) {
+	testenv.SkipIfLoaded(t)
 	sizes := []int{2000, 4000, 8000, 16000}
 	if raw := os.Getenv("CODECTX_SEAL_SIZES"); raw != "" {
 		sizes = nil
