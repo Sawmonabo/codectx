@@ -13,7 +13,10 @@
 #   4. --no-tools and --tools-for-repo together are a refusal, not a
 #      silently-ignored word; and
 #   5. the tool store install.sh resolves is the one the product resolves,
-#      including for a relative XDG_DATA_HOME, which both ignore.
+#      including for a relative XDG_DATA_HOME, which both ignore; and
+#   6. the configuration file it points an operator at is the one the product
+#      resolves, including for a relative XDG_CONFIG_HOME, which the product
+#      refuses outright rather than falling back to $HOME/.config.
 #
 # Every case runs --dry-run, which by contract fetches nothing and writes
 # nothing, so the test needs no network and no release.
@@ -98,6 +101,28 @@ esac
 
 out="$(HOME=/home/tester XDG_DATA_HOME=/abs/share sh "$script" --help 2>&1 || true)"
 expect "an absolute XDG_DATA_HOME names the store" "/abs/share/codectx/tools" "$out"
+
+# 6. The config file the bundle hint names must be the one os.UserConfigDir
+# resolves. Go honours an absolute XDG_CONFIG_HOME, falls back to $HOME/.config
+# when it is unset, and ERRORS on a relative one -- so there the installer must
+# not name $HOME/.config, which the product would never read. The hint is
+# printed by a bundle dry run, which fetches and writes nothing.
+bundle_dry() { env HOME=/home/tester "$@" sh "$script" --bundle --dry-run --prefix "$prefix" 2>&1 || true; }
+
+out="$(bundle_dry XDG_CONFIG_HOME=/abs/cfg)"
+expect "an absolute XDG_CONFIG_HOME names the config file" "/abs/cfg/codectx/config.toml" "$out"
+
+out="$(bundle_dry XDG_CONFIG_HOME=)"
+expect "an unset XDG_CONFIG_HOME falls back to \$HOME/.config" "/home/tester/.config/codectx/config.toml" "$out"
+
+out="$(bundle_dry XDG_CONFIG_HOME=relcfg)"
+expect "a relative XDG_CONFIG_HOME is reported as unresolvable" "XDG_CONFIG_HOME is relative" "$out"
+case "$out" in
+*"/home/tester/.config/codectx/config.toml"* | *"relcfg/codectx/config.toml"*)
+	printf 'FAIL install.sh named a config file for a relative XDG_CONFIG_HOME that the product refuses to resolve\n  got: %s\n' "$out" >&2
+	failures=$((failures + 1))
+	;;
+esac
 
 if [ "$failures" -ne 0 ]; then
 	printf '\ninstall-sh-test: %s failure(s)\n' "$failures" >&2

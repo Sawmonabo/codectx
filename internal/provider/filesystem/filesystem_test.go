@@ -209,11 +209,14 @@ func TestBinaryDecisionIsAProportion(t *testing.T) {
 	if got := state.Details["nul_bytes"]; got != "1" {
 		t.Fatalf("nul_bytes = %q, want \"1\" (details %v)", got, state.Details)
 	}
-	// Real binary content still has no lexical index, and says why.
+	// Real binary content still has no lexical index, and says why with the
+	// family that means "not text", not the one that means "the provider
+	// could not run": an operator who sees the latter looks for a broken
+	// install that does not exist.
 	for _, path := range []string{"assets/img.png", "assets/utf16.txt"} {
 		_, state := index(t, files, path)
-		if state.State != model.CapabilityUnavailable || state.DiagnosticCode != model.CodeProviderUnavailable {
-			t.Fatalf("%s: search capability = %s (%s), want unavailable/%s", path, state.State, state.DiagnosticCode, model.CodeProviderUnavailable)
+		if state.State != model.CapabilityUnavailable || state.DiagnosticCode != model.CodeBinaryContent {
+			t.Fatalf("%s: search capability = %s (%s), want unavailable/%s", path, state.State, state.DiagnosticCode, model.CodeBinaryContent)
 		}
 	}
 }
