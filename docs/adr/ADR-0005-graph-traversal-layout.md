@@ -176,8 +176,8 @@ Research note 17 (this repository) carries the full bibliography [S1]–[S37]; r
 carries [R1]–[R36]. The entries below are the ones this record's text relies on, each once.
 
 - [P] GPERF-P profile of the impact walk on the reference store, 2026-09-15 (per-phase split,
-  rate versus N, `/proc/<pid>/io` bytes, level structure) — recorded in research note 17 §1 and in
-  the wave ledger; harness `scripts/perf/gperf-p-impact.sh`.
+  rate versus N, `/proc/<pid>/io` bytes, level structure) — recorded in research note 17 §1;
+  harness `scripts/perf/gperf-p-impact.sh`.
 - [17 §1–§4] Graph traversal throughput: external-memory BFS, adjacency layout, visited sets,
   ranking — `docs/research/17-graph-traversal-throughput.md` (query-plan defect, blob sizing,
   Bloom saturation, direction-optimising rejection).

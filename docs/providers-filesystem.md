@@ -140,8 +140,8 @@ The `structure` capability is always `fresh` for a unit that seals.
 
 `CTX_PROVIDER_UNAVAILABLE` for binary content is a reuse of an existing
 Section 22 family, because `internal/model` is frozen: the honest code would
-be a dedicated `CTX_BINARY_CONTENT`. It is ledgered as a shared-helper change,
-not worked around here.
+be a dedicated `CTX_BINARY_CONTENT`, which is the pending shared-model change;
+this provider does not invent a local code in the meantime.
 
 ## What `manifest` emits per file
 
