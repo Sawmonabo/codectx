@@ -1669,36 +1669,6 @@ func (a *scopeAdjacency) Capabilities(stdcontext.Context) ([]model.CapabilitySta
 	return a.caps, nil
 }
 
-// Edges is keyset-ordered by relation id after `after`, exactly as the port
-// documents; an empty kinds slice means every kind.
-func (a *scopeAdjacency) Edges(_ stdcontext.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	want := make(map[model.NodeID]bool, len(nodes))
-	for _, n := range nodes {
-		want[n] = true
-	}
-	allowed := make(map[model.RelationKind]bool, len(kinds))
-	for _, k := range kinds {
-		allowed[k] = true
-	}
-	out := make([]model.Relation, 0, limit)
-	for _, r := range a.relations {
-		if r.ID <= after || (len(kinds) > 0 && !allowed[r.Kind]) {
-			continue
-		}
-		touches := (dir == model.DirectionOutgoing && want[r.From]) ||
-			(dir == model.DirectionIncoming && want[r.To]) ||
-			(dir == model.DirectionBoth && (want[r.From] || want[r.To]))
-		if !touches {
-			continue
-		}
-		if out = append(out, r); len(out) == limit {
-			break
-		}
-	}
-	return out, nil
-}
-
 func (a *scopeAdjacency) NodesByID(_ stdcontext.Context, ids []model.NodeID) ([]model.Node, error) {
 	out := make([]model.Node, 0, len(ids))
 	for _, id := range ids {

@@ -59,32 +59,6 @@ func (g *pathGraph) reader() *MemoryGraph {
 	return NewMemoryGraph(g.Binding(), nodes, append([]model.Relation(nil), g.rels...))
 }
 
-func (g *pathGraph) Edges(_ context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	want := map[model.NodeID]bool{}
-	for _, n := range nodes {
-		want[n] = true
-	}
-	allowed := map[model.RelationKind]bool{}
-	for _, k := range kinds {
-		allowed[k] = true
-	}
-	var out []model.Relation
-	for _, r := range g.rels {
-		if r.ID <= after || len(out) >= limit {
-			continue
-		}
-		if dir == model.DirectionOutgoing && !want[r.From] {
-			continue
-		}
-		if len(allowed) > 0 && !allowed[r.Kind] {
-			continue
-		}
-		out = append(out, r)
-	}
-	return out, nil
-}
-
 func (g *pathGraph) NodesByID(_ context.Context, ids []model.NodeID) ([]model.Node, error) {
 	var out []model.Node
 	for _, id := range ids {
