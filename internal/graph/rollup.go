@@ -396,6 +396,12 @@ func (p *pairRollup) flush() error {
 	if err != nil {
 		return err
 	}
+	// Evidence counts still come from the batched relation hydration rather
+	// than from GraphReader.EvidenceCounts, for one reason: that array is keyed
+	// by RelRef and the port offers no canonical-id-to-relation-surrogate
+	// resolution, while the walk's visitor delivers a model.Relation. It is one
+	// batched read per batch of relations either way -- it was never part of
+	// the rollup's cost -- and it moves with the walk's visitor signature.
 	evidence, err := p.e.evidenceCounts(p.ctx, relationIDs)
 	if err != nil {
 		return err
@@ -445,6 +451,12 @@ func (p *pairRollup) containerLabels(ids []model.NodeID) (map[model.NodeID]conta
 	missing := map[NodeRef]bool{}
 	owners := make([]NodeRef, 0, len(ids))
 	for _, chunk := range impactChunkNodes(ids) {
+		// THE RESOLUTION SEAM. The walk's visitor still delivers canonical
+		// endpoint ids, so this batch has to resolve them to surrogates before
+		// it can read the side arrays. Once the walk carries surrogates the
+		// endpoints arrive as refs already and this call -- and the id-keyed
+		// map around it -- is the only thing that has to go; every read below
+		// is already on refs.
 		refs, err := reader.Resolve(p.ctx, chunk)
 		if err != nil {
 			return nil, err

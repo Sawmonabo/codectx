@@ -251,7 +251,12 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"search state is kept, and following the cursor carries the same search on until it " +
 			"reaches the target. The answer is exact once the final page arrives.\n\n" +
 			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
-			"cap, not paged.\n\n" + nameArgumentHelp,
+			"cap, not paged.\n\n" +
+			"--direction chooses which way edges are followed. The default, outgoing, answers " +
+			"\"what does the first node depend on, on the way to the second\". A node that is only " +
+			"ever CALLED has no outgoing route to its callers, so a search for one reports no path " +
+			"at all; --direction incoming follows edges backwards and --direction both ignores " +
+			"their orientation, which gives the cheapest undirected route.\n\n" + nameArgumentHelp,
 		Args:          cobra.ExactArgs(2),
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -275,6 +280,10 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			direction, err := pathDirectionFlag(cmd)
+			if err != nil {
+				return err
+			}
 			var result model.PathResult
 			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
@@ -285,6 +294,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 					GenerationID: gen,
 					From:         nodes[0],
 					To:           nodes[1],
+					Direction:    direction,
 					MaxDepth:     depth,
 					MaxVisited:   visited,
 					Page:         page,
@@ -305,6 +315,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 	// cursored command states and docs/queries.md documents unconditionally.
 	addQueryFlags(cmd, true)
 	addTraversalFlags(cmd, false, false)
+	addPathDirectionFlag(cmd)
 	// A path search IS resumable now: a page that spends its deadline or its
 	// visited budget keeps its state and prints the token that continues it.
 	addCursorFlag(cmd)
@@ -711,6 +722,33 @@ func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 		cmd.Flags().Int(queryEdgesFlag, 0,
 			"maximum distinct relations the walk may admit"+cumulative+zeroBoundHelp)
 	}
+}
+
+// addPathDirectionFlag declares `path --direction`. It is not part of
+// addTraversalFlags: the other traversal commands PIN their direction (a
+// `callers` query that could be asked outgoing would not be a callers query),
+// and `path` is the one search where the orientation is the caller's question
+// rather than the command's.
+func addPathDirectionFlag(cmd *cobra.Command) {
+	cmd.Flags().String(queryDirectionFlag, string(model.DirectionOutgoing),
+		"follow edges `outgoing` (what the first node depends on), `incoming` (what depends on it) or `both` (either way, the cheapest undirected route)")
+}
+
+// pathDirectionFlag reads and validates it here rather than leaving it to the
+// request validator, so a misspelling is reported as the command-line mistake
+// it is, naming the three spellings, instead of surfacing from the engine.
+func pathDirectionFlag(cmd *cobra.Command) (model.Direction, error) {
+	v, err := stringFlag(cmd, queryDirectionFlag)
+	if err != nil {
+		return "", err
+	}
+	d := model.Direction(v)
+	if !d.Valid() {
+		return "", &model.Error{Code: model.CodeArgumentInvalid,
+			Message:     "--direction " + v + " is not a known direction",
+			Remediation: "use outgoing, incoming or both"}
+	}
+	return d, nil
 }
 
 // clip bounds one display cell. It never shortens an identifier a caller has to

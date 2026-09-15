@@ -173,3 +173,67 @@ func TestContainmentScanEndsOnTheLastEntry(t *testing.T) {
 		})
 	}
 }
+
+// TestShortestPathFollowsTheRequestedDirection is the certification's "0
+// paths" defect: the search only ever followed edges OUTGOING, so a pair
+// connected against the edge direction -- a hub reached only by its callers,
+// the ordinary case -- was reported as having no path at all. "No path exists"
+// is the one answer a path search may not get wrong.
+//
+// Mutation: pin w.direction back to model.DirectionOutgoing in
+// pathWalk.drain's Edges call and the incoming and both legs find no route.
+// Mutation: drop the direction from pathQueryHash and the cursor leg accepts a
+// token minted for the other direction.
+func TestShortestPathFollowsTheRequestedDirection(t *testing.T) {
+	f := newGraphFixture(t)
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited = 0, 0
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	// n-hub is reachable from n-a by an outgoing `calls` edge and by nothing
+	// else, so the pair (n-hub -> n-a) is connected ONLY against the edge
+	// direction: exactly the shape the certification hit.
+	req := model.PathRequest{GenerationID: f.binding.GenerationID,
+		From: fixtureNodeID("n-hub"), To: fixtureNodeID("n-a"),
+		Relations: []model.RelationKind{model.RelCalls}}
+	for _, tc := range []struct {
+		direction model.Direction
+		want      int
+	}{
+		{direction: "", want: 0},
+		{direction: model.DirectionOutgoing, want: 0},
+		{direction: model.DirectionIncoming, want: 1},
+		{direction: model.DirectionBoth, want: 1},
+	} {
+		t.Run(string(tc.direction)+"/", func(t *testing.T) {
+			r := req
+			r.Direction = tc.direction
+			res, err := e.ShortestPath(context.Background(), r)
+			if err != nil {
+				t.Fatalf("ShortestPath: %v", err)
+			}
+			if len(res.Paths) != tc.want {
+				t.Fatalf("direction %q found %d route(s), want %d: a pair connected only against "+
+					"the edge direction is not unreachable", tc.direction, len(res.Paths), tc.want)
+			}
+			for _, p := range res.Paths {
+				if len(p.Relations) == 0 {
+					t.Fatal("a served route carries no relation")
+				}
+			}
+		})
+	}
+	// The direction is part of the query a continuation is bound to: a token
+	// minted for one orientation resumes a settled set that means nothing in
+	// the other.
+	out := req
+	out.Direction = model.DirectionOutgoing
+	in := req
+	in.Direction = model.DirectionIncoming
+	if pathQueryHash(DefaultRelations(), out.Direction, out.From, out.To, 0) ==
+		pathQueryHash(DefaultRelations(), in.Direction, in.From, in.To, 0) {
+		t.Fatal("two directions of one pair share a query hash: a cursor would resume the other search")
+	}
+}

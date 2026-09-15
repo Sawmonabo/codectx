@@ -82,6 +82,16 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
 | `--visited` | `callers`, `callees`, `path`, `impact` | Nodes a walk may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path` it is a per-page work budget too: a page that spends it ends there with a cursor, and the search carries on from the state it kept, so the route it finally reports is the one an unbounded search would. On `impact`, which walks once for the whole answer, it is an **answer-level** bound: spending it truncates that answer and is reported. |
 | `--edges` | `callers`, `callees`, `impact` | Relations a walk may admit, on exactly the terms `--visited` is bounded on for the same command. |
+| `--direction` | `path` | Which way edges are followed: `outgoing` (the default), `incoming` or `both`. The other traversal commands pin their own direction — a `callers` query asked outgoing would not be a callers query — so only `path` takes it. |
+
+**`path --direction` is the difference between "no route" and "no route that way".**
+The default, `outgoing`, answers *what does the first node depend on, on the way to the
+second*. A node that is only ever called has no outgoing route to its callers, so an
+outgoing search between such a pair reports no path at all even though the two are
+connected; `--direction incoming` follows edges backwards, and `--direction both`
+ignores their orientation and returns the cheapest undirected route. The direction is
+part of the query a cursor is bound to, so a continuation cannot be presented to a
+search walking the other way.
 
 **Every graph command issues a continuation.** `search`, `symbol`, `refs`, `callers`,
 `callees`, `path` and `impact` print a `next` token when more remains. On `callers` and
@@ -197,7 +207,9 @@ flag for: it reports `edge budget exhausted` and mints a cursor. Only `--depth`
 truncates a `path` answer outright, because depth is part of the query a cursor
 is bound to. Truncation is always reported together with whatever routes were
 found — never as "no path exists", which is reserved for a target that is
-genuinely unreachable, and never because the search exceeded a memory ceiling.
+genuinely unreachable in the direction asked for, and never because the search
+exceeded a memory ceiling. A pair connected only against the edge direction is
+not unreachable: it is reached with `--direction incoming` or `--direction both`.
 
 **When a temp budget you set cannot hold a continuation.** The state the next
 page resumes from — a walk's frontier spool, a `path` search's retained scratch

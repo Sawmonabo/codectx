@@ -15,6 +15,7 @@ const (
 	queryLimitFlag      = "limit"
 	queryCursorFlag     = "cursor"
 	queryTimeoutFlag    = "timeout"
+	queryDirectionFlag  = "direction"
 )
 
 // addQueryFlags declares the flags every query command shares. --repo reuses
