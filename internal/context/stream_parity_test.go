@@ -189,12 +189,16 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			s.Requirement = model.RequirementFull
 		}
 		res.Candidates = append(res.Candidates, s)
-		if s.NodeID != "" && len(start) < model.MaxStartNodes {
+		if s.NodeID != "" && !cfg.MaxStartNodes.Exceeded(int64(len(start))+1) {
 			start = append(start, s.NodeID)
 		} else if s.NodeID != "" {
-			// More seeds than one bounded walk may start from: the boundaries
-			// of the seeds that did not start are unexplored, and the answer
-			// says so rather than reading as an exhaustive scope.
+			// More seeds than the user-set context.max_start_nodes admits: the
+			// boundaries of the seeds that did not start are unexplored, and
+			// the answer says so rather than reading as an exhaustive scope.
+			// The streamed side also emits one discloseUnwalkedRoots row here;
+			// as with the max_seeds cut, this reference mirrors the WIDTH rule
+			// and not the disclosure, because both keys are unlimited in every
+			// parity fixture and neither row is produced.
 			res.ScopeComplete = false
 		}
 	}

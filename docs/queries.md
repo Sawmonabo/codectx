@@ -287,6 +287,13 @@ names the required paths that do not fit and ends with `… and N more` when
 there are more of them than the detail field carries, so the count is always
 whole even where the list is not.
 
+`context.max_start_nodes` bounds how many discovered seeds become roots of the
+boundary walk and is unlimited by default, so a task naming hundreds of
+resolvable identities is walked from all of them. A value you set leaves the
+seeds past it unwalked, and the manifest carries an exclusion row naming the
+limit and how many roots did not start. See
+[Configuration](configuration.md#context--context-compiler).
+
 `resources.max_page_items` bounds every batch the compile issues — seed
 resolution, file hydration, the edge read behind per-edge precision and the
 evidence batch — and `resources.query_timeout` is the deadline around the whole
