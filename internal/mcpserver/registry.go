@@ -48,7 +48,11 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_callees", "Callees",
 		"Bounded outbound call neighborhood of one or more nodes.", h.callees)
 	addTool(s, "codectx_dependency_path", "Dependency path",
-		"Bounded shortest dependency path between two resolved nodes.", h.dependencyPath)
+		"Bounded shortest dependency path between two resolved nodes. `direction` chooses "+
+			"which way edges are followed: \"outgoing\" (the default: what `from` depends on), "+
+			"\"incoming\" (what depends on it) or \"both\" (either way). A node that is only ever "+
+			"called has no outgoing route to its callers, so a pair connected against the edge "+
+			"direction reports no path until `direction` is incoming or both.", h.dependencyPath)
 	addTool(s, "codectx_impact", "Impact",
 		"Affected scope and required package boundaries, with completeness.", h.impact)
 

@@ -697,8 +697,19 @@ type PathRequest struct {
 	From         NodeID         `json:"from"`
 	To           NodeID         `json:"to"`
 	Relations    []RelationKind `json:"relations,omitempty"`
-	MaxDepth     int            `json:"max_depth"`
-	MaxVisited   int            `json:"max_visited"`
+	// Direction is the orientation the search follows edges in. The empty
+	// value means DirectionOutgoing, which is what every caller got before
+	// this field existed: "what does From depend on, on the way to To".
+	//
+	// It exists because an outgoing-only search answers "no path" for a pair
+	// that IS connected against the edge direction -- a hub reached only by
+	// its callers is the ordinary case -- and "no path exists" is the one
+	// answer a path search may not get wrong. DirectionIncoming follows edges
+	// backwards and DirectionBoth follows them either way, which makes the
+	// result the undirected cheapest route.
+	Direction  Direction `json:"direction,omitempty"`
+	MaxDepth   int       `json:"max_depth"`
+	MaxVisited int       `json:"max_visited"`
 	// Page carries the continuation of a path search whose earlier page spent
 	// its work budget or its deadline before the walk reached the target. The
 	// external-memory walk persists its own state, so a resumed page carries
@@ -723,6 +734,12 @@ func (r PathRequest) Validate() error {
 		if !k.Valid() {
 			return invalid("%s %q is not a known relation kind", indexed("path.relations", i), truncateForMessage(string(k)))
 		}
+	}
+	// The empty direction is the outgoing default, so it is accepted here and
+	// normalized by the engine; any other unknown spelling is refused rather
+	// than silently walked in a direction the caller did not ask for.
+	if r.Direction != "" && !r.Direction.Valid() {
+		return invalid("path.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
 	}
 	if err := requireNonNegative("path.max_depth", int64(r.MaxDepth)); err != nil {
 		return err
