@@ -219,8 +219,10 @@ type resumeState struct {
 	Cursor   traversalCursor
 	Budget   *budget
 	Frontier []frontierState
-	// Visited streams the nodes the earlier pages admitted, straight off their
-	// spool. It is a STREAM and not a map because the cumulative set is sized
+	// Visited streams the VISITED SECTION of the spool the earlier pages
+	// wrote, ascending by NodeID: every node they admitted except the frontier
+	// they stopped at, which Frontier above already carries into this page's
+	// front. It is a STREAM and not a map because the cumulative set is sized
 	// by the walk: materializing it here was the last repository-sized heap
 	// structure on the traversal path (visited.go).
 	Visited visitedStream
