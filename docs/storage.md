@@ -473,41 +473,64 @@ The header row is written **last**, after every part. Its presence is therefore
 the commit marker: a reader that finds it is guaranteed every part behind it,
 and a half-written graph is indistinguishable from no graph at all.
 
-## The packed per-generation term statistics
+## The packed term list: sealed per unit, merged per generation
 
-The same activation publishes a packed form of the generation's lexical
-statistics, and a single-token search term reads its inputs from that and from
-nothing else ([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1). Like
-the adjacency it is derived from sealed facts, carries no provider version and
-no fingerprint of its own, and is dropped with the generation it describes.
-
+A search term reads its inputs — its document frequency, its posting list and
+every attribute of every candidate document — from a packed structure and from
+nothing else ([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decisions 1 and 2).
 It exists because the live posting path costs three b-tree descents per posting
 **instance** — the vocabulary row, the document row and the generation
-membership probe — plus a temporary b-tree per term for the document frequency,
-and all of that is paid again on every request. Resolving visibility once, at
-publication, into a document bitmap and folding one bare instance scan against
-it turns a per-request cost that grows with the corpus into a sequential read of
-one term's list.
+membership probe — plus a temporary b-tree per term for the document frequency
+and one document read per candidate, and all of that is paid again on every
+request.
 
-**The two tables.** `generation_lexical` carries one row per generation: the
-visible document count, the total token length and the number of terms.
-`generation_lexical_parts` carries the bytes, one row per chunk of one stream,
-keyed by generation, stream name and a 0-based part number whose parts
-concatenate to the stream. Both cascade from `generations`. The three streams
-are `term.dir`, a fixed-width directory in term order holding each term's
-document frequency and the slices of the other two streams that belong to it;
-`term.text`, the concatenated term bytes; and `post.list`, each term's
+The structure is built in two places, which is what keeps a one-file edit's
+publication independent of the repository's size. **At seal**, a unit's own term
+list is folded out of a temporary index that holds that unit's documents and no
+others, declared with exactly the same columns and tokenizer as the store-wide
+index so its terms are identical by construction. The documents are put into it
+in the same write that indexes them, because that is the only moment their text
+exists: the store-wide index is contentless. A delta's carried documents keep
+their original document ids and were never re-indexed, so their instances are
+merged out of the predecessor unit's list rather than re-tokenised. **At
+activation**, the visible units' lists are merged into the generation's, term by
+term and document by document, in batched passes whose heap is the batch and
+never the unit count: more units than one pass holds are merged into runs of the
+same format, and the runs are then merged. Visibility needs no bitmap and no
+probe — only the generation's members are merged — and a term's document
+frequency is the number of documents the merge emits for it.
+
+**The four tables.** `unit_lexical` and `unit_lexical_parts` hold a sealed
+unit's list; `generation_lexical` and `generation_lexical_parts` hold the
+generation's. The two commit rows carry a document count, a total token length
+and a term count; the two parts tables carry the bytes, one row per chunk of one
+stream, keyed by the unit or generation, the stream name and a 0-based part
+number whose parts concatenate to the stream. A unit's list cascades from
+`units` and is reused by every generation that carries the unit, exactly as its
+facts are; a generation's cascades from `generations`.
+
+The five streams are `term.dir`, a fixed-width directory in term order holding
+each term's document frequency and the slices of the next two streams that
+belong to it; `term.text`, the concatenated term bytes; `post.list`, each term's
 per-document, column-ascending `(column, count)` sequence, documents encoded as
-deltas. A term lookup is a binary search over the fixed-width directory, so a
-query reads a bounded window of parts rather than a vocabulary.
+deltas; `doc.dir`, a fixed-width directory in document order; and `doc.attr`,
+one record per document carrying every field a search answer reads from a
+document row — identity, node, file, path, kind, name, qualified name,
+signature, byte range and token length. A term lookup and a candidate lookup are
+both a binary search over a fixed-width directory, so a query reads a bounded
+window of parts rather than a vocabulary, and a page of ascending candidates
+walks the document directory once with no statement per candidate.
 
-The commit row is written **last**, after every part, for the same reason the
+Each commit row is written **last**, after every part, for the same reason the
 graph header is: a reader that finds it is guaranteed every part behind it.
 
-The build is one streaming pass — heap is one part, one term's list and the
-bitmap — and it holds the same 5 % share of the index wall clock the adjacency
-build is held to. Its start and end are logged on their own so an operator can
-see the pass rather than infer it from the activation's total.
+The seal fold's cost is a unit's and is paid once per unit version, in the
+parallel seal phase; the activation merge is a streaming copy bounded by the
+packed bytes of the generation. Together they hold the same 5 % share of the
+index wall clock the adjacency build is held to, and a delta activation is held
+to three times the adjacency build on the same store. The merge's start and end
+are logged on their own so an operator can see the pass rather than infer it
+from the activation's total.
 
 A **phrase** keeps the live posting path. The packed form stores counts, not
 offsets, and a phrase has to test adjacency; storing offsets would put a second
