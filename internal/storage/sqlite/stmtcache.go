@@ -38,13 +38,14 @@ func newStmtCache(tx *sql.Tx) *stmtCache {
 }
 
 // prepare returns the transaction's handle for query, preparing it on first
-// sight. A cache that does not belong to tx prepares an uncached statement for
-// the caller to close, which keeps the helper correct for any caller rather
-// than only for the writer that installed it.
+// sight. cached is false when there is no cache to own the handle -- the cache
+// is nil, or it belongs to another transaction -- in which case stmt is nil
+// and the caller issues its statement on the transaction itself. That keeps
+// the helper correct for every caller, not only for the writer that installed
+// the cache.
 func (c *stmtCache) prepare(ctx context.Context, tx *sql.Tx, query string) (stmt *sql.Stmt, cached bool, err error) {
 	if c == nil || c.tx != tx {
-		stmt, err := tx.PrepareContext(ctx, query)
-		return stmt, false, err
+		return nil, false, nil
 	}
 	if stmt, ok := c.by[query]; ok {
 		return stmt, true, nil
@@ -75,15 +76,15 @@ func (c *stmtCache) close() {
 // queryRow, query and exec are the three call shapes the writer's per-row
 // helpers use. Each runs through the cached handle, so the text is parsed once
 // per transaction instead of once per row.
+// A *sql.Row is scanned by its caller, so the statement behind it must outlive
+// this call: when the cache cannot own the handle -- it is nil, or it belongs
+// to another transaction -- the query goes to the transaction itself rather
+// than to a statement this function would have to close while the row is still
+// unread.
 func (c *stmtCache) queryRow(ctx context.Context, tx *sql.Tx, query string, args ...any) *sql.Row {
 	stmt, cached, err := c.prepare(ctx, tx, query)
-	if err != nil {
-		// Fall back to the transaction so the caller still gets a *sql.Row
-		// carrying the real error rather than a nil dereference.
+	if err != nil || !cached {
 		return tx.QueryRowContext(ctx, query, args...)
-	}
-	if !cached {
-		defer stmt.Close()
 	}
 	return stmt.QueryRowContext(ctx, args...)
 }
@@ -94,7 +95,7 @@ func (c *stmtCache) exec(ctx context.Context, tx *sql.Tx, query string, args ...
 		return nil, err
 	}
 	if !cached {
-		defer stmt.Close()
+		return tx.ExecContext(ctx, query, args...)
 	}
 	return stmt.ExecContext(ctx, args...)
 }
