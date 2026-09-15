@@ -12,6 +12,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -101,17 +102,38 @@ type Options struct {
 	Now func() time.Time
 }
 
-// Limits is the resolved budget list for one request. Every field is a hard
-// bound, and the visited and edge budgets are cumulative across the pages of
-// one traversal rather than reset per page.
+// Limits is the resolved budget list for one request.
+//
+// MaxDepth, MaxVisited, MaxEdges, MaxReasonPaths and FrontierBytes carry the
+// config.Limit convention verbatim: 0 is UNLIMITED, and only a negative value
+// is a wiring defect. They are stored as plain integers because that is what
+// the composition root hands over (config.Limit.Int()), and every comparison
+// below goes through config.Limit's own accessors -- Depth/Visited/Edges --
+// rather than re-inventing a zero test.
+//
+// MaxVisited and MaxEdges are PER-PAGE work budgets, not cumulative walk
+// ceilings: a page that spends one stops with a continuation cursor, and the
+// walk resumes on the next page. The cumulative counts are still carried by the
+// cursor and reported, so a caller sees the total the walk has spent.
+//
+// MaxPageItems, QueryTimeout and CursorTTL stay strictly positive: a page with
+// no item ceiling is a wire-security bound (class B), not a scale bound.
 type Limits struct {
 	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
 	QueryTimeout, CursorTTL                                      time.Duration
 	// FrontierBytes caps the edges one frontier level may hold at once,
-	// estimated by edgeRowBytes. A level that reaches it stops reading and the
-	// answer is truncated with reasonFrontierBytes.
+	// estimated by edgeRowBytes. A level that reaches it SPILLS: the walk stops
+	// that level, the frontier goes to the continuation spool and the next page
+	// carries on from the keyset position, so peak heap is bounded by this
+	// number and never by the graph.
 	FrontierBytes int64
 }
+
+// Depth, Visited and Edges are the three unlimited-capable count bounds read
+// through config.Limit, which owns the 0-means-unlimited semantics.
+func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
+func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
+func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
 
 // Engine answers graph queries against one pinned generation. One Engine is
 // built per request, which is why the concurrency Gate is passed in rather than
@@ -129,9 +151,13 @@ type Engine struct {
 
 // New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases
 // and Gate are optional as documented on Options, and a nil Now defaults to
-// time.Now. Every Limits field must be positive: a zero bound is resolved to
-// the configured default by the caller before it reaches here, so a zero
-// arriving at New is a wiring defect, not a request asking for "unlimited".
+// time.Now.
+//
+// The scale bounds accept 0 = unlimited (the config.Limit convention); only a
+// negative value is a wiring defect. The three that are not scale bounds --
+// the page item ceiling and the two durations -- stay strictly positive,
+// because an absent page ceiling or an absent deadline is a missing mechanism
+// rather than a generous one.
 func New(o Options) (*Engine, error) {
 	if o.Adjacency == nil {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
@@ -144,11 +170,21 @@ func New(o Options) (*Engine, error) {
 		{"max_depth", int64(o.Limits.MaxDepth)},
 		{"max_visited", int64(o.Limits.MaxVisited)},
 		{"max_edges", int64(o.Limits.MaxEdges)},
-		{"max_page_items", int64(o.Limits.MaxPageItems)},
 		{"max_reason_paths", int64(o.Limits.MaxReasonPaths)},
+		{"frontier_bytes", o.Limits.FrontierBytes},
+	} {
+		if b.value < 0 {
+			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
+				Message: "graph engine limit must not be negative"}).WithDetail("limit", b.field)
+		}
+	}
+	for _, b := range []struct {
+		field string
+		value int64
+	}{
+		{"max_page_items", int64(o.Limits.MaxPageItems)},
 		{"query_timeout", int64(o.Limits.QueryTimeout)},
 		{"cursor_ttl", int64(o.Limits.CursorTTL)},
-		{"frontier_bytes", o.Limits.FrontierBytes},
 	} {
 		if b.value <= 0 {
 			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
@@ -189,7 +225,12 @@ type frontierState struct {
 // truncated with no continuation rather than spending the budget again.
 type budget struct {
 	visited, edges int64
-	deadline       time.Time
+	// pageVisited and pageEdges are THIS page's own spend. The visited and edge
+	// bounds are per-page work budgets, so they are compared against these;
+	// visited and edges above stay cumulative because the cursor carries them
+	// and the answer reports them.
+	pageVisited, pageEdges int64
+	deadline               time.Time
 	// now is the engine clock the deadline was measured on. A budget whose
 	// deadline comes from e.now() must be compared against e.now(): mixing in
 	// time.Now would make a test clock's deadline either unreachable or
@@ -214,15 +255,19 @@ func (b *budget) clock() time.Time {
 type expandOptions struct {
 	Direction model.Direction
 	Kinds     []model.RelationKind
-	MaxDepth  int
+	// MaxDepth is the effective depth bound, unlimited when zero. A walk that
+	// runs out of depth with a frontier still standing reports reasonDepth;
+	// it is the one bound that is a property of the WALK rather than of the
+	// page, so it is not a per-page budget.
+	MaxDepth  config.Limit
 	Budget    *budget
 	BatchSize int
 	// FrontierBytes is Limits.FrontierBytes: the ceiling on the edges one
 	// frontier level may hold in memory at once. A level that reaches it stops
-	// reading and the walk is reported as truncated for that reason, rather
-	// than accumulating a whole hub's fan-out with no bound in front of it.
-	// Zero leaves the accumulation unbounded and is only reachable from a test
-	// that builds expandOptions directly.
+	// reading; the frontier it had built is spilled to the continuation spool
+	// and the next page resumes from the keyset position, rather than
+	// accumulating a whole hub's fan-out with no bound in front of it.
+	// Zero leaves the accumulation unbounded (config.Limit's convention).
 	FrontierBytes int64
 	// Resume, when non-nil, is the state a continuation restored: the walk
 	// starts from the spooled frontier at the cursor's depth instead of from

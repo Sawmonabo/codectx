@@ -93,6 +93,15 @@ type QueryMeta struct {
 	// Overlay is set only when the result came from the LSP overlay; a nil
 	// overlay means every record in the result is a canonical fact.
 	Overlay *OverlayBinding `json:"overlay,omitempty"`
+	// Notices are the answer's non-fatal disclosures: a request that asked for
+	// a bound larger than the configuration allows reports "requested N,
+	// effective M" here rather than being silently clamped, and a surface that
+	// skipped or cut something for a user-set reason names it here.
+	//
+	// A notice is not a truncation: Truncated says the ANSWER is short, a
+	// notice says the answer was produced under a bound the caller did not
+	// choose. Both can hold at once and neither implies the other.
+	Notices []string `json:"notices,omitempty"`
 }
 
 // Validate enforces the result metadata contract, including the rule that a
@@ -112,6 +121,18 @@ func (m QueryMeta) Validate() error {
 	}
 	if err := boundField("meta.next_cursor", m.NextCursor, MaxTokenBytes); err != nil {
 		return err
+	}
+	// Notices are bounded per ROW, not in total: the count is a function of how
+	// many bounds the caller asked to raise, which is small and bounded by the
+	// request shape, while an aggregate cap would be exactly the report-row
+	// drop this contract exists to prevent.
+	for _, n := range m.Notices {
+		if n == "" {
+			return invalid("meta.notices carries an empty notice")
+		}
+		if err := boundField("meta.notices", n, MaxReasonBytes); err != nil {
+			return err
+		}
 	}
 	if m.Overlay != nil {
 		if err := m.Overlay.Validate(); err != nil {
