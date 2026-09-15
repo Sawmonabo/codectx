@@ -82,6 +82,14 @@ it. pyright also never advertises `implementationProvider`, which is why
 `docs/providers-lsp.md` records python as "all but implementations". The 138 vs 136
 disagreement is unexplained and needs adjudicating before a swap.
 
+**Amended 2026-09-15.** The 138 above is this note's own one-off measurement and was **not
+reproduced** by the implementation lane: driven over the same repository with the client the
+product itself uses, the replaced server returned 2 locations cold and still 2 after settle
+windows of 15, 40 and 60 seconds, so no settled location set exists to diff against
+(`docs/providers-lsp.md` "The python row was re-measured for the swap"). The decisive comparison
+is therefore the cold one -- 2 versus 136 -- which is a wider gap than this table records, not a
+narrower one; 136 is the count of real occurrences. Read the `+15 s` pyright row as unreproduced.
+
 **TypeScript/JavaScript — `~/repos/r3/app`, 4,513 `.js`, Meteor, no `tsconfig.json`.**
 
 | Server | settle | `references` | results | server peak RSS | caps |
@@ -218,7 +226,9 @@ If Python moves to ty:
   rust-analyzer, which publish none. `node` stays pinned for the three other node-hosted
   payloads, so nothing else changes in the runtime graph.
 - **`internal/provider/lsp`** — the `pyright` `Definition` becomes `ty` with arguments
-  `["server"]` instead of `["--stdio"]`, same `PATH HOME` allowlist, same root markers. Because
+  `["server"]` instead of `["--stdio"]`, same `PATH HOME` allowlist, and the root markers with
+  the replaced server's `pyrightconfig.json` swapped for `ty.toml` (amended 2026-09-15: this
+  originally said the markers were unchanged). Because
   ty is not runtime-hosted, `Resolve` stops composing `<managed node> <entry>` for python and
   runs the payload directly — the same shape as gopls, clangd and rust-analyzer.
 - **What changes in the product**: python gains `implementations`,

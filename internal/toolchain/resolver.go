@@ -138,6 +138,11 @@ const (
 	StateUnsupportedPlatform State = "unsupported_platform"
 	StateOverride            State = "override"
 	StateCorrupt             State = "corrupt"
+	// StateUnlisted is a payload directory the store holds that no lock entry
+	// names. It is not a lock entry, so it carries no version and no digest;
+	// `tools verify` reports one row per such directory and `tools prefetch`
+	// removes them.
+	StateUnlisted State = "unlisted"
 )
 
 // Status is one line of the toolchain report. Detail is a short safe phrase; it
@@ -570,15 +575,39 @@ func (r *Resolver) Status(ctx context.Context) []Status {
 	return out
 }
 
-// Verify rehashes each installed entry executable against the lock, so a store
-// a user has edited or a disk has damaged is reported as corrupt rather than
-// discovered at the next run.
+// Verify rehashes each installed entry executable against the lock and then
+// reports what the store holds beyond the lock. Both halves answer the same
+// operator question -- is this store what this binary pins -- and a report that
+// only walked the lock would call a store clean while it held payloads nothing
+// vouches for.
 func (r *Resolver) Verify(ctx context.Context) ([]Status, error) {
 	out, err := r.report(ctx, true)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return out, model.Canceled(ctxErr)
 	}
-	return out, err
+	unlisted, uErr := r.unlistedStatus()
+	return append(out, unlisted...), errors.Join(err, uErr)
+}
+
+// unlistedStatus is one row per store directory the lock does not name. The
+// directory name is operator-visible output, so a name outside the lock's
+// alphabet -- which nothing in this package writes -- is reported as such
+// rather than rendered into a terminal.
+func (r *Resolver) unlistedStatus() ([]Status, error) {
+	entries, err := r.store.unlisted(r.lock)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Status, 0, len(entries))
+	for _, e := range entries {
+		s := Status{Name: e.Name(), State: StateUnlisted,
+			Detail: "the store holds this payload; no lock entry names it, and `codectx tools prefetch` removes it"}
+		if validToolName(s.Name) != nil {
+			s.Name = "(a name outside the lock's alphabet)"
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // report builds the status list. A store that cannot be inspected at all is
@@ -643,6 +672,13 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error {
 		if err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// Prefetch's post-condition is a store that holds what the lock names, so
+	// it also removes what the lock does not: payload directories left by a
+	// superseded entry are bytes no digest in this binary vouches for, and the
+	// operator who ran prefetch is the one asking for the store to be right.
+	if _, err := r.store.pruneUnlisted(ctx, r.lock); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }
