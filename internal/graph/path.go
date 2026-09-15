@@ -26,6 +26,7 @@ const (
 	pathReasonEdges    = "the edge budget was exhausted before the path search completed"
 	pathReasonDepth    = "the max-depth bound stopped the path search; the routes returned are the cheapest within that depth"
 	pathReasonRoutes   = "the route-enumeration budget was exhausted before every equal-cost route was collected"
+	pathReasonMemory   = "the query memory budget was exhausted before the path search completed"
 	pathReasonDeferred = "dependence units are still building"
 )
 
@@ -88,6 +89,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		maxDepth:   pathBound(req.MaxDepth, e.limits.Depth()),
 		maxVisited: pathBound(req.MaxVisited, e.limits.Visited()),
 		maxEdges:   e.limits.Edges(),
+		maxBytes:   e.limits.FrontierBytes,
 		dist:       map[model.NodeID]int64{},
 		depth:      map[model.NodeID]int{},
 		settled:    map[model.NodeID]bool{},
@@ -115,6 +117,8 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// found under an exhausted budget is the cheapest one seen, not provably the
 	// cheapest one there is.
 	switch {
+	case w.memoryHit:
+		pathTruncate(&res.Meta, pathReasonMemory)
 	case w.deadlineHit:
 		pathTruncate(&res.Meta, pathReasonDeadline)
 	case w.visitedHit:
@@ -252,6 +256,17 @@ type pathWalk struct {
 	maxDepth   config.Limit
 	maxVisited config.Limit
 	maxEdges   config.Limit
+	// maxBytes is Limits.FrontierBytes: the ceiling on what the walk's own
+	// state -- dist, depth, settled, the cached edges and the priority queue --
+	// may hold at once. Before it, those four maps grew with the REACHABLE SET
+	// and the finite default budgets were the only thing bounding them; with
+	// every count bound unlimited by default there was nothing left. Unlike the
+	// BFS frontier this state cannot spill: a Dijkstra resumed from a persisted
+	// frontier also needs its settled distances, and that is a continuation
+	// this endpoint does not have. So the ceiling is REPORTED as truncation
+	// (pathReasonMemory) with the cheapest routes found so far, and the
+	// operator's remedy is resources.query_memory_bytes.
+	maxBytes int64
 
 	dist    map[model.NodeID]int64
 	depth   map[model.NodeID]int
@@ -264,8 +279,12 @@ type pathWalk struct {
 	pq      pathHeap
 	visited int64
 	spent   int64
+	// bytes is the running estimate of what the four maps and the heap hold,
+	// charged with the same conservative per-row overhead the BFS frontier uses.
+	bytes int64
 
 	depthPruned bool
+	memoryHit   bool
 	visitedHit  bool
 	edgesHit    bool
 	deadlineHit bool
@@ -278,6 +297,7 @@ type pathWalk struct {
 func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 	w.dist[from] = 0
 	w.depth[from] = 0
+	w.charge(pathNodeBytes(from) + pathQueueBytes(from))
 	heap.Push(&w.pq, pathHeapItem{node: from})
 
 	for w.pq.Len() > 0 {
@@ -321,7 +341,7 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 		if err := w.expandBatch(ctx, expand); err != nil {
 			return err
 		}
-		if w.edgesHit {
+		if w.edgesHit || w.memoryHit {
 			return nil
 		}
 	}
@@ -374,8 +394,12 @@ func (w *pathWalk) expandBatch(ctx context.Context, nodes []model.NodeID) error 
 				w.edgesHit = true
 				return nil
 			}
+			w.charge(pathEdgeBytes(r))
 			w.edges[r.From] = append(w.edges[r.From], r)
 			w.relax(r)
+			if w.memoryHit {
+				return nil
+			}
 		}
 		// Only an empty page ends the keyset walk: the reader clamps the
 		// requested limit down to model.MaxPageItems, so a short page is the
@@ -400,13 +424,45 @@ func (w *pathWalk) relax(r model.Relation) {
 	known, seen := w.dist[r.To]
 	switch {
 	case !seen || cost < known:
+		if !seen {
+			w.charge(pathNodeBytes(r.To))
+		}
 		w.dist[r.To] = cost
 		w.depth[r.To] = depth
+		w.charge(pathQueueBytes(r.To))
 		heap.Push(&w.pq, pathHeapItem{cost: cost, depth: depth, node: r.To})
 	case cost == known && depth < w.depth[r.To]:
 		w.depth[r.To] = depth
+		w.charge(pathQueueBytes(r.To))
 		heap.Push(&w.pq, pathHeapItem{cost: cost, depth: depth, node: r.To})
 	}
+}
+
+// charge adds n bytes to the walk's estimate and trips memoryHit once the
+// ceiling is crossed. An unlimited ceiling (0) never trips, which is what keeps
+// `query_memory_bytes = 0` meaning "bounded by the graph and the count budgets
+// alone" rather than "stop immediately".
+func (w *pathWalk) charge(n int64) {
+	w.bytes += n
+	if w.maxBytes > 0 && w.bytes > w.maxBytes {
+		w.memoryHit = true
+	}
+}
+
+// pathNodeBytes, pathQueueBytes and pathEdgeBytes estimate what one settled
+// node, one queue entry and one cached edge cost. Like edgeRowOverheadBytes
+// they are deliberate over-estimates: the ceiling is a memory ceiling, and an
+// estimate that read low would let it be crossed before the walk noticed.
+//
+// A node is charged once for its three map entries (dist, depth, settled) and
+// again for every queue entry it takes, because a node relaxed twice occupies
+// the heap twice.
+func pathNodeBytes(n model.NodeID) int64 { return 3 * (edgeRowOverheadBytes + int64(len(n))) }
+
+func pathQueueBytes(n model.NodeID) int64 { return edgeRowOverheadBytes + int64(len(n)) }
+
+func pathEdgeBytes(r model.Relation) int64 {
+	return edgeRowOverheadBytes + int64(len(r.ID)+len(r.From)+len(r.To)+len(r.Kind))
 }
 
 // routes enumerates up to want equal-cost shortest routes from the shortest-path
