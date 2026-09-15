@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -51,16 +52,21 @@ type Options struct {
 // synchronousPragma pairs the value the DSN applies with the value reading
 // `PRAGMA synchronous` back must report, so the two halves cannot drift.
 // The unknown case fails closed: the store never picks a durability mode the
-// operator did not ask for. The match is exact, matching the configuration
-// validator, so the two layers accept the same set of spellings.
+// operator did not ask for.
+//
+// The spellings are the configuration package's own constants rather than
+// literals repeated here, so the accepted set cannot drift from the validator
+// that refuses everything outside it (internal/config/validate.go). A comment
+// claiming the two sets match enforced nothing; sharing the constants does.
 func synchronousPragma(mode string) (pragma, error) {
 	switch mode {
-	case "normal":
+	case config.SynchronousNormal:
 		return pragma{"synchronous", "NORMAL", "1"}, nil
-	case "full":
+	case config.SynchronousFull:
 		return pragma{"synchronous", "FULL", "2"}, nil
 	}
-	return pragma{}, invalid("storage.synchronous is %q; use %q or %q", mode, "normal", "full")
+	return pragma{}, invalid("storage.synchronous is %q; use %q or %q",
+		mode, config.SynchronousNormal, config.SynchronousFull)
 }
 
 func (o Options) withDefaults() Options {
@@ -89,7 +95,7 @@ func (o Options) withDefaults() Options {
 		o.MaxJSONBytes = 8 << 20
 	}
 	if o.Synchronous == "" {
-		o.Synchronous = "normal"
+		o.Synchronous = config.SynchronousNormal
 	}
 	return o
 }

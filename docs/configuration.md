@@ -398,6 +398,24 @@ following the cursor reaches the same nodes an unbounded walk would. The
 pages of one walk, so a caller still sees the total the walk has spent, and a
 replayed cursor neither resets nor doubles it.
 
+`impact` spends those two budgets on different terms, and an operator setting
+them should know which. It walks **once for the whole answer** and then ranks
+what the walk admitted, so `max_visited_nodes` and `max_graph_edges` are
+answer-level bounds there: spending one truncates that answer and is reported,
+rather than ending a page. What the pages then serve is the finished ranking —
+one globally ordered list, `score_micros` descending, then `depth` ascending,
+then `node_id` ascending, with each entity listed **exactly once** no matter how
+many frontiers reached it (the cheapest route wins and the reasons of every edge
+that touched it are merged into that one entry). Paging does not re-rank: a page
+is a window on the one global order, never a chunk ranked against itself, so no
+entity is re-listed under a later page and none is reordered by where the page
+boundary fell. The cost shape follows from that — the **first** page pays for
+the whole walk and the ranking, and the pages after it are reads of the ranked
+result. A query deadline reached during either ends the page rather than the
+answer: the request comes back with `query deadline reached` and a cursor that
+carries the walk or the ranking on, so an unfinished `impact` is never served as
+a complete one. `docs/queries.md` states the same contract from the query side.
+
 `max_graph_edges` is read in one more place: the context compiler's scan that
 resolves the **kind** of every relation a selection's explanation routes name.
 That scan pages the store by keyset, one page of `resources.max_page_items`

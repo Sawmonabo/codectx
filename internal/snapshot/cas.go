@@ -189,8 +189,14 @@ func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRe
 		return model.BlobRecord{}, err
 	}
 	if tmp == nil {
-		// Already published by an earlier generation, so already durable:
-		// deduplicated content costs no sync.
+		// Already published by an earlier generation, so the BYTES cost no
+		// sync. The bucket DIRENT still does: the batch that published it may
+		// have died before its own Barrier, leaving a file whose name is not
+		// durable, and this batch is about to commit a manifest that names it.
+		// Recording the bucket costs one fsync per two-hex prefix and is what
+		// the pre-batch put did unconditionally. The directory exists (the
+		// blob is in it), so the MkdirAll this skips is not owed.
+		b.dirty[filepath.Dir(final)] = struct{}{}
 		return rec, nil
 	}
 	if _, ok := b.pending[rec.Hash]; ok {

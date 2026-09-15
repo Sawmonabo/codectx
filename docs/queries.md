@@ -166,11 +166,20 @@ with `graph depth budget exhausted` and no continuation. `impact` walks once for
 the whole answer, so a `--visited` or `--edges` allowance it spends truncates
 that answer, reports the same reason and offers no continuation — the ranked
 pages that follow are what is left of a walk that stopped, not a walk to be
-resumed. `path` is not
-paged at all and its visited, edge and depth budgets truncate the one search it
-runs; it reports truncation together with whatever routes it found — never as
-"no path exists", which is reserved for a target that is genuinely unreachable,
-and never because the search exceeded a memory ceiling.
+resumed.
+
+`path` is the third shape, and it is neither of those. It declares no `--limit`
+because a route set is bounded by the reason-path cap rather than paged into
+items, but the **search** behind it is paged: `--visited` is a per-page work
+budget there, and a page that spends it ends with `next` rather than an answer.
+Following that cursor resumes the same search from the state it kept, so the
+routes it finally reports are the ones an unbounded search would report. The
+query deadline behaves the same way on `path` — the page ends, the cursor
+carries on. Only `--depth` truncates a `path` answer outright, because depth is
+part of the query a cursor is bound to. Truncation is always reported together
+with whatever routes were found — never as "no path exists", which is reserved
+for a target that is genuinely unreachable, and never because the search
+exceeded a memory ceiling.
 
 The query deadline ends a page and not an answer: a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
