@@ -7,9 +7,10 @@ cached, governed per unit, and honest about every way an analysis can come
 back incomplete.
 
 This is the only product document that names the engine behind it in prose.
-Elsewhere the product name survives only as the tool lock's entry id, in the
-toolchain pages that install it, in source-reference lists, and in the dated
-research reports under `docs/research/`. Everywhere else — the provider id, the
+Elsewhere the name appears only as an identifier (the tool lock entry, the
+backend package path), in the pages that install and configure it, in licence
+and source lists, and in the dated research reports under `docs/research/`.
+Everywhere else — the provider id, the
 configuration table, capability names, evidence details, error details, log
 fields, query results — it is "the engine".
 

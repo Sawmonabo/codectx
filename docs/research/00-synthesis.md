@@ -13,14 +13,14 @@ All answered by experiment on this machine; details in `09-scaling-governance-em
 | Memory envelope on large repos | The multi-GB RSS was JVM default sizing. A 500 MB heap cap produced a byte-identical graph for 239k Go lines (1.0 GB RSS vs 7.2 GB); a 2 GB cap handled 506k Python lines; a too-small cap fails closed with no output. Governor sizes the cap per unit (~2–4 MB per 1k LOC), retries once, never emits partial facts. |
 | Call-site join design | Confirmed on 8,325 Go call sites: 97.6% of method/package calls and every bare user-function call resolve at the call-site range; every miss is a builtin, a conversion, a build-tag-excluded file, or a call through a value. Call site and symbol stay separate nodes; the `callsite:` alias joins them and both evidence rows survive. Nothing the engine's CALL edge carries is lost. |
 | reads / writes | Produced by the dependence provider from assignment operators: 5,542 assignments on codectx, 3,660 with a resolved written target. Neither SCIP (no write role anywhere) nor syntax alone can do it. |
-| Process-tree governance | Heap cap via the frontend's environment; per-unit sizing; `max_concurrent_heavy_analyzers`; `failed: memory` with observed peak; no capability reduction at any cap. |
+| Process-tree governance | Heap cap via the frontend's environment; per-unit sizing; one admission ledger that admits every heavy child against a single machine-derived allocation by summed reservations, strict first-in-first-out, rather than a concurrency count; `failed: memory` with observed peak; no capability reduction at any cap. |
 | Backend provenance | `provider_version` carries the engine payload digest; `Detection.ObservedVersion` reports engine name/version/digest to status and doctor; docs map digests to releases. |
 | First-query-only vs background | Changed: `auto` now means low-priority background units after the base index activates, queried units promoted first, typed `pending`. Base readiness is untouched. |
 | Cache key closure | Source hashes + manifests/lockfiles + frontend argv (excludes, definition cap, include paths) + engine digest + runtime digest. |
-| Long-term backend | The engine remains viable once capped: 239k Go lines in 12 s / 1 GB, 506k Python in 37 s / 3.9 GB. One real engine bug (its JS/TS frontend crashing on a code shape) was hit on a 1.0M-line Meteor app and on its 324k-line client; per-unit runs contain it. No alternative covers nine languages with control and data dependence: Infer is compositional but C/Java/ObjC and emits no dependence graph; CodeQL is heavier; another open CPG engine has the same JVM profile. Revisit only if the engine bug rate in the CI matrix stays high. |
+| Long-term backend | The engine remains viable once capped: 239k Go lines in 12 s / 1 GB, 506k Python in 37 s / 3.9 GB. One real engine bug (its JS/TS frontend crashing on a code shape) was hit on a 1.0M-line JavaScript application and on one 324k-line subtree of it; per-unit runs contain it. No alternative covers nine languages with control and data dependence: Infer is compositional but C/Java/ObjC and emits no dependence graph; CodeQL is heavier; Fraunhofer cpg has the same JVM profile. Revisit only if the engine bug rate in the CI matrix stays high. |
 
 ## 0a. Third-round verification (reviewer's twelve points)
-All by experiment; details and raw logs in `10-round3-empirical.md`.
+All by experiment; details and raw logs in `10-engine-empirical.md`.
 
 | Point | Result |
 |---|---|
@@ -128,14 +128,14 @@ either completely or not at all, never partially, and the `pending` capability a
 real answer exactly at activation.
 
 ## 7. Round-3 evidence
-See `10-round3-empirical.md` for the tree-summed memory tables (parse and export), per-language
+See `10-engine-empirical.md` for the tree-summed memory tables (parse and export), per-language
 caps on C, Rust, TypeScript, Java and large Python, the Kubernetes go.work finding, the six-language
 call-site join, the reads/writes lowering algebra, subdivision parity and the definition-cap retry.
 
 ## 8. Direction ruling (2026-09-13, user-adopted reviewer directive)
 Engine-backed `dependence` is the MVP backend. No default memory ceiling: estimates schedule and
-serialize work (`max_concurrent_heavy_analyzers = 1` by default, co-schedule only when summed
-reservations fit); only an explicit user limit rejects work up front; one OOM retry at the
+serialize work (one admission ledger, one machine-derived allocation, first-in-first-out by summed
+reservations, so units co-schedule only when their reservations fit); one OOM retry at the
 machine-derived allocation, only when it exceeds the failed cap. Subdivision is the last-resort
 recovery from a reproducible engine crash (confirmed by one rerun with the frontend's fixed,
 currently empty, semantics-neutral option allowlist), never for memory, published per capability as
@@ -148,3 +148,7 @@ The §8 ruling above was generalised from the dependence tier to the whole produ
 the decisions, the alternatives weighed against them and the measurements behind them are recorded in
 [ADR-0001 — Scale posture](../adr/ADR-0001-scale-posture.md), with the bound inventory in
 [15-scale-posture.md](15-scale-posture.md).
+
+The future native engine the §8 ruling names as the successor is planned, sized and phased in
+[20-native-engine-post-mvp.md](20-native-engine-post-mvp.md) (raw evidence under
+`raw/native-engine/`). It does not start before the MVP ships and it does not reverse the ruling.

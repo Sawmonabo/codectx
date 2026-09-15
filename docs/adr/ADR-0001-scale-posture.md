@@ -608,9 +608,10 @@ therefore determinism, and it is recorded as the next one if the redesign misses
 reserve is the second-order change to the evidence family, which is 21.6 % of the file as one row
 per fact-to-owner link plus its indexes: replacing those rows with a compressed integer set per
 owner plus a fact-id interval map. The closest published analogue solves the identical
-fact-to-owner problem at **+7 %** of database size for 2–3 % more index time [S25], which is why it
-is second-order — it buys the row count, not bytes — and is attempted only if the surrogates and
-the interning miss the gate.
+fact-to-owner problem with exactly that pair of structures, at **+7 %** of *its own* database size
+and 2–3 % more index time [S25]. It is second-order here — attempted only if the surrogates and the
+interning miss the gate — because it is a schema change to one family rather than a change at every
+reference site.
 
 **Why bytes-per-symbol is the metric.** The cost is per identity, so it scales with symbols, not
 source bytes: the same symbol count spread over 14× more source moves the *ratio* by roughly that
