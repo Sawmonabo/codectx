@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -38,10 +37,14 @@ import (
 //     across the chain would end the whole walk at the first internal page and
 //     serve a partial blast radius as a complete one; budget.visited/edges are
 //     the answer's disclosed spend and keep growing.
-//   - the cumulative admitted-node set is appended to ONE scratch file for the
-//     whole run rather than copied spool-to-spool per internal page. A copy per
-//     page is O(pages x nodes) -- the cost cursor.go's one-fresh-spool-per-page
-//     rule exists to avoid between requests, and no cheaper inside one.
+//   - the cumulative admitted-node set is APPENDED to, never copied. Each link
+//     adds one ascending run of its own admissions to the walk's persistent
+//     visited store (visitedstore.go), which is the same state the continuation
+//     carries to the next request. A copy per page is O(pages x nodes), and
+//     appends that reached only a request-scoped scratch file were worse than
+//     that: the links' admissions never reached the continuation at all, so the
+//     next request re-admitted every one of them and reported the same entity
+//     on two pages.
 //   - the keyset position is recorded here, from the visitor, because expand
 //     does not report it and a mid-level internal boundary must resume exactly
 //     where the last ADMITTED row left off.
@@ -72,23 +75,17 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 		return nil
 	}
 
-	// The nodes every earlier link of the chain admitted. Nil until the first
-	// internal boundary: a walk that finishes in one expand pays no file.
-	var scratch *visitedScratch
-	release := func() {
-		if scratch != nil {
-			scratch.release()
-		}
+	if o.Visited == nil {
+		return walkState{}, (&model.Error{Code: model.CodeInternal,
+			Message: "graph expansion requires a persistent visited set"}).
+			WithDetail("operation", "run_walk_to_completion")
 	}
-	carried := outerVisited(o.Resume)
 	for {
 		spent := o.Budget.edges
 		state, err := expand(ctx, e.adjacency, seeds, o, wrapped)
 		if err != nil {
-			release()
 			return walkState{}, err
 		}
-		state.Carried, state.ReleaseCarried = carried, release
 		switch {
 		case len(state.Frontier) == 0 || state.DepthLimited:
 			// Exhausted, or stopped at the user-set depth bound -- the one stop
@@ -124,20 +121,16 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			// has just reset.
 			var typed *model.Error
 			if !errors.As(err, &typed) || typed.Code != model.CodeQueryDeadline {
-				release()
 				return walkState{}, err
 			}
 			o.Budget.deadlineHit = true
 			return state, nil
 		}
-		if scratch == nil {
-			if scratch, err = newVisitedScratch(e.walkScratchDir()); err != nil {
-				return walkState{}, err
-			}
-			carried = chainVisited(outerVisited(o.Resume), scratch.stream)
-		}
-		if err := scratch.append(state.Admitted.newlyAdmitted()); err != nil {
-			release()
+		// This link's OWN admissions, as one ascending run of the persistent
+		// store. Only its own: the frontier it resumed belongs to the run the
+		// previous link wrote. The store is flushed by the append, so the next
+		// link's membership sweep reads what this one just admitted.
+		if err := o.Visited.appendRun(state.Admitted.addedNodes()); err != nil {
 			return walkState{}, err
 		}
 		// The next link resumes from this one exactly as a signed continuation
@@ -148,7 +141,8 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			Cursor:   traversalCursor{Depth: state.Depth, LastOwner: lastOwner, LastKey: lastKey},
 			Budget:   o.Budget,
 			Frontier: state.Frontier,
-			Visited:  carried,
+			Visited:  o.Visited.stream,
+			Filter:   o.Visited.filter,
 			Release:  func() {},
 		}
 		if state.LevelBoundary {
@@ -164,106 +158,8 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 	}
 }
 
-// outerVisited is the cumulative set the REQUEST arrived with: the spool of the
-// cursor being resumed, or nothing on the first request of a walk.
-func outerVisited(r *resumeState) visitedStream {
-	if r == nil {
-		return nil
-	}
-	return r.Visited
-}
-
-// chainVisited replays two cumulative sets as one. Order does not matter to a
-// membership sweep, and a node present in both is answered by whichever comes
-// first; visitedSet.warm already tolerates a repeat.
-func chainVisited(first, second visitedStream) visitedStream {
-	if first == nil {
-		return second
-	}
-	return func(ctx context.Context, fn func(model.NodeID) error) error {
-		if err := first(ctx, fn); err != nil {
-			return err
-		}
-		return second(ctx, fn)
-	}
-}
-
-// visitedScratch is the append-only file the internal links of one
-// walk-to-completion record their admitted nodes in.
-//
-// It is NOT a pagination spool: a spool is continuation state bound to a lease
-// and a query hash, and this never outlives the request that wrote it. It is a
-// plain length-free line file because a model.NodeID is hex and cannot contain
-// a separator.
-type visitedScratch struct {
-	f *os.File
-	w *bufio.Writer
-}
-
-// newVisitedScratch opens one under dir.
-func newVisitedScratch(dir string) (*visitedScratch, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, &model.Error{Code: model.CodeInternal,
-			Message: "graph: opening the walk scratch directory: " + err.Error()}
-	}
-	f, err := os.CreateTemp(dir, "graph-visited-*")
-	if err != nil {
-		return nil, &model.Error{Code: model.CodeInternal,
-			Message: "graph: opening the walk scratch file: " + err.Error()}
-	}
-	return &visitedScratch{f: f, w: bufio.NewWriter(f)}, nil
-}
-
-// append records one internal page's admissions.
-func (s *visitedScratch) append(ids []model.NodeID) error {
-	for _, id := range ids {
-		if _, err := s.w.WriteString(string(id)); err != nil {
-			return scratchErr(err)
-		}
-		if err := s.w.WriteByte('\n'); err != nil {
-			return scratchErr(err)
-		}
-	}
-	return s.w.Flush()
-}
-
-// stream replays every node recorded so far, from the start of the file. The
-// writer is flushed by append, so a replay always sees every completed link.
-func (s *visitedScratch) stream(ctx context.Context, fn func(model.NodeID) error) error {
-	f, err := os.Open(s.f.Name())
-	if err != nil {
-		return scratchErr(err)
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 4096), model.MaxIdentifierBytes+1)
-	for sc.Scan() {
-		if err := ctx.Err(); err != nil {
-			return typedContextError(ctx, err)
-		}
-		if err := fn(model.NodeID(sc.Text())); err != nil {
-			return err
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return scratchErr(err)
-	}
-	return nil
-}
-
-// release closes and removes the file. It is deferred by whoever consumed the
-// walk, because the continuation spill reads the stream after the walk returns.
-func (s *visitedScratch) release() {
-	_ = s.f.Close()
-	_ = os.Remove(s.f.Name())
-}
-
-func scratchErr(err error) error {
-	return &model.Error{Code: model.CodeInternal, Message: "graph: the walk scratch file: " + err.Error()}
-}
-
-// walkScratchDir is where this request's scratch file and sort runs spill: the
-// spool store's own sort directory, so a query's temporary files sit in one
+// walkScratchDir is where this request's retained state and sort runs spill:
+// the spool store's own sort directory, so a query's temporary files sit in one
 // place (pagination.Spools.SortDir states why sort runs are not charged against
 // the continuation byte budget). An engine with no spool store has no
 // continuations either and falls back to the process temp directory.
