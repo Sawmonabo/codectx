@@ -482,7 +482,13 @@ func (a *impactAccumulator) Relations() []model.Relation { return a.edges }
 // reasonPaths is context.max_reason_paths_per_entry. The accumulator records
 // ONE parent per admitted node -- the edge that first reached it, which is the
 // edge the entry's reason names -- so there is exactly one route to
-// reconstruct and a positive bound admits it while a zero bound suppresses it.
+// reconstruct, and every loadable setting admits it: a positive bound is at
+// least one, and zero is UNLIMITED under the config.Limit convention, not
+// "none". There is deliberately no spelling that suppresses the route here --
+// a negative is a wiring defect, not a way to ask for zero paths -- because an
+// impact entry's single route is the evidence for the reason it already
+// reports, and an entry whose reason nothing backs is what Section 14.3
+// rejects.
 // Enumerating alternate routes would mean keeping every parent of every node
 // for the whole walk, which is the frontier blow-up MaxVisited exists to
 // prevent; `path` is the command that answers "the equal-cost routes", and it

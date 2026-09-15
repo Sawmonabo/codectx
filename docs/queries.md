@@ -78,7 +78,21 @@ from a later page's frontier is listed again with that page's reasons.
 `visited_count` and `edge_count` are cumulative and grow across the pages of one
 answer. The same paragraph applies to the package-dependency rollup, which pages
 on identical terms; it has no CLI, app-facade or MCP surface today, so its
-continuation is reachable only from the engine API. `path` is not paged at all — it declares neither flag, and its
+continuation is reachable only from the engine API.
+
+**Known defect, under remediation — the per-page ranking above is not the
+intended contract.** Ranking each page over its own chunk, and listing an entity
+again when a later page's frontier reaches it, are consequences of taking the
+whole-walk accumulator off the heap, not a behaviour chosen for callers. The
+intended contract is the one a single unbounded walk gives: one globally ranked,
+deduplicated sequence paged without reordering or repetition. Until that lands,
+treat the paragraph above as a description of current behaviour rather than as a
+guarantee to build on. The same applies to `path` below: a search whose state
+exceeds `resources.query_memory_bytes` is reported truncated with the cheapest
+routes found so far rather than the provably cheapest route, and that truncation
+is a defect under remediation, not a contract.
+
+`path` is not paged at all — it declares neither flag, and its
 `--visited` budget is spent by the one search it runs.
 
 **Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
