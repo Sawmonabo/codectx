@@ -54,9 +54,9 @@ const (
 
 // Bound names. A manifest over one of them is reported partial with
 // CTX_RESOURCE_LIMIT and the capability carries the count that crossed it.
-// Both bounds are unlimited by default: how many dependencies a manifest
-// declares is a property of the repository, not something the product cuts on
-// the user's behalf.
+// All four are unlimited by default: how much a manifest declares, and how
+// many lines or elements it takes to declare it, are properties of the
+// repository, not something the product cuts on the user's behalf.
 const (
 	BoundDependencies = "max_dependencies"
 	BoundEntries      = "max_entries" // modules, members, headings, links, properties
@@ -69,9 +69,12 @@ const (
 	BoundTOMLLines   = "max_toml_lines"
 )
 
-// Options are the admission settings this provider honours
-// (workspace.max_parse_file_bytes); they are part of the analysis
-// configuration hash.
+// Options are the admission settings this provider honours.
+// MaxParseFileBytes (workspace.max_parse_file_bytes) is part of the analysis
+// configuration hash; the four providers.manifest.* bounds below are NOT yet
+// folded into config.AnalysisConfigHash, so raising one does not by itself
+// invalidate units indexed under a lower one and their cut facts stay cut.
+// Closing that is four quoteLimit lines in config/fingerprint.go.
 type Options struct {
 	// MaxParseFileBytes is the largest manifest or document parsed. A
 	// larger file stays retained and searchable; its capability here is
