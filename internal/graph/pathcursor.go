@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"sort"
 	"strconv"
@@ -187,6 +188,30 @@ func (e *Engine) resumePath(ctx context.Context, token, queryHash string) (*path
 	}}, nil
 }
 
+// terminalRetention makes a failure raised AFTER the page's state was committed
+// and handed to the spool store TERMINAL, whatever its origin.
+//
+// Past sc.detach() the search state is committed and the directory is no longer
+// this request's: the cursor the caller still holds names a position the state
+// on disk has moved past, and the directory itself is removed on the way out of
+// the branches below. A failure spelled RETRYABLE there would invite the one
+// thing that cannot work -- presenting that cursor again -- and the caller
+// would meet CTX_CURSOR_INVALID instead of the error it was told to retry.
+// errRetentionBudget is already deliberately non-retryable for this reason;
+// this is the same rule for the failures that do not choose their own spelling,
+// such as a raw filesystem error out of AdoptDir.
+func terminalRetention(err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *model.Error
+	if errors.As(err, &typed) && !typed.Retryable {
+		return err
+	}
+	return internalErr("path continuation: the search state was committed and handed over, " +
+		"so this failure cannot be retried on the same cursor: " + err.Error())
+}
+
 // nextPathCursor retains the search's state directory under a fresh
 // cursor-owned lease and signs the continuation for the page after it.
 //
@@ -227,7 +252,9 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 	// resume a search that has forgotten half its work.
 	dir, err := sc.detach()
 	if err != nil {
-		return "", e.releaseLease(ctx, lease.ID, err)
+		// detach() failing leaves the state neither committed nor this
+		// request's to resume from, so this one is terminal too.
+		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
 	}
 	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
 	if err != nil {
@@ -238,22 +265,22 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 			// Reported, never silent: ending the answer here with no token
 			// under whichever WORK budget happened to be set told the caller to
 			// raise a bound that was not the one that stopped it.
-			return "", e.releaseLease(ctx, lease.ID, errRetentionBudget("search"))
+			return "", terminalRetention(e.releaseLease(ctx, lease.ID, errRetentionBudget("search")))
 		}
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
 	}
 	next.ScratchID = id
 	if err := next.validate(); err != nil {
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
-		return "", e.releaseLease(ctx, lease.ID,
-			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
+		return "", terminalRetention(e.releaseLease(ctx, lease.ID,
+			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()}))
 	}
 	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
 	if err != nil {
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
 	}
 	return token, nil
 }
