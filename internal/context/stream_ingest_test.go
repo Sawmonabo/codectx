@@ -202,7 +202,18 @@ func streamScope(t *testing.T, fx *contextFixture, eng *graph.Engine, seeds []ca
 	t.Helper()
 	sorts := openSorts(t, fx.Cfg)
 	c := &Compiler{cfg: fx.Cfg}
-	got, err := c.passAIngest(fx.ctx, sorts, eng, fx.Gen, seeds, fixtureCapabilities)
+	// P-A takes the sink the Section 15.2 producers push into (ruling C10), so
+	// a test with a slice of seeds pushes them the way discovery would.
+	ingest, err := c.newSeedIngest(sorts)
+	if err != nil {
+		t.Fatalf("newSeedIngest: %v", err)
+	}
+	for i := range seeds {
+		if err := ingest.Admit(seeds[i]); err != nil {
+			t.Fatalf("Admit: %v", err)
+		}
+	}
+	got, err := c.passAIngest(fx.ctx, ingest, eng, fx.Gen, fixtureCapabilities)
 	if err != nil {
 		t.Fatalf("passAIngest: %v", err)
 	}

@@ -116,6 +116,27 @@ var fixtureCapabilities = []model.CapabilityState{
 
 // fixtureNow is the frozen clock every compile in this scenario reads, so that
 // CreatedAt is the only field a recompile is allowed to change.
+// fixtureSpoolBudgetDivisor mirrors internal/app's own share of the temporary
+// budget a query spool area gets (compose.go spoolBudgetDivisor). It is
+// repeated rather than imported because that constant is unexported and
+// internal/app depends on this package.
+const fixtureSpoolBudgetDivisor = 8
+
+// collectSeeds is the test-side seedSink: it keeps what a production compile
+// pushes into its sorts, so a test can assert over the seeds a discovery pass
+// produced without the production path holding them.
+type collectSeeds struct {
+	cands []candidate
+	steps []string
+}
+
+func (c *collectSeeds) Admit(cand candidate) error {
+	c.cands = append(c.cands, cand)
+	return nil
+}
+
+func (c *collectSeeds) BeginStep(_ originKind, step string) { c.steps = append(c.steps, step) }
+
 func fixtureNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
 
 // newContextFixture opens an in-process store, publishes fixtureFiles as one
@@ -539,19 +560,23 @@ func TestContextCompilerScenario(t *testing.T) {
 
 				// One task mixing an explicit seed, a backticked identifier, a
 				// path token, a free term and a path that names nothing.
+				sink := &collectSeeds{}
 				seeds, err := c.extractSeeds(fx.ctx, reader, fx.Gen, model.ContextRequest{
 					Task:  "Update `Place` so internal/order/handler.go keeps working; check Repository and docs/missing.md",
 					Seeds: []string{"internal/order/ports.go"},
 					Phase: model.PhaseVerify,
-				})
+				}, sink)
 				if err != nil {
 					t.Fatalf("extractSeeds: %v", err)
 				}
+				// The sink holds what discovery pushed, in discovery order and
+				// BEFORE the entity fold, which is where the dedupe now lives.
+				pushed := sink.cands
 
 				// Every Section 15.2 step contributes, so the order assertion below
 				// covers the whole chain instead of a subset of it.
 				contributed := map[originKind]bool{}
-				for _, cnd := range seeds.Candidates {
+				for _, cnd := range pushed {
 					contributed[cnd.Origin] = true
 				}
 				for _, step := range []originKind{originExplicitSeed, originBacktick, originPathToken,
@@ -562,14 +587,14 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 				// The steps append in order, so the origins a compile produces are
 				// non-decreasing. Reordering any two steps breaks this.
-				for i := 1; i < len(seeds.Candidates); i++ {
-					if seeds.Candidates[i].Origin < seeds.Candidates[i-1].Origin {
+				for i := 1; i < len(pushed); i++ {
+					if pushed[i].Origin < pushed[i-1].Origin {
 						t.Fatalf("seed %d has origin %d after origin %d: extraction ran out of Section 15.2 order",
-							i, seeds.Candidates[i].Origin, seeds.Candidates[i-1].Origin)
+							i, pushed[i].Origin, pushed[i-1].Origin)
 					}
 				}
 				byPath := map[string]candidate{}
-				for _, cnd := range seeds.Candidates {
+				for _, cnd := range pushed {
 					if cnd.NodeID == "" {
 						byPath[cnd.Path] = cnd
 					}
@@ -593,7 +618,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					t.Fatalf("the fixture resolves %q to %d declarations; the row needs an ambiguous name", "Place", len(page.Items))
 				}
 				declared := map[model.NodeID]bool{}
-				for _, cnd := range seeds.Candidates {
+				for _, cnd := range pushed {
 					if cnd.Origin == originBacktick && cnd.NodeID != "" {
 						declared[cnd.NodeID] = true
 					}
@@ -1714,7 +1739,12 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 	if err != nil {
 		f.t.Fatalf("OpenSigner: %v", err)
 	}
-	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, f.Store)
+	// The spool budget is the fixture's configured one, as internal/app wires
+	// it (compose.go), and not a constant: a walk over a fan-out of tens of
+	// thousands spools more than a megabyte, and a hard-coded megabyte turned
+	// that into a refused compile that said nothing about the code under test.
+	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"),
+		f.Cfg.Resources.MaxTempBytes/fixtureSpoolBudgetDivisor, f.Store)
 	if err != nil {
 		f.t.Fatalf("NewSpools: %v", err)
 	}

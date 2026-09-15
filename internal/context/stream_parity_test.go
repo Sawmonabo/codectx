@@ -928,10 +928,17 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	defer reader.Close()
 	gen := reader.Binding().GenerationID
 
-	seeds, err := c.extractSeeds(ctx, reader, gen, req)
+	// The reference pipeline keeps the whole-set shape it is the reference FOR,
+	// so it collects what discovery pushes into a slice of its own.
+	sink := &collectSeeds{}
+	seeds, err := c.extractSeeds(ctx, reader, gen, req, sink)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
+	// The dedupe the producers no longer do: the streamed side folds the
+	// identity-carrying seeds by entity, keeping the earliest, and the
+	// reference reproduces exactly that over its slice.
+	seedCands := dedupeByEntity(sink.cands)
 	caps, err := reader.Capabilities(ctx)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
@@ -943,7 +950,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	defer release()
 
 	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
-		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
+		append(append([]candidate(nil), seedCands...), seeds.Excluded...), caps)
 	if err != nil {
 		return plan{}, false, nil, model.Budget{}, err
 	}
@@ -1062,6 +1069,26 @@ var generatedParityRequests = []struct {
 	// The same scope under a file budget that drops more than a hundred files,
 	// so the packer's drop stream is emitted over many files and in rank order.
 	{"the generated fan-out, the file budget drops a hundred files", generatedDropBudget},
+}
+
+// dedupeByEntity keeps the first candidate for each entity identity and drops
+// the later ones, which is what the streamed side's lessEntityID/foldMinSeq
+// fold does over the same stream. A candidate with no identity has no key and
+// is kept, exactly as the fold keeps it.
+func dedupeByEntity(in []candidate) []candidate {
+	seen := map[string]bool{}
+	out := make([]candidate, 0, len(in))
+	for _, c := range in {
+		key := c.entityID()
+		if key != "" {
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // readBackManifest reads a persisted manifest's entries, slices and exclusions

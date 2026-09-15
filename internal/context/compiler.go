@@ -81,6 +81,15 @@ type Compiler struct {
 	spools  *pagination.Spools
 	signer  *pagination.Signer
 	leases  *pagination.Leases
+	// observeSorts, when set, receives one compile's per-sort memory
+	// observations after its sort area is released, in the order the sorts
+	// were opened. It is the compile-level half of the hook newSort records:
+	// compileSorts is built inside Compile and never leaves it, so without
+	// this the peak and spill counts of a REAL compile -- as opposed to a sort
+	// exercised directly -- are unreadable. It is observation only: it is
+	// called after the plan is decided, it cannot change one, and a compile
+	// with no observer set does not pay for it.
+	observeSorts func([]sortObservation)
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -254,6 +263,13 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		return CompileResult{}, err
 	}
 	defer func() {
+		// Close records each sort's final observation, so the observer runs
+		// after it and sees the peak every sort actually reached.
+		defer func() {
+			if c.observeSorts != nil {
+				c.observeSorts(sorts.observations())
+			}
+		}()
 		if cerr := sorts.Close(); cerr != nil {
 			// The plan is already decided by the time this runs, so a failed
 			// removal must not fail a correct compile -- but it is real
@@ -463,9 +479,24 @@ func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, g
 func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
 	req model.ContextRequest, sorts *compileSorts, st *compileState,
 ) error {
-	seeds, err := c.extractSeeds(ctx, reader, gen, req)
+	// The sink is opened BEFORE discovery: ruling C10 makes seed extraction a
+	// producer that pushes into this compile's sorts, so nothing between the
+	// two holds a seed slice.
+	ingest, err := c.newSeedIngest(sorts)
+	if err != nil {
+		return err
+	}
+	seeds, err := c.extractSeeds(ctx, reader, gen, req, ingest)
 	if err != nil {
 		return contextErr(ctx, err)
+	}
+	// The exclusions follow every candidate, which is the admission order the
+	// whole pipeline has always replayed (candidates, then exclusions) and the
+	// order the manifest's exclusion projection is ordinalled in.
+	for i := range seeds.Excluded {
+		if err := ingest.Admit(seeds.Excluded[i]); err != nil {
+			return contextErr(ctx, err)
+		}
 	}
 	caps, err := reader.Capabilities(ctx)
 	if err != nil {
@@ -477,8 +508,7 @@ func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader,
 	}
 	defer release()
 
-	in, err := c.passAIngest(ctx, sorts, engine, gen,
-		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
+	in, err := c.passAIngest(ctx, ingest, engine, gen, caps)
 	if err != nil {
 		return contextErr(ctx, err)
 	}

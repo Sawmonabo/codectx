@@ -296,6 +296,32 @@ Two rules bind the interpretation:
   investigation and a written explanation, even when the absolute budget is
   still met.
 
+### 3.3 The context compile's memory: what the peak is a function of
+
+The streamed context compile claims that its live working set is the sort run
+buffer and not the repository. Two measurements on the host of Section 1, both
+from `internal/context`:
+
+| What was pushed | Records | Peak live records per sort | Heap in use, live, after the push | Spilled runs |
+|---|---|---|---|---|
+| Seed push sink (ruling C10), 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
+| Seed push sink, 50 000 entities offered twice | 100 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +144 KiB | seed sorts spill |
+| One compile sort at the primitive's floor run budget | 20 000 | 401 (~2× the run budget in bytes, the record that triggers the spill included) | — | 50 |
+
+Ten times the seeds, the same peak per sort and the same order of live bytes:
+the sink holds one run buffer whatever discovery finds. Both rows come from
+`TestTheSeedSinkPeaksOnTheRunBufferAtEitherSeedCount`; the third is
+`TestACompileSortHoldsItsRunBudgetAndSpills`. Each figure is asserted by the
+test that produced it, so a regression fails rather than being noticed here.
+
+**Not measured, and owed:** the same peak across two WHOLE compiles (20 000 and
+40 000 entities) with the per-page read latencies beside it.
+`TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale` is written and opt-in
+behind `CODECTX_SCALE_PROOF=1`, but on this host publishing the 20 000-file
+fixture alone costs 76 s and the compile that follows it had not finished after
+twelve minutes. That is an unexplained figure, not a budget: it is recorded here
+so the next measurement pass starts from it rather than rediscovering it.
+
 ## 7. Reproducing this page
 
 ```bash
@@ -304,7 +330,13 @@ go test ./internal/bench -run TestResourceBudgets -count=1
 go test ./internal/bench -run TestSessionStatusClamp -count=1 -v
 go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
+go test ./internal/context -run 'TestTheSeedSinkPeaks|TestACompileSortHolds' -count=1 -v
+CODECTX_SCALE_PROOF=1 go test ./internal/context \
+  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 40m
 ```
+
+The two `internal/context` lines produce Section 3.3: the first its measured
+rows, the second the compile-level row that is still owed.
 
 That block produces every row of Section 3 except three. Rows 9 and 13 need a
 cold index of the reference corpus, and row 16 needs a real workspace; both are

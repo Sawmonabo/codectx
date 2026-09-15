@@ -97,6 +97,14 @@ type ExternalSort[T any] struct {
 	bufBytes int64
 	runs     []string
 	count    int64
+	// spilled counts the runs this sort has written out of its buffer, and it
+	// only ever grows. It is a CUMULATIVE count and not len(runs) because
+	// Sorted consumes the runs and clears that slice (removeRuns), so an
+	// observation taken after a sort was read would report zero for a sort
+	// that spilled repeatedly. Runs produced by collapse are not counted:
+	// those are fan-in artefacts of the merge, not buffer pressure, and the
+	// question this answers is how often the run budget was reached.
+	spilled int
 	// peakRecords is the high-water mark of records held in memory at once,
 	// across buffering and every merge pass. It is the structural memory
 	// assertion: a test asserts it stays within the envelope the run budget
@@ -182,6 +190,9 @@ func AdoptRuns[T any](dir, prefix string, bufRecords int, runs []string,
 		}
 	}
 	s.runs = slices.Clone(runs)
+	// An adopted run was spilled by the sort this one continues, so the
+	// continuation reports the interrupted sort's spills plus its own.
+	s.spilled = len(s.runs)
 	return s, nil
 }
 
@@ -251,6 +262,13 @@ func (s *ExternalSort[T]) WithRunBytes(runBytes int64, sizeOf func(T) int64) *Ex
 // held. It is the memory invariant a test asserts on; reading it never changes
 // the sort.
 func (s *ExternalSort[T]) PeakLiveRecords() int { return s.peakRecords }
+
+// SpilledRuns reports how many runs this sort has written out of its run
+// buffer. Zero means the whole input stayed inside the buffer and the sort
+// answered from memory; any larger number is the count of times the budget was
+// reached and a run went to disk. Reading it never changes the sort, and it
+// stays meaningful after Sorted and after Detach.
+func (s *ExternalSort[T]) SpilledRuns() int { return s.spilled }
 
 // observe records a live-set high-water mark.
 func (s *ExternalSort[T]) observe(records int) {
@@ -325,6 +343,7 @@ func (s *ExternalSort[T]) spill() error {
 		return s.err
 	}
 	s.runs = append(s.runs, f.Name())
+	s.spilled++
 	s.buf, s.bufBytes = s.buf[:0], 0
 	return nil
 }
