@@ -66,6 +66,11 @@ type GraphReader interface {
 	// MaxNode is the largest node surrogate present in the generation; a
 	// visited bitset is sized from it.
 	MaxNode() NodeRef
+	// MaxRelation is the largest relation surrogate present in the
+	// generation. It bounds the walk's cumulative emitted-relation set the
+	// same way MaxNode bounds the visited set, so a surrogate from another
+	// generation is refused by RANGE and not only by the cursor's fence.
+	MaxRelation() RelRef
 	// Kinds is the generation's relation-kind dictionary.
 	Kinds() KindTable
 	// Resolve maps canonical ids to surrogates, 0 for an id that is not

@@ -120,7 +120,11 @@ func splitDictionary(raw []byte) []string {
 
 func (g *graphReader) Binding() model.Binding { return g.r.Binding() }
 func (g *graphReader) MaxNode() graph.NodeRef { return g.maxNode }
-func (g *graphReader) Kinds() graph.KindTable { return g.kinds }
+
+// MaxRelation answers the generation header's max_relation, the same column the
+// reader already range-checks relation refs against.
+func (g *graphReader) MaxRelation() graph.RelRef { return g.maxRelation }
+func (g *graphReader) Kinds() graph.KindTable    { return g.kinds }
 
 // part returns one part of a stream through the request's bounded window,
 // reading it from the store on a miss and evicting the least recently used part

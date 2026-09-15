@@ -36,6 +36,10 @@ type MemoryGraph struct {
 
 	relIDs  []model.RelationID // indexed by relation surrogate-1
 	relByID map[model.RelationID]RelRef
+	// evidence is the per-relation evidence count side array, keyed by
+	// canonical id because that is what a fixture declares it with. Nil means
+	// the fixture declared none.
+	evidence map[model.RelationID]int64
 
 	// out and in are indexed by surrogate, so index 0 is the unused zero
 	// surrogate and stays empty. Each list is sorted by (Neighbour, Rel),
@@ -249,6 +253,9 @@ func (g *MemoryGraph) Binding() model.Binding { return g.binding }
 
 func (g *MemoryGraph) MaxNode() NodeRef { return NodeRef(len(g.nodes)) }
 
+// MaxRelation is the largest relation surrogate this fixture generation holds.
+func (g *MemoryGraph) MaxRelation() RelRef { return RelRef(len(g.relIDs)) }
+
 func (g *MemoryGraph) Kinds() KindTable { return g.kinds }
 
 func (g *MemoryGraph) Resolve(ctx context.Context, ids []model.NodeID) ([]NodeRef, error) {
@@ -367,7 +374,7 @@ func (g *MemoryGraph) ownerList(ref NodeRef, direction model.Direction) []Edge {
 // than assumed because a caller that passes an unsorted or repeated frontier
 // gets a silently wrong page -- an edge delivered twice, or one skipped by the
 // resume position -- instead of an error.
-func ascendingRefs(refs []NodeRef) error {
+func ascendingRefs[T ~uint64](refs []T) error {
 	for i := 1; i < len(refs); i++ {
 		if refs[i] <= refs[i-1] {
 			return &model.Error{Code: model.CodeArgumentInvalid,
@@ -433,9 +440,27 @@ func (g *MemoryGraph) EvidenceCounts(ctx context.Context, rels []RelRef) ([]int6
 		if ref == 0 || int(ref) > len(g.relIDs) {
 			continue
 		}
+		if n, ok := g.evidence[g.relIDs[ref-1]]; ok {
+			out[i] = n
+			continue
+		}
+		// A fixture that declared no evidence at all still describes relations
+		// the analysis derived, so one is the honest floor; a fixture that DID
+		// declare evidence gets its own counts above.
 		out[i] = 1
 	}
 	return out, nil
+}
+
+// WithEvidenceCounts records the evidence backing each relation, so a fixture
+// that declares evidence reports it through the side array the rollup reads.
+//
+// It is a separate call rather than a constructor parameter because the port's
+// evidence count is a per-generation SIDE ARRAY, not part of the graph
+// structure, and most fixtures have no evidence to declare at all.
+func (g *MemoryGraph) WithEvidenceCounts(counts map[model.RelationID]int64) *MemoryGraph {
+	g.evidence = counts
+	return g
 }
 
 // NodesByID hydrates the fixture's nodes in the order asked, skipping an id the

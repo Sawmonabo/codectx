@@ -187,7 +187,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// the WHOLE retained input once the walk is exhausted.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
+		if retain, err = e.openWalkState(); err != nil {
 			return answer, nil, nil, "", err
 		}
 	}
@@ -200,7 +200,13 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry, resume)
+		reader, err := e.consumerReader()
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
+		names := &levelNames{}
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry,
+			names, kindNames(reader))
 		// ONE streamed pass, TEED: the rollup's batching drives the walk, so
 		// every admitted edge reaches the entity record and the package pair as
 		// it is read and nothing is held between the edge that produced it and
@@ -227,22 +233,26 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				DeadlineStops:            true,
 				DeadlineResumesEmptyPage: true,
 				Resume:                   resume,
-				// The walk's cumulative admitted-node set, append-only and
-				// persistent: every internal link adds its own admissions to it
-				// directly, so the continuation carries them and the next page
-				// never re-admits a node an earlier link reported.
-				Visited: retain.visited,
-			}, func(fs frontierState, rel model.Relation) error {
+				// The walk's retained state: the frontier it commits level by
+				// level, the cumulative admitted-node bitset, the cumulative
+				// emitted-relation bitset and this answer's pass-1 input, all in
+				// one directory the continuation carries forward by rename.
+				Retain: retain,
+				// The per-level canonical resolution the accumulator reads. One
+				// pointer, refilled by the walk before each level's edges are
+				// delivered, so a record is named without a round trip per edge.
+				Names: names,
+			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
 				// admitted, so the rollup must not count it. Every edge it
 				// accepts reaches the rollup, including one that reaches a seed
 				// -- a seed is not an affected entity but the edge to it is
 				// still a package-level dependency the walk read.
-				if err := acc.Visit(fs, rel); err != nil {
+				if err := acc.Visit(fs, edge); err != nil {
 					return err
 				}
-				return sink.Visit(fs, rel)
+				return sink.Visit(fs, edge)
 			})
 			return werr
 		}, retain.addPair, e.rollupProbe())
@@ -256,7 +266,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND the records this leg admitted
 		// forward, so the request that finishes the walk ranks all of them.
-		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
+		if walkStalled(b, state, resume) {
 			// No continuation: it would be the one this request was given.
 			// That cursor stays ADOPTABLE for the rest of its lease, which is
 			// what makes the reason's remedy -- present it again under a
@@ -269,8 +279,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			return answer, nil, b, "", nil
 		}
 		markTruncated(&meta, reasonDeadline)
-		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state,
-			acc.lastOwner, acc.lastKey, resume, retain)
+		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state, retain)
 		if err != nil {
 			return answer, nil, nil, "", err
 		}
@@ -682,37 +691,20 @@ func (e *Engine) spillRanked(next traversalCursor, h rankedHeader,
 // alongside the frontier spool (walkretain.go); the token names both, and the
 // leg that exhausts the walk ranks the whole of it.
 func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHash string,
-	state walkState, lastOwner model.NodeID, lastKey model.RelationID,
-	resume *resumeState, retain *retainedWalk) (string, error) {
+	state walkState, retain *retainedWalk) (string, error) {
 	if len(state.Frontier) == 0 || state.DepthLimited {
 		return "", nil
 	}
-	if state.LevelBoundary {
-		// The deadline stopped BETWEEN levels: the frontier this cursor carries
-		// has not been read at all, so the keyset position the accumulator last
-		// emitted belongs to the level already finished. Carried into the next
-		// level it is a filter, not a resume point -- levelEdges drops every row
-		// whose owner sorts below it (traverse.go states the rule) -- and those
-		// rows are dropped SILENTLY, with the nodes already marked visited by
-		// the leg that admitted them, so no later page can reach them either.
-		// Measured before this: an 8-mid fixture cut at its first level boundary
-		// served 38 of 56 entities, untruncated. traverse.go:821 and
-		// walkrun.go:152 apply the same rule to the traversal endpoint and to a
-		// walk's internal links; this is the cross-request half of it.
-		lastOwner, lastKey = "", ""
-	}
-	// The cumulative admitted set is NOT materialized here and NOT copied
-	// forward: only the nodes THIS page admitted are, appended to the retained
-	// run store as one more ascending run (visitedstore.go). Everything earlier
-	// stays exactly where the page that admitted it wrote it.
+	// Nothing of the walk is materialized or copied here. The frontier is
+	// already in the retained level file, the admitted nodes are already bits
+	// beside it, and the token names the directory rather than a copy of what
+	// is in it.
 	return e.nextTraversalCursor(ctx, b, continuation{
 		Endpoint:  endpoint,
 		QueryHash: queryHash,
 		Depth:     state.Depth,
-		LastOwner: lastOwner,
-		LastKey:   lastKey,
+		LevelPos:  state.LevelPos,
 		Frontier:  state.Frontier,
-		Visited:   state.Admitted.addedNodes(),
 		Retain:    retain,
 	})
 }
@@ -736,13 +728,12 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 // It is only ever true on a RESUMED page. The request that mints the answer
 // has no earlier continuation to repeat, and a deadline there always leaves a
 // frontier the caller has never seen.
-func walkStalled(b *budget, state walkState, lastOwner model.NodeID, lastKey model.RelationID,
-	resume *resumeState) bool {
+func walkStalled(b *budget, state walkState, resume *resumeState) bool {
 	if resume == nil || b.pageEdges != 0 || b.pageVisited != 0 {
 		return false
 	}
 	return len(state.Frontier) == len(resume.Frontier) &&
-		lastOwner == resume.Cursor.LastOwner && lastKey == resume.Cursor.LastKey
+		state.LevelPos == resume.Cursor.LevelPos
 }
 
 // continueRank mints ruling P7's continuation: the walk is EXHAUSTED and the
@@ -894,13 +885,14 @@ type impactAccumulator struct {
 	maxVisited config.Limit
 	maxEdges   config.Limit
 	reason     string
-	// lastOwner and lastKey are the keyset position the continuation resumes
-	// from: the frontier node whose chunk the last admitted row came from, and
-	// that row's relation id. They are SEEDED from the continuation this leg
-	// resumed (newImpactAccumulator), so a leg that admits nothing carries the
-	// position forward instead of resetting it to the start of the level.
-	lastOwner model.NodeID
-	lastKey   model.RelationID
+	// names is the per-level canonical resolution expand refills before each
+	// level's edges are delivered. The walk carries surrogates; a ranking
+	// record must carry content-derived canonical ids, and this is the one
+	// batched read per level that turns the one into the other.
+	names *levelNames
+	// kinds names a relation kind from the generation's kind code, so a reason
+	// and a cost are read off the edge without a dictionary lookup per edge.
+	kinds []model.RelationKind
 }
 
 // newImpactAccumulator builds the visitor for one LEG of a walk. resume is the
@@ -918,16 +910,15 @@ type impactAccumulator struct {
 // the common shape, since a deadline lands inside a multi-owner chunk -- could
 // not report it until it had first thrown the position away.
 func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges config.Limit,
-	emit func(impactRecord) error, resume *resumeState) *impactAccumulator {
+	emit func(impactRecord) error, names *levelNames, kinds []model.RelationKind) *impactAccumulator {
 	a := &impactAccumulator{
 		isSeed:     make(map[model.NodeID]bool, len(start)),
 		emit:       emit,
 		budget:     b,
 		maxVisited: maxVisited,
 		maxEdges:   maxEdges,
-	}
-	if resume != nil {
-		a.lastOwner, a.lastKey = resume.Cursor.LastOwner, resume.Cursor.LastKey
+		names:      names,
+		kinds:      kinds,
 	}
 	for _, s := range start {
 		if a.isSeed[s] {
@@ -948,7 +939,7 @@ func (a *impactAccumulator) Seeds() []model.NodeID { return a.seeds }
 // Visit is the expand visitor: one call per admitted edge, in frontier order.
 // state is the FRONTIER node the edge left from, so the node this edge affects
 // is the other end of it, one hop deeper and one edge cost further away.
-func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error {
+func (a *impactAccumulator) Visit(state frontierState, e Edge) error {
 	switch {
 	// The CUMULATIVE counters, not the per-page ones. Under ruling P2 the walk
 	// runs to completion inside one request, so a bound compared against a
@@ -970,16 +961,30 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 	// truncation that did not happen; what survives is the reason of the link
 	// that actually ended the answer.
 	a.reason = ""
-	// The keyset position a continuation resumes from.
-	a.lastOwner, a.lastKey = state.Node, rel.ID
-	reached := otherEndpoint(state.Node, rel)
+	if a.emit == nil {
+		// The package rollup rides on the same walk but reads only the edges;
+		// it has no record sort to stream into.
+		return nil
+	}
+	reached := a.names.node(e.Neighbour)
+	if reached == "" {
+		// The generation carries an adjacency entry for a node it publishes no
+		// canonical id for. It cannot be named, so it cannot be listed; the
+		// EDGE is still admitted, because the walk read it and the rollup
+		// counts it.
+		return nil
+	}
 	if a.isSeed[reached] {
 		// A seed is the thing being changed, not something the change affects.
 		// The edge itself is still admitted -- the package rollup teed off this
 		// visitor counts it -- so this returns nil rather than a stop.
 		return nil
 	}
-	direction := impactEdgeDirection(state.Node, rel)
+	kind := a.kindOf(e.Kind)
+	direction := model.DirectionOutgoing
+	if !e.Outgoing {
+		direction = model.DirectionIncoming
+	}
 	depth := state.Depth + 1
 	// One record per admitted edge, not per node. Two edges reaching the same
 	// node produce two records with the same NodeID, and pass 1 of the sort
@@ -987,43 +992,31 @@ func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error
 	// per-node merge did (cheapest route wins, an incoming direction is sticky,
 	// the reasons are the deduplicated union), without a map whose size was the
 	// reachable set.
-	if a.emit == nil {
-		// The package rollup rides on the same walk but reads only the edges;
-		// it has no record sort to stream into.
-		return nil
-	}
+	//
+	// Every identifier on the record is CANONICAL, resolved from this level's
+	// one batched read. That is ADR-0005 Decision 2's whole point: the walk is
+	// free to carry build-dependent surrogates, and the order the answer is
+	// served in is not -- foldImpact's route tie-break reads Via, Route and
+	// Parent, so leaving any of the three a surrogate would let a fresh index
+	// and a delta-built index of the same tree serve different pages.
 	return a.emit(impactRecord{
 		NodeID:    reached,
 		Depth:     depth,
-		Cost:      state.Cost + Cost(rel.Kind),
+		Cost:      state.Cost + Cost(kind),
 		Direction: direction,
-		Via:       rel.ID,
-		Parent:    state.Node,
-		Route:     appendRoute(state.Route, rel.ID),
-		Reasons:   []string{impactReason(rel.Kind, direction, depth)},
+		Via:       a.names.rel(e.Rel),
+		Parent:    a.names.node(state.Node),
+		Route:     a.names.route(appendRoute(state.Route, e.Rel)),
+		Reasons:   []string{impactReason(kind, direction, depth)},
 	})
 }
 
-// impactEdgeDirection is the Section 14.3 discriminator, read off the frontier
-// node the edge left from: an edge leaving that node lands on something the
-// seed depends on, which may need reading (outgoing); an edge arriving at it
-// comes from something that depends on the seed and may need modification
-// (incoming). A self-edge leaves and arrives at once and is reported as
-// outgoing, then upgraded to incoming by the visitor.
-func impactEdgeDirection(owner model.NodeID, rel model.Relation) model.Direction {
-	if rel.From == owner {
-		return model.DirectionOutgoing
+// kindOf names the relation kind behind one edge's generation kind code.
+func (a *impactAccumulator) kindOf(code KindCode) model.RelationKind {
+	if int(code) >= len(a.kinds) {
+		return ""
 	}
-	return model.DirectionIncoming
-}
-
-// otherEndpoint is the node an edge reaches, given the frontier node it left
-// from.
-func otherEndpoint(node model.NodeID, rel model.Relation) model.NodeID {
-	if rel.From == node {
-		return rel.To
-	}
-	return rel.From
+	return a.kinds[code]
 }
 
 // impactReason renders one reason in product vocabulary, naming the relation

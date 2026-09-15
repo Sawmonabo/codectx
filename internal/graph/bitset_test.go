@@ -16,35 +16,35 @@ func TestAVisitedBitsetCountsOnlyTheBitsItTurnsOn(t *testing.T) {
 	dir := t.TempDir()
 	level := []NodeRef{3, 9, 4096, 70_000}
 
-	set, err := openBitset(dir, 100_000, nil)
+	set, err := openBitset(dir, bitsetNodeFile, 100_000, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if _, err := set.set(level); err != nil {
+	if _, err := bitsetSet(set, level); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	// The re-application adoption performs, in the same handle and then across
 	// one: neither may count a node the walk has already admitted.
-	if _, err := set.set(level); err != nil {
+	if _, err := bitsetSet(set, level); err != nil {
 		t.Fatalf("re-apply: %v", err)
 	}
 	if err := set.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	resumed, err := openBitset(dir, 100_000, nil)
+	resumed, err := openBitset(dir, bitsetNodeFile, 100_000, nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	defer resumed.close()
-	if _, err := resumed.set(level); err != nil {
+	if _, err := bitsetSet(resumed, level); err != nil {
 		t.Fatalf("adopt: %v", err)
 	}
 	if got := resumed.count(); got != uint64(len(level)) {
 		t.Fatalf("count after two re-applications = %d, want %d", got, len(level))
 	}
 	for _, ref := range level {
-		ok, err := resumed.test(ref)
+		ok, err := resumed.test(uint64(ref))
 		if err != nil {
 			t.Fatalf("test(%d): %v", ref, err)
 		}
@@ -54,7 +54,7 @@ func TestAVisitedBitsetCountsOnlyTheBitsItTurnsOn(t *testing.T) {
 	}
 	// A neighbouring bit in the same byte as ref 3 must be untouched, or the
 	// walk would refuse to admit a node it never reached.
-	if ok, err := resumed.test(2); err != nil || ok {
+	if ok, err := resumed.test(uint64(2)); err != nil || ok {
 		t.Fatalf("test(2) = %v, %v; want false with no error", ok, err)
 	}
 }
@@ -75,18 +75,18 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 	}
 	maxNode := refs[len(refs)-1]
 
-	set, err := openBitset(dir, maxNode, nil)
+	set, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if _, err := set.set(refs); err != nil {
+	if _, err := bitsetSet(set, refs); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	if err := set.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	resumed, err := openBitset(dir, maxNode, nil)
+	resumed, err := openBitset(dir, bitsetNodeFile, uint64(maxNode), nil)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 		t.Fatalf("count = %d, want %d", got, pages)
 	}
 	for _, ref := range refs {
-		ok, err := resumed.test(ref)
+		ok, err := resumed.test(uint64(ref))
 		if err != nil {
 			t.Fatalf("test(%d): %v", ref, err)
 		}
@@ -112,27 +112,27 @@ func TestAVisitedBitsetKeepsBitsThatOutliveItsPageCache(t *testing.T) {
 // An unsorted level is merely slow -- it thrashes the cache instead of walking
 // it forward once -- and nothing downstream would ever report it.
 func TestAVisitedBitsetRefusesRefsItCannotHold(t *testing.T) {
-	set, err := openBitset(t.TempDir(), 64, nil)
+	set, err := openBitset(t.TempDir(), bitsetNodeFile, 64, nil)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	defer set.close()
 
-	if _, err := set.set([]NodeRef{65}); err == nil {
+	if _, err := bitsetSet(set, []NodeRef{65}); err == nil {
 		t.Fatal("set accepted a surrogate above MaxNode, want an error")
 	}
-	if _, err := set.test(65); err == nil {
+	if _, err := set.test(uint64(65)); err == nil {
 		t.Fatal("test accepted a surrogate above MaxNode, want an error")
 	}
 
-	_, err = set.set([]NodeRef{9, 4})
+	_, err = bitsetSet(set, []NodeRef{9, 4})
 	var typed *model.Error
 	if !errors.As(err, &typed) || typed.Code != model.CodeArgumentInvalid {
 		t.Fatalf("set of a descending level = %v, want CTX_ARGUMENT_INVALID", err)
 	}
 
 	// Zero is never a node, so it has no bit and it is not counted.
-	if _, err := set.set([]NodeRef{0, 7}); err != nil {
+	if _, err := bitsetSet(set, []NodeRef{0, 7}); err != nil {
 		t.Fatalf("set with the zero surrogate: %v", err)
 	}
 	if got := set.count(); got != 1 {

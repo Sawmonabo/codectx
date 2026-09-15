@@ -272,6 +272,14 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		t.Fatalf("the one-byte ceiling served %d edge(s), a ceiling that never binds %d: the ceiling changed the set",
 			len(order), len(ref.Relations))
 	}
+	// Set equality is checked BEFORE order so that a run which fails the order
+	// assertion still reports whether the ceiling lost or invented an edge:
+	// equal cardinality plus exactly-once leaves a swap undetected on its own.
+	for _, want := range ref.Relations {
+		if seen[want.ID] == 0 {
+			t.Errorf("the one-byte ceiling never served %s: the ceiling dropped an edge", want.ID)
+		}
+	}
 	for i, want := range ref.Relations {
 		if order[i] != want.ID {
 			t.Fatalf("at position %d the spilled pages carry %s, the unbounded-ceiling walk %s: the ceiling changed the order",
@@ -735,7 +743,7 @@ func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -876,7 +884,7 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 6, jump: 2 * time.Minute, fired: &fired}
-	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -1131,7 +1139,7 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 			calls, fired := 0, false
 			slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 				trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-			paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+			paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 				Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 				Now: func() time.Time { return clock }})
 			if err != nil {
@@ -1227,7 +1235,7 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 2, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -1269,5 +1277,68 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 		// Without the refusal the run proves nothing: the budget was never
 		// reached and the silent-truncation branch was never entered.
 		t.Fatal("the shared continuation budget was never exhausted; the case this test exists for was not exercised")
+	}
+}
+
+// slowReader is slowAdjacency's counterpart on the PACKED reader, and it is
+// where the fixture clock now advances: the walk reads structure through
+// GraphReader, so a clock driven by Adjacency.Edges never moved at all and
+// every deadline case silently became a case with no deadline.
+//
+// One packed scan covers a whole level, where the old reader made one round
+// trip per node chunk per keyset page of at most model.MaxPageItems rows, plus
+// the empty page that ended the keyset loop. A clock that ticked once per scan
+// would therefore be far coarser than the one these cases were calibrated
+// against, so a "round trip" here is one scan, one per adjacencyBatch entries
+// it delivers, and one for the scan's end -- the same granularity the old port
+// charged, which is what lets the trigger counts stand unchanged.
+type slowReader struct {
+	GraphReader
+	knobs slowAdjacency
+	seen  *int
+}
+
+// reader wraps r with this fixture's clock knobs, sharing the same call
+// counter so a case that drives both ports sees one sequence.
+func (s slowAdjacency) reader(r GraphReader) slowReader {
+	seen := 0
+	return slowReader{GraphReader: r, knobs: s, seen: &seen}
+}
+
+func (s slowReader) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
+	s.tick()
+	pos, err := s.GraphReader.Neighbours(ctx, refs, dir, kinds, from, func(e Edge) error {
+		*s.seen++
+		if *s.seen%adjacencyBatch == 0 {
+			s.tick()
+		}
+		return fn(e)
+	})
+	// The old port charged a SECOND round trip at the end of every chunk: its
+	// keyset loop only knew it was done when a page came back empty. Charging
+	// it here is what keeps these cases' trigger counts meaning the level they
+	// were calibrated to.
+	s.tick()
+	return pos, err
+}
+
+// tick is one charged round trip: it advances the call counter and, on the
+// branch this case selected, the clock.
+func (s slowReader) tick() {
+	k := s.knobs
+	*k.calls++
+	switch {
+	case k.stallAfter > 0:
+		if *k.calls > k.stallAfter {
+			*k.clock = k.clock.Add(k.jump)
+		}
+	case k.every > 0:
+		if *k.calls%k.every == 0 {
+			*k.clock = k.clock.Add(k.jump)
+		}
+	case !*k.fired && *k.calls >= k.trigger:
+		*k.fired = true
+		*k.clock = k.clock.Add(k.jump)
 	}
 }

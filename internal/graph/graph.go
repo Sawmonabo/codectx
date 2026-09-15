@@ -258,12 +258,20 @@ func New(o Options) (*Engine, error) {
 
 // frontierState is one admitted node's position in a walk: how far it sits from
 // the nearest seed, what it cost to reach, and the edge that reached it.
+//
+// It carries SURROGATES, not canonical ids (ADR-0005 Decision 2). A frontier
+// level, the spooled level a continuation adopts and the internal maps a walk
+// builds are all sized by the walk, so holding a 64-hex canonical id in each of
+// them made peak heap a function of the reachable set. Canonical ids are
+// resolved once per committed level, batched and ascending, and only into the
+// RANKING record, which is where a content-derived order is owed.
 type frontierState struct {
 	Depth int
 	Cost  int64
-	Node  model.NodeID
-	Via   model.RelationID
-	// Route is the chain of relation ids from a seed to this node, Via last.
+	Node  NodeRef
+	Via   RelRef
+	// Route is the chain of relation surrogates from a seed to this node, Via
+	// last.
 	//
 	// It travels with the frontier because ruling P2's walk runs to completion
 	// and streams its records into a sort: there is no page-local byNode map
@@ -272,7 +280,7 @@ type frontierState struct {
 	// is capped at model.MaxRelationsPerPath+1 by appendRoute -- one past the
 	// bound, so a consumer can tell "too long to report" from "exactly at the
 	// bound" -- which is what keeps the frontier's per-node cost bounded.
-	Route []model.RelationID
+	Route []RelRef
 }
 
 // appendRoute extends a parent's route with the edge that left it, copying
@@ -282,13 +290,60 @@ type frontierState struct {
 // It stops one past model.MaxRelationsPerPath. A route at that length is
 // already longer than a servable path, so the elements beyond it would be
 // carried through the whole walk to be discarded at hydration.
-func appendRoute(parent []model.RelationID, via model.RelationID) []model.RelationID {
+func appendRoute(parent []RelRef, via RelRef) []RelRef {
 	if len(parent) > model.MaxRelationsPerPath {
 		return parent
 	}
-	out := make([]model.RelationID, len(parent), len(parent)+1)
+	out := make([]RelRef, len(parent), len(parent)+1)
 	copy(out, parent)
 	return append(out, via)
+}
+
+// levelNames is ONE committed level's canonical ids, resolved in one batched
+// primary-key read per identifier space (ADR-0005 Decision 2). The walk carries
+// surrogates; the RANKING record must carry content-derived canonical ids, or
+// a fresh index and a delta-built index of the same tree would fold different
+// routes and serve different pages. This is where the two meet.
+//
+// It is refilled by expand before the level's edges reach the visitor and is
+// never accumulated across levels: a map that grew with the walk would be the
+// repository-sized heap structure the surrogate walk exists to remove. The
+// visitor therefore sees only the names of the level it is being handed, which
+// is exactly what a record built from that level needs.
+type levelNames struct {
+	nodes map[NodeRef]model.NodeID
+	rels  map[RelRef]model.RelationID
+}
+
+// node and rel are total: a surrogate the level did not resolve returns the
+// zero id. Callers treat that as "not in this generation" -- the same answer
+// GraphReader.Resolve gives for an id it cannot see -- rather than inventing
+// one.
+func (n *levelNames) node(ref NodeRef) model.NodeID {
+	if n == nil {
+		return ""
+	}
+	return n.nodes[ref]
+}
+
+func (n *levelNames) rel(ref RelRef) model.RelationID {
+	if n == nil {
+		return ""
+	}
+	return n.rels[ref]
+}
+
+// route names a whole parent chain. It returns nil for an empty route so an
+// entry with no path carries no empty slice into its record.
+func (n *levelNames) route(refs []RelRef) []model.RelationID {
+	if len(refs) == 0 {
+		return nil
+	}
+	out := make([]model.RelationID, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, n.rel(r))
+	}
+	return out
 }
 
 // queryDeadline is the instant one graph query runs under.
@@ -409,17 +464,23 @@ type expandOptions struct {
 	// starts from the spooled frontier at the cursor's depth instead of from
 	// seeds, and skips the rows the issuing page already emitted.
 	Resume *resumeState
-	// Visited is the walk's PERSISTENT cumulative admitted-node set
-	// (visitedstore.go), set by the operations that chain several expand calls
-	// inside one request. runWalkToCompletion appends each internal link's own
-	// admissions to it directly, so the next link -- and the next REQUEST --
-	// reads them as part of the one cumulative set. Without it the earlier
-	// links' admissions reached no continuation at all and the next page
-	// re-admitted every one of them, reporting the same entity twice.
+	// Retain is the walk's RETAINED state directory (walkretain.go): the
+	// cumulative admitted-node bitset over the generation's surrogate range,
+	// the last committed level's frontier records, and -- for the two ranking
+	// endpoints -- the pass-1 input. It is required, because the bitset IS the
+	// walk's membership set: a walk with nowhere to keep it would re-admit
+	// every node its earlier pages already reported.
 	//
-	// It is nil on the paged traversal, which runs one expand per request and
-	// carries its cumulative set forward in the continuation spool.
-	Visited *visitedStore
+	// One owner, one lifetime: the bitset is never passed separately, so a
+	// level's records and the bits that mark them can never be opened against
+	// two different directories.
+	Retain *retainedWalk
+	// Names is the per-level canonical resolution the VISITOR reads. expand
+	// refills it before each level's edges are delivered; the caller allocates
+	// it and hands the same pointer to its visitor, which is what lets a record
+	// be named without a round trip per edge. Nil means the visitor needs no
+	// names (the package rollup, which reads refs only).
+	Names *levelNames
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

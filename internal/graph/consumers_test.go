@@ -34,7 +34,12 @@ func memGraphFor(f *graphFixture) *MemoryGraph {
 		nodes = append(nodes, n)
 	}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
-	return NewMemoryGraph(f.binding, nodes, append([]model.Relation(nil), f.relations...))
+	counts := make(map[model.RelationID]int64, len(f.evidence))
+	for id, rows := range f.evidence {
+		counts[id] = int64(len(rows))
+	}
+	return NewMemoryGraph(f.binding, nodes, append([]model.Relation(nil), f.relations...)).
+		WithEvidenceCounts(counts)
 }
 
 // golden compares got against the committed capture, and writes it when

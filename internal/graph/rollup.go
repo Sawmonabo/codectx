@@ -92,7 +92,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// records survive the request that produced them.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
+		if retain, err = e.openWalkState(); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}
@@ -109,7 +109,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil, resume)
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil, nil, nil)
 		walkErr := e.rollupInto(ctx, &meta, func(sink edgeSink) error {
 			var werr error
 			state, werr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
@@ -126,19 +126,21 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				DeadlineStops:            true,
 				DeadlineResumesEmptyPage: true,
 				Resume:                   resume,
-				// The walk's cumulative admitted-node set, append-only and
-				// persistent: every internal link adds its own admissions to it
-				// directly, so the continuation carries them and the next page
-				// never re-admits a node an earlier link reported.
-				Visited: retain.visited,
-			}, func(fs frontierState, rel model.Relation) error {
+				// The walk's retained state: the frontier it commits level by
+				// level and both cumulative sets, in one directory the
+				// continuation carries forward by rename. This endpoint ranks
+				// pairs, so it needs no per-level canonical naming: a pair is a
+				// fact about the edge's endpoint REFS, which the rollup reads
+				// the side arrays with directly.
+				Retain: retain,
+			}, func(fs frontierState, edge Edge) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
 				// admitted, so the rollup must not count it.
-				if err := acc.Visit(fs, rel); err != nil {
+				if err := acc.Visit(fs, edge); err != nil {
 					return err
 				}
-				return sink.Visit(fs, rel)
+				return sink.Visit(fs, edge)
 			})
 			return werr
 		}, retain.addPair, e.rollupProbe())
@@ -151,7 +153,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND this leg's pair records forward.
-		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
+		if walkStalled(b, state, resume) {
 			// No continuation: it would be the one this request was given, and
 			// it stays adoptable so presenting it again under a longer timeout
 			// resumes this walk.
@@ -161,7 +163,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		}
 		markTruncated(&meta, reasonDeadline)
 		if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
-			state, acc.lastOwner, acc.lastKey, resume, retain); err != nil {
+			state, retain); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 		return validatedPairPage(meta, nil)
@@ -295,8 +297,13 @@ const packageDepsEndpoint = "graph.package_dependencies"
 // The frontier state is part of the signature so a sink can be passed straight
 // to expand (or runWalkToCompletion) as its visit function. The package rollup
 // ignores it: a pair is a fact about the edge's endpoints alone.
+//
+// The edge arrives as SURROGATES. That is what removed the rollup's last
+// canonical-id-to-surrogate resolution: every read it does -- the container
+// side array, the evidence counts -- is keyed by ref, so the batch now goes
+// straight into them instead of being resolved back first.
 type edgeSink interface {
-	Visit(state frontierState, rel model.Relation) error
+	Visit(state frontierState, e Edge) error
 }
 
 // pairRollupBatch is how many admitted edges one resolution batch holds. An
@@ -319,7 +326,7 @@ type pairRollup struct {
 	meta *model.QueryMeta
 	add  func(pairRecord) error
 
-	batch []model.Relation
+	batch []Edge
 	// labels caches the reported label of each container the rollup has
 	// resolved, keyed by its surrogate. Its bound is the number of DISTINCT
 	// CONTAINERS the walk touched -- packages and modules -- and never the
@@ -347,13 +354,13 @@ type containerLabel struct {
 func newPairRollup(ctx context.Context, e *Engine, meta *model.QueryMeta,
 	add func(pairRecord) error) *pairRollup {
 	return &pairRollup{ctx: ctx, e: e, meta: meta, add: add,
-		batch:  make([]model.Relation, 0, pairRollupBatch),
+		batch:  make([]Edge, 0, pairRollupBatch),
 		labels: map[NodeRef]containerLabel{}}
 }
 
 // Visit buffers one admitted edge and resolves the batch once it is full.
-func (p *pairRollup) Visit(_ frontierState, rel model.Relation) error {
-	p.batch = append(p.batch, rel)
+func (p *pairRollup) Visit(_ frontierState, e Edge) error {
+	p.batch = append(p.batch, e)
 	if len(p.batch) > p.peak {
 		p.peak = len(p.batch)
 	}
@@ -367,9 +374,9 @@ func (p *pairRollup) Visit(_ frontierState, rel model.Relation) error {
 // full batch and once more for the remainder, so an edge is emitted exactly
 // once however the batches fell.
 //
-// The resolution is three ARRAY reads on the pinned reader -- the endpoints'
-// surrogates, their container surrogates and the batch's evidence counts --
-// and never a containment traversal. ADR-0005 states why: the old rollup
+// The resolution is two ARRAY reads on the pinned reader -- the endpoints'
+// container surrogates and the batch's evidence counts -- and never a
+// containment traversal. ADR-0005 states why: the old rollup
 // re-read the incoming `contains` edges of every endpoint of every batch and
 // re-hydrated the same handful of container nodes over a thousand batches,
 // which is where 93 per cent of a large walk's wall clock went. The container
@@ -386,29 +393,31 @@ func (p *pairRollup) flush() error {
 	// second time. Nothing appends to p.batch while batch is being read, so
 	// the two may alias.
 	p.batch = p.batch[:0]
-	endpoints := make([]model.NodeID, 0, 2*len(batch))
-	relationIDs := make([]model.RelationID, 0, len(batch))
-	for _, r := range batch {
-		endpoints = append(endpoints, r.From, r.To)
-		relationIDs = append(relationIDs, r.ID)
+	endpoints := make([]NodeRef, 0, 2*len(batch))
+	rels := make([]RelRef, 0, len(batch))
+	for _, e := range batch {
+		from, to := edgeEnds(e)
+		endpoints = append(endpoints, from, to)
+		rels = append(rels, e.Rel)
 	}
 	containers, err := p.containerLabels(endpoints)
 	if err != nil {
 		return err
 	}
-	// Evidence counts still come from the batched relation hydration rather
-	// than from GraphReader.EvidenceCounts, for one reason: that array is keyed
-	// by RelRef and the port offers no canonical-id-to-relation-surrogate
-	// resolution, while the walk's visitor delivers a model.Relation. It is one
-	// batched read per batch of relations either way -- it was never part of
-	// the rollup's cost -- and it moves with the walk's visitor signature.
-	evidence, err := p.e.evidenceCounts(p.ctx, relationIDs)
+	// The evidence count is the generation's own per-relation side array,
+	// read by surrogate. It used to come from the batched relation hydration,
+	// because the walk's visitor delivered canonical relations and the port
+	// offers no canonical-id-to-relation-surrogate resolution; the surrogate
+	// walk hands the refs over directly, so the array read that was always the
+	// right one is now reachable.
+	evidence, err := p.evidenceCounts(rels)
 	if err != nil {
 		return err
 	}
-	for _, r := range batch {
-		from, okFrom := containers[r.From]
-		to, okTo := containers[r.To]
+	for _, e := range batch {
+		fromRef, toRef := edgeEnds(e)
+		from, okFrom := containers[fromRef]
+		to, okTo := containers[toRef]
 		// An edge whose endpoints share a container contributes nothing: a
 		// package depending on itself is not a dependency. An edge with no
 		// resolvable container is dropped rather than attributed to a guessed
@@ -419,7 +428,7 @@ func (p *pairRollup) flush() error {
 		if err := p.add(pairRecord{
 			FromNodeID: from.id, ToNodeID: to.id,
 			FromPath: from.path, ToPath: to.path,
-			PairCount: 1, EvidenceCount: evidence[r.ID],
+			PairCount: 1, EvidenceCount: evidence[e.Rel],
 		}); err != nil {
 			return err
 		}
@@ -438,30 +447,20 @@ func (p *pairRollup) flush() error {
 // that decides that is keyed by the container surrogate: the hydration cost of
 // a whole walk is therefore one batched node read per adjacencyBatch DISTINCT
 // containers, not one per batch of edges.
-func (p *pairRollup) containerLabels(ids []model.NodeID) (map[model.NodeID]containerLabel, error) {
+func (p *pairRollup) containerLabels(refs []NodeRef) (map[NodeRef]containerLabel, error) {
 	reader, err := p.e.consumerReader()
 	if err != nil {
 		return nil, err
 	}
-	ids = dedupeNodes(append([]model.NodeID(nil), ids...))
-	out := make(map[model.NodeID]containerLabel, len(ids))
+	refs = ascending(refs)
+	out := make(map[NodeRef]containerLabel, len(refs))
 	// missing collects the containers this batch needs and the cache does not
 	// hold, deduplicated by surrogate so one unseen package is hydrated once
 	// however many of this batch's endpoints name it.
 	missing := map[NodeRef]bool{}
-	owners := make([]NodeRef, 0, len(ids))
-	for _, chunk := range impactChunkNodes(ids) {
-		// THE RESOLUTION SEAM. The walk's visitor still delivers canonical
-		// endpoint ids, so this batch has to resolve them to surrogates before
-		// it can read the side arrays. Once the walk carries surrogates the
-		// endpoints arrive as refs already and this call -- and the id-keyed
-		// map around it -- is the only thing that has to go; every read below
-		// is already on refs.
-		refs, err := reader.Resolve(p.ctx, chunk)
-		if err != nil {
-			return nil, err
-		}
-		containers, err := reader.Containers(p.ctx, refs)
+	owners := make([]NodeRef, 0, len(refs))
+	for _, chunk := range impactChunkRefs(refs) {
+		containers, err := reader.Containers(p.ctx, chunk)
 		if err != nil {
 			return nil, err
 		}
@@ -478,7 +477,7 @@ func (p *pairRollup) containerLabels(ids []model.NodeID) (map[model.NodeID]conta
 	if err := p.hydrate(reader, missing); err != nil {
 		return nil, err
 	}
-	for i, id := range ids {
+	for i, ref := range refs {
 		label, ok := p.labels[owners[i]]
 		if !ok {
 			// No container in this generation, or one the generation does not
@@ -486,7 +485,42 @@ func (p *pairRollup) containerLabels(ids []model.NodeID) (map[model.NodeID]conta
 			// dropped, exactly as before.
 			continue
 		}
-		out[id] = label
+		out[ref] = label
+	}
+	return out, nil
+}
+
+// edgeEnds is the edge's from-node and to-node, read off the owner and the
+// direction flag the reader set. The PAIR is directed -- "this package depends
+// on that one" -- so which end is which is part of the answer, not a detail.
+func edgeEnds(e Edge) (from, to NodeRef) {
+	if e.Outgoing {
+		return e.Owner, e.Neighbour
+	}
+	return e.Neighbour, e.Owner
+}
+
+// evidenceCounts reads one batch's per-relation evidence counts off the
+// generation's side array, in ascending surrogate order so the array's parts
+// are touched sequentially.
+func (p *pairRollup) evidenceCounts(rels []RelRef) (map[RelRef]int64, error) {
+	reader, err := p.e.consumerReader()
+	if err != nil {
+		return nil, err
+	}
+	rels = ascending(rels)
+	out := make(map[RelRef]int64, len(rels))
+	for _, chunk := range impactChunkRefs(rels) {
+		counts, err := reader.EvidenceCounts(p.ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		if len(counts) != len(chunk) {
+			return nil, internalErr("graph: the reader counted a different number of relations than it was given")
+		}
+		for i, ref := range chunk {
+			out[ref] = counts[i]
+		}
 	}
 	return out, nil
 }

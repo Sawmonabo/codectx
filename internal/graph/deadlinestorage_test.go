@@ -150,13 +150,17 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	// while every page still advances, which is the condition under which a
 	// continuation, not the terminal stalled reason, is the right answer.
 	//
-	// A budget so small that a page cannot advance at all is a LEGITIMATE
-	// outcome -- the engine reports reasonDeadlineStalled with no cursor, and
-	// the real binary does exactly that on r3 under a 2s budget -- but it
-	// serves nothing, so the union assertion below would have no answer to
-	// compare. Rather than tolerate it and assert less, the budget is raised
-	// and the chain re-run: the invariant stays the full one, and the case
-	// stops depending on how loaded the machine is.
+	// A budget so small that the chain cannot advance is a LEGITIMATE outcome
+	// in either of the two shapes drainImpact reports -- the walk leg's
+	// terminal reasonDeadlineStalled with no cursor, which the real binary
+	// returns on r3 under a 2s budget, or a rank leg that keeps timing out,
+	// re-sorting the same retained input from scratch each time -- but
+	// neither serves the answer, so the union assertion below would have
+	// nothing to compare. Rather than tolerate it and assert less, the budget
+	// is raised and the chain re-run: the invariant stays the full one, and the
+	// case stops depending on how loaded the machine is, which under -race it
+	// otherwise is (there the first budget reaches the rank leg and cannot
+	// finish it, and the second does).
 	var got []model.NodeID
 	for attempt, stalled := 0, true; stalled; attempt++ {
 		if attempt == 3 {
@@ -184,20 +188,61 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 // in served order, failing on the three shapes the invariant forbids: an error
 // instead of a page, a truncated page with no continuation, and an entity
 // served twice.
-// It reports whether the chain ended on the terminal stalled reason instead of
-// running to exhaustion; the caller decides what that means for its assertion.
+//
+// It reports whether the chain FAILED TO ADVANCE at this budget instead of
+// running to exhaustion; the caller decides what that means for its assertion
+// (the case above raises the budget and re-runs). Two shapes count:
+//
+//	(a) the engine's own terminal reasonDeadlineStalled, minted when the walk
+//	    could not move and so hands back no continuation at all;
+//	(b) stallStreak pages IN A ROW that each handed back a continuation yet
+//	    advanced NOTHING -- not the cumulative visited set, not the edges read,
+//	    not one more entity served. A walk leg that moves nothing is (a); this
+//	    is the rank leg, whose continuation names the retained input alone, so
+//	    a budget too small to finish the sort re-sorts from scratch forever.
+//
+// Progress, not a page count, is what bounds the chain, because no page count
+// can be calibrated here: under -race the rank leg at the derived budget cannot
+// finish its sort and re-runs without limit (measured: past 2000 pages), which
+// is a budget outcome, not a length.
+//
+// The streak has to be long, and that is the whole subtlety of this guard. A
+// SINGLE non-advancing page is ordinary even at a budget that works -- the
+// unmutated chain shows exactly one, the rank leg's first try -- and returning
+// on it would raise the budget past the regime where the deadline lands inside
+// a storage read at all, which is the regime the case exists to test. Ending
+// the drain early there hid the isDeadline mutation completely: the mutated
+// engine loses its remainder only under the tight budget, so the escalated
+// re-run agreed with the reference and the case passed. A budget that truly
+// cannot finish the sort cannot finish it on any attempt, so a long streak
+// separates the two without weakening either.
+//
+// The absolute cap is only a runaway guard: it is far above any page count this
+// fixture's 2440 entities can reach while pages keep advancing, and it names
+// the failure instead of leaving a broken chain to the package timeout.
 func drainImpact(t *testing.T, e *Engine, req func(string) model.ImpactRequest,
 	label string) ([]model.NodeID, bool) {
 	t.Helper()
-	const pageCap = 2000
+	const (
+		pageCap     = 5000
+		stallStreak = 64
+	)
+	// The walk's cumulative accounting, which every continuation carries: a page
+	// that leaves all three unchanged did no work the next page can build on.
+	type progress struct{ visited, edges, served int64 }
 	var (
 		order []model.NodeID
 		seen  = map[model.NodeID]int{}
 		next  string
+		last  progress
+		stall int
+		// Page 1 has nothing to be compared against: walkStalled needs a resume
+		// state, so the first page always mints a continuation.
+		havePrev bool
 	)
 	for page := 1; ; page++ {
 		if page > pageCap {
-			t.Fatalf("%s: the cursor chain did not end within %d pages", label, pageCap)
+			t.Fatalf("%s: the cursor chain still advanced after %d pages", label, pageCap)
 		}
 		res, err := e.Impact(context.Background(), req(next))
 		if err != nil {
@@ -220,10 +265,23 @@ func drainImpact(t *testing.T, e *Engine, req func(string) model.ImpactRequest,
 					t.Fatalf("%s page %d: truncated (%s) with no continuation",
 						label, page, res.Meta.TruncationReason)
 				}
+				t.Logf("%s: stalled on page %d after %d entries", label, page, len(order))
 				return order, true
 			}
+			t.Logf("%s: exhausted in %d pages, %d entries", label, page, len(order))
 			return order, false
 		}
+		cur := progress{res.VisitedCount, res.EdgeCount, int64(len(order))}
+		if havePrev && cur == last {
+			if stall++; stall >= stallStreak {
+				t.Logf("%s: %d pages in a row advanced nothing by page %d (visited %d, edges %d, served %d)",
+					label, stall, page, cur.visited, cur.edges, cur.served)
+				return order, true
+			}
+		} else {
+			stall = 0
+		}
+		last, havePrev = cur, true
 		next = res.Meta.NextCursor
 	}
 }
