@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -10,34 +9,16 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// ctxAdjacency is the half of the shipped storage reader that every in-memory
-// fixture was missing: a real SQLite read returns the context's OWN error,
-// untyped, when the deadline falls inside the query (sqlite/open.go's wrap
-// passes context.DeadlineExceeded through deliberately, so a caller can tell it
-// from a crash). Every fixture Adjacency returned rows regardless of the clock,
-// so no graph test ever exercised the classification of a RAW deadline arriving
-// from below -- which is why the engine shipped treating it as fatal and threw
-// away the page, the frontier and the cursor with it.
+// ctxAdjacency is the half of the shipped storage reader an in-memory fixture
+// otherwise omits: a real SQLite read returns the context's OWN error, untyped,
+// when the deadline falls inside the query (sqlite/open.go's wrap passes
+// context.DeadlineExceeded through deliberately, so a caller can tell it from a
+// crash). It is what exercises the engine's classification of a RAW deadline
+// arriving from below, rather than of a typed one the engine synthesized.
 //
 // Checking the context at the TOP of the read is what makes the deadline land
-// inside it rather than on a checkWalk between reads: the engine's own checks
-// synthesize a typed error and were always handled.
-type ctxAdjacency struct {
-	*graphFixture
-	mu    sync.Mutex
-	calls int
-}
-
-func (a *ctxAdjacency) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	a.mu.Lock()
-	a.calls++
-	a.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return a.graphFixture.Edges(ctx, nodes, direction, kinds, after, limit)
-}
+// inside it rather than on a checkWalk between reads.
+type ctxAdjacency struct{ *graphFixture }
 
 func (a *ctxAdjacency) NodesByID(ctx context.Context, ids []model.NodeID) ([]model.Node, error) {
 	if err := ctx.Err(); err != nil {

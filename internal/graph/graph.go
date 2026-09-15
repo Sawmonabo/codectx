@@ -17,25 +17,18 @@ import (
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
-// adjacencyBatch is the number of frontier NodeIDs sent to Adjacency.Edges in
-// one round trip. It bounds both the SQL IN-list and the rows a single call can
-// return, which is what keeps a high fan-out hub from turning one expansion
-// step into an unbounded query.
+// adjacencyBatch is the number of surrogates or ids a batched read sends in one
+// round trip. It bounds both the SQL IN-list and the rows a single call can
+// return, which is what keeps a high fan-out hub from turning one step into an
+// unbounded query.
 const adjacencyBatch = 256
 
-// Adjacency is the only way the engine reads facts. It is deliberately batched:
-// a per-node reader would turn every expansion step into N+1 queries against
-// the relation indexes.
+// Adjacency is how the engine hydrates the answer it delivers: the nodes a
+// traversal admitted, the evidence backing a page of relations, and the pinned
+// generation it is bound to. Structure is read through GraphReader. It is
+// deliberately batched: a per-node reader would turn every delivery step into
+// N+1 queries.
 type Adjacency interface {
-	// Edges returns every visible edge touching any of nodes in direction, restricted to kinds,
-	// keyset-ordered by relation id after `after`, at most limit rows. One round trip per call.
-	//
-	// An empty kinds slice means "no kind filter", not "no rows": callers resolve
-	// DefaultRelations before calling, so an empty slice is a caller that wants every
-	// kind. limit must be positive -- every batch carries an explicit finite bound --
-	// and an implementation may reject a non-positive limit with CTX_ARGUMENT_INVALID.
-	Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-		kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error)
 	// NodesByID hydrates the nodes a traversal admitted, in one round trip.
 	NodesByID(ctx context.Context, ids []model.NodeID) ([]model.Node, error)
 	// EvidenceFor hydrates the evidence backing a page of relations, in one
