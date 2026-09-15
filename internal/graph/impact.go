@@ -56,8 +56,9 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		Entries:  entries,
 		Packages: answer.Packages,
 		// Cumulative spend, the same accounting the traversal operations
-		// report, and the same on every page of one answer: the walk happened
-		// once.
+		// report: a resumed page carries what the earlier pages already spent
+		// and adds its own, so the counters GROW across the pages of one walk
+		// rather than repeating a single-shot total.
 		VisitedCount: b.visited,
 		EdgeCount:    b.edges,
 	}

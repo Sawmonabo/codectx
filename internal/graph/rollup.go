@@ -190,12 +190,12 @@ func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation)
 		}
 		return x.ToNodeID < y.ToNodeID
 	})
-	// No MaxRecordsPerResult cut here. It used to discard the tail of the
-	// aggregation with a comment saying it could not disclose the loss, which
-	// made the page-overflow notice below understate what the answer held.
-	// The aggregate is over ONE page's edges -- the per-page edge and visited
-	// budgets bound what the walk read -- so the pair set is already
-	// page-sized, and the page slice is the only cut, disclosed by count.
+	// No MaxRecordsPerResult cut here, and no page slice either. The walk that
+	// produced these relations stops at the page's item bound, so the pairs it
+	// aggregates are already page-sized: `limit` edges can yield at most `limit`
+	// distinct pairs. Nothing is discarded, so there is nothing to disclose by
+	// count -- the continuation the caller mints carries the rest of the walk,
+	// and a pair's counts sum across pages to the whole-walk total.
 	return out, nil
 }
 
