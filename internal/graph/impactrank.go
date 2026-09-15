@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"os"
 	"slices"
 	"time"
 
@@ -397,11 +398,72 @@ func (e *Engine) rankImpact(ctx context.Context,
 // sums over the whole walk rather than over one page; pass 2 keys lessByPair,
 // which is the order the rollup has always served. Close the returned run.
 //
+// The two passes are what make the answer independent of arrival order: the
+// fold runs once over the fully ordered stream of pass 1, so a pair split
+// across any number of emitting batches sums to the same counts a single-shot
+// rollup of the same edges would report, and pass 2 orders the distinct pairs
+// globally rather than one batch at a time.
+//
 // Owned by lane P-c.
 func (e *Engine) rankPairs(ctx context.Context,
 	emit func(add func(pairRecord) error) error) (*pagination.SortedRun[pairRecord], error) {
-	_, _ = ctx, emit
-	return nil, errNotImplemented("graph.rank_pairs")
+	byKey, err := e.newPairSort("graphpairkey-", lessByPairKey)
+	if err != nil {
+		return nil, err
+	}
+	byKey = byKey.WithFold(foldPair)
+	defer byKey.Close()
+	if err := emit(byKey.Add); err != nil {
+		return nil, err
+	}
+	folded, err := byKey.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	defer folded.Close()
+	// The deadline ends a page and never the answer (ruling P3), but a
+	// cancelled request must not pay for a second pass over a set it will
+	// never serve.
+	if err := ctx.Err(); err != nil {
+		return nil, typedContextError(ctx, err)
+	}
+	byPair, err := e.newPairSort("graphpair-", lessByPair)
+	if err != nil {
+		return nil, err
+	}
+	defer byPair.Close()
+	if err := folded.Each(byPair.Add); err != nil {
+		return nil, err
+	}
+	return byPair.Sorted()
+}
+
+// newPairSort opens one pass of the pair sort with the frozen codec and the
+// query's own run budget. The budget is a share of resources.query_memory_bytes
+// -- the same number Limits.FrontierBytes carries into the engine -- so one
+// query's structures are all charged against the one admission it was granted
+// rather than against a second key that could oversubscribe it.
+func (e *Engine) newPairSort(prefix string,
+	compare func(a, b pairRecord) int) (*pagination.ExternalSort[pairRecord], error) {
+	sorter, err := pagination.NewExternalSort(e.pairSortDir(), prefix, 0,
+		encodePairRecord, decodePairRecord, compare)
+	if err != nil {
+		return nil, err
+	}
+	return sorter.WithRunBytes(pagination.SortRunBytes(e.limits.FrontierBytes), sizeOfPairRecord), nil
+}
+
+// pairSortDir is where the pair sort's runs spill: beside the store's
+// continuation spools when the engine has them, so an operator has one place
+// to look and the store's sweep reports and reclaims the files, and the
+// operating system's temporary directory otherwise -- an engine built without
+// Spools has no store directory of its own, and the sort removes every file it
+// creates when its runs and its output are closed.
+func (e *Engine) pairSortDir() string {
+	if e.spools == nil {
+		return os.TempDir()
+	}
+	return e.spools.SortDir()
 }
 
 // servePage reads at most limit records out of the spool tail names, starting
