@@ -173,6 +173,8 @@ it concludes. All are **user** trust.
 | `reconcile_interval` | `"30s"` | Period of full reconciliation, which catches missed and timestamp-preserving changes. |
 | `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. `0` retains every ref, matching `max_retained_bytes`. This keeps a finite default because a generation is reconstructible by re-indexing, so evicting one is lifecycle retention rather than a dropped row. |
 | `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
+| `capture_max_retries` | `0` | Validation passes of a snapshot capture that may find the worktree changed under them before the capture is declared unstable. `0` (unlimited) is the default: a retry count that refuses a busy monorepo would be a scale refusal. Attempts are reported on the capture either way. |
+| `capture_retry_deadline` | `"10m"` | Wall clock for the whole validated capture. Finite by design, and not a size bound: with `capture_max_retries` unlimited this is the only thing that ends a capture of a worktree that never quiesces. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
 

@@ -120,13 +120,24 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 	return res, nil
 }
 
+// captureBuilder is the snapshot builder this generation captures with. It is
+// its own function so the operator settings it carries -- index.capture_max_retries
+// and index.capture_retry_deadline, the only escape hatch from a worktree that
+// never settles -- are reachable by a test without running a capture.
+func (g *generation) captureBuilder() *snapshot.Builder {
+	c := g.c
+	return &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
+		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
+		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log,
+		MaxRetries:    c.opts.Config.Index.CaptureMaxRetries.Value(),
+		RetryDeadline: c.opts.Config.Index.CaptureRetryDeadline.Std()}
+}
+
 // capture builds the immutable snapshot this generation is about and reads the
 // active pointer it will publish over.
 func (g *generation) capture(ctx context.Context) error {
 	c := g.c
-	b := &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
-		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
-		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log}
+	b := g.captureBuilder()
 	snap, err := b.Build(ctx)
 	if err != nil {
 		return err
