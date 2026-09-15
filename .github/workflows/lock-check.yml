@@ -49,9 +49,11 @@ jobs:
           go-version: "1.27.1"
           check-latest: false
 
-      # -check aborts on the first payload whose served bytes disagree, naming
-      # the entry and platform it was reading ("<tool>/<platform>: ..."), so the
-      # failing step's log names what differs. The scratch directory is the
+      # -check reads every pinned payload and prints one "DIFFERS
+      # <tool>/<platform>: ..." line per entry it could not confirm -- served
+      # bytes that disagree, or a payload it could not fetch -- then exits once
+      # with the count, so one failing run's log names every entry that moved,
+      # not just the first. The scratch directory is the
       # runner's workspace, which it reclaims with the job; a zip payload spools
       # past a file there and is deleted as soon as it has been hashed.
       - name: Re-download every pinned payload and confirm the lock
@@ -66,6 +68,6 @@ jobs:
             echo "The tool lock still matches every published payload." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "**The tool lock no longer matches what upstream publishes.**" >> "$GITHUB_STEP_SUMMARY"
-            echo "The failing step names the entry and platform that differs." >> "$GITHUB_STEP_SUMMARY"
-            echo "Re-pin it with \`go run ./internal/tools/toollock -tools <name>\`." >> "$GITHUB_STEP_SUMMARY"
+            echo "The failing step prints one \`DIFFERS <tool>/<platform>\` line for every entry that differs, and a count." >> "$GITHUB_STEP_SUMMARY"
+            echo "Re-pin each tool named there with \`go run ./internal/tools/toollock -tools <name>\`." >> "$GITHUB_STEP_SUMMARY"
           fi
