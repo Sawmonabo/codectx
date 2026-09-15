@@ -597,7 +597,7 @@ func (w *UnitWriter) inputHash(ctx context.Context, tx *sql.Tx, file model.FileI
 func (w *UnitWriter) clipEvidence(ctx context.Context, tx *sql.Tx) error {
 	res, err := tx.ExecContext(ctx, `DELETE FROM evidence WHERE unit_id = ?1 AND id IN (
 		SELECT id FROM (SELECT id, row_number() OVER (PARTITION BY node_id, relation_id ORDER BY id) AS rank
-			FROM evidence WHERE unit_id = ?1) WHERE rank > ?2)`, w.rowID, model.MaxEvidencePerFact)
+			FROM evidence WHERE unit_id = ?1) WHERE rank > ?2)`, w.rowID, w.s.opts.MaxEvidencePerFact)
 	if err != nil {
 		return wrap("evidence", err)
 	}
