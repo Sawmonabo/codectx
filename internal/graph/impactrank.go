@@ -315,25 +315,23 @@ func lessByPair(a, b pairRecord) int {
 // spool holding the records ranked AFTER this page, the lease that keeps it
 // alive, and the totals the answer discloses.
 //
-// It carries an Offset rather than a sort key because pagination.Spools.Open
-// streams a spool from the start and cannot seek (cursor.go states the
-// constraint). The continuation therefore follows internal/search's shape: the
-// page being served is read off the front of the spool and the remainder is
-// copied record-by-record into a FRESH spool, so Offset is how many records of
-// the source spool the next read skips -- never a position a caller could
-// choose, and never state that grows with the answer.
+// It carries a BYTE offset rather than a sort key because a spool is a record
+// stream with no index: the page that wrote it records where each section
+// begins, and every later page seeks straight to its own position
+// (pagination.Spools.OpenAt). One spool holds the whole ranked remainder and is
+// read, never copied, so a page's cost is the page limit and never the
+// remainder behind it. The offset is server-minted state inside a signed token,
+// never a position a caller could choose.
 type rankedTail struct {
 	// SpoolID names the spool the next page reads; empty when the answer ended
 	// with the page that produced this handle.
 	SpoolID string
 	// LeaseID is the cursor-owned retention lease minted with that spool.
 	LeaseID string
-	// Offset is how many RANKED records the next page skips before its own
-	// first record. It does not count the spool's leading header record, which
-	// every read skips unconditionally -- the same convention internal/search's
-	// spoolTail applies to its metadata record -- so an Offset of zero means
-	// the first ranked record and never the header.
-	Offset int
+	// Offset is the BYTE position in that spool where the next page's first
+	// record begins. It is never zero on a live handle: zero is the spool's own
+	// header frame, which is not a record position.
+	Offset int64
 	// Served is how many records every page up to and including this one has
 	// served, and Total how many the whole ranked answer holds. Both are
 	// cumulative facts of the ANSWER, not of the page, so a caller can see
@@ -482,6 +480,28 @@ type heapProbe struct {
 	// in quadratic time, which is the defect this state layout closed.
 	VisitedBytes  int64
 	ResumeRecords int64
+	// SpoolBytesRead is how many bytes of ranked continuation spools this
+	// request read, and SpoolBytesWritten how many it wrote. They are the
+	// ranked half of the same append-only invariant: a page of a settled
+	// ranking must read its own page and write nothing, so both must be flat
+	// across pages. A build where either tracks the unserved remainder pages a
+	// ranked answer to completion in quadratic time.
+	SpoolBytesRead    int64
+	SpoolBytesWritten int64
+}
+
+// recordSpoolRead and recordSpoolWritten report one page's ranked-spool I/O to
+// the probe. Both are nil checks in production.
+func (e *Engine) recordSpoolRead(n int64) {
+	if e.probe != nil {
+		e.probe.SpoolBytesRead += n
+	}
+}
+
+func (e *Engine) recordSpoolWritten(n int64) {
+	if e.probe != nil {
+		e.probe.SpoolBytesWritten += n
+	}
 }
 
 // rankProbe, pairProbe and rollupProbe hand the ranking passes the counters to

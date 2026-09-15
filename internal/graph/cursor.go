@@ -87,7 +87,7 @@ import (
 // earlier page already reported -- the same entity on page after page. There is
 // no shape in a version-4 token that says so, so the version is the only honest
 // refusal.
-const traversalCursorVersion = 5
+const traversalCursorVersion = 6
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -146,13 +146,24 @@ type traversalCursor struct {
 	// continuation with an empty frontier is otherwise indistinguishable from a
 	// finished answer, which mints no cursor at all.
 	WalkDone bool `json:"walk_done,omitempty"`
-	// RankOffset is how many records of that spool the next page skips, and
-	// RankServed/RankTotal the cumulative answer facts the page discloses.
-	// An offset is carried instead of a sort key because Spools.Open streams
-	// from the start and cannot seek; see rankedTail (impactrank.go).
-	RankOffset int   `json:"rank_offset,omitempty"`
+	// RankOffset is the BYTE offset in that spool where the next page's first
+	// entity record begins, and RankServed/RankTotal the cumulative answer
+	// facts the page discloses. The spool is written ONCE, by the page that
+	// settled the order, and every later page seeks to its own offset and
+	// reads only its own page out of it (pagination.Spools.OpenAt), so a
+	// page's cost is its page and never the remainder behind it.
+	//
+	// A byte offset rather than a record index because the pair section below
+	// begins after every entity record: one index cannot name both resume
+	// points, and counting records to find the second is the O(remaining) scan
+	// the offsets exist to remove. It is server-minted state inside a signed
+	// token, never a caller's choice.
+	RankOffset int64 `json:"rank_offset,omitempty"`
 	RankServed int64 `json:"rank_served,omitempty"`
 	RankTotal  int64 `json:"rank_total,omitempty"`
+	// PairOffset is the same byte offset for the SECOND section, which the
+	// first page records as it lays the two sorted runs into the one spool.
+	PairOffset int64 `json:"pair_offset,omitempty"`
 	// PairServed and PairTotal are the same two facts for the SECOND ranked
 	// list an impact answer carries, its package rollup. One result has room
 	// for one cursor, so the two lists are paged together behind it: a
@@ -221,7 +232,7 @@ func (c traversalCursor) validate() error {
 func (c traversalCursor) validateRanked() error {
 	if !c.Ranked {
 		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 ||
-			c.PairServed != 0 || c.PairTotal != 0 {
+			c.PairOffset != 0 || c.PairServed != 0 || c.PairTotal != 0 {
 			return cursorInvalid("a walk continuation carries a ranked position")
 		}
 		if c.WalkDone {
@@ -252,12 +263,21 @@ func (c traversalCursor) validateRanked() error {
 	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
 		return cursorInvalid("cursor carries a negative ranked position")
 	}
-	if c.PairServed < 0 || c.PairTotal < 0 {
+	if c.PairOffset < 0 || c.PairServed < 0 || c.PairTotal < 0 {
 		return cursorInvalid("cursor carries a negative ranked position")
 	}
-	if c.RankServed > c.RankTotal || int64(c.RankOffset) > c.RankTotal ||
-		c.PairServed > c.PairTotal {
+	// The offsets are BYTE positions in the spool, not record counts, so they
+	// are not comparable with the totals; a position past the end of the file
+	// is caught by the reader, which reports corruption rather than serving
+	// invented records.
+	if c.RankServed > c.RankTotal || c.PairServed > c.PairTotal {
 		return cursorInvalid("cursor continues past the end of the ranked answer")
+	}
+	if c.RankOffset == 0 || (c.PairTotal > 0 && c.PairOffset == 0) {
+		// Both sections are placed by the page that WROTE the spool, so a
+		// ranked continuation always names where its records begin. Zero is the
+		// spool's own header frame, which is never a record position.
+		return cursorInvalid("a ranked continuation names no position in its result spool")
 	}
 	return nil
 }
@@ -362,9 +382,14 @@ const (
 // (the package rollup's pairs), and two for impact, whose one answer carries a
 // ranked entity list AND a ranked package list and must page both under the
 // one cursor a result has room for. The layout is
-// [header][Count entity records][PairCount pair records], so Count is the only
-// thing a reader needs in order to tell one section's records from the other's;
-// nothing is inferred from a record's own bytes.
+// [header][Count entity records][PairCount pair records], and the cursor names
+// each section's byte offset, so a record's section is a fact of the position
+// the writer recorded; nothing is inferred from a record's own bytes.
+//
+// The spool is written ONCE and read by every page after it, so Count and
+// PairCount are the counts as CREATED, not as remaining: checkAgainst compares
+// them with what the presenting cursor still claims is unserved, which is the
+// one consistency a reader can check between a cursor and the spool it names.
 type rankedHeader struct {
 	Kind  string `json:"k"`
 	Total int64  `json:"total"`
@@ -387,6 +412,18 @@ func encodeRankedHeader(h rankedHeader) ([]byte, error) {
 			Message: "continuation state encoding: " + err.Error()}
 	}
 	return b, nil
+}
+
+// checkAgainst rejects a cursor that claims more unserved records than the
+// spool it names was ever created holding. The spool now outlives the page that
+// wrote it, so this is a real invariant rather than a tautology: a build that
+// let a page advance Served without advancing its offset, or the reverse, is
+// caught here instead of serving a short or a repeated page.
+func (h rankedHeader) checkAgainst(rankRemaining, pairRemaining int64) error {
+	if int64(h.Count) < rankRemaining || int64(h.PairCount) < pairRemaining {
+		return cursorInvalid("the cursor claims more ranked records than its result page holds")
+	}
+	return nil
 }
 
 // decodeRankedHeader reads it back. A record that is not this build's ranked
