@@ -105,8 +105,7 @@ func (u *unit) packageJSON(ctx context.Context) error {
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			var req string
