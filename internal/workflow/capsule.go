@@ -472,3 +472,43 @@ func (s *Service) capsulePageLimit(requested int) int {
 	}
 	return requested
 }
+
+// CapsuleRows reads one keyset page of one sealed capsule list, with the
+// continuation the caller uses to read the next.
+//
+// It exists for the whole-capsule render `codectx context export` performs.
+// Export answers identity and counts only -- a sealed capsule's records are
+// rows -- so a caller that must write every record streams each list through
+// this call one page at a time, and the records resident in either process are
+// one page's worth whatever the session recorded.
+//
+// The continuation rule is Capsule's, for the same reason: the sealed count is
+// the length of the whole list, so the last row of the last page is the one
+// whose ordinal is count-1. A reader is therefore never handed a cursor that
+// would fetch an empty page.
+func (s *Service) CapsuleRows(ctx context.Context, req model.SessionRequest,
+	list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, string, error) {
+	if err := req.Validate(); err != nil {
+		return nil, "", err
+	}
+	if !list.Valid() {
+		return nil, "", typedErrf(model.CodeArgumentInvalid,
+			"%q is not a capsule list", list)
+	}
+	c, err := s.sessions.Capsule(ctx, req.SessionID, req.ActorID)
+	if err != nil {
+		return nil, "", err
+	}
+	rows, err := s.sessions.CapsuleRows(ctx, req.SessionID, req.ActorID, list,
+		after, s.capsulePageLimit(limit))
+	if err != nil {
+		return nil, "", err
+	}
+	var next string
+	if len(rows) > 0 {
+		if last := rows[len(rows)-1]; last.Ordinal+1 < c.Counts.Of(list) {
+			next = last.Key
+		}
+	}
+	return rows, next, nil
+}
