@@ -441,8 +441,13 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 // copy is dropped. Every relation is therefore emitted exactly once per walk,
 // with no cumulative relation set and no per-level map. An outgoing-only or
 // incoming-only walk sees one owner per relation anyway, so the rule is a
-// no-op there.
+// no-op there -- and it is SKIPPED there, because it is not merely redundant
+// but wrong: an outgoing-only walk never scans the incoming copy, so dropping
+// X->Y because Y was admitted earlier would drop the only copy there is.
 func (w *levelWalk) keepEntry(e Edge) (bool, error) {
+	if w.o.Direction != model.DirectionBoth {
+		return true, nil
+	}
 	visited, err := w.o.Retain.bits.test(uint64(e.Neighbour))
 	if err != nil || !visited {
 		return !visited, err
