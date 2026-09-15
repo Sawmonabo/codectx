@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -35,7 +36,8 @@ import (
 // and sweep the visited set once, instead of seeking per node). The spool is
 // a forward-only stream, so a per-node probe would be a full scan per node;
 // one scan per LEVEL is what keeps the I/O the same order the spool copy
-// already costs. Levels per page are bounded by the page item ceiling, because
+// already costs, and the scan stops as soon as the level's last candidate is
+// answered rather than always running to the end of the spool. Levels per page are bounded by the page item ceiling, because
 // a level that yields no row ends the walk and one that yields rows spends
 // page items.
 //
@@ -117,13 +119,48 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 	if len(want) == 0 {
 		return nil
 	}
-	return v.stream(ctx, func(id model.NodeID) error {
-		if _, ok := want[id]; ok {
-			v.probed[id] = struct{}{}
+	// The sweep ENDS as soon as every candidate is answered: a level whose
+	// neighbours were all admitted earlier costs the prefix of the spool that
+	// holds them, not the whole cumulative set. Only the unanswered remainder
+	// costs a full pass, and that is the case where a full pass is the answer
+	// ("none of these was admitted"), so no scan reads further than the fact it
+	// is looking for.
+	//
+	// Batching SEVERAL levels into one sweep -- the other half of the finding
+	// -- is not available to a BFS: level n+1's candidates are the neighbours
+	// of the nodes level n admits, so they do not exist until level n's sweep
+	// has already answered. Supplying them would mean reading level n+1's edges
+	// before level n was admitted, which is a second pass over the edge rows
+	// and a second frontier in heap -- strictly worse than the pass it saves.
+	found := 0
+	err := v.stream(ctx, func(id model.NodeID) error {
+		if _, ok := want[id]; !ok {
+			return nil
+		}
+		if _, seen := v.probed[id]; seen {
+			// The spool may hold a node twice (a carried record and the
+			// visited record the issuing page wrote); counting it twice would
+			// end the sweep before every candidate was answered.
+			return nil
+		}
+		v.probed[id] = struct{}{}
+		found++
+		if found == len(want) {
+			return errWarmComplete
 		}
 		return nil
 	})
+	if errors.Is(err, errWarmComplete) {
+		return nil
+	}
+	return err
 }
+
+// errWarmComplete ends a membership sweep that has answered every candidate it
+// was given. It never leaves warm: the stream is a forward-only replay with no
+// state of its own beyond the open spool, which the caller closes either way,
+// so stopping early is indistinguishable from reaching the end.
+var errWarmComplete = errors.New("membership sweep answered every candidate")
 
 // newlyAdmitted is what this page must append to the fresh spool, in the frozen
 // NodeID order. The carried nodes are deliberately absent: they are copied
