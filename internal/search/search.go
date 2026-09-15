@@ -60,10 +60,14 @@ type Service struct {
 	// runBytes is the in-memory run budget one query's ranking sort may hold,
 	// a share of resources.query_memory_bytes.
 	runBytes int64
-	timeout  time.Duration
-	ttl      time.Duration
-	now      func() time.Time
-	log      *slog.Logger
+	// timeout is resources.query_timeout: the DEFAULT deadline of one query,
+	// never a ceiling, and unlimited (zero) unless the operator set it. Every
+	// use goes through model.QueryDeadline, which leaves a caller's own
+	// deadline in charge and installs nothing at zero.
+	timeout time.Duration
+	ttl     time.Duration
+	now     func() time.Time
+	log     *slog.Logger
 }
 
 // New validates the options and builds the service.
@@ -87,13 +91,14 @@ func New(o Options) (*Service, error) {
 	if !model.ValidHexID(string(o.Repo)) {
 		return nil, optionErr("a repository identity")
 	}
-	timeout := o.Resources.QueryTimeout.Std()
 	// max_query_terms is a config.Limit: 0 means unlimited, which is its
-	// default, so it is deliberately absent from this check. Only the two
-	// plain ints that must be positive to size a page and a deadline are
-	// checked here.
-	if timeout <= 0 || o.Resources.MaxPageItems <= 0 {
-		return nil, optionErr("positive query_timeout and max_page_items")
+	// default, so it is deliberately absent from this check. So is
+	// query_timeout: zero is its "no deadline" spelling and its default, and a
+	// query nobody bounded is meant to return the COMPLETE answer rather than
+	// the first page of one. max_page_items stays positive because it sizes a
+	// wire page, which is a lossless bound the next cursor carries the rest of.
+	if o.Resources.MaxPageItems <= 0 {
+		return nil, optionErr("a positive max_page_items")
 	}
 	ttl := o.CursorTTL
 	if ttl <= 0 {
@@ -117,7 +122,7 @@ func New(o Options) (*Service, error) {
 		lexical:  newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
 		maxPage:  o.Resources.MaxPageItems,
 		runBytes: pagination.SortRunBytes(o.Resources.QueryMemoryBytes),
-		timeout:  timeout,
+		timeout:  o.Resources.QueryTimeout.Std(),
 		ttl:      ttl,
 		now:      now,
 		log:      logger,
@@ -182,10 +187,12 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if err != nil {
 		return empty, err
 	}
-	// resources.query_timeout bounds the CANDIDATE SEARCH and nothing else.
-	// That is the only unbounded part of this answer -- the tiers walk their
-	// keysets to the end -- and ruling Q4 says the timeout ends a PAGE, not an
-	// answer: the hits ranked before it are a real ordered prefix, and a query
+	// resources.query_timeout, WHEN SET, bounds the CANDIDATE SEARCH and
+	// nothing else. It is unlimited by default and it is never a ceiling: a
+	// search nobody bounded ranks every candidate, and a caller who set a
+	// deadline of their own keeps it (model.QueryDeadline). That search is the
+	// only unbounded part of this answer -- the tiers walk their keysets to
+	// the end -- and ruling Q4 says a deadline ends a PAGE, not an answer: the hits ranked before it are a real ordered prefix, and a query
 	// that returned nothing at all because it took too long to look is the
 	// refusal the scale posture forbids. Everything after the search (pinning,
 	// hydrating one page, writing the tail into the continuation spool) is
@@ -252,7 +259,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		}
 	} else {
 		var run *pagination.SortedRun[scored]
-		searchCtx, searchCancel := context.WithTimeout(ctx, s.timeout)
+		searchCtx, searchCancel := model.QueryDeadline(ctx, s.timeout)
 		run, truncated, reason, err = s.rank(searchCtx, reader, req, filter)
 		searchCancel()
 		if err != nil {
@@ -752,7 +759,7 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	if err := req.Validate(); err != nil {
 		return empty, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.timeout)
 	defer cancel()
 	now := s.now()
 	hash := symbolQueryHash(req)
