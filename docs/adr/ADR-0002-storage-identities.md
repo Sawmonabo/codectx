@@ -258,6 +258,10 @@ difference below is representation, not corpus.
 | store bytes | 1 005 887 488 | 632 266 752 | **−373 620 736 (−37.1 %)** |
 | **bytes per indexed symbol** | **5 732.8** | **3 603.5** | **−37.1 %** |
 
+Both totals are **pre-narrowing**: the after store was built before `idx_nodes_file`
+lost its dead middle column, and that index's −1 093 632 B is measured on a copy of
+the same store further down. The two savings are not additive with the headline.
+
 Per b-tree, largest movers (bytes):
 
 | b-tree | before | after |
