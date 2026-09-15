@@ -143,8 +143,15 @@ func measureEntry(c candidate, ordinal int, chargeSource bool) (model.ContextEnt
 }
 
 // evidencePaths projects the ranking lane's explanation paths onto the stored
-// relation-id lists, bounded by model.MaxReasonPathsPerEntry and
-// model.MaxRelationsPerPath so a persisted entry cannot fail its own Validate.
+// relation-id lists.
+//
+// The path COUNT is not re-bounded here. The ranking lane already applied
+// context.max_reason_paths_per_entry as written -- including a value above
+// model.MaxReasonPathsPerEntry, and including unlimited -- and
+// model.ContextEntry.Validate no longer refuses the entry on that count, so a
+// second clip at 3 would discard routes the operator asked to keep after the
+// lane that honoured the setting had produced them. Only the per-path relation
+// list keeps model.MaxRelationsPerPath, which Validate does still enforce.
 func evidencePaths(paths []model.RelationPath) [][]model.RelationID {
 	if len(paths) == 0 {
 		return nil
@@ -159,9 +166,6 @@ func evidencePaths(paths []model.RelationPath) [][]model.RelationID {
 			rel = rel[:model.MaxRelationsPerPath]
 		}
 		out = append(out, append([]model.RelationID(nil), rel...))
-		if len(out) == model.MaxReasonPathsPerEntry {
-			break
-		}
 	}
 	if len(out) == 0 {
 		return nil

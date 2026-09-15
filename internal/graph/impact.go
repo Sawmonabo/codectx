@@ -176,9 +176,18 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	}
 
 	entries := acc.Entries(e.limits.MaxReasonPaths)
-	entries, hydrateErr := e.hydrateImpactEntries(ctx, entries)
+	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
 	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
 		return answer, nil, nil, err
+	}
+	if unhydratable > 0 {
+		// An entry the pinned generation cannot hydrate is still a node the
+		// walk admitted. Dropping it silently made the answer read as the
+		// complete impact set; the count is the honest channel, since the
+		// entry itself cannot be listed without inventing its kind.
+		meta.Notices = appendNotice(meta.Notices,
+			fmt.Sprintf("impact: %d affected node(s) were reached but could not be hydrated from the pinned generation and are not listed",
+				unhydratable))
 	}
 	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
 		return answer, nil, nil, err
@@ -642,22 +651,25 @@ func (a *impactAccumulator) path(n *impactNode) (model.RelationPath, bool) {
 
 // hydrateImpactEntries fills the kind, file and path an entry reports, in
 // batched round trips rather than one lookup per entry. A node the pinned
-// generation cannot hydrate is dropped: reporting it without its kind would
-// fail the entry contract, and inventing one would publish a fact nothing
-// backs.
-func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.ImpactEntry) ([]model.ImpactEntry, error) {
+// generation cannot hydrate cannot be listed: reporting it without its kind
+// would fail the entry contract, and inventing one would publish a fact
+// nothing backs. It is COUNTED and returned so the caller discloses the
+// omission instead of letting the answer read as complete.
+func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.ImpactEntry) ([]model.ImpactEntry, int, error) {
 	ids := make([]model.NodeID, 0, len(entries))
 	for _, entry := range entries {
 		ids = append(ids, entry.NodeID)
 	}
 	nodes, err := e.nodesByID(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
+	dropped := 0
 	out := entries[:0]
 	for _, entry := range entries {
 		n, ok := nodes[entry.NodeID]
 		if !ok {
+			dropped++
 			continue
 		}
 		entry.Kind = n.Kind
@@ -679,7 +691,7 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 		}
 		return x.NodeID < y.NodeID
 	})
-	return out, nil
+	return out, dropped, nil
 }
 
 // nodesByID hydrates ids in bounded batches and returns them keyed by id.

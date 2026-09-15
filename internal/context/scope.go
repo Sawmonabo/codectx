@@ -188,8 +188,8 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			Origin:      originExpansion,
 			Depth:       e.Depth,
 			Reasons:     boundReasons(e.Reasons),
-			Paths:       boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry.Int()),
 		}
+		c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
 		if admitted[c.entityID()] {
 			// A seed the walk reached again keeps its seed requirement, which
 			// is the strongest one; re-adding it would double an entry.
@@ -269,15 +269,21 @@ func boundReasons(reasons []string) []string {
 	return out
 }
 
-// boundPaths clamps the stored evidence paths to context.max_reason_paths_per_entry.
-func boundPaths(paths []model.RelationPath, max int) []model.RelationPath {
-	if max <= 0 || max > model.MaxReasonPathsPerEntry {
-		max = model.MaxReasonPathsPerEntry
+// boundPaths applies context.max_reason_paths_per_entry to the routes an
+// expansion entry arrives with, and returns the number it could not carry so
+// the caller discloses them rather than losing them.
+//
+// It no longer floors the setting at model.MaxReasonPathsPerEntry. That
+// constant is a report threshold, not a wire ceiling: rank.go honours a
+// configured value above it, and re-clamping to 3 here would silently undo
+// the operator's setting one lane later -- the class-G shape this wave removes.
+// config.Limit owns the test, so unlimited keeps every route.
+func boundPaths(paths []model.RelationPath, max config.Limit) ([]model.RelationPath, int64) {
+	if !max.Exceeded(int64(len(paths))) {
+		return append([]model.RelationPath(nil), paths...), 0
 	}
-	if len(paths) > max {
-		paths = paths[:max]
-	}
-	return append([]model.RelationPath(nil), paths...)
+	keep := max.Int()
+	return append([]model.RelationPath(nil), paths[:keep]...), int64(len(paths) - keep)
 }
 
 // degradedCapabilities is every capability row that is not fresh, from the
