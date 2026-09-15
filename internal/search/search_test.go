@@ -271,6 +271,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
 		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
 		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
+		{"rank/the_answer_does_not_depend_on_the_order_candidates_arrive", legFoldOrderIndependent},
 		{"rank/the_ranked_set_is_bounded_by_its_run_budget", legRankedSetIsBoundedByItsRunBudget},
 		{"cursor/a_streamed_continuation_walk_reproduces_the_whole_answer", legStreamedWalkParity},
 		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
@@ -325,39 +326,148 @@ func rankedOf(tier model.SearchTier, score int64, path string, start uint64, nod
 		NodeID: node, SearchKey: key, Occurrences: 1}
 }
 
+// scoredOf wraps a sort tuple as the record the served order compares, with
+// the served facts a real candidate carries.
+func scoredOf(r ranked, kind model.NodeKind, name string, end uint64) scored {
+	return scored{ranked: r, Folded: r.ScoreMicros, Span: &model.ByteRange{Start: r.StartByte, End: end},
+		Hit: model.SearchHit{NodeID: r.NodeID, Path: r.Path, Kind: kind, Name: name}}
+}
+
 // legLessChain proves the full Section 14.2 chain, one key at a time. A
 // dropped or reordered key would silently reorder results for identical
-// inputs, which is the determinism guarantee Section 14.2 sells.
+// inputs, which is the determinism guarantee Section 14.2 sells. The keys
+// after start byte are the content keys that make the order independent of
+// WHERE the tree was indexed: end byte, kind, name, qualified name and
+// signature all precede the root-dependent NodeID and SearchKey.
 func legLessChain(t *testing.T, _ *fixture) {
-	base := rankedOf(model.TierExactName, 100, "b", 10, "n2", "k2")
+	baseR := rankedOf(model.TierExactName, 100, "b", 10, "n2", "k2")
+	base := scoredOf(baseR, model.NodeFunction, "m2", 20)
 	cases := []struct {
 		key   string
-		lower ranked
+		lower scored
 	}{
-		{"tier", rankedOf(model.TierExactPath, 0, "b", 10, "n2", "k2")},
-		{"score", rankedOf(model.TierExactName, 101, "b", 10, "n2", "k2")},
-		{"path", rankedOf(model.TierExactName, 100, "a", 10, "n2", "k2")},
-		{"start_byte", rankedOf(model.TierExactName, 100, "b", 9, "n2", "k2")},
-		{"node_id", rankedOf(model.TierExactName, 100, "b", 10, "n1", "k2")},
-		{"search_key", rankedOf(model.TierExactName, 100, "b", 10, "n2", "k1")},
+		{"tier", scoredOf(rankedOf(model.TierExactPath, 0, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"score", scoredOf(rankedOf(model.TierExactName, 101, "b", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"path", scoredOf(rankedOf(model.TierExactName, 100, "a", 10, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"start_byte", scoredOf(rankedOf(model.TierExactName, 100, "b", 9, "n2", "k2"), model.NodeFunction, "m2", 20)},
+		{"end_byte", scoredOf(baseR, model.NodeFunction, "m2", 19)},
+		{"kind", scoredOf(baseR, model.NodeDocument, "m2", 20)},
+		{"name", scoredOf(baseR, model.NodeFunction, "m1", 20)},
+		{"qualified_name", withQName(scoredOf(baseR, model.NodeFunction, "m2", 20), "q1")},
+		{"signature", withSignature(scoredOf(baseR, model.NodeFunction, "m2", 20), "s1")},
+		{"node_id", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n1", "k2"), model.NodeFunction, "m2", 20)},
+		{"search_key", scoredOf(rankedOf(model.TierExactName, 100, "b", 10, "n2", "k1"), model.NodeFunction, "m2", 20)},
+	}
+	// The base carries a qualified name and a signature so the two cases that
+	// isolate those keys have something to sort below.
+	base = withSignature(withQName(base, "q2"), "s2")
+	for i := range cases {
+		if cases[i].key != "qualified_name" && cases[i].key != "signature" {
+			cases[i].lower = withSignature(withQName(cases[i].lower, "q2"), "s2")
+		}
+		if cases[i].key == "qualified_name" {
+			cases[i].lower = withSignature(cases[i].lower, "s2")
+		}
+		if cases[i].key == "signature" {
+			cases[i].lower = withQName(cases[i].lower, "q2")
+		}
 	}
 	for _, c := range cases {
-		if !c.lower.less(base) {
+		if cmpScored(c.lower, base) >= 0 {
 			t.Errorf("%s: want the %s-lower candidate to sort first", c.key, c.key)
 		}
-		if base.less(c.lower) {
+		if cmpScored(base, c.lower) <= 0 {
 			t.Errorf("%s: the order is not antisymmetric", c.key)
 		}
 	}
 	// A tier with a worse score still outranks a better-scoring later tier:
 	// tier is the FIRST key, not a tiebreak after score.
-	exact := rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9")
-	lexical := rankedOf(model.TierLexicalFTS, 9_999_999, "a", 0, "n0", "k0")
-	if !exact.less(lexical) {
+	exact := scoredOf(rankedOf(model.TierExactQualifiedName, 0, "z", 99, "n9", "k9"), model.NodeFunction, "m9", 100)
+	lexical := scoredOf(rankedOf(model.TierLexicalFTS, 9_999_999, "a", 0, "n0", "k0"), model.NodeFunction, "m0", 1)
+	if cmpScored(exact, lexical) >= 0 {
 		t.Error("a zero-scored exact hit must outrank a high-scoring lexical hit")
 	}
-	if base.less(base) {
-		t.Error("less must be irreflexive")
+	if cmpScored(base, base) != 0 {
+		t.Error("the order must be reflexive-equal on one record")
+	}
+	// A candidate with no span sorts below one that has one, and the order
+	// stays total either way.
+	noSpan := scoredOf(baseR, model.NodeFunction, "m2", 20)
+	noSpan.Span = nil
+	if cmpScored(noSpan, base) >= 0 {
+		t.Error("a candidate without a span must sort before one that has an end byte")
+	}
+}
+
+// withQName and withSignature set the served fields the tail of the order
+// compares, which scoredOf leaves empty.
+func withQName(s scored, q string) scored     { s.Hit.QualifiedName = q; return s }
+func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
+
+// legFoldOrderIndependent is the certification F9 invariant in one package:
+// the served answer must be a pure function of the candidates, never of the
+// order they arrive in. A delta re-index walks the lexical tier in a different
+// search_units.doc_id order than a fresh index of the same tree does -- a
+// delta carries doc ids forward, a fresh index assigns them anew -- so any
+// arrival-ordered choice makes the two indexes of one tree answer differently.
+//
+// The shape is the real one that broke: a Markdown file's headings all carry
+// that file's document node as their NodeID, so they share a deduplication key
+// while differing in name, range and score; and one group spans two tiers, the
+// case where folding the ACCUMULATED score made the survivor arrival-ordered.
+//
+// Mutation: restore `keep.Hit, keep.Span = a.Hit, a.Span` in fold, or compare
+// Folded instead of ScoreMicros in it, and this fails.
+func legFoldOrderIndependent(t *testing.T, _ *fixture) {
+	// Three headings of one Markdown file under the file's document node,
+	// plus a two-tier group: an exact-name hit and a lexical hit of one node.
+	group := []scored{
+		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),
+		scoredOf(rankedOf(model.TierLexicalFTS, 700, "docs/skill.md", 5474, "n-doc", "k-h2"), model.NodeDocument, "1. Map the config surface", 5504),
+		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 5771, "n-doc", "k-h3"), model.NodeDocument, "2. Config failure patterns", 5802),
+		scoredOf(rankedOf(model.TierExactName, 0, "pkg/cfg.go", 12, "n-fn", "k-fn-x"), model.NodeFunction, "Config", 40),
+		scoredOf(rankedOf(model.TierLexicalFTS, 5000, "pkg/cfg.go", 12, "n-fn", "k-fn-y"), model.NodeFunction, "Config", 40),
+		scoredOf(rankedOf(model.TierLexicalFTS, 100, "pkg/other.go", 3, "n-o", "k-o"), model.NodeFunction, "configure", 20),
+	}
+	// Every permutation of six candidates is 720 orders. These five are chosen
+	// so that EVERY member of each deduplication group leads its group in at
+	// least one of them: an order that always offers the eventual survivor
+	// first would pass even with the arrival-ordered fold restored.
+	orders := [][]int{{0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {2, 0, 4, 1, 5, 3}, {1, 3, 5, 0, 2, 4}, {4, 5, 0, 2, 3, 1}}
+	var want []string
+	for _, order := range orders {
+		c := collectorFor(t)
+		for _, i := range order {
+			v := group[i]
+			if err := c.add(v.ranked, hitFacts{hit: v.Hit, span: v.Span}, "matched the "+string(v.Tier)+" tier"); err != nil {
+				t.Fatalf("order %v: adding a candidate: %v", order, err)
+			}
+		}
+		var got []string
+		for _, r := range resultsOf(t, c) {
+			got = append(got, fmt.Sprintf("%s|%d|%s|%s|%d|%v", r.Tier, r.ScoreMicros, r.Hit.Path, r.Hit.Name, r.Occurrences, r.Reasons))
+		}
+		if want == nil {
+			want = got
+			if len(want) != 3 {
+				t.Fatalf("the three deduplication keys folded to %d results: %v", len(want), want)
+			}
+			continue
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("arrival order %v served\n  %v\nbut the first order served\n  %v", order, got, want)
+		}
+	}
+	// The two-tier group ranks first -- it keeps the LOWER tier rank -- and it
+	// is served at the higher score, carrying the reasons of both sides in a
+	// fixed order.
+	if want[0] != "exact_name|5000|pkg/cfg.go|Config|2|[matched the exact_name tier matched the lexical_fts tier]" {
+		t.Errorf("the two-tier group served %q, want the exact tier at the lexical score", want[0])
+	}
+	// The survivor of the Markdown group is decided by content, not by which
+	// heading arrived first: highest score, then the earliest start byte.
+	if want[1] != "lexical_fts|900|docs/skill.md|Skill: Reverse-Proxy Config Hunt|3|[matched the lexical_fts tier]" {
+		t.Errorf("the Markdown group served %q, want the highest-scoring, earliest heading", want[1])
 	}
 }
 
@@ -478,7 +588,9 @@ func legRankedSetLossless(t *testing.T, _ *fixture) {
 	if len(got) != distinct {
 		t.Fatalf("results = %d, want every one of the %d distinct hits", len(got), distinct)
 	}
-	sort.Slice(oracle, func(i, j int) bool { return oracle[i].less(oracle[j]) })
+	sort.Slice(oracle, func(i, j int) bool {
+		return cmpScored(scored{ranked: oracle[i]}, scored{ranked: oracle[j]}) < 0
+	})
 	for i := range oracle {
 		if got[i].ranked != oracle[i] {
 			t.Fatalf("hit %d = %+v, want %+v (rank order differs from the oracle)", i, got[i].ranked, oracle[i])
