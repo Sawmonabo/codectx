@@ -949,8 +949,25 @@ func TestSessionStatusClamp(t *testing.T) {
 	// compiles every later manifest under the CURRENT manifest's budget: a
 	// planBudget-sized ceiling (200 files) would refuse with CTX_MINIMUM_BUDGET
 	// exactly as the session approached the page it exists to exercise.
-	budget := model.Budget{MaxFiles: 500, MaxSlices: 128,
-		MaxBytes: planBudget.MaxBytes, MaxEstimatedTokens: planBudget.MaxEstimatedTokens}
+	//
+	// Re-pinned to the walk this row now measures. The walk's root width is
+	// context.max_start_nodes and unlimited by default, so 24 task seeds resolve
+	// to every distinct entity they name rather than the first 64, and the
+	// required scope is legitimately wider than the constants above were sized
+	// for: MaxSlices 128 refuses it outright with CTX_MINIMUM_BUDGET.
+	//
+	// The byte and token terms are the SLICE-CUT terms, not headroom:
+	// packedSliceCountStream opens a new slice when the next group would take
+	// the running total past MaxBytes or MaxEstimatedTokens, with no per-slice
+	// divisor. planBudget's 4 MiB over a ~193 KB corpus never cuts, so the
+	// packer emits every admitted entry into ONE slice and
+	// model.ContextSlice.Validate refuses its 1508-record entry_ordinals against
+	// the 1000-record page width. 64 KiB / 128k tokens cuts the same required
+	// set into slices no page refuses; MaxSlices 512 is the ceiling that count
+	// has to clear. Widening MaxFiles alone does not help -- it is not the
+	// binding term at either setting.
+	budget := model.Budget{MaxFiles: 500, MaxSlices: 512,
+		MaxBytes: 64 << 10, MaxEstimatedTokens: 128_000}
 	// Batches are disjoint and small: sessionFilesSQL is INSERT OR IGNORE, so a
 	// repeated package adds nothing, and one batch's walk must stay inside the
 	// budget above.
