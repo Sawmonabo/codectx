@@ -136,6 +136,17 @@ func newConvergentAdjacency() *convergentAdjacency {
 // measurement that reads a per-page figure at a named page can make the walk
 // long enough to reach it.
 func newConvergentAdjacencyOfLength(links int) *convergentAdjacency {
+	return newBackEdgeAdjacency(links, 0)
+}
+
+// newBackEdgeAdjacency is that shape WIDENED: every chain link also calls
+// `width` leaves of its own, so a level is wide enough to spill the frontier
+// ceiling and split ONE request into several internal legs, while the shared
+// sink every link calls is still admitted at level 1 and expanded at level 2 --
+// long off the frontier by the time the deeper levels reach it again. A width
+// of zero is the plain convergent chain, which is what the constructor above
+// asks for.
+func newBackEdgeAdjacency(links, width int) *convergentAdjacency {
 	a := &convergentAdjacency{
 		binding: model.Binding{
 			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
@@ -161,13 +172,18 @@ func newConvergentAdjacencyOfLength(links int) *convergentAdjacency {
 		next := add(fmt.Sprintf("c-%04d", i))
 		edge(prev, next)
 		edge(prev, sink)
+		for j := 0; j < width; j++ {
+			edge(prev, add(fmt.Sprintf("w-%04d-%03d", i-1, j)))
+		}
 		prev = next
 	}
 	edge(prev, sink)
+	for j := 0; j < width; j++ {
+		edge(prev, add(fmt.Sprintf("w-%04d-%03d", links-1, j)))
+	}
 	edge(sink, terminal)
 	return a
 }
-
 func (a *convergentAdjacency) Edges(_ context.Context, nodes []model.NodeID, _ model.Direction,
 	_ []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	want := map[model.NodeID]bool{}

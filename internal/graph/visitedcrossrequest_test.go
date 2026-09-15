@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -164,49 +163,4 @@ func TestABackEdgeReachedByALaterRequestIsNeverReadmitted(t *testing.T) {
 	}
 	t.Logf("%d pages, %d nodes admitted exactly once, %d served, %d bytes of runs appended",
 		pages, visited, len(entries), probe.VisitedBytes)
-}
-
-// newBackEdgeAdjacency is the convergent chain WIDENED: every chain link also
-// calls `width` leaves of its own, so a level is wide enough to spill the
-// frontier ceiling and split ONE request into several internal legs, while the
-// shared sink every link calls is still admitted at level 1 and expanded at
-// level 2 -- long off the frontier by the time the deeper levels reach it
-// again.
-func newBackEdgeAdjacency(links, width int) *convergentAdjacency {
-	a := &convergentAdjacency{
-		binding: model.Binding{
-			RepositoryID: model.RepositoryID(fixtureID("repo-1")),
-			SnapshotID:   model.SnapshotID(fixtureID("snap-1")),
-			GenerationID: 1,
-			AnalysisKey:  model.AnalysisKey(fixtureID("akey-1")),
-		},
-		nodes: map[model.NodeID]model.Node{},
-	}
-	add := func(name string) model.NodeID {
-		id := fixtureNodeID(name)
-		a.nodes[id] = model.Node{ID: id, Kind: model.NodeFunction, Name: name, QualifiedName: name,
-			Language: "go", SemanticSource: model.SemanticCanonical}
-		return id
-	}
-	sink, terminal := add("c-sink"), add("c-terminal")
-	edge := func(from, to model.NodeID) {
-		a.rels = append(a.rels, model.Relation{ID: fixtureRelationID(len(a.rels) + 1),
-			From: from, To: to, Kind: model.RelCalls})
-	}
-	prev := add("c-0000")
-	for i := 1; i < links; i++ {
-		next := add(fmt.Sprintf("c-%04d", i))
-		edge(prev, next)
-		edge(prev, sink)
-		for j := 0; j < width; j++ {
-			edge(prev, add(fmt.Sprintf("w-%04d-%03d", i-1, j)))
-		}
-		prev = next
-	}
-	edge(prev, sink)
-	for j := 0; j < width; j++ {
-		edge(prev, add(fmt.Sprintf("w-%04d-%03d", links-1, j)))
-	}
-	edge(sink, terminal)
-	return a
 }
