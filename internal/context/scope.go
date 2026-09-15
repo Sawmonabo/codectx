@@ -308,6 +308,12 @@ type seedIngest struct {
 	start   []model.NodeID
 	cursor  string
 	started bool
+	// stalls counts the CONSECUTIVE non-advancing pages the walk has met. It
+	// is part of P-A's mid-walk carry for the same reason cursor is: the
+	// continuation a stalled page mints is byte-for-byte the cursor the
+	// request arrived with, so a bound kept only in a local would restart at
+	// zero on every continuation and never fire.
+	stalls int
 }
 
 // newSeedIngest opens the sort area's seed-side sorts and returns the sink the
@@ -671,6 +677,24 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 		// a whole scope, so the halt below re-issues this same page instead.
 		stalled := impact.Meta.Truncated && impact.Meta.NextCursor == "" && len(impact.Entries) == 0
 		next := impact.Meta.NextCursor
+		if stalled {
+			in.stalls++
+		} else {
+			in.stalls = 0
+		}
+		// A non-advancing page is re-issued exactly ONCE. Minting the request's
+		// own cursor back is only a continuation if the next call can get past
+		// it; a walk whose page cannot complete inside the deadline would
+		// otherwise hand out that same token for as long as a client kept
+		// presenting it, and the answer would never arrive. The second
+		// consecutive stall therefore ends the walk here with an INCOMPLETE
+		// scope -- the same verdict any truncated page leaves -- rather than
+		// with a token that cannot advance. The graph engine bounds its own
+		// repeats the same way.
+		if in.stalls > 1 {
+			in.scope.ScopeComplete = false
+			break
+		}
 		if stalled {
 			next = cursor
 		}

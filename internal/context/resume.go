@@ -95,6 +95,11 @@ type checkpointScalars struct {
 	WalkCursor string         `json:"walk_cursor,omitempty"`
 	WalkStart  []model.NodeID `json:"walk_start,omitempty"`
 	Seq        int64          `json:"seq,omitempty"`
+	// Stalls is the count of consecutive non-advancing walk pages. A stalled
+	// page mints the cursor the request arrived with, so this is the only
+	// state that can bound how often that token is handed back: without it the
+	// bound would restart at zero on every continuation.
+	Stalls int `json:"walk_stalls,omitempty"`
 }
 
 // checkpointVersion is the on-disk shape of a compile's continuation state.
@@ -711,6 +716,7 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 		scalars.WalkCursor = st.ingest.cursor
 		scalars.WalkStart = st.ingest.start
 		scalars.Seq = st.ingest.seq
+		scalars.Stalls = st.ingest.stalls
 	}
 	state := checkpointState{
 		Pass:        st.pass,
@@ -785,6 +791,7 @@ func (c *Compiler) resumedIngest(s *compileSorts, sc checkpointScalars) *seedIng
 		seq:     sc.Seq,
 		start:   sc.WalkStart,
 		cursor:  sc.WalkCursor,
+		stalls:  sc.Stalls,
 		started: true,
 		scope: scopeResult{
 			Completeness:     sc.Completeness,
