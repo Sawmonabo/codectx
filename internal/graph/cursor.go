@@ -232,7 +232,15 @@ type resumeState struct {
 	Cursor   traversalCursor
 	Budget   *budget
 	Frontier []frontierState
-	Visited  map[model.NodeID]struct{}
+	// Visited streams the nodes the earlier pages admitted, straight off their
+	// spool. It is a STREAM and not a map because the cumulative set is sized
+	// by the walk: materializing it here was the last repository-sized heap
+	// structure on the traversal path (visited.go).
+	Visited visitedStream
+	// Release ends the replayed continuation's spool and lease. The caller
+	// defers it: the spool must outlive the walk, because both the membership
+	// probes and the next page's spill read from it.
+	Release func()
 }
 
 // continuation is what the page just answered hands to nextTraversalCursor.
@@ -243,9 +251,14 @@ type continuation struct {
 	Depth     int
 	LastOwner model.NodeID
 	LastKey   model.RelationID
-	// Frontier is where the walk stopped, and Visited the nodes it admitted.
+	// Frontier is where the walk stopped, and Visited the nodes THIS page
+	// admitted -- bounded by the page, never by the walk.
 	Frontier []frontierState
 	Visited  []model.NodeID
+	// Carried streams the cumulative set the earlier pages admitted, off the
+	// spool they wrote. spill copies it forward without materializing it, so a
+	// walk of any size costs one spool block of heap here.
+	Carried visitedStream
 	// Records is the already-built state of a RANKED page -- the answer-level
 	// record, the ranked tail and the rollup pairs impact spills. A traversal
 	// leaves a frontier instead and sets none of these; a ranked page leaves
@@ -312,11 +325,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		return nil, err
 	}
 	now := e.now()
-	s := &resumeState{Cursor: c, Budget: b, Visited: map[model.NodeID]struct{}{}}
+	s := &resumeState{Cursor: c, Budget: b, Release: func() {
+		e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+	}}
 	if c.SpoolID == "" {
-		// A pure keyset continuation carries a lease and no spool; it is
-		// consumed here for the same reason a spooled one is below.
-		e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
+		// A pure keyset continuation carries a lease and no spool; the caller
+		// still releases it, for the same reason a spooled one is released.
 		return s, nil
 	}
 	if e.spools == nil {
@@ -341,9 +355,9 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		switch r.Kind {
 		case spoolRecordFrontier:
 			s.Frontier = append(s.Frontier, frontierState{Depth: r.Depth, Cost: r.Cost, Node: r.Node, Via: r.Via})
-			s.Visited[r.Node] = struct{}{}
 		case spoolRecordVisited:
-			s.Visited[r.Node] = struct{}{}
+			// Deliberately not accumulated: the cumulative set stays on disk
+			// and is streamed by s.Visited below.
 		default:
 			return cursorInvalid("continuation state is not readable")
 		}
@@ -352,15 +366,28 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	if err != nil {
 		return nil, err
 	}
-	// The continuation is consumed: its frontier and visited set are in memory
-	// now, and the page being built will spill a FRESH spool under a FRESH
-	// lease. Holding the replayed pair until the cursor TTL would pin a
-	// generation against retention -- one lease and one spool per page of every
-	// walk -- for state nothing will read again. Presenting the same token
-	// twice is therefore CTX_CURSOR_INVALID rather than a replayed page, which
-	// is the deliberate trade: the caller's remedy is the continuation this
-	// page hands it.
-	e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
+	// The continuation is consumed -- but only once the page that is resuming
+	// it has finished, because the cumulative visited set it holds is read
+	// twice more: once per level for the membership probes, and once by the
+	// spill that copies it forward into the fresh spool. The caller therefore
+	// defers Release. Holding the pair past that would pin a generation
+	// against retention -- one lease and one spool per page of every walk --
+	// for state nothing will read again; presenting the same token twice is
+	// CTX_CURSOR_INVALID rather than a replayed page, which is the deliberate
+	// trade: the caller's remedy is the continuation this page hands it.
+	s.Visited = func(ctx context.Context, fn func(model.NodeID) error) error {
+		return e.spools.Open(ctx, c.spoolCursor(), e.now(), func(record []byte) error {
+			var r spoolRecord
+			if err := json.Unmarshal(record, &r); err != nil {
+				return cursorInvalid("continuation state is not readable")
+			}
+			switch r.Kind {
+			case spoolRecordFrontier, spoolRecordVisited:
+				return fn(r.Node)
+			}
+			return cursorInvalid("continuation state is not readable")
+		})
+	}
 	return s, nil
 }
 
@@ -442,7 +469,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	if needsSpool {
-		id, err := e.spill(next, c)
+		id, err := e.spill(ctx, next, c)
 		if err != nil {
 			return "", e.releaseLease(ctx, lease.ID, err)
 		}
@@ -483,7 +510,7 @@ func (e *Engine) releaseLease(ctx context.Context, id string, cause error) error
 // spill writes one fresh spool holding c's records, frontier and visited set
 // and returns its id. The spool is bound to next's lease, generation, analysis key and
 // query hash, which is what Spools.Open checks before it replays a record.
-func (e *Engine) spill(next traversalCursor, c continuation) (string, error) {
+func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation) (string, error) {
 	sp, err := e.spools.Create(next.spoolCursor())
 	if err != nil {
 		return "", err
@@ -508,13 +535,26 @@ func (e *Engine) spill(next traversalCursor, c continuation) (string, error) {
 		}
 		frontierNodes[fs.Node] = struct{}{}
 	}
-	for _, n := range c.Visited {
+	// The cumulative set the earlier pages admitted is copied STREAM to
+	// STREAM: one record in flight, never the whole set. Every carried record
+	// is written as a visited record whatever kind it had -- a node that was
+	// on the previous page's FRONTIER is not on this one's, and copying its
+	// kind forward would resurrect a stale frontier on the next replay.
+	writeVisited := func(n model.NodeID) error {
 		// A frontier record already marks its node visited; writing it twice
 		// would spend the shared spool budget for nothing.
 		if _, ok := frontierNodes[n]; ok {
-			continue
+			return nil
 		}
-		if err := appendRecord(spoolRecord{Kind: spoolRecordVisited, Node: n}); err != nil {
+		return appendRecord(spoolRecord{Kind: spoolRecordVisited, Node: n})
+	}
+	if c.Carried != nil {
+		if err := c.Carried(ctx, writeVisited); err != nil {
+			return "", e.releaseSpool(sp, err)
+		}
+	}
+	for _, n := range c.Visited {
+		if err := writeVisited(n); err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
 	}
