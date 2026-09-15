@@ -18,14 +18,35 @@ Three rules apply to every key:
 - **Unknown keys are rejected** with `CTX_CONFIG_INVALID`. There is no extension
   namespace, so an unrecognized key is always a typo or a setting from a
   different version that this build would otherwise silently ignore.
-- **No zero or negative value means "unlimited."** Every limit is a positive
-  number. Exactly three keys give `0` a documented meaning of its own, and each
-  is still a finite bound: `index.workers = 0` chooses from the available CPUs
-  and memory reservations, `index.max_retained_bytes = 0` leaves retention
-  governed by `index.retain_refs` alone rather than by a byte budget, and
-  `providers.dependence.unit_memory_ceiling_bytes = 0` derives a unit's
-  allocation from the machine. A negative value is rejected everywhere; it is
-  never a third meaning.
+- **`0` — or the string `"unlimited"` — means unlimited, and it is the default
+  for every count and size bound.** This build indexes a repository of any size:
+  no shipped value refuses a repository, skips a file, fails an analysis unit,
+  drops a row or truncates an answer. Set a bound and it is honoured, and
+  exceeding it is always **reported** — a named file, a reason, a count — never
+  a silent clamp and never a silent drop. A negative value is rejected
+  everywhere; it is not a third meaning.
+
+  Three groups of keys are **not** bounds and keep positive values:
+
+  - **Reservations** — worker counts, batch and queue sizes, memory budgets,
+    connection counts. These size the machine the work is given, not the
+    repository. A zero-sized batch or a zero-connection reader is a broken
+    reservation, not an unbounded one, so `0` is rejected. They never refuse a
+    repository either: they serialise and defer work instead.
+  - **Caller budgets** — `context.default_max_bytes`, `default_estimated_tokens`,
+    `default_max_files` and `max_slices`. A context plan must fit a model's
+    window, so these keep non-zero defaults. They are honest: the manifest names
+    **every** excluded file with a reason, paginated, never summarised.
+  - **Wire and pagination ceilings** — `resources.max_page_items`,
+    `max_query_text_bytes`, `max_metadata_response_bytes`,
+    `max_source_response_bytes`, `coverage.chunk_bytes`, `max_chunk_bytes`,
+    `max_receipts_per_confirmation`, `tools.max_fetch_bytes`. These bound one
+    page or one message, which is lossless: the next page carries the rest.
+
+  Two keys give `0` a meaning of its own that is not "unlimited":
+  `index.workers = 0` chooses the count from available CPUs and reservations,
+  and `providers.dependence.unit_memory_ceiling_bytes = 0` derives a unit's
+  allocation from the machine.
 - **A limit may be lowered, never raised past its contract ceiling.**
   Configuration narrows what this build does; it cannot widen what a stored
   column or a bounded response can hold.
@@ -62,9 +83,9 @@ command found on the host. Detecting a tool by running it with `--version` or
 | `include_untracked` | `true` | project | Index files Git does not track. Ignore rules apply to untracked discovery; tracked files are indexed even when an ignore pattern matches them. |
 | `index_generated` | `false` | project | Index paths classified as generated (see below). |
 | `index_vendor` | `false` | project | Index vendored dependency directories (see below). |
-| `max_files` | `250000` | project (lower only) | Maximum files in one workspace. Exceeding it is `CTX_RESOURCE_LIMIT`, never a truncated index. It is a budget, not a response ceiling: it may be set as large as the workspace needs. |
-| `max_parse_file_bytes` | `5242880` | project (lower only) | Largest file admitted to structural parsing. |
-| `max_search_file_bytes` | `26214400` | project (lower only) | Largest file admitted to search indexing. |
+| `max_files` | `0` (unlimited) | project (lower only) | Maximum files in one workspace. Unlimited by default: a repository is never refused for its size. A value you set is reported when exceeded (files seen against the limit), never a truncated index. |
+| `max_parse_file_bytes` | `0` (unlimited) | project (lower only) | Largest file admitted to structural parsing. Unlimited by default; a value you set reports each skipped file with its reason. |
+| `max_search_file_bytes` | `0` (unlimited) | project (lower only) | Largest file admitted to search indexing. Unlimited by default; a value you set reports each skipped file with its reason. |
 
 `max_parse_file_bytes` and `max_search_file_bytes` are **analysis admission
 limits, not retention limits**. A file over the limit is still captured, still
@@ -119,7 +140,7 @@ it concludes. All are **user** trust.
 | `watch_pending_bytes` | `2097152` | Reserved bytes for pending watch events. |
 | `watch_debounce` | `"250ms"` | Quiet period before a watch batch is scheduled. |
 | `reconcile_interval` | `"30s"` | Period of full reconciliation, which catches missed and timestamp-preserving changes. |
-| `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. The minimum is `1`, which retains the active ref alone. |
+| `retain_refs` | `8` | Distinct refs (branches or commits) whose results stay on disk. Retention is by ref, not by snapshot count: switching A → B → C → A finds A's units still there and reuses them without a run. Every unit any retained generation references is retained with it. `0` retains every ref, matching `max_retained_bytes`. This keeps a finite default because a generation is reconstructible by re-indexing, so evicting one is lifecycle retention rather than a dropped row. |
 | `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
@@ -140,9 +161,9 @@ All **user** trust.
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
 | `query_timeout` | `"10s"` | Deadline for one query. `codectx search` and `codectx symbol` apply it to the whole request, from pinning the generation to hydrating the page; exceeding it is `CTX_QUERY_DEADLINE`, an explicit incomplete answer, never a persisted complete one. `--timeout` on those commands narrows it further and never widens it. |
 | `max_query_text_bytes` | `8192` | Largest query text. |
-| `max_query_terms` | `32` | Most terms in one query. Query text is tokenized with the index's own tokenizer, and a quoted phrase counts as one term. |
+| `max_query_terms` | `0` (unlimited) | Most terms in one query. Unlimited by default; a value you set refuses the query with the term count, never silently drops terms. Query text is tokenized with the index's own tokenizer, and a quoted phrase counts as one term. |
 | `max_page_items` | `200` | Largest page, and the bound `--limit` is clamped to, for `codectx search` and `codectx symbol` as well as the graph commands: lowering it lowers the pages they serve. The candidate bound each retrieval tier of `codectx search` is read to stays the `200` ceiling, so narrowing the page never narrows what was ranked; a tier that fills that bound makes the answer report `truncated` with a reason rather than silently serving a short page, and every continuation of that answer repeats the same `truncated` flag and reason. |
-| `max_provider_record_bytes` | `4194304` | Largest single provider record; must fit `index.batch_bytes`. |
+| `max_provider_record_bytes` | `0` (unlimited) | Largest single provider record. Unlimited by default, so one oversized record never fails a unit; when you set one it must fit `index.batch_bytes`. |
 
 ## `[storage]` — SQLite and the data directory
 
@@ -226,15 +247,17 @@ directories and network posture are product code, not configuration.
 | `tree_sitter.languages` | `["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]` | project | Languages to parse. |
 | `tree_sitter.worker_idle_ttl` | `"60s"` | user | Idle time before a parser worker is stopped. |
 | `scip.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
-| `scip.timeout` | `"20m"` | user | Deadline for one SCIP indexer run. |
+| `scip.timeout` | `"0s"` (no limit) | user | Wall-clock deadline for one SCIP indexer run. `0` by default: a monorepo's import is slow, not broken, and a deadline that fails an analysis unit refuses a repository for its size. |
+| `scip.stall_timeout` | `"5m"` | user | Hang detector, not a size limit. How long a subprocess may make **no progress at all** — no stdout, no stderr, no CPU, no growth of its output file — before the unit fails with reason `stalled` and is reported. Finite by default: a wedged process makes no progress however large the repository. |
 | `lsp.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
 | `lsp.request_timeout` | `"15s"` | user | Deadline for one language-server request. |
 | `lsp.max_servers` | `1` | user | Concurrent language servers. |
 | `lsp.max_outstanding_requests` | `8` | user | In-flight requests per server. |
 | `lsp.idle_ttl` | `"60s"` | user | Idle time before a server is stopped. |
-| `lsp.max_overlay_bytes` | `536870912` | user | Bounds, separately, the materialized snapshot, the pinned bytes cached for coordinate conversion, and the bytes sent to and received from a server over its lifetime. Must be at least `resources.max_source_response_bytes`. |
+| `lsp.max_overlay_bytes` | `0` (unlimited) | user | Unlimited by default. When set, it bounds, separately, the materialized snapshot, the pinned bytes cached for coordinate conversion, and the bytes sent to and received from a server over its lifetime. A value you set must be at least `resources.max_source_response_bytes`. |
 | `dependence.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. `"auto"` runs dependence units as low-priority background work once the base generation is active; a query that asks for a dependence fact promotes its units and is answered `pending` until they seal. `true` blocks the index on them. The provider never delays base readiness: nothing is installed when the workspace is opened, and the analysis payload is fetched by the first unit that needs it. A one-shot building command -- `codectx index` or `codectx refresh` -- prints its own generation as soon as that generation is active and then stays until the deferred queue is empty, publishing each batch as a further generation; interrupting it keeps everything already published and reports how much is still queued. `false` is the opt-out: it plans no dependence unit at all. |
-| `dependence.timeout` | `"45m"` | user | Deadline for one dependence unit. |
+| `dependence.timeout` | `"0s"` (no limit) | user | Wall-clock deadline for one dependence unit. `0` by default, for the same reason as `scip.timeout`. |
+| `dependence.stall_timeout` | `"5m"` | user | The same progress-based hang detector as `scip.stall_timeout`, applied to one dependence unit. |
 | `dependence.cache_bytes` | `4294967296` | user | Budget for the per-unit parsed-graph cache, which is what makes an unchanged unit cost nothing on refresh. |
 | `dependence.unit_memory_floor_bytes` | `805306368` | user | Smallest allocation a unit may be sized to. Sizing a unit near its live set costs time rather than memory, so the floor keeps a small unit from being starved into a much slower run. |
 | `dependence.unit_memory_ceiling_bytes` | `0` | user | Largest allocation a unit may be sized to. `0` derives it from the machine: free memory minus the base index footprint minus a safety margin. There is no default memory ceiling, and only a non-zero value here may reject a unit before it runs. |
@@ -268,26 +291,31 @@ cloud or AI credential fields in core.
 | `default_max_bytes` | `524288` | project (lower only) | Default byte budget; must fit `max_manifest_bytes`. |
 | `default_max_files` | `200` | project (lower only) | Default file budget; must fit `workspace.max_files`. |
 | `max_slices` | `16` | user | Most slices in one manifest. |
-| `max_graph_depth` | `3` | user | Graph expansion depth. |
-| `max_visited_nodes` | `50000` | user | Nodes visited in one expansion. |
-| `max_graph_edges` | `100000` | user | Edges traversed in one expansion. |
-| `max_reason_paths_per_entry` | `3` | user | Explanation paths per entry. |
-| `max_manifest_bytes` | `8388608` | user | Largest manifest. |
-| `max_capsule_bytes` | `8388608` | user | Largest capsule. |
+| `max_graph_depth` | `0` (unlimited) | user | Graph expansion depth. |
+| `max_visited_nodes` | `0` (unlimited) | user | Nodes visited in one expansion. |
+| `max_graph_edges` | `0` (unlimited) | user | Edges traversed in one expansion. |
+| `max_reason_paths_per_entry` | `0` (unlimited) | user | Explanation paths stored per entry. |
+| `max_manifest_bytes` | `0` (unlimited) | user | Largest manifest. Unlimited by default; a compile is never refused for the size of its plan. |
+| `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule. |
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 
 The context compiler binds them as follows. The three `default_*` budgets and
-`max_slices` are what a **zero** field of a request's budget resolves to — zero
-never means unlimited, and a configured default that resolves to zero or less is
-a wiring defect the compile reports rather than an unbounded plan.
+`max_slices` are what a **zero** field of a request's budget resolves to. They
+are the one family where zero in a *request* is "use the default" rather than
+"unlimited", because a context plan that does not fit a window is not an answer.
 `default_max_bytes` and `default_estimated_tokens` apply **per slice**,
 `default_max_files` counts distinct selected files across the whole plan, and
-`max_slices` caps the total. `max_graph_depth`, `max_visited_nodes` and
-`max_graph_edges` bound the one expansion a compile runs, and a walk that
-reaches any of them reports `scope_complete = false` rather than an exhaustive
-plan. `max_reason_paths_per_entry` caps the explanation routes stored per entry;
-routes beyond it are reported as a count, never enumerated.
+`max_slices` caps the total. Those four are caller budgets, not limits on the
+repository, which is why they alone keep non-zero defaults — and every file a
+budget excludes is named in the manifest with its reason.
+
+`max_graph_depth`, `max_visited_nodes` and `max_graph_edges` bound the one
+expansion a compile runs. They are unlimited by default and the walk is
+resumable: reaching a bound you set ends a **page** and returns a cursor, so
+continuing reaches the same nodes an unbounded walk would.
+`max_reason_paths_per_entry` bounds the explanation routes stored per entry;
+routes beyond it are reported as a count, never silently dropped.
 
 The ranking weights themselves are **not** configuration. They are compile-time
 constants labelled by the manifest's `policy_version`, so changing one changes
@@ -306,7 +334,7 @@ All **user** trust.
 | `max_chunk_bytes` | `1048576` | Largest raw source chunk. The chunk plus its worst-case base64 expansion and envelope must fit `resources.max_source_response_bytes`. |
 | `session_ttl` | `"24h"` | Lifetime of a coverage session. |
 | `max_receipts_per_confirmation` | `16` | Receipts per confirmation batch. |
-| `max_unconfirmed_chunks_per_session` | `64` | Issued but unconfirmed chunks per session. |
+| `max_unconfirmed_chunks_per_session` | `0` (unlimited) | Issued but unconfirmed chunks per session. Unlimited by default; a value you set pauses further chunks until receipts are confirmed, and says so. |
 
 There is no receipt lifetime of its own: a source receipt lives as long as
 `storage.query_cursor_ttl`, which the `[storage]` table above describes. A
@@ -331,7 +359,8 @@ relationships that must hold:
 - `coverage.max_chunk_bytes` base64-encoded, plus the response envelope, fits
   `resources.max_source_response_bytes`, which itself fits the 7 MiB ceiling.
 - `resources.max_metadata_response_bytes` < `resources.max_source_response_bytes`.
-- `resources.max_provider_record_bytes` ≤ `index.batch_bytes` ≤ `index.queue_bytes`.
+- `resources.max_provider_record_bytes` ≤ `index.batch_bytes` ≤ `index.queue_bytes`,
+  the first pairing only when you set a record bound at all.
   One record must fit one batch, and one batch must fit the queue reservation.
   There is no separate ceiling on a record beyond that: `index.batch_bytes` is
   the real constraint, and inventing a second one would refuse a configuration
@@ -341,7 +370,8 @@ relationships that must hold:
   ≤ `resources.base_memory_budget_bytes`.
 - `resources.max_temp_bytes` > `resources.min_free_disk_bytes`.
 - `context.default_max_files` ≤ `workspace.max_files`, and
-  `context.default_max_bytes` ≤ `context.max_manifest_bytes`.
+  `context.default_max_bytes` ≤ `context.max_manifest_bytes` — each only when
+  the bound on the right is set. There is nothing to exceed in an unlimited one.
 - `providers.dependence.unit_memory_ceiling_bytes`, when set, is at least
   `providers.dependence.unit_memory_floor_bytes`. A ceiling under the floor is
   not a narrow budget; it is a provider that rejects every unit before it runs.

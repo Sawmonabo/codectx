@@ -1992,9 +1992,9 @@ follow_symlinks = false
 include_untracked = true
 index_generated = false
 index_vendor = false
-max_files = 250000
-max_parse_file_bytes = 5242880
-max_search_file_bytes = 26214400
+max_files = 0                  # 0 or "unlimited" = no bound; the default for every count/size key
+max_parse_file_bytes = 0       # 0 = unlimited; a value you set reports each skipped file
+max_search_file_bytes = 0      # 0 = unlimited; a value you set reports each skipped file
 
 [index]
 # 0 = choose from available CPUs and memory reservations, never "unlimited".
@@ -2008,7 +2008,7 @@ watch_pending_bytes = 2097152
 watch_debounce = "250ms"
 reconcile_interval = "30s"
 # Results of the last N distinct refs (branches/commits) you indexed stay on disk; A -> B -> C -> A reuses A.
-retain_refs = 8
+retain_refs = 8                # lifecycle retention, not a row drop; 0 keeps every ref
 # 0 = no size limit. User-set only; when set, evicts least-recently-used refs first, never the active one.
 max_retained_bytes = 0
 
@@ -2025,9 +2025,9 @@ max_metadata_response_bytes = 262144
 max_source_response_bytes = 7340032
 query_timeout = "10s"
 max_query_text_bytes = 8192
-max_query_terms = 32
+max_query_terms = 0            # 0 = unlimited
 max_page_items = 200
-max_provider_record_bytes = 4194304
+max_provider_record_bytes = 0  # 0 = unlimited; when set, must fit index.batch_bytes
 
 [storage]
 data_dir = ""
@@ -2054,7 +2054,8 @@ worker_idle_ttl = "60s"
 
 [providers.scip]
 enabled = "auto"
-timeout = "20m"
+timeout = "0s"                 # no wall-clock limit; stall_timeout catches a wedged run
+stall_timeout = "5m"           # hang detector: no stdout/stderr/CPU/output growth for this long
 
 [providers.lsp]
 enabled = "auto"
@@ -2067,7 +2068,8 @@ idle_ttl = "60s"
 # auto = low-priority background units after the base index activates, queried units first;
 # true = block the index on them; false = off.
 enabled = "auto"
-timeout = "45m"
+timeout = "0s"                 # no wall-clock limit
+stall_timeout = "5m"           # hang detector, as for scip
 cache_bytes = 4294967296
 unit_memory_floor_bytes = 805306368
 # 0 = machine-derived (free memory minus base footprint minus safety margin).
@@ -2078,14 +2080,14 @@ unit_memory_ceiling_bytes = 0
 default_phase = "sweep"
 default_estimated_tokens = 80000
 default_max_bytes = 524288
-default_max_files = 200
+default_max_files = 200   # caller budget: keeps a non-zero default so a plan fits a window
 max_slices = 16
-max_graph_depth = 3
-max_visited_nodes = 50000
-max_graph_edges = 100000
-max_reason_paths_per_entry = 3
-max_manifest_bytes = 8388608
-max_capsule_bytes = 8388608
+max_graph_depth = 0            # 0 = unlimited; a bound you set ends a page and returns a cursor
+max_visited_nodes = 0          # 0 = unlimited, resumable
+max_graph_edges = 0            # 0 = unlimited, resumable
+max_reason_paths_per_entry = 0 # 0 = unlimited
+max_manifest_bytes = 0         # 0 = unlimited
+max_capsule_bytes = 0          # 0 = unlimited
 strict_read_gate = true
 allow_exploratory_waiver_consolidation = false
 
@@ -2094,16 +2096,16 @@ chunk_bytes = 65536
 max_chunk_bytes = 1048576
 session_ttl = "24h"
 max_receipts_per_confirmation = 16
-max_unconfirmed_chunks_per_session = 64
+max_unconfirmed_chunks_per_session = 0  # 0 = unlimited
 
 [mcp]
 transport = "stdio"
 watch = true
 ```
 
-Parse/search file thresholds are explicit analysis admission limits, not snapshot retention limits. Report a skipped analysis with file/scope/capability reason; users may raise the limit with sufficient reservations. A resource budget is neither permission to omit required context nor proof that a native process cannot temporarily exceed it. Low-memory operation reduces concurrency and caches before it rejects work. All mandatory and optional capabilities remain implemented.
+Parse/search file thresholds are explicit analysis admission limits, not snapshot retention limits, and they are unlimited by default: a *shipped* value that skips a file is exactly what the scale posture forbids. When a user sets one, report every skipped analysis with its file/scope/capability reason. A resource budget is neither permission to omit required context nor proof that a native process cannot temporarily exceed it. Low-memory operation reduces concurrency and caches before it rejects work. All mandatory and optional capabilities remain implemented.
 
-Validate related values together: source chunk plus worst-case wire encoding must fit the source response budget; batches must fit queue/memory reservations; baseline concurrency must fit aggregate memory; file and result arithmetic must not overflow; disk budgets must leave the free-space reserve. No zero/negative setting means unlimited. Log only effective numeric policy, not credentials or source paths.
+Validate related values together: source chunk plus worst-case wire encoding must fit the source response budget; batches must fit queue/memory reservations; baseline concurrency must fit aggregate memory; file and result arithmetic must not overflow; disk budgets must leave the free-space reserve. `0`, or the string `"unlimited"`, means unlimited for every count and size bound, and that is the default for all of them: no shipped value refuses a repository, skips a file, fails an analysis unit, drops a row or truncates an answer. Exceeding a bound the user set is always reported, never a silent clamp or drop; a negative value is rejected everywhere. Three families are not bounds and stay positive — reservations (worker counts, batch and queue sizes, memory budgets, connection counts), which size the machine rather than the repository and serialise work instead of refusing it; caller budgets (`context.default_max_bytes`, `default_estimated_tokens`, `default_max_files`, `max_slices`), which keep non-zero defaults because a plan must fit a window and which name every excluded file with a reason; and per-page wire and pagination ceilings, which are lossless because the next page carries the rest. The two analysis timeouts default to `0` = no wall clock, with a finite `stall_timeout` hang detector in their place; `resources.query_timeout` stays finite because it ends a page, not an answer. Cross-field pairings against a bound apply only when that bound is set. Log only effective numeric policy, not credentials or source paths.
 
 <a id="202-trust-and-fingerprints"></a>
 ### 20.2 Trust and Fingerprints
