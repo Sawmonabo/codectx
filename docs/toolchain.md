@@ -415,6 +415,24 @@ The generator resumes: each finished platform is recorded, so an interrupted
 run does not repeat work that already succeeded, and a hosted asset that is
 already published at the right size is not uploaded again.
 
+`-check` runs **daily** in `.github/workflows/lock-check.yml`, and on any change
+to `internal/toolchain/tools.lock.json`. A published tag is not immutable: an
+upstream project re-uploaded the assets of an already-published release three
+hours after the lock had recorded their digests, and the lock — honest when it
+was written — was discovered to be stale only by a user's index refusing to
+fetch the analyzer mid-run. A gate that runs only when we change the lock cannot
+see a change upstream makes, so this one runs on a clock. It aborts at the first
+payload whose served bytes disagree, naming the entry and platform; re-pin that
+one entry with `-tools <name>`.
+
+The same drift is visible **locally, without a network call**, in
+`codectx tools verify`: each row carries `lock:` — the digest this binary pins
+for the entry executable — beside `disk:`, the digest the installed bytes hash
+to, with the full pair in the `--json` envelope as `entry_sha256` and
+`installed_sha256`. `disk:-` is an entry nothing on disk hashed: not installed,
+or corrupt, and the row beside it says which. `tools status` never prints a
+`disk:` digest, because it does not rehash.
+
 ## Licenses
 
 Every pinned payload's license is recorded in the lock entry and in
