@@ -84,8 +84,12 @@ func New(o Options) (*Service, error) {
 		return nil, optionErr("a repository identity")
 	}
 	timeout := o.Resources.QueryTimeout.Std()
-	if timeout <= 0 || o.Resources.MaxQueryTerms <= 0 || o.Resources.MaxPageItems <= 0 {
-		return nil, optionErr("positive query_timeout, max_query_terms and max_page_items")
+	// max_query_terms is a config.Limit: 0 means unlimited, which is its
+	// default, so it is deliberately absent from this check. Only the two
+	// plain ints that must be positive to size a page and a deadline are
+	// checked here.
+	if timeout <= 0 || o.Resources.MaxPageItems <= 0 {
+		return nil, optionErr("positive query_timeout and max_page_items")
 	}
 	ttl := o.CursorTTL
 	if ttl <= 0 {
@@ -106,7 +110,7 @@ func New(o Options) (*Service, error) {
 		spools:  o.Spools,
 		leases:  o.Leases,
 		content: o.Content,
-		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms.Int(), defaultStatsCacheBytes),
+		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
 		maxPage: o.Resources.MaxPageItems,
 		timeout: timeout,
 		ttl:     ttl,
@@ -211,7 +215,24 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		return empty, err
 	}
 	if len(rest) > 0 {
-		if meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, rest); err != nil {
+		// A spool budget that is already full must end THIS page, never the
+		// query: the hits of page 1 are in hand and refusing to serve them
+		// because the tail could not be written is the class-D refusal the
+		// scale posture forbids. The answer says it is incomplete and why, and
+		// carries no continuation because there is nothing to continue from.
+		// Every other spool failure -- a disk fault, a corrupt spool -- is a
+		// real fault and still surfaces.
+		meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, rest)
+		switch {
+		case err == nil:
+		case pagination.IsBudgetExhausted(err):
+			meta.Truncated, meta.NextCursor = true, ""
+			if meta.TruncationReason == "" {
+				meta.TruncationReason = truncationSpoolBudgetFull
+			}
+			s.log.Warn("a search answer was cut short by the spool disk budget", "component", "search",
+				"generation_id", int64(binding.GenerationID), "dropped_hits", len(rest))
+		default:
 			return empty, err
 		}
 	}
@@ -507,6 +528,11 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // that filled its per-tier bound. Storage clamps a page to
 // model.MaxPageItems, so a full tier means there were more candidates than one
 // answer can carry.
+// truncationSpoolBudgetFull is the reason a caller sees when the hits of this
+// page were served but the remainder could not be written to the query spool.
+const truncationSpoolBudgetFull = "the shared query spool ran out of disk budget before the rest of this answer could be written; " +
+	"retry after outstanding cursors expire, or raise resources.max_temp_bytes"
+
 const truncationExactTierFull = "an exact or prefix tier returned its maximum number of candidates; narrow the query or add a filter"
 
 // hitFilter is SearchRequest.Languages and .Paths, applied uniformly to every

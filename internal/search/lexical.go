@@ -5,8 +5,10 @@ package search
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -85,15 +87,14 @@ const occurrencePageSize = model.MaxPageItems
 type lexicalTier struct {
 	tok      lexicalTokenizer
 	stats    *statsCache
-	maxTerms int
+	maxTerms config.Limit
 }
 
-// newLexicalTier builds the tier. maxTerms is resources.max_query_terms;
-// cacheBytes is the statistics cache ceiling.
-func newLexicalTier(tok lexicalTokenizer, maxTerms int, cacheBytes int64) *lexicalTier {
-	if maxTerms <= 0 {
-		maxTerms = 1
-	}
+// newLexicalTier builds the tier. maxTerms is resources.max_query_terms, which
+// is a config.Limit: an unlimited (0) value means every term of the query is
+// scored. The former 0 -> 1 coercion here silently turned "no bound" into the
+// tightest bound in the tree, which is the one reading of 0 the wave forbids.
+func newLexicalTier(tok lexicalTokenizer, maxTerms config.Limit, cacheBytes int64) *lexicalTier {
 	return &lexicalTier{tok: tok, stats: newStatsCache(cacheBytes), maxTerms: maxTerms}
 }
 
@@ -234,9 +235,11 @@ func (l *lexicalTier) parseQuery(ctx context.Context, text string) ([]lexicalTer
 	// silently dropping terms, matching Tokenize's rejection of
 	// max_query_text_bytes: a query that scores only the first 32 of its terms
 	// would return confidently wrong rankings.
-	if len(terms) > l.maxTerms {
+	if l.maxTerms.Exceeded(int64(len(terms))) {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
-			Message: "query has more terms than resources.max_query_terms allows"}
+			Message: "the query carries " + strconv.Itoa(len(terms)) +
+				" terms, more than the resources.max_query_terms limit of " + l.maxTerms.String(),
+			Remediation: "narrow the query, or raise resources.max_query_terms (0 or \"unlimited\" scores every term)"}
 	}
 	return terms, nil
 }
