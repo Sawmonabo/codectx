@@ -192,6 +192,10 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// context.WithTimeout would silently take the smaller of the two -- so a
 	// raised deadline would expire at the configured default and report the
 	// compile as out of time when the operator had granted it more.
+	//
+	// Zero is "no deadline", and it is the default: a compile nobody bounded
+	// runs to a COMPLETE plan. The checkpoint-and-continue path below is what
+	// happens when somebody sets a bound, not the ordinary way to get a plan.
 	if _, ok := ctx.Deadline(); !ok {
 		if timeout := c.cfg.Resources.QueryTimeout.Std(); timeout > 0 {
 			var cancel context.CancelFunc

@@ -121,8 +121,13 @@ func queryFlagValues(cmd *cobra.Command) (model.PageRequest, model.GenerationID,
 
 // queryContext applies an operator-supplied deadline to the service call alone.
 // The workspace open is deliberately outside it: a slow open is not a query
-// that ran out of time, and reporting it as one would name the wrong cause. A
-// zero timeout leaves the context alone so resources.query_timeout applies.
+// that ran out of time, and reporting it as one would name the wrong cause.
+//
+// A zero `--timeout` installs NO deadline and leaves the configured
+// resources.query_timeout in charge, which itself defaults to unlimited: the
+// command returns the complete answer unless the operator asked for a bound.
+// context.WithTimeout is never called with zero, which would expire the call
+// immediately -- the opposite of what "no limit" means.
 func queryContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
 		return context.WithCancel(ctx)
