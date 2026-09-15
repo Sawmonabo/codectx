@@ -53,6 +53,12 @@ func (s *seedSet) noteCut(origin originKind, step string) {
 	}
 	s.cutStages[origin] = true
 	s.Excluded = append(s.Excluded, candidate{
+		// The step is the exclusion's Path because ContextReference refuses a
+		// reference that names neither a node, a file nor a path, and the cut
+		// names no single entity -- it names the step that stopped. Without it
+		// the manifest's own validator would turn this disclosure into a failed
+		// compile, which is the opposite of what reporting the cut is for.
+		Path:   "seed discovery: " + step,
 		Origin: origin,
 		Excluded: boundReason(fmt.Sprintf(
 			"seed discovery stopped at the %d-seed bound while collecting %s; identities beyond it were never examined",
