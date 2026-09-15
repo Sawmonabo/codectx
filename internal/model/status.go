@@ -81,7 +81,7 @@ func (r IndexResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("index_result.runs", len(r.Runs), MaxRecordsPerResult); err != nil {
+	if err := boundPage("index_result.runs", len(r.Runs)); err != nil {
 		return err
 	}
 	for _, run := range r.Runs {

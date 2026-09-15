@@ -279,11 +279,12 @@ func (r *capabilityReport) add(s model.CapabilityState) {
 		return
 	}
 	r.order = append(r.order, key)
-	// scopesDetail is written on the first arrival too, not only on a
-	// collision: it is the reserved key the count is read from, and a row that
-	// carries it explicitly cannot be under-counted by a later fold that never
-	// saw this one arrive.
-	r.rows[key] = s.WithDetail(scopesDetail, strconv.Itoa(countDetail(s)))
+	// No scopesDetail here: a row folded for the first time stands for one
+	// scope, which countDetail already reads from its absence. Writing
+	// `scopes=1` on every row would put a word that says nothing on every line
+	// of the report. What makes the count survive is that the key is RESERVED,
+	// not that it is written early.
+	r.rows[key] = s
 }
 
 // scopeNamingDetails are the details whose value names the one scope the row

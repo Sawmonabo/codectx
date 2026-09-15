@@ -47,3 +47,36 @@ func TestOversizeStorageFieldsDoNotFailTheUnit(t *testing.T) {
 		t.Fatal("the field classification does not match the rule it documents")
 	}
 }
+
+// TestResultPageWidthIsAProducerDefectNotAnAnswerRefusal protects the rule that
+// MaxRecordsPerResult is a page width, not a ceiling on the answer.
+//
+// ImpactResult.Validate refused a real 1284-package impact answer on a
+// 4019-file repository with CTX_ARGUMENT_INVALID -- a client error code for a
+// question whose honest answer is simply larger than one page, and which no
+// caller could do anything about. A full page still validates; an over-full one
+// is the producer's failure to page, and says so.
+func TestResultPageWidthIsAProducerDefectNotAnAnswerRefusal(t *testing.T) {
+	id := strings.Repeat("a", IDHexLen)
+	full := make([]PackageEdge, MaxRecordsPerResult)
+	for i := range full {
+		full[i] = PackageEdge{FromNodeID: NodeID(id), ToNodeID: NodeID(id), FromPath: "a", ToPath: "b", PairCount: 1, EvidenceCount: 1}
+	}
+	meta := QueryMeta{Binding: Binding{RepositoryID: RepositoryID(id), SnapshotID: SnapshotID(id), GenerationID: 1}}
+	r := ImpactResult{Meta: meta, Packages: full}
+	if err := r.Validate(); err != nil {
+		t.Fatalf("a full %d-record page was refused: %v", MaxRecordsPerResult, err)
+	}
+	r.Packages = append(r.Packages, PackageEdge{FromNodeID: NodeID(id), ToNodeID: NodeID(id), FromPath: "a", ToPath: "b", PairCount: 1, EvidenceCount: 1})
+	err := r.Validate()
+	if err == nil {
+		t.Fatalf("a page of %d records was admitted; the page width is not enforced", len(r.Packages))
+	}
+	typed, ok := err.(*Error)
+	if !ok || typed.Code != CodeInternal {
+		t.Fatalf("an over-full page reported %v, want a %s producer defect", err, CodeInternal)
+	}
+	if !strings.Contains(typed.Message, "cursor") {
+		t.Fatalf("the defect does not name the paging obligation: %q", typed.Message)
+	}
+}
