@@ -701,7 +701,20 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// forward both read from that spool. Deferring the release here -- not
 		// at the end of the happy path -- is what keeps an error return from
 		// leaking a spool and a lease for the whole cursor TTL.
-		defer resume.Release()
+		//
+		// Terminal outcomes only. A RETRYABLE failure -- CTX_WORKSPACE_BUSY
+		// from a contended store, a transient read error, the query deadline --
+		// tells the caller to present this SAME cursor again, so the spool, the
+		// retained state directory and the lease it names must all still be
+		// adoptable. Releasing unconditionally turned one busy edge read on a
+		// resumed page into CTX_CURSOR_INVALID and made the whole walk behind
+		// that cursor unrecoverable; the state is still bounded, because it
+		// expires with the cursor's own lease TTL.
+		defer func() {
+			if terminalOutcome(err) {
+				resume.Release()
+			}
+		}()
 		// The resumed budget carries the earlier pages' cumulative spend by
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
