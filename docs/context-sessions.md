@@ -45,6 +45,20 @@ excludes is named in the manifest with its reason, paginated and never
 summarised. Nothing is silently dropped: a truncated manifest presented as
 complete is the one failure this whole surface exists to prevent.
 
+Seed discovery — the pass that turns `--task` and `--seed` into the candidates
+selection starts from — examines every identity the task names by default. The
+`context.max_seeds` setting bounds it for a caller who wants a smaller plan; a
+task that exceeds a value you set is not truncated in silence, but reported as an
+exclusion naming the key and the value.
+
+A plan that excluded candidates says so in a `notice` line on its own output, and
+that notice names where the reasons are: the manifest header carries counts, not
+lists, so the exclusions themselves are a paged projection reached with
+`codectx context entries <session-id> --view excluded`. Every excluded candidate
+there carries its reason. When `scope_complete` is false the same pointer is
+printed, including on a repeated `plan` that reuses an existing manifest, so an
+incomplete scope is never reported without a route to what is missing.
+
 The manifest is pinned to the generation it was compiled from. Later indexing
 does not move it.
 

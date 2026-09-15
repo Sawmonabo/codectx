@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -29,23 +30,25 @@ type seedSet struct {
 	Excluded   []candidate
 	Unresolved bool
 	// cutStages names the Section 15.2 steps already reported as having stopped
-	// at model.MaxSeeds, so one bound that stops several later steps is named
+	// at the context.max_seeds bound, so one bound that stops several later steps is named
 	// once per step rather than once per skipped identity. The key is the STEP,
 	// not the step's originKind: several steps share one origin, and keying on
 	// the origin reported only the first of them and dropped the rest.
 	cutStages map[string]bool
 }
 
-// noteCut records that a Section 15.2 discovery step stopped at model.MaxSeeds
-// with identities it never examined.
+// noteCut records that a Section 15.2 discovery step stopped at a user-set
+// context.max_seeds bound with identities it never examined.
 //
-// The bound stays -- MaxSeeds is what keeps one plan a plan -- but it stops
-// being silent: the cut is reported in the plan's own exclusions, beside every
-// other reason a candidate is absent, and it marks the scope incomplete. A plan
-// that saw the first MaxSeeds identities and a plan that saw all of them are
-// now distinguishable by their manifest alone, which is what a caller deciding
-// whether to narrow the task needs.
-func (s *seedSet) noteCut(origin originKind, step string) {
+// The bound is the operator's, not the build's: context.max_seeds defaults to
+// unlimited, so this row appears only when a user asked for a smaller plan than
+// the task names. When it does appear it is not silent -- the cut is reported in
+// the plan's own exclusions, beside every other reason a candidate is absent,
+// naming the key and the value that stopped the step, and it marks the scope
+// incomplete. A plan that saw the first N identities and a plan that saw all of
+// them are distinguishable by their manifest alone, which is what a caller
+// deciding whether to raise the key or narrow the task needs.
+func (s *seedSet) noteCut(origin originKind, step string, limit config.Limit) {
 	s.Unresolved = true
 	if s.cutStages == nil {
 		s.cutStages = map[string]bool{}
@@ -63,15 +66,16 @@ func (s *seedSet) noteCut(origin originKind, step string) {
 		Path:   "seed discovery: " + step,
 		Origin: origin,
 		Excluded: boundReason(fmt.Sprintf(
-			"seed discovery stopped at the %d-seed bound while collecting %s; identities beyond it were never examined",
-			model.MaxSeeds, step)),
+			"seed discovery stopped at the context.max_seeds bound of %s while collecting %s; identities beyond it were never examined",
+			limit, step)),
 	})
 }
 
 // notePageEnd records that a Section 15.2 discovery step consumed one page of a
 // bounded read and did not continue past it.
 //
-// It is the page-boundary sibling of noteCut: MaxSeeds is a bound on the plan,
+// It is the page-boundary sibling of noteCut: context.max_seeds is a bound on
+// the plan,
 // a page is a bound on one read, and a step that stopped at the second saw less
 // of the repository than the step that stopped at the first. Both leave the
 // plan partial, so both are disclosed as exclusions and both mark the scope
@@ -109,6 +113,13 @@ type seedToken struct {
 	Origin originKind
 }
 
+// seedsFull reports whether discovery has already admitted every seed a
+// user-set context.max_seeds allows. An unlimited bound -- the default -- is
+// never full, so discovery examines every identity the task names.
+func seedsFull(limit config.Limit, n int) bool {
+	return !limit.IsUnlimited() && int64(n) >= limit.Value()
+}
+
 // extractSeeds runs the Section 15.2 steps in order over one pinned
 // generation:
 //
@@ -121,27 +132,37 @@ type seedToken struct {
 // prose, where a word that matches nothing is not a failed identity and leaves
 // no exclusion.
 //
+// What bounds the seed set with context.max_seeds unlimited is the REQUEST, not
+// the repository: steps 0-5 mine the task text, which boundTask clips to
+// model.MaxTaskBytes before any scanning, and each identity that text names is
+// resolved by exactly ONE page of at most c.pageLimit() declarations. Peak heap
+// is therefore the identities one clipped task can spell times one page, and the
+// lowest-priority step 6 reads one page of captured changes and discloses the
+// continuation rather than materialising a whole working tree. No step walks the
+// repository, so no step scales with it.
+//
 // gen is the generation Compile pinned once; it is passed into every
 // downstream request so that an activation mid-compile can never split one
 // manifest across two generations (Section 15.1). reader is that same pinned
 // reader, so a path token is checked against visible facts only.
 func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, req model.ContextRequest) (seedSet, error) {
 	var out seedSet
+	limit := c.cfg.Context.MaxSeeds
 	seen := map[string]bool{}
 	excluded := map[string]bool{}
 
-	tokens := make([]seedToken, 0, len(req.Seeds)+model.MaxSeeds)
+	tokens := make([]seedToken, 0, len(req.Seeds))
 	for _, s := range req.Seeds {
 		if t := strings.TrimSpace(s); t != "" {
 			tokens = append(tokens, seedToken{Text: t, Origin: originExplicitSeed})
 		}
 	}
 	task := boundTask(req.Task)
-	tokens = append(tokens, taskTokens(task)...)
+	tokens = append(tokens, taskTokens(task, limit)...)
 
 	for _, tok := range tokens {
-		if len(out.Candidates) >= model.MaxSeeds {
-			out.noteCut(tok.Origin, "the identities the task names")
+		if seedsFull(limit, len(out.Candidates)) {
+			out.noteCut(tok.Origin, "the identities the task names", limit)
 			break
 		}
 		found, err := c.resolveIdentity(ctx, reader, gen, tok, seen, &out)
@@ -229,13 +250,14 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 // A word that answers nothing is prose, not a failed identity, so it leaves no
 // exclusion and does not make the scope incomplete.
 func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, task string, claimed []seedToken, seen map[string]bool, out *seedSet) error {
+	limit := c.cfg.Context.MaxSeeds
 	taken := make(map[string]bool, len(claimed))
 	for _, tok := range claimed {
 		taken[tok.Text] = true
 	}
-	for _, term := range freeTerms(task) {
-		if len(out.Candidates) >= model.MaxSeeds {
-			out.noteCut(originExactResolve, "the declarations the task's free terms name")
+	for _, term := range freeTerms(task, limit) {
+		if seedsFull(limit, len(out.Candidates)) {
+			out.noteCut(originExactResolve, "the declarations the task's free terms name", limit)
 			return nil
 		}
 		if taken[term] {
@@ -253,8 +275,8 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 				fmt.Sprintf("the task mentions %q, which names a declaration in the pinned snapshot", term)))
 		}
 	}
-	if len(out.Candidates) >= model.MaxSeeds {
-		out.noteCut(originLexical, "the lexical matches of the task text")
+	if seedsFull(limit, len(out.Candidates)) {
+		out.noteCut(originLexical, "the lexical matches of the task text", limit)
 		return nil
 	}
 	if strings.TrimSpace(task) == "" {
@@ -278,8 +300,8 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 		return contextErr(ctx, err)
 	}
 	for _, hit := range page.Items {
-		if len(out.Candidates) >= model.MaxSeeds {
-			out.noteCut(originLexical, "the lexical matches of the task text")
+		if seedsFull(limit, len(out.Candidates)) {
+			out.noteCut(originLexical, "the lexical matches of the task text", limit)
 			return nil
 		}
 		cnd := candidate{
@@ -309,65 +331,63 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 // admitted last and at the lowest priority, so an active edit informs the plan
 // without displacing an identity the task named.
 //
-// It reads changed rows only, through PinnedReader.ChangedFiles, rather than
-// paging every file row of the snapshot and discarding the unchanged ones. That
-// is what bounds it: a page holds only admissible rows, so the loop stops after
-// at most model.MaxSeeds/pageLimit + 1 reads whatever the workspace's file
-// count is. The page ceiling this used to carry bounded the scan by declaring a
-// 250,000-file workspace's scope unresolvable, which a supported workspace must
-// never be.
+// It reads ONE page of changed rows through PinnedReader.ChangedFiles, which is
+// what bounds it: with context.max_seeds unlimited the working tree is not a
+// bound on the seed set, and paging a repository-sized change set into the
+// compile's heap is exactly the whole-repo materialisation this step may not
+// perform. A page is the same shape the lexical step already stops at, and for
+// the same reason -- this is the weakest discovery step, so it contributes one
+// page and says so. A full page means changes remain, which is disclosed with
+// the continuation cursor rather than assumed to be the whole working tree; a
+// short page is genuinely the end and discloses nothing.
+//
+// A user-set context.max_seeds can still cut the page before it is consumed,
+// which is the operator's own bound and is disclosed as such.
 func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedReader, seen map[string]bool, out *seedSet) error {
-	var after model.FileID
+	limit := c.cfg.Context.MaxSeeds
 	// Compiler.pageLimit only ever yields a value in (0, model.MaxPageItems],
 	// which is exactly the window sqlite.pageLimit passes through unchanged, so
 	// a page shorter than this limit is genuinely the last page and not a
 	// clamped read that still has rows behind it.
-	limit := c.pageLimit()
-	if len(out.Candidates) >= model.MaxSeeds {
+	pageSize := c.pageLimit()
+	if seedsFull(limit, len(out.Candidates)) {
 		// An earlier step already filled the seed set, so this one never runs.
 		// A step that never examined a single changed file is exactly the cut
 		// row 20 forbids leaving silent.
-		out.noteCut(originChangedFile, "the captured working-tree changes")
+		out.noteCut(originChangedFile, "the captured working-tree changes", limit)
 		return nil
 	}
-	for len(out.Candidates) < model.MaxSeeds {
-		files, err := reader.ChangedFiles(ctx, after, changedStatuses, limit)
-		if err != nil {
-			return contextErr(ctx, err)
-		}
-		if len(files) == 0 {
-			return nil
-		}
-		for _, fv := range files {
-			after = fv.ID
-			if len(out.Candidates) >= model.MaxSeeds {
-				// Changed files remain that this plan never saw, exactly like a
-				// discovery step stopped at any other of its own bounds, so the
-				// scope is reported incomplete AND the cut is named in the
-				// exclusions rather than left as an unexplained flag.
-				out.noteCut(originChangedFile, "the captured working-tree changes")
-				return nil
-			}
-			add(out, seen, candidate{
-				FileID:      fv.ID,
-				Path:        fv.Path,
-				Requirement: model.RequirementOptional,
-				Origin:      originChangedFile,
-				Status:      fv.Status,
-				SizeBytes:   fv.Size,
-				Reasons:     []string{boundReason(fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status))},
-			})
-		}
-		if len(files) < limit {
-			// A short page is the end of the keyset walk; asking for the page
-			// after it would cost one more read that can only come back empty.
-			return nil
-		}
+	files, err := reader.ChangedFiles(ctx, "", changedStatuses, pageSize)
+	if err != nil {
+		return contextErr(ctx, err)
 	}
-	// The loop condition failed on entry or after a full page: seeds filled up
-	// before every captured change was admitted, and the unseen ones make this
-	// a partial view of the working tree.
-	out.Unresolved = true
+	var last model.FileID
+	for _, fv := range files {
+		last = fv.ID
+		if seedsFull(limit, len(out.Candidates)) {
+			// Changed files remain that this plan never saw, exactly like a
+			// discovery step stopped at any other of its own bounds, so the
+			// scope is reported incomplete AND the cut is named in the
+			// exclusions rather than left as an unexplained flag.
+			out.noteCut(originChangedFile, "the captured working-tree changes", limit)
+			return nil
+		}
+		add(out, seen, candidate{
+			FileID:      fv.ID,
+			Path:        fv.Path,
+			Requirement: model.RequirementOptional,
+			Origin:      originChangedFile,
+			Status:      fv.Status,
+			SizeBytes:   fv.Size,
+			Reasons:     []string{boundReason(fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status))},
+		})
+	}
+	if len(files) == pageSize {
+		// A full page is a page boundary, not an exhausted working tree: the
+		// keyset cursor is the last file identity read, so a caller who wants
+		// the rest knows where the read resumes.
+		out.notePageEnd(originChangedFile, "the captured working-tree changes", string(last))
+	}
 	return nil
 }
 
@@ -513,11 +533,11 @@ func clipUTF8(s string, max int) string {
 // path-like tokens, then bare qualified identifiers. A token found by an
 // earlier step is not offered again by a later one, so the origin a candidate
 // carries is the strongest step that named it.
-func taskTokens(task string) []seedToken {
+func taskTokens(task string, limit config.Limit) []seedToken {
 	var out []seedToken
 	taken := map[string]bool{}
 	emit := func(text string, origin originKind) {
-		if text == "" || taken[text] || len(out) >= model.MaxSeeds {
+		if text == "" || taken[text] || seedsFull(limit, len(out)) {
 			return
 		}
 		taken[text] = true
@@ -525,7 +545,7 @@ func taskTokens(task string) []seedToken {
 	}
 
 	backticked := map[string]bool{}
-	for _, tok := range backtickTokens(task) {
+	for _, tok := range backtickTokens(task, limit) {
 		backticked[tok] = true
 		emit(tok, originBacktick)
 	}
@@ -545,10 +565,10 @@ func taskTokens(task string) []seedToken {
 
 // backtickTokens returns the contents of every backtick-delimited span, which
 // Section 15.2 reads as the caller quoting an identity verbatim.
-func backtickTokens(task string) []string {
+func backtickTokens(task string, limit config.Limit) []string {
 	var out []string
 	rest := task
-	for len(out) < model.MaxSeeds {
+	for !seedsFull(limit, len(out)) {
 		open := strings.IndexByte(rest, '`')
 		if open < 0 {
 			return out
@@ -586,12 +606,12 @@ func splitWords(task string) []string {
 // freeTerms is the Section 15.2 step 4/5 input: the plain words of the task,
 // which are mined for declarations and lexical hits. One-character words carry
 // no identity, so they are not queried.
-func freeTerms(task string) []string {
+func freeTerms(task string, limit config.Limit) []string {
 	words := splitWords(task)
 	out := make([]string, 0, len(words))
 	seen := map[string]bool{}
 	for _, w := range words {
-		if len(w) < 2 || seen[w] || len(out) >= model.MaxSeeds {
+		if len(w) < 2 || seen[w] || seedsFull(limit, len(out)) {
 			continue
 		}
 		seen[w] = true

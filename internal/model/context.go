@@ -271,7 +271,10 @@ func (s ContextSlice) Validate() error {
 	if len(s.EntryOrdinals) == 0 {
 		return invalid("context_slice %d has no entries", s.Index)
 	}
-	if err := boundCount("context_slice.entry_ordinals", len(s.EntryOrdinals), MaxRecordsPerResult); err != nil {
+	// A page width, not a ceiling on a slice: a slice wider than one page is
+	// served as a page plus a cursor, so this reports a producer that returned
+	// an oversized page rather than refusing a legitimate plan.
+	if err := boundPage("context_slice.entry_ordinals", len(s.EntryOrdinals)); err != nil {
 		return err
 	}
 	for i, o := range s.EntryOrdinals {

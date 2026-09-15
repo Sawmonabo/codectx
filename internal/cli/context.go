@@ -52,11 +52,12 @@ const (
 	contextOutputFlag          = "output"
 )
 
-// maxObservationInputBytes bounds what --input may read. No legal observation
-// document is anywhere near this large: the widest one the model admits is a
-// scope review whose eight categories each carry a MaxNoteBytes note and
-// MaxObservationReferences bounded references. The bound exists so a file that
-// is not an observation at all is refused at the read rather than decoded.
+// maxObservationInputBytes bounds what --input may read. It is a bound on ONE
+// local file the CLI decodes, not on how many references an observation may
+// carry: workflow.max_observation_references is the caller's own ceiling and is
+// unlimited by default, so the model no longer fixes a widest legal document.
+// The bound exists so a file that is not an observation at all is refused at the
+// read rather than decoded.
 const maxObservationInputBytes = 1 << 20
 
 // actorFlagHelp is the one sentence every command in this group repeats.

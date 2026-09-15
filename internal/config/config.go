@@ -474,6 +474,11 @@ type Context struct {
 	// AllowExploratoryWaiverConsolidation is user-only and never weakens strict
 	// read readiness (Section 20.2).
 	AllowExploratoryWaiverConsolidation bool `toml:"allow_exploratory_waiver_consolidation"`
+	// MaxSeeds bounds Section 15.2 seed discovery: the identities a context
+	// compile examines before it stops. Unlimited by default, so every identity
+	// the task names is examined; a user-set value that a task exceeds is
+	// reported as a named exclusion on the manifest, never applied silently.
+	MaxSeeds Limit `toml:"max_seeds"`
 }
 
 // Coverage is the source-read chunking and receipt policy.
@@ -643,6 +648,7 @@ func Defaults() Config {
 			MaxCapsuleBytes:                     Unlimited,
 			StrictReadGate:                      true,
 			AllowExploratoryWaiverConsolidation: false,
+			MaxSeeds:                            Unlimited,
 		},
 		Coverage: Coverage{
 			ChunkBytes:                     65536,
