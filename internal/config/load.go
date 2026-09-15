@@ -19,14 +19,38 @@ const ProjectConfigName = ".codectx.toml"
 const (
 	appDirName     = "codectx"
 	userConfigName = "config.toml"
+	// toolStoreDirName is the store's directory name under the user data
+	// directory. It matches the name the toolchain package uses under a data
+	// directory and the one the installer's bundle path creates.
+	toolStoreDirName = "tools"
 )
 
-// userConfigDir and userCacheDir are indirected so the layered resolution can
-// be exercised without depending on the developer's real home directory.
+// userConfigDir, userCacheDir and userDataDir are indirected so the layered
+// resolution can be exercised without depending on the developer's real home
+// directory.
 var (
 	userConfigDir = os.UserConfigDir
 	userCacheDir  = os.UserCacheDir
+	userDataDir   = osUserDataDir
 )
+
+// osUserDataDir is the XDG user data directory. The standard library has no
+// os.UserDataDir, and the installer already writes the shared tool store to
+// ${XDG_DATA_HOME:-$HOME/.local/share}/codectx/tools, so this resolves the same
+// base by the same rule. A relative XDG_DATA_HOME is ignored rather than
+// honoured: the specification requires an absolute path, and a relative one
+// would produce a tool store that changes with the process working directory
+// and that validate rejects for not being absolute.
+func osUserDataDir() (string, error) {
+	if dir := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(dir) {
+		return dir, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "share"), nil
+}
 
 // projectPermitted is the closed set of keys a repository's own file may set:
 // source inclusion, language selection and safe query preferences (Section
@@ -86,10 +110,46 @@ func Load(root string) (Config, error) {
 		cfg.Storage.DataDir = filepath.Clean(cfg.Storage.DataDir)
 	}
 
+	// The tool store is resolved after the layered merge, and it is resolved to
+	// a machine-wide path rather than to a subdirectory of the data directory
+	// above. The payloads are many gigabytes and are identical for every
+	// checkout, so a per-workspace store would install them again for each one
+	// and leave a fresh repository with nothing installed. `[tools]` is
+	// user-configuration-only, so nothing a project file wrote can reach here.
+	if cfg.Tools.CacheDir == "" {
+		dir, err := DefaultToolStoreDir()
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Tools.CacheDir = dir
+	} else {
+		if !filepath.IsAbs(cfg.Tools.CacheDir) {
+			return Config{}, configInvalid("tools.cache_dir %q is not an absolute path", cfg.Tools.CacheDir)
+		}
+		cfg.Tools.CacheDir = filepath.Clean(cfg.Tools.CacheDir)
+	}
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// DefaultToolStoreDir is the machine-wide managed tool store: one store shared
+// by every workspace on the host, outside every repository and outside the
+// per-workspace data directory. It is the same path the installer populates
+// from the offline bundle, so a bundle install and an on-demand install fill
+// one store rather than two.
+//
+// Load does not create it. The toolchain owner creates it user-private on the
+// first install, which is what keeps a read-only report from materializing a
+// directory on a host that has never installed anything.
+func DefaultToolStoreDir() (string, error) {
+	base, err := userDataDir()
+	if err != nil {
+		return "", configInvalid("the user data directory is unavailable: %v", err)
+	}
+	return filepath.Join(base, appDirName, toolStoreDirName), nil
 }
 
 // UserConfigPath is the user-level configuration file location. It lives in the
