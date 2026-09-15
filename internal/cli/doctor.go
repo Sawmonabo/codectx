@@ -40,9 +40,13 @@ const doctorWorkspaceCheck = "workspace_open"
 // 0 is "successful complete operation", and the operation here is the
 // diagnosis, not the workspace.
 //
-// It also keeps the Section 18.1 spelling `doctor [path]` rather than declaring
-// --repo, for the same reason `init` does: both are meant to be pointed at a
-// directory that may not be a working installation at all.
+// It keeps the Section 18.1 spelling `doctor [path]` -- it is meant to be
+// pointed at a directory that may not be a working installation at all -- and
+// also declares the shared --repo flag every other workspace command spells
+// the same question with. One concept must not have two spellings across
+// sibling commands: an operator who reaches for `doctor` after `repo-map` or
+// `status` should not have their --repo rejected as an unknown flag. Naming
+// the repository both ways is refused by repoTarget rather than resolved.
 func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "doctor [path]",
@@ -57,6 +61,8 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 			"this host cannot measure is reported as unavailable rather than as zero. A " +
 			"workspace that cannot be opened is itself reported as a failing check, so this " +
 			"command answers on exactly the installations it exists to diagnose.\n\n" +
+			"The repository is named as a positional path, or with --repo, and naming it " +
+			"both ways is refused rather than resolved to one of them.\n\n" +
 			"--deep additionally runs the expensive integrity and parser smoke checks; no " +
 			"full database scan happens without it. --offline asks for the offline-policy " +
 			"checks, and what the report says is what those checks found -- the flag itself " +
@@ -68,6 +74,7 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 			return runDoctor(cmd, args, build)
 		},
 	}
+	addRepoFlag(cmd)
 	cmd.Flags().Bool(doctorOfflineFlag, false,
 		"include the offline-policy checks in the report")
 	cmd.Flags().Bool(doctorDeepFlag, false,
@@ -78,16 +85,15 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 // runDoctor resolves the target, produces one report and renders it.
 func runDoctor(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 	req := model.DoctorRequest{}
-	var err error
+	root, err := repoTarget(cmd, args)
+	if err != nil {
+		return err
+	}
 	if req.Offline, err = boolFlag(cmd, doctorOfflineFlag); err != nil {
 		return err
 	}
 	if req.Deep, err = boolFlag(cmd, doctorDeepFlag); err != nil {
 		return err
-	}
-	root := "."
-	if len(args) == 1 {
-		root = args[0]
 	}
 	report, err := doctorReport(cmd.Context(), build, root, req)
 	if err != nil {
