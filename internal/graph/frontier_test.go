@@ -707,12 +707,22 @@ type slowAdjacency struct {
 	trigger int
 	jump    time.Duration
 	fired   *bool
+	// every, when positive, jumps the clock on every every-th round trip
+	// instead of once at trigger. A case that needs ONE deadline sets trigger;
+	// a case that needs a walk split into many pages sets every, and the two
+	// branches are separate so neither case's stop moves when the other's does.
+	every int
 }
 
 func (s slowAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	*s.calls++
-	if !*s.fired && *s.calls >= s.trigger {
+	switch {
+	case s.every > 0:
+		if *s.calls%s.every == 0 {
+			*s.clock = s.clock.Add(s.jump)
+		}
+	case !*s.fired && *s.calls >= s.trigger:
 		*s.fired = true
 		*s.clock = s.clock.Add(s.jump)
 	}

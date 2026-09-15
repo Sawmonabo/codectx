@@ -467,6 +467,21 @@ type heapProbe struct {
 	// retained input and happens to reach the same answer.
 	AdoptedRuns    int
 	ReaddedRecords int64
+	// VisitedBytes is how many bytes the walk's cumulative admitted-node set
+	// has been GROWN by (visitedstore.go appendRun: the run, the filter words
+	// its probes dirtied, the manifest), and ResumeRecords how many
+	// continuation-spool records a resume has decoded (cursor.go
+	// resumeTraversal). Both are cumulative over the requests one probe is
+	// attached to, so a test reads a page's own cost as the delta across that
+	// page's call.
+	//
+	// They are the two halves of the append-only invariant: the first must be a
+	// function of what a page ADMITTED and never of the walk behind it, the
+	// second a function of the FRONTIER and never of the cumulative set. A
+	// build where either grows with the page number pages a walk to completion
+	// in quadratic time, which is the defect this state layout closed.
+	VisitedBytes  int64
+	ResumeRecords int64
 }
 
 // rankProbe, pairProbe and rollupProbe hand the ranking passes the counters to
