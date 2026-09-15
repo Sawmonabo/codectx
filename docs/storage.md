@@ -34,6 +34,19 @@ all-integer — `(unit_id, scope_key_id, native_key_id, node_id)` — and eviden
 carries `native_key_id`. Evidence and aliases share `native_keys`: the values
 come from the same vocabulary.
 
+The two dictionaries allocate their ids differently. `scope_keys` keeps
+`key TEXT UNIQUE` and resolves key to id through that index. `native_keys` does
+not: its automatic index over `key` cost more than the table it indexed (38.8 MB
+against 34.5 MB on one reference store), because interning stored every distinct
+key twice. It is **hash-keyed** instead — the id is the first 63 bits of
+`SHA-256(key)`, zero clamped to 1 — so the writer computes the id without a
+lookup and one b-tree holds one copy of each key. Both directions still work:
+a reader joins id to key through the primary key, and a writer or the alias
+reconciler resolves key to id by walking that key's chain, comparing the stored
+key at each id and probing the next on disagreement. **Two keys whose digests
+agree are detected and separated, never merged**; the comparison is the safety
+property, not the improbability of a collision.
+
 Three properties follow, and each is load-bearing for the rest of this
 document.
 
