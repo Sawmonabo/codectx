@@ -125,7 +125,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	case !admitted:
 		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeResourceLimit)
 	case binary:
-		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeProviderUnavailable)
+		e.Capability(CapabilitySearch, model.CapabilityUnavailable, model.CodeBinaryContent)
 	default:
 		lost, err := ch.each(ctx, func(r model.ByteRange, body []byte) error {
 			return e.PutSearch(ctx, chunkDocument(fv, fileNode.ID, r, body))
