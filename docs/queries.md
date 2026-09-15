@@ -59,7 +59,7 @@ evidence row behind it.
 | `--limit` | all but `path` | Items in one page. |
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path`, which walks once, spending it truncates that walk; on `impact` it ends the page and mints a continuation. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path`, which walks once, spending it truncates that walk (its memory budget never does); on `impact` it ends the page and mints a continuation. |
 | `--edges` | `callers`, `callees`, `impact` | Relations one page may admit. On `callers` and `callees` this is a per-page budget on the same terms as `--visited`; on `impact` it is a per-page budget too. |
 
 **`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
@@ -87,13 +87,21 @@ whole-walk accumulator off the heap, not a behaviour chosen for callers. The
 intended contract is the one a single unbounded walk gives: one globally ranked,
 deduplicated sequence paged without reordering or repetition. Until that lands,
 treat the paragraph above as a description of current behaviour rather than as a
-guarantee to build on. The same applies to `path` below: a search whose state
-exceeds `resources.query_memory_bytes` is reported truncated with the cheapest
-routes found so far rather than the provably cheapest route, and that truncation
-is a defect under remediation, not a contract.
+guarantee to build on.
 
-`path` is not paged at all — it declares neither flag, and its
-`--visited` budget is spent by the one search it runs.
+**`path` returns the provably cheapest route, whatever the graph's size.** Its
+search is an external-memory Dijkstra: every relation cost is an integer of at
+least 1, so the search runs as cost-bucket phases, and a node is final once its
+bucket is settled. The settled distances, the parent edges of the shortest-path
+DAG and the tentative buckets live in a private scratch database for the life of
+the request, not on the heap, so peak heap is one node-aligned slice of the
+current bucket — `resources.query_memory_bytes` — plus that database's fixed
+page cache, and never a function of the reachable set. Crossing that number
+costs another slice and nothing else: there is no memory truncation reason, and
+a `path` answer is never shortened because the search ran out of heap. `path` is
+not paged at all — it declares neither flag, and its `--visited` and depth
+budgets, which are the only things that can still truncate it, are spent by the
+one search it runs.
 
 **Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
 `--depth`, `--visited` or `--edges` takes the configured bound, and a positive
@@ -117,9 +125,10 @@ of the query a cursor is bound to, so a walk that ran out of depth is truncated
 with `graph depth budget exhausted` and no continuation. `impact` no longer walks once: a per-page
 budget it exhausts ends that page and mints a continuation, on the same terms as
 `callers` and `callees`. `path` is not
-paged at all and its budgets truncate the one search it runs; it reports
-truncation together with whatever routes it found — never as "no path exists",
-which is reserved for a target that is genuinely unreachable.
+paged at all and its visited, edge and depth budgets truncate the one search it
+runs; it reports truncation together with whatever routes it found — never as
+"no path exists", which is reserved for a target that is genuinely unreachable,
+and never because the search exceeded a memory ceiling.
 
 The query deadline is not a work budget and is not resumable: a walk that
 exceeds it fails the request with `CTX_QUERY_DEADLINE` rather than returning a
@@ -140,7 +149,7 @@ where the workspace is composed, and handed to it.
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills to the continuation spool, the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
+| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills to the continuation spool, the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts

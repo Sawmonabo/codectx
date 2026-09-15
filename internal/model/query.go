@@ -661,13 +661,17 @@ type PathRequest struct {
 	Relations    []RelationKind `json:"relations,omitempty"`
 	MaxDepth     int            `json:"max_depth"`
 	MaxVisited   int            `json:"max_visited"`
+	// Page carries the continuation of a path search whose earlier page spent
+	// its work budget or its deadline before the walk reached the target. The
+	// external-memory walk persists its own state, so a resumed page carries
+	// on settling cost buckets rather than restarting; Limit is unused here
+	// (a path answer is one route list, not a keyset page) and is validated
+	// only so a caller that sets it is told so rather than ignored.
+	Page PageRequest `json:"page"`
 }
 
 // Validate enforces the request shape.
 func (r PathRequest) Validate() error {
-	if err := requireNonNegative("path.generation_id", int64(r.GenerationID)); err != nil {
-		return err
-	}
 	if err := requireID("path.from", string(r.From)); err != nil {
 		return err
 	}
@@ -686,6 +690,11 @@ func (r PathRequest) Validate() error {
 		return err
 	}
 	if err := requireNonNegative("path.max_visited", int64(r.MaxVisited)); err != nil {
+		return err
+	}
+	// The same rule GraphRequest keeps: a cursor already pins its generation,
+	// so a request that names both is rejected rather than silently repinned.
+	if err := r.Page.ValidatePinned("path", r.GenerationID); err != nil {
 		return err
 	}
 	return nil
