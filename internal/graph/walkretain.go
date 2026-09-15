@@ -3,6 +3,8 @@ package graph
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // A walk that is split across REQUESTS cannot be ranked from what one request
@@ -146,9 +149,11 @@ type retainedWalk struct {
 	// store, and is released through the consumed continuation instead --
 	// removing it here would take the bytes out from under the store's own
 	// accounting.
-	owned   bool
-	entries *retainFile
-	pairs   *retainFile
+	owned bool
+	// chunkSize overrides frontierChunk. It is zero outside tests.
+	chunkSize int
+	entries   *retainFile
+	pairs     *retainFile
 }
 
 // openRetainedWalk names a fresh retained input under parent. Nothing is
@@ -837,4 +842,289 @@ func (e *Engine) reopenWalkState(dir, prevID string) (*retainedWalk, error) {
 		return nil, err
 	}
 	return reopenRetainedWalk(dir, prevID, boundsOf(reader), e.probe)
+}
+
+// frontierChunk is how many frontier states one scan of the next level takes at
+// a time. It is an INTERNAL constant and not a user limit: it bounds resident
+// memory, never the work a walk may do or the answer it returns. 65 536 states
+// is one Neighbours call over a wide level, so a million-node frontier costs
+// sixteen scans and never sixteen million.
+const frontierChunk = 65536
+
+// chunk is the frontier chunk this walk uses. The field exists so a test can
+// prove the chunking itself -- that a resumed scan starts at the right state --
+// on a fixture of a few records rather than of sixty-five thousand.
+func (w *retainedWalk) chunk() int {
+	if w.chunkSize > 0 {
+		return w.chunkSize
+	}
+	return frontierChunk
+}
+
+// encodeFrontierState frames one admitted state: uvarints throughout, so a
+// level of admitted nodes costs bytes rather than 64-hex canonical ids.
+func encodeFrontierState(fs frontierState) []byte {
+	buf := make([]byte, 0, 40+len(fs.Route)*binary.MaxVarintLen64)
+	buf = binary.AppendUvarint(buf, uint64(int64(fs.Depth)))
+	buf = binary.AppendUvarint(buf, uint64(fs.Cost))
+	buf = binary.AppendUvarint(buf, uint64(fs.Node))
+	buf = binary.AppendUvarint(buf, uint64(fs.Via))
+	buf = binary.AppendUvarint(buf, uint64(len(fs.Route)))
+	for _, r := range fs.Route {
+		buf = binary.AppendUvarint(buf, uint64(r))
+	}
+	return buf
+}
+
+func decodeFrontierState(b []byte) (frontierState, error) {
+	d := &recordDecoder{b: b}
+	var fs frontierState
+	fs.Depth = int(int64(d.uvarint()))
+	fs.Cost = int64(d.uvarint())
+	fs.Node = NodeRef(d.uvarint())
+	fs.Via = RelRef(d.uvarint())
+	n := d.uvarint()
+	if d.err != nil {
+		return frontierState{}, d.err
+	}
+	if n > model.MaxRelationsPerPath+1 {
+		return frontierState{}, levelCorrupt("an admitted state carries a route longer than a servable path")
+	}
+	fs.Route = make([]RelRef, 0, n)
+	for i := uint64(0); i < n; i++ {
+		fs.Route = append(fs.Route, RelRef(d.uvarint()))
+	}
+	if d.err != nil {
+		return frontierState{}, d.err
+	}
+	if len(d.b) != 0 {
+		return frontierState{}, levelCorrupt("an admitted state carries trailing bytes")
+	}
+	return fs, nil
+}
+
+// admitState is the state the winning record of a neighbour group admits: one
+// hop past its owner, at its owner's cost plus the edge's kind cost, with the
+// admitting relation appended to the owner's route.
+func admitState(r levelRecord, costs kindCosts) frontierState {
+	return frontierState{
+		Depth: r.Owner.Depth + 1,
+		Cost:  r.Owner.Cost + costs.of(r.Edge.Kind),
+		Node:  r.Edge.Neighbour,
+		Via:   r.Edge.Rel,
+		Route: appendRoute(r.Owner.Route, r.Edge.Rel),
+	}
+}
+
+// compareAdmitRoute picks the surviving route inside ONE neighbour group:
+// cheapest, then shallowest, then the smallest admitting relation, then the
+// smallest owner. It is compareImpactRoute's order over the fields a level
+// record carries, and every term is CONTENT-derived -- the canonical ids and
+// the kind costs -- so the winner is the same on a fresh index and on a
+// delta-built one. Surrogates never enter it.
+func compareAdmitRoute(a, b levelRecord, costs kindCosts) int {
+	if c := cmp.Compare(a.Owner.Cost+costs.of(a.Edge.Kind), b.Owner.Cost+costs.of(b.Edge.Kind)); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.Owner.Depth, b.Owner.Depth); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.RelID, b.RelID); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.OwnerID, b.OwnerID)
+}
+
+// admitLevel is the level transition's COMMIT, and the order of its effects is
+// the whole of page atomicity.
+//
+// admitted.<level> is written FIRST, and reused untouched when it is already
+// there. Bits marked without the states they belong to would leave nodes
+// admitted that nothing can ever expand -- they are lost, and the answer
+// silently shrinks -- while states written without their bits cost only a
+// re-application, which is idempotent because the bitset counts bit
+// TRANSITIONS. A redo after a crash therefore admits nothing twice and rebuilds
+// the identical frontier.
+//
+// The visited bits come next, then the frontier set is rebuilt from the same
+// file (cleared, not merged: the frontier is one level, not a running union),
+// and both are synced before the manifest naming this level can be written.
+//
+// Peak heap is one neighbour group plus the sort's run buffer: the admitted
+// states are ordered by surrogate through an external sort, because the file is
+// read back in ascending surrogate order by both bitsets and by the next
+// level's scan, and the level arrives in canonical order.
+func (w *retainedWalk) admitLevel(ctx context.Context, s *sortedLevel, level int, costs kindCosts) (int64, error) {
+	if s.level != level {
+		return 0, internalErr("graph: a level transition was asked to commit a run from another level")
+	}
+	file := openRetainFile(w.home, levelFileName(admittedLevelPrefix, level))
+	count, err := w.writeAdmitted(ctx, s, file, level, costs)
+	if err != nil {
+		return 0, err
+	}
+	if err := w.applyAdmitted(file, w.bits); err != nil {
+		return 0, err
+	}
+	if err := w.frontier.clear(); err != nil {
+		return 0, err
+	}
+	if err := w.applyAdmitted(file, w.frontier); err != nil {
+		return 0, err
+	}
+	if err := w.bits.sync(); err != nil {
+		return 0, err
+	}
+	if err := w.frontier.sync(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// writeAdmitted builds admitted.<level>, or counts the one a previous attempt
+// already committed. A file that exists is the committed decision of this
+// level: rebuilding it would test visited bits that attempt has already set and
+// admit nothing at all.
+func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *retainFile,
+	level int, costs kindCosts) (int64, error) {
+	var count int64
+	if _, err := os.Stat(file.path()); err == nil {
+		err := file.each(func([]byte) error {
+			count++
+			return nil
+		})
+		return count, err
+	} else if !os.IsNotExist(err) {
+		return 0, internalErr("graph: the admitted level: " + err.Error())
+	}
+
+	dir, err := w.home.ensure()
+	if err != nil {
+		return 0, err
+	}
+	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "admitsort"),
+		levelFileName(admittedLevelPrefix, level), 0,
+		func(fs frontierState) ([]byte, error) { return encodeFrontierState(fs), nil },
+		decodeFrontierState,
+		func(a, b frontierState) int { return cmp.Compare(a.Node, b.Node) })
+	if err != nil {
+		return 0, err
+	}
+	defer sorter.Close()
+
+	var best levelRecord
+	var have bool
+	admit := func() error {
+		if !have {
+			return nil
+		}
+		have = false
+		in, err := w.bits.test(uint64(best.Edge.Neighbour))
+		if err != nil || in {
+			return err
+		}
+		count++
+		return sorter.Add(admitState(best, costs))
+	}
+	if err := s.each(0, func(r levelRecord, _ int64) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if have && r.NodeID != best.NodeID {
+			if err := admit(); err != nil {
+				return err
+			}
+		}
+		if !have || compareAdmitRoute(r, best, costs) < 0 {
+			best, have = r, true
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	if err := admit(); err != nil {
+		return 0, err
+	}
+
+	run, err := sorter.Sorted()
+	if err != nil {
+		return 0, err
+	}
+	defer run.Close()
+	if err := run.Each(func(fs frontierState) error { return file.append(encodeFrontierState(fs)) }); err != nil {
+		return 0, err
+	}
+	return count, file.close()
+}
+
+// applyAdmitted sets every admitted surrogate in set, in ascending chunks so
+// that the bitset's page cache is walked forward once.
+func (w *retainedWalk) applyAdmitted(file *retainFile, set *pagedBitset) error {
+	refs := make([]NodeRef, 0, w.chunk())
+	flush := func() error {
+		if len(refs) == 0 {
+			return nil
+		}
+		if _, err := bitsetSet(set, refs); err != nil {
+			return err
+		}
+		refs = refs[:0]
+		return nil
+	}
+	if err := file.each(func(b []byte) error {
+		fs, err := decodeFrontierState(b)
+		if err != nil {
+			return err
+		}
+		refs = append(refs, fs.Node)
+		if len(refs) < w.chunk() {
+			return nil
+		}
+		return flush()
+	}); err != nil {
+		return err
+	}
+	return flush()
+}
+
+// eachFrontier streams the level's admitted states in ascending surrogate
+// order, in chunks of at most frontierChunk, resuming at fromNode.
+//
+// The next level's scan calls GraphReader.Neighbours once per chunk, so the
+// frontier is never held whole: a page cut inside a level carries the surrogate
+// it stopped on and the resumed scan picks the chunk up from there.
+func (w *retainedWalk) eachFrontier(level int, fromNode NodeRef, fn func(chunk []frontierState) error) error {
+	file := openRetainFile(w.home, levelFileName(admittedLevelPrefix, level))
+	chunk := make([]frontierState, 0, w.chunk())
+	if err := file.each(func(b []byte) error {
+		fs, err := decodeFrontierState(b)
+		if err != nil {
+			return err
+		}
+		if fs.Node < fromNode {
+			return nil
+		}
+		chunk = append(chunk, fs)
+		if len(chunk) < w.chunk() {
+			return nil
+		}
+		if err := fn(chunk); err != nil {
+			return err
+		}
+		chunk = chunk[:0]
+		return nil
+	}); err != nil {
+		return err
+	}
+	if len(chunk) == 0 {
+		return nil
+	}
+	return fn(chunk)
+}
+
+// testFrontier reports whether ref is on the level being scanned. The direction
+// dedup rule asks it of every delivered entry, which is why it is a bitset and
+// not a set the level would have to be held in heap to build.
+func (w *retainedWalk) testFrontier(ref NodeRef) (bool, error) {
+	return w.frontier.test(uint64(ref))
 }
