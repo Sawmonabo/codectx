@@ -235,16 +235,28 @@ func releaseSpool(spools *pagination.Spools, sp *pagination.Spool) {
 	spools.Release(sp.ID())
 }
 
-// readSpool replays the metadata record and the hits a cursor's spool holds,
-// in ranked order. Spools validates the header against the cursor and the
-// lease against now, so an expired lease, a released spool or a spool minted
-// for another query is CTX_CURSOR_INVALID here rather than a wrong page.
-func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time) (spoolMeta, []model.SearchHit, error) {
+// readSpool replays a cursor's spool: its metadata record, at most limit hits
+// of the page it is serving, and the NUMBER of hits that remain after them.
+// Spools validates the header against the cursor and the lease against now, so
+// an expired lease, a released spool or a spool minted for another query is
+// CTX_CURSOR_INVALID here rather than a wrong page.
+//
+// It retains exactly one page. The spooled tail of a wide answer is the thing
+// a continuation must not hold in heap -- accumulating it here would make a
+// continuation's peak a function of the match count -- so the records past the
+// page are counted and dropped, and spoolTail walks them again straight into
+// the next spool. The walk is a sequential read of one file, which is what
+// tailOf does over the ranked run on the first page.
+func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, limit int) (spoolMeta, []model.SearchHit, int, error) {
 	if spools == nil {
-		return spoolMeta{}, nil, &model.Error{Code: model.CodeInternal, Message: "search: no spool store is configured"}
+		return spoolMeta{}, nil, 0, &model.Error{Code: model.CodeInternal, Message: "search: no spool store is configured"}
 	}
 	var meta spoolMeta
-	var hits []model.SearchHit
+	// The capacity is the page bound, which Service.pageLimit has already
+	// clamped to model.MaxPageItems, so this allocation cannot track the
+	// answer.
+	hits := make([]model.SearchHit, 0, limit)
+	rest := 0
 	first := true
 	err := spools.Open(ctx, c, now, func(record []byte) error {
 		if err := ctx.Err(); err != nil {
@@ -262,6 +274,13 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 			}
 			return nil
 		}
+		if len(hits) == limit {
+			// Past the page: counted, not decoded and not kept. The count is
+			// what the spool-budget truncation reason names when the tail
+			// cannot be written.
+			rest++
+			return nil
+		}
 		var h model.SearchHit
 		if err := json.Unmarshal(record, &h); err != nil {
 			return &model.Error{Code: model.CodeStorageCorrupt, Message: "a spooled result is not readable"}
@@ -270,7 +289,38 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 		return nil
 	})
 	if err != nil {
-		return spoolMeta{}, nil, err
+		return spoolMeta{}, nil, 0, err
 	}
-	return meta, hits, nil
+	return meta, hits, rest, nil
+}
+
+// spoolTail streams the hits after the first skip of a cursor's spool into the
+// continuation sink, one at a time. It is the continuation-page counterpart of
+// tailOf: the source spool is still live here -- the consumed cursor's spool
+// and lease are released only after the page validates -- so the remainder is
+// copied spool to spool without ever standing in heap.
+func spoolTail(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, skip int) func(func(model.SearchHit) error) error {
+	return func(yield func(model.SearchHit) error) error {
+		at := 0
+		first := true
+		return spools.Open(ctx, c, now, func(record []byte) error {
+			if err := ctx.Err(); err != nil {
+				return contextErr(err)
+			}
+			if first {
+				// The leading metadata record is not a hit: the new spool
+				// writes its own, so it is skipped rather than counted.
+				first = false
+				return nil
+			}
+			if at++; at <= skip {
+				return nil
+			}
+			var h model.SearchHit
+			if err := json.Unmarshal(record, &h); err != nil {
+				return &model.Error{Code: model.CodeStorageCorrupt, Message: "a spooled result is not readable"}
+			}
+			return yield(h)
+		})
+	}
 }

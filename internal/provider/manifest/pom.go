@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 )
@@ -36,8 +37,11 @@ type pomModel struct {
 	group, artifact, version, packaging string
 	parent                              *pomDependency
 	modules                             []pomEntry
-	dependencies, managed               []pomDependency
-	properties                          map[string]string
+	// cutProperties counts properties the entry bound kept out of the table,
+	// so the unit reports the cut with its count rather than in silence.
+	cutProperties         int64
+	dependencies, managed []pomDependency
+	properties            map[string]string
 }
 
 type pomEntry struct {
@@ -51,10 +55,20 @@ type pomEntry struct {
 // `${property}` references are carried verbatim and marked unresolved, never
 // evaluated.
 func (u *unit) pom(ctx context.Context) error {
-	m, ok := parsePom(u.data)
+	m, ok, overElements := parsePom(u.data, u.entries)
 	if !ok {
 		u.malformed()
 		return nil
+	}
+	if m.cutProperties > 0 {
+		u.overBound(BoundEntries, u.entries, int64(len(m.properties))+m.cutProperties)
+	}
+	if overElements {
+		// The element bound cut the token stream. What was parsed before the
+		// cut is published; the file is reported partial with
+		// CTX_RESOURCE_LIMIT rather than malformed, because a large POM is
+		// large, not invalid.
+		u.degraded(BoundXMLElements, "token stream stopped at the element ceiling")
 	}
 	group, version := m.group, m.version
 	var inherited []string
@@ -93,8 +107,7 @@ func (u *unit) pom(ctx context.Context) error {
 		}
 	}
 	for i, d := range m.dependencies {
-		if i >= MaxDependencies {
-			u.overBound()
+		if u.cut(BoundDependencies, u.deps, int64(i+1)) {
 			break
 		}
 		if err := u.pomEdge(ctx, pkg, model.RelDependsOn, d, mavenKind(d)); err != nil {
@@ -102,8 +115,7 @@ func (u *unit) pom(ctx context.Context) error {
 		}
 	}
 	for i, d := range m.managed {
-		if i >= MaxDependencies {
-			u.overBound()
+		if u.cut(BoundDependencies, u.deps, int64(i+1)) {
 			break
 		}
 		if err := u.pomEdge(ctx, pkg, model.RelConfigures, d, mavenKind(d), "managed", "true"); err != nil {
@@ -111,8 +123,7 @@ func (u *unit) pom(ctx context.Context) error {
 		}
 	}
 	for i, mod := range m.modules {
-		if i >= MaxEntries {
-			u.overBound()
+		if u.cut(BoundEntries, u.entries, int64(i+1)) {
 			break
 		}
 		rng := u.rng(mod.start, mod.end)
@@ -168,7 +179,7 @@ func mavenKind(d pomDependency) string {
 // offset before a StartElement token is the start of its tag (the preceding
 // character data is its own token), and the offset after an EndElement is
 // the end of the element.
-func parsePom(data []byte) (pomModel, bool) {
+func parsePom(data []byte, entries config.Limit) (pomModel, bool, bool) {
 	m := pomModel{properties: map[string]string{}}
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	var stack []string
@@ -176,23 +187,28 @@ func parsePom(data []byte) (pomModel, bool) {
 	var cur *pomDependency
 	var entryStart int
 	elements := 0
-	for {
+	overElements := false
+	for !overElements {
 		before := int(dec.InputOffset())
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return m, false
+			return m, false, false
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, t.Name.Local)
 			if len(stack) > maxXMLDepth || (len(stack) == 1 && t.Name.Local != "project") {
-				return m, false
+				return m, false, false
 			}
 			if elements++; elements > maxXMLElements {
-				return m, false
+				// Stop reading and report the cut. Refusing here said the
+				// file was malformed, which a large but perfectly valid POM
+				// is not.
+				overElements = true
+				break
 			}
 			text.Reset()
 			switch strings.Join(stack, "/") {
@@ -238,7 +254,9 @@ func parsePom(data []byte) (pomModel, bool) {
 				case cur != nil && len(stack) == cur.depth+1:
 					setCoordinate(cur, stack[len(stack)-1], val)
 				case len(stack) == 3 && stack[1] == "properties":
-					if len(m.properties) < MaxEntries {
+					if entries.Exceeded(int64(len(m.properties) + 1)) {
+						m.cutProperties++
+					} else {
 						m.properties[stack[2]] = val
 					}
 				}
@@ -247,7 +265,13 @@ func parsePom(data []byte) (pomModel, bool) {
 			text.Reset()
 		}
 	}
-	return m, len(stack) == 0 && elements > 0
+	if overElements {
+		// A cut stream leaves the element stack open, which is the
+		// well-formedness test below. The file parsed cleanly up to the
+		// bound, so it is valid and partial, not malformed.
+		return m, true, true
+	}
+	return m, len(stack) == 0 && elements > 0, false
 }
 
 func setCoordinate(d *pomDependency, field, val string) {

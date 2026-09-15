@@ -36,9 +36,28 @@ same manifest. `--phase` is `sweep` (gather) or `verify` (confirm);
 `--seed` (repeatable) names a path or symbol the plan starts selection from.
 The four budget flags — `--budget` (estimated tokens per slice),
 `--budget-bytes`, `--budget-files` and `--budget-slices` — bound one slice and
-the whole plan. A plan that cannot fit its scope inside those bounds says so;
-it does not silently drop files, because a truncated manifest presented as
+the whole plan. They are **caller budgets, not scale refusals**: they exist
+because a plan must fit a model's window, which is why they are the one family
+of settings that keeps a non-zero default, and a request may raise them above
+that default as well as lower it. They stay honest because a plan that cannot
+fit its scope inside those bounds says so, and because every file a budget
+excludes is named in the manifest with its reason, paginated and never
+summarised. Nothing is silently dropped: a truncated manifest presented as
 complete is the one failure this whole surface exists to prevent.
+
+Seed discovery — the pass that turns `--task` and `--seed` into the candidates
+selection starts from — examines every identity the task names by default. The
+`context.max_seeds` setting bounds it for a caller who wants a smaller plan; a
+task that exceeds a value you set is not truncated in silence, but reported as an
+exclusion naming the key and the value.
+
+A plan that excluded candidates says so in a `notice` line on its own output, and
+that notice names where the reasons are: the manifest header carries counts, not
+lists, so the exclusions themselves are a paged projection reached with
+`codectx context entries <session-id> --view excluded`. Every excluded candidate
+there carries its reason. When `scope_complete` is false the same pointer is
+printed, including on a repeated `plan` that reuses an existing manifest, so an
+incomplete scope is never reported without a route to what is missing.
 
 The manifest is pinned to the generation it was compiled from. Later indexing
 does not move it.
@@ -210,6 +229,16 @@ a capsule is never sealed with records silently omitted.
   between actors and none across a changed file.
 - **There is no waiver shortcut to readiness.** With no waiver, readiness is
   strict; with one, the waiver and its reason travel with the answer.
+- **Disabling the read gate changes the reason, not the attestation.** With
+  `context.strict_read_gate = false` an unfinished read no longer shuts the
+  gate at that precondition, and the rest are still evaluated and reported —
+  but nothing confirmed the coverage, so the session is reported neither
+  `ready_for_implementation` nor `strict_gate_satisfied`, the sealed capsule
+  records the strict gate false, and the answer's `guarantee_limit` begins
+  `strict_read_gate=disabled` instead of naming files the configuration
+  excused. Toggling
+  the key also changes the context-policy fingerprint, so context answers
+  compiled under the other setting are recompiled rather than reused.
 - **Coverage is about the pinned snapshot**, so a session's claims stay true
   even after the repository moves on.
 

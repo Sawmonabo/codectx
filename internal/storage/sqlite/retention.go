@@ -36,6 +36,18 @@ type RetentionPolicy struct {
 	MaxRetainedBytes int64
 }
 
+// bytesBounded and overRetained are the one place this package spells the
+// zero-means-unlimited comparison for MaxRetainedBytes, mirroring
+// config.Limit's own accessors (IsUnlimited and Exceeded -- strictly greater)
+// exactly. The field arrives here as an int64 because this package takes its
+// policy from a caller rather than from configuration, so the semantics travel
+// as these two methods rather than as a hand-rolled `== 0` at each comparison.
+func (p RetentionPolicy) bytesBounded() bool { return p.MaxRetainedBytes > 0 }
+
+func (p RetentionPolicy) overRetained(total int64) bool {
+	return p.bytesBounded() && total > p.MaxRetainedBytes
+}
+
 // RetentionReport is what one pass did and what a stricter limit could still
 // reclaim. BytesReclaimable is measured even when MaxRetainedBytes is 0
 // (unlimited), so `status` can warn before a disk fills: it is the accounted
@@ -212,7 +224,7 @@ func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p R
 			return nil, err
 		}
 	}
-	if p.MaxRetainedBytes == 0 {
+	if !p.bytesBounded() {
 		return kept, nil
 	}
 	var total int64
@@ -223,7 +235,7 @@ func (s *Store) keepByRef(ctx context.Context, repoRaw []byte, active int64, p R
 		total += kept[i].bytes
 	}
 	// kept is most-recent first, so eviction walks it from the back.
-	for i := len(kept) - 1; i >= 0 && total > p.MaxRetainedBytes; i-- {
+	for i := len(kept) - 1; i >= 0 && p.overRetained(total); i-- {
 		if kept[i].generation == active {
 			continue
 		}

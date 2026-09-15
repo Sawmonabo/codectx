@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -149,13 +150,16 @@ func classify(name string) (kind string, label string, part string, ok bool) {
 // importExport streams every recognized CSV file of one export directory into
 // the scratch, in sorted name order so a run reads them the same way every
 // time. Returns the bytes consumed.
-func importExport(ctx context.Context, sc *scratch, dir string, maxRecordBytes int64) (int64, error) {
+func importExport(ctx context.Context, sc *scratch, dir string, maxRecordBytes int64,
+	maxExportFiles config.Limit) (int64, error) {
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, outputInvalid("the export directory cannot be read: %v", err)
 	}
-	if len(entries) > maxExportFiles {
-		return 0, resourceLimit("the export has %d entries, over the %d bound", len(entries), maxExportFiles).WithDetail("limit", "max_export_files")
+	if maxExportFiles.Exceeded(int64(len(entries))) {
+		return 0, resourceLimit("the export has %d entries, over the %d bound the user set",
+			len(entries), maxExportFiles.Value()).WithDetail("limit", "max_export_files")
 	}
 	files := map[string]*exportFile{}
 	for _, ent := range entries {

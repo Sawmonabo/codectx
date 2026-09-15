@@ -394,7 +394,7 @@ func codeOf(err error) string {
 // digest is the durable record and is carried on every diagnostic this path
 // returns. The unit's durable binding is UnitSpec.InputHash, which the
 // coordinator computes over the declared inputs.
-func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string) (indexPath, manifestSHA string, err error) {
+func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.SnapshotView, runDir string, seen *limitSeen) (indexPath, manifestSHA string, err error) {
 	if p.runner == nil {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable, Message: "scip profiles need the shared process runner"})
 	}
@@ -405,14 +405,20 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	// installed distributions, the headers -- and the unit's scope is the
 	// workspace, so a copy narrowed to some subset of files would produce an
 	// index that describes less than the unit claims. See docs/providers-scip.md.
-	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes})
+	// max_materialize_bytes is unlimited by default, so the copy is the whole
+	// snapshot unless an operator asks otherwise. A user-set budget leaves
+	// files out, and the materializer is what reports those exclusions --
+	// count and exemplars, to the operator, from the one place that knows
+	// which files they were. It is deliberately not tallied here: this
+	// provider would only be able to repeat the figure the operator set.
+	mat, err := snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{Dir: filepath.Join(runDir, "src"), MaxBytes: p.limits.MaxMaterializeBytes.Value()})
 	if err != nil {
 		return "", "", p.profileError(prof, "", err)
 	}
 	defer mat.Close()
 	switch prof.Kind {
 	case KindClang:
-		if err := normalizeCompileCommands(mat.Root(), p.limits.MaxManifestBytes); err != nil {
+		if err := normalizeCompileCommands(mat.Root(), p.limits.MaxManifestBytes, seen); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindJava:
@@ -439,7 +445,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	_, err = p.runner.Run(ctx, process.Spec{
 		Path: path, Args: args, Dir: mat.Root(), Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
-		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace,
+		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
 	})
 	if err != nil {
@@ -455,9 +461,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	if !info.Mode().IsRegular() {
 		return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderOutputInvalid, Message: prof.Name() + " output is not a regular file"})
 	}
-	if info.Size() > p.limits.MaxIndexBytes {
-		return "", "", p.profileError(prof, "", overLimit("index bytes", info.Size(), p.limits.MaxIndexBytes))
-	}
+	seen.note(limitIndexBytes, info.Size())
 	indexSHA, err := fileSHA256(output)
 	if err != nil {
 		return "", "", p.profileError(prof, "", err)

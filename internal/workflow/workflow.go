@@ -156,9 +156,13 @@ type Limits struct {
 	// MaxPageItems bounds every page this service returns
 	// (resources.max_page_items).
 	MaxPageItems int
-	// MaxObservationReferences bounds the references on one observation
-	// (model.MaxObservationReferences).
-	MaxObservationReferences int
+	// MaxObservationReferences is the CALLER's ceiling on the references one
+	// observation carries, and on the references a scope review carries across
+	// all eight of its categories (workflow.max_observation_references). It is
+	// unlimited by default: an attestation over a large scope cites what it
+	// read, and it is never refused for the size of the repository. A caller
+	// that set a ceiling is told the ceiling and the count, never trimmed.
+	MaxObservationReferences config.Limit
 	// MaxCapsuleBytes is the CALLER's budget for the serialized capsule
 	// (context.max_capsule_bytes). It is unlimited by default and a request may
 	// raise it: a capsule is reported as over budget only because the caller
@@ -185,6 +189,19 @@ type Limits struct {
 	// default false). It never changes StrictGateSatisfied, which stays false
 	// whenever any waiver exists.
 	AllowExploratoryWaiverConsolidation bool
+	// StrictReadGateDisabled is context.strict_read_gate (user-level only,
+	// default TRUE) as this service reads it, inverted by the caller so that
+	// the zero value here is the enforcing one: a Limits built without this
+	// field can never silently relax the gate.
+	//
+	// When it is set, readiness precondition 3 -- every required file fully
+	// served to this actor at the pinned hashes -- no longer shuts the gate.
+	// The shortfall is not forgiven, it is reported: the gate records that the
+	// read was left unconfirmed, its reason names the configuration, and Strict
+	// -- and therefore the capsule's StrictGateSatisfied, which is taken
+	// straight from it -- stays false. A disabled gate never stamps a strict
+	// claim over a read nothing verified.
+	StrictReadGateDisabled bool
 }
 
 // Service is the Section 17 workflow service. Every field is read-only after
@@ -233,16 +250,16 @@ func New(o Options) (*Service, error) {
 
 // checkLimits rejects a Limits that cannot bound a request. Zero on a request
 // field means the configured default, so a zero default means "unlimited",
-// which Section 20.2 forbids for the page, reference and deadline bounds below.
-// MaxCapsuleBytes is deliberately absent: it is a config.Limit whose zero is
-// the documented "no caller ceiling", not a missing bound.
+// which Section 20.2 forbids for the page and deadline bounds below.
+// MaxCapsuleBytes and MaxObservationReferences are deliberately absent: each is
+// a config.Limit whose zero is the documented "no caller ceiling", not a
+// missing bound.
 func checkLimits(l Limits) error {
 	for _, b := range []struct {
 		name  string
 		value int64
 	}{
 		{"max_page_items", int64(l.MaxPageItems)},
-		{"max_observation_references", int64(l.MaxObservationReferences)},
 		{"query_timeout", int64(l.QueryTimeout)},
 	} {
 		if b.value <= 0 {
@@ -270,6 +287,13 @@ type gate struct {
 	// strict implementation readiness; Strict is the strict gate itself, which
 	// is false whenever any waiver exists.
 	ReadComplete, Ready, Strict, ScopeComplete bool
+	// ReadGateDisabled records that precondition 3 was skipped because
+	// Limits.StrictReadGateDisabled is set AND the read was in fact
+	// incomplete. It is what holds Strict -- and the capsule stamp taken from
+	// it -- false over an unconfirmed read, and it is why the reason names the
+	// configuration rather than telling the operator to read files the
+	// configuration excused.
+	ReadGateDisabled bool
 	// Superseded reports that a newer generation is active than the one this
 	// session pinned. It rides on the gate rather than beside it because Ready
 	// is defined in terms of it and every gate reader must see the same answer.

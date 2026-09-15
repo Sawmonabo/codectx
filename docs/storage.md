@@ -117,7 +117,7 @@ being deleted.
 
 ## The two granularities
 
-Two wave-A importers produce deltas at two different granularities, and
+Two importers produce deltas at two different granularities, and
 `Replaced` expresses both.
 
 | Producer | Delta unit | What the applier names |
@@ -339,7 +339,7 @@ store.SealUnit(ctx, w)
 rep.Manifest.Close()
 ```
 
-This is the sequence the lane's real-tool proof runs (scip-go 0.2.7 over two
+This is the sequence the real-tool proof runs (scip-go 0.2.7 over two
 copies of this repository, one file edited): `changed=1`, `unchanged=173`, and
 the delta-built unit is row-identical to a full re-import across every fact
 table.

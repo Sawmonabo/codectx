@@ -116,9 +116,17 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	}
 
 	// Precondition 3 -- read completeness for this actor, this session, these
-	// pinned hashes.
+	// pinned hashes. context.strict_read_gate (user-level, default true) is the
+	// operator's switch for exactly this precondition: with it off the
+	// shortfall no longer shuts the gate, but it is recorded rather than
+	// forgiven, so the reason below names the configuration and the strict
+	// claim at the end of this function is withheld.
 	if !e.ReadComplete {
-		shut = append(shut, "required files are not all fully served to this actor")
+		if s.limits.StrictReadGateDisabled {
+			e.ReadGateDisabled = true
+		} else {
+			shut = append(shut, "required files are not all fully served to this actor")
+		}
 	}
 
 	// Precondition 6 -- no required-file waiver. A waiver is an honest
@@ -171,7 +179,7 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	}
 
 	if len(shut) > 0 {
-		e.Reason = strings.Join(shut, "; ")
+		e.Reason = e.reason(strings.Join(shut, "; "))
 		return e, nil
 	}
 
@@ -183,12 +191,12 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 		return gate{}, err
 	}
 	if review == nil || review.Review == nil {
-		e.Reason = "no scope review covers this manifest at the current scope version"
+		e.Reason = e.reason("no scope review covers this manifest at the current scope version")
 		return e, nil
 	}
 	for _, entry := range review.Review.Entries {
 		if entry.Blocking {
-			e.Reason = "the current scope review records blocking uncertainty in " + string(entry.Category)
+			e.Reason = e.reason("the current scope review records blocking uncertainty in " + string(entry.Category))
 			return e, nil
 		}
 	}
@@ -198,12 +206,46 @@ func (s *Service) readiness(ctx context.Context, rec sqlite.SessionRecord, m mod
 	// separately: Strict is the strict gate Section 17.3 stamps into a capsule,
 	// Ready is write permission, and a future precondition that shuts one
 	// without the other must not be able to land silently.
+	//
+	// The one thing that does not reach here is a strict claim the disabled
+	// read gate never checked. Precondition 3 was skipped above, so nothing
+	// confirmed the coverage; the gate reports that in its own words, stays
+	// not-strict and therefore not-ready, and the capsule seals
+	// StrictGateSatisfied false. Answering true here would be the silent stamp
+	// this whole branch exists to prevent.
+	if e.ReadGateDisabled {
+		e.Reason = e.reason("every other readiness precondition holds")
+		s.log.Warn("readiness evaluated with the strict read gate disabled",
+			"session_id", string(rec.ID), "scope_version", rec.ScopeVersion,
+			"required_files", e.Required, "fully_read_files", e.FullyRead)
+		return e, nil
+	}
 	e.Strict = true
 	e.Ready = e.Strict && !e.Superseded
 	e.Reason = guaranteeLimit
 	s.log.Warn("strict readiness gate is open",
 		"session_id", string(rec.ID), "scope_version", rec.ScopeVersion, "guarantee", guaranteeLimit)
 	return e, nil
+}
+
+// strictGateDisabledNote is the marker every readiness answer carries once
+// precondition 3 was skipped by configuration. It is a stable, greppable
+// key=value: a reader of a status must be able to tell an unconfirmed read
+// apart from a confirmed one without re-deriving the counts beside it.
+const strictGateDisabledNote = "strict_read_gate=disabled"
+
+// reason prefixes the operator-facing text with the disabled-gate marker when
+// precondition 3 was skipped. Every Reason this package assigns goes through
+// it, so no readiness answer can report a disabled gate as an ordinary one.
+// The marker is deliberately 25 bytes rather than a sentence: it is prefixed
+// onto a join of up to seven shut reasons, and the prose that explains it
+// belongs in the log line and the documentation, not in a field
+// SessionStatus.Validate bounds at model.MaxReasonBytes.
+func (e gate) reason(text string) string {
+	if e.ReadGateDisabled {
+		return strictGateDisabledNote + "; " + text
+	}
+	return text
 }
 
 // superseded reports whether a newer generation is active for this

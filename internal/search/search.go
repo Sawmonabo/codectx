@@ -140,15 +140,29 @@ func (s *Service) Close() error { return nil }
 // which Section 20.1 fixes as the configured maximum, never "unlimited"; a
 // request above it is clamped to it, so lowering the key really does lower the
 // pages this service serves rather than only the model ceiling.
-func (s *Service) pageLimit(limit int) int {
+//
+// It also answers the NOTICE that clamp owes the caller. model.PageRequest
+// refuses a limit above model.MaxPageItems outright, so the storage layer's
+// own clamp collector can never fire on this path -- every read below asks for
+// exactly the wire ceiling. The reachable silent clamp is this one: an
+// operator who lowers resources.max_page_items has every request above it
+// served short, and a caller that cannot tell a clamped page from the end of
+// an answer is the silence the scale posture forbids. The answer carries the
+// notice and, as always, a cursor to read the rest.
+func (s *Service) pageLimit(limit int) (int, string) {
 	maximum := s.maxPage
 	if maximum <= 0 || maximum > model.MaxPageItems {
 		maximum = model.MaxPageItems
 	}
-	if limit <= 0 || limit > maximum {
-		return maximum
+	if limit <= 0 {
+		return maximum, ""
 	}
-	return limit
+	if limit > maximum {
+		return maximum, "a page bound was clamped: requested " + strconv.Itoa(limit) +
+			", effective " + strconv.Itoa(maximum) +
+			" (the configured resources.max_page_items; continue with the cursor to read the rest)"
+	}
+	return limit, ""
 }
 
 // Search answers the lexical + exact discovery endpoint, paging through a
@@ -168,8 +182,17 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if err != nil {
 		return empty, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	// resources.query_timeout bounds the CANDIDATE SEARCH and nothing else.
+	// That is the only unbounded part of this answer -- the tiers walk their
+	// keysets to the end -- and ruling Q4 says the timeout ends a PAGE, not an
+	// answer: the hits ranked before it are a real ordered prefix, and a query
+	// that returned nothing at all because it took too long to look is the
+	// refusal the scale posture forbids. Everything after the search (pinning,
+	// hydrating one page, writing the tail into the continuation spool) is
+	// work over a set already in hand, bounded by one page and one spool
+	// write, and runs under the CALLER's context -- so a search that ended on
+	// its deadline still has a live context to serve its page with, and a
+	// caller who stopped asking still stops all of it.
 	// Every storage read this answer makes resolves its page bound against the
 	// wire ceiling; a request the storage layer served at a different size than
 	// it was asked for is reported on the answer rather than applied silently.
@@ -192,7 +215,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	defer reader.Close()
 	binding := reader.Binding()
 
-	limit := s.pageLimit(req.Page.Limit)
+	limit, clampNotice := s.pageLimit(req.Page.Limit)
 	var (
 		hits      []model.SearchHit
 		truncated bool
@@ -207,7 +230,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		var meta spoolMeta
-		if meta, hits, err = readSpool(ctx, s.spools, cursor, now); err != nil {
+		if meta, hits, restN, err = readSpool(ctx, s.spools, cursor, now, limit); err != nil {
 			return empty, err
 		}
 		// The answer-level truncation the FIRST page computed. A continuation
@@ -215,13 +238,18 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		// of its own to compute it from and must carry it forward or report a
 		// complete answer for an answer that is not.
 		truncated, reason = meta.Truncated, meta.TruncationReason
-		if len(hits) > limit {
-			rest := hits[limit:]
-			hits, restN, tail = hits[:limit], len(rest), sliceTail(rest)
+		if restN > 0 {
+			// The remainder is streamed from the consumed spool into the next
+			// one rather than carried here: it is the tail of the answer, and
+			// a continuation's heap must be the page, not what follows it.
+			tail = spoolTail(ctx, s.spools, cursor, now, len(hits))
 		}
 	} else {
 		var run *pagination.SortedRun[scored]
-		if run, truncated, reason, err = s.rank(ctx, reader, req, filter); err != nil {
+		searchCtx, searchCancel := context.WithTimeout(ctx, s.timeout)
+		run, truncated, reason, err = s.rank(searchCtx, reader, req, filter)
+		searchCancel()
+		if err != nil {
 			return empty, err
 		}
 		defer run.Close()
@@ -235,6 +263,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 
 	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason,
 		Notices: clamps.Notices()}
+	if clampNotice != "" {
+		meta.Notices = append(meta.Notices, clampNotice)
+	}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
@@ -332,11 +363,13 @@ type hitFacts struct {
 // rank runs every tier for one request, folds the candidates and returns the
 // whole ranked answer with its source ranges hydrated.
 //
-// The full answer is hydrated, not just the first page, because every hit that
-// is not served now is spooled and will be served by a continuation that has
-// no byte intervals left to hydrate from -- a spool record is a SearchHit.
-// Hydration is therefore paid once per distinct result (at most maxRankedHits)
-// rather than once per page.
+// The whole answer is hydrated, not just the first page, because every hit
+// that is not served now is spooled and will be served by a continuation that
+// has no byte intervals left to hydrate from -- a spool record is a SearchHit.
+// Hydration is therefore paid once per distinct result, but never for the
+// whole answer at once: it is paid ONE CHUNK AT A TIME, in pageFrom for the
+// page that is served and in tailOf for the remainder as it streams into the
+// continuation spool.
 func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest, filter hitFilter) (*pagination.SortedRun[scored], bool, string, error) {
 	c, err := newCollector(s.spools.SortDir(), s.runBytes)
 	if err != nil {
@@ -350,6 +383,7 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 	// no longer a bound on how many candidates a tier may yield. Candidates are
 	// streamed into the collector, so neither the whole tier result nor the
 	// distinct set ever materialises in heap.
+	deadline := false
 	if err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
 		func(e exactHit) error {
 			r, ok := exactRanked(e)
@@ -358,17 +392,36 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 			}
 			return c.add(r, exactHitOf(e), reasonFor(e.Tier))
 		}); err != nil {
-		return nil, false, "", err
+		// Ruling Q4: the time budget ends a PAGE, not an answer. What the
+		// collector already holds is a real ordered prefix of the answer, and
+		// throwing it away to return an error means the widest queries -- the
+		// only ones that ever reach the deadline -- have no servable answer at
+		// all. The deadline stops the tiers; everything below still runs.
+		if !isQueryDeadline(err) {
+			return nil, false, "", err
+		}
+		deadline = true
 	}
 
-	outcome, err := s.lexicalCandidates(ctx, reader, req, filter, c)
-	if err != nil {
-		return nil, false, "", err
+	var outcome lexicalOutcome
+	if !deadline {
+		var err error
+		if outcome, err = s.lexicalCandidates(ctx, reader, req, filter, c); err != nil {
+			if !isQueryDeadline(err) {
+				return nil, false, "", err
+			}
+			deadline = true
+		}
 	}
 
 	truncated, reason := c.truncation()
 	if !truncated && outcome.Truncated {
 		truncated, reason = true, outcome.Reason
+	}
+	if deadline {
+		// The deadline OVERWRITES a tier's reason: a tier's truncation says the
+		// candidate set was bounded, this says the query stopped looking.
+		truncated, reason = true, deadlineReason
 	}
 
 	run, err := c.results()
@@ -376,6 +429,26 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 		return nil, false, "", err
 	}
 	return run, truncated, reason, nil
+}
+
+// deadlineReason is the truncation a page carries when resources.query_timeout
+// ended the candidate search. It names the key the operator can act on, and
+// the answer still carries its continuation: the hits ranked before the
+// deadline are paged and their tail is spooled like any other answer's.
+const deadlineReason = "the query time budget (resources.query_timeout) ended the candidate search; " +
+	"this page holds the hits ranked before it, and the cursor continues them"
+
+// isQueryDeadline reports whether err is a time-budget failure. It is the one
+// error the candidate search converts into a truncated page rather than a
+// failed query.
+func isQueryDeadline(err error) bool {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return typed.Code == model.CodeQueryDeadline
+	}
+	// A storage read returns the bare context error; only this package maps it
+	// to the typed answer, and the tiers are below that mapping.
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // errStopWalk ends a sorted-run walk early. SortedRun.Each returns a
@@ -483,19 +556,6 @@ func (s *Service) tailOf(ctx context.Context, reader *sqlite.PinnedReader, run *
 			return err
 		}
 		return flush()
-	}
-}
-
-// sliceTail streams an already-materialised tail, which is what a continuation
-// replayed from a spool still has.
-func sliceTail(hits []model.SearchHit) func(func(model.SearchHit) error) error {
-	return func(yield func(model.SearchHit) error) error {
-		for _, h := range hits {
-			if err := yield(h); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
 }
 
@@ -740,7 +800,8 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 		}
 	}
 
-	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, s.pageLimit(req.Page.Limit))
+	limit, clampNotice := s.pageLimit(req.Page.Limit)
+	result, err := resolveSymbols(ctx, reader, req, cursor.LastKey, limit)
 	if err != nil {
 		return empty, err
 	}
@@ -748,6 +809,9 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 		return empty, err
 	}
 	meta := model.QueryMeta{Binding: binding}
+	if clampNotice != "" {
+		meta.Notices = append(meta.Notices, clampNotice)
+	}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}

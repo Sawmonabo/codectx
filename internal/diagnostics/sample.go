@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,12 +42,18 @@ type HostSamplerOptions struct {
 	Processes []ProcessCounter
 }
 
-// maxWalkedEntries bounds one directory measurement. Section 6 requires a
-// finite bound on every traversal, and a content-addressed store is the one
-// directory in this application that grows with the repository. A walk that
-// reaches the bound reports the figure as absent rather than partial, because a
-// CAS size that silently stops at 200k objects is a wrong measurement, not an
-// incomplete one.
+// maxWalkedEntries is where one directory measurement stops counting and
+// starts disclosing. A content-addressed store is the one directory in this
+// application that grows with the repository, and a sampler runs on a timer,
+// so a complete walk of every object on every sample is a cost the measurement
+// does not justify.
+//
+// Reaching it neither fails the sample nor hides it: the figure is the bytes
+// actually walked, reported as a floor, and the sampler says so in the log
+// with the entry count it stopped at. A floor is strictly more useful than the
+// absent figure this used to produce -- pressure against
+// resources.max_temp_bytes is actionable as soon as the floor crosses it --
+// and the log line is what keeps the floor from being read as the whole.
 const maxWalkedEntries = 200000
 
 // HostSampler is the Sampler implementation that reads this host.
@@ -168,7 +175,8 @@ func (h *HostSampler) tempBytes() *uint64 {
 
 // directoryBytes sums the apparent size of every regular file under dir. A
 // directory that does not exist yet is legitimately zero bytes; any other
-// failure, and a subtree larger than the traversal bound, is absent.
+// failure is absent. A subtree larger than maxWalkedEntries is summed as far
+// as the walk went and disclosed as a floor, never dropped.
 func directoryBytes(dir string) *uint64 {
 	var total uint64
 	var seen int
@@ -199,6 +207,10 @@ func directoryBytes(dir string) *uint64 {
 	switch {
 	case err == nil:
 		return &total
+	case errors.Is(err, errWalkBound):
+		slog.Warn("a measured directory is larger than one sample walks; the reported size is a floor",
+			"component", "diagnostics", "entries_walked", seen-1, "bytes_at_least", total)
+		return &total
 	case os.IsNotExist(err):
 		zero := uint64(0)
 		return &zero
@@ -208,8 +220,8 @@ func directoryBytes(dir string) *uint64 {
 }
 
 // errWalkBound stops a traversal that reached maxWalkedEntries. It is never
-// returned to a caller: it makes the figure absent, which is the honest report
-// for a subtree this sampler refused to finish walking.
+// returned to a caller: it turns the figure into the disclosed floor
+// maxWalkedEntries describes.
 var errWalkBound = errors.New("directory traversal reached its bound")
 
 // parentRSSBytes reads this process's resident set size from /proc/self/statm,

@@ -184,9 +184,11 @@ func (e ScopeReviewEntry) Validate() error {
 	if err := requireTrimmed("scope_review_entry.note", e.Note, MaxNoteBytes); err != nil {
 		return err
 	}
-	if err := boundCount("scope_review_entry.references", len(e.References), MaxObservationReferences); err != nil {
-		return err
-	}
+	// No count ceiling: a review category cites what the actor read, and a
+	// large scope legitimately cites a lot of it. The operator's own ceiling is
+	// workflow.max_observation_references (unlimited by default), applied to
+	// the whole attestation by workflow.Service.checkReferenceCount, which
+	// reports the ceiling and the count instead of refusing an anonymous bound.
 	for _, r := range e.References {
 		if err := r.Validate(); err != nil {
 			return err
@@ -267,9 +269,9 @@ func (r ObservationRequest) Validate() error {
 	if err := requireTrimmed("observation.note", r.Note, MaxNoteBytes); err != nil {
 		return err
 	}
-	if err := boundCount("observation.references", len(r.References), MaxObservationReferences); err != nil {
-		return err
-	}
+	// No count ceiling here either; see ScopeReviewEntry.Validate. The
+	// distinctness map below is the only thing that grows with the list, and
+	// it is the caller's own request, already in memory.
 	seen := make(map[string]bool, len(r.References))
 	relations := 0
 	for i, ref := range r.References {
@@ -640,9 +642,9 @@ func (r ObservationReference) Validate() error {
 	if !r.Kind.Valid() {
 		return invalid("observation_reference.kind %q is not a known observation kind", truncateForMessage(string(r.Kind)))
 	}
-	if err := boundCount("observation_reference.references", len(r.References), MaxObservationReferences); err != nil {
-		return err
-	}
+	// No count ceiling: this record is READ back from stored observations that
+	// were admitted under the operator's ceiling at write time, so refusing one
+	// here would make an already-stored attestation unreadable.
 	for _, ref := range r.References {
 		if err := ref.Validate(); err != nil {
 			return err

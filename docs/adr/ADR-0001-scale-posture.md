@@ -94,9 +94,11 @@ facts on a 604-file cut of the same generator). Because the cost is per identity
 source byte, the ratio moves with the corpus while the per-symbol number does not — which is why
 the per-symbol number, not the ratio, became the primary regression metric.
 
-The same reference-scale run recorded the other open miss: an indexing **process-tree peak of
-912.6 MiB against a 768 MiB envelope**, with the cold index itself passing at 2 m 56 s against a
-3 min target.
+The same reference-scale run recorded a second miss at the time: an indexing process-tree peak of
+912.6 MiB against a 768 MiB envelope, with the cold index itself passing at 2 m 56 s against a
+3 min target. Re-measured after the planner's external merge sort and the batched provider sinks
+landed, the same corpus indexes in 1 m 32 s with a **145.3 MiB** process-tree peak (two cold runs,
+250 ms and 50 ms sampling, within 0.1 MiB of each other), so that miss is closed.
 
 ---
 
@@ -184,7 +186,7 @@ continuation spool, and membership is answered **per level in one sequential swe
 
 **Alternatives considered.**
 
-*A roaring bitmap over dense node ordinals* [S10][S11] — the plan's own first proposal, and the
+*A compressed bitmap over dense node ordinals* [S10][S11] — the plan's own first proposal, and the
 standard answer for a visited set. **Rejected on evidence from the schema**: a node identity here
 is a content hash, not an ordinal, so there is no dense integer id space for a bitmap to compress.
 A bitmap would first require assigning dense ids, which is a storage change of its own. The
@@ -602,16 +604,23 @@ data opaquely as a blob rather than as rows, with a further 50 % cut from flatte
 messages [S28]. Another mature design stores entries once in sorted first-normal-form and leaves
 query indexing to the consumer, and explicitly sanctions hashing wide signatures down to
 fingerprints [S29] — a lever *not* taken here, because it would change canonical identities and
-therefore determinism, and it is recorded as the next one if the redesign misses.
+therefore determinism, and it is recorded as the next one if the redesign misses. Held in the same
+reserve is the second-order change to the evidence family, which is 21.6 % of the file as one row
+per fact-to-owner link plus its indexes: replacing those rows with a compressed integer set per
+owner plus a fact-id interval map. The closest published analogue solves the identical
+fact-to-owner problem with exactly that pair of structures, at **+7 %** of *its own* database size
+and 2–3 % more index time [S25]. It is second-order here — attempted only if the surrogates and the
+interning miss the gate — because it is a schema change to one family rather than a change at every
+reference site.
 
 **Why bytes-per-symbol is the metric.** The cost is per identity, so it scales with symbols, not
 source bytes: the same symbol count spread over 14× more source moves the *ratio* by roughly that
 factor while the per-symbol cost does not move at all. Measured at ≈3.4 KB per indexed symbol
 today; 3.5× on the original corpus would imply ≈158 B per symbol. Cross-system calibration brackets
-the target without settling it: a whole-corpus positional-trigram index measures about 3–3.5× of
-corpus size, but it also stores a copy of the content and is a substring index, not a fact store
-[S21]; the like-for-like pair is an integer-id fact store at 0.8 GB against a normalised-SQLite
-code-fact store at 5.2 GB on the same corpus — **6.5×**, the same direction and magnitude as the
+the target without settling it: a published whole-corpus positional-trigram index measures about
+3–3.5× of corpus size, but it also stores a copy of the content and is a substring index, not a
+fact store [S21]; the like-for-like pair is a published integer-id fact store at 0.8 GB against a
+normalised-SQLite code-fact store at 5.2 GB on the same corpus — **6.5×**, the same direction and magnitude as the
 gap being closed [S27]. Neither says 3.5× is right for this product. Only re-measurement can.
 
 **Determinism and migration.** Canonical hashes exclude operational identifiers by specification,
@@ -694,7 +703,7 @@ whose lists are shorter than the counts the seal pinned.
 | Index planning | Sort run buffer + fan-in × block size; the plan's own unit list remains and is named |
 | Graph traversal | Resumed frontier (frontier byte budget) + this page's admissions (page items) + one level's probes + one page of relations + one spool record |
 | Providers | One batch (batch records / batch bytes) + the per-sink pool reservation; truncation bounds each row |
-| Search | Distinct results in the answer, plus the deduplication set for a range scan — **both open** |
+| Search | Sort run buffer + merge fan-in blocks + one page |
 | Process tree | Fixed capture buffers; admission reservations taken together under one lock |
 | Storage writes | One batch; interning is a bounded cache flushed per batch |
 
@@ -722,16 +731,31 @@ duplicates an existing assertion.
   its two successors, `context.max_capsule_records_per_list` and
   `context.max_capsule_coverage_files`, are unlimited by default and only an operator-set value
   refuses work.
-- **Two reference-scale misses** stand: the indexing process-tree peak at **912.6 MiB against a
-  768 MiB envelope**, and storage at **16.10× against 3.5×**. The first is to be re-measured now
-  that the planner's external merge and the batched provider sinks have landed; if it still
-  exceeds, a profiling pass owns it. The second is the storage wave's to close (§2.8).
-- **Search heap** is proportional to the answer and, for a short prefix query, to the range scan
-  (§2.4). The external sorter that fixes it exists but is not yet wired.
+- **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage wave's to
+  close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
+  the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
+- **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
+  external sort primitive (§2.4), so peak heap on this path is the sort run buffer plus the merge
+  fan-in's blocks plus one page, independent of the match count. The two residuals §2.4 names are
+  the ones that stand: a continuation page still materialises the whole spooled tail it was handed
+  before re-spooling the remainder, and per-request sort runs are not charged to the temporary-byte
+  reservation, though they live under the same spool directory and the sweeper counts them as real
+  disk.
 - **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).
 - Smaller residuals are recorded at their sites: an undisclosed cut on a joined documentation body,
-  one provider-side derived-row refusal, an unconverted observation-reference count, and a clamp
-  notice that is recorded but has no reader on two query paths.
+  and a clamp notice that is recorded but still has no reader on the context and adjacency query
+  paths -- neither of them builds the answer metadata the notice would travel on, so carrying it
+  needs a field on the context manifest and an installation at the graph engine's own metadata
+  sites. The provider-side derived-row refusal is closed. The observation-reference count is a
+  user-set bound at the service boundary but the wire contract still refuses more than 64 references
+  on a single observation, so the aggregate path is unlimited and the single-observation path is
+  not.
+- **The traversal reads that unlimited defaults have now unbounded in heap**: the repository map's
+  containment read accumulates one page of containers' children in one slice, and the shortest-path
+  walk holds its settled set, distances and read edges for the walk. The finite defaults used to
+  bound all four; the page bound now covers only the containers, not the children. Each needs the
+  same treatment the ranked set got -- a keyset-paged containment read and a spilled frontier --
+  and until then their peak is a function of one container's fan-out rather than of a page.
 
 ### 3.4 What verification on real repositories must show
 

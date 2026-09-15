@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -90,14 +91,27 @@ type Options struct {
 	UnitMemoryCeilingBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
-	// MaxUnitsPerFamily and MaxStagedRows are the two user-set reporting
-	// thresholds of `[providers.dependence]`, 0 (the default) meaning no
-	// threshold at all. Neither refuses anything: a repository's project count
-	// and an export's row count are properties of the source, so exceeding
-	// either is published on the unit's capability rows -- never a plan
-	// refusal, never a silently truncated list, never a failed unit.
-	MaxUnitsPerFamily int64
-	MaxStagedRows     int64
+	// MaxUnitsPerFamily, MaxStagedRows and MaxDerivedRows are the three
+	// user-set reporting thresholds of `[providers.dependence]`, 0 (the
+	// default) meaning no threshold at all. None refuses anything: a
+	// repository's project count, an export's row count and the occurrences
+	// that project from it are properties of the source, so exceeding one is
+	// published on the unit's capability rows -- never a plan refusal, never a
+	// silently truncated list, never a failed unit.
+	//
+	// They are config.Limit values rather than plain integers: the type is
+	// what carries "0 and unlimited are the same absent bound" and the strict
+	// Exceeded comparison, and a copy re-declared as an int64 here would be a
+	// second place those semantics could drift.
+	MaxUnitsPerFamily config.Limit
+	MaxStagedRows     config.Limit
+	MaxDerivedRows    config.Limit
+	// MaxExportFiles is the user's bound on the entries of one export
+	// directory, unlimited by default. Unlike the three thresholds above it
+	// refuses the import when a user set it and the export crosses it, which
+	// is the only thing an entry count can honestly do: the files are the
+	// import's input, not its output.
+	MaxExportFiles config.Limit
 }
 
 // Provider is the dependence provider.Provider. One instance serves a process
@@ -132,8 +146,8 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	if opts.Timeout < 0 || opts.StallTimeout < 0 {
 		return nil, invalid("the dependence provider's unit timeout and stall timeout may not be negative")
 	}
-	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 {
-		return nil, invalid("the dependence provider's max_units_per_family and max_staged_rows may not be negative; 0 is no threshold")
+	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 || opts.MaxDerivedRows < 0 {
+		return nil, invalid("the dependence provider's max_units_per_family, max_staged_rows and max_derived_rows may not be negative; 0 is no threshold")
 	}
 	if err := opts.Limits.Validate(); err != nil {
 		return nil, err
@@ -314,6 +328,10 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
+	// Storage fields the import had to cut to their model ceiling. Nothing was
+	// refused: the fact carries the clipped value, and the row says which
+	// fields were clipped and how many values each cut covered.
+	pub.TruncatedFields = report.TruncatedFields
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
@@ -327,14 +345,19 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	// pub.OverUnitsPerFamily may already carry a subdivided unit's part count
 	// against the same threshold; the plan's count is the larger claim about
 	// the family and takes it.
-	if n := plan.Projects[unit.Family]; p.opts.MaxUnitsPerFamily > 0 && int64(n) > p.opts.MaxUnitsPerFamily && n > pub.OverUnitsPerFamily {
-		pub.OverUnitsPerFamily, pub.UnitsPerFamilyBound = n, p.opts.MaxUnitsPerFamily
+	if n := plan.Projects[unit.Family]; p.opts.MaxUnitsPerFamily.Exceeded(int64(n)) && n > pub.OverUnitsPerFamily {
+		pub.OverUnitsPerFamily, pub.UnitsPerFamilyBound = n, p.opts.MaxUnitsPerFamily.Value()
 	}
 	// The unit's staged rows are the sum over its parts when it was subdivided,
 	// so the threshold is compared here rather than read off the flag: a unit
 	// can cross it in total without any one part crossing it alone.
-	if p.opts.MaxStagedRows > 0 && report.StagedRows > p.opts.MaxStagedRows {
-		pub.StagedRows, pub.StagedRowsBound = report.StagedRows, p.opts.MaxStagedRows
+	if p.opts.MaxStagedRows.Exceeded(report.StagedRows) {
+		pub.StagedRows, pub.StagedRowsBound = report.StagedRows, p.opts.MaxStagedRows.Value()
+	}
+	// The projected occurrences are summed over a subdivided unit's parts for
+	// the same reason, and compared here for the same one.
+	if p.opts.MaxDerivedRows.Exceeded(report.DerivedRows) {
+		pub.DerivedRows, pub.DerivedRowsBound = report.DerivedRows, p.opts.MaxDerivedRows.Value()
 	}
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
@@ -350,11 +373,13 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
+		"truncated_fields", len(report.TruncatedFields),
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"unplanned_projects", pub.UnplannedProjects,
 		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
 		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
+		"derived_rows", report.DerivedRows, "over_max_derived_rows", report.OverDerivedRows,
 		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
 		"keys_removed", report.Removed)
@@ -406,11 +431,6 @@ func (p *Provider) openRun(req provider.UnitRequest) (*runDir, error) {
 func runsRoot(dataDir string) string    { return filepath.Join(dataDir, "dependence", "runs") }
 func scratchRoot(dataDir string) string { return filepath.Join(dataDir, "dependence", "scratch") }
 
-// maxSweptEntries bounds the startup sweep's directory scan, so a corrupted or
-// hand-filled private root can never turn provider construction into an
-// unbounded walk (Section 6: an explicit finite bound on every traversal).
-const maxSweptEntries = 4096
-
 // sweepPrivate removes everything left under the provider's private working
 // roots. defer covers every return and every panic but not SIGKILL or power
 // loss, and a killed unit leaves a materialization, a graph, an export and a
@@ -432,16 +452,26 @@ func sweepPrivate(dataDir string) {
 		if err != nil {
 			continue
 		}
-		if len(entries) > maxSweptEntries {
-			entries = entries[:maxSweptEntries]
-		}
+		// Every entry is swept, however many there are. The scan used to stop
+		// at a fixed count, which left the rest of a large private root on
+		// disk without saying so -- and saved nothing, because the directory
+		// was already read in full to find them. What the sweep did is
+		// disclosed as a count per root, so leftover disk is visible even when
+		// per-entry logging is not read.
+		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())
 			if err := os.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				failed++
 				slog.Error("a stale dependence working directory was not removed", "component", component, "error", err)
 				continue
 			}
+			swept++
 			slog.Info("a stale dependence working directory was swept", "component", component, "name", e.Name())
+		}
+		if swept > 0 || failed > 0 {
+			slog.Info("the dependence provider swept a private working root", "component", component,
+				"entries", len(entries), "swept", swept, "not_removed", failed)
 		}
 	}
 }
@@ -488,7 +518,7 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 			return publication{}, ImportReport{}, err
 		}
 		return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(outcome),
-			OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily}, report, nil
+			OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily.Value()}, report, nil
 	}
 
 	exp, err := p.export(ctx, req, unit, res, run, graph)
@@ -685,6 +715,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows,
+		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles,
 		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		return ImportReport{}, err
@@ -713,7 +744,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 	// unit the caller wanted to hear about, so crossing it is reported on
 	// every capability row this subdivided unit publishes.
 	overParts := 0
-	if p.opts.MaxUnitsPerFamily > 0 && int64(len(children)) > p.opts.MaxUnitsPerFamily {
+	if p.opts.MaxUnitsPerFamily.Exceeded(int64(len(children))) {
 		overParts = len(children)
 		slog.Warn("a subdivided dependence unit has more parts than providers.dependence.max_units_per_family; every part is analysed",
 			"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
@@ -836,6 +867,8 @@ func merge(a, b ImportReport) ImportReport {
 	// crossed on its own is never lost behind a sum.
 	a.StagedRows += b.StagedRows
 	a.OverStagedRows = a.OverStagedRows || b.OverStagedRows
+	a.DerivedRows += b.DerivedRows
+	a.OverDerivedRows = a.OverDerivedRows || b.OverDerivedRows
 	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
@@ -843,6 +876,17 @@ func merge(a, b ImportReport) ImportReport {
 		}
 		for l, n := range b.UnknownLabels {
 			a.UnknownLabels[l] += n
+		}
+	}
+	// Each part cuts its own oversize descriptive fields, so the unit's count
+	// per field is the sum over its parts. Dropping this sum would lose the
+	// report for exactly the largest units, which are the ones subdivided.
+	if b.TruncatedFields != nil {
+		if a.TruncatedFields == nil {
+			a.TruncatedFields = map[string]int{}
+		}
+		for f, n := range b.TruncatedFields {
+			a.TruncatedFields[f] += n
 		}
 	}
 	return a

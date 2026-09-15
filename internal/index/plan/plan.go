@@ -235,6 +235,14 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	// The run buffer is charged in BYTES as well as records. A model.UnitInput
+	// is two bounded hex ids, so the record count alone would be a ~13 MiB
+	// constant -- but "bounded" is the field ceiling, not a fixed width, and a
+	// byte budget is what makes the planner's peak the same operator-set
+	// number the query path's sorts already respect instead of a second,
+	// implicit one. resources.query_memory_bytes is that number, and
+	// pagination.SortRunBytes takes one sort's quarter share of it.
+	sorter = sorter.WithRunBytes(pagination.SortRunBytes(in.Config.Resources.QueryMemoryBytes), sizeOfInput)
 	b.allInputs = sorter
 	// Sorted() removes the runs on the success path; this covers every early
 	// return, which would otherwise leave spill files behind.
@@ -811,6 +819,16 @@ func decodeInput(b []byte) (model.UnitInput, error) {
 		return model.UnitInput{}, internalErr("decoding a unit input from the plan's external sort: " + err.Error())
 	}
 	return in, nil
+}
+
+// sizeOfInput charges one buffered input against the run's byte budget: the
+// two id strings plus the slice header and the two string headers the buffer
+// holds them in. It is the retained heap of one record, not its encoded
+// length; the encoded form is written straight to the run file and never
+// accumulates.
+func sizeOfInput(in model.UnitInput) int64 {
+	const overhead = 64
+	return int64(len(in.FileID)+len(in.ContentHash)) + overhead
 }
 
 // compareInput orders the sort by the same key model.UnitInputHasher requires,

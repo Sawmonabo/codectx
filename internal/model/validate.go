@@ -1,16 +1,23 @@
 package model
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
-// Structural bounds enforced by this package. They are absolute contract
-// ceilings, not the tunable resource policy of Section 20.1: configuration may
-// lower an effective limit but never raise one past the value a stored column
-// or a bounded response can hold. Sizes are byte counts, not rune counts.
+// Structural bounds enforced by this package, not the tunable resource policy
+// of Section 20.1: configuration may lower an effective limit but never raise
+// one past the value a stored column or a bounded response can hold. Sizes are
+// byte counts, not rune counts.
+//
+// They are not all enforced the same way. A ceiling on a value that is matched,
+// joined or addressed by its exact bytes is a REJECTION; a ceiling on a
+// descriptive or explanatory field is a storage width its producer shortens and
+// flags, and this package admits an over-wide value rather than failing the unit
+// or the answer that carries it. truncatingField is that classification.
 const (
 	MaxIdentifierBytes    = 256   // provider/capability/actor/policy identifiers
 	MaxLanguageBytes      = 64    // language tag
@@ -46,13 +53,20 @@ const (
 	MaxRelationsPerPath        = 64 // edges retained in one explanation path
 	MaxAmbiguousCandidates     = 16 // Section 9.4 bounded may_refer_to candidates
 	MaxCapabilityStates        = 256
-	MaxObservationReferences   = 64
 	MaxReceiptsPerConfirmation = 16 // Section 20.1 coverage.max_receipts_per_confirmation
-	// MaxRecordsPerResult bounds any list a single result carries that is not
-	// itself a Page: Section 6 requires an explicit finite bound on every
-	// response. It no longer reaches the capsule, whose lists are durable rows
-	// read a page at a time and bounded only by the two user-set
-	// context.max_capsule_* keys, unlimited by default.
+	// MaxRecordsPerResult bounds ONE PAGE of any list a result carries that is
+	// not itself a Page: Section 6 requires an explicit finite bound on every
+	// response.
+	//
+	// It is a page width, never a ceiling on the ANSWER. A repository whose
+	// impact set is 1284 packages has an impact answer of 1284 packages; the
+	// producer owes the caller two pages and a cursor, and boundPage says so
+	// when it does not. Refusing the answer for its size is the failure the
+	// bound exists to prevent, not the bound.
+	//
+	// It no longer reaches the capsule, whose lists are durable rows read a page
+	// at a time and bounded only by the two user-set context.max_capsule_* keys,
+	// unlimited by default.
 	MaxRecordsPerResult = 1000
 	MaxEvidencePerFact  = 64 // Section 11.1: a fact carries bounded evidence
 )
@@ -124,11 +138,97 @@ func requireField(field, value string, max int) *Error {
 }
 
 // boundField enforces a byte ceiling on an optional value.
+//
+// A value over its ceiling is a rejection only where shortening it would
+// change what the value MEANS. Every other ceiling is a storage width, and a
+// stored fact that is wider than its column is shortened by its producer
+// through TruncateField and flagged in the record's `truncated_fields` meta --
+// never a reason to fail the unit that produced it or the answer that carries
+// it. Refusing there answers nothing; a clipped signature still answers most
+// questions about the symbol it belongs to.
+//
+// truncatedFields below is the whole of that classification, keyed by the
+// field's last name segment so that a new record type inherits the verdict its
+// fields already carry.
 func boundField(field, value string, max int) *Error {
-	if len(value) > max {
-		return invalid("%s is %d bytes, limit %d", field, len(value), max)
+	if len(value) <= max {
+		return nil
 	}
-	return nil
+	if truncatingField(field) {
+		return nil
+	}
+	return invalid("%s is %d bytes, limit %d", field, len(value), max)
+}
+
+// truncatedFields are the field names whose value is shortened and flagged by
+// its producer instead of rejected here. They are keyed by NAME, not by
+// ceiling: MaxNameBytes and MaxReasonBytes are both 512 and
+// MaxQualifiedNameBytes, MaxScopeKeyBytes and MaxNativeKeyBytes are all 2048,
+// so the ceiling does not separate a storage width from a join key.
+//
+// What is in the set: the descriptive fields of a stored fact (name,
+// qualified_name, from_name, signature), the machine-readable particulars of a
+// degradation (detail, details, remediation), and the explanatory lists an
+// answer carries (reasons, warnings, notices, truncation_reason). None of them
+// is matched, joined or addressed by its exact bytes, and every one of them
+// sits on a record nobody can resubmit: refusing one fails the unit that
+// produced it or the answer that carries it, and answers nothing.
+//
+// What is deliberately NOT in it, and why each is identity:
+//
+//   - id, version, provider_id, capability, actor_id, policy_version,
+//     analysis_config_hash, action, code, diagnostic_code (MaxIdentifierBytes)
+//     -- matched exactly; a reader switches on the code and joins on the id, so
+//     a shortened one names a different thing or nothing.
+//   - language (MaxLanguageBytes) -- an exactly matched tag; "typescrip" names
+//     no language, and no legitimate tag approaches 64 bytes.
+//   - path (MaxPathBytes) -- a truncated path names a different file, or none.
+//   - scope_key (MaxScopeKeyBytes), native_key / strong_key / canonical_key
+//     (MaxNativeKeyBytes) -- the keys unit reuse and symbol resolution join on.
+//   - cursor, next_cursor, receipt (MaxTokenBytes) and read_chunk_response
+//     content (MaxChunkContentBytes) -- signed tokens and wire-encoding
+//     ceilings; a clipped cursor verifies as nothing.
+//   - note, task, query, reason on a waiver or an exclusion -- an actor's own
+//     text on a REQUEST. The caller is present and can resubmit, and silently
+//     clipping an attestation or a query falsifies it rather than shortening
+//     it. Rejecting a request is not the failure this rule is about.
+var truncatedFields = map[string]bool{
+	"name": true, "qualified_name": true, "from_name": true, "signature": true,
+	"detail": true, "details": true, "remediation": true,
+	"reasons": true, "warnings": true, "notices": true, "truncation_reason": true,
+}
+
+// fieldVerdictOverrides settles the three fields whose last name segment gives
+// the wrong verdict, so the segment rule stays simple and the exceptions are
+// visible rather than implied.
+var fieldVerdictOverrides = map[string]bool{
+	// A doctor check is addressed by its name -- an operator and a script both
+	// match on it -- so it is an identifier that happens to be spelled "name".
+	"doctor_check.name": false,
+	// Both of these are answer-carried explanation, not the actor request text
+	// the other `reason`-shaped fields are: nobody can resubmit the compiled
+	// context an entry was excluded from, or the session status that names
+	// which guarantee limited it.
+	"session_status.guarantee_limit": true,
+	"excluded_context_entry.reason":  true,
+}
+
+// truncatingField reports whether a value over its ceiling is shortened and
+// flagged by its producer rather than rejected here. field is a dotted path
+// such as "node.qualified_name" or "search_hit.reasons[2]"; the verdict is
+// carried by its last segment unless fieldVerdictOverrides settles the whole
+// path, so a new record type inherits the verdict its fields already carry.
+func truncatingField(field string) bool {
+	if i := strings.IndexByte(field, '['); i >= 0 {
+		field = field[:i]
+	}
+	if verdict, ok := fieldVerdictOverrides[field]; ok {
+		return verdict
+	}
+	if i := strings.LastIndexByte(field, '.'); i >= 0 {
+		field = field[i+1:]
+	}
+	return truncatedFields[field]
 }
 
 // requireTrimmed rejects a value that is empty or only whitespace, matching the
@@ -166,6 +266,25 @@ func boundCount(field string, n, max int) *Error {
 		return invalid("%s has %d entries, limit %d", field, n, max)
 	}
 	return nil
+}
+
+// boundPage bounds ONE PAGE of a result list at MaxRecordsPerResult.
+//
+// Over-length here is a PRODUCER defect, not a client error and never a verdict
+// on the size of the repository: the caller asked a question whose honest
+// answer has more rows than one page holds, and the producer owed it a page
+// plus a cursor. So this reports CodeInternal and names the obligation, rather
+// than handing the caller a CTX_ARGUMENT_INVALID they can do nothing about --
+// which is what refused a whole 1284-package impact answer on a 4019-file
+// repository.
+func boundPage(field string, n int) *Error {
+	if n <= MaxRecordsPerResult {
+		return nil
+	}
+	return &Error{Code: CodeInternal, Message: fmt.Sprintf(
+		"%s carries %d records in one page, over the %d-record page width; "+
+			"the producer must return one page and a cursor for the rest",
+		field, n, MaxRecordsPerResult)}
 }
 
 // boundSigned64 enforces the Section 9.3 rule that an unsigned byte quantity

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -107,6 +108,12 @@ type Emitter struct {
 	records      uint64
 	bytes        uint64
 	states       []model.CapabilityState
+
+	// clipped counts evidence occurrences dropped because the fact already
+	// carries model.MaxEvidencePerFact of them. The fact itself is still
+	// published; the count is what keeps that truncation from being silent,
+	// and Result publishes it on every capability state of the unit.
+	clipped int
 }
 
 // NewEmitter binds an emitter to the unit and the file it indexes.
@@ -139,7 +146,7 @@ func (e *Emitter) Node(ctx context.Context, cand model.NodeCandidate, a Attrs) (
 	}
 	ev := e.evidence(node.ID, "", a)
 	if i, dup := e.seenNode[node.ID]; dup {
-		e.nodes[i].Evidence = appendEvidence(e.nodes[i].Evidence, ev)
+		e.nodes[i].Evidence = e.appendEvidence(e.nodes[i].Evidence, ev)
 		return node, nil
 	}
 	e.seenNode[node.ID] = len(e.nodes)
@@ -162,7 +169,7 @@ func (e *Emitter) Relation(from model.NodeID, kind model.RelationKind, to model.
 	rel := model.Relation{ID: model.NewRelationID(e.req.Binding.RepositoryID, from, kind, to), From: from, Kind: kind, To: to}
 	ev := e.evidence("", rel.ID, a)
 	if i, dup := e.seenRel[rel.ID]; dup {
-		e.relations[i].Evidence = appendEvidence(e.relations[i].Evidence, ev)
+		e.relations[i].Evidence = e.appendEvidence(e.relations[i].Evidence, ev)
 		return nil
 	}
 	e.seenRel[rel.ID] = len(e.relations)
@@ -262,10 +269,34 @@ func (e *Emitter) Capability(capability string, state model.CapabilityStateValue
 	e.states = append(e.states, cs)
 }
 
+// CapabilityDetail adds one bounded diagnostic pair to the state already
+// recorded for capability, so a provider can report what a bound cut and by
+// how much alongside the state that cut it. A capability with no state yet is
+// ignored: a detail without its state would name a degradation nobody
+// declared.
+func (e *Emitter) CapabilityDetail(capability, key, value string) {
+	for i := range e.states {
+		if e.states[i].Capability == capability {
+			e.states[i] = e.states[i].WithDetail(key, value)
+			return
+		}
+	}
+}
+
 // Result is the succeeded result for this unit with its counters and
 // per-file capability states.
 func (e *Emitter) Result() model.ProviderResult {
-	return model.ProviderResult{RunID: e.req.Run, State: model.RunSucceeded, Capabilities: e.states, RecordsEmitted: e.records, BytesProcessed: e.bytes}
+	states := e.states
+	if e.clipped > 0 {
+		// Occurrences were cut by the per-fact evidence bound. Every
+		// capability this unit publishes carries the count, so the answer
+		// built from these facts can say how much evidence it is missing.
+		states = make([]model.CapabilityState, len(e.states))
+		for i, cs := range e.states {
+			states[i] = cs.WithDetail("evidence_clipped", strconv.Itoa(e.clipped))
+		}
+	}
+	return model.ProviderResult{RunID: e.req.Run, State: model.RunSucceeded, Capabilities: states, RecordsEmitted: e.records, BytesProcessed: e.bytes}
 }
 
 // evidence builds one evidence row for this unit and run. Every row binds
@@ -279,14 +310,17 @@ func (e *Emitter) evidence(node model.NodeID, rel model.RelationID, a Attrs) mod
 }
 
 // appendEvidence adds ev unless an identical occurrence is already present
-// or the fact's evidence is at its bound.
-func appendEvidence(list []model.Evidence, ev model.Evidence) []model.Evidence {
+// or the fact's evidence is at its bound. A duplicate is not a loss and is
+// not counted; an occurrence cut by the bound is, so the unit reports how
+// many occurrences it did not store instead of dropping them in silence.
+func (e *Emitter) appendEvidence(list []model.Evidence, ev model.Evidence) []model.Evidence {
 	for _, have := range list {
 		if have.ID == ev.ID {
 			return list
 		}
 	}
 	if len(list) >= model.MaxEvidencePerFact {
+		e.clipped++
 		return list
 	}
 	return append(list, ev)
