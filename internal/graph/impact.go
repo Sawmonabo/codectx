@@ -898,11 +898,11 @@ type impactAccumulator struct {
 // continuation this leg was handed, or nil on the request that mints the
 // answer.
 //
-// The keyset position is SEEDED from that continuation rather than left zero.
-// Two things depend on it, and both were wrong while it started empty. A page
-// that admits nothing -- every adjacency read ran past the deadline -- must
-// mint the position it was given, not LastOwner:"", which restarts the level
-// from its beginning and re-reads every row the previous page already read.
+// The scan position is SEEDED from that continuation rather than left zero.
+// Two things depend on it. A page that admits nothing -- every adjacency read
+// ran past the deadline -- must mint the position it was given, not the zero
+// EdgePos, which restarts the level from its beginning and re-reads every row
+// the previous page already read.
 // And walkStalled compares this position against the cursor's to decide that
 // the page made no progress at all: with a zero start the two could only ever
 // match on a resume taken at a LEVEL BOUNDARY, so a walk stalled MID-LEVEL --
