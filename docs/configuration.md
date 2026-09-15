@@ -408,12 +408,16 @@ routes beyond it are reported as a count, never silently dropped.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What
-bounds that pass with no value set is the **request**, not the repository: the
-task text is clipped to a fixed byte bound before any scanning, each identity it
-names is resolved by exactly one page of declarations, and the lowest-priority
-step that admits captured working-tree changes reads one page and discloses its
-continuation cursor rather than materialising a whole working tree. Peak memory
-is therefore a function of the task and the page size. A value you do set is
+bounds the identity steps with no value set is the **request**, not the
+repository: the task text is clipped to a fixed byte bound before any scanning,
+and each identity it names is resolved by exactly one page of declarations. The
+two steps that read the repository — the lexical matches of the task text and
+the captured working-tree changes — are paged to exhaustion on their own keyset
+cursors, so a branch with more changed files than one page contributes all of
+them rather than the prefix a page boundary happened to cut. What keeps those
+two from dominating a plan is the ranking (both score last) and
+`max_manifest_bytes`, which names every candidate it drops in the plan's
+excluded projection; every read is one page at a time. A value you do set is
 disclosed where it bites: the step that stopped is named in the manifest's
 exclusions, with the key and the value that stopped it, and the scope is reported
 incomplete.

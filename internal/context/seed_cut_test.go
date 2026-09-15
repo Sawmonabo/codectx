@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 )
@@ -101,5 +102,57 @@ func TestUnlimitedSeedDiscoveryExaminesEveryIdentityTheTaskNames(t *testing.T) {
 	}
 	if !seedsFull(config.Limit(10), 10) {
 		t.Fatal("a bound of 10 did not report the seed set full at 10 candidates")
+	}
+}
+
+// TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary is the exact-boundary
+// half of Section 15.2 step 6.
+//
+// Failure mode it protects, in two halves. A working tree whose changed-file
+// count is an exact multiple of the read's page size is COMPLETE, and a step
+// that infers "changes remain" from a full page reports such a scope incomplete
+// with a page-end exclusion naming files that do not exist -- an actor then
+// widens a plan that was already whole. The other half is the one that made the
+// bound worth removing: the step must keep reading past the first page, so a
+// branch with more changed files than one page contributes all of them and not
+// the arbitrary prefix a page boundary happened to cut.
+//
+// The fixture publishes exactly one captured change (contextFixture.putBlob
+// tracks every file but the implementation), so a page size of one is the exact
+// boundary: page 1 is full, page 2 is empty, and only the second read can tell
+// the difference.
+func TestChangedFileSeedsExhaustTheWorkingTreeAtAPageBoundary(t *testing.T) {
+	fx := newContextFixture(t)
+	// One row per read, over one changed file: len(page) == pageSize on the
+	// page that is also the last one.
+	fx.Cfg.Resources.MaxPageItems = 1
+	c := intCompiler(t, fx, fx.Now)
+	reader, err := c.store.PinGeneration(fx.ctx, c.repo, fx.Binding.GenerationID, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	defer reader.Close()
+
+	var out seedSet
+	if err := c.changedFileSeeds(fx.ctx, reader, map[string]bool{}, &out); err != nil {
+		t.Fatalf("changedFileSeeds: %v", err)
+	}
+	var changed []string
+	for _, cand := range out.Candidates {
+		if cand.Origin == originChangedFile {
+			changed = append(changed, cand.Path)
+		}
+	}
+	if len(changed) != 1 {
+		t.Fatalf("the step admitted %v from a working tree with one captured change", changed)
+	}
+	if out.Unresolved {
+		t.Errorf("a working tree whose changed-file count equals the page size was reported INCOMPLETE; "+
+			"the exclusions say %v. A full page is a page boundary, not a remainder: only the next read answers that",
+			out.Excluded)
+	}
+	if len(out.Excluded) != 0 {
+		t.Errorf("the step disclosed %v over a complete working tree; a page end that did not happen must not be named",
+			out.Excluded)
 	}
 }
