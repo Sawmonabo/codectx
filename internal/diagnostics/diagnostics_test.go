@@ -398,21 +398,38 @@ var scenarios = []scenario{
 		// operator to check was unreadable from the product. The mode is
 		// reported by BOTH readings of the storage check, because an ordinary
 		// doctor is the call an operator actually makes.
-		name: "the storage check names the durability mode the workspace runs in",
+		// FX-H-X7 (REV-H3b D4 residual): the row reported the CONFIGURED mode,
+		// which verifies nothing -- it re-prints an input. The fixture is
+		// therefore MISMATCHED on purpose: configured `normal`, live `full`.
+		// A phrase that echoes configuration prints normal and fails here.
+		name: "the storage check reads the live durability mode back",
 		run: func(t *testing.T) {
 			cfg := config.Defaults()
-			cfg.Storage.Synchronous = config.SynchronousFull
-			svc := newTestService(t, Options{Config: cfg, Store: &fakeStore{}})
+			cfg.Storage.Synchronous = config.SynchronousNormal
+			svc := newTestService(t, Options{Config: cfg,
+				Store: &fakeStore{synchronous: config.SynchronousFull}})
 			for _, req := range []model.DoctorRequest{{}, {Deep: true}} {
 				rep, err := svc.Doctor(context.Background(), req)
 				if err != nil {
 					t.Fatalf("Doctor(deep=%v): %v", req.Deep, err)
 				}
 				got := checkNamed(t, rep, checkStorageIntegrity)
-				if !strings.Contains(got.Detail, "storage.synchronous = full") {
-					t.Fatalf("storage_integrity (deep=%v) detail %q does not name the live durability mode",
-						req.Deep, got.Detail)
+				if !strings.Contains(got.Detail, "storage.synchronous reads back full") {
+					t.Fatalf("storage_integrity (deep=%v) detail %q does not report the mode the store "+
+						"read back (full); the configured mode is normal", req.Deep, got.Detail)
 				}
+			}
+			// The honesty half: a store that cannot answer must drop the
+			// read-back claim rather than print configuration as measurement.
+			bare := newTestService(t, Options{Config: cfg, Store: bareStore{}})
+			rep, err := bare.Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor with a bare store: %v", err)
+			}
+			got := checkNamed(t, rep, checkStorageIntegrity)
+			if strings.Contains(got.Detail, "reads back") || !strings.Contains(got.Detail, "as configured") {
+				t.Fatalf("a store that cannot read the mode back reports %q; it must name the configured "+
+					"mode as configured", got.Detail)
 			}
 		},
 	},
@@ -456,6 +473,10 @@ type fakeStore struct {
 	// asked for, so a row can prove --deep widens it.
 	supplied    []SuppliedIndex
 	sampleLimit int
+	// synchronous is the LIVE durability mode this store reads back, which a
+	// row sets to something the configuration does not say so that a phrase
+	// echoing the configuration cannot pass. Empty means the read failed.
+	synchronous string
 	// hashes is what SampleBlobs reports. Nil is the ordinary fixture (an
 	// empty store); a row that needs a populated one sets it.
 	hashes []string
@@ -487,6 +508,13 @@ func (f *fakeStore) WatchHeartbeat(context.Context, model.RepositoryID) (WatchHe
 		return WatchHeartbeat{}, false, f.err
 	}
 	return *f.heartbeat, true, f.err
+}
+
+func (f *fakeStore) SynchronousMode(context.Context) (string, error) {
+	if f.synchronous == "" {
+		return "", f.err
+	}
+	return f.synchronous, f.err
 }
 
 // bareStore is a StoreReader implementing the frozen four methods and none of
