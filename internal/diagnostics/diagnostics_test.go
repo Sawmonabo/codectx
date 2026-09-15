@@ -134,7 +134,7 @@ var scenarios = []scenario{
 				Remediation: "inspect /home/private/.local/share/codectx by hand"}
 			opts := Options{
 				Store:     &fakeStore{err: leak},
-				Workspace: &fakeWorkspace{writeErr: leak, freeErr: leak},
+				Workspace: &fakeWorkspace{writeErr: leak, readErr: leak, freeErr: leak},
 				Sampler:   &fakeSampler{err: leak},
 				Toolchain: &fakeToolchain{err: leak},
 			}
@@ -366,11 +366,14 @@ func (f *fakeToolchain) Statuses(context.Context) ([]toolchain.Status, error) {
 
 type fakeWorkspace struct {
 	writeErr error
+	readErr  error
 	free     *uint64
 	freeErr  error
 }
 
 func (f *fakeWorkspace) Writable(context.Context, string) error { return f.writeErr }
+
+func (f *fakeWorkspace) Readable(context.Context, string) error { return f.readErr }
 
 func (f *fakeWorkspace) FreeDiskBytes(context.Context, string) (*uint64, error) {
 	return f.free, f.freeErr
@@ -391,6 +394,9 @@ func newTestService(t *testing.T, opts Options) *Service {
 	}
 	if opts.Workspace == nil {
 		opts.Workspace = &fakeWorkspace{}
+	}
+	if opts.Root == "" {
+		opts.Root = t.TempDir()
 	}
 	if opts.Repo == "" {
 		opts.Repo = model.RepositoryID("00000000000000000000000000000000000000000000000000000000000000ab")
