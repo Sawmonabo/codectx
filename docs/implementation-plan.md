@@ -3123,7 +3123,7 @@ func (r *Resolver) Prefetch(ctx context.Context, names []string) error
 func (r *Resolver) Verify(ctx context.Context) ([]Status, error)
 func (r *Resolver) GC(ctx context.Context) (removed int, err error)
 
-type State string // "installed" | "available" | "unsupported_platform" | "override" | "corrupt"
+type State string // "installed" | "available" | "unsupported_platform" | "override" | "corrupt" | "unlisted"
 type Status struct{ Name, Version string; State State; Languages []string; Detail string }
 ```
 

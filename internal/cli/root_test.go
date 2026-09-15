@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/cli"
@@ -594,5 +595,30 @@ func TestMCPServeRefusalStaysOffTheProtocolStream(t *testing.T) {
 					stderr.String())
 			}
 		})
+	}
+}
+
+// TestVerifyOnAnEmptyStoreSaysNothingIsInstalled protects the one sentence an
+// operator reads after running the command that is supposed to tell them
+// whether this machine is provisioned. `tools verify` verifies what is
+// installed, so an empty store is honestly `ok` with exit 0 -- and its state
+// counts alone then read as a clean bill of health for a store that holds
+// nothing at all. The human report has to say so and name the command that
+// fixes it; false readiness here strands a run mid-index instead.
+func TestVerifyOnAnEmptyStoreSaysNothingIsInstalled(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	isolateUserDirs(t, "")
+	var stdout, stderr bytes.Buffer
+	root := cli.NewRoot(build, &stdout, &stderr)
+	if err := cli.Execute(context.Background(), build, root, []string{"tools", "verify"}); err != nil {
+		t.Fatalf("tools verify on an empty store = %v, want the report and no failure", err)
+	}
+	want := "installed -- run `codectx tools prefetch`"
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("`tools verify` on an empty store did not say nothing is installed\n  want substring: %s\n  got: %s",
+			want, stdout.String())
+	}
+	if !strings.HasPrefix(stdout.String(), "platform") {
+		t.Errorf("the report is missing: %q", stdout.String())
 	}
 }

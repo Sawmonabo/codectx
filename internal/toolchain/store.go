@@ -274,27 +274,89 @@ func hashEntry(name, payloadDir, entry, want string) (string, error) {
 // trees. It never waits on an install lock, so a collection running beside an
 // install skips that tool rather than blocking or racing it.
 func (s *store) gc(ctx context.Context, lock Lock) (int, error) {
+	payloads, err := s.payloadEntries()
+	if err != nil {
+		return 0, err
+	}
+	var removed int
+	var errs []error
+	for _, e := range payloads {
+		if err := ctx.Err(); err != nil {
+			return removed, model.Canceled(err)
+		}
+		n, err := s.collectTool(ctx, lock, e)
+		removed += n
+		errs = append(errs, err)
+	}
+	// sweepStaging reports a store with no staging tree as nothing to do, so it
+	// is called unconditionally rather than only when the listing named it.
+	n, err := s.sweepStaging(ctx)
+	removed += n
+	errs = append(errs, err)
+	return removed, errors.Join(errs...)
+}
+
+// payloadEntries lists the store's top-level entries that are neither the lock
+// directory nor the staging tree: everything else is a payload directory the
+// current lock either names or does not. A store that does not exist holds
+// none, which is not an error -- nothing has been installed yet.
+//
+// It is the one place that knows the store's reserved names, so the collector
+// and the unlisted report cannot drift into disagreeing about them.
+func (s *store) payloadEntries() ([]fs.DirEntry, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
+			return nil, nil
 		}
-		return 0, ioError("tool store listing", err)
+		return nil, ioError("tool store listing", err)
+	}
+	out := make([]fs.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		switch e.Name() {
+		case locksDirName, stagingDirName:
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// unlisted returns the payload entries no lock entry names. They are bytes
+// nothing in this binary vouches for -- a superseded tool the store kept across
+// an upgrade, or a directory something else wrote -- so a report that omits
+// them tells an operator the store holds exactly what the lock pins when it
+// does not.
+func (s *store) unlisted(lock Lock) ([]fs.DirEntry, error) {
+	payloads, err := s.payloadEntries()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]fs.DirEntry, 0, len(payloads))
+	for _, e := range payloads {
+		if _, pinned := lock.Tools[e.Name()]; pinned {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// pruneUnlisted removes exactly those entries, taking each tool's install lock
+// the way gc does and skipping one another process holds. It is gc's first half
+// with the superseded-version pass left out: prefetch is asked to make the
+// store hold what the lock names, and removing a version of a pinned tool that
+// another workspace may still be resolving is gc's decision, not prefetch's.
+func (s *store) pruneUnlisted(ctx context.Context, lock Lock) (int, error) {
+	entries, err := s.unlisted(lock)
+	if err != nil {
+		return 0, err
 	}
 	var removed int
 	var errs []error
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
 			return removed, model.Canceled(err)
-		}
-		switch e.Name() {
-		case locksDirName:
-			continue
-		case stagingDirName:
-			n, err := s.sweepStaging(ctx)
-			removed += n
-			errs = append(errs, err)
-			continue
 		}
 		n, err := s.collectTool(ctx, lock, e)
 		removed += n

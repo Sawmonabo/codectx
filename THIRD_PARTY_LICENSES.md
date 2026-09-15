@@ -69,7 +69,7 @@ the two the bytes come from.
 | `scip-typescript` | 0.4.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-typescript |
 | `scip-python` | 0.6.6 | MIT (the package vendors pyright) | redistributed | https://www.npmjs.com/package/@sourcegraph/scip-python |
 | `scip-java` | 0.13.1 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-java |
-| `rust-analyzer` | 2026-08-17.4 | MIT OR Apache-2.0 | upstream | https://github.com/rust-lang/rust-analyzer |
+| `rust-analyzer` | 2026-09-14 | MIT OR Apache-2.0 | upstream | https://github.com/rust-lang/rust-analyzer |
 | `scip-clang` | 0.4.0 | Apache-2.0 | upstream | https://github.com/sourcegraph/scip-clang |
 | `gopls` | 0.23.0 | BSD-3-Clause (the Go project) | redistributed | https://pkg.go.dev/golang.org/x/tools/gopls |
 | `typescript-language-server` | 6.0.0 | Apache-2.0 | redistributed | https://www.npmjs.com/package/typescript-language-server |
