@@ -180,6 +180,76 @@ var scenarios = []scenario{
 			}
 		},
 	},
+	// FX-H-X1 rows
+	{
+		// Failure mode: the CAS orphan sweep walks all 256 buckets and every
+		// object in them, and a collection pass runs after EVERY activation --
+		// so an incremental refresh of one file paid for a full walk of the
+		// store, under the workspace lock and the indexing mutex. It is gated
+		// to once per blob-grace window, and both directions of that gate are
+		// invariants: a second pass inside the window must NOT re-walk, and a
+		// pass after the window must, or the cadence would be a cap and
+		// orphans would never be reclaimed at all.
+		name: "the orphan sweep runs once per grace window, and still runs after it",
+		run: func(t *testing.T) {
+			const window = time.Hour
+			base := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+			now := base
+			objects := &fakeObjects{swept: 3}
+			dataDir := t.TempDir()
+			c := newTestCollector(t, Options{Objects: objects,
+				Config: RetentionConfig{DataDir: dataDir, GraceWindow: window},
+				Now:    func() time.Time { return now }})
+
+			report, err := c.grace(context.Background(), Report{})
+			if err != nil {
+				t.Fatalf("first pass: %v", err)
+			}
+			now = base.Add(window / 2)
+			report, err = c.grace(context.Background(), report)
+			if err != nil {
+				t.Fatalf("second pass: %v", err)
+			}
+			if objects.calls != 1 {
+				t.Fatalf("two activations inside one %v grace window walked the whole store %d times, want 1",
+					window, objects.calls)
+			}
+			if report.OrphanObjectsSwept != 3 {
+				t.Fatalf("the pass that did sweep reported %d objects, want the 3 it reclaimed",
+					report.OrphanObjectsSwept)
+			}
+			if _, err := os.Stat(filepath.Join(dataDir, orphanSweepPath)); err != nil {
+				t.Fatalf("the sweep recorded no stamp, so the gate has nothing to read next pass: %v", err)
+			}
+
+			// Past the window the sweep runs again: the cadence delays work,
+			// it never drops it.
+			now = base.Add(window + time.Second)
+			report, err = c.grace(context.Background(), report)
+			if err != nil {
+				t.Fatalf("third pass: %v", err)
+			}
+			if objects.calls != 2 {
+				t.Fatalf("a pass %v after the last sweep ran %d sweeps, want a second one: the cadence "+
+					"must delay the walk, not cancel it", window+time.Second, objects.calls)
+			}
+			if report.OrphanObjectsSwept != 6 {
+				t.Fatalf("the second sweep's %d objects did not reach the report", report.OrphanObjectsSwept)
+			}
+
+			// A clock stepped backwards leaves a stamp in the future, which a
+			// plain "now - stamp < window" test reads as "not due" for an
+			// unbounded time. The gate never fails closed.
+			now = base.Add(-24 * time.Hour)
+			if _, err := c.grace(context.Background(), Report{}); err != nil {
+				t.Fatalf("pass under a backwards clock: %v", err)
+			}
+			if objects.calls != 3 {
+				t.Fatalf("a stamp dated in the future disabled the sweep (%d calls): the gate must sweep "+
+					"on any stamp it cannot trust", objects.calls)
+			}
+		},
+	},
 }
 
 // --- deterministic fakes for the frozen interfaces --------------------------
@@ -273,6 +343,9 @@ type fakeObjects struct {
 	// swept is what the orphan sweep reports, and grace/batch record the
 	// window and working set it was actually given.
 	swept int64
+	// calls counts the sweeps, which is what a cadence row reads: the sweep
+	// walks the whole store, so how OFTEN it runs is an invariant of its own.
+	calls int
 	grace time.Duration
 	batch int
 	// oracle is the func the collector handed over, so a row can prove the
@@ -285,6 +358,7 @@ func (f *fakeObjects) Remove(string) error { return f.err }
 func (f *fakeObjects) SweepOrphans(_ context.Context, known func(context.Context, []string) (map[string]struct{}, error),
 	_ time.Time, grace time.Duration, batch int) (int64, error) {
 	f.oracle, f.grace, f.batch = known, grace, batch
+	f.calls++
 	return f.swept, f.err
 }
 
