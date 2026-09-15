@@ -61,9 +61,14 @@ const (
 	ReasonQueueOverflow = "the operating system's notification queue overflowed"
 	ReasonWatchLimit    = "the operating system refused a directory watch"
 	ReasonWatchSetLimit = "the workspace holds more directories than one watcher may watch"
-	ReasonUnavailable   = "filesystem notification is unavailable on this host"
-	ReasonRescanFailed  = "the workspace could not be traversed to place watches"
-	ReasonPeriodic      = "periodic reconciliation"
+	// ReasonPathTooLong is an event about a path longer than
+	// model.MaxPathBytes. The path cannot be carried in a batch, so
+	// notification coverage over it is reported incomplete rather than the
+	// event being dropped in silence.
+	ReasonPathTooLong  = "a changed path is longer than the representable path limit"
+	ReasonUnavailable  = "filesystem notification is unavailable on this host"
+	ReasonRescanFailed = "the workspace could not be traversed to place watches"
+	ReasonPeriodic     = "periodic reconciliation"
 )
 
 // Batch is one debounced set of changes. Paths are root-relative, sorted and
@@ -109,6 +114,8 @@ type Options struct {
 type Watcher struct {
 	opts    Options
 	dataDir string
+	// longPathSeen makes the over-long-path warning one-shot per watcher.
+	longPathSeen bool
 
 	mu             sync.Mutex
 	complete       bool
@@ -122,13 +129,18 @@ func New(o Options) (*Watcher, error) {
 	if o.Root.Path == "" {
 		return nil, invalid("the watcher needs an opened workspace root")
 	}
-	// The watch set is directories, so index.max_files never bounds it -- but a
-	// zero-valued Policy is a caller that never built one, and watching a tree
-	// with none of the capture's exclusions applied is what this refuses.
-	// MaxFiles is the field that is never legitimately zero in a real policy,
-	// so it is the one the check reads.
-	if o.Policy.MaxFiles <= 0 {
+	// The watch set is directories, so workspace.max_files never bounds it --
+	// but a zero-valued Policy is a caller that never built one, and watching a
+	// tree with none of the capture's exclusions applied is what this refuses.
+	// DataDir is the field the check reads: Config.TraversalPolicy always fills
+	// it and snapshot.Builder.validate already requires it to be absolute, so
+	// it is present in every real policy. MaxFiles no longer serves: with
+	// unlimited the default, a real policy's MaxFiles is zero.
+	if o.Policy.DataDir == "" {
 		return nil, invalid("the watcher needs the capture's traversal policy, not a zero value")
+	}
+	if o.Policy.MaxFiles < 0 {
+		return nil, invalid("workspace.max_files is negative; zero means unlimited")
 	}
 	for _, b := range []struct {
 		name  string
@@ -553,6 +565,26 @@ func (w *Watcher) relevant(name string, isDir bool) (string, bool) {
 		return "", false
 	}
 	if len(slashed) > model.MaxPathBytes {
+		// Neither this batch nor the capture can name this path, so the honest
+		// answer is that notification coverage is not complete. Dropping it
+		// silently -- what this replaces -- left a file that is never
+		// reindexed and nothing saying so.
+		//
+		// This reports rather than arming a reconciliation, unlike the pending
+		// overflow channel beside it, because a reconciliation would change
+		// nothing: workspace.Walk skips the same path for the same reason, so
+		// the path is unreachable to the indexer by any route. The next rescan
+		// resets coverage to complete; that is a known hole, and the warning
+		// below is what survives it.
+		//
+		// The one-shot flag and the coverage call are both reached only from
+		// the single event-loop goroutine that owns relevant's only call site.
+		if !w.longPathSeen {
+			w.longPathSeen = true
+			w.opts.Logger.Warn("watch event about an unrepresentable path",
+				"component", "index.watch", "reason", ReasonPathTooLong, "path_bytes", len(slashed))
+		}
+		w.setCoverage(false, ReasonPathTooLong)
 		return "", false
 	}
 	if w.opts.Policy.ForceInclude != nil && w.opts.Policy.ForceInclude(slashed) {

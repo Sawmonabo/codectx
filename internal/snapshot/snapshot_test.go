@@ -398,14 +398,18 @@ func TestCaptureRetainsExactWorktreeBytes(t *testing.T) {
 }
 
 // TestUnstableCaptureIsReported protects the Section 10.2 bound: a file that
-// keeps changing under the builder is recaptured at most twice and then the
-// capture fails with CTX_SNAPSHOT_UNSTABLE, rather than publishing a manifest
-// whose bytes were never validated or retrying forever.
+// keeps changing under the builder is recaptured until the user-set retry
+// budget is spent and the capture then fails with CTX_SNAPSHOT_UNSTABLE,
+// rather than publishing a manifest whose bytes were never validated or
+// retrying forever. The budget is now the caller's (zero is unlimited, bounded
+// by RetryDeadline), so the test sets it instead of reading a constant.
 func TestUnstableCaptureIsReported(t *testing.T) {
+	const retries = 4
 	f := newFixture(t, false)
 	f.write("flaky.dat", []byte("v0\n"), 0o644)
 	f.write("stable.dat", []byte("stable\n"), 0o644)
 	b := f.builder()
+	b.MaxRetries = retries
 	captures := 0
 	b.afterCapture = func(rel string) {
 		if rel != "flaky.dat" {
@@ -416,8 +420,8 @@ func TestUnstableCaptureIsReported(t *testing.T) {
 	}
 	_, err := b.Build(f.ctx)
 	wantCode(t, err, model.CodeSnapshotUnstable)
-	if captures != 1+maxRetries {
-		t.Fatalf("flaky.dat was captured %d times, want the initial read plus %d retries", captures, maxRetries)
+	if captures != 1+retries {
+		t.Fatalf("flaky.dat was captured %d times, want the initial read plus %d retries", captures, retries)
 	}
 	if entries, _ := os.ReadDir(StagingDir(f.dataDir)); len(entries) != 0 {
 		t.Fatalf("a failed capture left %d staging files behind", len(entries))
@@ -559,5 +563,49 @@ func TestMaterializeCopiesExactlyTheSelectedFiles(t *testing.T) {
 		if int64(len(b)) != fv.Size {
 			t.Errorf("%s is %d bytes, want the manifest's %d", rel, len(b), fv.Size)
 		}
+	}
+}
+
+// TestCaptureReportsSkippedAndOverBoundPaths protects the operator-visible half
+// of the scale posture: the walk now skips an unrepresentable path and reports
+// a passed file budget instead of failing, so the capture is only honest if
+// both reach Notes. Without this, the walk's report sink could be unset in the
+// one walk that matters and every skip would be silent again -- the class-G
+// defect this replaces, moved one layer up.
+func TestCaptureReportsSkippedAndOverBoundPaths(t *testing.T) {
+	f := newFixture(t, false)
+	f.write("a.go", []byte("package p\n"), 0o644)
+	f.write("b.go", []byte("package p\n"), 0o644)
+	f.write("c.go", []byte("package p\n"), 0o644)
+	component := strings.Repeat("d", 200)
+	func() {
+		t.Chdir(f.repoDir)
+		for depth := 0; depth*(len(component)+1) <= model.MaxPathBytes; depth++ {
+			if err := os.Mkdir(component, 0o700); err != nil {
+				t.Fatalf("mkdir at depth %d: %v", depth, err)
+			}
+			if err := os.Chdir(component); err != nil {
+				t.Fatalf("chdir at depth %d: %v", depth, err)
+			}
+		}
+		if err := os.WriteFile("buried.go", []byte("package p\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	b := f.builder()
+	b.Policy.MaxFiles = 1
+	snap, _ := f.build(b)
+	if snap.FileCount < 3 {
+		t.Fatalf("the capture recorded %d files under a budget of 1; a budget reports, it never clamps", snap.FileCount)
+	}
+	notes := b.Notes()
+	if notes.LongPathCount != 1 || len(notes.LongPaths) != 1 || len(notes.LongPaths[0]) != model.MaxPathBytes {
+		t.Fatalf("Notes long paths = %d/%d exemplars, want exactly the one skipped path, named and truncated to %d bytes",
+			notes.LongPathCount, len(notes.LongPaths), model.MaxPathBytes)
+	}
+	if !slices.Contains(notes.BoundsExceeded, workspace.SkipFileBudget) {
+		t.Fatalf("Notes.BoundsExceeded = %q, want %s: a passed budget the operator cannot see is a silent limit",
+			notes.BoundsExceeded, workspace.SkipFileBudget)
 	}
 }

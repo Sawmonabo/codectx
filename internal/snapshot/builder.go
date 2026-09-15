@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"time"
 
@@ -21,7 +22,11 @@ import (
 const (
 	// maxRetries is the Section 10.2 bound: a changing file or membership is
 	// recaptured at most twice before the capture is reported unstable.
-	maxRetries = 2
+	// DefaultRetryDeadline bounds validated capture when no retry budget is
+	// set. It is a wall clock, not a count: a busy monorepo whose worktree
+	// settles on the fifth pass must capture, and one that never settles must
+	// still end. Exported so an operator-facing caller can raise it.
+	DefaultRetryDeadline = 10 * time.Minute
 	// domainManifest is the hash domain of the canonical sorted manifest whose
 	// aggregate digest feeds SnapshotID (Section 9.1).
 	domainManifest = "source-manifest-v1"
@@ -78,6 +83,33 @@ type Notes struct {
 	ExcludedTracked int
 	// Retries is how many validation passes found changes and recaptured.
 	Retries int
+	// LongPaths are paths the traversal skipped because they exceed
+	// model.MaxPathBytes, truncated to that bound; LongPathCount is complete.
+	// Each is one file that is not in the snapshot: the walk reports it rather
+	// than failing, so this is the only place it is visible.
+	LongPaths     []string
+	LongPathCount int
+	// BoundsExceeded names every user-set bound this capture passed, each at
+	// most once: the workspace.Policy traversal bounds by their Skip* reason
+	// and the Git listing bounds by their git.Bound* name. Passing a bound is
+	// reported and the capture completes; nothing is dropped or clamped.
+	BoundsExceeded []string
+}
+
+func (n *Notes) addLongPath(path string) {
+	n.LongPathCount++
+	if len(n.LongPaths) < maxNotePaths {
+		n.LongPaths = append(n.LongPaths, path)
+	}
+}
+
+// addBound records a passed bound once. The list is bounded by the number of
+// distinct bound names, which is fixed by the code, so it needs no cap.
+func (n *Notes) addBound(name string) {
+	if slices.Contains(n.BoundsExceeded, name) {
+		return
+	}
+	n.BoundsExceeded = append(n.BoundsExceeded, name)
 }
 
 func (n *Notes) addSubmodule(path string) {
@@ -113,6 +145,17 @@ type Builder struct {
 	// acquires the lock for the capture and releases it before returning.
 	Lock     *WorkspaceLock
 	LockWait time.Duration
+	// MaxRetries bounds how many validation passes may find changes before the
+	// capture is declared unstable. Zero -- the default -- means unlimited
+	// retries, bounded instead by RetryDeadline: a count that refuses a busy
+	// monorepo is a scale refusal, whereas a deadline ends a capture that
+	// genuinely never settles. Attempts are reported in Notes.Retries either
+	// way.
+	MaxRetries int64
+	// RetryDeadline bounds the whole validated capture. Zero selects
+	// DefaultRetryDeadline; it is never unlimited, because with MaxRetries
+	// unlimited it is the only thing that ends a worktree that never settles.
+	RetryDeadline time.Duration
 	// OperatorFrozen records that the operator supplied a quiescent or
 	// OS-snapshotted source. It is never inferred: the default is
 	// validated_capture.
@@ -140,6 +183,21 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	}
 	started := time.Now()
 	b.notes = Notes{}
+	// Every traversal and listing bound is reported, not enforced: these two
+	// sinks are the whole reporting path from the walker and from Git into the
+	// capture notes and the operator log. Without them a skipped long path or
+	// a passed user-set budget would be invisible, which is the class-G defect
+	// this replaces.
+	b.Policy.OnSkip = func(rel, reason string) {
+		if reason == workspace.SkipPathTooLong {
+			b.notes.addLongPath(rel)
+			return
+		}
+		b.notes.addBound(reason)
+	}
+	if b.Git != nil {
+		b.Git.OnOverBound = func(bound string, _, _ int64) { b.notes.addBound(bound) }
+	}
 	lock := b.Lock
 	if lock == nil {
 		var err error
@@ -159,8 +217,18 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 	if err != nil {
 		return model.Snapshot{}, typed(err)
 	}
+	deadline := b.RetryDeadline
+	if deadline <= 0 {
+		deadline = DefaultRetryDeadline
+	}
+	expiry := started.Add(deadline)
 	for pass := 1; ; pass++ {
-		detectOnly := pass >= 2+maxRetries
+		// A detect-only pass is the last one: it compares without recapturing,
+		// so a difference it finds is the unstable-capture failure. It is
+		// reached when a user-set retry budget is spent or when the deadline
+		// has passed, whichever comes first.
+		budgetSpent := b.MaxRetries > 0 && int64(pass) >= 2+b.MaxRetries
+		detectOnly := budgetSpent || (pass > 1 && !time.Now().Before(expiry))
 		changes, err := c.pass(ctx, pass, detectOnly)
 		if err != nil {
 			return model.Snapshot{}, typed(err)
@@ -169,8 +237,12 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 			break
 		}
 		if detectOnly {
+			reason := "after " + strconv.Itoa(b.notes.Retries) + " recaptures within " + deadline.String()
+			if budgetSpent {
+				reason = "after the configured " + strconv.FormatInt(b.MaxRetries, 10) + " recaptures"
+			}
 			return model.Snapshot{}, &model.Error{Code: model.CodeSnapshotUnstable, Retryable: true,
-				Message:     "the worktree kept changing during capture; " + strconv.Itoa(changes) + " paths differed after " + strconv.Itoa(maxRetries) + " recaptures",
+				Message:     "the worktree kept changing during capture; " + strconv.Itoa(changes) + " paths differed " + reason,
 				Remediation: "pause writers to the worktree and run the capture again, or supply an operator-frozen source"}
 		}
 		if pass > 1 {
@@ -193,6 +265,7 @@ func (b *Builder) Build(ctx context.Context) (model.Snapshot, error) {
 		"retries", b.notes.Retries, "submodules", b.notes.SubmoduleCount, "lfs_pointers", b.notes.LFSPointerCount,
 		"sparse_skipped", b.notes.SparseSkipped, "skipped_symlinks", b.notes.SkippedSymlinks,
 		"skipped_non_regular", b.notes.SkippedNonRegular, "excluded_tracked", b.notes.ExcludedTracked,
+		"long_paths", b.notes.LongPathCount, "bounds_exceeded", b.notes.BoundsExceeded,
 		"duration", time.Since(started))
 	return snap, nil
 }
@@ -203,8 +276,8 @@ func (b *Builder) validate() error {
 		return invalid("snapshot builder needs an opened workspace root")
 	case !filepath.IsAbs(b.Policy.DataDir):
 		return invalid("snapshot builder needs an absolute data directory in its policy")
-	case b.Policy.MaxFiles <= 0:
-		return invalid("snapshot builder needs a positive file budget; no zero or negative bound means unlimited")
+	case b.Policy.MaxFiles < 0 || b.MaxRetries < 0:
+		return invalid("a snapshot builder bound is negative; zero means unlimited")
 	case !model.ValidHexID(string(b.Repository)):
 		return invalid("snapshot builder needs a repository identity")
 	case !model.ValidHexID(b.SourcePolicyHash):
@@ -291,6 +364,11 @@ func (c *capture) pass(ctx context.Context, pass int, detectOnly bool) (int, err
 	b := c.b
 	// The unseen sweep below recomputes these from scratch every pass.
 	b.notes.SkippedSymlinks, b.notes.SkippedNonRegular, b.notes.ExcludedTracked = 0, 0, 0
+	// Every validation pass walks the tree again and reports the same skips, so
+	// these are reset here with the other per-pass counters: without it a
+	// two-pass capture would claim twice as many skipped paths as there are.
+	b.notes.LongPaths, b.notes.LongPathCount = nil, 0
+	b.notes.BoundsExceeded = nil
 	b.notes.Submodules, b.notes.SubmoduleCount = nil, 0
 	changes := 0
 	policy := b.Policy

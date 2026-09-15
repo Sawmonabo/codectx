@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,9 +68,7 @@ const (
 	// stderrExcerptBytes bounds the sanitized Git diagnostic carried in an
 	// error message.
 	stderrExcerptBytes = 200
-	// maxFilterDrivers bounds the configured filter drivers a run neutralizes;
-	// more than this is not a repository, it is a configuration attack.
-	maxFilterDrivers = 256
+
 	// maxConfigBytes bounds the filter enumeration output.
 	maxConfigBytes = 1 << 20
 )
@@ -102,7 +101,41 @@ type Git struct {
 	path    string
 	env     []string
 	timeout time.Duration
+
+	// MaxFilterDrivers bounds how many configured filter drivers one run
+	// neutralizes. Zero -- the default -- is unlimited: a monorepo really does
+	// configure hundreds, and refusing the repository for it was a scale
+	// refusal. A user-set bound that is passed is reported through OnOverBound
+	// and every driver is still neutralized, because neutralizing only some of
+	// them would be worse than neutralizing none.
+	MaxFilterDrivers int64
+	// OnOverBound reports one user-set bound being passed: the bound's name
+	// (BoundEntries or BoundFilterDrivers), the limit set and the count
+	// reached. It is called at most once per bound per operation and never
+	// fails it. A nil sink loses the report, so a caller that sets a bound
+	// sets this too.
+	OnOverBound func(bound string, limit, seen int64)
 }
+
+// Bound names carried by Git.OnOverBound. They are operator-visible strings.
+const (
+	// BoundEntries is the per-listing entry budget (workspace.max_files).
+	BoundEntries = "git_listing_entries"
+	// BoundFilterDrivers is Git.MaxFilterDrivers.
+	BoundFilterDrivers = "git_filter_drivers"
+)
+
+// overBound reports a passed bound when the caller supplied a sink.
+func (g *Git) overBound(bound string, limit, seen int64) {
+	if g.OnOverBound != nil {
+		g.OnOverBound(bound, limit, seen)
+	}
+}
+
+// exceedsBound is the one zero-means-unlimited comparison in this package. It
+// mirrors config.Limit.Exceeded -- unlimited at zero, strictly greater -- which
+// this package does not call because it must stay usable without configuration.
+func exceedsBound(bound, n int64) bool { return bound > 0 && n > bound }
 
 // Locate resolves the git executable on PATH once and returns its absolute
 // path. The result is recorded in Git at construction; nothing resolves PATH
@@ -444,6 +477,7 @@ func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error
 		return nil, err
 	}
 	seen := map[string]bool{}
+	overFilters := false
 	var env []string
 	for _, record := range bytes.Split(out.Bytes(), []byte{0}) {
 		key, _, _ := bytes.Cut(record, []byte{'\n'})
@@ -456,11 +490,11 @@ func (g *Git) filterOverrides(ctx context.Context, root string) ([]string, error
 		if seen[driver] {
 			continue
 		}
-		if len(seen) >= maxFilterDrivers {
-			return nil, &model.Error{Code: model.CodeResourceLimit,
-				Message: fmt.Sprintf("more than %d filter drivers are configured", maxFilterDrivers)}
-		}
 		seen[driver] = true
+		if exceedsBound(g.MaxFilterDrivers, int64(len(seen))) && !overFilters {
+			overFilters = true
+			g.overBound(BoundFilterDrivers, g.MaxFilterDrivers, int64(len(seen)))
+		}
 		for _, kv := range [...][2]string{{"clean", ""}, {"process", ""}, {"required", "false"}} {
 			i := strconv.Itoa(len(env) / 2)
 			env = append(env, "GIT_CONFIG_KEY_"+i+"=filter."+driver+"."+kv[0], "GIT_CONFIG_VALUE_"+i+"="+kv[1])
@@ -542,15 +576,26 @@ func isHexObjectID(s string) bool {
 }
 
 // stream runs one listing command, feeding its stdout through p as it arrives.
-// extraEnv is appended to the fixed environment for this run only. The stdout
-// bound is derived from the entry budget: a listing longer than the configured
-// file budget is a typed limit, never a truncated manifest.
+// extraEnv is appended to the fixed environment for this run only.
+//
+// maxEntries is the caller's file budget, zero meaning unlimited. Passing a
+// user-set budget is reported through OnOverBound and every listed path is
+// still parsed and visited: a truncated manifest would be recorded as a set of
+// deletions, so the listing is never cut. The stdout bound the runner needs is
+// derived from the budget when there is one and is otherwise the largest
+// int64, because internal/process requires a positive capture bound and this
+// output is streamed through the parser, not buffered.
 func (g *Git) stream(ctx context.Context, root string, extraEnv []string, p *parser, maxEntries int64, args ...string) error {
-	if maxEntries <= 0 {
-		return &model.Error{Code: model.CodeResourceLimit, Message: "git listing needs a positive entry budget"}
+	if maxEntries < 0 {
+		return &model.Error{Code: model.CodeResourceLimit, Message: "git listing entry budget is negative; zero means unlimited"}
 	}
 	p.maxRecords = maxEntries
-	_, err := g.runEnv(ctx, root, extraEnv, p, maxEntries*maxRecordBytes, args...)
+	p.overRecords = func(seen int64) { g.overBound(BoundEntries, maxEntries, seen) }
+	maxStdout := int64(math.MaxInt64)
+	if maxEntries > 0 && maxEntries <= math.MaxInt64/maxRecordBytes {
+		maxStdout = maxEntries * maxRecordBytes
+	}
+	_, err := g.runEnv(ctx, root, extraEnv, p, maxStdout, args...)
 	if p.err != nil {
 		// The parser's own typed rejection is the cause; the runner only saw
 		// its sink refuse bytes.
@@ -652,7 +697,11 @@ type parser struct {
 	buf        []byte
 	records    int64
 	maxRecords int64
-	err        error
+	// overRecords is called once when maxRecords is passed. The listing then
+	// continues: the budget is reported, never enforced by truncation.
+	overRecords func(seen int64)
+	reported    bool
+	err         error
 }
 
 func newParser(visit func(record []byte) error) *parser {
@@ -683,10 +732,11 @@ func (p *parser) Write(b []byte) (int, error) {
 			return 0, p.err
 		}
 		p.records++
-		if p.records > p.maxRecords {
-			p.err = &model.Error{Code: model.CodeResourceLimit,
-				Message: fmt.Sprintf("git listed more than the configured %d paths", p.maxRecords)}
-			return 0, p.err
+		if p.maxRecords > 0 && p.records > p.maxRecords && !p.reported {
+			p.reported = true
+			if p.overRecords != nil {
+				p.overRecords(p.records)
+			}
 		}
 		if err := p.visit(record); err != nil {
 			p.err = err
