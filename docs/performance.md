@@ -8,6 +8,11 @@ budget that was missed is written with its number, and a platform that could not
 be built on the measuring host is named as an unproven platform rather than
 being reported as a pass.
 
+The scale posture these budgets are measured against — unlimited by default,
+bounded by page — and the reasoning behind the two open misses on this page
+(the indexing process-tree peak and the storage ratio) are recorded in
+[ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md).
+
 The rule that governs every figure below is Section 23.5's: **no target may be
 met by excluding the failing feature or by rewriting the benchmark after seeing
 the results.**
