@@ -214,30 +214,6 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 // is indistinguishable from reaching the end.
 var errWarmComplete = errors.New("membership sweep answered every candidate")
 
-// spillable is what this page must contribute to the fresh spool's visited
-// SECTION, ascending: the nodes it admitted itself, plus the frontier it
-// resumed. The carried nodes belong here because the stream that copies the
-// previous spool forward replays that spool's visited section only -- its
-// frontier records are answered from this page's front instead (cursor.go), so
-// nothing else would carry them forward. Both halves are bounded by the page
-// and by the frontier ceiling, never by the walk, and the previous visited
-// section stays on disk.
-func (v *visitedSet) spillable() []model.NodeID {
-	out := make([]model.NodeID, 0, len(v.added)+len(v.carried))
-	for id := range v.added {
-		out = append(out, id)
-	}
-	for id := range v.carried {
-		out = append(out, id)
-	}
-	sortNodeIDs(out)
-	return out
-}
-
-// newlyAdmitted is the name the paged TRAVERSAL calls spillable by: that
-// endpoint still carries its cumulative set forward in the continuation spool.
-func (v *visitedSet) newlyAdmitted() []model.NodeID { return v.spillable() }
-
 // addedNodes is this leg's OWN admissions, ascending, and nothing else. It is
 // what the append-only run store takes (visitedstore.go): the resumed frontier
 // carried in v.carried belongs to an earlier leg's run already, so including it
@@ -297,24 +273,30 @@ type visitedFilter struct {
 // filter and the size of the walk is not known then.
 const visitedFilterBudgetShare = 8
 
-// spoolFilterBits sizes the summary the PAGED TRAVERSAL rebuilds per page from
-// its spool: sixteen bits for every node the cursor says the walk has admitted,
-// clamped to maxBytes of heap and rounded to whole words. That path re-reads
-// the whole set on every page anyway, so its filter is re-derived rather than
-// frozen, and a walk past the clamp simply gets a denser one -- more false
-// positives, more sweeps -- never a refusal or a truncation.
-func spoolFilterBits(estimate, maxBytes int64) uint64 {
-	if estimate <= 0 || maxBytes <= 0 {
-		return 0
+// visitedFilterBytes is what a walk's persisted membership summary may claim:
+// its share of the frontier ceiling, and never more than the same share of the
+// shared continuation byte budget the retained directory is charged against.
+//
+// The second clamp exists because the summary is an ACCELERATOR and not state
+// any answer depends on: a miss proves the runs cannot hold a node, a hit costs
+// a sweep, and a filter of zero bits is simply no information -- every level
+// merge-joins the runs instead. Sizing it at a fixed share of a frontier
+// ceiling that may be far larger than the whole temp budget would make a
+// workspace with a tight resources.max_temp_bytes unable to page a walk AT ALL,
+// which is a refusal bought for a speed-up. A denser summary is the honest
+// trade: more false positives, more sweeps, the same answer.
+func (e *Engine) visitedFilterBytes() int64 {
+	want := e.limits.FrontierBytes / visitedFilterBudgetShare
+	if e.spools == nil {
+		return want
 	}
-	words := (estimate*16 + 63) / 64
-	if maxWords := maxBytes / 8; words > maxWords {
-		words = maxWords
+	// Zero is the store's spelling of UNLIMITED, where nothing clamps.
+	if budget := e.spools.ByteBudget(); budget > 0 {
+		if share := budget / visitedFilterBudgetShare; share < want {
+			return share
+		}
 	}
-	if words <= 0 {
-		return 0
-	}
-	return uint64(words) * 64
+	return want
 }
 
 // newFrozenVisitedFilter builds a filter of exactly bits bits and k probes.

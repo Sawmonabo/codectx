@@ -704,6 +704,21 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
 	}
+	// The cumulative admitted-node set of THIS walk, append-only state in a
+	// retained directory (visitedstore.go), exactly as impact and the package
+	// rollup keep theirs. A resumed page reopens the one its predecessor left;
+	// a first page creates one only if it actually mints a continuation, which
+	// is why this is nil here and filled in at the mint below: a neighbours
+	// query that fits one page -- the common one -- would otherwise pay a
+	// fixed-size filter file and a manifest for state nothing will ever read.
+	retain := resumeRetained(resume)
+	// Discarded AFTER the continuation below has taken it: a page that mints a
+	// cursor detaches the directory, and this then finds nothing to remove.
+	defer func() {
+		if retain != nil {
+			retain.discard()
+		}
+	}()
 	var (
 		relations  []model.Relation
 		walkReason string
@@ -812,10 +827,14 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
 		// The cumulative set is NOT materialized into a slice here: only the
-		// nodes THIS page admitted are, and the rest is copied spool to spool.
-		var carried visitedStream
-		if resume != nil {
-			carried = resume.Visited
+		// nodes THIS page admitted are, and every earlier page's run stays
+		// where that page wrote it. The resumed frontier is deliberately left
+		// out -- every node that ever reaches a frontier was added by the page
+		// that discovered it, so it is already in that page's own run.
+		if retain == nil {
+			if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes()); err != nil {
+				return model.GraphResult{}, err
+			}
 		}
 		nextCursor, err = e.nextTraversalCursor(finish, b, continuation{
 			Endpoint:  endpoint,
@@ -824,8 +843,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			LastOwner: lastOwner,
 			LastKey:   lastKey,
 			Frontier:  state.Frontier,
-			Visited:   state.Admitted.newlyAdmitted(),
-			Carried:   carried,
+			Visited:   state.Admitted.addedNodes(),
+			Retain:    retain,
 		})
 		if err != nil {
 			return model.GraphResult{}, err
