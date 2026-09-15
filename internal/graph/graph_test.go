@@ -574,16 +574,15 @@ func TestGraphScenarios(t *testing.T) {
 		{
 			// resources.query_memory_bytes is the ONLY bound on how much of one
 			// frontier level is held in memory at once, and both the config and
-			// docs/queries.md promise it exists. A level that keeps accumulating
-			// past it restores the unbounded hub the bound was written to stop,
-			// and -- because the walk then still reports a clean finish -- the
-			// operator is never told the ceiling was crossed. n-wide's fan-out
-			// under a budget that holds only a handful of its rows is the
-			// smallest case that separates "stopped at the ceiling and said so"
-			// from "ignored the ceiling". The complementary half (the whole
-			// fan-out is carried under the 32 MiB default, untruncated) is held
-			// by the storage-clamp row above and is not repeated here.
-			name: "traverse/a level past the frontier byte budget truncates and says so",
+			// docs/queries.md promise it exists. It is a MEMORY ceiling and not
+			// a bound on the answer: a level past it spills its collected run
+			// to the retained directory and carries on, so the walk serves the
+			// same edges it serves under a ceiling that never binds and reports
+			// no truncation. A build that let the ceiling end the level instead
+			// would answer short, which is the functional shortcut ADR-0005
+			// forbids. n-wide's fan-out under a budget that holds only a handful
+			// of its rows is the smallest case that separates the two.
+			name: "traverse/a level past the frontier byte budget spills and serves it whole",
 			run: func(t *testing.T, f *graphFixture) {
 				limits := fixtureLimits()
 				// Neither the page bound nor the edge budget may be what cuts
@@ -603,12 +602,12 @@ func TestGraphScenarios(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Neighbors: %v", err)
 				}
-				if !got.Meta.Truncated || got.Meta.TruncationReason != reasonFrontierBytes {
-					t.Fatalf("truncated=%v reason=%q, want true and %q: the frontier byte ceiling was crossed without disclosure",
-						got.Meta.Truncated, got.Meta.TruncationReason, reasonFrontierBytes)
+				if got.Meta.Truncated {
+					t.Fatalf("truncated=%v reason=%q: the frontier byte ceiling is a memory bound, not an answer bound",
+						got.Meta.Truncated, got.Meta.TruncationReason)
 				}
-				if len(got.Relations) == 0 || len(got.Relations) >= fixtureWideCount {
-					t.Fatalf("returned %d of %d edges under a %d-byte frontier budget: the budget bounded nothing",
+				if len(got.Relations) != fixtureWideCount {
+					t.Fatalf("returned %d of %d edges under a %d-byte frontier budget: the ceiling changed the answer",
 						len(got.Relations), fixtureWideCount, limits.FrontierBytes)
 				}
 			},

@@ -292,17 +292,17 @@ func appendRoute(parent []RelRef, via RelRef) []RelRef {
 	return append(out, via)
 }
 
-// levelNames is ONE committed level's canonical ids, resolved in one batched
-// primary-key read per identifier space (ADR-0005 Decision 2). The walk carries
-// surrogates; the RANKING record must carry content-derived canonical ids, or
-// a fresh index and a delta-built index of the same tree would fold different
-// routes and serve different pages. This is where the two meet.
+// levelNames is ONE served BATCH's canonical ids (ADR-0005 Decision 2). The
+// walk carries surrogates; the RANKING record must carry content-derived
+// canonical ids, or a fresh index and a delta-built index of the same tree
+// would fold different routes and serve different pages. This is where the two
+// meet.
 //
-// It is refilled by expand before the level's edges reach the visitor and is
-// never accumulated across levels: a map that grew with the walk would be the
-// repository-sized heap structure the surrogate walk exists to remove. The
-// visitor therefore sees only the names of the level it is being handed, which
-// is exactly what a record built from that level needs.
+// It is refilled by expand before each batch reaches the visitor and is never
+// accumulated: a map that grew with the walk would be the repository-sized heap
+// structure the surrogate walk exists to remove. The ids of the batch's own
+// edges travel on the level records; only the ROUTE relations are looked up,
+// through the bounded cache in traverse.go.
 type levelNames struct {
 	nodes map[NodeRef]model.NodeID
 	rels  map[RelRef]model.RelationID
@@ -389,15 +389,10 @@ type budget struct {
 	// time.Now would make a test clock's deadline either unreachable or
 	// already past. Nil means time.Now, for a budget built without a clock.
 	now func() time.Time
-	// frontierHit records that levelEdges stopped accumulating because the
-	// frontier byte budget was spent. The walk itself is a clean finish; the
-	// caller turns this into the truncation reason, because only it owns the
-	// answer's meta.
-	frontierHit bool
 	// deadlineHit records that the walk stopped because the request's
 	// query_timeout ran out with edges already admitted. Ruling Q4 makes the
-	// deadline end a PAGE, not an answer, so -- like frontierHit -- it is a
-	// clean finish here and the caller turns it into the truncation reason and
+	// deadline end a PAGE, not an answer, so it is a clean finish here and the
+	// caller turns it into the truncation reason and
 	// the continuation cursor. It is set only by a walk that opted in
 	// (expandOptions.DeadlineStops). For a PAGED traversal it is set only once
 	// the page holds a row -- a deadline before any edge has nothing partial to
@@ -425,14 +420,13 @@ type expandOptions struct {
 	// runs out of depth with a frontier still standing reports reasonDepth;
 	// it is the one bound that is a property of the WALK rather than of the
 	// page, so it is not a per-page budget.
-	MaxDepth  config.Limit
-	Budget    *budget
-	BatchSize int
-	// FrontierBytes is Limits.FrontierBytes: the ceiling on the edges one
-	// frontier level may hold in memory at once. A level that reaches it stops
-	// reading; the frontier it had built is spilled to the continuation spool
-	// and the next page resumes from the keyset position, rather than
-	// accumulating a whole hub's fan-out with no bound in front of it.
+	MaxDepth config.Limit
+	Budget   *budget
+	// FrontierBytes is Limits.FrontierBytes: the ceiling on the encoded edges
+	// one frontier level may hold in memory at once. A level that reaches it
+	// SPILLS the run it has collected to the retained directory and carries on
+	// reading, rather than accumulating a whole hub's fan-out in heap; peak
+	// heap is therefore this ceiling plus one record whatever the level costs.
 	// It is strictly positive (New refuses 0): it is a memory ceiling, so a
 	// zero would remove the level's only heap bound rather than lift a scale
 	// cap.
@@ -468,8 +462,8 @@ type expandOptions struct {
 	// level's records and the bits that mark them can never be opened against
 	// two different directories.
 	Retain *retainedWalk
-	// Names is the per-level canonical resolution the VISITOR reads. expand
-	// refills it before each level's edges are delivered; the caller allocates
+	// Names is the canonical resolution the VISITOR reads. expand refills it
+	// before each batch of a served level reaches the visitor; the caller allocates
 	// it and hands the same pointer to its visitor, which is what lets a record
 	// be named without a round trip per edge. Nil means the visitor needs no
 	// names (the package rollup, which reads refs only).

@@ -37,15 +37,6 @@ const (
 	// j*8+i, least significant bit first. Its manifest count is the answer's
 	// disclosed visited_count.
 	bitsetNodeFile = "visited.bits"
-	// bitsetRelFile is the same structure over RELATION surrogates: the set of
-	// relations the walk has already emitted, which keeps a cycle, an
-	// overlapping level or a DirectionBoth edge whose two endpoints sit on
-	// different levels from being counted and emitted twice.
-	//
-	// It is on disk for the reason the node set is: an in-heap set of admitted
-	// relations is sized by the walk's EDGE count, which on a large repository
-	// is the largest structure a traversal holds.
-	bitsetRelFile = "emitted.bits"
 	// bitsetFrontierFile is the CURRENT level's frontier over node surrogates.
 	// It is rebuilt from admitted.<level> at every level transition, so it
 	// answers "is this neighbour on the level being scanned?" without holding

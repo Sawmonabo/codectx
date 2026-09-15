@@ -17,7 +17,7 @@ import (
 // test writes into it, which is what the lazy-directory case relies on.
 func newLevelWalk(t *testing.T, chunk int) *retainedWalk {
 	t.Helper()
-	w, err := openRetainedWalk(filepath.Join(t.TempDir(), "scratch"), walkBounds{Node: 1 << 20, Relation: 1 << 20}, nil)
+	w, err := openRetainedWalk(filepath.Join(t.TempDir(), "scratch"), walkBounds{Node: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("openRetainedWalk: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestEachFrontierChunksAndResumesAtTheNode(t *testing.T) {
 // below fails.
 func TestAWalkThatNeitherSpillsNorDetachesLeavesNothingOnDisk(t *testing.T) {
 	parent := filepath.Join(t.TempDir(), "scratch")
-	w, err := openRetainedWalk(parent, walkBounds{Node: 1 << 20, Relation: 1 << 20}, nil)
+	w, err := openRetainedWalk(parent, walkBounds{Node: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("openRetainedWalk: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestAWalkThatNeitherSpillsNorDetachesLeavesNothingOnDisk(t *testing.T) {
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("the detached directory is not on disk: %v", err)
 	}
-	reopened, err := reopenRetainedWalk(dir, "", walkBounds{Node: 1 << 20, Relation: 1 << 20}, nil)
+	reopened, err := reopenRetainedWalk(dir, "", walkBounds{Node: 1 << 20}, nil)
 	if err != nil {
 		t.Fatalf("reopenRetainedWalk: %v", err)
 	}
