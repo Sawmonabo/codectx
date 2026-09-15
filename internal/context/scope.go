@@ -229,57 +229,71 @@ type ingested struct {
 // own.
 func lessCandSeq(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }
 
-// expandScopeStream is expandScope as sorted streams. It produces the same
-// candidates, in the same admission order, with the same scope verdict, holding
-// one sort run buffer per sort instead of res.Candidates and
-// `admitted map[string]bool` (ruling C2).
+// seedStage records where in the seed stream one Section 15.2 discovery step
+// began. It is what lets a user-set context.max_seeds, applied to the FOLDED
+// seed stream, still name the steps it cut: the stream carries no step label,
+// only an origin, and several steps share one origin. There is one row per step
+// -- a constant of Section 15.2, not a function of the repository.
+type seedStage struct {
+	origin   originKind
+	step     string
+	firstSeq int64
+}
+
+// seedIngest is the push sink every Section 15.2 producer writes its seeds to
+// (ruling C10).
 //
-// The dedupe is two folds and no join. Seeds that participate in today's
-// dedupe (resolved, and carrying an entity identity) go through a first
-// lessEntityID/foldMinSeq sort so that `start` can be built from the survivors
-// before the walk runs; those survivors and every impact entry then go through
-// a second one. foldMinSeq over that union reproduces BOTH of today's dedupe
-// sites at once: a seed survivor's seq is always smaller than any impact
-// entry's, so a boundary the walk reaches again keeps its seed requirement
-// (scope.go:204), and two impact entries fold to the earlier one (scope.go:209).
-// Re-folding an already-folded seed survivor is idempotent.
+// Before it, extractSeeds accumulated every admitted seed in a slice and a
+// `seen map[string]bool` beside it, and the compile held both until the
+// expansion consumed them: two repository-sized structures on the heap for a
+// pipeline whose whole point is that its peak is one run buffer. Now a producer
+// pushes each seed as it finds it, straight into the sorts the expansion
+// already runs, and nothing between discovery and the walk grows with the seed
+// count.
 //
-// Seeds that do NOT participate today -- an unresolved token, and a seed
-// carrying neither a node nor a file identity -- are added straight to the
-// output sort, exactly as today's loop appends them without consulting the map.
-//
-// Seq is the seed's index for a seed and len(seeds)+j for the j-th impact
-// entry, which is why the route emission below can index impact.Entries
-// directly instead of joining against it.
-func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *graph.Engine,
-	gen model.GenerationID, seeds []candidate, caps []model.CapabilityState) (*ingested, error) {
+// The dedupe moves with it. `add`'s map keyed on the entity identity, first
+// writer wins, is exactly what the scope-seed sort's lessEntityID comparator
+// and foldMinSeq fold already do over the same key, because seq is assigned in
+// discovery order: the earliest step that found an entity keeps it. A seed
+// carrying NO entity identity has no dedupe key, and is admitted in arrival
+// order rather than dropped -- the map dropped it, silently, for want of a key.
+type seedIngest struct {
+	sorts *compileSorts
+	cfg   config.Context
+	// seedSort folds the identity-carrying seeds by entity, keeping the
+	// earliest; candSort is the admission-order spool every later pass replays;
+	// entitySort is the union fold the walk's entries join the survivors in;
+	// the two route sorts take the walk's routes as each page arrives.
+	seedSort, entitySort, candSort *pagination.ExternalSort[candRec]
+	pathSort                       *pagination.ExternalSort[pathRec]
+	hopSort                        *pagination.ExternalSort[hopRec]
+	// seq is the arrival counter: the seed's discovery position, then the
+	// walk's entries after it. It is the only per-seed state this sink keeps.
+	seq int64
+	// resolved counts the seeds that carry an identity, which is what decides
+	// whether a walk is run at all.
+	resolved int
+	stages   []seedStage
+	scope    scopeResult
+}
+
+// newSeedIngest opens the sort area's seed-side sorts and returns the sink the
+// Section 15.2 producers push into.
+func (c *Compiler) newSeedIngest(s *compileSorts) (*seedIngest, error) {
 	if s == nil {
 		return nil, argumentInvalid("a streamed scope expansion requires an open sort area")
 	}
-	if eng == nil {
-		return nil, argumentInvalid("scope expansion requires a graph engine")
-	}
-	if gen == 0 {
-		return nil, argumentInvalid("scope expansion requires an explicit pinned generation")
-	}
-	cfg := c.cfg.Context
-
-	seedSort, err := newSort[candRec](s, "scope-seed", lessEntityID, sizeOfCand)
-	if err != nil {
+	in := &seedIngest{sorts: s, cfg: c.cfg.Context, scope: scopeResult{ScopeComplete: true}}
+	var err error
+	if in.seedSort, err = newSort[candRec](s, "scope-seed", lessEntityID, sizeOfCand); err != nil {
 		return nil, err
 	}
-	seedSort = seedSort.WithFold(foldMinSeq)
-	seedSeqSort, err := newSort[candRec](s, "scope-seedseq", lessCandSeq, sizeOfCand)
-	if err != nil {
+	in.seedSort = in.seedSort.WithFold(foldMinSeq)
+	if in.entitySort, err = newSort[candRec](s, "scope-entity", lessEntityID, sizeOfCand); err != nil {
 		return nil, err
 	}
-	entitySort, err := newSort[candRec](s, "scope-entity", lessEntityID, sizeOfCand)
-	if err != nil {
-		return nil, err
-	}
-	entitySort = entitySort.WithFold(foldMinSeq)
-	candSort, err := newSort[candRec](s, "scope-cand", lessCandSeq, sizeOfCand)
-	if err != nil {
+	in.entitySort = in.entitySort.WithFold(foldMinSeq)
+	if in.candSort, err = newSort[candRec](s, "scope-cand", lessCandSeq, sizeOfCand); err != nil {
 		return nil, err
 	}
 	// The two route sorts are opened here rather than in finishIngest because
@@ -288,80 +302,105 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 	// walk, which is the structure this wave removes. They therefore carry the
 	// routes of entries the fold later drops, and finishIngest filters them
 	// against the surviving candidate stream.
-	pathSort, err := newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath)
-	if err != nil {
+	if in.pathSort, err = newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath); err != nil {
 		return nil, err
 	}
-	hopSort, err := newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop)
-	if err != nil {
+	if in.hopSort, err = newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop); err != nil {
 		return nil, err
 	}
-	emitRoutes := func(seq int64, raw []model.RelationPath) error {
-		paths, _ := boundPaths(raw, cfg.MaxReasonPathsPerEntry)
-		for pi := range paths {
-			p := paths[pi]
-			if err := pathSort.Add(pathRec{
-				Seq: seq, PathIdx: int32(pi), CostUnits: p.CostUnits,
-				Evidence: p.Evidence, HopCount: int32(len(p.Relations)),
+	return in, nil
+}
+
+// BeginStep names the Section 15.2 step whose seeds follow. A producer calls it
+// once per step, before pushing that step's first seed, and the sink records
+// only the arrival position the step started at.
+func (in *seedIngest) BeginStep(origin originKind, step string) {
+	if n := len(in.stages); n > 0 && in.stages[n-1].step == step {
+		return
+	}
+	in.stages = append(in.stages, seedStage{origin: origin, step: step, firstSeq: in.seq})
+}
+
+// Admit takes one discovered seed. It is the sink: the whole of what used to be
+// expandScope's loop over the accumulated slice, run once per seed as the
+// producer finds it.
+//
+// An excluded candidate is not diverted -- it goes on the admission spool with
+// its reason, which is where P-I's exclusion projection reads it -- except that
+// an EXPLICIT seed the caller named and nothing answers ends the compile, the
+// one Section 15.2 boundary that is an error rather than a discovery answer.
+func (in *seedIngest) Admit(sd candidate) error {
+	seq := in.seq
+	in.seq++
+	if sd.Excluded != "" {
+		if sd.Origin == originExplicitSeed {
+			return scopeIncomplete(sd.Path)
+		}
+		// An unresolved extracted token stays visible as an exclusion and
+		// carries the answer down to discovery rather than out of it.
+		in.scope.ScopeComplete = false
+		return in.candSort.Add(candRecOf(sd, seq))
+	}
+	in.resolved++
+	sd.Depth = 0
+	if sd.Requirement == "" {
+		// Every Section 15.2 seed producer assigns its own requirement; the
+		// default stands only for a seed that carries none, which would
+		// otherwise rank below optional and be droppable.
+		sd.Requirement = model.RequirementFull
+	}
+	if sd.entityID() == "" {
+		// No identity, so no dedupe key and no fold: the seed goes straight to
+		// the admission spool in arrival order.
+		return in.candSort.Add(candRecOf(sd, seq))
+	}
+	return in.seedSort.Add(candRecOf(sd, seq))
+}
+
+// emitRoutes writes one walk entry's routes into the two route sorts.
+func (in *seedIngest) emitRoutes(seq int64, raw []model.RelationPath) error {
+	paths, _ := boundPaths(raw, in.cfg.MaxReasonPathsPerEntry)
+	for pi := range paths {
+		p := paths[pi]
+		if err := in.pathSort.Add(pathRec{
+			Seq: seq, PathIdx: int32(pi), CostUnits: p.CostUnits,
+			Evidence: p.Evidence, HopCount: int32(len(p.Relations)),
+		}); err != nil {
+			return err
+		}
+		for hi, rel := range p.Relations {
+			if err := in.hopSort.Add(hopRec{
+				RelationID: rel, Seq: seq, PathIdx: int32(pi), HopIdx: int32(hi),
 			}); err != nil {
 				return err
 			}
-			for hi, rel := range p.Relations {
-				if err := hopSort.Add(hopRec{
-					RelationID: rel, Seq: seq, PathIdx: int32(pi), HopIdx: int32(hi),
-				}); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-
-	out := &ingested{Scope: scopeResult{ScopeComplete: true}}
-	resolved := 0
-	for i := range seeds {
-		sd := seeds[i]
-		seq := int64(i)
-		if sd.Excluded != "" {
-			if sd.Origin == originExplicitSeed {
-				return nil, scopeIncomplete(sd.Path)
-			}
-			// An unresolved extracted token stays visible as an exclusion and
-			// carries the answer down to discovery rather than out of it.
-			out.Scope.ScopeComplete = false
-			if err := candSort.Add(candRecOf(sd, seq)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		resolved++
-		sd.Depth = 0
-		if sd.Requirement == "" {
-			// Every Section 15.2 seed producer assigns its own requirement; the
-			// default stands only for a seed that carries none, which would
-			// otherwise rank below optional and be droppable. Today this runs
-			// after the dedupe skip, which only ever discards the record it
-			// would have applied to, so applying it before the fold is the same.
-			sd.Requirement = model.RequirementFull
-		}
-		if sd.entityID() == "" {
-			// Today's guard is `if id := s.entityID(); id != ""`: a seed with no
-			// identity never enters the map and so is never a duplicate.
-			if err := candSort.Add(candRecOf(sd, seq)); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if err := seedSort.Add(candRecOf(sd, seq)); err != nil {
-			return nil, err
 		}
 	}
+	return nil
+}
 
-	seedRun, err := seedSort.Sorted()
+// foldSeeds drains the entity fold into seq order, applies the ONE count bound
+// over the seed set -- the user-set context.max_seeds -- and builds the walk's
+// start set from the survivors.
+//
+// The bound is applied HERE, to the folded stream, and not by the producers:
+// a producer counting its own admissions counts duplicates the fold has not
+// collapsed yet, so the same task cut at the same limit answered differently
+// depending on how many of its identities two steps had both named. The set
+// this keeps is the first N distinct entities in discovery order, which is what
+// the map-and-slice version kept. It is unlimited by default; a limit that
+// cuts is disclosed, per step, as an exclusion AND leaves the scope incomplete.
+func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
+	s := in.sorts
+	seedRun, err := in.seedSort.Sorted()
 	if err != nil {
 		return nil, err
 	}
 	trackRun(s, seedRun)
+	seedSeqSort, err := newSort[candRec](s, "scope-seedseq", lessCandSeq, sizeOfCand)
+	if err != nil {
+		return nil, err
+	}
 	if err := seedRun.Each(func(r candRec) error { return seedSeqSort.Add(r) }); err != nil {
 		return nil, err
 	}
@@ -371,13 +410,24 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 	}
 	trackRun(s, seedSeqRun)
 
+	limit := in.cfg.MaxSeeds
+	admitted := int64(0)
+	cutAt := int64(-1)
 	// start is built from the deduped survivors in seq order, never at ingest:
-	// today a duplicate seed returns before the start logic, so counting it
-	// here would both reorder the walk's roots and mis-trigger the overflow
-	// disclosure below.
+	// a duplicate seed never reached the start logic before the fold, so
+	// counting it here would both reorder the walk's roots and mis-trigger the
+	// overflow disclosure below.
 	start := make([]model.NodeID, 0, model.MaxStartNodes)
 	if err := seedSeqRun.Each(func(r candRec) error {
-		if err := entitySort.Add(r); err != nil {
+		if !limit.IsUnlimited() && admitted >= limit.Value() {
+			if cutAt < 0 {
+				cutAt = r.Seq
+			}
+			in.scope.ScopeComplete = false
+			return nil
+		}
+		admitted++
+		if err := in.entitySort.Add(r); err != nil {
 			return err
 		}
 		if r.NodeID == "" {
@@ -390,25 +440,97 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 		// More seeds than one bounded walk may start from: the boundaries of
 		// the seeds that did not start are unexplored, and the answer says so
 		// rather than reading as an exhaustive scope.
-		out.Scope.ScopeComplete = false
+		in.scope.ScopeComplete = false
 		return nil
 	}); err != nil {
 		return nil, err
 	}
+	if cutAt >= 0 {
+		if err := in.discloseCut(cutAt, limit); err != nil {
+			return nil, err
+		}
+	}
+	return start, nil
+}
+
+// discloseCut names every Section 15.2 step the context.max_seeds bound stopped:
+// the step the first dropped seed belongs to, and every step after it, one
+// exclusion row each, exactly as the per-step cut the producers used to report.
+// A step is stopped when any of its arrivals lies at or past the cut.
+func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
+	for i, st := range in.stages {
+		last := int64(-1)
+		if i+1 < len(in.stages) {
+			last = in.stages[i+1].firstSeq - 1
+		} else {
+			last = in.seq - 1
+		}
+		if last < cutAt {
+			continue
+		}
+		seq := in.seq
+		in.seq++
+		if err := in.candSort.Add(candRecOf(seedCut(st.origin, st.step, limit), seq)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// expandScopeStream is expandScope as sorted streams. It produces the same
+// candidates, in the same admission order, with the same scope verdict, holding
+// one sort run buffer per sort instead of res.Candidates and
+// `admitted map[string]bool` (ruling C2).
+//
+// The dedupe is two folds and no join. Seeds that participate in today's
+// dedupe (resolved, and carrying an entity identity) go through a first
+// lessEntityID/foldMinSeq sort so that `start` can be built from the survivors
+// before the walk runs; those survivors and every impact entry then go through
+// a second one. foldMinSeq over that union reproduces BOTH of today's dedupe
+// sites at once: a seed survivor's seq is always smaller than any impact
+// entry's, so a boundary the walk reaches again keeps its seed requirement,
+// and two impact entries fold to the earlier one.
+// Re-folding an already-folded seed survivor is idempotent.
+//
+// It takes the sink the seeds were pushed into rather than a slice of them:
+// the seeds are already inside the sorts by the time this runs, and seq is the
+// sink's arrival counter continued by the walk.
+func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *graph.Engine,
+	gen model.GenerationID, caps []model.CapabilityState) (*ingested, error) {
+	if in == nil {
+		return nil, argumentInvalid("a streamed scope expansion requires an open seed sink")
+	}
+	if eng == nil {
+		return nil, argumentInvalid("scope expansion requires a graph engine")
+	}
+	if gen == 0 {
+		return nil, argumentInvalid("scope expansion requires an explicit pinned generation")
+	}
+	cfg := in.cfg
+	s := in.sorts
+	out := &ingested{}
+	start, err := in.foldSeeds()
+	if err != nil {
+		return nil, err
+	}
+	finish := func() (*ingested, error) {
+		out.Scope = in.scope
+		return finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
+	}
 
 	switch {
-	case resolved == 0:
+	case in.resolved == 0:
 		// Discovery: nothing resolved, so nothing is required and no walk is
 		// run. Seeds already carry their own exclusion reasons.
-		out.Scope.ScopeComplete = false
-		return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
+		in.scope.ScopeComplete = false
+		return finish()
 	case len(start) == 0:
 		// Files resolved but no symbol did, so no boundary can be walked from
 		// them. Each seed keeps the requirement its Section 15.2 step assigned;
 		// the scope is not complete.
-		out.Scope.ScopeComplete = false
-		out.Scope.Completeness = degradedCapabilities(caps, nil)
-		return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
+		in.scope.ScopeComplete = false
+		in.scope.Completeness = degradedCapabilities(caps, nil)
+		return finish()
 	}
 
 	// The walk is read TO EXHAUSTION. graph.Impact answers one globally ranked
@@ -428,8 +550,6 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 	// deduplicated capability rows: each page's entries go straight into the
 	// dedupe sort and their routes straight into the route sorts, so the pass
 	// holds one page and its sorts' run buffers however long the walk runs.
-	impactBase := int64(len(seeds))
-	seq := impactBase
 	pageSize := c.pageLimit()
 	var disclosed []model.CapabilityState
 	cursor := ""
@@ -451,7 +571,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 			return nil, contextErr(ctx, err)
 		}
 		if impact.Meta.Truncated {
-			out.Scope.ScopeComplete = false
+			in.scope.ScopeComplete = false
 		}
 		// Deduplicated per page rather than appended: the rows are a property
 		// of the generation and every page repeats the same disclosure, so
@@ -471,30 +591,31 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 			}
 			var dropped, truncated int64
 			cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
-			out.Scope.ReasonsDropped += dropped
-			out.Scope.ReasonsTruncated += truncated
+			in.scope.ReasonsDropped += dropped
+			in.scope.ReasonsTruncated += truncated
 			// Only the disclosure count is kept on the record; the routes
 			// themselves go to the route sorts, and finishIngest keeps the ones
 			// whose candidate survived the fold.
 			_, cand.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-			if err := entitySort.Add(candRecOf(cand, seq)); err != nil {
+			seq := in.seq
+			in.seq++
+			if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {
 				return nil, err
 			}
-			if err := emitRoutes(seq, e.Paths); err != nil {
+			if err := in.emitRoutes(seq, e.Paths); err != nil {
 				return nil, err
 			}
-			seq++
 		}
 		if impact.Meta.NextCursor == "" {
 			break
 		}
 		cursor = impact.Meta.NextCursor
 	}
-	out.Scope.Completeness = degradedCapabilities(caps, disclosed)
-	if len(out.Scope.Completeness) > 0 {
-		out.Scope.ScopeComplete = false
+	in.scope.Completeness = degradedCapabilities(caps, disclosed)
+	if len(in.scope.Completeness) > 0 {
+		in.scope.ScopeComplete = false
 	}
-	return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
+	return finish()
 }
 
 // pinnedGeneration is the generation a walk request carries: the pinned one on

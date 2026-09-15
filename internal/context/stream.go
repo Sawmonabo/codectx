@@ -634,10 +634,10 @@ type compileSorts struct {
 
 // sortObservation is what one sort reports about its own memory behaviour.
 //
-// Spilled is DERIVED rather than read from the primitive, which exposes no run
-// count: the run buffer only ever shrinks by spilling, so a sort that never
-// spilled ends with every added record still buffered and Added == Peak, and
-// Added > Peak holds exactly when at least one run was written.
+// Spilled is READ FROM THE PRIMITIVE (pagination.ExternalSort.SpilledRuns), so
+// it is the count of runs the sort wrote rather than a boolean derived from
+// Added > Peak. The count is what distinguishes a sort that reached its run
+// budget once from one that reached it a thousand times over the same peak.
 type sortObservation struct {
 	// Name is the sort's name as newSort was called with it.
 	Name string
@@ -645,8 +645,9 @@ type sortObservation struct {
 	Peak int
 	// Added is how many records the sort accepted.
 	Added int64
-	// Spilled says whether the sort wrote at least one run to disk.
-	Spilled bool
+	// Spilled is how many runs the sort wrote to disk; zero means the whole
+	// input stayed inside one run buffer.
+	Spilled int
 }
 
 // observations reports what each of this compile's sorts held, newest sort
@@ -742,7 +743,7 @@ func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	s.track(func() error {
 		s.observed[idx] = sortObservation{
 			Name: name, Peak: sorter.PeakLiveRecords(), Added: sorter.Len(),
-			Spilled: sorter.Len() > int64(sorter.PeakLiveRecords()),
+			Spilled: sorter.SpilledRuns(),
 		}
 		return nil
 	})
@@ -783,13 +784,12 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // deliberately does not filter on it while hydrateFiles does, and P-I derives
 // the exclusion projection by replaying this spool in seq order.
 //
-// The parameter list and result are completed here, as this freeze reserves to
-// the owning lane: the pass cannot receive its seeds, engine, generation and
-// capability report, nor hand on the three runs and the scope verdict, through
-// (ctx, s) alone. Name, receiver and position in the pass order are unchanged.
-func (c *Compiler) passAIngest(ctx context.Context, s *compileSorts, eng *graph.Engine,
-	gen model.GenerationID, seeds []candidate, caps []model.CapabilityState) (*ingested, error) {
-	return c.expandScopeStream(ctx, s, eng, gen, seeds, caps)
+// It takes the seed SINK the Section 15.2 producers pushed into, not a slice of
+// seeds (ruling C10): by the time this pass runs the seeds are already inside
+// the sort area, and what remains is the walk and the folds over them.
+func (c *Compiler) passAIngest(ctx context.Context, in *seedIngest, eng *graph.Engine,
+	gen model.GenerationID, caps []model.CapabilityState) (*ingested, error) {
+	return c.expandScopeStream(ctx, in, eng, gen, caps)
 }
 
 // passBHydrate — §2 P-B, lane L1. Streams the candidate spool in pageLimit()

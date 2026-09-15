@@ -297,9 +297,14 @@ func TestACompileSortHoldsItsRunBudgetAndSpills(t *testing.T) {
 	if len(obs) != 1 {
 		t.Fatalf("the sort area observed %d sorts, want 1", len(obs))
 	}
-	if !obs[0].Spilled {
-		t.Errorf("%d records under a %d-byte run budget never spilled, so the peak below is not "+
-			"evidence of anything", records, sorts.runBytes)
+	// A COUNT, not a boolean: the invariant is that the budget was reached over
+	// and over while the peak stayed put, so one run would be as suspicious as
+	// none. The count also survives Sorted(), which removes the run files and
+	// clears the primitive's run slice before this observation is taken.
+	if obs[0].Spilled < 2 {
+		t.Errorf("%d records under a %d-byte run budget wrote %d runs, want many: the peak below is "+
+			"not evidence of anything unless the budget was reached repeatedly",
+			records, sorts.runBytes, obs[0].Spilled)
 	}
 	// Peak is in RECORDS and the budget is in BYTES, so the assertion is on the
 	// bytes those records could have held: no more than one run buffer's worth,
