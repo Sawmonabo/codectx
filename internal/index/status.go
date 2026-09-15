@@ -394,7 +394,52 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 		carried = collapseCarried(carried)
 	}
 	out = append(out, carried...)
-	return boundStates(out, log)
+	return boundStates(foldToPrimaryKey(out), log)
+}
+
+// foldToPrimaryKey brings the assembled list inside the one row per
+// (provider_id, capability, scope_key) that generation_capabilities is keyed
+// by -- its primary key does not carry the state. The three assembly buckets
+// above key their own rows by state as well, so one provider capability
+// reaches here more than once at one scope in three shapes, each of which
+// failed the insert and took `codectx index` down on a constraint error
+// instead of publishing the degraded generation it had built:
+//
+//   - a sibling unit that succeeded folds a `fresh` row to the workspace scope
+//     (add) while the unit that failed publishes the `failed` fold here;
+//   - the planner's and the registry's `partial` degradations are workspace
+//     scoped too (plan.builder.partial, provider detection), so they collide
+//     with that same `failed` fold;
+//   - a carried scope whose key is itself the workspace scope -- a dependence
+//     family planned as one whole-workspace unit -- publishes `stale` beside
+//     either of those.
+//
+// The most severe row survives, ranked by the same severityRank boundStates
+// truncates by: Section 13.3 lets a report under-claim and never over-claim.
+// The fold keeps the first occurrence of a key and never reorders, so the
+// published row is a function of the set and not of the order the concurrent
+// unit workers reported in -- the determinism the exemplar choices above exist
+// for, because these rows fold into the AnalysisKey.
+//
+// It does not make addDeferred's demotion redundant. That one deletes the
+// fresh row so that reported() stops finding it and the deferred row is added
+// at all; without the delete the capability publishes one `fresh` row, alone,
+// and this fold has nothing to out-rank it with.
+func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
+	at := make(map[string]int, len(rows))
+	out := make([]model.CapabilityState, 0, len(rows))
+	for _, c := range rows {
+		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
+		if i, ok := at[key]; ok {
+			if severityRank(c.State) < severityRank(out[i].State) {
+				out[i] = c
+			}
+			continue
+		}
+		at[key] = len(out)
+		out = append(out, c)
+	}
+	return out
 }
 
 // boundStates brings an assembled capability list inside
