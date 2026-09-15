@@ -130,9 +130,24 @@ func TestSearchCoversEveryByte(t *testing.T) {
 		doc.WriteString("<p>Risk\xa0Management section " + strconv.Itoa(i) + " doesn\x92t stop here.</p>\n")
 	}
 	doc.WriteString("</body></html>\n")
+	// A newline-free file longer than one chunk whose bytes force the chunk
+	// boundary off a rune boundary: an invalid byte early on (so a
+	// validity-gated trim gives up), and at byte 32768 either a multi-byte
+	// rune straddling the edge or a run of bare continuation bytes longer
+	// than any well-formed sequence. Both used to end the chunk mid-sequence
+	// and fail the next call with "offset 32768 is inside a UTF-8 sequence",
+	// losing the whole unit.
+	straddle := func(at []byte) string {
+		raw := []byte(strings.Repeat("x", 70<<10))
+		raw[100] = 0xa0 // invalid UTF-8, as in the document above
+		copy(raw[filesystem.ChunkBytes-1:], at)
+		return string(raw)
+	}
 	files := map[string]string{
-		"policy.htm":   doc.String(),
-		"minified.txt": strings.Repeat("x", 5<<20),
+		"policy.htm":       doc.String(),
+		"minified.txt":     strings.Repeat("x", 5<<20),
+		"rune.min.js":      straddle([]byte("\u20ac")),
+		"contbytes.min.js": straddle([]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80}),
 	}
 	for _, tc := range []struct {
 		path      string
@@ -140,6 +155,8 @@ func TestSearchCoversEveryByte(t *testing.T) {
 	}{
 		{"policy.htm", true},
 		{"minified.txt", false},
+		{"rune.min.js", true},
+		{"contbytes.min.js", true},
 	} {
 		docs, state := index(t, files, tc.path)
 		if state.State != model.CapabilityFresh {

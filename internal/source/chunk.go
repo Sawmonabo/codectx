@@ -69,11 +69,14 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 
 	partial := false
 	if !atEOF {
-		// Back off to a complete UTF-8 sequence, but only when that is what
-		// makes the chunk decodable: for bytes that are not text at all the
-		// trim would drop content for no benefit, and base64 ranges are
-		// byte-based anyway.
-		if trimmed := trimToRuneBoundary(body); trimmed != len(body) && utf8.Valid(window[:trimmed]) {
+		// Back off to a rune boundary, whatever the window holds. The trim is
+		// not about decodability -- it is what keeps the next chunk's start
+		// legal: a boundary in the middle of a UTF-8 sequence is rejected by
+		// the guard above, so a chunk cut mid-sequence would fail the very
+		// next call and with it the whole unit. Bytes that are not text at
+		// all cost nothing here: the trim only ever moves the boundary, it
+		// never drops a byte, and the next chunk carries what it gave back.
+		if trimmed := trimToRuneBoundary(body); trimmed != len(body) {
 			end = trimmed
 			body = window[:end]
 		}
@@ -108,21 +111,35 @@ func PlanChunk(window []byte, windowStart, fileSize uint64, maxBytes uint32) (Ch
 	return chunk, nil
 }
 
-// trimToRuneBoundary returns the length of the longest prefix of body that ends
-// on a complete UTF-8 sequence. Bytes that are not a valid sequence at all are
-// left alone: they are carried as base64, and trimming them would drop content.
+// trimToRuneBoundary returns the length of the longest prefix of body that
+// ends on a rune boundary, so the next chunk starts on a byte utf8.RuneStart
+// accepts. It walks back over a run of continuation bytes of any length, not
+// just the at most three a well-formed sequence can have: a file may hold an
+// arbitrarily long run of them, and stopping the walk early would hand the
+// next chunk an illegal start offset and fail the unit.
+//
+// It never returns zero. When body holds no rune boundary after its first
+// byte, every cut but the full window would leave the chunk making no
+// progress, so the window is kept whole; its trailing bytes are not a
+// sequence under any reading and the caller carries them as base64 or
+// sanitises them.
 func trimToRuneBoundary(body []byte) int {
-	for i := len(body); i > 0 && len(body)-i < utf8.UTFMax; i-- {
-		if !utf8.RuneStart(body[i-1]) {
-			continue
+	last := -1
+	for i := len(body) - 1; i >= 0; i-- {
+		if utf8.RuneStart(body[i]) {
+			last = i
+			break
 		}
-		if r, size := utf8.DecodeRune(body[i-1:]); r != utf8.RuneError || size > 1 {
-			if i-1+size <= len(body) {
-				return len(body)
-			}
-			return i - 1
-		}
-		return i - 1
 	}
-	return len(body)
+	if last <= 0 {
+		return len(body)
+	}
+	// A complete sequence ending exactly at the window edge is already on a
+	// boundary. Anything else -- a sequence cut short by the edge, an invalid
+	// start byte, or stray continuation bytes after a complete rune -- is
+	// given back to the next chunk, which then starts at last.
+	if r, size := utf8.DecodeRune(body[last:]); (r != utf8.RuneError || size > 1) && last+size == len(body) {
+		return len(body)
+	}
+	return last
 }
