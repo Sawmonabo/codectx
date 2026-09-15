@@ -15,6 +15,10 @@ validated once, and `codectx` refuses to start if it does not hold together.
 
 Three rules apply to every key:
 
+Why the count and size keys below default to unlimited, why `0` and
+`"unlimited"` are one value, and which two families deliberately keep a finite
+default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md).
+
 - **Unknown keys are rejected** with `CTX_CONFIG_INVALID`. There is no extension
   namespace, so an unrecognized key is always a typo or a setting from a
   different version that this build would otherwise silently ignore.
