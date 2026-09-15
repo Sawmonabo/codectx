@@ -1195,7 +1195,7 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 			// silently drops occurrences a caller may be counting on, so the
 			// unit and the count are on the record. No source, no native keys.
 			slog.Warn("evidence occurrences were dropped to hold the per-fact bound",
-				"unit_id", string(w.build.Spec.ID), "dropped", w.evidenceClipped, "limit", model.MaxEvidencePerFact)
+				"unit_id", string(w.build.Spec.ID), "dropped", w.evidenceClipped, "limit", w.s.opts.MaxEvidencePerFact)
 		}
 	}
 	return err

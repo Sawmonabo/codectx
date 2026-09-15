@@ -360,7 +360,7 @@ namespace, `#` class, `().` method under a type else function, `.` variable,
 Every evidence row is `compiler` precision with the SCIP symbol as
 `native_key` and the role word as `detail`. The same edge at two ranges is
 one relation with two evidence rows; the same edge at the same range is one
-row. One relation carries at most `model.MaxEvidencePerFact` (64) evidence
+row. One relation carries at most `model.MaxEvidencePerFact` (65536, or the user-set `index.max_evidence_per_fact`) evidence
 rows; further occurrences are counted and the capabilities are `partial`
 with `CTX_RESOURCE_LIMIT`. The first definition of a symbol is the one
 references bind to; a later definition keeps its own located identity.
