@@ -30,8 +30,10 @@ type seedSet struct {
 	Unresolved bool
 	// cutStages names the Section 15.2 steps already reported as having stopped
 	// at model.MaxSeeds, so one bound that stops several later steps is named
-	// once per step rather than once per skipped identity.
-	cutStages map[originKind]bool
+	// once per step rather than once per skipped identity. The key is the STEP,
+	// not the step's originKind: several steps share one origin, and keying on
+	// the origin reported only the first of them and dropped the rest.
+	cutStages map[string]bool
 }
 
 // noteCut records that a Section 15.2 discovery step stopped at model.MaxSeeds
@@ -46,12 +48,12 @@ type seedSet struct {
 func (s *seedSet) noteCut(origin originKind, step string) {
 	s.Unresolved = true
 	if s.cutStages == nil {
-		s.cutStages = map[originKind]bool{}
+		s.cutStages = map[string]bool{}
 	}
-	if s.cutStages[origin] {
+	if s.cutStages[step] {
 		return
 	}
-	s.cutStages[origin] = true
+	s.cutStages[step] = true
 	s.Excluded = append(s.Excluded, candidate{
 		// The step is the exclusion's Path because ContextReference refuses a
 		// reference that names neither a node, a file nor a path, and the cut
@@ -376,6 +378,31 @@ func (c *Compiler) pageLimit() int {
 		return n
 	}
 	return model.MaxPageItems
+}
+
+// pageLimitNotice is the disclosure that goes with pageLimit's clamp.
+//
+// model.MaxPageItems stays: a page size is a bound on ONE read and on the wire
+// shape of a page, not on the answer -- every identity past it is read by the
+// next page -- so it is not the kind of cap this wave removes. What it stopped
+// being is silent. A configured resources.max_page_items above the wire ceiling
+// is reported as "requested N, effective M" on the manifest, so an operator who
+// raised the setting and saw no change learns why from the answer instead of
+// from the source.
+//
+// It is a pure function of configuration, so the compiler evaluates it once per
+// compile rather than at each of the six pageLimit() call sites -- one notice,
+// not one per read -- and emits it on the manifest-reuse path too, where no
+// read runs but the caller asked for the same page size.
+func (c *Compiler) pageLimitNotice() string {
+	n := c.cfg.Resources.MaxPageItems
+	if n <= 0 || n <= model.MaxPageItems {
+		return ""
+	}
+	note, _ := model.TruncateField(fmt.Sprintf(
+		"resources.max_page_items requested %d, effective %d: a page size bounds one read, not the answer; every identity past a page is read by continuation",
+		n, model.MaxPageItems), model.MaxReasonBytes)
+	return note
 }
 
 // nodeCandidate builds the seed candidate for one resolved declaration. A

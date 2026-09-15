@@ -53,6 +53,14 @@ type scopeResult struct {
 	// and none sets it true, so no later pass can repair a truncated walk, a
 	// degraded capability or an unresolved seed by scoring around it.
 	ScopeComplete bool
+	// ReasonsDropped and ReasonsTruncated count the Section 15.3 explanation
+	// cuts boundReasons applied across the whole expansion. They are COUNTS and
+	// not one notice per entry: an entry-sized disclosure list is
+	// repository-sized in heap, which is the shape this wave removes, while the
+	// two counts are what a caller deciding whether an explanation is whole
+	// actually needs. The compiler turns them into manifest notices.
+	ReasonsDropped   int64
+	ReasonsTruncated int64
 }
 
 // expandScope turns resolved seeds into the Section 15.2 required scope. The
@@ -187,8 +195,11 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			Requirement: boundaryRequirement(e.Kind, e.Depth),
 			Origin:      originExpansion,
 			Depth:       e.Depth,
-			Reasons:     boundReasons(e.Reasons),
 		}
+		var dropped, truncated int64
+		c.Reasons, dropped, truncated = boundReasons(e.Reasons)
+		res.ReasonsDropped += dropped
+		res.ReasonsTruncated += truncated
 		c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
 		if admitted[c.entityID()] {
 			// A seed the walk reached again keeps its seed requirement, which
@@ -251,22 +262,34 @@ func baseRequirement(kind model.NodeKind) model.Requirement {
 	return model.RequirementOptional
 }
 
-// boundReasons clamps an entry's explanation to the Section 15.3 caps. The
-// engine already bounds them, so this guards a future engine change from
-// producing a manifest that model.ContextEntry.Validate would reject at
-// persistence time, one pass too late to explain itself.
-func boundReasons(reasons []string) []string {
+// boundReasons clamps an entry's explanation to the Section 15.3 caps and
+// returns what it had to cut. The engine already bounds them, so this guards a
+// future engine change from producing a manifest that
+// model.ContextEntry.Validate would reject at persistence time, one pass too
+// late to explain itself.
+//
+// The cut is no longer silent. Both halves are counted and surfaced as manifest
+// notices by the compiler: an explanation shortened without saying so reads as
+// the whole reason an entity was selected. The flag does NOT ride on the
+// entry's own Reasons -- the caps this function enforces are exactly the ones
+// ContextEntry.Validate checks, so appending a disclosure there would produce
+// MaxReasonsPerEntry+1 reasons and turn a disclosed clamp into a failed
+// compile. The per-reason cut goes through model.TruncateField, which never
+// leaves a partial UTF-8 sequence behind as the raw slice did.
+func boundReasons(reasons []string) (out []string, dropped, truncated int64) {
 	if len(reasons) > model.MaxReasonsPerEntry {
+		dropped = int64(len(reasons) - model.MaxReasonsPerEntry)
 		reasons = reasons[:model.MaxReasonsPerEntry]
 	}
-	out := make([]string, 0, len(reasons))
+	out = make([]string, 0, len(reasons))
 	for _, r := range reasons {
-		if len(r) > model.MaxReasonBytes {
-			r = r[:model.MaxReasonBytes]
+		bounded, original := model.TruncateField(r, model.MaxReasonBytes)
+		if original > len(bounded) {
+			truncated++
 		}
-		out = append(out, r)
+		out = append(out, bounded)
 	}
-	return out
+	return out, dropped, truncated
 }
 
 // boundPaths applies context.max_reason_paths_per_entry to the routes an
