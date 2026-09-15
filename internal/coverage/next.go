@@ -28,7 +28,7 @@ func (s *Service) Next(ctx context.Context, req model.SessionRequest) (model.Nex
 		return model.NextContextItem{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	// Gate the actor before anything else: Store.Session skips its actor check

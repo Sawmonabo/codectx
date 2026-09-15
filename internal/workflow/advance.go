@@ -22,7 +22,7 @@ func (s *Service) Advance(ctx context.Context, req model.AdvanceRequest) (model.
 		return noTransition, noStatus, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	rec, applied, err := s.transition(ctx, req)
@@ -70,7 +70,7 @@ func (s *Service) Close(ctx context.Context, req model.SessionRequest, expectedV
 		return model.WorkflowStatus{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	_, applied, err := s.transition(ctx, advance)
