@@ -17,16 +17,19 @@ import (
 // config.Context default. Section 20.2 is explicit that a zero never means
 // unlimited, so nothing downstream sees a zero bound and skips a check.
 // MaxBytes and MaxTokens apply PER SLICE; MaxFiles counts distinct selected
-// files across the whole plan; MaxSlices caps total slices; MaxManifestBytes
-// caps the whole stored manifest and comes from configuration alone, since
-// Section 15.4's stored-manifest cap is a deployment bound a request may not
-// raise.
+// files across the whole plan; MaxSlices caps total slices.
+//
+// MaxManifestBytes caps the whole stored manifest and is a CALLER budget the
+// request may raise: the deployment value is the default window, not a ceiling
+// on what a caller with a larger window may ask for. It carries the
+// config.Limit convention -- zero is unlimited, and an unlimited manifest bound
+// is safe here because the per-slice bounds and MaxSlices still bound the plan.
 type resolvedBudget struct {
 	MaxBytes         int64
 	MaxTokens        int64
 	MaxFiles         int
 	MaxSlices        int
-	MaxManifestBytes int64
+	MaxManifestBytes config.Limit
 }
 
 // resolveBudget applies the Section 20.1 [context] defaults to req's zero
@@ -42,10 +45,8 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		MaxFiles:  pick(b.MaxFiles, cfg.DefaultMaxFiles),
 		// context.max_slices carries no Default prefix but is the same kind of
 		// setting: the value a zero budget.max_slices resolves to.
-		MaxSlices: pick(b.MaxSlices, cfg.MaxSlices),
-		// Not pick64: no budget field offers a stored-manifest cap, so the
-		// configured value is the only one.
-		MaxManifestBytes: cfg.MaxManifestBytes.Value(),
+		MaxSlices:        pick(b.MaxSlices, cfg.MaxSlices),
+		MaxManifestBytes: config.Limit(pick64(b.MaxManifestBytes, cfg.MaxManifestBytes.Value())),
 	}
 	for _, f := range []struct {
 		key   string
@@ -55,7 +56,6 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		{"context.default_estimated_tokens", out.MaxTokens},
 		{"context.default_max_files", int64(out.MaxFiles)},
 		{"context.max_slices", int64(out.MaxSlices)},
-		{"context.max_manifest_bytes", out.MaxManifestBytes},
 	} {
 		if f.value <= 0 {
 			return resolvedBudget{}, argumentInvalid("%s resolved to %d; a budget bound must be positive, and zero never means unlimited", f.key, f.value)
@@ -393,7 +393,9 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 	for _, s := range slices {
 		total += s.EstimatedBytes
 	}
-	if total <= b.MaxManifestBytes {
+	// An unlimited manifest budget has nothing to exceed. config.Limit owns the
+	// test; a bare `total <= value` would read unlimited as "refuse everything".
+	if !b.MaxManifestBytes.Exceeded(total) {
 		return nil
 	}
 	return (&model.Error{
@@ -402,8 +404,7 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 	}).
 		WithDetail("manifest_bytes", fmt.Sprint(total)).
 		WithDetail("cap", "context.max_manifest_bytes").
-		WithDetail("cap_bytes", fmt.Sprint(b.MaxManifestBytes)).
-		WithRemediation("narrow the task or lower the per-request budget; if the REQUIRED scope alone exceeds the cap " +
-			"neither applies -- required context is never dropped -- and only raising context.max_manifest_bytes in " +
-			"the deployment configuration, which a request cannot do, admits this task")
+		WithDetail("cap_bytes", b.MaxManifestBytes.String()).
+		WithRemediation("narrow the task, or raise budget.max_manifest_bytes on the request (it is a caller budget, " +
+			"defaulting to context.max_manifest_bytes, and 0 means unlimited)")
 }

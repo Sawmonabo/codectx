@@ -508,8 +508,12 @@ const (
 )
 
 // compilerPolicyVersion is the frozen code-side ranking/budget policy label
-// stored in every manifest header.
-const compilerPolicyVersion = "codectx.context.v1"
+// stored in every manifest header. v2 added budget.max_manifest_bytes to the
+// request hash and the canonical projection: a caller budget that decides
+// whether a plan is admitted is part of a request's identity, and the label is
+// what tells a stored v1 manifest apart from a v2 one rather than letting the
+// two collide under one id.
+const compilerPolicyVersion = "codectx.context.v2"
 
 // The model.H domains. Two lanes computing a different preimage would make the
 // Section 15.1 immutable-manifest reuse lookup silently never hit, so the

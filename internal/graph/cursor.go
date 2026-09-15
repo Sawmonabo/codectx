@@ -322,18 +322,18 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	if e.spools == nil {
 		return nil, cursorInvalid("continuation state has expired or was released")
 	}
-	// One fresh spool per page: this replays the PREVIOUS page's spool. The
-	// replay is bounded by MaxVisited, which is also what bounded the page
-	// that wrote it, so a tampered or corrupt spool cannot make a resume
-	// allocate without limit.
-	var records int64
+	// One fresh spool per page: this replays the PREVIOUS page's spool.
+	//
+	// The replay is bounded by the SPOOL's own byte budget
+	// (resources.max_temp_bytes, which pagination.Spools reserves on every
+	// Append -- Open itself re-checks the binding and the lease, not the
+	// budget, so the bound is the one the WRITE already paid), never by
+	// max_visited: that is a per-page work budget now, while the spooled
+	// visited set is cumulative across the whole walk, so testing the one
+	// against the other refused the third page of any walk whose budget it was
+	// working correctly. A tampered or oversized spool is caught by the byte
+	// budget, which is also what keeps peak heap a function of page size.
 	err = e.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
-		records++
-		if records > int64(e.limits.MaxVisited) {
-			return (&model.Error{Code: model.CodeResourceLimit,
-				Message:     "continuation state exceeds the visited bound",
-				Remediation: "restart the query with a narrower scope"}).WithDetail("limit", "max_visited")
-		}
 		var r spoolRecord
 		if err := json.Unmarshal(record, &r); err != nil {
 			return cursorInvalid("continuation state is not readable")
@@ -398,18 +398,13 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		// is holding.
 		return "", nil
 	}
-	// This is the ONE place the cumulative caps decide whether a WALK may
-	// continue. A resumed page that arrives already at cap therefore answers
-	// Truncated with no NextCursor without spending the budget a second time.
-	// The test is gated on the continuation actually resuming a walk, which
-	// every traversal mint does (traverse.go mints only with a live frontier),
-	// so traversal behaviour is unchanged. A ranked continuation replays
-	// records the first page already computed and spends no traversal budget at
-	// all; refusing it here would silently drop entries the walk did find.
+	// The visited and edge bounds are PER-PAGE work budgets now, so they no
+	// longer decide whether a walk may continue -- spending one is exactly the
+	// condition that mints this cursor. A walk ends when its frontier is empty,
+	// when the depth bound is reached (reported, not resumed) or when the
+	// request deadline passes; nothing here silently withholds a continuation
+	// from a walk that still has work.
 	resumesWalk := len(c.Frontier) > 0 || c.LastKey != ""
-	if resumesWalk && (b.visited >= int64(e.limits.MaxVisited) || b.edges >= int64(e.limits.MaxEdges)) {
-		return "", nil
-	}
 	if !resumesWalk && len(c.Records) == 0 {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil

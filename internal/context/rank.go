@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -141,23 +142,17 @@ func morePathsReason(more int64) []string {
 	return []string{fmt.Sprintf("%d further route(s) reach this entity and are not enumerated", more)}
 }
 
-// reasonPathLimit is the configured cap on stored explanation paths per entry,
-// floored at the model bound so an unlimited or oversized config value cannot
-// make a manifest that PutManifest rejects.
+// reasonPathLimit is the configured cap on stored explanation paths per entry.
 //
-// L2 owns finishing this: the configuration now ACCEPTS a value above
-// model.MaxReasonPathsPerEntry (validateStructuralCeilings no longer couples the
-// two, because a per-entry explanation count is a report threshold and not a
-// wire ceiling), and this function still silently discards it. Until
-// model.MaxReasonPathsPerEntry stops being a hard manifest bound, a user who
-// sets a larger value gets the smaller one with no report -- the class-G shape
-// this wave exists to remove.
-func (c *Compiler) reasonPathLimit() int {
-	limit := c.cfg.Context.MaxReasonPathsPerEntry
-	if limit.IsUnlimited() || limit.Int() > model.MaxReasonPathsPerEntry {
-		return model.MaxReasonPathsPerEntry
-	}
-	return limit.Int()
+// It no longer clamps. model.MaxReasonPathsPerEntry is a report threshold, not
+// a wire ceiling, so a configured value ABOVE it is honoured rather than
+// silently replaced by the smaller one -- the class-G shape this wave removes.
+// The returned value keeps the config.Limit convention: zero is unlimited, and
+// scoreRoutes stores every admissible route for it. What an entry still cannot
+// enumerate is disclosed by MorePaths, so a bounded explanation never reads as
+// an unexplained selection.
+func (c *Compiler) reasonPathLimit() config.Limit {
+	return c.cfg.Context.MaxReasonPathsPerEntry
 }
 
 // resolvePrecision maps every relation on every candidate route to its edge
@@ -239,7 +234,7 @@ type routeScore struct {
 // admits one parent per node, so the maximum IS the admitted route, and summing
 // would let a cycle inflate an entity above an entity that genuinely matters.
 func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
-	precision map[model.RelationID]int64, pathLimit int) (routeScore, error) {
+	precision map[model.RelationID]int64, pathLimit config.Limit) (routeScore, error) {
 	out := routeScore{kinds: map[model.RelationKind]struct{}{}}
 	type scored struct {
 		path         model.RelationPath
@@ -289,7 +284,12 @@ func scoreRoutes(cand candidate, relations map[model.RelationID]model.Relation,
 		}
 		return admitted[i].path.Relations[0] < admitted[j].path.Relations[0]
 	})
-	keep := min(pathLimit, len(admitted))
+	// An unlimited path bound keeps every admissible route; config.Limit owns
+	// the test, so there is no bare zero check here.
+	keep := len(admitted)
+	if pathLimit.Exceeded(int64(keep)) {
+		keep = pathLimit.Int()
+	}
 	out.paths = make([]model.RelationPath, 0, keep)
 	for _, s := range admitted[:keep] {
 		out.paths = append(out.paths, s.path)
