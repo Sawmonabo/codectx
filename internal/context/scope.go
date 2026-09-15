@@ -7,6 +7,7 @@ package context
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -431,6 +432,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 	// counting it here would both reorder the walk's roots and mis-trigger the
 	// overflow disclosure below.
 	start := make([]model.NodeID, 0, model.MaxStartNodes)
+	unwalkedRoots := int64(0)
 	if err := seedSeqRun.Each(func(r candRec) error {
 		if !limit.IsUnlimited() && admitted >= limit.Value() {
 			if cutAt < 0 {
@@ -450,9 +452,12 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 			start = append(start, r.NodeID)
 			return nil
 		}
-		// More seeds than one bounded walk may start from: the boundaries of
+		// More seeds than one walk request may start from: the boundaries of
 		// the seeds that did not start are unexplored, and the answer says so
-		// rather than reading as an exhaustive scope.
+		// rather than reading as an exhaustive scope. HOW MANY did not start is
+		// counted and disclosed below -- an incomplete verdict on its own does
+		// not tell a caller whether one root or a thousand went unexplored.
+		unwalkedRoots++
 		in.scope.ScopeComplete = false
 		return nil
 	}); err != nil {
@@ -463,7 +468,35 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 			return nil, err
 		}
 	}
+	if unwalkedRoots > 0 {
+		if err := in.discloseUnwalkedRoots(unwalkedRoots); err != nil {
+			return nil, err
+		}
+	}
 	return start, nil
+}
+
+// discloseUnwalkedRoots reports the resolved seeds that did not become walk
+// roots, with their count, as one exclusion row on the manifest.
+//
+// model.MaxStartNodes is a bound on ONE impact request (ImpactRequest.Validate
+// refuses a longer start list), not a bound this package chose, so the honest
+// answer while it stands is to say how much of the scope it left unexplored
+// instead of leaving the caller a bare ScopeComplete=false. Finding B2's
+// config key cannot be honoured until that request bound is lifted; see the
+// FX-H-X2 report.
+func (in *seedIngest) discloseUnwalkedRoots(n int64) error {
+	seq := in.seq
+	in.seq++
+	return in.candSort.Add(candRecOf(candidate{
+		// As with seedCut: the row names the step that stopped, because
+		// ContextReference refuses a reference naming no entity at all.
+		Path:   "seed discovery: walk roots",
+		Origin: originExpansion,
+		Excluded: boundReason(fmt.Sprintf(
+			"%d resolved seeds beyond the %d one impact request may start from were not walked; "+
+				"their boundaries are unexplored", n, model.MaxStartNodes)),
+	}, seq))
 }
 
 // discloseCut names every Section 15.2 step the context.max_seeds bound stopped:
