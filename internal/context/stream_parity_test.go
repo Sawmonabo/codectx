@@ -1001,11 +1001,18 @@ var parityRequests = []struct {
 	{"routed scope, the file budget drops groups", model.ContextRequest{
 		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
 		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 5}}, routedScope},
-	// The same shaped scope under a byte budget, which drops inside a group
-	// as well as between groups.
-	{"routed scope, the byte budget drops files", model.ContextRequest{
+	// The same shaped scope at the TIGHTEST budget that still fits it: one
+	// slice fewer, or 16 KiB, and the compile raises CTX_MINIMUM_BUDGET
+	// instead of planning. It is deliberately NOT named a drop row -- measured,
+	// this scope excludes nothing at any byte budget, because every one of its
+	// seven entities is reached on a route and so is required; a byte budget
+	// over an all-required scope either fits or refuses. What it does prove is
+	// that the packer's slice accounting agrees between the two pipelines right
+	// at the floor, where an off-by-one on either side would show as a refusal
+	// on that side alone.
+	{"routed scope, the tightest budget that fits it", model.ContextRequest{
 		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
-		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 16384, MaxSlices: 4}}, routedScope},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 20480, MaxSlices: 5}}, routedScope},
 	// Ruling C8: the relation-kind scan reads an UNLIMITED
 	// context.max_graph_edges to exhaustion rather than as one page. Under a
 	// scope of more than 200 wanted relations -- model.MaxPageItems is 200 --
@@ -1085,13 +1092,10 @@ func denseScope(fx *contextFixture) []model.Relation {
 func TestTheStreamedCompileIsByteForByteTheWholeSetPlan(t *testing.T) {
 	for _, row := range parityRequests {
 		t.Run(row.name, func(t *testing.T) {
-			fx := newContextFixture(t)
-			// Set before either compiler is built: intCompiler reads
-			// fx.Rels when it composes the graph factory, and a row that
-			// shaped the scope between the two would compare two scopes.
-			if row.rels != nil {
-				fx.Rels = row.rels(fx)
-			}
+			// The scope is shaped by the BUILDER: the edges have to be
+			// sealed into the generation before it activates, and both
+			// compilers of a row must then walk and read the one scope.
+			fx := newContextFixture(t, row.rels)
 			c := intCompiler(t, fx, fx.Now)
 			ref, refScopeComplete, refNotices, refBudget, err := c.referenceCompile(fx.ctx, row.req)
 			if err != nil {
