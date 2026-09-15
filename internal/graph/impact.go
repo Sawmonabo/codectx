@@ -781,7 +781,7 @@ func beginImpactQuery(ctx context.Context, e *Engine) (context.Context, time.Tim
 	// One clock: the deadline is measured on the ENGINE clock, the same one the
 	// walk budget compares against, and it is returned so the caller reuses this
 	// instant instead of recomputing a later one after the gate wait.
-	deadline := e.now().Add(e.limits.QueryTimeout)
+	deadline := e.queryDeadline(ctx)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	if e.gate == nil {
 		return ctx, deadline, cancel, nil

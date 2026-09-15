@@ -48,7 +48,7 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// The deadline wraps the gate as well as the walk: waiting for a slot past
 	// the request deadline is a resource limit the caller must see, not a silent
 	// queue.
-	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
+	ctx, cancel := context.WithDeadline(ctx, e.queryDeadline(ctx))
 	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {

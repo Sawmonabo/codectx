@@ -273,6 +273,29 @@ func appendRoute(parent []model.RelationID, via model.RelationID) []model.Relati
 	return append(out, via)
 }
 
+// queryDeadline is the instant one graph query runs under.
+//
+// resources.query_timeout is a DEFAULT, never a ceiling. When the INCOMING
+// context already carries a deadline -- the CLI facade sets one from --timeout
+// or from config, and the MCP server likewise -- that deadline is the
+// request's, whether it is shorter or longer than the configured one. Every
+// entry point used to compute now+QueryTimeout unconditionally, so `--timeout
+// 120s` expired after the configured 10s and reported the answer as out of
+// time at a twelfth of the time the operator had asked for. A --timeout of 0
+// mints no deadline at all (internal/cli queryContext), so it falls through to
+// the configured default exactly as before.
+//
+// A context with no deadline gets now+QueryTimeout on the ENGINE clock, the
+// same clock the walk budget compares against. A caller-set deadline is a real
+// instant, so a fixture that drives the engine clock must derive the deadline
+// it passes in from that clock or the two are not comparable.
+func (e *Engine) queryDeadline(ctx context.Context) time.Time {
+	if deadline, ok := ctx.Deadline(); ok {
+		return deadline
+	}
+	return e.now().Add(e.limits.QueryTimeout)
+}
+
 // budget is the cumulative, cursor-carried work allowance of one traversal. It
 // does NOT reset per page: a resumed page that is already at a cap answers
 // truncated with no continuation rather than spending the budget again.

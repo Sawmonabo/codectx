@@ -681,7 +681,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// past the request deadline is the resource limit the caller must see, and
 	// every adjacency round trip below runs under Section 3's per-request
 	// deadline rather than only being checked between expansion steps.
-	deadline := e.now().Add(e.limits.QueryTimeout)
+	deadline := e.queryDeadline(ctx)
 	// The caller's own context, kept aside: a page the deadline ended still has
 	// to be DELIVERED -- its endpoints hydrated and its continuation minted --
 	// and both of those run after the walk's deadline has passed. See the
