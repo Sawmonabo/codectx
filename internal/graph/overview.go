@@ -251,7 +251,15 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 // position is resolved at MINT time and named back at resume time; what travels
 // in the token is the generation-local surrogate every other traversal position
 // is written in, and the cursor's generation fence covers it.
+//
+// It runs on a context DETACHED from the request deadline for the reason
+// nextTraversalCursor does (cursor.go): minting is the LAST thing a page that
+// ran out of time does, so charged against the expired context this read would
+// fail with the context's own error and a page the engine had decided to
+// continue would come back with nothing to resume from. It is one batched
+// primary-key read of a single id, not another enumeration.
 func (e *Engine) containerPosition(ctx context.Context, id model.NodeID) (NodeRef, error) {
+	ctx = context.WithoutCancel(ctx)
 	reader, err := e.consumerReader()
 	if err != nil {
 		return 0, err
