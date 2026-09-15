@@ -32,7 +32,7 @@ func TestSelectedToolsIsTheRootsOwnAnswer(t *testing.T) {
 	// families run with its own runtime. The engine and its runtime are read
 	// from the lock rather than named, so this file names no analyzer backend.
 	lock := toolchain.Embedded()
-	want := []string{"gopls", "node", "pyright", "scip-go", "scip-python"}
+	want := []string{"gopls", "node", "scip-go", "scip-python", "ty"}
 	for _, name := range lock.Names() {
 		if lock.Tools[name].Kind != cpgKind {
 			continue
