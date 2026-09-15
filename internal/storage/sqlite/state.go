@@ -276,6 +276,57 @@ func (s *Store) Manifest(ctx context.Context, id model.ManifestID) (model.Contex
 	return m, err
 }
 
+// ManifestScopeNodes pages the DISTINCT node ids a manifest's entries name, in
+// node-id order, by keyset on the node id itself.
+//
+// The capsule's scope list is exactly this set, and deriving it in SQL is what
+// keeps the seal's memory a function of the page size: a Go-side walk of
+// ManifestEntries would have to hold a dedup set and a sort buffer over every
+// entry the manifest carries, and context.max_manifest_bytes is unlimited by
+// default. Entries that name no node (a file pulled in whole) contribute
+// nothing and are excluded here rather than skipped by the caller.
+//
+// node_id is not indexed on context_entries (the primary key is
+// (manifest_id, ordinal)), so SQLite satisfies the DISTINCT and the ORDER BY
+// from a temporary b-tree over one manifest's entries. That cost is the
+// database's, not the process heap's, and it is bounded by the manifest.
+func (s *Store) ManifestScopeNodes(ctx context.Context, id model.ManifestID,
+	after model.NodeID, limit int) ([]model.NodeID, error) {
+	raw, err := idBlob("manifest_id", string(id))
+	if err != nil {
+		return nil, err
+	}
+	// An empty cursor must admit the lowest node id, and a zero-length blob
+	// sorts below every real identifier, so it is the natural "before the
+	// first row" sentinel.
+	afterRaw := []byte{}
+	if after != "" {
+		if afterRaw, err = idBlob("after", string(after)); err != nil {
+			return nil, err
+		}
+	}
+	limit = pageLimit(ctx, limit)
+	var out []model.NodeID
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT node_id FROM context_entries
+			WHERE manifest_id = ? AND node_id IS NOT NULL AND node_id > ? ORDER BY node_id LIMIT ?`,
+			raw, afterRaw, limit)
+		if err != nil {
+			return wrap("context_entries", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var node []byte
+			if err := rows.Scan(&node); err != nil {
+				return wrap("context_entries", err)
+			}
+			out = append(out, model.NodeID(idHex(node)))
+		}
+		return wrap("context_entries", rows.Err())
+	})
+	return out, err
+}
+
 // ManifestEntries pages a manifest's entries by ordinal.
 func (s *Store) ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error) {
 	raw, err := idBlob("manifest_id", string(id))
