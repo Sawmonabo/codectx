@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
@@ -385,6 +386,33 @@ var scenarios = []scenario{
 			}
 			if bare := checkNamed(t, rep, checkWatchHeartbeat); bare.State != model.CheckUnavailable {
 				t.Fatalf("a store with no heartbeat probe reports %q, want %q", bare.State, model.CheckUnavailable)
+			}
+		},
+	},
+	// FX-H-X1 rows
+	{
+		// Failure mode: ADR-0004 Decision 1a tells an operator that a receipt
+		// acknowledged under `normal` can be lost to a machine-level crash and
+		// that `full` closes that window, while no doctor row said which mode
+		// the workspace is running in -- so the one fact the decision asks an
+		// operator to check was unreadable from the product. The mode is
+		// reported by BOTH readings of the storage check, because an ordinary
+		// doctor is the call an operator actually makes.
+		name: "the storage check names the durability mode the workspace runs in",
+		run: func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.Storage.Synchronous = config.SynchronousFull
+			svc := newTestService(t, Options{Config: cfg, Store: &fakeStore{}})
+			for _, req := range []model.DoctorRequest{{}, {Deep: true}} {
+				rep, err := svc.Doctor(context.Background(), req)
+				if err != nil {
+					t.Fatalf("Doctor(deep=%v): %v", req.Deep, err)
+				}
+				got := checkNamed(t, rep, checkStorageIntegrity)
+				if !strings.Contains(got.Detail, "storage.synchronous = full") {
+					t.Fatalf("storage_integrity (deep=%v) detail %q does not name the live durability mode",
+						req.Deep, got.Detail)
+				}
 			}
 		},
 	},
