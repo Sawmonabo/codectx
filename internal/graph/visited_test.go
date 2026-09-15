@@ -270,3 +270,45 @@ func TestSpooledVisitedSetAnswersACrossPageRevisit(t *testing.T) {
 		}
 	}
 }
+
+// TestWarmStopsWhenEveryCandidateIsAnswered is the F29 proof. The membership
+// sweep is one sequential pass over the cumulative spool per level, and levels
+// per page are bounded only by the page item ceiling, so a sweep that always
+// runs to the end of the spool costs O(levels x |visited|) per page. It now
+// ends at the last candidate it was looking for.
+//
+// Mutation (`return errWarmComplete` deleted from warm's callback): the read
+// count below becomes the whole set.
+func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
+	const size = 1000
+	read := 0
+	v := newVisitedSet(func(ctx context.Context, fn func(model.NodeID) error) error {
+		for i := 0; i < size; i++ {
+			read++
+			if err := fn(model.NodeID(fmt.Sprintf("n-%04d", i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	// One candidate, early in the spool: the sweep must stop at it.
+	if err := v.warm(context.Background(), []model.NodeID{"n-0002"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if !v.has("n-0002") {
+		t.Fatal("warm did not answer a candidate the spool holds")
+	}
+	if read != 3 {
+		t.Fatalf("the sweep read %d of %d records to answer one candidate at position 3; want 3", read, size)
+	}
+	// A candidate the spool does not hold is still a full pass: the pass IS
+	// the answer, so this is the bound, not a regression.
+	read = 0
+	if err := v.warm(context.Background(), []model.NodeID{"n-absent"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if v.has("n-absent") || read != size {
+		t.Fatalf("an unanswerable candidate read %d records and has=%v; want a full pass and false",
+			read, v.has("n-absent"))
+	}
+}
