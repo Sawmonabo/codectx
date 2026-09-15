@@ -1,0 +1,330 @@
+package graph
+
+import (
+	"container/list"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/Sawmonabo/codectx/internal/model"
+)
+
+// A walk's cumulative admitted-node set is a BITSET over the generation's node
+// surrogates (ADR-0005 Decision 2), held in a sparse file inside the retained
+// walk directory and reached through a bounded cache of pages.
+//
+// It replaces the append-only sorted runs, the frozen Bloom filter and the
+// merge-join sweep those two needed. The filter's geometry had to be fixed
+// before the walk's size was known, so past roughly m/16 admitted nodes it
+// saturated and every level fell back to a full merge-join against the whole
+// cumulative set -- the quadratic paging the layout exists to remove. A bitset
+// over dense surrogates has no geometry to freeze, no false positives and no
+// fallback: one bit per node, and only the pages a level actually touches are
+// ever resident.
+//
+// Cost. The file is sized from GraphReader.MaxNode, so at 10^8 nodes it is
+// 11.9 MiB of ADDRESS space; the filesystem allocates only the blocks that
+// were written, and a walk that admits a thousand nodes in one region occupies
+// one block. Heap is the page cache alone: bitsetCachePages pages of
+// bitsetPageBytes each, a constant, whatever the walk reaches.
+//
+// Ordering. Levels test and set in ascending surrogate order, so a level walks
+// the cache forward and touches each page once instead of thrashing it.
+const (
+	// bitsetFile is the sparse bit file. Bit i of byte j is surrogate j*8+i,
+	// least significant bit first.
+	bitsetFile = "visited.bits"
+	// bitsetManifestFile carries the population count. It is maintained rather
+	// than recomputed because the count is the answer's disclosed visited_count
+	// and scanning the file for it would make an O(1) report cost O(nodes).
+	bitsetManifestFile = "visited.bits.json"
+)
+
+const (
+	// bitsetPageBytes is one cached page: 4 KiB, the page size the filesystem
+	// reads and writes anyway, so a partial write never costs a read-modify
+	// -write below this layer.
+	bitsetPageBytes = 4096
+	// bitsetCachePages bounds the cache at 256 pages, one mebibyte. It is an
+	// INTERNAL constant and not a user limit: it bounds resident memory, never
+	// the work a walk may do or the answer it returns. A walk whose level
+	// touches more pages than this still admits every node; it re-reads a page
+	// it evicted, which is one 4 KiB read.
+	bitsetCachePages = 256
+)
+
+// bitsetVersion is the on-disk layout version. A manifest written by another
+// layout is refused rather than read under this one's assumptions; the
+// traversal cursor version is bumped with it, so a token naming such a
+// directory never reaches here.
+const bitsetVersion = 1
+
+// bitsetManifest is the O(1) state a resumed page reads: the population count
+// and nothing per-page, so a page's own write never grows with the page number.
+type bitsetManifest struct {
+	Version int `json:"version"`
+	// Count is how many DISTINCT surrogates have been admitted. It counts bit
+	// transitions, not set calls, because adoption re-applies the last spooled
+	// level and a re-applied bit must not be counted twice.
+	Count uint64 `json:"count"`
+}
+
+// bitsetPage is one resident page and whether it has unwritten changes.
+type bitsetPage struct {
+	index int64
+	data  []byte
+	dirty bool
+}
+
+// pagedBitset is one request's handle on the set.
+type pagedBitset struct {
+	path string
+	f    *os.File
+	// limit is the largest surrogate the pinned generation carries. A ref above
+	// it is a surrogate from another generation and is refused rather than
+	// silently extending the file: the cursor fence exists to make that
+	// impossible, and a bitset that quietly accepted one would hide the breach.
+	limit NodeRef
+
+	pages map[int64]*list.Element // page index -> element holding *bitsetPage
+	lru   *list.List              // most recently used at the front
+
+	dir      string
+	admitted uint64
+	// grown is how many bytes this handle has written: the pages it flushed
+	// plus the manifests it replaced. It is what the walk charges to the probe,
+	// and it must stay a function of what a page ADMITTED rather than of the
+	// set behind it.
+	grown int64
+	probe *heapProbe
+}
+
+// openBitset opens the set in dir, creating it when it is not there and
+// adopting the count an earlier page left when it is. maxNode sizes the address
+// space; nothing is allocated for it, because the file is extended lazily by
+// the first write into a region.
+func openBitset(dir string, maxNode NodeRef, probe *heapProbe) (*pagedBitset, error) {
+	path := filepath.Join(dir, bitsetFile)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, bitsetErr(err)
+	}
+	b := &pagedBitset{
+		path:  path,
+		f:     f,
+		limit: maxNode,
+		pages: make(map[int64]*list.Element, bitsetCachePages),
+		lru:   list.New(),
+		dir:   dir,
+		probe: probe,
+	}
+	m, err := readBitsetManifest(dir)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	b.admitted = m.Count
+	return b, nil
+}
+
+// readBitsetManifest reads the count a previous page left. A missing manifest
+// is the zero value, which is the state a set that has admitted nothing is in.
+func readBitsetManifest(dir string) (bitsetManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, bitsetManifestFile))
+	if os.IsNotExist(err) {
+		return bitsetManifest{Version: bitsetVersion}, nil
+	}
+	if err != nil {
+		return bitsetManifest{}, bitsetErr(err)
+	}
+	var m bitsetManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return bitsetManifest{}, &model.Error{Code: model.CodeStorageCorrupt,
+			Message: "graph: the retained visited bitset manifest is not readable"}
+	}
+	if m.Version != bitsetVersion {
+		return bitsetManifest{}, &model.Error{Code: model.CodeStorageCorrupt,
+			Message: "graph: the retained visited bitset was written by another layout"}
+	}
+	return m, nil
+}
+
+// count is the number of distinct surrogates admitted so far.
+func (b *pagedBitset) count() uint64 { return b.admitted }
+
+// test reports whether ref has been admitted. It is an I/O operation, not a
+// lookup: the page holding the bit is read on a miss, so the error is returned
+// rather than folded into a false, which would re-admit a node the walk has
+// already served and put the same entity on two pages.
+func (b *pagedBitset) test(ref NodeRef) (bool, error) {
+	if ref == 0 {
+		// Zero is never a node (ADR-0002). It has no bit, and answering "not
+		// admitted" would let a caller that lost a surrogate admit a phantom.
+		return false, nil
+	}
+	if err := b.inRange(ref); err != nil {
+		return false, err
+	}
+	page, off, mask := b.locate(ref)
+	p, err := b.page(page)
+	if err != nil {
+		return false, err
+	}
+	return p.data[off]&mask != 0, nil
+}
+
+// set admits every ref, which MUST be ascending and duplicate-free, and reports
+// how many bytes the set grew by.
+//
+// It is IDEMPOTENT and the count follows bit TRANSITIONS: a page cut between
+// spooling a level and applying its bits is resumed by re-applying that level,
+// so a bit that was already set must leave the count alone. A set that counted
+// calls would disclose a visited_count larger than the set it describes on
+// every resumed walk.
+//
+// The refs are required ascending for the same reason GraphReader.Neighbours
+// requires it: the cache is walked forward, so a level in order touches each
+// page once. It is CHECKED rather than assumed, because an unsorted level would
+// merely be slow and nothing downstream would report it.
+func (b *pagedBitset) set(refs []NodeRef) (int64, error) {
+	if err := ascendingRefs(refs); err != nil {
+		return 0, err
+	}
+	before := b.grown
+	for _, ref := range refs {
+		if ref == 0 {
+			continue
+		}
+		if err := b.inRange(ref); err != nil {
+			return b.grown - before, err
+		}
+		page, off, mask := b.locate(ref)
+		p, err := b.page(page)
+		if err != nil {
+			return b.grown - before, err
+		}
+		if p.data[off]&mask != 0 {
+			continue
+		}
+		p.data[off] |= mask
+		p.dirty = true
+		b.admitted++
+	}
+	if err := b.sync(); err != nil {
+		return b.grown - before, err
+	}
+	grown := b.grown - before
+	if b.probe != nil {
+		b.probe.VisitedBytes += grown
+	}
+	return grown, nil
+}
+
+// sync writes every dirty page and replaces the manifest, in that order: a
+// manifest that named a count whose bits were not yet on disk would resume a
+// walk into a set smaller than the count it discloses.
+func (b *pagedBitset) sync() error {
+	for e := b.lru.Back(); e != nil; e = e.Prev() {
+		if err := b.flush(e.Value.(*bitsetPage)); err != nil {
+			return err
+		}
+	}
+	return b.writeManifest()
+}
+
+// inRange refuses a surrogate the pinned generation does not carry.
+func (b *pagedBitset) inRange(ref NodeRef) error {
+	if ref <= b.limit {
+		return nil
+	}
+	return internalErr("graph: the visited bitset was handed a node surrogate outside the pinned generation")
+}
+
+// locate maps a surrogate to its page, the byte inside that page and its bit.
+func (b *pagedBitset) locate(ref NodeRef) (page int64, off int, mask byte) {
+	byteAt := int64(ref / 8)
+	return byteAt / bitsetPageBytes, int(byteAt % bitsetPageBytes), byte(1) << (ref % 8)
+}
+
+// page returns the resident page, reading it and evicting the least recently
+// used one when it is not. A read past the end of the sparse file yields zeros,
+// which is exactly what an unwritten region means.
+func (b *pagedBitset) page(index int64) (*bitsetPage, error) {
+	if e, ok := b.pages[index]; ok {
+		b.lru.MoveToFront(e)
+		return e.Value.(*bitsetPage), nil
+	}
+	if b.lru.Len() >= bitsetCachePages {
+		// Evicting DROPS the page's bytes, so it is flushed first. A dropped
+		// dirty page is a node admitted in heap and never on disk, which the
+		// next page re-admits.
+		oldest := b.lru.Back()
+		p := oldest.Value.(*bitsetPage)
+		if err := b.flush(p); err != nil {
+			return nil, err
+		}
+		b.lru.Remove(oldest)
+		delete(b.pages, p.index)
+	}
+	p := &bitsetPage{index: index, data: make([]byte, bitsetPageBytes)}
+	if _, err := b.f.ReadAt(p.data, index*bitsetPageBytes); err != nil &&
+		!errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, bitsetErr(err)
+	}
+	b.pages[index] = b.lru.PushFront(p)
+	return p, nil
+}
+
+// flush writes one dirty page in place. WriteAt extends the file, so a region
+// no page has touched is never written and stays a hole.
+func (b *pagedBitset) flush(p *bitsetPage) error {
+	if !p.dirty {
+		return nil
+	}
+	n, err := b.f.WriteAt(p.data, p.index*bitsetPageBytes)
+	b.grown += int64(n)
+	if err != nil {
+		return bitsetErr(err)
+	}
+	p.dirty = false
+	return nil
+}
+
+// writeManifest replaces the count atomically: a torn manifest would resume a
+// walk with a visited_count that never existed.
+func (b *pagedBitset) writeManifest() error {
+	raw, err := json.Marshal(bitsetManifest{Version: bitsetVersion, Count: b.admitted})
+	if err != nil {
+		return internalErr("graph: encoding the retained visited bitset manifest: " + err.Error())
+	}
+	tmp := filepath.Join(b.dir, bitsetManifestFile+".tmp")
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return bitsetErr(err)
+	}
+	if err := os.Rename(tmp, filepath.Join(b.dir, bitsetManifestFile)); err != nil {
+		_ = os.Remove(tmp)
+		return bitsetErr(err)
+	}
+	b.grown += int64(len(raw))
+	return nil
+}
+
+// close flushes and releases the handle. The FILE outlives it: the retained
+// walk directory is what the continuation carries forward.
+func (b *pagedBitset) close() error {
+	if b.f == nil {
+		return nil
+	}
+	err := b.sync()
+	if cerr := b.f.Close(); err == nil && cerr != nil {
+		err = bitsetErr(cerr)
+	}
+	b.f, b.pages, b.lru = nil, nil, nil
+	return err
+}
+
+func bitsetErr(err error) error {
+	return internalErr("graph: the retained visited bitset: " + err.Error())
+}
