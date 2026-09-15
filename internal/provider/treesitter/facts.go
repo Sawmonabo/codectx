@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -26,14 +27,6 @@ const (
 	maxDocBytes    = 8 << 10
 	capabilityName = "structure"
 	searchDomain   = "treesitter-search-v1"
-	// maxCalleeReferences bounds the distinct callee reference nodes one file
-	// may mint: the callees no single declaration of this file can be. A
-	// generated or minified file can hold tens of thousands of distinct such
-	// names, each of which would be a node, a relation and evidence; past the
-	// bound the call is counted and the file's structural coverage is reported
-	// partial instead. The call-site aliases a file publishes are bounded with
-	// it and by wire.MaxRefsPerFile, which bounds its references outright.
-	maxCalleeReferences = 2000
 	// maxPutRecords bounds one hand-off to the sink, so a unit's facts stream
 	// through it in bounded slices rather than one slice the size of the whole
 	// file's output. provider.Sink does not expose the sink's Limits, so this
@@ -78,6 +71,14 @@ type builder struct {
 	// callee-reference bound, and declaration or call-site keys over
 	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
 	dropped int
+
+	// maxCallees is tree_sitter.max_callee_references, the bound on the
+	// distinct callee reference nodes this file may mint: the callees no
+	// single declaration of this file can be. Unlimited by default -- a
+	// generated file names what it names -- and bounded in any case by the
+	// file's own references. Past a user-set bound the call is counted into
+	// dropped and the file reports partial.
+	maxCallees config.Limit
 }
 
 // declFact is one validated declaration and its resolved identity.
@@ -557,7 +558,7 @@ func (b *builder) refs() error {
 			resolution, candidates := calleeResolution(r, targets)
 			res, ok := callees[key]
 			if !ok {
-				if len(callees) >= maxCalleeReferences {
+				if b.maxCallees.Exceeded(int64(len(callees) + 1)) {
 					// Past the bound the call is counted, not minted: a file
 					// with more distinct cross-file callees than this is
 					// reported partial rather than allowed to publish an

@@ -448,14 +448,15 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 	if s.ts, err = treesitter.New(treesitter.Options{
-		Languages:         cfg.Providers.TreeSitter.Languages,
-		MaxWorkers:        parserWorkers,
-		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL:     cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
-		WorkerMemoryBytes: parserWorkerReservationBytes,
-		Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner:            parsers,
-		WorkDir:           tsWorkDir,
+		Languages:           cfg.Providers.TreeSitter.Languages,
+		MaxWorkers:          parserWorkers,
+		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
+		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
+		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
+		WorkerMemoryBytes:   parserWorkerReservationBytes,
+		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
+		Runner:              parsers,
+		WorkDir:             tsWorkDir,
 	}); err != nil {
 		return nil, err
 	}
