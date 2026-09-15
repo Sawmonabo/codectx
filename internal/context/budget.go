@@ -239,9 +239,9 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 // worth stating where a reader meets them:
 //
 //   - `Index` counts SURVIVORS of the three `sized` filters, never records of
-//     the ranked stream. Today's `i` is a position in `sized` (budget.go:282),
-//     so counting a filtered record would shift every later ordinal and with it
-//     every stored slice membership.
+//     the ranked stream. The whole-set `i` is a position in `sized`
+//     (stream_parity_test.go:465-466), so counting a filtered record would
+//     shift every later ordinal and with it every stored slice membership.
 //   - Exclusions keep today's sequence (ruling C1): the pre-sort exclusions in
 //     expansion order first, then the packer's drops in group order. The first
 //     group is replayed from a run keyed by `Seq` -- the ingest order the
@@ -308,8 +308,9 @@ type measuredPlan struct {
 	Groups *pagination.SortedRun[groupRec]
 	// Excluded is the pre-sort exclusions, ordered by Seq, each carrying its
 	// reason in `Excluded` and its reference path in `PathAtRank` -- the value
-	// today's exclude() reads, since buildPlan's unconditional path overwrite
-	// happens only on the surviving branch (budget.go:254).
+	// the whole-set exclude() reads, since buildPlan's unconditional path
+	// overwrite happens only on the surviving branch
+	// (stream_parity_test.go:438).
 	Excluded *pagination.SortedRun[candRec]
 	// Paths and Hops are the route streams re-keyed from Seq to Index.
 	Paths *pagination.SortedRun[pathRec]
@@ -344,7 +345,8 @@ type keepRec struct {
 
 // dropRec is one member of a group the packer dropped, keyed so that replaying
 // the run reproduces appendDrops' order exactly: groups in rank order, and
-// within a group its entries in rank order (slice.go's `indexes` are ascending).
+// within a group its entries in the order the group carries them, which
+// groupByFile builds in rank order (stream_parity_test.go:777).
 type dropRec struct {
 	Cand     candRec `json:"c"`
 	MinIndex int64   `json:"m"`
@@ -448,18 +450,68 @@ func (r *routeCursors) take(index int64) ([]model.RelationPath, error) {
 	return out, r.hops.err()
 }
 
+// missingList is the bounded accumulator behind CTX_MINIMUM_BUDGET's `missing`
+// detail: it takes required paths until the joined detail reaches its wire
+// bound and counts the rest, so the list is f(model.MaxDetailBytes) and never
+// f(required scope).
+//
+// moreReserve is held back from the bound so the "… and N more" tail always fits
+// inside it: appending the tail at the bound would push the join past
+// MaxDetailBytes and Error.WithDetail would clip away the very count that says
+// the list is partial.
+type missingList struct {
+	paths []string
+	bytes int
+	more  int64
+}
+
+const missingMoreReserve = 32
+
+func (m *missingList) add(path string) {
+	n := len(path)
+	if len(m.paths) > 0 {
+		// The separator strings.Join writes before this entry.
+		n++
+	}
+	if m.bytes+n > model.MaxDetailBytes-missingMoreReserve {
+		m.more++
+		return
+	}
+	m.paths = append(m.paths, path)
+	m.bytes += n
+}
+
+// reset empties the list for the second pass, which replaces a per-file answer
+// with the whole required set.
+func (m *missingList) reset() { *m = missingList{} }
+
+// empty reports that nothing was recorded at all -- counting the paths dropped
+// for the bound, which are still required paths that did not fit.
+func (m *missingList) empty() bool { return len(m.paths) == 0 && m.more == 0 }
+
+// detail is the list minimumBudget joins, with the count of what it left out.
+func (m *missingList) detail() []string {
+	if m.more == 0 {
+		return m.paths
+	}
+	return append(m.paths[:len(m.paths):len(m.paths)], fmt.Sprintf("… and %d more", m.more))
+}
+
 // checkRequiredFitsStream is checkRequiredFits over a sorted run. It walks the
 // run up to three times -- SortedRun.Each re-opens its backing file per call
 // and only refuses after Close -- for the floor, the slice count at that floor,
 // and, on the refusing path only, the required path list the error reports.
 //
-// `missing` is the one list that still accumulates, and only on the error path:
-// it is the detail minimumBudget joins, and model.MaxDetailBytes bounds it at
-// the error boundary exactly as it bounds today's.
+// `missing` is the one list that still accumulates, and only on the error path.
+// It is bounded AS IT IS BUILT rather than clipped after the join: the required
+// set is f(seeds + expansion) and the detail is a kilobyte, so materialising one
+// path per required group and letting WithDetail cut the result held the whole
+// required scope in heap on precisely the broad large-repository request that
+// reaches CTX_MINIMUM_BUDGET.
 func checkRequiredFitsStream(ctx context.Context, groups *pagination.SortedRun[groupRec], b resolvedBudget) error {
 	var floorBytes, floorTokens int64
 	var requiredFiles int
-	var missing []string
+	var missing missingList
 	if err := groups.Each(func(g groupRec) error {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -471,7 +523,7 @@ func checkRequiredFitsStream(ctx context.Context, groups *pagination.SortedRun[g
 		floorBytes = max(floorBytes, g.Bytes)
 		floorTokens = max(floorTokens, g.Tokens)
 		if g.Bytes > b.MaxBytes || g.Tokens > b.MaxTokens {
-			missing = append(missing, g.Path)
+			missing.add(g.Path)
 		}
 		return nil
 	}); err != nil {
@@ -486,22 +538,22 @@ func checkRequiredFitsStream(ctx context.Context, groups *pagination.SortedRun[g
 	}
 	tooManyFiles := requiredFiles > b.MaxFiles
 	tooManySlices := floorSlices > b.MaxSlices
-	if len(missing) == 0 && !tooManyFiles && !tooManySlices {
+	if missing.empty() && !tooManyFiles && !tooManySlices {
 		return nil
 	}
 	if tooManyFiles || tooManySlices {
 		// The whole required set is what does not fit, not one file of it.
-		missing = missing[:0]
+		missing.reset()
 		if err := groups.Each(func(g groupRec) error {
 			if g.Required {
-				missing = append(missing, g.Path)
+				missing.add(g.Path)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
 	}
-	return minimumBudget(floorBytes, floorTokens, max(floorSlices, 1), requiredFiles, missing)
+	return minimumBudget(floorBytes, floorTokens, max(floorSlices, 1), requiredFiles, missing.detail())
 }
 
 // packedSliceCountStream is packedSliceCount over a sorted run: the same walk

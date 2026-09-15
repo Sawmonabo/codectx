@@ -116,6 +116,17 @@ func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedRe
 // dependence (impact.go:41) and therefore under-reports stale, partial,
 // unavailable and failed providers; both are merged so neither is lost.
 //
+// refScope is the reference expansion's own result: the production scopeResult
+// -- which is scalars only -- plus the candidate list this whole-set reference
+// implementation still builds in heap. The list lives HERE and not on
+// scopeResult so that nothing a compile carries across a pass boundary is
+// sized by the repository, which is what the streamed expansion replaced it
+// with sorted runs to achieve.
+type refScope struct {
+	scopeResult
+	Candidates []candidate
+}
+
 // An unresolvable EXPLICIT seed is the one scope failure that is an error: the
 // caller named a boundary and it does not exist, so CTX_SCOPE_INCOMPLETE says
 // so instead of quietly compiling a plan around it. An empty or wholly
@@ -123,15 +134,18 @@ func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedRe
 // ScopeComplete false, no required entry and every unresolved token kept as its
 // own reasoned exclusion (Section 15.2, ruling Q7).
 func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID, cfg config.Context,
-	seeds []candidate, caps []model.CapabilityState) (scopeResult, error) {
+	seeds []candidate, caps []model.CapabilityState) (refScope, error) {
 	if eng == nil {
-		return scopeResult{}, argumentInvalid("scope expansion requires a graph engine")
+		return refScope{}, argumentInvalid("scope expansion requires a graph engine")
 	}
 	if gen == 0 {
-		return scopeResult{}, argumentInvalid("scope expansion requires an explicit pinned generation")
+		return refScope{}, argumentInvalid("scope expansion requires an explicit pinned generation")
 	}
 
-	res := scopeResult{ScopeComplete: true, Candidates: make([]candidate, 0, len(seeds))}
+	res := refScope{
+		scopeResult: scopeResult{ScopeComplete: true},
+		Candidates:  make([]candidate, 0, len(seeds)),
+	}
 	admitted := make(map[string]bool, len(seeds))
 	start := make([]model.NodeID, 0, len(seeds))
 	resolved := 0
@@ -139,7 +153,7 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 	for _, s := range seeds {
 		if s.Excluded != "" {
 			if s.Origin == originExplicitSeed {
-				return scopeResult{}, scopeIncomplete(s.Path)
+				return refScope{}, scopeIncomplete(s.Path)
 			}
 			// An unresolved extracted token stays visible as an exclusion and
 			// carries the answer down to discovery rather than out of it.
@@ -226,7 +240,7 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 			Page: model.PageRequest{Cursor: cursor},
 		})
 		if err != nil {
-			return scopeResult{}, contextErr(ctx, err)
+			return refScope{}, contextErr(ctx, err)
 		}
 		if impact.Meta.Truncated {
 			res.ScopeComplete = false
@@ -980,7 +994,7 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 	}
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	return packed, scopeComplete, c.manifestNotices(scoped, partsOf(packed)), stored, nil
+	return packed, scopeComplete, c.manifestNotices(scoped.scopeResult, partsOf(packed)), stored, nil
 }
 
 // parityRequests are the requests the parity proof compiles through both

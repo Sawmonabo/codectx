@@ -166,7 +166,7 @@ func seedsFull(limit config.Limit, n int) bool {
 // disclosed as a cut when an operator sets one and it stops a step.
 //
 // Every repository read here is one page at a time, so the READ working set is
-// a page. The admitted seeds themselves accumulate in out.Candidates, which the
+// a page. The admitted seeds themselves go into the ingest sink, which the
 // whole compile pipeline -- expandScope, hydrateFiles, rank, buildPlan -- also
 // holds as one slice; making discovery alone stream would not lower the
 // compile's peak by a byte. Streaming the pipeline end to end is its own change.

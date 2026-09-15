@@ -399,11 +399,11 @@ go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
 go test ./internal/context -run 'TestTheSeedSinkPeaks|TestACompileSortHolds' -count=1 -v
 CODECTX_SCALE_PROOF=1 go test ./internal/context \
-  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 40m
+  -run TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale -count=1 -v -timeout 30m
 ```
 
 The two `internal/context` lines produce Section 3.3: the first its measured
-rows, the second the compile-level row that is still owed.
+rows, the second the compile-level rows of the same table.
 
 That block produces every row of Section 3 except three. Rows 9 and 13 need a
 cold index of the reference corpus, and row 16 needs a real workspace; both are

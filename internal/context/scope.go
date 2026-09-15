@@ -7,6 +7,7 @@ package context
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -38,15 +39,16 @@ var scopeRelations = []model.RelationKind{
 	model.RelReferences, model.RelExports,
 }
 
-// scopeResult is what the expansion pass hands to ranking: the seeds with their
-// requirements assigned plus every boundary the walk admitted, the capability
-// rows that made the answer less than complete, and the ScopeComplete verdict.
+// scopeResult is the expansion pass's SCALAR verdict: the capability rows that
+// made the answer less than complete, the ScopeComplete verdict and the two
+// explanation-cut counts. The candidates themselves are not here -- they are
+// the sorted streams finishIngest answers -- so nothing about this record is
+// sized by the repository, which is what lets a checkpoint carry it whole.
 //
-// Exclusions are not a separate list: a candidate whose Excluded reason is set
-// is the excluded record (compiler.go), so an omission cannot be dropped on the
-// way from one pass to the next.
+// Exclusions are not a separate list either: a candidate whose Excluded reason
+// is set is the excluded record (compiler.go), so an omission cannot be dropped
+// on the way from one pass to the next.
 type scopeResult struct {
-	Candidates []candidate
 	// Completeness holds the non-fresh capability rows behind ScopeComplete,
 	// deduplicated and ordered, for the manifest header.
 	Completeness []model.CapabilityState
@@ -159,6 +161,18 @@ func boundPaths(paths []model.RelationPath, max config.Limit) ([]model.RelationP
 	}
 	keep := max.Int()
 	return append([]model.RelationPath(nil), paths[:keep]...), int64(len(paths) - keep)
+}
+
+// countBoundPaths answers only what boundPaths would have dropped. The walk
+// keeps the COUNT on the candidate record and sends the routes themselves to
+// the route sorts, so calling boundPaths there allocated and discarded one
+// path slice per entry -- once per boundary the walk admits, which is the
+// hottest loop P-A has.
+func countBoundPaths(paths []model.RelationPath, max config.Limit) int64 {
+	if !max.Exceeded(int64(len(paths))) {
+		return 0
+	}
+	return int64(len(paths) - max.Int())
 }
 
 // degradedCapabilities is every capability row that is not fresh, from the
@@ -418,6 +432,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 	// counting it here would both reorder the walk's roots and mis-trigger the
 	// overflow disclosure below.
 	start := make([]model.NodeID, 0, model.MaxStartNodes)
+	unwalkedRoots := int64(0)
 	if err := seedSeqRun.Each(func(r candRec) error {
 		if !limit.IsUnlimited() && admitted >= limit.Value() {
 			if cutAt < 0 {
@@ -437,9 +452,12 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 			start = append(start, r.NodeID)
 			return nil
 		}
-		// More seeds than one bounded walk may start from: the boundaries of
+		// More seeds than one walk request may start from: the boundaries of
 		// the seeds that did not start are unexplored, and the answer says so
-		// rather than reading as an exhaustive scope.
+		// rather than reading as an exhaustive scope. HOW MANY did not start is
+		// counted and disclosed below -- an incomplete verdict on its own does
+		// not tell a caller whether one root or a thousand went unexplored.
+		unwalkedRoots++
 		in.scope.ScopeComplete = false
 		return nil
 	}); err != nil {
@@ -450,7 +468,35 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 			return nil, err
 		}
 	}
+	if unwalkedRoots > 0 {
+		if err := in.discloseUnwalkedRoots(unwalkedRoots); err != nil {
+			return nil, err
+		}
+	}
 	return start, nil
+}
+
+// discloseUnwalkedRoots reports the resolved seeds that did not become walk
+// roots, with their count, as one exclusion row on the manifest.
+//
+// model.MaxStartNodes is a bound on ONE impact request (ImpactRequest.Validate
+// refuses a longer start list), not a bound this package chose, so the honest
+// answer while it stands is to say how much of the scope it left unexplored
+// instead of leaving the caller a bare ScopeComplete=false. Finding B2's
+// config key cannot be honoured until that request bound is lifted; see the
+// FX-H-X2 report.
+func (in *seedIngest) discloseUnwalkedRoots(n int64) error {
+	seq := in.seq
+	in.seq++
+	return in.candSort.Add(candRecOf(candidate{
+		// As with seedCut: the row names the step that stopped, because
+		// ContextReference refuses a reference naming no entity at all.
+		Path:   "seed discovery: walk roots",
+		Origin: originExpansion,
+		Excluded: boundReason(fmt.Sprintf(
+			"%d resolved seeds beyond the %d one impact request may start from were not walked; "+
+				"their boundaries are unexplored", n, model.MaxStartNodes)),
+	}, seq))
 }
 
 // discloseCut names every Section 15.2 step the context.max_seeds bound stopped:
@@ -479,7 +525,7 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 
 // expandScopeStream is expandScope as sorted streams. It produces the same
 // candidates, in the same admission order, with the same scope verdict, holding
-// one sort run buffer per sort instead of res.Candidates and
+// one sort run buffer per sort instead of a whole-set candidate list and
 // `admitted map[string]bool` (ruling C2).
 //
 // The dedupe is two folds and no join. Seeds that participate in today's
@@ -596,7 +642,7 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			// Only the disclosure count is kept on the record; the routes
 			// themselves go to the route sorts, and finishIngest keeps the ones
 			// whose candidate survived the fold.
-			_, cand.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
+			cand.MorePaths = countBoundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
 			seq := in.seq
 			in.seq++
 			if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {
