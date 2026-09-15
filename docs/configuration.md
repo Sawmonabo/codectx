@@ -117,6 +117,9 @@ command found on the host. Detecting a tool by running it with `--version` or
 | `max_files` | `0` (unlimited) | project (lower only) | Maximum files in one workspace. Unlimited by default: a repository is never refused for its size. A value you set is reported when exceeded (files seen against the limit), never a truncated index. |
 | `max_parse_file_bytes` | `0` (unlimited) | project (lower only) | Largest file admitted to structural parsing. Unlimited by default; a value you set reports each skipped file with its reason. |
 | `max_search_file_bytes` | `0` (unlimited) | project (lower only) | Largest file admitted to search indexing. Unlimited by default; a value you set reports each skipped file with its reason. |
+| `max_dir_entries` | `0` (unlimited) | project (lower only) | How many children one directory may hold. Unlimited by default; a value you set is reported once per directory that passes it and the traversal continues — it is never a clamp and never a refusal. |
+| `max_depth` | `0` (unlimited) | project (lower only) | How deeply directories may nest. Unlimited by default; a value you set is reported once per level that passes it and the traversal continues into the deeper tree. |
+| `max_ignored_roots` | `0` (unlimited) | project (lower only) | How many outermost ignored paths the shared traversal policy holds. Unlimited by default; a value you set that is exceeded degrades the policy to the base one — the ignored trees are walked rather than excluded, and the degradation is logged — never a refusal. |
 
 `max_parse_file_bytes` and `max_search_file_bytes` are **analysis admission
 limits, not retention limits**. A file over the limit is still captured, still

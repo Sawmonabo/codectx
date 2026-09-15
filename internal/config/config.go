@@ -125,6 +125,23 @@ type Workspace struct {
 	MaxFiles           Limit `toml:"max_files"`
 	MaxParseFileBytes  Limit `toml:"max_parse_file_bytes"`
 	MaxSearchFileBytes Limit `toml:"max_search_file_bytes"`
+	// MaxDirEntries bounds how many children one directory may hold and
+	// MaxDepth how deeply directories may nest. Both unlimited by default:
+	// one generated directory or one deep vendored tree must never refuse a
+	// capture. A user-set value that is exceeded is reported through the
+	// traversal's skip sink -- which the capture records in its notes -- and
+	// the walk continues to completion. They are the operator's escape hatch
+	// over a directory so wide that sorting it spills to disk.
+	MaxDirEntries Limit `toml:"max_dir_entries"`
+	MaxDepth      Limit `toml:"max_depth"`
+	// MaxIgnoredRoots bounds the ignored-root set the shared traversal policy
+	// holds. Unlimited by default: the set is one entry per OUTERMOST ignored
+	// path of the worktree and every lookup is a random-access ancestor probe,
+	// so it is resident by construction and small on any real checkout. A
+	// user-set value that is exceeded does not refuse the workspace: the
+	// policy degrades to the base policy -- the ignored trees are walked
+	// rather than excluded -- and the degradation is logged.
+	MaxIgnoredRoots Limit `toml:"max_ignored_roots"`
 }
 
 // Index is operational scheduling policy: none of it is a semantic input.
@@ -410,6 +427,9 @@ func (c Config) TraversalPolicy() workspace.Policy {
 		IndexGenerated:   c.Workspace.IndexGenerated,
 		IncludeUntracked: c.Workspace.IncludeUntracked,
 		MaxFiles:         c.Workspace.MaxFiles.Value(),
+		MaxDirEntries:    c.Workspace.MaxDirEntries.Value(),
+		MaxDepth:         c.Workspace.MaxDepth.Value(),
+		MaxIgnoredRoots:  c.Workspace.MaxIgnoredRoots.Value(),
 		DataDir:          c.Storage.DataDir,
 	}
 }
@@ -427,6 +447,9 @@ func Defaults() Config {
 			MaxFiles:           Unlimited,
 			MaxParseFileBytes:  Unlimited,
 			MaxSearchFileBytes: Unlimited,
+			MaxDirEntries:      Unlimited,
+			MaxDepth:           Unlimited,
+			MaxIgnoredRoots:    Unlimited,
 		},
 		Index: Index{
 			Workers:           0,

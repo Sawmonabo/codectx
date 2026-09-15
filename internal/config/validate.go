@@ -96,6 +96,9 @@ func (c Config) validate() error {
 		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
 		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
+		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
+		{"workspace.max_depth", c.Workspace.MaxDepth},
+		{"workspace.max_ignored_roots", c.Workspace.MaxIgnoredRoots},
 	} {
 		if p.v < 0 {
 			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",
