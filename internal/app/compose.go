@@ -626,6 +626,7 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,
 				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily.Value(),
 				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows.Value(),
+				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows.Value(),
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
@@ -879,14 +880,14 @@ func (s *stack) openWorkflow() error {
 // enforces. It is the only place configuration is turned into those bounds, so
 // the service itself never reads config.Config.
 //
-// MaxObservationReferences has no configuration key: it is the model's own
-// ceiling on one observation's reference list (model.MaxObservationReferences),
-// and an operator-settable second ceiling would be a bound the model already
-// refuses to exceed.
+// MaxObservationReferences is workflow.max_observation_references, unlimited by
+// default: the model keeps its own structural ceiling on one reference list,
+// and this is the operator's separate ceiling on an attestation as a whole,
+// which is what a scope review's eight categories are counted against.
 func workflowLimits(cfg config.Config) workflow.Limits {
 	return workflow.Limits{
 		MaxPageItems:                        cfg.Resources.MaxPageItems,
-		MaxObservationReferences:            model.MaxObservationReferences,
+		MaxObservationReferences:            cfg.Workflow.MaxObservationReferences,
 		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
 		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
 		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,

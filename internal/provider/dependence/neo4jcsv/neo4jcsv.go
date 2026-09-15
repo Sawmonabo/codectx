@@ -75,8 +75,6 @@ const (
 	// maxOperandDepth bounds the descent into one assignment's written
 	// operand and into its read operands.
 	maxOperandDepth = 16
-	// maxDerivedRows bounds the projected relation occurrences of one unit.
-	maxDerivedRows = 4_000_000
 	// pageSize bounds every keyset page read from the scratch.
 	pageSize = 512
 	// maxRangeFileBytes bounds the source held in memory at once: one file's
@@ -128,6 +126,12 @@ type Options struct {
 	// unlimited. It is a reporting threshold and never a refusal -- crossing
 	// it stages, publishes and reports everything (Report.OverStagedRows).
 	MaxStagedRows int64
+	// MaxDerivedRows is the user's `providers.dependence.max_derived_rows`:
+	// how many relation occurrences the caller wants one import to project
+	// from its staged rows. 0, the default, is unlimited. Like MaxStagedRows
+	// it is a reporting threshold and never a refusal -- crossing it projects,
+	// publishes and reports everything (Report.OverDerivedRows).
+	MaxDerivedRows int64
 	// PreviousKeys is the key set the previous sealed run of this unit
 	// published. The zero value is the absent set and means a full import.
 	PreviousKeys KeySet
@@ -223,6 +227,12 @@ type Report struct {
 	// crossing from being silent.
 	StagedRows     int64
 	OverStagedRows bool
+	// DerivedRows is how many relation occurrences this import projected, and
+	// OverDerivedRows whether that crossed a user-set Options.MaxDerivedRows.
+	// The projection is neither truncated nor refused when it does; the flag
+	// is what keeps the crossing from being silent.
+	DerivedRows     int64
+	OverDerivedRows bool
 }
 
 // Import streams one export directory into sink and reports what it
@@ -299,6 +309,8 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	rep.UnlocatedFacts, rep.UnresolvedWrites = e.noRange, e.unresolved
 	rep.ClippedEvidence, rep.UnknownRows, rep.IgnoredFiles = e.clipped, sc.unknownN, sc.ignoredFiles
 	rep.StagedRows, rep.OverStagedRows = sc.rows, sc.overRows
+	rep.DerivedRows = sc.derivedRows
+	rep.OverDerivedRows = opts.MaxDerivedRows > 0 && sc.derivedRows > opts.MaxDerivedRows
 	rep.Changed, rep.Unchanged, rep.Removed = delta.Changed, delta.Unchanged, delta.Removed
 	rep.Keys = fresh
 	for label, n := range sc.unknown {

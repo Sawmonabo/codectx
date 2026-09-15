@@ -842,3 +842,38 @@ func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 			bounded.StagedRows, whole.StagedRows, bounded.Nodes, whole.Nodes, bounded.Relations, whole.Relations)
 	}
 }
+
+// TestDerivedRowsOverAUserSetBoundImportsAndReports pins the same invariant for
+// providers.dependence.max_derived_rows. The projected occurrence count used to
+// be a hard 4,000,000 that failed the unit outright, and the projection query
+// carried a matching `LIMIT bound+1` that silently truncated it — a refusal and
+// a silent cut on a count that belongs to the analysed source. The equality
+// assertions below are what catch a restored truncation: a surviving LIMIT under
+// a bound of 1 leaves two occurrences and every published relation behind it.
+func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
+	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
+	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if whole.DerivedRows == 0 {
+		t.Fatalf("the import derived no occurrences, so the bound below proves nothing")
+	}
+	if whole.OverDerivedRows {
+		t.Fatalf("an import with no max_derived_rows reported crossing one")
+	}
+	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxDerivedRows: 1})
+	if err != nil {
+		t.Fatalf("an import over max_derived_rows must not fail the unit: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: crossing a reporting threshold may not fail the unit", state)
+	}
+	if !bounded.OverDerivedRows {
+		t.Fatalf("an import of %d occurrences over max_derived_rows = 1 did not report crossing it", bounded.DerivedRows)
+	}
+	if bounded.DerivedRows != whole.DerivedRows || bounded.Relations != whole.Relations {
+		t.Fatalf("the bounded import published less than the unbounded one: derived %d/%d relations %d/%d",
+			bounded.DerivedRows, whole.DerivedRows, bounded.Relations, whole.Relations)
+	}
+}

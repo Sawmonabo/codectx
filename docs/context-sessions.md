@@ -36,8 +36,13 @@ same manifest. `--phase` is `sweep` (gather) or `verify` (confirm);
 `--seed` (repeatable) names a path or symbol the plan starts selection from.
 The four budget flags — `--budget` (estimated tokens per slice),
 `--budget-bytes`, `--budget-files` and `--budget-slices` — bound one slice and
-the whole plan. A plan that cannot fit its scope inside those bounds says so;
-it does not silently drop files, because a truncated manifest presented as
+the whole plan. They are **caller budgets, not scale refusals**: they exist
+because a plan must fit a model's window, which is why they are the one family
+of settings that keeps a non-zero default, and a request may raise them above
+that default as well as lower it. They stay honest because a plan that cannot
+fit its scope inside those bounds says so, and because every file a budget
+excludes is named in the manifest with its reason, paginated and never
+summarised. Nothing is silently dropped: a truncated manifest presented as
 complete is the one failure this whole surface exists to prevent.
 
 The manifest is pinned to the generation it was compiled from. Later indexing
@@ -168,7 +173,12 @@ The capsule is the deterministic completion record: what was planned, what was
 served, what was reviewed, what was waived and with which reason, and every
 observation with its citations. `capsule` pages one projection of it; `export`
 writes the whole sealed capsule to a file **outside the repository**, and never
-overwrites an existing file.
+overwrites an existing file. Sealing is the one place in this build where a
+built-in cap can still refuse work: a session carrying coverage or waivers for
+more than 250 000 files, or a capsule list of more than 1 000 records, is
+refused with `CTX_RESOURCE_LIMIT` naming the list and the bound rather than
+sealed with a truncated list. See
+[the one remaining default cap](configuration.md#the-one-remaining-default-cap).
 
 `close` takes the final version-checked transition.
 

@@ -38,9 +38,16 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
     reservation, not an unbounded one, so `0` is rejected. They never refuse a
     repository either: they serialise and defer work instead.
   - **Caller budgets** — `context.default_max_bytes`, `default_estimated_tokens`,
-    `default_max_files` and `max_slices`. A context plan must fit a model's
-    window, so these keep non-zero defaults. They are honest: the manifest names
-    **every** excluded file with a reason, paginated, never summarised.
+    `default_max_files` and `max_slices`. This is the **one family of non-zero
+    defaults deliberately kept**. They are not scale refusals: a context plan
+    must fit a model's window, and a plan that does not fit one is not an
+    answer. They stay honest on two conditions, both of which hold. The
+    manifest names **every** excluded file with a reason, paginated, never
+    summarised — an exclusion is a row in the manifest, not a count. And a
+    request may ask for **more** than the default: a positive `budget.*` field
+    on a request wins over the configured default in either direction, and
+    `budget.max_manifest_bytes` may additionally be set to unlimited by a
+    caller that can hold any manifest.
   - **Wire and pagination ceilings** — `resources.max_page_items`,
     `max_query_text_bytes`, `max_metadata_response_bytes`,
     `max_source_response_bytes`, `coverage.chunk_bytes`, `max_chunk_bytes`,
@@ -51,6 +58,26 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   `index.workers = 0` chooses the count from available CPUs and reservations,
   and `providers.dependence.unit_memory_ceiling_bytes = 0` derives a unit's
   allocation from the machine.
+
+  **Every bound that defaults to unlimited**, grouped by the table it lives in.
+  Each key is described in full in that table below.
+
+  | Table | Keys defaulting to `0` / `"unlimited"` |
+  |---|---|
+  | `[workspace]` | `max_files`, `max_parse_file_bytes`, `max_search_file_bytes` |
+  | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone) |
+  | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
+  | `[providers.lsp]` | `max_overlay_bytes` |
+  | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes` |
+  | `[coverage]` | `max_unconfirmed_chunks_per_session` |
+  | `[workflow]` | `max_observation_references` |
+
+  `index.retain_refs` is the one key of this shape that keeps a finite default
+  (`8`), because evicting a generation is lifecycle retention of something
+  re-indexing reconstructs, not a dropped row; it still accepts `0` for "retain
+  every ref".
+
 - **A limit may be lowered, never raised past its contract ceiling.**
   Configuration narrows what this build does; it cannot widen what a stored
   column or a bounded response can hold.
@@ -159,7 +186,7 @@ All **user** trust.
 | `max_concurrent_queries` | `4` | Concurrent queries. |
 | `max_concurrent_graph_queries` | `2` | Concurrent graph queries; must not exceed `max_concurrent_queries`. |
 | `max_concurrent_heavy_analyzers` | `1` | Concurrent heavy analyzer runs. |
-| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. |
+| `max_temp_bytes` | `4294967296` | Temporary bytes across materializations; must exceed `min_free_disk_bytes`. One eighth of it is the budget for the paging spools that hold the ranked remainder of a `codectx search` answer between pages; the rest stays the materialization budget it already was. Temporary sort runs written while a query is being ranked share the spool directory but are deliberately **not** charged against this budget, because a run set is sized by the match count and charging it would let this budget refuse a wide query outright; size the directory for the ranked working set of the largest query you expect in addition to the live continuation spools the budget does cover. |
 | `min_free_disk_bytes` | `1073741824` | Free-space reserve. Disk pressure returns a typed error or pauses indexing; it never evicts open-session source. |
 | `max_metadata_response_bytes` | `262144` | Ceiling for generic tool responses, which never carry source bodies. Must be smaller than the source budget. |
 | `max_source_response_bytes` | `7340032` | Ceiling for a source response, including encoding and envelope expansion. The 7 MiB hard ceiling cannot be raised. |
@@ -267,6 +294,24 @@ directories and network posture are product code, not configuration.
 | `dependence.unit_memory_ceiling_bytes` | `0` | user | Largest allocation a unit may be sized to. `0` derives it from the machine: free memory minus the base index footprint minus a safety margin. There is no default memory ceiling, and only a non-zero value here may reject a unit before it runs. |
 | `dependence.max_units_per_family` | `0` (unlimited) | user | How many frontend-native projects of one language family you want a plan to hold. Unlimited by default: a monorepo's project count belongs to the repository, so every project is planned as its own unit and a crashed unit is still split along every one of its parts. A set value refuses nothing and drops nothing — crossing it marks the family's capability rows partial with `CTX_RESOURCE_LIMIT`, naming the family, the project count and this value. |
 | `dependence.max_staged_rows` | `0` (unlimited) | user | How many rows you want one unit's import to stage. Unlimited by default: staging is an on-disk database read back one keyset page at a time, so the row count bounds disk (roughly 10× the export's bytes), not memory. A set value never fails the unit and never stops the import — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the staged count and this value. |
+| `dependence.max_derived_rows` | `0` (unlimited) | user | How many relation occurrences you want one unit's import to project from its staged rows. Unlimited by default: the projection is computed and paged inside the same on-disk staging database, so the occurrence count bounds disk rather than memory, and it belongs to the source. A set value never fails the unit and never truncates the projection — crossing it marks the unit's capability rows partial with `CTX_RESOURCE_LIMIT`, carrying the derived count and this value. |
+
+### Timeouts here are hang detectors, not size limits
+
+`providers.scip.timeout` and `providers.dependence.timeout` are `0` by default,
+which means **no wall-clock limit at all**. A wall clock cannot tell a large
+analysis unit from a wedged one — on a monorepo the legitimate run is the long
+one — so a deadline that fails a unit is a refusal of the repository for its
+size.
+
+What catches a wedged subprocess instead is `providers.*.stall_timeout`, which
+is finite by default (`5m`) and measures **progress, not elapsed time**: bytes
+read from the child's stdout or stderr (counted before any output bound, and
+whether or not the bytes are kept) and, where the platform can sample a running
+tree, the tree's consumed CPU time. A child that produces none of those signals
+for the whole window is terminated, and the unit fails with reason `stalled`
+and is reported. Setting either `stall_timeout` to `0` disables the detector for
+that provider; a negative value is rejected.
 
 ## Analyzer profiles are not configurable
 
@@ -298,11 +343,11 @@ cloud or AI credential fields in core.
 | `default_max_files` | `200` | project (lower only) | Default file budget; must fit `workspace.max_files`. |
 | `max_slices` | `16` | user | Most slices in one manifest. |
 | `max_graph_depth` | `0` (unlimited) | user | Graph expansion depth. |
-| `max_visited_nodes` | `0` (unlimited) | user | Nodes visited in one expansion. |
-| `max_graph_edges` | `0` (unlimited) | user | Edges traversed in one expansion. |
+| `max_visited_nodes` | `0` (unlimited) | user | Nodes **one page** of an expansion may visit. A per-page work budget, not a ceiling on the walk. |
+| `max_graph_edges` | `0` (unlimited) | user | Relations **one page** of an expansion may admit. A per-page work budget, not a ceiling on the walk. |
 | `max_reason_paths_per_entry` | `0` (unlimited) | user | Explanation paths stored per entry. |
 | `max_manifest_bytes` | `0` (unlimited) | user | Largest manifest. Unlimited by default; a compile is never refused for the size of its plan. |
-| `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule. |
+| `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule, by bytes. Unlimited by default. It is not the only thing that bounds a capsule today — see [The one remaining default cap](#the-one-remaining-default-cap) below. |
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 
@@ -316,10 +361,27 @@ are the one family where zero in a *request* is "use the default" rather than
 repository, which is why they alone keep non-zero defaults — and every file a
 budget excludes is named in the manifest with its reason.
 
-`max_graph_depth`, `max_visited_nodes` and `max_graph_edges` bound the one
-expansion a compile runs. They are unlimited by default and the walk is
-resumable: reaching a bound you set ends a **page** and returns a cursor, so
-continuing reaches the same nodes an unbounded walk would.
+`max_graph_depth`, `max_visited_nodes` and `max_graph_edges` bound graph
+expansion, and all three are unlimited by default.
+
+`max_visited_nodes` and `max_graph_edges` are **per-page work budgets, not
+cumulative ceilings on a walk**. A page spends its own allowance; a page that
+exhausts one stops there, reports the reason that stopped it (`visited node
+budget exhausted` or `edge budget exhausted`) and mints a continuation cursor,
+and the next page resumes the walk from the persisted frontier with a fresh
+allowance. The answer is therefore bounded per page and unlimited in total:
+following the cursor reaches the same nodes an unbounded walk would. The
+`visited` and `edges` counts a result reports stay **cumulative** across the
+pages of one walk, so a caller still sees the total the walk has spent, and a
+replayed cursor neither resets nor doubles it.
+
+Two stops are not resumable, and both say so rather than pretending otherwise.
+`max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
+out of depth is reported truncated with no continuation. And `impact` performs
+its whole walk on the first page and then serves a spooled ranked tail, so a
+per-page budget it exhausts ends that one walk: the answer is truncated with
+the reason, and every later page repeats the same flag and reason.
+
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.
 
@@ -329,6 +391,30 @@ that label rather than one workspace's answers. The whole `[context]` table is
 already part of manifest identity through the context policy fingerprint below,
 so a manifest compiled under different bounds is a different manifest rather
 than a silent reuse.
+
+### The one remaining default cap
+
+One built-in cap in this build can still refuse work, and it is stated here
+rather than left to be discovered. Sealing a capsule is bounded by two
+constants that are **not** configuration and do not default to unlimited:
+
+- **250 000 coverage or waiver files per capsule.** A session whose coverage or
+  waiver set is larger cannot be sealed.
+- **1 000 records per capsule list** for the capsule's scope and its typed
+  record lists.
+
+Crossing either refuses the seal with `CTX_RESOURCE_LIMIT`, naming the list and
+the bound; a capsule is never sealed with a truncated list, so nothing is
+silently dropped. What a user hits today is therefore an explicit refusal on
+`codectx context capsule` for a session of that size, with the remediation to
+narrow the session's scope — every other surface of that session, including its
+coverage and manifest pages, is unaffected.
+
+This is the one known remaining default cap in the tree. Making the capsule a
+paginated, resumable surface is a schema-level change across the workflow, MCP
+and CLI layers, and it is scheduled as its own sub-track of the next wave rather
+than half-landed here. The reasoning is recorded in
+[ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md).
 
 ## `[coverage]` — source reads and receipts
 
@@ -346,6 +432,18 @@ There is no receipt lifetime of its own: a source receipt lives as long as
 `storage.query_cursor_ttl`, which the `[storage]` table above describes. A
 session that reads for longer than that must acknowledge as it goes, because an
 expired receipt cannot be confirmed and its bytes earn no coverage.
+
+## `[workflow]` — observations and scope reviews
+
+All **user** trust.
+
+| Key | Default | Trust | Meaning |
+|---|---|---|---|
+| `max_observation_references` | `0` (unlimited) | user | How many references you want one recorded observation — or one scope review, counted across all eight of its categories — to carry. Unlimited by default: a review of a large scope cites what it read, and the product does not refuse an attestation for the size of the repository it attests to. A set value is the operator's own ceiling: crossing it is reported with `CTX_RESOURCE_LIMIT`, naming the reference count and this value, so raising it is a decision with both numbers in hand. |
+
+A single observation's own wire contract still refuses more than 64 references,
+so this key governs the aggregate scope-review path in full and the
+single-observation path only up to that contract ceiling.
 
 ## `[mcp]` — server transport
 

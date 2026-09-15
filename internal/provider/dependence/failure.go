@@ -168,6 +168,12 @@ type publication struct {
 	// unless it crossed. The import staged and published every row regardless.
 	StagedRows      int64
 	StagedRowsBound int64
+	// DerivedRows is the count of relation occurrences the import projected
+	// and DerivedRowsBound the user-set providers.dependence.max_derived_rows
+	// it crossed; both are zero unless it crossed. The projection was neither
+	// truncated nor refused.
+	DerivedRows      int64
+	DerivedRowsBound int64
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -222,6 +228,11 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
 			row = row.WithDetail("staged_rows", strconv.FormatInt(p.StagedRows, 10)).
 				WithDetail("max_staged_rows", strconv.FormatInt(p.StagedRowsBound, 10))
+		}
+		if p.DerivedRows > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("derived_rows", strconv.FormatInt(p.DerivedRows, 10)).
+				WithDetail("max_derived_rows", strconv.FormatInt(p.DerivedRowsBound, 10))
 		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid

@@ -174,10 +174,11 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 		Use:   name + " <node-id> [node-id...]",
 		Short: short,
 		Long: detail + "\n\nThe walk is bounded: --depth caps the hop count from the nearest seed, " +
-			"--visited and --edges cap the distinct nodes and relations it may admit, and each of " +
-			"those budgets is cumulative across the pages of one traversal rather than refilled " +
-			"per page. Exhausting any of them, or --timeout, reports the answer as truncated with " +
-			"the reason rather than presenting it as exhaustive.\n\n" +
+			"--visited and --edges cap the distinct nodes and relations it may admit, and those two " +
+			"are per-page work budgets that refill on each page rather than ceilings on the whole " +
+			"traversal. A page that spends one ends there and returns a continuation cursor; " +
+			"--timeout ends a page the same way. Following the cursor reaches the rest of the " +
+			"walk, so a page-end reason is not a claim that the answer is all there is.\n\n" +
 			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
 			"that asking for the overlay is refused explicitly rather than answered from canonical " +
 			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
@@ -684,9 +685,12 @@ func writePackageEdges(b *strings.Builder, edges []model.PackageEdge) {
 // no continuation would describe a workflow it cannot perform.
 func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
-	cumulative := ""
+	// The two paging endpoints refill these budgets per page and mint a cursor
+	// where a page spends one; impact expands its walk in one request, so there
+	// the same flag is a ceiling on the whole answer.
+	cumulative := " for the whole walk"
 	if acrossPages {
-		cumulative = ", cumulative across pages"
+		cumulative = " per page; a page that spends it returns a cursor"
 	}
 	cmd.Flags().Int(queryVisitedFlag, 0, "maximum distinct nodes the walk may admit"+cumulative+zeroBoundHelp)
 	if edges {

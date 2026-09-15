@@ -175,7 +175,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDepth)
 	}
 
-	entries := acc.Entries(e.limits.MaxReasonPaths)
+	entries := acc.Entries(e.limits.ReasonPaths())
 	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
 	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
 		return answer, nil, nil, err
@@ -594,7 +594,7 @@ func (a *impactAccumulator) Relations() []model.Relation { return a.edges }
 // prevent; `path` is the command that answers "the equal-cost routes", and it
 // is where this key bounds a count greater than one. docs/queries.md states
 // the split.
-func (a *impactAccumulator) Entries(reasonPaths int) []model.ImpactEntry {
+func (a *impactAccumulator) Entries(reasonPaths config.Limit) []model.ImpactEntry {
 	entries := make([]model.ImpactEntry, 0, len(a.order))
 	for _, id := range a.order {
 		n := a.byNode[id]
@@ -605,7 +605,7 @@ func (a *impactAccumulator) Entries(reasonPaths int) []model.ImpactEntry {
 			ScoreMicros: 1_000_000 / (1 + n.cost),
 			Reasons:     n.reasons,
 		}
-		if p, ok := a.path(n); ok && reasonPaths > 0 {
+		if p, ok := a.path(n); ok && !reasonPaths.Exceeded(1) {
 			entry.Paths = []model.RelationPath{p}
 		}
 		entries = append(entries, entry)
