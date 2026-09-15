@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"unicode/utf8"
 
@@ -22,9 +21,6 @@ import (
 func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest) (page model.Page[model.PackageEdge], err error) {
 	defer func() { err = typedContextError(ctx, err) }()
 	if err := req.Validate(); err != nil {
-		return model.Page[model.PackageEdge]{}, err
-	}
-	if err := continuationUnavailable(req.Page.Cursor); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
 	ctx, deadline, done, err := beginImpactQuery(ctx, e)
@@ -51,8 +47,26 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	maxVisited, visitedNotice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())
 	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
 	maxDepth, depthNotice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
-	meta.Notices = appendNotice(appendNotice(appendNotice(meta.Notices, visitedNotice), edgeNotice), depthNotice)
-	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges)
+	limit, limitNotice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
+	meta.Notices = appendNotice(appendNotice(appendNotice(appendNotice(meta.Notices,
+		visitedNotice), edgeNotice), depthNotice), limitNotice)
+	// The page limit is part of the normalized query a continuation is bound to:
+	// a resumed page asking for a different one would stop the walk somewhere
+	// the issuing page never did.
+	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth.Int(), limit)
+	var resume *resumeState
+	if req.Page.Cursor != "" {
+		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, packageDepsEndpoint, queryHash, deadline)
+		if err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+		// The consumed spool outlives the walk -- the membership probes and the
+		// spill that copies the cumulative set forward both read it -- so the
+		// release is deferred rather than run on the happy path alone.
+		defer resume.Release()
+		b = resume.Budget
+	}
+	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges, limit)
 	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
@@ -60,6 +74,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		Budget:        b,
 		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
+		Resume:        resume,
 	}, acc.Visit)
 	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
@@ -79,18 +94,16 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	limit, limitNotice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
-	meta.Notices = appendNotice(meta.Notices, limitNotice)
-	if len(items) > limit {
-		// The pairs beyond this page are DISCLOSED, not dropped in silence:
-		// PackageDependencies offers no continuation (continuationUnavailable),
-		// so the count of what the page could not carry is the only honest
-		// channel there is.
-		meta.Notices = appendNotice(meta.Notices,
-			fmt.Sprintf("package rollup: %d further package pair(s) were aggregated and are not listed on this page",
-				len(items)-limit))
-		items = items[:limit]
-		markTruncated(&meta, reasonPageFull)
+	// No page cut here, and no "further pairs were aggregated" notice: the walk
+	// itself stops at `limit` admitted edges, so the distinct pairs it rolls up
+	// can never exceed the page. The notice used to stand in for the
+	// continuation this endpoint refused to offer; the continuation below is
+	// now the honest channel, and each pair's counts are the counts of THIS
+	// page's edges -- summing a pair across pages reproduces the whole-walk
+	// total, because every edge is admitted on exactly one page.
+	if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
+		state, acc.lastOwner, acc.lastKey, resume); err != nil {
+		return model.Page[model.PackageEdge]{}, err
 	}
 	page = model.Page[model.PackageEdge]{Meta: meta, Items: items}
 	if err := page.Validate(); err != nil {
@@ -103,6 +116,12 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	}
 	return page, nil
 }
+
+// packageDepsEndpoint binds a package-dependency continuation to the operation
+// that issued it. It is deliberately NOT impactEndpoint: verifyContinuation's
+// endpoint check is the only thing that stops a deps cursor resuming an impact
+// walk, and the two produce different answers from the same frontier.
+const packageDepsEndpoint = "graph.package_dependencies"
 
 // rollupPackages aggregates symbol-level relations into distinct package pairs.
 // It is the shared body behind ImpactResult.Packages and the standalone
@@ -189,8 +208,17 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	var lookup []model.NodeID
 	lookup = append(lookup, ids...)
 	for _, batch := range impactChunkNodes(ids) {
-		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, config.Limit(int64(len(batch))*maxContainersPerNode))
+		// Streaming, not a slice: each containment row is folded into the
+		// candidate list of the node it contains as it arrives, so the heap
+		// here is one adjacency page plus the candidates themselves, never the
+		// whole containment fan-out of the batch.
+		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionIncoming,
+			[]model.RelationKind{model.RelContains}, config.Limit(int64(len(batch))*maxContainersPerNode),
+			func(r model.Relation) error {
+				candidates[r.To] = append(candidates[r.To], r.From)
+				lookup = append(lookup, r.From)
+				return nil
+			})
 		if err != nil {
 			return nil, err
 		}
@@ -202,10 +230,6 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 			return nil, (&model.Error{Code: model.CodeResourceLimit,
 				Message:     "this generation contains more containment edges for one batch of nodes than a rollup may read",
 				Remediation: "narrow the request scope"}).WithDetail("limit", "containers_per_node")
-		}
-		for _, r := range rels {
-			candidates[r.To] = append(candidates[r.To], r.From)
-			lookup = append(lookup, r.From)
 		}
 	}
 	nodes, err := e.nodesByID(ctx, lookup)
@@ -270,25 +294,67 @@ const maxContainersPerNode = 16
 // its members reads as a smaller package, not as an incomplete answer.
 func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
 	direction model.Direction, kinds []model.RelationKind, maxEdges config.Limit) ([]model.Relation, bool, error) {
+	var out []model.Relation
+	complete, err := e.streamContainsEdges(ctx, batch, direction, kinds, maxEdges,
+		func(r model.Relation) error {
+			out = append(out, r)
+			return nil
+		})
+	if err != nil {
+		return nil, false, err
+	}
+	return out, complete, nil
+}
+
+// streamContainsEdges is the same keyset-paged containment read, delivered one
+// ROW at a time. It holds one adjacency page -- adjacencyBatch rows -- and never
+// the whole containment fan-out of a batch of containers, so a caller that only
+// needs to fold each row (a rollup keeps one candidate list per node; the
+// repository map keeps one counter per container) pays a page of heap rather
+// than a level of it.
+//
+// It reports whether the read COMPLETED, and that flag is F7's fix: a read whose
+// budget is spent EXACTLY as the rows run out is complete, not incomplete. The
+// old loop condition returned false whenever the budget was reached, so a
+// containment set that exactly filled it made both callers refuse a legitimately
+// whole answer. The walk now ends on the empty page, and a spent budget only
+// reports incomplete once a one-row probe shows a further row exists.
+func (e *Engine) streamContainsEdges(ctx context.Context, batch []model.NodeID,
+	direction model.Direction, kinds []model.RelationKind, maxEdges config.Limit,
+	fn func(model.Relation) error) (bool, error) {
 	var (
-		out   []model.Relation
+		read  int
 		after model.RelationID
 	)
-	for !atBound(maxEdges, len(out)) {
+	for {
+		if atBound(maxEdges, read) {
+			// The budget is spent. Whether that is a truncation depends on
+			// whether anything is left: one more row settles it, and reading one
+			// row is cheaper than reporting a complete answer as partial.
+			more, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, 1)
+			if err != nil {
+				return false, err
+			}
+			return len(more) == 0, nil
+		}
 		rels, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, adjacencyBatch)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
-		out = append(out, rels...)
 		// Only an empty page ends the walk: the reader clamps the requested
 		// limit down to model.MaxPageItems, so testing for a short page would
 		// stop after the first one and under-roll every container.
 		if len(rels) == 0 {
-			return out, true, nil
+			return true, nil
+		}
+		for _, r := range rels {
+			if err := fn(r); err != nil {
+				return false, err
+			}
+			read++
 		}
 		after = rels[len(rels)-1].ID
 	}
-	return out, false, nil
 }
 
 // evidenceCounts counts the evidence records backing each relation, in bounded
