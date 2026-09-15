@@ -155,11 +155,12 @@ languages codectx does not index.
 
 ## 5. Recommendation per language
 
-**Python — switch the *server* to ty, keep scip-python, and gate the switch on two checks.**
+**Python — switch the *server* to ty and keep scip-python.**
 This is the one language where the pinned choice is measurably wrong for codectx's session
 shape. On an 11k-file repository a cold pyright answers 2 of 136 references and cannot answer
-`implementation` at all; ty answers all 136 in 0.21 s at 168 MB, reports `serverInfo`,
-negotiates `utf-8`, and ships as a single static binary with no runtime — which would also let
+`implementation` at all; ty answers all 136 in 0.21 s at 168 MB, answers `implementation`
+correctly (verified against a subclass fixture), reports `serverInfo`, negotiates `utf-8`, and
+ships as a single static binary with a `.sha256` sidecar and no runtime — which would also let
 the lock stop paying Node for Python. The strongest case for *keeping* pyright is that the gap
 is a readiness bug, not a capability one: the overlay could wait for the server to finish
 indexing before its first `references`, and pyright then returns 138 in 0.23 s. That is the
