@@ -150,7 +150,7 @@ func mustFoldPair(t *testing.T, a, b pairRecord) pairRecord {
 }
 
 func TestRankedSpoolHeaderIsNotAWalkRecord(t *testing.T) {
-	b, err := encodeRankedHeader(42)
+	b, err := encodeRankedHeader(rankedHeader{Total: 42, Count: 7, PairTotal: 9, PairCount: 3})
 	if err != nil {
 		t.Fatalf("encoding a ranked header: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestRankedSpoolHeaderIsNotAWalkRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decoding a ranked header: %v", err)
 	}
-	if h.Kind != spoolRecordRanked || h.Total != 42 {
+	if h.Kind != spoolRecordRanked || h.Total != 42 || h.Count != 7 || h.PairTotal != 9 || h.PairCount != 3 {
 		t.Fatalf("ranked header round trip: %+v", h)
 	}
 	// A frontier record must not read as a ranked header: the two spool shapes

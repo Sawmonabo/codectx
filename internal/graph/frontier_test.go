@@ -3,7 +3,9 @@ package graph
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -216,6 +218,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		Start:     []model.NodeID{fixtureNodeID("n-a")},
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 	seen := map[model.RelationID]int{}
+	var order []model.RelationID
 	for page := 1; ; page++ {
 		if page > 500 {
 			t.Fatalf("the walk did not terminate after %d pages with %d edges seen", page-1, len(seen))
@@ -226,6 +229,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		}
 		for _, rel := range res.Relations {
 			seen[rel.ID]++
+			order = append(order, rel.ID)
 		}
 		if res.Meta.NextCursor == "" {
 			break
@@ -241,37 +245,63 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 			t.Errorf("relation %s was returned %d times, want exactly once", id, n)
 		}
 	}
+
+	// D15: the ceiling is an internal page boundary, so the pages it forces
+	// must CONCATENATE to the answer a ceiling that never binds returns --
+	// same edges, same (depth asc, NodeID asc, RelationID asc) order, none
+	// dropped, none reordered. Exactly-once alone passes both a walk that
+	// silently drops what a mid-chunk cut never read and a fix that resumes
+	// mid-chunk and emits one level's owners out of order; this does not.
+	limits.FrontierBytes = 32 << 20
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	ref, err := whole.Neighbors(context.Background(), model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("unbounded-ceiling walk: %v", err)
+	}
+	if ref.Meta.NextCursor != "" || ref.Meta.Truncated {
+		t.Fatalf("the reference walk is paged (%v) or truncated (%q)",
+			ref.Meta.NextCursor != "", ref.Meta.TruncationReason)
+	}
+	if len(order) != len(ref.Relations) {
+		t.Fatalf("the one-byte ceiling served %d edge(s), a ceiling that never binds %d: the ceiling changed the set",
+			len(order), len(ref.Relations))
+	}
+	for i, want := range ref.Relations {
+		if order[i] != want.ID {
+			t.Fatalf("at position %d the spilled pages carry %s, the unbounded-ceiling walk %s: the ceiling changed the order",
+				i, order[i], want.ID)
+		}
+	}
 }
 
 // TestImpactAndPackageDepsResumeAcrossPages is the R3 proof for the two
-// endpoints that had no continuation at all: impact and the package rollup used
-// to walk the WHOLE reachable subgraph on one page, holding every admitted edge
-// and every affected node in impactAccumulator.byNode/order/edges, and then
-// minted either a ranked-tail spool (impact) or nothing (the rollup). Both now
-// run the same page-bounded, spooled, cursor-resumable walk a traversal runs:
-// the accumulator stops at the page's item bound and the frontier plus the
-// cumulative admitted set go to the continuation spool.
+// endpoints that had no honest continuation: impact and the package rollup used
+// to walk the whole reachable subgraph on one page, holding every admitted edge
+// and every affected node in heap, and then ranked whatever chunk the page had
+// read. Both now run ruling P2's shape -- the request that mints the answer
+// walks to COMPLETION, streams every admitted edge into a disk-backed sort,
+// ranks the whole answer once, serves the first page and spools the globally
+// ranked remainder behind the `r` cursor.
 //
-// What the union of pages preserves, and what this asserts:
-//   - the rollup's PairCount and EvidenceCount SUM, per pair, to the whole-walk
-//     totals -- every edge is admitted on exactly one page, so the aggregate is
-//     split across pages rather than lost;
-//   - impact's affected-node SET is exactly the whole-walk set.
+// What that makes provable, and what this asserts for BOTH lists of BOTH
+// endpoints: the pages CONCATENATE to the single-shot answer -- same records,
+// same global order, each exactly once -- rather than merely covering the same
+// set. A page-ranked answer satisfies set equality and fails every assertion
+// below.
 //
-// What it deliberately does not assert is entry identity: a node admitted on an
-// early page is reported again if a later page's frontier reaches it, because
-// the accumulator is page-scoped by construction while the admitted set lives on
-// the spool. That is the cost of a page-bounded aggregate and it is documented
-// on walkImpact.
-//
-// Mutation proof (each fails this test):
-//   - drop the `len(a.edges) >= a.pageItems` stop in impactAccumulator.Visit and
-//     the walk is single-shot again: no page fills, sawPageFull is false;
-//   - drop `Resume: resume` from either expand call and the resumed page
-//     restarts from the seeds, so the pair counts sum to more than the whole
-//     walk's and the same edges are counted twice;
-//   - drop the continueWalk call in either endpoint and the pages stop after the
-//     first, so the union is a strict subset of the whole-walk answer.
+// Mutation proofs (each fails this test):
+//   - drop pass 2 of the rank (return pass 1's folded run from rankImpact or
+//     rankPairs): the pages carry the identity order, not the ranked one;
+//   - drop `.WithFold(foldImpact)` from pass 1: a node reached by two edges is
+//     listed twice, so the pages hold more records than the single-shot answer;
+//   - drop `.WithFold(foldPair)` from the pair sort: the pair counts are 1 each
+//     instead of the whole walk's sums.
 func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 	f := newGraphFixture(t)
 	engine := func(t *testing.T, pageItems int) *Engine {
@@ -287,7 +317,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		}
 		limits := fixtureLimits()
 		// Unlimited depth, visited and edge budgets: this row isolates the page
-		// item bound as the thing that ends a page.
+		// bound as the thing that ends a page.
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = pageItems
 		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
@@ -298,10 +328,13 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		return e
 	}
 	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
-	// A page bound far above the fixture's edge count is the single-shot answer
-	// the pages are compared against.
+	// A page bound far above the fixture's record count is the single-shot
+	// answer the pages are compared against.
 	const wholePage = 100000
-	const pageItems = 5
+	// Two: small enough that BOTH of impact's lists -- the affected entities
+	// and the package pairs the same walk rolled up -- span several pages of the
+	// fixture, which is what makes the order assertions below load-bearing.
+	const pageItems = 2
 
 	t.Run("package dependencies", func(t *testing.T) {
 		req := model.GraphRequest{GenerationID: 1, Start: seeds,
@@ -314,14 +347,14 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			t.Fatalf("the ground truth must be one complete answer, got truncated=%v reason=%q",
 				whole.Meta.Truncated, whole.Meta.TruncationReason)
 		}
-		if len(whole.Items) == 0 {
-			t.Fatal("the whole-walk rollup found no package pairs; the proof would be vacuous")
+		if len(whole.Items) <= pageItems {
+			t.Fatalf("the whole-walk rollup found %d pair(s); the proof needs more than one page of %d",
+				len(whole.Items), pageItems)
 		}
 
-		type pair struct{ from, to model.NodeID }
-		summed := map[pair]model.PackageEdge{}
+		var concatenated []model.PackageEdge
 		paged := engine(t, pageItems)
-		pages, sawPageFull := 0, false
+		pages := 0
 		for {
 			pages++
 			if pages > 200 {
@@ -331,43 +364,31 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			if err != nil {
 				t.Fatalf("page %d: %v", pages, err)
 			}
-			if res.Meta.TruncationReason == reasonPageFull {
-				sawPageFull = true
-				if res.Meta.NextCursor == "" {
-					t.Fatalf("page %d filled its page with no continuation: the frontier is unreachable", pages)
-				}
+			if len(res.Items) > pageItems {
+				t.Fatalf("page %d served %d pairs over a page bound of %d", pages, len(res.Items), pageItems)
 			}
-			for _, item := range res.Items {
-				k := pair{item.FromNodeID, item.ToNodeID}
-				acc := summed[k]
-				acc.FromNodeID, acc.ToNodeID = item.FromNodeID, item.ToNodeID
-				acc.FromPath, acc.ToPath = item.FromPath, item.ToPath
-				acc.PairCount += item.PairCount
-				acc.EvidenceCount += item.EvidenceCount
-				summed[k] = acc
-			}
+			concatenated = append(concatenated, res.Items...)
 			if res.Meta.NextCursor == "" {
 				break
 			}
 			req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
 			req.GenerationID = 0
 		}
-		if !sawPageFull {
-			t.Fatal("no page stopped on its item bound; the proof did not exercise the bound it names")
+		if pages < 2 {
+			t.Fatalf("the paged rollup answered in %d page(s); the proof needs a continuation to consume", pages)
 		}
-		if len(summed) != len(whole.Items) {
-			t.Fatalf("the pages aggregated %d distinct pairs, the whole walk %d", len(summed), len(whole.Items))
+		// ORDER and identity, not set equality: every pair once, in the
+		// single-shot rank, with the whole walk's exact counts.
+		if len(concatenated) != len(whole.Items) {
+			t.Fatalf("the pages carried %d pair(s), the single-shot answer %d: a pair is duplicated or missing",
+				len(concatenated), len(whole.Items))
 		}
-		for _, want := range whole.Items {
-			got, ok := summed[pair{want.FromNodeID, want.ToNodeID}]
-			if !ok {
-				t.Fatalf("pair %s -> %s is in the whole-walk rollup but no page carried it", want.FromPath, want.ToPath)
-			}
-			if got.PairCount != want.PairCount || got.EvidenceCount != want.EvidenceCount {
-				t.Errorf("pair %s -> %s summed to (%d edges, %d evidence) across pages, want the whole walk's (%d, %d)",
-					want.FromPath, want.ToPath, got.PairCount, got.EvidenceCount, want.PairCount, want.EvidenceCount)
+		for i, want := range whole.Items {
+			if concatenated[i] != want {
+				t.Fatalf("at rank %d the pages carry %+v, the single-shot answer %+v", i, concatenated[i], want)
 			}
 		}
+		assertPairOrder(t, concatenated)
 	})
 
 	t.Run("impact", func(t *testing.T) {
@@ -387,16 +408,14 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		if whole.Meta.NextCursor != "" {
 			t.Fatal("the ground truth must be one complete answer")
 		}
-		if len(whole.Entries) == 0 {
-			t.Fatal("the whole-walk impact found no affected entities; the proof would be vacuous")
-		}
-		wholeSet := map[model.NodeID]bool{}
-		for _, entry := range whole.Entries {
-			wholeSet[entry.NodeID] = true
+		if len(whole.Entries) <= pageItems || len(whole.Packages) == 0 {
+			t.Fatalf("the whole-walk impact found %d entr(ies) and %d package pair(s); the proof needs more than one page of %d entries and at least one pair",
+				len(whole.Entries), len(whole.Packages), pageItems)
 		}
 
 		paged := engine(t, pageItems)
-		seen := map[model.NodeID]bool{}
+		var entries []model.ImpactEntry
+		var packages []model.PackageEdge
 		pages := 0
 		for {
 			pages++
@@ -410,13 +429,12 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			if err := res.Validate(); err != nil {
 				t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
 			}
-			if len(res.Entries) > pageItems {
-				t.Fatalf("page %d served %d entries over a page bound of %d: the accumulator is not page-bounded",
-					pages, len(res.Entries), pageItems)
+			if len(res.Entries) > pageItems || len(res.Packages) > pageItems {
+				t.Fatalf("page %d served %d entries and %d pairs over a page bound of %d",
+					pages, len(res.Entries), len(res.Packages), pageItems)
 			}
-			for _, entry := range res.Entries {
-				seen[entry.NodeID] = true
-			}
+			entries = append(entries, res.Entries...)
+			packages = append(packages, res.Packages...)
 			if res.Meta.NextCursor == "" {
 				break
 			}
@@ -424,24 +442,72 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			req.GenerationID = 0
 		}
 		if pages < 2 {
-			// The truncation REASON cannot carry this assertion: the fixture's
-			// generation has deferred dependence units, and markTruncated keeps
-			// the first reason, so reasonDependence is reported in place of the
-			// page stop. A second page existing at all is the observable that
-			// the page bound and the continuation both worked.
 			t.Fatalf("the paged impact answered in %d page(s); the proof needs a continuation to consume", pages)
 		}
-		for id := range wholeSet {
-			if !seen[id] {
-				t.Errorf("node %s is affected in the whole-walk answer but no page reported it", id)
+		// BOTH lists concatenate to the single-shot answer in the single-shot
+		// order. Uniqueness is implied and asserted separately, because a
+		// duplicate is the specific defect ruling P2 removes.
+		if len(entries) != len(whole.Entries) {
+			t.Fatalf("the pages served %d affected entit(ies), the single-shot answer %d: an entity is duplicated or missing",
+				len(entries), len(whole.Entries))
+		}
+		seen := map[model.NodeID]bool{}
+		for i, want := range whole.Entries {
+			if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+				entries[i].Depth != want.Depth || entries[i].Direction != want.Direction {
+				t.Fatalf("at rank %d the pages report %s (score %d, depth %d, %s), the single-shot answer %s (score %d, depth %d, %s)",
+					i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth, entries[i].Direction,
+					want.NodeID, want.ScoreMicros, want.Depth, want.Direction)
+			}
+			if seen[entries[i].NodeID] {
+				t.Fatalf("node %s is listed twice across the pages", entries[i].NodeID)
+			}
+			seen[entries[i].NodeID] = true
+		}
+		if len(packages) != len(whole.Packages) {
+			t.Fatalf("the pages carried %d package pair(s), the single-shot answer %d",
+				len(packages), len(whole.Packages))
+		}
+		for i, want := range whole.Packages {
+			if packages[i] != want {
+				t.Fatalf("at rank %d the pages carry the pair %+v, the single-shot answer %+v", i, packages[i], want)
 			}
 		}
-		for id := range seen {
-			if !wholeSet[id] {
-				t.Errorf("node %s was reported by a page but is not in the whole-walk answer", id)
+		assertPairOrder(t, packages)
+		// The rank KEY, not merely agreement with a single-shot run of the same
+		// build: comparing the pages against a baseline the same code produced
+		// cannot see an order that is wrong in both. Ruling P1 freezes
+		// (ScoreMicros desc, Depth asc, NodeID asc), with Name no longer a
+		// tie-break.
+		for i := 1; i < len(entries); i++ {
+			prev, cur := entries[i-1], entries[i]
+			ordered := prev.ScoreMicros > cur.ScoreMicros ||
+				(prev.ScoreMicros == cur.ScoreMicros && (prev.Depth < cur.Depth ||
+					(prev.Depth == cur.Depth && prev.NodeID < cur.NodeID)))
+			if !ordered {
+				t.Fatalf("ranks %d and %d are out of ruling P1's order: (score %d, depth %d, %s) then (score %d, depth %d, %s)",
+					i-1, i, prev.ScoreMicros, prev.Depth, prev.NodeID, cur.ScoreMicros, cur.Depth, cur.NodeID)
 			}
 		}
 	})
+}
+
+// assertPairOrder checks the frozen package-pair order -- (FromPath, ToPath,
+// FromNodeID, ToNodeID) ascending -- against the key itself rather than against
+// a baseline the same build produced, which is what makes it sensitive to a
+// rank pass that was skipped on both sides.
+func assertPairOrder(t *testing.T, pairs []model.PackageEdge) {
+	t.Helper()
+	for i := 1; i < len(pairs); i++ {
+		prev, cur := pairs[i-1], pairs[i]
+		if lessByPair(pairRecord{FromNodeID: prev.FromNodeID, ToNodeID: prev.ToNodeID,
+			FromPath: prev.FromPath, ToPath: prev.ToPath},
+			pairRecord{FromNodeID: cur.FromNodeID, ToNodeID: cur.ToNodeID,
+				FromPath: cur.FromPath, ToPath: cur.ToPath}) >= 0 {
+			t.Fatalf("ranks %d and %d are out of the frozen pair order: %s -> %s then %s -> %s",
+				i-1, i, prev.FromPath, prev.ToPath, cur.FromPath, cur.ToPath)
+		}
+	}
 }
 
 // exactFillAdjacency serves a fixed containment row set through the keyset
@@ -785,5 +851,382 @@ func TestFrontierBytesMustBePositive(t *testing.T) {
 	limits.FrontierBytes = 0
 	if _, err := New(Options{Adjacency: f, Limits: limits}); err == nil {
 		t.Fatal("New accepted frontier_bytes = 0: a level would have no heap bound at all")
+	}
+}
+
+// TestImpactRanksAWalkSplitAcrossRequests is the D14 proof, and the one this
+// programme's whole retention design exists for.
+//
+// Ruling P3 lets the query deadline end a PAGE mid-walk and carry the frontier
+// forward in the `f` cursor; ruling P2 ranks the answer globally. Before the
+// retained pass-1 input, those two could not both be true: the ExternalSort was
+// built per REQUEST, so the leg that finished the walk ranked only what IT
+// admitted -- and the cumulative visited set the cursor carries guarantees the
+// earlier legs' nodes are never admitted again, so their entities were lost
+// with no cursor and no disclosure at all.
+//
+// The assertion is therefore not "the pages terminate" but "the pages
+// CONCATENATE to the unbounded walk's answer, in its order, including the
+// entities the FIRST leg admitted before the deadline".
+//
+// Mutation (rank from a fresh retained input each request -- i.e. replace
+// `retain := resumeRetained(resume)` in walkImpact with `var retain
+// *retainedWalk`, which is exactly the pre-fix behaviour): the pages serve 0
+// affected entities where the unbounded walk serves 52.
+func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	// Unlimited depth, visited and edge budgets: this proof isolates the
+	// DEADLINE as the thing that splits the walk.
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 100000
+	limits.QueryTimeout = time.Minute
+	// A frontier ceiling the fixture's levels exceed, so runWalkToCompletion
+	// chains several INTERNAL links. That is what gives the deadline a boundary
+	// to land on with a frontier still standing -- a walk that finishes inside
+	// one expand call can only meet the deadline before it has admitted
+	// anything or after it has admitted everything, and neither is the split
+	// this proof is about. The ground truth below runs under the same ceiling,
+	// so the two answers are the same question.
+	limits.FrontierBytes = 16 << 10
+
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	req := model.ImpactRequest{GenerationID: 1, Start: seeds,
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	// Ground truth: the same walk, one request, no deadline in the way.
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Impact(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unbounded impact: %v", err)
+	}
+	if all.Meta.Truncated || all.Meta.NextCursor != "" || len(all.Entries) == 0 {
+		t.Fatalf("ground truth is truncated (%q), paged (%v) or empty (%d entries)",
+			all.Meta.TruncationReason, all.Meta.NextCursor != "", len(all.Entries))
+	}
+
+	// The deadline fires ONCE, after enough adjacency round trips that the
+	// first leg has already admitted edges and still has a frontier standing.
+	// That is the split the fix is about: entities on both sides of it.
+	clock := time.Now()
+	calls, fired := 0, false
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		trigger: 6, jump: 2 * time.Minute, fired: &fired}
+	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	var entries []model.ImpactEntry
+	var packages []model.PackageEdge
+	split := false
+	for pages := 1; ; pages++ {
+		if pages > 200 {
+			t.Fatalf("the deadline-split impact did not terminate after %d pages", pages-1)
+		}
+		res, err := paged.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: a deadline threw the answer away instead of ending the page: %v", pages, err)
+		}
+		if err := res.Validate(); err != nil {
+			t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
+		}
+		if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline {
+			if res.Meta.NextCursor == "" {
+				t.Fatalf("page %d stopped on the deadline with no cursor: the rest of the walk is unreachable", pages)
+			}
+			split = true
+		}
+		entries = append(entries, res.Entries...)
+		packages = append(packages, res.Packages...)
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if !split {
+		t.Fatal("the deadline never split the walk; this proof needs a walk spread over more than one request")
+	}
+	if len(entries) != len(all.Entries) {
+		t.Fatalf("the deadline-split pages served %d affected entit(ies), the unbounded walk %d: the legs before the deadline were dropped",
+			len(entries), len(all.Entries))
+	}
+	seen := map[model.NodeID]bool{}
+	for i, want := range all.Entries {
+		if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+			entries[i].Depth != want.Depth {
+			t.Fatalf("at rank %d the split pages report %s (score %d, depth %d), the unbounded walk %s (score %d, depth %d)",
+				i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth,
+				want.NodeID, want.ScoreMicros, want.Depth)
+		}
+		if seen[entries[i].NodeID] {
+			t.Fatalf("node %s is listed twice across the split pages", entries[i].NodeID)
+		}
+		seen[entries[i].NodeID] = true
+	}
+	if len(packages) != len(all.Packages) {
+		t.Fatalf("the split pages carried %d package pair(s), the unbounded walk %d", len(packages), len(all.Packages))
+	}
+	for i, want := range all.Packages {
+		if packages[i] != want {
+			t.Fatalf("at rank %d the split pages carry %+v, the unbounded walk %+v", i, packages[i], want)
+		}
+	}
+	// The retained pass-1 input is continuation state like any other: once the
+	// answer is fully served nothing of it may be left behind, or a walk split
+	// by a deadline would leak a directory per page for the whole cursor TTL.
+	assertNoRetainedState(t, spoolDir)
+}
+
+// assertNoRetainedState fails if the spool store still holds any entry. It is
+// called once every continuation of the answer has been consumed, so a
+// surviving entry is a leak rather than live state.
+func assertNoRetainedState(t *testing.T, dir string) {
+	t.Helper()
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the spool store: %v", err)
+	}
+	for _, e := range left {
+		if strings.HasPrefix(e.Name(), "spool-") {
+			t.Errorf("the fully served answer left continuation state behind: %s (directory=%v)",
+				e.Name(), e.IsDir())
+		}
+	}
+	// The retained pass-1 input and the walk's scratch file are state of the
+	// same kind -- they live in the store's sort directory, which is the store
+	// directory itself -- and a served answer must leave neither behind.
+	for _, e := range left {
+		if strings.HasPrefix(e.Name(), "walkretain-") || strings.HasPrefix(e.Name(), "graph-visited-") {
+			t.Errorf("the fully served answer left walk state behind: %s (directory=%v)",
+				e.Name(), e.IsDir())
+		}
+	}
+}
+
+// TestFrontierCeilingDoesNotShrinkTheImpactAnswer is D15: the blast radius a
+// request reports must be a function of the GRAPH, never of the memory ceiling
+// the walk was given. Limits.FrontierBytes is an internal page boundary --
+// runWalkToCompletion chains through it -- so a smaller ceiling may cost more
+// internal links, more round trips and more disk, and must cost not one entity.
+//
+// It did. A node chunk is keyset-paged by relation id while the emission order
+// is (owner asc, relation asc), so a chunk of several owners cut in the middle
+// by the byte ceiling kept a NON-prefix of that order; the continuation's
+// keyset skip then dropped every row it had not read that sorted below the cut,
+// and the walk ended with every truncation flag clear. Measured on this
+// fixture: 16 KiB -> 52 entries, 64 KiB -> 154, 256 KiB -> 306, all reporting
+// Truncated=false. A ceiling that quietly returns a sixth of the answer and
+// calls it complete is worse than one that refuses.
+//
+// The table is load-bearing: a single ceiling can pass under a fix that only
+// happens to work at one size, and it was the graduated 52/154/306 that made
+// the defect legible in the first place.
+//
+// Mutation (restore the defect): in levelEdges, replace the multi-owner
+// rollback and single-node re-read with `break chunks` -- FAIL at 16 KiB with
+// 52 entries against the baseline's 306.
+func TestFrontierCeilingDoesNotShrinkTheImpactAnswer(t *testing.T) {
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	run := func(t *testing.T, frontierBytes int64) model.ImpactResult {
+		t.Helper()
+		f := newGraphFixture(t)
+		signer, err := pagination.OpenSigner(t.TempDir())
+		if err != nil {
+			t.Fatalf("open signer: %v", err)
+		}
+		store := newFixtureLeases()
+		spools, err := pagination.NewSpools(t.TempDir(), 64<<20, store)
+		if err != nil {
+			t.Fatalf("new spools: %v", err)
+		}
+		limits := fixtureLimits()
+		// Unlimited depth, visited and edge budgets, and a page bound above the
+		// fixture's record count: the frontier ceiling is the ONLY thing that
+		// differs between the rows of this table.
+		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+		limits.MaxPageItems = 100000
+		limits.FrontierBytes = frontierBytes
+		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+		if err != nil {
+			t.Fatalf("new engine: %v", err)
+		}
+		res, err := e.Impact(context.Background(), model.ImpactRequest{GenerationID: 1,
+			Start: seeds, Direction: model.DirectionOutgoing,
+			Relations: []model.RelationKind{model.RelCalls}})
+		if err != nil {
+			t.Fatalf("frontier ceiling %d bytes: %v", frontierBytes, err)
+		}
+		return res
+	}
+
+	// A ceiling far above the whole level: the walk never spills, so this is
+	// the answer the graph alone decides.
+	all := run(t, 32<<20)
+	if len(all.Entries) == 0 || all.Meta.Truncated || all.Meta.NextCursor != "" {
+		t.Fatalf("baseline is empty (%d), truncated (%q) or paged (%v)",
+			len(all.Entries), all.Meta.TruncationReason, all.Meta.NextCursor != "")
+	}
+	for _, frontierBytes := range []int64{16 << 10, 64 << 10, 256 << 10} {
+		res := run(t, frontierBytes)
+		if res.Meta.Truncated {
+			t.Errorf("ceiling %d: the answer is truncated (%q); a frontier byte ceiling is an internal page boundary, not an answer-level bound",
+				frontierBytes, res.Meta.TruncationReason)
+		}
+		if len(res.Entries) != len(all.Entries) {
+			t.Fatalf("ceiling %d: %d affected entit(ies), the unbounded-ceiling walk %d: the ceiling shrank the answer",
+				frontierBytes, len(res.Entries), len(all.Entries))
+		}
+		seen := map[model.NodeID]bool{}
+		for i, want := range all.Entries {
+			got := res.Entries[i]
+			if got.NodeID != want.NodeID || got.ScoreMicros != want.ScoreMicros || got.Depth != want.Depth {
+				t.Fatalf("ceiling %d: at rank %d %s (score %d, depth %d), the unbounded-ceiling walk %s (score %d, depth %d)",
+					frontierBytes, i, got.NodeID, got.ScoreMicros, got.Depth,
+					want.NodeID, want.ScoreMicros, want.Depth)
+			}
+			if seen[got.NodeID] {
+				t.Fatalf("ceiling %d: node %s is listed twice", frontierBytes, got.NodeID)
+			}
+			seen[got.NodeID] = true
+		}
+		if len(res.Packages) != len(all.Packages) {
+			t.Fatalf("ceiling %d: %d package pair(s), the unbounded-ceiling walk %d",
+				frontierBytes, len(res.Packages), len(all.Packages))
+		}
+		for i, want := range all.Packages {
+			if res.Packages[i] != want {
+				t.Fatalf("ceiling %d: at rank %d %+v, the unbounded-ceiling walk %+v",
+					frontierBytes, i, res.Packages[i], want)
+			}
+		}
+	}
+}
+
+// TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation is the Defect A proof.
+// Ruling P3 makes the query deadline end a PAGE and never the answer, and for
+// impact that has to hold for EVERY deadline, not only one that arrives after
+// the page admitted an edge: the walk's frontier and every record its earlier
+// legs admitted are retained across the request, so a page that served nothing
+// still carries the walk forward. Before this, a deadline that landed before
+// the page's first edge left expand with the raw CTX_QUERY_DEADLINE, which
+// impactPhaseError turned into Truncated with NO cursor -- the retained walk
+// discarded and its remainder unreachable.
+//
+// Mutation (`o.Budget.pageEdges == 0` restored as an unconditional guard in
+// deadlineStop, i.e. DeadlineResumesEmptyPage ignored): the first page below is
+// truncated on the deadline with an empty cursor, which is the assertion this
+// test leads with.
+func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 100000
+	limits.QueryTimeout = time.Minute
+	limits.FrontierBytes = 16 << 10
+
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	base := model.ImpactRequest{GenerationID: 1, Start: seeds,
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Impact(context.Background(), base)
+	if err != nil {
+		t.Fatalf("unbounded impact: %v", err)
+	}
+	if all.Meta.Truncated || len(all.Entries) == 0 {
+		t.Fatalf("ground truth is truncated (%q) or empty (%d entries)",
+			all.Meta.TruncationReason, len(all.Entries))
+	}
+
+	// Trigger 1 is the defect's own shape: the clock jumps inside the FIRST
+	// adjacency round trip, so the deadline is seen by the very next reader
+	// check, before a single edge has been admitted. Triggers 2 and 3 land the
+	// same stop one and two round trips later.
+	for _, trigger := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("trigger-%d", trigger), func(t *testing.T) {
+			clock := time.Now()
+			calls, fired := 0, false
+			slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+				trigger: trigger, jump: 2 * time.Minute, fired: &fired}
+			paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+				Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+				Now: func() time.Time { return clock }})
+			if err != nil {
+				t.Fatalf("new engine: %v", err)
+			}
+			req := base
+			var entries []model.ImpactEntry
+			for pages := 1; ; pages++ {
+				if pages > 200 {
+					t.Fatalf("the deadline-split impact did not terminate after %d pages", pages-1)
+				}
+				res, err := paged.Impact(context.Background(), req)
+				if err != nil {
+					t.Fatalf("page %d: a deadline threw the answer away instead of ending the page: %v", pages, err)
+				}
+				if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline &&
+					res.Meta.NextCursor == "" {
+					t.Fatalf("page %d stopped on the deadline with no cursor after serving %d entries: the rest of the walk is unreachable",
+						pages, len(res.Entries))
+				}
+				entries = append(entries, res.Entries...)
+				if res.Meta.NextCursor == "" {
+					break
+				}
+				req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+				req.GenerationID = 0
+			}
+			if len(entries) != len(all.Entries) {
+				t.Fatalf("the pages served %d affected entit(ies), the unbounded walk %d",
+					len(entries), len(all.Entries))
+			}
+			seen := map[model.NodeID]bool{}
+			for i, want := range all.Entries {
+				if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+					entries[i].Depth != want.Depth {
+					t.Fatalf("at rank %d the pages report %s (score %d, depth %d), the unbounded walk %s (score %d, depth %d)",
+						i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth,
+						want.NodeID, want.ScoreMicros, want.Depth)
+				}
+				if seen[entries[i].NodeID] {
+					t.Fatalf("node %s is listed twice across the pages", entries[i].NodeID)
+				}
+				seen[entries[i].NodeID] = true
+			}
+			assertNoRetainedState(t, spoolDir)
+		})
 	}
 }
