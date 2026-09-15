@@ -18,7 +18,7 @@ CALL=110619
 CDG=101330
 REACHING_DEF=746962
 METHOD=90101 FILE=1713
-### r3app (jssrc) /home/sabossedgh/repos/r3/app 
+### r3app (jssrc) <repos>/r3/app 
 parse wall=165.96 s rss=12201364 KB exit=1
 skipped_methods=12
 2026-09-13 19:00:56.135 WARN  RecoverForJavaScriptFile  Unhandled field structure (BLOCK,new Error()),(FIELD_IDENTIFIER,stack) @ server/lib/publish/_utils.js#L2
@@ -31,7 +31,7 @@ CALL=
 CDG=
 REACHING_DEF=
 METHOD= FILE=
-### redglass (pythonsrc) /home/sabossedgh/repos/redglass 
+### redglass (pythonsrc) <repos>/redglass 
 parse wall=25.84 s rss=6977712 KB exit=0
 skipped_methods=1
 cpg_kb=97708

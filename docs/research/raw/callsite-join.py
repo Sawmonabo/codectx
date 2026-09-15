@@ -1,7 +1,7 @@
 import json,sys,subprocess,re
 from tree_sitter import Language, Parser, Query, QueryCursor
 import tree_sitter_go, tree_sitter_python, tree_sitter_typescript, tree_sitter_java, tree_sitter_rust, tree_sitter_c
-Q='/home/sabossedgh/dev/codectx/internal/provider/treesitter/lang/queries/'
+Q='internal/provider/treesitter/lang/queries/'  # run from the repository root
 SCIP='/tmp/claude-1000/-home-sabossedgh-dev-codectx/b0d7dd67-07aa-4b1e-90f3-b5373301a26b/scratchpad/scip'
 langs={
  'go':      (Language(tree_sitter_go.language()), 'go.scm', f'{SCIP}/mod/a.go', f'{SCIP}/mod/index.scip','a.go'),
