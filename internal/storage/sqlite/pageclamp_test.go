@@ -43,8 +43,16 @@ func TestPageLimitReportsWhatItClamped(t *testing.T) {
 		t.Fatalf("an unbounded or in-range request was reported as a clamp: %q", clamps.Notices())
 	}
 
+	// An edge batch limit of 0 is a USER setting meaning unlimited, so its
+	// resolution to the ceiling is reported where pageLimit's bare zero is not.
+	recordUnbounded(ctx, model.MaxPageItems)
+	if len(clamps.Notices()) != 2 {
+		t.Fatalf("an unlimited edge batch request was not reported: %q", clamps.Notices())
+	}
+
 	// Without a collector installed the clamp still applies and nothing panics.
 	if got := pageLimit(context.Background(), model.MaxPageItems+1); got != model.MaxPageItems {
 		t.Fatalf("pageLimit without a collector served %d; want %d", got, model.MaxPageItems)
 	}
+	recordUnbounded(context.Background(), model.MaxPageItems)
 }

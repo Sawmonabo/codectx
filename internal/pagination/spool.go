@@ -191,6 +191,10 @@ type Spool struct {
 	file    *os.File
 	w       *bufio.Writer
 	written int64
+	// pending is what the record currently being written has put in the
+	// buffer, so a fault part way through a chunked record returns only the
+	// reservation the record did not use.
+	pending int64
 }
 
 // Create allocates a spool for cursor c. The header is written, flushed and
@@ -247,9 +251,10 @@ func (sp *Spool) ID() string { return sp.header.SpoolID }
 // one frame. No record size is refused: the only limit is the shared byte
 // budget, and exceeding that is a typed limit, never a silent truncation.
 //
-// A record is written whole or not at all: the caller's reservation for the
-// chunks already written is returned when a later chunk fails, and a reader
-// that meets a half-written chain reports corruption rather than serving a
+// A record is admitted against the shared budget whole or not at all: the whole
+// chain is reserved before any of it is written, so a record the budget cannot
+// hold leaves nothing behind. A reader that meets a half-written chain -- which
+// only a disk fault can produce -- reports corruption rather than serving a
 // truncated record.
 func (sp *Spool) Append(record []byte) error {
 	if sp.w == nil {
@@ -261,7 +266,23 @@ func (sp *Spool) Append(record []byte) error {
 // writeFrame emits p as one or more frames. Every chunk but the last is
 // exactly maxSpoolChunkBytes and carries frameContinues, which is what lets a
 // reader bound each allocation and detect a chain that ends early.
+//
+// The WHOLE chain is reserved against the shared budget before any of it is
+// written, which is what makes the record atomic against the budget: a record
+// the budget cannot hold is refused before a byte of it exists, rather than
+// leaving a continued chunk with no successor behind. A write fault mid-chain
+// still leaves a partial chain, but its bytes are unreserved and the spool is
+// discarded by its caller, exactly as before chunking.
 func (sp *Spool) writeFrame(p []byte) error {
+	chunks := int64(len(p))/maxSpoolChunkBytes + 1
+	if len(p) > 0 && len(p)%maxSpoolChunkBytes == 0 {
+		// An exact multiple needs no extra short chunk.
+		chunks--
+	}
+	need := int64(len(p)) + 4*chunks
+	if err := sp.owner.reserve(sp.header.SpoolID, need); err != nil {
+		return err
+	}
 	// An empty record is one empty frame, so a reader sees it rather than
 	// nothing; the loop below would emit no frame at all for it.
 	for first := true; first || len(p) > 0; first = false {
@@ -271,18 +292,21 @@ func (sp *Spool) writeFrame(p []byte) error {
 			chunk, more = chunk[:maxSpoolChunkBytes], true
 		}
 		if err := sp.writeChunk(chunk, more); err != nil {
+			sp.owner.unreserve(sp.header.SpoolID, need-sp.pending)
+			sp.pending = 0
 			return err
 		}
 		p = p[len(chunk):]
 	}
+	sp.written += need
+	sp.pending = 0
 	return nil
 }
 
+// writeChunk emits one frame against the reservation writeFrame already took.
+// pending tracks what this record has actually written, so a fault mid-chain
+// returns only the reservation for the bytes that never reached the buffer.
 func (sp *Spool) writeChunk(p []byte, more bool) error {
-	need := int64(4 + len(p))
-	if err := sp.owner.reserve(sp.header.SpoolID, need); err != nil {
-		return err
-	}
 	header := uint32(len(p))
 	if more {
 		header |= frameContinues
@@ -290,14 +314,13 @@ func (sp *Spool) writeChunk(p []byte, more bool) error {
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], header)
 	if _, err := sp.w.Write(length[:]); err != nil {
-		sp.owner.unreserve(sp.header.SpoolID, need)
 		return internalErr("spool write: " + err.Error())
 	}
+	sp.pending += 4
 	if _, err := sp.w.Write(p); err != nil {
-		sp.owner.unreserve(sp.header.SpoolID, need)
 		return internalErr("spool write: " + err.Error())
 	}
-	sp.written += need
+	sp.pending += int64(len(p))
 	return nil
 }
 
