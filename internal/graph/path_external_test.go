@@ -45,6 +45,18 @@ func newPathGraph(edges [][3]string) *pathGraph {
 
 func (g *pathGraph) node(n string) model.NodeID { return model.NodeID(fixtureID("node-" + n)) }
 
+// reader is the packed adjacency the search reads structure through. The
+// Adjacency methods above stay because the ANSWER is still hydrated through
+// them (nodes and evidence); only the adjacency reads moved.
+func (g *pathGraph) reader() *MemoryGraph {
+	nodes := make([]model.Node, 0, len(g.nodes))
+	for _, n := range g.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return NewMemoryGraph(g.Binding(), nodes, append([]model.Relation(nil), g.rels...))
+}
+
 func (g *pathGraph) Edges(_ context.Context, nodes []model.NodeID, dir model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	want := map[model.NodeID]bool{}
@@ -225,7 +237,7 @@ func TestShortestPathIsExactUnderATinyChunkBudget(t *testing.T) {
 	for _, frontier := range []int64{1, 1 << 20} {
 		limits := pathProofLimits()
 		limits.FrontierBytes = frontier
-		e, err := New(Options{Adjacency: g, Limits: limits})
+		e, err := New(Options{Adjacency: g, Reader: g.reader(), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
 		}
@@ -276,7 +288,10 @@ func TestPathWalkHeapIsBoundedByTheChunk(t *testing.T) {
 			t.Fatalf("scratch: %v", err)
 		}
 		defer sc.close()
-		w := &pathWalk{adjacency: g, kinds: []model.RelationKind{model.RelCalls, model.RelImports},
+		reader := g.reader()
+		kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+		codes, absent := kindCodesFor(reader, kinds)
+		w := &pathWalk{reader: reader, kinds: kinds, kindCodes: codes, kindsAbsent: absent,
 			frontierBytes: frontier, sc: sc, scCtx: context.Background()}
 		if err := w.run(context.Background(), g.node("s"), g.node("unreachable")); err != nil {
 			t.Fatalf("width %d: walk: %v", width, err)
@@ -324,7 +339,7 @@ func TestPathDeadlineTruncatesRatherThanFails(t *testing.T) {
 	// Already past by the time the walk issues its first statement, wherever
 	// in the search that lands.
 	limits.QueryTimeout = time.Nanosecond
-	e, err := New(Options{Adjacency: g, Limits: limits})
+	e, err := New(Options{Adjacency: g, Reader: g.reader(), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
@@ -344,7 +359,7 @@ func TestPathDeadlineTruncatesRatherThanFails(t *testing.T) {
 // continuations: a signer, a lease store and a spool store whose directory is
 // also where the retained search state lands, which is what the leak check
 // below reads.
-func pathPagingEngine(t *testing.T, g Adjacency, dir string, store *fixtureLeases, maxVisited int) *Engine {
+func pathPagingEngine(t *testing.T, g *pathGraph, reader GraphReader, dir string, store *fixtureLeases, maxVisited int) *Engine {
 	t.Helper()
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
@@ -356,7 +371,7 @@ func pathPagingEngine(t *testing.T, g Adjacency, dir string, store *fixtureLease
 	}
 	limits := pathProofLimits()
 	limits.MaxVisited = maxVisited
-	e, err := New(Options{Adjacency: g, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: g, Reader: reader, Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -397,7 +412,7 @@ func TestPathResumesAcrossPagesWithTheSameAnswer(t *testing.T) {
 	from, to := g.node("s"), g.node("t")
 	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
 
-	whole := pathPagingEngine(t, g, t.TempDir(), newFixtureLeases(), 0)
+	whole := pathPagingEngine(t, g, g.reader(), t.TempDir(), newFixtureLeases(), 0)
 	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: from, To: to, Relations: kinds})
 	if err != nil {
@@ -411,7 +426,7 @@ func TestPathResumesAcrossPagesWithTheSameAnswer(t *testing.T) {
 	dir := t.TempDir()
 	// Three settled nodes per page: the proof graph needs far more than that
 	// before the target settles, so the answer can only arrive in pages.
-	e := pathPagingEngine(t, g, dir, newFixtureLeases(), 3)
+	e := pathPagingEngine(t, g, g.reader(), dir, newFixtureLeases(), 3)
 	var got model.PathResult
 	cursor := ""
 	pages := 0
@@ -482,9 +497,9 @@ func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
 	// deadline and mints a cursor either way -- so there is no flake window in
 	// the other direction.
 	stalled := false
-	slow := slowPathGraph{pathGraph: g, calls: new(int), trigger: 2,
+	slow := slowPathGraph{MemoryGraph: g.reader(), calls: new(int), trigger: 2,
 		stall: 4 * pathDeadlineProofTimeout, fired: &stalled}
-	e := pathPagingEngine(t, slow, dir, store, 0)
+	e := pathPagingEngine(t, g, slow, dir, store, 0)
 	e.limits.QueryTimeout = pathDeadlineProofTimeout
 
 	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
@@ -539,7 +554,7 @@ func TestExpiredPathLeaseSweepsTheRetainedState(t *testing.T) {
 	g := pathProofGraph(64)
 	dir := t.TempDir()
 	store := newFixtureLeases()
-	e := pathPagingEngine(t, g, dir, store, 3)
+	e := pathPagingEngine(t, g, g.reader(), dir, store, 3)
 	res, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: g.node("s"), To: g.node("t"),
 		Relations: []model.RelationKind{model.RelCalls, model.RelImports}})
@@ -575,41 +590,42 @@ const pathDeadlineProofTimeout = 150 * time.Millisecond
 // traversal has one already (slowAdjacency, frontier_test.go), but it works by
 // jumping the engine's injected clock, and the path search's stop is a real
 // context deadline -- so here the stall is real time, fired once at a fixed
-// edge read. It is passed by value like slowAdjacency, and embeds *pathGraph so
-// NodesByID, EvidenceFor, Capabilities and Binding are the fixture's own.
+// adjacency scan. It hooks the READER, which is where the search's structure
+// reads now live, and embeds *MemoryGraph so every other port method is the
+// fixture's own.
 type slowPathGraph struct {
-	*pathGraph
+	*MemoryGraph
 	calls   *int
 	trigger int
 	stall   time.Duration
 	fired   *bool
 }
 
-func (s slowPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+func (s slowPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
 	*s.calls++
 	if !*s.fired && *s.calls >= s.trigger {
 		*s.fired = true
 		time.Sleep(s.stall)
 	}
-	return s.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+	return s.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, fn)
 }
 
-// busyPathGraph fails one edge read of the RESUMED page with a retryable
+// busyPathGraph fails one adjacency scan of the RESUMED page with a retryable
 // CTX_WORKSPACE_BUSY, the way a contended store does.
 type busyPathGraph struct {
-	*pathGraph
+	*MemoryGraph
 	armed *bool
 }
 
-func (b busyPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+func (b busyPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
 	if *b.armed {
 		*b.armed = false
-		return nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		return from, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
 			Message: "storage: another writer holds the workspace"}
 	}
-	return b.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+	return b.MemoryGraph.Neighbours(ctx, refs, dir, kinds, from, fn)
 }
 
 // TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
@@ -631,7 +647,7 @@ func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
 	from, to := g.node("s"), g.node("t")
 	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
 
-	whole := pathPagingEngine(t, g, t.TempDir(), newFixtureLeases(), 0)
+	whole := pathPagingEngine(t, g, g.reader(), t.TempDir(), newFixtureLeases(), 0)
 	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: from, To: to, Relations: kinds})
 	if err != nil {
@@ -640,10 +656,10 @@ func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
 
 	dir := t.TempDir()
 	armed := false
-	busy := busyPathGraph{pathGraph: g, armed: &armed}
+	busy := busyPathGraph{MemoryGraph: g.reader(), armed: &armed}
 	// Three settled nodes per page, so the first page ends early and hands
 	// back a continuation over retained search state.
-	e := pathPagingEngine(t, busy, dir, newFixtureLeases(), 3)
+	e := pathPagingEngine(t, g, busy, dir, newFixtureLeases(), 3)
 
 	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: from, To: to, Relations: kinds})

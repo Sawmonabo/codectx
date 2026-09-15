@@ -347,3 +347,59 @@ func (s *pathScratch) each(ctx context.Context, query string, args []any,
 func internalErr(msg string) *model.Error {
 	return &model.Error{Code: model.CodeInternal, Message: msg}
 }
+
+// kindCodesFor maps a query's relation kinds onto the pinned generation's kind
+// dictionary. The second result says the query named kinds and the generation
+// seals NONE of them, which is the case a caller must not confuse with the nil
+// slice the port reads as "every kind": a query for a vocabulary this
+// generation never produced answers nothing, not everything.
+//
+// A query that named no kind at all walks every kind, and both results are
+// then empty and false.
+func kindCodesFor(reader GraphReader, kinds []model.RelationKind) ([]KindCode, bool) {
+	if len(kinds) == 0 {
+		return nil, false
+	}
+	codes := make([]KindCode, 0, len(kinds))
+	for _, k := range kinds {
+		if code, ok := reader.Kinds().Code(k); ok {
+			codes = append(codes, code)
+		}
+	}
+	return codes, len(codes) == 0
+}
+
+// encodeEdgePos and decodeEdgePos are the scratch's spelling of a scan
+// position. It lives in the state file rather than in the continuation token
+// because it is a position inside ONE pending batch's scan, which the token
+// never names: the token names the cost bucket, and the batch is rebuilt from
+// `pending` on the next page.
+//
+// The zero position is the empty string, so a state file written before the
+// first edge page reads back as "the beginning of the scan" and needs no
+// separate flag.
+func encodeEdgePos(p EdgePos) string {
+	if p.IsZero() {
+		return ""
+	}
+	return strconv.FormatUint(uint64(p.Node), 10) + ":" + strconv.FormatUint(uint64(p.Index), 10)
+}
+
+func decodeEdgePos(s string) (EdgePos, error) {
+	if s == "" {
+		return EdgePos{}, nil
+	}
+	node, index, ok := strings.Cut(s, ":")
+	if !ok {
+		return EdgePos{}, internalErr("path scratch holds a malformed scan position")
+	}
+	n, err := strconv.ParseUint(node, 10, 64)
+	if err != nil {
+		return EdgePos{}, internalErr("path scratch holds a malformed scan position")
+	}
+	i, err := strconv.ParseUint(index, 10, 32)
+	if err != nil {
+		return EdgePos{}, internalErr("path scratch holds a malformed scan position")
+	}
+	return EdgePos{Node: NodeRef(n), Index: uint32(i)}, nil
+}
