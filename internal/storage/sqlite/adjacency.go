@@ -147,9 +147,12 @@ func (r *PinnedReader) EdgesBatch(ctx context.Context, nodes []model.NodeID, dir
 // query plan can be asserted against exactly the SQL that ships.
 func (r *PinnedReader) edgesBatchQuery(nodes []model.NodeID, direction model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) (string, []any, error) {
-	if limit <= 0 {
-		return "", nil, invalid("edge batch limit must be positive")
+	if limit < 0 {
+		return "", nil, invalid("edge batch limit cannot be negative")
 	}
+	// A zero limit is "no caller-side bound", which pageLimit resolves to the
+	// page size the storage layer serves anyway. Refusing it made 0 mean
+	// "broken" in the one place the rest of the tree now reads as "unlimited".
 	limit = pageLimit(limit)
 	if !direction.Valid() {
 		return "", nil, invalid("direction %q is not a known direction", direction)

@@ -72,6 +72,29 @@ const (
 	headerlessGrace = time.Minute
 )
 
+// budgetDetailKey / budgetDetailValue mark the one error a caller must be able
+// to tell apart from a disk fault: the shared spool budget is full. A caller
+// that was spooling the TAIL of an answer ends the page there instead of
+// failing the whole query, which is why this is a detail on the typed error
+// rather than a distinct code -- the code and remediation an operator sees are
+// unchanged.
+const (
+	budgetDetailKey   = "spool_budget"
+	budgetDetailValue = "exhausted"
+)
+
+// IsBudgetExhausted reports whether err is the shared spool byte budget running
+// out, as opposed to a disk fault, a corrupt spool or a programming error. Only
+// this one is safe to degrade into "the page ends here"; everything else is a
+// real failure and must surface.
+func IsBudgetExhausted(err error) bool {
+	var e *model.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	return e.Details[budgetDetailKey] == budgetDetailValue
+}
+
 // NewSpools opens dir (created 0700) with a total byte cap across live spools
 // and the lease store that decides whether a spool is still live. Bytes
 // already on disk from a previous process count against the cap until Sweep
@@ -101,8 +124,10 @@ func (s *Spools) reserve(id string, n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.used+n > s.maxBytes {
-		return &model.Error{Code: model.CodeResourceLimit, Retryable: true,
-			Message: "query spool exceeds its disk budget", Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}
+		return (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
+			Message:     "query spool exceeds its disk budget",
+			Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}).
+			WithDetail(budgetDetailKey, budgetDetailValue)
 	}
 	s.used += n
 	r, ok := s.reserved[id]

@@ -149,7 +149,13 @@ type Limits struct {
 	MaxSourceResponseBytes   int64
 	MaxMetadataResponseBytes int64
 
-	MaxReceiptsPerConfirmation     int
+	MaxReceiptsPerConfirmation int
+	// MaxUnconfirmedChunksPerSession carries coverage.max_unconfirmed_chunks_per_session
+	// with its configured meaning intact: ZERO IS UNLIMITED, which is its
+	// default, because unconfirmed chunks are rows in the session store and not
+	// heap. It is therefore the one Limits field the positive-value check in
+	// newService exempts. (This package imports no config, by design, so the
+	// convention travels as an int rather than as config.Limit.)
 	MaxUnconfirmedChunksPerSession int
 	MaxPageItems                   int
 

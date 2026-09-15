@@ -39,11 +39,12 @@ const (
 	// (*Spools).Sweep both guard their temporaries the same way.
 	serverConfigStagingGrace = 15 * time.Minute
 
-	// maxSweptWorkDirs bounds this pass's directory scan. Section 6 requires an
-	// explicit finite bound on every traversal; a hand-filled work-directory
-	// root must not turn collection into an unbounded walk. The remainder is
-	// reclaimed by the next pass.
-	maxSweptWorkDirs = 4096
+	// The work-directory scans below are deliberately unbounded in entry count.
+	// os.ReadDir has already materialised the whole listing by the time a slice
+	// could bound it, so the former entries[:4096] spent the memory and then
+	// SILENTLY dropped the remainder -- every pass reclaiming the same first
+	// 4096 names and never reaching the rest. The listing is one directory of
+	// names, not a traversal, and reclaiming is idempotent.
 )
 
 // ToolPins reports the tool payloads the lock currently pins, as a complete map
@@ -157,9 +158,6 @@ func (c *Collector) sweepServerWorkDirs(ctx context.Context, now time.Time) erro
 		}
 		return sweepError("the language-server work directory root cannot be listed", err)
 	}
-	if len(entries) > maxSweptWorkDirs {
-		entries = entries[:maxSweptWorkDirs]
-	}
 	var errs []error
 	for _, e := range entries {
 		if err := ctx.Err(); err != nil {
@@ -193,9 +191,6 @@ func (c *Collector) sweepServerVersions(ctx context.Context, root, name, pinnedD
 			return nil
 		}
 		return sweepError("a language-server work directory cannot be listed", err)
-	}
-	if len(entries) > maxSweptWorkDirs {
-		entries = entries[:maxSweptWorkDirs]
 	}
 	var errs []error
 	for _, e := range entries {
@@ -232,9 +227,6 @@ func (c *Collector) sweepConfigStaging(workDir string, now time.Time) error {
 			return nil
 		}
 		return sweepError("a language-server work directory cannot be listed", err)
-	}
-	if len(entries) > maxSweptWorkDirs {
-		entries = entries[:maxSweptWorkDirs]
 	}
 	var errs []error
 	for _, e := range entries {

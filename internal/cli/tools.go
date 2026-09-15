@@ -404,11 +404,11 @@ const (
 	// once. Nothing is retained beyond one batch: the answer is a single bit and
 	// the first source file decides it.
 	rootListingBatch = 512
-	// maxRootEntries bounds that listing. This is one directory -- a repository
-	// root -- not a traversal, and a root holding more entries than this is
-	// pathological, so refusing it keeps a prefetch's work finite instead of
-	// letting a hostile tree turn the selection into an unbounded listing.
-	maxRootEntries = 200_000
+	// There is no bound on the number of entries the loop below reads. The
+	// listing is batched at rootListingBatch and keeps no entry, so its peak
+	// cost is ONE batch regardless of how many names the root holds; refusing a
+	// large root made the toolchain probe -- and with it the whole prefetch --
+	// fail on a repository that is merely big.
 )
 
 // rootHasDependenceSource reports whether the repository root itself holds a
@@ -433,17 +433,13 @@ func rootHasDependenceSource(root workspace.Root) (bool, error) {
 		return false, listingError(err.Error())
 	}
 	defer dir.Close()
-	for seen := 0; ; {
+	for {
 		entries, err := dir.ReadDir(rootListingBatch)
 		if errors.Is(err, io.EOF) {
 			return false, nil
 		}
 		if err != nil {
 			return false, listingError(err.Error())
-		}
-		if seen += len(entries); seen > maxRootEntries {
-			return false, &model.Error{Code: model.CodeResourceLimit,
-				Message: fmt.Sprintf("the repository root holds more than %d entries", maxRootEntries)}
 		}
 		for _, e := range entries {
 			if !e.Type().IsRegular() {
