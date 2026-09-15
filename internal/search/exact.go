@@ -3,6 +3,7 @@ package search
 // L2 owns this file: the exact and prefix retrieval tiers (exact_path, exact_qualified_name, qualified_name_prefix, exact_name) that serve resolve, document-symbols, workspace-symbols and definition.
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"path"
@@ -21,6 +22,7 @@ type exactReader interface {
 	FileByPath(ctx context.Context, path string) (model.FileID, error)
 	File(ctx context.Context, id model.FileID) (model.FileVersion, error)
 	NodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
+	DistinctNodesInFile(ctx context.Context, file model.FileID, afterStart int64, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 	Nodes(ctx context.Context, f sqlite.NodeFilter, after model.NodeID, limit int) ([]sqlite.StoredNode, error)
 }
 
@@ -105,15 +107,38 @@ func normalizeQueryPath(query string) (string, bool) {
 	return q, true
 }
 
-// pathResolver memoizes file paths for one request: tiers 1-3 return nodes that
+// pathResolver caches file paths for one request: tiers 1-3 return nodes that
 // carry a FileID but no path, and one page can hold many nodes from one file.
+//
+// The cache holds at most one entry per file of ONE READ PAGE, least recently
+// used evicted first, so the heap it costs is a function of the page and not of
+// the answer. A request whose answer spans more files than that still answers
+// every one of them: an evicted entry costs one more r.File read and nothing
+// else. That is why the bound is not a limit in the sense the scale posture
+// makes user-configurable -- it rejects no work, drops no candidate and
+// truncates no answer; it is a read-amplification knob whose only observable
+// effect is how many times a path is fetched.
 type pathResolver struct {
-	r     exactReader
-	paths map[model.FileID]string
+	r exactReader
+	// cap is the entry bound, order the LRU chain with the most recently used
+	// at the front, and paths the index into it.
+	cap   int
+	order *list.List
+	paths map[model.FileID]*list.Element
 }
 
-func newPathResolver(r exactReader) *pathResolver {
-	return &pathResolver{r: r, paths: map[model.FileID]string{}}
+// cachedPath is one chain entry. It carries its own key so eviction can drop
+// the index entry without searching the map.
+type cachedPath struct {
+	file model.FileID
+	path string
+}
+
+// newPathResolver sizes the cache from the read page already in scope: a page
+// cannot hold candidates from more files than it holds candidates, so a page
+// whose nodes all come from distinct files still resolves each path once.
+func newPathResolver(r exactReader, page int) *pathResolver {
+	return &pathResolver{r: r, cap: max(page, 1), order: list.New(), paths: map[model.FileID]*list.Element{}}
 }
 
 // path returns the normalized path of file. A node with no file (a manifest
@@ -122,14 +147,20 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 	if file == "" {
 		return "", nil
 	}
-	if known, ok := p.paths[file]; ok {
-		return known, nil
+	if e, ok := p.paths[file]; ok {
+		p.order.MoveToFront(e)
+		return e.Value.(*cachedPath).path, nil
 	}
 	fv, err := p.r.File(ctx, file)
 	if err != nil {
 		return "", err
 	}
-	p.paths[file] = fv.Path
+	if p.order.Len() >= p.cap {
+		oldest := p.order.Back()
+		delete(p.paths, oldest.Value.(*cachedPath).file)
+		p.order.Remove(oldest)
+	}
+	p.paths[file] = p.order.PushFront(&cachedPath{file: file, path: fv.Path})
 	return fv.Path, nil
 }
 
@@ -143,10 +174,16 @@ func (p *pathResolver) path(ctx context.Context, file model.FileID) (string, err
 // ids it emitted; the id is empty when the query is not a path or names no
 // visible file, which is exactly when this tier emits nothing.
 //
-// It pages NodesInFile on its (start_byte, node_id) keyset rather than issuing
-// one bounded read, because storage takes no kind filter (search.go:109) and so
-// applies the bound BEFORE the filter: a single read of page nodes would answer
-// "0 hits" for a file whose matching declarations all sit past node page.
+// It pages DistinctNodesInFile on its (start_byte, node_id) keyset rather than
+// issuing one bounded read, because storage takes no kind filter and so applies
+// the bound BEFORE the filter: a single read of page nodes would answer "0
+// hits" for a file whose matching declarations all sit past node page.
+//
+// The DISTINCT reading is what a retrieval tier needs: a candidate is a node
+// identity, and a node two units declare at two offsets would otherwise be
+// emitted twice by this tier. document-symbols keeps NodesInFile, which returns
+// every declared offset. Storage decides it, so this walk holds no set of the
+// ids it has emitted and its heap stays one read page.
 //
 // page is the READ size, not a bound on the answer: the walk runs the keyset to
 // its end and emits every kept candidate. A file's declarations are not dropped
@@ -174,13 +211,13 @@ func pathCandidates(ctx context.Context, r exactReader, query string, kinds []mo
 		// most model.MaxPageItems (query.go:291); asking for more would be a
 		// bound this code believes and the database does not, and the walk
 		// would then end on the first page.
-		nodes, err := r.NodesInFile(ctx, file, afterStart, after, page)
+		nodes, err := r.DistinctNodesInFile(ctx, file, afterStart, after, page)
 		if err != nil {
 			return file, err
 		}
 		if len(nodes) == 0 {
 			// An empty page is the end of the file's keyset. Only an empty one
-			// ends the walk: NodesInFile can return a short page while the
+			// ends the walk: the read can return a short page while the
 			// keyset continues, and `after` advances strictly on every
 			// non-empty page, so this terminates.
 			return file, nil
@@ -272,7 +309,7 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 // those two filters.
 func exactCandidates(ctx context.Context, r exactReader, query string, kinds []model.NodeKind,
 	page int, emit func(exactHit) error) error {
-	paths := newPathResolver(r)
+	paths := newPathResolver(r, page)
 	pathFile, err := pathCandidates(ctx, r, query, kinds, page, emit)
 	if err != nil {
 		return err
