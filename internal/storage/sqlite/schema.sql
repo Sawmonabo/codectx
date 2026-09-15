@@ -193,8 +193,7 @@ CREATE TABLE node_facts (
 ) WITHOUT ROWID;
 -- relation_ids mirrors node_ids (S-2/S-5): an INTEGER surrogate, the canonical
 -- 32-byte RelationID stored once in `canonical`, and the endpoints carried as
--- node surrogates. Today this row holds four 32-byte BLOBs and is replicated by
--- two autoindexes plus idx_relations_from/_to.
+-- node surrogates.
 CREATE TABLE relation_ids (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
@@ -609,4 +608,12 @@ CREATE TABLE context_capsule_rows (
     row_json TEXT NOT NULL,
     PRIMARY KEY(session_id, list, ordinal)
 ) WITHOUT ROWID;
+-- The coverage and waiver lists key their row on FileID alone, which this index
+-- would reject a second time. That state is unreachable: a session pins exactly
+-- one snapshot (read_sessions.id, snapshot_id is what session_files' foreign
+-- key names, and nothing updates snapshot_id), snapshot_files is keyed
+-- (snapshot_id, file_id), so one file has exactly one content hash inside one
+-- session -- and both session_files and coverage_waivers are keyed
+-- (session_id, file_id, content_hash). One file therefore yields at most one
+-- coverage row and at most one waiver per session.
 CREATE UNIQUE INDEX idx_capsule_row_key ON context_capsule_rows(session_id, list, row_key);
