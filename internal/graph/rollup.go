@@ -189,7 +189,7 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	lookup = append(lookup, ids...)
 	for _, batch := range impactChunkNodes(ids) {
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, int64(len(batch))*maxContainersPerNode)
+			[]model.RelationKind{model.RelContains}, int64(len(batch))*maxContainersPerNode, false)
 		if err != nil {
 			return nil, err
 		}
@@ -268,12 +268,15 @@ const maxContainersPerNode = 16
 // partial containment as the whole of it: a package that silently loses half
 // its members reads as a smaller package, not as an incomplete answer.
 func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
-	direction model.Direction, kinds []model.RelationKind, maxEdges int64) ([]model.Relation, bool, error) {
+	direction model.Direction, kinds []model.RelationKind, maxEdges int64, unlimited bool) ([]model.Relation, bool, error) {
 	var (
 		out   []model.Relation
 		after model.RelationID
 	)
-	for int64(len(out)) < maxEdges {
+	// An unlimited edge bound reads the containment tree to its end: the walk
+	// is still paged and its working set is still one page, so the only thing
+	// the bound would add is a refusal the operator never configured.
+	for unlimited || int64(len(out)) < maxEdges {
 		rels, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, adjacencyBatch)
 		if err != nil {
 			return nil, false, err
