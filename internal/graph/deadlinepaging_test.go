@@ -442,11 +442,11 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 		t.Fatalf("page 1 ended the answer with %q: the stall must begin AFTER a page that made progress",
 			first.Meta.TruncationReason)
 	}
-	if owner := cursorKeysetOwner(t, paged, first.Meta.NextCursor); owner == "" {
+	if pos := cursorLevelPos(t, paged, first.Meta.NextCursor); pos == (EdgePos{}) {
 		t.Fatal("page 1 stopped at a level boundary: this case only proves anything when the " +
-			"continuation carries a real mid-level keyset position")
+			"continuation carries a real mid-level scan position")
 	} else {
-		t.Logf("page 1 stopped mid-level at owner %q", owner)
+		t.Logf("page 1 stopped mid-level at node %d entry %d", pos.Node, pos.Index)
 	}
 
 	req.Page, req.GenerationID = model.PageRequest{Cursor: first.Meta.NextCursor}, 0
@@ -554,9 +554,11 @@ func unboundedImpactCount(t *testing.T, f *graphFixture, signer *pagination.Sign
 	}
 }
 
-// cursorKeysetOwner is the frontier node a continuation resumes its level from.
-// An empty owner means the page that minted it stopped on a level boundary.
-func cursorKeysetOwner(t *testing.T, e *Engine, token string) model.NodeID {
+// cursorLevelPos is the scan position a continuation resumes its level from.
+// A zero position means the page that minted it stopped on a level boundary:
+// the walk carries surrogates now, so the resume point is an EdgePos in the
+// generation's adjacency, not a canonical keyset pair.
+func cursorLevelPos(t *testing.T, e *Engine, token string) EdgePos {
 	t.Helper()
 	payload, err := e.signer.Verify(token, pagination.PurposeCursor, e.now())
 	if err != nil {
@@ -566,7 +568,7 @@ func cursorKeysetOwner(t *testing.T, e *Engine, token string) model.NodeID {
 	if err := json.Unmarshal(payload, &c); err != nil {
 		t.Fatalf("decode cursor: %v", err)
 	}
-	return c.LastOwner
+	return c.LevelPos
 }
 
 // TestALevelBoundaryDeadlineKeepsTheWholeAnswer is the cross-request half of
@@ -634,9 +636,10 @@ func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 		t.Fatalf("page 1 ended the answer with %q; it must hand the standing frontier on",
 			first.Meta.TruncationReason)
 	}
-	if owner := cursorKeysetOwner(t, paged, first.Meta.NextCursor); owner != "" {
-		t.Fatalf("the level-boundary continuation carries keyset owner %q: the level it names has "+
-			"not been read, so any position in it is a filter over rows nobody has seen", owner)
+	if pos := cursorLevelPos(t, paged, first.Meta.NextCursor); pos != (EdgePos{}) {
+		t.Fatalf("the level-boundary continuation carries scan position %d/%d: the level it names "+
+			"has not been read, so any position in it resumes past rows nobody has seen",
+			pos.Node, pos.Index)
 	}
 
 	// The rest of the walk, read by a reader that does not run past the
