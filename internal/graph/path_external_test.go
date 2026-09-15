@@ -3,12 +3,15 @@ package graph
 import (
 	"context"
 	"fmt"
+	"os"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // pathGraph is a standalone adjacency built from an explicit edge list, so a
@@ -330,5 +333,214 @@ func TestPathDeadlineTruncatesRatherThanFails(t *testing.T) {
 	if !res.Meta.Truncated || res.Meta.TruncationReason != pathReasonDeadline {
 		t.Fatalf("got truncated=%v reason=%q, want %q", res.Meta.Truncated, res.Meta.TruncationReason,
 			pathReasonDeadline)
+	}
+}
+
+// pathPagingEngine builds an engine that can mint and honour path
+// continuations: a signer, a lease store and a spool store whose directory is
+// also where the retained search state lands, which is what the leak check
+// below reads.
+func pathPagingEngine(t *testing.T, g *pathGraph, dir string, store *fixtureLeases, maxVisited int) *Engine {
+	t.Helper()
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	spools, err := pagination.NewSpools(dir, 8<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := pathProofLimits()
+	limits.MaxVisited = maxVisited
+	e, err := New(Options{Adjacency: g, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	return e
+}
+
+// retainedDirs counts the state directories the spool store is holding. Zero is
+// the only acceptable number once a search has ended.
+func retainedDirs(t *testing.T, dir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPathResumesAcrossPagesWithTheSameAnswer is the P5 continuation proof: a
+// per-page visited budget small enough to force several pages must change only
+// how many requests the answer takes, never the answer. The final page's routes
+// and cost are compared against the same search run in one page, which the
+// exactness proof above has already tied to the unbounded in-memory reference.
+//
+// Mutation (drop the resume position -- resume every page from the start of the
+// cost bucket instead of from the cursor's last settled node, or drop the
+// `pending` work queue so a node settled by one page is never expanded by the
+// next) makes this FAIL: the search either loops without converging or serves a
+// route list that is short of the single-page one.
+func TestPathResumesAcrossPagesWithTheSameAnswer(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+
+	whole := pathPagingEngine(t, g, t.TempDir(), newFixtureLeases(), 0)
+	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("single-page search: %v", err)
+	}
+	if want.Meta.Truncated || len(want.Paths) == 0 {
+		t.Fatalf("the single-page search must be a complete answer: truncated=%v paths=%d",
+			want.Meta.Truncated, len(want.Paths))
+	}
+
+	dir := t.TempDir()
+	// Three settled nodes per page: the proof graph needs far more than that
+	// before the target settles, so the answer can only arrive in pages.
+	e := pathPagingEngine(t, g, dir, newFixtureLeases(), 3)
+	var got model.PathResult
+	cursor := ""
+	pages := 0
+	for {
+		pages++
+		if pages > 200 {
+			t.Fatalf("the search did not converge in %d pages", pages)
+		}
+		req := model.PathRequest{From: from, To: to, Relations: kinds}
+		if cursor == "" {
+			req.GenerationID = 1
+		} else {
+			req.Page = model.PageRequest{Cursor: cursor}
+		}
+		got, err = e.ShortestPath(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		if got.Meta.NextCursor == "" {
+			break
+		}
+		if !got.Meta.Truncated {
+			t.Fatalf("page %d hands back a cursor but is not marked truncated", pages)
+		}
+		cursor = got.Meta.NextCursor
+	}
+	if pages < 3 {
+		t.Fatalf("the per-page budget must force at least 3 pages; it took %d", pages)
+	}
+	if got.Meta.Truncated {
+		t.Fatalf("the final page must be a complete answer, got reason %q", got.Meta.TruncationReason)
+	}
+	if gotSeq, wantSeq := routeSequences(got), routeSequences(want); !reflect.DeepEqual(gotSeq, wantSeq) {
+		t.Fatalf("the paged search answered %v over %d pages;\nthe single-page search says %v",
+			gotSeq, pages, wantSeq)
+	}
+	if got.VisitedCount < want.VisitedCount {
+		t.Fatalf("the paged search reports %d visited cumulatively; the single-page search spent %d",
+			got.VisitedCount, want.VisitedCount)
+	}
+	// The retained state belongs to the pages, not to the answer: once the
+	// final page has arrived nothing of the search is left on disk.
+	if n := retainedDirs(t, dir); n != 0 {
+		t.Fatalf("the completed search left %d retained state directories behind", n)
+	}
+}
+
+// TestPathDeadlineMintsAResumableCursor is ruling P3 for the path search: a
+// deadline ends the PAGE, not the answer. The first page is given a deadline it
+// cannot finish under, and the continuation it mints must complete the search.
+//
+// Mutation (end the answer on the deadline instead of retaining the state --
+// the behaviour before this change) makes this FAIL at the missing cursor.
+func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+	dir := t.TempDir()
+	store := newFixtureLeases()
+	e := pathPagingEngine(t, g, dir, store, 0)
+	// A deadline that lands in the middle of the search rather than before it:
+	// long enough to settle something, far too short to reach the target.
+	e.limits.QueryTimeout = 300 * time.Microsecond
+
+	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("an expired deadline must end the page, not fail the request: %v", err)
+	}
+	if first.Meta.TruncationReason != pathReasonDeadline {
+		t.Skipf("the deadline did not land inside the search (reason %q); the budget row proves the same contract",
+			first.Meta.TruncationReason)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a deadline must end the page with a continuation, not the answer without one")
+	}
+	// The continuation runs under a deadline it can finish in.
+	e.limits.QueryTimeout = time.Minute
+	cursor := first.Meta.NextCursor
+	for i := 0; i < 200; i++ {
+		res, err := e.ShortestPath(context.Background(),
+			model.PathRequest{From: from, To: to, Relations: kinds,
+				Page: model.PageRequest{Cursor: cursor}})
+		if err != nil {
+			t.Fatalf("continuation %d: %v", i, err)
+		}
+		if res.Meta.NextCursor == "" {
+			if len(res.Paths) == 0 {
+				t.Fatal("the continuation completed the search but found no route")
+			}
+			if n := retainedDirs(t, dir); n != 0 {
+				t.Fatalf("the completed search left %d retained state directories behind", n)
+			}
+			return
+		}
+		cursor = res.Meta.NextCursor
+	}
+	t.Fatal("the continuation never completed the search")
+}
+
+// TestExpiredPathLeaseSweepsTheRetainedState is the other half of the leak
+// check: a continuation nobody follows must not pin its search state forever.
+// The spool store sweeps a retained state DIRECTORY on lease expiry exactly as
+// it sweeps a spool file, which is what pagination.Spools.AdoptDir buys.
+//
+// Mutation (restore `e.IsDir()` to Sweep's skip list) makes this FAIL: the
+// directory survives the sweep.
+func TestExpiredPathLeaseSweepsTheRetainedState(t *testing.T) {
+	g := pathProofGraph(64)
+	dir := t.TempDir()
+	store := newFixtureLeases()
+	e := pathPagingEngine(t, g, dir, store, 3)
+	res, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: g.node("s"), To: g.node("t"),
+		Relations: []model.RelationKind{model.RelCalls, model.RelImports}})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if res.Meta.NextCursor == "" {
+		t.Fatal("the per-page budget must end this page with a continuation")
+	}
+	if n := retainedDirs(t, dir); n != 1 {
+		t.Fatalf("a page that ended early must retain exactly one state directory, got %d", n)
+	}
+	spools, err := pagination.NewSpools(dir, 8<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	// Every lease this search took is long past.
+	if _, err := spools.Sweep(context.Background(), time.Now().Add(365*24*time.Hour)); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n := retainedDirs(t, dir); n != 0 {
+		t.Fatalf("the sweep left %d retained state directories behind an expired lease", n)
 	}
 }
