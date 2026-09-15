@@ -453,8 +453,9 @@ table, no approved path and no PATH lookup (Section 20.2 — trust is the lock).
 Every one of the six was resolved through the real lock and store and run end
 to end on `linux/amd64` — materialize, index, import, seal — against a fixture
 of its own language; the exact argv, the environment allowlist and the sealed
-result of each run were recorded when the matrix was verified. The six profiles and the argument
-arrays this build pins, after the payload's own launcher prefix:
+result of each run were recorded when the matrix was verified. The six
+profiles and the argument arrays this build pins, after the payload's own
+launcher prefix:
 
 | Profile | Triggers | Arguments after the launcher | Environment allowlist | Network posture | Host toolchain it needs |
 |---|---|---|---|---|---|

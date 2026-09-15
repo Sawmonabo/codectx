@@ -186,7 +186,7 @@ continuation spool, and membership is answered **per level in one sequential swe
 
 **Alternatives considered.**
 
-*A roaring bitmap over dense node ordinals* [S10][S11] — the plan's own first proposal, and the
+*A compressed bitmap over dense node ordinals* [S10][S11] — the plan's own first proposal, and the
 standard answer for a visited set. **Rejected on evidence from the schema**: a node identity here
 is a content hash, not an ordinal, so there is no dense integer id space for a bitmap to compress.
 A bitmap would first require assigning dense ids, which is a storage change of its own. The
@@ -604,16 +604,23 @@ data opaquely as a blob rather than as rows, with a further 50 % cut from flatte
 messages [S28]. Another mature design stores entries once in sorted first-normal-form and leaves
 query indexing to the consumer, and explicitly sanctions hashing wide signatures down to
 fingerprints [S29] — a lever *not* taken here, because it would change canonical identities and
-therefore determinism, and it is recorded as the next one if the redesign misses.
+therefore determinism, and it is recorded as the next one if the redesign misses. Held in the same
+reserve is the second-order change to the evidence family, which is 21.6 % of the file as one row
+per fact-to-owner link plus its indexes: replacing those rows with a compressed integer set per
+owner plus a fact-id interval map. The closest published analogue solves the identical
+fact-to-owner problem with exactly that pair of structures, at **+7 %** of *its own* database size
+and 2–3 % more index time [S25]. It is second-order here — attempted only if the surrogates and the
+interning miss the gate — because it is a schema change to one family rather than a change at every
+reference site.
 
 **Why bytes-per-symbol is the metric.** The cost is per identity, so it scales with symbols, not
 source bytes: the same symbol count spread over 14× more source moves the *ratio* by roughly that
 factor while the per-symbol cost does not move at all. Measured at ≈3.4 KB per indexed symbol
 today; 3.5× on the original corpus would imply ≈158 B per symbol. Cross-system calibration brackets
-the target without settling it: a whole-corpus positional-trigram index measures about 3–3.5× of
-corpus size, but it also stores a copy of the content and is a substring index, not a fact store
-[S21]; the like-for-like pair is an integer-id fact store at 0.8 GB against a normalised-SQLite
-code-fact store at 5.2 GB on the same corpus — **6.5×**, the same direction and magnitude as the
+the target without settling it: a published whole-corpus positional-trigram index measures about
+3–3.5× of corpus size, but it also stores a copy of the content and is a substring index, not a
+fact store [S21]; the like-for-like pair is a published integer-id fact store at 0.8 GB against a
+normalised-SQLite code-fact store at 5.2 GB on the same corpus — **6.5×**, the same direction and magnitude as the
 gap being closed [S27]. Neither says 3.5× is right for this product. Only re-measurement can.
 
 **Determinism and migration.** Canonical hashes exclude operational identifiers by specification,
@@ -688,7 +695,7 @@ whole, the restored-refusal mutation, and the single-pass-hash mutation.
 | Index planning | Sort run buffer + fan-in × block size; the plan's own unit list remains and is named |
 | Graph traversal | Resumed frontier (frontier byte budget) + this page's admissions (page items) + one level's probes + one page of relations + one spool record |
 | Providers | One batch (batch records / batch bytes) + the per-sink pool reservation; truncation bounds each row |
-| Search | Distinct results in the answer, plus the deduplication set for a range scan — **both open** |
+| Search | Sort run buffer + merge fan-in blocks + one page |
 | Process tree | Fixed capture buffers; admission reservations taken together under one lock |
 | Storage writes | One batch; interning is a bounded cache flushed per batch |
 
@@ -716,10 +723,13 @@ duplicates an existing assertion.
 - **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage wave's to
   close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
-- **Search heap**: the ranked set and the deduplication set now stream through the one external sort
-  primitive (§2.4), so neither is proportional to the match count. What remains on this path is the
-  exact-tier candidate set, which holds one node identity per distinct exact candidate and is
-  therefore still proportional to a short prefix query's range scan.
+- **Search heap**: the ranked set and the candidate-deduplication set now stream through the one
+  external sort primitive (§2.4), so peak heap on this path is the sort run buffer plus the merge
+  fan-in's blocks plus one page, independent of the match count. The two residuals §2.4 names are
+  the ones that stand: a continuation page still materialises the whole spooled tail it was handed
+  before re-spooling the remainder, and per-request sort runs are not charged to the temporary-byte
+  reservation, though they live under the same spool directory and the sweeper counts them as real
+  disk.
 - **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).
 - Smaller residuals are recorded at their sites: an undisclosed cut on a joined documentation body,
   and a clamp notice that is recorded but still has no reader on the context and adjacency query
