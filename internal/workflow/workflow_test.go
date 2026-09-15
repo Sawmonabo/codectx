@@ -41,6 +41,65 @@ func TestWorkflowScenarios(t *testing.T) {
 	t.Parallel()
 	cases := []scenario{
 		// L1 rows
+		// resources.query_timeout is unlimited by DEFAULT and is a default,
+		// never a ceiling. Both halves were broken here: checkLimits refused a
+		// non-positive value, so the shipped configuration could not compose a
+		// workflow service at all, and Advance, Status and Include each wrapped
+		// their request in context.WithTimeout unconditionally -- so a zero
+		// minted `now + 0`, an instant already past that refuses every request,
+		// and a caller's longer deadline was silently cut back to the
+		// configured default. The row asserts at the seam where it is
+		// decidable, the context the service hands the store, so it costs no
+		// wall clock.
+		//
+		// Mutation: restore context.WithTimeout(ctx, s.limits.QueryTimeout) in
+		// advance.go, ready.go or include.go in place of model.QueryDeadline
+		// and the zero-timeout leg fails with a deadline nobody asked for.
+		{name: "an unbounded call carries no deadline and a caller's own is kept", run: func(t *testing.T, h *harness) {
+			status := func(timeout time.Duration, ctx context.Context) bool {
+				saw := false
+				svc, err := New(Options{
+					Sessions: deadlineStore{h.store, &saw},
+					Compile:  h.store,
+					Validate: h.store,
+					Limits: Limits{
+						MaxPageItems:             model.MaxPageItems,
+						MaxObservationReferences: config.Unlimited,
+						MaxCapsuleBytes:          8 << 20,
+						QueryTimeout:             timeout,
+					},
+					Now:    func() time.Time { return fixtureNow },
+					Logger: slog.New(slog.DiscardHandler),
+				})
+				if err != nil {
+					t.Fatalf("build a workflow service with query_timeout %s: %v", timeout, err)
+				}
+				if _, err := svc.Status(ctx, model.SessionRequest{
+					SessionID: fixtureSession, ActorID: fixtureActor,
+				}); err != nil {
+					t.Fatalf("Status under query_timeout %s: %v", timeout, err)
+				}
+				return saw
+			}
+			if status(0, context.Background()) {
+				t.Fatal("query_timeout 0 means NO deadline, yet the call ran under one: " +
+					"`now + 0` is an instant already past and would refuse every request")
+			}
+
+			// A caller's own deadline is the request's, and a positive
+			// configured value must not narrow it. A minute is far beyond
+			// anything this package would install of its own.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			defer cancel()
+			before, _ := ctx.Deadline()
+			if !status(10*time.Second, ctx) {
+				t.Fatal("the caller's deadline was dropped")
+			}
+			if after, _ := ctx.Deadline(); !after.Equal(before) {
+				t.Fatalf("the caller's deadline moved from %s to %s: query_timeout is a ceiling", before, after)
+			}
+		}},
+
 		// Failure mode: a service that picked its own version from a
 		// pre-read record, retried the store's compare-and-swap or
 		// swallowed its conflict would let two clients both believe they
@@ -848,6 +907,20 @@ var capsuleListOfKind = map[model.ObservationKind]model.CapsuleList{
 	model.ObservationContradiction: model.CapsuleListContradictions,
 	model.ObservationUnresolved:    model.CapsuleListUnresolved,
 	model.ObservationScopeReview:   model.CapsuleListScopeReviewIDs,
+}
+
+// deadlineStore records whether the context the service handed down carried a
+// deadline. It embeds the fake rather than reimplementing it, so it keeps
+// satisfying Sessions however that interface is widened.
+type deadlineStore struct {
+	*fakeStore
+	sawDeadline *bool
+}
+
+func (d deadlineStore) Session(ctx context.Context, id model.SessionID, actor string) (sqlite.SessionRecord, error) {
+	_, ok := ctx.Deadline()
+	*d.sawDeadline = ok
+	return d.fakeStore.Session(ctx, id, actor)
 }
 
 func newFakeStore() *fakeStore {
