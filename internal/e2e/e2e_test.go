@@ -1136,8 +1136,9 @@ func TestE2EProductBoundary(t *testing.T) {
 		t.Fatalf("search resolved no node for %q in the generated repository: %+v", tinySeedSymbol, hitKeys(hits.Items))
 	}
 	impactEnv, impactCode := s.run(t, "impact", string(node))
+	whole := data[model.ImpactResult](t, impactEnv, impactCode)
 	var relation model.RelationID
-	for _, entry := range data[model.ImpactResult](t, impactEnv, impactCode).Entries {
+	for _, entry := range whole.Entries {
 		for _, path := range entry.Paths {
 			if len(path.Relations) > 0 {
 				relation = path.Relations[0]
@@ -1146,6 +1147,33 @@ func TestE2EProductBoundary(t *testing.T) {
 	}
 	if relation == "" {
 		t.Fatalf("impact on %s produced no evidence-backed relation to cite", node)
+	}
+	// The `r` continuation, end to end through the CLI: one page of one, then
+	// the token that page printed. Impact runs its whole walk on the first
+	// request and serves the globally ranked remainder from a spool, so this is
+	// the only boundary at which the ranked cursor's round trip -- signed,
+	// bound to this query, and read back as a ranked spool rather than a walk
+	// -- is exercised against the built binary.
+	if len(whole.Entries) > 1 || len(whole.Packages) > 1 {
+		firstEnv, firstCode := s.run(t, "impact", string(node), "--limit", "1")
+		first := data[model.ImpactResult](t, firstEnv, firstCode)
+		if first.Meta.NextCursor == "" {
+			t.Fatalf("impact on %s holds %d entr(ies) and %d pair(s) but offered no continuation at a page of one",
+				node, len(whole.Entries), len(whole.Packages))
+		}
+		nextEnv, nextCode := s.run(t, "impact", string(node), "--limit", "1",
+			"--cursor", first.Meta.NextCursor)
+		next := data[model.ImpactResult](t, nextEnv, nextCode)
+		if len(next.Entries)+len(next.Packages) == 0 {
+			t.Fatalf("the ranked continuation served nothing: %+v", next.Meta)
+		}
+	} else if _, code := s.run(t, "impact", string(node), "--cursor",
+		"not-a-token"); code == 0 {
+		// The generated repository's blast radius fits one page, so the token
+		// this build would have to accept cannot be produced here. What is
+		// still provable at this boundary is that --cursor REACHES the request:
+		// a malformed one must be refused rather than ignored.
+		t.Fatal("`impact --cursor` accepted a malformed token: the flag is not reaching the request")
 	}
 	start := seed{Node: node, Relation: relation}
 
