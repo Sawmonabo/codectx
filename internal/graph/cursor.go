@@ -859,13 +859,27 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 	if e.spools == nil {
 		return "", nil
 	}
+	prev := w.prevID
 	dir, err := w.detach()
 	if err != nil {
 		return "", err
 	}
-	id, err := e.spools.AdoptDir(next.retainCursor(), dir)
+	var id string
+	if prev != "" {
+		// A directory the store already holds is re-adopted INCREMENTALLY: it
+		// is charged only the bytes this page appended to it, and the previous
+		// reservation is transferred rather than released afterwards. Measuring
+		// and reserving it whole made the shared budget hold two copies of the
+		// cumulative retained state at every page boundary, which append-only
+		// runs alone do not fix.
+		id, err = e.spools.ReadoptDir(next.retainCursor(), prev)
+	} else {
+		id, err = e.spools.AdoptDir(next.retainCursor(), dir)
+	}
 	if err != nil {
-		_ = os.RemoveAll(dir)
+		if prev == "" {
+			_ = os.RemoveAll(dir)
+		}
 		if pagination.IsBudgetExhausted(err) {
 			return "", errRetentionBudget("walk")
 		}

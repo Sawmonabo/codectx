@@ -49,20 +49,8 @@ func (s *Spools) AdoptDir(c Cursor, dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	h := SpoolHeader{Version: spoolVersion, SpoolID: id, LeaseID: c.LeaseID, GenerationID: c.GenerationID,
-		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC()}
-	head, err := json.Marshal(h)
-	if err != nil {
-		return "", internalErr("spool header: " + err.Error())
-	}
-	frame := make([]byte, 4+len(head))
-	binary.BigEndian.PutUint32(frame[:4], uint32(len(head)))
-	copy(frame[4:], head)
-	// The header is written BEFORE the rename, so a directory that carries the
-	// spool naming always carries a readable header: a sweep never meets one
-	// mid-adoption and never has to fall back to the headerless grace window.
-	if err := os.WriteFile(filepath.Join(dir, spoolDirHeader), frame, 0o600); err != nil {
-		return "", internalErr("spool adopt: " + err.Error())
+	if err := writeDirHeader(dir, id, c); err != nil {
+		return "", err
 	}
 	size, err := dirBytes(dir)
 	if err != nil {
@@ -76,6 +64,110 @@ func (s *Spools) AdoptDir(c Cursor, dir string) (string, error) {
 		return "", internalErr("spool adopt: " + err.Error())
 	}
 	return id, nil
+}
+
+// ReadoptDir rebinds the retained directory prevID already names to cursor c,
+// under a fresh id, charging the shared budget only the bytes it has GROWN by.
+//
+// It exists because a paged walk extends one directory page after page.
+// AdoptDir measures the whole directory and reserves it again while the
+// previous reservation is released only afterwards, so the budget held roughly
+// TWICE the cumulative retained bytes at every page boundary -- and a walk
+// whose state is append-only would still stop being able to mint a
+// continuation at half the budget it actually needs. Here the previous
+// reservation is transferred to the new id inside one critical section, so the
+// entry is charged its real size exactly once and only the delta has to fit.
+//
+// The caller must NOT hold the directory open for write across this call for
+// anything it still needs named: the rename moves the entry, exactly as
+// AdoptDir does.
+func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
+	if err := c.Validate(); err != nil {
+		return "", err
+	}
+	if !model.ValidHexID(prevID) {
+		return "", cursorInvalid("spool id is malformed")
+	}
+	from := filepath.Join(s.dir, spoolPrefix+prevID)
+	if info, err := os.Stat(from); err != nil || !info.IsDir() {
+		return "", cursorInvalid("continuation state has expired or was released")
+	}
+	id, err := model.NewRandomID()
+	if err != nil {
+		return "", err
+	}
+	if err := writeDirHeader(from, id, c); err != nil {
+		return "", err
+	}
+	size, err := dirBytes(from)
+	if err != nil {
+		return "", err
+	}
+	if err := s.transfer(prevID, id, size); err != nil {
+		return "", err
+	}
+	if err := os.Rename(from, filepath.Join(s.dir, spoolPrefix+id)); err != nil {
+		s.transferBack(id, prevID)
+		return "", internalErr("spool adopt: " + err.Error())
+	}
+	return id, nil
+}
+
+// transfer moves prevID's reservation onto id and adjusts it to size, claiming
+// only the difference against the budget. A shrunk directory gives bytes back;
+// a grown one that does not fit is refused with the budget-exhausted detail,
+// and nothing is moved.
+func (s *Spools) transfer(prevID, id string, size int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prev := s.reserved[prevID].bytes
+	delta := size - prev
+	if s.maxBytes > 0 && delta > 0 && s.used+delta > s.maxBytes {
+		return (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
+			Message:     "query spool exceeds its disk budget",
+			Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}).
+			WithDetail(budgetDetailKey, budgetDetailValue)
+	}
+	s.used += delta
+	if s.used < 0 {
+		s.used = 0
+	}
+	delete(s.reserved, prevID)
+	s.seq++
+	s.reserved[id] = reservation{seq: s.seq, bytes: size}
+	return nil
+}
+
+// transferBack undoes transfer when the rename that was to follow it failed:
+// the directory is still where it was, still under its old id.
+func (s *Spools) transferBack(id, prevID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	bytes := s.reserved[id].bytes
+	delete(s.reserved, id)
+	s.seq++
+	s.reserved[prevID] = reservation{seq: s.seq, bytes: bytes}
+}
+
+// writeDirHeader stamps a retained directory with the binding it is being
+// adopted under. The header is written BEFORE the rename, so a directory that
+// carries the spool naming always carries a readable header: a sweep never
+// meets one mid-adoption and never has to fall back to the headerless grace
+// window.
+func writeDirHeader(dir, id string, c Cursor) error {
+	h := SpoolHeader{Version: spoolVersion, SpoolID: id, LeaseID: c.LeaseID, GenerationID: c.GenerationID,
+		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC()}
+	head, err := json.Marshal(h)
+	if err != nil {
+		return internalErr("spool header: " + err.Error())
+	}
+	frame := make([]byte, 4+len(head))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(head)))
+	copy(frame[4:], head)
+	if err := os.WriteFile(filepath.Join(dir, spoolDirHeader), frame, 0o600); err != nil {
+		return internalErr("spool adopt: " + err.Error())
+	}
+	return nil
 }
 
 // OpenDir validates that the retained directory named by cursor c exists, was
