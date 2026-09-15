@@ -599,7 +599,7 @@ func Defaults() Config {
 			MaxConcurrentQueries:      4,
 			MaxConcurrentGraphQueries: 2,
 			MaxConcurrentHeavy:        1,
-			MaxTempBytes:              4294967296,
+			MaxTempBytes:              0,
 			MinFreeDiskBytes:          1073741824,
 			MaxMetadataResponseBytes:  262144,
 			MaxSourceResponseBytes:    7340032,
