@@ -44,13 +44,20 @@ func addLimitFlag(cmd *cobra.Command) {
 // reason-path cap and prints no token, and offering the flag there would
 // advertise a workflow the command refuses.
 func addCursorFlag(cmd *cobra.Command) {
+	// The repeat-every-flag clause is the first half of the help because it is
+	// the refusal an operator actually hits: the request's direction, relation
+	// kinds, seeds, depth and page size are hashed into the token, so `--cursor`
+	// alone -- the shape a paging loop naturally takes -- is refused as a
+	// different query. verifyContinuation names those inputs in the message it
+	// returns; this says them before the command is run at all.
+	//
 	// The refusal list is worded for BOTH families this flag serves. `search`
 	// and `symbol` repin the cursor's own generation, so a newer one cannot
 	// disturb them; the graph commands read the ACTIVE generation and refuse a
 	// cursor that pins a different one (verifyContinuation in graph/cursor.go:
 	// "cursor pins a generation that is no longer the one being read"), which is
 	// a refusal the caller can hit without altering the token.
-	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, was issued for a different query or command, or -- for the graph commands -- names a generation that is no longer the active one")
+	cmd.Flags().String(queryCursorFlag, "", "continue a previous answer from the token it printed as next; repeat every other flag and argument of the original request, --limit and --depth included, because a token is bound to the question it was issued for and a page asked with different ones is refused rather than answered; the continuation stays on the generation that answer was read from, and is refused if the token has expired, was altered, was issued for a different query or command, or -- for the graph commands -- names a generation that is no longer the active one")
 }
 
 // pageRequest reads the page flags of a command that declares them. A command

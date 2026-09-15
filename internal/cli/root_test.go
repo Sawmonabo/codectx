@@ -13,7 +13,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
-	"github.com/spf13/cobra"
 )
 
 // TestCommandEnvelope protects the machine-stable CLI boundary of Section 18.2:
@@ -66,10 +65,7 @@ func TestCommandEnvelope(t *testing.T) {
 		missingRepo bool
 		// absentWorkspaceArg does the same for the two Section 18.1 commands
 		// that name their repository POSITIONALLY -- `doctor [path]` and
-		// `repo-map [path]` -- and, because the Task 20 integration lane is the
-		// one that registers them in root.go, skips the row until that line
-		// lands rather than letting it pass as an unknown command for the wrong
-		// reason. The skip clears itself the moment the command is registered.
+		// `repo-map [path]`.
 		absentWorkspaceArg bool
 		exitCode           int
 		ok                 bool
@@ -182,9 +178,6 @@ func TestCommandEnvelope(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			root := cli.NewRoot(build, &stdout, &stderr)
 			if tc.absentWorkspaceArg {
-				if !hasCommand(root, tc.args[0]) {
-					t.Skipf("`codectx %s` is not registered in root.go yet; the Task 20 integration lane adds it", tc.args[0])
-				}
 				args = append(args, filepath.Join(t.TempDir(), "absent"))
 			}
 			err := cli.Execute(context.Background(), build, root, args)
@@ -275,19 +268,6 @@ func isolateUserDirs(t *testing.T, userConfig string) {
 	if err := os.WriteFile(filepath.Join(appDir, "config.toml"), []byte(userConfig), 0o600); err != nil {
 		t.Fatalf("user configuration file: %v", err)
 	}
-}
-
-// hasCommand reports whether the built tree registers a command by name. It
-// reads the tree rather than a build tag or an environment variable so the two
-// rows that depend on a registration this lane does not own go live by
-// themselves as soon as that registration lands.
-func hasCommand(root *cobra.Command, name string) bool {
-	for _, c := range root.Commands() {
-		if c.Name() == name {
-			return true
-		}
-	}
-	return false
 }
 
 // checkUnopenableWorkspaceReport holds `doctor` to the contract that makes it

@@ -172,7 +172,7 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 	lookup = append(lookup, ids...)
 	for _, batch := range impactChunkNodes(ids) {
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			int64(len(batch))*maxContainersPerNode)
+			[]model.RelationKind{model.RelContains}, int64(len(batch))*maxContainersPerNode)
 		if err != nil {
 			return nil, err
 		}
@@ -235,23 +235,29 @@ func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID) (map
 // bound.
 const maxContainersPerNode = 16
 
-// containsEdges reads the `contains` edges of one batch of nodes in direction,
+// containsEdges reads the containment edges of one batch of nodes in direction,
 // keyset-paged by RelationID, up to maxEdges rows.
 //
+// kinds is the containment vocabulary the caller counts over, and it is a
+// parameter rather than a constant because the two callers mean different
+// things by "contained": a rollup and an ancestry climb ask which CONTAINER
+// holds a node, which only `contains` answers, while the repository map counts
+// what a container holds and a top-level declaration hangs off its module with
+// `defines` (see overviewRelationKinds).
+//
 // It reports whether the read COMPLETED. The caller decides what an incomplete
-// containment read means for its answer -- a rollup refuses, the repository map
-// truncates and says so -- because the one thing neither may do is report a
+// containment read means for its answer -- both a rollup and the repository
+// map's counts refuse -- because the one thing neither may do is report a
 // partial containment as the whole of it: a package that silently loses half
 // its members reads as a smaller package, not as an incomplete answer.
 func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
-	direction model.Direction, maxEdges int64) ([]model.Relation, bool, error) {
+	direction model.Direction, kinds []model.RelationKind, maxEdges int64) ([]model.Relation, bool, error) {
 	var (
 		out   []model.Relation
 		after model.RelationID
 	)
 	for int64(len(out)) < maxEdges {
-		rels, err := e.adjacency.Edges(ctx, batch, direction,
-			[]model.RelationKind{model.RelContains}, after, adjacencyBatch)
+		rels, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, adjacencyBatch)
 		if err != nil {
 			return nil, false, err
 		}
