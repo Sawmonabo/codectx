@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,72 @@ func TestDiagnostics(t *testing.T) {
 }
 
 var scenarios = []scenario{
+	{
+		// Failure mode: the doctor lists a toolchain row for every entry the
+		// lock carries, so an operator on a Go and Python repository is told
+		// to install a C++ indexer and a Java indexer their repository will
+		// never run, beside a dozen rows for payloads that are already there.
+		// The one actionable line -- install what THIS repository needs and
+		// does not have -- is then indistinguishable from the noise, and the
+		// remediation beside it downloads gigabytes nothing will execute.
+		// A corrupt payload must survive both filters: it is installed, and
+		// doctor is the only place a damaged store is reported.
+		name: "doctor names only the tools this repository selects and lacks",
+		run: func(t *testing.T) {
+			tc := &fakeToolchain{
+				selected: []string{"gopls", "node", "scip-go", "scip-python"},
+				statuses: []toolchain.Status{
+					{Name: "clangd", Version: "22.1.6", State: toolchain.StateAvailable},
+					{Name: "gopls", Version: "0.23.0", State: toolchain.StateAvailable},
+					{Name: "node", Version: "22.23.2", State: toolchain.StateInstalled},
+					{Name: "scip-go", Version: "0.2.7", State: toolchain.StateCorrupt},
+					{Name: "scip-java", Version: "0.13.1", State: toolchain.StateInstalled},
+					{Name: "scip-python", Version: "0.6.6", State: toolchain.StateAvailable},
+				},
+			}
+			rep, err := newTestService(t, Options{Toolchain: tc}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			var got []string
+			for _, c := range rep.Checks {
+				if name, ok := strings.CutPrefix(c.Name, checkToolchainPrefix); ok {
+					got = append(got, name+"="+string(c.State))
+				}
+			}
+			// gopls and scip-python are selected and missing; scip-go is
+			// selected and damaged. node is selected but installed, clangd is
+			// missing but unselected, scip-java is both installed and
+			// unselected: none of the three is the operator's business.
+			want := []string{"gopls=" + string(model.CheckWarn), "scip-go=" + string(model.CheckFail),
+				"scip-python=" + string(model.CheckWarn)}
+			if !slices.Equal(got, want) {
+				t.Fatalf("toolchain rows %v, want %v", got, want)
+			}
+			if c := checkNamed(t, rep, checkToolchainPrefix+"gopls"); !strings.Contains(c.Remediation, "tools prefetch --for-repo") {
+				t.Fatalf("the missing-tool remediation must name a command that installs it: %q", c.Remediation)
+			}
+		},
+	},
+	{
+		// Failure mode: the repository root cannot be read, the selection
+		// fails, and the doctor answers with no toolchain row at all -- a
+		// clean bill of health for a workspace nobody can list.
+		name: "a selection that cannot be computed is a failing check, not silence",
+		run: func(t *testing.T) {
+			tc := &fakeToolchain{
+				selErr:   &model.Error{Code: model.CodeArgumentInvalid, Message: "the repository root cannot be listed"},
+				statuses: []toolchain.Status{{Name: "gopls", Version: "0.23.0", State: toolchain.StateAvailable}},
+			}
+			rep, err := newTestService(t, Options{Toolchain: tc}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			if c := checkNamed(t, rep, checkToolchainPrefix+"selection"); c.State != model.CheckFail {
+				t.Fatalf("selection check is %q, want %q", c.State, model.CheckFail)
+			}
+		},
+	},
 	// L0 rows
 	{
 		// Failure mode: a metric this host cannot read is defaulted to zero,
@@ -577,11 +644,17 @@ func (f *fakeStore) Blob(context.Context, string) (model.BlobRecord, error) {
 
 type fakeToolchain struct {
 	statuses []toolchain.Status
+	selected []string
 	err      error
+	selErr   error
 }
 
 func (f *fakeToolchain) Statuses(context.Context) ([]toolchain.Status, error) {
 	return f.statuses, f.err
+}
+
+func (f *fakeToolchain) Selected(context.Context, string) ([]string, error) {
+	return f.selected, f.selErr
 }
 
 type fakeWorkspace struct {

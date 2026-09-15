@@ -11,15 +11,60 @@ labelled with the server, its version and an input digest, and carries
 (`lsp.SemanticSource`). When the server stops the answers are simply gone;
 canonical generations never change.
 
+**The overlay therefore has no row in the `codectx status` completeness
+table, by design.** That table reports the capability state of the providers
+that produced the sealed units of the active generation; the overlay produces
+none, so a row there could only ever describe a server this build might start
+later, qualified by a snapshot no query has asked for yet. The overlay reports
+its state **per query** instead: a query carrying `--semantic-source lsp
+--profile <server>` either answers with `semantic_source=lsp` and the server,
+its version and the input digest attached, or fails with the typed reason from
+the `Resolve` table above (`CTX_PROVIDER_UNAVAILABLE`, `CTX_TOOL_OFFLINE`,
+`CTX_TOOL_UNSUPPORTED_PLATFORM`, `CTX_TOOL_CORRUPT`). To see ahead of a query
+whether a server *could* start, read whether its pinned payload is installed:
+`codectx tools status` lists every server the lock names, and `codectx doctor`
+reports the ones this repository selects and does not have.
+
 ## What runs, and why it is allowed to
 
 A `Definition` is what this build knows about a supported server: name — which
 is also the name of its entry in the embedded tool lock — manifest language
 tags, the stdio argument array, the environment allowlist, the budgets and the
 root markers. `Definitions()` lists the six of Section 11.5. A definition
-**authorizes nothing**. `Definition.Detect(root)` reports which root markers
-exist, reading metadata through the confined `workspace.Root` only; it is a
+**authorizes nothing**. `Definition.ProjectRoot(ctx, view, path)` reports the
+project directory a server would be rooted at for one snapshot file — the
+deepest directory at or above it holding one of the server's root markers, read
+from the pinned snapshot's manifest and never from the live checkout; it is a
 hint for choosing among the supported servers and never a reason to execute.
+
+## One server per project
+
+A language server resolves a project from the directory it is started in. A
+repository does not keep its projects at its root, so a server started at the
+workspace root of a monorepo is handed a directory whose manifest declares none
+of the projects beneath it: it resolves no dependency, builds no project model,
+and answers about a file with whatever that file alone tells it — a degraded
+answer labelled exactly like a good one.
+
+A server is therefore identified by the snapshot, the profile **and** the
+project directory, and so is everything derived from it: its private working
+directory (which for the Java server holds that project's own workspace index)
+and the `input_digest` on the overlay binding it publishes. The project is the
+queried file's own. A request that names no file — a workspace-symbol query,
+which is about the repository rather than about a position in it — is answered
+by the server at the project the workspace root itself declares.
+
+The materialization stays whole: the server is rooted inside it, and every URI
+the client sends and resolves is still a snapshot-relative path, so a location
+the server returns from outside its project is mapped and admitted exactly as
+before. Concurrency is the machine's: each server is admitted against the one
+machine-derived allocation by the memory its pinned definition reserves, so a
+repository with many projects runs as many servers at once as the machine has
+room for. That allocation is the whole process's, not this package's — the
+analysis engine's heavy units are admitted from the same ledger and in the same
+first-in-first-out order, so a server never overtakes a unit that asked first.
+When there is no room, an idle server is stopped to make room and otherwise the
+open waits — another project's server already running is never a refusal.
 
 A `Profile` is runnable, and `Resolve(ctx, resolver, cfg, name)` is its only
 constructor:
@@ -38,8 +83,8 @@ constructor:
 `enabled = "auto"` therefore means "start the pinned payload for this
 language"; nothing found on `PATH` is ever started and there is no
 `[analyzers.<name>]` approval to write (Section 20.2 — trust is the lock). The
-argument array, the environment allowlist, the budgets and the lifetime are
-constants of this build; `${input_dir}` is the materialization root and
+argument array, the environment allowlist and the budgets are constants of
+this build, and a server has no lifetime bound; `${input_dir}` is the materialization root and
 `${work_dir}` the server's private working directory
 `<data_dir>/lsp/<server>/<payload identity>/`, which the overlay creates before
 the server starts. The last component is the digest half of the resolved
@@ -64,13 +109,13 @@ a host `JAVA_HOME` can never shadow the managed JDK.
 |---|---|---|---|---|
 | `gopls` | go | `serve` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | `go.mod`, `go.work` |
 | `rust-analyzer` | rust | | `PATH HOME CARGO_HOME RUSTUP_HOME` | `Cargo.toml` |
-| `pyright` | python | `--stdio` | `PATH HOME` | `pyproject.toml`, `pyrightconfig.json`, `setup.py`, `requirements.txt` |
+| `ty` | python | `server` | `PATH HOME` | `pyproject.toml`, `ty.toml`, `setup.py`, `requirements.txt` |
 | `typescript-language-server` | typescript, tsx, javascript | `--stdio` | `PATH HOME` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | `clangd` | c, cpp | | `PATH HOME` | `compile_commands.json`, `compile_flags.txt`, `.clangd`, `CMakeLists.txt` |
 | `jdtls` | java | `-configuration ${work_dir}/config -data ${work_dir}/data` | `PATH HOME` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
 
-The launcher itself comes from the lock: `gopls`, `clangd` and `rust-analyzer`
-run as themselves; `pyright` and `typescript-language-server` run as
+The launcher itself comes from the lock: `gopls`, `clangd`, `rust-analyzer` and
+`ty` run as themselves; `typescript-language-server` runs as
 `<managed node> <pinned entry>`; `jdtls` runs as
 `<managed jdk>/bin/java -jar <pinned launcher jar>` with `JAVA_HOME` set.
 
@@ -116,17 +161,39 @@ binding that validates, advertised its capabilities and shut down cleanly:
 | Server | Reported version | Bound `ProviderVersion` | Capabilities |
 |---|---|---|---|
 | `gopls` | `v0.23.0` | `v0.23.0` | all seven |
-| `rust-analyzer` | `0.3.3016-standalone` | same | all seven |
+| `rust-analyzer` | `0.3.3049-standalone` | same | all seven |
 | `clangd` | `clangd version 22.1.6 …` | same | all seven |
-| `pyright` | **none** | `1.1.414` (pinned) | all but implementations |
+| `ty` | `0.0.81` | same | all seven |
 | `typescript-language-server` | **none** | `6.0.0` (pinned) | all seven |
 | `jdtls` | `1.61.0-SNAPSHOT` | same | all seven |
 
-`pyright` and `typescript-language-server` answer `initialize` with no
-`serverInfo` object at all (measured, both through the product and with a raw
-`initialize` outside it). `OverlayBinding.Validate` requires a non-empty
-`ProviderVersion`, so the overlay used to fail for python, typescript, tsx and
-javascript with `CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
+**The python row was re-measured for the swap.** The python server is the
+native checker [ADR-0006](adr/ADR-0006-language-servers.md) chose, and the
+row above was re-run against a large Python repository (17 488 `.py`) for
+one widely referenced class, on a cold session with no settle window — the only kind
+the overlay has. All seven requests were answered; `serverInfo` reported
+`ty 0.0.81` and the negotiated `positionEncoding` was `utf-8`, so the bound
+`ProviderVersion` is the server's own report and both feed the overlay's input
+digest; `references` returned **136 locations in 0.217 s** at a server peak RSS
+of **168.7 MB** (`VmHWM`), matching the measurement the decision was taken on.
+Every one of the 136 is a real occurrence of the identifier: none is a string
+or comment match. The server it replaced, driven over the same repository with
+the same client — including the array-shaped `workspace/configuration` answer
+this client sends — returned **2** locations cold and still **2** after settle
+windows of 15, 40 and 60 seconds, at 265–267 MB, and never advertised
+`implementation`. The two-result disagreement the decision record asked to
+adjudicate (138 versus 136) therefore did not reproduce: the old server never
+reached its settled count here, so there is no second location set to diff
+against. What did reproduce, more strongly than recorded, is the completeness
+gap that decided the swap.
+
+`typescript-language-server` answers `initialize` with no `serverInfo` object at
+all (measured, both through the product and with a raw `initialize` outside it),
+and since the python row moved to a native binary that reports one it is the
+only pinned server that does. `OverlayBinding.Validate` requires a non-empty
+`ProviderVersion`, so the overlay used to fail for typescript, tsx, javascript
+and, before the swap, python, with
+`CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
 The label now falls back to the version of the payload the lock pinned, which
 is never empty and is the honest identity of a server that declines to name
 itself; the **reported** string keeps feeding the input digest unchanged, so a
@@ -164,19 +231,18 @@ Bounds, all finite:
 
 | Bound | Source | Effect when hit |
 |---|---|---|
-| concurrent servers | `providers.lsp.max_servers` (default 1) | an idle server is stopped to make room; otherwise `CTX_RESOURCE_LIMIT` |
-| in-flight requests per server | `providers.lsp.max_outstanding_requests` | callers wait for a slot under their context |
-| one request | `providers.lsp.request_timeout` | `$/cancelRequest` sent, `CTX_PROVIDER_TIMEOUT` |
+| concurrent servers | the machine-derived allocation, summed over the definitions' memory reservations | an idle server is stopped to make room; otherwise the open waits for room |
+| in-flight requests per server | `providers.lsp.max_outstanding_requests` (default unlimited: every caller already waits on its own gate) | with a value set, callers wait for a slot under their context |
+| a request making no progress, the `initialize` handshake included | `providers.lsp.stall_timeout` (default 5m, the server consuming no processor time) | `$/cancelRequest` sent, `CTX_UNAVAILABLE` with `reason=stalled`. There is no deadline on an answer: a server computing one is working however long it takes, and where a platform cannot observe a running process tree the connection's byte count stands in. |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
-| server lifetime | the definition's own `Timeout` (1 h) | the runner terminates the tree |
 | materialized bytes, one admitted file, bytes sent per rolling minute | `Options.MaxOverlayBytes` (default unlimited) | files that do not fit are named in the log and left out; a file over the bound is not admitted and the query answers about the rest; a sustained flood over the send budget fails the server |
 | cached pinned bytes | `Options.MaxOverlayBytes` when set, otherwise `DefaultDocCacheBytes` (512 MiB) | cache evicts least-recently-used; eviction costs a re-read, never an answer |
 | one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
-| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable — a request reports it to its caller, an answer to a server-initiated request is dropped and the writer goroutine continues |
+| one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable and the request reports it to its caller; an answer to a server-initiated request that cannot fit fails the connection instead, because a server waiting on an answer it can never receive would wait forever |
 | header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels — the line bound is applied to the chunk the reader holds before it is accumulated | protocol error, connection failed |
-| queued answers to server-initiated requests | 4 | the reply is dropped; the reader never blocks on a write |
+| queued answers to server-initiated requests | one frame's worth of bytes (`Options.MaxFrameBytes`), unwritten | no answer is ever dropped: a server holding more than that unread is not reading its input, and the connection is failed with `CTX_UNAVAILABLE` (`reason=not_draining`) |
 | documents held open on the server | 16 | `didClose` of the least recently opened |
-| handshake, shutdown | `Options.StartTimeout` (60 s), `Options.StopTimeout` (5 s) | start fails; the runner forces the stop |
+| shutdown | `Options.StopTimeout` (5 s), the grace after a stop has been requested; it bounds nothing else | the runner forces the stop |
 
 Stderr is a server's log and is discarded, not retained or logged (Section
 22); its bound still terminates a server that floods it.
@@ -192,10 +258,10 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 - **Cancellation.** When a call's context ends the client sends
   `$/cancelRequest`, forgets the id and returns `CTX_CANCELED` (or
   `CTX_PROVIDER_TIMEOUT` for a deadline). The connection stays usable.
-  `conn.write` itself is not context-aware, so a call can wait on the writer
-  lock behind a frame the server has not yet consumed; that wait is bounded by
-  the server's own progress and ultimately by the approval's `timeout`
-  terminating the tree, not by `providers.lsp.request_timeout`.
+  A write parked behind a frame the server has not consumed is reached by no
+  context, so when `providers.lsp.stall_timeout` ends a call while a send is
+  parked, the server is failed as `stalled` and its process stopped, which
+  ends the pipe the write waits on.
 - **Server-initiated requests** are handled by explicit policy:
   `workspace/configuration` is answered with `null` per item (at most 64
   items) — codectx supplies no settings; **everything else** is answered with
@@ -205,13 +271,17 @@ Stderr is a server's log and is discarded, not retained or logged (Section
   server's behalf. Notifications (`window/logMessage`,
   `textDocument/publishDiagnostics`, `$/progress`) are read and dropped, as
   is a response the server could not attribute to a request (`"id": null`).
-  The answer is **queued** (at most four) for one dedicated writer goroutine:
-  the goroutine that reads the server's output never writes, because a write
-  parks on the server's stdin while the server is parked writing stdout that
-  only the reader drains. A full queue drops the reply rather than blocking,
-  and so does a reply the frame bound refuses — its id and method name come
-  from the server, so one long-named server request must not be able to stop
-  every later answer. The writer exits only once the connection is failed.
+  The answer is **queued** for one dedicated writer goroutine: the goroutine
+  that reads the server's output never writes, because a write parks on the
+  server's stdin while the server is parked writing stdout that only the
+  reader drains. No answer is dropped. The queue is bounded by bytes, at one
+  frame's worth: answers are written as fast as the server reads its input, so
+  a server holding more than that unread is asking while it has stopped
+  reading, and the connection is failed with `CTX_UNAVAILABLE`
+  (`reason=not_draining`) rather than left to wait forever on answers it can
+  never receive. A request whose id leaves no room for an answer within the
+  frame bound fails the connection the same way, as `CTX_RESOURCE_LIMIT`. The
+  writer exits only once the connection is failed.
 - **Position encoding.** The client offers `utf-8`, `utf-32`, `utf-16` in
   that order; the server's `positionEncoding` (default `utf-16`) is used for
   every coordinate in both directions. A choice the client did not offer is
@@ -256,7 +326,7 @@ Stderr is a server's log and is discarded, not retained or logged (Section
 ## Typed surface
 
 ```go
-mgr, _ := lsp.New(lsp.Options{Runner: runner, DataDir: dataDir, MaxServers: cfg.Providers.LSP.MaxServers, ...})
+mgr, _ := lsp.New(lsp.Options{Runner: runner, DataDir: dataDir, Admission: ledger, ...})
 profile, err := lsp.Resolve(ctx, resolver, cfg, "gopls")     // CTX_TOOL_* when the payload does not resolve
 ov, err := mgr.Open(ctx, view, profile)            // starts lazily, shares a running server
 defer ov.Close()                                   // last close starts the idle TTL
@@ -288,8 +358,8 @@ Null), TypeParameter and anything unknown→variable.
 
 ## Failure
 
-Any transport error, protocol violation, frame over its bound, process exit
-or lifetime cap **fails the server**: every pending call is released with the
+Any transport error, protocol violation, frame over its bound, reply queue a
+server does not drain, or process exit **fails the server**: every pending call is released with the
 typed reason, the process tree is terminated through the runner, the
 materialization is removed once the tree is reaped, and the manager forgets
 the server so the next `Open` starts a fresh one. Overlays still holding the
@@ -306,19 +376,17 @@ has already been forgotten does not keep it above zero.
 
 Detection of an unexpected exit is bounded by the runner's stdin handling:
 the runner's input pump parks on the client's stdin reader after the child
-dies and `Run` returns after twice the grace (`Options.StopTimeout`); the
-Task 10 report names the shared change that would make it immediate.
+dies and `Run` returns after twice the grace (`Options.StopTimeout`).
 
 ## Documented residuals
 
 These are deliberate and bounded, not defects; each is named here so a reader
 does not have to rediscover it.
 
-- **A server's lifetime is the approval's `timeout`.** There is no separate
-  lifetime setting: the value that bounds one analyzer run bounds a whole
-  language server here, and when it elapses the runner terminates the tree and
-  the next `Open` starts a fresh server. An operator approving a server for
-  interactive use approves a `timeout` of that length.
+- **A server has no lifetime bound.** It ends when it has been idle for
+  `providers.lsp.idle_ttl`, when it is stopped, when a request finds it making
+  no progress, or when it fails; a long interactive session is never ended for
+  its length.
 - **`Options.MaxOverlayBytes` is set from `providers.lsp.max_overlay_bytes`**
   (default unlimited; a value you set is validated to be at least
   `resources.max_source_response_bytes`). When set it bounds, separately, the
@@ -344,7 +412,7 @@ does not have to rediscover it.
 
 ## Consumers
 
-The query facade (Task 17) routes `semantic_source=lsp` requests here with
+The query facade (`internal/app`) routes `semantic_source=lsp` requests here with
 the caller's `profile`, maps `Location`/`Symbol`/`Call` onto the overlay-aware
 `model.Node` and `model.ReferenceOccurrence` shapes and sets
 `QueryMeta.Overlay`. Context compilation always requests canonical mode and

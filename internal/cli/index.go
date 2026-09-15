@@ -240,7 +240,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 					if err := writeIndexStatus(out, data.Index); err != nil {
 						return err
 					}
-					return writeToolTable(out, data.Tools)
+					return writeToolTable(out, data.Tools, false)
 				})
 		},
 	}
