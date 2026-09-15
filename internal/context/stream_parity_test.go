@@ -1135,8 +1135,19 @@ func TestTheStreamedCompileIsByteForByteTheWholeSetPlan(t *testing.T) {
 					m.EntryCount, m.SliceCount, len(ref.Entries), len(ref.Slices))
 			}
 			_, reqHash := manifestIdentity(fx.Binding, row.req, fx.Cfg)
-			want := canonicalManifestHash(fx.Binding, reqHash, refBudget, refScopeComplete,
-				ref.Entries, ref.Slices, ref.Excluded)
+			refExcluded := sqlite.ExcludedEntries(func(yield func(model.ExcludedContextEntry) error) error {
+				for _, ex := range ref.Excluded {
+					if err := yield(ex); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			want, err := canonicalManifestHash(fx.Binding, reqHash, refBudget, refScopeComplete,
+				ref.Entries, ref.Slices, int64(len(ref.Excluded)), refExcluded)
+			if err != nil {
+				t.Fatalf("hash the whole-set plan: %v", err)
+			}
 			if m.CanonicalHash != want {
 				t.Errorf("canonical hash %s, the whole-set plan hashes to %s", m.CanonicalHash, want)
 			}
