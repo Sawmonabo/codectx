@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -319,4 +320,125 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 		assertNoRetainedState(t, spoolDir)
 	})
 
+}
+
+// TestAMidLevelStallEndsTheAnswer is the other half of the livelock proof, and
+// the shape TestADeadlineSplitWalkAlwaysAdvances cannot see.
+//
+// Its no-progress case stalls from the very first round trip, so the cursor
+// every page resumes was minted at a LEVEL BOUNDARY and carries an EMPTY keyset
+// position. That is the one shape in which a guard comparing a zero-valued
+// accumulator position against the cursor's could ever match. The common shape
+// is the opposite: a walk runs, admits edges, and the deadline lands INSIDE a
+// multi-owner adjacency chunk, so the continuation names a real frontier node
+// and relation id. Here the first page does exactly that, and only then does
+// every later read run past the deadline.
+//
+// Asserted: page 1 mints a continuation whose LastOwner is a real node, and the
+// page that follows it -- the FIRST one to make no progress -- is the one that
+// reports it: truncated, reasonDeadlineStalled, no cursor. The page count is
+// the assertion, because it is what the seeding buys.
+//
+// Mutation (applied, run, reverted in one command): the accumulator's keyset
+// seeding dropped (`newImpactAccumulator` ignoring resume). Measured, and
+// stated here rather than the stronger claim: the chain does NOT spin forever
+// on this fixture, it costs one page and the level position. Page 2 admits
+// nothing, the guard cannot fire because the accumulator's position is zero
+// while the cursor's is a real node, so page 2 mints LastOwner:"" -- throwing
+// away the keyset position and asking page 3 to re-scan the level from its
+// beginning -- and page 3 is where the (now matching, because both are empty)
+// guard fires. The case fails with "reported it could not advance on page 3".
+func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
+	const mids, fanOut = 8, 6
+	const pageCap = 400
+
+	f := newReachableFixture(t, mids, fanOut)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 0, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 8
+	limits.QueryTimeout = time.Minute
+	limits.FrontierBytes = 8 << 20
+
+	clock := time.Now()
+	calls, fired := 0, false
+	// One real round trip, then the clock is past the deadline on every read:
+	// page 1 admits the seed's children and stops with a keyset position, and
+	// no page after it can reach an edge at all.
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		jump: 2 * time.Minute, fired: &fired, stallAfter: 1}
+	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	req := model.ImpactRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("bound-seed")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+	first, err := paged.Impact(context.Background(), req)
+	if err != nil {
+		t.Fatalf("page 1: %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatalf("page 1 ended the answer with %q: the stall must begin AFTER a page that made progress",
+			first.Meta.TruncationReason)
+	}
+	if owner := cursorKeysetOwner(t, paged, first.Meta.NextCursor); owner == "" {
+		t.Fatal("page 1 stopped at a level boundary: this case only proves anything when the " +
+			"continuation carries a real mid-level keyset position")
+	} else {
+		t.Logf("page 1 stopped mid-level at owner %q", owner)
+	}
+
+	req.Page, req.GenerationID = model.PageRequest{Cursor: first.Meta.NextCursor}, 0
+	for pages := 2; ; pages++ {
+		if pages > pageCap {
+			t.Fatalf("a mid-level stall minted %d cursors: every page admitted nothing and handed "+
+				"back the cursor it was given", pages-1)
+		}
+		res, err := paged.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		if res.Meta.NextCursor == "" {
+			if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDeadlineStalled {
+				t.Fatalf("page %d ended the answer with reason %q, want %q",
+					pages, res.Meta.TruncationReason, reasonDeadlineStalled)
+			}
+			if pages > 2 {
+				t.Fatalf("a mid-level stall reported it could not advance on page %d: the FIRST page "+
+					"that admits nothing must report it, and a later one only can by first "+
+					"discarding the keyset position and re-scanning the level", pages)
+			}
+			t.Logf("terminated after %d page(s) with %q", pages, res.Meta.TruncationReason)
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+}
+
+// cursorKeysetOwner is the frontier node a continuation resumes its level from.
+// An empty owner means the page that minted it stopped on a level boundary.
+func cursorKeysetOwner(t *testing.T, e *Engine, token string) model.NodeID {
+	t.Helper()
+	payload, err := e.signer.Verify(token, pagination.PurposeCursor, e.now())
+	if err != nil {
+		t.Fatalf("verify cursor: %v", err)
+	}
+	var c traversalCursor
+	if err := json.Unmarshal(payload, &c); err != nil {
+		t.Fatalf("decode cursor: %v", err)
+	}
+	return c.LastOwner
 }

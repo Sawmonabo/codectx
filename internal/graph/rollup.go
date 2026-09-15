@@ -99,7 +99,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil)
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil, resume)
 		walkErr := e.rollupInto(ctx, &meta, func(sink edgeSink) error {
 			var werr error
 			state, werr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
