@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -1228,5 +1229,96 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 			}
 			assertNoRetainedState(t, spoolDir)
 		})
+	}
+}
+
+// TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget is SK8. Under a small
+// shared continuation budget an impact walk split across many deadline pages
+// eventually cannot hand its retained pass-1 input to the spool store. That
+// used to return an empty token and a NIL error (`retain` degraded a budget
+// refusal into `("", nil)` and nextTraversalCursor passed it through), so the
+// answer ended mid-walk with `truncated:true`, `truncation_reason:"query
+// deadline reached"`, `next_cursor:null` and exit 0 -- 17% of an answer
+// presented as a whole one, under a reason that named a bound which was not the
+// one that stopped it. Soaking r3 under `resources.query_timeout="2s"` hit it
+// at page 131 of a 761-page walk.
+//
+// The contract asserted here: EVERY page either carries the walk on with a
+// cursor, or is refused with a typed CTX_RESOURCE_LIMIT naming the user-set key
+// to raise. A deadline-reasoned page with no cursor is the defect.
+//
+// Mutation (`return "", nil` restored in `retain`'s IsBudgetExhausted branch):
+// the walk stops at a deadline page with no cursor and the first Fatalf fires.
+func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	// Small enough that a leg's retained input cannot always be adopted, large
+	// enough that the first pages succeed: the defect only shows once the walk
+	// has been split, which is exactly the shape the soak reached.
+	spools, err := pagination.NewSpools(spoolDir, 8<<10, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 100000
+	limits.QueryTimeout = time.Minute
+	limits.FrontierBytes = 16 << 10
+
+	req := model.ImpactRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	clock := time.Now()
+	calls, fired := 0, false
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		trigger: 2, jump: 2 * time.Minute, fired: &fired}
+	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	refused := false
+	for pages := 1; ; pages++ {
+		if pages > 200 {
+			t.Fatalf("the walk did not terminate after %d pages", pages-1)
+		}
+		res, err := e.Impact(context.Background(), req)
+		if err != nil {
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+				t.Fatalf("page %d: %v", pages, err)
+			}
+			if typed.Details["limit"] != "resources.max_temp_bytes" {
+				t.Fatalf("page %d refused without naming the key to raise: %+v", pages, typed)
+			}
+			if typed.Retryable {
+				t.Fatalf("page %d: a budget refusal must not be retryable; retrying frees no bytes", pages)
+			}
+			refused = true
+			break
+		}
+		if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline &&
+			res.Meta.NextCursor == "" {
+			t.Fatalf("page %d ended the ANSWER on the deadline with no cursor (%d entries served): the rest of the walk is unreachable and the reason names the wrong bound",
+				pages, len(res.Entries))
+		}
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if !refused {
+		// Without the refusal the run proves nothing: the budget was never
+		// reached and the silent-truncation branch was never entered.
+		t.Fatal("the shared continuation budget was never exhausted; the case this test exists for was not exercised")
 	}
 }

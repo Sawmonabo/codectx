@@ -116,8 +116,7 @@ type impactAnswer struct {
 // reported as truncation with the ranked answer it did reach.
 func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
 	maxDepth config.Limit, limit int, queryHash string,
-	deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, string, error) {
-	var answer impactAnswer
+	deadline time.Time) (answer impactAnswer, _ []model.ImpactEntry, _ *budget, _ string, err error) {
 	meta := model.QueryMeta{}
 	// The capability disclosure happens before the walk: a missing dependence
 	// edge must not read as a genuine absence of impact.
@@ -150,7 +149,17 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// probes and the spill that copies the cumulative set forward both read
 		// from it. Deferring the release here keeps an error return from leaking
 		// a spool and a lease for the whole cursor TTL.
-		defer resume.Release()
+		// Released only on a TERMINAL outcome. A RETRYABLE failure inside the
+		// walk -- CTX_WORKSPACE_BUSY from a contended store, a transient read
+		// error -- tells the caller to present this same cursor again, and
+		// releasing here destroyed the state that retry needs: the next
+		// request answered CTX_CURSOR_INVALID and every page behind it was
+		// lost. The state stays adoptable and expires with its own lease TTL.
+		defer func() {
+			if terminalOutcome(err) {
+				resume.Release()
+			}
+		}()
 		// The resumed budget carries the earlier pages' cumulative spend by
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
@@ -370,10 +379,16 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 // page left, copies what follows this page into a fresh one, and reports the
 // answer-level facts the first page settled.
 func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *budget, limit int,
-	answer impactAnswer, meta model.QueryMeta) (impactAnswer, []model.ImpactEntry, *budget, string, error) {
-	// The consumed spool is released only after the page is built: the copy
-	// below reads it.
-	defer e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+	answer impactAnswer, meta model.QueryMeta) (_ impactAnswer, _ []model.ImpactEntry, _ *budget, _ string, err error) {
+	// The consumed spool is released only after the page is built (the copy
+	// below reads it) and only on a TERMINAL outcome: a retryable failure --
+	// a busy store, a transient read -- leaves this cursor adoptable so the
+	// caller can present it again instead of losing the ranked remainder.
+	defer func() {
+		if terminalOutcome(err) {
+			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+		}
+	}()
 	page, pairPage, h, err := serveRankedSections(ctx, e.spools, c.spoolCursor(), e.now(), limit)
 	if err != nil {
 		return answer, nil, nil, "", err
