@@ -1882,3 +1882,47 @@ func longRoute(ids ...model.RelationID) []model.RelationID {
 	}
 	return out
 }
+
+// TestCompileHonoursCallerDeadline protects the rule that
+// resources.query_timeout is the DEFAULT deadline of a compile and never a
+// ceiling on one the caller already set. Silently taking the smaller of the two
+// makes `--timeout 180s` expire at the configured ten seconds and reports a
+// compile the operator had granted more time as out of time -- the
+// no-default-limits rule inverted, and invisible because the answer is a
+// well-formed deadline report.
+func TestCompileHonoursCallerDeadline(t *testing.T) {
+	fx := newContextFixture(t)
+	// Search and the graph engine take their own deadline from the same key and
+	// are built here, at the fixture's default, so the only component under an
+	// already-spent query_timeout is the compiler: this asserts which deadline
+	// the COMPILE honours and not what a downstream service does with the key.
+	svc := searchService(t, fx)
+	eng := fx.scopeEngine(fx.Rels, fixtureCapabilities)
+	cfg := fx.Cfg
+	// A configured default that is already spent: applied over the caller's own
+	// deadline it leaves the compile unable to take a single step.
+	cfg.Resources.QueryTimeout = config.Duration(time.Nanosecond)
+	c, err := New(Options{
+		Store: fx.Store, Repo: fx.Repo, Search: svc,
+		Graph: func(_ stdcontext.Context, _ model.GenerationID) (*graph.Engine, func() error, error) {
+			return eng, func() error { return nil }, nil
+		},
+		Config: cfg, Now: fx.Now,
+		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SortDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { c.Close() })
+	// A real-clock deadline, because it is the CALLER'S: `--timeout` installs it
+	// on the process context. The compiler's own boundary check reads the
+	// fixture clock, which never reaches it, so no pass halts and the only thing
+	// under test is which of the two deadlines won.
+	ctx, cancel := stdcontext.WithTimeout(fx.ctx, time.Hour)
+	defer cancel()
+	req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}
+	if _, err := c.Compile(ctx, req); err != nil {
+		t.Fatalf("Compile under a caller deadline of one hour: %v; the configured default was applied as a ceiling", err)
+	}
+}

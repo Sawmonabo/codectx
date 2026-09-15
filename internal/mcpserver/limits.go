@@ -171,8 +171,16 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			// wait as well as the handler: time spent waiting for a slot is time
 			// the caller is waiting, and a gate that could be queued on without
 			// a deadline is the unbounded wait Section 6 forbids.
-			ctx, cancel := context.WithTimeout(ctx, s.limits.timeout)
-			defer cancel()
+			// resources.query_timeout is the DEFAULT deadline and not a
+			// ceiling: a client whose request already carries one has said how
+			// long the call may run, and context.WithTimeout would silently
+			// take the smaller of the two, expiring a raised budget at the
+			// configured default.
+			if _, ok := ctx.Deadline(); !ok {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, s.limits.timeout)
+				defer cancel()
+			}
 
 			release, failed := s.limits.acquire(ctx, call.Params.Name)
 			if failed != nil {
