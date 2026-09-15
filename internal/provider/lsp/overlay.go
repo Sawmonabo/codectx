@@ -33,13 +33,44 @@ type Location struct {
 	Selection   *model.SourceRange `json:"selection,omitempty"`
 }
 
-// Symbol is one document or workspace symbol.
+// Symbol is one document or workspace symbol. Every string it carries is
+// written into a model record, so each is bounded here, at the boundary that
+// reads the server's bytes, and the cut is recorded: the storage ceilings no
+// longer reject an over-long value, so a producer that does not truncate
+// serves the whole thing.
 type Symbol struct {
 	Name      string         `json:"name"`
 	Detail    string         `json:"detail,omitempty"`
 	Container string         `json:"container,omitempty"`
 	Kind      model.NodeKind `json:"kind"`
 	Location  Location       `json:"location"`
+	// TruncatedFields names the fields a storage ceiling cut against their
+	// original lengths, so an answer built from this symbol says which of its
+	// values are prefixes rather than presenting a cut value as the whole.
+	TruncatedFields map[string]int `json:"truncated_fields,omitempty"`
+}
+
+// newSymbol bounds every stored field of one symbol and records what it cut.
+// It is the only constructor: a symbol built field-by-field would be one
+// server response away from writing an unbounded name into a record.
+func newSymbol(name, detail, container string, kind model.NodeKind, loc Location) Symbol {
+	sym := Symbol{Kind: kind, Location: loc}
+	sym.Name = sym.bound("name", name, model.MaxNameBytes)
+	sym.Detail = sym.bound("signature", detail, model.MaxSignatureBytes)
+	sym.Container = sym.bound("container", container, model.MaxNameBytes)
+	return sym
+}
+
+// bound truncates one field and records the original length when it cut.
+func (s *Symbol) bound(field, value string, max int) string {
+	bounded, original := model.TruncateField(value, max)
+	if original > len(bounded) {
+		if s.TruncatedFields == nil {
+			s.TruncatedFields = map[string]int{}
+		}
+		s.TruncatedFields[field] = original
+	}
+	return bounded
 }
 
 // CallItem is a call-hierarchy participant. It is passed back to
@@ -203,7 +234,7 @@ func (o *Overlay) DocumentSymbols(ctx context.Context, file model.FileID, limit 
 				out.Excluded++
 				continue
 			}
-			out.Items = append(out.Items, Symbol{Name: si.Name, Container: si.ContainerName, Kind: nodeKindOf(si.Kind), Location: loc})
+			out.Items = append(out.Items, newSymbol(si.Name, "", si.ContainerName, nodeKindOf(si.Kind), loc))
 		}
 		return out, nil
 	}
@@ -233,10 +264,8 @@ func (o *Overlay) flatten(doc *document, symbols []documentSymbol, container str
 		if err != nil {
 			return outputInvalid("textDocument/documentSymbol selection range for %q does not describe %s: %v", truncate(ds.Name, 64), doc.version.Path, err)
 		}
-		out.Items = append(out.Items, Symbol{
-			Name: ds.Name, Detail: ds.Detail, Container: container, Kind: nodeKindOf(ds.Kind),
-			Location: Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng, Selection: &sel},
-		})
+		out.Items = append(out.Items, newSymbol(ds.Name, ds.Detail, container, nodeKindOf(ds.Kind),
+			Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng, Selection: &sel}))
 		if err := o.flatten(doc, ds.Children, ds.Name, limit, out); err != nil {
 			return err
 		}
@@ -284,7 +313,7 @@ func (o *Overlay) WorkspaceSymbols(ctx context.Context, query string, limit int)
 			out.Excluded++
 			continue
 		}
-		out.Items = append(out.Items, Symbol{Name: ws.Name, Container: ws.ContainerName, Kind: nodeKindOf(ws.Kind), Location: loc})
+		out.Items = append(out.Items, newSymbol(ws.Name, "", ws.ContainerName, nodeKindOf(ws.Kind), loc))
 	}
 	return out, nil
 }
@@ -425,7 +454,7 @@ func (o *Overlay) callItem(ctx context.Context, raw json.RawMessage) (CallItem, 
 	if err != nil || !ok {
 		return CallItem{}, ok, err
 	}
-	return CallItem{Symbol: Symbol{Name: it.Name, Detail: it.Detail, Kind: nodeKindOf(it.Kind), Location: loc}, raw: raw}, true, nil
+	return CallItem{Symbol: newSymbol(it.Name, it.Detail, "", nodeKindOf(it.Kind), loc), raw: raw}, true, nil
 }
 
 // begin checks the server is serving and the operation is advertised, and

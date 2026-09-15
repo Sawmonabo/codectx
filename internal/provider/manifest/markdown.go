@@ -54,8 +54,7 @@ func (u *unit) markdown(ctx context.Context) error {
 			fence = trimmed[:3]
 		case bytes.HasPrefix(trimmed, []byte("#")):
 			if title, ok := atxHeading(trimmed); ok {
-				if headings++; u.cut(BoundEntries, u.entries, int64(headings)) {
-				} else {
+				if headings++; !u.cut(BoundEntries, u.entries, int64(headings)) {
 					u.heading(doc, title, off, lineEnd)
 				}
 			}
