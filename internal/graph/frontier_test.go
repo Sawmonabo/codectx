@@ -118,3 +118,123 @@ func TestResumableFrontierCompletesAcrossPages(t *testing.T) {
 		t.Errorf("the pages returned %d distinct edges, the unlimited walk %d", len(seen), len(whole.Relations))
 	}
 }
+
+// TestDepthBoundIsReportedNotSilent is the row-14 proof. A walk that ran out of
+// depth with nodes still unexpanded used to fall out of the loop with
+// Truncated=false and no reason at all: a partial answer that read as a whole
+// one. It now reports reasonDepth, and offers no continuation -- see
+// walkState.DepthLimited for why one would be a cursor chain that never ends.
+//
+// Mutation: delete the `state.DepthLimited` branch in traverse and Truncated
+// goes false, which fails the first assertion here.
+func TestDepthBoundIsReportedNotSilent(t *testing.T) {
+	f := newGraphFixture(t)
+	limits := fixtureLimits()
+	// Two hops over a fixture that is deeper than two hops: the third level is
+	// admitted into the frontier and never expanded.
+	limits.MaxDepth = 2
+	limits.MaxVisited, limits.MaxEdges = 0, 0
+	limits.MaxPageItems = 2000
+	e, err := New(Options{Adjacency: f, Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	res, err := e.Neighbors(context.Background(), model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("Neighbors: %v", err)
+	}
+	if !res.Meta.Truncated || res.Meta.TruncationReason != reasonDepth {
+		t.Fatalf("truncated = %v, reason = %q; want a depth-limited walk to say so",
+			res.Meta.Truncated, res.Meta.TruncationReason)
+	}
+	if res.Meta.NextCursor != "" {
+		t.Error("a depth-limited walk offered a continuation; resuming it can only stop at the same bound")
+	}
+	if res.MaxDepth != 2 {
+		t.Errorf("meta echoes max_depth %d, want the effective bound 2", res.MaxDepth)
+	}
+
+	// The same walk with the bound removed is complete: the truncation above is
+	// the bound's doing, not the fixture running out of graph.
+	limits.MaxDepth = 0
+	deep, err := New(Options{Adjacency: f, Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	whole, err := deep.Neighbors(context.Background(), model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}})
+	if err != nil {
+		t.Fatalf("unlimited walk: %v", err)
+	}
+	if whole.Meta.Truncated {
+		t.Fatalf("the unlimited walk is truncated (%q); the depth row proves nothing",
+			whole.Meta.TruncationReason)
+	}
+	if len(whole.Relations) <= len(res.Relations) {
+		t.Errorf("unlimited walk returned %d edges, the depth-bounded one %d; the bound cut nothing",
+			len(whole.Relations), len(res.Relations))
+	}
+}
+
+// TestFrontierBytesSpillsAndTerminates is the row-16 proof: a frontier byte
+// budget smaller than a single edge row must still return every edge, across
+// pages, and must terminate. Admitting at least one edge per level-read is what
+// guarantees that -- without it the resumed page re-reads the same level from
+// the same keyset position, admits nothing and mints again forever.
+//
+// Mutation: drop the `spent > 0` guard in levelEdges and this test fails on the
+// page ceiling below, having returned no edges at all.
+func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 2000
+	// Below edgeRowOverheadBytes, so EVERY row on its own exceeds the budget.
+	limits.FrontierBytes = 1
+	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	req := model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+	seen := map[model.RelationID]int{}
+	for page := 1; ; page++ {
+		if page > 500 {
+			t.Fatalf("the walk did not terminate after %d pages with %d edges seen", page-1, len(seen))
+		}
+		res, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		for _, rel := range res.Relations {
+			seen[rel.ID]++
+		}
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if len(seen) == 0 {
+		t.Fatal("a one-byte frontier budget returned no edges at all")
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("relation %s was returned %d times, want exactly once", id, n)
+		}
+	}
+}

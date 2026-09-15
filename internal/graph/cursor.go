@@ -325,8 +325,9 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	// One fresh spool per page: this replays the PREVIOUS page's spool.
 	//
 	// The replay is bounded by the SPOOL's own byte budget
-	// (resources.max_temp_bytes, enforced by pagination.Spools on every Append
-	// and re-checked here by Open against the spool header), never by
+	// (resources.max_temp_bytes, which pagination.Spools reserves on every
+	// Append -- Open itself re-checks the binding and the lease, not the
+	// budget, so the bound is the one the WRITE already paid), never by
 	// max_visited: that is a per-page work budget now, while the spooled
 	// visited set is cumulative across the whole walk, so testing the one
 	// against the other refused the third page of any walk whose budget it was

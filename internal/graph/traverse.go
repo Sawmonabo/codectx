@@ -297,11 +297,20 @@ chunks:
 					(row.owner.Node == skipOwner && row.rel.ID <= skipKey)) {
 					continue
 				}
-				if o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
-					// The level does not fit in the configured frontier budget.
-					// Stopping here and disclosing it is the honest answer; the
-					// alternative is accumulating an unbounded hub in memory
-					// under a bound the configuration says exists.
+				if spent > 0 && o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
+					// The level does not fit in the configured frontier budget:
+					// spill what was read and let the continuation carry on,
+					// rather than accumulating an unbounded hub in memory under
+					// a bound the configuration says exists.
+					//
+					// `spent > 0` is what makes that terminate. A budget smaller
+					// than ONE edge row would otherwise trip here before any row
+					// was admitted, and since the resumed page re-reads the level
+					// from the same keyset position it would trip at the same row
+					// again: a cursor chain that returns no edge and never ends.
+					// Every level-read therefore admits at least one edge --
+					// exceeding the byte bound by at most one row -- which is the
+					// same trade every other per-page budget here makes.
 					o.Budget.frontierHit = true
 					break chunks
 				}

@@ -23,7 +23,7 @@ import (
 func hashInt(n int64) string { return strconv.FormatInt(n, 10) }
 
 // requestHash is the Section 15.1 semantic identity of a compile request: the
-// task, its seeds in sorted order, the phase and the four budget fields. The
+// task, its seeds in sorted order, the phase and the five budget fields. The
 // seed count is hashed alongside the joined list so a seed that itself contains
 // the field separator cannot forge a different split.
 //
@@ -42,6 +42,10 @@ func requestHash(req model.ContextRequest) string {
 		hashInt(req.Budget.MaxBytes),
 		hashInt(int64(req.Budget.MaxFiles)),
 		hashInt(int64(req.Budget.MaxSlices)),
+		// max_manifest_bytes is a caller budget that decides whether a plan is
+		// admitted at all, so two requests differing only in it are two
+		// different requests and must not share a manifest id.
+		hashInt(req.Budget.MaxManifestBytes),
 	)
 }
 
@@ -82,6 +86,7 @@ func canonicalManifestHash(b model.Binding, reqHash string, budget model.Budget,
 	h.AddString(hashInt(budget.MaxBytes))
 	h.AddString(hashInt(int64(budget.MaxFiles)))
 	h.AddString(hashInt(int64(budget.MaxSlices)))
+	h.AddString(hashInt(budget.MaxManifestBytes))
 	h.AddString(strconv.FormatBool(scopeComplete))
 
 	h.AddString(hashInt(int64(len(entries))))
