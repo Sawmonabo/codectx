@@ -114,14 +114,18 @@ func RunUnit(ctx context.Context, p Provider, req UnitRequest, out UnitOutput, l
 // capability rows, which is where a generation stores what a run had to give
 // up.
 //
-// A row this marks is partial, not fresh, and that is forced rather than
-// chosen: the generation's fold collapses every fresh row to one
-// workspace-scoped row and DISCARDS its details
-// (internal/index/status.go:269-272), so a degradation carried on a fresh row
-// reaches no caller at all. State is the only channel that survives the fold,
-// and silence is what the scale posture forbids outright. A row that is
-// already partial, failed or unavailable keeps the state and code it has:
-// those are more severe and their details already survive.
+// A degradation the sink counts is a truncate-and-flag outcome, never a
+// partial one: both paths that count a record over the user-set record bound
+// (BatchSink.Reserve and put) admit the record and then report the bound, so
+// nothing was dropped and nothing failed. The row therefore keeps the state it
+// has -- a fresh row stays fresh -- and carries the counts as details. The
+// generation's capability fold collapses fresh rows to one workspace-scoped
+// row but merges their details, so a count carried on a fresh row does reach
+// the reader; only the diagnostic code and the details that NAME the one scope
+// a row was reported at are dropped there. Keep these detail keys out of that
+// scope-naming set, or the fold will discard them. A row that is already
+// partial, failed or unavailable likewise keeps the state and code it has:
+// those describe an outcome the sink's counters do not.
 //
 // A provider that published no capability row has no other place to carry
 // this, so one row per declared capability is synthesized; the descriptor's
@@ -138,12 +142,6 @@ func reportDegradations(states []model.CapabilityState, degraded []Degradation, 
 		}
 	}
 	for i, st := range states {
-		if st.State == model.CapabilityFresh {
-			st.State = model.CapabilityPartial
-			if st.DiagnosticCode == "" {
-				st.DiagnosticCode = model.CodeResourceLimit
-			}
-		}
 		for _, d := range degraded {
 			st = st.WithDetail("over_"+d.Limit, strconv.FormatUint(d.Count, 10)).
 				WithDetail(d.Limit, strconv.FormatInt(d.Bound, 10)).
