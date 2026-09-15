@@ -123,9 +123,9 @@ func Load(root string) (Config, error) {
 		}
 		cfg.Tools.CacheDir = dir
 	} else {
-		if !filepath.IsAbs(cfg.Tools.CacheDir) {
-			return Config{}, configInvalid("tools.cache_dir %q is not an absolute path", cfg.Tools.CacheDir)
-		}
+		// Cleaned, not checked: validateTools already owns "must be absolute"
+		// for this key, and Clean leaves a relative path relative, so it still
+		// reaches that refusal with the key named.
 		cfg.Tools.CacheDir = filepath.Clean(cfg.Tools.CacheDir)
 	}
 
