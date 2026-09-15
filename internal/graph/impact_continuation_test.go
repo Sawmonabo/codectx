@@ -15,7 +15,7 @@ import (
 // It used to be served with Truncated=false and no cursor, which reads as a
 // complete answer and is the one thing a truncated answer may never do.
 //
-// Mutation (restore the bare `return "", nil` in nextRankedCursor's nil-guard,
+// Mutation (restore the bare `return "", nil` in canContinue's nil-guard,
 // dropping the markTruncated): this FAILS on the untruncated answer below.
 func TestRankedImpactWithoutContinuationMachinerySaysItIsCut(t *testing.T) {
 	// A walk far wider than one page, so the ranking always has a remainder.

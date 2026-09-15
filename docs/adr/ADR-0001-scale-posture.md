@@ -827,7 +827,11 @@ duplicates an existing assertion.
   (`Spools.ReadoptDir` transfers the previous reservation inside one critical section and charges
   only the delta), so the shared budget no longer holds two copies of the cumulative state at every
   page boundary. The neighbours endpoint builds its own continuation in `traverse.go` and still
-  uses the spooled visited section; giving it a store of its own is the one piece outstanding.
+  uses the spooled visited section; giving it a store of its own is the one piece outstanding. The RANKED tail of those same two endpoints is O(page) per page
+  as well: the page that settles the order writes one spool and every later page seeks to the byte
+  offsets its cursor carries (`RankOffset`, `PairOffset`, payload version 6) and reads only its own
+  page out of it, where it used to re-open the spool at record zero and copy the whole unserved
+  remainder into a fresh one.
 
   **What it measures.** On a twenty-thousand-node walk split into many legs by the frontier
   ceiling, the cumulative set grew by 2 398 281 bytes against a ceiling of 5 648 381 derived from
