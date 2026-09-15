@@ -46,9 +46,13 @@ import (
 // The baseline is taken AFTER the fixture is built, so what is reported is the
 // walk's own high-water mark and not the generation it reads.
 //
-// Mutation proof: give levelNames.fill a map that is not rebuilt per level
-// (`if n.nodes == nil` around the two makes) and the walk's peak rises with
-// every level instead of staying flat.
+// Mutation proof: make retainedWalk.membership ignore the bitset (return an
+// empty map) and the walk re-admits every node it reaches, so the answer is no
+// longer the generation's own node and edge counts.
+//
+// The heap bound below is a RUNAWAY GUARD, not the proof: at this fixture's
+// 753 MiB baseline no heap assertion tight enough to catch a single structure
+// is available, which is why the number is logged and reported instead.
 func TestAMillionNodeWalkHoldsAPageNotTheGraph(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the million-node fixture is built in memory")
