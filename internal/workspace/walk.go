@@ -110,6 +110,12 @@ type Policy struct {
 	// OnSkip and the traversal continues.
 	MaxDirEntries int64
 	MaxDepth      int64
+	// MaxIgnoredRoots is carried for the traversal-policy builder, which asks
+	// Git for the worktree's outermost ignored paths; Walk does not interpret
+	// it, exactly as it does not interpret IncludeUntracked. It travels on
+	// Policy because that is the one value every traversing component already
+	// shares. Zero means unlimited.
+	MaxIgnoredRoots int64
 	// OnSkip receives every path the traversal could not emit, or emitted past
 	// a user-set bound, with one of the Skip* reasons. It is the walk's only
 	// report channel: without it such a path is lost, which is why the snapshot

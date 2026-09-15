@@ -231,3 +231,37 @@ func TestFingerprintsCoverEligibilityInputs(t *testing.T) {
 		t.Error("SourcePolicyHash covers only the configured toggles; the built-in exclusion lists are not an input")
 	}
 }
+
+// TestTraversalPolicyCarriesEveryTraversalBound protects the "every key is
+// read" invariant for the four workspace bounds the traversal owns. Three of
+// them were dead fields: configured, validated, documented and never carried
+// into the policy, so the walk's own SkipDirEntries and SkipDepth reports were
+// unreachable and an operator had no escape hatch over a pathological tree.
+func TestTraversalPolicyCarriesEveryTraversalBound(t *testing.T) {
+	c := Defaults()
+	c.Workspace.MaxFiles = 11
+	c.Workspace.MaxDirEntries = 22
+	c.Workspace.MaxDepth = 33
+	c.Workspace.MaxIgnoredRoots = 44
+	p := c.TraversalPolicy()
+	for _, tc := range []struct {
+		key  string
+		got  int64
+		want int64
+	}{
+		{"workspace.max_files", p.MaxFiles, 11},
+		{"workspace.max_dir_entries", p.MaxDirEntries, 22},
+		{"workspace.max_depth", p.MaxDepth, 33},
+		{"workspace.max_ignored_roots", p.MaxIgnoredRoots, 44},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("TraversalPolicy carried %s as %d, want %d: the key is configured and documented but unread",
+				tc.key, tc.got, tc.want)
+		}
+	}
+	// Unlimited is the default and must travel as 0, which the traversal reads
+	// as no bound at all rather than as a bound of zero.
+	if d := Defaults().TraversalPolicy(); d.MaxFiles != 0 || d.MaxDirEntries != 0 || d.MaxDepth != 0 || d.MaxIgnoredRoots != 0 {
+		t.Errorf("the default traversal policy carries bounds %+v, want every one unlimited (0)", d)
+	}
+}
