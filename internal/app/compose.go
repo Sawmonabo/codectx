@@ -1027,6 +1027,10 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Config: s.cfg,
 		Now:    time.Now,
 		Logger: s.logger,
+		// The compile's external-sort runs live beside the query spools, under
+		// the same resources.max_temp_bytes area the workspace already sweeps
+		// and reports (ruling C5').
+		SortDir: s.spools.SortDir(),
 	})
 	if err != nil {
 		return err

@@ -165,9 +165,18 @@ func (c *Compiler) reuseManifest(ctx context.Context, id model.ManifestID) (mode
 // cancellation must return an explicit incomplete answer and leave no manifest
 // behind, so nothing here is written incrementally.
 func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req model.ContextRequest,
-	budget model.Budget, p plan, completeness []model.CapabilityState,
+	budget model.Budget, p planParts, entries []model.ContextEntry,
+	exclusions []model.ExcludedContextEntry, completeness []model.CapabilityState,
 	scopeComplete bool) (model.ContextManifest, error) {
-	entries, slices, exclusions := p.Entries, p.Slices, p.Excluded
+	slices := p.Slices
+	// P-I counts what it emitted independently of what the sink collected. A
+	// disagreement means a sink dropped a row, which would persist a manifest
+	// whose header counts are right and whose rows are not -- so it fails here,
+	// where the defect is, rather than as a puzzling count mismatch in storage.
+	if int64(len(entries)) != p.Entries || int64(len(exclusions)) != p.Excluded {
+		return model.ContextManifest{}, &model.Error{Code: model.CodeInternal,
+			Message: "the compiled plan's emitted rows disagree with the counts the budget pass reported"}
+	}
 	for _, x := range exclusions {
 		// Every omission must be visible. A blank reason would persist as a
 		// row that says an entity was dropped and not why, which is exactly

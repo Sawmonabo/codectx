@@ -317,3 +317,20 @@ func TestStreamedBudgetRecordRoundTrip(t *testing.T) {
 	roundTrip(t, "packVerdict dropped",
 		packVerdict{Decision: decisionRec{FileID: "f1"}, MinIndex: 3, Reason: dropOversized})
 }
+
+// partsOf projects a whole-set `plan` onto the streamed planParts the compiler
+// now carries, and persistPlan is persistManifest taking that whole-set form.
+// Both exist so the tests that still build a `plan` directly -- the reference
+// pipeline's own tests -- reach the streamed signatures without restating the
+// projection at each call site.
+func partsOf(p plan) planParts {
+	return planParts{Slices: p.Slices, RelationsClipped: p.RelationsClipped,
+		Entries: int64(len(p.Entries)), Excluded: int64(len(p.Excluded))}
+}
+
+func (c *Compiler) persistPlan(ctx context.Context, b model.Binding, req model.ContextRequest,
+	budget model.Budget, p plan, completeness []model.CapabilityState,
+	scopeComplete bool) (model.ContextManifest, error) {
+	return c.persistManifest(ctx, b, req, budget, partsOf(p), p.Entries, p.Excluded,
+		completeness, scopeComplete)
+}

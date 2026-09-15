@@ -38,6 +38,13 @@ type Options struct {
 	Config config.Config
 	Now    func() time.Time
 	Logger *slog.Logger
+	// SortDir is where a compile writes its external-sort runs: the workspace's
+	// own spool area (pagination.Spools.SortDir), so a compile's temporary
+	// bytes are swept, reported and accounted under resources.max_temp_bytes
+	// exactly as a continuation spool is (ruling C5'). It is required, not
+	// defaulted: falling back to the process temporary directory would put run
+	// files where nothing reclaims them.
+	SortDir string
 }
 
 // GraphFactory opens a bounded engine over ONE explicit generation and returns
@@ -48,13 +55,14 @@ type GraphFactory func(ctx context.Context, gen model.GenerationID) (*graph.Engi
 
 // Compiler compiles deterministic context manifests. Safe for concurrent use.
 type Compiler struct {
-	store  *sqlite.Store
-	repo   model.RepositoryID
-	search *search.Service
-	graph  GraphFactory
-	cfg    config.Config
-	now    func() time.Time
-	log    *slog.Logger
+	store   *sqlite.Store
+	repo    model.RepositoryID
+	search  *search.Service
+	graph   GraphFactory
+	cfg     config.Config
+	now     func() time.Time
+	log     *slog.Logger
+	sortDir string
 }
 
 // New validates the options and builds a Compiler. Every dependency is
@@ -73,13 +81,15 @@ func New(o Options) (*Compiler, error) {
 		return nil, argumentInvalid("context compiler requires a graph factory")
 	case o.Now == nil:
 		return nil, argumentInvalid("context compiler requires a clock")
+	case o.SortDir == "":
+		return nil, argumentInvalid("context compiler requires the workspace sort directory")
 	}
 	log := o.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Compiler{store: o.Store, repo: o.Repo, search: o.Search, graph: o.Graph,
-		cfg: o.Config, now: o.Now, log: log}, nil
+		cfg: o.Config, now: o.Now, log: log, sortDir: o.SortDir}, nil
 }
 
 // Compile produces the immutable manifest for req. It pins one generation for
@@ -133,7 +143,7 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 		// re-emitted here: it is a fact about THIS request's bounds, and a
 		// caller who hit the reuse path asked for the same page size as the
 		// caller who compiled.
-		m.Notices = c.manifestNotices(scopeResult{}, plan{})
+		m.Notices = c.manifestNotices(scopeResult{}, planParts{})
 		if !m.ScopeComplete {
 			// The reused header knows its scope is partial but not how many
 			// candidates were excluded -- the count lives in the stored
@@ -164,42 +174,128 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	}
 	defer release()
 
-	// An unresolved seed is carried INTO the expansion rather than around it:
-	// expandScope is what decides whether an unresolvable identity is the
-	// discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit
-	// boundary, and it can only decide that if it sees the exclusions.
-	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
+	// The streamed pipeline's sort area. Every sort and sorted run below is
+	// registered with it, so ONE deferred release removes every run file on
+	// every exit path, error paths included (rulings C5/C5').
+	sorts, err := newCompileSorts(c.cfg, c.sortDir)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	defer func() {
+		if cerr := sorts.Close(); cerr != nil {
+			// The plan is already decided by the time this runs, so a failed
+			// removal must not fail a correct compile -- but it is real
+			// temporary disk this workspace stays charged for, so the operator
+			// hears about it instead of the sweeper discovering it later.
+			c.logger().Warn("a context compile could not release its sort runs",
+				"component", "context", "error", cerr)
+		}
+	}()
+
+	// The budget is resolved BEFORE the passes run. It is a property of the
+	// request, not of the plan, so a budget that cannot be resolved is reported
+	// without paying for an expansion whose result could never be admitted.
+	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+
+	// P-A ingest. An unresolved seed is carried INTO the expansion rather than
+	// around it: the expansion is what decides whether an unresolvable identity
+	// is the discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an
+	// explicit boundary, and it can only decide that if it sees the exclusions.
+	in, err := c.passAIngest(ctx, sorts, engine, gen,
 		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
 	if err != nil {
 		return model.ContextManifest{}, contextErr(ctx, err)
 	}
-	scopeComplete := scoped.ScopeComplete && !seeds.Unresolved
+	scopeComplete := in.Scope.ScopeComplete && !seeds.Unresolved
 
-	files, err := c.hydrateFiles(ctx, reader, scoped.Candidates)
+	// P-B hydrate.
+	hydrated, err := c.passBHydrate(ctx, sorts, reader, in.Cands)
 	if err != nil {
 		return model.ContextManifest{}, contextErr(ctx, err)
 	}
-	relations, complete, err := c.relationsOnPaths(ctx, reader, scoped.Candidates)
+
+	// P-C relation attributes, over the PRE-hydration spool and before any
+	// scoring: that is what relationsOnPaths reads today, and running it here
+	// keeps the edge-scan reads ahead of the evidence reads exactly as today's
+	// call order does. Both passes may read `in.Cands` because a sorted run is
+	// replayable until the sort area is released.
+	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, in.Hops, in.Cands)
 	if err != nil {
 		return model.ContextManifest{}, contextErr(ctx, err)
 	}
-	if !complete {
+	if !attrs.Complete {
 		// A route whose edges could not all be read is scored as inadmissible,
 		// which changes the ranking. Disclosing it keeps that from being a
 		// silent difference between two compiles of one generation.
 		scopeComplete = false
 	}
 
-	ranked, err := c.rank(ctx, reader, scoped.Candidates, relations)
+	// P-D route scoring. The edge sort folds a repeated (package, relation)
+	// pair at insertion because P-E counts DISTINCT edges per package; without
+	// the fold a package reached twice over one edge would over-count its
+	// centrality boost.
+	retainedPaths, err := newSort(sorts, "kept-path", lessPathSeq, sizeOfPath)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	retainedHops, err := newSort(sorts, "kept-hop", lessHopSeq, sizeOfHop)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	edges, err := newSort(sorts, "pkg-edge", lessPkgEdge, sizeOfPkgEdge)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	scored, err := c.passDRouteScoring(ctx, sorts, hydrated, in.Paths, attrs.Hops,
+		retainedPaths, retainedHops, edges.WithFold(foldPkgEdgeDistinct))
 	if err != nil {
 		return model.ContextManifest{}, contextErr(ctx, err)
 	}
 
-	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	// P-E centrality, complete before P-F applies a single boost.
+	counts, err := c.passECentrality(ctx, sorts, edges)
+	if err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+
+	// P-F boosts. The ranked sort's comparator IS the Section 15.3 total order,
+	// so draining it is the reading order the plan is packed and stored in.
+	rankedSort, err := newSort(sorts, "ranked", lessRank, sizeOfCand)
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
-	packed, err := buildPlan(ranked, files, resolved)
+	if err := c.passFBoosts(ctx, scored, counts, rankedSort); err != nil {
+		return model.ContextManifest{}, contextErr(ctx, err)
+	}
+	rankedRun, err := sortedRun(sorts, rankedSort)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	keptPaths, err := sortedRun(sorts, retainedPaths)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	keptHops, err := sortedRun(sorts, retainedHops)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+
+	// P-G, P-H and P-I: what buildPlan did whole-set. Their errors are NOT
+	// reclassified through contextErr, because this is where CTX_MINIMUM_BUDGET
+	// is raised and a floor report must reach the caller as itself.
+	measured, err := c.passGMeasure(ctx, sorts, rankedStreams{Ranked: rankedRun, Paths: keptPaths, Hops: keptHops})
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	packed, err := c.passHPack(ctx, sorts, measured, resolved)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	var sink planBuffer
+	parts, err := c.passIEmit(ctx, sorts, measured, packed, resolved, &sink)
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
@@ -216,17 +312,45 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	// default" at compile time.
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	m, err := c.persistManifest(ctx, binding, req, stored, packed, scoped.Completeness, scopeComplete)
+	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, sink.excluded,
+		in.Scope.Completeness, scopeComplete)
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
 	// Set after persistence, deliberately: the notices describe how THIS
 	// compile was bounded, not what the plan is, and they are neither hashed
 	// nor stored.
-	m.Notices = c.manifestNotices(scoped, packed)
+	m.Notices = c.manifestNotices(in.Scope, parts)
 	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
 	return m, nil
+}
+
+// planBuffer is the compile's planSink: it collects what P-I emits so the
+// single-transaction Store.PutManifest can be handed the whole plan.
+//
+// Entries are held deliberately and Excluded is held under protest. An entry
+// list is bounded by the RESOLVED budget -- the caller's own declared window,
+// the same class ruling C4 already accepts for EntryOrdinals and the MaxSlices
+// array -- so holding it is a constant-factor extension of an accepted
+// structure. The exclusion list is NOT of that class: C-STREAM-plan.md §1 names
+// it the unbounded one, and it stays in heap here only because the manifest
+// writer takes slices. Streaming it needs a row-at-a-time manifest writer in
+// internal/storage/sqlite/state.go, which this lane does not own; the C-INT2
+// report carries it as an open defect against that file.
+type planBuffer struct {
+	entries  []model.ContextEntry
+	excluded []model.ExcludedContextEntry
+}
+
+func (b *planBuffer) Entry(e model.ContextEntry) error {
+	b.entries = append(b.entries, e)
+	return nil
+}
+
+func (b *planBuffer) Exclude(e model.ExcludedContextEntry) error {
+	b.excluded = append(b.excluded, e)
+	return nil
 }
 
 // manifestNotices is every non-fatal disclosure this compile owes the caller:
@@ -239,7 +363,7 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 //
 // An empty result is the honest answer that nothing was cut, and the field is
 // omitempty, so a compile under no bound reads exactly as it did before.
-func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
+func (c *Compiler) manifestNotices(scoped scopeResult, packed planParts) []string {
 	var out []string
 	add := func(format string, args ...any) {
 		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
@@ -255,7 +379,7 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
 	if n := scoped.ReasonsTruncated; n > 0 {
 		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
 	}
-	if n := len(packed.Excluded); n > 0 {
+	if n := packed.Excluded; n > 0 {
 		// The manifest header carries no exclusion list -- exclusions are a
 		// paged projection, and embedding them would make the header
 		// repository-sized -- so scope_complete=false on its own leaves the
