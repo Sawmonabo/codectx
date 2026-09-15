@@ -66,9 +66,12 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 			"The repository is named as a positional path, or with --repo, and naming it " +
 			"both ways is refused rather than resolved to one of them.\n\n" +
 			"Without --deep the checks that walk the whole database are not run: the " +
-			"database integrity and referential checks, the row-count accounting and the " +
-			"retained-object sample are each reported as a check in state unverified, " +
-			"naming --deep as what verifies them. The header, page count, schema " +
+			"database integrity and referential checks and the row-count accounting are " +
+			"each reported as a check in state unverified, naming --deep as what verifies " +
+			"them. The retained-object sample is bounded either way and reports what it " +
+			"sampled; it is unverified only when that sample came back empty, which " +
+			"without the row counts cannot be told from an unreadable one. " +
+			"The header, page count, schema " +
 			"fingerprint, write-ahead-log mode and size are still read and can still fail " +
 			"the report. --deep runs those checks in full; no full database scan happens " +
 			"without it. --offline asks for the offline-policy " +
@@ -85,7 +88,7 @@ func newDoctorCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().Bool(doctorOfflineFlag, false,
 		"include the offline-policy checks in the report")
 	cmd.Flags().Bool(doctorDeepFlag, false,
-		"also run the whole-database checks an ordinary run reports as unverified: database integrity, referential integrity, the search index, the row-count accounting and a wider retained-object sample")
+		"also run the whole-database checks an ordinary run reports as unverified -- database integrity, referential integrity, the search index and the row-count accounting -- and widen the retained-object sample")
 	return cmd
 }
 
