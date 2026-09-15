@@ -228,6 +228,11 @@ differently, and both are load-bearing:
   and it is not `fail`. A check that was skipped because you did not pass
   `--deep` has `state: "unverified"` -- also not `pass`.
 
+The query-time working-tree overlay has **no row in this command's completeness
+table, by design** -- it produces no sealed facts and reports its state per
+query instead; [the overlay page](providers-lsp.md) says what to read ahead of a
+query.
+
 If you see `0` where you expected a figure, it is a measurement of zero — file
 it as a bug rather than assuming the platform does not support it.
 
