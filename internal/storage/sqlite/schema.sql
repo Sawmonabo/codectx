@@ -484,3 +484,30 @@ CREATE TABLE generation_supplied_indexes (
     resolved INTEGER NOT NULL CHECK(resolved IN (0, 1)),
     PRIMARY KEY(generation_id, path)
 );
+-- The live watch heartbeat of one repository: what a `codectx index --watch`
+-- process in another terminal knows, published where a second process can read
+-- it. Without the row, a reporting process has no cross-process source for the
+-- pending-event count and no way to say whether a watch is running at all.
+--
+-- `expires_at` is written by the watcher itself, not derived by the reader from
+-- configuration: a reader whose `[index]` block differs from the watcher's --
+-- another checkout, another user, an edited file since the watch started --
+-- would otherwise compute a liveness window the writer never promised. The
+-- writer states its own deadline and refreshes it while it lives, so an expired
+-- row means the process that owned it stopped refreshing, which is the only
+-- signal of process death that works on every platform this product supports
+-- (a pid can be reused, and probing one is neither portable nor race-free).
+--
+-- `pending_events` and `last_pass_at` are nullable because absent and zero are
+-- different answers here as everywhere else: a watch driven only by periodic
+-- reconciliation has no notification queue to count, and a watch that has not
+-- completed a pass yet has no pass time -- neither is "0 pending" or "the epoch".
+--
+-- One row per repository, replaced in place: this is liveness, not history.
+CREATE TABLE watch_heartbeat (
+    repository_id BLOB PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+    writer_pid INTEGER NOT NULL CHECK(writer_pid > 0),
+    last_pass_at TEXT,
+    pending_events INTEGER CHECK(pending_events IS NULL OR pending_events >= 0),
+    expires_at TEXT NOT NULL
+);
