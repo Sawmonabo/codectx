@@ -278,7 +278,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"scenario/search_serves_the_section_14_2_order", legEndToEndRanking},
 
 		// FX-C13b rows
-		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierLossless},
+		{"fix/path_tier_walks_the_whole_keyset_and_filters_it", legPathTierLossless},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
