@@ -791,7 +791,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// has nothing to consolidate yet.
 	capsule := model.Capsule{SessionID: open.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
 		ScopeVersion: 1, CanonicalHash: model.H("capsule"), CreatedAt: time.Now().UTC()}
-	if _, err := f.s.PutCapsule(ctx, capsule); err == nil {
+	if _, err := f.s.PutCapsule(ctx, capsule, nil); err == nil {
 		t.Fatal("PutCapsule stored a capsule for a session that is not in consolidate_open")
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
