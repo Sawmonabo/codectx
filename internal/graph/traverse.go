@@ -124,6 +124,14 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 			Message: "graph expansion requires a visitor"}).WithDetail("operation", "expand")
 	}
 	codes, costs, err := walkKinds(r, o.Kinds)
+	if errors.Is(err, errNoSuchKinds) {
+		// Every relation kind the request named is absent from this
+		// generation's dictionary, so the walk selects nothing. That is an
+		// ANSWER of nothing, not a failure: a generation built before an
+		// analyzer existed simply has none of its edges, and the walk reports
+		// the empty result with no truncation rather than refusing the query.
+		return walkState{}, nil
+	}
 	if err != nil {
 		return walkState{}, err
 	}
