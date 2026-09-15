@@ -764,16 +764,187 @@ func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
 // lessHopSeq, so scoreRoutes and scorePath run unchanged on a working set of one
 // candidate. Scored records go to the ranked stream and each admitted
 // (pkg, relationID) to the centrality sort.
-func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-D route scoring")
+// The parameter list is this lane's to complete (see the header above). The
+// three inputs are sorted runs and not spools because P-D is a three-way
+// merge-join on Seq: the candidate stream in ingest order, the route stream
+// under lessPathSeq and the attributed hop stream under lessHopSeq. The four
+// outputs are sorts the caller owns, so one compile's release list covers them.
+//
+//   - retainedPaths / retainedHops carry the routes scoreRoutes KEPT, renumbered
+//     to their retained position, which is the order today's candidate.Paths
+//     holds and therefore the order P-I's EvidencePaths must read. A dropped
+//     route leaves no record; its existence is disclosed by MorePaths.
+//   - edges receives every admitted (package, relation) pair. It is fed from
+//     routeScore.admittedEdges and NOT from the retained routes: scoreRoutes
+//     appends the edges of a route that is too long to store before it drops it
+//     (rank.go's MaxRelationsPerPath branch), so an over-long route still counts
+//     towards its package's centrality and towards the test-or-contract boost.
+func (c *Compiler) passDRouteScoring(ctx context.Context, s *compileSorts,
+	cands *pagination.SortedRun[candRec],
+	routes *pagination.SortedRun[pathRec],
+	hops *pagination.SortedRun[hopRec],
+	retainedPaths *pagination.ExternalSort[pathRec],
+	retainedHops *pagination.ExternalSort[hopRec],
+	edges *pagination.ExternalSort[pkgEdgeRec],
+) (*pagination.SortedRun[scoredRec], error) {
+	scored, err := newSort(s, "scored", lessScoredPkg, sizeOfScored)
+	if err != nil {
+		return nil, err
+	}
+	nextRoute, stopRoutes := pullRun(routes)
+	defer stopRoutes()
+	nextHop, stopHops := pullRun(hops)
+	defer stopHops()
+
+	// The two peeked records are the only cross-candidate state this pass
+	// holds: everything else lives for one candidate.
+	route, haveRoute, err := nextRoute()
+	if err != nil {
+		return nil, err
+	}
+	hop, haveHop, err := nextHop()
+	if err != nil {
+		return nil, err
+	}
+	limit := c.reasonPathLimit()
+
+	walkErr := cands.Each(func(rec candRec) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(ctx, err)
+		}
+		var myRoutes []pathRec
+		for haveRoute && route.Seq <= rec.Seq {
+			if route.Seq == rec.Seq {
+				myRoutes = append(myRoutes, route)
+			}
+			if route, haveRoute, err = nextRoute(); err != nil {
+				return err
+			}
+		}
+		var myHops []hopRec
+		for haveHop && hop.Seq <= rec.Seq {
+			if hop.Seq == rec.Seq {
+				myHops = append(myHops, hop)
+			}
+			if hop, haveHop, err = nextHop(); err != nil {
+				return err
+			}
+		}
+		ws, err := rebuildRoutes(rec.Seq, myRoutes, myHops)
+		if err != nil {
+			return err
+		}
+		// rankCandidate reads PathAtRank (C3), which is the path packageOf,
+		// the centrality bucket and the boost reason are taken from.
+		cand := rec.rankCandidate()
+		cand.Paths = ws.paths
+		routed, err := scoreRoutes(cand, ws.relations, ws.precision, limit)
+		if err != nil {
+			return err
+		}
+		pkg := packageOf(rec.PathAtRank)
+		for _, id := range routed.admittedEdges {
+			if err := edges.Add(pkgEdgeRec{Pkg: pkg, RelationID: id}); err != nil {
+				return err
+			}
+		}
+		for idx, p := range routed.paths {
+			if err := retainedPaths.Add(pathRec{Seq: rec.Seq, PathIdx: int32(idx),
+				CostUnits: p.CostUnits, Evidence: p.Evidence, HopCount: int32(len(p.Relations))}); err != nil {
+				return err
+			}
+			for hopIdx, id := range p.Relations {
+				if err := retainedHops.Add(hopRec{RelationID: id, Seq: rec.Seq,
+					PathIdx: int32(idx), HopIdx: int32(hopIdx),
+					Kind: ws.relations[id].Kind, Multiplier: ws.precision[id]}); err != nil {
+					return err
+				}
+			}
+		}
+		// The record is mutated in place and never rebuilt through candRecOf,
+		// which would write PathAtRank into PathFinal and collapse the two
+		// values ruling C3 keeps apart.
+		rec.MorePaths = routed.morePaths
+		// The routes that were not enumerated are disclosed BEFORE the route
+		// reason and before P-F's boost reasons, exactly as rank appends them:
+		// appendReason drops at MaxReasonsPerEntry, so the order decides which
+		// explanation an entry at the bound keeps.
+		for _, reason := range append(morePathsReason(rec.MorePaths), routed.reasons...) {
+			rec.Reasons = appendReason(rec.Reasons, reason)
+		}
+		base := originContribution(rec.Origin)
+		if routed.best > base {
+			base = routed.best
+		}
+		return scored.Add(scoredRec{Cand: rec, Pkg: pkg, Base: base,
+			Associated: associatedTestOrContract(routed)})
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+	run, err := scored.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	return trackRun(s, run), nil
 }
 
 // passFBoosts — §2 P-F, lane L3. Sorts the ranked stream by package,
 // merge-joins it with P-E's counts, applies boostsFor, clamps, appends the
 // reasons in today's order, and adds every record to the sort whose comparator
 // is lessRank. No fold.
-func (c *Compiler) passFBoosts(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-F boosts")
+// The parameter list is this lane's to complete. scored is P-D's output under
+// lessScoredPkg, counts is P-E's aggregate under lessPkg, and ranked is the sort
+// whose comparator is lessRank, which P-G consumes.
+//
+// The join is LEFT-outer on the package: a package this compile walked no edge
+// in has no pkgCountRec, and its candidates take a zero centrality boost rather
+// than dropping out of the plan. That is what `len(centrality[pkg])` answers
+// today for a package the map never gained a key for.
+// It opens no sort of its own -- the ranked sort is P-G's and the caller owns
+// it -- so it takes no compileSorts.
+func (c *Compiler) passFBoosts(ctx context.Context,
+	scored *pagination.SortedRun[scoredRec],
+	counts *pagination.SortedRun[pkgCountRec],
+	ranked *pagination.ExternalSort[candRec],
+) error {
+	nextCount, stopCounts := pullRun(counts)
+	defer stopCounts()
+	count, haveCount, err := nextCount()
+	if err != nil {
+		return err
+	}
+	return scored.Each(func(rec scoredRec) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(ctx, err)
+		}
+		for haveCount && count.Pkg < rec.Pkg {
+			if count, haveCount, err = nextCount(); err != nil {
+				return err
+			}
+		}
+		var edges int64
+		if haveCount && count.Pkg == rec.Pkg {
+			edges = count.Edges
+		}
+		// boostsForCounts is the same implementation rank reaches through
+		// boostsFor, so the boost set, the clamp and the reason ORDER are one
+		// definition and cannot drift between the two pipelines.
+		boosts, reasons := boostsForCounts(rec.Cand.rankCandidate(), rec.Associated, edges)
+		score := rec.Base + boosts
+		if score > maxScoreMicros {
+			score = maxScoreMicros
+		}
+		if score < 0 {
+			score = 0
+		}
+		cand := rec.Cand
+		cand.ScoreMicros = score
+		for _, reason := range reasons {
+			cand.Reasons = appendReason(cand.Reasons, reason)
+		}
+		return ranked.Add(cand)
+	})
 }
 
 // passGMeasure — §2 P-G, lane L4. Applies the three `sized` filters on ingest
