@@ -76,11 +76,26 @@ func TestBusyResumedTraversalPageKeepsItsContinuation(t *testing.T) {
 		t.Fatalf("the first page minted no continuation: this proof needs a RESUMED page")
 	}
 
-	// The resumed page fails one edge read, retryably.
-	adj.fail = true
+	// A resumed page that serves out of the sorted level reads no adjacency at
+	// all -- that is what makes a page a seek and its own records -- so the
+	// failure is injected on every page until one of them reaches the scan
+	// that collects the next level. That page is the subject.
 	req.Page, req.GenerationID = model.PageRequest{Cursor: first.Meta.NextCursor}, 0
-	if _, err = e.Neighbors(context.Background(), req); err == nil {
-		t.Fatalf("the contended resumed page succeeded: the failure was never injected")
+	for page := 2; ; page++ {
+		if page > 200 {
+			t.Fatalf("no resumed page reached an adjacency read: the failure was never injected")
+		}
+		adj.fail = true
+		res, perr := e.Neighbors(context.Background(), req)
+		if perr != nil {
+			err = perr
+			break
+		}
+		adj.fail = false
+		if res.Meta.NextCursor == "" {
+			t.Fatalf("the walk ended without a resumed page reaching an adjacency read")
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
 	}
 	var typed *model.Error
 	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy || !typed.Retryable {

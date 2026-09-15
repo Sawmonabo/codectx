@@ -907,6 +907,11 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 	if e.spools == nil {
 		return "", nil
 	}
+	// The level this page was resumed into is superseded by the token about to
+	// be signed, so its sorted run can go now.
+	if err := w.releaseServed(); err != nil {
+		return "", err
+	}
 	prev := w.prevID
 	dir, err := w.detach()
 	if err != nil {

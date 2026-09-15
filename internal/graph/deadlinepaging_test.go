@@ -122,20 +122,19 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 	t.Run("progress", func(t *testing.T) {
 		clock := time.Now()
 		calls, fired := 0, false
-		// The clock passes the deadline on the 200th round trip of each page:
-		// the counter is reset below before every request, so each page reads a
-		// hundred and ninety-nine batches -- more than the widest level of this
-		// fixture needs -- before its own fresh deadline expires. A jump on a
+		// The clock passes the deadline on the 20th round trip of each page: the
+		// counter is reset below before every request, so each page reads
+		// nineteen batches before its own fresh deadline expires. A jump on a
 		// page's FIRST read is the no-progress case below -- a different
 		// assertion, because such a page cannot advance at all.
 		//
-		// It was 512 while the package rollup resolved its containers by
-		// WALKING containment: those round trips are gone now that the rollup
-		// reads the generation's container side array (ADR-0005), so a page no
-		// longer reaches five hundred reads and the deadline that splits this
-		// walk has to be counted against what the walk itself reads.
+		// It was 512, then 200, while a level cost one round trip per node
+		// chunk per page. A level is now ONE scan over the whole frontier plus
+		// one charged round trip per adjacencyBatch entries it delivers, so the
+		// whole of this fixture is about eighty round trips and a trigger in the
+		// hundreds would never split the walk at all.
 		slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
-			jump: 2 * time.Minute, fired: &fired, every: 200}
+			jump: 2 * time.Minute, fired: &fired, every: 20}
 		probe := &heapProbe{}
 		paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
@@ -177,7 +176,7 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 				t.Fatalf("page %d: a deadline threw the answer away instead of ending the page: %v", pages, err)
 			}
 			if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadlineStalled {
-				t.Fatalf("page %d reported no progress though the clock jumps only every 512th read of the page: %s",
+				t.Fatalf("page %d reported no progress though the clock jumps only every 20th read of the page: %s",
 					pages, res.Meta.TruncationReason)
 			}
 			if res.VisitedCount > maxSeen {
@@ -232,12 +231,14 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 				len(samples), len(unbounded), limits.MaxPageItems)
 		}
 
-		// (1b): the records a resume decodes are a function of the FRONTIER the
-		// page before it stopped at, never of the cumulative set behind it. The
-		// whole chain therefore decodes at most one record per node the walk
-		// ever admitted; a resume that replayed the cumulative set would decode
-		// that many on EVERY leg, which is the quadratic shape this state
-		// layout closed.
+		// (1b): the states a resume decodes are a function of the FRONTIER the
+		// page before it stopped at, never of the cumulative set behind it. A
+		// resumed leg streams the admitted level it picks up and nothing else --
+		// the level, its state and the position in it ride in the token -- so
+		// the whole chain decodes at most one state per node the walk ever
+		// admitted; a resume that replayed the cumulative set would decode that
+		// many on EVERY leg, which is the quadratic shape this state layout
+		// closed.
 		var resumed int
 		for _, s := range samples {
 			if s.resumeRecords > 0 {
