@@ -394,16 +394,17 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 		carried = collapseCarried(carried)
 	}
 	out = append(out, carried...)
-	return boundStates(foldToPrimaryKey(out), log)
+	return boundStates(out, log)
 }
 
 // foldToPrimaryKey brings the assembled list inside the one row per
 // (provider_id, capability, scope_key) that generation_capabilities is keyed
 // by -- its primary key does not carry the state. The three assembly buckets
-// above key their own rows by state as well, so one provider capability
-// reaches here more than once at one scope in three shapes, each of which
-// failed the insert and took `codectx index` down on a constraint error
-// instead of publishing the degraded generation it had built:
+// above key their own rows by state as well, and the bound's own collapse
+// keys by state too, so one provider capability reaches here more than once at
+// one scope in four shapes, each of which failed the insert and took `codectx
+// index` down on a constraint error instead of publishing the degraded
+// generation it had built:
 //
 //   - a sibling unit that succeeded folds a `fresh` row to the workspace scope
 //     (add) while the unit that failed publishes the `failed` fold here;
@@ -412,7 +413,13 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 //     with that same `failed` fold;
 //   - a carried scope whose key is itself the workspace scope -- a dependence
 //     family planned as one whole-workspace unit -- publishes `stale` beside
-//     either of those.
+//     either of those;
+//   - above the bound, collapseScopes folds by provider capability AND state
+//     and rewrites every fold's scope to the workspace scope, so two states of
+//     one provider capability that fold separately come back out as two
+//     workspace-scoped rows (collapseCarried can add a third). That shape is
+//     regenerated after the first fold, which is why boundStates folds again
+//     on the far side of the collapse rather than trusting its input.
 //
 // The most severe row survives, ranked by the same severityRank boundStates
 // truncates by: Section 13.3 lets a report under-claim and never over-claim.
@@ -448,15 +455,23 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 // finish, and Status calls it after folding in the composition-time rows, so a
 // published list can never exceed the bound its own contract validates against.
 //
+// It is also the one place the primary key of generation_capabilities is
+// closed. Every caller's list is folded to one row per (provider, capability,
+// scope) on the way in, and folded again on the far side of collapseScopes,
+// which keys by state and rewrites each fold to the workspace scope and so
+// regenerates the very duplicates the first fold removed.
+//
 // When rows must go, the degradations stay. The list is first folded to one
 // row per provider capability and state, and only if that is still too long is
 // it ordered by severity -- failed, stale, partial, unavailable, then fresh --
 // and cut from the tail. Truncating the assembly order instead would drop the
 // failures and carries, which are appended last, and keep the fresh rows:
 // Section 13.3 allows a report to under-claim and never to over-claim.
+// Truncation only removes rows, so the folded key stays closed.
 func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, int) {
+	out = foldToPrimaryKey(out)
 	if len(out) > model.MaxCapabilityStates {
-		out = collapseScopes(out)
+		out = foldToPrimaryKey(collapseScopes(out))
 	}
 	if len(out) <= model.MaxCapabilityStates {
 		return out, 0
