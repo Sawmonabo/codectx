@@ -55,23 +55,37 @@ type contextFixture struct {
 	// edges must be persisted before the generation activates, which only the
 	// builder can do.
 	Rels []model.Relation
+	// Specs is the file table this fixture published, in publication order. It
+	// is fixtureFiles for the shared builder and the generated table for
+	// newGeneratedFixture; Node, scopeEngine and searchService all read it
+	// rather than the package-level table, so a generated snapshot resolves,
+	// walks and serves its OWN files.
+	Specs []fixtureFileSpec
 }
 
 // fixtureFiles is the deterministic content of the fixture snapshot, in the
 // order it is published. Sizes are content-derived, so an assertion on a byte
 // floor can be written against them without loading source bytes.
-var fixtureFiles = []struct {
+type fixtureFileSpec struct {
 	path    string
 	symbol  string
 	kind    model.NodeKind
 	content string
-}{
-	{"internal/order/ports.go", "Repository", model.NodeInterface, "package order\n\ntype Repository interface{ Save(Order) error }\n"},
-	{"internal/order/service.go", "Place", model.NodeFunction, "package order\n\nfunc Place(r Repository, o Order) error { return r.Save(o) }\n"},
-	{"internal/order/handler.go", "Handle", model.NodeFunction, "package order\n\nfunc Handle(r Repository) error { return Place(r, Order{}) }\n"},
-	{"internal/order/service_test.go", "TestPlace", model.NodeTest, "package order\n\nfunc TestPlace(t *testing.T) { _ = Place }\n"},
-	{"docs/order.md", "Orders", model.NodeDocument, "# Orders\n\nPlace writes through the Repository port.\n"},
-	{"config/order.toml", "order", model.NodeConfiguration, "[order]\nmax_items = 10\n"},
+	// modified marks the file as a captured working-tree change. The published
+	// fixture marks exactly one (the implementation file, the Section 15.3
+	// active-change boost's input); a generated fixture marks as many as the
+	// row needs, which is the only way a step that reads changed files can be
+	// asked for more than one page of them.
+	modified bool
+}
+
+var fixtureFiles = []fixtureFileSpec{
+	{"internal/order/ports.go", "Repository", model.NodeInterface, "package order\n\ntype Repository interface{ Save(Order) error }\n", false},
+	{"internal/order/service.go", "Place", model.NodeFunction, "package order\n\nfunc Place(r Repository, o Order) error { return r.Save(o) }\n", true},
+	{"internal/order/handler.go", "Handle", model.NodeFunction, "package order\n\nfunc Handle(r Repository) error { return Place(r, Order{}) }\n", false},
+	{"internal/order/service_test.go", "TestPlace", model.NodeTest, "package order\n\nfunc TestPlace(t *testing.T) { _ = Place }\n", false},
+	{"docs/order.md", "Orders", model.NodeDocument, "# Orders\n\nPlace writes through the Repository port.\n", false},
+	{"config/order.toml", "order", model.NodeConfiguration, "[order]\nmax_items = 10\n", false},
 	// The oversized artifact of Section 15.4. Its worst-case wire size,
 	// 4*ceil(600_019/3) = 800_028 bytes, exceeds context.default_max_bytes
 	// (524_288),
@@ -82,7 +96,7 @@ var fixtureFiles = []struct {
 	// file with one checkpoint at byte 0 however it was indexed. 15 + 600*1000
 	// + 4 = 600_019 bytes either way.
 	{"internal/order/generated.go", "Generated", model.NodeFunction, "package order\n\n" +
-		strings.Repeat("// "+strings.Repeat("x", 996)+"\n", 600) + "//x\n"},
+		strings.Repeat("// "+strings.Repeat("x", 996)+"\n", 600) + "//x\n", false},
 }
 
 // The fixture's one provider identity. Every unit, run and evidence row in the
@@ -123,6 +137,20 @@ func fixtureNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 // to the fixture after this returns.
 func newContextFixture(t *testing.T, rels ...func(*contextFixture) []model.Relation) *contextFixture {
 	t.Helper()
+	var hook func(*contextFixture) []model.Relation
+	if len(rels) > 0 {
+		hook = rels[0]
+	}
+	return newFixtureFrom(t, fixtureFiles, hook)
+}
+
+// newFixtureFrom is newContextFixture's body over an arbitrary file table. The
+// shared fixture and every generated one differ ONLY in that table: the
+// snapshot, the provider run, the per-file units, the relation unit and the
+// activation are the one publication path, so a generated fixture cannot drift
+// into publishing facts the shared one does not.
+func newFixtureFrom(t *testing.T, specs []fixtureFileSpec, hook func(*contextFixture) []model.Relation) *contextFixture {
+	t.Helper()
 	ctx := stdcontext.Background()
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
 	s, err := store.Open(ctx, dbPath, store.Options{})
@@ -133,15 +161,15 @@ func newContextFixture(t *testing.T, rels ...func(*contextFixture) []model.Relat
 
 	fx := &contextFixture{t: t, ctx: ctx, Store: s, DBPath: dbPath, Cfg: config.Defaults(),
 		Repo:  model.RepositoryID(model.H("codectx.test.repo", "task-15")),
-		Files: map[string]model.FileVersion{}, Now: fixtureNow}
+		Files: map[string]model.FileVersion{}, Now: fixtureNow, Specs: specs}
 	if err := s.EnsureRepository(ctx, fx.Repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
 	}
 
-	versions := make([]model.FileVersion, 0, len(fixtureFiles))
+	versions := make([]model.FileVersion, 0, len(specs))
 	var sourceBytes uint64
-	for _, f := range fixtureFiles {
-		versions = append(versions, fx.putBlob(f.path, f.content))
+	for _, f := range specs {
+		versions = append(versions, fx.putBlob(f.path, f.content, f.modified))
 		sourceBytes += uint64(len(f.content))
 	}
 	manifest := model.H("codectx.test.manifest", "task-15")
@@ -174,15 +202,15 @@ func newContextFixture(t *testing.T, rels ...func(*contextFixture) []model.Relat
 	if err != nil {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
-	units := make([]model.UnitID, 0, len(fixtureFiles))
-	for i, f := range fixtureFiles {
+	units := make([]model.UnitID, 0, len(specs))
+	for i, f := range specs {
 		units = append(units, fx.sealUnit(run, versions[i], f.symbol, f.kind))
 	}
 	// After every endpoint is a sealed node fact -- SealUnit refuses an edge
 	// whose endpoints are not visible through the unit's dependency closure --
 	// and before activation closes staging.
-	if len(rels) > 0 && rels[0] != nil {
-		fx.Rels = rels[0](fx)
+	if hook != nil {
+		fx.Rels = hook(fx)
 		fx.sealRelations(run, versions[1], units)
 	}
 	if fx.Binding, err = s.Activate(ctx, fx.Gen, 0, model.HealthFresh, fixtureCapabilities, "norm-v1"); err != nil {
@@ -194,7 +222,7 @@ func newContextFixture(t *testing.T, rels ...func(*contextFixture) []model.Relat
 // putBlob stores one file's content and records its snapshot metadata. Status
 // is tracked except for the implementation file, which is a captured change so
 // the Section 15.3 active-change boost has an input.
-func (f *contextFixture) putBlob(path, content string) model.FileVersion {
+func (f *contextFixture) putBlob(path, content string, modified bool) model.FileVersion {
 	f.t.Helper()
 	// The block digests, the whole-file hash and the SPARSE LINE CHECKPOINTS
 	// all come from the one streaming index the product computes at CAS
@@ -218,7 +246,7 @@ func (f *contextFixture) putBlob(path, content string) model.FileVersion {
 		f.t.Fatalf("PutBlob(%s): %v", path, err)
 	}
 	status := model.FileTracked
-	if path == "internal/order/service.go" {
+	if modified {
 		status = model.FileModified
 	}
 	fv := model.FileVersion{ID: model.NewFileID(f.Repo, path), Path: path, Status: status,
@@ -316,8 +344,16 @@ func (f *contextFixture) sealRelations(run model.ProviderRunID, anyFile model.Fi
 		ev.ID = model.NewEvidenceID(ev)
 		facts = append(facts, model.RelationFact{Relation: r, Evidence: []model.Evidence{ev}})
 	}
-	if err := w.PutRelations(f.ctx, facts); err != nil {
-		f.t.Fatalf("PutRelations(%d edges): %v", len(facts), err)
+	// In batches: the writer refuses a batch past the configured record and
+	// byte ceilings, which a fixture of a few thousand edges exceeds. The
+	// batch size is the resolved page limit, the same bound every other
+	// batched write in this package is charged against, so the fixture cannot
+	// drift past a ceiling the product enforces.
+	batch := f.Cfg.Resources.MaxPageItems
+	for start := 0; start < len(facts); start += batch {
+		if err := w.PutRelations(f.ctx, facts[start:min(start+batch, len(facts))]); err != nil {
+			f.t.Fatalf("PutRelations(edges %d..%d of %d): %v", start, min(start+batch, len(facts)), len(facts), err)
+		}
 	}
 	if err := f.Store.SealUnit(f.ctx, w); err != nil {
 		f.t.Fatalf("SealUnit(relations): %v", err)
@@ -328,7 +364,7 @@ func (f *contextFixture) sealRelations(run model.ProviderRunID, anyFile model.Fi
 // expansion seed without recomputing the canonical key.
 func (f *contextFixture) Node(path string) model.NodeID {
 	f.t.Helper()
-	for _, spec := range fixtureFiles {
+	for _, spec := range f.Specs {
 		if spec.path == path {
 			return model.NewNodeID(f.Repo, spec.kind, model.CanonicalNodeKey(path, spec.symbol))
 		}
@@ -425,7 +461,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					// row's CAS already holds while giving each path its own file
 					// identity, so the two declarations are genuinely distinct.
 					body := fixtureFiles[1].content
-					versions = append(versions, fx.putBlob(path, body))
+					versions = append(versions, fx.putBlob(path, body, false))
 					sourceBytes += uint64(len(body))
 				}
 				manifest := model.H("codectx.test.manifest", "task-15-ambiguous")
@@ -1660,7 +1696,7 @@ func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int
 func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.CapabilityState) *graph.Engine {
 	f.t.Helper()
 	adj := &scopeAdjacency{binding: f.Binding, nodes: map[model.NodeID]model.Node{}, relations: rels, caps: caps}
-	for _, spec := range fixtureFiles {
+	for _, spec := range f.Specs {
 		fv := f.File(spec.path)
 		id := f.Node(spec.path)
 		adj.nodes[id] = model.Node{ID: id, Kind: spec.kind, Language: "go", Name: spec.symbol,
@@ -1727,7 +1763,7 @@ func searchService(t *testing.T, fx *contextFixture) *search.Service {
 	if err != nil {
 		t.Fatalf("OpenCAS: %v", err)
 	}
-	for _, spec := range fixtureFiles {
+	for _, spec := range fx.Specs {
 		if _, err := cas.Put(fx.ctx, strings.NewReader(spec.content)); err != nil {
 			t.Fatalf("CAS.Put(%s): %v", spec.path, err)
 		}
