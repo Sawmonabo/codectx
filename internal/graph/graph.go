@@ -344,12 +344,11 @@ func (n *levelNames) route(refs []RelRef) []model.RelationID {
 // resources.query_timeout is a DEFAULT, never a ceiling. When the INCOMING
 // context already carries a deadline -- the CLI facade sets one from --timeout
 // or from config, and the MCP server likewise -- that deadline is the
-// request's, whether it is shorter or longer than the configured one. Every
-// entry point used to compute now+QueryTimeout unconditionally, so `--timeout
-// 120s` expired after the configured 10s and reported the answer as out of
-// time at a twelfth of the time the operator had asked for. A --timeout of 0
-// mints no deadline at all (internal/cli queryContext), so it falls through to
-// the configured default exactly as before.
+// request's, whether it is shorter or longer than the configured one.
+// Computing now+QueryTimeout unconditionally would make `--timeout 120s` expire
+// after the configured 10s and report the answer as out of time at a twelfth of
+// the time the operator asked for. A --timeout of 0 mints no deadline at all
+// (internal/cli queryContext), so it falls through to the configured default.
 //
 // A context with no deadline gets now+QueryTimeout on the ENGINE clock, the
 // same clock the walk budget compares against. A caller-set deadline is a real

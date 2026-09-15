@@ -23,9 +23,9 @@ const (
 	reasonVisitedBudget = "visited node budget exhausted"
 	reasonPageFull      = "page item limit reached"
 	reasonDependence    = "dependence units are still building"
-	// reasonDepth is the depth bound. Before this it was the ONE stop that
-	// reported nothing at all: the loop simply fell out with a live frontier
-	// and Truncated=false, so a depth-limited answer read as a complete one.
+	// reasonDepth is the depth bound. Without it the loop falls out with a
+	// live frontier and Truncated=false, so a depth-limited answer reads as a
+	// complete one -- the one stop that would report nothing at all.
 	reasonDepth = "graph depth budget exhausted"
 )
 
@@ -1093,10 +1093,10 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// admitted-node bitset it tests membership against. A resumed page reopens
 	// the one its predecessor left.
 	//
-	// It is opened UNCONDITIONALLY now, where a first page used to create one
-	// only if it actually minted a continuation. The bitset IS the membership
-	// set the walk tests against, so a walk with nowhere to keep it is not a
-	// cheaper walk, it is a wrong one. What the one-page query pays for it is a
+	// It is opened UNCONDITIONALLY, and not only by a page that mints a
+	// continuation. The bitset IS the membership set the walk tests against, so
+	// a walk with nowhere to keep it is not a cheaper walk, it is a wrong one.
+	// What the one-page query pays for it is a
 	// directory, a sparse file whose allocated blocks are only the regions the
 	// walk touched, and a manifest -- and it is discarded below when no cursor
 	// is minted.

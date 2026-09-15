@@ -127,12 +127,13 @@ func TestOverviewCountsAreUnchangedByTheReader(t *testing.T) {
 	golden(t, "overview_items.json", page.Items)
 }
 
-// TestContainmentScanEndsOnTheLastEntry is F7, carried onto the packed reader:
-// the containment scan used to report an incomplete read the moment its edge
-// allowance was reached, so a containment set whose entries fill the allowance
-// EXACTLY reported complete=false -- and both callers refuse an incomplete
-// containment read, turning a whole answer into an omitted container. Only an
-// allowance with an entry still standing in front of it is incomplete.
+// TestContainmentScanEndsOnTheLastEntry is F7, carried onto the packed reader.
+// The failure mode: a containment scan that reports an incomplete read the
+// moment its edge allowance is reached answers complete=false for a containment
+// set whose entries fill the allowance EXACTLY -- and both callers refuse an
+// incomplete containment read, turning a whole answer into an omitted
+// container. Only an allowance with an entry still standing in front of it is
+// incomplete.
 //
 // Mutation: make the allowance test `maxEdges.Exceeded(read)` in
 // scanNeighbours and the exact-fill leg below fails.

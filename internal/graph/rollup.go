@@ -400,11 +400,9 @@ func (p *pairRollup) flush() error {
 		return err
 	}
 	// The evidence count is the generation's own per-relation side array,
-	// read by surrogate. It used to come from the batched relation hydration,
-	// because the walk's visitor delivered canonical relations and the port
-	// offers no canonical-id-to-relation-surrogate resolution; the surrogate
-	// walk hands the refs over directly, so the array read that was always the
-	// right one is now reachable.
+	// read by surrogate. The walk's visitor delivers the relation refs
+	// directly, so the count is one array read and never a hydration of the
+	// relation rows behind it.
 	evidence, err := p.evidenceCounts(rels)
 	if err != nil {
 		return err
@@ -613,10 +611,10 @@ func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
 // rollupInto is the streaming half alone: feed's admitted edges are batched,
 // each batch resolves its own containers and evidence, and one pairRecord per
 // surviving edge is appended to add. It is factored out of rollupRanked
-// because the sink's destination is no longer always a sort -- a walk that is
-// split across requests appends its pairs to the RETAINED pass-1 input
-// instead (walkretain.go) and ranks them only once the walk is exhausted -- and
-// the batching, the cut state and the exactness of the counts must be the same
+// because the sink's destination is not always a sort -- a walk that is split
+// across requests appends its pairs to the RETAINED pass-1 input instead
+// (walkretain.go) and ranks them only once the walk is exhausted -- and the
+// batching, the cut state and the exactness of the counts must be the same
 // either way.
 //
 // stats may be nil.

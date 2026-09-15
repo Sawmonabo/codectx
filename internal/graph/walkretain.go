@@ -214,8 +214,8 @@ func (w *retainedWalk) open() {
 }
 
 // addEntry appends one admitted impactRecord. It is the accumulator's emit
-// callback: what used to go straight into pass 1 now lands here, and pass 1 is
-// fed from the replay once the walk is exhausted.
+// callback: every admitted record lands here, and pass 1 is fed from the replay
+// once the walk is exhausted.
 func (w *retainedWalk) addEntry(r impactRecord) error {
 	b, err := encodeImpactRecord(r)
 	if err != nil {

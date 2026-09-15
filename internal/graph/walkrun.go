@@ -151,9 +151,9 @@ func (e *Engine) walkScratchDir() string {
 // walk state (walkretain.go): pass 1 keys lessByNode and folds foldImpact,
 // pass 2 keys lessByRank and does not fold, and either pass may be cut short by
 // the query deadline and resumed by the next request over the runs it had
-// already spilled. Ruling P7 used to re-sort the whole retained input on every
-// resumed request; it now adopts those runs instead, so a ranking split across
-// requests does the work of ONE ranking and serves the identical answer.
+// already spilled. A resumed request ADOPTS those runs rather than re-sorting
+// the whole retained input, so a ranking split across requests does the work of
+// ONE ranking and serves the identical answer (ruling P7).
 //
 // Close the returned run.
 //

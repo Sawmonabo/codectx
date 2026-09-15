@@ -12,8 +12,8 @@ import (
 // truncation proof for the ranked page. An engine built without a signer, a
 // lease store or a spool store can rank the whole walk but cannot hand back a
 // token for the remainder, so the page it serves is a PREFIX of the ranking.
-// It used to be served with Truncated=false and no cursor, which reads as a
-// complete answer and is the one thing a truncated answer may never do.
+// The failure mode: serving it with Truncated=false and no cursor, which reads
+// as a complete answer and is the one thing a truncated answer may never do.
 //
 // Mutation (restore the bare `return "", nil` in canContinue's nil-guard,
 // dropping the markTruncated): this FAILS on the untruncated answer below.
