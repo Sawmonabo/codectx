@@ -76,7 +76,8 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_context_advance", "Advance workflow",
 		"Move the session to a target workflow state under its version.", h.contextAdvance)
 	addTool(s, "codectx_context_capsule", "Context capsule",
-		`One bounded capsule view, or view="export" for canonical export metadata.`, h.contextCapsule)
+		`One keyset page of one capsule list named by view, continued with meta.next_cursor; `+
+			`view="export" returns the capsule's identity and per-list record counts instead.`, h.contextCapsule)
 	addTool(s, "codectx_context_close", "Close session",
 		"Close a session under its expected state version.", h.contextClose)
 }
@@ -138,7 +139,7 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 	reflect.TypeFor[model.ContextView](): stringEnum(
 		string(model.ViewEntries), string(model.ViewSlices), string(model.ViewExcluded)),
 	// The capsule view carries one spelling the model type does not: "export"
-	// selects the canonical metadata projection rather than a bounded page.
+	// selects the identity-and-counts projection rather than a page of one list.
 	reflect.TypeFor[model.CapsuleView](): stringEnum(
 		string(model.CapsuleViewAcceptedFacts), string(model.CapsuleViewRejectedFacts),
 		string(model.CapsuleViewContradictions), string(model.CapsuleViewUnresolved),
@@ -160,7 +161,8 @@ var enumSchemas = map[reflect.Type]*jsonschema.Schema{
 }
 
 // capsuleViewExport is the codectx_context_capsule spelling that routes to
-// Export's canonical metadata instead of Capsule's bounded page (digest §4).
+// Export's identity-and-counts metadata instead of one keyset page of one
+// capsule list (digest §4).
 const capsuleViewExport = "export"
 
 // stringEnum is the one schema shape in the table above.
