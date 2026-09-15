@@ -15,13 +15,16 @@ retention by distinct ref — is Sections 12.2–12.4 of
 ## How identities are stored
 
 Node and relation identities live in two dictionary tables, `node_ids` and
-`relation_ids`. Each has an `INTEGER PRIMARY KEY` surrogate and keeps the
-canonical 32-byte identity exactly once, in `canonical BLOB(32) UNIQUE`. Every
+`relation_ids`. Each has an `INTEGER PRIMARY KEY` surrogate and stores the
+canonical 32-byte identity once per row rather than replicating it at every
+reference site, in `canonical BLOB NOT NULL UNIQUE` under a
+`CHECK(length(canonical) = 32)`. Every
 other table references a node or a relation by that **integer** surrogate:
 `node_facts`, `relation_facts`, `relation_ids`' own two endpoints,
 `native_aliases`, `fact_keys`, `evidence`, `search_units` and
-`context_entries`. `node_ids.canonical_key` is a `BLOB(32)` — not the
-64-character hex text it used to be — and neither identity table carries a
+`context_entries`. `node_ids.canonical_key` is a `BLOB` under a
+`CHECK(length(canonical_key) = 32)` — not the 64-character hex text it used to
+be, and unique only in combination, through `UNIQUE(kind, canonical_key)` — and neither identity table carries a
 `repository_id` column any more, because one store is one repository.
 (`snapshots` and `generations` still carry theirs.)
 

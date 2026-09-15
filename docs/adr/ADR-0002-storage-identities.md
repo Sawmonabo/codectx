@@ -2,9 +2,9 @@
 
 - **Status:** Accepted (implemented)
 - **Date:** 2026-09-14
-- **Refines:** [`ADR-0001 — Scale posture`](ADR-0001-scale-posture.md) §2.8, which accepted and
-  scheduled this redesign; this record carries the shape that was built, the alternatives that were
-  refused on the way, and the sources the implementation lanes cited
+- **Refines:** [`ADR-0001 — Scale posture`](ADR-0001-scale-posture.md) §2.8, which took the
+  decision to make this change; this record carries the shape that was built, the alternatives that
+  were refused on the way, and the sources cited for it
 - **Inventory and per-table attribution:** [`docs/research/15-scale-posture.md`](../research/15-scale-posture.md)
 - **Budget row:** [`docs/performance.md`](../performance.md) row 13
 
@@ -20,10 +20,11 @@ their corpus attached; none of them is a restatement of another.
 - **73.86× stored bytes over eligible source bytes** — 420 810 752 B over 5 697 273 B on the
   10 000-file generated corpus, against a 3.5× budget. An earlier run of the same corpus reported
   75.00×. This is `docs/performance.md` row 13's miss.
-- **6784.0 bytes per indexed symbol** — the redesign's own baseline, taken with per-b-tree byte
-  attribution [S1] over a read-only copy of the `cache-wave-g2` fixture store: 587 776 000 database
-  bytes (`page_size` 4096, `page_count` 143 500, 51 free pages, no write-ahead log bytes
-  outstanding) over 86 642 `node_facts` rows.
+- **6 784.0 bytes per indexed symbol** — taken with per-b-tree byte attribution [S1] over a
+  read-only copy of a prepared control store: 587 776 000 database bytes (`page_size` 4096,
+  `page_count` 143 500, 51 free pages, no write-ahead log bytes outstanding) over 86 642
+  `node_facts` rows. This figure is **not** the redesign's before/after comparison point — it is a
+  different corpus. The before/after pair is the one under *Measurements* below.
 - **≈3.4 KB per indexed symbol** on the 604-file cut of the same generator, the figure ADR-0001
   §2.8 quotes.
 
@@ -65,13 +66,14 @@ which 52 711 are distinct (average 53 B).
 ### 2.1 Surrogate row identities, canonical identity stored once
 
 `node_ids` and `relation_ids` become rowid tables: `id INTEGER PRIMARY KEY CHECK(id > 0)`, with the
-canonical 32-byte identity kept exactly once as
-`canonical BLOB NOT NULL UNIQUE CHECK(length(...) = 32)`. Every reference site — `node_facts.node_id`, `relation_facts.relation_id`, `relation_ids`'
+canonical 32-byte identity stored once per row rather than replicated at every reference site, as
+`canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32)`. Every reference site — `node_facts.node_id`, `relation_facts.relation_id`, `relation_ids`'
 endpoints, `native_aliases.node_id`, `fact_keys`' two nullable refs, `evidence`' two nullable refs,
 `search_units.node_id`, `context_entries.node_id` — becomes `INTEGER`.
 
-`node_ids.canonical_key` becomes `BLOB(32)`, having been 64-character lowercase hex TEXT stored
-twice (in the table and in its unique auto-index). The blob ordering is byte-for-byte the old
+`node_ids.canonical_key` becomes a `BLOB` carrying `CHECK(length(canonical_key) = 32)` — unique
+only in combination, through `UNIQUE(kind, canonical_key)` — having been 64-character lowercase hex
+TEXT stored twice (in the table and in that constraint's auto-index). The blob ordering is byte-for-byte the old
 lowercase-hex TEXT ordering, proven on rows including a high first byte and a tie broken by the
 canonical identity, so the reconcile keyset resumes exactly where it did before.
 
@@ -142,9 +144,9 @@ seek to a table scan.
 
 ### 2.6 Migration is a rebuild
 
-The schema fingerprint is a digest of the embedded DDL, so it bumps by construction
-(`f0f6573d…` → `4748ed37a98d3bd60e95565eab2cebf12e250ebf0df3ce87847305a57b889143`). An existing
-store fails closed with `CTX_SCHEMA_MISMATCH` and an explicit rebuild decision. There is no
+The schema fingerprint is a digest of the embedded DDL, so it bumps by construction — and by any
+edit to that file, a comment included, which is why no literal digest is reproduced here. An
+existing store fails closed with `CTX_SCHEMA_MISMATCH` and an explicit rebuild decision. There is no
 migration layer and no dual read path.
 
 ---
@@ -159,7 +161,7 @@ and returns the bytes it saved. Refused. Interning is what makes those indexes c
 **Converting the alias table to a rowid table with a unique auto-index.** Measured net-neutral,
 5.07 → 4.96 MB. Refused as churn.
 
-**S-6 — making `evidence.id` a plain rowid (≈ −13.5 MB projected).** **Dropped, not forced**, and
+**Making `evidence.id` a plain rowid (≈ −13.5 MB projected).** **Dropped, not forced**, and
 by call site rather than by size. The unit-seal and carry-over writers both upsert with
 `INSERT … ON CONFLICT(id) DO NOTHING` (`units.go:747`, `delta.go:435`), and a conflict target
 resolves only against a primary key or a unique index [S8] — so dropping it is a statement-prepare
@@ -170,7 +172,7 @@ folds those values. The id is a pure function of the evidence fields, so the uni
 is a derived invariant rather than an arbitrary surrogate. The node and relation refs on the table
 still become INTEGER.
 
-**S-7 — evidence as a compressed set rather than one row per fact→unit link.** Deferred: it is a
+**Evidence as a compressed set rather than one row per fact→unit link.** Deferred: it is a
 second-order change against a first-order one, and it is worth attempting only if the surrogates
 and the dictionaries miss the gate. ADR-0001 §2.8 records the published analogue.
 
@@ -212,7 +214,7 @@ once each instead of three and four times respectively.
 **What the reader pays.** One dictionary probe per returned row, and only per returned row: the
 hydration is an outer select over the keyset-bounded, limit-bounded inner select. Across the full
 before/after plan matrix no table is scanned on either side; the one added `SCAN` line is over a
-materialised co-routine — the outer hydration reading at most a page of rows — which is the point of
+materialised co-routine [S13] — the outer hydration reading at most a page of rows — which is the point of
 the shape. Two read paths move their keyset from a fact table onto the canonical identity column,
 because a cursor may carry only the canonical identity; both remain unit-bounded and page-bounded.
 The alias lookup's identity probe becomes a rowid seek where it was a unique-index probe.
@@ -284,22 +286,26 @@ cost when replicated per alias and per evidence row.
 Two numbers this corpus does **not** settle. `fact_keys` has **0 rows** in a
 single-generation full index — the delta path is what populates it — so the
 `fact_keys.fact_key` sizing stays the fixture's 204 887 rows. And the
-source-bytes ratio is S-VERIFY's to report, not this one's.
+stored-bytes-over-source-bytes ratio is owed by the reference-corpus verification run, not by this
+one.
 
-### `native_keys` sweep (progress-ledger ruling (b))
+### `native_keys` sweep
 
 The two indexes the sweep needs, built on the after store and measured:
 `idx_alias_native ON native_aliases(native_key_id)` = 6 799 360 B and
 `idx_evidence_native ON evidence(native_key_id)` = 7 352 320 B, together
-**14 151 680 B = 2.24 % of the 632 266 752 B store** — over the 2 % line the
-ruling drew. With them the batched predicate is fully indexed
+**14 151 680 B = 2.24 % of the 632 266 752 B store** — over the 2 % of store
+size that was set as the line an added index may not cross. With them the batched predicate is fully indexed
 (`SEARCH na USING COVERING INDEX idx_alias_native`, `SEARCH e USING COVERING
 INDEX idx_evidence_native`); without them each candidate costs a full pass over
-643 025 evidence rows. Per the ruling the indexes are therefore **not added**
+643 025 evidence rows. The indexes are therefore **not added**
 and the sweep is owed as a bounded batch job per retention run; it is not
 implemented here.
 
-### Index re-audit (§3c), against `EXPLAIN QUERY PLAN` on the after store
+### Index re-audit, against `EXPLAIN QUERY PLAN` on the after store
+
+Each index was re-examined from the call sites that use it, keeping the ones a plan actually seeks
+or covers and dropping the rest [S12].
 
 `idx_search_unit ON search_units(unit_id, rowid)` — **KEPT, with the reason the
 audit asked for.** `delta.go:419` pages the rows a unit just wrote by rowid:
@@ -378,12 +384,8 @@ for the call-site-driven index audit.
 [S13] https://www.sqlite.org/eqp.html — `EXPLAIN QUERY PLAN` output grammar (SEARCH versus SCAN,
 CO-ROUTINE, temporary b-trees); how the before/after plan matrix in §4 is read.
 
-[S14] https://www.sqlite.org/optoverview.html#the_analyze_command — `ANALYZE` and the default
-selectivity used when no statistics exist; why the before/after comparison was taken on
-un-analysed stores, where a SCAN means no usable index exists at all.
 
 ---
 
-*Every figure in this record is drawn from the implementation and verification reports of
-2026-09-14, each of which carries the plan output, byte attribution or mutation proof for the
-assertion it supports.*
+*Every figure in this record is drawn from an implementation or verification run that carries the
+plan output, byte attribution or mutation proof for the assertion it supports.*
