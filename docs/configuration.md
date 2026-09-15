@@ -69,7 +69,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
 
@@ -355,6 +355,7 @@ cloud or AI credential fields in core.
 | `max_capsule_bytes` | `0` (unlimited) | user | Largest capsule, by bytes. Unlimited by default. It is not the only thing that bounds a capsule today — see [The one remaining default cap](#the-one-remaining-default-cap) below. |
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
+| `max_seeds` | `0` (unlimited) | user | Identities seed discovery examines before it stops. Unlimited by default, so every identity a task names is examined; a task that exceeds a value you set is reported as a named exclusion on the manifest, never cut silently. |
 
 The context compiler binds them as follows. The three `default_*` budgets and
 `max_slices` are what a **zero** field of a request's budget resolves to. They
@@ -389,6 +390,18 @@ the reason, and every later page repeats the same flag and reason.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.
+
+`max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
+words into the candidates a plan starts from — and is unlimited by default. What
+bounds that pass with no value set is the **request**, not the repository: the
+task text is clipped to a fixed byte bound before any scanning, each identity it
+names is resolved by exactly one page of declarations, and the lowest-priority
+step that admits captured working-tree changes reads one page and discloses its
+continuation cursor rather than materialising a whole working tree. Peak memory
+is therefore a function of the task and the page size. A value you do set is
+disclosed where it bites: the step that stopped is named in the manifest's
+exclusions, with the key and the value that stopped it, and the scope is reported
+incomplete.
 
 The ranking weights themselves are **not** configuration. They are compile-time
 constants labelled by the manifest's `policy_version`, so changing one changes
