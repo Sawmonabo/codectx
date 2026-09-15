@@ -298,3 +298,207 @@ func (s *PackedStream) Next(ctx context.Context, limit int) ([]TermOccurrence, e
 func (s *PackedStream) malformed() error {
 	return corrupt("packed lexical posting list of term %q in generation %d is malformed", s.term, s.gen)
 }
+
+// The per-document attribute record (ADR-0007 Decision 2). One record holds
+// EVERY field the search package reads from a document row -- the ranker's
+// tie-break and the deduplication key read the identity, path, kind, name,
+// qualified name, signature and byte range, and the filters read two of them
+// -- so a candidate is hydrated from the packed stream and no document row is
+// read per candidate. The layout, in order: search key, node id (a presence
+// byte and, when present, the canonical id), file id, start byte, end byte as
+// a delta from the start, token count, then kind, path, name, qualified name
+// and signature, each preceded by its length. Ids are the raw 32 bytes rather
+// than their hex spelling: the stream is written once per document and read on
+// every page that names it.
+const attrIDBytes = 32
+
+// encodeSearchDocument appends d's attribute record to dst.
+func encodeSearchDocument(dst []byte, d SearchDocument) []byte {
+	key, _ := model.DecodeID(d.ID)
+	file, _ := model.DecodeID(string(d.FileID))
+	dst = append(dst, key...)
+	if d.NodeID == "" {
+		dst = append(dst, 0)
+	} else {
+		node, _ := model.DecodeID(string(d.NodeID))
+		dst = append(dst, 1)
+		dst = append(dst, node...)
+	}
+	dst = append(dst, file...)
+	dst = binary.AppendUvarint(dst, d.Bytes.Start)
+	dst = binary.AppendUvarint(dst, d.Bytes.End-d.Bytes.Start)
+	dst = binary.AppendUvarint(dst, uint64(d.TokenCount))
+	for _, s := range [...]string{string(d.Kind), d.Path, d.Name, d.QualifiedName, d.Signature} {
+		dst = binary.AppendUvarint(dst, uint64(len(s)))
+		dst = append(dst, s...)
+	}
+	return dst
+}
+
+// decodeSearchDocument reads back one attribute record. A record that does not
+// decode is a corrupt store, not an empty document: the stream is written in
+// one transaction with the commit row that publishes it.
+func decodeSearchDocument(raw []byte, doc int64) (SearchDocument, error) {
+	d := SearchDocument{RowID: doc}
+	r := attrReader{raw: raw}
+	d.ID = idHex(r.fixed(attrIDBytes))
+	if flag := r.byteAt(); flag == 1 {
+		d.NodeID = model.NodeID(idHex(r.fixed(attrIDBytes)))
+	} else if flag != 0 {
+		r.bad = true
+	}
+	d.FileID = model.FileID(idHex(r.fixed(attrIDBytes)))
+	start := r.uvarint()
+	d.Bytes = model.ByteRange{Start: start, End: start + r.uvarint()}
+	d.TokenCount = int64(r.uvarint())
+	d.Kind = model.NodeKind(r.text())
+	d.Path, d.Name, d.QualifiedName, d.Signature = r.text(), r.text(), r.text(), r.text()
+	if r.bad || len(r.raw) != 0 {
+		return SearchDocument{}, corrupt("the packed attribute record of document %d is malformed", doc)
+	}
+	return d, nil
+}
+
+// attrReader decodes one record field by field, latching the first malformed
+// field instead of returning an error from every step: a record is either
+// whole or the store is corrupt, and one check at the end says which.
+type attrReader struct {
+	raw []byte
+	bad bool
+}
+
+func (r *attrReader) fixed(n int) []byte {
+	if r.bad || len(r.raw) < n {
+		r.bad = true
+		return nil
+	}
+	out := r.raw[:n]
+	r.raw = r.raw[n:]
+	return out
+}
+
+func (r *attrReader) byteAt() byte {
+	b := r.fixed(1)
+	if b == nil {
+		return 0
+	}
+	return b[0]
+}
+
+func (r *attrReader) uvarint() uint64 {
+	if r.bad {
+		return 0
+	}
+	v, n := binary.Uvarint(r.raw)
+	if n <= 0 {
+		r.bad = true
+		return 0
+	}
+	r.raw = r.raw[n:]
+	return v
+}
+
+func (r *attrReader) text() string {
+	n := r.uvarint()
+	if r.bad || uint64(len(r.raw)) < n {
+		r.bad = true
+		return ""
+	}
+	s := string(r.raw[:n])
+	r.raw = r.raw[n:]
+	return s
+}
+
+// docEntry is one decoded document-directory entry.
+type docEntry struct {
+	doc     int64
+	attrOff int64
+	attrLen int
+}
+
+func (x *lexicalIndex) docEntryAt(ctx context.Context, ordinal int64) (docEntry, error) {
+	raw, err := x.readAt(ctx, streamDocDir, ordinal*docEntryBytes, docEntryBytes)
+	if err != nil {
+		return docEntry{}, err
+	}
+	return docEntry{
+		doc:     int64(binary.LittleEndian.Uint64(raw[docEntryID:])),
+		attrOff: int64(binary.LittleEndian.Uint64(raw[docEntryAttrOff:])),
+		attrLen: int(binary.LittleEndian.Uint32(raw[docEntryAttrLen:])),
+	}, nil
+}
+
+// PackedDocuments hydrates visible documents by rowid from the generation's
+// packed attribute stream (len(rowids) <= model.MaxPageItems). Rowids the
+// generation does not carry are omitted, and the answer is in the requested
+// order, so a ranked page hydrates into the order it was ranked in.
+//
+// A page of ascending rowids walks the document directory once: each lookup
+// resumes where the previous one stopped, so a page costs a bounded window of
+// parts and no statement per document. A rowid that goes backwards restarts
+// the walk, which keeps the answer right for a caller that does not sort.
+func (r *PinnedReader) PackedDocuments(ctx context.Context, rowids []int64) ([]SearchDocument, error) {
+	if len(rowids) == 0 {
+		return nil, nil
+	}
+	if len(rowids) > model.MaxPageItems {
+		return nil, invalid("search document hydration asked for %d rowids, limit %d", len(rowids), model.MaxPageItems)
+	}
+	x, err := r.openLexical(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SearchDocument, 0, len(rowids))
+	lo, prev := int64(0), int64(0)
+	for _, id := range rowids {
+		if id <= 0 {
+			return nil, invalid("search document rowid %d is not positive", id)
+		}
+		if id < prev {
+			lo = 0
+		}
+		prev = id
+		ordinal, e, ok, err := x.findDocument(ctx, lo, id)
+		if err != nil {
+			return nil, err
+		}
+		lo = ordinal
+		if !ok {
+			continue
+		}
+		raw, err := x.readAt(ctx, streamDocAttr, e.attrOff, e.attrLen)
+		if err != nil {
+			return nil, err
+		}
+		d, err := decodeSearchDocument(raw, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+		lo = ordinal + 1
+	}
+	return out, nil
+}
+
+// findDocument binary-searches the document directory from ordinal lo for doc,
+// answering the ordinal the search settled on so the next lookup of a larger
+// rowid starts there instead of at the beginning.
+func (x *lexicalIndex) findDocument(ctx context.Context, lo, doc int64) (int64, docEntry, bool, error) {
+	hi := x.docCount
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		e, err := x.docEntryAt(ctx, mid)
+		if err != nil {
+			return lo, docEntry{}, false, err
+		}
+		switch {
+		case e.doc == doc:
+			return mid, e, true, nil
+		case e.doc < doc:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return lo, docEntry{}, false, nil
+}

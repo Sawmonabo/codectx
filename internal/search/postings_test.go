@@ -18,7 +18,7 @@ type fakePostings struct {
 	opened   map[string]int  // TermOccurrences calls per term
 	sessions int             // OpenPostings calls
 	live     map[string]bool // streams still open
-	docCalls int             // SearchDocuments calls
+	docCalls int             // PackedDocuments calls
 	docRows  int             // rowids asked for across those calls
 }
 
@@ -46,7 +46,7 @@ func (f *fakePostings) Match(_ context.Context, _ string, after int64, limit int
 	return out, nil
 }
 
-func (f *fakePostings) SearchDocuments(_ context.Context, rowids []int64) ([]sqlite.SearchDocument, error) {
+func (f *fakePostings) PackedDocuments(_ context.Context, rowids []int64) ([]sqlite.SearchDocument, error) {
 	f.docCalls++
 	f.docRows += len(rowids)
 	out := make([]sqlite.SearchDocument, 0, len(rowids))
@@ -165,7 +165,7 @@ func TestWalkHoldsOnePostingStatementPerToken(t *testing.T) {
 
 // TestOneDocumentReadPerRowidPage is the regression guard for the duplicated
 // hydration: the tier and its consumer used to fetch the SAME rowid page from
-// SearchDocuments twice, once for TokenCount and once for path/kind/name. One
+// PackedDocuments twice, once for TokenCount and once for path/kind/name. One
 // read per rowid page must now carry both, so the walk issues exactly as many
 // document reads as it has candidate pages, and the emitted hit carries the
 // document's servable facts as well as the length its score was computed from.

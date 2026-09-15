@@ -162,6 +162,10 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 					Remediation: "the previous unit was written without keys; rebuild it in full before importing a key delta"}
 			}
 		}
+		// The carried documents' term instances exist only in the
+		// predecessor's packed lexical list, so the seal fold needs to know
+		// which unit to merge.
+		w.carriedFrom = prevRow
 		return w.copyFacts(ctx, tx, prevRow, replaced.IndexLevel, &stats)
 	})
 	if err != nil {

@@ -918,9 +918,9 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentFrequency: %v", err)
 	}
-	hitsBefore, err := readerStable.SearchDocuments(ctx, ids)
+	hitsBefore, err := readerStable.PackedDocuments(ctx, ids)
 	if err != nil {
-		t.Fatalf("SearchDocuments: %v", err)
+		t.Fatalf("PackedDocuments: %v", err)
 	}
 	if len(dfBefore) != 1 || dfBefore[0] != 1 || len(hitsBefore) != 1 {
 		t.Fatalf("gen2 lexical statistics = df %v over %d documents, want df 1 and the one b.go document containing \"changed\"", dfBefore, len(hitsBefore))
@@ -1092,9 +1092,9 @@ func TestStorePublicationScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DocumentFrequency after publication and retention: %v", err)
 	}
-	hitsAfter, err := readerStable.SearchDocuments(ctx, []int64{ids[0], ownIDs[0]})
+	hitsAfter, err := readerStable.PackedDocuments(ctx, []int64{ids[0], ownIDs[0]})
 	if err != nil {
-		t.Fatalf("SearchDocuments after publication and retention: %v", err)
+		t.Fatalf("PackedDocuments after publication and retention: %v", err)
 	}
 	if len(dfAfter) != 1 || dfAfter[0] != dfBefore[0] || len(hitsAfter) != 1 || hitsAfter[0] != hitsBefore[0] {
 		t.Fatalf("gen2 lexical statistics moved from df %v %+v to df %v %+v while later generations published and were swept; a score is not reproducible within its binding",

@@ -720,6 +720,28 @@ CREATE TABLE generation_graph_parts (
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
 
+-- unit_lexical is the SEALED unit's own packed term list and document
+-- attributes, in exactly the generation structure's format (ADR-0007
+-- Decision 1 as amended). It is built once, in the unit's seal transaction,
+-- and every generation that carries the unit merges it instead of rescanning
+-- the store-wide vocabulary; the row is written LAST, so its presence is the
+-- commit marker for the parts behind it.
+CREATE TABLE unit_lexical (
+    unit_id INTEGER PRIMARY KEY REFERENCES units(id) ON DELETE CASCADE,
+    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
+    token_total INTEGER NOT NULL CHECK(token_total >= 0),
+    term_count INTEGER NOT NULL CHECK(term_count >= 0)
+);
+-- One chunk of one of the unit's lexical streams, chunked exactly as the
+-- generation's are, so one writer and one reader serve both.
+CREATE TABLE unit_lexical_parts (
+    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
+    part INTEGER NOT NULL CHECK(part >= 0),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(unit_id, stream, part)
+) WITHOUT ROWID;
+
 -- generation_lexical is written LAST, after every lexical part, so its presence
 -- is the commit marker: a reader that finds the row is guaranteed every part
 -- behind it. It also carries the generation's document statistics, which the
@@ -734,13 +756,16 @@ CREATE TABLE generation_lexical (
 -- One chunk of one lexical stream. `term.dir` is the fixed-width term
 -- directory in term order -- term slice, document frequency and the slice of
 -- `post.list` holding that term's per-document (column, count) sequence --
--- `term.text` the concatenated term bytes it points into, and `post.list` the
--- posting lists themselves. `part` is 0-based and the parts of a stream
+-- `term.text` the concatenated term bytes it points into, `post.list` the
+-- posting lists themselves, and `doc.dir`/`doc.attr` the per-document
+-- attributes every candidate is hydrated from, addressed by document ordinal
+-- (ADR-0007 Decision 2) and ordered by document id so a rowid is found by
+-- binary search. `part` is 0-based and the parts of a stream
 -- concatenate to it, so a reader holds a bounded window of parts rather than a
 -- whole vocabulary.
 CREATE TABLE generation_lexical_parts (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
-    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list')),
+    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
     part INTEGER NOT NULL CHECK(part >= 0),
     bytes BLOB NOT NULL,
     PRIMARY KEY(generation_id, stream, part)

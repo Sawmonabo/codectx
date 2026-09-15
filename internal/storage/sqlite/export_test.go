@@ -18,9 +18,17 @@ func SetEdgePartBytes(n int) func() {
 func OutgoingEdgeQuery() string { return outgoingEdgeQuery() }
 func IncomingEdgeQuery() string { return incomingEdgeQuery() }
 
-// LexicalInstanceQuery is the bare instance scan the packed-lexical build
-// streams, exported so the query-plan test asserts the SQL that ships.
-func LexicalInstanceQuery() string { return lexicalInstanceQuery }
+// UnitInstanceQuery is the bare instance scan the per-unit lexical fold
+// streams, and MergePartQuery the one statement a merge pass issues per part,
+// exported so the query-plan test asserts the SQL that ships.
+func UnitInstanceQuery(vocab string) string { return unitInstanceQuery(vocab) }
+
+func MergePartQuery(table, column string) string {
+	return `SELECT bytes FROM ` + table + ` WHERE ` + column + ` = 1 AND stream = 'term.dir' AND part = 0`
+}
+
+// UnitLexicalPartsTable is the table a sealed unit's packed streams live in.
+const UnitLexicalPartsTable = unitLexicalPartsTable
 
 // EvidenceCountQuery is the build's third ordered scan.
 func EvidenceCountQuery() string { return evidenceCountQuery() }

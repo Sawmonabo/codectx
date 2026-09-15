@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -239,7 +237,7 @@ func (r *PinnedReader) nodesInFile(ctx context.Context, file model.FileID, after
 // Every stream it opens reads the same snapshot, and that snapshot is held for
 // the whole candidate walk instead of being re-taken per page. It runs on the
 // posting pool, never the reader pool, so a query that holds a session can
-// still issue the short reads (Match, SearchDocuments) the same walk needs.
+// still issue the short reads (Match, PackedDocuments) the same walk needs.
 // Close rolls the transaction back and is safe to call more than once; closing
 // it also closes every stream still open on it.
 type PostingSession struct {
@@ -472,61 +470,21 @@ func flushDocument(group []TermOccurrence) []TermOccurrence {
 	return group
 }
 
-// SearchDocuments hydrates visible documents by rowid in one bounded query
-// (len(rowids) <= model.MaxPageItems). Missing rowids are omitted.
-func (r *PinnedReader) SearchDocuments(ctx context.Context, rowids []int64) ([]SearchDocument, error) {
-	if len(rowids) == 0 {
-		return nil, nil
+// scanSearchDocument reads one row of searchDocumentColumns. It is the single
+// decoder of that column list: the packed attribute stream is written from it
+// at seal (lexicalbuild.go) and nothing else reads a document row.
+func scanSearchDocument(rows *sql.Rows) (SearchDocument, error) {
+	var d SearchDocument
+	var key, node, file []byte
+	var start, end int64
+	if err := rows.Scan(&d.RowID, &key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName,
+		&d.Signature, &start, &end, &d.TokenCount); err != nil {
+		return d, wrap("search_units", err)
 	}
-	if len(rowids) > model.MaxPageItems {
-		return nil, invalid("search document hydration asked for %d rowids, limit %d", len(rowids), model.MaxPageItems)
+	d.ID, d.FileID = idHex(key), model.FileID(idHex(file))
+	if node != nil {
+		d.NodeID = model.NodeID(idHex(node))
 	}
-	marks := make([]string, len(rowids))
-	args := []any{r.gen}
-	for i, id := range rowids {
-		if id <= 0 {
-			return nil, invalid("search document rowid %d is not positive", id)
-		}
-		marks[i] = "?" + strconv.Itoa(i+2)
-		args = append(args, id)
-	}
-	query := `SELECT ` + searchDocumentColumns + ` FROM search_units su
-		LEFT JOIN node_ids ni ON ni.id = su.node_id
-		WHERE su.doc_id IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su")
-	byRowID := make(map[int64]SearchDocument, len(rowids))
-	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return wrap("search_units", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var d SearchDocument
-			var key, node, file []byte
-			var start, end int64
-			if err := rows.Scan(&d.RowID, &key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName,
-				&d.Signature, &start, &end, &d.TokenCount); err != nil {
-				return wrap("search_units", err)
-			}
-			d.ID, d.FileID = idHex(key), model.FileID(idHex(file))
-			if node != nil {
-				d.NodeID = model.NodeID(idHex(node))
-			}
-			d.Bytes = model.ByteRange{Start: uint64(start), End: uint64(end)}
-			byRowID[d.RowID] = d
-		}
-		return wrap("search_units", rows.Err())
-	})
-	if err != nil {
-		return nil, err
-	}
-	// Requested order, so a ranked page hydrates into the order it was ranked
-	// in; a rowid the generation does not contain is omitted, not zeroed.
-	out := make([]SearchDocument, 0, len(rowids))
-	for _, id := range rowids {
-		if d, ok := byRowID[id]; ok {
-			out = append(out, d)
-		}
-	}
-	return out, nil
+	d.Bytes = model.ByteRange{Start: uint64(start), End: uint64(end)}
+	return d, nil
 }

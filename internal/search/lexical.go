@@ -22,7 +22,7 @@ type lexicalSource interface {
 	DocumentFrequency(ctx context.Context, terms []string) ([]int64, error)
 	OpenPostings(ctx context.Context) (postingSession, error)
 	Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error)
-	SearchDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
+	PackedDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
 }
 
 // postingSession is one held-open read transaction over the posting lists of a
@@ -108,7 +108,7 @@ func (t lexicalTerm) key() string { return strings.Join(t.tokens, " ") }
 // lexicalHit is one scored lexical candidate. It carries the document the
 // score was computed from: the tier already reads every column of that row to
 // get TokenCount, so handing the same row on costs nothing and spares the
-// consumer a second SearchDocuments round trip over the identical rowid page
+// consumer a second hydration round trip over the identical rowid page
 // (QPERF-4 §5). Doc is carried BY VALUE, not as a pointer into the tier's
 // per-page slice, so an emit that outlives the page cannot alias a reused row.
 // Occurrences is the number of matched term instances in this document, folded
@@ -134,7 +134,7 @@ type lexicalOutcome struct {
 const truncatedOffsetsReason = "phrase frequencies are a lower bound: a document's term offsets exceeded the per-document offset cap"
 
 // matchPageSize is the candidate window. It is also the hydration batch, so it
-// must not exceed model.MaxPageItems, which SearchDocuments requires.
+// must not exceed model.MaxPageItems, which PackedDocuments requires.
 const matchPageSize = model.MaxPageItems
 
 // occurrencePageSize is the posting-list page. It must NOT exceed
@@ -226,13 +226,14 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			return out, nil
 		}
 		after = rowids[len(rowids)-1]
-		// One read per rowid page, carrying everything both consumers need:
-		// TokenCount for the score here, path/kind/name/identity for the ranker
-		// downstream. SearchDocuments answers in the requested order and omits
-		// rowids the generation does not make visible, so walking docs is the
-		// rowid walk minus exactly the rows that have no document length to score
-		// against.
-		docs, err := src.SearchDocuments(ctx, rowids)
+		// One walk of the packed attribute stream per rowid page, carrying
+		// everything both consumers need: TokenCount for the score here,
+		// path/kind/name/identity for the ranker downstream, and no document
+		// row read per candidate (ADR-0007 Decision 2). PackedDocuments answers
+		// in the requested order and omits rowids the generation does not make
+		// visible, so walking docs is the rowid walk minus exactly the rows
+		// that have no document length to score against.
+		docs, err := src.PackedDocuments(ctx, rowids)
 		if err != nil {
 			return out, err
 		}

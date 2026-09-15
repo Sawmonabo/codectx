@@ -228,7 +228,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	}
 	// Posting streams hold one read transaction open for the whole candidate
 	// walk of a query. They get their own pool so that holding one can never
-	// starve the short reads (Match, SearchDocuments) the same query issues
+	// starve the short reads (Match, PackedDocuments) the same query issues
 	// while the stream is open, which on the shared reader pool would be a
 	// deadlock as soon as two queries ran at once.
 	s.postings, err = openPool(abs, readerPragmas, "deferred", opts.ReadConnections)

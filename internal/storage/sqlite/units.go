@@ -219,6 +219,13 @@ type UnitWriter struct {
 	// evidenceClipped records what SealUnit dropped to hold the evidence
 	// bound, so a caller can report the truncation instead of it being silent.
 	evidenceClipped int64
+
+	// carriedFrom is the predecessor unit a delta copied this unit's carried
+	// documents from, or zero. Their term instances live only in that unit's
+	// packed lexical list: the index is contentless, so no row of this
+	// database can reproduce the text they were indexed with, and the seal
+	// fold merges the predecessor's list instead of re-tokenising them.
+	carriedFrom int64
 }
 
 // UnitID is the immutable key of the unit being written.
@@ -727,6 +734,21 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 				return err
 			}
 			defer index.Close()
+			// The same documents go into the unit's own temporary index, under
+			// the same rowids and the same tokenizer, because this is the only
+			// moment the body text exists: search_fts is contentless, so once
+			// this returns nothing can tokenise the document again. Sealing
+			// folds that index -- and it alone, never the store-wide
+			// vocabulary -- into the unit's packed term list.
+			if err := createUnitIndex(ctx, tx, w.rowID); err != nil {
+				return err
+			}
+			unit, err := tx.PrepareContext(ctx, `INSERT INTO `+unitFTSName(w.rowID)+
+				`(rowid, name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?, ?)`)
+			if err != nil {
+				return wrap("unit index", err)
+			}
+			defer unit.Close()
 			defer w.endBatch()
 			for i, d := range docs {
 				keyRaw, _ := model.DecodeID(d.ID)
@@ -755,6 +777,9 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 				if _, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
 					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i], docID); err != nil {
 					return err
+				}
+				if _, err := unit.ExecContext(ctx, docID, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body); err != nil {
+					return wrap("unit index", err)
 				}
 				inserted++
 			}
@@ -1095,9 +1120,13 @@ func (w *UnitWriter) Abandon(ctx context.Context) error {
 	}
 	w.done = true
 	return w.s.write(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
-			string(model.UnitFailed), w.rowID, string(model.UnitBuilding))
-		return wrap("units", err)
+		if _, err := tx.ExecContext(ctx, `UPDATE units SET state = ? WHERE id = ? AND state = ?`,
+			string(model.UnitFailed), w.rowID, string(model.UnitBuilding)); err != nil {
+			return wrap("units", err)
+		}
+		// The temporary index lives on the writer connection, which outlives
+		// every unit, so a unit that never seals must still drop its own.
+		return dropUnitIndex(ctx, tx, w.rowID)
 	})
 }
 
@@ -1119,6 +1148,9 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 		}
 		if state != model.UnitBuilding {
 			return conflict("unit %s is %s and cannot be failed", w.build.Spec.ID, state)
+		}
+		if err := dropUnitIndex(ctx, tx, w.rowID); err != nil {
+			return err
 		}
 		return w.s.deleteUnit(ctx, tx, w.rowID)
 	})
@@ -1180,6 +1212,14 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		}
 		if docs != w.searchDocs {
 			return corrupt("unit %s has %d search document rows but the writer accounted for %d", w.build.Spec.ID, docs, w.searchDocs)
+		}
+		// The unit's packed lexical list is folded HERE, in the seal
+		// transaction: a sealed unit is immutable and reused by every
+		// generation that carries it, so the fold is paid once per unit
+		// version, in the parallel seal phase, instead of once per activation
+		// over the whole store (ADR-0007 Decision 1 as amended).
+		if err := buildUnitLexical(ctx, tx, w.rowID, w.carriedFrom); err != nil {
+			return err
 		}
 		if err := exec1(ctx, tx, conflict("unit %s is no longer building", w.build.Spec.ID),
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {

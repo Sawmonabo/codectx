@@ -157,14 +157,27 @@ func vocabularyTerms(t *testing.T, db *sql.DB) []string {
 	return out
 }
 
-// The build's instance scan must not build a temporary b-tree: it steps every
-// posting instance of the repository, and a sorter over that set is unbounded
-// memory at activation -- the defect ADR-0007 Decision 1 exists to avoid.
-func TestLexicalBuildScanUsesNoTempBTree(t *testing.T) {
+// The fold and the merge must not build a temporary b-tree. The fold steps
+// every posting instance of a unit and the merge every part of every visible
+// unit, and a sorter over either set is unbounded memory at index time -- the
+// defect ADR-0007 Decision 1 exists to avoid.
+func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 	_, _, _, dbPath := packedLexicalFixture(t)
-	plan := explain(t, openRawDB(t, dbPath), store.LexicalInstanceQuery())
-	t.Logf("instance scan plan:\n%s", plan)
-	if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
-		t.Fatalf("the build's instance scan builds a temporary b-tree over every posting instance:\n%s", plan)
+	db := openRawDB(t, dbPath)
+	if _, err := db.Exec(`CREATE VIRTUAL TABLE temp.unit_fts_1 USING fts5(name, qualified_name, signature, path, body, content='', tokenize='unicode61', detail='full')`); err != nil {
+		t.Fatalf("unit index: %v", err)
+	}
+	if _, err := db.Exec(`CREATE VIRTUAL TABLE temp.unit_vocab_1 USING fts5vocab(unit_fts_1, 'instance')`); err != nil {
+		t.Fatalf("unit vocabulary: %v", err)
+	}
+	for _, q := range []string{
+		store.UnitInstanceQuery("temp.unit_vocab_1"),
+		store.MergePartQuery(store.UnitLexicalPartsTable, "unit_id"),
+	} {
+		plan := explain(t, db, q)
+		t.Logf("%s\n%s", q, plan)
+		if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {
+			t.Fatalf("a lexical build scan builds a temporary b-tree:\n%s\n%s", q, plan)
+		}
 	}
 }
