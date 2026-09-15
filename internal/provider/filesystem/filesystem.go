@@ -13,6 +13,7 @@ package filesystem
 
 import (
 	"context"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -39,7 +40,10 @@ const (
 // the analysis configuration hash, so changing them re-keys every unit.
 type Options struct {
 	// MaxSearchFileBytes is the largest file admitted to search indexing.
-	MaxSearchFileBytes int64
+	// Unlimited (0) admits every file; a user-set value excludes the larger
+	// ones and each exclusion is reported on the search capability, naming
+	// the limit that excluded it.
+	MaxSearchFileBytes config.Limit
 }
 
 // Provider is the filesystem provider.
@@ -49,9 +53,6 @@ type Provider struct {
 
 // New validates the options and returns the provider.
 func New(opts Options) (*Provider, error) {
-	if opts.MaxSearchFileBytes <= 0 {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "filesystem provider needs a positive max_search_file_bytes; zero would mean unlimited"}
-	}
 	return &Provider{opts: opts}, nil
 }
 
@@ -86,7 +87,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 
 	// The head is read before any fact is emitted so the binary decision can
 	// travel on the file node; the same window then seeds the chunker.
-	admitted := fv.Size <= p.opts.MaxSearchFileBytes
+	admitted := !p.opts.MaxSearchFileBytes.Exceeded(fv.Size)
 	var ch *chunker
 	binary := false
 	if admitted {

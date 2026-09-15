@@ -429,18 +429,18 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		return nil, err
 	}
 
-	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes.Value()})
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: cfg.Workspace.MaxSearchFileBytes})
 	if err != nil {
 		return nil, err
 	}
-	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes.Value()})
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes})
 	if err != nil {
 		return nil, err
 	}
 	if s.ts, err = treesitter.New(treesitter.Options{
 		Languages:         cfg.Providers.TreeSitter.Languages,
 		MaxWorkers:        parserWorkers,
-		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes.Value(),
+		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
 		WorkerIdleTTL:     cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		WorkerMemoryBytes: parserWorkerReservationBytes,
 		Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},

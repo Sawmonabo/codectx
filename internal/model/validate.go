@@ -89,6 +89,26 @@ func TruncateDetail(value string) string {
 	return truncateUTF8(value, MaxDetailBytes)
 }
 
+// TruncateField bounds one indexed field value to its byte ceiling without
+// splitting a rune and reports the value's original length, so a caller can
+// flag the truncation on the fact it publishes. It is the one helper every
+// field ceiling goes through: a value that exceeds a storage bound is
+// shortened and flagged, never a reason to refuse the fact or fail the unit
+// that produced it, because a dropped unit answers nothing while a clipped
+// name still answers most questions about it.
+//
+// The second result is the ORIGINAL byte length. It is greater than
+// len(bounded) exactly when the value was cut, which is the condition a
+// caller records alongside the original length.
+//
+// This is index-time, permanent truncation of a stored field. It is a
+// different fact from a result page that was cut short by a limit and is
+// completed by following a cursor, and the two must never share a flag: a
+// caller that conflates them cannot answer whether it received everything.
+func TruncateField(value string, max int) (bounded string, originalLen int) {
+	return truncateUTF8(value, max), len(value)
+}
+
 // truncateForMessage keeps a rejected value out of an unbounded log line while
 // staying useful. It never returns a partial UTF-8 sequence.
 func truncateForMessage(s string) string {

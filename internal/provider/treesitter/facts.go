@@ -88,6 +88,23 @@ type declFact struct {
 	sig  string
 	doc  string
 	res  model.Resolution
+	// truncated names the fields this declaration's storage ceilings cut,
+	// with the original byte length of each. It is index-time truncation of
+	// a stored value and is published as its own attribute, never merged
+	// with a result page's transient truncation flag.
+	truncated map[string]int
+}
+
+// truncate bounds one of this declaration's fields and records the cut.
+func (d *declFact) truncate(field, value string, max int) string {
+	bounded, original := model.TruncateField(value, max)
+	if original > len(bounded) {
+		if d.truncated == nil {
+			d.truncated = map[string]int{}
+		}
+		d.truncated[field] = original
+	}
+	return bounded
 }
 
 // outputInvalid is the parent's verdict on a fact the worker sent that does
@@ -168,10 +185,13 @@ func (b *builder) validateDecls() error {
 		if d.Parent < -1 || d.Parent >= i {
 			return outputInvalid("declaration names a parent that does not precede it")
 		}
-		if d.Name == "" || len(d.Name) > model.MaxNameBytes || !utf8.ValidString(d.Name) ||
-			len(d.Qualified) > model.MaxQualifiedNameBytes || !utf8.ValidString(d.Qualified) ||
-			len(d.Impl) > model.MaxNameBytes {
-			return outputInvalid("declaration name is empty, over its bound or not UTF-8")
+		// Emptiness and encoding still refuse the fact: a missing name has
+		// nothing to store and truncating invalid UTF-8 does not make it
+		// valid. Length does not, because generated code clears these
+		// ceilings routinely and refusing there publishes nothing for the
+		// whole file. The over-long values are cut and flagged below.
+		if d.Name == "" || !utf8.ValidString(d.Name) || !utf8.ValidString(d.Qualified) {
+			return outputInvalid("declaration name is empty or not UTF-8")
 		}
 		if d.Qualified == "" {
 			d.Qualified = d.Name
@@ -197,6 +217,9 @@ func (b *builder) validateDecls() error {
 			return err
 		}
 		f := declFact{Decl: d, kind: kind, rng: rng, sig: collapse(string(b.src[d.Start:d.SigEnd]), model.MaxSignatureBytes)}
+		f.Name = f.truncate("name", d.Name, model.MaxNameBytes)
+		f.Qualified = f.truncate("qualified_name", d.Qualified, model.MaxQualifiedNameBytes)
+		f.Impl = f.truncate("receiver", d.Impl, model.MaxNameBytes)
 		if d.DocEnd > 0 {
 			if _, err := b.rangeOf(d.DocStart, d.DocEnd); err != nil {
 				return err
@@ -204,7 +227,7 @@ func (b *builder) validateDecls() error {
 			f.doc = cleanDoc(string(b.src[d.DocStart:d.DocEnd]))
 		}
 		b.decls = append(b.decls, f)
-		b.byName[d.Name] = append(b.byName[d.Name], i)
+		b.byName[f.Name] = append(b.byName[f.Name], i)
 	}
 	return nil
 }
@@ -236,7 +259,7 @@ func (b *builder) resolveDecls() error {
 	for i := range b.decls {
 		d := &b.decls[i]
 		res, err := b.resolve(model.NodeCandidate{
-			ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: d.Qualified, Kind: d.kind, Language: b.lang.Name,
+			ProviderID: lang.ProviderID, ScopeKey: b.scope, NativeKey: b.identityKey(d), Kind: d.kind, Language: b.lang.Name,
 			Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
 			FileID: b.fv.ID, ContentHash: b.fv.ContentHash, Range: d.rng,
 		})
@@ -257,6 +280,12 @@ func (b *builder) resolveDecls() error {
 		if d.Impl != "" {
 			meta["receiver"] = d.Impl
 		}
+		if len(d.truncated) > 0 {
+			// Index-time field truncation, reported on the fact itself so an
+			// answer built from it says which stored values were cut and how
+			// long they were. Distinct from result truncation by name.
+			meta["truncated_fields"] = d.truncated
+		}
 		b.putNode(res, d.rng, d.Qualified, meta)
 		b.ambiguous(res, d.rng)
 
@@ -269,7 +298,16 @@ func (b *builder) resolveDecls() error {
 		if d.Exported && d.Parent < 0 {
 			b.putRelation(b.module.Node.ID, model.RelExports, res.Node.ID, d.rng, d.Qualified, "")
 		}
-		b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		if _, cut := d.truncated["qualified_name"]; !cut {
+			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: d.Qualified, NodeID: res.Node.ID})
+		} else {
+			// The qualified name was cut to its storage ceiling, so it is no
+			// longer an identity: publishing it as an alias would claim that
+			// every declaration sharing the first MaxQualifiedNameBytes is
+			// the same symbol. It is omitted and counted, exactly as declKey
+			// omits an over-long key.
+			b.dropped++
+		}
 		if key := b.declKey(d); key != "" {
 			b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: b.scope, NativeKey: key, NodeID: res.Node.ID})
 		} else {
@@ -284,7 +322,7 @@ func (b *builder) resolveDecls() error {
 		if d.Parent < 0 {
 			pkg, over := b.packageScope()
 			switch {
-			case pkg != "":
+			case pkg != "" && d.truncated["qualified_name"] == 0:
 				b.aliases = append(b.aliases, model.NativeAlias{ScopeKey: pkg, NativeKey: d.Qualified, NodeID: res.Node.ID})
 			case over:
 				// The package alias scope did not fit and was omitted rather
@@ -298,6 +336,23 @@ func (b *builder) resolveDecls() error {
 		b.search = append(b.search, b.searchUnit(d))
 	}
 	return nil
+}
+
+// identityKey is the native key the declaration's node is resolved under.
+// The qualified name is that key while it fits: it is the identity every
+// other provider joins on. Once it has been cut to its storage ceiling it is
+// a prefix, not an identity, so the file-local declaration key stands in --
+// unique within this file and already the cross-provider key. Should that
+// not fit either, the cut qualified name is the last resort and the caller's
+// b.dropped count is what reports the weakened identity.
+func (b *builder) identityKey(d *declFact) string {
+	if _, cut := d.truncated["qualified_name"]; !cut {
+		return d.Qualified
+	}
+	if key := b.declKey(d); key != "" {
+		return key
+	}
+	return d.Qualified
 }
 
 // declKey is the cross-provider declaration key of the controller's ruling,
