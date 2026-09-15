@@ -48,11 +48,12 @@ type contextFixture struct {
 	Binding model.Binding
 	Now     func() time.Time
 	// Rels are the relations every engine this fixture builds through
-	// intCompiler walks. It is nil by default -- the scenario rows that
-	// predate it compile over an edgeless graph, and an edgeless graph is
-	// what they assert against -- and a row that needs a shaped scope sets
-	// it BEFORE it builds any compiler, so the two pipelines of a parity row
-	// walk the one graph rather than two.
+	// intCompiler walks AND the edges sealed into the generation, set by the
+	// rels hook of newContextFixture. It is nil by default -- the scenario
+	// rows that predate it compile over an edgeless graph, and an edgeless
+	// graph is what they assert against. A row never assigns it directly: the
+	// edges must be persisted before the generation activates, which only the
+	// builder can do.
 	Rels []model.Relation
 }
 
@@ -105,7 +106,22 @@ func fixtureNow() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 // newContextFixture opens an in-process store, publishes fixtureFiles as one
 // snapshot and activates a generation over it.
-func newContextFixture(t *testing.T) *contextFixture {
+//
+// rels, when supplied and non-nil, shapes the scope: it is called ONCE, after
+// every file's node is registered and BEFORE the generation activates, and the
+// edges it returns are both assigned to fx.Rels (the fake adjacency the graph
+// engine walks) and SEALED INTO THE GENERATION through the store's own
+// UnitWriter.PutRelations. Both halves matter and neither is optional: a
+// compile walks the graph to build its scope, then reads the relation kinds and
+// evidence precision of the routes it kept back through the pinned reader. A
+// fixture that only declared edges to the fake left the store edgeless, so the
+// edge scan matched nothing and every pass downstream of a relation kind was
+// asserted against a scope that carried none.
+//
+// It is a hook rather than a field because the generation is sealed here: the
+// store activates a generation out of staging, so a row cannot add a relation
+// to the fixture after this returns.
+func newContextFixture(t *testing.T, rels ...func(*contextFixture) []model.Relation) *contextFixture {
 	t.Helper()
 	ctx := stdcontext.Background()
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
@@ -158,8 +174,16 @@ func newContextFixture(t *testing.T) *contextFixture {
 	if err != nil {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
+	units := make([]model.UnitID, 0, len(fixtureFiles))
 	for i, f := range fixtureFiles {
-		fx.sealUnit(run, versions[i], f.symbol, f.kind)
+		units = append(units, fx.sealUnit(run, versions[i], f.symbol, f.kind))
+	}
+	// After every endpoint is a sealed node fact -- SealUnit refuses an edge
+	// whose endpoints are not visible through the unit's dependency closure --
+	// and before activation closes staging.
+	if len(rels) > 0 && rels[0] != nil {
+		fx.Rels = rels[0](fx)
+		fx.sealRelations(run, versions[1], units)
 	}
 	if fx.Binding, err = s.Activate(ctx, fx.Gen, 0, model.HealthFresh, fixtureCapabilities, "norm-v1"); err != nil {
 		t.Fatalf("Activate: %v", err)
@@ -205,8 +229,10 @@ func (f *contextFixture) putBlob(path, content string) model.FileVersion {
 
 // sealUnit publishes one file-scoped unit holding the file's single node, its
 // native alias and its lexical document, so Search.Resolve and Search.Search
-// have something to resolve and the generation has units to activate.
-func (f *contextFixture) sealUnit(run model.ProviderRunID, fv model.FileVersion, symbol string, kind model.NodeKind) {
+// have something to resolve and the generation has units to activate. It
+// returns the unit's identity, which the relations unit declares as a
+// dependency so its endpoints are visible through the closure seal checks.
+func (f *contextFixture) sealUnit(run model.ProviderRunID, fv model.FileVersion, symbol string, kind model.NodeKind) model.UnitID {
 	f.t.Helper()
 	in := model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash}
 	h := model.NewUnitInputHasher()
@@ -246,6 +272,55 @@ func (f *contextFixture) sealUnit(run model.ProviderRunID, fv model.FileVersion,
 	}
 	if err := f.Store.SealUnit(f.ctx, w); err != nil {
 		f.t.Fatalf("SealUnit(%s): %v", fv.Path, err)
+	}
+	return spec.ID
+}
+
+// sealRelations publishes fx.Rels as one further unit of the same generation,
+// so the relation kinds and the evidence precision a compile resolves through
+// the pinned reader are the SAME edges the graph engine walked. in names the
+// unit's input; any published file version does, since a relation-only unit is
+// not file scoped and the store keys the unit by its scope key. deps are the
+// file units holding the endpoints; SealUnit resolves endpoint visibility
+// through the dependency closure, so a relation unit that declared none would
+// be refused however many nodes the generation holds.
+//
+// One unit rather than one per edge: the unit is the transaction, and the read
+// side joins relation_facts to the generation's active units, not to a file.
+func (f *contextFixture) sealRelations(run model.ProviderRunID, anyFile model.FileVersion, deps []model.UnitID) {
+	f.t.Helper()
+	in := model.UnitInput{FileID: anyFile.ID, ContentHash: anyFile.ContentHash}
+	h := model.NewUnitInputHasher()
+	if err := h.Add(in); err != nil {
+		f.t.Fatalf("relations unit input hash: %v", err)
+	}
+	spec := model.UnitSpec{ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
+		ScopeKey: "codectx.test.relations", InputHash: h.Sum(), DependencyHash: model.DependencyHash(deps)}
+	spec.ID = model.NewUnitID(spec, fixtureConfigHash)
+	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: fixtureConfigHash, OriginRunID: run,
+		SourceBinding: model.SourceBindingVerified, Dependencies: deps}
+	w, err := f.Store.BeginUnit(f.ctx, f.Gen, build, func(yield func(model.UnitInput) error) error { return yield(in) })
+	if err != nil {
+		f.t.Fatalf("BeginUnit(relations): %v", err)
+	}
+	facts := make([]model.RelationFact, 0, len(f.Rels))
+	for _, r := range f.Rels {
+		// Evidence names the relation and nothing else: the table's subject is
+		// an XOR, and a relation's occurrence is not a node attribute. The
+		// precision class is the one every fixture fact carries, so the
+		// multiplier a route resolves is the fixture's single value rather than
+		// an accident of which edge was read first.
+		ev := model.Evidence{UnitID: w.UnitID(), ProviderID: fixtureProviderID,
+			ProviderVersion: fixtureProviderVersion, OriginRunID: run,
+			RelationID: r.ID, Precision: model.PrecisionSyntax}
+		ev.ID = model.NewEvidenceID(ev)
+		facts = append(facts, model.RelationFact{Relation: r, Evidence: []model.Evidence{ev}})
+	}
+	if err := w.PutRelations(f.ctx, facts); err != nil {
+		f.t.Fatalf("PutRelations(%d edges): %v", len(facts), err)
+	}
+	if err := f.Store.SealUnit(f.ctx, w); err != nil {
+		f.t.Fatalf("SealUnit(relations): %v", err)
 	}
 }
 
