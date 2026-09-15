@@ -469,6 +469,18 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Timeout:      cfg.Providers.SCIP.Timeout.Std(),
 		StallTimeout: cfg.Providers.SCIP.StallTimeout.Std(),
 		WorkDir:      scipWorkDir,
+		// MaxRecordBytes is deliberately absent: it is the wire reader's
+		// pre-allocation ceiling, product code rather than configuration, and
+		// taking it from an unlimited resources key would silently clamp it.
+		Limits: scip.Limits{
+			MaxIndexBytes:             cfg.Providers.SCIP.MaxIndexBytes,
+			MaxDocuments:              cfg.Providers.SCIP.MaxDocuments,
+			MaxOccurrencesPerDocument: cfg.Providers.SCIP.MaxOccurrencesPerDocument,
+			MaxSpoolBytes:             cfg.Providers.SCIP.MaxSpoolBytes,
+			MaxSourceFileBytes:        cfg.Providers.SCIP.MaxSourceFileBytes,
+			MaxMaterializeBytes:       cfg.Providers.SCIP.MaxMaterializeBytes,
+			MaxManifestBytes:          cfg.Providers.SCIP.MaxManifestBytes,
+		},
 	})
 	if err != nil {
 		return nil, err

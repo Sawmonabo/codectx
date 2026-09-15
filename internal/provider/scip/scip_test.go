@@ -821,3 +821,93 @@ func TestOverLimitFieldsAreDroppedAndCounted(t *testing.T) {
 		t.Fatalf("a run that dropped records reported %+v; it must be partial under a named reason", c)
 	}
 }
+
+// newBoundedProvider is newProvider with the user-set import bounds under test.
+func newBoundedProvider(t *testing.T, importPath string, limits scip.Limits) *scip.Provider {
+	t.Helper()
+	p, err := scip.New(context.Background(), scip.Options{Import: importPath, WorkDir: t.TempDir(), Limits: limits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestUserSetImportBoundsAreReportedNotRefused protects the row-28 contract
+// for the SCIP provider: the figures a user may now set under providers.scip.*
+// are reporting thresholds, not refusals. Each of the three asserted here used
+// to fail the whole unit the moment it was crossed, with no key to raise, so a
+// repository larger than a built-in constant published nothing at all.
+//
+// The bounds are set to 1 so every one of them is crossed, and the run must
+// still succeed, still publish the facts of BOTH documents, and name each
+// crossed key with the figure seen -- reporting the pass is the only thing
+// that changes when a threshold nothing enforces is exceeded.
+func TestUserSetImportBoundsAreReportedNotRefused(t *testing.T) {
+	files := fixture(t)
+	files["bounds.scip"] = string(miniIndex("scip-fixture", "0.1.0",
+		documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8)),
+		documentRecord("pkg/a.go", "go", 1, occurrenceRecord(symBar, 0, 2, 5, 8))))
+	inputs := append([]string{"bounds.scip"}, sourcePaths...)
+	p := newBoundedProvider(t, "bounds.scip", scip.Limits{MaxIndexBytes: 1, MaxDocuments: 1, MaxSpoolBytes: 1})
+	got, rep := importDelta(t, providertest.New(t, files), p, scip.ImportScope("bounds.scip"), inputs, nil)
+
+	if rep.Result.State != model.RunSucceeded {
+		t.Fatalf("an import over three user-set bounds failed the unit: state=%s", rep.Result.State)
+	}
+	if len(got.nodes) == 0 {
+		t.Fatal("an import over a user-set bound published nothing; a threshold must not cut the facts")
+	}
+	if n := rep.Manifest.Len(); n != 2 {
+		t.Fatalf("the import admitted %d documents, want 2: max_documents must not drop a document", n)
+	}
+	c := rep.Result.Capabilities[0]
+	crossed := c.Details["resource_limits_exceeded"]
+	for _, key := range []string{"max_documents=2/1", "max_index_bytes=", "max_spool_bytes="} {
+		if !strings.Contains(crossed, key) {
+			t.Fatalf("resource_limits_exceeded = %q, want it to name %q: a crossed bound the operator set must be reported", crossed, key)
+		}
+	}
+	if c.State != model.CapabilityPartial || c.DiagnosticCode == "" {
+		t.Fatalf("a run that crossed a user-set bound reported %+v; it must be partial under a named reason", c)
+	}
+}
+
+// TestOverLimitSignatureIsTruncatedNotDropped protects F26: the two producers
+// of a signature must answer the same way. The structural provider truncates a
+// long signature to its ceiling and flags the cut; this one used to discard it
+// whole, so the same symbol carried a usable prefix from one and nothing at
+// all from the other.
+func TestOverLimitSignatureIsTruncatedNotDropped(t *testing.T) {
+	files := fixture(t)
+	long := strings.Repeat("s", model.MaxSignatureBytes+64)
+	sig := appendBytes(nil, 5, []byte(long))
+	symbolRecord := appendBytes(appendBytes(nil, 1, []byte(symBar)), 7, sig)
+	doc := documentRecord("pkg/d.go", "go", 1, occurrenceRecord(symBar, 1, 2, 5, 8))
+	files["sig.scip"] = string(miniIndex("scip-fixture", "0.1.0", appendBytes(doc, 3, symbolRecord)))
+	inputs := append([]string{"sig.scip"}, sourcePaths...)
+	got, _ := importDelta(t, providertest.New(t, files), newProvider(t, "sig.scip"),
+		scip.ImportScope("sig.scip"), inputs, nil)
+
+	var found bool
+	for _, n := range got.nodes {
+		if n.Node.Signature == "" {
+			continue
+		}
+		found = true
+		if len(n.Node.Signature) > model.MaxSignatureBytes {
+			t.Fatalf("the stored signature is %d bytes, over the %d-byte ceiling", len(n.Node.Signature), model.MaxSignatureBytes)
+		}
+		var meta struct {
+			Truncated map[string]int64 `json:"truncated_fields"`
+		}
+		if err := json.Unmarshal(n.Node.Metadata, &meta); err != nil {
+			t.Fatalf("node metadata: %v", err)
+		}
+		if got := meta.Truncated["signature"]; got != int64(len(long)) {
+			t.Fatalf("truncated_fields[signature] = %d, want %d: a cut signature must say how long it was", got, len(long))
+		}
+	}
+	if !found {
+		t.Fatal("an over-limit signature was dropped whole; it must be truncated to its ceiling and flagged")
+	}
+}

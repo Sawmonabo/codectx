@@ -27,7 +27,6 @@ type scratch struct {
 	db    *sql.DB
 	tx    *sql.Tx
 	bytes int64
-	max   int64
 }
 
 const scratchSchema = `
@@ -37,6 +36,7 @@ CREATE TABLE occ(doc INTEGER NOT NULL, seq INTEGER NOT NULL, symbol TEXT NOT NUL
 	r0 INTEGER NOT NULL, r1 INTEGER NOT NULL, r2 INTEGER NOT NULL, r3 INTEGER NOT NULL,
 	e0 INTEGER, e1 INTEGER, e2 INTEGER, e3 INTEGER, PRIMARY KEY(doc, seq)) WITHOUT ROWID;
 CREATE TABLE sym(key TEXT PRIMARY KEY, symbol TEXT NOT NULL, kind INTEGER NOT NULL, name TEXT NOT NULL, sig TEXT NOT NULL,
+	sigcut INTEGER NOT NULL DEFAULT 0,
 	node TEXT NOT NULL DEFAULT '', def_doc INTEGER NOT NULL DEFAULT -1, def_start INTEGER NOT NULL DEFAULT 0, def_end INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
 CREATE TABLE rel(key TEXT NOT NULL, target TEXT NOT NULL, flags INTEGER NOT NULL, PRIMARY KEY(key, target)) WITHOUT ROWID;
 CREATE TABLE defs(doc INTEGER NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL, node TEXT NOT NULL, PRIMARY KEY(doc, start, end, node)) WITHOUT ROWID;
@@ -47,8 +47,8 @@ CREATE TABLE manifest(path TEXT PRIMARY KEY, hash TEXT NOT NULL) WITHOUT ROWID;
 `
 
 // openScratch creates the scratch database in a fresh private directory
-// under parent, bounded at maxBytes of spooled records.
-func openScratch(ctx context.Context, parent string, maxBytes int64) (*scratch, error) {
+// under parent. What it spools is counted, not capped: see scratch.charge.
+func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	if !filepath.IsAbs(parent) {
 		return nil, invalid("the scip work directory must be an absolute private path")
 	}
@@ -59,7 +59,7 @@ func openScratch(ctx context.Context, parent string, maxBytes int64) (*scratch, 
 	if err != nil {
 		return nil, internal("scip scratch directory: " + err.Error())
 	}
-	s := &scratch{dir: dir, max: maxBytes}
+	s := &scratch{dir: dir}
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "mmap_size(0)", "cache_size(-4096)"} {
 		q.Add("_pragma", p)
@@ -108,11 +108,13 @@ func (s *scratch) close() error {
 	return nil
 }
 
-// charge accounts n spooled bytes against the bound before a row is written.
+// charge accounts n spooled bytes. The spool is an on-disk database under the
+// shared temporary-bytes budget, so the running total is a figure the import
+// reports against providers.scip.max_spool_bytes when the operator set one --
+// never a reason to stop spooling and fail a unit halfway through an index.
+// The error result is kept so callers read like every other scratch write.
 func (s *scratch) charge(n int64) error {
-	if s.bytes += n; s.bytes > s.max {
-		return overLimit("spool bytes", s.bytes, s.max)
-	}
+	s.bytes += n
 	return nil
 }
 

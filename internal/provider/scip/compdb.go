@@ -7,17 +7,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // compileCommandsName is the compilation database the C/C++ profile reads.
 const compileCommandsName = "compile_commands.json"
-
-// maxCompileCommandEntries bounds the database the normalizer will rewrite.
-// It is an explicit finite bound, not a guess at what is reasonable: a
-// database larger than this is not normalized and the run proceeds against
-// what the snapshot holds.
-const maxCompileCommandEntries = 200_000
 
 // normalizeCompileCommands rewrites the `directory` field of every entry of
 // the compilation database **inside the private materialization** so it names
@@ -35,13 +30,26 @@ const maxCompileCommandEntries = 200_000
 // inside the materialization the provider created. It never invents a
 // directory: entries are moved by their common prefix, so a database whose
 // entries live in several subdirectories keeps that shape. A database that is
-// absent, unreadable, too large, not the expected JSON array, or whose entries
-// are already relative is left exactly as it is — the run then fails or
+// absent, unreadable, not the expected JSON array, or whose entries are
+// already relative is left exactly as it is — the run then fails or
 // succeeds on the tool's own terms rather than on a guess made here.
-func normalizeCompileCommands(matRoot string, maxBytes int64) error {
+//
+// There is no bound on the number of entries. The file is parsed whole, so
+// what bounds the work is bytes, and that is providers.scip.max_manifest_bytes
+// — unlimited by default, so no repository's database is skipped unless an
+// operator asks for it, and a database the operator's own bound excludes is
+// REPORTED rather than silently left unnormalized. That distinction is the
+// whole cost of the skip: an un-normalized database makes the indexer's worker
+// crash on paths that do not exist in the private copy while its driver waits,
+// so the unit burns its whole timeout for nothing.
+func normalizeCompileCommands(matRoot string, maxBytes config.Limit, seen *limitSeen) error {
 	path := filepath.Join(matRoot, compileCommandsName)
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > maxBytes {
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	if maxBytes.Exceeded(info.Size()) {
+		seen.note(limitManifestBytes, info.Size())
 		return nil
 	}
 	data, err := os.ReadFile(path)
@@ -49,7 +57,7 @@ func normalizeCompileCommands(matRoot string, maxBytes int64) error {
 		return nil
 	}
 	var entries []map[string]json.RawMessage
-	if err := json.Unmarshal(data, &entries); err != nil || len(entries) == 0 || len(entries) > maxCompileCommandEntries {
+	if err := json.Unmarshal(data, &entries); err != nil || len(entries) == 0 {
 		return nil
 	}
 	dirs := make([]string, len(entries))
