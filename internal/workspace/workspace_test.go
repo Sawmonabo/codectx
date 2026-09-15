@@ -323,3 +323,40 @@ func TestLongPathSkipsOnePathNotTheWalk(t *testing.T) {
 		t.Fatalf("reports = %q, want a %s report: a skipped path that nothing reports is a silent loss", reports, SkipPathTooLong)
 	}
 }
+
+// TestDiscoveryAscendsPastAnyNestingDepth protects the discovery invariant a
+// fixed ascent cap silently broke: a workspace nested deeper than the cap was
+// answered with itself as the root and HasGit false -- a wrong answer, not a
+// refused one, so every command that traverses it captured the wrong tree. The
+// ascent needs no cap because filepath.Dir is lexical and strictly shortens the
+// path, so the parent == dir test is the only termination the loop can need.
+func TestDiscoveryAscendsPastAnyNestingDepth(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "repo")
+	mustWrite(t, filepath.Join(root, ".git", "config"), "[core]\n")
+
+	const depth = 300 // past the 256-component cap this replaces.
+	deepest := root
+	func() {
+		t.Chdir(root)
+		for range depth {
+			if err := os.Mkdir("d", 0o700); err != nil {
+				t.Fatalf("mkdir at depth: %v", err)
+			}
+			if err := os.Chdir("d"); err != nil {
+				t.Fatalf("chdir: %v", err)
+			}
+			deepest = filepath.Join(deepest, "d")
+		}
+	}()
+
+	opened, err := Discover(deepest)
+	if err != nil {
+		t.Fatalf("Discover %d components below the root: %v", depth, err)
+	}
+	defer opened.Close()
+	if opened.Path != root || !opened.HasGit {
+		t.Fatalf("Discover(%d deep) = %q hasGit=%v, want the repository root %q with its Git directory",
+			depth, opened.Path, opened.HasGit, root)
+	}
+}

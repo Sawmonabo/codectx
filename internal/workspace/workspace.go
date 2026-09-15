@@ -27,10 +27,6 @@ import (
 // ordinary clone and a file in a worktree or submodule.
 const gitDirName = ".git"
 
-// maxDiscoveryDepth bounds the walk toward the filesystem root so a pathological
-// mount cannot turn discovery into an unbounded loop.
-const maxDiscoveryDepth = 256
-
 // Root is an opened workspace: an absolute path plus the OS-confined handle
 // every read goes through. It is safe for concurrent use.
 type Root struct {
@@ -76,7 +72,13 @@ func Discover(start string) (Root, error) {
 
 	rootPath, gitPath := abs, ""
 	dir := abs
-	for range maxDiscoveryDepth {
+	// The ascent is bounded by the path itself and needs no depth cap: every
+	// step is a lexical filepath.Dir, which strictly shortens the path, and the
+	// parent == dir test below is the filesystem root. A fixed cap here would
+	// not guard against anything -- the loop cannot diverge -- and it would
+	// silently answer "no repository" for a workspace nested deeper than the
+	// cap, which is a wrong answer rather than a refused one.
+	for {
 		candidate := filepath.Join(dir, gitDirName)
 		if _, err := os.Lstat(candidate); err == nil {
 			rootPath, gitPath = dir, candidate
