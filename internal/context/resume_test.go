@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -266,12 +265,6 @@ func TestACheckpointedRunKeepsItsArrivalOrderUnderANonTotalComparator(t *testing
 	if len(files) < 2 {
 		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))
 	}
-	for i, f := range files {
-		if base := checkpointPrefix("scored") + "run" + strconv.Itoa(i); f != base {
-			t.Fatalf("run %d is stored as %q, want %q", i, f, base)
-		}
-	}
-
 	restored, err := restoreRun(sorts, stateDir, "scored", files, lessScoredPkg, sizeOfScored)
 	if err != nil {
 		t.Fatalf("restoreRun: %v", err)

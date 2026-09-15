@@ -282,7 +282,10 @@ configured default that resolves to zero or less is rejected rather than
 disabling the bound. A budget that cannot hold the required scope is
 `CTX_MINIMUM_BUDGET` carrying the floor (`min_bytes`, `min_estimated_tokens`,
 `min_slices`, `min_files`, `missing`): required files are never demoted, split
-into misleading independently complete slices, or dropped to fit.
+into misleading independently complete slices, or dropped to fit. `missing`
+names the required paths that do not fit and ends with `… and N more` when
+there are more of them than the detail field carries, so the count is always
+whole even where the list is not.
 
 `resources.max_page_items` bounds every batch the compile issues — seed
 resolution, file hydration, the edge read behind per-edge precision and the
