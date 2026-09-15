@@ -585,7 +585,10 @@ func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
 		return traversalCursor{}, nil, cursorInvalid(
 			"cursor was issued for a different query: the direction, relation kinds, seeds, depth and page limit that minted it must be repeated on every page")
 	}
-	binding := e.adjacency.Binding()
+	binding, err := e.walkBinding()
+	if err != nil {
+		return traversalCursor{}, nil, err
+	}
 	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
 		return traversalCursor{}, nil, cursorInvalid("cursor pins a generation that is no longer the one being read")
 	}
@@ -780,7 +783,10 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// invocation's spool read would be refused and the continuation would be
 	// unusable. The lease expires with the cursor, so nothing minted here pins
 	// a generation for longer than the token lives.
-	binding := e.adjacency.Binding()
+	binding, err := e.walkBinding()
+	if err != nil {
+		return "", err
+	}
 	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
 	if err != nil {
 		return "", err
@@ -902,6 +908,23 @@ func (e *Engine) releaseSpool(sp *pagination.Spool, cause error) error {
 	_ = sp.Close()
 	_ = e.spools.Release(sp.ID())
 	return cause
+}
+
+// walkBinding is the generation a traversal cursor is fenced to, and it is the
+// READER's, not the adjacency port's. A v8 payload names surrogates -- a scan
+// position and a retained directory whose two bitsets are indexed by node and
+// relation ref -- and every one of them was minted by the reader. Fencing on
+// the other port would leave the one hole the fence exists to close: two ports
+// pinned to different generations, a token that verifies, and an answer about
+// whichever nodes those refs happen to name in the generation now being read.
+//
+// Minting and verifying both go through here, so the two can never disagree.
+func (e *Engine) walkBinding() (model.Binding, error) {
+	reader, err := e.consumerReader()
+	if err != nil {
+		return model.Binding{}, err
+	}
+	return reader.Binding(), nil
 }
 
 // cursorInvalid is the one rejection this file produces. Every tampered,
