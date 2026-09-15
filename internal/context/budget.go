@@ -46,7 +46,7 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		// context.max_slices carries no Default prefix but is the same kind of
 		// setting: the value a zero budget.max_slices resolves to.
 		MaxSlices:        pick(b.MaxSlices, cfg.MaxSlices),
-		MaxManifestBytes: config.Limit(pick64(b.MaxManifestBytes, cfg.MaxManifestBytes.Value())),
+		MaxManifestBytes: resolveManifestBytes(b.MaxManifestBytes, cfg.MaxManifestBytes),
 	}
 	for _, f := range []struct {
 		key   string
@@ -62,6 +62,21 @@ func resolveBudget(b model.Budget, cfg config.Context) (resolvedBudget, error) {
 		}
 	}
 	return out, nil
+}
+
+// resolveManifestBytes resolves the one budget field a request may raise to
+// unlimited. Zero inherits the deployment value (which is itself unlimited by
+// default); model.BudgetUnlimited is the caller saying it can hold any manifest,
+// and it wins over a finite deployment default because this is a caller budget,
+// not a ceiling on what a caller with a larger window may ask for.
+func resolveManifestBytes(requested int64, configured config.Limit) config.Limit {
+	if requested == model.BudgetUnlimited {
+		return config.Unlimited
+	}
+	if requested > 0 {
+		return config.Limit(requested)
+	}
+	return configured
 }
 
 func pick64(requested, fallback int64) int64 {
