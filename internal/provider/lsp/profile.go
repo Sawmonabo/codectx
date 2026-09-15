@@ -96,11 +96,14 @@ var definitions = map[string]Definition{
 		RootMarkers:       []string{"Cargo.toml"},
 		MemoryBudgetBytes: serverMemoryLarge, DiskBudgetBytes: serverDiskLarge, Timeout: serverLifetime,
 	},
-	"pyright": {
-		Name: "pyright", Languages: []string{"python"},
-		Args:              []string{"--stdio"},
+	// The python server is a native static binary started with its server
+	// subcommand, so it runs as itself like gopls, clangd and rust-analyzer
+	// rather than under the managed Node runtime (ADR-0006).
+	"ty": {
+		Name: "ty", Languages: []string{"python"},
+		Args:              []string{"server"},
 		EnvAllowlist:      []string{"PATH", "HOME"},
-		RootMarkers:       []string{"pyproject.toml", "pyrightconfig.json", "setup.py", "requirements.txt"},
+		RootMarkers:       []string{"pyproject.toml", "ty.toml", "setup.py", "requirements.txt"},
 		MemoryBudgetBytes: serverMemoryBudget, DiskBudgetBytes: serverDiskBudget, Timeout: serverLifetime,
 	},
 	"typescript-language-server": {

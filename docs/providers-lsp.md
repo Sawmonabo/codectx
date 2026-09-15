@@ -78,13 +78,13 @@ a host `JAVA_HOME` can never shadow the managed JDK.
 |---|---|---|---|---|
 | `gopls` | go | `serve` | `PATH HOME GOPATH GOCACHE GOMODCACHE GOFLAGS GOPROXY GOPRIVATE` | `go.mod`, `go.work` |
 | `rust-analyzer` | rust | | `PATH HOME CARGO_HOME RUSTUP_HOME` | `Cargo.toml` |
-| `pyright` | python | `--stdio` | `PATH HOME` | `pyproject.toml`, `pyrightconfig.json`, `setup.py`, `requirements.txt` |
+| `ty` | python | `server` | `PATH HOME` | `pyproject.toml`, `ty.toml`, `setup.py`, `requirements.txt` |
 | `typescript-language-server` | typescript, tsx, javascript | `--stdio` | `PATH HOME` | `tsconfig.json`, `jsconfig.json`, `package.json` |
 | `clangd` | c, cpp | | `PATH HOME` | `compile_commands.json`, `compile_flags.txt`, `.clangd`, `CMakeLists.txt` |
 | `jdtls` | java | `-configuration ${work_dir}/config -data ${work_dir}/data` | `PATH HOME` | `pom.xml`, `build.gradle`, `build.gradle.kts` |
 
-The launcher itself comes from the lock: `gopls`, `clangd` and `rust-analyzer`
-run as themselves; `pyright` and `typescript-language-server` run as
+The launcher itself comes from the lock: `gopls`, `clangd`, `rust-analyzer` and
+`ty` run as themselves; `typescript-language-server` runs as
 `<managed node> <pinned entry>`; `jdtls` runs as
 `<managed jdk>/bin/java -jar <pinned launcher jar>` with `JAVA_HOME` set.
 
@@ -130,17 +130,39 @@ binding that validates, advertised its capabilities and shut down cleanly:
 | Server | Reported version | Bound `ProviderVersion` | Capabilities |
 |---|---|---|---|
 | `gopls` | `v0.23.0` | `v0.23.0` | all seven |
-| `rust-analyzer` | `0.3.3016-standalone` | same | all seven |
+| `rust-analyzer` | `0.3.3049-standalone` | same | all seven |
 | `clangd` | `clangd version 22.1.6 …` | same | all seven |
-| `pyright` | **none** | `1.1.414` (pinned) | all but implementations |
+| `ty` | `0.0.81` | same | all seven |
 | `typescript-language-server` | **none** | `6.0.0` (pinned) | all seven |
 | `jdtls` | `1.61.0-SNAPSHOT` | same | all seven |
 
-`pyright` and `typescript-language-server` answer `initialize` with no
-`serverInfo` object at all (measured, both through the product and with a raw
-`initialize` outside it). `OverlayBinding.Validate` requires a non-empty
-`ProviderVersion`, so the overlay used to fail for python, typescript, tsx and
-javascript with `CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
+**The python row was re-measured for the swap.** The python server is the
+native checker [ADR-0006](adr/ADR-0006-language-servers.md) chose, and the
+row above was re-run against `~/repos/m32rimm` (17 488 `.py`) for
+`AimProductRequests`, on a cold session with no settle window — the only kind
+the overlay has. All seven requests were answered; `serverInfo` reported
+`ty 0.0.81` and the negotiated `positionEncoding` was `utf-8`, so the bound
+`ProviderVersion` is the server's own report and both feed the overlay's input
+digest; `references` returned **136 locations in 0.217 s** at a server peak RSS
+of **168.7 MB** (`VmHWM`), matching the measurement the decision was taken on.
+Every one of the 136 is a real occurrence of the identifier: none is a string
+or comment match. The server it replaced, driven over the same repository with
+the same client — including the array-shaped `workspace/configuration` answer
+this client sends — returned **2** locations cold and still **2** after settle
+windows of 15, 40 and 60 seconds, at 265–267 MB, and never advertised
+`implementation`. The two-result disagreement the decision record asked to
+adjudicate (138 versus 136) therefore did not reproduce: the old server never
+reached its settled count here, so there is no second location set to diff
+against. What did reproduce, more strongly than recorded, is the completeness
+gap that decided the swap.
+
+`typescript-language-server` answers `initialize` with no `serverInfo` object at
+all (measured, both through the product and with a raw `initialize` outside it),
+and since the python row moved to a native binary that reports one it is the
+only pinned server that does. `OverlayBinding.Validate` requires a non-empty
+`ProviderVersion`, so the overlay used to fail for typescript, tsx, javascript
+and, before the swap, python, with
+`CTX_ARGUMENT_INVALID: overlay.provider_version is required`.
 The label now falls back to the version of the payload the lock pinned, which
 is never empty and is the honest identity of a server that declines to name
 itself; the **reported** string keeps feeding the input digest unchanged, so a
