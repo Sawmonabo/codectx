@@ -575,16 +575,46 @@ func (s *Service) checkTemporary(ctx context.Context) model.DoctorCheck {
 		Detail: bytesPhrase(int64(*report.TempBytes)) + " of temporary state, against a configured ceiling of " + ceiling}
 }
 
-// checkToolchain reports one check per lock entry, named by the entry. A tool
-// the lock names for another platform is unavailable, not a failure: that is
-// the honest answer on a host the payload was never published for.
+// checkToolchain reports the lock entries this repository actually needs and
+// cannot use. Two filters decide the rows, and both exist so the operator sees
+// only work they must do:
+//
+//   - an entry the repository does not select is skipped entirely -- a Go and
+//     Python repository is not told to install a C++ indexer it will never run;
+//   - a selected entry that is installed (or replaced by a user override) is
+//     skipped too, because there is nothing to act on.
+//
+// A selected entry that is NOT usable always produces a row: `available` warns
+// with the install remediation, `corrupt` fails, and a tool the lock names for
+// another platform is unavailable rather than a failure -- that is the honest
+// answer on a host the payload was never published for. Corrupt is deliberately
+// not swallowed by the installed filter: a damaged payload is installed, and
+// doctor is the only place it is reported.
+//
+// A selection that cannot be computed (an unreadable repository root) is one
+// failing check of its own, never silence: dropping every row on that path
+// would report a healthy toolchain for a workspace nobody can read.
 func (s *Service) checkToolchain(ctx context.Context) []model.DoctorCheck {
 	statuses, err := s.opts.Toolchain.Statuses(ctx)
 	if err != nil {
 		return []model.DoctorCheck{failure(checkToolchainPrefix+"status", err)}
 	}
+	names, err := s.opts.Toolchain.Selected(ctx, s.opts.Root)
+	if err != nil {
+		return []model.DoctorCheck{failure(checkToolchainPrefix+"selection", err)}
+	}
+	selected := make(map[string]bool, len(names))
+	for _, name := range names {
+		selected[name] = true
+	}
 	out := make([]model.DoctorCheck, 0, len(statuses))
 	for _, st := range statuses {
+		if !selected[st.Name] {
+			continue
+		}
+		if st.State == toolchain.StateInstalled || st.State == toolchain.StateOverride {
+			continue
+		}
 		c := model.DoctorCheck{Name: checkToolchainPrefix + st.Name, State: model.CheckPass,
 			Detail: st.Name + " " + st.Version + " is " + string(st.State)}
 		switch st.State {
