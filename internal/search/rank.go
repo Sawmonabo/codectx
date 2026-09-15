@@ -16,9 +16,9 @@ import (
 
 // ranked is one candidate in the external sort's record: the Section 14.2 sort
 // tuple, the rowid that hydrates it, and the folded occurrence count. Nothing
-// else -- carrying name/qualified name/signature on every candidate would size
-// the sort's run buffer by the widest symbol in the corpus, and
-// SearchDocuments exists to hydrate one chunk instead. Ordering compares only
+// else -- carrying name/qualified name/signature on the ORDERING tuple would
+// size every comparison by the widest symbol in the corpus; the servable facts
+// ride alongside on scored instead. Ordering compares only
 // integers and exact strings; no float reaches a comparison (digest §4).
 type ranked struct {
 	Tier        model.SearchTier

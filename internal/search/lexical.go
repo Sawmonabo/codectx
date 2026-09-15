@@ -90,15 +90,20 @@ func (t lexicalTerm) phrase() bool { return len(t.tokens) > 1 }
 // quoted string, so one spelling serves both.
 func (t lexicalTerm) key() string { return strings.Join(t.tokens, " ") }
 
-// lexicalHit is one scored lexical candidate. It carries only what the ranker
-// needs: name, path and kind arrive later through SearchDocuments, which is
-// what keeps the bounded heap small. Occurrences is the number of matched term
-// instances in this document, folded across query terms and indexed columns —
-// L4 sums it when deduplication folds several documents of one node.
+// lexicalHit is one scored lexical candidate. It carries the document the
+// score was computed from: the tier already reads every column of that row to
+// get TokenCount, so handing the same row on costs nothing and spares the
+// consumer a second SearchDocuments round trip over the identical rowid page
+// (QPERF-4 §5). Doc is carried BY VALUE, not as a pointer into the tier's
+// per-page slice, so an emit that outlives the page cannot alias a reused row.
+// Occurrences is the number of matched term instances in this document, folded
+// across query terms and indexed columns — L4 sums it when deduplication folds
+// several documents of one node.
 type lexicalHit struct {
 	RowID       int64
 	ScoreMicros int64
 	Occurrences int64
+	Doc         sqlite.SearchDocument
 }
 
 // lexicalOutcome reports a lower-bound answer. QueryMeta.Validate rejects a
@@ -206,23 +211,18 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			return out, nil
 		}
 		after = rowids[len(rowids)-1]
+		// One read per rowid page, carrying everything both consumers need:
+		// TokenCount for the score here, path/kind/name/identity for the ranker
+		// downstream. SearchDocuments answers in the requested order and omits
+		// rowids the generation no longer makes visible, so walking docs is the
+		// rowid walk minus exactly the rows that had no document length to score
+		// against -- which is what the dropped lengths lookup used to skip.
 		docs, err := src.SearchDocuments(ctx, rowids)
 		if err != nil {
 			return out, err
 		}
-		lengths := make(map[int64]int64, len(docs))
 		for _, d := range docs {
-			lengths[d.RowID] = d.TokenCount
-		}
-		for _, rowid := range rowids {
-			dl, ok := lengths[rowid]
-			if !ok {
-				// SearchDocuments omits rowids that are no longer visible;
-				// without dl there is no defined score, so the candidate is
-				// dropped rather than scored against a guessed length.
-				continue
-			}
-			score, occ, lower, err := l.score(ctx, streams, idfs, rowid, dl, avgdl)
+			score, occ, lower, err := l.score(ctx, streams, idfs, d.RowID, d.TokenCount, avgdl)
 			if err != nil {
 				return out, err
 			}
@@ -232,7 +232,7 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			if occ == 0 {
 				continue
 			}
-			if err := emit(lexicalHit{RowID: rowid, ScoreMicros: quantizeScore(score), Occurrences: occ}); err != nil {
+			if err := emit(lexicalHit{RowID: d.RowID, ScoreMicros: quantizeScore(score), Occurrences: occ, Doc: d}); err != nil {
 				return out, err
 			}
 		}
