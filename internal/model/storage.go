@@ -187,9 +187,13 @@ func (b UnitBuild) Validate() error {
 	if !b.SourceBinding.Valid() {
 		return invalid("unit_build.source_binding %q is not a known source binding", truncateForMessage(string(b.SourceBinding)))
 	}
-	if err := boundCount("unit_build.dependencies", len(b.Dependencies), MaxDependenciesPerUnit); err != nil {
-		return err
-	}
+	// A unit's dependency list is NOT bounded here. MaxDependenciesPerUnit was a
+	// refusal: a unit that legitimately depends on more units than the constant
+	// names -- an aggregate target in a monorepo -- could not be declared at
+	// all, which is a scale refusal, not a validity check. The list's identity
+	// rules below are what a dependency set must satisfy; its length is not one
+	// of them. The constant survives as the page size for reading a unit's
+	// dependencies back (internal/index/plan), never as a reason to fail a unit.
 	seen := make(map[UnitID]bool, len(b.Dependencies))
 	for i, d := range b.Dependencies {
 		if err := requireID(indexed("unit_build.dependencies", i), string(d)); err != nil {

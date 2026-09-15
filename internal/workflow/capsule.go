@@ -351,17 +351,29 @@ func (s *Service) currentObservations(ctx context.Context, rec sqlite.SessionRec
 	return out, nil
 }
 
-// checkCapsuleBytes enforces context.max_capsule_bytes against the serialized
-// record, the same measure and the same rejection the store applies, so an
-// over-budget capsule fails before the write instead of at it.
+// checkCapsuleBytes applies context.max_capsule_bytes as a CALLER BUDGET
+// against the serialized record, so an over-budget capsule is reported before
+// the write instead of at it.
+//
+// The key is unlimited by default: a capsule is never refused for being the
+// capsule of a large repository. A caller that set a ceiling -- because it must
+// fit the record in a window -- is told the ceiling it set and the size the
+// capsule reached, so raising it is a decision with both numbers in hand rather
+// than a retry against an unnamed bound.
 func (s *Service) checkCapsuleBytes(c model.Capsule) error {
 	payload, err := json.Marshal(c)
 	if err != nil {
 		return typedErrf(model.CodeInternal, "the capsule could not be serialized: %v", err)
 	}
-	if int64(len(payload)) > s.limits.MaxCapsuleBytes {
-		return (&model.Error{Code: model.CodeResourceLimit, Message: "capsule exceeds the stored JSON bound"}).
-			WithRemediation("export the capsule paginated; raise context.max_capsule_bytes only with sufficient reservations")
+	if s.limits.MaxCapsuleBytes.Exceeded(int64(len(payload))) {
+		return (&model.Error{Code: model.CodeResourceLimit,
+			Message: "capsule exceeds the caller's context.max_capsule_bytes budget",
+			Details: map[string]string{
+				"limit":         "context.max_capsule_bytes",
+				"limit_value":   s.limits.MaxCapsuleBytes.String(),
+				"capsule_bytes": strconv.Itoa(len(payload)),
+			}}).
+			WithRemediation("page the capsule through its six views, or raise context.max_capsule_bytes (0 or \"unlimited\" removes the ceiling)")
 	}
 	return nil
 }

@@ -28,6 +28,42 @@ type seedSet struct {
 	Candidates []candidate
 	Excluded   []candidate
 	Unresolved bool
+	// cutStages names the Section 15.2 steps already reported as having stopped
+	// at model.MaxSeeds, so one bound that stops several later steps is named
+	// once per step rather than once per skipped identity.
+	cutStages map[originKind]bool
+}
+
+// noteCut records that a Section 15.2 discovery step stopped at model.MaxSeeds
+// with identities it never examined.
+//
+// The bound stays -- MaxSeeds is what keeps one plan a plan -- but it stops
+// being silent: the cut is reported in the plan's own exclusions, beside every
+// other reason a candidate is absent, and it marks the scope incomplete. A plan
+// that saw the first MaxSeeds identities and a plan that saw all of them are
+// now distinguishable by their manifest alone, which is what a caller deciding
+// whether to narrow the task needs.
+func (s *seedSet) noteCut(origin originKind, step string) {
+	s.Unresolved = true
+	if s.cutStages == nil {
+		s.cutStages = map[originKind]bool{}
+	}
+	if s.cutStages[origin] {
+		return
+	}
+	s.cutStages[origin] = true
+	s.Excluded = append(s.Excluded, candidate{
+		// The step is the exclusion's Path because ContextReference refuses a
+		// reference that names neither a node, a file nor a path, and the cut
+		// names no single entity -- it names the step that stopped. Without it
+		// the manifest's own validator would turn this disclosure into a failed
+		// compile, which is the opposite of what reporting the cut is for.
+		Path:   "seed discovery: " + step,
+		Origin: origin,
+		Excluded: boundReason(fmt.Sprintf(
+			"seed discovery stopped at the %d-seed bound while collecting %s; identities beyond it were never examined",
+			model.MaxSeeds, step)),
+	})
 }
 
 // seedToken is one identity the task named, tagged with the Section 15.2 step
@@ -70,6 +106,7 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 
 	for _, tok := range tokens {
 		if len(out.Candidates) >= model.MaxSeeds {
+			out.noteCut(tok.Origin, "the identities the task names")
 			break
 		}
 		found, err := c.resolveIdentity(ctx, reader, gen, tok, seen, &out)
@@ -160,6 +197,7 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 	}
 	for _, term := range freeTerms(task) {
 		if len(out.Candidates) >= model.MaxSeeds {
+			out.noteCut(originExactResolve, "the declarations the task's free terms name")
 			return nil
 		}
 		if taken[term] {
@@ -174,7 +212,11 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 				fmt.Sprintf("the task mentions %q, which names a declaration in the pinned snapshot", term)))
 		}
 	}
-	if len(out.Candidates) >= model.MaxSeeds || strings.TrimSpace(task) == "" {
+	if len(out.Candidates) >= model.MaxSeeds {
+		out.noteCut(originLexical, "the lexical matches of the task text")
+		return nil
+	}
+	if strings.TrimSpace(task) == "" {
 		return nil
 	}
 
@@ -196,6 +238,7 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 	}
 	for _, hit := range page.Items {
 		if len(out.Candidates) >= model.MaxSeeds {
+			out.noteCut(originLexical, "the lexical matches of the task text")
 			return nil
 		}
 		cnd := candidate{
@@ -232,6 +275,13 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 	// a page shorter than this limit is genuinely the last page and not a
 	// clamped read that still has rows behind it.
 	limit := c.pageLimit()
+	if len(out.Candidates) >= model.MaxSeeds {
+		// An earlier step already filled the seed set, so this one never runs.
+		// A step that never examined a single changed file is exactly the cut
+		// row 20 forbids leaving silent.
+		out.noteCut(originChangedFile, "the captured working-tree changes")
+		return nil
+	}
 	for len(out.Candidates) < model.MaxSeeds {
 		files, err := reader.ChangedFiles(ctx, after, changedStatuses, limit)
 		if err != nil {
@@ -245,8 +295,9 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 			if len(out.Candidates) >= model.MaxSeeds {
 				// Changed files remain that this plan never saw, exactly like a
 				// discovery step stopped at any other of its own bounds, so the
-				// scope is reported incomplete rather than silently partial.
-				out.Unresolved = true
+				// scope is reported incomplete AND the cut is named in the
+				// exclusions rather than left as an unexplained flag.
+				out.noteCut(originChangedFile, "the captured working-tree changes")
 				return nil
 			}
 			add(out, seen, candidate{
