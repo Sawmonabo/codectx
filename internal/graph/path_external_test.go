@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -592,4 +593,108 @@ func (s slowPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir mode
 		time.Sleep(s.stall)
 	}
 	return s.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+}
+
+// busyPathGraph fails one edge read of the RESUMED page with a retryable
+// CTX_WORKSPACE_BUSY, the way a contended store does.
+type busyPathGraph struct {
+	*pathGraph
+	armed *bool
+}
+
+func (b busyPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	if *b.armed {
+		*b.armed = false
+		return nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+			Message: "storage: another writer holds the workspace"}
+	}
+	return b.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+}
+
+// TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
+// ShortestPath releases the continuation it consumed on the way out, and it
+// used to do so on EVERY exit: one transient CTX_WORKSPACE_BUSY on one page
+// then turned the next presentation of that same cursor into
+// CTX_CURSOR_INVALID, and an hours-long search behind it was unrecoverable --
+// while the error itself told the caller to retry.
+//
+// The retry must also see the state the failing page STARTED from, not a page
+// torn off halfway through, so the routes it finishes with are compared against
+// the same search run in a single page.
+//
+// Mutation (the terminalOutcome guard over the scratch in path.go removed): the
+// retry fails with CTX_CURSOR_INVALID, which is the assertion this test leads
+// with.
+func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+
+	whole := pathPagingEngine(t, g, t.TempDir(), newFixtureLeases(), 0)
+	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("single-page search: %v", err)
+	}
+
+	dir := t.TempDir()
+	armed := false
+	busy := busyPathGraph{pathGraph: g, armed: &armed}
+	// Three settled nodes per page, so the first page ends early and hands
+	// back a continuation over retained search state.
+	e := pathPagingEngine(t, busy, dir, newFixtureLeases(), 3)
+
+	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	cursor := first.Meta.NextCursor
+	if cursor == "" {
+		t.Fatal("the per-page budget must end this page with a continuation")
+	}
+
+	// The resumed page hits a contended store.
+	armed = true
+	resume := model.PathRequest{From: from, To: to, Relations: kinds,
+		Page: model.PageRequest{Cursor: cursor}}
+	_, err = e.ShortestPath(context.Background(), resume)
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		t.Fatalf("the resumed page must surface the store's retryable failure, got %v", err)
+	}
+	if armed {
+		t.Fatal("the busy failure was never reached: the page did not read an edge")
+	}
+	if n := retainedDirs(t, dir); n != 1 {
+		t.Fatalf("a retryable failure must leave the search's retained state in place, found %d directories", n)
+	}
+
+	// The SAME cursor, which is exactly what a retryable error tells the caller
+	// to present, and the search carries on to its answer.
+	for i := 0; i < 200; i++ {
+		res, err := e.ShortestPath(context.Background(), resume)
+		if err != nil {
+			t.Fatalf("retry %d after a retryable failure: %v", i, err)
+		}
+		if res.Meta.NextCursor == "" {
+			if len(res.Paths) == 0 {
+				t.Fatal("the retried continuation completed the search but found no route")
+			}
+			// The abandoned page was rolled back, so the retry resumed from the
+			// state the cursor names: the answer is the whole search's, not one
+			// missing the routes through the half-written page.
+			if gotSeq, wantSeq := routeSequences(res), routeSequences(want); !reflect.DeepEqual(gotSeq, wantSeq) {
+				t.Fatalf("the search retried through a busy page answered %v;\nthe uninterrupted single-page search says %v",
+					gotSeq, wantSeq)
+			}
+			if n := retainedDirs(t, dir); n != 0 {
+				t.Fatalf("the completed search left %d retained state directories behind", n)
+			}
+			return
+		}
+		resume.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+	t.Fatal("the retried continuation never completed the search")
 }
