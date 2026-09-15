@@ -20,24 +20,34 @@ import (
 // loosening it.
 var scaleFrontierBytes = config.Defaults().Resources.QueryMemoryBytes
 
-// scaleAllowance is everything a walk's heap holds that the 4 x FrontierBytes
-// term does not, DERIVED from the 100 000-wide measurement below and fixed
-// here.
+// scaleAllowance is what a walk's heap holds that the 4 x FrontierBytes term
+// does not, DERIVED from the 100 000-wide measurement below and fixed here.
 //
-// Derivation. The 100 000-wide walk peaks 112 MiB above its fixture (the
-// t.Logf line this test prints). Its level is ~21 MiB of encoded records, so it
-// never reaches the 32 MiB ceiling and the level pipeline is nowhere near the
-// 4 x 32 MiB the ceiling term already allows: those 112 MiB are therefore the
-// envelope of everything a walk holds that the level cannot move -- one
-// frontier chunk of 65 536 states, the two paged bitsets' resident pages, the
-// bounded route-name LRU, one levelResolveBatch of records being named, one
-// delivered page, the external sorts' merge readers, AND the collector float
-// the sampler cannot tell from live data (HeapAlloc is read without forcing a
-// collection, so at GOGC 20 a fixture of F bytes floats up to F/5 of garbage
-// into every sample; that term grows with the FIXTURE, not with the level, and
-// is why the two measured figures are 112 MiB and 192 MiB rather than equal).
-// 128 MiB is that 112 MiB rounded up to the next whole multiple of
-// FrontierBytes, which is the unit every other term here is stated in.
+// Derivation. The 100 000-wide walk peaks 112 MiB above its fixture (the t.Logf
+// line this test prints). Its level is ~21 MiB of encoded records, so it never
+// reaches the 32 MiB ceiling and the level pipeline is nowhere near the 4 x
+// 32 MiB the ceiling term already allows. Those 112 MiB are therefore two
+// things and only two:
+//
+//   - the walk's level-independent structures -- one frontier chunk of 65 536
+//     states, the two paged bitsets' resident pages, the bounded route-name LRU,
+//     one levelResolveBatch of records being named, one delivered page, the
+//     external sorts' merge readers; and
+//   - the sampler's float. HeapAlloc is read without forcing a collection, so
+//     at GOGC 20 a fixture of F bytes floats up to F/5 of unreached garbage into
+//     every sample.
+//
+// The float term is a property of THIS TEST'S FIXTURE, not of a walk: it is why
+// the two measured figures are 112 MiB and 192 MiB rather than equal (the 1M
+// fixture's baseline is 564 MiB against the 100k fixture's 52 MiB), and it is
+// why the ceiling below is a bound on this fixture rather than a decomposition
+// of a walk. Widening the fixture without revisiting this number loosens the
+// bound. 128 MiB is the measured 112 MiB rounded up to the next whole multiple
+// of FrontierBytes, the unit every other term here is stated in.
+//
+// The LEVEL-INDEPENDENCE claim does not rest on this number. It rests on the
+// 2x ratio assertion, which compares two walks whose levels differ by a factor
+// of ten; the ceiling beside it is the absolute runaway guard.
 const scaleAllowance = 128 << 20
 
 // TestAWalkHoldsAPageNotTheLevel is ADR-0005 Decision 2's scale claim,
@@ -50,7 +60,7 @@ const scaleAllowance = 128 << 20
 // 1 000 000, ten times wider, and the two heap figures must be within 2x of
 // each other. A structure that grew with the level would be an order of
 // magnitude apart; the measured pair is 112 MiB and 192 MiB, a factor of 1.7
-// for a factor of 10 in width, and the gap is the collector float scaleAllowance
+// for a factor of 10 in width, and the gap is the sampler float scaleAllowance
 // accounts for. The 4 x FrontierBytes + scaleAllowance ceiling on the 1 000 000
 // figure is the absolute runaway guard beside it: four sorts and collectors may
 // each hold their ceiling at once, and nothing else in the walk has a size the
