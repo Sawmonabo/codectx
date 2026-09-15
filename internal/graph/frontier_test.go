@@ -684,21 +684,8 @@ func TestPathWalkStateIsBoundedByTheMemoryBudget(t *testing.T) {
 		t.Fatalf("the bounded search settled %d node(s), the unbounded one %d: the ceiling bounded nothing",
 			res.VisitedCount, whole.VisitedCount)
 	}
-	// Zero stays unlimited: a workspace that sets no ceiling is bounded by the
-	// graph and the count budgets alone, exactly as the unbounded leg above.
-	limits.FrontierBytes = 0
-	zero, err := New(Options{Adjacency: f, Limits: limits})
-	if err != nil {
-		t.Fatalf("new engine: %v", err)
-	}
-	again, err := zero.ShortestPath(context.Background(), req)
-	if err != nil {
-		t.Fatalf("zero-ceiling path: %v", err)
-	}
-	if again.Meta.Truncated || again.VisitedCount != whole.VisitedCount {
-		t.Fatalf("a zero memory ceiling truncated the search (truncated=%v reason=%q, %d visited vs %d): 0 must mean unlimited",
-			again.Meta.Truncated, again.Meta.TruncationReason, again.VisitedCount, whole.VisitedCount)
-	}
+	// frontier_bytes is a memory ceiling and is strictly positive (F30), so
+	// there is no zero-means-unlimited leg for it: the walk is always charged.
 }
 
 // slowAdjacency is the fixture reader with a clock attached: after `trigger`
