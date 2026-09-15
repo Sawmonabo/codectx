@@ -20,18 +20,26 @@ const drainBufferBytes = 32 * 1024
 // yet exited still holds the write end, and closing the read end is the only
 // way to unblock the drain without waiting for it.
 //
-// Once the limit is reached the drain keeps reading and discarding. Stopping
-// instead would leave the child blocked writing into a full pipe, where it
-// could neither make progress nor notice that it is being asked to stop.
+// The drain never stops reading and never stops the child. Stopping would
+// leave the child blocked writing into a full pipe, where it could neither
+// make progress nor notice that it is being asked to stop, and a stream that
+// produced more bytes than expected is a large run, not a wedged one.
+//
+// The limit bounds the capture buffer and nothing else, because the capture
+// buffer is the only thing this package allocates per byte. It applies only
+// when sink is nil: a caller-supplied writer takes every byte, and its own
+// blocking Write is the backpressure that bounds the run -- dropping bytes
+// from a framed protocol such as JSON-RPC or the parser worker's stream would
+// corrupt it rather than degrade it. A zero or negative limit is no bound at
+// all, which is what a discarded stream wants.
 type streamPipe struct {
 	r, w *os.File
 	sink io.Writer
 	// capture holds the bytes when the caller supplied no writer.
 	capture bytes.Buffer
-	limit   int64
-
-	limitHit  chan struct{}
-	limitOnce sync.Once
+	// limit bounds capture only; see the type comment. Zero or negative, and
+	// any value at all when sink is non-nil, means unbounded.
+	limit int64
 
 	// progress counts every byte the drain has read from the pipe, whether it
 	// was delivered, discarded past the limit, or written to a caller's sink.
@@ -62,7 +70,7 @@ func newStreamPipe(sink io.Writer, limit int64, target *io.Writer) (*streamPipe,
 	if err != nil {
 		return nil, internalError("an output pipe cannot be created: %v", err)
 	}
-	p := &streamPipe{r: r, w: w, sink: sink, limit: limit, limitHit: make(chan struct{})}
+	p := &streamPipe{r: r, w: w, sink: sink, limit: limit}
 	// Assigning an *os.File makes os/exec hand the descriptor to the child
 	// directly, with no copying goroutine of its own to wait for.
 	*target = w
@@ -71,24 +79,26 @@ func newStreamPipe(sink io.Writer, limit int64, target *io.Writer) (*streamPipe,
 
 func (p *streamPipe) drain() {
 	buf := make([]byte, drainBufferBytes)
+	bounded := p.sink == nil && p.limit > 0
 	for {
 		n, err := p.r.Read(buf)
 		if n > 0 {
 			p.progress.Add(int64(n))
-			remaining := p.limit - p.delivered
-			if remaining > 0 {
-				take := int64(n)
-				if take > remaining {
+			take := int64(n)
+			if bounded {
+				// Only a capture buffer is bounded, so the arithmetic below is
+				// never reached for a caller's writer and an unlimited capture
+				// never computes a negative remainder from the sentinel.
+				if remaining := p.limit - p.delivered; take > remaining {
 					take = remaining
+					p.truncated = true
 				}
+			}
+			if take > 0 {
 				if werr := p.write(buf[:take]); werr != nil && p.failure == nil {
 					p.failure = werr
 				}
 				p.delivered += take
-			}
-			if int64(n) > remaining {
-				p.truncated = true
-				p.limitOnce.Do(func() { close(p.limitHit) })
 			}
 		}
 		if err != nil {
@@ -123,6 +133,9 @@ func (p *streamPipe) captured() ([]byte, int64) {
 	return p.capture.Bytes(), p.delivered
 }
 
+// limited reports that bytes the child produced were dropped rather than
+// captured. It is never a reason to fail the run: the caller reports it, and
+// what it holds is a complete prefix of the stream.
 func (p *streamPipe) limited() bool { return p.truncated }
 
 // progressed reports the raw bytes read from the pipe so far. It is safe to

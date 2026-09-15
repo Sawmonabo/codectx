@@ -47,17 +47,23 @@ type Spec struct {
 	// merged with the parent's environment; an empty Env means the child runs
 	// with no environment at all.
 	Env []string
-	// Stdin is the optional bounded input. At most MaxStdinBytes are copied and
-	// the child's stdin is then closed, so a child cannot stall the parent by
-	// refusing to read. A Stdin that implements io.Closer is closed when the
+	// Stdin is the optional bounded input. At most MaxStdinBytes are copied --
+	// zero means no bound -- and the child's stdin is then closed, so a child
+	// cannot stall the parent by refusing to read. Unlike the output bounds,
+	// a positive stdin bound the input exceeds fails the run: the child would
+	// otherwise compute its answer from a prefix nobody agreed to cut. A Stdin that implements io.Closer is closed when the
 	// run ends -- on every path, not only on a failure -- so the runner takes
 	// ownership of it: hand it a reader whose lifetime is this run, never one
 	// the caller reads again afterwards.
 	Stdin         io.Reader
 	MaxStdinBytes int64
 	// Stdout and Stderr optionally receive the streams. When either is nil the
-	// stream is captured into Result instead. The byte limits apply in both
-	// cases: a caller-supplied writer does not opt out of termination.
+	// stream is captured into Result instead. MaxStdoutBytes and MaxStderrBytes
+	// bound that capture buffer and nothing else: zero means no bound, and a
+	// caller-supplied writer is never truncated, because its own blocking Write
+	// is what paces the child. Crossing the bound drops the excess and sets
+	// Result.OutputTruncated; it never terminates the tree and never fails the
+	// run -- a stream longer than expected is a large repository, not a hang.
 	Stdout         io.Writer
 	Stderr         io.Writer
 	MaxStdoutBytes int64
@@ -104,8 +110,9 @@ type Result struct {
 	// Section 22 requires cancellation not to be reported as a crash.
 	TimedOut bool
 	Canceled bool
-	// OutputTruncated reports that a stream reached its limit and the tree was
-	// terminated for it.
+	// OutputTruncated reports that captured bytes the child produced were
+	// dropped because a capture bound was reached. What was captured is a
+	// complete prefix; the run itself is unaffected.
 	OutputTruncated bool
 	// Signaled reports that the child was killed by a signal rather than
 	// exiting, which is the normal outcome of a forced termination.
@@ -249,11 +256,12 @@ func (s Spec) validate() error {
 		// exit once it has been asked to, so it is always finite.
 		return resourceLimit("grace %s must be positive", s.Grace)
 	}
-	if s.MaxStdoutBytes <= 0 || s.MaxStderrBytes <= 0 {
-		return resourceLimit("output limits are %d and %d; both must be positive", s.MaxStdoutBytes, s.MaxStderrBytes)
+	if s.MaxStdoutBytes < 0 || s.MaxStderrBytes < 0 {
+		return resourceLimit("output capture bounds are %d and %d; neither may be negative, and zero means no bound",
+			s.MaxStdoutBytes, s.MaxStderrBytes)
 	}
-	if s.Stdin != nil && s.MaxStdinBytes <= 0 {
-		return resourceLimit("stdin is supplied without a positive byte bound")
+	if s.MaxStdinBytes < 0 {
+		return resourceLimit("the stdin byte bound is %d; it may not be negative, and zero means no bound", s.MaxStdinBytes)
 	}
 	if s.MemoryReservationBytes < 0 || s.DiskReservationBytes < 0 {
 		return invalidArgument("reservations are memory %d and disk %d; neither may be negative",
@@ -402,7 +410,7 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	defer watchdog.stopWatching()
 
 	waiter := newWaiter(cmd)
-	reason, unreaped := waitForExit(ctx, deadline, job, cmd, spec, outPipe, errPipe, watchdog, waiter)
+	reason, unreaped := waitForExit(ctx, deadline, job, cmd, spec, watchdog, waiter)
 	var waitErr error
 	if !unreaped {
 		waitErr = waiter.wait()
@@ -453,8 +461,6 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	// An explicit stop decision is why the run ended, so it names the error.
 	switch reason {
-	case stopOutputLimit:
-		return result, resourceLimit("%s exceeded its output limit and was terminated", filepath.Base(spec.Path))
 	case stopTimeout:
 		return result, timedOut("%s exceeded its %s timeout and was terminated", filepath.Base(spec.Path), spec.Timeout)
 	case stopStalled:
@@ -465,12 +471,6 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 			WithDetail("stop_reason", stopStalled.String())
 	case stopCanceled:
 		return result, model.Canceled(ctx.Err())
-	}
-	// The child exited on its own, but a stream that crossed its limit is still
-	// a refusal: the caller would otherwise receive truncated output reported
-	// as a complete run.
-	if result.OutputTruncated {
-		return result, resourceLimit("%s exceeded its output limit; the output is truncated", filepath.Base(spec.Path))
 	}
 	if err := outPipe.err(); err != nil {
 		return result, err
@@ -510,7 +510,6 @@ const (
 	stopNone stopReason = iota
 	stopCanceled
 	stopTimeout
-	stopOutputLimit
 	stopStalled
 )
 
@@ -520,8 +519,6 @@ func (r stopReason) String() string {
 		return "canceled"
 	case stopTimeout:
 		return "timeout"
-	case stopOutputLimit:
-		return "output_limit"
 	case stopStalled:
 		return "stalled"
 	default:
@@ -537,7 +534,7 @@ func (r stopReason) String() string {
 // uninterruptible kernel operation cannot be killed at all, and blocking on it
 // would hang the caller with no diagnosis.
 func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, cmd *exec.Cmd,
-	spec Spec, outPipe, errPipe *streamPipe, watchdog *stallWatchdog, w *waiter) (stopReason, bool) {
+	spec Spec, watchdog *stallWatchdog, w *waiter) (stopReason, bool) {
 	var reason stopReason
 	select {
 	case <-w.exited:
@@ -546,10 +543,6 @@ func waitForExit(ctx context.Context, timeout <-chan time.Time, job jobControl, 
 		reason = stopCanceled
 	case <-timeout:
 		reason = stopTimeout
-	case <-outPipe.limitHit:
-		reason = stopOutputLimit
-	case <-errPipe.limitHit:
-		reason = stopOutputLimit
 	case <-watchdog.stalledC():
 		reason = stopStalled
 	}
@@ -737,8 +730,12 @@ func (p *stdinPump) closeBoth() {
 
 func (p *stdinPump) pump() {
 	defer close(p.done)
-	n, err := io.Copy(p.dst, io.LimitReader(p.src, p.limit))
-	if err == nil && n == p.limit {
+	src := p.src
+	if p.limit > 0 {
+		src = io.LimitReader(p.src, p.limit)
+	}
+	n, err := io.Copy(p.dst, src)
+	if err == nil && p.limit > 0 && n == p.limit {
 		// io.Copy stops at the bound without saying whether anything was left.
 		// Silently truncating a child's input would produce a result computed
 		// from bytes the caller never agreed to drop.
