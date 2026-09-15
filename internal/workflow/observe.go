@@ -30,8 +30,9 @@ func (s *Service) Record(ctx context.Context, req model.ObservationRequest) (mod
 	if err := req.Validate(); err != nil {
 		return model.Observation{}, model.SessionStatus{}, err
 	}
-	// Validate already bounds references by model.MaxObservationReferences;
-	// this is the operator's own ceiling, unlimited by default.
+	// The model carries no count ceiling of its own: this is the only ceiling
+	// on an observation's references, it is the operator's, and it is unlimited
+	// by default.
 	if err := s.checkReferenceCount(len(req.References), "observation"); err != nil {
 		return model.Observation{}, model.SessionStatus{}, err
 	}
@@ -218,12 +219,11 @@ func (s *Service) reviewSupported(ctx context.Context, rec sqlite.SessionRecord,
 		return typedErrf(model.CodeScopeChanged,
 			"the scope review binds a manifest this session's scope no longer comes from")
 	}
-	// Section 20.1 bounds references per observation, and a review carries
-	// them inside its entries rather than on the request, so the aggregate is
-	// what the configured ceiling has to hold: ScopeReviewEntry.Validate caps
-	// each category at the model ceiling and eight capped categories are still
-	// eight times any ceiling an operator asked for. Unlimited -- the default --
-	// admits all eight.
+	// A review carries its references inside its entries rather than on the
+	// request, so the aggregate across the eight categories is what the
+	// configured ceiling has to hold. Neither the entries nor this total are
+	// bounded by the model; unlimited -- the default -- admits all eight
+	// categories however much of a large scope they cite.
 	total := 0
 	for _, entry := range review.Entries {
 		total += len(entry.References)

@@ -624,7 +624,7 @@ func (r GraphResult) Validate() error {
 	if !r.Direction.Valid() {
 		return invalid("graph_result.direction %q is not a known direction", truncateForMessage(string(r.Direction)))
 	}
-	if err := boundCount("graph_result.nodes", len(r.Nodes), MaxRecordsPerResult); err != nil {
+	if err := boundPage("graph_result.nodes", len(r.Nodes)); err != nil {
 		return err
 	}
 	for _, n := range r.Nodes {
@@ -632,7 +632,7 @@ func (r GraphResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("graph_result.relations", len(r.Relations), MaxRecordsPerResult); err != nil {
+	if err := boundPage("graph_result.relations", len(r.Relations)); err != nil {
 		return err
 	}
 	for _, rel := range r.Relations {
@@ -750,7 +750,7 @@ func (r PathResult) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("path_result.nodes", len(r.Nodes), MaxRecordsPerResult); err != nil {
+	if err := boundPage("path_result.nodes", len(r.Nodes)); err != nil {
 		return err
 	}
 	for _, n := range r.Nodes {

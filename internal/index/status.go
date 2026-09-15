@@ -279,6 +279,11 @@ func (r *capabilityReport) add(s model.CapabilityState) {
 		return
 	}
 	r.order = append(r.order, key)
+	// No scopesDetail here: a row folded for the first time stands for one
+	// scope, which countDetail already reads from its absence. Writing
+	// `scopes=1` on every row would put a word that says nothing on every line
+	// of the report. What makes the count survive is that the key is RESERVED,
+	// not that it is written early.
 	r.rows[key] = s
 }
 
@@ -298,11 +303,20 @@ const (
 	// scopeKeyDetail carries the exemplar scope of a fold.
 	scopeKeyDetail = "scope_key"
 	// scopesDetail counts the scopes a folded row stands for.
-	scopesDetail = "scopes"
+	//
+	// It, unitsFailedDetail and truncatedDetail are the model's RESERVED
+	// capability-detail keys: model.CapabilityState.WithDetail holds room for
+	// them back from the provider budget, so this fold's own bookkeeping can
+	// never be the entry evicted to make room for a provider detail. Naming
+	// them from model rather than respelling them here is what makes that
+	// guarantee apply to these writes.
+	scopesDetail = model.DetailScopes
+	// unitsFailedDetail counts the units that failed behind one row.
+	unitsFailedDetail = model.DetailUnitsFailed
 	// truncatedDetail names the merged details that did not fit
 	// model.MaxDetailBytes, so a clipped value is never published as if it
 	// were whole.
-	truncatedDetail = "details_truncated"
+	truncatedDetail = model.DetailDetailsTruncated
 	// detailSeparator joins the values of a merged multi-valued detail.
 	detailSeparator = ","
 )
@@ -587,7 +601,7 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 	for _, f := range failures {
 		out = append(out, model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
 			Scope: provider.ScopeWorkspace, State: model.CapabilityFailed, DiagnosticCode: f.code,
-			Details: map[string]string{"units_failed": strconv.Itoa(f.units), scopeKeyDetail: model.TruncateDetail(f.scope)}})
+			Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units), scopeKeyDetail: model.TruncateDetail(f.scope)}})
 	}
 	carried := slices.Clone(r.carried)
 	slices.SortFunc(carried, func(a, b model.CapabilityState) int {
