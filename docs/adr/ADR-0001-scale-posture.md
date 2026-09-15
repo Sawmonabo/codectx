@@ -182,7 +182,9 @@ non-empty frontier, not only for "the page is full". Visited-node and edge budge
 cumulative ceilings on a whole walk and become **per-page work budgets**. The frontier spills to
 the existing per-query spool when it exceeds its byte budget, and continues on the next page
 instead of stopping. The cumulative visited set leaves the heap entirely: it lives in the
-continuation spool, and membership is answered **per level in one sequential sweep**, not per node.
+continuation spool, and membership is answered **per level**, not per node: first against a Bloom
+filter over that spool built during the resume replay that already decodes it, then — only for what
+the filter cannot rule out — by a **merge-join** against the spool's NodeID-ordered visited section.
 
 **Alternatives considered.**
 
@@ -192,11 +194,20 @@ is a content hash, not an ordinal, so there is no dense integer id space for a b
 A bitmap would first require assigning dense ids, which is a storage change of its own. The
 rejection is recorded because the idea is attractive enough to be re-proposed.
 
-*A blocked Bloom filter in front of the spool.* Rejected: a filter accelerates *negatives*, and the
-level-batched sweep already answers a whole level in one pass. It would add a false-positive path —
-and here a node wrongly reported as already admitted is an **edge silently dropped**, the exact
-class-G defect this wave exists to remove — in exchange for no bound the design did not already
-have.
+*A blocked Bloom filter in front of the spool.* First rejected, then **adopted** — the rejection
+reasoned that a filter accelerates *negatives* while the level-batched sweep already answers a whole
+level in one pass, and that a node wrongly reported as already admitted is an **edge silently
+dropped**. Both halves were wrong for this walk. The sweep is one pass per LEVEL, and its early exit
+fires only once every candidate has been *found*, so a chain — which is what a call chain is — reaches
+freshly admitted nodes at every level, never satisfies it, and pays a full pass per level: at
+reference scale (a ~200 000-node cumulative set, up to 200 levels in one page) 4 × 10⁷ record decodes
+per page against 2 × 10⁵ for one pass. And the filter answers only *misses*, which have no false
+positives to be wrong about: a hit is not an admission, it merely falls through to the merge-join,
+which is exact. No edge can be dropped by it. The filter is sized from the cumulative admitted count
+the cursor already carries and clamped to an eighth of the frontier memory ceiling, so peak heap is a
+function of that configured ceiling, not of the walk; past the clamp it simply grows denser (more
+false positives, more merge-joins), never refusing or truncating. Probes are the two-hash
+construction of [S33].
 
 *Re-deriving the frontier per page from a keyset scan under the pinned generation*, avoiding a spool
 altogether, as mature search systems do with a point-in-time view and `search_after` [S14],
@@ -207,7 +218,8 @@ introducing a second continuation mechanism.
 
 *Per-node membership probes against the spool.* Rejected on cost: the spool is forward-only, so a
 per-node probe is a full scan per node. Level-batched duplicate elimination is the published shape
-for exactly this problem [S31], and keeping a bounded front in RAM while the bulk lives outside it
+for exactly this problem [S31], and ordering the spooled set by NodeID is what turns that batch from
+a scan into a merge-join that stops at the first key past the level's largest candidate, and keeping a bounded front in RAM while the bulk lives outside it
 is semi-external breadth-first search as described in the literature [S32][S7][S9]. Designs that
 scan the whole edge set per iteration are the wrong family here [S8]: the frontier is small
 relative to the graph, and edge I/O should be issued only for it.
@@ -887,6 +899,10 @@ per level rather than per node (§2.2).
 
 [S32] Mehlhorn, K. and Meyer, U., *External-memory breadth-first search with sublinear I/O*, ESA
 2002 — a bounded front in memory with the bulk outside it; the semi-external shape adopted (§2.2).
+
+[S33] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
+filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
+construction (§2.2).
 
 [S33] Knuth, D. E., *The Art of Computer Programming*, vol. 3, §5.4.1 — replacement selection and
 bounded merge order; the classical statement of the lever recorded but not taken (§2.3).
