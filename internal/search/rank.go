@@ -601,9 +601,11 @@ func checkpointIndex(rec model.BlobRecord) source.Index {
 
 // contextErr maps a context failure to the digest §6 codes. model.Canceled
 // reports CTX_CANCELED for both causes, but Section 22 separates a caller who
-// stopped asking from a query that ran past resources.query_timeout: the
-// latter is an explicit incomplete answer the operator can act on by raising
-// the timeout or narrowing the query.
+// stopped asking from a query that ran past its deadline: the latter is an
+// explicit incomplete answer the operator can act on. The remediation names
+// both places that deadline can come from, because either can be the one that
+// fired -- resources.query_timeout is unlimited by default, so on a shipped
+// configuration it is usually the caller's own `--timeout`.
 func contextErr(err error) error {
 	if err == nil {
 		return nil
@@ -611,7 +613,7 @@ func contextErr(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &model.Error{Code: model.CodeQueryDeadline, Retryable: true,
 			Message:     "the query exceeded its time budget before it could answer completely",
-			Remediation: "narrow the query or raise resources.query_timeout"}
+			Remediation: "narrow the query, or raise the deadline you set with --timeout or resources.query_timeout"}
 	}
 	return model.Canceled(err)
 }

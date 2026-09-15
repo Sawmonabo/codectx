@@ -196,13 +196,9 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	// Zero is "no deadline", and it is the default: a compile nobody bounded
 	// runs to a COMPLETE plan. The checkpoint-and-continue path below is what
 	// happens when somebody sets a bound, not the ordinary way to get a plan.
-	if _, ok := ctx.Deadline(); !ok {
-		if timeout := c.cfg.Resources.QueryTimeout.Std(); timeout > 0 {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, timeout)
-			defer cancel()
-		}
-	}
+	var cancel context.CancelFunc
+	ctx, cancel = model.QueryDeadline(ctx, c.cfg.Resources.QueryTimeout.Std())
+	defer cancel()
 
 	reader, err := c.store.PinGeneration(ctx, c.repo, req.GenerationID, c.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {

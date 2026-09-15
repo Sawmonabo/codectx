@@ -184,7 +184,11 @@ type Limits struct {
 	// session's file set rather than with what the actor observed. Also
 	// unlimited by default.
 	MaxCapsuleCoverageFiles config.Limit
-	// QueryTimeout is the per-request deadline (resources.query_timeout).
+	// QueryTimeout is the DEFAULT per-request deadline (resources.query_timeout),
+	// never a ceiling, and ZERO IS "NO DEADLINE", which is its default. Every
+	// use goes through model.QueryDeadline, which leaves a caller's own
+	// deadline in charge and installs nothing at zero, so a workflow call
+	// nobody bounded runs to a complete answer.
 	QueryTimeout time.Duration
 	// AllowExploratoryWaiverConsolidation permits verify_open ->
 	// consolidate_open with recorded waivers
@@ -251,24 +255,21 @@ func New(o Options) (*Service, error) {
 	}, nil
 }
 
-// checkLimits rejects a Limits that cannot bound a request. Zero on a request
-// field means the configured default, so a zero default means "unlimited",
-// which Section 20.2 forbids for the page and deadline bounds below.
-// MaxCapsuleBytes and MaxObservationReferences are deliberately absent: each is
-// a config.Limit whose zero is the documented "no caller ceiling", not a
-// missing bound.
+// checkLimits rejects a Limits that cannot bound a request. MaxPageItems sizes
+// a wire page, a lossless bound whose next cursor carries the rest, so it must
+// be positive. MaxCapsuleBytes and MaxObservationReferences are deliberately
+// absent: each is a config.Limit whose zero is the documented "no caller
+// ceiling", not a missing bound. So is QueryTimeout, whose zero is "no
+// deadline" and is its default; only a negative one is a wiring defect, and it
+// is refused here because model.QueryDeadline would ignore it silently.
 func checkLimits(l Limits) error {
-	for _, b := range []struct {
-		name  string
-		value int64
-	}{
-		{"max_page_items", int64(l.MaxPageItems)},
-		{"query_timeout", int64(l.QueryTimeout)},
-	} {
-		if b.value <= 0 {
-			return typedErrf(model.CodeInternal,
-				"workflow service was built with a non-positive %s bound", b.name)
-		}
+	if l.MaxPageItems <= 0 {
+		return typedErrf(model.CodeInternal,
+			"workflow service was built with a non-positive max_page_items bound")
+	}
+	if l.QueryTimeout < 0 {
+		return typedErrf(model.CodeInternal,
+			"workflow service was built with a negative query_timeout bound")
 	}
 	return nil
 }

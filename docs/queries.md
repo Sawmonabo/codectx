@@ -76,7 +76,7 @@ as itself rather than arriving as a complete answer with per-hit footnotes. Run
 |---|---|---|
 | `--repo` | all | Workspace root to answer from. |
 | `--generation` | all | Answer from this generation instead of the active one. It is not combinable with `--cursor`: a cursor already pins its generation. |
-| `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is becoming unlimited, so a command you do not bound answers in full. `codectx context plan` and the MCP tools honour that today; `search`, `symbol` and the graph walks still apply the configured value to their own inner deadline and will follow. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it, because that key is a default and never a ceiling — and a bounded call ends with a continuation cursor rather than an answer. Zero asks for no deadline of its own and leaves the configured value in charge. |
+| `--timeout` | all | Deadline for this invocation, and the only thing that bounds one: `resources.query_timeout` is a default and not a ceiling, and it is unlimited, so a command you do not bound answers in full. Every command honours that — `search`, `symbol`, the graph walks, `context plan`, the coverage and workflow commands, and the MCP tools alike. A value here **sets** the deadline for the call — above a configured `resources.query_timeout` as readily as below it — and a bounded call ends with a continuation cursor rather than an answer. Zero asks for no deadline of its own and leaves the configured value in charge. |
 | `--limit` | all but `path` | Items in one page. A route set is bounded by the reason-path cap rather than paged, so `path` declares no `--limit`. |
 | `--cursor` | all | Continue a previous page — on `path`, continue the same search. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
@@ -114,9 +114,9 @@ package-dependency rollup answers on identical terms from its own endpoint.
 `visited_count` and `edge_count` are cumulative and grow across the pages of one
 answer.
 
-**What a query deadline does to that, when you set one.** The intent is that
-there is none by default — `resources.query_timeout` is becoming unlimited — so
-an unbounded `impact` request answers over the whole walk. A deadline you do set — through `--timeout`, or by giving
+**What a query deadline does to that, when you set one.** There is none by
+default — `resources.query_timeout` is unlimited — so an unbounded `impact`
+request answers over the whole walk. A deadline you do set — through `--timeout`, or by giving
 that key a positive value — ends a page, never the answer, with one exception,
 the third case below, which ends the answer and says so. There are three
 outcomes.
@@ -251,7 +251,7 @@ where the workspace is composed, and handed to it.
 | `context.max_graph_edges` | Default and ceiling for `--edges`. Unlimited by default. |
 | `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
-| `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Becoming unlimited, so an unbounded walk answers in full. |
+| `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
 | `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills to the continuation spool, the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
@@ -351,8 +351,9 @@ limit and how many roots did not start. See
 
 `resources.max_page_items` bounds every batch the compile issues — seed
 resolution, file hydration, the edge read behind per-edge precision and the
-evidence batch — and `resources.query_timeout` is the deadline around the whole
-compile. A deadline or a cancellation persists no manifest. A **cancellation**
+evidence batch — and `resources.query_timeout`, when you set one, is the
+deadline around the whole compile; unset, which is the default, nothing bounds
+it and the compile returns the whole plan. A deadline or a cancellation persists no manifest. A **cancellation**
 is an explicit incomplete answer (`CTX_CANCELED`); a **deadline** ends the pass
 the compile is in rather than the answer, and `context plan` returns
 `truncated = deadline` with a `next_cursor` you present back as `--cursor` to

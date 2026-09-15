@@ -185,11 +185,9 @@ func (s *Server) limitMiddleware() mcp.Middleware {
 			// configured default. Zero is "no deadline", the default: a tool
 			// call answers in full rather than handing back a continuation the
 			// client never asked for.
-			if _, ok := ctx.Deadline(); !ok && s.limits.timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, s.limits.timeout)
-				defer cancel()
-			}
+			var cancel context.CancelFunc
+			ctx, cancel = model.QueryDeadline(ctx, s.limits.timeout)
+			defer cancel()
 
 			release, failed := s.limits.acquire(ctx, call.Params.Name)
 			if failed != nil {
