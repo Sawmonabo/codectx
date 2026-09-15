@@ -635,16 +635,22 @@ host. Blocking the unlimited posture on a 10 000-line package rewrite would trad
 reported risk for a long stall. The verification lane for this record therefore **reports** the
 ratio and the per-symbol cost; the storage wave's own verification is where they gate.
 
-### 2.9 Capsule pagination *(accepted; scheduled)*
+### 2.9 Capsule pagination *(accepted; closed)*
 
 **Decision.** The sealed context capsule's lists become **durable, per-list rows** written inside
 the seal's own write transaction, with the capsule blob keeping identity and per-list counts only,
-a paged read surface, and the canonical hash computed over three bounded passes of the source. This
-did not land in the current wave. The current release therefore ships with the capsule's
-250 000-file coverage ceiling and its record bounds **still in force** — the one known remaining
-default cap, documented as such.
+a paged read surface, and the canonical hash computed over three bounded passes of the source.
 
-**Why it did not land, stated plainly.** Three separate implementation lanes reached this item and
+**This has landed.** The capsule's 250 000-file coverage ceiling and its record bounds are gone,
+replaced by `context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`, both
+**unlimited by default**: only a value an operator sets refuses a seal, and the refusal names the
+key and the count the list reached rather than truncating. Every capsule read is a keyset page —
+the six `capsule --view` projections through the tool and command surfaces, and `context export`,
+which streams all eight lists onto the file a page at a time and refuses to write a file whose list
+is shorter than the count the seal pinned. The record set resident in any process is one page's
+worth whatever the session recorded.
+
+**Why it took four lanes to land, stated plainly.** Three separate implementation lanes reached this item and
 each declined to half-land it, for three different and cumulative reasons. The first found that the
 mechanism named in the plan was wrong: a continuation spool is lease-bound and expiry-stamped,
 while a sealed capsule is a write-once durable artefact replayed by a later session — the
@@ -657,7 +663,7 @@ footprint spans the workflow, server, command-line and storage layers plus five 
 carry the byte-identity and replay evidence, which must be rewritten in the same commit or the gate
 is red on a half-landed capsule.
 
-Two design facts were established on the way and are load-bearing for the scheduled work. The
+Two design facts were established on the way and are load-bearing for the landed work. The
 store opens a single-connection writer pool and a separate reader pool under write-ahead logging,
 so a read issued from inside the write callback takes a *reader* connection and cannot deadlock —
 which means the rows can be written inside the seal's own transaction, keeping the seal genuinely
@@ -668,11 +674,13 @@ Three bounded passes over the source — count, hash, then write — are byte-id
 digest. Because no stored golden digest existed anywhere in the tree, two reference digests were
 computed and pinned so the change can be proved rather than asserted.
 
-**Consequences.** Shipping with this cap is a deliberate, recorded exception to the ruling, not an
-oversight. The scheduled shape is one interface lane (schema rows, the writer and reader inside the
-seal transaction, the counts on the record, page validation), then two parallel fill-in lanes, then
-one integration lane that runs the three proofs: the large seal-and-page with union equal to the
-whole, the restored-refusal mutation, and the single-pass-hash mutation.
+**Consequences.** The shape the fourth attempt used, and which landed, is one interface lane
+(schema rows, the writer and reader inside the seal transaction, the counts on the record, page
+validation), then two parallel fill-in lanes, then one integration lane. Each behavioural change
+carries a mutation proof: a single-pass hash breaks the pinned digests, a source that buffers a
+list is caught by a walk count rather than by the digest it would reproduce, a tool that drops the
+page cursor never terminates the capsule walk, and an export that stops streaming writes a file
+whose lists are shorter than the counts the seal pinned.
 
 ---
 
@@ -710,7 +718,10 @@ duplicates an existing assertion.
 
 ### 3.3 What is still open
 
-- **The capsule's coverage ceiling** is the one known remaining default cap (§2.9).
+- **No default cap remains.** The capsule's coverage ceiling, the last one, is closed (§2.9):
+  its two successors, `context.max_capsule_records_per_list` and
+  `context.max_capsule_coverage_files`, are unlimited by default and only an operator-set value
+  refuses work.
 - **Two reference-scale misses** stand: the indexing process-tree peak at **912.6 MiB against a
   768 MiB envelope**, and storage at **16.10× against 3.5×**. The first is to be re-measured now
   that the planner's external merge and the batched provider sinks have landed; if it still
