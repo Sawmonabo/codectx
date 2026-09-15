@@ -193,35 +193,65 @@ func TestStreamedBudgetMatchesTheWholeSetPlan(t *testing.T) {
 		NodeID: "n-huge", FileID: "bbb", Path: "internal/order/huge.go",
 		Requirement: model.RequirementOptional, Origin: originLexical})
 
+	// A wider fixture whose exclusion sits in the MIDDLE of the ranked order.
+	// An entry's measured size counts its own serialized ordinal, so numbering
+	// a filtered record shifts the ordinals below it across the 9-to-10 digit
+	// boundary and changes the bytes the budget is checked against. A fixture
+	// that excluded only its top-ranked candidate would shift every survivor
+	// uniformly and prove nothing.
+	wide := make([]candidate, 0, 16)
+	wideFiles := append([]model.FileVersion(nil), files...)
+	for i := 0; i < 15; i++ {
+		id := model.FileID("w" + string(rune('a'+i)))
+		path := "internal/wide/" + string(rune('a'+i)) + ".go"
+		wideFiles = append(wideFiles, fileVersion(string(id), path, 256))
+		if i == 3 {
+			wide = append(wide, candidate{NodeID: "n-mid-cut", FileID: id, Path: path,
+				Requirement: model.RequirementOptional, ScoreMicros: int64(1000 - i),
+				Excluded: "the seed cut dropped this identity"})
+			continue
+		}
+		wide = append(wide, candidate{NodeID: model.NodeID("n-wide-" + string(rune('a'+i))),
+			FileID: id, Path: path, Requirement: model.RequirementOptional,
+			Origin: originLexical, ScoreMicros: int64(1000 - i)})
+	}
+
 	cases := []struct {
-		name   string
-		cands  []candidate
-		budget resolvedBudget
+		name     string
+		cands    []candidate
+		snapshot []model.FileVersion
+		budget   resolvedBudget
 	}{
-		{"every file fits one slice", base,
+		{"every file fits one slice", base, files,
 			resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8}},
-		{"the file limit drops the lowest-ranked groups", base,
+		{"the file limit drops the lowest-ranked groups", base, files,
 			resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1 << 20, MaxFiles: 2, MaxSlices: 8}},
-		{"a small byte budget opens several slices", base,
+		{"a small byte budget opens several slices", base, files,
 			resolvedBudget{MaxBytes: 6000, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8}},
-		{"the slice limit drops every later group", base,
+		{"the slice limit drops every later group", base, files,
 			resolvedBudget{MaxBytes: 6000, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 1}},
-		{"a file too large for one slice is dropped alone", withHuge,
+		{"a file too large for one slice is dropped alone", withHuge, files,
 			resolvedBudget{MaxBytes: 1 << 19, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8}},
-		{"the token budget bounds a slice", base,
+		{"the token budget bounds a slice", base, files,
 			resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1500, MaxFiles: 8, MaxSlices: 8}},
-		{"a manifest cap the packed plan exceeds", base,
+		{"a manifest cap the packed plan exceeds", base, files,
 			resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8,
 				MaxManifestBytes: config.Limit(64)}},
-		{"the required scope does not fit one slice", base,
+		{"the required scope does not fit one slice", base, files,
 			resolvedBudget{MaxBytes: 512, MaxTokens: 1 << 20, MaxFiles: 8, MaxSlices: 8}},
-		{"the required files outnumber the file budget", base,
+		{"the required files outnumber the file budget", base, files,
 			resolvedBudget{MaxBytes: 1 << 20, MaxTokens: 1 << 20, MaxFiles: 1, MaxSlices: 8}},
+		// The byte budget is the exact cumulative phase-one size of the first
+		// ten groups, so one entry measured a single byte wider -- which is
+		// what numbering a filtered record does, by pushing an ordinal across
+		// the 9-to-10 digit boundary -- moves a group into the next slice.
+		{"an exclusion inside the ranked order shifts no ordinal", wide, wideFiles,
+			resolvedBudget{MaxBytes: 4971, MaxTokens: 1 << 20, MaxFiles: 32, MaxSlices: 8}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			want, wantErr := buildPlan(append([]candidate(nil), tc.cands...), files, tc.budget)
-			got, gotErr := streamPlan(t, tc.cands, files, tc.budget)
+			want, wantErr := buildPlan(append([]candidate(nil), tc.cands...), tc.snapshot, tc.budget)
+			got, gotErr := streamPlan(t, tc.cands, tc.snapshot, tc.budget)
 			if (wantErr == nil) != (gotErr == nil) {
 				t.Fatalf("buildPlan error %v, streamed error %v", wantErr, gotErr)
 			}
