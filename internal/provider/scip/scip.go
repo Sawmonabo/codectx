@@ -175,8 +175,12 @@ type Options struct {
 	Resolver *toolchain.Resolver
 	// Runner is the shared process runner; required when a resolver is given.
 	Runner *process.Runner
-	// Timeout caps every profile run (providers.scip.timeout).
+	// Timeout caps every profile run (providers.scip.timeout). Zero is no
+	// wall-clock cap: an indexer on a monorepo is slow, not wedged.
 	Timeout time.Duration
+	// StallTimeout is the progress-based hang detector that stands in for the
+	// wall clock (providers.scip.stall_timeout). Zero disables it.
+	StallTimeout time.Duration
 	// WorkDir is the absolute private directory for import scratch state.
 	WorkDir string
 	// Limits bound the import; zero selects DefaultLimits.
@@ -198,12 +202,15 @@ type Provider struct {
 	version  string
 	// resolver is kept for exactly that deferred fetch. Nothing else in the
 	// provider reaches for a tool after construction.
-	resolver  *toolchain.Resolver
-	runner    *process.Runner
-	timeout   time.Duration
-	workDir   string
-	limits    Limits
-	lookupEnv func(string) (string, bool)
+	resolver *toolchain.Resolver
+	runner   *process.Runner
+	// timeout is the configured wall clock, zero meaning none; stallTimeout is
+	// the progress-based hang detector that stands in its place.
+	timeout      time.Duration
+	stallTimeout time.Duration
+	workDir      string
+	limits       Limits
+	lookupEnv    func(string) (string, bool)
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -270,7 +277,7 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 		version = Version + "/" + toolsFingerprint(identities)
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
-		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout,
+		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
 		workDir: o.WorkDir, limits: o.Limits, lookupEnv: o.LookupEnv}, nil
 }
 

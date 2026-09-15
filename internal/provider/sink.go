@@ -13,8 +13,9 @@ import (
 
 // Limits are the per-batch bounds of Section 11.1: a batch is capped by both
 // records and retained bytes, and flushes at whichever is reached first.
-// MaxRecordBytes is resources.max_provider_record_bytes; a record over it, or
-// over BatchBytes, is CTX_RESOURCE_LIMIT naming the limit it broke.
+// MaxRecordBytes is resources.max_provider_record_bytes, and zero is
+// unlimited: no shipped value refuses a record for being large. A record over
+// a limit the USER set is CTX_RESOURCE_LIMIT naming the limit it broke.
 type Limits struct {
 	BatchRecords   int
 	BatchBytes     int64
@@ -26,11 +27,14 @@ type Limits struct {
 // the configured values). A bad bound is a configuration rejection, not
 // resource exhaustion.
 func (l Limits) Validate() error {
-	if l.BatchRecords <= 0 || l.BatchBytes <= 0 || l.MaxRecordBytes <= 0 {
-		return invalid(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; every bound must be positive",
+	// BatchRecords and BatchBytes size the machine rather than the repository:
+	// they are reservations, and a zero reservation is a configuration error.
+	// MaxRecordBytes is a repository bound, so zero means unlimited there.
+	if l.BatchRecords <= 0 || l.BatchBytes <= 0 || l.MaxRecordBytes < 0 {
+		return invalid(fmt.Sprintf("sink limits are %d records, %d batch bytes and %d record bytes; the batch reservations must be positive and the record bound may not be negative",
 			l.BatchRecords, l.BatchBytes, l.MaxRecordBytes))
 	}
-	if l.MaxRecordBytes > l.BatchBytes {
+	if l.MaxRecordBytes > 0 && l.MaxRecordBytes > l.BatchBytes {
 		return invalid(fmt.Sprintf("max record bytes %d exceed batch bytes %d; such a record could never be flushed", l.MaxRecordBytes, l.BatchBytes))
 	}
 	return nil
@@ -96,6 +100,14 @@ func (p *Pool) release(n int64) {
 // relieves pressure by flushing every live sink's queued batches; if that
 // released anything it retries at once. Nothing is held while blocked.
 func (p *Pool) acquire(ctx context.Context, n int64) error {
+	// With max_provider_record_bytes unlimited, nothing upstream refuses a
+	// record larger than the whole pool, and such a record can never fit
+	// however much every other sink releases. Waiting for it would wedge the
+	// unit with no diagnosis, so it is refused here, naming the reservation
+	// that is too small rather than a repository bound the user did not set.
+	if n > p.capacity {
+		return resourceLimit(fmt.Sprintf("a single record of %d bytes does not fit the %d-byte sink pool (index.queue_bytes)", n, p.capacity))
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			// Checked before relieving: relief may issue one write per live
@@ -335,12 +347,13 @@ func (s *BatchSink) Bytes() uint64   { s.mu.Lock(); defer s.mu.Unlock(); return 
 // Reserve charges n bytes against the pool before a provider decodes or
 // buffers input of that size, blocking until the reservation fits and
 // returning promptly on cancellation. The returned release must be called
-// exactly once. A reservation over MaxRecordBytes is refused outright.
+// exactly once. A reservation over a user-set MaxRecordBytes is refused
+// outright.
 func (s *BatchSink) Reserve(ctx context.Context, n int64) (release func(), err error) {
 	if n <= 0 {
 		return nil, invalid("a reservation must be positive")
 	}
-	if n > s.limits.MaxRecordBytes {
+	if s.limits.MaxRecordBytes > 0 && n > s.limits.MaxRecordBytes {
 		return nil, s.overLimit(n, "max_provider_record_bytes", s.limits.MaxRecordBytes)
 	}
 	if err := s.failure(); err != nil {
@@ -502,7 +515,7 @@ func (s *BatchSink) PutSearchUnits(ctx context.Context, docs []model.SearchUnit)
 // overflow check is repeated after a blocking charge because another worker
 // may have appended meanwhile.
 func put[T any](s *BatchSink, ctx context.Context, b *batch[T], item T, size int64) error {
-	if size > s.limits.MaxRecordBytes {
+	if s.limits.MaxRecordBytes > 0 && size > s.limits.MaxRecordBytes {
 		return s.overLimit(size, "max_provider_record_bytes", s.limits.MaxRecordBytes)
 	}
 	s.mu.Lock()

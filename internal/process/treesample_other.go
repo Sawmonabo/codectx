@@ -17,3 +17,7 @@ type treeSampler struct{}
 func startTreeSampler(int, time.Duration) *treeSampler { return nil }
 
 func (s *treeSampler) stopSampling() int64 { return 0 }
+
+// cpuTicks is always zero here: with no tree sampling there is no CPU signal,
+// so the stall watchdog is left with the portable byte counters alone.
+func (s *treeSampler) cpuTicks() int64 { return 0 }

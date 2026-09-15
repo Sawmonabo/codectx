@@ -427,14 +427,19 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 	output := filepath.Join(runDir, "index.scip")
 	manifestPath := filepath.Join(runDir, "inputs.manifest")
 	path, args := prof.argv(argPaths{InputDir: mat.Root(), OutputFile: output, WorkDir: runDir})
-	timeout := prof.spec().timeout
-	if p.timeout > 0 && p.timeout < timeout {
-		timeout = p.timeout
+	// The configured value is authoritative: zero, the default, is no wall
+	// clock at all, and the profile's own figure is a built-in ceiling that
+	// would otherwise reinstate the refusal the configuration removed. A
+	// wedged indexer is caught by the stall detector instead, at any repository
+	// size.
+	timeout := p.timeout
+	if spec := prof.spec().timeout; timeout > 0 && spec > 0 && spec < timeout {
+		timeout = spec
 	}
 	_, err = p.runner.Run(ctx, process.Spec{
 		Path: path, Args: args, Dir: mat.Root(), Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
-		Timeout: timeout, Grace: toolGrace,
+		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace,
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
 	})
 	if err != nil {
