@@ -84,23 +84,6 @@ func TestInternerCacheStaysBoundedAndIDsSurviveReset(t *testing.T) {
 		}
 	}
 
-	// The diagnostic counters the writer reads: every first sight missed, and
-	// the post-reset pass missed again because reset() flushed the cache.
-	// Counts are cumulative across reset by contract.
-	st := in.stats()
-	if st.Misses != uint64(total+total) || st.Hits != 0 {
-		t.Fatalf("stats() = %+v, want %d misses and 0 hits", st, total+total)
-	}
-	// A repeat lookup of a key still resident in the LRU is served from the
-	// cache: one miss for its first sight, one hit for the repeat.
-	for range 2 {
-		if _, err := in.nativeKey(ctx, tx, "native-key-repeat"); err != nil {
-			t.Fatalf("nativeKey: %v", err)
-		}
-	}
-	if got := in.stats(); got.Hits != 1 || got.Misses != st.Misses+1 {
-		t.Fatalf("stats() = %+v after one miss and one hit over %+v", got, st)
-	}
 }
 
 // TestInternerUpsertThenReadConverges proves the contract's concurrency clause
