@@ -131,6 +131,16 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 
 	b := &budget{deadline: deadline, now: e.now}
 	var resume *resumeState
+	// stalled is set only by the walkStalled path below. That page ends the
+	// answer TERMINALLY with no cursor of its own, so the cursor the caller is
+	// still holding is the whole remedy the reason offers -- and a fresh
+	// request gets a fresh deadline (beginImpactQuery), so a warm read really
+	// can advance where this one could not. Releasing the state on that path
+	// destroyed it and made the documented remedy cost the walk from its seed.
+	// It is an explicit flag rather than "no cursor was minted", because the
+	// exhausted, fully served answer mints no cursor either and that state is
+	// genuinely finished; same shape as serveRankedImpact's complete.
+	stalled := false
 	if req.Page.Cursor != "" {
 		c, rb, err := e.verifyContinuation(req.Page.Cursor, impactEndpoint, queryHash, deadline)
 		if err != nil {
@@ -156,7 +166,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// request answered CTX_CURSOR_INVALID and every page behind it was
 		// lost. The state stays adoptable and expires with its own lease TTL.
 		defer func() {
-			if terminalOutcome(err) {
+			if terminalOutcome(err) && !stalled {
 				resume.Release()
 			}
 		}()
@@ -190,7 +200,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry)
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry, resume)
 		// ONE streamed pass, TEED: the rollup's batching drives the walk, so
 		// every admitted edge reaches the entity record and the package pair as
 		// it is read and nothing is held between the edge that produced it and
@@ -248,6 +258,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// forward, so the request that finishes the walk ranks all of them.
 		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
 			// No continuation: it would be the one this request was given.
+			// That cursor stays ADOPTABLE for the rest of its lease, which is
+			// what makes the reason's remedy -- present it again under a
+			// longer resources.query_timeout -- resume the walk instead of
+			// restarting it from the seed.
+			stalled = true
 			markTruncated(&meta, reasonDeadlineStalled)
 			answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 				Notices: answer.Notices, Completeness: meta.Completeness}
@@ -643,6 +658,20 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 	if len(state.Frontier) == 0 || state.DepthLimited {
 		return "", nil
 	}
+	if state.LevelBoundary {
+		// The deadline stopped BETWEEN levels: the frontier this cursor carries
+		// has not been read at all, so the keyset position the accumulator last
+		// emitted belongs to the level already finished. Carried into the next
+		// level it is a filter, not a resume point -- levelEdges drops every row
+		// whose owner sorts below it (traverse.go states the rule) -- and those
+		// rows are dropped SILENTLY, with the nodes already marked visited by
+		// the leg that admitted them, so no later page can reach them either.
+		// Measured before this: an 8-mid fixture cut at its first level boundary
+		// served 38 of 56 entities, untruncated. traverse.go:821 and
+		// walkrun.go:152 apply the same rule to the traversal endpoint and to a
+		// walk's internal links; this is the cross-request half of it.
+		lastOwner, lastKey = "", ""
+	}
 	// The cumulative admitted set is NOT materialized here and NOT copied
 	// forward: only the nodes THIS page admitted are, appended to the retained
 	// run store as one more ascending run (visitedstore.go). Everything earlier
@@ -830,19 +859,38 @@ type impactAccumulator struct {
 	reason     string
 	// lastOwner and lastKey are the keyset position the continuation resumes
 	// from: the frontier node whose chunk the last admitted row came from, and
-	// that row's relation id.
+	// that row's relation id. They are SEEDED from the continuation this leg
+	// resumed (newImpactAccumulator), so a leg that admits nothing carries the
+	// position forward instead of resetting it to the start of the level.
 	lastOwner model.NodeID
 	lastKey   model.RelationID
 }
 
+// newImpactAccumulator builds the visitor for one LEG of a walk. resume is the
+// continuation this leg was handed, or nil on the request that mints the
+// answer.
+//
+// The keyset position is SEEDED from that continuation rather than left zero.
+// Two things depend on it, and both were wrong while it started empty. A page
+// that admits nothing -- every adjacency read ran past the deadline -- must
+// mint the position it was given, not LastOwner:"", which restarts the level
+// from its beginning and re-reads every row the previous page already read.
+// And walkStalled compares this position against the cursor's to decide that
+// the page made no progress at all: with a zero start the two could only ever
+// match on a resume taken at a LEVEL BOUNDARY, so a walk stalled MID-LEVEL --
+// the common shape, since a deadline lands inside a multi-owner chunk -- could
+// not report it until it had first thrown the position away.
 func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges config.Limit,
-	emit func(impactRecord) error) *impactAccumulator {
+	emit func(impactRecord) error, resume *resumeState) *impactAccumulator {
 	a := &impactAccumulator{
 		isSeed:     make(map[model.NodeID]bool, len(start)),
 		emit:       emit,
 		budget:     b,
 		maxVisited: maxVisited,
 		maxEdges:   maxEdges,
+	}
+	if resume != nil {
+		a.lastOwner, a.lastKey = resume.Cursor.LastOwner, resume.Cursor.LastKey
 	}
 	for _, s := range start {
 		if a.isSeed[s] {

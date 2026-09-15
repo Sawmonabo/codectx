@@ -458,13 +458,14 @@ type heapProbe struct {
 	Pairs  rankStats
 	Rollup rollupStats
 	// AdoptedRuns is how many spilled runs of an interrupted ranking this
-	// request continued instead of re-sorting, and ReaddedRecords how many
-	// records it put into a sort that the adopted runs already held. The
-	// second is zero by construction and is counted anyway: it is what tells a
-	// resumed ranking that REUSES its runs from one that re-sorts the whole
-	// retained input and happens to reach the same answer.
+	// request continued instead of re-sorting, and SkippedRecords how many of
+	// the retained input's records it passed over because an adopted run
+	// already held them. Neither alone is the invariant: a ranking that
+	// adopted runs and then fed the whole input back in would reach the same
+	// answer having done all the work again, and it is the skip count that
+	// tells the two apart.
 	AdoptedRuns    int
-	ReaddedRecords int64
+	SkippedRecords int64
 	// VisitedBytes is how many bytes the walk's cumulative admitted-node set
 	// has been GROWN by (visitedstore.go appendRun: the run, the filter words
 	// its probes dirtied, the manifest), and ResumeRecords how many

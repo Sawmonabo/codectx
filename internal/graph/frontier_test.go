@@ -712,12 +712,21 @@ type slowAdjacency struct {
 	// a case that needs a walk split into many pages sets every, and the two
 	// branches are separate so neither case's stop moves when the other's does.
 	every int
+	// stallAfter, when positive, lets the first stallAfter round trips run at
+	// the frozen clock and then jumps on EVERY one after them. It is the shape
+	// a stall that begins mid-walk needs: the opening page reaches edges and
+	// stops at a real keyset position, and no page after it can reach one.
+	stallAfter int
 }
 
 func (s slowAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	*s.calls++
 	switch {
+	case s.stallAfter > 0:
+		if *s.calls > s.stallAfter {
+			*s.clock = s.clock.Add(s.jump)
+		}
 	case s.every > 0:
 		if *s.calls%s.every == 0 {
 			*s.clock = s.clock.Add(s.jump)

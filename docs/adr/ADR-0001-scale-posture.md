@@ -761,7 +761,12 @@ Four mechanisms now carry the load the caps used to carry, and each is exercised
 for the failure mode it protects, not for the mechanism:
 
 - **The query deadline** is the only remaining stop on an unbounded walk, and it must end a *page*.
-  A deadline that returns "truncated" with no cursor is a class-E defect by definition.
+  A deadline that returns "truncated" with no cursor is a class-E defect by definition — with one
+  named exception, which is the stall detector below rather than a deadline stop: a resumed page
+  whose every adjacency read already ran past the deadline can only mint the cursor it was handed,
+  so it reports `query deadline reached before the walk could advance` and offers no cursor. The
+  state that page resumed is left adoptable, so the cursor the caller already holds carries the walk
+  on under a larger timeout; the answer ends, the walk does not.
 - **Memory admission** serialises and defers; only an explicit non-zero user ceiling rejects
   anything, and then with both numbers in the message.
 - **Disk-backed spools** replace every heap-resident whole-repository set, bounded by the temporary
