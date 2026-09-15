@@ -11,6 +11,20 @@ labelled with the server, its version and an input digest, and carries
 (`lsp.SemanticSource`). When the server stops the answers are simply gone;
 canonical generations never change.
 
+**The overlay therefore has no row in the `codectx status` completeness
+table, by design.** That table reports the capability state of the providers
+that produced the sealed units of the active generation; the overlay produces
+none, so a row there could only ever describe a server this build might start
+later, qualified by a snapshot no query has asked for yet. The overlay reports
+its state **per query** instead: a query carrying `--semantic-source lsp
+--profile <server>` either answers with `semantic_source=lsp` and the server,
+its version and the input digest attached, or fails with the typed reason from
+the `Resolve` table above (`CTX_PROVIDER_UNAVAILABLE`, `CTX_TOOL_OFFLINE`,
+`CTX_TOOL_UNSUPPORTED_PLATFORM`, `CTX_TOOL_CORRUPT`). To see ahead of a query
+whether a server *could* start, read whether its pinned payload is installed:
+`codectx tools status` lists every server the lock names, and `codectx doctor`
+reports the ones this repository selects and does not have.
+
 ## What runs, and why it is allowed to
 
 A `Definition` is what this build knows about a supported server: name — which
