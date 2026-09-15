@@ -3,9 +3,11 @@ package graph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -19,6 +21,10 @@ const (
 	reasonPageFull      = "page item limit reached"
 	reasonDependence    = "dependence units are still building"
 	reasonFrontierBytes = "frontier memory budget exhausted"
+	// reasonDepth is the depth bound. Before this it was the ONE stop that
+	// reported nothing at all: the loop simply fell out with a live frontier
+	// and Truncated=false, so a depth-limited answer read as a complete one.
+	reasonDepth = "graph depth budget exhausted"
 )
 
 // edgeRowOverheadBytes is the fixed per-row cost of holding one edge of a
@@ -94,6 +100,7 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			frontier = append(frontier, frontierState{Node: s})
 		}
 		o.Budget.visited += int64(len(frontier))
+		o.Budget.pageVisited += int64(len(frontier))
 	} else {
 		// A resume never re-enters the seeds: they are already in the visited
 		// set the issuing page spooled, and re-admitting them would spend the
@@ -124,7 +131,11 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	}
 	sort.Slice(frontier, func(i, j int) bool { return frontier[i].Node < frontier[j].Node })
 
-	for ; depth < o.MaxDepth && len(frontier) > 0; depth++ {
+	// Expanding level `depth` produces nodes at depth+1, so the bound is
+	// crossed when depth+1 would exceed it. config.Limit.Exceeded is the whole
+	// test: an unlimited bound is never exceeded, so the walk is bounded by the
+	// graph, by the page budgets below and by the deadline instead.
+	for ; len(frontier) > 0 && !o.MaxDepth.Exceeded(int64(depth+1)); depth++ {
 		if err := checkWalk(ctx, o.Budget); err != nil {
 			return walkState{}, err
 		}
@@ -164,11 +175,13 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			}
 			admittedRel[row.rel.ID] = true
 			o.Budget.edges++
+			o.Budget.pageEdges++
 			if admittedNode[row.neighbor] {
 				continue
 			}
 			admittedNode[row.neighbor] = true
 			o.Budget.visited++
+			o.Budget.pageVisited++
 			next = append(next, frontierState{
 				Depth: depth + 1,
 				Cost:  row.owner.Cost + Cost(row.rel.Kind),
@@ -177,13 +190,28 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			})
 		}
 		if o.Budget.frontierHit {
-			return walkState{Admitted: admittedNode}, nil
+			// The frontier byte ceiling SPILLS rather than stopping: the level
+			// as far as it was read, plus the next level as far as it was
+			// built, become the continuation the caller spools. The resumed
+			// page re-reads this level from (lastOwner, lastKey), so no edge is
+			// read twice and none is skipped -- exactly the deliberate
+			// mid-level stop above, reached by a different trigger.
+			stopped := make([]frontierState, 0, len(frontier)+len(next))
+			stopped = append(stopped, frontier...)
+			stopped = append(stopped, next...)
+			return walkState{Depth: depth, Frontier: stopped, Admitted: admittedNode}, nil
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
 	}
-	// A walk that falls out of the loop ran to completion: an empty Frontier is
-	// what tells the caller there is nothing to continue from.
+	// A walk that falls out of the loop with an EMPTY frontier ran to
+	// completion. One that still holds a frontier ran out of depth: those nodes
+	// are admitted but their edges were never read, which is a truncation the
+	// caller must be told about. Reporting it is the whole of row 14 -- see
+	// DepthLimited for why no continuation is minted for it.
+	if len(frontier) > 0 {
+		return walkState{Depth: depth, Frontier: frontier, Admitted: admittedNode, DepthLimited: true}, nil
+	}
 	return walkState{Depth: depth, Admitted: admittedNode}, nil
 }
 
@@ -199,6 +227,18 @@ type walkState struct {
 	Frontier []frontierState
 	// Admitted is every node the walk has admitted, cumulative across pages.
 	Admitted map[model.NodeID]bool
+	// DepthLimited records that the walk stopped because the user-set depth
+	// bound was reached, with those nodes' edges still unread.
+	//
+	// A depth stop is REPORTED but not resumable, and it is the only stop of
+	// which that is true. Every other bound here is a per-page work budget, so
+	// the next page makes progress; the depth bound is a property of the walk
+	// and is part of the query hash a cursor is bound to, so a continuation
+	// minted for it would resume a walk that is already past the bound, stop at
+	// once and mint another -- a cursor chain that never terminates and never
+	// returns a row. The honest answer is Truncated + reasonDepth, and the
+	// caller's remedy is to raise max_depth.
+	DepthLimited bool
 }
 
 // edgeRow is one edge of a level attributed to the frontier node it left from,
@@ -257,11 +297,20 @@ chunks:
 					(row.owner.Node == skipOwner && row.rel.ID <= skipKey)) {
 					continue
 				}
-				if o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
-					// The level does not fit in the configured frontier budget.
-					// Stopping here and disclosing it is the honest answer; the
-					// alternative is accumulating an unbounded hub in memory
-					// under a bound the configuration says exists.
+				if spent > 0 && o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
+					// The level does not fit in the configured frontier budget:
+					// spill what was read and let the continuation carry on,
+					// rather than accumulating an unbounded hub in memory under
+					// a bound the configuration says exists.
+					//
+					// `spent > 0` is what makes that terminate. A budget smaller
+					// than ONE edge row would otherwise trip here before any row
+					// was admitted, and since the resumed page re-reads the level
+					// from the same keyset position it would trip at the same row
+					// again: a cursor chain that returns no edge and never ends.
+					// Every level-read therefore admits at least one edge --
+					// exceeding the byte bound by at most one row -- which is the
+					// same trade every other per-page budget here makes.
 					o.Budget.frontierHit = true
 					break chunks
 				}
@@ -372,11 +421,54 @@ func continuationUnavailable(cursor string) error {
 // resolveBound applies the Section 20.1 zero-value convention: zero takes the
 // configured default and a positive request value is honoured only as far as
 // that default, so a request can tighten a bound but never raise it.
+//
+// It is the FINITE form, for the one bound that is never unlimited: the page
+// item ceiling. Use resolveLimit for every scale bound -- a silent clamp there
+// is the class-G defect this wave removes.
 func resolveBound(requested, configured int) int {
 	if requested <= 0 || requested > configured {
 		return configured
 	}
 	return requested
+}
+
+// resolveLimit resolves one unlimited-capable count bound and, when the request
+// asked for more than the configuration allows, returns the notice that says so.
+// A request can still only tighten a bound -- raising it is an operator
+// decision, not a caller's -- but it is never SILENTLY tightened: the answer
+// carries "requested N, effective M" so the caller can tell a small answer
+// caused by its own request from one caused by the configuration.
+//
+// config.Limit.Min owns the comparison, with unlimited as the top of the
+// lattice, so an unlimited configuration honours any finite request.
+func resolveLimit(key string, requested int, configured config.Limit) (config.Limit, string) {
+	if requested <= 0 {
+		return configured, ""
+	}
+	effective := config.Limit(requested).Min(configured)
+	if effective.Value() == int64(requested) {
+		return effective, ""
+	}
+	return effective, fmt.Sprintf("%s: requested %d, effective %s (the configured bound)",
+		key, requested, effective)
+}
+
+// resolvePageItems is resolveBound with the same disclosure obligation.
+func resolvePageItems(requested, configured int) (int, string) {
+	effective := resolveBound(requested, configured)
+	if requested <= 0 || effective == requested {
+		return effective, ""
+	}
+	return effective, fmt.Sprintf("page.limit: requested %d, effective %d (the configured bound)",
+		requested, effective)
+}
+
+// appendNotice collects the non-empty disclosures a walk accumulated.
+func appendNotice(into []string, notice string) []string {
+	if notice == "" {
+		return into
+	}
+	return append(into, notice)
 }
 
 // traverse is the body behind Neighbors: dir and kinds are what the request
@@ -407,10 +499,15 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		kinds = DefaultRelations()
 	}
 
-	maxDepth := resolveBound(req.MaxDepth, e.limits.MaxDepth)
-	maxVisited := int64(resolveBound(req.MaxVisited, e.limits.MaxVisited))
-	maxEdges := int64(resolveBound(req.MaxEdges, e.limits.MaxEdges))
-	maxItems := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
+	var notices []string
+	maxDepth, notice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
+	notices = appendNotice(notices, notice)
+	maxVisited, notice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())
+	notices = appendNotice(notices, notice)
+	maxEdges, notice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
+	notices = appendNotice(notices, notice)
+	maxItems, notice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
+	notices = appendNotice(notices, notice)
 
 	// The capability disclosure happens before the walk: a missing dependence
 	// edge must not read as a genuine absence of edges.
@@ -426,7 +523,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// The query hash binds a continuation to this exact normalized walk, so a
 	// cursor presented to a differently filtered or differently bounded query is
 	// CTX_CURSOR_INVALID rather than a silently repinned answer.
-	queryHash := traversalQueryHash(dir, kinds, req.Start, maxDepth, maxItems)
+	queryHash := traversalQueryHash(dir, kinds, req.Start, maxDepth.Int(), maxItems)
 	var resume *resumeState
 	if req.Page.Cursor != "" {
 		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, endpoint, queryHash, deadline)
@@ -448,11 +545,15 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		endpoints[s] = true
 	}
 	visit := func(owner frontierState, rel model.Relation) error {
+		// The visited and edge budgets are compared against THIS page's spend:
+		// they are work budgets that end a page, not ceilings that end a walk.
+		// Exceeded is strictly greater, so the test is on the spend this row
+		// would take the page to.
 		switch {
-		case b.edges >= maxEdges:
+		case maxEdges.Exceeded(b.pageEdges + 1):
 			walkReason = reasonEdgeBudget
 			return errStopExpansion
-		case b.visited >= maxVisited:
+		case maxVisited.Exceeded(b.pageVisited + 1):
 			walkReason = reasonVisitedBudget
 			return errStopExpansion
 		case len(relations) >= maxItems:
@@ -496,16 +597,24 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	if reason == "" && b.frontierHit {
 		reason = reasonFrontierBytes
 	}
+	// A walk that ran out of depth with nodes still unexpanded is truncated and
+	// says so: before this it fell out of the loop reporting nothing.
+	if reason == "" && state.DepthLimited {
+		reason = reasonDepth
+	}
 	if reason == "" && deferred {
 		reason = reasonDependence
 	}
-	// A continuation is offered for exactly one stop: the page filled up while
-	// the walk still had a frontier. Every other truncation reason means the
-	// walk cannot usefully go on -- a spent visited or edge budget is cumulative
-	// and a resumed page would stop at once, and a level the frontier byte
-	// ceiling cut short would be cut short again.
+	// A continuation is offered for EVERY stop that left a frontier standing --
+	// a full page, a spent per-page visited or edge budget, a level the frontier
+	// byte ceiling spilled. All three are now per-page budgets, so the resumed
+	// page makes progress rather than stopping at once.
+	//
+	// The depth bound is the single exception, and DepthLimited on walkState
+	// carries the reason: it is part of the query hash the cursor is bound to,
+	// so a continuation minted for it could only resume a walk already past it.
 	var nextCursor string
-	if reason == reasonPageFull && len(state.Frontier) > 0 {
+	if len(state.Frontier) > 0 && !state.DepthLimited {
 		visited := make([]model.NodeID, 0, len(state.Admitted))
 		for id := range state.Admitted {
 			visited = append(visited, id)
@@ -531,6 +640,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			Truncated:        reason != "",
 			TruncationReason: reason,
 			NextCursor:       nextCursor,
+			Notices:          notices,
 		},
 		Direction: dir,
 		Nodes:     nodes,
@@ -542,7 +652,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// MaxDepth echoes the effective depth bound the walk ran under, so a
 		// caller can tell a shallow answer caused by a tightened bound from one
 		// caused by the graph simply ending.
-		MaxDepth: maxDepth,
+		MaxDepth: maxDepth.Int(),
 	}
 	if err := result.Validate(); err != nil {
 		return model.GraphResult{}, err
