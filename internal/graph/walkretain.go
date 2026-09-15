@@ -3,6 +3,8 @@ package graph
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -277,4 +279,140 @@ func (r *retainFile) close() error {
 func retainCorrupt(err error) error {
 	return &model.Error{Code: model.CodeStorageCorrupt,
 		Message: "graph: the retained walk input ends mid-record: " + err.Error()}
+}
+
+// Ruling P7 -- a deadline that lands after the walk is complete but before the
+// RANKING is -- is served out of the same directory. The ranking is two
+// sequential external sorts, and both are resumable:
+//
+//   - the runs the interrupted sort had already spilled are MOVED into this
+//     directory (they spill into the engine's sort directory, which nothing
+//     leases) and the next request opens a sort over them with
+//     pagination.AdoptRuns instead of re-sorting the records they hold;
+//   - the manifest records how many records of the retained input were already
+//     Added into those runs, because eachEntry replays the WHOLE input and the
+//     adopted runs already hold a prefix of it. Without that count the resumed
+//     sort would add every adopted record a second time and the fold would
+//     double it;
+//   - pass 2's input is pass 1's OUTPUT, which the sort removes as soon as it
+//     has been read, so it is retained here too. A deadline in pass 2 therefore
+//     resumes pass 2 rather than re-running the fold.
+//
+// The manifest and the runs it names are written together, at the interruption
+// and nowhere else: a manifest that named runs a later step had consumed would
+// resume into a missing file, and one written without its runs would drop
+// every record they held.
+const (
+	retainRankFile   = "rank"
+	retainFoldedFile = "folded"
+)
+
+// rankProgress is that manifest. A directory with no manifest has a zero one,
+// which reads as "pass 1, nothing adopted, nothing added" -- the state a walk
+// that has never been ranked is in.
+type rankProgress struct {
+	// Pass is the pass the next request resumes INTO: 0 or 1 for the fold, 2
+	// for the rank. It is explicit rather than inferred from Folded because a
+	// pass-2 resume with nothing yet added has no runs and no offset to tell
+	// it apart from a pass-1 resume.
+	Pass int `json:"pass"`
+	// Runs are the adopted runs' names WITHIN this directory. They are base
+	// names, never paths: the directory is renamed when the spool store adopts
+	// it, so a stored absolute path would name a file that no longer exists.
+	Runs []string `json:"runs,omitempty"`
+	// Added is how many records of that pass's input the runs already hold,
+	// counted from the front of the input in replay order.
+	Added int64 `json:"added"`
+}
+
+// rankProgress reads the manifest. A missing one is the zero value.
+func (w *retainedWalk) rankProgress() (rankProgress, error) {
+	b, err := os.ReadFile(filepath.Join(w.dir, retainRankFile))
+	if os.IsNotExist(err) {
+		return rankProgress{}, nil
+	}
+	if err != nil {
+		return rankProgress{}, internalErr("graph: the retained ranking manifest: " + err.Error())
+	}
+	var p rankProgress
+	if err := json.Unmarshal(b, &p); err != nil {
+		return rankProgress{}, &model.Error{Code: model.CodeStorageCorrupt,
+			Message: "graph: the retained ranking manifest is not readable"}
+	}
+	return p, nil
+}
+
+// setRankProgress replaces the manifest atomically: a torn manifest would
+// resume the ranking from a state that never existed.
+func (w *retainedWalk) setRankProgress(p rankProgress) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return internalErr("graph: encoding the retained ranking manifest: " + err.Error())
+	}
+	tmp := filepath.Join(w.dir, retainRankFile+".tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return internalErr("graph: the retained ranking manifest: " + err.Error())
+	}
+	if err := os.Rename(tmp, filepath.Join(w.dir, retainRankFile)); err != nil {
+		_ = os.Remove(tmp)
+		return internalErr("graph: the retained ranking manifest: " + err.Error())
+	}
+	return nil
+}
+
+// adoptRunFiles moves the runs a detached sort handed over into this directory
+// and returns their names there. Ownership moves with them, exactly as
+// pagination.Detach states: the sort that adopts them removes them.
+func (w *retainedWalk) adoptRunFiles(paths []string) ([]string, error) {
+	names := make([]string, 0, len(paths))
+	for i, from := range paths {
+		// The name is the run's INDEX, not its source name. Detach returns the
+		// runs this sort adopted followed by the ones it spilled itself, in
+		// that order and never reordered (pagination.AdoptRuns), so index i
+		// names the same run across any number of interruptions -- and a run
+		// already sitting at that name is the one being re-detached and is left
+		// where it is rather than renamed onto itself.
+		name := fmt.Sprintf("run-%06d", i)
+		to := filepath.Join(w.dir, name)
+		if from != to {
+			if err := os.Rename(from, to); err != nil {
+				return nil, internalErr("graph: retaining an interrupted sort run: " + err.Error())
+			}
+		}
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// runPaths resolves manifest names against the directory's CURRENT location.
+func (w *retainedWalk) runPaths(names []string) []string {
+	paths := make([]string, 0, len(names))
+	for _, name := range names {
+		paths = append(paths, filepath.Join(w.dir, name))
+	}
+	return paths
+}
+
+// openFolded opens the retained pass-2 input for append, truncating whatever an
+// abandoned earlier attempt left: the folded set is rewritten whole or not at
+// all, and half of one appended to half of another is not a fold of anything.
+func (w *retainedWalk) openFolded() (*retainFile, error) {
+	path := filepath.Join(w.dir, retainFoldedFile)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return nil, internalErr("graph: the retained fold output: " + err.Error())
+	}
+	return openRetainFile(path)
+}
+
+// eachFolded replays the retained pass-2 input, the same way eachEntry replays
+// pass 1's. The file has no open writer by then, so nothing is flushed first.
+func (w *retainedWalk) eachFolded(add func(impactRecord) error) error {
+	f := &retainFile{path: filepath.Join(w.dir, retainFoldedFile)}
+	return f.each(func(b []byte) error {
+		r, err := decodeImpactRecord(b)
+		if err != nil {
+			return err
+		}
+		return add(r)
+	})
 }

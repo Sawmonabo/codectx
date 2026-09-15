@@ -154,6 +154,12 @@ type Engine struct {
 	// probe is TEST-only memory instrumentation (heapProbe in impactrank.go):
 	// nil in production, and every ranking pass's observation is a nil check.
 	probe *heapProbe
+	// rankStopAfter is TEST-only: when positive, each ranking pass reports the
+	// query deadline once this request has added that many records to it, which
+	// is the only way to reach ruling P7's mid-rank branch deterministically --
+	// a fixture's ranking is far too fast to be caught by a clock that advances
+	// on adjacency round trips.
+	rankStopAfter int
 }
 
 // New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases
