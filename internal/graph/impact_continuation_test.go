@@ -25,7 +25,7 @@ func TestRankedImpactWithoutContinuationMachinerySaysItIsCut(t *testing.T) {
 	limits.MaxPageItems = 20
 	limits.QueryTimeout = time.Minute
 	// No Signer, no Spools, no Leases: the workspace offers no continuations.
-	e, err := New(Options{Adjacency: f, Limits: limits})
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}

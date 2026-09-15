@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -124,6 +125,18 @@ type convergentAdjacency struct {
 	nodes   map[model.NodeID]model.Node
 }
 
+// reader is the same graph through the packed-adjacency port, so an engine
+// over this fake carries both the walk's Adjacency and the consumers'
+// GraphReader over ONE set of facts.
+func (a *convergentAdjacency) reader() *MemoryGraph {
+	nodes := make([]model.Node, 0, len(a.nodes))
+	for _, n := range a.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return NewMemoryGraph(a.binding, nodes, a.rels)
+}
+
 // convergentChain is long enough that the walk needs several pages at the page
 // size the test sets.
 const convergentChain = 60
@@ -242,7 +255,7 @@ func TestSpooledVisitedSetAnswersACrossPageRevisit(t *testing.T) {
 		limits := fixtureLimits()
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = pageItems
-		e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: a, Reader: a.reader(), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
@@ -474,7 +487,7 @@ func resumeSpooledWalk(t *testing.T, pages int) *resumeState {
 	limits := fixtureLimits()
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 	limits.MaxPageItems = 8
-	e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: a, Reader: a.reader(), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)

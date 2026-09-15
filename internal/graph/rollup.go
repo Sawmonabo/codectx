@@ -3,9 +3,9 @@ package graph
 import (
 	"context"
 	"errors"
+	"slices"
 	"unicode/utf8"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -320,24 +320,35 @@ type pairRollup struct {
 	add  func(pairRecord) error
 
 	batch []model.Relation
-	// cut is the containment-cut state of the WHOLE rollup, not of one batch:
-	// a user-set edge allowance that stops a containment read must be
-	// disclosed once however many batches it stops, and a node it dropped must
-	// stay dropped rather than resolve from the candidates a later batch
-	// happens to add for it. Both are what keep the answer independent of
-	// where the batch boundaries fell.
-	cut containmentCut
+	// labels caches the reported label of each container the rollup has
+	// resolved, keyed by its surrogate. Its bound is the number of DISTINCT
+	// CONTAINERS the walk touched -- packages and modules -- and never the
+	// number of nodes or edges it visited: a container is hydrated once per
+	// walk however many of its members the walk admits, which is what turned
+	// the old rollup's per-batch re-hydration of the same few packages into 93
+	// per cent of a large walk. A repository has orders of magnitude fewer
+	// packages than symbols, so the cache is a page-sized structure by
+	// construction.
+	labels map[NodeRef]containerLabel
 	// peak is the largest batch the sink ever held, the memory high-water mark
 	// rollupStats reports.
 	peak int
+}
+
+// containerLabel is what a rolled-up endpoint reports: the container's
+// canonical id, which the pair is ordered and folded by, and its path-shaped
+// label, already clipped to the served field bound.
+type containerLabel struct {
+	id   model.NodeID
+	path string
 }
 
 // newPairRollup opens a sink that emits into add.
 func newPairRollup(ctx context.Context, e *Engine, meta *model.QueryMeta,
 	add func(pairRecord) error) *pairRollup {
 	return &pairRollup{ctx: ctx, e: e, meta: meta, add: add,
-		batch: make([]model.Relation, 0, pairRollupBatch),
-		cut:   containmentCut{unattributed: map[model.NodeID]bool{}}}
+		batch:  make([]model.Relation, 0, pairRollupBatch),
+		labels: map[NodeRef]containerLabel{}}
 }
 
 // Visit buffers one admitted edge and resolves the batch once it is full.
@@ -355,6 +366,15 @@ func (p *pairRollup) Visit(_ frontierState, rel model.Relation) error {
 // flush resolves the buffered batch and empties it. It is called for every
 // full batch and once more for the remainder, so an edge is emitted exactly
 // once however the batches fell.
+//
+// The resolution is three ARRAY reads on the pinned reader -- the endpoints'
+// surrogates, their container surrogates and the batch's evidence counts --
+// and never a containment traversal. ADR-0005 states why: the old rollup
+// re-read the incoming `contains` edges of every endpoint of every batch and
+// re-hydrated the same handful of container nodes over a thousand batches,
+// which is where 93 per cent of a large walk's wall clock went. The container
+// of a node is a per-generation side array now, so a batch costs one indexed
+// read per array whatever the fan-out of its endpoints.
 func (p *pairRollup) flush() error {
 	if len(p.batch) == 0 {
 		return nil
@@ -372,7 +392,7 @@ func (p *pairRollup) flush() error {
 		endpoints = append(endpoints, r.From, r.To)
 		relationIDs = append(relationIDs, r.ID)
 	}
-	containers, err := p.e.containerPackages(p.ctx, endpoints, p.meta, &p.cut)
+	containers, err := p.containerLabels(endpoints)
 	if err != nil {
 		return err
 	}
@@ -387,18 +407,128 @@ func (p *pairRollup) flush() error {
 		// package depending on itself is not a dependency. An edge with no
 		// resolvable container is dropped rather than attributed to a guessed
 		// package.
-		if !okFrom || !okTo || from.ID == to.ID {
+		if !okFrom || !okTo || from.id == to.id {
 			continue
 		}
-		// The labels are clipped HERE, where the record is built: pairRecord's
-		// projection onto model.PackageEdge does no clipping, and an over-long
-		// path would fail the served item's own validation.
 		if err := p.add(pairRecord{
-			FromNodeID: from.ID, ToNodeID: to.ID,
-			FromPath: clipPath(packageLabel(from)), ToPath: clipPath(packageLabel(to)),
+			FromNodeID: from.id, ToNodeID: to.id,
+			FromPath: from.path, ToPath: to.path,
 			PairCount: 1, EvidenceCount: evidence[r.ID],
 		}); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// containerLabels maps each endpoint of one batch to the package or module
+// that contains it, reading the generation's container side array rather than
+// walking containment. A node that is itself a container maps to itself (the
+// reader's own rule), so a package-level edge rolls up to the pair it already
+// names, and a node with no container is absent from the map, which drops its
+// edge rather than attributing it to a guessed package.
+//
+// Only containers this rollup has not seen before are hydrated, and the cache
+// that decides that is keyed by the container surrogate: the hydration cost of
+// a whole walk is therefore one batched node read per adjacencyBatch DISTINCT
+// containers, not one per batch of edges.
+func (p *pairRollup) containerLabels(ids []model.NodeID) (map[model.NodeID]containerLabel, error) {
+	reader, err := p.e.consumerReader()
+	if err != nil {
+		return nil, err
+	}
+	ids = dedupeNodes(append([]model.NodeID(nil), ids...))
+	out := make(map[model.NodeID]containerLabel, len(ids))
+	// missing collects the containers this batch needs and the cache does not
+	// hold, deduplicated by surrogate so one unseen package is hydrated once
+	// however many of this batch's endpoints name it.
+	missing := map[NodeRef]bool{}
+	owners := make([]NodeRef, 0, len(ids))
+	for _, chunk := range impactChunkNodes(ids) {
+		refs, err := reader.Resolve(p.ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		containers, err := reader.Containers(p.ctx, refs)
+		if err != nil {
+			return nil, err
+		}
+		owners = append(owners, containers...)
+		for _, c := range containers {
+			if c == 0 {
+				continue
+			}
+			if _, cached := p.labels[c]; !cached {
+				missing[c] = true
+			}
+		}
+	}
+	if err := p.hydrate(reader, missing); err != nil {
+		return nil, err
+	}
+	for i, id := range ids {
+		label, ok := p.labels[owners[i]]
+		if !ok {
+			// No container in this generation, or one the generation does not
+			// publish a node for: the endpoint is unattributed and its edge is
+			// dropped, exactly as before.
+			continue
+		}
+		out[id] = label
+	}
+	return out, nil
+}
+
+// hydrate reads the canonical id and the reported label of every container the
+// cache is missing, in batched round trips, and records them. A container the
+// generation publishes no node for is recorded as absent rather than retried
+// on the next batch, so one unpublishable container cannot cost one read per
+// batch for the rest of the walk.
+func (p *pairRollup) hydrate(reader GraphReader, missing map[NodeRef]bool) error {
+	if len(missing) == 0 {
+		return nil
+	}
+	refs := make([]NodeRef, 0, len(missing))
+	for ref := range missing {
+		refs = append(refs, ref)
+	}
+	// Ascending, so the reads cluster the way the packed side arrays are laid
+	// out rather than probing them in map-iteration order.
+	slices.Sort(refs)
+	for len(refs) > 0 {
+		chunk := refs
+		if len(chunk) > adjacencyBatch {
+			chunk = chunk[:adjacencyBatch]
+		}
+		refs = refs[len(chunk):]
+		ids, err := reader.NodeIDs(p.ctx, chunk)
+		if err != nil {
+			return err
+		}
+		want := make([]model.NodeID, 0, len(ids))
+		for _, id := range ids {
+			if id != "" {
+				want = append(want, id)
+			}
+		}
+		nodes, err := reader.NodesByID(p.ctx, want)
+		if err != nil {
+			return err
+		}
+		byID := make(map[model.NodeID]model.Node, len(nodes))
+		for _, n := range nodes {
+			byID[n.ID] = n
+		}
+		for i, ref := range chunk {
+			n, ok := byID[ids[i]]
+			if !ok {
+				continue
+			}
+			// The label is clipped HERE, where it enters the cache:
+			// pairRecord's projection onto model.PackageEdge does no clipping,
+			// and an over-long path would fail the served item's own
+			// validation.
+			p.labels[ref] = containerLabel{id: n.ID, path: clipPath(packageLabel(n))}
 		}
 	}
 	return nil
@@ -462,166 +592,6 @@ func (e *Engine) rollupInto(ctx context.Context, meta *model.QueryMeta,
 		stats.observe(sink.peak)
 	}
 	return nil
-}
-
-// containmentCut is the containment-read cut state of ONE rollup: the nodes a
-// user-set edge allowance dropped, and whether the bound has been disclosed.
-// It is the caller's rather than containerPackages' own, because the rollup
-// resolves its endpoints in batches and both facts are facts of the whole
-// answer: disclosed once, and a dropped node dropped for good.
-type containmentCut struct {
-	unattributed map[model.NodeID]bool
-	disclosed    bool
-}
-
-// containerPackages maps each node to the package or module node that contains
-// it, in bounded batched round trips. A node that is itself a container maps to
-// itself, so a package-level edge rolls up to the pair it already names.
-//
-// The containment read is bounded by the CONFIGURED edge allowance, which is
-// unlimited by default, so the shipped configuration reads every containment
-// edge a batch has. It used to be bounded by a hard-coded sixteen containers
-// per node: a graph that legitimately claimed a node from more containers than
-// that refused the whole rollup on a default configuration, which is a scale
-// refusal rather than a policy the operator chose.
-//
-// A user-set allowance that stops a batch's read OMITS that batch's nodes from
-// the map and discloses the bound once, the shape containerContents already
-// uses. Omission is what the old refusal was protecting: a node whose candidate
-// list is half-read would be attributed to the wrong package, not merely to
-// fewer, and an unattributed endpoint drops its edge from the rollup -- the
-// same treatment the rollup already gives an endpoint with no container at
-// all. The pairs that remain are therefore measured pairs, and the answer says
-// it is not the whole rollup.
-func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID,
-	meta *model.QueryMeta, state *containmentCut) (map[model.NodeID]model.Node, error) {
-	ids = dedupeNodes(append([]model.NodeID(nil), ids...))
-	candidates := map[model.NodeID][]model.NodeID{}
-	var lookup []model.NodeID
-	lookup = append(lookup, ids...)
-	if state.unattributed == nil {
-		state.unattributed = map[model.NodeID]bool{}
-	}
-	unattributed := state.unattributed
-	// cut drops every candidate a stopped batch collected -- a half-read
-	// candidate list is a wrong attribution, not a short one -- and discloses
-	// the bound once however many batches it stops, ACROSS the whole rollup:
-	// state outlives this call so a resolution split into batches discloses
-	// the same once and drops the same nodes as a single-shot one.
-	cut := func(batch []model.NodeID) {
-		for _, id := range batch {
-			delete(candidates, id)
-			unattributed[id] = true
-		}
-		markTruncated(meta, reasonEdgeBudget)
-		if state.disclosed {
-			return
-		}
-		state.disclosed = true
-		meta.Notices = appendNotice(meta.Notices,
-			"max_graph_edges: the configured edge bound stopped a containment read, so the "+
-				"relations of the nodes it covered are omitted from this rollup rather than "+
-				"attributed to a partly-read container")
-	}
-	for _, batch := range impactChunkNodes(ids) {
-		// Streaming, not a slice: each containment row is folded into the
-		// candidate list of the node it contains as it arrives, so the heap
-		// here is one adjacency page plus the candidates themselves, never the
-		// whole containment fan-out of the batch.
-		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, e.limits.Edges(),
-			func(r model.Relation) error {
-				candidates[r.To] = append(candidates[r.To], r.From)
-				lookup = append(lookup, r.From)
-				return nil
-			})
-		if err != nil {
-			return nil, err
-		}
-		if !complete {
-			cut(batch)
-		}
-	}
-	nodes, err := e.nodesByID(ctx, lookup)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[model.NodeID]model.Node, len(ids))
-	for _, id := range ids {
-		if unattributed[id] {
-			continue
-		}
-		if n, ok := nodes[id]; ok && isContainerKind(n.Kind) {
-			out[id] = n
-			continue
-		}
-		// Several containers can claim one node; the lowest NodeID wins so the
-		// rollup is reproducible from the facts alone rather than from the order
-		// the adjacency happened to return.
-		var best *model.Node
-		for _, cand := range candidates[id] {
-			n, ok := nodes[cand]
-			if !ok || !isContainerKind(n.Kind) {
-				continue
-			}
-			if best == nil || n.ID < best.ID {
-				chosen := n
-				best = &chosen
-			}
-		}
-		if best != nil {
-			out[id] = *best
-		}
-	}
-	return out, nil
-}
-
-// streamContainsEdges reads the containment edges of one batch of nodes in
-// direction, keyset-paged by RelationID and delivered one ROW at a time, up to
-// maxEdges rows. It holds one adjacency page -- adjacencyBatch rows -- and never
-// the whole containment fan-out of a batch of containers, so a caller that only
-// needs to fold each row (a rollup keeps one candidate list per node; the
-// repository map keeps one counter per container) pays a page of heap rather
-// than a level of it.
-//
-// It reports whether the read COMPLETED, and that flag is F7's fix: a read
-// whose budget is spent EXACTLY as the rows run out is complete, not
-// incomplete. The old loop tested the budget before each PAGE, so a containment
-// set that exactly filled it reported incomplete and both callers refused a
-// legitimately whole answer -- and, in the other direction, a page could
-// deliver up to adjacencyBatch rows past the budget before the test ran. The
-// budget is compared per ROW now, and only the empty page ends the walk.
-func (e *Engine) streamContainsEdges(ctx context.Context, batch []model.NodeID,
-	direction model.Direction, kinds []model.RelationKind, maxEdges config.Limit,
-	fn func(model.Relation) error) (bool, error) {
-	var (
-		read  int
-		after model.RelationID
-	)
-	for {
-		rels, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, adjacencyBatch)
-		if err != nil {
-			return false, err
-		}
-		// Only an empty page ends the walk: the reader clamps the requested
-		// limit down to model.MaxPageItems, so testing for a short page would
-		// stop after the first one and under-roll every container.
-		if len(rels) == 0 {
-			return true, nil
-		}
-		for _, r := range rels {
-			if atBound(maxEdges, read) {
-				// The budget is spent and a row is still standing: that, and
-				// only that, is an incomplete containment read.
-				return false, nil
-			}
-			if err := fn(r); err != nil {
-				return false, err
-			}
-			read++
-			after = r.ID
-		}
-	}
 }
 
 // evidenceCounts counts the evidence records backing each relation, in bounded

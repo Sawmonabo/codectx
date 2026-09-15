@@ -39,7 +39,8 @@ func (b *busyOnceAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir
 }
 
 func TestBusyResumedTraversalPageKeepsItsContinuation(t *testing.T) {
-	adj := &busyOnceAdjacency{Adjacency: newGraphFixture(t)}
+	f := newGraphFixture(t)
+	adj := &busyOnceAdjacency{Adjacency: f}
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
 		t.Fatalf("open signer: %v", err)
@@ -54,7 +55,7 @@ func TestBusyResumedTraversalPageKeepsItsContinuation(t *testing.T) {
 	// the page under test is a RESUMED one.
 	limits.MaxPageItems = 1
 	limits.QueryTimeout = time.Minute
-	e, err := New(Options{Adjacency: adj, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: adj, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)

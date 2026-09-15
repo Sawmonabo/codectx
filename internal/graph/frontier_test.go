@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -53,7 +52,7 @@ func TestResumableFrontierCompletesAcrossPages(t *testing.T) {
 		limits.MaxDepth, limits.MaxEdges = 0, 0
 		limits.MaxVisited = maxVisited
 		limits.MaxPageItems = 2000
-		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
@@ -142,7 +141,7 @@ func TestDepthBoundIsReportedNotSilent(t *testing.T) {
 	limits.MaxDepth = 2
 	limits.MaxVisited, limits.MaxEdges = 0, 0
 	limits.MaxPageItems = 2000
-	e, err := New(Options{Adjacency: f, Limits: limits})
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
@@ -166,7 +165,7 @@ func TestDepthBoundIsReportedNotSilent(t *testing.T) {
 	// The same walk with the bound removed is complete: the truncation above is
 	// the bound's doing, not the fixture running out of graph.
 	limits.MaxDepth = 0
-	deep, err := New(Options{Adjacency: f, Limits: limits})
+	deep, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}
@@ -210,7 +209,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 	limits.MaxPageItems = 2000
 	// Below edgeRowOverheadBytes, so EVERY row on its own exceeds the budget.
 	limits.FrontierBytes = 1
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -254,7 +253,7 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 	// silently drops what a mid-chunk cut never read and a fix that resumes
 	// mid-chunk and emits one level's owners out of order; this does not.
 	limits.FrontierBytes = 32 << 20
-	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -321,7 +320,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 		// bound as the thing that ends a page.
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = pageItems
-		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
@@ -511,75 +510,6 @@ func assertPairOrder(t *testing.T, pairs []model.PackageEdge) {
 	}
 }
 
-// exactFillAdjacency serves a fixed containment row set through the keyset
-// protocol so a read can be given a budget that its rows fill EXACTLY. The
-// fixture's own graph cannot express that: the rollup derives the budget from
-// the batch size, so no fixture shape makes the two land on the same number.
-type exactFillAdjacency struct {
-	*graphFixture
-	rows []model.Relation
-}
-
-func (a exactFillAdjacency) Edges(_ context.Context, _ []model.NodeID, _ model.Direction,
-	_ []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	out := a.rows
-	for len(out) > 0 && out[0].ID <= after {
-		out = out[1:]
-	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return append([]model.Relation(nil), out...), nil
-}
-
-// TestContainmentReadEndsOnTheEmptyPage is F7. streamContainsEdges used to exit
-// its loop the moment the budget was reached, so a containment set whose rows
-// fill the budget exactly reported complete=false -- and both callers (the
-// rollup and the repository map) refuse an incomplete containment read
-// outright, turning a whole answer into CTX_RESOURCE_LIMIT.
-//
-// Mutation: replace the one-row probe in streamContainsEdges with
-// `return false, nil` and the exact-fill leg below fails.
-func TestContainmentReadEndsOnTheEmptyPage(t *testing.T) {
-	f := newGraphFixture(t)
-	rows := make([]model.Relation, 4)
-	for i := range rows {
-		rows[i] = model.Relation{
-			ID:   fixtureRelationID(0xe00 + i),
-			From: fixtureNodeID("n-a"), To: fixtureNodeID("n-b"), Kind: model.RelContains,
-		}
-	}
-	e, err := New(Options{Adjacency: exactFillAdjacency{f, rows}, Limits: fixtureLimits()})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	batch := []model.NodeID{fixtureNodeID("n-b")}
-	for _, tc := range []struct {
-		name     string
-		budget   int64
-		wantRead int
-		wantDone bool
-	}{
-		{name: "the budget is exactly filled", budget: int64(len(rows)), wantRead: len(rows), wantDone: true},
-		{name: "a row is left past the budget", budget: int64(len(rows)) - 1, wantRead: len(rows) - 1, wantDone: false},
-		{name: "the budget is unlimited", budget: 0, wantRead: len(rows), wantDone: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			read := 0
-			done, err := e.streamContainsEdges(context.Background(), batch, model.DirectionIncoming,
-				[]model.RelationKind{model.RelContains}, config.Limit(tc.budget),
-				func(model.Relation) error { read++; return nil })
-			if err != nil {
-				t.Fatalf("streamContainsEdges: %v", err)
-			}
-			if read != tc.wantRead || done != tc.wantDone {
-				t.Fatalf("read %d row(s), complete=%v; want %d row(s), complete=%v",
-					read, done, tc.wantRead, tc.wantDone)
-			}
-		})
-	}
-}
-
 // widePackageCount is the affected-package fan-out of the VF1/VF2 shape. It is
 // deliberately above model.MaxRecordsPerResult so a single-shot answer would
 // carry more package pairs than one result may hold.
@@ -638,7 +568,7 @@ func TestImpactPagesPastTheResultRecordCap(t *testing.T) {
 	limits := fixtureLimits()
 	// The refused invocation's own bounds: every count budget unlimited.
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
-	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -769,7 +699,7 @@ func TestDeadlineEndsThePageNotTheAnswer(t *testing.T) {
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
 	// Ground truth: the same walk that never runs out of time.
-	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -805,7 +735,7 @@ func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -869,7 +799,7 @@ func TestFrontierBytesMustBePositive(t *testing.T) {
 	f := newGraphFixture(t)
 	limits := fixtureLimits()
 	limits.FrontierBytes = 0
-	if _, err := New(Options{Adjacency: f, Limits: limits}); err == nil {
+	if _, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits}); err == nil {
 		t.Fatal("New accepted frontier_bytes = 0: a level would have no heap bound at all")
 	}
 }
@@ -925,7 +855,7 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
 	// Ground truth: the same walk, one request, no deadline in the way.
-	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -946,7 +876,7 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 6, jump: 2 * time.Minute, fired: &fired}
-	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -1084,7 +1014,7 @@ func TestFrontierCeilingDoesNotShrinkTheImpactAnswer(t *testing.T) {
 		limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
 		limits.MaxPageItems = 100000
 		limits.FrontierBytes = frontierBytes
-		e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 			Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
@@ -1177,7 +1107,7 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 	base := model.ImpactRequest{GenerationID: 1, Start: seeds,
 		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
 
-	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+	whole, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
@@ -1201,7 +1131,7 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 			calls, fired := 0, false
 			slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 				trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-			paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+			paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 				Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 				Now: func() time.Time { return clock }})
 			if err != nil {
@@ -1297,7 +1227,7 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 2, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
