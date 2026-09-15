@@ -322,20 +322,17 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	if e.spools == nil {
 		return nil, cursorInvalid("continuation state has expired or was released")
 	}
-	// One fresh spool per page: this replays the PREVIOUS page's spool. The
-	// replay is bounded by MaxVisited when the operator set one; when they did
-	// not, the spool's own byte budget (resources.max_temp_bytes, enforced by
-	// pagination.Spools on every Append) is the bound, which is what makes peak
-	// heap a function of page size rather than of graph size. Reading the
-	// unlimited spelling as "reject every record" is the defect being removed.
-	var records int64
+	// One fresh spool per page: this replays the PREVIOUS page's spool.
+	//
+	// The replay is bounded by the SPOOL's own byte budget
+	// (resources.max_temp_bytes, enforced by pagination.Spools on every Append
+	// and re-checked here by Open against the spool header), never by
+	// max_visited: that is a per-page work budget now, while the spooled
+	// visited set is cumulative across the whole walk, so testing the one
+	// against the other refused the third page of any walk whose budget it was
+	// working correctly. A tampered or oversized spool is caught by the byte
+	// budget, which is also what keeps peak heap a function of page size.
 	err = e.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
-		records++
-		if e.limits.Visited().Exceeded(records) {
-			return (&model.Error{Code: model.CodeResourceLimit,
-				Message:     "continuation state exceeds the visited bound",
-				Remediation: "restart the query with a narrower scope"}).WithDetail("limit", "max_visited")
-		}
 		var r spoolRecord
 		if err := json.Unmarshal(record, &r); err != nil {
 			return cursorInvalid("continuation state is not readable")
