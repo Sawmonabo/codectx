@@ -160,7 +160,7 @@ CREATE TABLE generation_capabilities (
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
--- node_ids is the node identity dictionary (Section 12.2, S-1/S-4/S-5).
+-- node_ids is the node identity dictionary (Section 12.2).
 -- id is a storage-internal surrogate: an INTEGER PRIMARY KEY is the b-tree key
 -- itself, so it costs zero payload bytes in the table and 1-4 varint bytes
 -- wherever it is referenced, against ~33 B for a 32-byte BLOB reference.
@@ -191,9 +191,9 @@ CREATE TABLE node_facts (
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 ) WITHOUT ROWID;
--- relation_ids mirrors node_ids (S-2/S-5): an INTEGER surrogate, the canonical
--- 32-byte RelationID stored once in `canonical`, and the endpoints carried as
--- node surrogates.
+-- relation_ids mirrors node_ids: an INTEGER surrogate, the canonical 32-byte
+-- RelationID stored once in `canonical`, and the endpoints carried as node
+-- surrogates.
 CREATE TABLE relation_ids (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
@@ -224,7 +224,7 @@ CREATE TABLE fact_keys (
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
 );
--- evidence.id stays a PRIMARY KEY: S-6 is REFUSED by call site, not by size.
+-- evidence.id stays a PRIMARY KEY, refused by call site rather than by size.
 -- units.go:748 and delta.go:437 upsert with ON CONFLICT(id) DO NOTHING, which
 -- SQLite only accepts against a PRIMARY KEY or UNIQUE index, and delta.go:573
 -- clips surplus evidence BY id value. The id is a pure function of the evidence
@@ -258,11 +258,11 @@ CREATE TABLE unit_delta_state (
     payload BLOB NOT NULL,
     PRIMARY KEY(unit_id, kind)
 ) WITHOUT ROWID;
--- S-3 intern dictionaries. A WITHOUT ROWID table re-stores its whole primary
+-- Intern dictionaries. A WITHOUT ROWID table re-stores its whole primary
 -- key inside every secondary index, so a wide PK is paid for once per index.
 -- Interning replaces the wide text columns with surrogates so that the PK, and
 -- therefore each index built over it, is a handful of varints.
--- Measured on the wave-g2 fixture: 274 807 alias rows carry only 403 distinct
+-- Measured on a control fixture store: 274 807 alias rows carry only 403 distinct
 -- scope keys (avg 34 B) and 216 385 distinct native keys (avg 52 B), each
 -- replicated three times (table + idx_alias_lookup + idx_alias_node); evidence
 -- adds 477 388 native-key copies drawn from the same 52 711-value vocabulary.
@@ -280,7 +280,7 @@ CREATE TABLE native_keys (
 -- search_units.path, and search_fts declares it as an external-content FTS5
 -- column (content='search_units'), so it must stay a TEXT column of that name
 -- or the path field leaves the full-text index. files.path is 818 rows /
--- 114 KiB on the wave-g2 fixture and is not an amplifier.
+-- 114 KiB on that same fixture and is not an amplifier.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
@@ -487,7 +487,7 @@ CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
 -- and the index is 20.5% smaller.
 CREATE INDEX idx_nodes_file ON node_facts(file_id);
 CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
--- No idx_relations_from: dropping the constant repository_id (S-5) leaves
+-- No idx_relations_from: dropping the constant repository_id leaves
 -- relation_ids with UNIQUE(from_node_id, kind, to_node_id), whose autoindex is
 -- column-for-column the index this used to be. Its call sites (query.go:380,
 -- adjacency.go:194, gc.go:196) keep an identical access path. idx_relations_to
