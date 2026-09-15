@@ -4,6 +4,7 @@ import (
 	stdcontext "context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -1410,6 +1411,41 @@ func TestContextCompilerScenario(t *testing.T) {
 				// asserting both at once is possible.
 				if !third.CreatedAt.After(first.CreatedAt) {
 					t.Fatalf("second compile CreatedAt = %s, want a later instant than %s", third.CreatedAt, first.CreatedAt)
+				}
+			},
+		},
+		{
+			// Guards row 41 / F15: the manifest notices are INSTALLED on the
+			// compile's result, not merely computable. Both the page-clamp
+			// disclosure and the pointer at the excluded-candidate projection
+			// reach the caller only through Compile's own two assignments, and
+			// a compile whose bounds cut silently cannot be told from one that
+			// cut nothing.
+			name: "a compile installs its page-clamp and excluded-candidate disclosures on the manifest it returns",
+			setup: func(t *testing.T, fx *contextFixture) {
+				// Above the wire ceiling is the only configuration that clamps:
+				// a page size at or under it is served as asked.
+				fx.Cfg.Resources.MaxPageItems = model.MaxPageItems + 500
+			},
+			run: func(t *testing.T, fx *contextFixture) {
+				// One file of budget over a fixture of seven: the plan packs
+				// one candidate and excludes the rest, which is what gives the
+				// count-bearing notice something to point at.
+				req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify,
+					Budget: model.Budget{MaxFiles: 1}}
+				m, err := intCompiler(t, fx, fx.Now).Compile(fx.ctx, req)
+				if err != nil {
+					t.Fatalf("Compile: %v", err)
+				}
+				joined := strings.Join(m.Notices, "\n")
+				for _, want := range []string{
+					fmt.Sprintf("requested %d, effective %d", model.MaxPageItems+500, model.MaxPageItems),
+					excludedViewPointer,
+				} {
+					if !strings.Contains(joined, want) {
+						t.Fatalf("the compiled manifest disclosed %q, which does not carry %q; the notices never reached the caller",
+							m.Notices, want)
+					}
 				}
 			},
 		},
