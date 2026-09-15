@@ -32,14 +32,18 @@ const RunBufferRecords = 1 << 16
 // merge's own cost is fan-in x this.
 const mergeBlockBytes = 1 << 16
 
-// maxSortFanIn bounds how many runs one merge reads at once, and with it how
+// MaxSortFanIn bounds how many runs one merge reads at once, and with it how
 // many records the merge holds live. Without a cap the merge heap is one
 // record per run and the run count is (records / run buffer) -- proportional
 // to the input, which is exactly the property this primitive exists to remove.
 // Runs beyond the cap are collapsed in groups into fewer, longer runs first,
 // so the depth grows logarithmically while the live set stays constant. The
 // value follows the small constant fan-in production external sorts use [S15].
-const maxSortFanIn = 16
+//
+// It is exported because it is half of the memory envelope a caller's bound
+// assertion is written against: a test must read the design constant rather
+// than restate it.
+const MaxSortFanIn = 16
 
 // minSortRunBytes floors a byte-budgeted run. A run smaller than this makes
 // the run count, and so the number of collapse passes, explode for no memory
@@ -326,7 +330,7 @@ func (s *ExternalSort[T]) foldBuffer(buf []T) ([]T, error) {
 }
 
 // collapse merges runs in groups until one merge pass can read them all at
-// once, so the final merge never holds more than maxSortFanIn records live
+// once, so the final merge never holds more than MaxSortFanIn records live
 // however many runs the input produced.
 //
 // Each group's input runs are removed as soon as THAT group's merge completes,
@@ -336,10 +340,10 @@ func (s *ExternalSort[T]) foldBuffer(buf []T) ([]T, error) {
 // continuation spools also draw on. Removing per group keeps the peak at the
 // run set plus the one run currently being written.
 func (s *ExternalSort[T]) collapse() error {
-	for len(s.runs) > maxSortFanIn {
-		next := make([]string, 0, (len(s.runs)+maxSortFanIn-1)/maxSortFanIn)
-		for i := 0; i < len(s.runs); i += maxSortFanIn {
-			group := s.runs[i:min(i+maxSortFanIn, len(s.runs))]
+	for len(s.runs) > MaxSortFanIn {
+		next := make([]string, 0, (len(s.runs)+MaxSortFanIn-1)/MaxSortFanIn)
+		for i := 0; i < len(s.runs); i += MaxSortFanIn {
+			group := s.runs[i:min(i+MaxSortFanIn, len(s.runs))]
 			if len(group) == 1 {
 				next = append(next, group[0])
 				continue
@@ -384,7 +388,7 @@ func (s *ExternalSort[T]) mergeToRun(group []string) (string, error) {
 
 // merge is the k-way merge over runs: one open reader and one heap entry per
 // run, so the merge holds len(runs) records and len(runs) read blocks whatever
-// the runs hold, and collapse keeps len(runs) at maxSortFanIn. It returns how
+// the runs hold, and collapse keeps len(runs) at MaxSortFanIn. It returns how
 // many records it wrote, which is fewer than it read when fold is set.
 func (s *ExternalSort[T]) merge(out *os.File, runs []string, fold bool) (int64, error) {
 	readers := make([]*runReader[T], 0, len(runs))
