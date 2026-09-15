@@ -681,15 +681,6 @@ func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityStat
 // store exposes membership-restricted rowids and aggregates; ranking is not
 // implemented here.
 
-// SearchStats returns the visible document count and total token length, the
-// corpus statistics a generation-local BM25 needs.
-func (r *PinnedReader) SearchStats(ctx context.Context) (documents, tokens int64, err error) {
-	err = r.s.read(ctx, func(tx *sql.Tx) error {
-		return wrap("search_units", tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(su.token_count), 0) FROM search_units su`+r.visible("su"), r.gen).Scan(&documents, &tokens))
-	})
-	return documents, tokens, err
-}
-
 // SearchUnitRowIDs pages the visible search document ids by keyset. The id is
 // search_units.doc_id -- the search_fts rowid the document's text lives at --
 // which is what Match returns and what the vocabulary joins on.

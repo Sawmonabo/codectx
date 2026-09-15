@@ -1407,6 +1407,12 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 		if err := buildGraph(ctx, tx, g.id); err != nil {
 			return err
 		}
+		// The packed term statistics follow the adjacency, under the same rule
+		// and in the same transaction (ADR-0007 Decision 1): a generation is
+		// never published without the structure every lexical query reads.
+		if err := buildLexical(ctx, tx, g.id); err != nil {
+			return err
+		}
 
 		snapshotID := model.SnapshotID(idHex(g.snapshot))
 		key := model.NewAnalysisKey(snapshotID, Fingerprint, membership.Sum(), capsHash.Sum(), normalizationVersion, g.semantic)
