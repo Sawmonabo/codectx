@@ -127,11 +127,78 @@ func requireField(field, value string, max int) *Error {
 }
 
 // boundField enforces a byte ceiling on an optional value.
+//
+// A value over its ceiling is a rejection only where shortening it would
+// change what the value MEANS. Every other ceiling is a storage width, and a
+// stored fact that is wider than its column is shortened by its producer
+// through TruncateField and flagged in the record's `truncated_fields` meta --
+// never a reason to fail the unit that produced it or the answer that carries
+// it. Refusing there answers nothing; a clipped signature still answers most
+// questions about the symbol it belongs to.
+//
+// truncatedFields below is the whole of that classification, keyed by the
+// field's last name segment so that a new record type inherits the verdict its
+// fields already carry.
 func boundField(field, value string, max int) *Error {
-	if len(value) > max {
-		return invalid("%s is %d bytes, limit %d", field, len(value), max)
+	if len(value) <= max {
+		return nil
 	}
-	return nil
+	if truncatingField(field) {
+		return nil
+	}
+	return invalid("%s is %d bytes, limit %d", field, len(value), max)
+}
+
+// truncatedFields are the field names whose value is shortened and flagged by
+// its producer instead of rejected here. They are keyed by NAME, not by
+// ceiling: MaxNameBytes and MaxReasonBytes are both 512 and
+// MaxQualifiedNameBytes, MaxScopeKeyBytes and MaxNativeKeyBytes are all 2048,
+// so the ceiling does not separate a storage width from a join key.
+//
+// What is in the set: the descriptive fields of a stored fact (name,
+// qualified_name, from_name, signature), the machine-readable particulars of a
+// degradation (detail, details, remediation), and the explanatory lists an
+// answer carries (reasons, warnings, notices, truncation_reason). None of them
+// is matched, joined or addressed by its exact bytes, and every one of them
+// sits on a record nobody can resubmit: refusing one fails the unit that
+// produced it or the answer that carries it, and answers nothing.
+//
+// What is deliberately NOT in it, and why each is identity:
+//
+//   - id, version, provider_id, capability, actor_id, policy_version,
+//     analysis_config_hash, action, code, diagnostic_code (MaxIdentifierBytes)
+//     -- matched exactly; a reader switches on the code and joins on the id, so
+//     a shortened one names a different thing or nothing.
+//   - language (MaxLanguageBytes) -- an exactly matched tag; "typescrip" names
+//     no language, and no legitimate tag approaches 64 bytes.
+//   - path (MaxPathBytes) -- a truncated path names a different file, or none.
+//   - scope_key (MaxScopeKeyBytes), native_key / strong_key / canonical_key
+//     (MaxNativeKeyBytes) -- the keys unit reuse and symbol resolution join on.
+//   - cursor, next_cursor, receipt (MaxTokenBytes) and read_chunk_response
+//     content (MaxChunkContentBytes) -- signed tokens and wire-encoding
+//     ceilings; a clipped cursor verifies as nothing.
+//   - note, task, query, reason on a waiver or an exclusion -- an actor's own
+//     text on a REQUEST. The caller is present and can resubmit, and silently
+//     clipping an attestation or a query falsifies it rather than shortening
+//     it. Rejecting a request is not the failure this rule is about.
+var truncatedFields = map[string]bool{
+	"name": true, "qualified_name": true, "from_name": true, "signature": true,
+	"detail": true, "details": true, "remediation": true,
+	"reasons": true, "warnings": true, "notices": true, "truncation_reason": true,
+}
+
+// truncatingField reports whether a value over its ceiling is shortened and
+// flagged by its producer rather than rejected here. field is a dotted path
+// such as "node.qualified_name" or "search_hit.reasons[2]"; the verdict is
+// carried by its last segment, so a new record type inherits it.
+func truncatingField(field string) bool {
+	if i := strings.LastIndexByte(field, '.'); i >= 0 {
+		field = field[i+1:]
+	}
+	if i := strings.IndexByte(field, '['); i >= 0 {
+		field = field[:i]
+	}
+	return truncatedFields[field]
 }
 
 // requireTrimmed rejects a value that is empty or only whitespace, matching the
