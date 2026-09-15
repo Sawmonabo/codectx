@@ -816,8 +816,13 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 // Section 18.2 allows it -- otherwise the session it has to use next is only
 // reachable by a second round trip.
 type contextPlan struct {
-	Plan    model.PlanResult    `json:"plan"`
-	Session model.SessionStatus `json:"session"`
+	Plan model.PlanResult `json:"plan"`
+	// omitzero, not a bare tag: a truncated plan (ruling C9) opened no session,
+	// and a zero SessionStatus encoded as a real `session` object would show a
+	// machine consumer a blank session id and a "not ready" gate as though a
+	// session had been opened and found wanting. The field is absent on that
+	// path and present on every other.
+	Session model.SessionStatus `json:"session,omitzero"`
 }
 
 // contextBudgetValue reads the four budget flags. Section 18.1 keeps the
