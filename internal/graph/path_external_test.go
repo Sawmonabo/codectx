@@ -343,7 +343,7 @@ func TestPathDeadlineTruncatesRatherThanFails(t *testing.T) {
 // continuations: a signer, a lease store and a spool store whose directory is
 // also where the retained search state lands, which is what the leak check
 // below reads.
-func pathPagingEngine(t *testing.T, g *pathGraph, dir string, store *fixtureLeases, maxVisited int) *Engine {
+func pathPagingEngine(t *testing.T, g Adjacency, dir string, store *fixtureLeases, maxVisited int) *Engine {
 	t.Helper()
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
@@ -470,18 +470,32 @@ func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
 	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
 	dir := t.TempDir()
 	store := newFixtureLeases()
-	e := pathPagingEngine(t, g, dir, store, 0)
-	// A deadline that lands in the middle of the search rather than before it:
-	// long enough to settle something, far too short to reach the target.
-	e.limits.QueryTimeout = 300 * time.Microsecond
+	// The deadline is landed by the graph itself, not by racing the clock: the
+	// adjacency stalls past the whole query timeout on its second edge read, so
+	// the next checkDeadline ALWAYS fires and this proof can never be skipped.
+	// (`path` builds its deadline with context.WithDeadline from e.now(), which
+	// the runtime enforces against the real clock, so the traversal's
+	// clock-jumping slowAdjacency does not transfer here.) Landing the stop
+	// EARLIER than the stall would satisfy every assertion below just as well
+	// -- deadlineHit makes the walk resumable, so the page is truncated on the
+	// deadline and mints a cursor either way -- so there is no flake window in
+	// the other direction.
+	stalled := false
+	slow := slowPathGraph{pathGraph: g, calls: new(int), trigger: 2,
+		stall: 4 * pathDeadlineProofTimeout, fired: &stalled}
+	e := pathPagingEngine(t, slow, dir, store, 0)
+	e.limits.QueryTimeout = pathDeadlineProofTimeout
 
 	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: from, To: to, Relations: kinds})
 	if err != nil {
 		t.Fatalf("an expired deadline must end the page, not fail the request: %v", err)
 	}
+	if !stalled {
+		t.Fatal("the adjacency never stalled: the deadline was not landed deterministically and this proof would be vacuous")
+	}
 	if first.Meta.TruncationReason != pathReasonDeadline {
-		t.Skipf("the deadline did not land inside the search (reason %q); the budget row proves the same contract",
+		t.Fatalf("a page whose search ran past the query timeout must be truncated on the deadline, got reason %q",
 			first.Meta.TruncationReason)
 	}
 	if first.Meta.NextCursor == "" {
@@ -546,4 +560,34 @@ func TestExpiredPathLeaseSweepsTheRetainedState(t *testing.T) {
 	if n := retainedDirs(t, dir); n != 0 {
 		t.Fatalf("the sweep left %d retained state directories behind an expired lease", n)
 	}
+}
+
+// pathDeadlineProofTimeout is the query timeout the deadline proofs run under.
+// It is short enough that stalling past it costs the test well under a second
+// and long enough that an ordinary scheduling hiccup cannot expire it before
+// the stall does.
+const pathDeadlineProofTimeout = 150 * time.Millisecond
+
+// slowPathGraph is the deterministic deadline hook for the path search. The
+// traversal has one already (slowAdjacency, frontier_test.go), but it works by
+// jumping the engine's injected clock, and the path search's stop is a real
+// context deadline -- so here the stall is real time, fired once at a fixed
+// edge read. It is passed by value like slowAdjacency, and embeds *pathGraph so
+// NodesByID, EvidenceFor, Capabilities and Binding are the fixture's own.
+type slowPathGraph struct {
+	*pathGraph
+	calls   *int
+	trigger int
+	stall   time.Duration
+	fired   *bool
+}
+
+func (s slowPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	*s.calls++
+	if !*s.fired && *s.calls >= s.trigger {
+		*s.fired = true
+		time.Sleep(s.stall)
+	}
+	return s.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
 }
