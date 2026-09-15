@@ -1329,7 +1329,7 @@ func (im *importer) emitEdges(ctx context.Context) error {
 				current = &model.RelationFact{Relation: rel}
 			}
 			loc := location{file: model.FileVersion{ID: model.FileID(fileID), ContentHash: hash}, rng: &rng}
-			if len(current.Evidence) >= model.MaxEvidencePerFact {
+			if len(current.Evidence) >= im.p.evidenceClip {
 				overflow++
 				return nil
 			}

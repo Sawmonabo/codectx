@@ -91,6 +91,11 @@ type Options struct {
 	UnitMemoryCeilingBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 	// MaxUnitsPerFamily, MaxStagedRows and MaxDerivedRows are the three
 	// user-set reporting thresholds of `[providers.dependence]`, 0 (the
 	// default) meaning no threshold at all. None refuses anything: a
@@ -716,7 +721,8 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows,
 		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles,
-		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
+		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
+		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		return ImportReport{}, err
 	}

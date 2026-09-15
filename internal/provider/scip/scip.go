@@ -179,6 +179,11 @@ type Options struct {
 	// hashes that does not commit to the index is an assertion about some
 	// index, not about this one, and proves nothing.
 	Manifest string
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 	// Resolver hands out the pinned indexer payloads. It is the whole of the
 	// provider's trust in a tool: nothing is looked up on PATH and nothing is
 	// approved in configuration. A nil resolver means this build imports
@@ -222,6 +227,10 @@ type Provider struct {
 	stallTimeout time.Duration
 	workDir      string
 	limits       Limits
+	// evidenceClip is the effective per-fact evidence bound this provider
+	// emits under (Options.MaxEvidencePerFact), already resolved to a finite
+	// number by New.
+	evidenceClip int
 	lookupEnv    func(string) (string, bool)
 }
 
@@ -251,6 +260,9 @@ var _ provider.Provider = (*Provider)(nil)
 // with the toolchain's own CTX_TOOL_* code and reported as honest absence, so
 // a machine whose platform has no C++ payload still indexes Go.
 func New(ctx context.Context, o Options) (*Provider, error) {
+	if o.MaxEvidencePerFact <= 0 {
+		o.MaxEvidencePerFact = model.MaxEvidencePerFact
+	}
 	if o.Limits.MaxRecordBytes == 0 {
 		o.Limits.MaxRecordBytes = defaultRecordBytes
 	}
@@ -290,7 +302,7 @@ func New(ctx context.Context, o Options) (*Provider, error) {
 	}
 	return &Provider{importPath: o.Import, manifestPath: o.Manifest, profiles: profs, deferred: deferred, missing: missing,
 		version: version, resolver: o.Resolver, runner: o.Runner, timeout: o.Timeout, stallTimeout: o.StallTimeout,
-		workDir: o.WorkDir, limits: o.Limits, lookupEnv: o.LookupEnv}, nil
+		workDir: o.WorkDir, limits: o.Limits, evidenceClip: o.MaxEvidencePerFact, lookupEnv: o.LookupEnv}, nil
 }
 
 // Descriptor declares the provider: optional, workspace-invalidated, on top

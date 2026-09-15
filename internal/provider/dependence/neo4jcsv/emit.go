@@ -33,7 +33,7 @@ type emitter struct {
 	dropped                   int // entities refused: unmatched path or oversized attribute
 	noRange                   int // located facts whose coordinates did not verify
 	unresolved                int // assignment targets published as may_refer_to
-	clipped                   int // evidence rows over MaxEvidencePerFact
+	clipped                   int // evidence rows over the effective per-fact clip
 	// truncatedFields counts, by field name, the descriptive storage values
 	// this import cut to their model ceiling before writing them to the sink.
 	// The model accepts an oversize storage field, so the cut is the
@@ -1004,7 +1004,7 @@ func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 			if r.key != "" {
 				currentKeys = append(currentKeys, r.key)
 			}
-			if len(current.Evidence) >= model.MaxEvidencePerFact {
+			if len(current.Evidence) >= e.opts.MaxEvidencePerFact {
 				e.clipped++
 				continue
 			}

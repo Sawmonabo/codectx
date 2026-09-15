@@ -75,6 +75,11 @@ type Options struct {
 	// the worker that extracts and the parent that reads the frames back apply
 	// the one number the operator set.
 	MaxRecordsPerFile config.Limit
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 	// ParseTimeout bounds one parse; a worker past it is killed and the unit
 	// is CTX_PROVIDER_TIMEOUT.
 	ParseTimeout time.Duration
@@ -241,7 +246,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		return model.ProviderResult{}, err
 	}
 	b := &builder{ctx: ctx, req: req, fv: fv, lang: l, src: src, cur: source.NewCursor(src), ex: ex,
-		maxCallees: p.opts.MaxCalleeReferences}
+		maxCallees: p.opts.MaxCalleeReferences, evidenceClip: p.opts.MaxEvidencePerFact}
 	if err := b.build(); err != nil {
 		return model.ProviderResult{}, err
 	}
