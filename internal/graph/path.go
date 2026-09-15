@@ -100,7 +100,15 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		// adopted under a fresh lease before this release runs. Deferring it
 		// here -- not at the end of the happy path -- is what keeps an error
 		// return from pinning a generation for the whole cursor TTL.
-		defer resume.Release()
+		// Terminal outcomes only: a retryable failure (a busy store, a
+		// transient read error) must leave the state adoptable, because the
+		// caller's retry presents this same cursor. Releasing unconditionally
+		// made an hours-long search unrecoverable on one contended page.
+		defer func() {
+			if terminalOutcome(err) {
+				resume.Release()
+			}
+		}()
 	}
 
 	// The search state is a private scratch file. A fresh search owns it for

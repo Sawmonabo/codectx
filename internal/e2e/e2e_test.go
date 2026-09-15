@@ -1175,6 +1175,33 @@ func TestE2EProductBoundary(t *testing.T) {
 		// a malformed one must be refused rather than ignored.
 		t.Fatal("`impact --cursor` accepted a malformed token: the flag is not reaching the request")
 	}
+	// `codectx path`, end to end. This is the ONLY CLI-level coverage the
+	// command has: nothing else in the tree runs it, and it spent a release
+	// dying on every invocation with "flag accessed but not defined: limit"
+	// (pageRequest read a --limit `path` deliberately does not declare) while
+	// `go test ./...` stayed green. The assertion is deliberately weak on the
+	// ROUTES -- the generated repository need not connect any two nodes -- and
+	// strong on the invocation: it must reach the workspace and answer.
+	for _, entry := range whole.Entries {
+		if entry.NodeID == node {
+			continue
+		}
+		pathEnv, pathCode := s.run(t, "path", string(node), string(entry.NodeID))
+		if !pathEnv.OK || pathCode != 0 {
+			t.Fatalf("`codectx path %s %s` failed (exit %d): %+v", node, entry.NodeID, pathCode, pathEnv.Error)
+		}
+		_ = data[model.PathResult](t, pathEnv, pathCode)
+		// --cursor reaches the request: `path` is resumable, and a page that
+		// spends its deadline or its visited budget prints a token. A search
+		// this small finishes in one page, so what is provable here is that the
+		// flag is wired -- a malformed token must be refused, not ignored.
+		if _, code := s.run(t, "path", string(node), string(entry.NodeID),
+			"--cursor", "not-a-token"); code == 0 {
+			t.Fatal("`path --cursor` accepted a malformed token: the flag is not reaching the request")
+		}
+		break
+	}
+
 	start := seed{Node: node, Relation: relation}
 
 	var cli, viaMCP walk
