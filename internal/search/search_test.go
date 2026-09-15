@@ -690,9 +690,12 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if err := next.Validate(); err != nil {
 		t.Fatalf("a spooled cursor does not validate: %v", err)
 	}
-	meta, got, err := readSpool(f.ctx, f.opts.Spools, next, now)
+	meta, got, rest, err := readSpool(f.ctx, f.opts.Spools, next, now, model.MaxPageItems)
 	if err != nil {
 		t.Fatalf("readSpool: %v", err)
+	}
+	if rest != 0 {
+		t.Fatalf("readSpool reports %d hits past a page that holds the whole spool", rest)
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("readSpool replayed %+v, want %+v", got, want)
@@ -705,7 +708,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	// A spool bound to another query is not this cursor's continuation.
 	foreign := next
 	foreign.QueryHash = searchQueryHash(model.SearchRequest{Query: "other"})
-	_, _, err = readSpool(f.ctx, f.opts.Spools, foreign, now)
+	_, _, _, err = readSpool(f.ctx, f.opts.Spools, foreign, now, model.MaxPageItems)
 	assertCode(t, "foreign spool", err, model.CodeCursorInvalid)
 
 	// Releasing the lease ends the continuation rather than serving a page
@@ -713,7 +716,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if err := leases.Release(f.ctx, lease.ID); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	_, _, err = readSpool(f.ctx, f.opts.Spools, next, now)
+	_, _, _, err = readSpool(f.ctx, f.opts.Spools, next, now, model.MaxPageItems)
 	assertCode(t, "released lease", err, model.CodeCursorInvalid)
 }
 
@@ -1182,6 +1185,20 @@ func legSymbolByCanonicalID(t *testing.T, f *fixture) {
 	}
 }
 
+// sliceTail streams an already-materialised tail into a spool sink. Only a
+// test has one: both production tails -- the ranked run on a first page, the
+// source spool on a continuation -- are walks, never slices.
+func sliceTail(hits []model.SearchHit) func(func(model.SearchHit) error) error {
+	return func(yield func(model.SearchHit) error) error {
+		for _, h := range hits {
+			if err := yield(h); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 // collectorFor opens a ranking collector whose external sort spills under the
 // test's own directory. The run budget is the floor, so these legs exercise
 // the spilling path rather than the buffer-only one.
@@ -1234,7 +1251,7 @@ func resultsOf(t *testing.T, c *collector) []scored {
 // Mutation: drop the byte budget so a run is unbounded (WithRunBytes's sizeOf
 // nil-guard, or a runBytes larger than the input) and the high-water mark
 // becomes the match count at both sizes.
-func legRankedSetIsBoundedByItsRunBudget(t *testing.T, _ *fixture) {
+func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
 	peakAt := func(n int) int {
 		c := collectorFor(t)
 		for i := range n {
@@ -1266,6 +1283,56 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, _ *fixture) {
 	const envelope = 4096
 	if large > envelope {
 		t.Fatalf("live record high-water was %d at 200000 candidates, over the %d-record envelope", large, envelope)
+	}
+
+	// The SAME bound on the continuation page, whose working set is the other
+	// half of a search answer's peak. A continuation reads its hits from a
+	// spool, so a readSpool that accumulated the whole spool would make page 2
+	// of a wide answer hold the entire ranked tail -- the match-count-sized
+	// heap the run budget has just been shown to keep out of page 1. The
+	// witness is the retained slice's CAPACITY: retained at the page bound it
+	// is that bound at every answer size; accumulated it tracks the spool.
+	retainedAt := func(n int) int {
+		leases := pagination.NewLeases(f.store, time.Minute)
+		lease, err := leases.Acquire(f.ctx, f.gen, "", model.LeaseCursor)
+		if err != nil {
+			t.Fatalf("Acquire: %v", err)
+		}
+		// Its own store: the fixture's spool budget is sized for the corpus,
+		// not for a tail that stands in for a wide answer.
+		spools, err := pagination.NewSpools(filepath.Join(t.TempDir(), "spools"), 1<<30, f.store)
+		if err != nil {
+			t.Fatalf("NewSpools: %v", err)
+		}
+		now := time.Now().UTC()
+		c := newCursor(endpointSearch, f.binding, lease.ID, searchQueryHash(model.SearchRequest{Query: "handle"}), now.Add(time.Minute))
+		id, err := spoolHits(spools, c, spoolMeta{}, func(yield func(model.SearchHit) error) error {
+			for i := range n {
+				if err := yield(model.SearchHit{NodeID: model.NodeID("n" + strconv.Itoa(i)),
+					Path: "pkg/f.go", Name: "name" + strconv.Itoa(i), Tier: model.TierLexicalFTS}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("spoolHits(%d): %v", n, err)
+		}
+		c.SpoolID = id
+		_, hits, rest, err := readSpool(f.ctx, spools, c, now, model.MaxPageItems)
+		if err != nil {
+			t.Fatalf("readSpool(%d): %v", n, err)
+		}
+		if len(hits) != model.MaxPageItems || rest != n-model.MaxPageItems {
+			t.Fatalf("a %d-hit spool replayed %d hits with %d remaining, want %d and %d",
+				n, len(hits), rest, model.MaxPageItems, n-model.MaxPageItems)
+		}
+		return cap(hits)
+	}
+	smallTail, largeTail := retainedAt(2_000), retainedAt(20_000)
+	if smallTail != largeTail || largeTail > model.MaxPageItems {
+		t.Fatalf("a continuation retained %d hits of a 2000-hit spool and %d of a 20000-hit spool; it must retain one %d-hit page of either",
+			smallTail, largeTail, model.MaxPageItems)
 	}
 }
 

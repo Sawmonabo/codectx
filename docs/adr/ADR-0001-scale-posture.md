@@ -716,12 +716,25 @@ duplicates an existing assertion.
 - **One reference-scale miss** stands: storage at **16.10× against 3.5×**, the storage wave's to
   close (§2.8). The indexing peak, 912.6 MiB when first measured, re-measured at 145.3 MiB against
   the 768 MiB envelope after the planner's external merge and the batched provider sinks landed.
-- **Search heap** is proportional to the answer and, for a short prefix query, to the range scan
-  (§2.4). The external sorter that fixes it exists but is not yet wired.
+- **Search heap**: the ranked set and the deduplication set now stream through the one external sort
+  primitive (§2.4), so neither is proportional to the match count. What remains on this path is the
+  exact-tier candidate set, which holds one node identity per distinct exact candidate and is
+  therefore still proportional to a short prefix query's range scan.
 - **Two whole-walk callers** — impact and rollup — still expand a walk in one request (§2.2).
 - Smaller residuals are recorded at their sites: an undisclosed cut on a joined documentation body,
-  one provider-side derived-row refusal, an unconverted observation-reference count, and a clamp
-  notice that is recorded but has no reader on two query paths.
+  and a clamp notice that is recorded but still has no reader on the context and adjacency query
+  paths -- neither of them builds the answer metadata the notice would travel on, so carrying it
+  needs a field on the context manifest and an installation at the graph engine's own metadata
+  sites. The provider-side derived-row refusal is closed. The observation-reference count is a
+  user-set bound at the service boundary but the wire contract still refuses more than 64 references
+  on a single observation, so the aggregate path is unlimited and the single-observation path is
+  not.
+- **The traversal reads that unlimited defaults have now unbounded in heap**: the repository map's
+  containment read accumulates one page of containers' children in one slice, and the shortest-path
+  walk holds its settled set, distances and read edges for the walk. The finite defaults used to
+  bound all four; the page bound now covers only the containers, not the children. Each needs the
+  same treatment the ranked set got -- a keyset-paged containment read and a spilled frontier --
+  and until then their peak is a function of one container's fan-out rather than of a page.
 
 ### 3.4 What verification on real repositories must show
 

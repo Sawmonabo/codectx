@@ -94,6 +94,8 @@ func (c Config) validate() error {
 		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
 		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
 		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
+		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
+		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 	} {
 		if p.v < 0 {
 			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",

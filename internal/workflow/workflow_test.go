@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -653,7 +654,7 @@ func newHarness(t *testing.T) *harness {
 		Validate: store,
 		Limits: Limits{
 			MaxPageItems:             model.MaxPageItems,
-			MaxObservationReferences: model.MaxObservationReferences,
+			MaxObservationReferences: config.Unlimited,
 			MaxCapsuleBytes:          8 << 20,
 			QueryTimeout:             10 * time.Second,
 		},
@@ -678,7 +679,7 @@ func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 		Validate: h.store,
 		Limits: Limits{
 			MaxPageItems:                        model.MaxPageItems,
-			MaxObservationReferences:            model.MaxObservationReferences,
+			MaxObservationReferences:            config.Unlimited,
 			MaxCapsuleBytes:                     8 << 20,
 			QueryTimeout:                        10 * time.Second,
 			AllowExploratoryWaiverConsolidation: true,

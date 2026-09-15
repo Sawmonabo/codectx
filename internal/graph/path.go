@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -84,9 +85,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	w := &pathWalk{
 		adjacency:  e.adjacency,
 		kinds:      kinds,
-		maxDepth:   pathBound(req.MaxDepth, e.limits.MaxDepth),
-		maxVisited: int64(pathBound(req.MaxVisited, e.limits.MaxVisited)),
-		maxEdges:   int64(e.limits.MaxEdges),
+		maxDepth:   pathBound(req.MaxDepth, e.limits.Depth()),
+		maxVisited: pathBound(req.MaxVisited, e.limits.Visited()),
+		maxEdges:   e.limits.Edges(),
 		dist:       map[model.NodeID]int64{},
 		depth:      map[model.NodeID]int{},
 		settled:    map[model.NodeID]bool{},
@@ -99,9 +100,13 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 	var routes [][]model.Relation
 	if w.settled[req.To] {
-		want := min(e.limits.MaxReasonPaths, model.MaxReasonPathsPerEntry)
+		// model.MaxReasonPathsPerEntry is still the wire bound PathResult's
+		// Validate enforces, so it floors the configured setting rather than
+		// being floored by it; an unlimited setting yields the wire bound, not
+		// zero routes. A cut is reported as pathReasonRoutes below.
+		want := e.limits.ReasonPaths().Min(config.Limit(model.MaxReasonPathsPerEntry))
 		var capped bool
-		routes, capped = w.routes(req.From, req.To, want)
+		routes, capped = w.routes(req.From, req.To, want.Int())
 		if capped {
 			pathTruncate(&res.Meta, pathReasonRoutes)
 		}
@@ -150,12 +155,20 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 // pathBound resolves a request bound: zero means "the configured default", and
 // a request may only narrow the engine's limit, never widen it.
-func pathBound(requested, limit int) int {
-	if requested <= 0 || requested > limit {
+// A request may only narrow the configured bound, never widen it, and an
+// unlimited configured bound is the top of the lattice: any finite request
+// lowers it, and an absent request leaves the walk unbounded.
+func pathBound(requested int, limit config.Limit) config.Limit {
+	if requested <= 0 {
 		return limit
 	}
-	return requested
+	return config.Limit(requested).Min(limit)
 }
+
+// atBound reports whether a walk that has already taken n steps has reached
+// bound, so the step after it would cross. An unlimited bound is never reached:
+// reading the zero Limit as a numeric ceiling would stop every walk at once.
+func atBound(bound config.Limit, n int) bool { return bound.Exceeded(int64(n) + 1) }
 
 // pathTruncate marks the answer incomplete. The first reason wins, so the
 // budget that actually stopped the search is the one reported.
@@ -236,9 +249,9 @@ func (h *pathHeap) Pop() any     { old := *h; it := old[len(old)-1]; *h = old[:l
 type pathWalk struct {
 	adjacency  Adjacency
 	kinds      []model.RelationKind
-	maxDepth   int
-	maxVisited int64
-	maxEdges   int64
+	maxDepth   config.Limit
+	maxVisited config.Limit
+	maxEdges   config.Limit
 
 	dist    map[model.NodeID]int64
 	depth   map[model.NodeID]int
@@ -293,7 +306,7 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 		}
 		var expand []model.NodeID
 		for _, it := range bucket {
-			if it.depth >= w.maxDepth {
+			if atBound(w.maxDepth, it.depth) {
 				// Cheapest-by-cost may still need more hops than the depth
 				// bound allows; the answer is then the cheapest route WITHIN
 				// the depth bound, and that is reported as truncation.
@@ -325,7 +338,7 @@ func (w *pathWalk) popBucket() []pathHeapItem {
 		if w.settled[it.node] || it.cost != w.dist[it.node] {
 			continue // a stale entry superseded by a cheaper relaxation
 		}
-		if w.visited >= w.maxVisited {
+		if atBound(w.maxVisited, int(w.visited)) {
 			w.visitedHit = true
 			break
 		}
@@ -357,7 +370,7 @@ func (w *pathWalk) expandBatch(ctx context.Context, nodes []model.NodeID) error 
 		for _, r := range rels {
 			after = r.ID
 			w.spent++
-			if w.spent > w.maxEdges {
+			if w.maxEdges.Exceeded(w.spent) {
 				w.edgesHit = true
 				return nil
 			}
@@ -441,7 +454,7 @@ func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, 
 			out = append(out, append([]model.Relation(nil), cur...))
 			return
 		}
-		if len(cur) >= w.maxDepth || len(cur) >= model.MaxRelationsPerPath {
+		if atBound(w.maxDepth, len(cur)) || len(cur) >= model.MaxRelationsPerPath {
 			return
 		}
 		for _, r := range w.admitted(n) {
