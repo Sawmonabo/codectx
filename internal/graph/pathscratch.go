@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"modernc.org/sqlite"
@@ -50,6 +51,30 @@ type pathScratch struct {
 	// engine reads it to decide whether the search is being seeded or resumed.
 	retained bool
 }
+
+// pathScratchJournalFresh and pathScratchJournalRetained are the journal modes
+// the two entry points open under, and the difference is load-bearing.
+//
+// A FRESH search's directory is this request's alone: whatever happens to it,
+// close() removes it, so there is nothing to roll back and OFF is the cheapest
+// correct mode.
+//
+// A REOPENED search's directory is state a continuation NAMES. When a resumed
+// page exits on a retryable failure the directory is kept so the caller's retry
+// can present the same cursor, and the page's half-written transaction has to
+// be undone exactly -- committing it would advance `pending` and
+// `progress.expand_after` past edges the cursor's counters say were never
+// folded into a bucket, which loses routes silently. Under journal_mode=OFF
+// SQLite documents ROLLBACK as behaving in an undefined way and the file as
+// likely corrupt, so the retained search is opened under a real rollback
+// journal instead. DELETE, not MEMORY -- a memory journal would grow with the
+// page's writes, and the per-page budgets are unlimited by default -- and not
+// WAL, which is persistent in the file and would add sidecar files the spool
+// store's directory adoption knows nothing about.
+const (
+	pathScratchJournalFresh    = "OFF"
+	pathScratchJournalRetained = "DELETE"
+)
 
 // pathScratchCacheKiB is the SQLite page-cache ceiling for one path search, in
 // KiB, passed as a negative cache_size. It is a fixed working-set floor for the
@@ -110,7 +135,7 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 		return nil, internalErr("path scratch directory: " + err.Error())
 	}
 	s := &pathScratch{dir: dir}
-	if err := s.open(ctx); err != nil {
+	if err := s.open(ctx, pathScratchJournalFresh); err != nil {
 		s.close()
 		return nil, err
 	}
@@ -129,7 +154,7 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 // in them, are the point.
 func reopenPathScratch(ctx context.Context, dir string) (*pathScratch, error) {
 	s := &pathScratch{dir: dir, retained: true}
-	if err := s.open(ctx); err != nil {
+	if err := s.open(ctx, pathScratchJournalRetained); err != nil {
 		s.close()
 		return nil, err
 	}
@@ -141,10 +166,11 @@ func reopenPathScratch(ctx context.Context, dir string) (*pathScratch, error) {
 
 // open attaches the database handle to s.dir's file, creating it if it is not
 // there. It is shared by the fresh and the resumed path so both searches run
-// under exactly the same page-cache ceiling and pragma set.
-func (s *pathScratch) open(ctx context.Context) error {
+// under exactly the same page-cache ceiling and pragma set; journal names the
+// one pragma that differs between them (see the constants above).
+func (s *pathScratch) open(ctx context.Context, journal string) error {
 	q := url.Values{}
-	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "mmap_size(0)",
+	for _, p := range []string{"journal_mode(" + journal + ")", "synchronous(OFF)", "temp_store(FILE)", "mmap_size(0)",
 		"cache_size(-" + strconv.Itoa(pathScratchCacheKiB) + ")"} {
 		q.Add("_pragma", p)
 	}
@@ -161,6 +187,18 @@ func (s *pathScratch) open(ctx context.Context) error {
 	s.db.SetMaxIdleConns(1)
 	if err := s.db.PingContext(ctx); err != nil {
 		return internalErr("path scratch open: " + err.Error())
+	}
+	// Read the journal mode BACK. A retained search's ability to undo an
+	// abandoned page is the whole reason its state survives a retryable
+	// failure, and a DSN pragma that was quietly ignored would leave that
+	// promise resting on an undefined rollback. Refusing here is honest; a
+	// silently unrollbackable search is not.
+	var got string
+	if err := s.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&got); err != nil {
+		return internalErr("path scratch journal mode: " + err.Error())
+	}
+	if !strings.EqualFold(got, journal) {
+		return internalErr("path scratch journal mode: asked for " + journal + ", got " + got)
 	}
 	return nil
 }
@@ -198,6 +236,40 @@ func (s *pathScratch) detach() (string, error) {
 	dir := s.dir
 	s.dir = ""
 	return dir, nil
+}
+
+// retain rolls the page's writes back and closes the database WITHOUT removing
+// the directory, leaving the retained state exactly as the page found it. The
+// caller's close() afterwards is then a no-op on the directory.
+//
+// This is the non-terminal exit: a retryable failure tells the caller to
+// present the SAME cursor again, and that cursor names this directory. The
+// rollback is what makes the retry see the pre-page state rather than a page
+// torn off halfway through.
+func (s *pathScratch) retain() error {
+	if s == nil {
+		return nil
+	}
+	var rollback error
+	if s.tx != nil {
+		rollback = s.tx.Rollback()
+		s.tx = nil
+	}
+	if s.db != nil {
+		if err := s.db.Close(); err != nil && rollback == nil {
+			rollback = err
+		}
+		s.db = nil
+	}
+	if rollback != nil {
+		// The undo did not complete, so what is on disk is not the state the
+		// cursor names. s.dir is deliberately LEFT set: the caller's close()
+		// then removes it, and the retry is refused with CTX_CURSOR_INVALID
+		// rather than resumed from a half-rolled-back search.
+		return internalErr("path scratch retain: " + rollback.Error())
+	}
+	s.dir = ""
+	return nil
 }
 
 // close discards the transaction and removes the directory. It is safe to call
