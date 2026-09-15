@@ -1428,11 +1428,16 @@ func TestContextCompilerScenario(t *testing.T) {
 				fx.Cfg.Resources.MaxPageItems = model.MaxPageItems + 500
 			},
 			run: func(t *testing.T, fx *contextFixture) {
-				// One file of budget over a fixture of seven: the plan packs
-				// one candidate and excludes the rest, which is what gives the
-				// count-bearing notice something to point at.
-				req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify,
-					Budget: model.Budget{MaxFiles: 1}}
+				// The exclusion this row points at is an identity the task
+				// named that the pinned snapshot answers with nothing -- a
+				// reason a candidate is absent that exists on every fixture and
+				// on every real repository. It is deliberately NOT a page-end
+				// disclosure: the seed steps page to exhaustion, so a page
+				// boundary no longer manufactures an exclusion, and a row that
+				// relied on one was asserting an artifact of the bound rather
+				// than the notice install.
+				req := model.ContextRequest{Task: "make `Place` and `NoSuchSymbol` idempotent",
+					Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 1}}
 				m, err := intCompiler(t, fx, fx.Now).Compile(fx.ctx, req)
 				if err != nil {
 					t.Fatalf("Compile: %v", err)
