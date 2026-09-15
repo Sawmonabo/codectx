@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -269,21 +270,159 @@ func (r *capabilityReport) add(s model.CapabilityState) {
 	if s.State == model.CapabilityFresh {
 		s.Scope = provider.ScopeWorkspace
 		s.DiagnosticCode = ""
-		s.Details = nil
+		s = withoutScopeNamingDetails(s)
 	}
 	key := stateKey(s.ProviderID, s.Capability, s.Scope, s.State)
 	if existing, ok := r.rows[key]; ok {
-		r.rows[key] = existing.WithDetail("scopes", strconv.Itoa(countDetail(existing)+1))
+		merged := mergeDetails(existing, s)
+		r.rows[key] = merged.WithDetail(scopesDetail, strconv.Itoa(countDetail(existing)+countDetail(s)))
 		return
 	}
 	r.order = append(r.order, key)
 	r.rows[key] = s
 }
 
+// scopeNamingDetails are the details whose value names the one scope the row
+// was reported at: the fold rewrites a fresh row to the workspace scope, so
+// they would name a scope the published row no longer stands for.
+//
+// They are also the details a merge must not join. Every other detail is a
+// count or a reason, and two of them are both true of the merged row; a scope
+// name is an exemplar -- joining one row's scope name onto another row's
+// diagnostic code publishes a row that pairs one scope's key with another
+// scope's reason, the misreport collapseScopes chooses its exemplar row whole
+// to avoid.
+var scopeNamingDetails = map[string]bool{scopeKeyDetail: true, "unit_id": true, "file_id": true, "path": true}
+
+const (
+	// scopeKeyDetail carries the exemplar scope of a fold.
+	scopeKeyDetail = "scope_key"
+	// scopesDetail counts the scopes a folded row stands for.
+	scopesDetail = "scopes"
+	// truncatedDetail names the merged details that did not fit
+	// model.MaxDetailBytes, so a clipped value is never published as if it
+	// were whole.
+	truncatedDetail = "details_truncated"
+	// detailSeparator joins the values of a merged multi-valued detail.
+	detailSeparator = ","
+)
+
+// withoutScopeNamingDetails drops the scope-naming details of a row whose
+// scope the fold has just rewritten, and keeps every other detail.
+//
+// Only those keys go. A fresh row carries its degradations here -- how many
+// oversize records were admitted, which fields were truncated to fit a stored
+// ceiling -- and clearing the whole map made state the only channel that
+// survived the fold, which is why a provider with nothing worse than an
+// admitted-oversize count had to publish `partial` to be heard at all. The
+// per-unit noise the fold exists to keep out of the report is the scope name
+// itself: one row per file saying which file it was.
+func withoutScopeNamingDetails(s model.CapabilityState) model.CapabilityState {
+	kept := 0
+	for k := range s.Details {
+		if !scopeNamingDetails[k] {
+			kept++
+		}
+	}
+	if kept == len(s.Details) {
+		return s
+	}
+	if kept == 0 {
+		s.Details = nil
+		return s
+	}
+	details := make(map[string]string, kept)
+	for k, v := range s.Details {
+		if !scopeNamingDetails[k] {
+			details[k] = v
+		}
+	}
+	s.Details = details
+	return s
+}
+
+// mergeDetails folds other's details into row's, so a fold publishes what both
+// rows knew instead of only the first or the most severe one's.
+//
+// The merge is a function of the two maps and not of the order they arrived
+// in, which these rows require: details_json folds into the AnalysisKey, and
+// the rows come from unit workers that run concurrently. Equal values stay as
+// they are; two integers sum, because every numeric detail here is a count of
+// units, scopes, records or bytes and the merged row stands for both sets; any
+// other pair is deduped and joined in sorted order, so two reasons are both
+// reported and a reason repeated by ten units is reported once. A
+// scope-naming detail keeps the receiving row's value: that row's diagnostic
+// code is the one being published, so its exemplar scope must be too.
+//
+// A joined value is bounded by model.TruncateField and a cut one is named in
+// the `details_truncated` detail. WithDetail bounds a value silently; a reader
+// that acts on a list of reasons must know the list is not the whole list.
+func mergeDetails(row, other model.CapabilityState) model.CapabilityState {
+	if len(other.Details) == 0 {
+		return row
+	}
+	keys := make([]string, 0, len(other.Details))
+	for k := range other.Details {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	var cut []string
+	for _, k := range keys {
+		have, ok := row.Details[k]
+		if !ok {
+			row = row.WithDetail(k, other.Details[k])
+			continue
+		}
+		value, truncated := mergeDetailValue(k, have, other.Details[k])
+		if truncated {
+			cut = append(cut, k)
+		}
+		row = row.WithDetail(k, value)
+	}
+	if len(cut) > 0 {
+		flagged, _ := mergeDetailValue(truncatedDetail, row.Details[truncatedDetail], strings.Join(cut, detailSeparator))
+		row = row.WithDetail(truncatedDetail, flagged)
+	}
+	return row
+}
+
+// mergeDetailValue combines the two values one detail key carries and reports
+// whether the result had to be cut to fit model.MaxDetailBytes.
+func mergeDetailValue(key, a, b string) (value string, truncated bool) {
+	if a == b {
+		return a, false
+	}
+	if scopeNamingDetails[key] {
+		return a, false
+	}
+	if x, err := strconv.Atoi(a); err == nil {
+		if y, err := strconv.Atoi(b); err == nil {
+			return strconv.Itoa(x + y), false
+		}
+	}
+	bounded, original := model.TruncateField(joinDetailValues(a, b), model.MaxDetailBytes)
+	return bounded, original > len(bounded)
+}
+
+// joinDetailValues unions two multi-valued details: the values are deduped and
+// sorted, so the result is the same whichever row the fold merged into.
+func joinDetailValues(a, b string) string {
+	parts := make([]string, 0, 8)
+	for _, v := range []string{a, b} {
+		for _, part := range strings.Split(v, detailSeparator) {
+			if part != "" {
+				parts = append(parts, part)
+			}
+		}
+	}
+	slices.Sort(parts)
+	return strings.Join(slices.Compact(parts), detailSeparator)
+}
+
 // countDetail reads the scope count a folded row carries; a row folded for the
 // first time carries none and counts as one.
 func countDetail(s model.CapabilityState) int {
-	if n, err := strconv.Atoi(s.Details["scopes"]); err == nil {
+	if n, err := strconv.Atoi(s.Details[scopesDetail]); err == nil {
 		return n
 	}
 	return 1
@@ -413,7 +552,7 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 	for _, f := range failures {
 		out = append(out, model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
 			Scope: provider.ScopeWorkspace, State: model.CapabilityFailed, DiagnosticCode: f.code,
-			Details: map[string]string{"units_failed": strconv.Itoa(f.units), "scope_key": model.TruncateDetail(f.scope)}})
+			Details: map[string]string{"units_failed": strconv.Itoa(f.units), scopeKeyDetail: model.TruncateDetail(f.scope)}})
 	}
 	carried := slices.Clone(r.carried)
 	slices.SortFunc(carried, func(a, b model.CapabilityState) int {
@@ -474,9 +613,20 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 	for _, c := range rows {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
 		if i, ok := at[key]; ok {
+			survivor, other := out[i], c
 			if severityRank(c.State) < severityRank(out[i].State) {
-				out[i] = c
+				survivor, other = c, out[i]
 			}
+			merged := mergeDetails(survivor, other)
+			// The counts do not add here: the two rows are two assertions
+			// about the SAME scope, so the greater of them is the number of
+			// scopes the merged row stands for and summing would count one
+			// scope twice. After the collapse they stand for disjoint sets and
+			// foldCollapsed adds them.
+			if n := max(countDetail(out[i]), countDetail(c)); n > 1 {
+				merged = merged.WithDetail(scopesDetail, strconv.Itoa(n))
+			}
+			out[i] = merged
 			continue
 		}
 		at[key] = len(out)
@@ -510,14 +660,16 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 			continue
 		}
 		scopes := countDetail(out[i]) + countDetail(c)
-		units := atoiDetail(out[i], "units_failed") + atoiDetail(c, "units_failed")
+		survivor, other := out[i], c
 		if severityRank(c.State) < severityRank(out[i].State) {
-			out[i] = c
+			survivor, other = c, out[i]
 		}
-		out[i] = out[i].WithDetail("scopes", strconv.Itoa(scopes))
-		if units > 0 {
-			out[i] = out[i].WithDetail("units_failed", strconv.Itoa(units))
-		}
+		// mergeDetails already sums the numeric details the two rows share --
+		// units_failed among them -- and carries over the ones only the less
+		// severe row holds. Only `scopes` is written here, because its sum
+		// must count a row that carries no count at all as the one scope it
+		// stands for.
+		out[i] = mergeDetails(survivor, other).WithDetail(scopesDetail, strconv.Itoa(scopes))
 	}
 	return out
 }
@@ -641,9 +793,9 @@ func collapseScopes(rows []model.CapabilityState) []model.CapabilityState {
 		exemplar := row.Scope
 		row.Scope = provider.ScopeWorkspace
 		if scoped[key] {
-			row = row.WithDetail("scope_key", model.TruncateDetail(exemplar))
+			row = row.WithDetail(scopeKeyDetail, model.TruncateDetail(exemplar))
 		}
-		out = append(out, row.WithDetail("scopes", strconv.Itoa(counts[key])))
+		out = append(out, row.WithDetail(scopesDetail, strconv.Itoa(counts[key])))
 	}
 	return out
 }
