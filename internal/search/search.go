@@ -636,8 +636,8 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 
 	// The exact tiers first. model.MaxPageItems is the READ size of one keyset
 	// step -- storage clamps any larger request to it (pageLimit), so asking for
-	// more would be a bound this code believes and the database does not -- and
-	// no longer a bound on how many candidates a tier may yield. Candidates are
+	// more would be a bound this code believes and the database does not -- not
+	// a bound on how many candidates a tier may yield. Candidates are
 	// streamed into the collector, so neither the whole tier result nor the
 	// distinct set ever materialises in heap.
 	deadline := false

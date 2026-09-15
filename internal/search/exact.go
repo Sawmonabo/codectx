@@ -286,7 +286,7 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 //     column both reads filter on identically (query.go:133), so a candidate
 //     this skips is always one pathCandidates already emitted.
 //
-// One case the set used to cover and the predicates do not: Nodes picks the
+// One case the predicates do not cover: Nodes picks the
 // precedence-winning row PER TIER's WHERE clause, so a node whose units publish
 // different qualified names can present one at exact_qualified_name and another
 // at exact_name, and the second tier's predicate then does not recognize the
@@ -295,9 +295,9 @@ func matchesKinds(kind model.NodeKind, kinds []model.NodeKind) bool {
 // on both sides -- the only visible difference is that the survivor carries the
 // reason of both tiers.
 //
-// The set this replaces held one model.NodeID per distinct candidate, so a
-// one-character qualified_name_prefix that range-scans a corpus-sized slice of
-// node_ids used to cost that much heap; it now costs one page.
+// Heap is one page: a one-character qualified_name_prefix that range-scans a
+// corpus-sized slice of node_ids never holds more than one keyset page of
+// candidates at a time.
 //
 // Every candidate scores 0 (digest §4, Q6): tier rank, not score, separates the
 // exact tiers, and a candidate that also matched lexically keeps that score when
