@@ -313,12 +313,13 @@ func (e *Engine) containsEdges(ctx context.Context, batch []model.NodeID,
 // repository map keeps one counter per container) pays a page of heap rather
 // than a level of it.
 //
-// It reports whether the read COMPLETED, and that flag is F7's fix: a read whose
-// budget is spent EXACTLY as the rows run out is complete, not incomplete. The
-// old loop condition returned false whenever the budget was reached, so a
-// containment set that exactly filled it made both callers refuse a legitimately
-// whole answer. The walk now ends on the empty page, and a spent budget only
-// reports incomplete once a one-row probe shows a further row exists.
+// It reports whether the read COMPLETED, and that flag is F7's fix: a read
+// whose budget is spent EXACTLY as the rows run out is complete, not
+// incomplete. The old loop tested the budget before each PAGE, so a containment
+// set that exactly filled it reported incomplete and both callers refused a
+// legitimately whole answer -- and, in the other direction, a page could
+// deliver up to adjacencyBatch rows past the budget before the test ran. The
+// budget is compared per ROW now, and only the empty page ends the walk.
 func (e *Engine) streamContainsEdges(ctx context.Context, batch []model.NodeID,
 	direction model.Direction, kinds []model.RelationKind, maxEdges config.Limit,
 	fn func(model.Relation) error) (bool, error) {
@@ -327,16 +328,6 @@ func (e *Engine) streamContainsEdges(ctx context.Context, batch []model.NodeID,
 		after model.RelationID
 	)
 	for {
-		if atBound(maxEdges, read) {
-			// The budget is spent. Whether that is a truncation depends on
-			// whether anything is left: one more row settles it, and reading one
-			// row is cheaper than reporting a complete answer as partial.
-			more, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, 1)
-			if err != nil {
-				return false, err
-			}
-			return len(more) == 0, nil
-		}
 		rels, err := e.adjacency.Edges(ctx, batch, direction, kinds, after, adjacencyBatch)
 		if err != nil {
 			return false, err
@@ -348,12 +339,17 @@ func (e *Engine) streamContainsEdges(ctx context.Context, batch []model.NodeID,
 			return true, nil
 		}
 		for _, r := range rels {
+			if atBound(maxEdges, read) {
+				// The budget is spent and a row is still standing: that, and
+				// only that, is an incomplete containment read.
+				return false, nil
+			}
 			if err := fn(r); err != nil {
 				return false, err
 			}
 			read++
+			after = r.ID
 		}
-		after = rels[len(rels)-1].ID
 	}
 }
 
