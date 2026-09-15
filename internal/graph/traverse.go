@@ -202,6 +202,13 @@ type levelWalk struct {
 	// resumedCounted marks that the leg's FIRST collected level -- the only one
 	// a resume picks up rather than starts -- has been measured.
 	resumedCounted bool
+	// group is the neighbour group the serve is inside, and groupOpen whether
+	// there is one. A group is counted against the visited budget when it ENDS,
+	// so a page cut inside one leaves it to the page that finishes it: counting
+	// at the START would count it again on that page.
+	group     NodeRef
+	groupID   model.NodeID
+	groupOpen bool
 	// entryLevel is the SERVING level this leg was resumed into, or zero. Its
 	// sorted run is the one file the cursor the caller still holds names, so it
 	// outlives the serve and is released when the next cursor supersedes it: a
@@ -325,12 +332,14 @@ func (w *levelWalk) collect(ctx context.Context, st *walkState) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	// The whole level is admitted at its transition -- the bits are set from
-	// admitted.<level> before anything of it is served -- so the spend is
-	// counted here. visited_count is the nodes the walk admitted, exactly as it
-	// was when admission happened one row at a time.
-	o.Budget.visited += admitted
-	o.Budget.pageVisited += admitted
+	// The nodes themselves are counted as the level is SERVED, one neighbour
+	// group at a time (closeGroup): the visited budget is what a caller sets to
+	// bound the work a page does, so charging a whole level's admissions before
+	// the first of them is served would spend a 300-node bound on a 300-wide
+	// level and serve nothing at all.
+	if admitted < 0 {
+		return false, internalErr("graph: a level transition admitted a negative number of nodes")
+	}
 	w.sorted = sorted
 	st.LevelState, st.LevelPos, st.RawBytes, st.LevelOffset = levelServing, EdgePos{}, 0, 0
 	return false, nil
@@ -575,9 +584,24 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 			return nil
 		}
 		if err := w.nameBatch(ctx, batch); err != nil {
-			return err
+			if !deadlineStop(err, o) {
+				return err
+			}
+			// The deadline fell inside the batched read that names this
+			// batch's routes. The batch is dropped whole and the page ends at
+			// the record it began with, which is where `at` already stands, so
+			// the continuation serves exactly these records.
+			o.Budget.deadlineHit = true
+			stop = true
+			return errLevelCut
 		}
 		for i, rec := range batch {
+			if w.groupOpen && rec.NodeID != w.groupID {
+				if err := w.closeGroup(); err != nil {
+					return err
+				}
+			}
+			w.group, w.groupID, w.groupOpen = rec.Edge.Neighbour, rec.NodeID, true
 			if err := w.visit(rec.Owner, rec.Edge); err != nil {
 				cut := deadlineStop(err, o)
 				if !cut && !errors.Is(err, errStopExpansion) {
@@ -619,6 +643,10 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 		st.LevelOffset, st.More = at, true
 		return true, nil
 	}
+	// The last group of the level ends with the level.
+	if err := w.closeGroup(); err != nil {
+		return false, err
+	}
 	// The level has been served whole: the frontier it was collected from is
 	// released, its own sorted run with it, and the level after it begins. The
 	// run this leg was RESUMED into is held back instead -- see entryLevel.
@@ -633,6 +661,26 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 	w.sorted = nil
 	st.Level, st.LevelState, st.LevelOffset, st.LevelBoundary = st.Level+1, levelCollecting, 0, true
 	return false, nil
+}
+
+// closeGroup charges the neighbour group that has just ended against the
+// visited budget, if that neighbour is one this level ADMITTED. The frontier
+// bitset is exactly the level's admissions, so one bitset test per group
+// answers it; a neighbour the level merely reached again is not a new node and
+// is not counted, which is what keeps visited_count the size of the admitted
+// set across any number of pages.
+func (w *levelWalk) closeGroup() error {
+	if !w.groupOpen {
+		return nil
+	}
+	w.groupOpen = false
+	admitted, err := w.o.Retain.testFrontier(w.group)
+	if err != nil || !admitted {
+		return err
+	}
+	w.o.Budget.visited++
+	w.o.Budget.pageVisited++
+	return nil
 }
 
 // nameBatch resolves the canonical ids one served batch needs. The edge's own
