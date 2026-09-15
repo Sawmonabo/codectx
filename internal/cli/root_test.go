@@ -545,3 +545,54 @@ func TestBrokenStdoutPipeIsNotADefect(t *testing.T) {
 		t.Fatalf("exit code = %d, want 7 (err: %v)", got, err)
 	}
 }
+
+// TestMCPServeRefusalStaysOffTheProtocolStream pins the one command whose
+// stdout is not its own. `codectx mcp serve` hands stdout to the MCP framing
+// for the life of the process, so a --json refusal must not put an envelope
+// there: a client reading the protocol stream would decode the first bytes of
+// the session as a malformed message. The refusal Cobra produces while PARSING
+// the flags is the case the RunE redirect could never cover -- it is returned
+// before any Run hook -- and it is the case an operator hits by typo, which is
+// exactly when a corrupted stream is hardest to recognize.
+//
+// It is not a row in TestCommandEnvelope because that harness asserts stdout
+// carries one envelope and stderr is empty, which is the inverse of the
+// contract here.
+func TestMCPServeRefusalStaysOffTheProtocolStream(t *testing.T) {
+	build := model.BuildInfo{Version: "1.2.3", Commit: "abc1234", Toolchain: "go1.27.1", SchemaVersion: "1"}
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "a flag Cobra cannot parse", args: []string{"mcp", "serve", "--bogus", "--json"}},
+		{name: "a positional argument the command takes none of", args: []string{"mcp", "serve", "extra", "--json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateUserDirs(t, "")
+			var stdout, stderr bytes.Buffer
+			root := cli.NewRoot(build, &stdout, &stderr)
+			err := cli.Execute(context.Background(), build, root, tc.args)
+			if got := cli.ExitCode(err); got != 2 {
+				t.Fatalf("exit code = %d, want 2 (err: %v)", got, err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("the refusal wrote %q to the protocol stream", stdout.String())
+			}
+			var env struct {
+				Command string `json:"command"`
+				OK      bool   `json:"ok"`
+				Error   *struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(stderr.Bytes(), &env); err != nil {
+				t.Fatalf("stderr does not carry one envelope: %v (%q)", err, stderr.String())
+			}
+			if env.OK || env.Command != "mcp serve" || env.Error == nil ||
+				env.Error.Code != "CTX_ARGUMENT_INVALID" {
+				t.Fatalf("envelope = %q, want a failed mcp serve envelope carrying CTX_ARGUMENT_INVALID",
+					stderr.String())
+			}
+		})
+	}
+}

@@ -86,9 +86,10 @@ func repoMapOpener(repo string) opener {
 	}
 }
 
-// repoTarget resolves which repository the command is about. Section 18.1
-// spells `repo-map [path]` positionally while every other workspace command
-// spells the same question --repo, so both are accepted. Naming both is refused
+// repoTarget resolves which repository the command is about, for the two
+// Section 18.1 commands spelled positionally -- `repo-map [path]` and
+// `doctor [path]`. Every other workspace command spells the same question
+// --repo, so both spellings are accepted here. Naming both is refused
 // instead of resolved: either precedence silently ignores something the
 // operator typed, and the one they meant is the one that gets ignored half the
 // time.
