@@ -294,7 +294,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		// checkpoint is taken ONLY here, because this is the only boundary
 		// whose carry is persisted; a deadline anywhere else still ends the
 		// call as the error it was before.
-		if paging && deadlineReached(ctx) {
+		if paging && c.deadlineReached(ctx) {
 			token, cerr := c.checkpointHalf(ctx, binding, requestHash, ranked, scoped, scopeComplete)
 			if cerr != nil {
 				return CompileResult{}, cerr
