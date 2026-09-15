@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -217,5 +218,78 @@ func TestCheckpointStateRoundTrip(t *testing.T) {
 	}
 	if _, err := readCheckpointState(t.TempDir()); err == nil {
 		t.Fatal("a missing state file was accepted")
+	}
+}
+
+// TestACheckpointedRunKeepsItsArrivalOrderUnderANonTotalComparator pins what
+// finding B3 found unpinned: the runs a checkpoint detaches are stored in
+// DETACH order, because the merge that adopts them breaks ties by run index.
+// Storing them under their os.CreateTemp suffixes instead orders the tied
+// records by a random number, so the resumed compile ranks a package's
+// candidates differently from the uninterrupted one.
+//
+// lessScoredPkg is the compile's one checkpointed non-total comparator (it
+// orders on Pkg alone), so it is the comparator the invariant is asserted on:
+// under a total comparator every order is the same order and the test would
+// guard nothing.
+func TestACheckpointedRunKeepsItsArrivalOrderUnderANonTotalComparator(t *testing.T) {
+	sorts, stateDir := resumeArea(t)
+
+	sorter, err := newSort(sorts, "scored", lessScoredPkg, sizeOfScored)
+	if err != nil {
+		t.Fatalf("newSort: %v", err)
+	}
+	// Many candidates per package: the ties are what the run index orders.
+	const packages, perPkg = 300, 8
+	for i := packages - 1; i >= 0; i-- {
+		for j := range perPkg {
+			r := scoredRec{Pkg: fmt.Sprintf("pkg/%04d", i)}
+			r.Cand.Seq = int64(i*perPkg + j)
+			if err := sorter.Add(r); err != nil {
+				t.Fatalf("add: %v", err)
+			}
+		}
+	}
+	run, err := sortedRun(sorts, sorter)
+	if err != nil {
+		t.Fatalf("sorted: %v", err)
+	}
+	var want []int64
+	if err := run.Each(func(r scoredRec) error { want = append(want, r.Cand.Seq); return nil }); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+
+	files, err := checkpointRun(stateDir, "scored", sorts.runBytes, run, lessScoredPkg, sizeOfScored)
+	if err != nil {
+		t.Fatalf("checkpointRun: %v", err)
+	}
+	if len(files) < 2 {
+		t.Fatalf("the fixture did not spill: %d run files, want at least 2", len(files))
+	}
+	for i, f := range files {
+		if base := checkpointPrefix("scored") + "run" + strconv.Itoa(i); f != base {
+			t.Fatalf("run %d is stored as %q, want %q", i, f, base)
+		}
+	}
+
+	restored, err := restoreRun(sorts, stateDir, "scored", files, lessScoredPkg, sizeOfScored)
+	if err != nil {
+		t.Fatalf("restoreRun: %v", err)
+	}
+	i := 0
+	if err := restored.Each(func(r scoredRec) error {
+		if i >= len(want) {
+			return fmt.Errorf("the restored run is longer than the %d records checkpointed", len(want))
+		}
+		if r.Cand.Seq != want[i] {
+			return fmt.Errorf("record %d restored as seq %d, want %d", i, r.Cand.Seq, want[i])
+		}
+		i++
+		return nil
+	}); err != nil {
+		t.Fatalf("%v", err)
+	}
+	if i != len(want) {
+		t.Fatalf("the restored run holds %d records, want %d", i, len(want))
 	}
 }
