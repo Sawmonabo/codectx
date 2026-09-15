@@ -351,6 +351,17 @@ type expandOptions struct {
 	// starts from the spooled frontier at the cursor's depth instead of from
 	// seeds, and skips the rows the issuing page already emitted.
 	Resume *resumeState
+	// Visited is the walk's PERSISTENT cumulative admitted-node set
+	// (visitedstore.go), set by the operations that chain several expand calls
+	// inside one request. runWalkToCompletion appends each internal link's own
+	// admissions to it directly, so the next link -- and the next REQUEST --
+	// reads them as part of the one cumulative set. Without it the earlier
+	// links' admissions reached no continuation at all and the next page
+	// re-admitted every one of them, reporting the same entity twice.
+	//
+	// It is nil on the paged traversal, which runs one expand per request and
+	// carries its cumulative set forward in the continuation spool.
+	Visited *visitedStore
 }
 
 // expand, the ONE batched BFS every operation walks with, lives in traverse.go.

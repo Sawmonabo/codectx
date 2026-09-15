@@ -82,7 +82,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// records survive the request that produced them.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir()); err != nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir(), e.limits.FrontierBytes/visitedFilterBudgetShare); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 	}
@@ -116,6 +116,11 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				DeadlineStops:            true,
 				DeadlineResumesEmptyPage: true,
 				Resume:                   resume,
+				// The walk's cumulative admitted-node set, append-only and
+				// persistent: every internal link adds its own admissions to it
+				// directly, so the continuation carries them and the next page
+				// never re-admits a node an earlier link reported.
+				Visited: retain.visited,
 			}, func(fs frontierState, rel model.Relation) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
@@ -127,11 +132,6 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 			})
 			return werr
 		}, retain.addPair, e.rollupProbe())
-		if state.ReleaseCarried != nil {
-			// After the continuation below has been spilled: the spill is what
-			// reads the carried stream.
-			defer state.ReleaseCarried()
-		}
 		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
