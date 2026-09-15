@@ -63,9 +63,18 @@ type Sessions interface {
 	// PutCapsule is write-once: context_capsules.session_id is the primary key,
 	// so it returns the first stored capsule unchanged when a row exists. It
 	// does no canonical-hash comparison -- that determinism check is this
-	// package's (see canonicalCapsuleHash).
-	PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule, error)
+	// package's (see buildCapsule). src streams the capsule's records into
+	// context_capsule_rows inside the same write transaction, so a capsule is
+	// never committed without the rows its identity was derived from; a second
+	// seal returns the stored capsule and writes no rows.
+	PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error)
 	Capsule(ctx context.Context, session model.SessionID, actor string) (model.Capsule, error)
+	// CapsuleRows reads one keyset page of one list of a sealed capsule, after
+	// a cursor that is a row's own key. The capsule blob carries counts only,
+	// so this is the only way to read a capsule's records and the page a
+	// caller sees is never held whole in this process.
+	CapsuleRows(ctx context.Context, session model.SessionID, actor string,
+		list model.CapsuleList, after string, limit int) ([]model.CapsuleRow, error)
 	// Coverage pages one actor's per-file coverage by keyset on file_id. It is
 	// paged only for a user-visible list; counts come from CoverageSummary.
 	Coverage(ctx context.Context, session model.SessionID, actor string, after model.FileID, limit int) ([]model.FileCoverage, error)
@@ -76,6 +85,10 @@ type Sessions interface {
 	CoverageSummary(ctx context.Context, session model.SessionID, actor string) (sqlite.CoverageCounts, error)
 	Manifest(ctx context.Context, id model.ManifestID) (model.ContextManifest, error)
 	ManifestEntries(ctx context.Context, id model.ManifestID, afterOrdinal int, limit int) ([]model.ContextEntry, error)
+	// ManifestScopeNodes pages the DISTINCT node ids a manifest names, in
+	// node-id order. It is the capsule's scope list, deduplicated and ordered
+	// in SQL so the seal never holds a manifest-sized set in Go.
+	ManifestScopeNodes(ctx context.Context, id model.ManifestID, after model.NodeID, limit int) ([]model.NodeID, error)
 	// RangeConfirmed reports whether one interval is already fully confirmed
 	// served to this actor for this file at this content hash. It returns a
 	// bounded boolean, never an interval list: containment is answered in SQL
@@ -153,6 +166,17 @@ type Limits struct {
 	// enforces its own wire bound; this is the value the service builds against
 	// so an over-budget capsule is reported before the write.
 	MaxCapsuleBytes config.Limit
+	// MaxCapsuleRecordsPerList bounds how many records ONE of the sealing
+	// capsule's lists may hold (context.max_capsule_records_per_list). It is
+	// unlimited by default: a completion is never refused for the number of
+	// observations the session recorded. Only an operator who set a ceiling
+	// sees a refusal, and it names this key and the count the list reached.
+	MaxCapsuleRecordsPerList config.Limit
+	// MaxCapsuleCoverageFiles is the same bound for the capsule's coverage
+	// list alone (context.max_capsule_coverage_files), which grows with the
+	// session's file set rather than with what the actor observed. Also
+	// unlimited by default.
+	MaxCapsuleCoverageFiles config.Limit
 	// QueryTimeout is the per-request deadline (resources.query_timeout).
 	QueryTimeout time.Duration
 	// AllowExploratoryWaiverConsolidation permits verify_open ->
@@ -261,12 +285,6 @@ type gate struct {
 	// open, carries the point-in-time guarantee limit (ruling Q10).
 	Reason string
 }
-
-// canonicalCapsuleDomain is the hash domain of the Section 17.3 capsule
-// identity preimage. The version suffix is part of the domain, so a change to
-// the preimage's composition yields a disjoint identity space rather than
-// silently reinterpreting stored hashes. Owned by L5.
-const canonicalCapsuleDomain = "codectx.capsule.canonical.v1"
 
 // errNotConsolidating is the sentinel for a capsule asked for outside the one
 // state that produces it. Owned by L5.

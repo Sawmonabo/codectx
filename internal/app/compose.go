@@ -888,6 +888,8 @@ func workflowLimits(cfg config.Config) workflow.Limits {
 		MaxPageItems:                        cfg.Resources.MaxPageItems,
 		MaxObservationReferences:            model.MaxObservationReferences,
 		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
+		MaxCapsuleRecordsPerList:            cfg.Context.MaxCapsuleRecordsPerList,
+		MaxCapsuleCoverageFiles:             cfg.Context.MaxCapsuleCoverageFiles,
 		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
 		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,
 	}
