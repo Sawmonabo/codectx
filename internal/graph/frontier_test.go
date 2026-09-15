@@ -3,7 +3,9 @@ package graph
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -814,5 +816,163 @@ func TestFrontierBytesMustBePositive(t *testing.T) {
 	limits.FrontierBytes = 0
 	if _, err := New(Options{Adjacency: f, Limits: limits}); err == nil {
 		t.Fatal("New accepted frontier_bytes = 0: a level would have no heap bound at all")
+	}
+}
+
+// TestImpactRanksAWalkSplitAcrossRequests is the D14 proof, and the one this
+// programme's whole retention design exists for.
+//
+// Ruling P3 lets the query deadline end a PAGE mid-walk and carry the frontier
+// forward in the `f` cursor; ruling P2 ranks the answer globally. Before the
+// retained pass-1 input, those two could not both be true: the ExternalSort was
+// built per REQUEST, so the leg that finished the walk ranked only what IT
+// admitted -- and the cumulative visited set the cursor carries guarantees the
+// earlier legs' nodes are never admitted again, so their entities were lost
+// with no cursor and no disclosure at all.
+//
+// The assertion is therefore not "the pages terminate" but "the pages
+// CONCATENATE to the unbounded walk's answer, in its order, including the
+// entities the FIRST leg admitted before the deadline".
+//
+// Mutation (rank from a fresh retained input each request -- i.e. replace
+// `retain := resumeRetained(resume)` in walkImpact with `var retain
+// *retainedWalk`, which is exactly the pre-fix behaviour): the pages serve 0
+// affected entities where the unbounded walk serves 52.
+func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	// Unlimited depth, visited and edge budgets: this proof isolates the
+	// DEADLINE as the thing that splits the walk.
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 100000
+	limits.QueryTimeout = time.Minute
+	// A frontier ceiling the fixture's levels exceed, so runWalkToCompletion
+	// chains several INTERNAL links. That is what gives the deadline a boundary
+	// to land on with a frontier still standing -- a walk that finishes inside
+	// one expand call can only meet the deadline before it has admitted
+	// anything or after it has admitted everything, and neither is the split
+	// this proof is about. The ground truth below runs under the same ceiling,
+	// so the two answers are the same question.
+	limits.FrontierBytes = 16 << 10
+
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	req := model.ImpactRequest{GenerationID: 1, Start: seeds,
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	// Ground truth: the same walk, one request, no deadline in the way.
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Impact(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unbounded impact: %v", err)
+	}
+	if all.Meta.Truncated || all.Meta.NextCursor != "" || len(all.Entries) == 0 {
+		t.Fatalf("ground truth is truncated (%q), paged (%v) or empty (%d entries)",
+			all.Meta.TruncationReason, all.Meta.NextCursor != "", len(all.Entries))
+	}
+
+	// The deadline fires ONCE, after enough adjacency round trips that the
+	// first leg has already admitted edges and still has a frontier standing.
+	// That is the split the fix is about: entities on both sides of it.
+	clock := time.Now()
+	calls, fired := 0, false
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		trigger: 5, jump: 2 * time.Minute, fired: &fired}
+	paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	var entries []model.ImpactEntry
+	var packages []model.PackageEdge
+	split := false
+	for pages := 1; ; pages++ {
+		if pages > 200 {
+			t.Fatalf("the deadline-split impact did not terminate after %d pages", pages-1)
+		}
+		res, err := paged.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: a deadline threw the answer away instead of ending the page: %v", pages, err)
+		}
+		if err := res.Validate(); err != nil {
+			t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
+		}
+		if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline {
+			if res.Meta.NextCursor == "" {
+				t.Fatalf("page %d stopped on the deadline with no cursor: the rest of the walk is unreachable", pages)
+			}
+			split = true
+		}
+		entries = append(entries, res.Entries...)
+		packages = append(packages, res.Packages...)
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if !split {
+		t.Fatal("the deadline never split the walk; this proof needs a walk spread over more than one request")
+	}
+	if len(entries) != len(all.Entries) {
+		t.Fatalf("the deadline-split pages served %d affected entit(ies), the unbounded walk %d: the legs before the deadline were dropped",
+			len(entries), len(all.Entries))
+	}
+	seen := map[model.NodeID]bool{}
+	for i, want := range all.Entries {
+		if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+			entries[i].Depth != want.Depth {
+			t.Fatalf("at rank %d the split pages report %s (score %d, depth %d), the unbounded walk %s (score %d, depth %d)",
+				i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth,
+				want.NodeID, want.ScoreMicros, want.Depth)
+		}
+		if seen[entries[i].NodeID] {
+			t.Fatalf("node %s is listed twice across the split pages", entries[i].NodeID)
+		}
+		seen[entries[i].NodeID] = true
+	}
+	if len(packages) != len(all.Packages) {
+		t.Fatalf("the split pages carried %d package pair(s), the unbounded walk %d", len(packages), len(all.Packages))
+	}
+	for i, want := range all.Packages {
+		if packages[i] != want {
+			t.Fatalf("at rank %d the split pages carry %+v, the unbounded walk %+v", i, packages[i], want)
+		}
+	}
+	// The retained pass-1 input is continuation state like any other: once the
+	// answer is fully served nothing of it may be left behind, or a walk split
+	// by a deadline would leak a directory per page for the whole cursor TTL.
+	assertNoRetainedState(t, spoolDir)
+}
+
+// assertNoRetainedState fails if the spool store still holds any entry. It is
+// called once every continuation of the answer has been consumed, so a
+// surviving entry is a leak rather than live state.
+func assertNoRetainedState(t *testing.T, dir string) {
+	t.Helper()
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the spool store: %v", err)
+	}
+	for _, e := range left {
+		if strings.HasPrefix(e.Name(), "spool-") {
+			t.Errorf("the fully served answer left continuation state behind: %s (directory=%v)",
+				e.Name(), e.IsDir())
+		}
 	}
 }
