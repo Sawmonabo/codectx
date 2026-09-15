@@ -217,6 +217,15 @@ the live continuation spools the budget does cover.
 A compile under the run budget never touches disk: the sort spills only once its
 run buffer fills, so a small task is still two in-memory sorts.
 
+The plan a compile persists follows the same rule. Its entries and slices are
+bounded by the budget you asked for -- your own declared window -- and are
+written from it. Its **exclusion list is not**: a plan that keeps forty entries
+can exclude every other candidate in the repository, so the exclusions are
+spooled as the emission pass produces them and streamed into the manifest
+transaction row by row, in the order `--view excluded` reads them back. Writing
+a manifest therefore costs one exclusion row of memory, not all of them, however
+many candidates the budget turned away.
+
 A zero budget field means "use the configured default", never "unlimited", and a
 configured default that resolves to zero or less is rejected rather than
 disabling the bound. A budget that cannot hold the required scope is

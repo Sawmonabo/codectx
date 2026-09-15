@@ -294,8 +294,23 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
-	var sink planBuffer
+	// The exclusion projection is spooled, not collected. It is the one
+	// repository-sized list a compile produces, so P-I streams it into this
+	// sort and persistManifest replays the sorted run twice -- once to fold the
+	// canonical hash, once to write the rows -- instead of holding it. The sort
+	// is registered with the compile's area, so its run files are removed on
+	// every exit path with every other run, and it is opened here rather than
+	// inside P-I so that release order stays the area's single responsibility.
+	exclSort, err := newSort(sorts, "excluded", lessExcludedOrdinal, sizeOfExcluded)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	sink := planBuffer{excluded: exclSort}
 	parts, err := c.passIEmit(ctx, sorts, measured, packed, resolved, &sink)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
+	exclRun, err := sortedRun(sorts, exclSort)
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
@@ -312,7 +327,12 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	// default" at compile time.
 	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
 		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
-	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, sink.excluded,
+	// exclRun is read INSIDE persistManifest, and the sort area's deferred
+	// release above is what removes it afterwards. That ordering is the reason
+	// the release is deferred in Compile rather than taken by whichever pass
+	// produced the run: the exclusion run outlives P-I and dies with the
+	// compile, not with the pass.
+	m, err := c.persistManifest(ctx, binding, req, stored, parts, sink.entries, exclRun,
 		in.Scope.Completeness, scopeComplete)
 	if err != nil {
 		return model.ContextManifest{}, err
@@ -326,21 +346,23 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	return m, nil
 }
 
-// planBuffer is the compile's planSink: it collects what P-I emits so the
-// single-transaction Store.PutManifest can be handed the whole plan.
+// planBuffer is the compile's planSink: it collects the entries P-I emits so
+// the single-transaction Store.PutManifest can be handed them, and spools the
+// exclusions it emits so that method never sees a slice of them.
 //
-// Entries are held deliberately and Excluded is held under protest. An entry
-// list is bounded by the RESOLVED budget -- the caller's own declared window,
-// the same class ruling C4 already accepts for EntryOrdinals and the MaxSlices
-// array -- so holding it is a constant-factor extension of an accepted
-// structure. The exclusion list is NOT of that class: C-STREAM-plan.md §1 names
-// it the unbounded one, and it stays in heap here only because the manifest
-// writer takes slices. Streaming it needs a row-at-a-time manifest writer in
-// internal/storage/sqlite/state.go, which this lane does not own; the C-INT2
-// report carries it as an open defect against that file.
+// The split is the memory class of each list. An entry list is bounded by the
+// RESOLVED budget -- the caller's own declared window, the same class ruling C4
+// already accepts for EntryOrdinals and the MaxSlices array -- so holding it is
+// a constant-factor extension of an accepted structure. The exclusion list is
+// the one C-STREAM-plan.md §1 names unbounded: it goes to the external sort,
+// whose peak live records are a function of the run budget and never of how
+// many candidates were excluded.
 type planBuffer struct {
-	entries  []model.ContextEntry
-	excluded []model.ExcludedContextEntry
+	entries []model.ContextEntry
+	// excluded is the spool P-I's exclusions stream into, in the ordinal order
+	// P-I assigns them (ruling C1). It is required: a nil sink here would drop
+	// every exclusion silently, which is the omission Section 15.4 forbids.
+	excluded *pagination.ExternalSort[model.ExcludedContextEntry]
 }
 
 func (b *planBuffer) Entry(e model.ContextEntry) error {
@@ -349,8 +371,33 @@ func (b *planBuffer) Entry(e model.ContextEntry) error {
 }
 
 func (b *planBuffer) Exclude(e model.ExcludedContextEntry) error {
-	b.excluded = append(b.excluded, e)
-	return nil
+	if b.excluded == nil {
+		return &model.Error{Code: model.CodeInternal,
+			Message: "the compiled plan's exclusion spool was not opened"}
+	}
+	return b.excluded.Add(e)
+}
+
+// lessExcludedOrdinal orders the exclusion projection by the ordinal P-I
+// assigned, which IS ruling C1's sequence (pre-sort exclusions in expansion
+// order, then the packer's drops in group order). Ordinals are unique, so the
+// order is total and the sort is a spill-capable identity over an already
+// ordered stream rather than a re-ordering.
+func lessExcludedOrdinal(a, b model.ExcludedContextEntry) int {
+	switch {
+	case a.Ordinal < b.Ordinal:
+		return -1
+	case a.Ordinal > b.Ordinal:
+		return 1
+	}
+	return 0
+}
+
+// sizeOfExcluded charges one exclusion against the run budget: the two ids, the
+// path and the reason, plus the per-record overhead every other record pays.
+func sizeOfExcluded(x model.ExcludedContextEntry) int64 {
+	return int64(len(x.Reference.NodeID)+len(x.Reference.FileID)+len(x.Reference.Path)+len(x.Reason)) +
+		recordOverheadBytes
 }
 
 // manifestNotices is every non-fatal disclosure this compile owes the caller:
