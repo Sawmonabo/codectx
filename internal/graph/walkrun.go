@@ -322,14 +322,14 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 		if seen <= adopted {
 			// Already inside an adopted run. Re-adding it would fold a record
 			// into itself and double every count the fold carries.
+			if e.probe != nil {
+				e.probe.SkippedRecords++
+			}
 			return nil
 		}
 		if err := e.rankInterrupted(ctx, addedHere); err != nil {
 			seen--
 			return err
-		}
-		if seen <= adopted && e.probe != nil {
-			e.probe.ReaddedRecords++
 		}
 		addedHere++
 		return sorter.Add(r)
