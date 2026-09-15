@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -173,4 +174,121 @@ func TestClosedInputRunRefusesToReadAsEmpty(t *testing.T) {
 		t.Fatalf("reading a closed run yielded %d inputs and no error; an empty walk here folds the "+
 			"empty input digest, which is a unit identity that reuses forever", n)
 	}
+}
+
+// unitAt is one file-invalidated provider's planned unit, as the manifest walk
+// spills it: a deep scope key, because MaxScopeKeyBytes and not a fixed width
+// is what the record's byte budget is charged against.
+func unitAt(i int) fileUnitRecord {
+	in := inputAt(i)
+	return fileUnitRecord{Order: 0, Seq: int64(i), ProviderID: "filesystem", ProviderVersion: "1",
+		ScopeKey:  "file:src/very/deeply/nested/package/path/pkg" + itoa(i%26) + "/file" + itoa(i) + ".go",
+		FileID:    in.FileID,
+		DependsOn: model.UnitID("unit" + itoa(i)), ContentHash: in.ContentHash}
+}
+
+// The plan's units must never be materialised whole. A file-invalidated
+// provider plans one unit per snapshot file, so an in-heap []Unit made peak
+// RSS a function of repository size -- the one property the product may not
+// have. Plan.Units is now a sequence over the planner's merged run, and this
+// holds a 200 000-unit plan against a 30 000-unit one: the live set the sort
+// ever held must stay inside ONE run batch, and the heap held midway through
+// the executor's walk must not carry the unit count with it.
+//
+// The heap delta alone would not be evidence -- a sort that never spilled
+// would also hold a flat heap, for the wrong reason -- so each measurement
+// also counts the sort's files: it must have spilled more than the merged
+// output before the merge, and the merged run must be the only file left
+// after it.
+func TestPlannedUnitsAreStreamedNotHeldInHeap(t *testing.T) {
+	// The run buffer is shrunk to 4096 records so that a plan a test can
+	// afford to build still spills and merges for real; production's is
+	// pagination.RunBufferRecords under the same byte budget, and is bounded
+	// by this same statement. One batch is that buffer plus the merge's own
+	// one record per run at the fan-in cap -- read from the constant, not
+	// restated.
+	const runBuffer = 4096
+	const batch = runBuffer + pagination.MaxSortFanIn
+	measure := func(n int) (peak int, held uint64) {
+		dir := t.TempDir()
+		files := func() int {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("ReadDir: %v", err)
+			}
+			return len(entries)
+		}
+		sorter, err := pagination.NewExternalSort(dir, "plan-units-", runBuffer,
+			encodeUnit, decodeUnit, compareUnit)
+		if err != nil {
+			t.Fatalf("NewExternalSort: %v", err)
+		}
+		defer func() { _ = sorter.Close() }()
+		sorter = sorter.WithRunBytes(
+			pagination.SortRunBytes(config.Defaults().Resources.QueryMemoryBytes), sizeOfUnit)
+		for i := range n {
+			if err := sorter.Add(unitAt(i)); err != nil {
+				t.Fatalf("Add: %v", err)
+			}
+		}
+		if spilled := files(); spilled < 2 {
+			t.Fatalf("a %d-unit plan left %d run files before the merge; it never spilled, so a "+
+				"flat heap here would prove nothing", n, spilled)
+		}
+		run, err := sorter.Sorted()
+		if err != nil {
+			t.Fatalf("Sorted: %v", err)
+		}
+		defer func() { _ = run.Close() }()
+		if left := files(); left != 1 {
+			t.Fatalf("%d files remain after the merge of %d units, want only the merged run", left, n)
+		}
+
+		// The executor's own walk, through the production sequence. Peak heap
+		// is read at its midpoint, with everything the plan owns alive.
+		seen, mid := 0, n/2
+		err = unitSequence(run, make([][]Unit, 1))(func(u Unit) error {
+			if want := unitAt(seen).ScopeKey; u.ScopeKey != want {
+				return errOrder(seen, u.ScopeKey, want)
+			}
+			seen++
+			if seen == mid {
+				var m runtime.MemStats
+				runtime.GC()
+				runtime.ReadMemStats(&m)
+				held = m.HeapAlloc
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walking the plan's units: %v", err)
+		}
+		if seen != n {
+			t.Fatalf("the plan streamed %d units, want %d", seen, n)
+		}
+		runtime.KeepAlive(run)
+		return sorter.PeakLiveRecords(), held
+	}
+	smallPeak, small := measure(30_000)
+	largePeak, large := measure(200_000)
+	if largePeak > batch {
+		t.Fatalf("planning 200 000 units held %d unit records live at once, want at most one batch "+
+			"of %d: the plan is materialising its units", largePeak, batch)
+	}
+	if large > small*2 {
+		t.Fatalf("heap held midway through a 200 000-unit walk is %d bytes against %d midway through "+
+			"a 30 000-unit one: the executor is holding the plan, not streaming it", large, small)
+	}
+	t.Logf("peak live unit records: 30 000 units %d, 200 000 units %d (one batch = %d)",
+		smallPeak, largePeak, batch)
+	t.Logf("heap held mid-walk: 30 000 units %d bytes, 200 000 units %d bytes", small, large)
+}
+
+// errOrder names a unit the plan streamed out of the order the in-heap
+// concatenation answered in. The executor runs a provider's units as one
+// group and storage refuses a unit whose dependency is not sealed, so an order
+// change is a build failure, not a cosmetic one.
+func errOrder(at int, got, want string) error {
+	return &model.Error{Code: model.CodeInternal,
+		Message: "the plan streamed unit " + itoa(at) + " as " + got + ", want " + want}
 }
