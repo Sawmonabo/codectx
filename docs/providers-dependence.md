@@ -6,9 +6,12 @@ nine supported languages. It is the Section 11.6 provider: extraction-lazy,
 cached, governed per unit, and honest about every way an analysis can come
 back incomplete.
 
-This is the only product document that names the engine behind it. Everywhere
-else — the provider id, the configuration table, capability names, evidence
-details, error details, log fields, query results — it is "the engine".
+This is the only product document that names the engine behind it in prose.
+Elsewhere the product name survives only as the tool lock's entry id, in the
+toolchain pages that install it, in source-reference lists, and in the dated
+research reports under `docs/research/`. Everywhere else — the provider id, the
+configuration table, capability names, evidence details, error details, log
+fields, query results — it is "the engine".
 
 ## What it publishes
 
