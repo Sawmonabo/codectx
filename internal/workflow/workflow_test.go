@@ -1489,33 +1489,45 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 		t.Fatalf("the two seals counted %+v and %+v", first.Counts, elsewhere.Counts)
 	}
 	for _, list := range model.CapsuleListOrder {
-		want := capsuleRowKeys(t, h.store, list)
-		got := capsuleRowKeys(t, other.store, list)
+		want := capsuleRowKeys(t, h.svc, list)
+		got := capsuleRowKeys(t, other.svc, list)
 		if !slices.Equal(want, got) {
 			t.Fatalf("the %s list sealed row keys %v on one store and %v on another", list, want, got)
 		}
 	}
 }
 
-// capsuleRowKeys reads one sealed list's keys by walking the store's keyset
-// pages to exhaustion, which is how every reader of a sealed capsule reaches
-// its records.
-func capsuleRowKeys(t *testing.T, store *fakeStore, list model.CapsuleList) []string {
+// capsuleRowKeys reads one sealed list's keys by following the service's own
+// continuations to exhaustion, which is exactly what `codectx context export`
+// does to render a capsule whole. It walks Service.CapsuleRows rather than the
+// store so the continuation rule -- a cursor is offered only while the sealed
+// count says records remain -- is exercised by the seal's own determinism row
+// instead of being asserted nowhere: a rule that is off by one either truncates
+// the export or never terminates it.
+func capsuleRowKeys(t *testing.T, svc *Service, list model.CapsuleList) []string {
 	t.Helper()
+	req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
 	var keys []string
 	var cursor string
-	for {
-		rows, err := store.CapsuleRows(context.Background(), fixtureSession, fixtureActor, list, cursor, 2)
+	for calls := 0; ; calls++ {
+		rows, next, err := svc.CapsuleRows(context.Background(), req, list, cursor, 2)
 		if err != nil {
 			t.Fatalf("page the sealed %s list after %q: %v", list, cursor, err)
 		}
-		if len(rows) == 0 {
-			return keys
+		if len(rows) == 0 && cursor != "" {
+			t.Fatalf("the %s continuation %q fetched an empty page", list, cursor)
 		}
 		for _, row := range rows {
 			keys = append(keys, row.Key)
 		}
-		cursor = rows[len(rows)-1].Key
+		if next == "" {
+			return keys
+		}
+		if calls > len(keys) {
+			t.Fatalf("the %s walk made %d calls for %d keys; the continuation does not terminate",
+				list, calls, len(keys))
+		}
+		cursor = next
 	}
 }
 
