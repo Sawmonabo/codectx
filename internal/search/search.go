@@ -445,12 +445,16 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 	return run, truncated, reason, nil
 }
 
-// deadlineReason is the truncation a page carries when resources.query_timeout
-// ended the candidate search. It names the key the operator can act on, and
-// the answer still carries its continuation: the hits ranked before the
-// deadline are paged and their tail is spooled like any other answer's.
-const deadlineReason = "the query time budget (resources.query_timeout) ended the candidate search; " +
-	"this page holds the hits ranked before it, and the cursor continues them"
+// deadlineReason is the truncation a page carries when a deadline ended the
+// candidate search. It names BOTH places that deadline can come from, because
+// either can be the one that fired: resources.query_timeout is unlimited by
+// default, so on a shipped configuration the deadline is usually the caller's
+// own `--timeout`, and a reason that named only the configured key would send
+// the operator to tune a setting that had nothing to do with it. The answer
+// still carries its continuation: the hits ranked before the deadline are
+// paged and their tail is spooled like any other answer's.
+const deadlineReason = "the query time budget (--timeout, or resources.query_timeout) " +
+	"ended the candidate search; this page holds the hits ranked before it, and the cursor continues them"
 
 // isQueryDeadline reports whether err is a time-budget failure. It is the one
 // error the candidate search converts into a truncated page rather than a
