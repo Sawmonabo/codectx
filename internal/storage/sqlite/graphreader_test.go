@@ -311,7 +311,7 @@ func countGraphParts(t *testing.T, db *sql.DB, stream string) int {
 	return n
 }
 
-// The three ordered scans of the packed adjacency build must never sort. Each
+// The four ordered scans of the packed adjacency build must never sort. Each
 // one's group order IS its output order, taken from an index; the moment the
 // planner substitutes a temporary b-tree the pass stops being linear in the
 // generation and becomes superlinear in the whole store's facts, which is the
@@ -348,6 +348,10 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 			t.Fatalf("%s: %v", tmp, err)
 		}
 	}
+	if _, err := db.Exec(`CREATE TEMP TABLE tmp_graph_node_container(
+		node_id INTEGER PRIMARY KEY, container INTEGER NOT NULL, canonical BLOB NOT NULL)`); err != nil {
+		t.Fatalf("tmp_graph_node_container: %v", err)
+	}
 	for _, q := range []struct {
 		name  string
 		query string
@@ -355,6 +359,7 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 		{"outgoing", store.OutgoingEdgeQuery()},
 		{"incoming", store.IncomingEdgeQuery()},
 		{"evidence", store.EvidenceCountQuery()},
+		{"container", store.ContainerQuery()},
 	} {
 		plan := explain(t, db, q.query)
 		t.Logf("%s plan:\n%s", q.name, plan)

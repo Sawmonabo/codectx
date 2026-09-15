@@ -284,6 +284,38 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 		JOIN generation_units gu ON gu.unit_id = nf.unit_id AND gu.generation_id = ?`, gen); err != nil {
 		return wrap("tmp_graph_node", err)
 	}
+	// One row per file, naming the container-kind node published for it. It is
+	// materialised for the reason the other temp tables are: containerQuery's
+	// driving scan is the ordered walk of every visible node, and asking the
+	// planner to find each node's container through node_ids on the fly makes
+	// it re-choose that driving table once statistics exist. It is also what
+	// keeps the pass off the Go heap -- the file-to-container directory is
+	// repository-scale, so it lives in the database, not in a map.
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_file_container(
+		file_id BLOB PRIMARY KEY, node_id INTEGER NOT NULL, canonical BLOB NOT NULL)`); err != nil {
+		return wrap("tmp_graph_file_container", err)
+	}
+	containerArgs := make([]any, 0, len(containerKinds))
+	for _, k := range containerKinds {
+		containerArgs = append(containerArgs, k)
+	}
+	if _, err := tx.ExecContext(ctx, fileContainerInsert(), containerArgs...); err != nil {
+		return wrap("tmp_graph_file_container", err)
+	}
+	// The settled container of every claimed node. The two claims are folded
+	// here, in node order, so buildNodeArrays reads one ordered integer-key
+	// scan and the precedence between them is stated once.
+	if _, err := tx.ExecContext(ctx, `CREATE TEMP TABLE tmp_graph_node_container(
+		node_id INTEGER PRIMARY KEY, container INTEGER NOT NULL, canonical BLOB NOT NULL)`); err != nil {
+		return wrap("tmp_graph_node_container", err)
+	}
+	if _, err := tx.ExecContext(ctx, fileClaimInsert); err != nil {
+		return wrap("tmp_graph_node_container", err)
+	}
+	if _, err := tx.ExecContext(ctx, containsClaimInsert(),
+		append([]any{string(model.RelContains)}, containerArgs...)...); err != nil {
+		return wrap("tmp_graph_node_container", err)
+	}
 
 	var maxNode, maxRelation, nodeCount, edgeCount int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*), coalesce(max(id), 0) FROM tmp_graph_node`).
@@ -332,7 +364,8 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 }
 
 func dropGraphTemp(ctx context.Context, tx *sql.Tx) error {
-	for _, name := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit"} {
+	for _, name := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit",
+		"tmp_graph_file_container", "tmp_graph_node_container"} {
 		if _, err := tx.ExecContext(ctx, `DROP TABLE IF EXISTS temp.`+name); err != nil {
 			return wrap(name, err)
 		}
@@ -500,36 +533,92 @@ func visibleNodeQuery() string {
 	) ORDER BY node_id`
 }
 
-// containerQuery reads each contained node's container: the CONTAINER-KIND
-// `contains` parent with the LOWEST CANONICAL ID. The tie-break is on the
-// 32-byte canonical id, never on the surrogate -- surrogates are assigned in
-// the order ids were first interned, so the lowest surrogate is a different
-// node from the lowest canonical id whenever a repository was indexed in any
-// order but sorted. min() over canonical picks the row, and the bare
-// from_node_id beside it is that row's own surrogate.
-func containerQuery() string {
+// containerMarks is the parameter list the two container claims bind their
+// vocabulary to.
+func containerMarks() string {
 	marks := make([]string, len(containerKinds))
 	for i := range containerKinds {
 		marks[i] = "?"
 	}
-	return `SELECT ri.to_node_id, ri.from_node_id, min(ni.canonical) FROM relation_ids ri
+	return strings.Join(marks, ",")
+}
+
+// fileContainerInsert fills tmp_graph_file_container: one row per file, naming
+// the CONTAINER-KIND node the generation publishes FOR that file.
+//
+// The tie-break is on the 32-byte canonical id, never on the surrogate --
+// surrogates are assigned in the order ids were first interned, so the lowest
+// surrogate is a different node from the lowest canonical id whenever a
+// repository was indexed in any order but sorted. min() over canonical picks
+// the row, and the bare node_id beside it is that row's own surrogate.
+func fileContainerInsert() string {
+	return `INSERT INTO tmp_graph_file_container(file_id, node_id, canonical)
+		SELECT nf.file_id, nf.node_id, min(ni.canonical) FROM node_facts nf
+		JOIN tmp_graph_unit u ON u.id = nf.unit_id
+		JOIN node_ids ni ON ni.id = nf.node_id
+		WHERE nf.file_id IS NOT NULL AND ni.kind IN (` + containerMarks() + `)
+		GROUP BY nf.file_id`
+}
+
+// fileClaimInsert claims every visible node for the container-kind node that
+// owns the node's OWN FILE.
+//
+// It is what makes the slot answerable at all. A provider attaches a TOP-LEVEL
+// declaration to the module that holds it with `defines` and reserves
+// `contains` for a NESTED one, so the containment claim below finds no
+// container-kind parent anywhere on an ordinary repository -- zero rows, and a
+// graph that reads as having no packages -- and even read over `defines` too it
+// would still leave every nested declaration unattributed, because its parent
+// is the enclosing function. The file is what both cases agree on: a container
+// is minted per file and a declaration never nests across files, so the file's
+// owner IS the container-kind node at the top of the node's containment chain,
+// reached in one ordered scan rather than by climbing.
+//
+// A node whose file publishes no container-kind node -- and one with no file at
+// all, which is every unresolved reference -- is not claimed here, and its slot
+// stays zero rather than taking a directory or a file, neither of which answers
+// "which package does this symbol belong to".
+//
+// A node the generation claims from several member units can name several
+// files; the same canonical tie-break settles that, so the slot is a function
+// of the facts and not of the order the scan met the units.
+const fileClaimInsert = `INSERT INTO tmp_graph_node_container(node_id, container, canonical)
+	SELECT nf.node_id, m.node_id, min(m.canonical) FROM node_facts nf
+	JOIN tmp_graph_node t ON t.id = nf.node_id
+	JOIN tmp_graph_unit u ON u.id = nf.unit_id
+	JOIN tmp_graph_file_container m ON m.file_id = nf.file_id
+	GROUP BY nf.node_id`
+
+// containsClaimInsert overrides that claim wherever a container-kind node
+// claims the node DIRECTLY, by a `contains` edge, with the lowest canonical id
+// among such claimants. An explicit containment fact is the stronger statement
+// of where a node belongs, and it is the rule the in-heap reference reader
+// applies, so honouring it first is what keeps the two readers answering alike
+// on a graph that states it.
+func containsClaimInsert() string {
+	return `INSERT INTO tmp_graph_node_container(node_id, container, canonical)
+		SELECT ri.to_node_id, ri.from_node_id, min(ni.canonical) FROM relation_ids ri
 		JOIN tmp_graph_rel t ON t.id = ri.id
 		JOIN node_ids ni ON ni.id = ri.from_node_id
-		WHERE ri.kind = ? AND ni.kind IN (` + strings.Join(marks, ",") + `)
-		GROUP BY ri.to_node_id ORDER BY ri.to_node_id`
+		WHERE ri.kind = ? AND ni.kind IN (` + containerMarks() + `)
+		GROUP BY ri.to_node_id
+		ON CONFLICT(node_id) DO UPDATE SET container = excluded.container, canonical = excluded.canonical`
+}
+
+// containerQuery reads the settled claims in node order. Both claims are folded
+// into tmp_graph_node_container before the pass runs, so the build's container
+// cursor is an ordered walk of an integer primary key and never a sort.
+func containerQuery() string {
+	return `SELECT node_id, container, canonical FROM tmp_graph_node_container ORDER BY node_id`
 }
 
 // buildNodeArrays streams node.kind, node.container and node.bytes. The two
 // ordered cursors -- visible nodes and container claims -- are merge-joined, so
 // the pass holds one row of each rather than a map over the node set.
 func buildNodeArrays(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64, nodeCode map[string]byte) error {
-	args := []any{string(model.RelContains)}
-	for _, k := range containerKinds {
-		args = append(args, k)
-	}
-	claims, err := tx.QueryContext(ctx, containerQuery(), args...)
+	claims, err := tx.QueryContext(ctx, containerQuery())
 	if err != nil {
-		return wrap("relation_ids", err)
+		return wrap("tmp_graph_node_container", err)
 	}
 	defer claims.Close()
 	var claimNode, claimContainer int64
@@ -537,10 +626,10 @@ func buildNodeArrays(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64,
 	nextClaim := func() error {
 		claimOK = claims.Next()
 		if !claimOK {
-			return wrap("relation_ids", claims.Err())
+			return wrap("tmp_graph_node_container", claims.Err())
 		}
 		var canonical []byte
-		return wrap("relation_ids", claims.Scan(&claimNode, &claimContainer, &canonical))
+		return wrap("tmp_graph_node_container", claims.Scan(&claimNode, &claimContainer, &canonical))
 	}
 	if err := nextClaim(); err != nil {
 		return err
