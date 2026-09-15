@@ -310,7 +310,7 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 			}
 			return nil
 		}
-		if err := e.rankInterrupted(ctx, addedHere, e.rankStopAfter); err != nil {
+		if err := e.rankInterrupted(ctx, addedHere); err != nil {
 			seen--
 			return err
 		}
@@ -324,14 +324,11 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 // how many records THIS request has put into the current pass, which is what
 // the test hook counts: a hook that counted the whole pass would stop a resumed
 // request at the same record it stopped the first one at and never finish.
-// stopAfter is the phase's own hook -- rankStopAfter for the two impact passes,
-// pairStopAfter for the package-pair fold -- so a fixture can cut one phase
-// without cutting the other.
-func (e *Engine) rankInterrupted(ctx context.Context, added, stopAfter int) error {
+func (e *Engine) rankInterrupted(ctx context.Context, added int) error {
 	if err := ctx.Err(); err != nil {
 		return typedContextError(ctx, err)
 	}
-	if stopAfter > 0 && added >= stopAfter {
+	if e.rankStopAfter > 0 && added >= e.rankStopAfter {
 		return &model.Error{Code: model.CodeQueryDeadline,
 			Message: "graph: the query deadline reached the ranking pass"}
 	}
