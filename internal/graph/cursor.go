@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"sort"
 	"strconv"
 	"time"
@@ -67,7 +68,16 @@ import (
 // walk past a node the spool holds and report it absent. That is a
 // cross-page RE-ADMISSION: the node would be emitted on two pages. The
 // version is what refuses such a token instead of answering it wrong.
-const traversalCursorVersion = 3
+//
+// Version 4 adds the RETAINED pass-1 input a walk continuation names
+// (walkretain.go). A version-3 `f` token names a frontier and a cumulative
+// visited set and nothing else, so a build that resumed it would carry the walk
+// on, rank what THIS leg admitted, and serve that as the whole blast radius --
+// the earlier legs' entities are unreachable, because the carried visited set
+// guarantees they are never admitted again. There is no shape in a version-3
+// token that says so, so the version is the only honest refusal; a caller
+// re-runs the query and receives the whole answer under one contract.
+const traversalCursorVersion = 4
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -112,6 +122,20 @@ type traversalCursor struct {
 	// vocabularies -- a walk to resume and an order to continue -- are read by
 	// different code and must never be fed each other's spool.
 	Ranked bool `json:"ranked,omitempty"`
+	// RetainID names the retained state directory holding the pass-1 INPUT of
+	// this walk -- every impactRecord and every pairRecord every leg so far has
+	// admitted (walkretain.go). It travels on the WALK vocabulary, never on the
+	// ranked one: once the order is settled the input is dead and released. A
+	// walk continuation without it is a traversal (neighbours), which ranks
+	// nothing and retains nothing.
+	RetainID string `json:"retain_id,omitempty"`
+	// WalkDone marks ruling P7's third shape: the walk is EXHAUSTED and the
+	// ranking is what the deadline cut short. The next request walks nothing --
+	// there is no frontier to walk -- and re-runs both passes over the retained
+	// input RetainID names. It is an explicit discriminator because a walk
+	// continuation with an empty frontier is otherwise indistinguishable from a
+	// finished answer, which mints no cursor at all.
+	WalkDone bool `json:"walk_done,omitempty"`
 	// RankOffset is how many records of that spool the next page skips, and
 	// RankServed/RankTotal the cumulative answer facts the page discloses.
 	// An offset is carried instead of a sort key because Spools.Open streams
@@ -159,6 +183,9 @@ func (c traversalCursor) validate() error {
 	if c.SpoolID != "" && !model.ValidHexID(c.SpoolID) {
 		return cursorInvalid("cursor spool id is malformed")
 	}
+	if c.RetainID != "" && !model.ValidHexID(c.RetainID) {
+		return cursorInvalid("cursor retained-input id is malformed")
+	}
 	if len(c.LastKey) > model.MaxIdentifierBytes || len(c.LastOwner) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor sort key exceeds its bound")
 	}
@@ -187,7 +214,24 @@ func (c traversalCursor) validateRanked() error {
 			c.PairServed != 0 || c.PairTotal != 0 {
 			return cursorInvalid("a walk continuation carries a ranked position")
 		}
+		if c.WalkDone {
+			// Ruling P7's shape: nothing left to walk, the whole answer still
+			// to rank. A token that claimed it while naming a frontier spool or
+			// a keyset position would resume a walk this build believes is
+			// over, and lose whatever that frontier still held.
+			if c.RetainID == "" {
+				return cursorInvalid("a completed walk names no retained input")
+			}
+			if c.SpoolID != "" || c.LastOwner != "" || c.LastKey != "" {
+				return cursorInvalid("a completed walk carries a frontier to resume")
+			}
+		}
 		return nil
+	}
+	if c.RetainID != "" || c.WalkDone {
+		// The order is settled and the pass-1 input is released: a ranked
+		// continuation that named one would resume a sort nothing will run.
+		return cursorInvalid("a ranked continuation carries a walk's retained input")
 	}
 	if c.SpoolID == "" {
 		return cursorInvalid("a ranked continuation names no result spool")
@@ -222,6 +266,17 @@ func (c traversalCursor) spoolCursor() pagination.Cursor {
 		LeaseID:      c.LeaseID,
 		ExpiresAt:    c.ExpiresAt,
 	}
+}
+
+// retainCursor is the same projection for the RETAINED pass-1 input: the spool
+// store checks one binding for every entry it holds, and the retained state
+// directory is bound to this cursor exactly as the frontier spool is. Only the
+// entry's id differs, which is why the two projections are separate functions
+// rather than one with a flag.
+func (c traversalCursor) retainCursor() pagination.Cursor {
+	rc := c.spoolCursor()
+	rc.SpoolID = c.RetainID
+	return rc
 }
 
 // traversalQueryHash is the normalized query/filter/ordering hash of Section
@@ -366,9 +421,14 @@ type resumeState struct {
 	// frontier -- so it costs no extra I/O, and it lets a level whose
 	// candidates are all freshly reached skip the stream entirely.
 	Filter *visitedFilter
-	// Release ends the replayed continuation's spool and lease. The caller
-	// defers it: the spool must outlive the walk, because both the membership
-	// probes and the next page's spill read from it.
+	// Retain is the retained pass-1 input the earlier legs appended to, reopened
+	// for append. It is nil on a continuation that retained none (a neighbours
+	// traversal), and the caller discards it.
+	Retain *retainedWalk
+	// Release ends the replayed continuation's spool, its retained input and
+	// its lease. The caller defers it: the spool must outlive the walk, because
+	// both the membership probes and the next page's spill read from it, and
+	// the retained input is appended to for the whole page.
 	Release func()
 }
 
@@ -390,6 +450,15 @@ type continuation struct {
 	// wrote, ascending. spill merges it with Visited without materializing it,
 	// so a walk of any size costs one spool block of heap here.
 	Carried visitedStream
+	// Retain is the pass-1 input this leg appended to, handed over for the
+	// store to adopt (walkretain.go). It is nil for the endpoints that rank
+	// nothing -- a neighbours page has no pass-1 input to retain.
+	Retain *retainedWalk
+	// WalkDone says the frontier is empty because the walk FINISHED, not
+	// because there is nothing to continue: ruling P7's mid-rank deadline. It
+	// is what lets nextTraversalCursor mint a token for a walk with no
+	// frontier, which it otherwise refuses.
+	WalkDone bool
 }
 
 // verifyContinuation is the half of a resume every paging endpoint shares: it
@@ -451,8 +520,25 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	}
 	now := e.now()
 	s := &resumeState{Cursor: c, Budget: b, Release: func() {
+		// The retained input is released with the same lease: by the time this
+		// runs, either the ranking has consumed it or the page that continued
+		// the walk has renamed it out from under this id (nextTraversalCursor),
+		// so the release then costs only the accounting.
+		e.releaseConsumed(context.WithoutCancel(ctx), c.RetainID, "")
 		e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
 	}}
+	if c.RetainID != "" {
+		if e.spools == nil {
+			return nil, cursorInvalid("continuation state has expired or was released")
+		}
+		dir, err := e.spools.OpenDir(ctx, c.retainCursor(), now)
+		if err != nil {
+			return nil, err
+		}
+		if s.Retain, err = reopenRetainedWalk(dir); err != nil {
+			return nil, err
+		}
+	}
 	if c.SpoolID == "" {
 		// A pure keyset continuation carries a lease and no spool; the caller
 		// still releases it, for the same reason a spooled one is released.
@@ -577,7 +663,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// when the depth bound is reached (reported, not resumed) or when the
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
-	resumesWalk := len(c.Frontier) > 0 || c.LastKey != ""
+	resumesWalk := len(c.Frontier) > 0 || c.LastKey != "" || c.WalkDone
 	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
@@ -609,30 +695,78 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		LastOwner:    c.LastOwner,
 		LastKey:      c.LastKey,
 		Depth:        c.Depth,
+		WalkDone:     c.WalkDone,
 		Visited:      b.visited,
 		Edges:        b.edges,
 		ExpiresAt:    e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
+	if c.Retain != nil {
+		// The pass-1 input is handed over BEFORE the frontier is spilled and
+		// before the token is signed: a token that named a frontier whose
+		// admitted records were never retained is exactly the silent loss this
+		// retention exists to remove.
+		id, err := e.retain(next, c.Retain)
+		if err != nil {
+			return "", e.releaseLease(ctx, lease.ID, err)
+		}
+		if id == "" {
+			// The shared continuation budget cannot hold the input. The answer
+			// ends here, truncated and without a token, rather than continuing
+			// into a leg that would rank only itself.
+			return "", e.releaseLease(ctx, lease.ID, nil)
+		}
+		next.RetainID = id
+	}
 	if needsSpool {
 		id, err := e.spill(ctx, next, c)
 		if err != nil {
+			e.releaseConsumed(ctx, next.RetainID, "")
 			return "", e.releaseLease(ctx, lease.ID, err)
 		}
 		next.SpoolID = id
 	}
 	if err := next.validate(); err != nil {
+		e.releaseConsumed(ctx, next.RetainID, "")
 		return "", e.releaseLease(ctx, lease.ID, err)
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
+		e.releaseConsumed(ctx, next.RetainID, "")
 		return "", e.releaseLease(ctx, lease.ID,
 			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
 	}
 	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
 	if err != nil {
+		e.releaseConsumed(ctx, next.RetainID, "")
 		return "", e.releaseLease(ctx, lease.ID, err)
 	}
 	return token, nil
+}
+
+// retain hands the pass-1 input this leg appended to the spool store, bound to
+// next exactly as a spool file is, and returns the id the cursor names it by.
+//
+// An empty id and a nil error mean the shared continuation byte budget cannot
+// hold it: the caller ends the answer without a token, the contract a spooled
+// page that cannot spill already has. The directory is this request's to clean
+// up until the store takes it.
+func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
+	if e.spools == nil {
+		return "", nil
+	}
+	dir, err := w.detach()
+	if err != nil {
+		return "", err
+	}
+	id, err := e.spools.AdoptDir(next.retainCursor(), dir)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		if pagination.IsBudgetExhausted(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
 }
 
 // releaseLease returns a lease whose cursor never reached the caller and
