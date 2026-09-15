@@ -1448,28 +1448,43 @@ func (s *Store) SessionFilePaths(ctx context.Context, session model.SessionID, a
 	return out, nil
 }
 
-// Waivers reads this session's recorded coverage exceptions, in file-id order.
-// Waive is a writer whose returned record echoes the request's reason, and
-// FileCoverage carries only the Waived flag, so this is the only reader of the
-// stored reasons -- the text a sealed capsule has to carry to be an honest
-// durable artifact (Section 17.3).
+// WaiversAfter pages this session's recorded coverage exceptions by keyset on
+// file_id, the key Coverage pages session_files on. Waive is a writer whose
+// returned record echoes the request's reason, and FileCoverage carries only
+// the Waived flag, so this is the only reader of the stored reasons -- the text
+// a sealed capsule has to carry to be an honest durable artifact (Section 17.3).
 //
 // coverage_waivers is append-only and has no actor column: the exception is a
 // property of the session, so ActorID comes from the resolved session record
-// exactly as Waive sets it. The page loop runs inside one read transaction, so
-// every page is read from the same snapshot and the assembled list is the set
-// one consistent read would have returned. Like Coverage and CoverageSummary it
-// answers honestly beside CTX_SESSION_EXPIRED: a capsule is sealed from what the
-// session recorded, and an expired session still recorded it.
+// exactly as Waive sets it. Like Coverage, Observations and ManifestScopeNodes
+// each page is its own read transaction rather than one loop inside a single
+// snapshot: coverage_waivers is only ever appended to, and a Waive that lands
+// between a seal's counting pass and its digest pass is caught by
+// CapsuleCanonicalHash's count-versus-stream refusal instead of being sealed.
+// The caller therefore never holds a session-sized list, which is the property
+// a whole-list read could not give.
 //
-// The keyset is file_id alone, the key Coverage pages session_files on. Both
-// tables are keyed (session_id, file_id, content_hash), so both carry the same
-// latent boundary if one session ever pinned one file at two content hashes;
-// nothing in the writer path produces that today, and answering it differently
-// here would be the only place in the package that does.
-func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+// Like Coverage and CoverageSummary it answers honestly beside
+// CTX_SESSION_EXPIRED: a capsule is sealed from what the session recorded, and
+// an expired session still recorded it.
+//
+// The keyset is file_id alone. Both coverage_waivers and session_files are keyed
+// (session_id, file_id, content_hash), so both carry the same latent boundary if
+// one session ever pinned one file at two content hashes; nothing in the writer
+// path produces that today, and answering it differently here would be the only
+// place in the package that does.
+func (s *Store) WaiversAfter(ctx context.Context, session model.SessionID, actor string,
+	after model.FileID, limit int) ([]model.WaiverRecord, error) {
+	limit = pageLimit(ctx, limit)
+	afterRaw, err := optionalBlob("after", string(after))
+	if err != nil {
+		return nil, err
+	}
+	if afterRaw == nil {
+		afterRaw = []byte{}
+	}
 	var out []model.WaiverRecord
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	err = s.read(ctx, func(tx *sql.Tx) error {
 		rec, err := s.session(ctx, tx, session, actor, time.Now())
 		if err != nil {
 			// Digest Section 11: errors.As, never a type assertion, so a
@@ -1481,38 +1496,25 @@ func (s *Store) Waivers(ctx context.Context, session model.SessionID, actor stri
 			}
 		}
 		sessionRaw, _ := model.DecodeID(string(rec.ID))
-		after := []byte{}
-		for {
-			rows, err := tx.QueryContext(ctx, waiversSQL, sessionRaw, after, model.MaxPageItems)
-			if err != nil {
-				return wrap("coverage_waivers", err)
-			}
-			n := 0
-			for rows.Next() {
-				var file, hash []byte
-				var created string
-				w := model.WaiverRecord{SessionID: rec.ID, ActorID: rec.ActorID}
-				if err := rows.Scan(&file, &hash, &w.Reason, &created); err != nil {
-					rows.Close()
-					return wrap("coverage_waivers", err)
-				}
-				if w.CreatedAt, err = parseTime(created); err != nil {
-					rows.Close()
-					return wrap("coverage_waivers", err)
-				}
-				w.FileID, w.ContentHash = model.FileID(idHex(file)), idHex(hash)
-				out = append(out, w)
-				after, n = file, n+1
-			}
-			if err := rows.Err(); err != nil {
-				rows.Close()
-				return wrap("coverage_waivers", err)
-			}
-			rows.Close()
-			if n < model.MaxPageItems {
-				return nil
-			}
+		rows, err := tx.QueryContext(ctx, waiversSQL, sessionRaw, afterRaw, limit)
+		if err != nil {
+			return wrap("coverage_waivers", err)
 		}
+		defer rows.Close()
+		for rows.Next() {
+			var file, hash []byte
+			var created string
+			w := model.WaiverRecord{SessionID: rec.ID, ActorID: rec.ActorID}
+			if err := rows.Scan(&file, &hash, &w.Reason, &created); err != nil {
+				return wrap("coverage_waivers", err)
+			}
+			if w.CreatedAt, err = parseTime(created); err != nil {
+				return wrap("coverage_waivers", err)
+			}
+			w.FileID, w.ContentHash = model.FileID(idHex(file)), idHex(hash)
+			out = append(out, w)
+		}
+		return wrap("coverage_waivers", rows.Err())
 	})
 	if err != nil {
 		return nil, err

@@ -804,13 +804,18 @@ func TestStorePublicationScenario(t *testing.T) {
 	// The waiver's reason survives only in coverage_waivers: Waive's return
 	// value echoes the request, so this read-back is what proves the stored row
 	// is what a sealed capsule carries.
-	waivers, err := f.s.Waivers(ctx, open.ID, actorID)
+	waivers, err := f.s.WaiversAfter(ctx, open.ID, actorID, "", model.MaxPageItems)
 	if err != nil {
-		t.Fatalf("Waivers: %v", err)
+		t.Fatalf("WaiversAfter: %v", err)
 	}
 	if len(waivers) != 1 || waivers[0].FileID != empty.id || waivers[0].Reason != "generated file reviewed out of band" ||
 		waivers[0].ActorID != actorID || waivers[0].CreatedAt.IsZero() {
-		t.Fatalf("Waivers read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
+		t.Fatalf("WaiversAfter read back %+v; want one row for %s with the recorded reason, actor and timestamp", waivers, empty.id)
+	}
+	// The keyset is what the seal pages on: a cursor past the only row ends the
+	// list instead of restarting it.
+	if tail, err := f.s.WaiversAfter(ctx, open.ID, actorID, empty.id, model.MaxPageItems); err != nil || len(tail) != 0 {
+		t.Fatalf("WaiversAfter past the last file id returned %d rows (err %v); the keyset must end the list", len(tail), err)
 	}
 	// One wrong-actor assertion covers every session reader: they all resolve
 	// the session through the same actor-checked s.session, so a second reader
