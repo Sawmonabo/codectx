@@ -414,13 +414,15 @@ capability row of the unit as `partial` with `CTX_RESOURCE_LIMIT`, under the
 detail `resource_limits_exceeded`, as a sorted `key=seen/bound` list — the run
 reports that the figure was passed and admits every fact regardless.
 
-Two of the seven do leave something out, because they are the two that bound
-memory and disk rather than counting them: `max_source_file_bytes` (a document
-whose source would be held whole is skipped, reported under the same detail)
-and `max_materialize_bytes` (files left out of an indexer's private copy,
-named in the materializer's own operator report with a complete count). Both
-are therefore part of the index fingerprint; the five reporting thresholds
-deliberately are not, so adjusting one never invalidates an index.
+Three of the seven do leave something out: `max_source_file_bytes` (a document
+whose source would be held whole is skipped, reported under the same detail),
+`max_materialize_bytes` (files left out of an indexer's private copy, named in
+the materializer's own operator report with a complete count) and, for C and
+C++ only, `max_manifest_bytes` (a compilation database over it is left
+un-normalized, which costs that unit its whole run — reported, never silent).
+Those three are therefore part of the index fingerprint; the four pure
+reporting thresholds deliberately are not, so adjusting one never invalidates
+an index.
 
 `MaxRecordBytes` (4 MiB) is the one bound that stays product code. It is the
 wire reader's pre-allocation ceiling — the bytes one record may cause to be
