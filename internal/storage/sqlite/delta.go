@@ -18,6 +18,17 @@ import (
 // 12.4 would have to learn about unit chains. A copy costs one bounded
 // INSERT..SELECT per fact table and leaves all of that untouched.
 //
+// One thing is shared rather than copied, for the same reason node_ids is: a
+// lexical document's FTS posting. search_fts is contentless (ADR-0003 §2.1),
+// so the indexed text exists ONLY as postings -- no column of this database
+// holds it, and it cannot be re-derived from the source either, because a
+// producer's Body is not the file's bytes over [start_byte, end_byte)
+// (treesitter publishes names, signature and documentation; the filesystem
+// provider publishes none). A carried document therefore keeps the posting it
+// was indexed into, by copying search_units.doc_id along with the rest of the
+// row, and re-indexes nothing. deleteUnit releases a posting only when no
+// surviving unit's row still names it, exactly as it releases a node id.
+//
 // Two retention granularities are supported because the two wave-A importers
 // have two:
 //
@@ -156,7 +167,7 @@ func (w *UnitWriter) CarryOver(ctx context.Context, prev model.UnitID, replaced 
 	if err != nil {
 		return CarryOverStats{}, err
 	}
-	w.ftsDocs += stats.SearchUnits
+	w.searchDocs += stats.SearchUnits
 	return stats, nil
 }
 
@@ -389,19 +400,19 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 	return w.copyEvidence(ctx, tx, prevRow, replaceIndexLevel, stats)
 }
 
-// copySearchUnits copies the lexical documents and then indexes exactly the
-// rows it wrote. search_units.rowid is assigned by the copy, so the index must
-// be built against the new rowids; indexing the previous unit's would leave
-// this unit's documents unfindable and the old unit's rowids double-indexed.
+// copySearchUnits carries the lexical documents forward. doc_id travels with
+// the row, so each carried document keeps the posting its text was indexed
+// into and nothing is re-indexed: the copy is one bounded INSERT..SELECT that
+// reads and writes no text at all, and it chains through repeated deltas
+// because the column it copies is itself a copy. Re-deriving the body instead
+// -- from the content store over [start_byte, end_byte) -- would index source
+// text no producer ever published as a document body, silently changing every
+// carried document's lexical hits, BM25 length and snippets.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
-	var before int64
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(rowid), 0) FROM search_units`).Scan(&before); err != nil {
-		return wrap("search_units", err)
-	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
-		name, qualified_name, signature, start_byte, end_byte, token_count)
+		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
 		SELECT ?3, su.search_key, su.node_id, su.file_id, su.path, su.kind,
-			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count
+			su.name, su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count, su.doc_id
 		FROM search_units su WHERE su.unit_id = ?1
 			AND su.file_id NOT IN (SELECT file_id FROM cx_carry_files)
 			AND (su.node_id IS NULL OR EXISTS (SELECT 1 FROM node_facts nf WHERE nf.unit_id = ?3 AND nf.node_id = su.node_id))
@@ -413,94 +424,8 @@ func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow in
 	if err != nil {
 		return wrap("search_units", err)
 	}
-	if n == 0 {
-		return nil
-	}
-	if err := w.indexCarriedSearchUnits(ctx, tx, before); err != nil {
-		return err
-	}
 	stats.SearchUnits = n
 	return nil
-}
-
-// carrySearchIndexPage bounds one page of the carry-over's re-indexing: the
-// rows whose text is resolved and the blob records held at once. It is a
-// working-set bound, not a limit on the work: the loop pages until the copy is
-// fully indexed.
-const carrySearchIndexPage = 200
-
-// carriedDoc is one copied lexical document awaiting its index row.
-type carriedDoc struct {
-	rowid                  int64
-	hash                   string
-	path, name, qname, sig string
-	start, end             int64
-}
-
-// indexCarriedSearchUnits feeds search_fts the documents copySearchUnits just
-// wrote. search_fts is contentless (ADR-0003 §2.1): the database holds no body
-// to copy forward, so each carried document's text is resolved from the content
-// store through the verified range reader, over the byte range the copied row
-// carries and the content hash THIS unit declares for that file --
-// checkCarriedInputs has already refused any carry-over whose file the unit does
-// not declare with the same content. Rows are paged and keyset by rowid, so the
-// working set is one page of documents, never one unit's worth.
-func (w *UnitWriter) indexCarriedSearchUnits(ctx context.Context, tx *sql.Tx, before int64) error {
-	if w.s.opts.Content == nil {
-		return internal("carrying lexical documents forward needs the content store's range reader, and this store was opened without one")
-	}
-	after := before
-	for {
-		page, err := w.carriedSearchPage(ctx, tx, after)
-		if err != nil || len(page) == 0 {
-			return err
-		}
-		blobs := make(map[string]model.BlobRecord, len(page))
-		for _, d := range page {
-			rec, ok := blobs[d.hash]
-			if !ok {
-				if rec, err = blobRecord(ctx, tx, d.hash); err != nil {
-					return err
-				}
-				blobs[d.hash] = rec
-			}
-			body, err := w.s.opts.Content.ReadRange(ctx, rec, model.ByteRange{Start: uint64(d.start), End: uint64(d.end)})
-			if err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO search_fts(rowid, name, qualified_name, signature, path, body)
-				VALUES(?, ?, ?, ?, ?, ?)`, d.rowid, d.name, d.qname, d.sig, d.path, string(body)); err != nil {
-				return wrap("search_fts", err)
-			}
-			after = d.rowid
-		}
-	}
-}
-
-// carriedSearchPage reads one page of the rows the copy wrote, with the content
-// hash this unit declares for each document's file. The rows are materialized
-// before any index write: the same transaction cannot execute an insert while
-// this query's rows are open.
-func (w *UnitWriter) carriedSearchPage(ctx context.Context, tx *sql.Tx, after int64) ([]carriedDoc, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT su.rowid, ui.content_hash, su.path, su.name, su.qualified_name,
-		su.signature, su.start_byte, su.end_byte FROM search_units su
-		JOIN unit_inputs ui ON ui.unit_id = su.unit_id AND ui.file_id = su.file_id
-		WHERE su.unit_id = ?1 AND su.rowid > ?2 ORDER BY su.rowid LIMIT ?3`, w.rowID, after, carrySearchIndexPage)
-	if err != nil {
-		return nil, wrap("search_units", err)
-	}
-	defer rows.Close()
-	page := make([]carriedDoc, 0, carrySearchIndexPage)
-	for rows.Next() {
-		var d carriedDoc
-		var hash []byte
-		if err := rows.Scan(&d.rowid, &hash, &d.path, &d.name, &d.qname, &d.sig, &d.start, &d.end); err != nil {
-			return nil, wrap("search_units", err)
-		}
-		d.hash = idHex(hash)
-		page = append(page, d)
-	}
-	return page, wrap("search_units", rows.Err())
 }
 
 // carryEvidencePage bounds one page of the evidence copy.

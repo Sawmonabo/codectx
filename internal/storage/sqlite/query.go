@@ -690,12 +690,14 @@ func (r *PinnedReader) SearchStats(ctx context.Context) (documents, tokens int64
 	return documents, tokens, err
 }
 
-// SearchUnitRowIDs pages the visible search document rowids by keyset.
+// SearchUnitRowIDs pages the visible search document ids by keyset. The id is
+// search_units.doc_id -- the search_fts rowid the document's text lives at --
+// which is what Match returns and what the vocabulary joins on.
 func (r *PinnedReader) SearchUnitRowIDs(ctx context.Context, after int64, limit int) ([]int64, error) {
 	limit = pageLimit(ctx, limit)
 	var out []int64
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, `SELECT su.rowid FROM search_units su`+r.visible("su")+` WHERE su.rowid > ?2 ORDER BY su.rowid LIMIT ?3`, r.gen, after, limit)
+		rows, err := tx.QueryContext(ctx, `SELECT su.doc_id FROM search_units su`+r.visible("su")+` WHERE su.doc_id > ?2 ORDER BY su.doc_id LIMIT ?3`, r.gen, after, limit)
 		if err != nil {
 			return wrap("search_units", err)
 		}
@@ -723,7 +725,7 @@ func (r *PinnedReader) Match(ctx context.Context, expression string, after int64
 	var out []int64
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT f.rowid FROM search_fts f WHERE f.search_fts MATCH ?2 AND f.rowid > ?3
-			AND EXISTS (SELECT 1 FROM search_units su JOIN generation_units gu ON gu.unit_id = su.unit_id WHERE su.rowid = f.rowid AND gu.generation_id = ?1)
+			AND EXISTS (SELECT 1 FROM search_units su JOIN generation_units gu ON gu.unit_id = su.unit_id WHERE su.doc_id = f.rowid AND gu.generation_id = ?1)
 			ORDER BY f.rowid LIMIT ?4`, r.gen, expression, after, limit)
 		if err != nil {
 			return wrap("search_fts", err)
@@ -741,7 +743,10 @@ func (r *PinnedReader) Match(ctx context.Context, expression string, after int64
 	return out, err
 }
 
-// SearchUnit reads one visible document by rowid. Body is always empty: the
+// SearchUnit reads one visible document by doc id. A posting is shared along a
+// carry chain, but generation_units admits one unit per (provider, scope) and
+// CarryOver refuses a predecessor from another, so at most one row of a chain
+// is visible here and the doc id names one document. Body is always empty: the
 // database stores no source body (ADR-0003 §2.1), and a caller that needs the
 // text reads it from the content store over the returned file identity and
 // byte range.
@@ -752,7 +757,7 @@ func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.Searc
 		var start, end int64
 		err := tx.QueryRowContext(ctx, `SELECT su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
 			su.start_byte, su.end_byte, su.token_count FROM search_units su`+r.visible("su")+
-			`LEFT JOIN node_ids ni ON ni.id = su.node_id WHERE su.rowid = ?2`, r.gen, rowid).
+			`LEFT JOIN node_ids ni ON ni.id = su.node_id WHERE su.doc_id = ?2`, r.gen, rowid).
 			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.TokenCount)
 		if isNoRows(err) {
 			return invalid("search document %d is not visible in generation %d", rowid, r.gen)

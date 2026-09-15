@@ -71,3 +71,26 @@ func loadLimitFixture(t *testing.T, user string) Config {
 	}
 	return cfg
 }
+
+// TestManifestBoundsInvalidateCachedUnits protects the one thing a truncating
+// bound needs from the fingerprint. Past max_toml_lines or max_xml_elements the
+// manifest provider stops reading and flags the unit rather than failing it, so
+// a unit cached under a lower bound holds FEWER dependencies than the same
+// manifest yields under a higher one. If neither bound reached
+// AnalysisConfigHash, raising one would leave every truncated unit valid and
+// nothing would ever re-read the manifest: the user raises the bound and the
+// answer never changes.
+func TestManifestBoundsInvalidateCachedUnits(t *testing.T) {
+	base := loadLimitFixture(t, "[providers.manifest]\nmax_toml_lines = 1000\nmax_xml_elements = 1000\n")
+	for _, raised := range []struct {
+		name, user string
+	}{
+		{"max_toml_lines", "[providers.manifest]\nmax_toml_lines = 5000\nmax_xml_elements = 1000\n"},
+		{"max_xml_elements", "[providers.manifest]\nmax_toml_lines = 1000\nmax_xml_elements = 5000\n"},
+	} {
+		cfg := loadLimitFixture(t, raised.user)
+		if cfg.AnalysisConfigHash() == base.AnalysisConfigHash() {
+			t.Errorf("raising providers.manifest.%s left AnalysisConfigHash unchanged; units truncated under the lower bound stay cached", raised.name)
+		}
+	}
+}

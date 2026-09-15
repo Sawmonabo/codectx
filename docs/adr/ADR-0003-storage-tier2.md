@@ -280,11 +280,22 @@ arithmetic is shown. §2.1 has been implemented; §2.2–§2.5 have not.*
 
 **Implementation note on §2.1.** The record says `body`'s only database readers are the insert and
 the two paths that feed the index a delete. There is a third: the delta carry-over copies a previous
-unit's lexical documents and re-indexes them at their new rowids, and it read `body` back to do so.
-Contentless, there is nothing to read back, so the carry-over now resolves each carried document's
-text from the content store through the verified range reader — over the byte range the copied row
-carries and the content hash this unit declares for that file, which `checkCarriedInputs` has
-already proved — in bounded pages, so its working set is one page of documents. A store opened
-without a range reader refuses that carry-over with a typed error rather than indexing a document
-without its body. This is the same "rebuild source becomes the content store" consequence the
-trade-off names, reaching one more path than the record anticipated.
+unit's lexical documents, and it read `body` back to re-index them at their new rowids. Contentless,
+there is nothing to read back — and nothing to re-derive either. A document's body is what its
+producer published, not the file's bytes over `[start_byte, end_byte)`: the tree-sitter provider
+publishes a symbol's names, signature and attached documentation over the whole declaration's
+extent, and the filesystem provider publishes no body at all. Re-indexing a carried document from
+the source would therefore index text that was never any document's body, changing that document's
+hits, BM25 length and snippets on every delta, with no failing check anywhere — every integrity
+check a contentless index offers is internal to the index.
+
+So the carry-over does not rebuild the posting; it **keeps** it. `search_units` carries a `doc_id`
+column naming the `search_fts` rowid its text was indexed into, the carry-over copies that column
+forward with the rest of the row, and every read resolves a document by `doc_id`. Sharing is
+confined to one carry chain — `CarryOver` refuses a predecessor of another provider or scope key,
+and `generation_units` is keyed by `(generation_id, provider_id, scope_key)`, so at most one row of
+a chain is visible in any generation — and a posting is released, like a `node_ids` row, only when
+no surviving unit still names it. The carry-over reads and writes no text at all: one bounded
+`INSERT..SELECT`, no content-store read, and a peak set by the statement rather than by the unit.
+The "rebuild source becomes the content store" consequence the trade-off names still holds for a
+rebuild from scratch; it does not reach the incremental path.

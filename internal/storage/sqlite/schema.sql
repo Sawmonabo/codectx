@@ -294,10 +294,11 @@ CREATE TABLE native_keys (
     key TEXT NOT NULL
 );
 -- No `paths` intern table: the only high-multiplicity path column is
--- search_units.path, and search_fts declares it as an external-content FTS5
--- column (content='search_units'), so it must stay a TEXT column of that name
--- or the path field leaves the full-text index. files.path is 818 rows /
--- 114 KiB on that same fixture and is not an amplifier.
+-- search_units.path, and `path` is one of the columns search_fts indexes, fed
+-- from this column on every write. Interning it would put a surrogate id where
+-- the index expects text, so the path field would leave the full-text index.
+-- files.path is 818 rows / 114 KiB on that same fixture and is not an
+-- amplifier.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
@@ -319,13 +320,30 @@ CREATE TABLE search_units (
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
     token_count INTEGER NOT NULL CHECK(token_count >= 0),
+    -- The search_fts rowid holding this document's indexed text. It is the
+    -- DOCUMENT's identity, not the row's: a delta carry-over copies this
+    -- column forward with the rest of the row, so the carried unit points at
+    -- the posting the text was originally indexed into instead of re-deriving
+    -- a body the producer never published (a producer's Body is not the source
+    -- over [start_byte,end_byte) -- see internal/provider/treesitter/facts.go).
+    -- Sharing is confined to one carry chain: CarryOver refuses a predecessor
+    -- of another provider or scope key, and generation_units is keyed by
+    -- (generation_id, provider_id, scope_key), so at most one row of a chain
+    -- is visible in any generation and a doc_id still names one document
+    -- there. The posting is released like node_ids: deleteUnit removes it only
+    -- when no other unit's row still names it.
+    doc_id INTEGER NOT NULL CHECK(doc_id > 0),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
--- S-4 (ADR-0003 §2.1): the lexical tier stores no second copy of the source.
+-- The lexical tier stores no second copy of the source (ADR-0003 §2.1).
 -- search_units carries no `body` column and search_fts is CONTENTLESS, so the
--- indexed body text exists only as index postings. `contentless_delete=1` is
+-- indexed body text exists only as index postings. That makes the postings
+-- irreplaceable rather than merely economical: no row of this database can
+-- reconstruct the text a document was indexed with, which is why a carry-over
+-- REUSES a carried document's posting through search_units.doc_id instead of
+-- rebuilding one. `contentless_delete=1` is
 -- what keeps DELETE and INSERT OR REPLACE available on unit invalidation
 -- (https://sqlite.org/fts5.html#contentless_tables, engine floor 3.43.0; the
 -- embedded engine is 3.53.4). Snippets and highlights are served from the
@@ -578,6 +596,10 @@ CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 -- pathology idx_context_entries_node exists to prevent, on the sibling column.
 CREATE INDEX idx_context_entries_file ON context_entries(file_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
+-- deleteUnit releases a posting only when no surviving unit's row still names
+-- it, and every read resolves a document by doc_id. Without this index both
+-- are a scan of search_units per probe.
+CREATE INDEX idx_search_doc ON search_units(doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
