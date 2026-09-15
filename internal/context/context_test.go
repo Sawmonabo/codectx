@@ -1014,7 +1014,7 @@ func TestContextCompilerScenario(t *testing.T) {
 					for _, s := range p.Slices {
 						total += s.EstimatedBytes
 					}
-					t.Fatalf("a %d-byte manifest was accepted under a %d-byte cap", total, b.MaxManifestBytes)
+					t.Fatalf("a %d-byte manifest was accepted under a %s-byte cap", total, b.MaxManifestBytes)
 				}
 				var got *model.Error
 				if !errors.As(err, &got) || got.Code != model.CodeResourceLimit {
@@ -1027,8 +1027,8 @@ func TestContextCompilerScenario(t *testing.T) {
 				if err != nil {
 					t.Fatalf("manifest_bytes = %q, want the measured total: %v", got.Details["manifest_bytes"], err)
 				}
-				if bytes <= b.MaxManifestBytes {
-					t.Errorf("manifest_bytes = %d, which does not exceed the cap %d the refusal cites", bytes, b.MaxManifestBytes)
+				if !b.MaxManifestBytes.Exceeded(bytes) {
+					t.Errorf("manifest_bytes = %d, which does not exceed the cap %s the refusal cites", bytes, b.MaxManifestBytes)
 				}
 				// The refusal must be the manifest cap, not a per-slice bound
 				// reached first, or the row would prove the wrong check.

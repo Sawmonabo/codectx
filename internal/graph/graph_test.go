@@ -887,7 +887,12 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("new spools: %v", err)
 				}
 				limits := fixtureLimits()
-				limits.MaxDepth = 2
+				// Unlimited depth: this row proves that pages partition the same
+				// edge set the one-page walk returns, and a finite depth bound now
+				// (correctly) reports reasonDepth on a graph deeper than it, which
+				// would make the ground truth a truncated answer rather than the
+				// whole one this row compares against.
+				limits.MaxDepth = 0
 				limits.MaxPageItems = 400
 				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
 					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})

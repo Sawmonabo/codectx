@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -32,13 +33,13 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 	defer done()
 
 	kinds := impactAllowlist(req.Relations)
-	maxDepth := resolveBound(req.MaxDepth, e.limits.MaxDepth)
+	maxDepth, depthNotice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
 	limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems)
 	// The page limit is part of the normalized query a continuation is bound
 	// to, exactly as it is for a traversal: a resumed page that asked for a
 	// different limit would cut the ranked list somewhere the issuing page
 	// never stopped.
-	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth, limit)
+	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth.Int(), limit)
 
 	var (
 		answer  impactAnswer
@@ -58,7 +59,8 @@ func (e *Engine) Impact(ctx context.Context, req model.ImpactRequest) (res model
 		return model.ImpactResult{}, err
 	}
 
-	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness}
+	meta := model.QueryMeta{Binding: e.adjacency.Binding(), Completeness: answer.Completeness,
+		Notices: appendNotice(append([]string(nil), answer.Notices...), depthNotice)}
 	if answer.Truncated {
 		markTruncated(&meta, answer.Reason)
 	}
@@ -111,8 +113,12 @@ const impactEndpoint = "graph.impact"
 // exceed the spool's per-record byte bound and turn a legal answer into a
 // resource-limit refusal on the page that spills it.
 type impactAnswer struct {
-	Truncated    bool                    `json:"t,omitempty"`
-	Reason       string                  `json:"r,omitempty"`
+	Truncated bool   `json:"t,omitempty"`
+	Reason    string `json:"r,omitempty"`
+	// Notices travel with the answer so every page of a spooled ranked list
+	// repeats the same disclosure: page 2 was produced under the same bounds
+	// page 1 was, and must say so.
+	Notices      []string                `json:"n,omitempty"`
 	Completeness []model.CapabilityState `json:"-"`
 	Packages     []model.PackageEdge     `json:"-"`
 }
@@ -126,7 +132,7 @@ type impactAnswer struct {
 // facts at all. The cost is bounded by the record cap the accumulator already
 // enforces, and it is paid once for the whole answer rather than once per page.
 func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds []model.RelationKind,
-	maxDepth int, deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
+	maxDepth config.Limit, deadline time.Time) (impactAnswer, []model.ImpactEntry, *budget, error) {
 	var answer impactAnswer
 	meta := model.QueryMeta{}
 	// The capability disclosure happens before the walk: a missing dependence
@@ -141,10 +147,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	}
 
 	b := &budget{deadline: deadline, now: e.now}
-	acc := newImpactAccumulator(req.Start, b,
-		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
-		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
-	_, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
+	maxVisited, visitedNotice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())
+	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
+	answer.Notices = appendNotice(appendNotice(answer.Notices, visitedNotice), edgeNotice)
+	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges)
+	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
 		MaxDepth:      maxDepth,
@@ -162,6 +169,10 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// A level the frontier budget cut short is truncation the caller must
 		// see: the ranking below is over the edges that were read, not all of them.
 		markTruncated(&meta, reasonFrontierBytes)
+	case state.DepthLimited:
+		// Nodes at the depth bound were admitted but never expanded; an impact
+		// answer that stopped there is not the whole blast radius.
+		markTruncated(&meta, reasonDepth)
 	}
 
 	entries := acc.Entries(e.limits.MaxReasonPaths)
@@ -440,8 +451,8 @@ type impactAccumulator struct {
 	order      []model.NodeID
 	edges      []model.Relation
 	budget     *budget
-	maxVisited int64
-	maxEdges   int64
+	maxVisited config.Limit
+	maxEdges   config.Limit
 	reason     string
 }
 
@@ -451,7 +462,7 @@ type impactAccumulator struct {
 // ranking pass is allowed to hold at all.
 const reasonRecordCap = "affected entity record limit reached"
 
-func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges int64) *impactAccumulator {
+func newImpactAccumulator(start []model.NodeID, b *budget, maxVisited, maxEdges config.Limit) *impactAccumulator {
 	a := &impactAccumulator{
 		isSeed:     make(map[model.NodeID]bool, len(start)),
 		byNode:     map[model.NodeID]*impactNode{},
@@ -480,10 +491,10 @@ func (a *impactAccumulator) Seeds() []model.NodeID { return a.seeds }
 // is the other end of it, one hop deeper and one edge cost further away.
 func (a *impactAccumulator) Visit(state frontierState, rel model.Relation) error {
 	switch {
-	case a.budget.edges >= a.maxEdges:
+	case a.maxEdges.Exceeded(a.budget.pageEdges + 1):
 		a.reason = reasonEdgeBudget
 		return errStopExpansion
-	case a.budget.visited >= a.maxVisited:
+	case a.maxVisited.Exceeded(a.budget.pageVisited + 1):
 		a.reason = reasonVisitedBudget
 		return errStopExpansion
 	case len(a.order) >= model.MaxRecordsPerResult:

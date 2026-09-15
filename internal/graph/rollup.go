@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"unicode/utf8"
 
@@ -46,13 +47,15 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	}
 
 	b := &budget{deadline: deadline, now: e.now}
-	acc := newImpactAccumulator(req.Start, b,
-		int64(resolveBound(req.MaxVisited, e.limits.MaxVisited)),
-		int64(resolveBound(req.MaxEdges, e.limits.MaxEdges)))
-	_, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
+	maxVisited, visitedNotice := resolveLimit("max_visited", req.MaxVisited, e.limits.Visited())
+	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
+	maxDepth, depthNotice := resolveLimit("max_depth", req.MaxDepth, e.limits.Depth())
+	meta.Notices = appendNotice(appendNotice(appendNotice(meta.Notices, visitedNotice), edgeNotice), depthNotice)
+	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges)
+	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
-		MaxDepth:      resolveBound(req.MaxDepth, e.limits.MaxDepth),
+		MaxDepth:      maxDepth,
 		Budget:        b,
 		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
@@ -67,13 +70,24 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		// The rollup summarises the edges the walk read; a level the frontier
 		// budget cut short must not read as the whole neighbourhood.
 		markTruncated(&meta, reasonFrontierBytes)
+	case state.DepthLimited:
+		markTruncated(&meta, reasonDepth)
 	}
 
 	items, rollupErr := e.rollupPackages(ctx, acc.Relations())
 	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	if limit := resolveBound(req.Page.Limit, e.limits.MaxPageItems); len(items) > limit {
+	limit, limitNotice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
+	meta.Notices = appendNotice(meta.Notices, limitNotice)
+	if len(items) > limit {
+		// The pairs beyond this page are DISCLOSED, not dropped in silence:
+		// PackageDependencies offers no continuation (continuationUnavailable),
+		// so the count of what the page could not carry is the only honest
+		// channel there is.
+		meta.Notices = appendNotice(meta.Notices,
+			fmt.Sprintf("package rollup: %d further package pair(s) were aggregated and are not listed on this page",
+				len(items)-limit))
 		items = items[:limit]
 		markTruncated(&meta, reasonPageFull)
 	}

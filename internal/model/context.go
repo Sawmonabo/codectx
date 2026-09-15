@@ -75,6 +75,12 @@ type Budget struct {
 	MaxBytes           int64 `json:"max_bytes"`
 	MaxFiles           int   `json:"max_files"`
 	MaxSlices          int   `json:"max_slices"`
+	// MaxManifestBytes is the stored-manifest byte budget for THIS request. It
+	// is a caller budget, not a deployment ceiling: a request that knows it can
+	// hold a larger manifest may raise the configured value, and zero takes the
+	// configured one. Refusing to compile because a deployment default was
+	// smaller than the caller's real window is a scale refusal.
+	MaxManifestBytes int64 `json:"max_manifest_bytes,omitempty"`
 }
 
 // Validate rejects a negative budget field. Zero is accepted and means "use the
@@ -90,6 +96,7 @@ func (b Budget) Validate() error {
 		{"budget.max_bytes", b.MaxBytes},
 		{"budget.max_files", int64(b.MaxFiles)},
 		{"budget.max_slices", int64(b.MaxSlices)},
+		{"budget.max_manifest_bytes", b.MaxManifestBytes},
 	} {
 		if err := requireNonNegative(f.field, f.value); err != nil {
 			return err
