@@ -431,7 +431,12 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 	// a duplicate seed never reached the start logic before the fold, so
 	// counting it here would both reorder the walk's roots and mis-trigger the
 	// overflow disclosure below.
-	start := make([]model.NodeID, 0, model.MaxStartNodes)
+	// The walk's root width is the user-set context.max_start_nodes, unlimited
+	// by default, so the capacity hint is the admitted count and never a
+	// constant: preallocating a hard ceiling would allocate for a bound that no
+	// longer exists.
+	width := in.cfg.MaxStartNodes
+	start := []model.NodeID{}
 	unwalkedRoots := int64(0)
 	if err := seedSeqRun.Each(func(r candRec) error {
 		if !limit.IsUnlimited() && admitted >= limit.Value() {
@@ -448,15 +453,20 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		if r.NodeID == "" {
 			return nil
 		}
-		if len(start) < model.MaxStartNodes {
+		if !width.Exceeded(int64(len(start)) + 1) {
 			start = append(start, r.NodeID)
 			return nil
 		}
-		// More seeds than one walk request may start from: the boundaries of
-		// the seeds that did not start are unexplored, and the answer says so
+		// More seeds than the user-set root width admits: the boundaries of the
+		// seeds that did not start are unexplored, and the answer says so
 		// rather than reading as an exhaustive scope. HOW MANY did not start is
 		// counted and disclosed below -- an incomplete verdict on its own does
 		// not tell a caller whether one root or a thousand went unexplored.
+		//
+		// The overflow is never chunked into a second walk: graph.Impact ranks
+		// one walk's boundaries globally, so a second walk from the remaining
+		// roots would answer its own local ranking rather than extend this
+		// one's order.
 		unwalkedRoots++
 		in.scope.ScopeComplete = false
 		return nil
@@ -469,7 +479,7 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 		}
 	}
 	if unwalkedRoots > 0 {
-		if err := in.discloseUnwalkedRoots(unwalkedRoots); err != nil {
+		if err := in.discloseUnwalkedRoots(unwalkedRoots, width); err != nil {
 			return nil, err
 		}
 	}
@@ -477,15 +487,15 @@ func (in *seedIngest) foldSeeds() ([]model.NodeID, error) {
 }
 
 // discloseUnwalkedRoots reports the resolved seeds that did not become walk
-// roots, with their count, as one exclusion row on the manifest.
+// roots, with their count and the limit that stopped them, as one exclusion row
+// on the manifest.
 //
-// model.MaxStartNodes is a bound on ONE impact request (ImpactRequest.Validate
-// refuses a longer start list), not a bound this package chose, so the honest
-// answer while it stands is to say how much of the scope it left unexplored
-// instead of leaving the caller a bare ScopeComplete=false. Finding B2's
-// config key cannot be honoured until that request bound is lifted; see the
-// FX-H-X2 report.
-func (in *seedIngest) discloseUnwalkedRoots(n int64) error {
+// It is reachable only when the operator SET context.max_start_nodes: the key
+// is unlimited by default, so a default install walks from every resolvable
+// seed and this row never appears. A cut the operator asked for is still never
+// silent -- the count is what tells a caller whether one root or a thousand
+// went unexplored, which a bare ScopeComplete=false does not.
+func (in *seedIngest) discloseUnwalkedRoots(n int64, width config.Limit) error {
 	seq := in.seq
 	in.seq++
 	return in.candSort.Add(candRecOf(candidate{
@@ -494,8 +504,8 @@ func (in *seedIngest) discloseUnwalkedRoots(n int64) error {
 		Path:   "seed discovery: walk roots",
 		Origin: originExpansion,
 		Excluded: boundReason(fmt.Sprintf(
-			"%d resolved seeds beyond the %d one impact request may start from were not walked; "+
-				"their boundaries are unexplored", n, model.MaxStartNodes)),
+			"%d resolved seeds beyond the context.max_start_nodes limit of %s were not walked; "+
+				"their boundaries are unexplored", n, width)),
 	}, seq))
 }
 

@@ -43,11 +43,25 @@ const (
 	// package admits: ceil(MaxRawChunkBytes/3)*4.
 	MaxChunkContentBytes = ((MaxRawChunkBytes + 2) / 3) * 4
 
-	MaxPageItems               = 200 // Section 20.1 resources.max_page_items
-	MaxQueryTextBytes          = 8192
-	MaxFilterValues            = 64 // kinds/languages/paths/relations per request
-	MaxSeeds                   = 64
-	MaxStartNodes              = 64
+	MaxPageItems      = 200 // Section 20.1 resources.max_page_items
+	MaxQueryTextBytes = 8192
+	MaxFilterValues   = 64 // kinds/languages/paths/relations per request
+	MaxSeeds          = 64
+	// MaxStartNodes bounds the start list of ONE externally supplied traversal
+	// request (ImpactRequest, GraphRequest and the CLI that builds them), which
+	// is a wire bound on untrusted input and not a bound on how wide a walk may
+	// be. It is a structural ceiling only -- it exists so a request's start
+	// list is finite, not to size it -- and it mirrors
+	// MaxCoverageFilesPerCapsule's referent: a caller may honestly name every
+	// file a single context session could touch.
+	//
+	// The operative bound on the context compiler's OWN start set is the
+	// user-set context.max_start_nodes (unlimited by default), applied to the
+	// folded seed stream in context/scope.go. This constant is deliberately far
+	// wider than any seed set one task can produce, so it never cuts that set;
+	// a start list that reached it would be an externally supplied request, and
+	// boundCount reports it rather than trimming it.
+	MaxStartNodes              = 250000
 	MaxReasonsPerEntry         = 8
 	MaxReasonPathsPerEntry     = 3  // Section 20.1 context.max_reason_paths_per_entry
 	MaxRelationsPerPath        = 64 // edges retained in one explanation path

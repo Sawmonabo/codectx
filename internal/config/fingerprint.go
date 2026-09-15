@@ -120,5 +120,6 @@ func (c Config) ContextPolicyHash() string {
 		quoteBool(c.Context.StrictReadGate),
 		quoteBool(c.Context.AllowExploratoryWaiverConsolidation),
 		quoteLimit(c.Context.MaxSeeds),
+		quoteLimit(c.Context.MaxStartNodes),
 	)
 }
