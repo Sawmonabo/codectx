@@ -340,9 +340,9 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // its TTL rather than held until Close.
 //
 // They are what makes index.max_parser_workers a concurrency CEILING and not
-// a resident cost: a worker process costs ~18 MiB of resident set on its own
-// (PERF-4 measured it; the binary's mapped pages dominate and a parse adds
-// nothing lasting, the tree being closed per file), so a pool that spawned
+// a resident cost: a worker process costs ~18 MiB of resident set before it
+// has parsed anything (PERF-4 measured it; the binary's mapped pages
+// dominate), so a pool that spawned
 // its ceiling eagerly, or never reaped, would charge ceiling x 18 MiB to
 // every process that holds a provider -- an MCP server serving queries most
 // of all. TestResourceBudgets/idle-mcp-rss is the end-to-end figure; this is
