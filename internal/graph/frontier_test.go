@@ -272,6 +272,14 @@ func TestFrontierBytesSpillsAndTerminates(t *testing.T) {
 		t.Fatalf("the one-byte ceiling served %d edge(s), a ceiling that never binds %d: the ceiling changed the set",
 			len(order), len(ref.Relations))
 	}
+	// Set equality is checked BEFORE order so that a run which fails the order
+	// assertion still reports whether the ceiling lost or invented an edge:
+	// equal cardinality plus exactly-once leaves a swap undetected on its own.
+	for _, want := range ref.Relations {
+		if seen[want.ID] == 0 {
+			t.Errorf("the one-byte ceiling never served %s: the ceiling dropped an edge", want.ID)
+		}
+	}
 	for i, want := range ref.Relations {
 		if order[i] != want.ID {
 			t.Fatalf("at position %d the spilled pages carry %s, the unbounded-ceiling walk %s: the ceiling changed the order",
