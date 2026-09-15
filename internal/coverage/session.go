@@ -89,7 +89,6 @@ func checkLimits(l Limits) error {
 		{"max_source_response_bytes", l.MaxSourceResponseBytes},
 		{"max_metadata_response_bytes", l.MaxMetadataResponseBytes},
 		{"max_receipts_per_confirmation", int64(l.MaxReceiptsPerConfirmation)},
-		{"max_unconfirmed_chunks_per_session", int64(l.MaxUnconfirmedChunksPerSession)},
 		{"max_page_items", int64(l.MaxPageItems)},
 		{"session_ttl", int64(l.SessionTTL)},
 		{"query_timeout", int64(l.QueryTimeout)},
@@ -100,6 +99,14 @@ func checkLimits(l Limits) error {
 				"coverage limit %s is %d; every bound must be resolved to a positive value before the service is built",
 				b.name, b.value)
 		}
+	}
+	// max_unconfirmed_chunks_per_session is exempt from the positive check
+	// above and only refuses a negative: zero is its default and means
+	// unlimited (Limits).
+	if l.MaxUnconfirmedChunksPerSession < 0 {
+		return typedErrf(model.CodeInternal,
+			"coverage limit max_unconfirmed_chunks_per_session is %d; a bound cannot be negative",
+			l.MaxUnconfirmedChunksPerSession)
 	}
 	if l.MaxReceiptsPerConfirmation > model.MaxReceiptsPerConfirmation {
 		return typedErrf(model.CodeInternal,

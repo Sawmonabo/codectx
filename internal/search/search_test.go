@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -267,7 +268,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"rank/quantization_is_the_only_float_boundary", legQuantization},
 		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
 		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
-		{"rank/ranked_set_bound_truncates_loudly", legRankedSetBound},
+		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
 		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
 		{"rank/range_hydration_reads_a_bounded_window", legRangeHydration},
 		{"cursor/query_hash_binds_the_query_and_its_filters", legQueryHash},
@@ -279,6 +280,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		// FX-C13b rows
 		{"fix/path_tier_announces_its_bound_and_filters_the_keyset", legPathTierBound},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
+		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 	}
 	f := newFixture(t)
@@ -429,39 +431,45 @@ func legDedupFileKey(t *testing.T, _ *fixture) {
 	}
 }
 
-// legRankedSetBound proves that overflowing the candidate bound is announced.
-// A silent drop would serve a caller a confidently incomplete answer with no
-// way to detect it (digest §6).
-func legRankedSetBound(t *testing.T, _ *fixture) {
+// legRankedSetLossless proves the ranked set is lossless: the former bound of
+// 10*model.MaxPageItems distinct results refused every new key past 2000 and
+// discarded the tail of the corpus. 5000 distinct candidates, offered in an
+// order unrelated to their rank, must ALL survive, in exactly the order an
+// in-memory oracle sorted by the Section 14.2 chain produces, and the answer
+// must not claim to be truncated.
+//
+// Mutation: restore the refusal in collector.add and this fails on the count.
+func legRankedSetLossless(t *testing.T, _ *fixture) {
+	const distinct = 5000
+	oracle := make([]ranked, 0, distinct)
 	c := newCollector()
-	for i := range maxRankedHits {
-		c.add(rankedOf(model.TierLexicalFTS, int64(i), "p", 0, model.NodeID("n"+strconv.Itoa(i)), "k"+strconv.Itoa(i)))
+	// A stride coprime with distinct offers the candidates in an order that
+	// shares no prefix with the ranked order, so a collector that silently
+	// kept only a prefix of what it was offered cannot pass.
+	for i := range distinct {
+		n := (i * 2237) % distinct
+		r := rankedOf(model.TierLexicalFTS, int64(n), "pkg/f"+strconv.Itoa(n%97)+".go", uint64(n),
+			model.NodeID("n"+strconv.Itoa(n)), "k"+strconv.Itoa(n))
+		oracle = append(oracle, r)
+		c.add(r, "lexical")
 	}
-	if truncated, _ := c.truncation(); truncated {
-		t.Fatalf("the set is truncated at exactly %d distinct results", maxRankedHits)
-	}
-	c.add(rankedOf(model.TierExactPath, 0, "p", 0, "overflow", "k-overflow"))
-	truncated, reason := c.truncation()
-	if !truncated {
-		t.Error("the candidate bound was exceeded without setting Truncated")
-	}
-	if reason == "" || len(reason) > model.MaxReasonBytes {
-		t.Errorf("truncation reason = %q, want a non-empty reason within %d bytes", reason, model.MaxReasonBytes)
+	if truncated, reason := c.truncation(); truncated {
+		t.Fatalf("a %d-result answer reported itself truncated: %s", distinct, reason)
 	}
 	got := c.results()
-	if len(got) != maxRankedHits {
-		t.Fatalf("results = %d, want the bound %d", len(got), maxRankedHits)
+	if len(got) != distinct {
+		t.Fatalf("results = %d, want every one of the %d distinct hits", len(got), distinct)
 	}
-	for _, r := range got {
-		if r.NodeID == "overflow" {
-			t.Fatal("the refused candidate entered the set anyway")
+	sort.Slice(oracle, func(i, j int) bool { return oracle[i].less(oracle[j]) })
+	for i := range oracle {
+		if got[i].ranked != oracle[i] {
+			t.Fatalf("hit %d = %+v, want %+v (rank order differs from the oracle)", i, got[i].ranked, oracle[i])
 		}
 	}
-	// An already-present key still folds past the bound: dropping the fold
-	// would understate an occurrence count that is already being served.
-	c.add(rankedOf(model.TierLexicalFTS, 0, "p", 0, "n0", "k0"))
-	if got := c.results(); got[len(got)-1].Occurrences != 2 {
-		t.Errorf("a fold into an existing key was refused past the bound")
+	// A repeat of a key still folds rather than entering twice, at any size.
+	c.add(oracle[0], "exact")
+	if again := c.results(); len(again) != distinct {
+		t.Fatalf("a repeated key grew the set to %d, want %d", len(again), distinct)
 	}
 }
 
@@ -1036,6 +1044,43 @@ func legPathTierBound(t *testing.T, _ *fixture) {
 	if len(out) != 3 || full {
 		t.Fatalf("pathCandidates(kind filter) served %d candidates, truncated=%t; want 3 and false: the filter runs over the keyset, not over one bounded read",
 			len(out), full)
+	}
+}
+
+// legSpoolExhaustionEndsThePage proves the class-D refusal is gone: when the
+// shared spool byte budget cannot hold the tail of an answer, the hits already
+// in hand are still served. Before, spoolNext's error propagated out of Search
+// and page 1 failed because the page after it could not be written.
+//
+// The budget is set to one byte, so Create's header alone exhausts it and no
+// continuation can be minted for a corpus that certainly has one.
+//
+// Mutation: restore `return empty, err` in the spoolNext branch and Search
+// fails here instead of answering.
+func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
+	full, err := pagination.NewSpools(filepath.Join(t.TempDir(), "spools"), 1, f.store)
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	opts := f.opts
+	opts.Spools = full
+	s := newService(t, opts)
+	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
+	page, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a full spool failed page 1 instead of ending it: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("page 1 served %d hits, want the 1 it had in hand", len(page.Items))
+	}
+	if page.Meta.NextCursor != "" {
+		t.Error("an answer whose tail could not be spooled still minted a continuation")
+	}
+	if !page.Meta.Truncated {
+		t.Fatal("an answer that dropped its tail did not report itself truncated")
+	}
+	if !strings.Contains(page.Meta.TruncationReason, "spool") {
+		t.Errorf("truncation reason = %q, want the dropped tail named", page.Meta.TruncationReason)
 	}
 }
 

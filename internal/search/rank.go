@@ -55,15 +55,6 @@ func (a ranked) less(b ranked) bool {
 	return a.SearchKey < b.SearchKey
 }
 
-// maxRankedHits bounds the heap (digest §6).
-const maxRankedHits = 10 * model.MaxPageItems
-
-// truncationRankedSetFull is the QueryMeta.TruncationReason a caller sees when
-// the candidate set outgrew maxRankedHits. Section 14.3 forbids a silent drop:
-// the answer says it is incomplete and why.
-var truncationRankedSetFull = "the ranked candidate set reached its bound of " +
-	strconv.Itoa(maxRankedHits) + " distinct results; narrow the query or add a filter"
-
 // scored is a ranked candidate with the bounded ranking reasons that survive
 // deduplication. Reasons live beside ranked rather than inside it because the
 // frozen struct is sized for 2000 entries under the query memory ceiling.
@@ -78,11 +69,14 @@ type scored struct {
 // fold can change a survivor's tier and score, the whole set is ordered once
 // at the end rather than maintained as a partial order while it mutates.
 //
-// The bound is on DISTINCT keys, which is what maxRankedHits means: 2000
-// ranked structs plus their reasons sort in microseconds and stay three orders
-// of magnitude under resources.query_memory_bytes, so a literal heap would buy
-// nothing and would additionally have to track each key's position in the
-// backing array to fold into it.
+// There is no bound on the number of distinct keys. The set is sized by the
+// ANSWER (one entry per distinct result the query actually has), not by the
+// repository: the lexical tier emits each document once and the exact tiers are
+// themselves page-bounded, so this is not a repository-sized heap structure.
+// The tail of the ordered set is written to the disk-backed spool and served by
+// a continuation cursor, so a large answer costs one page of wire bytes and one
+// spool frame at a time -- refusing a new distinct key past 2000 discarded the
+// tail of the corpus instead.
 type collector struct {
 	index     map[string]int
 	items     []scored
@@ -104,18 +98,12 @@ func dedupKey(r ranked) string {
 	return "file\x00" + r.Path + "\x00" + strconv.FormatUint(r.StartByte, 10)
 }
 
-// add folds one candidate into the set. Beyond maxRankedHits distinct keys a
-// NEW key is refused and the set is marked truncated; an existing key still
-// folds, because dropping a fold would understate an occurrence count that is
-// already represented in the answer.
+// add folds one candidate into the set. A repeat of a key folds into the entry
+// already held; a new key is always admitted.
 func (c *collector) add(r ranked, reasons ...string) {
 	key := dedupKey(r)
 	if i, ok := c.index[key]; ok {
 		c.items[i] = fold(c.items[i], scored{ranked: r, Reasons: reasons})
-		return
-	}
-	if len(c.items) >= maxRankedHits {
-		c.truncated, c.reason = true, truncationRankedSetFull
 		return
 	}
 	c.index[key] = len(c.items)
