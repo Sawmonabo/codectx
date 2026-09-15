@@ -186,11 +186,10 @@ func (s *Service) nextAction(ctx context.Context, rec sqlite.SessionRecord, atEO
 	if err != nil {
 		return "", err
 	}
-	// Zero is unlimited (Limits.MaxUnconfirmedChunksPerSession), so an
-	// unbounded session never reports itself capped.
-	limit := s.limits.MaxUnconfirmedChunksPerSession
-	capped := limit > 0 && unconfirmed >= int64(limit)
-	if (atEOF && unconfirmed > 0) || capped {
+	// Zero is unlimited (Limits.MaxUnconfirmedChunksPerSession); the one
+	// spelling of that comparison lives on Limits, so this endpoint and the
+	// read endpoint cannot drift about what "capped" means.
+	if (atEOF && unconfirmed > 0) || s.limits.unconfirmedCapped(unconfirmed) {
 		return actionAcknowledgeReceipt, nil
 	}
 	return actionReadSource, nil

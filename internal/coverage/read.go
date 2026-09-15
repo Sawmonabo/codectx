@@ -62,16 +62,16 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 	// not heap. A user-set value still refuses the chunk that would exceed it,
 	// naming the limit, because the remedy is to confirm the receipts already
 	// issued rather than to serve more.
-	if limit := s.limits.MaxUnconfirmedChunksPerSession; limit > 0 {
+	if s.limits.MaxUnconfirmedChunksPerSession > 0 {
 		outstanding, err := s.sessions.UnconfirmedChunks(ctx, req.SessionID)
 		if err != nil {
 			return model.ReadChunkResponse{}, err
 		}
-		if outstanding >= int64(limit) {
+		if s.limits.unconfirmedCapped(outstanding) {
 			return model.ReadChunkResponse{}, &model.Error{Code: model.CodeResourceLimit, Message: fmt.Sprintf(
 				"session holds %d unconfirmed chunks, at the coverage.max_unconfirmed_chunks_per_session limit of %d; "+
 					"confirm the receipts already issued rather than raising the cap",
-				outstanding, limit)}
+				outstanding, s.limits.MaxUnconfirmedChunksPerSession)}
 		}
 	}
 
