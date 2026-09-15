@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1304,11 +1305,13 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("pkg-app holds %d symbols and %d files, want 5 and 0",
 						app.SymbolCount, app.FileCount)
 				}
-				// The other half of the same failure mode: when the edge budget
-				// cannot cover one page's children, the counts that WERE
-				// accumulated are short by an unknown amount, so the map must
-				// refuse rather than hand back numbers no caller can tell from
-				// measured ones.
+				// The other half of the same failure mode: when a USER-SET edge
+				// bound cannot cover one page's children, the counts that WERE
+				// accumulated are short by an unknown amount. The map must not
+				// publish them as measured -- and it must not refuse the whole
+				// answer either, which left "narrow the request scope" as the
+				// only remedy for a bound the operator chose. It OMITS the
+				// containers it could not measure and discloses the bound.
 				starved := fixtureLimits()
 				starved.MaxEdges = 1
 				se, err := New(Options{Adjacency: f, Limits: starved})
@@ -1317,10 +1320,28 @@ func TestGraphScenarios(t *testing.T) {
 				}
 				page, err := se.Overview(context.Background(), model.OverviewRequest{
 					GenerationID: f.binding.GenerationID})
-				var typed *model.Error
-				if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-					t.Fatalf("a map whose containment budget is spent returned (%+v, %v), want a %s refusal",
-						page.Items, err, model.CodeResourceLimit)
+				if err != nil {
+					t.Fatalf("a user-set edge bound refused the whole map: %v", err)
+				}
+				if !page.Meta.Truncated || page.Meta.TruncationReason != reasonEdgeBudget {
+					t.Fatalf("truncated = %v, reason = %q; want %q",
+						page.Meta.Truncated, page.Meta.TruncationReason, reasonEdgeBudget)
+				}
+				disclosed := false
+				for _, n := range page.Meta.Notices {
+					if strings.Contains(n, "max_graph_edges") {
+						disclosed = true
+					}
+				}
+				if !disclosed {
+					t.Fatalf("the edge bound that cut the counts was not disclosed; notices = %q",
+						page.Meta.Notices)
+				}
+				for _, item := range page.Items {
+					if item.NodeID == fixtureNodeID("pkg-app") {
+						t.Fatalf("pkg-app was published with a half-read count (%d symbols)",
+							item.SymbolCount)
+					}
 				}
 			},
 		},

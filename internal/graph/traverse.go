@@ -9,6 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // Truncation reasons. Each names the exact bound that stopped the walk, so a
@@ -26,6 +27,26 @@ const (
 	// and Truncated=false, so a depth-limited answer read as a complete one.
 	reasonDepth = "graph depth budget exhausted"
 )
+
+// The per-request query deadline reuses impact.go's reasonDeadline: it is the
+// same bound with the same name, and for a PAGED traversal it ends a page
+// rather than an answer -- the edges already read are returned and the frontier
+// becomes a continuation, instead of the whole page being thrown away with a
+// bare CTX_QUERY_DEADLINE.
+
+// deadlineStop reports whether err is the walk's own deadline AND this page has
+// something partial to hand back. Both halves matter: a cancellation is never a
+// stop (the caller is gone and wants nothing), and a deadline that arrives
+// before the page admitted an edge has no partial page to return -- converting
+// it would mint a cursor over an empty page, and a client that retried would
+// get another empty page, a chain that never returns a row.
+func deadlineStop(err error, o expandOptions) bool {
+	if !o.DeadlineStops || o.Budget.pageEdges == 0 {
+		return false
+	}
+	var me *model.Error
+	return errors.As(err, &me) && me.Code == model.CodeQueryDeadline
+}
 
 // edgeRowOverheadBytes is the fixed per-row cost of holding one edge of a
 // frontier level in memory: the edgeRow struct, its model.Relation, the string
@@ -143,7 +164,15 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	// graph, by the page budgets below and by the deadline instead.
 	for ; len(frontier) > 0 && !o.MaxDepth.Exceeded(int64(depth+1)); depth++ {
 		if err := checkWalk(ctx, o.Budget); err != nil {
-			return walkState{}, err
+			if !deadlineStop(err, o) {
+				return walkState{}, err
+			}
+			// Out of time between levels, with edges already admitted: the
+			// standing frontier becomes the continuation, exactly as a spent
+			// page budget's does.
+			o.Budget.deadlineHit = true
+			return walkState{Depth: depth, Frontier: frontier, Admitted: admitted,
+				LevelBoundary: true}, nil
 		}
 		level := make(map[model.NodeID]frontierState, len(frontier))
 		nodes := make([]model.NodeID, 0, len(frontier))
@@ -206,8 +235,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 				Via:   row.rel.ID,
 			})
 		}
-		if o.Budget.frontierHit {
-			// The frontier byte ceiling SPILLS rather than stopping: the level
+		if o.Budget.frontierHit || o.Budget.deadlineHit {
+			// The frontier byte ceiling -- and, for a paged traversal, the
+			// query deadline -- SPILL rather than stopping: the level
 			// as far as it was read, plus the next level as far as it was
 			// built, become the continuation the caller spools. The resumed
 			// page re-reads this level from (lastOwner, lastKey), so no edge is
@@ -216,7 +246,14 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			stopped := make([]frontierState, 0, len(frontier)+len(next))
 			stopped = append(stopped, frontier...)
 			stopped = append(stopped, next...)
-			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
+			// A deadline can trip on this level's FIRST reader check, before it
+			// collected a row. Then nothing here advanced the keyset position
+			// and the one the page carries still names the previous level's
+			// last row -- which, applied to this level, would drop every row
+			// whose owner sorts below it. The frontier-byte spill cannot reach
+			// this: its `spent > 0` guard means it always collected a row.
+			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
+				LevelBoundary: len(rows) == 0}, nil
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
@@ -245,6 +282,13 @@ type walkState struct {
 	// Admitted is the cumulative admitted-node set. Only its bounded front is
 	// in heap; the remainder is the continuation spool (visited.go).
 	Admitted *visitedSet
+	// LevelBoundary records that the walk stopped BETWEEN levels rather than
+	// inside one: the level in Frontier has not been read at all yet. The
+	// keyset position the page last emitted belongs to the level BEFORE it, so
+	// a continuation must not carry it -- applied to the new level it would
+	// silently drop every row whose owner sorts below that node. Only the
+	// deadline stops here; every other stop is mid-level by construction.
+	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
 	//
@@ -282,6 +326,15 @@ func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level ma
 		rows  []edgeRow
 		spent int64
 	)
+	// The graph never asks for more rows than the wire may serve. The keyset
+	// loop treats a short page as "read on", so asking for the node-chunk size
+	// would cost nothing but an extra round trip -- and it would make the
+	// storage layer record a page-bound resolution on EVERY traversal answer,
+	// turning a disclosure that exists for real news into noise.
+	rowLimit := batch
+	if rowLimit > model.MaxPageItems {
+		rowLimit = model.MaxPageItems
+	}
 	collected := map[model.RelationID]bool{}
 chunks:
 	for start := 0; start < len(nodes); start += batch {
@@ -293,9 +346,18 @@ chunks:
 		after := model.RelationID("")
 		for {
 			if err := checkWalk(ctx, o.Budget); err != nil {
-				return nil, err
+				if !deadlineStop(err, o) {
+					return nil, err
+				}
+				// The page ran out of time mid-level. The rows read so far are
+				// facts and are kept; the caller stops after this level and
+				// mints a continuation, and the resumed page re-reads the level
+				// from the keyset position, so no edge is lost and none is read
+				// twice -- the frontier-byte spill below, reached by the clock.
+				o.Budget.deadlineHit = true
+				break chunks
 			}
-			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, batch)
+			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, rowLimit)
 			if err != nil {
 				return nil, err
 			}
@@ -315,7 +377,7 @@ chunks:
 					(row.owner.Node == skipOwner && row.rel.ID <= skipKey)) {
 					continue
 				}
-				if spent > 0 && o.FrontierBytes > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
+				if spent > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
 					// The level does not fit in the configured frontier budget:
 					// spill what was read and let the continuation carry on,
 					// rather than accumulating an unbounded hub in memory under
@@ -505,6 +567,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// every adjacency round trip below runs under Section 3's per-request
 	// deadline rather than only being checked between expansion steps.
 	deadline := e.now().Add(e.limits.QueryTimeout)
+	// The caller's own context, kept aside: a page the deadline ended still has
+	// to be DELIVERED -- its endpoints hydrated and its continuation minted --
+	// and both of those run after the walk's deadline has passed. See the
+	// finish context below.
+	parent := ctx
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	if e.gate != nil {
@@ -513,6 +580,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		}
 		defer e.gate.Release()
 	}
+	// Every storage read this answer makes resolves its own page bound against
+	// the wire ceiling; a read served at a size other than the one asked for is
+	// reported on the answer rather than applied silently. Only the observation
+	// sink is imported, never the store: facts still come through Adjacency.
+	ctx, clamps := sqlite.WithPageClamps(ctx)
 	if len(kinds) == 0 {
 		kinds = DefaultRelations()
 	}
@@ -599,10 +671,25 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		Budget:        b,
 		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
+		DeadlineStops: true,
 		Resume:        resume,
 	}, visit)
 	if err != nil {
 		return model.GraphResult{}, err
+	}
+
+	// Delivering a deadline-stopped page needs a live context: `ctx` is past
+	// its deadline by construction, so hydrating the endpoints and writing the
+	// continuation spool on it would fail with the very CTX_QUERY_DEADLINE this
+	// stop exists to replace. The grace runs on the CALLER's context, so a
+	// caller-set deadline still bounds it, and it is the same query_timeout the
+	// walk had -- delivery is bounded work (one batched node read of at most a
+	// page of endpoints, one spool write), not more walking.
+	finish := ctx
+	if b.deadlineHit {
+		var cancelFinish context.CancelFunc
+		finish, cancelFinish = context.WithTimeout(parent, e.limits.QueryTimeout)
+		defer cancelFinish()
 	}
 
 	ids := make([]model.NodeID, 0, len(endpoints))
@@ -610,7 +697,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	nodes, err := e.adjacency.NodesByID(ctx, ids)
+	nodes, err := e.adjacency.NodesByID(finish, ids)
 	if err != nil {
 		return model.GraphResult{}, err
 	}
@@ -620,6 +707,11 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// see; the visitor's own reason is more specific, so it wins when both hold.
 	if reason == "" && b.frontierHit {
 		reason = reasonFrontierBytes
+	}
+	// A page the clock ended is truncated for exactly that reason, and a
+	// continuation is minted from its frontier below like any other page stop.
+	if reason == "" && b.deadlineHit {
+		reason = reasonDeadline
 	}
 	// A walk that ran out of depth with nodes still unexpanded is truncated and
 	// says so: before this it fell out of the loop reporting nothing.
@@ -637,6 +729,12 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// The depth bound is the single exception, and DepthLimited on walkState
 	// carries the reason: it is part of the query hash the cursor is bound to,
 	// so a continuation minted for it could only resume a walk already past it.
+	if state.LevelBoundary {
+		// The stop was between levels: the emitted keyset position belongs to
+		// the level already finished, so the continuation starts the frontier's
+		// own level from its beginning.
+		lastOwner, lastKey = "", ""
+	}
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
 		// The cumulative set is NOT materialized into a slice here: only the
@@ -645,7 +743,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		if resume != nil {
 			carried = resume.Visited
 		}
-		nextCursor, err = e.nextTraversalCursor(ctx, b, continuation{
+		nextCursor, err = e.nextTraversalCursor(finish, b, continuation{
 			Endpoint:  endpoint,
 			QueryHash: queryHash,
 			Depth:     state.Depth,
@@ -666,7 +764,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			Truncated:        reason != "",
 			TruncationReason: reason,
 			NextCursor:       nextCursor,
-			Notices:          notices,
+			Notices:          append(notices, clamps.Notices()...),
 		},
 		Direction: dir,
 		Nodes:     nodes,

@@ -164,15 +164,15 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
-	// Unlike Neighbors and PackageDependencies, a failed or exhausted
-	// containment read is NOT turned into a truncated answer here
-	// (impactPhaseError's deadline-to-reasonDeadline path). Those endpoints
-	// report the edges they did read; this one reports COUNTS, and a container
-	// whose children were only half read renders as a smaller container -- a
-	// wrong measurement rather than a missing one, which is the one thing
-	// Section 23 forbids above all. A map that could not be counted refuses
-	// instead, which is what containerContents does on an exhausted budget.
-	held, err := e.containerContents(ctx, ids, b)
+	// This endpoint reports COUNTS, and a container whose children were only
+	// half read renders as a smaller container -- a wrong measurement rather
+	// than a missing one, which is the one thing Section 23 forbids above all.
+	// A user-set edge bound that cuts a containment read therefore OMITS the
+	// containers it could not measure and says so, rather than publishing a
+	// half count. It does not refuse the map: refusing turned one exhausted
+	// bound into no answer at all, with "narrow the request scope" as the only
+	// remedy, which is exactly the shape the scale posture forbids.
+	held, unmeasured, err := e.containerContents(ctx, ids, b, &meta)
 	if err != nil {
 		return model.Page[model.OverviewItem]{}, err
 	}
@@ -183,6 +183,11 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 		if !ok {
 			// Its containment chain is longer than the requested depth: the
 			// page reports the levels that were asked for and nothing else.
+			continue
+		}
+		if unmeasured[c.ID] {
+			// Its containment read was cut by the configured edge bound. The
+			// map omits it rather than under-counting it; meta says so.
 			continue
 		}
 		counts := held[c.ID]
@@ -384,25 +389,46 @@ type containerCounts struct{ files, symbols, bytes int64 }
 // short by an unknown amount, and a page flag naming no container would leave
 // every number on it indistinguishable from a measured one.
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
-	b *budget) (map[model.NodeID]containerCounts, error) {
+	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts,
+	map[model.NodeID]bool, error) {
 	out := make(map[model.NodeID]containerCounts, len(ids))
+	unmeasured := map[model.NodeID]bool{}
+	// cut marks every container of a batch whose containment read the edge
+	// bound stopped, and discloses the bound once. Those containers are omitted
+	// from the map: an omitted container is a missing measurement, which the
+	// caller can see and page past, while a half-counted one is a wrong
+	// measurement it cannot tell from a small container.
+	disclosed := false
+	cut := func(batch []model.NodeID) {
+		for _, id := range batch {
+			unmeasured[id] = true
+		}
+		markTruncated(meta, reasonEdgeBudget)
+		if disclosed {
+			// One bound, one disclosure: a map whose every batch was cut must
+			// not repeat the same notice once per batch.
+			return
+		}
+		disclosed = true
+		meta.Notices = appendNotice(meta.Notices,
+			"max_graph_edges: the configured edge bound stopped a containment read, so the "+
+				"containers it covered are omitted from this page rather than counted in part")
+	}
 	for _, batch := range impactChunkNodes(ids) {
 		remaining, exhausted := containmentBudget(b, e.limits)
 		if exhausted {
-			return nil, (&model.Error{Code: model.CodeResourceLimit,
-				Message:     "this generation holds more containment edges under one page of containers than a repository map may read, so its per-container counts cannot be measured",
-				Remediation: "narrow the request scope"}).WithDetail("limit", "edges")
+			cut(batch)
+			continue
 		}
 		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing,
 			overviewRelationKinds(), remaining)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		b.edges += int64(len(rels))
 		if !complete {
-			return nil, (&model.Error{Code: model.CodeResourceLimit,
-				Message:     "this generation holds more containment edges under one page of containers than a repository map may read, so its per-container counts cannot be measured",
-				Remediation: "narrow the request scope"}).WithDetail("limit", "edges")
+			cut(batch)
+			continue
 		}
 		children := make([]model.NodeID, 0, len(rels))
 		for _, r := range rels {
@@ -410,7 +436,7 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 		}
 		nodes, err := e.nodesByID(ctx, children)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, r := range rels {
 			child, ok := nodes[r.To]
@@ -434,7 +460,7 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 			out[r.From] = counts
 		}
 	}
-	return out, nil
+	return out, unmeasured, nil
 }
 
 // containmentBudget is what is LEFT of the page's cumulative edge allowance.

@@ -2,10 +2,12 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // referenceEndpoint binds a reference continuation to this operation, so
@@ -155,6 +157,19 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 		}
 		defer e.gate.Release()
 	}
+	// Every storage read this answer makes resolves its own page bound against
+	// the wire ceiling; a read the storage layer served at a different size
+	// than it was asked for is reported on the answer rather than applied
+	// silently. The evidence hydration below is the one that reaches it: it
+	// asks for pageLimit+1 occurrences per relation to tell "exactly a page"
+	// from "more than a page", so a page bound AT the wire ceiling asks for one
+	// row more than the wire may serve and the clipped flag loses its probe.
+	// That is news, and the caller now sees it.
+	//
+	// Only the observation sink is imported here, never the store: the engine
+	// still reads facts through its own Adjacency port.
+	ctx, clamps := sqlite.WithPageClamps(ctx)
+	var notices []string
 
 	queryHash := referenceQueryHash(req.NodeID, req.Operation)
 	after, err := e.resumeReferences(req, queryHash)
@@ -162,11 +177,22 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
 
-	pageLimit := req.Page.Limit
-	if pageLimit <= 0 || pageLimit > e.limits.MaxPageItems {
-		pageLimit = e.limits.MaxPageItems
-	}
-	if pageLimit > model.MaxPageItems {
+	// The page bound is RESOLVED, not silently clamped: a caller that asked
+	// for more occurrences than the configuration or the wire allows is told
+	// "requested N, effective M" on the answer, exactly as a traversal's
+	// bounds are. Before this the two clamps below happened in silence, which
+	// is the class-G defect this wave removes.
+	pageLimit, notice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
+	notices = appendNotice(notices, notice)
+	// Only a page bound the CALLER chose is reported against the wire ceiling.
+	// A request that named none is "no caller-side bound" and its resolution is
+	// not news -- reporting it would put a notice on every answer, which is the
+	// rule pageclamp.go states for the same reason. model.PageRequest.Validate
+	// already refuses a limit above the wire ceiling, so after this gate the
+	// branch is reachable only from an API caller that bypasses it.
+	if req.Page.Limit > 0 && pageLimit > model.MaxPageItems {
+		notices = appendNotice(notices, fmt.Sprintf(
+			"page.limit: effective %d, served %d (the wire ceiling)", pageLimit, model.MaxPageItems))
 		pageLimit = model.MaxPageItems
 	}
 
@@ -187,7 +213,8 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
-	meta := model.QueryMeta{Binding: binding, Completeness: caps}
+	notices = append(notices, clamps.Notices()...)
+	meta := model.QueryMeta{Binding: binding, Completeness: caps, Notices: notices}
 	if clipped {
 		// A single relation carried more occurrences than one page may hold.
 		// Those occurrences are unrecoverable once the keyset position moves

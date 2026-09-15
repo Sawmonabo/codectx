@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -697,5 +698,166 @@ func TestPathWalkStateIsBoundedByTheMemoryBudget(t *testing.T) {
 	if again.Meta.Truncated || again.VisitedCount != whole.VisitedCount {
 		t.Fatalf("a zero memory ceiling truncated the search (truncated=%v reason=%q, %d visited vs %d): 0 must mean unlimited",
 			again.Meta.Truncated, again.Meta.TruncationReason, again.VisitedCount, whole.VisitedCount)
+	}
+}
+
+// slowAdjacency is the fixture reader with a clock attached: after `trigger`
+// Edges round trips it pushes the shared clock past the engine's deadline,
+// ONCE. That is what makes the deadline arrive at a point the test chooses --
+// mid-walk, with edges already admitted -- instead of at whatever point a real
+// clock happens to reach, and the one-shot jump is what lets the continuation
+// finish on a fresh deadline.
+type slowAdjacency struct {
+	*graphFixture
+	clock   *time.Time
+	calls   *int
+	trigger int
+	jump    time.Duration
+	fired   *bool
+}
+
+func (s slowAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	*s.calls++
+	if !*s.fired && *s.calls >= s.trigger {
+		*s.fired = true
+		*s.clock = s.clock.Add(s.jump)
+	}
+	return s.graphFixture.Edges(ctx, nodes, dir, kinds, after, limit)
+}
+
+// TestDeadlineEndsThePageNotTheAnswer is the F8 proof. Ruling Q4 makes
+// query_timeout end a PAGE, not an answer: a walk that runs out of time with
+// edges already admitted must return them, say so, and hand back a cursor --
+// the same contract the page, visited, edge and frontier-byte stops keep.
+// Before this it returned model.GraphResult{} and CTX_QUERY_DEADLINE, so a walk
+// too big for one timeout could never progress at all.
+//
+// Mutation (`return walkState{}, err` restored at expand's loop-top check, i.e.
+// deadlineStop deleted): the first page below fails with CTX_QUERY_DEADLINE and
+// no answer, which is the assertion this test leads with.
+func TestDeadlineEndsThePageNotTheAnswer(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 1<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 2000
+	limits.QueryTimeout = time.Minute
+
+	req := model.GraphRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	// Ground truth: the same walk that never runs out of time.
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Neighbors(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unlimited walk: %v", err)
+	}
+	if all.Meta.Truncated || len(all.Relations) == 0 {
+		t.Fatalf("ground truth is truncated (%q) or empty (%d edges)",
+			all.Meta.TruncationReason, len(all.Relations))
+	}
+
+	// A real starting instant: the engine builds a context.WithDeadline from
+	// this clock, and a fake epoch would make that context already expired
+	// against the real one the runtime enforces it on.
+	// Two round trips is level 0 (the rows, then the empty page that ends its
+	// keyset walk), so trigger 2 lands the deadline at level 1's loop-top check
+	// and 3 and 4 land it INSIDE level 1's reader loop -- the two stops are
+	// different code paths and each must keep the same contract.
+	for _, trigger := range []int{2, 3, 4} {
+		t.Run(fmt.Sprintf("deadline-after-%d-reads", trigger), func(t *testing.T) {
+			deadlinePageCase(t, f, signer, spools, store, limits, req, all, trigger)
+		})
+	}
+}
+
+func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
+	spools *pagination.Spools, store *fixtureLeases, limits Limits,
+	req model.GraphRequest, all model.GraphResult, trigger int) {
+	t.Helper()
+	clock := time.Now()
+	calls, fired := 0, false
+	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+		trigger: trigger, jump: 2 * time.Minute, fired: &fired}
+	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+
+	first, err := e.Neighbors(context.Background(), req)
+	if err != nil {
+		t.Fatalf("a deadline threw the page away instead of ending it: %v", err)
+	}
+	if len(first.Relations) == 0 {
+		t.Fatal("the deadline-stopped page returned no edges; it must return what it read")
+	}
+	if !first.Meta.Truncated || first.Meta.TruncationReason != reasonDeadline {
+		t.Fatalf("truncated = %v, reason = %q; want %q",
+			first.Meta.Truncated, first.Meta.TruncationReason, reasonDeadline)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("the deadline-stopped page minted no cursor; its frontier is unreachable")
+	}
+
+	// The continuation runs on a fresh deadline and finishes the walk: the
+	// stop ended a page, so the answer is still reachable.
+	seen := map[model.RelationID]int{}
+	for _, rel := range first.Relations {
+		seen[rel.ID]++
+	}
+	req.Page = model.PageRequest{Cursor: first.Meta.NextCursor}
+	req.GenerationID = 0
+	for page := 2; ; page++ {
+		if page > 200 {
+			t.Fatalf("the walk did not terminate after %d pages", page-1)
+		}
+		res, err := e.Neighbors(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", page, err)
+		}
+		for _, rel := range res.Relations {
+			seen[rel.ID]++
+		}
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("relation %s was returned %d times across pages, want exactly once", id, n)
+		}
+	}
+	if len(seen) != len(all.Relations) {
+		t.Errorf("the deadline-paged walk returned %d distinct edges, the unlimited one %d",
+			len(seen), len(all.Relations))
+	}
+}
+
+// TestFrontierBytesMustBePositive is the F30 proof: frontier_bytes is the only
+// bound on how much of one level is held in heap, so zero there is not
+// "unlimited" the way a scale cap's zero is -- it is no ceiling at all.
+func TestFrontierBytesMustBePositive(t *testing.T) {
+	f := newGraphFixture(t)
+	limits := fixtureLimits()
+	limits.FrontierBytes = 0
+	if _, err := New(Options{Adjacency: f, Limits: limits}); err == nil {
+		t.Fatal("New accepted frontier_bytes = 0: a level would have no heap bound at all")
 	}
 }
