@@ -1044,7 +1044,13 @@ func (s *Store) Observations(ctx context.Context, session model.SessionID, actor
 // PutCapsule stores the deterministic completion record once, for a session
 // whose consolidate phase is open. A second call returns the first stored
 // capsule unchanged (Section 17.3).
-func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule, error) {
+//
+// The capsule blob carries identity and counts; src streams the records
+// themselves into context_capsule_rows inside this same write transaction,
+// after the "a capsule already exists" check, so the seal stays write-once and
+// a capsule is never committed without the rows its identity was derived from.
+// A second call returns the stored capsule and writes no rows.
+func (s *Store) PutCapsule(ctx context.Context, c model.Capsule, src model.CapsuleListSource) (model.Capsule, error) {
 	if err := c.Validate(); err != nil {
 		return model.Capsule{}, err
 	}
@@ -1085,7 +1091,10 @@ func (s *Store) PutCapsule(ctx context.Context, c model.Capsule) (model.Capsule,
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO context_capsules(session_id, canonical_hash, capsule_json, created_at) VALUES(?, ?, ?, ?)`,
 			sessionRaw, c.CanonicalHash, string(payload), formatTime(c.CreatedAt))
-		return wrap("context_capsules", err)
+		if err != nil {
+			return wrap("context_capsules", err)
+		}
+		return writeCapsuleRows(ctx, tx, sessionRaw, c.Counts, src)
 	})
 	return stored, err
 }
