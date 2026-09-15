@@ -1278,11 +1278,12 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 // every deadline case silently became a case with no deadline.
 //
 // One packed scan covers a whole level, where the old reader made one round
-// trip per node chunk per keyset page of at most model.MaxPageItems rows. A
-// clock that ticked once per scan would therefore be far coarser than the one
-// these cases were calibrated against, so a "round trip" here is one scan PLUS
-// one per adjacencyBatch entries it delivers -- the same granularity the old
-// port charged, which is what lets the trigger counts stand unchanged.
+// trip per node chunk per keyset page of at most model.MaxPageItems rows, plus
+// the empty page that ended the keyset loop. A clock that ticked once per scan
+// would therefore be far coarser than the one these cases were calibrated
+// against, so a "round trip" here is one scan, one per adjacencyBatch entries
+// it delivers, and one for the scan's end -- the same granularity the old port
+// charged, which is what lets the trigger counts stand unchanged.
 type slowReader struct {
 	GraphReader
 	knobs slowAdjacency
@@ -1299,13 +1300,19 @@ func (s slowAdjacency) reader(r GraphReader) slowReader {
 func (s slowReader) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
 	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
 	s.tick()
-	return s.GraphReader.Neighbours(ctx, refs, dir, kinds, from, func(e Edge) error {
+	pos, err := s.GraphReader.Neighbours(ctx, refs, dir, kinds, from, func(e Edge) error {
 		*s.seen++
 		if *s.seen%adjacencyBatch == 0 {
 			s.tick()
 		}
 		return fn(e)
 	})
+	// The old port charged a SECOND round trip at the end of every chunk: its
+	// keyset loop only knew it was done when a page came back empty. Charging
+	// it here is what keeps these cases' trigger counts meaning the level they
+	// were calibrated to.
+	s.tick()
+	return pos, err
 }
 
 // tick is one charged round trip: it advances the call counter and, on the
