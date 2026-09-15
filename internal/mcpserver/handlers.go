@@ -101,9 +101,15 @@ type graphInput struct {
 
 // planOutput shows the manifest and the opened session's status together, so
 // `context_plan` needs no second round trip — the facade returns both.
+//
+// Status is a POINTER because a truncated plan (ruling C9) opened no session:
+// the compile stopped at a pass boundary and answered a continuation cursor
+// instead. A zero SessionStatus on the wire there would show a client a blank
+// session id, an empty phase and a "not ready" gate as though a real session
+// had been opened and found wanting, so the field is absent instead.
 type planOutput struct {
-	Plan   model.PlanResult    `json:"plan"`
-	Status model.SessionStatus `json:"status"`
+	Plan   model.PlanResult     `json:"plan"`
+	Status *model.SessionStatus `json:"status,omitempty"`
 }
 
 // statusInput pages coverage for one session. Session and actor are TOOL
