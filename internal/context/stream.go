@@ -622,6 +622,44 @@ type compileSorts struct {
 	prefix string
 	// release holds one closer per opened sort and sorted run, newest first.
 	release []func() error
+	// observed holds one row per sort this compile opened, in open order, so a
+	// test can assert the memory invariant this wave exists for: every sort's
+	// live working set stays inside the run budget and the sorts that outgrew
+	// it spilled rather than growing the heap. It is OBSERVATION ONLY -- no
+	// pass reads it and no behaviour depends on it -- and it is bounded by the
+	// number of sorts a compile opens, which is a constant of the pipeline and
+	// not a function of the repository.
+	observed []sortObservation
+}
+
+// sortObservation is what one sort reports about its own memory behaviour.
+//
+// Spilled is DERIVED rather than read from the primitive, which exposes no run
+// count: the run buffer only ever shrinks by spilling, so a sort that never
+// spilled ends with every added record still buffered and Added == Peak, and
+// Added > Peak holds exactly when at least one run was written.
+type sortObservation struct {
+	// Name is the sort's name as newSort was called with it.
+	Name string
+	// Peak is pagination.ExternalSort.PeakLiveRecords at observation time.
+	Peak int
+	// Added is how many records the sort accepted.
+	Added int64
+	// Spilled says whether the sort wrote at least one run to disk.
+	Spilled bool
+}
+
+// observations reports what each of this compile's sorts held, newest sort
+// last. It is read by tests only; the compile itself never consults it.
+func (s *compileSorts) observations() []sortObservation {
+	if s == nil {
+		return nil
+	}
+	out := make([]sortObservation, 0, len(s.observed))
+	for _, o := range s.observed {
+		out = append(out, o)
+	}
+	return out
 }
 
 // newCompileSorts opens the sort area for one compile.
@@ -693,6 +731,21 @@ func newSort[T any](s *compileSorts, name string, compare func(a, b T) int,
 	if err != nil {
 		return nil, err
 	}
+	// The observation hook is registered with the release list rather than read
+	// at Sorted(): Close runs on EVERY exit path, so a sort that failed mid-way
+	// still reports the working set it reached, and a sort read to the end
+	// reports its final one. Registering it before sorter.Close keeps the
+	// newest-first release order running the observation while the sort is
+	// still readable.
+	idx := len(s.observed)
+	s.observed = append(s.observed, sortObservation{Name: name})
+	s.track(func() error {
+		s.observed[idx] = sortObservation{
+			Name: name, Peak: sorter.PeakLiveRecords(), Added: sorter.Len(),
+			Spilled: sorter.Len() > int64(sorter.PeakLiveRecords()),
+		}
+		return nil
+	})
 	s.track(sorter.Close)
 	return sorter.WithRunBytes(s.runBytes, sizeOf), nil
 }
