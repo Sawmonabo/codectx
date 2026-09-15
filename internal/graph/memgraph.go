@@ -195,6 +195,24 @@ func NewMemoryGraphOrdered(binding model.Binding, nodes []model.Node, relations 
 		}
 	}
 	containsCode, hasContains := g.kinds.Code(model.RelContains)
+	// One row per file, naming the container-kind node the fixture publishes
+	// FOR that file. It is the first half of the store's rule and the half that
+	// makes the slot answerable at all: a provider attaches a TOP-LEVEL
+	// declaration to its module with `defines` and reserves `contains` for a
+	// NESTED one, so a containment-only reading finds no container-kind parent
+	// for either. A container is minted per file and a declaration never nests
+	// across files, so the file's owner IS the container-kind node at the top
+	// of the node's containment chain.
+	fileContainer := map[model.FileID]NodeRef{}
+	for i, node := range g.nodes {
+		ref := NodeRef(i + 1)
+		if !memIsContainerKind(node.Kind) || node.FileID == "" {
+			continue
+		}
+		if best, ok := fileContainer[node.FileID]; !ok || node.ID < g.nodes[best-1].ID {
+			fileContainer[node.FileID] = ref
+		}
+	}
 	for i := range g.nodes {
 		ref := NodeRef(i + 1)
 		if memIsContainerKind(g.nodeKinds[ref]) {
@@ -203,23 +221,35 @@ func NewMemoryGraphOrdered(binding model.Binding, nodes []model.Node, relations 
 			g.containers[ref] = ref
 			continue
 		}
+		// The file claim, then the direct one: an explicit containment fact is
+		// the stronger statement of where a node belongs, so a container-kind
+		// node that claims the node by `contains` overrides its file's owner.
+		// A node whose file publishes no container -- and one with no file at
+		// all, which is every unresolved reference -- keeps a zero slot rather
+		// than taking a directory or a file, neither of which answers "which
+		// package does this symbol belong to".
+		best := fileContainer[g.nodes[i].FileID]
 		if !hasContains {
+			g.containers[ref] = best
 			continue
 		}
 		// Several containers can claim one node; the LOWEST CANONICAL ID wins,
-		// which is the tie-break the package rollup uses today, so the
-		// attribution is reproducible from the facts and not from the order the
-		// adjacency returned. The CANONICAL ids are compared, never the
-		// surrogates: MemoryGraphOrder lets the two orders diverge, and the
-		// store's build cannot take that shortcut either.
-		var best NodeRef
+		// which is the tie-break the store's build uses, so the attribution is
+		// reproducible from the facts and not from the order the adjacency
+		// returned. The CANONICAL ids are compared, never the surrogates:
+		// MemoryGraphOrder lets the two orders diverge, and the store's build
+		// cannot take that shortcut either.
+		var claim NodeRef
 		for _, e := range g.in[ref] {
 			if e.Kind != containsCode || !memIsContainerKind(g.nodeKinds[e.Neighbour]) {
 				continue
 			}
-			if best == 0 || g.nodes[e.Neighbour-1].ID < g.nodes[best-1].ID {
-				best = e.Neighbour
+			if claim == 0 || g.nodes[e.Neighbour-1].ID < g.nodes[claim-1].ID {
+				claim = e.Neighbour
 			}
+		}
+		if claim != 0 {
+			best = claim
 		}
 		g.containers[ref] = best
 	}

@@ -55,6 +55,16 @@ var (
 	Orphan = nodeID(model.NodeVariable, "pkg/a#orphan")
 	// FileF carries a source size in its metadata.
 	FileF = nodeID(model.NodeFile, "pkg/a/f.go")
+	// ModM is the container-kind node published FOR FixtureFile, so it is the
+	// container every node in that file falls to when nothing claims it
+	// directly.
+	ModM = nodeID(model.NodeModule, "mod/m")
+	// TopT is a top-level declaration: its module attaches it with `defines`
+	// and nothing `contains` it, which is the shape a real provider emits.
+	TopT = nodeID(model.NodeFunction, "mod/m#top")
+	// NestN is a nested declaration: its `contains` parent is TopT, which is
+	// not a container kind and must never take the slot.
+	NestN = nodeID(model.NodeFunction, "mod/m#top.nested")
 	// Invisible is a well-formed id the fixture does not carry: Resolve must
 	// report 0 for it rather than inventing a surrogate.
 	Invisible = nodeID(model.NodeFunction, "pkg/z#absent")
@@ -63,6 +73,15 @@ var (
 // FileSourceBytes is the size FileF carries in its metadata.
 const FileSourceBytes = int64(1234)
 
+// FixtureFilePath is the repository path every file-bearing fixture node names,
+// and FixtureFile is the identity derived from it. The derivation is
+// deterministic, so an implementation backed by a store publishes the same file
+// and computes the same id.
+const FixtureFilePath = "pkg/a/f.go"
+
+// FixtureFile is FixtureFilePath's identity.
+var FixtureFile = model.NewFileID(FixtureRepository, FixtureFilePath)
+
 // Nodes is the fixture's node set. Every node validates, so a store can ingest
 // it unchanged.
 func Nodes() []model.Node {
@@ -70,11 +89,17 @@ func Nodes() []model.Node {
 		{ID: PkgA, Kind: model.NodePackage, Name: "a", QualifiedName: "pkg/a"},
 		{ID: PkgB, Kind: model.NodePackage, Name: "b", QualifiedName: "pkg/b"},
 		{ID: DirD, Kind: model.NodeDirectory, Name: "d", QualifiedName: "dir/d"},
-		{ID: Hub, Kind: model.NodeFunction, Name: "hub", QualifiedName: "pkg/a#hub"},
+		{ID: Hub, Kind: model.NodeFunction, Name: "hub", QualifiedName: "pkg/a#hub",
+			FileID: FixtureFile},
 		{ID: Leaf, Kind: model.NodeFunction, Name: "leaf", QualifiedName: "pkg/b#leaf"},
 		{ID: Orphan, Kind: model.NodeVariable, Name: "orphan", QualifiedName: "pkg/a#orphan"},
 		{ID: FileF, Kind: model.NodeFile, Name: "f.go", QualifiedName: "pkg/a/f.go",
 			Metadata: []byte(`{"size":1234}`)},
+		{ID: ModM, Kind: model.NodeModule, Name: "m", QualifiedName: "mod/m", FileID: FixtureFile},
+		{ID: TopT, Kind: model.NodeFunction, Name: "top", QualifiedName: "mod/m#top",
+			FileID: FixtureFile},
+		{ID: NestN, Kind: model.NodeFunction, Name: "nested", QualifiedName: "mod/m#top.nested",
+			FileID: FixtureFile},
 	}
 }
 
@@ -95,6 +120,8 @@ func Relations() []model.Relation {
 		relation(Hub, model.RelReferences, Leaf),
 		relation(Hub, model.RelImports, FileF),
 		relation(Leaf, model.RelCalls, Hub),
+		relation(ModM, model.RelDefines, TopT),
+		relation(TopT, model.RelContains, NestN),
 		relation(Hub, model.RelCalls, Invisible),
 	}
 }
@@ -103,6 +130,16 @@ func Relations() []model.Relation {
 func VisibleRelations() []model.Relation {
 	all := Relations()
 	return all[:len(all)-1]
+}
+
+// hubContainer is the package that claims Hub by `contains`: PkgA and PkgB both
+// do and DirD does too, so the lowest canonical id among the CONTAINER-KIND
+// claimants wins and the attribution is a fact of the ids alone.
+func hubContainer(refs map[model.NodeID]graph.NodeRef) graph.NodeRef {
+	if PkgB < PkgA {
+		return refs[PkgB]
+	}
+	return refs[PkgA]
 }
 
 // edge is one delivered entry written in canonical ids, which is the only
@@ -123,7 +160,8 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 	ctx := context.Background()
 	g := open(t)
 
-	refs := resolveAll(t, g, []model.NodeID{PkgA, PkgB, DirD, Hub, Leaf, Orphan, FileF, Invisible})
+	refs := resolveAll(t, g, []model.NodeID{PkgA, PkgB, DirD, Hub, Leaf, Orphan, FileF,
+		ModM, TopT, NestN, Invisible})
 	for id, ref := range refs {
 		if id == Invisible {
 			if ref != 0 {
@@ -144,7 +182,14 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 		if _, ok := g.Kinds().Kind(0); ok {
 			t.Fatal("Kinds().Kind(0) resolved; code 0 must be unused so a zero value is never a kind")
 		}
-		for _, k := range []model.RelationKind{model.RelContains, model.RelCalls, model.RelReferences, model.RelImports} {
+		// The expectation is READ OFF the visible relations rather than
+		// written out, so a fixture that grows a relation kind cannot leave the
+		// dictionary asserting the old width.
+		want := map[model.RelationKind]bool{}
+		for _, r := range VisibleRelations() {
+			want[r.Kind] = true
+		}
+		for k := range want {
 			code, ok := g.Kinds().Code(k)
 			if !ok || code == 0 {
 				t.Fatalf("Kinds().Code(%s) = %d, %v; want a dense non-zero code", k, code, ok)
@@ -154,8 +199,8 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 				t.Fatalf("Kinds().Kind(%d) = %s, %v; want %s", code, back, ok, k)
 			}
 		}
-		if n := g.Kinds().Len(); n != 4 {
-			t.Fatalf("Kinds().Len() = %d, want 4 (the kinds the visible relations use)", n)
+		if n := g.Kinds().Len(); n != len(want) {
+			t.Fatalf("Kinds().Len() = %d, want %d (the kinds the visible relations use)", n, len(want))
 		}
 	})
 
@@ -364,14 +409,43 @@ func RunConformance(t *testing.T, open func(t *testing.T) graph.GraphReader) {
 		// PkgA and PkgB both contain Hub and DirD also does; the lowest
 		// canonical id among the CONTAINER-KIND claimants wins, so a directory
 		// never takes the slot and the attribution is a fact of the ids.
-		winner := refs[PkgA]
-		if PkgB < PkgA {
-			winner = refs[PkgB]
-		}
-		wantContainers := []graph.NodeRef{winner, refs[PkgA], 0, refs[PkgA], 0}
+		wantContainers := []graph.NodeRef{hubContainer(refs), refs[PkgA], 0, refs[PkgA], 0}
 		if !slices.Equal(containers, wantContainers) {
 			got, _ := g.NodeIDs(ctx, containers)
 			t.Fatalf("Containers = %v (%v), want %v", containers, got, wantContainers)
+		}
+	})
+
+	t.Run("the container slot follows the node's file", func(t *testing.T) {
+		// The settled rule: a node belongs to the container-kind node that owns
+		// its own FILE, and a container-kind node that claims it directly by
+		// `contains` overrides that. Read over `contains` alone the slot is
+		// empty on a real repository -- a provider attaches a TOP-LEVEL
+		// declaration to its module with `defines` and reserves `contains` for
+		// a NESTED one, whose parent is the enclosing declaration.
+		ask := []graph.NodeRef{refs[ModM], refs[TopT], refs[NestN], refs[Hub], refs[DirD]}
+		containers, err := g.Containers(ctx, ask)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []graph.NodeRef{
+			// A container is its own container.
+			refs[ModM],
+			// Top-level: only `defines` reaches it, so the file's module is
+			// what answers.
+			refs[ModM],
+			// Nested: its `contains` parent is a function, which is no
+			// container, so the file's module answers here too.
+			refs[ModM],
+			// Hub shares that file, but a package claims it directly by
+			// `contains`, and the direct claim overrides the file's.
+			hubContainer(refs),
+			// A directory has no file and no container-kind claimant.
+			0,
+		}
+		if !slices.Equal(containers, want) {
+			got, _ := g.NodeIDs(ctx, containers)
+			t.Fatalf("Containers = %v (%v), want %v", containers, got, want)
 		}
 	})
 
