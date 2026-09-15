@@ -258,8 +258,8 @@ func (o *captureOutput) PutSearchUnits(ctx context.Context, docs []model.SearchU
 
 // render produces the sorted canonical lines: every node with its kind,
 // qualified name and metadata; every relation occurrence with its detail;
-// every search document with its kind, name and range; every non-fresh
-// capability state.
+// every search document with its kind, name, range and the node it points at;
+// every non-fresh capability state.
 func (c *capture) render(t *testing.T, states map[string]model.CapabilityState) []string {
 	t.Helper()
 	name := func(id model.NodeID) string {
@@ -301,7 +301,10 @@ func (c *capture) render(t *testing.T, states map[string]model.CapabilityState) 
 		}
 	}
 	for _, d := range c.search {
-		line := fmt.Sprintf("search %s %s [%d,%d)", d.Kind, d.Path, d.Bytes.Start, d.Bytes.End)
+		// The node a search document points at is what `search` folds hits
+		// by, so it is rendered: a document whose headings all carry the
+		// file's node id collapses to one hit however distinct the rows look.
+		line := fmt.Sprintf("search %s %s [%d,%d) on %s", d.Kind, d.Path, d.Bytes.Start, d.Bytes.End, name(d.NodeID))
 		if d.Name != "" {
 			line += " name=" + d.Name
 		}
@@ -438,52 +441,52 @@ rel depends_on package pypi:my-service -> dependency pypi:ruff [179,185) syntax 
 rel documents document docs/README.md -> directory docs heuristic
 rel documents document docs/README.md -> directory web [53,60) heuristic {"link":"../web/"}
 rel documents document docs/README.md -> file go.mod [24,33) heuristic {"link":"../go.mod"}
-search configuration Cargo.toml [12,35) name=workspace qn=cargo:workspace:Cargo.toml
-search configuration go.work [0,0) name=go.work qn=go:work:go.work
-search dependency Cargo.toml [61,74) name=serde qn=cargo:serde
-search dependency crates/core/Cargo.toml [111,123) name=anyhow qn=cargo:anyhow
-search dependency crates/core/Cargo.toml [144,158) name=tempfile qn=cargo:tempfile
-search dependency crates/core/Cargo.toml [181,189) name=cc qn=cargo:cc
-search dependency crates/core/Cargo.toml [82,110) name=serde qn=cargo:serde
-search dependency go.mod [44,65) name=github.com/a/b qn=go:github.com/a/b
-search dependency go.mod [67,88) name=github.com/c/d qn=go:github.com/c/d
-search dependency java/pom.xml [323,638) name=com.google.guava:guava qn=maven:com.google.guava:guava
-search dependency java/pom.xml [34,149) name=org.acme:parent qn=maven:org.acme:parent
-search dependency java/pom.xml [643,797) name=junit:junit qn=maven:junit:junit
-search dependency java/pom.xml [802,1005) name=org.projectlombok:lombok qn=maven:org.projectlombok:lombok
-search dependency py/pyproject.toml [141,149) name=pytest qn=pypi:pytest
-search dependency py/pyproject.toml [179,185) name=ruff qn=pypi:ruff
-search dependency py/pyproject.toml [215,226) name=hatchling qn=pypi:hatchling
-search dependency py/pyproject.toml [71,84) name=requests qn=pypi:requests
-search dependency py/pyproject.toml [88,96) name=django qn=pypi:django
-search dependency web/package.json [140,162) name=typescript qn=npm:typescript
-search dependency web/package.json [208,230) name=react-dom qn=npm:react-dom
-search dependency web/package.json [260,280) name=fsevents qn=npm:fsevents
-search dependency web/package.json [97,115) name=react qn=npm:react
-search document docs/README.md [0,0) name=README.md qn=docs/README.md
-search document docs/long.txt [0,0) name=long.txt qn=docs/long.txt
-search document docs/wide.txt [0,0) name=wide.txt qn=docs/wide.txt
-search file Cargo.toml [0,75)
-search file broken/Cargo.toml [0,23)
-search file crates/core/Cargo.toml [0,190)
-search file docs/README.md [0,159)
-search file docs/long.txt [0,32767)
-search file docs/long.txt [32767,40001)
-search file docs/wide.txt [0,32745)
-search file docs/wide.txt [32627,35400)
-search file go.mod [0,135)
-search file go.work [0,29)
-search file java/pom.xml [0,1035)
-search file py/pyproject.toml [0,262)
-search file web/package.json [0,284)
-search module go.mod [0,22) name=example.com/app qn=go:example.com/app
-search package crates/core/Cargo.toml [10,23) name=core qn=cargo:core
-search package java/pom.xml [0,0) name=svc qn=maven:org.acme:svc
-search package py/pyproject.toml [10,29) name=My_Service qn=pypi:my-service
-search package web/package.json [4,23) name=@acme/web qn=npm:@acme/web
-search section docs/README.md [0,9) name=Service qn=docs/README.md#Service
-search section docs/README.md [133,141) name=Usage qn=docs/README.md#Service > Usage
-search section docs/README.md [150,158) name=Usage qn=docs/README.md#Service > Usage~2
+search configuration Cargo.toml [12,35) on configuration cargo:workspace:Cargo.toml name=workspace qn=cargo:workspace:Cargo.toml
+search configuration go.work [0,0) on configuration go:work:go.work name=go.work qn=go:work:go.work
+search dependency Cargo.toml [61,74) on dependency cargo:serde name=serde qn=cargo:serde
+search dependency crates/core/Cargo.toml [111,123) on dependency cargo:anyhow name=anyhow qn=cargo:anyhow
+search dependency crates/core/Cargo.toml [144,158) on dependency cargo:tempfile name=tempfile qn=cargo:tempfile
+search dependency crates/core/Cargo.toml [181,189) on dependency cargo:cc name=cc qn=cargo:cc
+search dependency crates/core/Cargo.toml [82,110) on dependency cargo:serde name=serde qn=cargo:serde
+search dependency go.mod [44,65) on dependency go:github.com/a/b name=github.com/a/b qn=go:github.com/a/b
+search dependency go.mod [67,88) on dependency go:github.com/c/d name=github.com/c/d qn=go:github.com/c/d
+search dependency java/pom.xml [323,638) on dependency maven:com.google.guava:guava name=com.google.guava:guava qn=maven:com.google.guava:guava
+search dependency java/pom.xml [34,149) on dependency maven:org.acme:parent name=org.acme:parent qn=maven:org.acme:parent
+search dependency java/pom.xml [643,797) on dependency maven:junit:junit name=junit:junit qn=maven:junit:junit
+search dependency java/pom.xml [802,1005) on dependency maven:org.projectlombok:lombok name=org.projectlombok:lombok qn=maven:org.projectlombok:lombok
+search dependency py/pyproject.toml [141,149) on dependency pypi:pytest name=pytest qn=pypi:pytest
+search dependency py/pyproject.toml [179,185) on dependency pypi:ruff name=ruff qn=pypi:ruff
+search dependency py/pyproject.toml [215,226) on dependency pypi:hatchling name=hatchling qn=pypi:hatchling
+search dependency py/pyproject.toml [71,84) on dependency pypi:requests name=requests qn=pypi:requests
+search dependency py/pyproject.toml [88,96) on dependency pypi:django name=django qn=pypi:django
+search dependency web/package.json [140,162) on dependency npm:typescript name=typescript qn=npm:typescript
+search dependency web/package.json [208,230) on dependency npm:react-dom name=react-dom qn=npm:react-dom
+search dependency web/package.json [260,280) on dependency npm:fsevents name=fsevents qn=npm:fsevents
+search dependency web/package.json [97,115) on dependency npm:react name=react qn=npm:react
+search document docs/README.md [0,0) on document docs/README.md name=README.md qn=docs/README.md
+search document docs/long.txt [0,0) on document docs/long.txt name=long.txt qn=docs/long.txt
+search document docs/wide.txt [0,0) on document docs/wide.txt name=wide.txt qn=docs/wide.txt
+search file Cargo.toml [0,75) on file Cargo.toml
+search file broken/Cargo.toml [0,23) on file broken/Cargo.toml
+search file crates/core/Cargo.toml [0,190) on file crates/core/Cargo.toml
+search file docs/README.md [0,159) on file docs/README.md
+search file docs/long.txt [0,32767) on file docs/long.txt
+search file docs/long.txt [32767,40001) on file docs/long.txt
+search file docs/wide.txt [0,32745) on file docs/wide.txt
+search file docs/wide.txt [32627,35400) on file docs/wide.txt
+search file go.mod [0,135) on file go.mod
+search file go.work [0,29) on file go.work
+search file java/pom.xml [0,1035) on file java/pom.xml
+search file py/pyproject.toml [0,262) on file py/pyproject.toml
+search file web/package.json [0,284) on file web/package.json
+search module go.mod [0,22) on module go:example.com/app name=example.com/app qn=go:example.com/app
+search package crates/core/Cargo.toml [10,23) on package cargo:core name=core qn=cargo:core
+search package java/pom.xml [0,0) on package maven:org.acme:svc name=svc qn=maven:org.acme:svc
+search package py/pyproject.toml [10,29) on package pypi:my-service name=My_Service qn=pypi:my-service
+search package web/package.json [4,23) on package npm:@acme/web name=@acme/web qn=npm:@acme/web
+search section docs/README.md [0,9) on section docs/README.md#Service name=Service qn=docs/README.md#Service
+search section docs/README.md [133,141) on section docs/README.md#Service > Usage name=Usage qn=docs/README.md#Service > Usage
+search section docs/README.md [150,158) on section docs/README.md#Service > Usage~2 name=Usage qn=docs/README.md#Service > Usage~2
 `
 
 // TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet is the one test of
