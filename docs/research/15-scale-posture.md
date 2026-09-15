@@ -65,6 +65,10 @@ Per-table attribution of the full store:
 | Nodes (facts, identity table, auto-indexes, name and path indexes) | ~83.9 MB | 20.0 % |
 | Search (units, full-text shadow tables, index) | ~40 MB | 9.5 % |
 
+The redesign that followed from this measurement — integer surrogate row identities, interned string
+keys and canonical identities hydrated at the response boundary — is recorded in
+[ADR-0002 — Storage identities](../adr/ADR-0002-storage-identities.md).
+
 The amplifier is **identity width**, not source volume: on the alias table, rows cost 117 B each
 for about 100 B of content, one secondary index costs the same 117 B/row and a second costs
 121 B/row — more than the table it indexes. Full-text content duplication, per-unit JSON payloads,

@@ -2,6 +2,7 @@ package model_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -188,10 +189,28 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	forgedObservationID := validObservation
 	forgedObservationID.ID = model.ObservationID(model.H("observation-v1", "invented"))
 
+	// node_ids.canonical_key is BLOB(32): a key that is not a 32-byte digest
+	// rendered as lowercase hex has no storable form, and the node identity is
+	// derived from the decoded bytes.
+	validFact := model.NodeFact{Node: validNode, CanonicalKey: model.H("canonical-entity-key-v1", "pkg.F"),
+		Evidence: []model.Evidence{validEvidence}}
+	if err := validFact.Validate(); err != nil {
+		t.Fatalf("valid node fact rejected: %v", err)
+	}
+	freeTextKey := validFact
+	freeTextKey.CanonicalKey = "pkg.F"
+	uppercaseKey := validFact
+	uppercaseKey.CanonicalKey = strings.ToUpper(validFact.CanonicalKey)
+	shortKey := validFact
+	shortKey.CanonicalKey = validFact.CanonicalKey[:63]
+
 	tests := []struct {
 		protects string
 		value    interface{ Validate() error }
 	}{
+		{"a free-text canonical key, which canonical_key BLOB(32) cannot store", freeTextKey},
+		{"an uppercase canonical key, which decodes to the same bytes under two spellings", uppercaseKey},
+		{"a short canonical key, which is not a 32-byte digest", shortKey},
 		{"node_facts range without its file_id, which the schema's mixed-range CHECK rejects", rangeWithoutFile},
 		{"an inverted half-open range, which would serve bytes outside the entity", inverted},
 		{"evidence naming both a node and a relation, breaking the subject XOR", bothSubjects},
