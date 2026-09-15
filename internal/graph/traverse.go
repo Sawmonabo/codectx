@@ -178,6 +178,9 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		c := o.Resume.Cursor
 		st = walkState{Level: c.Level, LevelState: c.LevelState, LevelPos: c.LevelPos,
 			RawBytes: c.RawBytes, LevelOffset: c.LevelOffset}
+		if c.LevelState == levelServing {
+			w.entryLevel = c.Level
+		}
 	}
 	return w.run(ctx, st)
 }
@@ -196,6 +199,15 @@ type levelWalk struct {
 	sorted *sortedLevel
 	// routes names the relations a served record's ROUTE holds.
 	routes *routeNames
+	// resumedCounted marks that the leg's FIRST collected level -- the only one
+	// a resume picks up rather than starts -- has been measured.
+	resumedCounted bool
+	// entryLevel is the SERVING level this leg was resumed into, or zero. Its
+	// sorted run is the one file the cursor the caller still holds names, so it
+	// outlives the serve and is released when the next cursor supersedes it: a
+	// RETRYABLE failure later in this page tells the caller to present that same
+	// cursor again, and a released run would answer it CTX_STORAGE_CORRUPT.
+	entryLevel int
 }
 
 // run drives the pipeline until the walk stops: it is exhausted, it reached the
@@ -359,7 +371,14 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 		return nil
 	}
 	from := st.LevelPos
+	// A resumed leg decodes the frontier of the level it picks up, chunk by
+	// chunk, and nothing else: that is what the resume costs.
+	resumed := o.Resume != nil && !w.resumedCounted
+	w.resumedCounted = true
 	err := o.Retain.eachFrontier(st.Level-1, from.Node, func(chunk []frontierState) error {
+		if resumed {
+			o.Retain.countResumed(len(chunk))
+		}
 		owners := make(map[NodeRef]frontierState, len(chunk))
 		refs := make([]NodeRef, 0, len(chunk))
 		for _, fs := range chunk {
@@ -372,58 +391,86 @@ func (w *levelWalk) scan(ctx context.Context, st *walkState, c *levelCollector) 
 			owners[fs.Node] = fs
 			refs = append(refs, fs.Node)
 		}
-		at, err := w.reader.Neighbours(ctx, refs, o.Direction, w.codes, from, func(e Edge) error {
-			if seen%edgeScanCheckEvery == 0 {
-				if err := checkWalk(ctx, o.Budget); err != nil {
-					if !deadlineStop(err, o) {
-						return err
+		// Where this chunk's scan begins. A position is the NEXT entry to
+		// deliver, so naming the chunk's first owner is what makes a cut inside
+		// the chunk resume at the chunk and not at the level.
+		start := from
+		from = EdgePos{}
+		if start.IsZero() {
+			start = EdgePos{Node: refs[0]}
+		}
+		for {
+			// The scan is cut every levelResolveBatch kept entries so that each
+			// batch begins at a position the reader reported: a deadline inside
+			// the batched id read below can then drop the batch and resume the
+			// level exactly where that batch started.
+			full := false
+			at, err := w.reader.Neighbours(ctx, refs, o.Direction, w.codes, start, func(e Edge) error {
+				if seen%edgeScanCheckEvery == 0 {
+					if err := checkWalk(ctx, o.Budget); err != nil {
+						if !deadlineStop(err, o) {
+							return err
+						}
+						// The page ran out of time mid-level. What the scan
+						// collected is fact; the continuation carries the
+						// position this stop reports and the run it collected
+						// into.
+						o.Budget.deadlineHit = true
+						cut = true
+						return ErrStopScan
 					}
-					// The page ran out of time mid-level. What the scan
-					// collected is fact; the continuation carries the position
-					// this stop reports and the run it collected into.
-					o.Budget.deadlineHit = true
-					cut = true
+				}
+				seen++
+				owner, ok := owners[e.Owner]
+				if !ok {
+					// The reader delivered an entry for a node that is not on
+					// this chunk. Dropping it is the only honest answer --
+					// attributing it to an arbitrary node would invent a path.
+					return nil
+				}
+				keep, err := w.keepEntry(e)
+				if err != nil || !keep {
+					return err
+				}
+				if len(pending) >= levelResolveBatch {
+					// Stopped BEFORE this entry is taken, so the position the
+					// reader reports delivers it again.
+					full = true
 					return ErrStopScan
 				}
+				pending = append(pending, levelRecord{Owner: owner, Edge: e})
+				return nil
+			})
+			if err != nil {
+				if !deadlineStop(err, o) {
+					return err
+				}
+				// The deadline fell INSIDE the read rather than on the check
+				// above it: the reader returned the context's own error.
+				o.Budget.deadlineHit = true
+				cut = true
 			}
-			seen++
-			owner, ok := owners[e.Owner]
-			if !ok {
-				// The reader delivered an entry for a node that is not on this
-				// chunk. Dropping it is the only honest answer -- attributing
-				// it to an arbitrary node would invent a path.
+			if ferr := flush(); ferr != nil {
+				if !deadlineStop(ferr, o) {
+					return ferr
+				}
+				// The deadline fell inside the batched id read. The batch is
+				// dropped whole and the level resumes where it began, so the
+				// resumed scan delivers exactly those entries again -- naming
+				// half a batch would either lose them or serve them twice.
+				o.Budget.deadlineHit = true
+				pending, pos, cut = pending[:0], start, true
+				return errLevelCut
+			}
+			if cut {
+				pos = at
+				return errLevelCut
+			}
+			if !full {
 				return nil
 			}
-			keep, err := w.keepEntry(e)
-			if err != nil || !keep {
-				return err
-			}
-			pending = append(pending, levelRecord{Owner: owner, Edge: e})
-			if len(pending) < levelResolveBatch {
-				return nil
-			}
-			return flush()
-		})
-		// Only the chunk a cursor stopped inside resumes from a position; every
-		// chunk after it is scanned whole.
-		from = EdgePos{}
-		if err != nil {
-			if !deadlineStop(err, o) {
-				return err
-			}
-			// The deadline fell INSIDE the read rather than on the check above
-			// it: the reader returned the context's own error.
-			o.Budget.deadlineHit = true
-			cut = true
+			start = at
 		}
-		if err := flush(); err != nil {
-			return err
-		}
-		if cut {
-			pos = at
-			return errLevelCut
-		}
-		return nil
 	})
 	if err != nil && !errors.Is(err, errLevelCut) {
 		return EdgePos{}, false, err
@@ -572,9 +619,12 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 		st.LevelOffset, st.More = at, true
 		return true, nil
 	}
-	// The level has been served whole: its sorted run and the frontier it was
-	// collected from are released, and the level after it begins.
-	if err := w.sorted.release(); err != nil {
+	// The level has been served whole: the frontier it was collected from is
+	// released, its own sorted run with it, and the level after it begins. The
+	// run this leg was RESUMED into is held back instead -- see entryLevel.
+	if st.Level == w.entryLevel {
+		o.Retain.holdServed(st.Level)
+	} else if err := w.sorted.release(); err != nil {
 		return false, err
 	}
 	if err := o.Retain.releaseFrontier(st.Level - 1); err != nil {

@@ -135,6 +135,14 @@ type retainedWalk struct {
 	owned bool
 	// chunkSize overrides frontierChunk. It is zero outside tests.
 	chunkSize int
+	// served is the level whose sorted run this request must not delete while
+	// the cursor that names it is still the newest one the caller holds. It is
+	// released when the next cursor is minted (releaseServed).
+	served int
+	// probe counts what a RESUMED leg decodes to pick the walk up again, for
+	// the invariant that the cost of a resume is a function of the frontier and
+	// never of the cumulative set behind it. It is nil outside tests.
+	probe *heapProbe
 	// crashInAdmit ends a level transition between choosing what to admit and
 	// writing admitted.<level>, which is the window the order of effects exists
 	// to survive. It is the only way to reach that state, because the code
@@ -179,6 +187,7 @@ func reopenRetainedWalk(dir, prevID string, max walkBounds, probe *heapProbe) (*
 // consulted.
 func (w *retainedWalk) openSets(max walkBounds, probe *heapProbe) error {
 	var err error
+	w.probe = probe
 	if w.bits, err = openBitset(w.home, bitsetNodeFile, uint64(max.Node), probe); err != nil {
 		return err
 	}
@@ -941,6 +950,16 @@ func (w *retainedWalk) eachFrontier(level int, fromNode NodeRef, fn func(chunk [
 	return fn(chunk)
 }
 
+// countResumed records the frontier states a RESUMED leg decoded to pick its
+// level up again. Nothing else decodes anything on a resume: the level and the
+// position inside it ride in the token, and the cumulative sets are bitsets the
+// resumed leg never reads whole.
+func (w *retainedWalk) countResumed(n int) {
+	if w.probe != nil {
+		w.probe.ResumeRecords += int64(n)
+	}
+}
+
 // testFrontier reports whether ref is on the level being scanned. The direction
 // dedup rule asks it of every delivered entry, which is why it is a bitset and
 // not a set the level would have to be held in heap to build.
@@ -1002,6 +1021,21 @@ func (w *retainedWalk) hasFrontier(level int) (bool, error) {
 		return false, err
 	}
 	return found, nil
+}
+
+// holdServed records the served level whose sorted run outlives this leg.
+func (w *retainedWalk) holdServed(level int) { w.served = level }
+
+// releaseServed deletes that run. It is called when the next continuation is
+// minted: the cursor the caller held is superseded then, so nothing can ask for
+// the level again.
+func (w *retainedWalk) releaseServed() error {
+	if w.served == 0 {
+		return nil
+	}
+	level := w.served
+	w.served = 0
+	return openRetainFile(w.home, levelFileName(sortedLevelPrefix, level)).remove()
 }
 
 // releaseFrontier deletes one level's admitted states. It is called when the
