@@ -240,7 +240,7 @@ func checkManifestFits(slices []model.ContextSlice, b resolvedBudget) error {
 //
 //   - `Index` counts SURVIVORS of the three `sized` filters, never records of
 //     the ranked stream. The whole-set `i` is a position in `sized`
-//     (stream_parity_test.go:465-466), so counting a filtered record would
+//     (stream_parity_test.go:469-470), so counting a filtered record would
 //     shift every later ordinal and with it every stored slice membership.
 //   - Exclusions keep today's sequence (ruling C1): the pre-sort exclusions in
 //     expansion order first, then the packer's drops in group order. The first
@@ -310,7 +310,7 @@ type measuredPlan struct {
 	// reason in `Excluded` and its reference path in `PathAtRank` -- the value
 	// the whole-set exclude() reads, since buildPlan's unconditional path
 	// overwrite happens only on the surviving branch
-	// (stream_parity_test.go:438).
+	// (stream_parity_test.go:442).
 	Excluded *pagination.SortedRun[candRec]
 	// Paths and Hops are the route streams re-keyed from Seq to Index.
 	Paths *pagination.SortedRun[pathRec]
@@ -346,7 +346,8 @@ type keepRec struct {
 // dropRec is one member of a group the packer dropped, keyed so that replaying
 // the run reproduces appendDrops' order exactly: groups in rank order, and
 // within a group its entries in the order the group carries them, which
-// groupByFile builds in rank order (stream_parity_test.go:777).
+// groupByFile builds in rank order (stream_parity_test.go:673) and appendDrops
+// (:798) replays.
 type dropRec struct {
 	Cand     candRec `json:"c"`
 	MinIndex int64   `json:"m"`
