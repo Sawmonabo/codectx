@@ -1351,6 +1351,9 @@ type runCursor[T any] struct {
 	index   int64
 	failure error
 	closed  bool
+	// drained records that the producer's own result has been collected, so
+	// neither next nor Close waits on it twice.
+	drained bool
 }
 
 // errCursorStopped ends the producer's walk when the consumer closes early. It
@@ -1385,7 +1388,12 @@ func (c *runCursor[T]) next() bool {
 	}
 	v, ok := <-c.ch
 	if !ok {
+		// The run ended -- but a walk that FAILED closes this channel too, and
+		// a merge join that reads `ok` rather than closing the cursor would
+		// otherwise read a short stream as a complete one. Collect the walk's
+		// result here so err() reports it at the step it happened on.
 		c.ok = false
+		c.collect()
 		return false
 	}
 	c.cur, c.ok = v, true
@@ -1426,11 +1434,21 @@ func (c *runCursor[T]) Close() error {
 	close(c.stopCh)
 	for range c.ch { //nolint:revive // drain so the producer can finish and report
 	}
-	err := <-c.done
-	if err != nil && !errors.Is(err, errCursorStopped) {
+	c.collect()
+	return c.failure
+}
+
+// collect joins the producer and keeps its error, once. A cursor read to its
+// end has already collected it, and waiting on the result channel a second time
+// would block forever.
+func (c *runCursor[T]) collect() {
+	if c.drained {
+		return
+	}
+	c.drained = true
+	if err := <-c.done; err != nil && !errors.Is(err, errCursorStopped) {
 		c.failure = err
 	}
-	return c.failure
 }
 
 // stop releases the cursor from a defer, where the walk's error is read back
