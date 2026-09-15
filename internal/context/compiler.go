@@ -365,61 +365,13 @@ func (c *Compiler) hydrateFiles(ctx context.Context, reader *sqlite.PinnedReader
 // inadmissible, so stopping at the edge bound with ids still unfound changes
 // scores. The caller discloses that as an incomplete scope rather than letting
 // two compiles of one generation disagree in silence.
+// It is a thin wrapper: the body moved to rankjoin.go, beside the streamed
+// pass that must reproduce its read log, and reads through the narrow
+// relationReader so that log is observable. Lane L5 removes this wrapper when
+// Compile stops calling it.
 func (c *Compiler) relationsOnPaths(ctx context.Context, reader *sqlite.PinnedReader,
 	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
-	wanted := map[model.RelationID]struct{}{}
-	nodes := make([]model.NodeID, 0, len(cands))
-	seenNode := map[model.NodeID]struct{}{}
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, rel := range p.Relations {
-				wanted[rel] = struct{}{}
-			}
-		}
-		if cand.NodeID == "" {
-			continue
-		}
-		if _, dup := seenNode[cand.NodeID]; dup {
-			continue
-		}
-		seenNode[cand.NodeID] = struct{}{}
-		nodes = append(nodes, cand.NodeID)
-	}
-	out := make(map[model.RelationID]model.Relation, len(wanted))
-	if len(wanted) == 0 || len(nodes) == 0 {
-		return out, len(wanted) == 0, nil
-	}
-
-	limit := c.pageLimit()
-	// An unlimited edge bound is not a zero-sized scan: L2 replaces this whole
-	// hydration budget with the resumable frontier, and until then an absent
-	// bound falls back to the page size it already used for a 0 value.
-	budget := int(c.cfg.Context.MaxGraphEdges.ValueOr(model.MaxPageItems))
-	scanned := 0
-	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
-		batch := nodes[start:min(start+limit, len(nodes))]
-		var after model.RelationID
-		for len(out) < len(wanted) {
-			page, err := reader.EdgesBatch(ctx, batch, model.DirectionBoth, scopeRelations, after, limit)
-			if err != nil {
-				return nil, false, err
-			}
-			for _, rel := range page {
-				if _, want := wanted[rel.ID]; want {
-					out[rel.ID] = rel
-				}
-				after = rel.ID
-			}
-			scanned += len(page)
-			if len(page) < limit || scanned >= budget {
-				break
-			}
-		}
-		if scanned >= budget {
-			break
-		}
-	}
-	return out, len(out) == len(wanted), nil
+	return c.relationsOnPathsWholeSet(ctx, reader, cands)
 }
 
 // candidate is the ONE intermediate record that crosses lane boundaries: seed
