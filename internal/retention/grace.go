@@ -138,7 +138,8 @@ func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
 	// them because it walks rows, and these files have none. The same window
 	// guards them -- an object younger than it may be a publication whose
 	// commit is still in flight -- and the sweep re-walks every bucket each
-	// pass, so the batch is a working-set size and not a cap on the reclaim.
+	// time it runs, so the batch is a working-set size and not a cap on the
+	// reclaim.
 	//
 	// It runs on a CADENCE, not on every pass. The sweep is the one phase whose
 	// cost is the size of the whole store rather than the size of the change:
