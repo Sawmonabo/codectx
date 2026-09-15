@@ -175,7 +175,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDepth)
 	}
 
-	entries := acc.Entries(e.limits.MaxReasonPaths)
+	// An unlimited reason-path bound means every entry may carry its path; the
+	// wire ceiling is what actually bounds the list, so it is the fallback.
+	entries := acc.Entries(int(e.limits.ReasonPaths().ValueOr(model.MaxReasonPathsPerEntry)))
 	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
 	if err := impactPhaseError(ctx, hydrateErr, &meta); err != nil {
 		return answer, nil, nil, err

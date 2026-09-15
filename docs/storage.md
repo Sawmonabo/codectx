@@ -1,14 +1,65 @@
 # Storage: delta imports
 
 `internal/storage/sqlite` is the Section 12 store. This document covers the
-one thing the DDL of Section 12.2 does not explain on its own: how a provider
-that can tell what changed since its last run seals a new unit as "the
-previous unit plus a delta" (Section 11.4) without weakening any of the
-guarantees a sealed unit carries.
+two things the DDL of Section 12.2 does not explain on its own: how identities
+are actually stored — as row surrogates and interned keys, with the canonical
+identity hydrated back at the response boundary — and how a provider that can
+tell what changed since its last run seals a new unit as "the previous unit
+plus a delta" (Section 11.4) without weakening any of the guarantees a sealed
+unit carries.
 
-Everything else about the store — the single writer, the current-schema-init
-fingerprint, generation activation, retention by distinct ref — is Sections
-12.2–12.4 of `docs/implementation-plan.md` and is not restated here.
+Everything else about the store — the single writer, generation activation,
+retention by distinct ref — is Sections 12.2–12.4 of
+`docs/implementation-plan.md` and is not restated here.
+
+## How identities are stored
+
+Node and relation identities live in two dictionary tables, `node_ids` and
+`relation_ids`. Each has an `INTEGER PRIMARY KEY` surrogate and keeps the
+canonical 32-byte identity exactly once, in `canonical BLOB(32) UNIQUE`. Every
+other table references a node or a relation by that **integer** surrogate:
+`node_facts`, `relation_facts`, `relation_ids`' own two endpoints,
+`native_aliases`, `fact_keys`, `evidence`, `search_units` and
+`context_entries`. `node_ids.canonical_key` is a `BLOB(32)` — not the
+64-character hex text it used to be — and neither identity table carries a
+`repository_id` column any more, because one store is one repository.
+(`snapshots` and `generations` still carry theirs.)
+
+The two wide text keys are interned the same way. `scope_keys(id, key)` and
+`native_keys(id, key)` hold each distinct string once; `native_aliases` is
+all-integer — `(unit_id, scope_key_id, native_key_id, node_id)` — and evidence
+carries `native_key_id`. Evidence and aliases share `native_keys`: the values
+come from the same vocabulary.
+
+Three properties follow, and each is load-bearing for the rest of this
+document.
+
+- **The surrogate never leaves the store.** `model.NodeID`, `model.RelationID`
+  and `model.EvidenceID` on the wire are the canonical identities, and a signed
+  cursor encodes the canonical identity too — a surrogate is meaningful only
+  inside one store and one rebuild. Every read joins the identity tables back
+  out and projects `canonical`, so the row shapes the reader returns are
+  unchanged. That hydration sits *outside* the keyset-bounded inner select, so
+  the dictionary probes run once per returned row and never once per candidate.
+- **The writer's dictionary is bounded.** Strings and identities are resolved
+  through a least-recently-used cache sized from the writer's batch sizing and
+  emptied at every batch boundary — never a whole-repository dictionary in
+  heap. A miss is one indexed lookup against a unique constraint. Resolution is
+  upsert-then-read inside the caller's own write transaction, so two writers
+  converge on the same row.
+- **Determinism is untouched.** Canonical hashes exclude operational
+  identifiers, so surrogate values — which depend on insert order — cannot
+  reach one. Carry-over re-derives evidence identities from canonical values,
+  joining back out to `node_ids`, `relation_ids` and `native_keys` to recover
+  them.
+
+There is no migration path onto this schema and none is offered: the schema
+fingerprint is a digest of the DDL, so it changed, and an older store is
+refused at open with `CTX_SCHEMA_MISMATCH` and an explicit rebuild decision.
+
+The reasoning behind the redesign, the alternatives that were refused and the
+sources are in
+[ADR-0002 — Storage identities](adr/ADR-0002-storage-identities.md).
 
 ## Why a refresh is a new unit
 
@@ -133,7 +184,9 @@ edge is published once and derived from N occurrences, each with its own key,
 and the emitter re-emits the whole fact as soon as one of those keys changes.
 That is why the keys live in a side table and why `PutKeyedNodes` and
 `PutKeyedRelations` take `keys [][]string`, parallel to the facts: `keys[i]`
-is every key backing `facts[i]`, at least one, each a lowercase hex digest,
+is every key backing `facts[i]`, at least one, each in practice a lowercase hex
+digest — a convention the producers keep but that no model type enforces, which
+is why the column stays TEXT (see ADR-0002, Measurements),
 sorted and without duplicates.
 
 Folding a fact's keys into one was considered and rejected: `Replaced.Keys`
@@ -177,8 +230,9 @@ its identity, so no repeat of one can diverge.
 ### Aliases
 
 `native_aliases` have neither evidence nor a file column, so they are excluded
-by `Replaced.Scopes` — the scope key is opaque to storage, which only matches
-the column — and are otherwise carried only while the node they target is a
+by `Replaced.Scopes` — the scope key is opaque to storage, which only resolves
+each named scope through `scope_keys` and matches the resulting
+`scope_key_id` — and are otherwise carried only while the node they target is a
 fact of the new unit, which is exactly the condition `SealUnit` enforces.
 
 ## What carry-over guarantees
@@ -195,7 +249,9 @@ fact of the new unit, which is exactly the condition `SealUnit` enforces.
 - **Evidence is re-identified.** Evidence identity folds the unit id (Section
   9.3), so a copied occurrence is a different row with a different primary key.
   It cannot be copied in SQL; `CarryOver` recomputes `NewEvidenceID` over the
-  new unit. `evidence.content_hash_bound` records whether the producer bound
+  new unit, joining back out to `node_ids`, `relation_ids` and `native_keys`
+  for the canonical values the derivation folds — the row itself holds only
+  surrogates. `evidence.content_hash_bound` records whether the producer bound
   the occurrence to its file's content hash, which is the one input to that
   derivation the row would otherwise have lost.
 - **The evidence bound is re-applied.** A provider under a delta sees only the

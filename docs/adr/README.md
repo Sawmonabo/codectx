@@ -14,3 +14,4 @@ once with its URL and what it was used for. Records are numbered in order and ne
 | Record | Title | Status |
 |---|---|---|
 | [ADR-0001](ADR-0001-scale-posture.md) | Scale posture: unlimited by default, bounded by page | Accepted, 2026-09-14 |
+| [ADR-0002](ADR-0002-storage-identities.md) | Storage identities: integer surrogates and interned keys | Accepted, 2026-09-14 |
