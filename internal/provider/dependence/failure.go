@@ -180,6 +180,12 @@ type publication struct {
 	// clipping from being silent, and it is bounded by the fixed set of
 	// descriptive field names, never by the repository.
 	TruncatedFields map[string]int
+	// ClippedEvidence counts the evidence occurrences the import removed from
+	// facts it published, under the user's own index.max_evidence_per_fact.
+	// The key's contract (internal/config/config.go) is that "the cut is
+	// reported on the unit's capability detail, never silent", so this is what
+	// carries it to the generation.
+	ClippedEvidence int
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -245,6 +251,13 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 		if names := p.truncatedFields(); names != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
 			row = row.WithDetail("truncated_fields", names)
+		}
+		// Evidence removed from a published fact degrades every capability
+		// alike: any pass can be the one whose fact lost occurrences, and a
+		// consumer counting occurrences reads a number the clip decided.
+		if p.ClippedEvidence > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(p.ClippedEvidence))
 		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
