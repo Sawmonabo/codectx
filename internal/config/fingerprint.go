@@ -73,6 +73,13 @@ func (c Config) AnalysisConfigHash() string {
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxSourceFileBytes))
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxMaterializeBytes))
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxManifestBytes))
+	// The two manifest bounds, for the same reason: past either one the
+	// manifest provider truncates and flags the unit's facts, so a unit cached
+	// under a lower bound holds fewer dependencies than the same manifest
+	// yields under a higher one. Without them, raising a bound leaves the
+	// truncated facts in place with nothing to invalidate them.
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxTOMLLines))
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxXMLElements))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
 	return h.Sum()

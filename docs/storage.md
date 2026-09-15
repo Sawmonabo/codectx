@@ -101,11 +101,21 @@ untouched.
 
 The copy is also cheaper than the re-import it replaces: nothing is decoded,
 resolved or validated against the snapshot, and `search_units.token_count` is
-copied rather than recomputed. The one thing the copy cannot take from the
-database is the carried documents' text, because the database no longer holds
-any (below); the copy re-reads each carried document's bytes from the content
-store through the verified range reader and feeds them to the index, one
-bounded page of documents at a time.
+copied rather than recomputed. The carried documents' text is not copied at
+all, and not re-derived either. The database holds no body (below), and the
+source over a document's byte range is not the body its producer published —
+the tree-sitter provider publishes a symbol's names, signature and attached
+documentation over the whole declaration's extent, and the filesystem provider
+publishes no body — so rebuilding the index from the file would index text that
+was never any document's body and silently change that document's hits, BM25
+length and snippets on every delta. Instead `search_units` carries a `doc_id`
+naming the `search_fts` rowid its text was indexed into; the carry-over copies
+that column forward and the carried document keeps its posting. Reads resolve a
+document by `doc_id`, sharing is confined to one carry chain (`CarryOver`
+refuses a predecessor of another provider or scope key, and `generation_units`
+admits one unit per `(generation, provider, scope)`), and a posting is released
+only when no surviving unit still names it — the same reference test that
+retires a `node_ids` row. The whole carry-over reads and writes no text.
 
 ## The lexical index keeps no second copy of the source
 

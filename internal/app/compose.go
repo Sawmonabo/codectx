@@ -312,9 +312,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		}
 	}
 	// The content store opens before the database: it holds no lock and no
-	// state of its own, and the store needs its range reader to re-index the
-	// lexical documents a delta carries forward, which keep no body in the
-	// database (ADR-0003 §2.1).
+	// state of its own.
 	if s.cas, err = snapshot.OpenCAS(snapshot.CASDir(s.dataDir)); err != nil {
 		return nil, err
 	}
@@ -327,7 +325,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		BatchRecords:      cfg.Index.BatchRecords,
 		BatchBytes:        cfg.Index.BatchBytes,
 		MaxJSONBytes:      cfg.Context.MaxManifestBytes.Value(),
-		Content:           s.cas,
 	}); err != nil {
 		return nil, err
 	}

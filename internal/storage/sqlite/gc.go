@@ -334,8 +334,14 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,
 		// search_fts is contentless with contentless_delete=1 (ADR-0003 §2.1),
 		// so a plain DELETE by rowid removes the document: no column values are
-		// read back and no body is stored to read.
-		`DELETE FROM search_fts WHERE rowid IN (SELECT rowid FROM search_units WHERE unit_id = ?1)`,
+		// read back and no body is stored to read. A posting is named by
+		// doc_id, and a delta carry-over shares one along a carry chain, so it
+		// is released only when no surviving unit still names it -- the same
+		// reference test node_ids and relation_ids get below. This runs before
+		// the search_units delete, so the survivor probe must exclude this
+		// unit's own rows explicitly. idx_search_doc serves both halves.
+		`DELETE FROM search_fts WHERE rowid IN (SELECT su.doc_id FROM search_units su WHERE su.unit_id = ?1
+			AND NOT EXISTS (SELECT 1 FROM search_units s2 WHERE s2.doc_id = su.doc_id AND s2.unit_id <> ?1))`,
 		`DELETE FROM search_units WHERE unit_id = ?1`,
 		`DELETE FROM evidence WHERE unit_id = ?1`,
 		`DELETE FROM fact_keys WHERE unit_id = ?1`,
