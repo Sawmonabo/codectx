@@ -170,9 +170,12 @@ func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation)
 		}
 		return x.ToNodeID < y.ToNodeID
 	})
-	if len(out) > model.MaxRecordsPerResult {
-		out = out[:model.MaxRecordsPerResult]
-	}
+	// No MaxRecordsPerResult cut here. It used to discard the tail of the
+	// aggregation with a comment saying it could not disclose the loss, which
+	// made the page-overflow notice below understate what the answer held.
+	// The aggregate is over ONE page's edges -- the per-page edge and visited
+	// budgets bound what the walk read -- so the pair set is already
+	// page-sized, and the page slice is the only cut, disclosed by count.
 	return out, nil
 }
 
