@@ -128,7 +128,34 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	if err != nil {
 		return model.PathResult{}, err
 	}
-	defer sc.close()
+	// Terminal outcomes only, exactly as the lease release above and for the
+	// same reason: on a retryable failure the caller presents THIS cursor
+	// again, and the cursor names this directory. Keeping the lease while
+	// removing the state it leases turned a busy page into
+	// CTX_CURSOR_INVALID -- A15. retain() rolls the half-written page back and
+	// leaves the directory as the previous page committed it, so the retry
+	// resumes from the pre-page state rather than from a page torn in half.
+	//
+	// A FRESH search has no such obligation: no cursor names its directory
+	// yet, nothing can adopt it, and close() removing it is the only way it
+	// does not leak.
+	defer func() {
+		if resume != nil && !terminalOutcome(err) {
+			// A rollback that itself failed leaves retain() holding the
+			// directory back, and close() below then removes it: a retry
+			// refused as CTX_CURSOR_INVALID is recoverable by re-running the
+			// search, a retry resumed from a half-undone one is not. The
+			// caller is told so -- the failure is folded into the answer as a
+			// TERMINAL one, which also lets the release above end the lease
+			// over state that no longer exists.
+			rerr := sc.retain()
+			if rerr == nil {
+				return
+			}
+			err = terminalRetention(errors.Join(err, rerr))
+		}
+		sc.close()
+	}()
 
 	w := &pathWalk{
 		adjacency: e.adjacency,

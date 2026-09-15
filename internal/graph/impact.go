@@ -369,7 +369,7 @@ func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[i
 		PairTotal: pairRun.Len(), PairCount: int(pairRun.Len()) - len(pairPage),
 	}
 	next, err := e.nextRankedCursor(ctx, b, impactEndpoint, queryHash, header,
-		int64(len(page)), int64(len(pairPage)),
+		int64(len(page)), int64(len(pairPage)), meta,
 		chainTails(rankedRunTail(ctx, run, len(page), encodeImpactRecord),
 			rankedRunTail(ctx, pairRun, len(pairPage), encodePairRecord)))
 	return entries, next, err
@@ -413,7 +413,7 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 			Total: h.Total, Count: h.Count - len(page),
 			PairTotal: h.PairTotal, PairCount: h.PairCount - len(pairPage),
 		}
-		next, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header, served, pairServed,
+		next, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header, served, pairServed, &meta,
 			rankedSpoolSections(ctx, e.spools, c.spoolCursor(), e.now(), h, len(page), len(pairPage)))
 		if err != nil {
 			return answer, nil, nil, "", err
@@ -461,10 +461,16 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 // including this one have handed back, so the continuation's RankOffset is
 // always zero: the new spool BEGINS at the next record.
 func (e *Engine) nextRankedCursor(ctx context.Context, b *budget, endpoint, queryHash string,
-	header rankedHeader, served, pairServed int64, tail func(func([]byte) error) error) (string, error) {
+	header rankedHeader, served, pairServed int64, meta *model.QueryMeta,
+	tail func(func([]byte) error) error) (string, error) {
 	if e.signer == nil || e.leases == nil || e.spools == nil {
-		// No continuation machinery: the answer stops with this page and says
-		// so, exactly as a walk that cannot spill its frontier does.
+		// No continuation machinery: the answer stops with this page and SAYS
+		// so, exactly as a walk that cannot spill its frontier does. It is only
+		// reached with a ranked remainder still unserved -- both callers check
+		// that first -- so the stop always cuts the answer, and returning an
+		// empty token alone left the caller reading a complete-looking page of
+		// a longer ranking. Marking it is what makes the cut visible.
+		markTruncated(meta, reasonNoContinuation)
 		return "", nil
 	}
 	binding := e.adjacency.Binding()
@@ -666,6 +672,14 @@ func impactPhaseError(ctx context.Context, err error, meta *model.QueryMeta) err
 // short. It names the bound, like every other truncation reason, so a caller
 // can tell a slow query from a budget that was too small.
 const reasonDeadline = "query deadline reached"
+
+// reasonNoContinuation is the truncation reason for a ranked answer whose
+// remainder cannot be paged because this engine was built without the
+// continuation machinery -- no signer, no lease store or no spool store. The
+// records exist and the ranking is complete; what is missing is the token that
+// would hand the rest of them back, so the page that is served is a prefix and
+// must say it is one.
+const reasonNoContinuation = "continuation state is unavailable in this workspace"
 
 // markTruncated records the first reason an answer fell short. The first reason
 // wins because it is the bound that actually stopped the work; overwriting it
