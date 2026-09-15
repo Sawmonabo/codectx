@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 
@@ -209,7 +208,12 @@ func checkpointStream[T any](dir, name string, runBytes int64, each func(func(T)
 		sorter.Close()
 		return nil, err
 	}
-	return relativeRuns(dir, runs)
+	// Renamed into DETACH order, never listed by their os.CreateTemp suffix:
+	// the merge that adopts these runs breaks ties by run index, so the index a
+	// run is stored under is what reproduces the single stable sort this stream
+	// already is. The files are already inside dir, so the rename only fixes
+	// their names.
+	return moveRuns(dir, name, runs)
 }
 
 // restoreRun adopts a checkpointed ALREADY-FOLDED stream and answers it as a
@@ -261,24 +265,6 @@ func restoreSort[T any](s *compileSorts, dir, name string, runs []string,
 // can tell them apart by inspection.
 func checkpointPrefix(name string) string { return "ctx-resume-" + name + "-" }
 
-// relativeRuns turns the absolute paths a sort wrote into names relative to the
-// state directory. Paths are stored relative because the directory is RENAMED
-// when the spool store adopts it: an absolute path recorded before the rename
-// names a directory that no longer exists, which would turn every resume into
-// an expired continuation.
-func relativeRuns(dir string, runs []string) ([]string, error) {
-	out := make([]string, 0, len(runs))
-	for _, r := range runs {
-		rel, err := filepath.Rel(dir, r)
-		if err != nil {
-			return nil, &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
-		}
-		out = append(out, rel)
-	}
-	slices.Sort(out)
-	return out, nil
-}
-
 // absoluteRuns resolves stored names back against the state directory and
 // refuses any name that escapes it. The names come from a file inside a
 // directory a cursor named, so they are validated rather than trusted: a
@@ -297,14 +283,20 @@ func absoluteRuns(dir string, runs []string) ([]string, error) {
 }
 
 // moveRuns renames detached run files into the state directory under this
-// stream's prefix, and answers their names relative to it. A failure part way
+// stream's prefix, NUMBERED BY DETACH ORDER, and answers their names relative
+// to it. The index is load-bearing and not cosmetic: pagination's merge breaks
+// ties by run index, so storing runs in arrival order is what makes the resumed
+// merge reproduce the order the interrupted stream was in -- which matters for
+// every comparator that is not total (lessScoredPkg orders on Pkg alone).
+// The "run" infix keeps a target name out of the namespace os.CreateTemp draws
+// the source suffixes from, so a rename can never land on a run not moved yet. A failure part way
 // through leaves the already-moved files in the directory, which the lease
 // reclaims: the caller's answer is an uninterrupted compile or an error, never
 // a checkpoint that names files it does not have.
 func moveRuns(dir, name string, runs []string) ([]string, error) {
 	out := make([]string, 0, len(runs))
 	for i, r := range runs {
-		base := checkpointPrefix(name) + strconv.Itoa(i)
+		base := checkpointPrefix(name) + "run" + strconv.Itoa(i)
 		if err := os.Rename(r, filepath.Join(dir, base)); err != nil {
 			return nil, &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
 		}
