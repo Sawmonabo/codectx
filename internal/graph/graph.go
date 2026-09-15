@@ -230,6 +230,32 @@ type frontierState struct {
 	Cost  int64
 	Node  model.NodeID
 	Via   model.RelationID
+	// Route is the chain of relation ids from a seed to this node, Via last.
+	//
+	// It travels with the frontier because ruling P2's walk runs to completion
+	// and streams its records into a sort: there is no page-local byNode map
+	// left to walk a parent chain through, and model.ImpactEntry.Paths is not
+	// optional (Section 14.3 rejects an entry whose reason nothing backs). It
+	// is capped at model.MaxRelationsPerPath+1 by appendRoute -- one past the
+	// bound, so a consumer can tell "too long to report" from "exactly at the
+	// bound" -- which is what keeps the frontier's per-node cost bounded.
+	Route []model.RelationID
+}
+
+// appendRoute extends a parent's route with the edge that left it, copying
+// rather than sharing the backing array: two neighbours of one frontier node
+// would otherwise append over each other's last element.
+//
+// It stops one past model.MaxRelationsPerPath. A route at that length is
+// already longer than a servable path, so the elements beyond it would be
+// carried through the whole walk to be discarded at hydration.
+func appendRoute(parent []model.RelationID, via model.RelationID) []model.RelationID {
+	if len(parent) > model.MaxRelationsPerPath {
+		return parent
+	}
+	out := make([]model.RelationID, len(parent), len(parent)+1)
+	copy(out, parent)
+	return append(out, via)
 }
 
 // budget is the cumulative, cursor-carried work allowance of one traversal. It
