@@ -255,12 +255,28 @@ func (s *Store) nativeKeyDeleteBudget(ctx context.Context, tx *sql.Tx) (int64, e
 // after a full-vocabulary churn would spend ~90 minutes inside one write
 // transaction.
 //
-// So the pass spends a bounded ROWS-EXAMINED budget per retention run and
-// drains across runs. Nothing is skipped permanently: a key this run does not
-// reach is still unreferenced next run, live keys are re-walked by rowid probe
-// at no foreign-key cost, and the deleted ones are gone, so each run advances.
-// A store whose child tables are small sweeps its whole dictionary in one run;
-// only a store large enough to make a run pathological drains over several.
+// So the budget bounds the child-table rows a run may EXAMINE, which is the
+// same thing as bounding the keys it may delete, and the rest drains over the
+// following runs. Nothing is skipped permanently: a key this run does not
+// delete is still unreferenced next run, and the ones it did delete are gone,
+// so every run advances. A store whose child tables are small sweeps its whole
+// dictionary in one run; only a store large enough to make a run pathological
+// drains over several.
+//
+// The WALK is deliberately not bounded, only the deletions. A batch that
+// deletes nothing examines no child row and costs one rowid-range scan with a
+// rowid probe per candidate -- the whole 402 568-key dictionary walks in under
+// the 405 ms that the same loop took while also deleting 201 285 rows with the
+// foreign keys off. Capping the walk instead would need a cursor persisted
+// between retention runs; without one, a cap would re-examine the same prefix
+// every run and leave dead keys past it permanently unreachable, which is a
+// correctness regression traded for a sub-second saving.
+//
+// The budget does NOT make the drain converge at reference scale: ~265 keys
+// per run against a ~201 k backlog. It bounds the damage rather than repairing
+// it. An index on evidence(native_key_id) turns each foreign-key check into a
+// lookup and the whole sweep sub-second; that index was refused on the probe's
+// cost, which the measurement above shows was never the binding cost.
 func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		for _, q := range []string{
