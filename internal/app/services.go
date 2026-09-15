@@ -105,6 +105,8 @@ type ContextService interface {
 	Advance(ctx context.Context, req model.AdvanceRequest) (model.WorkflowStatus, model.SessionStatus, error)
 	Capsule(ctx context.Context, req model.CapsuleRequest) (model.CapsulePage, error)
 	Export(ctx context.Context, req model.SessionRequest) (model.Capsule, error)
+	CapsuleRows(ctx context.Context, req model.SessionRequest, list model.CapsuleList,
+		after string, limit int) ([]model.CapsuleRow, string, error)
 	CloseSession(ctx context.Context, req model.SessionRequest, expectedVersion int) (model.SessionStatus, error)
 }
 
@@ -553,6 +555,29 @@ func (s *Services) Export(ctx context.Context, req model.SessionRequest) (model.
 		return model.Capsule{}, s.fail("context export", err)
 	}
 	return capsule, nil
+}
+
+// CapsuleRows reads one keyset page of one sealed capsule list and the cursor
+// that continues it.
+//
+// Export answers a capsule's identity and per-list counts; its records are
+// rows. A caller that must render the capsule whole -- `codectx context export`
+// is the only one -- walks each list through this call, so the records held in
+// this process are one page's worth however large the session was.
+func (s *Services) CapsuleRows(ctx context.Context, req model.SessionRequest, list model.CapsuleList,
+	after string, limit int) ([]model.CapsuleRow, string, error) {
+	if err := req.Validate(); err != nil {
+		return nil, "", err
+	}
+	wf, err := s.workflow()
+	if err != nil {
+		return nil, "", err
+	}
+	rows, next, err := wf.CapsuleRows(ctx, req, list, after, limit)
+	if err != nil {
+		return nil, "", s.fail("context export", err)
+	}
+	return rows, next, nil
 }
 
 // CloseSession closes the session under the caller's expected version.
