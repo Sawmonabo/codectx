@@ -69,7 +69,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_start_nodes` |
   | `[providers.tree_sitter]` | `max_callee_references`, `max_records_per_file` |
   | `[providers.manifest]` | `max_dependencies`, `max_entries` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
@@ -372,6 +372,7 @@ cloud or AI credential fields in core.
 | `strict_read_gate` | `true` | user | Require confirmed source coverage before implementation readiness. It is the switch for that one readiness precondition. With it set to `false` the shortfall no longer shuts the gate at precondition 3 — the remaining preconditions are still evaluated and reported — but it buys no strict claim either: nothing confirmed the coverage, so the session is reported **neither ready nor strict**, the sealed capsule records `strict_gate_satisfied` false, and the answer's reason carries `strict_read_gate=disabled` instead of naming files the configuration excused, so a reader can tell an unconfirmed read from a confirmed one. Changing it changes the context-policy fingerprint, so a cached context answer compiled under the other setting is invalidated rather than reused. |
 | `allow_exploratory_waiver_consolidation` | `false` | user | Exploratory waiver consolidation. It never weakens strict read readiness. |
 | `max_seeds` | `0` (unlimited) | user | Identities seed discovery examines before it stops. Unlimited by default, so every identity a task names is examined; a task that exceeds a value you set is reported as a named exclusion on the manifest, never cut silently. |
+| `max_start_nodes` | `0` (unlimited) | user | Discovered seeds that become roots of the boundary walk. Unlimited by default, so every resolvable seed a task names is walked from; seeds past a value you set are left unwalked and reported as a named exclusion carrying the dropped count, never cut silently. |
 
 The context compiler binds them as follows. The three `default_*` budgets and
 `max_slices` are what a **zero** field of a request's budget resolves to. They
@@ -439,6 +440,23 @@ and reason.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.
+
+`max_start_nodes` bounds how many of the seeds that survive discovery become
+roots of the Section 15.2 boundary walk, and is unlimited by default: every
+resolvable seed is walked from. Setting it leaves the seeds past it unexplored,
+and the manifest carries one exclusion row naming the limit and the number of
+roots that did not start — the overflow is never quietly re-walked as a second
+request, because one walk ranks its boundaries globally and a second walk would
+answer its own local ranking instead of extending the first one's order.
+
+One residual bound stands behind the unlimited default: a single traversal
+request's start list is validated against a structural wire ceiling of 250000
+node ids, which applies to externally supplied `impact` and `graph` requests and
+also to the request the compiler issues for its own walk. It is far wider than
+the seed set one task can produce — the task text is clipped to a fixed byte
+bound and each identity it names resolves through one page of declarations — so
+it does not cut a compile in practice; a start list that reached it would be
+reported, never trimmed.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What

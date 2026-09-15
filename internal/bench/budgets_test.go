@@ -150,6 +150,13 @@ func fixture(tb testing.TB) *budgetFixture {
 	return fixtureValue
 }
 
+// benchStartNodes is the seed width the traversal rows walk from. It is the
+// bench's OWN fixture constant and not a model or configuration bound: the row
+// has to measure the same walk from build to build, so widening the wire
+// ceiling (model.MaxStartNodes) or the operative context.max_start_nodes must
+// not move the baseline the budget is re-pinned against.
+const benchStartNodes = 64
+
 func buildFixture(tb testing.TB) *budgetFixture {
 	tb.Helper()
 	ctx := context.Background()
@@ -190,9 +197,8 @@ func buildFixture(tb testing.TB) *budgetFixture {
 	if err != nil {
 		tb.Fatalf("workspace symbols: %v", err)
 	}
-	// The traversal rows start from the widest seed set a request may carry
-	// (model.MaxStartNodes), led by the high-fanout symbol Section 23.1 asks
-	// for. A walk from one leaf visits two nodes and would measure nothing,
+	// The traversal rows start from benchStartNodes seeds, led by the
+	// high-fanout symbol Section 23.1 asks for. A walk from one leaf visits two nodes and would measure nothing,
 	// and the visited-node row has to state an upper bound the default budget
 	// is re-pinned against, not a best case. The exact-query row wants the
 	// opposite: one ordinary symbol, resolved by name.
@@ -216,7 +222,7 @@ func buildFixture(tb testing.TB) *budgetFixture {
 		}
 	}
 	for _, n := range symbols.Items {
-		if len(f.seeds) >= model.MaxStartNodes {
+		if len(f.seeds) >= benchStartNodes {
 			break
 		}
 		if n.Kind == model.NodeFunction || n.Kind == model.NodeMethod {

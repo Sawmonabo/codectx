@@ -198,3 +198,87 @@ func TestChangedFileSeedsKeepReadingPastTheFirstPage(t *testing.T) {
 		t.Errorf("a working tree the step read to the end was reported INCOMPLETE: %v", out.Excluded)
 	}
 }
+
+// TestTheWalkRootWidthIsTheConfiguredLimit protects finding B2's invariant: how
+// WIDE the boundary walk starts is the user-set context.max_start_nodes, and
+// that key is unlimited by default.
+//
+// Failure mode it guards: the root width used to be the hard constant
+// model.MaxStartNodes = 64, so a task naming 65 resolvable identities explored
+// 64 of them on every repository with no key to raise it and no count saying
+// how many roots went unexplored. No compiler fixture exceeds 64 seeds, so
+// nothing else in this package walks past that edge -- the default half of this
+// row is the one that catches a constant reintroduced anywhere in foldSeeds.
+func TestTheWalkRootWidthIsTheConfiguredLimit(t *testing.T) {
+	const seeds = 65
+	admit := func(t *testing.T, cfg config.Config) *seedIngest {
+		t.Helper()
+		sorts := openSorts(t, cfg)
+		t.Cleanup(func() { sorts.Close() })
+		c := &Compiler{cfg: cfg}
+		in, err := c.newSeedIngest(sorts)
+		if err != nil {
+			t.Fatalf("newSeedIngest: %v", err)
+		}
+		in.BeginStep(originChangedFile, "the captured working-tree changes")
+		for i := 0; i < seeds; i++ {
+			if err := in.Admit(candidate{NodeID: model.NodeID(fmt.Sprintf("n-%03d", i)),
+				Origin: originChangedFile}); err != nil {
+				t.Fatalf("Admit: %v", err)
+			}
+		}
+		return in
+	}
+
+	// Unlimited by default: every resolvable seed is a root, and the scope is
+	// not narrowed by a bound nobody set.
+	in := admit(t, config.Defaults())
+	start, err := in.foldSeeds()
+	if err != nil {
+		t.Fatalf("foldSeeds: %v", err)
+	}
+	if len(start) != seeds {
+		t.Fatalf("the default walk started from %d of %d resolvable seeds; max_start_nodes is unlimited by default",
+			len(start), seeds)
+	}
+	if !in.scope.ScopeComplete {
+		t.Fatal("an unbounded root set reported the scope incomplete")
+	}
+
+	// Set: the cut holds AND the row says how many roots did not start.
+	const width = config.Limit(10)
+	cfg := config.Defaults()
+	cfg.Context.MaxStartNodes = width
+	in = admit(t, cfg)
+	start, err = in.foldSeeds()
+	if err != nil {
+		t.Fatalf("foldSeeds: %v", err)
+	}
+	if int64(len(start)) != width.Value() {
+		t.Fatalf("a width of %s started %d roots", width, len(start))
+	}
+	if in.scope.ScopeComplete {
+		t.Fatal("a root cut left the scope reported as complete")
+	}
+	var rows []candidate
+	run, err := in.candSort.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	defer run.Close()
+	if err := run.Each(func(r candRec) error {
+		if strings.Contains(r.Excluded, "context.max_start_nodes") {
+			rows = append(rows, r.finalCandidate())
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Each: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("a root cut produced %d disclosure row(s), want exactly one", len(rows))
+	}
+	// The COUNT is the half a bare ScopeComplete=false does not carry.
+	if want := fmt.Sprintf("%d resolved seeds", seeds-width.Value()); !strings.Contains(rows[0].Excluded, want) {
+		t.Fatalf("the disclosure reads %q, want it to name %q", rows[0].Excluded, want)
+	}
+}
