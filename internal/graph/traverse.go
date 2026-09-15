@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 
@@ -56,28 +57,46 @@ func deadlineStop(err error, o expandOptions) bool {
 	return isDeadline(err)
 }
 
-// edgeRowOverheadBytes is the fixed per-row cost of holding one edge of a
-// frontier level in memory: the edgeRow struct, its model.Relation, the string
-// headers inside both, and the map entry that records the relation as
-// collected. It is a deliberately conservative ESTIMATE rather than a
-// measurement -- Limits.FrontierBytes is a ceiling on memory, and an estimate
-// that reads low would let the ceiling be crossed before the walk noticed.
+// edgeRowBytes is what one collected edge of a frontier level costs in heap:
+// the edgeRow struct -- a frontierState copy, whose Route backing array is
+// SHARED with the frontier record rather than copied here, plus one Edge.
+//
+// It is a CONSTANT, where it used to sum the lengths of four identifier
+// strings, because a level holds SURROGATES: every row of every repository
+// costs the same, and Limits.FrontierBytes now bounds a count of rows rather
+// than a guess at how long their names were. It reads deliberately high -- the
+// budget is a memory ceiling, and an estimate that read low would let the
+// ceiling be crossed before the walk noticed.
+const edgeRowBytes = 128
+
+// edgeRowOverheadBytes is the same estimate for a row that still carries
+// CANONICAL identifiers: the shortest-path scratch keeps model.Relation rows,
+// so its per-row cost is this fixed part plus the lengths of the ids it holds.
 const edgeRowOverheadBytes = 256
 
-// edgeRowBytes estimates what one edgeRow costs, adding the identifiers it
-// actually carries to the fixed overhead.
-func edgeRowBytes(r edgeRow) int64 {
-	return edgeRowOverheadBytes + int64(len(r.owner.Node)+len(r.owner.Via)+
-		len(r.rel.ID)+len(r.rel.From)+len(r.rel.To)+len(r.rel.Kind)+len(r.neighbor))
+// edgeScanCheckEvery is how often one level's scan re-reads the clock. A check
+// per entry would put a time.Now on the hot path of every decoded adjacency
+// entry; a check only between levels would let one hub outlive the deadline by
+// the whole of its fan-out. Every 256 entries bounds the overrun by 256
+// decodes.
+const edgeScanCheckEvery = 256
+
+// edgeRow is one edge of a level attributed to the frontier node it left from,
+// so visit receives that node's own state rather than a reconstructed one.
+type edgeRow struct {
+	owner frontierState
+	edge  Edge
 }
 
 // expand is the ONE batched BFS. visit is called once per admitted edge in the
-// frozen (depth asc, NodeID asc) order and may return errStopExpansion to end
-// the walk, which expand reports as a clean finish: the visitor stopped
-// deliberately and owns whatever truncation flag it set.
+// frozen (canonical owner asc, canonical relation asc) order and may return
+// errStopExpansion to end the walk, which expand reports as a clean finish: the
+// visitor stopped deliberately and owns whatever truncation flag it set.
 //
-// expand does one Adjacency.Edges round trip per frontier batch per keyset
-// page, never one per node: a hub with 40 out-edges costs one call, not 40.
+// expand does ONE GraphReader.Neighbours scan per frontier LEVEL, never one per
+// node and never one per node chunk: the whole level's surrogates go into one
+// ascending scan of the packed adjacency, which is the layout's reason for
+// existing. A level of 40 000 owners costs one call.
 //
 // It enforces only the bounds it is given -- MaxDepth, the deadline and
 // cancellation. MaxVisited and MaxEdges are deliberately absent from
@@ -85,87 +104,67 @@ func edgeRowBytes(r edgeRow) int64 {
 // spent, and the caller resolves the caps from Limits and the request, so the
 // visitor is the one place that compares the two. That keeps a resumed page
 // from spending a fresh budget.
-func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) (walkState, error) {
-	if a == nil {
+func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOptions,
+	visit func(frontierState, Edge) error) (walkState, error) {
+	switch {
+	case r == nil:
+		// The typed refusal the engine owes a caller that has not wired the
+		// packed reader yet. It names the missing port rather than failing
+		// somewhere inside the scan, where the cause would be invisible.
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
-			Message: "graph expansion requires an adjacency reader"}).WithDetail("operation", "expand")
-	}
-	if o.Budget == nil {
+			Message: "graph traversal requires the packed graph reader"}).WithDetail("operation", "expand")
+	case o.Budget == nil:
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a budget"}).WithDetail("operation", "expand")
-	}
-	if visit == nil {
+	case o.Retain == nil:
+		return walkState{}, (&model.Error{Code: model.CodeInternal,
+			Message: "graph expansion requires a retained walk directory"}).WithDetail("operation", "expand")
+	case visit == nil:
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a visitor"}).WithDetail("operation", "expand")
 	}
-	batch := o.BatchSize
-	if batch <= 0 {
-		batch = adjacencyBatch
+	codes, costs, err := walkKinds(r, o.Kinds)
+	if err != nil {
+		return walkState{}, err
 	}
-
-	// The cumulative admitted-node set. Its heap footprint is the bounded
-	// front of visitedSet, never the walk: the authoritative set is the
-	// continuation spool the resume streams from.
-	admitted := newVisitedSet(nil)
-	if o.Resume != nil {
-		admitted.stream = o.Resume.Visited
-		admitted.filter = o.Resume.Filter
-	}
-	// A relation is admitted at most once for the whole walk: a cycle, an
-	// overlapping batch or a DirectionBoth edge whose two endpoints are both on
-	// the frontier must not be counted or emitted twice.
-	admittedRel := map[model.RelationID]bool{}
 	var (
 		frontier []frontierState
 		// carry is the NEXT level as the page that issued the cursor had
 		// already built it, held aside until the re-read level completes.
-		carry     []frontierState
-		depth     int
-		skipOwner model.NodeID
-		skipKey   model.RelationID
+		carry []frontierState
+		depth int
+		// from is where this level's scan resumes. It REPLACES the
+		// (lastOwner, lastKey) keyset position: the packed reader resumes a
+		// scan at a stored-entry index, which is exact, where the keyset pair
+		// could only name a position in an order several independent reads had
+		// to be stitched into.
+		from EdgePos
 	)
 	if o.Resume == nil {
-		// Seeds enter at depth 0 in request order, de-duplicated, then sorted by
-		// NodeID: the frozen (depth asc, NodeID asc) order starts here.
-		for _, s := range seeds {
-			if s == "" || admitted.has(s) {
-				continue
-			}
-			admitted.add(s)
-			frontier = append(frontier, frontierState{Node: s})
+		if frontier, err = seedFrontier(ctx, r, seeds, o); err != nil {
+			return walkState{}, err
 		}
-		o.Budget.visited += int64(len(frontier))
-		o.Budget.pageVisited += int64(len(frontier))
+		if err := o.Retain.commitLevel(frontier, levelRefs(frontier)); err != nil {
+			return walkState{}, err
+		}
 	} else {
-		// A resume never re-enters the seeds: they are already in the visited
-		// set the issuing page spooled, and re-admitting them would spend the
-		// cumulative visited budget a second time for the same nodes. That set
-		// is NOT materialized here -- it is streamed from the spool one level
-		// at a time; only the resumed frontier's own nodes enter the front.
-		depth = o.Resume.Cursor.Depth
-		skipOwner, skipKey = o.Resume.Cursor.LastOwner, o.Resume.Cursor.LastKey
+		// A resume never re-enters the seeds: they are already in the bitset
+		// the issuing page committed, and re-admitting them would spend the
+		// cumulative visited budget a second time for the same nodes. The
+		// frontier comes from the retained level file the continuation adopted,
+		// whose bits have already been re-applied (cursor.go); that adoption is
+		// idempotent because the bitset counts bit transitions.
+		depth, from = o.Resume.Cursor.Depth, o.Resume.Cursor.LevelPos
 		for _, fs := range o.Resume.Frontier {
 			if fs.Depth == depth {
 				frontier = append(frontier, fs)
 			} else {
 				carry = append(carry, fs)
 			}
-			// Seeding admittedRel with the relation each frontier node was
-			// DISCOVERED by is what keeps a DirectionBoth walk from emitting one
-			// edge on two pages. Re-reading a frontier node returns the edge that
-			// reached it, which the issuing page already admitted; every node
-			// this page expands is either in this spooled frontier (Via-seeded
-			// here) or was discovered by this page itself (covered by the
-			// in-page admittedRel below).
-			if fs.Via != "" {
-				admittedRel[fs.Via] = true
-			}
-			admitted.carry(fs.Node)
 		}
-		sort.Slice(carry, func(i, j int) bool { return carry[i].Node < carry[j].Node })
+		sortFrontier(carry)
 	}
-	sort.Slice(frontier, func(i, j int) bool { return frontier[i].Node < frontier[j].Node })
+	sortFrontier(frontier)
 
 	// Expanding level `depth` produces nodes at depth+1, so the bound is
 	// crossed when depth+1 would exceed it. config.Limit.Exceeded is the whole
@@ -180,125 +179,121 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			// standing frontier becomes the continuation, exactly as a spent
 			// page budget's does.
 			o.Budget.deadlineHit = true
-			return walkState{Depth: depth, Frontier: frontier, Admitted: admitted,
-				LevelBoundary: true}, nil
+			return walkState{Depth: depth, Frontier: joinLevels(frontier, carry),
+				LevelPos: from, LevelBoundary: true}, nil
 		}
-		level := make(map[model.NodeID]frontierState, len(frontier))
-		nodes := make([]model.NodeID, 0, len(frontier))
-		for _, st := range frontier {
-			level[st.Node] = st
-			nodes = append(nodes, st.Node)
-		}
-
-		rows, err := levelEdges(ctx, a, nodes, level, o, batch, admittedRel, skipOwner, skipKey)
+		rows, pos, err := readLevel(ctx, r, frontier, o, codes, from)
 		if err != nil {
 			return walkState{}, err
 		}
-		// Only the level a cursor stopped inside is skipped; every level after
-		// it is read whole.
-		skipOwner, skipKey = "", ""
-		// A level that spent the frontier budget is still emitted -- the edges
-		// it did read are facts -- but the walk stops after it rather than
-		// expanding a level it knows is incomplete.
-
-		// One sequential pass over the spooled cumulative set answers the
-		// whole level's membership questions at once; see visited.go for why
-		// a per-node probe over a forward-only spool is not affordable.
-		candidates := make([]model.NodeID, 0, len(rows))
-		for _, row := range rows {
-			candidates = append(candidates, row.neighbor)
-		}
-		if err := admitted.warm(ctx, candidates); err != nil {
+		// Naming the level is a READ and can run out of time like any other.
+		// Nothing of this level has been taken, so the page ends here with the
+		// level standing at the position the scan reached.
+		if err := o.Names.fill(ctx, r, frontier, rows); err != nil {
 			if !deadlineStop(err, o) {
 				return walkState{}, err
 			}
-			// The membership sweep reads the cumulative set off its spool and
-			// so can run out of time like any other I/O. Nothing of this level
-			// has been taken, so the page ends here with the level standing.
 			o.Budget.deadlineHit = true
-			return walkState{Depth: depth, Frontier: append(append(
-				make([]frontierState, 0, len(frontier)+len(carry)), frontier...), carry...),
-				Admitted: admitted, LevelBoundary: true}, nil
+			return walkState{Depth: depth, Frontier: joinLevels(frontier, carry),
+				LevelPos: from, LevelBoundary: true}, nil
 		}
+		rows = orderLevel(rows, o.Names)
+		seen, err := o.Retain.membership(rows)
+		if err != nil {
+			return walkState{}, err
+		}
+		// Only the level a cursor stopped inside is resumed from a position;
+		// every level after it is read whole.
+		from = EdgePos{}
 
 		next := carry
 		carry = nil
 		// How many of THIS level's rows the visitor has taken. A stop on the
 		// first of them is a stop at a level BOUNDARY however it was triggered:
-		// nothing here has advanced the keyset position, so the one the page
+		// nothing here has advanced the scan position, so the one the page
 		// carries still names the level before this one.
 		taken := 0
+		var (
+			admitted []NodeRef
+			emitted  []RelRef
+		)
+		// commit writes what this level actually took, in the order ADR-0005
+		// Decision 2 froze, before any of it can be reported: records first,
+		// then the bits that mark them. It runs on every exit from the loop
+		// body, including the ones that end the page.
+		commit := func() error {
+			return o.Retain.commitTaken(joinLevels(frontier, next), admitted, emitted)
+		}
 		for _, row := range rows {
-			if err := visit(row.owner, row.rel); err != nil {
-				if deadlineStop(err, o) {
+			if err := visit(row.owner, row.edge); err != nil {
+				stop := deadlineStop(err, o)
+				if !stop && !errors.Is(err, errStopExpansion) {
+					return walkState{}, err
+				}
+				if stop {
 					// The VISITOR ran out of time. It is not a pure predicate:
-					// the impact rollup batches the edges it is given and
-					// resolves their containing packages with its own adjacency
-					// reads, so the request deadline lands inside the visitor as
-					// often as inside the walk's own reads -- and on a real
-					// repository it landed there FIRST, which is how a walk the
-					// engine was ready to continue came back as a bare
-					// CTX_QUERY_DEADLINE with its frontier discarded. The page
-					// ends exactly as the deliberate stop below does.
+					// the rollup teed off this walk does reads of its own, so
+					// the request deadline lands inside the visitor as often as
+					// inside the walk's own scan. The page ends exactly as the
+					// deliberate stop does.
 					o.Budget.deadlineHit = true
-					stopped := make([]frontierState, 0, len(frontier)+len(next))
-					stopped = append(stopped, frontier...)
-					stopped = append(stopped, next...)
-					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
-						LevelBoundary: taken == 0}, nil
 				}
-				if errors.Is(err, errStopExpansion) {
-					// A deliberate mid-level stop. The continuation re-reads
-					// THIS level from the row just admitted and keeps the next
-					// level as far as it was built, so no edge is read twice and
-					// none is skipped.
-					stopped := make([]frontierState, 0, len(frontier)+len(next))
-					stopped = append(stopped, frontier...)
-					stopped = append(stopped, next...)
-					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
-						LevelBoundary: taken == 0}, nil
+				// A mid-level stop, and the one cut whose exact position the
+				// reader cannot report: the rows after this one were DECODED
+				// but never emitted, and the scan position names only what was
+				// decoded. The continuation therefore re-reads this level from
+				// its BEGINNING, and the cumulative emitted-relation set drops
+				// every entry an earlier page already served -- inside the
+				// scan, before it can cost a frontier byte, which is what makes
+				// the re-read terminate instead of spending the whole ceiling
+				// on edges it is about to discard.
+				//
+				// Nothing is lost and nothing is repeated; what it costs is a
+				// re-decode of the level's entries once per page that stops
+				// inside it.
+				if err := commit(); err != nil {
+					return walkState{}, err
 				}
-				return walkState{}, err
+				return walkState{Depth: depth, Frontier: joinLevels(frontier, next),
+					LevelBoundary: taken == 0}, nil
 			}
 			taken++
-			admittedRel[row.rel.ID] = true
+			emitted = append(emitted, row.edge.Rel)
 			o.Budget.edges++
 			o.Budget.pageEdges++
-			if admitted.has(row.neighbor) {
+			if seen[row.edge.Neighbour] {
 				continue
 			}
-			admitted.add(row.neighbor)
+			seen[row.edge.Neighbour] = true
+			admitted = append(admitted, row.edge.Neighbour)
 			o.Budget.visited++
 			o.Budget.pageVisited++
 			next = append(next, frontierState{
 				Depth: depth + 1,
-				Cost:  row.owner.Cost + Cost(row.rel.Kind),
-				Node:  row.neighbor,
-				Via:   row.rel.ID,
-				Route: appendRoute(row.owner.Route, row.rel.ID),
+				Cost:  row.owner.Cost + costs.of(row.edge.Kind),
+				Node:  row.edge.Neighbour,
+				Via:   row.edge.Rel,
+				Route: appendRoute(row.owner.Route, row.edge.Rel),
 			})
+		}
+		if err := commit(); err != nil {
+			return walkState{}, err
 		}
 		if o.Budget.frontierHit || o.Budget.deadlineHit {
 			// The frontier byte ceiling -- and, for a paged traversal, the
-			// query deadline -- SPILL rather than stopping: the level
-			// as far as it was read, plus the next level as far as it was
-			// built, become the continuation the caller spools. The resumed
-			// page re-reads this level from (lastOwner, lastKey), so no edge is
-			// read twice and none is skipped -- exactly the deliberate
-			// mid-level stop above, reached by a different trigger.
-			stopped := make([]frontierState, 0, len(frontier)+len(next))
-			stopped = append(stopped, frontier...)
-			stopped = append(stopped, next...)
+			// query deadline -- SPILL rather than stopping: the level as far as
+			// it was read, plus the next level as far as it was built, become
+			// the continuation. The resumed page re-reads this level from pos,
+			// so no edge is read twice and none is skipped.
+			//
 			// A deadline can trip on this level's FIRST reader check, before it
-			// collected a row. Then nothing here advanced the keyset position
-			// and the one the page carries still names the previous level's
-			// last row -- which, applied to this level, would drop every row
-			// whose owner sorts below it. The frontier-byte spill cannot reach
-			// this: its `spent > 0` guard means it always collected a row.
-			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
-				LevelBoundary: len(rows) == 0}, nil
+			// collected a row. Then nothing here advanced the scan position and
+			// the level must be resumed from where the scan stopped, which is
+			// what pos carries either way.
+			return walkState{Depth: depth, Frontier: joinLevels(frontier, next),
+				LevelPos: pos, LevelBoundary: len(rows) == 0}, nil
 		}
-		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
+		sortFrontier(next)
 		frontier = next
 	}
 	// A walk that falls out of the loop with an EMPTY frontier ran to
@@ -307,9 +302,9 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 	// caller must be told about. Reporting it is the whole of row 14 -- see
 	// DepthLimited for why no continuation is minted for it.
 	if len(frontier) > 0 {
-		return walkState{Depth: depth, Frontier: frontier, Admitted: admitted, DepthLimited: true}, nil
+		return walkState{Depth: depth, Frontier: frontier, DepthLimited: true}, nil
 	}
-	return walkState{Depth: depth, Admitted: admitted}, nil
+	return walkState{Depth: depth}, nil
 }
 
 // walkState is where a walk stopped. A page that stopped on its item limit
@@ -321,24 +316,22 @@ type walkState struct {
 	// Frontier holds that level together with the next level as far as it was
 	// built. Each record carries its own depth, so a resumed walk measures
 	// MaxDepth from the original seeds rather than from its own frontier.
-	Frontier []frontierState
-	// Admitted is the cumulative admitted-node set. Only its bounded front is
-	// in heap; the remainder is the continuation spool (visited.go).
-	Admitted *visitedSet
-	// LevelBoundary records that the walk stopped BETWEEN levels rather than
-	// inside one: no row of the level in Frontier has been taken yet. The
-	// keyset position the page last emitted belongs to the level BEFORE it, so
-	// a continuation must not carry it -- applied to the new level it would
-	// silently drop every row whose owner sorts below that node, and those rows
-	// are lost for good because their owners are already in the cumulative
-	// visited set.
 	//
-	// Two stops reach it. The deadline, which can trip on a level's first
-	// reader check. And the PAGE ITEM limit, which spends its last item on the
-	// previous level and stops the visitor on this level's very first row:
-	// measured on an owner-major fixture at page limits 1, 2, 4 and 8, a
-	// neighbours walk ended with 39 of 57 nodes visited, no truncation reason
-	// and no cursor.
+	// It is also what the retained level file holds: the walk spools it BEFORE
+	// marking its bits, so a page cut between the two writes is repaired by
+	// re-applying the file rather than losing the nodes it names.
+	Frontier []frontierState
+	// LevelPos is where this level's adjacency scan stopped: the owner and the
+	// index of the stored entry that was NOT delivered. It REPLACES the
+	// (LastOwner, LastKey) keyset position, which had to name a row in an order
+	// stitched together from several independent reads; a scan position is
+	// exact, so a resumed level delivers exactly the entries the cut one did
+	// not.
+	LevelPos EdgePos
+	// LevelBoundary records that the walk stopped BETWEEN levels rather than
+	// inside one: no row of the level in Frontier has been taken yet. It is
+	// reported because the caller discloses it, and because a page that took
+	// nothing must not be read as one that made progress.
 	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
@@ -354,232 +347,252 @@ type walkState struct {
 	DepthLimited bool
 }
 
-// edgeRow is one edge of a level attributed to the frontier node it left from,
-// so visit receives that node's own state rather than a reconstructed one.
-type edgeRow struct {
-	owner    frontierState
-	rel      model.Relation
-	neighbor model.NodeID
+// kindCosts is the walk's relation-kind cost table, indexed by the generation's
+// kind CODE. Cost(kind) takes a model.RelationKind, and asking the reader's
+// dictionary for the kind behind every decoded entry would put a map lookup on
+// the hot path of the scan; the dictionary is small and fixed for the
+// generation, so it is flattened once per walk instead.
+type kindCosts []int64
+
+func (c kindCosts) of(code KindCode) int64 {
+	if int(code) >= len(c) {
+		return 0
+	}
+	return c[code]
 }
 
-// levelEdges reads every edge leaving one frontier level and returns them in
-// the frozen (NodeID asc, RelationID asc) order. Nodes are sent in batches of
-// at most batch ids, and each batch is keyset-paged by relation id, so the
-// number of round trips grows with the frontier divided by the batch size --
-// never with the frontier itself.
-// skipOwner/skipKey, when set, are a resumed page's keyset position: every row
-// at or before (skipOwner, skipKey) in the frozen emission order belongs to an
-// earlier page and is dropped before it costs a frontier byte.
+// walkKinds resolves the request's relation kinds into this generation's codes
+// and flattens the cost table. An empty request means EVERY kind, which the
+// reader spells as a nil code slice.
 //
-// That keyset resume is only sound if what the previous read KEPT was a true
-// prefix of the frozen order -- otherwise the rows it never read that sort
-// BELOW its last admitted row are dropped here and never seen again, which is
-// a walk silently shrinking under a memory ceiling rather than spilling under
-// it. A node chunk is keyset-paged by RELATION id, not by (owner, relation),
-// so a chunk of several owners cut in the middle keeps exactly such a
-// non-prefix. Two facts make an honest cut available anyway:
+// A requested kind the generation's dictionary does not carry contributes no
+// code: it selects nothing, which is the honest answer for a kind no relation
+// in this generation has. It is NOT an error -- a generation built before an
+// analyzer existed simply has none of its edges -- and it is not silently
+// widened to "every kind" either, which is what dropping the filter would do.
+func walkKinds(r GraphReader, kinds []model.RelationKind) ([]KindCode, kindCosts, error) {
+	table := r.Kinds()
+	if table == nil {
+		return nil, nil, internalErr("graph: the pinned generation has no relation-kind dictionary")
+	}
+	costs := make(kindCosts, table.Len()+1)
+	for code := 1; code <= table.Len(); code++ {
+		kind, ok := table.Kind(KindCode(code))
+		if !ok {
+			continue
+		}
+		costs[code] = Cost(kind)
+	}
+	if len(kinds) == 0 {
+		return nil, costs, nil
+	}
+	codes := make([]KindCode, 0, len(kinds))
+	for _, kind := range kinds {
+		code, ok := table.Code(kind)
+		if !ok {
+			continue
+		}
+		codes = append(codes, code)
+	}
+	if len(codes) == 0 {
+		// Every requested kind is absent from this generation. Handing the
+		// reader an EMPTY slice would mean "no filter" and walk the whole
+		// graph, so the walk is short-circuited with a filter that selects
+		// nothing instead.
+		return nil, costs, errNoSuchKinds
+	}
+	slices.Sort(codes)
+	return slices.Compact(codes), costs, nil
+}
+
+// errNoSuchKinds is the internal signal that the request named only relation
+// kinds this generation does not carry. expand's callers turn it into an empty
+// walk, never into a failure: an answer of "nothing" is correct there.
+var errNoSuchKinds = errors.New("graph: no relation kind of this request is present in the generation")
+
+// seedFrontier resolves the request's seeds to surrogates and builds depth 0.
 //
-//   - CHUNK boundaries are frozen-order boundaries. `nodes` is ascending and
-//     chunks are contiguous, so every row a chunk collects is owned by one of
-//     its own nodes: an edge with both ends on the frontier is attributed to
-//     the LOWER id, which lies in the earlier chunk and is collected there.
-//     A cut after a completed chunk is therefore a prefix.
-//   - a SINGLE-node chunk has one owner, so relation order is the frozen order
-//     within it and a mid-chunk cut is a prefix too.
+// Seeds enter in request order, de-duplicated, then sorted, so two requests
+// naming the same seeds differently answer identically. A seed the generation
+// cannot see resolves to 0: it has no adjacency and no bit, so it expands to
+// nothing -- exactly what an unknown node did before, which is why it is still
+// COUNTED against the visited budget and the disclosed visited_count.
+func seedFrontier(ctx context.Context, r GraphReader, seeds []model.NodeID,
+	o expandOptions) ([]frontierState, error) {
+	ids := dedupeNodes(seeds)
+	refs, err := r.Resolve(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) != len(ids) {
+		return nil, internalErr("graph: the reader resolved a different number of seeds than it was given")
+	}
+	frontier := make([]frontierState, 0, len(refs))
+	for _, ref := range refs {
+		o.Budget.visited++
+		o.Budget.pageVisited++
+		if ref == 0 {
+			continue
+		}
+		frontier = append(frontier, frontierState{Node: ref})
+	}
+	sortFrontier(frontier)
+	return frontier, nil
+}
+
+// sortFrontier puts a level into ascending surrogate order, which is what
+// GraphReader.Neighbours requires of the refs it is given and what makes the
+// bitset's page cache walk forward.
+func sortFrontier(level []frontierState) {
+	sort.Slice(level, func(i, j int) bool { return level[i].Node < level[j].Node })
+}
+
+// levelRefs is a level's node surrogates, ascending and unique.
+func levelRefs(level []frontierState) []NodeRef {
+	refs := make([]NodeRef, 0, len(level))
+	for _, fs := range level {
+		refs = append(refs, fs.Node)
+	}
+	slices.Sort(refs)
+	return slices.Compact(refs)
+}
+
+// joinLevels concatenates the level being expanded with the next level as far
+// as it was built. Both travel as one continuation: each record carries its own
+// depth, so the resumed walk splits them again.
+func joinLevels(a, b []frontierState) []frontierState {
+	out := make([]frontierState, 0, len(a)+len(b))
+	return append(append(out, a...), b...)
+}
+
+// readLevel reads one frontier level's edges in ONE GraphReader.Neighbours scan
+// over the level's ascending surrogates, starting after from.
 //
-// So the ceiling cuts only at those two places. When it binds inside a chunk of
-// several owners, that chunk's rows are rolled back -- rows, bytes and the
-// collected-relation set alike -- and its node range is re-read one node at a
-// time until the ceiling binds again, which it must, on a boundary that is now
-// exact. The re-read costs round trips only for the one chunk a spill lands in,
-// and only for as many of its nodes as the remaining budget holds.
-func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level map[model.NodeID]frontierState,
-	o expandOptions, batch int, admittedRel map[model.RelationID]bool,
-	skipOwner model.NodeID, skipKey model.RelationID) ([]edgeRow, error) {
+// It returns the rows it collected and the position to resume at. The scan is
+// cut by the frontier byte ceiling and by the deadline, and both cuts are
+// EXACT: the reader reports the position of the entry it did not deliver, so
+// the level resumes there and neither loses an entry nor repeats one. That is
+// what retires the old keyset resume, whose soundness depended on the rows kept
+// being a true prefix of an order stitched from independently paged reads --
+// the property that forced a chunk to be rolled back and re-read one node at a
+// time whenever the ceiling bound in the middle of it.
+func readLevel(ctx context.Context, r GraphReader, level []frontierState, o expandOptions,
+	codes []KindCode, from EdgePos) ([]edgeRow, EdgePos, error) {
+	owners := make(map[NodeRef]frontierState, len(level))
+	for _, fs := range level {
+		// The level is ascending, so the FIRST record for a surrogate wins; a
+		// level never holds one twice, because admission is what puts a node
+		// on it and a node is admitted once.
+		if _, ok := owners[fs.Node]; !ok {
+			owners[fs.Node] = fs
+		}
+	}
 	var (
 		rows  []edgeRow
 		spent int64
+		seen  int
 	)
-	// The graph never asks for more rows than the wire may serve. The keyset
-	// loop treats a short page as "read on", so asking for the node-chunk size
-	// would cost nothing but an extra round trip -- and it would make the
-	// storage layer record a page-bound resolution on EVERY traversal answer,
-	// turning a disclosure that exists for real news into noise. It is derived
-	// from the ORIGINAL batch, so the single-node re-read above keeps the same
-	// wire page and does not turn into one round trip per edge.
-	rowLimit := batch
-	if rowLimit > model.MaxPageItems {
-		rowLimit = model.MaxPageItems
-	}
-	collected := map[model.RelationID]bool{}
-
-	// readChunk reads one contiguous node range to exhaustion, appending its
-	// rows. It reports whether the read was CUT short -- by the frontier byte
-	// ceiling or by the deadline, which the budget flags tell apart -- rather
-	// than having reached the end of the range's edges.
-	readChunk := func(chunk []model.NodeID) (bool, error) {
-		after := model.RelationID("")
-		for {
+	emitted := o.Retain.emitted
+	pos, err := r.Neighbours(ctx, levelRefs(level), o.Direction, codes, from, func(e Edge) error {
+		if seen%edgeScanCheckEvery == 0 {
 			if err := checkWalk(ctx, o.Budget); err != nil {
 				if !deadlineStop(err, o) {
-					return false, err
+					return err
 				}
 				// The page ran out of time mid-level. The rows read so far are
-				// facts and are kept when the cut is on an exact boundary; the
-				// caller stops after this level and mints a continuation, and
-				// the resumed page re-reads the level from the keyset position,
-				// so no edge is lost and none is read twice.
+				// facts; the caller stops after this level and mints a
+				// continuation from the position this stop reports.
 				o.Budget.deadlineHit = true
-				return true, nil
+				return ErrStopScan
 			}
-			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, rowLimit)
-			if err != nil {
-				if !deadlineStop(err, o) {
-					return false, err
-				}
-				// The deadline fell INSIDE the read rather than on the check
-				// above it: the reader returned the context's own error and no
-				// rows. Identical outcome to the check -- the rows this chunk
-				// already appended are facts, the level stops here and the
-				// caller mints a continuation from the keyset position -- and
-				// the read that was cut short returned nothing, so nothing is
-				// lost by not counting it.
-				o.Budget.deadlineHit = true
-				return true, nil
-			}
-			for _, rel := range page {
-				if admittedRel[rel.ID] || collected[rel.ID] {
-					continue
-				}
-				owner, neighbor, ok := attribute(rel, o.Direction, level)
-				if !ok {
-					// The reader returned an edge touching no frontier node.
-					// Dropping it is the only honest answer -- attributing it
-					// to an arbitrary node would invent a path.
-					continue
-				}
-				row := edgeRow{owner: owner, rel: rel, neighbor: neighbor}
-				if skipKey != "" && (row.owner.Node < skipOwner ||
-					(row.owner.Node == skipOwner && row.rel.ID <= skipKey)) {
-					continue
-				}
-				if spent > 0 && spent+edgeRowBytes(row) > o.FrontierBytes {
-					// The level does not fit in the configured frontier budget:
-					// spill what was read and let the continuation carry on,
-					// rather than accumulating an unbounded hub in memory under
-					// a bound the configuration says exists.
-					//
-					// `spent > 0` is what makes that terminate. A budget smaller
-					// than ONE edge row would otherwise trip here before any row
-					// was admitted, and since the resumed page re-reads the level
-					// from the same keyset position it would trip at the same row
-					// again: a cursor chain that returns no edge and never ends.
-					// Every level-read therefore admits at least one edge --
-					// exceeding the byte bound by at most one row -- which is the
-					// same trade every other per-page budget here makes.
-					o.Budget.frontierHit = true
-					return true, nil
-				}
-				spent += edgeRowBytes(row)
-				collected[rel.ID] = true
-				rows = append(rows, row)
-			}
-			if len(page) == 0 {
-				break
-			}
-			// A short page is NOT exhaustion: Adjacency.Edges promises "at
-			// most limit rows", and the shipped reader clamps any limit above
-			// model.MaxPageItems down to it, so a full frontier chunk returns
-			// fewer rows than asked for on every page. Only an EMPTY page ends
-			// the keyset walk; the advance below is what makes the next one
-			// reachable.
-			after = page[len(page)-1].ID
 		}
-		return false, nil
-	}
-	// rollback undoes an inexact cut: the rows, the bytes AND the collected
-	// relation ids, which the re-read must be allowed to collect again or it
-	// would skip them as duplicates and lose exactly what this fix restores.
-	rollback := func(markRows int, markSpent int64) {
-		for _, r := range rows[markRows:] {
-			delete(collected, r.rel.ID)
-		}
-		rows, spent = rows[:markRows], markSpent
-	}
-
-chunks:
-	for start := 0; start < len(nodes); start += batch {
-		end := start + batch
-		if end > len(nodes) {
-			end = len(nodes)
-		}
-		markRows, markSpent := len(rows), spent
-		cut, err := readChunk(nodes[start:end])
+		seen++
+		// Already served by an earlier page or an earlier level of this walk.
+		// It is dropped HERE, before it costs a frontier byte, so a level
+		// re-read after a mid-level stop makes progress rather than spending
+		// its whole ceiling on entries it would discard afterwards.
+		done, err := emitted.test(uint64(e.Rel))
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if !cut {
-			continue
+		if done {
+			return nil
 		}
-		if end-start == 1 {
-			// One owner: relation order is the frozen order, so the cut is a
-			// prefix and the keyset position resumes it exactly.
-			break chunks
+		owner, ok := owners[e.Owner]
+		if !ok {
+			// The reader delivered an entry for a node that is not on this
+			// level. Dropping it is the only honest answer -- attributing it to
+			// an arbitrary node would invent a path.
+			return nil
 		}
-		rollback(markRows, markSpent)
-		if o.Budget.deadlineHit {
-			// Out of time: there is none to spend re-reading. Dropping this
-			// chunk's partial rows costs the next page a re-read of the range
-			// and loses nothing -- a level whose every row was rolled back
-			// carries no keyset position at all (walkState.LevelBoundary).
-			break chunks
+		if spent > 0 && spent+edgeRowBytes > o.FrontierBytes {
+			// The level does not fit in the configured frontier budget: spill
+			// what was read and let the continuation carry on, rather than
+			// accumulating an unbounded hub in memory under a bound the
+			// configuration says exists.
+			//
+			// `spent > 0` is what makes that terminate. A budget smaller than
+			// ONE row would otherwise trip before any row was collected, and
+			// the resumed page would trip at the same entry again: a cursor
+			// chain that returns no edge and never ends. Every level therefore
+			// collects at least one row -- exceeding the byte bound by at most
+			// one -- which is the trade every other per-page budget here makes.
+			o.Budget.frontierHit = true
+			return ErrStopScan
 		}
-		// The ceiling bound inside a chunk of several owners. Re-read the range
-		// one owner at a time so it binds on an exact boundary instead.
-		o.Budget.frontierHit = false
-		for i := start; i < end; i++ {
-			if cut, err = readChunk(nodes[i : i+1]); err != nil {
-				return nil, err
-			}
-			if cut {
-				break chunks
-			}
-		}
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].owner.Node != rows[j].owner.Node {
-			return rows[i].owner.Node < rows[j].owner.Node
-		}
-		return rows[i].rel.ID < rows[j].rel.ID
+		spent += edgeRowBytes
+		rows = append(rows, edgeRow{owner: owner, edge: e})
+		return nil
 	})
-	return rows, nil
+	if err != nil {
+		if !deadlineStop(err, o) {
+			return nil, EdgePos{}, err
+		}
+		// The deadline fell INSIDE the read rather than on the check above it:
+		// the reader returned the context's own error. The rows already
+		// collected are facts, and the position the reader reported is where
+		// the level resumes.
+		o.Budget.deadlineHit = true
+	}
+	return rows, pos, nil
 }
 
-// attribute decides which end of an edge is the frontier node that reached it.
-// Under DirectionBoth an edge may have both ends on the frontier; the lower
-// NodeID owns it, so the emission order is a function of the facts alone.
-func attribute(rel model.Relation, dir model.Direction,
-	level map[model.NodeID]frontierState) (frontierState, model.NodeID, bool) {
-	from, fromOK := level[rel.From]
-	to, toOK := level[rel.To]
-	switch dir {
-	case model.DirectionOutgoing:
-		return from, rel.To, fromOK
-	case model.DirectionIncoming:
-		return to, rel.From, toOK
-	}
-	switch {
-	case fromOK && toOK:
-		if rel.From <= rel.To {
-			return from, rel.To, true
+// orderLevel puts a level's rows into the frozen emission order and removes the
+// duplicate an undirected read produces.
+//
+// The order is (canonical owner asc, canonical relation asc) and the dedup
+// keeps the LOWER CANONICAL owner, both exactly as they were before the walk
+// carried surrogates. That is not a detail: surrogate order is a property of
+// the BUILD -- a fresh index and a delta-built index of the same tree assign
+// different ones -- so ordering or deduplicating on refs would make which route
+// survives, and therefore an entry's parent, depth and reasons, depend on how
+// the index was produced. ADR-0005 Decision 2 exists to prevent exactly that.
+//
+// Under DirectionBoth an edge with both ends on the level is delivered twice,
+// once from each owner's list. It is ONE edge: keeping both would count it
+// twice in edge_count and serve it twice.
+func orderLevel(rows []edgeRow, names *levelNames) []edgeRow {
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if ao, bo := names.node(a.owner.Node), names.node(b.owner.Node); ao != bo {
+			return ao < bo
 		}
-		return to, rel.From, true
-	case fromOK:
-		return from, rel.To, true
-	case toOK:
-		return to, rel.From, true
+		return names.rel(a.edge.Rel) < names.rel(b.edge.Rel)
+	})
+	// The two deliveries of one undirected edge sit under DIFFERENT owners, so
+	// they are not adjacent in this order and a run-length dedup cannot see
+	// them. The set is keyed on the relation surrogate and is sized by the
+	// level, which Limits.FrontierBytes already bounds.
+	kept := make(map[RelRef]struct{}, len(rows))
+	out := rows[:0]
+	for _, row := range rows {
+		if _, dup := kept[row.edge.Rel]; dup {
+			continue
+		}
+		kept[row.edge.Rel] = struct{}{}
+		out = append(out, row)
 	}
-	return frontierState{}, "", false
+	return out
 }
 
 // checkWalk fails the walk on the two conditions that are not budgets of
@@ -765,14 +778,24 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
 	}
-	// The cumulative admitted-node set of THIS walk, append-only state in a
-	// retained directory (visitedstore.go), exactly as impact and the package
-	// rollup keep theirs. A resumed page reopens the one its predecessor left;
-	// a first page creates one only if it actually mints a continuation, which
-	// is why this is nil here and filled in at the mint below: a neighbours
-	// query that fits one page -- the common one -- would otherwise pay a
-	// fixed-size filter file and a manifest for state nothing will ever read.
+	// The retained state of THIS walk, exactly as impact and the package rollup
+	// keep theirs: the frontier the walk commits level by level, the cumulative
+	// admitted-node bitset and the cumulative emitted-relation bitset. A
+	// resumed page reopens the one its predecessor left.
+	//
+	// It is opened UNCONDITIONALLY now, where a first page used to create one
+	// only if it actually minted a continuation. The bitset IS the membership
+	// set the walk tests against, so a walk with nowhere to keep it is not a
+	// cheaper walk, it is a wrong one. What the one-page query pays for it is a
+	// directory, a sparse file whose allocated blocks are only the regions the
+	// walk touched, and a manifest -- and it is discarded below when no cursor
+	// is minted.
 	retain := resumeRetained(resume)
+	if retain == nil {
+		if retain, err = e.openWalkState(); err != nil {
+			return model.GraphResult{}, err
+		}
+	}
 	// Discarded AFTER the continuation below has taken it: a page that mints a
 	// cursor detaches the directory, and this then finds nothing to remove.
 	defer func() {
@@ -783,14 +806,21 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	var (
 		relations  []model.Relation
 		walkReason string
-		lastOwner  model.NodeID
-		lastKey    model.RelationID
 	)
+	// names is refilled by the walk before each level's edges are delivered, so
+	// this page names the edges it serves from one batched read per level
+	// instead of one per edge.
+	names := &levelNames{}
+	reader, err := e.consumerReader()
+	if err != nil {
+		return model.GraphResult{}, err
+	}
+	kindByCode := kindNames(reader)
 	endpoints := map[model.NodeID]bool{}
 	for _, s := range req.Start {
 		endpoints[s] = true
 	}
-	visit := func(owner frontierState, rel model.Relation) error {
+	visit := func(owner frontierState, edge Edge) error {
 		// The visited and edge budgets are compared against THIS page's spend:
 		// they are work budgets that end a page, not ceilings that end a walk.
 		// Exceeded is strictly greater, so the test is on the spend this row
@@ -806,15 +836,27 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			walkReason = reasonPageFull
 			return errStopExpansion
 		}
+		from, to := edgeEnds(edge)
+		rel := model.Relation{
+			ID:   names.rel(edge.Rel),
+			From: names.node(from),
+			To:   names.node(to),
+			Kind: kindAt(kindByCode, edge.Kind),
+		}
+		if rel.ID == "" || rel.From == "" || rel.To == "" {
+			// The generation carries an adjacency entry it publishes no
+			// canonical id for one end of. It cannot be served -- a relation
+			// with an empty endpoint fails its own validation -- and inventing
+			// an id would publish a fact nothing backs. The edge is still
+			// COUNTED: the walk read it.
+			return nil
+		}
 		relations = append(relations, rel)
-		// The keyset position a continuation resumes from: the owner names the
-		// frontier node whose chunk the row came from, the relation id the row.
-		lastOwner, lastKey = owner.Node, rel.ID
 		endpoints[rel.From] = true
 		endpoints[rel.To] = true
 		return nil
 	}
-	state, err := expand(ctx, e.adjacency, req.Start, expandOptions{
+	state, err := expand(ctx, reader, req.Start, expandOptions{
 		Direction:     dir,
 		Kinds:         kinds,
 		MaxDepth:      maxDepth,
@@ -823,6 +865,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		FrontierBytes: e.limits.FrontierBytes,
 		DeadlineStops: true,
 		Resume:        resume,
+		Retain:        retain,
+		Names:         names,
 	}, visit)
 	if err != nil {
 		return model.GraphResult{}, err
@@ -887,32 +931,18 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// The depth bound is the single exception, and DepthLimited on walkState
 	// carries the reason: it is part of the query hash the cursor is bound to,
 	// so a continuation minted for it could only resume a walk already past it.
-	if state.LevelBoundary {
-		// The stop was between levels: the emitted keyset position belongs to
-		// the level already finished, so the continuation starts the frontier's
-		// own level from its beginning.
-		lastOwner, lastKey = "", ""
-	}
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
-		// The cumulative set is NOT materialized into a slice here: only the
-		// nodes THIS page admitted are, and every earlier page's run stays
-		// where that page wrote it. The resumed frontier is deliberately left
-		// out -- every node that ever reaches a frontier was added by the page
-		// that discovered it, so it is already in that page's own run.
-		if retain == nil {
-			if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
-				return model.GraphResult{}, err
-			}
-		}
+		// Nothing of the walk is materialized here. The frontier is already in
+		// the retained level file, committed as each level closed, and the
+		// admitted nodes are already bits beside it; the token names the
+		// directory rather than a copy of what is in it.
 		nextCursor, err = e.nextTraversalCursor(finish, b, continuation{
 			Endpoint:  endpoint,
 			QueryHash: queryHash,
 			Depth:     state.Depth,
-			LastOwner: lastOwner,
-			LastKey:   lastKey,
+			LevelPos:  state.LevelPos,
 			Frontier:  state.Frontier,
-			Visited:   state.Admitted.addedNodes(),
 			Retain:    retain,
 		})
 		if err != nil {
@@ -1021,3 +1051,111 @@ const (
 	// state or diagnostic code is introduced for pending work.
 	reasonUnitsDeferred = "units_deferred"
 )
+
+// ascending sorts a set of surrogates and removes its duplicates. It is the
+// precondition every cumulative-set call has -- the page cache is walked
+// forward, so an unordered batch would touch one page many times -- and it is
+// applied here rather than assumed of the caller, because an unordered batch
+// would merely be slow and nothing downstream would report it.
+func ascending[T NodeRef | RelRef](refs []T) []T {
+	slices.Sort(refs)
+	return slices.Compact(refs)
+}
+
+// fill resolves one level's canonical ids: the owners and the nodes their edges
+// reach, and the relations those edges are plus the relations on the routes
+// that reached the owners.
+//
+// It is TWO batched primary-key reads for the whole level, whatever its size --
+// ADR-0005 Decision 2's "one batched read per committed level". The route
+// relations are included because a ranking record carries its whole path in
+// canonical form, and every element of a route is the admitting edge of some
+// earlier level: resolving them here, deduplicated against the level's own
+// edges, is what avoids either a per-record round trip or a map of canonical
+// relation ids that grows with the walk.
+func (n *levelNames) fill(ctx context.Context, r GraphReader, level []frontierState, rows []edgeRow) error {
+	if n == nil {
+		return nil
+	}
+	nodes := make([]NodeRef, 0, len(level)+len(rows))
+	rels := make([]RelRef, 0, len(rows)+len(level))
+	for _, fs := range level {
+		nodes = append(nodes, fs.Node)
+		if fs.Via != 0 {
+			rels = append(rels, fs.Via)
+		}
+		rels = append(rels, fs.Route...)
+	}
+	for _, row := range rows {
+		nodes = append(nodes, row.edge.Neighbour)
+		rels = append(rels, row.edge.Rel)
+	}
+	nodes, rels = ascending(nodes), ascending(rels)
+	nodeIDs, err := r.NodeIDs(ctx, nodes)
+	if err != nil {
+		return err
+	}
+	if len(nodeIDs) != len(nodes) {
+		return internalErr("graph: the reader named a different number of nodes than it was given")
+	}
+	relIDs, err := r.RelationIDs(ctx, rels)
+	if err != nil {
+		return err
+	}
+	if len(relIDs) != len(rels) {
+		return internalErr("graph: the reader named a different number of relations than it was given")
+	}
+	// Rebuilt, never extended: a map kept across levels would grow with the
+	// walk, which is the repository-sized heap structure the surrogate walk
+	// exists to remove.
+	n.nodes = make(map[NodeRef]model.NodeID, len(nodes))
+	n.rels = make(map[RelRef]model.RelationID, len(rels))
+	for i, ref := range nodes {
+		n.nodes[ref] = nodeIDs[i]
+	}
+	for i, ref := range rels {
+		n.rels[ref] = relIDs[i]
+	}
+	return nil
+}
+
+// impactChunkRefs splits a batch of surrogates into reads the storage layer
+// can serve in one statement, the same bound impactChunkNodes applies to
+// canonical ids. The batch is already ascending, so the chunks are contiguous
+// ranges and the side array's parts are touched in order.
+func impactChunkRefs[T NodeRef | RelRef](refs []T) [][]T {
+	out := make([][]T, 0, len(refs)/adjacencyBatch+1)
+	for start := 0; start < len(refs); start += adjacencyBatch {
+		end := min(start+adjacencyBatch, len(refs))
+		out = append(out, refs[start:end])
+	}
+	return out
+}
+
+// kindNames flattens the generation's relation-kind dictionary into a slice
+// indexed by kind code. Codes are dense from 1 and the dictionary is small and
+// fixed for the generation, so a walk resolves it once instead of asking the
+// table for the kind behind every decoded entry.
+func kindNames(r GraphReader) []model.RelationKind {
+	table := r.Kinds()
+	if table == nil {
+		return nil
+	}
+	out := make([]model.RelationKind, table.Len()+1)
+	for code := 1; code <= table.Len(); code++ {
+		if kind, ok := table.Kind(KindCode(code)); ok {
+			out[code] = kind
+		}
+	}
+	return out
+}
+
+// kindAt names the relation kind behind one generation kind code. An
+// out-of-range code names nothing, which is how a served relation whose kind
+// the generation does not publish is dropped rather than given a guessed one.
+func kindAt(kinds []model.RelationKind, code KindCode) model.RelationKind {
+	if int(code) >= len(kinds) {
+		return ""
+	}
+	return kinds[code]
+}

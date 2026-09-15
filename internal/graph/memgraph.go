@@ -338,7 +338,7 @@ func (g *MemoryGraph) ownerList(ref NodeRef, direction model.Direction) []Edge {
 // than assumed because a caller that passes an unsorted or repeated frontier
 // gets a silently wrong page -- an edge delivered twice, or one skipped by the
 // resume position -- instead of an error.
-func ascendingRefs(refs []NodeRef) error {
+func ascendingRefs[T ~uint64](refs []T) error {
 	for i := 1; i < len(refs); i++ {
 		if refs[i] <= refs[i-1] {
 			return &model.Error{Code: model.CodeArgumentInvalid,

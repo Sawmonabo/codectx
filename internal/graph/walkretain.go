@@ -2,6 +2,7 @@ package graph
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -53,6 +54,18 @@ import (
 const (
 	retainEntriesFile = "entries"
 	retainPairsFile   = "pairs"
+	// retainLevelFile holds the LAST COMMITTED frontier level, whole, replaced
+	// atomically each time a level commits. It is the frontier carrier, not a
+	// log: a walk only ever resumes from the newest level, and a file that grew
+	// with the walk would make a page's write a function of the walk behind it.
+	//
+	// It is written BEFORE that level's bits are set, which is the whole of
+	// ADR-0005 Decision 2's page atomicity. Bits marked without their records
+	// would leave nodes admitted that nothing can expand -- they are lost, and
+	// the answer silently shrinks. Records written without their bits cost a
+	// re-application, which is idempotent because the bitset counts bit
+	// TRANSITIONS rather than set calls.
+	retainLevelFile = "level.recs"
 )
 
 // retainedWalk is one request's handle on that directory.
@@ -64,10 +77,17 @@ type retainedWalk struct {
 	// it GREW by, which is what keeps the shared budget from holding two copies
 	// of the cumulative state at every page boundary (cursor.go retain).
 	prevID string
-	// visited is the walk's cumulative admitted-node set, append-only
-	// (visitedstore.go). It lives here because this directory is already the
-	// state a walk continuation carries forward by rename.
-	visited *visitedStore
+	// bits is the walk's cumulative admitted-node set: a bitset over the
+	// generation's surrogate range (bitset.go). It lives here because this
+	// directory is already the state a walk continuation carries forward by
+	// rename, and because the LEVEL file beside it is what makes a page cut
+	// between the two writes recoverable.
+	bits *pagedBitset
+	// emitted is the walk's cumulative ADMITTED-RELATION set, the same
+	// structure over relation surrogates. It is what keeps one edge from being
+	// counted or served twice when a cycle, an overlapping level or a
+	// DirectionBoth edge brings the walk back to it.
+	emitted *pagedBitset
 	// owned marks a directory this request created and must remove itself if
 	// nothing adopts it. A directory REOPENED from the store is owned by the
 	// store, and is released through the consumed continuation instead --
@@ -78,9 +98,10 @@ type retainedWalk struct {
 	pairs   *retainFile
 }
 
-// openRetainedWalk creates a fresh retained input under parent. filterBytes is
-// the budget the cumulative set's membership summary is frozen at.
-func openRetainedWalk(parent string, filterBytes int64, probe *heapProbe) (*retainedWalk, error) {
+// openRetainedWalk creates a fresh retained input under parent. maxNode is the
+// pinned generation's largest node surrogate, which sizes the bitset's ADDRESS
+// space; nothing is allocated for it.
+func openRetainedWalk(parent string, maxNode NodeRef, probe *heapProbe) (*retainedWalk, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
 	}
@@ -93,7 +114,7 @@ func openRetainedWalk(parent string, filterBytes int64, probe *heapProbe) (*reta
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	if w.visited, err = openVisitedStore(dir, filterBytes, probe); err != nil {
+	if err = w.openSets(maxNode, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
@@ -102,17 +123,29 @@ func openRetainedWalk(parent string, filterBytes int64, probe *heapProbe) (*reta
 
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
-func reopenRetainedWalk(dir, prevID string, probe *heapProbe) (*retainedWalk, error) {
+func reopenRetainedWalk(dir, prevID string, maxNode NodeRef, probe *heapProbe) (*retainedWalk, error) {
 	w := &retainedWalk{dir: dir, prevID: prevID}
 	if err := w.open(); err != nil {
 		return nil, err
 	}
-	var err error
-	if w.visited, err = reopenVisitedStore(dir, probe); err != nil {
+	if err := w.openSets(maxNode, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
 	return w, nil
+}
+
+// openSets opens the two cumulative sets this directory holds. The relation set
+// is opened UNBOUNDED because the frozen reader port publishes no maximum
+// relation surrogate; the cursor's generation fence is what keeps a foreign
+// surrogate out of it.
+func (w *retainedWalk) openSets(maxNode NodeRef, probe *heapProbe) error {
+	var err error
+	if w.bits, err = openBitset(w.dir, bitsetNodeFile, maxNode, probe); err != nil {
+		return err
+	}
+	w.emitted, err = openBitset(w.dir, bitsetRelFile, 0, probe)
+	return err
 }
 
 func (w *retainedWalk) open() error {
@@ -193,10 +226,15 @@ func (w *retainedWalk) discard() {
 
 func (w *retainedWalk) close() error {
 	var first error
-	if w.visited != nil {
-		first = w.visited.close()
-		w.visited = nil
+	for _, b := range []*pagedBitset{w.bits, w.emitted} {
+		if b == nil {
+			continue
+		}
+		if err := b.close(); err != nil && first == nil {
+			first = err
+		}
 	}
+	w.bits, w.emitted = nil, nil
 	for _, f := range []*retainFile{w.entries, w.pairs} {
 		if f == nil {
 			continue
@@ -439,4 +477,194 @@ func (w *retainedWalk) eachFolded(add func(impactRecord) error) error {
 		}
 		return add(r)
 	})
+}
+
+// The frontier level file. Its records are SURROGATES encoded as uvarints,
+// which is what makes a spooled level cost bytes rather than 64-hex ids: a
+// level of 100 000 nodes at depth 3 is a few hundred kilobytes here and was
+// megabytes before.
+
+// spoolLevel replaces the retained frontier with level, whole and atomically.
+//
+// It is called BEFORE the level's bits are set. A page cut between the two
+// writes therefore leaves a level whose records are on disk and whose bits are
+// not, and adoptLevel + pagedBitset.set repair exactly that: the records come
+// back as the frontier and re-applying their refs sets the missing bits without
+// counting the ones that were already there.
+//
+// Atomically, because a torn level file is a frontier that lost its tail: those
+// nodes are marked admitted by bits an earlier attempt may already have set,
+// so nothing would ever expand them again.
+func (w *retainedWalk) spoolLevel(level []frontierState) error {
+	buf := make([]byte, 0, 32*len(level)+binary.MaxVarintLen64)
+	buf = binary.AppendUvarint(buf, uint64(len(level)))
+	for _, fs := range level {
+		if fs.Depth < 0 || fs.Cost < 0 {
+			return internalErr("graph: a frontier record carries a negative depth or cost")
+		}
+		buf = binary.AppendUvarint(buf, uint64(fs.Depth))
+		buf = binary.AppendUvarint(buf, uint64(fs.Cost))
+		buf = binary.AppendUvarint(buf, uint64(fs.Node))
+		buf = binary.AppendUvarint(buf, uint64(fs.Via))
+		buf = binary.AppendUvarint(buf, uint64(len(fs.Route)))
+		for _, r := range fs.Route {
+			buf = binary.AppendUvarint(buf, uint64(r))
+		}
+	}
+	tmp := filepath.Join(w.dir, retainLevelFile+".tmp")
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		return internalErr("graph: spooling the frontier level: " + err.Error())
+	}
+	if err := os.Rename(tmp, filepath.Join(w.dir, retainLevelFile)); err != nil {
+		_ = os.Remove(tmp)
+		return internalErr("graph: spooling the frontier level: " + err.Error())
+	}
+	return nil
+}
+
+// adoptLevel reads the last committed frontier back. A missing file is a walk
+// that has committed no level yet -- the seeds' own level -- and is the empty
+// frontier, not an error.
+func (w *retainedWalk) adoptLevel() ([]frontierState, error) {
+	raw, err := os.ReadFile(filepath.Join(w.dir, retainLevelFile))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, internalErr("graph: reading the spooled frontier level: " + err.Error())
+	}
+	rd := bytes.NewReader(raw)
+	n, err := binary.ReadUvarint(rd)
+	if err != nil {
+		return nil, retainCorrupt(err)
+	}
+	// The count is a LENGTH read off disk, so it never sizes an allocation on
+	// its own: a corrupt or tampered header would otherwise reserve gigabytes
+	// before the first record failed to decode. append grows it against the
+	// bytes that are actually there.
+	level := make([]frontierState, 0, min(uint64(rd.Len()/4)+1, n))
+	for i := uint64(0); i < n; i++ {
+		var fs frontierState
+		fields := [4]uint64{}
+		for j := range fields {
+			if fields[j], err = binary.ReadUvarint(rd); err != nil {
+				return nil, retainCorrupt(err)
+			}
+		}
+		fs.Depth, fs.Cost = int(fields[0]), int64(fields[1])
+		fs.Node, fs.Via = NodeRef(fields[2]), RelRef(fields[3])
+		routeLen, err := binary.ReadUvarint(rd)
+		if err != nil {
+			return nil, retainCorrupt(err)
+		}
+		if routeLen > model.MaxRelationsPerPath+1 {
+			return nil, retainCorrupt(fmt.Errorf("a spooled route is longer than a servable path"))
+		}
+		fs.Route = make([]RelRef, 0, routeLen)
+		for j := uint64(0); j < routeLen; j++ {
+			r, err := binary.ReadUvarint(rd)
+			if err != nil {
+				return nil, retainCorrupt(err)
+			}
+			fs.Route = append(fs.Route, RelRef(r))
+		}
+		level = append(level, fs)
+	}
+	return level, nil
+}
+
+// commitTaken is what one level actually took, written in the order ADR-0005
+// Decision 2 froze so that no caller can take the two writes in the other
+// order: the frontier RECORDS first, then the relations this level emitted,
+// then the nodes it admitted.
+//
+// Records before bits, because bits without their records leave nodes marked
+// admitted that nothing can ever expand -- they are lost, and the answer
+// silently shrinks. Records without their bits cost only a re-application,
+// which is idempotent because the bitset counts bit transitions.
+//
+// Emitted relations before admitted nodes, for the same asymmetry one level
+// down: a page cut between the two resumes with the edges already dropped and
+// the nodes re-admitted from the spooled records, where the other order would
+// serve those edges a second time.
+func (w *retainedWalk) commitTaken(level []frontierState, admitted []NodeRef, emitted []RelRef) error {
+	if err := w.spoolLevel(level); err != nil {
+		return err
+	}
+	if _, err := bitsetSet(w.emitted, ascending(emitted)); err != nil {
+		return err
+	}
+	_, err := bitsetSet(w.bits, ascending(admitted))
+	return err
+}
+
+// commitLevel is the seed level's commit: it has admitted nodes and no emitted
+// edges, because nothing has been read yet.
+func (w *retainedWalk) commitLevel(level []frontierState, refs []NodeRef) error {
+	return w.commitTaken(level, refs, nil)
+}
+
+// adopt re-applies the last spooled level's bits and returns it as the frontier
+// a continuation resumes from. It is the repair half of the commit order: a
+// page cut between the records and the bits left bits missing, and re-applying
+// every record's surrogate restores them without counting one twice.
+func (w *retainedWalk) adopt() ([]frontierState, error) {
+	level, err := w.adoptLevel()
+	if err != nil {
+		return nil, err
+	}
+	refs := make([]NodeRef, 0, len(level))
+	for _, fs := range level {
+		refs = append(refs, fs.Node)
+	}
+	if _, err := bitsetSet(w.bits, ascending(refs)); err != nil {
+		return nil, err
+	}
+	return level, nil
+}
+
+// membership answers the whole level's "has this node been admitted?" questions
+// at once, testing the bitset in ASCENDING surrogate order so the page cache is
+// walked forward and each page is touched once, rather than in the emission
+// order, which is canonical and therefore unrelated to page layout.
+func (w *retainedWalk) membership(rows []edgeRow) (map[NodeRef]bool, error) {
+	refs := make([]NodeRef, 0, len(rows))
+	for _, row := range rows {
+		refs = append(refs, row.edge.Neighbour)
+	}
+	refs = ascending(refs)
+	seen := make(map[NodeRef]bool, len(refs))
+	for _, ref := range refs {
+		in, err := w.bits.test(uint64(ref))
+		if err != nil {
+			return nil, err
+		}
+		if in {
+			seen[ref] = true
+		}
+	}
+	return seen, nil
+}
+
+// openWalkState opens a fresh retained walk for this request, sized from the
+// pinned generation. It goes through the reader GUARD rather than reading
+// e.reader directly, so a workspace wired without the packed reader is refused
+// with the typed defect report the guard carries instead of failing somewhere
+// inside the scan.
+func (e *Engine) openWalkState() (*retainedWalk, error) {
+	reader, err := e.consumerReader()
+	if err != nil {
+		return nil, err
+	}
+	return openRetainedWalk(e.walkScratchDir(), reader.MaxNode(), e.probe)
+}
+
+// reopenWalkState reopens the retained walk a continuation names, through the
+// same guard.
+func (e *Engine) reopenWalkState(dir, prevID string) (*retainedWalk, error) {
+	reader, err := e.consumerReader()
+	if err != nil {
+		return nil, err
+	}
+	return reopenRetainedWalk(dir, prevID, reader.MaxNode(), e.probe)
 }
