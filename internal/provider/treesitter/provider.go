@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"io"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ type Options struct {
 	MaxWorkers int
 	// MaxParseFileBytes is workspace.max_parse_file_bytes; a larger file is
 	// reported unavailable, never streamed.
-	MaxParseFileBytes int64
+	MaxParseFileBytes config.Limit
 	// WorkerIdleTTL is tree_sitter.worker_idle_ttl: how long an idle worker
 	// is kept before it is stopped.
 	WorkerIdleTTL time.Duration
@@ -77,11 +78,10 @@ type Options struct {
 }
 
 const (
-	defaultMaxWorkers    = 2
-	defaultMaxParseBytes = 5 << 20
-	defaultIdleTTL       = 60 * time.Second
-	defaultParseTimeout  = 60 * time.Second
-	defaultWorkerMemory  = 256 << 20
+	defaultMaxWorkers   = 2
+	defaultIdleTTL      = 60 * time.Second
+	defaultParseTimeout = 60 * time.Second
+	defaultWorkerMemory = 256 << 20
 )
 
 // Provider is the treesitter provider. It is safe for concurrent use; Close
@@ -98,10 +98,11 @@ func New(o Options) (*Provider, error) {
 	if o.MaxWorkers <= 0 {
 		o.MaxWorkers = defaultMaxWorkers
 	}
-	if o.MaxParseFileBytes <= 0 {
-		o.MaxParseFileBytes = defaultMaxParseBytes
-	}
-	if o.MaxParseFileBytes > wire.MaxSourceBytes {
+	// Unlimited is left unlimited: substituting a finite default here would
+	// discard a user's explicit "no bound" with no report. The worker's
+	// class-B source ceiling is enforced at the admission sites below, which
+	// is where a file that exceeds it is reported unavailable.
+	if o.MaxParseFileBytes.Exceeded(wire.MaxSourceBytes) {
 		return nil, invalidOption(fmt.Sprintf("max parse file bytes %d exceed the worker's %d-byte source ceiling", o.MaxParseFileBytes, wire.MaxSourceBytes))
 	}
 	if o.WorkerIdleTTL <= 0 {
@@ -212,7 +213,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !ok {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	if fv.Size > p.opts.MaxParseFileBytes {
+	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) || fv.Size > wire.MaxSourceBytes {
 		return finish(model.CapabilityUnavailable, model.CodeResourceLimit)
 	}
 	src, err := p.read(ctx, req.Content, fv)
@@ -345,7 +346,7 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 	if !ok {
 		return Probe{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "no pinned grammar for " + bound(relPath, 256)}
 	}
-	if int64(len(src)) > p.opts.MaxParseFileBytes {
+	if p.opts.MaxParseFileBytes.Exceeded(int64(len(src))) || int64(len(src)) > wire.MaxSourceBytes {
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file exceeds max parse file bytes"}
 	}
 	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint32(len(src))}, src)
