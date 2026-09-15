@@ -78,7 +78,7 @@ const (
 	// when it does not. Refusing the answer for its size is the failure the
 	// bound exists to prevent, not the bound.
 	//
-	// It no longer reaches the capsule, whose lists are durable rows read a page
+	// It does not apply to the capsule, whose lists are durable rows read a page
 	// at a time and bounded only by the two user-set context.max_capsule_* keys,
 	// unlimited by default.
 	MaxRecordsPerResult = 1000

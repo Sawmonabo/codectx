@@ -51,6 +51,11 @@ type reservation struct {
 // spool whose header disagrees with the presenting cursor. ExpiresAt is the
 // expiry at creation and is informational: liveness is the lease's.
 type SpoolHeader struct {
+	// Version fences the on-disk shape. It is kept, unlike the per-structure
+	// versions this greenfield deletes, because a spool is NOT reachable only
+	// through a signed cursor: Sweep and the state-directory reaper scan the
+	// spool directory and read each entry's header directly (spoolHeader), so
+	// this frame is decoded with no cursor in hand to fence it.
 	Version      int                `json:"version"`
 	SpoolID      string             `json:"spool_id"`
 	LeaseID      string             `json:"lease_id"`

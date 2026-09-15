@@ -28,9 +28,9 @@ const (
 	// emitted facts change. 4: the binary decision is a proportion of the
 	// sniffed head rather than a single NUL byte, so a text file carrying a
 	// stray NUL is indexed (with the NUL substituted) instead of left
-	// without a lexical index; and a chunk boundary that used to fall inside
-	// a UTF-8 sequence now moves, which changes the byte ranges a file's
-	// documents are keyed by. Units sealed by version 3 must be rebuilt.
+	// without a lexical index; and a chunk boundary is moved off the interior
+	// of a UTF-8 sequence, which changes the byte ranges a file's documents are
+	// keyed by. Units sealed by version 3 must be rebuilt.
 	Version = "4"
 
 	// CapabilityStructure is the repository/directory/file graph.

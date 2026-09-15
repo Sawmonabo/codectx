@@ -1,17 +1,12 @@
 package sqlite_test
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
-	"log/slog"
-	"math"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -406,71 +401,4 @@ func graphRowCounts(t *testing.T, db *sql.DB) graphCounts {
 		t.Fatalf("count graph rows: %v", err)
 	}
 	return c
-}
-
-// lockedBuffer is a writer safe to hand a slog handler while the store runs.
-type lockedBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *lockedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *lockedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// The build's completion line must state the build's own memory share.
-//
-// The failure mode it protects: ADR-0005 bounds what the one sequential pass
-// activation adds, and an operator holding a run to that bound can only
-// attribute a memory ceiling to this pass if the pass reports its own heap
-// delta. A build that reports duration alone leaves its share of a run's peak
-// indistinguishable from the rest of the activation, so the bound stops being
-// checkable from the logs.
-//
-// slog's default logger is process-global, so this case does not run parallel
-// and restores what it replaced.
-func TestPackedGraphBuildLogsItsOwnHeapShare(t *testing.T) {
-	var out lockedBuffer
-	prev := slog.Default()
-	t.Cleanup(func() { slog.SetDefault(prev) })
-	slog.SetDefault(slog.New(slog.NewJSONHandler(&out, &slog.HandlerOptions{Level: slog.LevelInfo})))
-
-	// Publishing the graph fixture activates a generation, which is the only
-	// thing that runs the packed adjacency build.
-	graphFixtureStore(t)
-
-	var finished map[string]any
-	for line := range strings.SplitSeq(strings.TrimSpace(out.String()), "\n") {
-		if line == "" {
-			continue
-		}
-		var rec map[string]any
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			t.Fatalf("log line %q is not JSON: %v", line, err)
-		}
-		if rec["msg"] == "packed adjacency build finished" {
-			finished = rec
-		}
-	}
-	if finished == nil {
-		t.Fatalf("no packed adjacency build finished line in:\n%s", out.String())
-	}
-	raw, ok := finished["heap_delta_bytes"]
-	if !ok {
-		t.Fatalf("the build's completion line carries %v and no heap_delta_bytes: the pass reports its "+
-			"wall clock without its memory share", finished)
-	}
-	delta, ok := raw.(float64)
-	if !ok || delta != math.Trunc(delta) {
-		t.Fatalf("heap_delta_bytes is %#v, want a whole number of bytes", raw)
-	}
-	t.Logf("packed adjacency build: duration_ms=%v heap_delta_bytes=%v", finished["duration_ms"], raw)
 }

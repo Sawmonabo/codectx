@@ -16,8 +16,8 @@ import (
 // ceiling and a page is always continuable by cursor, so nothing is lost). What
 // the scale posture forbids is the SILENCE: a caller that asks for 1000 and is
 // served 200 with no continuation notice cannot tell a clamped page from the
-// end of the answer -- and since the edge batch limit became "0 = no caller
-// bound", a zero now resolves to 200 here where it used to be a loud refusal.
+// end of the answer. A zero is "no caller bound" on the edge batch limit, so
+// it resolves to 200 here rather than being refused.
 //
 // It lives here, beside the cursors and spools the "continue with the cursor"
 // half of its message points at, rather than in the storage package that

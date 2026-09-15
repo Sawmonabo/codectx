@@ -337,6 +337,11 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	// refused: the fact carries the clipped value, and the row says which
 	// fields were clipped and how many values each cut covered.
 	pub.TruncatedFields = report.TruncatedFields
+	// Evidence occurrences the import removed under the user's own
+	// index.max_evidence_per_fact. The facts were published; what the clip
+	// took off them is disclosed on the capability, not only in the line
+	// logged below.
+	pub.ClippedEvidence = int(report.ClippedEvidence)
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
@@ -457,12 +462,12 @@ func sweepPrivate(dataDir string) {
 		if err != nil {
 			continue
 		}
-		// Every entry is swept, however many there are. The scan used to stop
-		// at a fixed count, which left the rest of a large private root on
-		// disk without saying so -- and saved nothing, because the directory
-		// was already read in full to find them. What the sweep did is
-		// disclosed as a count per root, so leftover disk is visible even when
-		// per-entry logging is not read.
+		// Every entry is swept, however many there are. Stopping at a fixed
+		// count would leave the rest of a large private root on disk without
+		// saying so, and would save nothing: the directory is read in full to
+		// find them either way. What the sweep did is disclosed as a count per
+		// root, so leftover disk is visible even when per-entry logging is not
+		// read.
 		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())

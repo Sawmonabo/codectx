@@ -36,7 +36,7 @@ import (
 // The reported Coverage is the state before this chunk: issuing grants nothing,
 // confirming does. At end of file the zero-length chunk is still issued -- an
 // empty file's coverage can come from nothing else.
-func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.ReadChunkResponse, error) {
+func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (_ model.ReadChunkResponse, err error) {
 	if err := req.Validate(); err != nil {
 		return model.ReadChunkResponse{}, err
 	}
@@ -48,6 +48,12 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 	// all, so an unbounded read serves the whole chunk.
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage read", err) }()
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
