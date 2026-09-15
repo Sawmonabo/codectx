@@ -388,72 +388,9 @@
       },
       "notes": "Node.js 22 LTS (Jod); runtime for the node-hosted indexers and servers."
     },
-    "pyright": {
-      "name": "pyright",
-      "version": "1.1.414",
-      "kind": "server",
-      "license": "MIT",
-      "upstream": "https://www.npmjs.com/package/pyright",
-      "runtime": "node",
-      "entry": "node_modules/pyright/langserver.index.js",
-      "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-      "platforms": {
-        "darwin_amd64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-darwin-amd64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        },
-        "darwin_arm64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-darwin-arm64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        },
-        "linux_amd64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-linux-amd64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        },
-        "linux_arm64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-linux-arm64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        },
-        "windows_amd64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-windows-amd64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        },
-        "windows_arm64": {
-          "url": "https://github.com/Sawmonabo/codectx/releases/download/tools-v1/pyright-1.1.414-windows-arm64.tar.gz",
-          "sha256": "39a2d831a7b44d994f952832b311ad7f44a1874295a95a4307316259dcfb0853",
-          "size": 4140229,
-          "entry": "node_modules/pyright/langserver.index.js",
-          "entry_sha256": "f200762078eb9880faf421a5b30f9ef3055b1d85c6f10780d75db4da8d8499f1",
-          "provenance": "built"
-        }
-      },
-      "languages": [
-        "python"
-      ]
-    },
     "rust-analyzer": {
       "name": "rust-analyzer",
-      "version": "2026-08-17.4",
+      "version": "2026-09-14",
       "kind": "indexer",
       "license": "MIT OR Apache-2.0",
       "upstream": "https://github.com/rust-lang/rust-analyzer",
@@ -462,51 +399,51 @@
       "entry_sha256": "",
       "platforms": {
         "darwin_amd64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-apple-darwin.gz",
-          "sha256": "134a7d305991de776864e43d1e6c291f60fa2888d4b9b7749864c562c5dc28b7",
-          "size": 14550902,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-x86_64-apple-darwin.gz",
+          "sha256": "58d827adc7bde3b8986ff52795484f462564a2beed3ba4f4b2cbc3cfd58ae05e",
+          "size": 14637240,
           "entry": "rust-analyzer-x86_64-apple-darwin",
-          "entry_sha256": "7533fcf2770418d52c49f67d1267f2053bc90f19bad590f98da143913da4eba8",
+          "entry_sha256": "cdeccb75dc9cd54e7085c4a07a06b5b01751dccd26b609d1237302829bdb7668",
           "provenance": "upstream"
         },
         "darwin_arm64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-apple-darwin.gz",
-          "sha256": "ece932daf2f077be87bf745d2eb0a62cbc550f4b1e2e31ca76dfafdd0cc599b3",
-          "size": 13829387,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-aarch64-apple-darwin.gz",
+          "sha256": "0c579403271f4021eb1efdfaa9bedb43e099595d02a02ee9b1f34c6c51a3ac26",
+          "size": 13877061,
           "entry": "rust-analyzer-aarch64-apple-darwin",
-          "entry_sha256": "5142e0d6d0a48bc8ba0638125eaa68296defba7d32628362175eff967d12e145",
+          "entry_sha256": "408be6269b4a73bdec188f081f9672465651ac51632bd286ec3146c54470c2af",
           "provenance": "upstream"
         },
         "linux_amd64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-unknown-linux-gnu.gz",
-          "sha256": "a559eaa29920e4c12718fba101f2055f1da0ad8bc458ef9dc1a670778cc66901",
-          "size": 14834607,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-x86_64-unknown-linux-gnu.gz",
+          "sha256": "7609ba53f85cd80a3bde77a4b2e94e304d0f94650e4f4cffc061b9bca454ba75",
+          "size": 14853937,
           "entry": "rust-analyzer-x86_64-unknown-linux-gnu",
-          "entry_sha256": "947d363b7bb74bfc07ec7b30e189b30426a7f7f100f81667f8a1c275a8e95722",
+          "entry_sha256": "8500d7c69a9b3df8929f06f6b95c42364ac83bc9aa6ae5fed22051ab87d0aa8a",
           "provenance": "upstream"
         },
         "linux_arm64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-unknown-linux-gnu.gz",
-          "sha256": "941ad31c4256eec3c8457257b0fcfb696d2b4f80c0e5a996f7375a92130c2447",
-          "size": 14284102,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-aarch64-unknown-linux-gnu.gz",
+          "sha256": "3d32c50aebf9288c2fd11b559813441bdff2aa57fbbb7177ad0ffe5ac4e9ad3d",
+          "size": 14327723,
           "entry": "rust-analyzer-aarch64-unknown-linux-gnu",
-          "entry_sha256": "9af7a48919c41e899ca30bcec333341caeb351ecc1a93ff43a5851cf38ae50f0",
+          "entry_sha256": "129c99033eaff72930295916238eda89288cda458a7470363fc2a0cc820edd2f",
           "provenance": "upstream"
         },
         "windows_amd64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-x86_64-pc-windows-msvc.zip",
-          "sha256": "3212cc9e7ab3f6b07f97be681c2a7200f73fb0463e6f8055c214ebe0b00901f2",
-          "size": 17452536,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-x86_64-pc-windows-msvc.zip",
+          "sha256": "631ea40942cbc1e70a3465218f27f49fd73d82d9c0dd21e5279d8417f7f2dd93",
+          "size": 17515427,
           "entry": "rust-analyzer.exe",
-          "entry_sha256": "3e1ca08e0468c9054cab61ec6d693bf04cdcfd5608f5940e824bb0d09adb32a3",
+          "entry_sha256": "ff70ce6141538413cb32113811508ee0cc460e1857927230b693ee0dd00a9957",
           "provenance": "upstream"
         },
         "windows_arm64": {
-          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-08-17.4/rust-analyzer-aarch64-pc-windows-msvc.zip",
-          "sha256": "604562665e30aed593ec87397bfa157b4601e2d72f3a01bb8b32776302c179f2",
-          "size": 15618764,
+          "url": "https://github.com/rust-lang/rust-analyzer/releases/download/2026-09-14/rust-analyzer-aarch64-pc-windows-msvc.zip",
+          "sha256": "742a792325bb433ab7a12f859f9bf3bd5c6721fe503eee530c029917b537b01d",
+          "size": 15646677,
           "entry": "rust-analyzer.exe",
-          "entry_sha256": "805f54b18d28df26824c78b1061686144fb78a6d5120c8a4c7480b7731deb77a",
+          "entry_sha256": "611b818ee763bb4cd915b90332f29a21e99dda3f0fc1a789eed2f47ffff0bcbe",
           "provenance": "upstream"
         }
       },
@@ -813,6 +750,76 @@
         "tsx",
         "javascript"
       ]
+    },
+    "ty": {
+      "name": "ty",
+      "version": "0.0.81",
+      "kind": "server",
+      "license": "MIT",
+      "upstream": "https://github.com/astral-sh/ty",
+      "runtime": "",
+      "entry": "ty-x86_64-unknown-linux-gnu/ty",
+      "entry_sha256": "",
+      "platforms": {
+        "darwin_amd64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-x86_64-apple-darwin.tar.gz",
+          "sha256": "c3330e9fc4c44a7b1a4f3c164ba86e75d0d88e2b82ff6c371ef88bb7ba22db92",
+          "size": 12850041,
+          "entry": "ty-x86_64-apple-darwin/ty",
+          "entry_sha256": "59015556729664023989b348491eb178d2145cbaa999d0edd098a5bb10371a70",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:c3330e9fc4c44a7b1a4f3c164ba86e75d0d88e2b82ff6c371ef88bb7ba22db92"
+        },
+        "darwin_arm64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-aarch64-apple-darwin.tar.gz",
+          "sha256": "452f3e6da350f08eac2024f997ad1a14917b91f4d6682d568fb980473d451ee3",
+          "size": 12540870,
+          "entry": "ty-aarch64-apple-darwin/ty",
+          "entry_sha256": "99b1c2d17164111bff7d4f9f141662d9b331966916332b94790f7cee33b06115",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:452f3e6da350f08eac2024f997ad1a14917b91f4d6682d568fb980473d451ee3"
+        },
+        "linux_amd64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-x86_64-unknown-linux-gnu.tar.gz",
+          "sha256": "d3073c4603d80a3201b058cd5c3969a2843c8abee562d34a5a80f4cf956b1adc",
+          "size": 13356106,
+          "entry": "ty-x86_64-unknown-linux-gnu/ty",
+          "entry_sha256": "97b6982e4be9e1f85bef66cbda9331936439e67687f1647ed65e837f2f9b1cd8",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:d3073c4603d80a3201b058cd5c3969a2843c8abee562d34a5a80f4cf956b1adc"
+        },
+        "linux_arm64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-aarch64-unknown-linux-gnu.tar.gz",
+          "sha256": "6d7fa364dda96e47a589f6f8b5dc76ceba65f14b5b89472c3201a08968ef7876",
+          "size": 12566757,
+          "entry": "ty-aarch64-unknown-linux-gnu/ty",
+          "entry_sha256": "ddc549b647401c2aa2f3bd65d4abec3c2f347d1fed1bdf737b885ea2fc3d0849",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:6d7fa364dda96e47a589f6f8b5dc76ceba65f14b5b89472c3201a08968ef7876"
+        },
+        "windows_amd64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-x86_64-pc-windows-msvc.zip",
+          "sha256": "9e01e7f18bd69a9cb2c62ce0736eecf2211bb5c871dac11751182e1c24c290ff",
+          "size": 12728973,
+          "entry": "ty.exe",
+          "entry_sha256": "92bbe54c1f372dbd35bafa556326065e14b1dc04b6a2024ceeebb4df4b8d4be3",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:9e01e7f18bd69a9cb2c62ce0736eecf2211bb5c871dac11751182e1c24c290ff"
+        },
+        "windows_arm64": {
+          "url": "https://github.com/astral-sh/ty/releases/download/0.0.81/ty-aarch64-pc-windows-msvc.zip",
+          "sha256": "3128613fa8e041fb5f82685be3c6c3f793a34b0199fb15cec2ed9e6c48e26f9f",
+          "size": 12454553,
+          "entry": "ty.exe",
+          "entry_sha256": "f20fc6e465d247a43f1d25f58ac6927013d1d655c4303a45d5c59f70f4391b29",
+          "provenance": "upstream",
+          "upstream_digest": "sha256:3128613fa8e041fb5f82685be3c6c3f793a34b0199fb15cec2ed9e6c48e26f9f"
+        }
+      },
+      "languages": [
+        "python"
+      ],
+      "notes": "Native Python checker and language server (ADR-0006); a single static binary per platform, so no managed runtime hosts it. Upstream publishes a per-asset .sha256 sidecar, recorded as upstream_digest."
     },
     "typescript-language-server": {
       "name": "typescript-language-server",
