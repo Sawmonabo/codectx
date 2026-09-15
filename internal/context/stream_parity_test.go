@@ -966,16 +966,108 @@ func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextReques
 var parityRequests = []struct {
 	name string
 	req  model.ContextRequest
+	// rels shapes the scope this row walks. Nil leaves the edgeless graph the
+	// first six rows were written against; the rows below it exist because an
+	// edgeless graph admits every candidate exactly once, folds nothing,
+	// routes nothing and drops nothing, so four of the five plan-table
+	// mutations produce the same plan through both pipelines and the proof
+	// says nothing about them.
+	rels func(*contextFixture) []model.Relation
 }{
-	{"unbounded", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}},
-	{"sweep phase", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseSweep}},
+	{"unbounded", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}, nil},
+	{"sweep phase", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseSweep}, nil},
 	{"byte budget drops files", model.ContextRequest{Task: "make `Place` idempotent",
-		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 4096, MaxSlices: 2}}},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 4096, MaxSlices: 2}}, nil},
 	{"file budget drops groups", model.ContextRequest{Task: "make `Place` idempotent",
-		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 2}}},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 2}}, nil},
 	{"unresolvable identity", model.ContextRequest{Task: "make `Place` and `NoSuchSymbol` idempotent",
-		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 1}}},
-	{"sweep phase, a different seed", model.ContextRequest{Task: "order placement", Phase: model.PhaseSweep}},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 1}}, nil},
+	{"sweep phase, a different seed", model.ContextRequest{Task: "order placement", Phase: model.PhaseSweep}, nil},
+
+	// Two seeds whose expansions both reach `Repository`, at ONE hop from
+	// `Place` and at TWO from `Handle`. The scope dedupe therefore sees the
+	// same entity twice with DIFFERENT payloads, which is what makes the
+	// min-sequence fold observable: a fold that kept the later arrival would
+	// keep the other depth, and depth reaches the score, the ordinal and the
+	// stored entry. An edgeless row cannot show this -- it admits nothing
+	// twice -- and neither can two seeds at equal depth, whose two arrivals
+	// fold to the same record whichever side survives.
+	{"two seeds admit one entity at two depths", model.ContextRequest{
+		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
+		Phase: model.PhaseVerify}, routedScope},
+	// The same shaped scope under a file budget that drops whole groups, so
+	// the packer emits a drop stream over more than one file and the order
+	// those drops are persisted in is decided by rank rather than by file.
+	{"routed scope, the file budget drops groups", model.ContextRequest{
+		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 5}}, routedScope},
+	// The same shaped scope under a byte budget, which drops inside a group
+	// as well as between groups.
+	{"routed scope, the byte budget drops files", model.ContextRequest{
+		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 16384, MaxSlices: 4}}, routedScope},
+	// Ruling C8: the relation-kind scan reads an UNLIMITED
+	// context.max_graph_edges to exhaustion rather than as one page. Under a
+	// scope of more than 200 wanted relations -- model.MaxPageItems is 200 --
+	// a scan that stopped at one page would leave edges untyped, ranking
+	// would score their routes as inadmissible, and the two pipelines would
+	// disagree. The six rows above are all far under 200 relations, so none
+	// of them can fail if the page bound comes back.
+	{"a scope wanting more than one page of relations", model.ContextRequest{
+		Task: "make `Place` idempotent", Seeds: []string{"Place", "Handle"},
+		Phase: model.PhaseVerify}, denseScope},
+}
+
+// routedScope is the shaped scope of the rows above: `Handle` calls `Place`,
+// `Place` calls `Repository` and is tested by `TestPlace`, documented by
+// `docs/order.md` and configured by `config/order.toml`. Seeded from both
+// `Place` and `Handle`, `Repository` is reached at two different depths and
+// every other artifact is reached on a route, so routes, package centrality,
+// multi-reason boosts and cross-file drops all have inputs.
+func routedScope(fx *contextFixture) []model.Relation {
+	return []model.Relation{
+		fx.edge("internal/order/handler.go", model.RelCalls, "internal/order/service.go"),
+		fx.edge("internal/order/service.go", model.RelCalls, "internal/order/ports.go"),
+		fx.edge("internal/order/service.go", model.RelImplements, "internal/order/ports.go"),
+		fx.edge("internal/order/service_test.go", model.RelTests, "internal/order/service.go"),
+		fx.edge("docs/order.md", model.RelDocuments, "internal/order/service.go"),
+		fx.edge("config/order.toml", model.RelConfigures, "internal/order/service.go"),
+	}
+}
+
+// denseScope is routedScope plus enough further edges among the same seven
+// nodes to take the wanted relation count past model.MaxPageItems. The kinds
+// are drawn from model's own vocabulary rather than invented, and every edge
+// is between two fixture nodes, so the walk stays over the published snapshot.
+//
+// The oversized artifact is left out of BOTH shaped scopes on purpose: an edge
+// to it pulls it into the required scope, whose worst-case wire size alone
+// exceeds the default byte budget, and every row would then report
+// CTX_MINIMUM_BUDGET before a single pass compared anything. The floor itself
+// already has its own coverage; these rows are about the plan.
+// oversizedFixtureFile is the fixture's Section 15.4 artifact, named once here
+// rather than repeated as a literal in the filter below.
+const oversizedFixtureFile = "internal/order/generated.go"
+
+func denseScope(fx *contextFixture) []model.Relation {
+	kinds := []model.RelationKind{model.RelReferences, model.RelReads, model.RelWrites,
+		model.RelDependsOn, model.RelDataFlowsTo, model.RelControlDependsOn, model.RelOwns,
+		model.RelImports, model.RelExports, model.RelBuilds}
+	out := routedScope(fx)
+	for _, k := range kinds {
+		for _, from := range fixtureFiles {
+			for _, to := range fixtureFiles {
+				if from.path == to.path || from.path == oversizedFixtureFile || to.path == oversizedFixtureFile {
+					continue
+				}
+				out = append(out, fx.edge(from.path, k, to.path))
+			}
+		}
+	}
+	if len(out) <= model.MaxPageItems {
+		panic("denseScope must declare more than one page of relations")
+	}
+	return out
 }
 
 // TestTheStreamedCompileIsByteForByteTheWholeSetPlan is C-STREAM proof (1).
@@ -994,6 +1086,12 @@ func TestTheStreamedCompileIsByteForByteTheWholeSetPlan(t *testing.T) {
 	for _, row := range parityRequests {
 		t.Run(row.name, func(t *testing.T) {
 			fx := newContextFixture(t)
+			// Set before either compiler is built: intCompiler reads
+			// fx.Rels when it composes the graph factory, and a row that
+			// shaped the scope between the two would compare two scopes.
+			if row.rels != nil {
+				fx.Rels = row.rels(fx)
+			}
 			c := intCompiler(t, fx, fx.Now)
 			ref, refScopeComplete, refNotices, refBudget, err := c.referenceCompile(fx.ctx, row.req)
 			if err != nil {
