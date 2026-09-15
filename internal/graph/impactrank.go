@@ -481,6 +481,15 @@ type heapProbe struct {
 	// in quadratic time, which is the defect this state layout closed.
 	VisitedBytes  int64
 	ResumeRecords int64
+	// VisitedFilterWords is how many 64-bit words of membership summary the
+	// walks this probe is attached to have FROZEN. The summary accelerates a
+	// resume and nothing else, so a query that answers in one request and
+	// mints no cursor must freeze none of it, and a paged walk must freeze its
+	// geometry exactly once however many pages it runs for. It is counted in
+	// words rather than bytes to keep it apart from VisitedBytes, which is the
+	// per-leg incremental cost and must stay a function of what a leg
+	// admitted (visitedstore.go freezeFilter, appendRun).
+	VisitedFilterWords int64
 	// SpoolBytesRead is how many bytes of ranked continuation spools this
 	// request read, and SpoolBytesWritten how many it wrote. They are the
 	// ranked half of the same append-only invariant: a page of a settled

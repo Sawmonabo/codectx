@@ -80,7 +80,7 @@ type retainedWalk struct {
 
 // openRetainedWalk creates a fresh retained input under parent. filterBytes is
 // the budget the cumulative set's membership summary is frozen at.
-func openRetainedWalk(parent string, filterBytes int64) (*retainedWalk, error) {
+func openRetainedWalk(parent string, filterBytes int64, probe *heapProbe) (*retainedWalk, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, internalErr("graph: opening the walk retention directory: " + err.Error())
 	}
@@ -93,7 +93,7 @@ func openRetainedWalk(parent string, filterBytes int64) (*retainedWalk, error) {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	if w.visited, err = openVisitedStore(dir, filterBytes); err != nil {
+	if w.visited, err = openVisitedStore(dir, filterBytes, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
@@ -102,13 +102,13 @@ func openRetainedWalk(parent string, filterBytes int64) (*retainedWalk, error) {
 
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
-func reopenRetainedWalk(dir, prevID string) (*retainedWalk, error) {
+func reopenRetainedWalk(dir, prevID string, probe *heapProbe) (*retainedWalk, error) {
 	w := &retainedWalk{dir: dir, prevID: prevID}
 	if err := w.open(); err != nil {
 		return nil, err
 	}
 	var err error
-	if w.visited, err = reopenVisitedStore(dir); err != nil {
+	if w.visited, err = reopenVisitedStore(dir, probe); err != nil {
 		w.discard()
 		return nil, err
 	}
