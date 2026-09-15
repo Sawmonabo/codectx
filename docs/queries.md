@@ -59,13 +59,15 @@ evidence row behind it.
 | `--limit` | all but `path` | Items in one page. |
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Maximum distinct nodes the walk may admit. |
-| `--edges` | `callers`, `callees`, `impact` | Maximum distinct relations the walk may admit. On `callers`, `callees` and `impact` it is cumulative across the pages of one answer. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `impact` and `path`, which walk once, spending it truncates that walk. |
+| `--edges` | `callers`, `callees`, `impact` | Relations one page may admit. On `callers` and `callees` this is a per-page budget on the same terms as `--visited`; on `impact`, which walks once, spending it truncates that walk. |
 
 **`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
-`callees` and `impact` print a `next` token when more remains, and resuming one
-carries the budget the earlier pages already spent rather than refilling it.
-`impact` resumes differently from the traversal commands: it ranks the whole
+`callees` and `impact` print a `next` token when more remains. On `callers` and
+`callees` a continuation resumes the walk itself, from the frontier the previous
+page persisted, with a fresh per-page work allowance; the `walked` counts it
+reports stay cumulative across the pages of the one walk, so replaying a cursor
+neither resets nor doubles them. `impact` resumes differently from the traversal commands: it ranks the whole
 walk on the first page, serves the first `--limit` entries and keeps the ranked
 tail, so a continuation replays that tail in rank order without walking again
 and spends no further budget. Its `walked` counts and its package rollup are
@@ -73,17 +75,36 @@ therefore the same on every page — they describe the one walk behind the whole
 answer. `path` is not paged at all — it declares neither flag, and its
 `--visited` budget is spent by the one search it runs.
 
-**Zero is not "unlimited".** A zero budget takes the configured default, and a
-positive value may narrow that default but never widen it. The visited and edge
-budgets are cumulative across the pages of one traversal rather than refilled
-per page, so a continuation cannot spend the allowance twice.
+**Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
+`--depth`, `--visited` or `--edges` takes the configured bound, and a positive
+value may narrow that bound but never widen it — a request that asks for more
+than the configuration allows is answered under the configured value and told
+so, in a notice reading `requested N, effective M`, rather than silently
+tightened. The configured bounds themselves default to unlimited.
 
-Exhausting any budget, or the deadline, marks the answer truncated with the
-reason that stopped it, and `path` reports truncation together with whatever
-routes it found — never as "no path exists", which is reserved for a target that
-is genuinely unreachable. A capability that is still building is reported as an
-unavailable row plus a warning, so an incomplete answer never reads as a
-complete one.
+**Bounded per page, unlimited in total, user-set limits reported.**
+`--visited` and `--edges` are per-page work budgets. On `callers` and `callees`,
+a page that exhausts one stops there, reports the reason (`visited node budget
+exhausted`, `edge budget exhausted`) and mints a continuation cursor; following
+that cursor reaches the same nodes an unbounded walk would, so a budget you set
+shapes the size of a page and never the completeness of the answer. The
+frontier memory budget behaves the same way: a level that reaches it spills to
+the continuation spool, reports `frontier memory budget exhausted`, and the
+next page carries on from where it stopped.
+
+Two stops end an answer rather than a page, and both say so. `--depth` is part
+of the query a cursor is bound to, so a walk that ran out of depth is truncated
+with `graph depth budget exhausted` and no continuation. And `impact` walks once
+on its first page, so a per-page budget it exhausts truncates that walk; the
+reason travels onto every later page of its spooled ranked tail. `path` is not
+paged at all and its budgets truncate the one search it runs; it reports
+truncation together with whatever routes it found — never as "no path exists",
+which is reserved for a target that is genuinely unreachable.
+
+The query deadline is not a work budget and is not resumable: a walk that
+exceeds it fails the request with `CTX_QUERY_DEADLINE` rather than returning a
+short page, so a slow answer is never served as a complete one. A capability that is still building is reported as an unavailable row plus a
+warning, so an incomplete answer never reads as a complete one.
 
 ## Configuration these commands read
 
@@ -92,14 +113,14 @@ where the workspace is composed, and handed to it.
 
 | Key | Effect here |
 |---|---|
-| `context.max_graph_depth` | Default and ceiling for `--depth`. |
-| `context.max_visited_nodes` | Default and ceiling for `--visited`. |
-| `context.max_graph_edges` | Default and ceiling for `--edges`. |
+| `context.max_graph_depth` | Default and ceiling for `--depth`. Unlimited by default. |
+| `context.max_visited_nodes` | Default and ceiling for `--visited`, per page. Unlimited by default. |
+| `context.max_graph_edges` | Default and ceiling for `--edges`, per page. Unlimited by default. |
 | `context.max_reason_paths_per_entry` | Equal-cost routes `path` returns. An `impact` entry carries the one route that admitted it, so a positive value admits that route and zero suppresses it. |
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The per-request deadline the walk runs under. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | Ceiling on the edges one frontier level of a traversal may hold at once. A level that reaches it stops reading, and the answer is truncated with `frontier memory budget exhausted` rather than accumulating a hub without a bound. |
+| `resources.query_memory_bytes` | Ceiling on the edges one frontier level of a traversal may hold at once. A level that reaches it spills: the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from, so peak heap is a function of this number rather than of the graph. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts
