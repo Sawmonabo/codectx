@@ -118,7 +118,7 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 	if stalledRef {
 		t.Fatalf("the reference walk stalled under a ten-minute budget")
 	}
-	budget := time.Since(start) / 6
+	budget := time.Since(start) / 40
 	if len(want) == 0 {
 		t.Fatalf("reference answer is empty; the fixture proves nothing")
 	}
@@ -126,10 +126,16 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 		budget = 5 * time.Millisecond
 	}
 
-	// The subject: a sixth of the whole answer's wall clock per request, so the
-	// deadline lands inside a read on every page and the walk needs several --
-	// while every page still advances, which is the condition under which a
+	// The subject: a fortieth of the whole answer's wall clock per request, so
+	// the deadline lands inside a read on every page and the walk needs several
+	// -- while every page still advances, which is the condition under which a
 	// continuation, not the terminal stalled reason, is the right answer.
+	//
+	// A fortieth rather than a sixth: a budget that small reaches EVERY step of
+	// the level pipeline, the transition between a level's collect and its
+	// serve included. A deadline there has no resumable half to stop at, and a
+	// walk that answers it with a state it never reached ends the chain
+	// believing it is exhausted -- the short answer this case measures.
 	//
 	// A budget so small that the chain cannot advance is a LEGITIMATE outcome
 	// in either of the two shapes drainImpact reports -- the walk leg's
