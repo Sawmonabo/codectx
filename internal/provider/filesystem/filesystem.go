@@ -25,20 +25,23 @@ import (
 const (
 	ID = "filesystem"
 	// Version is part of every unit key, so it is bumped whenever a unit's
-	// emitted facts change. 3: a chunk whose bytes are not valid UTF-8 is
-	// indexed rather than skipped, so units sealed by version 2 must be
-	// rebuilt to gain the documents they left out.
-	Version = "3"
+	// emitted facts change. 4: the binary decision is a proportion of the
+	// sniffed head rather than a single NUL byte, so a text file carrying a
+	// stray NUL is indexed (with the NUL substituted) instead of left
+	// without a lexical index; and a chunk boundary that used to fall inside
+	// a UTF-8 sequence now moves, which changes the byte ranges a file's
+	// documents are keyed by. Units sealed by version 3 must be rebuilt.
+	Version = "4"
 
 	// CapabilityStructure is the repository/directory/file graph.
 	CapabilityStructure = "structure"
 	// CapabilitySearch is the lexical chunk index of a file. It is reported
 	// per file: unavailable for binary or oversize content (an admission
 	// decision that never affects CAS retention), and fresh for every other
-	// file, including one whose bytes are not UTF-8 throughout -- those
-	// chunks are indexed with the offending bytes substituted, and the
-	// substitution is disclosed in the capability detail rather than
-	// costing the file its content.
+	// file, including one whose bytes are not UTF-8 throughout and one
+	// carrying a stray NUL -- those chunks are indexed with the offending
+	// bytes substituted, and the substitution is disclosed in the capability
+	// detail rather than costing the file its content.
 	CapabilitySearch = "search"
 )
 
@@ -131,9 +134,12 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 		// state must be recorded first, because a detail without its state
 		// is dropped.
 		e.Capability(CapabilitySearch, model.CapabilityFresh, "")
-		if lost.Chunks > 0 {
+		if lost.Bytes > 0 {
 			e.CapabilityDetail(CapabilitySearch, "lossy_utf8_chunks", strconv.Itoa(lost.Chunks))
 			e.CapabilityDetail(CapabilitySearch, "lossy_utf8_bytes", strconv.Itoa(lost.Bytes))
+		}
+		if lost.NULs > 0 {
+			e.CapabilityDetail(CapabilitySearch, "nul_bytes", strconv.Itoa(lost.NULs))
 		}
 	}
 	return e.Result(), nil

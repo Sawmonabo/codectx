@@ -27,7 +27,7 @@ func TestFilesystemConform(t *testing.T) {
 		"cmd/app/main.go": "package main\n\nfunc main() {}\n",
 		"Dockerfile":      "FROM scratch\n",
 		"docs/long.txt":   strings.Repeat("é", 20000),
-		"assets/logo.bin": "PNG\x00\x00binary",
+		"assets/logo.bin": pngBytes(2048),
 		"empty.txt":       "",
 	}
 	p, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: 1 << 20})
@@ -165,6 +165,55 @@ func TestSearchCoversEveryByte(t *testing.T) {
 		assertCovered(t, docs, uint64(len(files[tc.path])))
 		if _, ok := state.Details["lossy_utf8_bytes"]; ok != tc.wantLossy {
 			t.Fatalf("%s: lossy_utf8_bytes disclosed = %v, want %v (details %v)", tc.path, ok, tc.wantLossy, state.Details)
+		}
+	}
+}
+
+// pngBytes is a PNG header followed by deterministic pseudo-random bytes: a
+// real binary file, not a text file with a NUL in it.
+func pngBytes(n int) string {
+	raw := []byte("\x89PNG\r\n\x1a\n")
+	x := uint32(0x12345678)
+	for len(raw) < n {
+		x = x*1664525 + 1013904223
+		raw = append(raw, byte(x>>24), byte(x>>16), byte(x>>8), byte(x))
+	}
+	return string(raw)
+}
+
+// TestBinaryDecisionIsAProportion protects the no-skip rule against the binary
+// sniff: a text file is judged by how much of its head is not text at all, not
+// by whether a single NUL appears in it. Failure mode: one stray NUL byte in a
+// source file used to leave that file with no lexical index at all under
+// default settings -- state unavailable, its whole content searchable nowhere
+// -- while the file is plainly text a caller expects to find.
+func TestBinaryDecisionIsAProportion(t *testing.T) {
+	files := map[string]string{
+		"src/config.go":  "package main\n\nconst banner = \"codectx\x00\"\n" + strings.Repeat("// filler line\n", 200),
+		"assets/img.png": pngBytes(8192),
+		"assets/utf16.txt": func() string {
+			var b strings.Builder
+			for i := 0; i < 2000; i++ {
+				b.WriteString("a\x00")
+			}
+			return b.String()
+		}(),
+	}
+	// One NUL in a text file: indexed whole, fresh, and the substitution
+	// disclosed rather than silent.
+	docs, state := index(t, files, "src/config.go")
+	if state.State != model.CapabilityFresh {
+		t.Fatalf("search capability for a text file with one NUL = %s (%s), want fresh", state.State, state.DiagnosticCode)
+	}
+	assertCovered(t, docs, uint64(len(files["src/config.go"])))
+	if got := state.Details["nul_bytes"]; got != "1" {
+		t.Fatalf("nul_bytes = %q, want \"1\" (details %v)", got, state.Details)
+	}
+	// Real binary content still has no lexical index, and says why.
+	for _, path := range []string{"assets/img.png", "assets/utf16.txt"} {
+		_, state := index(t, files, path)
+		if state.State != model.CapabilityUnavailable || state.DiagnosticCode != model.CodeProviderUnavailable {
+			t.Fatalf("%s: search capability = %s (%s), want unavailable/%s", path, state.State, state.DiagnosticCode, model.CodeProviderUnavailable)
 		}
 	}
 }
