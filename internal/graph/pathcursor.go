@@ -234,9 +234,11 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 		// The state is this request's to clean up until the store takes it.
 		_ = os.RemoveAll(dir)
 		if pagination.IsBudgetExhausted(err) {
-			// The shared continuation budget is full: the answer ends here,
-			// truncated and without a token, exactly as a spooled page does.
-			return "", e.releaseLease(ctx, lease.ID, nil)
+			// The shared continuation budget cannot hold this search's state.
+			// Reported, never silent: ending the answer here with no token
+			// under whichever WORK budget happened to be set told the caller to
+			// raise a bound that was not the one that stopped it.
+			return "", e.releaseLease(ctx, lease.ID, errRetentionBudget("search"))
 		}
 		return "", e.releaseLease(ctx, lease.ID, err)
 	}
