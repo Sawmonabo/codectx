@@ -183,40 +183,52 @@ func (r *PinnedReader) edgesBatchQuery(ctx context.Context, nodes []model.NodeID
 	}
 	keyset := ""
 	if afterRaw != nil {
-		keyset = " AND ri.id > " + b.mark(afterRaw)
+		// Canonical RelationID, never relation_ids.id: the surrogate is
+		// rebuild-local (scale-posture-plan.md 3d).
+		keyset = " AND ri.canonical > " + b.mark(afterRaw)
 	}
 	limitMark := b.mark(limit)
 
 	// One indexed scan per direction column; an OR across the two columns would
 	// use neither index. The EXISTS applies the same membership rule visible()
 	// applies, as a semi-join so the scan stays on the relation index.
+	// The node list is matched against node_ids.canonical and the join drives
+	// from that dictionary into relation_ids, so the direction column stays an
+	// indexed probe. Written as a JOIN rather than `ri.<col> IN (SELECT id ...)`
+	// because the join form pins the drive order; the IN-subquery form lets the
+	// planner consider scanning relation_ids instead.
 	branch := func(column string) string {
-		return `SELECT ri.id AS id, ri.from_node_id AS from_node_id, ri.kind AS kind, ri.to_node_id AS to_node_id
-			FROM relation_ids ri WHERE ri.` + column + ` IN ` + nodeList + kindClause + keyset + `
+		return `SELECT ri.canonical AS id, ri.from_node_id AS from_ref, ri.kind AS kind, ri.to_node_id AS to_ref
+			FROM node_ids sn JOIN relation_ids ri ON ri.` + column + ` = sn.id
+			WHERE sn.canonical IN ` + nodeList + kindClause + keyset + `
 			AND EXISTS (SELECT 1 FROM relation_facts rf WHERE rf.relation_id = ri.id` + memberOf("rf") + `)
-			ORDER BY ri.id LIMIT ` + limitMark
+			ORDER BY ri.canonical LIMIT ` + limitMark
 	}
-	var query string
+	var inner string
 	switch direction {
 	case model.DirectionOutgoing:
-		query = branch("from_node_id")
+		inner = branch("from_node_id")
 	case model.DirectionIncoming:
-		query = branch("to_node_id")
+		inner = branch("to_node_id")
 	default:
 		// Each branch is already keyset-bounded, so the union of their first
 		// `limit` rows contains the union's first `limit` rows; the outer sort
 		// merges them back into relation-id order.
-		query = `SELECT id, from_node_id, kind, to_node_id FROM (
-			SELECT * FROM (` + branch("from_node_id") + `) UNION SELECT * FROM (` + branch("to_node_id") + `)
-		) ORDER BY id LIMIT ` + limitMark
+		inner = `SELECT * FROM (` + branch("from_node_id") + `) UNION SELECT * FROM (` + branch("to_node_id") + `)`
 	}
+	// Endpoints are hydrated to canonical ids OUTSIDE the keyset-bounded inner
+	// select, so the two dictionary probes run at most `limit` times per page
+	// instead of once per candidate edge. No surrogate leaves this function.
+	query := `SELECT x.id, fn.canonical, x.kind, tn.canonical FROM (` + inner + `) x
+		JOIN node_ids fn ON fn.id = x.from_ref JOIN node_ids tn ON tn.id = x.to_ref
+		ORDER BY x.id LIMIT ` + limitMark
 	return query, b.args, nil
 }
 
 // nodeBatchColumns is nodeColumns with explicit result names so the grouped
 // subquery can be projected by name. It must stay column-for-column identical
 // to nodeColumns, which is what scanNode reads.
-const nodeBatchColumns = `nf.node_id AS node_id, ni.kind AS kind, nf.language AS language, nf.name AS name,
+const nodeBatchColumns = `ni.canonical AS node_id, ni.kind AS kind, nf.language AS language, nf.name AS name,
 	nf.qualified_name AS qualified_name, nf.signature AS signature, nf.file_id AS file_id,
 	ui.content_hash AS content_hash, nf.start_byte AS start_byte, nf.end_byte AS end_byte,
 	nf.metadata_json AS metadata_json, u.unit_key AS unit_key, u.source_binding AS source_binding`
@@ -279,18 +291,23 @@ func (r *PinnedReader) nodesByIDQuery(ids []model.NodeID) (string, []any, error)
 		JOIN units u ON u.id = nf.unit_id
 		JOIN node_ids ni ON ni.id = nf.node_id
 		LEFT JOIN unit_inputs ui ON ui.unit_id = nf.unit_id AND ui.file_id = nf.file_id
-		WHERE nf.node_id IN ` + nodeList + memberOf("nf") + ` GROUP BY nf.node_id
+		WHERE ni.canonical IN ` + nodeList + memberOf("nf") + ` GROUP BY nf.node_id
 	) ORDER BY node_id LIMIT ` + limitMark
 	return query, b.args, nil
 }
 
 // evidenceBatchColumns names every column StoredEvidence needs, aliased so the
 // windowed subquery can be projected by name.
+// node_id is projected as a literal NULL, not joined: this batch filters on
+// e.relation_id, and the evidence CHECK admits exactly one of node_id /
+// relation_id, so every row here has a NULL node_id. A LEFT JOIN node_ids would
+// be a join that can never bind. The column stays so the list remains
+// column-for-column the one scanBatchedEvidence and Evidence share.
 const evidenceBatchColumns = `e.id AS id, u.unit_key AS unit_key, u.provider_id AS provider_id,
-	u.provider_version AS provider_version, u.origin_run_id AS origin_run_id, e.node_id AS node_id,
-	e.relation_id AS relation_id, e.precision AS precision, e.file_id AS file_id,
+	u.provider_version AS provider_version, u.origin_run_id AS origin_run_id, NULL AS node_id,
+	rl.canonical AS relation_id, e.precision AS precision, e.file_id AS file_id,
 	ui.content_hash AS content_hash, e.start_byte AS start_byte, e.end_byte AS end_byte,
-	e.native_key AS native_key, e.detail AS detail`
+	nk.key AS native_key, e.detail AS detail`
 
 const evidenceBatchOuterColumns = `id, unit_key, provider_id, provider_version, origin_run_id, node_id,
 	relation_id, precision, file_id, content_hash, start_byte, end_byte, native_key, detail`
@@ -347,8 +364,10 @@ func (r *PinnedReader) evidenceBatchQuery(ctx context.Context, relations []model
 		SELECT ` + evidenceBatchColumns + `, row_number() OVER (PARTITION BY e.relation_id ORDER BY e.id) AS rn
 		FROM evidence e
 		JOIN units u ON u.id = e.unit_id
+		JOIN relation_ids rl ON rl.id = e.relation_id
+		JOIN native_keys nk ON nk.id = e.native_key_id
 		LEFT JOIN unit_inputs ui ON ui.unit_id = e.unit_id AND ui.file_id = e.file_id
-		WHERE e.relation_id IN ` + relList + memberOf("e") + `
+		WHERE rl.canonical IN ` + relList + memberOf("e") + `
 	) WHERE rn <= ` + perMark + ` ORDER BY relation_id, id`
 	return query, b.args, nil
 }
