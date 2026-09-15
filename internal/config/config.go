@@ -469,9 +469,11 @@ type Dependence struct {
 type Tools struct {
 	// Offline makes every fetch a typed refusal without opening a socket.
 	Offline bool `toml:"offline"`
-	// CacheDir is the absolute tool store. Empty means <data_dir>/tools, which
-	// the toolchain owner creates user-private; this package resolves neither,
-	// exactly as it leaves Storage.DataDir's subdirectories alone.
+	// CacheDir is the absolute tool store. Empty is resolved by Load to
+	// DefaultToolStoreDir -- one machine-wide store shared by every workspace,
+	// which the toolchain owner creates user-private on the first install.
+	// Defaults() leaves it empty so it stays a pure function; a resolved
+	// configuration always names a store.
 	CacheDir string `toml:"cache_dir"`
 	// Mirror is an absolute https prefix that replaces the scheme and host of
 	// every lock asset URL, keeping the original host as the first path segment

@@ -264,7 +264,7 @@ for ordinary use.
 | Key | Default | Meaning |
 |---|---|---|
 | `offline` | `false` | Make every fetch a typed refusal without opening a socket. A tool already in the store still runs. |
-| `cache_dir` | `""` | Absolute path of the tool store. Empty resolves to `tools/` inside the data directory, created user-private. |
+| `cache_dir` | `""` | Absolute path of the tool store. Empty resolves to `$XDG_DATA_HOME/codectx/tools` (`~/.local/share/codectx/tools` when `XDG_DATA_HOME` is unset or not absolute) -- one store shared by every workspace on the machine, created user-private on the first install. |
 | `mirror` | `""` | Absolute `https` URL prefix serving every lock asset. It replaces the scheme and host and keeps the original host as the first path segment — `https://nodejs.org/dist/v22.23.2/node.tar.gz` becomes `<mirror>/nodejs.org/dist/v22.23.2/node.tar.gz` — so one mirror serves every publisher the lock names without their paths colliding. The digests stay the lock's, so a mirror relocates bytes and never changes which bytes are accepted. Plaintext `http` is rejected. A mirror answers `200` directly or redirects only within the upstream host's own set; a redirect to a host of the mirror's own is refused. |
 | `max_fetch_bytes` | `2147483648` | Ceiling on one payload download. |
 | `fetch_timeout` | `"10m"` | Deadline for one payload download. |

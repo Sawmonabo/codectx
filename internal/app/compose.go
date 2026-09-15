@@ -1178,10 +1178,10 @@ func evidenceClip(cfg config.Config) int {
 
 func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, string, error) {
 	// The two directories are distinct and are passed as such: config's data
-	// directory is per workspace and the store under it is <data_dir>/tools,
-	// while tools.cache_dir names the store itself -- which is how one store is
-	// shared by every checkout on the machine. Folding the second into the first
-	// would append "tools" to a path the user already pointed at the store.
+	// directory is per workspace, while tools.cache_dir names the tool store
+	// itself -- one machine-wide store every checkout shares, which is what Load
+	// resolves it to when the user has not set it. Folding the second into the
+	// first would append "tools" to a path that already names the store.
 	overrides := make(map[string]toolchain.Override, len(cfg.Tools.Override))
 	for name, ov := range cfg.Tools.Override {
 		overrides[name] = toolchain.Override(ov)

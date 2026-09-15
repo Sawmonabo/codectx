@@ -259,12 +259,22 @@ tool's own state at its run's work directory — and why an operator who suspect
 tampered tree reinstalls it with `prefetch` rather than trusting a green
 `verify`.
 
-`--repo` selects which workspace's resolved configuration is used, because the
-data directory is per workspace by default and the store under it is
-`<data_dir>/tools`. Set `tools.cache_dir` in the user configuration to give every
-checkout on the machine one shared store: the path it names **is** the store,
-used verbatim, not a parent that `tools` appends to. The path the reports print
-is the one the resolver actually reads, so the two can never disagree.
+The store is **one machine-wide directory shared by every workspace**:
+`$XDG_DATA_HOME/codectx/tools`, or `~/.local/share/codectx/tools` when
+`XDG_DATA_HOME` is unset or not absolute. That is the default, and it is the same
+path the installer populates from a bundle, so a payload installed once is
+installed for every repository on the host. The payloads are gigabytes and are
+byte-identical for every checkout; a per-workspace store would fetch them again
+for each one and leave a fresh clone with nothing installed.
+
+`tools.cache_dir` in the user configuration overrides it. The path it names **is**
+the store, used verbatim, not a parent that `tools` appends to. `--repo` selects
+which workspace's resolved configuration is read, which matters only on a host
+whose user configuration varies by repository. The path the reports print is the
+one the resolver actually reads, so the two can never disagree.
+
+Older builds put the store at `<data_dir>/tools`, which was per workspace. Those
+directories are inert: nothing reads them any more, and each may be deleted.
 
 None of the four commands creates anything it only reports on: `status`,
 `verify` and `gc` leave a machine with no store exactly as they found it, and the
@@ -282,8 +292,9 @@ both: **codectx never fetches anything the embedded lock does not name**, so
 "offline" is a refusal path, not a best-effort degradation.
 
 **A bundle archive** (`codectx-bundle_<version>_<os>_<arch>.tar.gz`) carries the
-binary with the tool store already populated for that one platform. Install it,
-point `[tools] cache_dir` at the unpacked store, and nothing ever dials out.
+binary with the tool store already populated for that one platform. The
+installer unpacks it into the shared store the default already resolves to, so
+only `[tools] offline = true` has to be set, and nothing ever dials out.
 Each bundle is built natively for its own target, so one host cannot produce
 another platform's bundle.
 
