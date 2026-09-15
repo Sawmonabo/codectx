@@ -618,7 +618,7 @@ func containerQuery() string {
 func buildNodeArrays(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64, nodeCode map[string]byte) error {
 	claims, err := tx.QueryContext(ctx, containerQuery())
 	if err != nil {
-		return wrap("relation_ids", err)
+		return wrap("tmp_graph_node_container", err)
 	}
 	defer claims.Close()
 	var claimNode, claimContainer int64
@@ -626,10 +626,10 @@ func buildNodeArrays(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64,
 	nextClaim := func() error {
 		claimOK = claims.Next()
 		if !claimOK {
-			return wrap("relation_ids", claims.Err())
+			return wrap("tmp_graph_node_container", claims.Err())
 		}
 		var canonical []byte
-		return wrap("relation_ids", claims.Scan(&claimNode, &claimContainer, &canonical))
+		return wrap("tmp_graph_node_container", claims.Scan(&claimNode, &claimContainer, &canonical))
 	}
 	if err := nextClaim(); err != nil {
 		return err
