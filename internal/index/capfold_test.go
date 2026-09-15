@@ -3,7 +3,9 @@ package index
 import (
 	"io"
 	"log/slog"
+	"maps"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -61,5 +63,125 @@ func TestCapabilityFoldSumsCollapsedCounts(t *testing.T) {
 	}
 	if got := bounded[0].Details["units_failed"]; got != "1" {
 		t.Fatalf("the surviving row reports units_failed=%q, want %q", got, "1")
+	}
+}
+
+// TestCapabilityFoldKeepsDegradationDetails protects the one channel a
+// degradation that is not severe enough to change a state has.
+//
+// Two rows that collide on the fold key are two units of one capability, and
+// what each gave up is true of the published row: keeping only the first one's
+// details reported one unit's dropped records and silently dropped the other's,
+// which is the silence the scale posture forbids. A fresh row's details are
+// kept for the same reason -- clearing the map made `partial` the only way a
+// provider could be heard at all, so a run that lost nothing had to over-claim
+// a degradation to report an admitted-oversize count.
+//
+// Mutation proof: restore the first-wins fold in `add`
+// (`r.rows[key] = existing.WithDetail(scopesDetail, ...)`) and the partial
+// assertions fail on records_dropped=2 and one reason; restore `s.Details =
+// nil` on the fresh row and the fresh assertion fails on an empty
+// truncated_fields.
+func TestCapabilityFoldKeepsDegradationDetails(t *testing.T) {
+	t.Parallel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	r := newCapabilityReport()
+	r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references", Scope: "pkg:go:a",
+		State: model.CapabilityPartial, DiagnosticCode: model.CodeResourceLimit,
+		Details: map[string]string{"records_dropped": "2", "reason": "resource_limit"}})
+	r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "references", Scope: "pkg:go:a",
+		State: model.CapabilityPartial, DiagnosticCode: model.CodeResourceLimit,
+		Details: map[string]string{"records_dropped": "3", "reason": "unverified_binding"}})
+	r.add(model.CapabilityState{ProviderID: scip.ID, Capability: "definitions", Scope: "pkg:go:b",
+		State:   model.CapabilityFresh,
+		Details: map[string]string{"truncated_fields": "7", "scope_key": "pkg:go:b"}})
+
+	rows := map[string]model.CapabilityState{}
+	for _, s := range r.finish(log) {
+		rows[s.Capability] = s
+	}
+	partial, ok := rows["references"]
+	if !ok {
+		t.Fatalf("the report published no references row: %+v", rows)
+	}
+	if got := partial.Details["records_dropped"]; got != "5" {
+		t.Fatalf("the colliding rows report records_dropped=%q, want %q: the counts of one unit were dropped", got, "5")
+	}
+	if got := partial.Details["reason"]; got != "resource_limit,unverified_binding" {
+		t.Fatalf("the colliding rows report reason=%q, want both reasons deduped and joined in sorted order", got)
+	}
+	if got := partial.Details[scopesDetail]; got != "2" {
+		t.Fatalf("the colliding rows report scopes=%q, want %q", got, "2")
+	}
+	fresh, ok := rows["definitions"]
+	if !ok {
+		t.Fatalf("the report published no definitions row: %+v", rows)
+	}
+	if got := fresh.Details["truncated_fields"]; got != "7" {
+		t.Fatalf("the fresh row reports truncated_fields=%q, want %q: its degradation reaches no caller", got, "7")
+	}
+	if got, ok := fresh.Details[scopeKeyDetail]; ok {
+		t.Fatalf("the fresh row kept scope_key=%q; the fold rewrote it to the workspace scope", got)
+	}
+}
+
+// TestCapabilityFoldMergesInOrderIndependently protects the determinism the
+// merged details are published under. They fold into details_json and from
+// there into the AnalysisKey, while the rows themselves come from unit workers
+// that run concurrently: two identical runs whose units finished in a
+// different order must key identically. The union only stays a function of the
+// set if a union too wide for model.MaxDetailBytes is cut between values --
+// cutting at a byte offset leaves a fragment that the next fold carries as a
+// value of its own, and which fragment that is depends on which row folded
+// first.
+//
+// Mutation proof: cut the union with
+// `model.TruncateField(strings.Join(parts, detailSeparator), model.MaxDetailBytes)`
+// instead of dropping whole values, and the reverse-order maps differ on
+// `reason`.
+func TestCapabilityFoldMergesInOrderIndependently(t *testing.T) {
+	t.Parallel()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	wide := func(prefix string) string {
+		reasons := make([]string, 0, 30)
+		for i := range 30 {
+			reasons = append(reasons, prefix+"_reason_"+strconv.Itoa(100+i)+"_of_a_widely_degraded_unit")
+		}
+		return strings.Join(reasons, ",")
+	}
+	first := model.CapabilityState{ProviderID: scip.ID, Capability: "references", Scope: "pkg:go:a",
+		State: model.CapabilityPartial, DiagnosticCode: model.CodeResourceLimit,
+		Details: map[string]string{"reason": wide("alpha")}}
+	second := first
+	second.Details = map[string]string{"reason": wide("omega")}
+
+	merged := func(rows ...model.CapabilityState) model.CapabilityState {
+		r := newCapabilityReport()
+		for _, row := range rows {
+			r.add(row)
+		}
+		out := r.finish(log)
+		if len(out) != 1 {
+			t.Fatalf("the report published %d rows, want one: %+v", len(out), out)
+		}
+		return out[0]
+	}
+	forward, reverse := merged(first, second), merged(second, first)
+	if !maps.Equal(forward.Details, reverse.Details) {
+		t.Fatalf("the fold published %v folding forward and %v folding in reverse; the merge must be a function of the set",
+			forward.Details, reverse.Details)
+	}
+	if got := forward.Details[truncatedDetail]; got != "reason" {
+		t.Fatalf("the fold reports details_truncated=%q, want %q: the cut list is published as if it were whole", got, "reason")
+	}
+	if got := len(forward.Details["reason"]); got > model.MaxDetailBytes {
+		t.Fatalf("the merged reason is %d bytes, want at most %d", got, model.MaxDetailBytes)
+	}
+	for _, value := range strings.Split(forward.Details["reason"], ",") {
+		if !strings.HasSuffix(value, "_of_a_widely_degraded_unit") {
+			t.Fatalf("the merged reason carries the fragment %q; the cut split a value", value)
+		}
 	}
 }
