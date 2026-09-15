@@ -197,6 +197,19 @@ func TestValidationRejectsBadRangesAndEnums(t *testing.T) {
 	if err := validFact.Validate(); err != nil {
 		t.Fatalf("valid node fact rejected: %v", err)
 	}
+	// A fact's evidence is not bounded at a number a real unit reaches: an
+	// identity referenced 200 times in one file publishes 200 occurrences.
+	// Failure mode: the bound was 64, so a provider clipped the 65th and
+	// storage deleted the surplus rows, and every reader saw 64 however it
+	// asked -- a truncated answer under default settings.
+	manyEvidence := validFact
+	for i := 0; i < 200; i++ {
+		manyEvidence.Evidence = append(manyEvidence.Evidence, validEvidence)
+	}
+	if err := manyEvidence.Validate(); err != nil {
+		t.Fatalf("a node fact with %d evidence occurrences rejected: %v", len(manyEvidence.Evidence), err)
+	}
+
 	freeTextKey := validFact
 	freeTextKey.CanonicalKey = "pkg.F"
 	uppercaseKey := validFact
