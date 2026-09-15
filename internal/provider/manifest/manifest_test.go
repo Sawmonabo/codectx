@@ -681,3 +681,43 @@ func TestParseBoundsAreUnlimitedByDefaultAndDegradeOnlyPastTheBound(t *testing.T
 		t.Fatalf("a 100-element bound published %d relations against %d unbounded; the walk did not stop", got, full)
 	}
 }
+
+// TestDeepHeadingTrailDoesNotFailTheUnit pins that a document's heading depth
+// is never a reason to publish nothing. A section's identity is its heading
+// trail, and six levels of long headings exceed MaxNativeKeyBytes, which the
+// node candidate refuses -- that refusal would fail the whole unit and cost a
+// real documentation file every fact it has. The trail is truncated and
+// flagged with a digest of the full trail instead, so two deep trails sharing
+// a prefix stay two sections. Removing the truncation makes this fail.
+func TestDeepHeadingTrailDoesNotFailTheUnit(t *testing.T) {
+	var md strings.Builder
+	for level := 1; level <= 6; level++ {
+		fmt.Fprintf(&md, "%s %s%d\n\n", strings.Repeat("#", level), strings.Repeat("h", model.MaxNameBytes-1), level)
+	}
+	// A second leaf under the same five parents: its trail shares every byte
+	// of the first past the truncation point.
+	fmt.Fprintf(&md, "###### %s%d\n", strings.Repeat("h", model.MaxNameBytes-1), 7)
+	files := map[string]string{"deep.md": md.String()}
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := &capture{}
+	states := map[string]model.CapabilityState{}
+	runUnit(t, providertest.New(t, files), mf, "deep.md", cap, states)
+	if cs := states[manifest.ID+" "+manifest.CapabilityDocumentation+" "+filesystem.ScopeKey("deep.md")]; cs.State != model.CapabilityFresh {
+		t.Fatalf("a deeply nested document published %s/%s, want fresh", cs.State, cs.DiagnosticCode)
+	}
+	qualified := map[string]bool{}
+	for _, d := range cap.search {
+		if d.Kind == model.NodeSection {
+			if len(d.QualifiedName) > model.MaxQualifiedNameBytes {
+				t.Fatalf("section qualified name is %d bytes, ceiling %d", len(d.QualifiedName), model.MaxQualifiedNameBytes)
+			}
+			qualified[d.QualifiedName] = true
+		}
+	}
+	if len(qualified) != 7 {
+		t.Fatalf("7 headings yielded %d distinct section identities", len(qualified))
+	}
+}

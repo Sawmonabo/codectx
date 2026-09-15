@@ -106,8 +106,18 @@ type section struct {
 	title string
 }
 
-// sectionTrail joins the open heading path for a qualified name.
-const sectionTrail = " > "
+// sectionTrail joins the open heading path for a qualified name, and
+// sectionKeyBytes is the budget that name has: the node candidate's native key
+// is the name behind the kind prefix, and a candidate over MaxNativeKeyBytes
+// fails validation, which would fail the whole unit. A deeply nested document
+// whose headings are long reaches it, so the name is truncated and flagged
+// with a digest instead -- a length ceiling truncates, it never refuses a file.
+const (
+	sectionTrail     = " > "
+	sectionDomain    = "manifest-section-v1"
+	sectionKeyBytes  = model.MaxNativeKeyBytes - len(string(model.NodeSection)+":")
+	sectionDigestHex = 16
+)
 
 // qualifySection names one heading: the document path, then the trail of
 // headings that encloses it. Two headings with the same trail (the same text
@@ -132,6 +142,14 @@ func qualifySection(rel string, trail []section, sections map[string]int) string
 	sections[qualified] = n + 1
 	if n > 0 {
 		qualified += "~" + strconv.Itoa(n+1)
+	}
+	if len(qualified) > sectionKeyBytes {
+		// The cut prefix is not an identity: two trails sharing it would
+		// otherwise become one section. The digest of the full trail keeps
+		// them apart and stays content-derived.
+		digest := model.H(sectionDomain, qualified)[:sectionDigestHex]
+		head, _ := model.TruncateField(qualified, sectionKeyBytes-len(digest)-1)
+		qualified = head + "~" + digest
 	}
 	return qualified
 }
