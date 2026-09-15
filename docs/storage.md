@@ -473,6 +473,47 @@ The header row is written **last**, after every part. Its presence is therefore
 the commit marker: a reader that finds it is guaranteed every part behind it,
 and a half-written graph is indistinguishable from no graph at all.
 
+## The packed per-generation term statistics
+
+The same activation publishes a packed form of the generation's lexical
+statistics, and a single-token search term reads its inputs from that and from
+nothing else ([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1). Like
+the adjacency it is derived from sealed facts, carries no provider version and
+no fingerprint of its own, and is dropped with the generation it describes.
+
+It exists because the live posting path costs three b-tree descents per posting
+**instance** — the vocabulary row, the document row and the generation
+membership probe — plus a temporary b-tree per term for the document frequency,
+and all of that is paid again on every request. Resolving visibility once, at
+publication, into a document bitmap and folding one bare instance scan against
+it turns a per-request cost that grows with the corpus into a sequential read of
+one term's list.
+
+**The two tables.** `generation_lexical` carries one row per generation: the
+visible document count, the total token length and the number of terms.
+`generation_lexical_parts` carries the bytes, one row per chunk of one stream,
+keyed by generation, stream name and a 0-based part number whose parts
+concatenate to the stream. Both cascade from `generations`. The three streams
+are `term.dir`, a fixed-width directory in term order holding each term's
+document frequency and the slices of the other two streams that belong to it;
+`term.text`, the concatenated term bytes; and `post.list`, each term's
+per-document, column-ascending `(column, count)` sequence, documents encoded as
+deltas. A term lookup is a binary search over the fixed-width directory, so a
+query reads a bounded window of parts rather than a vocabulary.
+
+The commit row is written **last**, after every part, for the same reason the
+graph header is: a reader that finds it is guaranteed every part behind it.
+
+The build is one streaming pass — heap is one part, one term's list and the
+bitmap — and it holds the same 5 % share of the index wall clock the adjacency
+build is held to. Its start and end are logged on their own so an operator can
+see the pass rather than infer it from the activation's total.
+
+A **phrase** keeps the live posting path. The packed form stores counts, not
+offsets, and a phrase has to test adjacency; storing offsets would put a second
+copy of the indexed text back in the database, which is exactly what the
+contentless index above exists to avoid.
+
 **The streams.** Per direction there are two: an offsets directory of one 64-bit
 little-endian entry per node surrogate, and an edge stream. A node's list starts
 at its own offset and ends at the next node's, so a node with no edges has two

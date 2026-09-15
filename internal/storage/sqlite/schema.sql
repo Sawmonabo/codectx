@@ -719,3 +719,29 @@ CREATE TABLE generation_graph_parts (
     bytes BLOB NOT NULL,
     PRIMARY KEY(generation_id, stream, part)
 ) WITHOUT ROWID;
+
+-- generation_lexical is written LAST, after every lexical part, so its presence
+-- is the commit marker: a reader that finds the row is guaranteed every part
+-- behind it. It also carries the generation's document statistics, which the
+-- scorer would otherwise recompute by probing every visible document
+-- (ADR-0007 Decision 1).
+CREATE TABLE generation_lexical (
+    generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
+    doc_count INTEGER NOT NULL CHECK(doc_count >= 0),
+    token_total INTEGER NOT NULL CHECK(token_total >= 0),
+    term_count INTEGER NOT NULL CHECK(term_count >= 0)
+);
+-- One chunk of one lexical stream. `term.dir` is the fixed-width term
+-- directory in term order -- term slice, document frequency and the slice of
+-- `post.list` holding that term's per-document (column, count) sequence --
+-- `term.text` the concatenated term bytes it points into, and `post.list` the
+-- posting lists themselves. `part` is 0-based and the parts of a stream
+-- concatenate to it, so a reader holds a bounded window of parts rather than a
+-- whole vocabulary.
+CREATE TABLE generation_lexical_parts (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list')),
+    part INTEGER NOT NULL CHECK(part >= 0),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(generation_id, stream, part)
+) WITHOUT ROWID;

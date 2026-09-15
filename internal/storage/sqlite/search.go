@@ -235,60 +235,6 @@ func (r *PinnedReader) nodesInFile(ctx context.Context, file model.FileID, after
 	return out, nil
 }
 
-// DocumentFrequency returns, per term in order, how many visible documents
-// contain it; the caller caps len(terms) at resources.max_query_terms.
-func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([]int64, error) {
-	if len(terms) == 0 {
-		return nil, invalid("document frequency needs at least one term")
-	}
-	if len(terms) > model.MaxFilterValues {
-		return nil, invalid("document frequency asked for %d terms, limit %d", len(terms), model.MaxFilterValues)
-	}
-	marks := make([]string, len(terms))
-	args := []any{r.gen}
-	for i, t := range terms {
-		if t == "" {
-			return nil, invalid("document frequency term %d is empty", i)
-		}
-		// Numbered, because the visibility clause that follows binds ?1 and
-		// SQLite would otherwise number these anonymous marks from 1 too.
-		marks[i] = "?" + strconv.Itoa(i+2)
-		args = append(args, t)
-	}
-	// One statement for every term: a per-term round trip would be N+1 against
-	// the vocabulary, which is the largest table a query touches.
-	query := `SELECT v.term, count(DISTINCT v.doc) FROM search_vocab v
-		JOIN search_units su ON su.doc_id = v.doc
-		WHERE v.term IN (` + strings.Join(marks, ",") + `)` + r.visibleDocument("su") + `GROUP BY v.term`
-	counts := make(map[string]int64, len(terms))
-	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return wrap("search_vocab", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var term string
-			var n int64
-			if err := rows.Scan(&term, &n); err != nil {
-				return wrap("search_vocab", err)
-			}
-			counts[term] = n
-		}
-		return wrap("search_vocab", rows.Err())
-	})
-	if err != nil {
-		return nil, err
-	}
-	// Input order, zero for a term no visible document carries: the caller
-	// indexes this slice by the position of its own term.
-	out := make([]int64, len(terms))
-	for i, t := range terms {
-		out[i] = counts[t]
-	}
-	return out, nil
-}
-
 // PostingSession is one read transaction dedicated to a query's term streams.
 // Every stream it opens reads the same snapshot, and that snapshot is held for
 // the whole candidate walk instead of being re-taken per page. It runs on the
@@ -297,8 +243,9 @@ func (r *PinnedReader) DocumentFrequency(ctx context.Context, terms []string) ([
 // Close rolls the transaction back and is safe to call more than once; closing
 // it also closes every stream still open on it.
 type PostingSession struct {
-	r  *PinnedReader
-	tx *sql.Tx
+	r   *PinnedReader
+	tx  *sql.Tx
+	lex *lexicalIndex
 }
 
 // OpenPostings begins a posting session for this generation.

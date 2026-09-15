@@ -71,6 +71,12 @@ func (f *fakePostings) TermOccurrences(_ context.Context, term string) (occurren
 	return &fakeStream{src: f, term: term}, nil
 }
 
+// TermCounts is the packed constructor; the fake serves both from one corpus,
+// because what this fake exists to catch is a stream RE-OPENED inside a walk.
+func (f *fakePostings) TermCounts(ctx context.Context, term string) (occurrenceStream, error) {
+	return f.TermOccurrences(ctx, term)
+}
+
 // fakeStream replays the corpus in document order in page-sized refills.
 type fakeStream struct {
 	src  *fakePostings
