@@ -12,6 +12,14 @@ import (
 // gcBatchUnits bounds one collection transaction.
 const gcBatchUnits = 200
 
+// gcNativeRowsExamined bounds the child-table rows one retention run may spend
+// proving native keys unreferenced. See collectUnreferencedNativeKeys: each
+// deleted key costs one scan of native_aliases and one of evidence, so this is
+// a work budget that DEFERS the remainder to the next run, never a cap that
+// skips or truncates anything. 200 million rows is ~7 s at the reference
+// corpus' child-table sizes and more deletions than any small store can offer.
+const gcNativeRowsExamined = 200_000_000
+
 // DeleteGeneration removes a failed or superseded generation's membership and
 // metadata, then collects units no retained generation or dependent unit
 // reaches, in reverse dependency order through the FTS-aware deletion
@@ -76,6 +84,9 @@ func (s *Store) sweep(ctx context.Context, now time.Time, snapshot []byte) error
 		return err
 	}
 	if err := s.collectUnreferencedScopeKeys(ctx); err != nil {
+		return err
+	}
+	if err := s.collectUnreferencedNativeKeys(ctx); err != nil {
 		return err
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
@@ -148,10 +159,9 @@ func (s *Store) collectUnreachableUnits(ctx context.Context) error {
 // deleted, so a dictionary of live keys is walked once per pass instead of
 // re-examining the same surviving prefix forever.
 //
-// native_keys has no counterpart here on purpose: see the lane report. Its two
-// child keys (native_aliases.native_key_id, evidence.native_key_id) are
-// unindexed, so the identical statement degrades to a full scan of evidence
-// per candidate. Sweeping it needs an index decision that is not this lane's.
+// native_keys is swept by collectUnreferencedNativeKeys below, in a different
+// shape: its two child keys are unindexed, so this per-candidate form would
+// degrade to one full scan of evidence per candidate.
 func (s *Store) collectUnreferencedScopeKeys(ctx context.Context) error {
 	var after int64
 	for {
@@ -175,6 +185,145 @@ func (s *Store) collectUnreferencedScopeKeys(ctx context.Context) error {
 		}
 		after = last
 	}
+}
+
+// nativeKeyDeleteBudget converts gcNativeRowsExamined into a number of native
+// keys this run may delete, from the size of the two child tables SQLite scans
+// per deleted parent row. It is deliberately derived rather than constant: the
+// same budget then sweeps a small store's dictionary whole and drains a large
+// one. Its two counts are one index scan each, paid once per run beside the two
+// the live set already costs. It never returns zero, so every run makes
+// progress however large the store.
+func (s *Store) nativeKeyDeleteBudget(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var rowsPerDelete int64
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM native_aliases) + (SELECT count(*) FROM evidence)`).
+		Scan(&rowsPerDelete); err != nil {
+		return 0, wrap("native_keys", err)
+	}
+	if rowsPerDelete < 1 {
+		rowsPerDelete = 1
+	}
+	return max(gcNativeRowsExamined/rowsPerDelete, 1), nil
+}
+
+// collectUnreferencedNativeKeys deletes the native-key dictionary rows that
+// no alias and no evidence row names any more. Like scope keys, a native key
+// outlives every unit that referred to it -- deleteUnit removes the alias and
+// evidence rows, never the interned string -- so a store rebuilt repeatedly
+// accumulates them forever. The retained cost is real: measured on the
+// reference corpus, native_keys plus its UNIQUE autoindex holds ~182 B per
+// distinct key, so a full-vocabulary churn of 402 568 keys strands ~73 MB per
+// re-index, monotonically and with no bound.
+//
+// It cannot copy collectUnreferencedScopeKeys' per-candidate probe. Scope keys
+// lead idx_alias_lookup, so each candidate costs one indexed lookup; the two
+// native-key child columns (native_aliases.native_key_id, evidence.native_key_id)
+// lead no index, so the same statement plans as a correlated SCAN of evidence
+// per candidate -- 477 388 rows examined per key on the reference corpus. The
+// re-spec deliberately refused an index for it: the two candidates cost 2.24 %
+// of the store, above the 2 % the ruling admits.
+//
+// So the live set is collected ONCE per retention run into a temp table keyed
+// by INTEGER PRIMARY KEY -- two sequential scans total, each a streaming
+// insert -- and each candidate is then a rowid probe into that table. Peak heap
+// is one cursor and one batch; the set itself is on disk (temp_store=FILE).
+//
+// The whole sweep runs in ONE write transaction, unlike the scope-key pass.
+// That is required, not incidental: a per-candidate probe re-evaluates
+// liveness at delete time and so is safe across transactions, whereas this
+// pass snapshots liveness up front. Between two transactions another writer
+// could intern a native key whose row this pass would then delete as
+// unreferenced. Holding the write transaction excludes that writer for the
+// duration. The deletes are still issued as gcBatchUnits-sized keyset
+// statements so that the rows examined by any one statement stay bounded.
+//
+// The probe is not the whole cost, and EQP does not show the rest. native_keys
+// is the PARENT of two foreign keys whose child columns lead no index
+// (evidence.native_key_id has none at all; native_aliases' idx_alias_lookup
+// leads with scope_key_id), and open.go sets foreign_keys=ON on every
+// connection, so SQLite scans both child tables once per DELETED row to prove
+// no reference survives. That cost is invisible to EXPLAIN QUERY PLAN, which
+// reports only the probe -- SEARCH native_keys USING INTEGER PRIMARY KEY plus
+// one CORRELATED SCALAR SUBQUERY that is SEARCH g USING INTEGER PRIMARY KEY.
+//
+// Measured on a corpus of the reference shape at 1/10 scale (40 257 keys,
+// 27 481 alias rows, 47 739 evidence rows), the cost is linear in rows DELETED
+// and independent of batch size: 200 deletions in 554 ms and 2 000 in 5.33 s,
+// both ~2.7 ms per deletion, versus 405 ms for the entire 201 285-row sweep
+// with foreign_keys=OFF. Scaling the child tables to the reference corpus
+// multiplies that by ten: ~27 ms per deleted key, so an unbounded first run
+// after a full-vocabulary churn would spend ~90 minutes inside one write
+// transaction.
+//
+// So the budget bounds the child-table rows a run may EXAMINE, which is the
+// same thing as bounding the keys it may delete, and the rest drains over the
+// following runs. Nothing is skipped permanently: a key this run does not
+// delete is still unreferenced next run, and the ones it did delete are gone,
+// so every run advances. A store whose child tables are small sweeps its whole
+// dictionary in one run; only a store large enough to make a run pathological
+// drains over several.
+//
+// The WALK is deliberately not bounded, only the deletions. A batch that
+// deletes nothing examines no child row and costs one rowid-range scan with a
+// rowid probe per candidate -- the whole 402 568-key dictionary walks in under
+// the 405 ms that the same loop took while also deleting 201 285 rows with the
+// foreign keys off. Capping the walk instead would need a cursor persisted
+// between retention runs; without one, a cap would re-examine the same prefix
+// every run and leave dead keys past it permanently unreachable, which is a
+// correctness regression traded for a sub-second saving.
+//
+// The budget does NOT make the drain converge at reference scale: ~265 keys
+// per run against a ~201 k backlog. It bounds the damage rather than repairing
+// it. An index on evidence(native_key_id) turns each foreign-key check into a
+// lookup and the whole sweep sub-second; that index was refused on the probe's
+// cost, which the measurement above shows was never the binding cost.
+func (s *Store) collectUnreferencedNativeKeys(ctx context.Context) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		for _, q := range []string{
+			`CREATE TEMP TABLE IF NOT EXISTS gc_live_native(id INTEGER PRIMARY KEY)`,
+			// A previous run in this process leaves the table declared; start
+			// from an empty set rather than from its residue.
+			`DELETE FROM gc_live_native`,
+			`INSERT OR IGNORE INTO gc_live_native SELECT native_key_id FROM native_aliases`,
+			`INSERT OR IGNORE INTO gc_live_native SELECT native_key_id FROM evidence`,
+		} {
+			if _, err := tx.ExecContext(ctx, q); err != nil {
+				return wrap("native_keys", err)
+			}
+		}
+		budget, err := s.nativeKeyDeleteBudget(ctx, tx)
+		if err != nil {
+			return err
+		}
+		var after, deleted int64
+		for deleted < budget {
+			var last int64
+			if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(id), 0) FROM
+				(SELECT id FROM native_keys WHERE id > ?1 ORDER BY id LIMIT ?2)`,
+				after, gcBatchUnits).Scan(&last); err != nil {
+				return wrap("native_keys", err)
+			}
+			if last == 0 {
+				break
+			}
+			res, err := tx.ExecContext(ctx, `DELETE FROM native_keys WHERE id > ?1 AND id <= ?2
+				AND NOT EXISTS (SELECT 1 FROM gc_live_native g WHERE g.id = native_keys.id)`,
+				after, last)
+			if err != nil {
+				return wrap("native_keys", err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return wrap("native_keys", err)
+			}
+			deleted += n
+			// The cursor advances past the whole batch whether or not its rows
+			// were deleted, so a dictionary of live keys is walked once.
+			after = last
+		}
+		_, err = tx.ExecContext(ctx, `DELETE FROM gc_live_native`)
+		return wrap("native_keys", err)
+	})
 }
 
 // collectUnits repeatedly selects up to gcBatchUnits unit rows with query
