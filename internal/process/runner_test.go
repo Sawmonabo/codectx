@@ -3,13 +3,13 @@
 package process
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -114,72 +114,77 @@ func waitForPID(t *testing.T, path string) int {
 	return 0
 }
 
-// TestOutputLimitTerminates protects the bounded-output invariant: a child that
-// writes without end must be stopped at the configured ceiling and reported as
-// a typed resource limit. Draining it into memory instead would let any
-// analyzer exhaust the serving process.
-func TestOutputLimitTerminates(t *testing.T) {
+// TestOutputOverTheCapCompletesAndIsFlagged protects the invariant that a
+// capture bound bounds memory and nothing else. A child that produces three
+// times the bound must still run to completion and still have every record it
+// wrote consumed; only the bytes this package would otherwise have to hold are
+// dropped, and only for a stream it is capturing. Terminating the tree instead
+// -- what this runner used to do -- turns a large repository into a refusal.
+func TestOutputOverTheCapCompletesAndIsFlagged(t *testing.T) {
 	requireExecutable(t, "/bin/sh")
 	runner, dir := testRunner(t)
 
+	// 3072 bytes of stdout against a 1024-byte capture bound.
+	const (
+		records   = 96
+		recordLen = 32
+		capBytes  = records * recordLen / 3
+	)
+	script := "i=0; while [ $i -lt 96 ]; do printf '%031d\\n' $i; i=$((i+1)); done"
+
 	result, err := runner.Run(context.Background(), Spec{
 		Path:           "/bin/sh",
-		Args:           []string{"-c", "while :; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; done"},
+		Args:           []string{"-c", script},
 		Dir:            dir,
-		MaxStdoutBytes: 4096,
-		MaxStderrBytes: 4096,
-		Timeout:        30 * time.Second,
-		Grace:          200 * time.Millisecond,
-	})
-	var typed *model.Error
-	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-		t.Fatalf("Run returned %v, want a typed %s", err, model.CodeResourceLimit)
-	}
-	if !result.OutputTruncated {
-		t.Error("Result does not report the truncation that caused the failure")
-	}
-	if int64(len(result.Stdout)) > 4096 {
-		t.Errorf("captured %d bytes of stdout, over the 4096-byte limit", len(result.Stdout))
-	}
-
-	// A child that crosses the limit and then exits successfully is still a
-	// truncated run: reporting success would hand the caller a partial result
-	// it has no way to recognize as partial.
-	//
-	// The slow sink is what makes the child's exit win the race: it writes 4 KiB
-	// into the pipe buffer and exits at once, while the drain is held inside its
-	// first delivery for 100 ms before it can notice the truncation. The margin
-	// is large, not infinite; if it ever proves tight the assertion still holds
-	// on the other ordering, which is the case the first half of this test
-	// covers.
-	slow := &slowWriter{delay: 100 * time.Millisecond}
-	result, err = runner.Run(context.Background(), Spec{
-		Path:           "/bin/sh",
-		Args:           []string{"-c", `printf '%04096d' 0; exit 0`},
-		Dir:            dir,
-		Stdout:         slow,
-		MaxStdoutBytes: 16,
-		MaxStderrBytes: 4096,
-		Timeout:        30 * time.Second,
+		MaxStdoutBytes: capBytes,
+		MaxStderrBytes: capBytes,
 		Grace:          5 * time.Second,
 	})
-	if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-		t.Fatalf("Run returned %v for a truncated but successful child, want a typed %s", err, model.CodeResourceLimit)
+	if err != nil {
+		t.Fatalf("a child three times over its capture bound failed the run: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("exit code %d, want 0", result.ExitCode)
 	}
 	if !result.OutputTruncated {
-		t.Error("Result does not report the truncation")
+		t.Error("Result does not report that captured bytes were dropped")
+	}
+	if int64(len(result.Stdout)) != capBytes {
+		t.Errorf("captured %d bytes of stdout, want exactly the %d-byte bound", len(result.Stdout), capBytes)
+	}
+
+	// The same child, its stdout handed to a caller's writer: a writer is fed
+	// every byte and paced by its own Write, so all 96 records arrive and
+	// nothing is flagged. A framed protocol could not survive anything less.
+	counter := &recordCounter{}
+	result, err = runner.Run(context.Background(), Spec{
+		Path:           "/bin/sh",
+		Args:           []string{"-c", script},
+		Dir:            dir,
+		Stdout:         counter,
+		MaxStdoutBytes: capBytes,
+		MaxStderrBytes: capBytes,
+		Grace:          5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("a child writing to a caller's sink failed the run: %v", err)
+	}
+	if counter.lines != records {
+		t.Errorf("the sink consumed %d records, want all %d", counter.lines, records)
+	}
+	if result.OutputTruncated {
+		t.Error("a caller-supplied sink was reported as truncated; its bytes are never dropped")
+	}
+	if result.StdoutBytes != records*recordLen {
+		t.Errorf("StdoutBytes is %d, want %d", result.StdoutBytes, records*recordLen)
 	}
 }
 
-// slowWriter delays its first write, which is how a test pins the ordering
-// between a child exiting and its output being delivered.
-type slowWriter struct {
-	delay time.Duration
-	once  sync.Once
-}
+// recordCounter counts the newline-terminated records a stream delivered.
+type recordCounter struct{ lines int }
 
-func (w *slowWriter) Write(b []byte) (int, error) {
-	w.once.Do(func() { time.Sleep(w.delay) })
+func (c *recordCounter) Write(b []byte) (int, error) {
+	c.lines += bytes.Count(b, []byte{'\n'})
 	return len(b), nil
 }
 
@@ -313,7 +318,8 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 	// The same must hold when the run ends through one of the stop decisions
 	// rather than by the child exiting: the copy is still in flight there, and
 	// a run that returns without closing the write end leaves it parked on a
-	// pipe forever.
+	// pipe forever. The wall clock is the stop decision used here because an
+	// output bound no longer is one.
 	requireExecutable(t, "/bin/sh")
 	before = openDescriptors(t)
 	for range 16 {
@@ -325,15 +331,15 @@ func TestStdinIsBoundedAndReleased(t *testing.T) {
 			MaxStdinBytes:  1 << 20,
 			MaxStdoutBytes: 64,
 			MaxStderrBytes: 64,
-			Timeout:        30 * time.Second,
+			Timeout:        200 * time.Millisecond,
 			Grace:          50 * time.Millisecond,
 		})
-		if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
-			t.Fatalf("Run returned %v, want a typed %s", err, model.CodeResourceLimit)
+		if !errors.As(err, &typed) || typed.Code != model.CodeProviderTimeout {
+			t.Fatalf("Run returned %v, want a typed %s", err, model.CodeProviderTimeout)
 		}
 	}
 	if after := openDescriptors(t); after > before+4 {
-		t.Fatalf("16 truncated runs left %d open descriptors, up from %d", after, before)
+		t.Fatalf("16 stopped runs left %d open descriptors, up from %d", after, before)
 	}
 }
 
