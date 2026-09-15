@@ -107,7 +107,9 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			"tools to install, pass --for-repo to install what one repository's " +
 			"own root selects, or pass --all for every entry the " +
 			"lock carries for this platform; one of the three is required, so a " +
-			"bare prefetch never downloads gigabytes by accident.",
+			"bare prefetch never downloads gigabytes by accident. It also removes " +
+			"any payload directory in the store that no lock entry names, which is " +
+			"what `verify` reports as unlisted.",
 		Args:          cobra.ArbitraryArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -136,7 +138,10 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			"pins for it, so a store a user edited or a disk damaged is reported " +
 			"here rather than discovered at the next analyzer run. A corrupt entry " +
 			"fails the command: a check that reports damage and exits 0 is a gate " +
-			"that passes silently in CI.",
+			"that passes silently in CI. It also lists any payload directory the " +
+			"store holds that no lock entry names, as an `unlisted` row; `prefetch` " +
+			"removes those. Verifying verifies what is installed, so a store that " +
+			"holds nothing yet is reported, not failed.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -415,6 +420,15 @@ func writeToolTable(w io.Writer, data toolReport, digests bool) error {
 	sort.Strings(states)
 	fmt.Fprintf(&b, "\n%d %s: %s\n", len(data.Tools), plural(len(data.Tools), "entry", "entries"),
 		strings.Join(states, ", "))
+	// A store with nothing installed is a legitimate report -- `verify`
+	// verifies what is installed -- but its state counts alone read as a clean
+	// bill of health to an operator who ran the command to learn whether this
+	// machine is provisioned. The one line below says what the counts imply and
+	// names the command that fixes it.
+	if lock, installed := lockedAndInstalled(data.Tools); lock > 0 && installed == 0 {
+		fmt.Fprintf(&b, "0 of %d selected %s installed -- run `codectx tools prefetch`\n",
+			lock, plural(lock, "tool is", "tools are"))
+	}
 	return writeText(w, "%s", b.String())
 }
 
@@ -428,6 +442,25 @@ func writeToolTable(w io.Writer, data toolReport, digests bool) error {
 // digests are in the --json envelope for a machine.
 func digestPhrase(t toolEntry) string {
 	return "lock:" + shortDigest(t.EntrySHA256) + " disk:" + shortDigest(t.InstalledSHA256)
+}
+
+// lockedAndInstalled counts the rows that are lock entries and, of those, the
+// ones whose payload is present. An unlisted row is neither: it is a directory
+// the lock does not name, so counting it would make an empty store holding one
+// stray directory report a tool it does not have.
+func lockedAndInstalled(rows []toolEntry) (locked, installed int) {
+	for _, r := range rows {
+		switch toolchain.State(r.State) {
+		case toolchain.StateUnlisted, toolchain.StateUnsupportedPlatform:
+			// Neither is a payload this host could install: the first is not a
+			// lock entry at all, the second has no payload for this platform.
+			continue
+		case toolchain.StateInstalled, toolchain.StateOverride:
+			installed++
+		}
+		locked++
+	}
+	return locked, installed
 }
 
 func shortDigest(hex string) string {

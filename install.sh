@@ -43,6 +43,19 @@ ctx_die() {
 	exit 1
 }
 
+# ctx_store_dir echoes the machine-wide tool store, resolved by exactly the rule
+# the product uses (internal/config.osUserDataDir): XDG_DATA_HOME is honoured
+# only when it is absolute, because a relative one names a store that moves with
+# the process working directory, which the product ignores and its configuration
+# validation rejects. If the installer resolved it differently, a bundle would
+# land in a directory nothing reads.
+ctx_store_dir() {
+	case "${XDG_DATA_HOME:-}" in
+	/*) printf '%s\n' "$XDG_DATA_HOME/codectx/tools" ;;
+	*) printf '%s\n' "${HOME:-}/.local/share/codectx/tools" ;;
+	esac
+}
+
 # ctx_usage is inline text, not a slice of this file: the script is normally
 # run by piping it into sh, where $0 is not a readable path.
 ctx_usage() {
@@ -68,9 +81,12 @@ Options:
 
 After the binary is installed and verified, the installer runs
 "codectx tools prefetch" so every pinned analyzer, language server and runtime
-is present before the first index. They land in one machine-wide store,
-$XDG_DATA_HOME/codectx/tools, shared by every repository on this host. The
-whole toolchain is several gigabytes; --tools-for-repo installs the subset one
+is present before the first index. They land in one machine-wide store, shared
+by every repository on this host:
+EOF
+	printf '\n  %s\n\n' "$(ctx_store_dir)"
+	cat <<'EOF'
+The whole toolchain is several gigabytes; --tools-for-repo installs the subset one
 repository selects, and --no-tools skips it entirely (a later run installs each
 tool on demand).
 
@@ -347,12 +363,12 @@ ctx_main() {
 	ctx_log "installed codectx $ctx_version to $ctx_prefix/codectx"
 
 	if [ "$ctx_bundle" = yes ]; then
-		ctx_store_dir="${XDG_DATA_HOME:-${HOME:-}/.local/share}/codectx/tools"
-		mkdir -p "$ctx_store_dir" || ctx_die "could not create $ctx_store_dir"
-		cp -R "$ctx_store/." "$ctx_store_dir/" ||
-			ctx_die "could not copy the bundled tool store into $ctx_store_dir"
-		chmod 0700 "$ctx_store_dir"
-		ctx_log "installed the bundled tool store to $ctx_store_dir"
+		ctx_store_target="$(ctx_store_dir)"
+		mkdir -p "$ctx_store_target" || ctx_die "could not create $ctx_store_target"
+		cp -R "$ctx_store/." "$ctx_store_target/" ||
+			ctx_die "could not copy the bundled tool store into $ctx_store_target"
+		chmod 0700 "$ctx_store_target"
+		ctx_log "installed the bundled tool store to $ctx_store_target"
 		ctx_log "that is the store codectx reads by default, so nothing needs configuring.
 To refuse every network fetch as well, add to ${XDG_CONFIG_HOME:-${HOME:-}/.config}/codectx/config.toml:
 
