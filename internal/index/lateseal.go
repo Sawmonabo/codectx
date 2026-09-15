@@ -613,10 +613,15 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	c.retain(ctx)
 	c.collect(ctx)
 	c.run.Unlock()
+	// The run list is the same wire-sized page the foreground publish serves,
+	// with the same count of what did not fit: a late-sealed generation with
+	// more runs than one response carries must say so rather than serve a
+	// short list as the whole of it.
+	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, StartedAt: started, CompletedAt: c.now()}, true, nil
+		Runs: runs, RunsOmitted: omitted, StartedAt: started, CompletedAt: c.now()}, true, nil
 }
 
 // attach fills the publication generation: the reused members, the sealed

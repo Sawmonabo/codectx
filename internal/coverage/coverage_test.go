@@ -1467,6 +1467,26 @@ func (f *fakeStore) LeaseExpiry(_ context.Context, id string) (time.Time, error)
 }
 
 func TestCoverage(t *testing.T) {
+	// The unconfirmed-chunk bound is the one Limits accessor no scenario
+	// reaches -- a session would have to hold four unissued receipts at once
+	// -- so its two arms are asserted directly. Both are load bearing: the
+	// zero arm is the documented "unlimited" spelling of
+	// coverage.max_unconfirmed_chunks_per_session, and a session AT the bound
+	// has no allowance left, so the comparison is >= on what it already
+	// holds. Mutating unconfirmedCapped to `return false` (or to `>`) fails
+	// here and nowhere else in this package.
+	t.Run("the unconfirmed-chunk bound is unlimited at zero and refuses at the bound", func(t *testing.T) {
+		if (Limits{MaxUnconfirmedChunksPerSession: 0}).unconfirmedCapped(1 << 20) {
+			t.Error("a zero bound capped a session holding a million unconfirmed chunks; zero is the unlimited spelling")
+		}
+		l := Limits{MaxUnconfirmedChunksPerSession: 4}
+		if l.unconfirmedCapped(3) {
+			t.Error("a session holding 3 of 4 unconfirmed chunks was refused its next one")
+		}
+		if !l.unconfirmedCapped(4) {
+			t.Error("a session already holding its 4-chunk allowance was served another; the bound is >= on what it holds")
+		}
+	})
 	for _, tc := range scenarios {
 		t.Run(tc.name, func(t *testing.T) { tc.run(t, newHarness(t)) })
 	}
