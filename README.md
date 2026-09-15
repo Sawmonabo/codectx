@@ -230,6 +230,7 @@ $ codectx version --json
 | Document | What it covers |
 |---|---|
 | [docs/operations.md](docs/operations.md) | Diagnosis, recovery codes, retention and the grace window, disk pressure, rebuilding |
+| [docs/diagnostics.md](docs/diagnostics.md) | Profiling a run: `CODECTX_PPROF_DIR`, what each profile holds, parent versus parser worker |
 | [docs/configuration.md](docs/configuration.md) | Every configuration key, its bounds and the cross-field rules |
 | [docs/toolchain.md](docs/toolchain.md) | The pinned analyzer set, offline hosts and bundles, mirrors, the per-platform matrix |
 | [docs/context-sessions.md](docs/context-sessions.md) | The strict actor workflow: receipts, review, waivers and the sealed capsule |
