@@ -96,18 +96,46 @@ func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := writeDirHeader(from, id, c); err != nil {
+	// The RESERVATION is taken before anything on disk changes, and the header
+	// is stamped only once the directory is this cursor's to keep.
+	//
+	// Stamping first was a way to lose a walk. A re-adoption can be refused --
+	// a grown directory that no longer fits the shared byte budget answers the
+	// retryable CTX_RESOURCE_LIMIT -- and the refusal left the directory still
+	// named spool-<prevID>, still reserved under it, but carrying the NEW id
+	// and lease in its header. OpenDir compares the two, so the cursor the
+	// caller was told to present again could never open it: a retryable
+	// failure had silently become a permanent one.
+	frame, err := dirHeaderFrame(id, c)
+	if err != nil {
 		return "", err
+	}
+	// The header file is part of what dirBytes measured, so the reservation is
+	// corrected by the difference between the header being replaced and the one
+	// replacing it rather than by re-measuring after the write.
+	prev, prevErr := os.ReadFile(filepath.Join(from, spoolDirHeader))
+	if prevErr != nil {
+		prev = nil
 	}
 	size, err := dirBytes(from)
 	if err != nil {
 		return "", err
 	}
+	size += int64(len(frame)) - int64(len(prev))
 	delta, err := s.transfer(prevID, id, size)
 	if err != nil {
 		return "", err
 	}
+	if err := replaceDirHeader(from, frame); err != nil {
+		s.transferBack(id, prevID, delta)
+		return "", err
+	}
 	if err := os.Rename(from, filepath.Join(s.dir, spoolPrefix+id)); err != nil {
+		// Put the directory back exactly as it was found: the accounting AND
+		// the binding prevID's cursor opens it by.
+		if prev != nil {
+			_ = replaceDirHeader(from, prev)
+		}
 		s.transferBack(id, prevID, delta)
 		return "", internalErr("spool adopt: " + err.Error())
 	}
@@ -140,8 +168,9 @@ func (s *Spools) transfer(prevID, id string, size int64) (int64, error) {
 }
 
 // transferBack undoes transfer when the rename that was to follow it failed:
-// the directory is still where it was, still under its old id, so the entry
-// must go back to that id AND the budget must give the delta back. Restoring
+// the directory is still where it was, still under its old id -- ReadoptDir
+// puts its header back to match -- so the entry must go back to that id AND the
+// budget must give the delta back. Restoring
 // the map alone would leave s.used inflated by the delta until the next Sweep,
 // which is the accounting drift ReadoptDir exists to remove.
 func (s *Spools) transferBack(id, prevID string, delta int64) {
@@ -163,16 +192,40 @@ func (s *Spools) transferBack(id, prevID string, delta int64) {
 // meets one mid-adoption and never has to fall back to the headerless grace
 // window.
 func writeDirHeader(dir, id string, c Cursor) error {
+	frame, err := dirHeaderFrame(id, c)
+	if err != nil {
+		return err
+	}
+	return replaceDirHeader(dir, frame)
+}
+
+// dirHeaderFrame is that stamp as bytes, without writing it. ReadoptDir needs
+// it separately: it must know the frame's size before it reserves, and it must
+// not touch the directory until the reservation has been granted.
+func dirHeaderFrame(id string, c Cursor) ([]byte, error) {
 	h := SpoolHeader{Version: spoolVersion, SpoolID: id, LeaseID: c.LeaseID, GenerationID: c.GenerationID,
 		AnalysisKey: c.AnalysisKey, QueryHash: c.QueryHash, ExpiresAt: c.ExpiresAt.UTC()}
 	head, err := json.Marshal(h)
 	if err != nil {
-		return internalErr("spool header: " + err.Error())
+		return nil, internalErr("spool header: " + err.Error())
 	}
 	frame := make([]byte, 4+len(head))
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(head)))
 	copy(frame[4:], head)
-	if err := os.WriteFile(filepath.Join(dir, spoolDirHeader), frame, 0o600); err != nil {
+	return frame, nil
+}
+
+// replaceDirHeader puts frame in place ATOMICALLY: a directory always carries
+// either the whole header it had or the whole one replacing it, never the
+// prefix of a write that failed part-way. That is what lets ReadoptDir put the
+// previous binding back when the rename it was preparing for does not happen.
+func replaceDirHeader(dir string, frame []byte) error {
+	tmp := filepath.Join(dir, spoolDirHeader+".new")
+	if err := os.WriteFile(tmp, frame, 0o600); err != nil {
+		return internalErr("spool adopt: " + err.Error())
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, spoolDirHeader)); err != nil {
+		_ = os.Remove(tmp)
 		return internalErr("spool adopt: " + err.Error())
 	}
 	return nil
