@@ -21,8 +21,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// This file is the Section 23.2 release gate and the published benchmark set
-// (lane T21-L2). It has no TestMain of its own: plateau_test.go's makes this
+// This file is the Section 23.2 release gate and the published benchmark set.
+// It has no TestMain of its own: plateau_test.go's makes this
 // test binary the parser worker, which is what lets a measurement here spawn
 // parsers the way the shipped binary does. The budget constants and the corpus
 // generator it measures against are corpus_test.go's; nothing is redeclared.
@@ -70,7 +70,8 @@ var corpusSmallReal = corpusSpec{Packages: 40, Seed: 2101}
 // count that has to clear the 200-record page is the SESSION's file count, not
 // the repository's, and neither one plan nor one repository size reaches it --
 // a plan over this generator saturates at ~161 files however large the tree is
-// (lane T21-L2), so the session is grown through `context include` instead. The
+// (the figures are in TestSessionStatusClamp), so the session is grown through
+// `context include` instead. The
 // repository still has to be large enough to hold a 200-file session with room
 // above it, which this repository and the 214-file shape are not: 3*120+4 files
 // leave the gate clear of its own fixture's ceiling.
@@ -699,8 +700,7 @@ var budgetRows = []budgetRow{
 }
 
 // measureScopeWalk is the Section 23.2 visited-node row and the measurement the
-// default context graph budgets are re-pinned from (obligation 8, the wave-e
-// VF2 ledger item).
+// default context graph budgets are re-pinned from (obligation 8).
 //
 // The plan's own scope walk is exactly this call: internal/context runs
 // eng.Impact with both directions and the three configured context bounds
@@ -869,9 +869,9 @@ func TestLowMemoryProfile(t *testing.T) {
 // coverageSummarySQL's required_full-only aggregate. Both are logged below;
 // only the paged total is gated.
 //
-// How the session gets past 200. A single plan cannot do it -- lane T21-L2
-// measured a plan over this generator saturating at ~161 files (131 required at
-// 214 repository files, 152 at 364, 161 at 724, 158 at 1204), because the scope
+// How the session gets past 200. A single plan cannot do it: a plan over this
+// generator was measured saturating at ~161 files (131 required at 214
+// repository files, 152 at 364, 161 at 724, 158 at 1204), because the scope
 // walk reaches one symbol per package and stops, and a path seed resolves a
 // file but no symbol. The session itself is what grows: `context include`
 // recompiles over further seeds under the session's own budget and unions the

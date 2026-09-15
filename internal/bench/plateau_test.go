@@ -35,9 +35,9 @@ import (
 // live at once -- `go test ./...` beside a targeted rerun of this package, a
 // CI stage beside a developer's shell -- and over a fixed path whichever
 // started second would clear the corpus out from under the first's remaining
-// rows. That is exactly the failure the wave-g VERIFY run saw: rows late in
-// the Section 23.2 table refused with CTX_PATH_ESCAPE because the repository
-// they were measuring had been removed mid-run.
+// rows. That is exactly the failure a full-suite race run was seen to hit:
+// rows late in the Section 23.2 table refused with CTX_PATH_ESCAPE because the
+// repository they were measuring had been removed mid-run.
 //
 // Its lifetime is TestMain's rather than any row's: the fixture deliberately
 // outlives the test or benchmark that happens to build it (see fixture), so no
