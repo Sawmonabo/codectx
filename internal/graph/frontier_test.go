@@ -735,7 +735,7 @@ func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -876,7 +876,7 @@ func TestImpactRanksAWalkSplitAcrossRequests(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 6, jump: 2 * time.Minute, fired: &fired}
-	paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -1131,7 +1131,7 @@ func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
 			calls, fired := 0, false
 			slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 				trigger: trigger, jump: 2 * time.Minute, fired: &fired}
-			paged, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+			paged, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 				Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 				Now: func() time.Time { return clock }})
 			if err != nil {
@@ -1227,7 +1227,7 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
 		trigger: 2, jump: 2 * time.Minute, fired: &fired}
-	e, err := New(Options{Adjacency: slow, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: slow.reader(memGraphFor(f)), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
@@ -1269,5 +1269,61 @@ func TestImpactWalkNeverEndsSilentlyOnTheRetentionBudget(t *testing.T) {
 		// Without the refusal the run proves nothing: the budget was never
 		// reached and the silent-truncation branch was never entered.
 		t.Fatal("the shared continuation budget was never exhausted; the case this test exists for was not exercised")
+	}
+}
+
+// slowReader is slowAdjacency's counterpart on the PACKED reader, and it is
+// where the fixture clock now advances: the walk reads structure through
+// GraphReader, so a clock driven by Adjacency.Edges never moved at all and
+// every deadline case silently became a case with no deadline.
+//
+// One packed scan covers a whole level, where the old reader made one round
+// trip per node chunk per keyset page of at most model.MaxPageItems rows. A
+// clock that ticked once per scan would therefore be far coarser than the one
+// these cases were calibrated against, so a "round trip" here is one scan PLUS
+// one per adjacencyBatch entries it delivers -- the same granularity the old
+// port charged, which is what lets the trigger counts stand unchanged.
+type slowReader struct {
+	GraphReader
+	knobs slowAdjacency
+	seen  *int
+}
+
+// reader wraps r with this fixture's clock knobs, sharing the same call
+// counter so a case that drives both ports sees one sequence.
+func (s slowAdjacency) reader(r GraphReader) slowReader {
+	seen := 0
+	return slowReader{GraphReader: r, knobs: s, seen: &seen}
+}
+
+func (s slowReader) Neighbours(ctx context.Context, refs []NodeRef, dir model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
+	s.tick()
+	return s.GraphReader.Neighbours(ctx, refs, dir, kinds, from, func(e Edge) error {
+		*s.seen++
+		if *s.seen%adjacencyBatch == 0 {
+			s.tick()
+		}
+		return fn(e)
+	})
+}
+
+// tick is one charged round trip: it advances the call counter and, on the
+// branch this case selected, the clock.
+func (s slowReader) tick() {
+	k := s.knobs
+	*k.calls++
+	switch {
+	case k.stallAfter > 0:
+		if *k.calls > k.stallAfter {
+			*k.clock = k.clock.Add(k.jump)
+		}
+	case k.every > 0:
+		if *k.calls%k.every == 0 {
+			*k.clock = k.clock.Add(k.jump)
+		}
+	case !*k.fired && *k.calls >= k.trigger:
+		*k.fired = true
+		*k.clock = k.clock.Add(k.jump)
 	}
 }
