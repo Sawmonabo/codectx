@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -235,5 +236,71 @@ func TestShortestPathFollowsTheRequestedDirection(t *testing.T) {
 	if pathQueryHash(DefaultRelations(), out.Direction, out.From, out.To, 0) ==
 		pathQueryHash(DefaultRelations(), in.Direction, in.From, in.To, 0) {
 		t.Fatal("two directions of one pair share a query hash: a cursor would resume the other search")
+	}
+}
+
+// TestContainerContentsCountsFilesSymbolsAndBytes covers the three branches the
+// shared fixture cannot reach: it carries no file node, so the file count and
+// the source-byte total are zero everywhere in it, and no container of it holds
+// another container. All three are exactly where a wrong count would read as
+// the repository's shape rather than as a missing measurement -- a package
+// whose nested packages were counted as its own symbols, or whose bytes were
+// silently zero.
+//
+// Mutations, each caught here: count a file as a symbol (drop the NodeFile
+// branch); count a nested container as a symbol (drop the isOverviewContainer
+// branch); read the byte total from anywhere but SourceBytes.
+func TestContainerContentsCountsFilesSymbolsAndBytes(t *testing.T) {
+	node := func(name string, kind model.NodeKind, size int64) model.Node {
+		n := model.Node{ID: fixtureNodeID(name), Kind: kind, Name: name, QualifiedName: name,
+			Language: "go", SemanticSource: model.SemanticCanonical}
+		if kind == model.NodeFile {
+			n.Metadata = json.RawMessage(`{"size":` + strconv.FormatInt(size, 10) + `}`)
+		}
+		return n
+	}
+	nodes := []model.Node{
+		node("c-pkg", model.NodePackage, 0),
+		node("c-nested", model.NodePackage, 0),
+		node("c-file-a", model.NodeFile, 400),
+		node("c-file-b", model.NodeFile, 26),
+		node("c-fn", model.NodeFunction, 0),
+		node("c-var", model.NodeVariable, 0),
+	}
+	var rels []model.Relation
+	add := func(from string, kind model.RelationKind, to string) {
+		rels = append(rels, model.Relation{ID: fixtureRelationID(len(rels)),
+			From: fixtureNodeID(from), Kind: kind, To: fixtureNodeID(to)})
+	}
+	add("c-pkg", model.RelContains, "c-file-a")
+	add("c-pkg", model.RelContains, "c-file-b")
+	add("c-pkg", model.RelContains, "c-nested") // structure, not a symbol
+	add("c-pkg", model.RelContains, "c-var")
+	add("c-pkg", model.RelDefines, "c-fn") // a top-level declaration
+	binding := model.Binding{RepositoryID: model.RepositoryID(fixtureID("repo-1")),
+		SnapshotID: model.SnapshotID(fixtureID("snap-1")), GenerationID: 1,
+		AnalysisKey: model.AnalysisKey(fixtureID("akey-1"))}
+	e := &Engine{reader: NewMemoryGraph(binding, nodes, rels), limits: fixtureLimits()}
+
+	pkg := fixtureNodeID("c-pkg")
+	meta := &model.QueryMeta{}
+	held, unmeasured, err := e.containerContents(context.Background(),
+		[]model.NodeID{pkg}, &budget{}, meta)
+	if err != nil {
+		t.Fatalf("containerContents: %v", err)
+	}
+	if unmeasured[pkg] {
+		t.Fatal("an unlimited edge allowance left the container unmeasured")
+	}
+	got := held[pkg]
+	// Two files, two symbols (the variable it contains and the function it
+	// defines), the nested package counted as neither, and the bytes of both
+	// files summed from the source-byte side array.
+	if got.files != 2 || got.symbols != 2 || got.bytes != 426 {
+		t.Fatalf("c-pkg holds %d file(s), %d symbol(s), %d byte(s); want 2, 2, 426",
+			got.files, got.symbols, got.bytes)
+	}
+	if meta.Truncated {
+		t.Fatalf("a complete count reported truncated: %q", meta.TruncationReason)
 	}
 }
