@@ -1401,6 +1401,29 @@ func (s *Store) GenerationStatus(ctx context.Context, gen model.GenerationID) (m
 	return status, err
 }
 
+// GenerationCapturedAt reports when the capture a generation serves was taken:
+// the creation time of its snapshot, not of the generation row. They differ
+// whenever a generation is built from a snapshot an earlier run captured, and
+// the snapshot's time is the one that answers "how old is the source this
+// workspace is serving".
+func (s *Store) GenerationCapturedAt(ctx context.Context, gen model.GenerationID) (time.Time, error) {
+	var captured time.Time
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		var created string
+		err := tx.QueryRowContext(ctx, `SELECT s.created_at FROM generations g JOIN snapshots s ON s.id = g.snapshot_id
+			WHERE g.id = ?`, int64(gen)).Scan(&created)
+		if isNoRows(err) {
+			return invalid("generation %d does not exist", gen)
+		}
+		if err != nil {
+			return wrap("generations", err)
+		}
+		captured, err = parseTime(created)
+		return err
+	})
+	return captured, err
+}
+
 // UnitOrigin reports the run that produced a retained unit. A reused unit keeps
 // its original run; a rerun never rewrites it (Section 9.3).
 func (s *Store) UnitOrigin(ctx context.Context, unit model.UnitID) (model.ProviderRunID, error) {

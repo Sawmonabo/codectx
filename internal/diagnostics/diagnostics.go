@@ -81,7 +81,14 @@ type ToolchainReporter interface {
 // are readable and writable, and how much space is left under the data
 // directory. FreeDiskBytes returns a nil count on a host where free space
 // cannot be determined -- again, absent rather than zero.
+//
+// Readable and Writable are two probes and not one on purpose. Writable proves
+// a directory by creating and removing a file in it, which is the only honest
+// proof and is exactly what must never happen inside the repository; Readable
+// opens the directory and reads one entry, which is what a capture needs from
+// the workspace root and all this product ever asks of it.
 type WorkspaceProber interface {
+	Readable(ctx context.Context, dir string) error
 	Writable(ctx context.Context, dir string) error
 	FreeDiskBytes(ctx context.Context, dir string) (*uint64, error)
 }
@@ -89,9 +96,17 @@ type WorkspaceProber interface {
 // Options are the dependencies of a Service. Every field is required except
 // Now, which defaults to time.Now.
 type Options struct {
-	Config    config.Config
-	Build     model.BuildInfo
-	Repo      model.RepositoryID
+	Config config.Config
+	Build  model.BuildInfo
+	Repo   model.RepositoryID
+	// Root is the absolute workspace root. The data-directory check probes it
+	// too: a workspace whose root this process cannot read produces an empty
+	// capture that reads as a repository with nothing in it, and the data
+	// directory being writable says nothing about it. It is probed for
+	// READability only -- Section 6 forbids this product writing anything into
+	// the repository, so the write probe the data directory gets must never be
+	// aimed at the workspace.
+	Root      string
 	Sampler   Sampler
 	Store     StoreReader
 	Toolchain ToolchainReporter
@@ -121,6 +136,8 @@ func New(opts Options) (*Service, error) {
 		return nil, missingDependency("workspace prober")
 	case opts.Repo == "":
 		return nil, missingDependency("repository id")
+	case opts.Root == "":
+		return nil, missingDependency("workspace root")
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -134,30 +151,3 @@ func missingDependency(what string) error {
 		Message:     "diagnostics: " + what + " is required",
 		Remediation: "this is a composition defect; report it with the command you ran"}
 }
-
-// notImplemented is what a stub below returns until its lane lands. It is
-// CTX_INTERNAL because no caller input can correct it, and it names the lane so
-// an operator who somehow reaches it learns what is absent rather than that
-// something broke. A stub never panics.
-func notImplemented(op, lane string) error {
-	return &model.Error{Code: model.CodeInternal,
-		Message:     "diagnostics: " + op + " has no implementation in this build",
-		Remediation: "this operation waits on lane " + lane}
-}
-
-// Frozen by L0, implemented by the named lane. A lane edits only its own file.
-//
-//	sample.go     -- L2: the Sampler implementation, simultaneous tree sampling
-//	resources.go  -- L2: func (s *Service) Resources(ctx) (model.ResourceReport, error)
-//	doctor.go     -- L1: func (s *Service) Doctor(ctx, model.DoctorRequest) (model.DoctorReport, error)
-//	grace.go      -- L3a: quarantine -> trash -> grace -> recheck -> delete
-//	sweep.go      -- L3b: the five caller-less helpers plus the two unreclaimed trees
-//	internal/graph/overview.go         -- L5: func (e *Engine) Overview(ctx, model.OverviewRequest) (model.Page[model.OverviewItem], error)
-//	internal/cli/doctor.go, repomap.go -- L6
-//	internal/app/*, internal/cli/root.go -- INT, and INT only
-//
-// Ruling Q1 widens the status facade. L0 freezes the request type
-// (model.StatusRequest, internal/model/status.go) and this signature; INT
-// re-points the facade, the CLI reader and the MCP tool input:
-//
-//	func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error)

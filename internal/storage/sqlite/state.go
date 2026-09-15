@@ -592,10 +592,14 @@ func (s *Store) AdvanceSession(ctx context.Context, req model.AdvanceRequest) (m
 			return err
 		}
 		if closedAt != nil {
-			// A terminal session reads nothing further -- session() refuses one
-			// whose closed_at is set -- so it stops pinning its generation here
-			// rather than at the end of its TTL, on the SAME condition that
-			// stamped closed_at. complete is terminal too and has no edge out,
+			// A terminal session stops pinning its generation here rather than
+			// at the end of its TTL, on the SAME condition that stamped
+			// closed_at. What the lease costs is not reads: session() still
+			// serves a `complete` session until its TTL expires. It is
+			// collection -- DeleteGeneration (gc.go) refuses while any
+			// read_sessions row names the generation, and the blob
+			// reachability predicate rides on those same rows -- so the lease
+			// a finished session leaves behind is pure retention debt. complete is terminal too and has no edge out,
 			// and Export serves the stored capsule row, never retained source.
 			// It is the same transaction as the transition: a session that is
 			// over never leaves a lease holding a generation retention may not

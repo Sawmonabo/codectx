@@ -32,6 +32,7 @@ package retention
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -98,9 +99,20 @@ type RetentionConfig struct {
 	GraceWindow            time.Duration
 	// BatchLimit bounds every delete pass. Section 6 requires a finite bound
 	// on every traversal; a collection pass that cannot finish in one batch
-	// finishes on the next one.
+	// finishes on the next one. A non-positive value is the collector's own
+	// defaultBatchLimit, defaulted in New: the blob phases rescue a zero on
+	// their own side, but sweep passes this straight to ExpireSessions and
+	// PruneSessions, where a zero limit expires and prunes nothing while the
+	// pass reports success.
 	BatchLimit int
 }
+
+// defaultBatchLimit is the fallback bound New applies to a non-positive
+// BatchLimit, the same role defaultGraceWindow (grace.go) plays for a zero
+// grace window. It is a bound, not a setting: the composition root states the
+// limit it wants, and this constant only keeps a collector built without one
+// from silently reclaiming nothing.
+const defaultBatchLimit = 200
 
 // Report is what one collection pass reclaimed. Every count is what this pass
 // actually removed, so a caller logs progress rather than intent.
@@ -146,6 +158,9 @@ func New(opts Options) (*Collector, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.Config.BatchLimit <= 0 {
+		opts.Config.BatchLimit = defaultBatchLimit
+	}
 	return &Collector{opts: opts}, nil
 }
 
@@ -153,13 +168,18 @@ func New(opts Options) (*Collector, error) {
 // (L3a), because a session or spool released by a sweep is what makes a blob
 // unreferenced in the same pass rather than the next one.
 //
+// The grace protocol runs even when a sweep step failed, and the two errors are
+// joined -- the same rule sweep states for its own five steps, "so no step
+// starves another". A failing tool-store collection or an unreadable <data>/lsp
+// root must not be what stops trashed source from ever being reclaimed: the
+// sweeps free references, they do not gate the protocol that acts on them, and
+// each grace phase rechecks reachability inside its own transaction anyway.
+//
 // The caller holds both locks named in the package comment. Collect takes none.
 func (c *Collector) Collect(ctx context.Context) (Report, error) {
-	report, err := c.sweep(ctx)
-	if err != nil {
-		return report, err
-	}
-	return c.grace(ctx, report)
+	report, sweepErr := c.sweep(ctx)
+	report, graceErr := c.grace(ctx, report)
+	return report, errors.Join(sweepErr, graceErr)
 }
 
 // missingDependency is the composition refusal New returns.
@@ -167,12 +187,4 @@ func missingDependency(what string) error {
 	return &model.Error{Code: model.CodeInternal,
 		Message:     "retention: " + what + " is required",
 		Remediation: "this is a composition defect; report it with the command you ran"}
-}
-
-// notImplemented is what a stub returns until its lane lands. A stub never
-// panics, and it names the lane so an operator learns what is absent.
-func notImplemented(op, lane string) error {
-	return &model.Error{Code: model.CodeInternal,
-		Message:     "retention: " + op + " has no implementation in this build",
-		Remediation: "this operation waits on lane " + lane}
 }

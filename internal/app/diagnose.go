@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -128,6 +129,36 @@ func (workspaceProber) Writable(ctx context.Context, dir string) error {
 	}
 	if rmErr != nil {
 		return probeError("remove the probe file", rmErr)
+	}
+	return nil
+}
+
+// Readable reports whether dir can be listed by this process. It opens the
+// directory and reads one entry: the workspace root is proved by reading
+// because Section 6 forbids this product writing anything into the repository,
+// and reading an entry is the whole of what a capture asks of the root.
+//
+// Like Writable it returns a typed model.Error carrying the bare syscall cause
+// and no path, because the doctor renders this text as a check detail.
+func (workspaceProber) Readable(ctx context.Context, dir string) error {
+	if err := ctx.Err(); err != nil {
+		return model.Canceled(err)
+	}
+	if dir == "" {
+		return &model.Error{Code: model.CodeInternal,
+			Message:     "app: the directory to probe for readability is empty",
+			Remediation: "this is a composition defect; report it with the command you ran"}
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return probeError("open the directory", err)
+	}
+	defer f.Close()
+	// One entry, never the whole listing: this is a permission proof, and a
+	// repository root holds an unbounded number of entries. io.EOF is an empty
+	// but perfectly readable directory.
+	if _, err := f.ReadDir(1); err != nil && !errors.Is(err, io.EOF) {
+		return probeError("read the directory", err)
 	}
 	return nil
 }
