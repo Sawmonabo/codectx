@@ -192,6 +192,16 @@ sealed with a truncated list. See
   between actors and none across a changed file.
 - **There is no waiver shortcut to readiness.** With no waiver, readiness is
   strict; with one, the waiver and its reason travel with the answer.
+- **Disabling the read gate changes the reason, not the attestation.** With
+  `context.strict_read_gate = false` an unfinished read no longer shuts the
+  gate at that precondition, and the rest are still evaluated and reported —
+  but nothing confirmed the coverage, so the session is reported neither
+  `ready_for_implementation` nor `strict_gate_satisfied`, the sealed capsule
+  records the strict gate false, and the answer's `guarantee_limit` begins
+  `strict_read_gate=disabled` instead of naming files the configuration
+  excused. Toggling
+  the key also changes the context-policy fingerprint, so context answers
+  compiled under the other setting are recompiled rather than reused.
 - **Coverage is about the pinned snapshot**, so a session's claims stay true
   even after the repository moves on.
 
