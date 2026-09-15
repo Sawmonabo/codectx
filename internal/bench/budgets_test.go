@@ -667,7 +667,7 @@ var budgetRows = []budgetRow{
 			peak := treePeak(t, func() { time.Sleep(idleMCPSample) })
 			_ = stdin.Close()
 			if err := cmd.Wait(); err != nil {
-				t.Fatalf("mcp serve exited with %v; the sampled window did not hold a live session", err)
+				t.Fatalf("mcp serve exited non-zero (%v)", err)
 			}
 			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes) +
 				fmt.Sprintf(" (resting session: watcher off, sampled over %s after a %s settle)",
