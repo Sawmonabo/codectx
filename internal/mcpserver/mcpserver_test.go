@@ -214,6 +214,15 @@ func (f *fakeServices) Capsule(ctx context.Context, r model.CapsuleRequest) (mod
 	return f.capsuleFn(ctx, r)
 }
 
+// CapsuleRows is on app.ContextService for the CLI's whole-capsule export. No
+// tool reaches it -- codectx_context_capsule pages through Capsule and projects
+// Export -- so the fake refuses it rather than answering a page a tool would
+// then be believed to serve.
+func (f *fakeServices) CapsuleRows(_ context.Context, _ model.SessionRequest, _ model.CapsuleList,
+	_ string, _ int) ([]model.CapsuleRow, string, error) {
+	return nil, "", unset("CapsuleRows")
+}
+
 func (f *fakeServices) Export(ctx context.Context, r model.SessionRequest) (model.Capsule, error) {
 	if f.exportFn == nil {
 		return model.Capsule{}, unset("Export")
