@@ -12,13 +12,15 @@
 package context
 
 import (
-	"context"
+	"errors"
 	"fmt"
+	"iter"
 	"sort"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
@@ -43,93 +45,6 @@ const evidencePerRelation = 8
 // arithmetic defect presented as a ranking.
 const maxScoreMicros = seedContribution + maxBoostMicros
 
-// rank scores every candidate in place and returns the same slice. It does NOT
-// order it: buildPlan rewrites each candidate's Path from the file version and
-// then sorts with the same total Section 15.3 order, so an order established
-// here would be sorted on a path key that budgeting replaces. It resolves
-// per-edge precision for the whole candidate set in one batched pass, scores
-// each admitted route in fixed point, keeps the maximum route (never a sum over
-// routes, which is how a cycle inflates a score), discloses the routes it did
-// not enumerate as a bounded reason, and adds each bounded boost at most once.
-//
-// relations carries every relation on an admitted path, keyed by id: a
-// RelationPath stores relation ids only and the pinned reader exposes no
-// by-id relation read, so the pass that walked the edges supplies their kinds.
-// An id missing from it, or a kind absent from contributionWeight, makes that
-// route inadmissible rather than free.
-//
-// Candidate Status must already be hydrated for the active-change boost to see
-// a captured change; the compile hydrates file metadata once and the budget
-// pass reuses it.
-//
-// It is not idempotent: it narrows each candidate's Paths to the routes it
-// retained, so a second call over the same slice would resolve precision for
-// only that subset and re-score against it. Rank once per compile.
-func (c *Compiler) rank(ctx context.Context, reader *sqlite.PinnedReader, cands []candidate,
-	relations map[model.RelationID]model.Relation) ([]candidate, error) {
-	if reader == nil {
-		return nil, argumentInvalid("ranking requires a pinned reader")
-	}
-	precision, err := c.resolvePrecision(ctx, reader, cands)
-	if err != nil {
-		return nil, err
-	}
-
-	// Pass one scores routes and records, per package, the distinct admitted
-	// edges this compile actually touched -- the walk-local centrality input.
-	routed := make([]routeScore, len(cands))
-	centrality := map[string]map[model.RelationID]struct{}{}
-	for i := range cands {
-		r, err := scoreRoutes(cands[i], relations, precision, c.reasonPathLimit())
-		if err != nil {
-			return nil, err
-		}
-		routed[i] = r
-		pkg := packageOf(cands[i].Path)
-		edges := centrality[pkg]
-		if edges == nil {
-			edges = map[model.RelationID]struct{}{}
-			centrality[pkg] = edges
-		}
-		for _, id := range r.admittedEdges {
-			edges[id] = struct{}{}
-		}
-	}
-
-	// Pass two needs the centrality map complete, so it cannot be folded into
-	// the loop above: a candidate ranked first would otherwise see fewer edges
-	// in its package than one ranked last.
-	for i := range cands {
-		cands[i].Paths = routed[i].paths
-		cands[i].MorePaths = routed[i].morePaths
-		base := originContribution(cands[i].Origin)
-		if routed[i].best > base {
-			base = routed[i].best
-		}
-		boosts, reasons := boostsFor(cands[i], routed[i], centrality)
-		score := base + boosts
-		if score > maxScoreMicros {
-			score = maxScoreMicros
-		}
-		if score < 0 {
-			score = 0
-		}
-		cands[i].ScoreMicros = score
-		// The routes that were not enumerated are disclosed BEFORE the boost
-		// reasons: appendReason drops silently at MaxReasonsPerEntry, and a
-		// bounded explanation that lost this line reads as an unexplained
-		// selection -- the one thing MorePaths exists to prevent.
-		for _, reason := range append(morePathsReason(cands[i].MorePaths), routed[i].reasons...) {
-			cands[i].Reasons = appendReason(cands[i].Reasons, reason)
-		}
-		for _, reason := range reasons {
-			cands[i].Reasons = appendReason(cands[i].Reasons, reason)
-		}
-	}
-
-	return cands, nil
-}
-
 // morePathsReason is the bounded disclosure of routes the manifest admitted but
 // could not enumerate (Section 15.3: "report additional-path counts rather than
 // growing an exponential path list"). model.ContextEntry carries reasons and
@@ -153,52 +68,6 @@ func morePathsReason(more int64) []string {
 // an unexplained selection.
 func (c *Compiler) reasonPathLimit() config.Limit {
 	return c.cfg.Context.MaxReasonPathsPerEntry
-}
-
-// resolvePrecision maps every relation on every candidate route to its edge
-// precision multiplier in ONE batched resolution pass. Precision lives on
-// Evidence and not on Relation, so there is no per-edge read to loop over here;
-// an edge with no visible evidence row takes the heuristic multiplier rather
-// than dropping out of the ranking. Only sealed facts reach this map: it reads
-// through the pinned reader, whose visibility join already excludes anything
-// that is not a selected unit of the pinned generation.
-//
-// The id set is sorted and de-duplicated before the read, so the request the
-// store sees is a function of the candidate set and not of discovery order. A
-// set larger than one batch is chunked rather than truncated: a silently
-// dropped edge would score a real route as heuristic.
-func (c *Compiler) resolvePrecision(ctx context.Context, reader *sqlite.PinnedReader,
-	cands []candidate) (map[model.RelationID]int64, error) {
-	seen := map[model.RelationID]struct{}{}
-	ids := make([]model.RelationID, 0, len(cands))
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, id := range p.Relations {
-				if _, dup := seen[id]; dup || id == "" {
-					continue
-				}
-				seen[id] = struct{}{}
-				ids = append(ids, id)
-			}
-		}
-	}
-	out := make(map[model.RelationID]int64, len(ids))
-	if len(ids) == 0 {
-		return out, nil
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	batch := c.pageLimit()
-	for start := 0; start < len(ids); start += batch {
-		end := min(start+batch, len(ids))
-		rows, err := reader.EvidenceBatch(ctx, ids[start:end], evidencePerRelation)
-		if err != nil {
-			return nil, contextErr(ctx, err)
-		}
-		for id, evidence := range rows {
-			out[id] = mostPrecise(evidence)
-		}
-	}
-	return out, nil
 }
 
 // mostPrecise picks the multiplier of the most precise evidence row backing one
@@ -371,14 +240,14 @@ func namedByTask(o originKind) bool {
 	return false
 }
 
-// boostsFor adds each Section 15.3 boost at most once and clamps their total at
-// maxBoostMicros. Every boost is evidence-backed: the task identifier boost
-// needs the task to have named the entity, the change boost needs a captured
-// working-tree status, the association boost needs an admitted route that
-// arrives over a test or contract edge, and centrality is bounded by the edges
-// this compile actually walked.
-func boostsFor(cand candidate, routed routeScore,
-	centrality map[string]map[model.RelationID]struct{}) (int64, []string) {
+// boostsForCounts is boostsFor over the two facts the route pass and the
+// centrality aggregation reduce to: whether an admitted route arrived over a
+// test or contract edge, and how many distinct edges this compile walked in the
+// candidate's package. It is the ONE implementation of the boost set and of the
+// order its reasons are appended in, so the whole-set pass and the streamed
+// pass cannot drift: rank reaches it through boostsFor with the nested
+// centrality map, and P-F reaches it with P-E's streamed count.
+func boostsForCounts(cand candidate, associated bool, edges int64) (int64, []string) {
 	var total int64
 	var reasons []string
 	if namedByTask(cand.Origin) {
@@ -389,13 +258,13 @@ func boostsFor(cand candidate, routed routeScore,
 		total += boostActiveChange
 		reasons = append(reasons, fmt.Sprintf("the working tree has a captured change (%s)", cand.Status))
 	}
-	if associatedTestOrContract(routed) {
+	if associated {
 		total += boostAssociatedTest
 		reasons = append(reasons, "an admitted route reaches it as a test or contract of the scope")
 	}
 	pkg := packageOf(cand.Path)
-	if edges := len(centrality[pkg]); edges > 0 {
-		boost := int64(edges) * centralityPerEdgeMicros
+	if edges > 0 {
+		boost := edges * centralityPerEdgeMicros
 		if boost > boostCentralityMax {
 			boost = boostCentralityMax
 		}
@@ -486,4 +355,140 @@ func appendReason(reasons []string, reason string) []string {
 		}
 	}
 	return append(reasons, reason)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming ranking (C-STREAM passes P-D and P-F)
+// ---------------------------------------------------------------------------
+//
+// The streamed passes below hold plumbing only and no policy: they rebuild one
+// candidate's working set from the sorted record streams and then call the very
+// functions `rank` calls -- scoreRoutes, scorePath, originContribution,
+// boostsForCounts, morePathsReason, appendReason. That is what makes the two
+// paths equal by construction rather than by a second derivation of Section
+// 15.3 that would have to be kept in step by hand.
+
+// scoredRec is the P-D -> P-F pipe: one candidate after its routes are scored
+// and before its boosts are known. It exists because P-F cannot run until P-E's
+// per-package edge counts are complete (rank.go's "pass two needs the
+// centrality map complete"), so the route result has to survive a sort.
+//
+// It carries only what P-F still needs from the route pass, which is why
+// routeScore itself is not the record: `paths` already travel as their own
+// retained pathRec/hopRec streams, `admittedEdges` are consumed into the
+// centrality sort by P-D, and `reasons` are appended to Cand.Reasons by P-D --
+// so nothing here is unbounded.
+//
+//   - Pkg is packageOf(PathAtRank), computed once by P-D. Ruling C3: the
+//     centrality bucket and the boost reason read the AT-RANK path, while
+//     lessRank reads PathFinal. Storing the key keeps the two apart.
+//   - Base is max(originContribution(Origin), routed.best), the rank pass's
+//     `base` before boosts.
+//   - Associated is associatedTestOrContract(routed): the kind set exists only
+//     to answer that one question, so the answer travels and the set does not.
+type scoredRec struct {
+	Cand candRec `json:"c"`
+	Pkg  string  `json:"p,omitempty"`
+
+	Base       int64 `json:"b,omitempty"`
+	Associated bool  `json:"a,omitempty"`
+}
+
+// lessScoredPkg groups scored candidates by package so P-F merge-joins them
+// against P-E's counts. A JOIN comparator in the sense of stream.go's note: the
+// key is the package alone, and the merge's stability keeps a package's members
+// in arrival order. No tie-break is needed or wanted, because P-F re-sorts every
+// record into the ranked sort under lessRank, which is total.
+func lessScoredPkg(a, b scoredRec) int { return cmpString(a.Pkg, b.Pkg) }
+
+// sizeOfScored charges one buffered scored record: its candidate plus the
+// package key it adds.
+func sizeOfScored(r scoredRec) int64 {
+	return sizeOfCand(r.Cand) + int64(len(r.Pkg)) + recordOverheadBytes
+}
+
+// pullRun turns a SortedRun into a pull iterator, so a pass can merge-join two
+// or three sorted streams without buffering any of them. SortedRun only pushes
+// (Each), and a merge-join needs to advance one side on demand.
+//
+// The walk error is reported by the final call, the one that reports the stream
+// exhausted: iter.Pull runs the sequence only as far as each yield, so Each has
+// returned exactly when ok is false. The caller must call stop.
+func pullRun[T any](r *pagination.SortedRun[T]) (next func() (T, bool, error), stop func()) {
+	var walkErr error
+	pullNext, pullStop := iter.Pull(func(yield func(T) bool) {
+		walkErr = r.Each(func(v T) error {
+			if !yield(v) {
+				return errStopRun
+			}
+			return nil
+		})
+		if errors.Is(walkErr, errStopRun) {
+			walkErr = nil
+		}
+	})
+	return func() (T, bool, error) {
+		v, ok := pullNext()
+		return v, ok, walkErr
+	}, pullStop
+}
+
+// routeWorkingSet is one candidate's rebuilt routes plus the two lookup maps
+// scoreRoutes and scorePath read. It is the per-candidate working set the plan
+// bounds P-D's heap by: it holds one candidate's hops and nothing else.
+type routeWorkingSet struct {
+	paths     []model.RelationPath
+	relations map[model.RelationID]model.Relation
+	precision map[model.RelationID]int64
+}
+
+// rebuildRoutes reassembles one candidate's Paths from the contiguous
+// (Seq, PathIdx) route run and (Seq, PathIdx, HopIdx) hop run, in exactly the
+// order today's candidate.Paths carries them, and derives the relation and
+// precision maps from the same hops.
+//
+// A hop run shorter than the route's HopCount is a defect and not a shorter
+// route: silently scoring a truncated route would claim a contribution for a
+// path the compile never walked.
+func rebuildRoutes(seq int64, routes []pathRec, hops []hopRec) (routeWorkingSet, error) {
+	ws := routeWorkingSet{
+		relations: make(map[model.RelationID]model.Relation, len(hops)),
+		precision: make(map[model.RelationID]int64, len(hops)),
+	}
+	byPath := make(map[int32][]hopRec, len(routes))
+	for _, h := range hops {
+		byPath[h.PathIdx] = append(byPath[h.PathIdx], h)
+		// The heuristic floor is applied on READ and not by the producer, so
+		// the value is today's precision whether the attribute join wrote the
+		// raw evidence multiplier or the already-floored one: mostPrecise never
+		// answers below the floor and an unresolved edge takes it
+		// (rank.go:324-327), so the maximum is idempotent either way.
+		if m := (relAttrRec{Multiplier: h.Multiplier}).precision(); m > ws.precision[h.RelationID] {
+			ws.precision[h.RelationID] = m
+		}
+		// A hop whose kind the attribute join could not resolve still occupies
+		// the map: scorePath's `known` lookup then succeeds and the missing
+		// contribution weight reports the route inadmissible, which is the same
+		// verdict today's missing-kind branch reaches.
+		if rel, ok := ws.relations[h.RelationID]; !ok || (rel.Kind == "" && h.Kind != "") {
+			ws.relations[h.RelationID] = model.Relation{ID: h.RelationID, Kind: h.Kind}
+		}
+	}
+	ws.paths = make([]model.RelationPath, 0, len(routes))
+	for _, r := range routes {
+		run := byPath[r.PathIdx]
+		if int32(len(run)) != r.HopCount {
+			return routeWorkingSet{}, &model.Error{Code: model.CodeInternal,
+				Message: fmt.Sprintf("a streamed context compile read %d hop(s) for route %d of candidate %d, which carries %d",
+					len(run), r.PathIdx, seq, r.HopCount)}
+		}
+		ids := make([]model.RelationID, 0, len(run))
+		for _, h := range run {
+			ids = append(ids, h.RelationID)
+		}
+		ws.paths = append(ws.paths, model.RelationPath{
+			Relations: ids, Evidence: r.Evidence, CostUnits: r.CostUnits,
+		})
+	}
+	return ws, nil
 }

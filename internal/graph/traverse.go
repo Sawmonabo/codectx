@@ -35,13 +35,19 @@ const (
 // bare CTX_QUERY_DEADLINE.
 
 // deadlineStop reports whether err is the walk's own deadline AND this page has
-// something partial to hand back. Both halves matter: a cancellation is never a
-// stop (the caller is gone and wants nothing), and a deadline that arrives
-// before the page admitted an edge has no partial page to return -- converting
-// it would mint a cursor over an empty page, and a client that retried would
-// get another empty page, a chain that never returns a row.
+// something to hand back. A cancellation is never a stop (the caller is gone
+// and wants nothing). What counts as "something" depends on the walk: a PAGED
+// traversal must have admitted an edge, because a cursor over an empty page it
+// did not advance would let a client retry into a chain that never returns a
+// row -- and it loses nothing by failing, since the caller still holds the
+// cursor it arrived with. A walk that persists its progress outside the page
+// (DeadlineResumesEmptyPage) always has the standing frontier and the records
+// its earlier legs retained to hand back, so every deadline ends its page.
 func deadlineStop(err error, o expandOptions) bool {
-	if !o.DeadlineStops || o.Budget.pageEdges == 0 {
+	if !o.DeadlineStops {
+		return false
+	}
+	if o.Budget.pageEdges == 0 && !o.DeadlineResumesEmptyPage {
 		return false
 	}
 	var me *model.Error
@@ -206,6 +212,11 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 
 		next := carry
 		carry = nil
+		// How many of THIS level's rows the visitor has taken. A stop on the
+		// first of them is a stop at a level BOUNDARY however it was triggered:
+		// nothing here has advanced the keyset position, so the one the page
+		// carries still names the level before this one.
+		taken := 0
 		for _, row := range rows {
 			if err := visit(row.owner, row.rel); err != nil {
 				if errors.Is(err, errStopExpansion) {
@@ -216,10 +227,12 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 					stopped := make([]frontierState, 0, len(frontier)+len(next))
 					stopped = append(stopped, frontier...)
 					stopped = append(stopped, next...)
-					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
+					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
+						LevelBoundary: taken == 0}, nil
 				}
 				return walkState{}, err
 			}
+			taken++
 			admittedRel[row.rel.ID] = true
 			o.Budget.edges++
 			o.Budget.pageEdges++
@@ -234,6 +247,7 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 				Cost:  row.owner.Cost + Cost(row.rel.Kind),
 				Node:  row.neighbor,
 				Via:   row.rel.ID,
+				Route: appendRoute(row.owner.Route, row.rel.ID),
 			})
 		}
 		if o.Budget.frontierHit || o.Budget.deadlineHit {
@@ -284,11 +298,19 @@ type walkState struct {
 	// in heap; the remainder is the continuation spool (visited.go).
 	Admitted *visitedSet
 	// LevelBoundary records that the walk stopped BETWEEN levels rather than
-	// inside one: the level in Frontier has not been read at all yet. The
+	// inside one: no row of the level in Frontier has been taken yet. The
 	// keyset position the page last emitted belongs to the level BEFORE it, so
 	// a continuation must not carry it -- applied to the new level it would
-	// silently drop every row whose owner sorts below that node. Only the
-	// deadline stops here; every other stop is mid-level by construction.
+	// silently drop every row whose owner sorts below that node, and those rows
+	// are lost for good because their owners are already in the cumulative
+	// visited set.
+	//
+	// Two stops reach it. The deadline, which can trip on a level's first
+	// reader check. And the PAGE ITEM limit, which spends its last item on the
+	// previous level and stops the visitor on this level's very first row:
+	// measured on an owner-major fixture at page limits 1, 2, 4 and 8, a
+	// neighbours walk ended with 39 of 57 nodes visited, no truncation reason
+	// and no cursor.
 	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
@@ -320,6 +342,29 @@ type edgeRow struct {
 // skipOwner/skipKey, when set, are a resumed page's keyset position: every row
 // at or before (skipOwner, skipKey) in the frozen emission order belongs to an
 // earlier page and is dropped before it costs a frontier byte.
+//
+// That keyset resume is only sound if what the previous read KEPT was a true
+// prefix of the frozen order -- otherwise the rows it never read that sort
+// BELOW its last admitted row are dropped here and never seen again, which is
+// a walk silently shrinking under a memory ceiling rather than spilling under
+// it. A node chunk is keyset-paged by RELATION id, not by (owner, relation),
+// so a chunk of several owners cut in the middle keeps exactly such a
+// non-prefix. Two facts make an honest cut available anyway:
+//
+//   - CHUNK boundaries are frozen-order boundaries. `nodes` is ascending and
+//     chunks are contiguous, so every row a chunk collects is owned by one of
+//     its own nodes: an edge with both ends on the frontier is attributed to
+//     the LOWER id, which lies in the earlier chunk and is collected there.
+//     A cut after a completed chunk is therefore a prefix.
+//   - a SINGLE-node chunk has one owner, so relation order is the frozen order
+//     within it and a mid-chunk cut is a prefix too.
+//
+// So the ceiling cuts only at those two places. When it binds inside a chunk of
+// several owners, that chunk's rows are rolled back -- rows, bytes and the
+// collected-relation set alike -- and its node range is re-read one node at a
+// time until the ceiling binds again, which it must, on a boundary that is now
+// exact. The re-read costs round trips only for the one chunk a spill lands in,
+// and only for as many of its nodes as the remaining budget holds.
 func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level map[model.NodeID]frontierState,
 	o expandOptions, batch int, admittedRel map[model.RelationID]bool,
 	skipOwner model.NodeID, skipKey model.RelationID) ([]edgeRow, error) {
@@ -331,36 +376,37 @@ func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level ma
 	// loop treats a short page as "read on", so asking for the node-chunk size
 	// would cost nothing but an extra round trip -- and it would make the
 	// storage layer record a page-bound resolution on EVERY traversal answer,
-	// turning a disclosure that exists for real news into noise.
+	// turning a disclosure that exists for real news into noise. It is derived
+	// from the ORIGINAL batch, so the single-node re-read above keeps the same
+	// wire page and does not turn into one round trip per edge.
 	rowLimit := batch
 	if rowLimit > model.MaxPageItems {
 		rowLimit = model.MaxPageItems
 	}
 	collected := map[model.RelationID]bool{}
-chunks:
-	for start := 0; start < len(nodes); start += batch {
-		end := start + batch
-		if end > len(nodes) {
-			end = len(nodes)
-		}
-		chunk := nodes[start:end]
+
+	// readChunk reads one contiguous node range to exhaustion, appending its
+	// rows. It reports whether the read was CUT short -- by the frontier byte
+	// ceiling or by the deadline, which the budget flags tell apart -- rather
+	// than having reached the end of the range's edges.
+	readChunk := func(chunk []model.NodeID) (bool, error) {
 		after := model.RelationID("")
 		for {
 			if err := checkWalk(ctx, o.Budget); err != nil {
 				if !deadlineStop(err, o) {
-					return nil, err
+					return false, err
 				}
 				// The page ran out of time mid-level. The rows read so far are
-				// facts and are kept; the caller stops after this level and
-				// mints a continuation, and the resumed page re-reads the level
-				// from the keyset position, so no edge is lost and none is read
-				// twice -- the frontier-byte spill below, reached by the clock.
+				// facts and are kept when the cut is on an exact boundary; the
+				// caller stops after this level and mints a continuation, and
+				// the resumed page re-reads the level from the keyset position,
+				// so no edge is lost and none is read twice.
 				o.Budget.deadlineHit = true
-				break chunks
+				return true, nil
 			}
 			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, rowLimit)
 			if err != nil {
-				return nil, err
+				return false, err
 			}
 			for _, rel := range page {
 				if admittedRel[rel.ID] || collected[rel.ID] {
@@ -393,7 +439,7 @@ chunks:
 					// exceeding the byte bound by at most one row -- which is the
 					// same trade every other per-page budget here makes.
 					o.Budget.frontierHit = true
-					break chunks
+					return true, nil
 				}
 				spent += edgeRowBytes(row)
 				collected[rel.ID] = true
@@ -409,6 +455,56 @@ chunks:
 			// the keyset walk; the advance below is what makes the next one
 			// reachable.
 			after = page[len(page)-1].ID
+		}
+		return false, nil
+	}
+	// rollback undoes an inexact cut: the rows, the bytes AND the collected
+	// relation ids, which the re-read must be allowed to collect again or it
+	// would skip them as duplicates and lose exactly what this fix restores.
+	rollback := func(markRows int, markSpent int64) {
+		for _, r := range rows[markRows:] {
+			delete(collected, r.rel.ID)
+		}
+		rows, spent = rows[:markRows], markSpent
+	}
+
+chunks:
+	for start := 0; start < len(nodes); start += batch {
+		end := start + batch
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		markRows, markSpent := len(rows), spent
+		cut, err := readChunk(nodes[start:end])
+		if err != nil {
+			return nil, err
+		}
+		if !cut {
+			continue
+		}
+		if end-start == 1 {
+			// One owner: relation order is the frozen order, so the cut is a
+			// prefix and the keyset position resumes it exactly.
+			break chunks
+		}
+		rollback(markRows, markSpent)
+		if o.Budget.deadlineHit {
+			// Out of time: there is none to spend re-reading. Dropping this
+			// chunk's partial rows costs the next page a re-read of the range
+			// and loses nothing -- a level whose every row was rolled back
+			// carries no keyset position at all (walkState.LevelBoundary).
+			break chunks
+		}
+		// The ceiling bound inside a chunk of several owners. Re-read the range
+		// one owner at a time so it binds on an exact boundary instead.
+		o.Budget.frontierHit = false
+		for i := start; i < end; i++ {
+			if cut, err = readChunk(nodes[i : i+1]); err != nil {
+				return nil, err
+			}
+			if cut {
+				break chunks
+			}
 		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -605,11 +701,39 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		// forward both read from that spool. Deferring the release here -- not
 		// at the end of the happy path -- is what keeps an error return from
 		// leaking a spool and a lease for the whole cursor TTL.
-		defer resume.Release()
+		//
+		// Terminal outcomes only. A RETRYABLE failure -- CTX_WORKSPACE_BUSY
+		// from a contended store, a transient read error, the query deadline --
+		// tells the caller to present this SAME cursor again, so the spool, the
+		// retained state directory and the lease it names must all still be
+		// adoptable. Releasing unconditionally turned one busy edge read on a
+		// resumed page into CTX_CURSOR_INVALID and made the whole walk behind
+		// that cursor unrecoverable; the state is still bounded, because it
+		// expires with the cursor's own lease TTL.
+		defer func() {
+			if terminalOutcome(err) {
+				resume.Release()
+			}
+		}()
 		// The resumed budget carries the earlier pages' cumulative spend by
 		// ASSIGNMENT, so replaying one cursor twice neither resets nor doubles it.
 		b = resume.Budget
 	}
+	// The cumulative admitted-node set of THIS walk, append-only state in a
+	// retained directory (visitedstore.go), exactly as impact and the package
+	// rollup keep theirs. A resumed page reopens the one its predecessor left;
+	// a first page creates one only if it actually mints a continuation, which
+	// is why this is nil here and filled in at the mint below: a neighbours
+	// query that fits one page -- the common one -- would otherwise pay a
+	// fixed-size filter file and a manifest for state nothing will ever read.
+	retain := resumeRetained(resume)
+	// Discarded AFTER the continuation below has taken it: a page that mints a
+	// cursor detaches the directory, and this then finds nothing to remove.
+	defer func() {
+		if retain != nil {
+			retain.discard()
+		}
+	}()
 	var (
 		relations  []model.Relation
 		walkReason string
@@ -718,10 +842,14 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	var nextCursor string
 	if len(state.Frontier) > 0 && !state.DepthLimited {
 		// The cumulative set is NOT materialized into a slice here: only the
-		// nodes THIS page admitted are, and the rest is copied spool to spool.
-		var carried visitedStream
-		if resume != nil {
-			carried = resume.Visited
+		// nodes THIS page admitted are, and every earlier page's run stays
+		// where that page wrote it. The resumed frontier is deliberately left
+		// out -- every node that ever reaches a frontier was added by the page
+		// that discovered it, so it is already in that page's own run.
+		if retain == nil {
+			if retain, err = openRetainedWalk(e.walkScratchDir(), e.visitedFilterBytes(), e.probe); err != nil {
+				return model.GraphResult{}, err
+			}
 		}
 		nextCursor, err = e.nextTraversalCursor(finish, b, continuation{
 			Endpoint:  endpoint,
@@ -730,8 +858,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 			LastOwner: lastOwner,
 			LastKey:   lastKey,
 			Frontier:  state.Frontier,
-			Visited:   state.Admitted.newlyAdmitted(),
-			Carried:   carried,
+			Visited:   state.Admitted.addedNodes(),
+			Retain:    retain,
 		})
 		if err != nil {
 			return model.GraphResult{}, err

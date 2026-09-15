@@ -207,7 +207,7 @@ which is exact. No edge can be dropped by it. The filter is sized from the cumul
 the cursor already carries and clamped to an eighth of the frontier memory ceiling, so peak heap is a
 function of that configured ceiling, not of the walk; past the clamp it simply grows denser (more
 false positives, more merge-joins), never refusing or truncating. Probes are the two-hash
-construction of [S33].
+construction of [S35].
 
 *Re-deriving the frontier per page from a keyset scan under the pinned generation*, avoiding a spool
 altogether, as mature search systems do with a point-in-time view and `search_after` [S14],
@@ -260,8 +260,13 @@ with the graph. The cost side is real and stated for the verification lane: one 
 *level* replaces one per page, so a chain-shaped graph — and a call chain is exactly that — can pay
 up to one sweep per page item. Two spools are transiently live per walk, since the consumed one is
 released only after the fresh one is written. The two callers that used to expand a whole walk in
-one request now have the same treatment: impact is a spooled, cursor-resumable continuation and the
-rollup's containment read is keyset-paged, so neither ranks or aggregates a whole walk in memory.
+one request keep the walk-to-completion their answers need, and pay for it on disk rather than in
+heap: impact and the package rollup stream every admitted edge into external sorts, rank the whole
+answer once, serve one page and spool the globally ranked remainder behind a cursor, with the
+rollup's containment read keyset-paged per batch. Neither ranks or aggregates a whole walk in
+memory, and neither loses the global order to do it: the pages concatenate to the single-shot
+answer, each record exactly once. Peak on this path gains the two sorts' run buffers and merge
+fan-in — a function of the query memory admission, not of the reachable set.
 
 ### 2.3 External merge for the planner, with byte-identical order
 
@@ -713,6 +718,45 @@ whose lists are shorter than the counts the seal pinned.
 
 ---
 
+### 2.10 The context compiler is a stream *(accepted; landed in part)*
+
+**Decision.** A compile no longer holds any structure sized by its candidate count. The whole-set
+passes — the admitted-candidate slice and its dedupe map, the hydrated file table, the relation and
+precision maps, the nested per-package centrality map, and the budget pass's five candidate-sized
+structures — become sorted streams joined by merge and reduced by streaming aggregation, over the
+same external sort the ranked search answer already uses. Peak heap is a function of that sort's run
+budget (the quarter share of `resources.query_memory_bytes`) and of the resolved budget, which is the
+caller's own declared window, and never of how wide the task's scope is. The plan is required to be
+byte-for-byte what the whole-set pipeline produced: the same entries, ordinals, slices, exclusions
+with their reasons, notices and canonical manifest hash.
+
+**Alternative rejected.** Bounding the candidate set instead. That is the shortcut this record exists
+to forbid: it would make a wide task return a narrower plan rather than the same plan more cheaply,
+and `scope_complete` would start reporting a ceiling rather than a fact about the repository.
+
+**Where the runs live.** Under the workspace's spool directory, removed on every exit path including
+the error paths, and — like the sort runs `search` writes — deliberately not charged against
+`resources.max_temp_bytes`, because a run set is sized by the candidate count and charging it would
+let that budget refuse a wide compile outright.
+
+**Open, with owners.**
+
+- *The exclusion list is still held in heap.* It is the one list this record's own analysis names as
+  unbounded — a plan may exclude every candidate it saw, with a reason each. It stays in heap only
+  because `Store.PutManifest` takes the plan as three slices in one transaction; streaming it needs a
+  row-at-a-time manifest writer in `internal/storage/sqlite`. The entry and slice lists are a
+  different class: both are bounded by the resolved budget. This is an open defect, not an accepted
+  trade-off.
+- *A deadline still ends the answer, not a pass.* A compile that exceeds `resources.query_timeout`
+  returns `CTX_QUERY_DEADLINE` with no manifest and no cursor, so a repository wide enough to outrun
+  the deadline has no route to a plan at all. The intended shape is the one every other long walk in
+  this record already has: the completed passes' sorted runs persist under a lease, the call returns a
+  continuation cursor with `truncation_reason=deadline`, the next call resumes at the first unfinished
+  pass, and the final call returns the identical plan.
+- *The whole-set pipeline is only half retired.* The two functions with no remaining production caller
+  have moved to the parity reference; the scope expansion, the ranking pass and the plan builder are
+  still compiled into the package and reachable, though nothing but tests calls them.
+
 ## 3. Consequences
 
 ### 3.1 What bounds peak memory now
@@ -733,7 +777,12 @@ Four mechanisms now carry the load the caps used to carry, and each is exercised
 for the failure mode it protects, not for the mechanism:
 
 - **The query deadline** is the only remaining stop on an unbounded walk, and it must end a *page*.
-  A deadline that returns "truncated" with no cursor is a class-E defect by definition.
+  A deadline that returns "truncated" with no cursor is a class-E defect by definition — with one
+  named exception, which is the stall detector below rather than a deadline stop: a resumed page
+  whose every adjacency read already ran past the deadline can only mint the cursor it was handed,
+  so it reports `query deadline reached before the walk could advance` and offers no cursor. The
+  state that page resumed is left adoptable, so the cursor the caller already holds carries the walk
+  on under a larger timeout; the answer ends, the walk does not.
 - **Memory admission** serialises and defers; only an explicit non-zero user ceiling rejects
   anything, and then with both numbers in the message.
 - **Disk-backed spools** replace every heap-resident whole-repository set, bounded by the temporary
@@ -767,15 +816,75 @@ duplicates an existing assertion.
   metadata sites. The provider-side derived-row refusal is closed. The observation-reference count
   is one user-set bound on both paths -- the wire contract's fixed 64-reference refusal is gone and
   the single-observation path reads the same configured limit the aggregate path does.
-- **One traversal read that unlimited defaults have unbounded in heap** stands: the shortest-path
-  walk holds its settled set, distances, depths and cached edges for the length of the walk, and
-  unlike a breadth-first frontier that state cannot spill, because a search resumed from a
-  persisted frontier would also need its settled distances. It is bounded instead by the query
-  memory budget: every map and queue entry is charged against `resources.query_memory_bytes`
-  (`frontier_bytes`) with a deliberate over-estimate, and crossing it truncates the answer with the
-  memory reason and the cheapest routes found so far rather than running on. The repository map's
-  containment read is closed -- it is keyset-paged now, so its peak is a page and not a container's
-  fan-out.
+- **A deadline that lands mid-RANK, after the walk completed, is CLOSED.** The external sort has an
+  adopt-existing-runs constructor (`pagination.AdoptRuns`), and `walkrun.go`'s `detachRankPass` hands
+  it the runs an interrupted ranking had already spilled -- moved into the retained state directory
+  -- and mints the `f` cursor over them. The next request re-enters those runs instead of re-sorting,
+  and the retained pass-1 input feeds whatever they do not yet hold. No stop on these two endpoints
+  returns truncated with no cursor.
+- **`resources.max_temp_bytes` defaults to unlimited; a paged walk no longer re-copies its
+  cumulative visited set.** Both rulings are accepted and both have LANDED.
+  (a) LANDED. The temporary-byte budget is a bound nobody set, so it defaults to unlimited like
+  every other count or size bound: the spool store reads a non-positive cap as unlimited (it
+  refuses no write and keeps the accounting the resource envelope reports), the configuration
+  default is `0`, the `max_temp_bytes > min_free_disk_bytes` validation is one-sided and applies
+  only to a value the operator set, and the process runners read a non-positive disk budget as
+  unlimited rather than refusing construction -- a value that IS set still refuses a run up front,
+  with a typed `CTX_RESOURCE_LIMIT` naming `resources.max_temp_bytes`. `min_free_disk_bytes` stays
+  as it is: it protects the host's free space rather than capping work, and it is still enforced
+  against actual free space under an unlimited temporary budget. (b) LANDED. A walk page used to write a FRESH
+  continuation spool holding the WHOLE cumulative visited set -- the previous page's visited section
+  is streamed record by record into the new spool -- and the resume decodes that same section again
+  to rebuild the frontier and the membership summary. Both are O(visited) per page, which is the
+  measured linear growth in page latency (0.31 s/page over the first fifty pages of a real
+  repository walk, 2.20 s/page by page 400) and therefore a quadratic walk to completion.
+  The state a page keeps is append-only now: one ascending RUN per leg holding that leg's own
+  admissions, an O(1) manifest, and the membership summary persisted beside the runs rather than
+  rebuilt -- the concatenated-ascending-runs shape the membership merge-join already read. The
+  filter's bit count and probe count are FROZEN at creation and carried in the manifest, because
+  bits set under one geometry and probed under another produce false negatives and therefore a
+  cross-page re-admission of the same entity. The carrier is `retainedWalk`
+  (`internal/graph/walkretain.go`), which already travels through the impact and rollup endpoints,
+  is reopened for append on every resume and is carried forward by rename; `expandOptions.Visited`
+  is the hop that lets the INTERNAL links append to it directly. EVERY paged endpoint keeps its set
+  there now -- the neighbours traversal included -- so a continuation spool holds frontier records
+  and nothing else, and the visited section, its record kind and the per-page filter rebuilt from it
+  are gone rather than merely bypassed (payload version 7). A neighbours page creates the store only
+  when it actually mints a continuation, and the filter is clamped to the same share of the shared
+  continuation byte budget that it takes of the frontier ceiling: it is an accelerator, so a tight
+  `resources.max_temp_bytes` makes it denser, never makes paging a walk impossible. The retained directory is re-adopted incrementally
+  (`Spools.ReadoptDir` transfers the previous reservation inside one critical section and charges
+  only the delta), so the shared budget no longer holds two copies of the cumulative state at every
+  page boundary. The RANKED tail of those same two endpoints is O(page) per page
+  as well: the page that settles the order writes one spool and every later page seeks to the byte
+  offsets its cursor carries (`RankOffset`, `PairOffset`, payload version 6) and reads only its own
+  page out of it, where it used to re-open the spool at record zero and copy the whole unserved
+  remainder into a fresh one.
+
+  **What it measures.** On a twenty-thousand-node walk split into many legs by the frontier
+  ceiling, the cumulative set grew by 2 398 281 bytes against a ceiling of 5 648 381 derived from
+  what the walk admitted, and the walk's `visited_count` is exactly the fixture's node count
+  (`graph.TestAWalkWritesItsVisitedSetOnce`); re-adoption charges the grown directory once rather
+  than twice (`pagination.TestReadoptingAGrownDirectoryChargesItOnce`). The "before" column is the
+  soak's own shape -- 0.31 s/page over the first fifty pages, 2.20 s/page by page 400 -- not a
+  re-measured build.
+
+  **Residual, by design.** The filter's geometry is frozen when the first page creates it, so past
+  roughly m/16 admitted nodes it saturates: `mayHold` answers true for everything and every level
+  falls back to the full merge-join. Correctness is intact -- a false positive costs a sweep, never
+  an answer -- and the remedy is a larger `resources.query_memory_bytes`, not a re-sized filter,
+  which would change the geometry the bits were set under.
+- **An impact or rollup continuation dropping the nodes its INTERNAL links admitted is CLOSED.**
+  `runWalkToCompletion` chains several `expand` calls inside one request, and the continuation it
+  minted used to carry only the OUTER cursor's stream, so a walk that crossed an internal boundary
+  forgot every node the earlier links admitted and the next page re-admitted them: the same entity
+  on two pages. The links now append their own admissions to the persisted runs through
+  `expandOptions.Visited`, and `walkState.Carried` and `ReleaseCarried` are gone.
+- **The shortest-path walk is external-memory** and truncates for no memory reason: its settled
+  set, distances and frontier live in a per-request SQLite scratch database under the retained
+  state directory (`path.go`, `pathscratch.go`), and a page that runs out of time mints the `p`
+  cursor over that scratch rather than ending the answer. The repository map's containment read is
+  closed too -- it is keyset-paged, so its peak is a page and not a container's fan-out.
 
 ### 3.4 What verification on real repositories must show
 
@@ -919,16 +1028,16 @@ per level rather than per node (§2.2).
 [S32] Mehlhorn, K. and Meyer, U., *External-memory breadth-first search with sublinear I/O*, ESA
 2002 — a bounded front in memory with the bulk outside it; the semi-external shape adopted (§2.2).
 
-[S33] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
-filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
-construction (§2.2).
-
 [S33] Knuth, D. E., *The Art of Computer Programming*, vol. 3, §5.4.1 — replacement selection and
 bounded merge order; the classical statement of the lever recorded but not taken (§2.3).
 
 [S34] https://pkg.go.dev/net/http/httptrace#WithClientTrace — a request-scoped observation collector
 carried on the context rather than through every function signature; the precedent for reporting a
 clamp without changing two dozen reader signatures (§2.1).
+
+[S35] Kirsch, A. and Mitzenmacher, M., *Less hashing, same performance: building a better Bloom
+filter*, ESA 2006 — k probes derived as h1 + i·h2 from two hashes; the membership summary's probe
+construction (§2.2).
 
 ---
 

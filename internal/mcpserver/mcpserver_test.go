@@ -453,6 +453,13 @@ func TestToolSchemaSnapshot(t *testing.T) {
 			t.Errorf("tool %q is registered but not in the snapshot", name)
 		}
 	}
+	// The continuation argument of ruling C9 is OPTIONAL, so it never enters
+	// the required list above and the table alone would not notice it
+	// disappearing. Its presence is what makes a deadline-truncated plan
+	// resumable over MCP, so it is pinned by name.
+	if seen["codectx_context_plan"].Properties["cursor"] == nil {
+		t.Error("codectx_context_plan exposes no \"cursor\" argument; a truncated plan would be unresumable over MCP")
+	}
 	for name, fields := range toolEnums {
 		for path, want := range fields {
 			got := enumAt(seen[name], path)

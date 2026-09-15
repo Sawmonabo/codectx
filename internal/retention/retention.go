@@ -129,6 +129,12 @@ type Report struct {
 	BlobsTrashed     int64
 	BlobsDeleted     int64
 	BlobsRestored    int64
+	// OrphanObjectsSwept is CAS files no blobs row named -- content whose
+	// naming commit never landed. It is counted apart from BlobsDeleted
+	// because the two reclaim different states: BlobsDeleted is a row and its
+	// object going together under the grace protocol, this is a file that
+	// never had a row.
+	OrphanObjectsSwept int64
 }
 
 // Collector runs one collection pass. It holds no mutable state; the lock order

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	contextpkg "github.com/Sawmonabo/codectx/internal/context"
 	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -197,6 +198,18 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 // coverage session of Task 16 walks.
 func (w *Workspace) Compile(ctx context.Context, req model.ContextRequest) (model.ContextManifest, error) {
 	return w.s.compiler.Compile(ctx, req)
+}
+
+// CompilePage is the CONTINUABLE form of Compile (ruling C7): a compile that
+// runs out of query deadline ends the pass it is in rather than the answer, and
+// reports the token the next call resumes from. An empty cursor starts a fresh
+// compile.
+//
+// Compile is kept beside it and not reimplemented in terms of this one: its
+// callers ask a question that has no continuation to hand back, and for them a
+// deadline must stay the error it always was.
+func (w *Workspace) CompilePage(ctx context.Context, req model.ContextRequest, cursor string) (contextpkg.CompileResult, error) {
+	return w.s.compiler.CompilePage(ctx, req, cursor)
 }
 
 // Close releases the coordinator and then everything below it, in reverse.

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,9 +108,17 @@ func IsBudgetExhausted(err error) bool {
 // and the lease store that decides whether a spool is still live. Bytes
 // already on disk from a previous process count against the cap until Sweep
 // reconciles them.
+//
+// maxBytes of zero or less is UNLIMITED: nothing this store holds is refused
+// for want of budget. That is the scale posture's spelling of an unset bound --
+// only a bound an operator SET may refuse work -- and it is what lets
+// resources.max_temp_bytes default to unlimited without this constructor
+// rejecting the configuration it derives from. Accounting is unchanged either
+// way: used still tracks what is live, because that figure is reported by the
+// resource envelope whether or not anything is capped.
 func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
-	if maxBytes <= 0 {
-		return nil, &model.Error{Code: model.CodeConfigInvalid, Message: "spool byte cap must be positive"}
+	if maxBytes < 0 {
+		maxBytes = 0
 	}
 	if leases == nil {
 		return nil, &model.Error{Code: model.CodeConfigInvalid, Message: "spools require a lease store"}
@@ -126,12 +135,22 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 	return s, nil
 }
 
+// ByteBudget is the shared continuation byte budget, or zero when this store
+// is UNLIMITED. It is read by callers that size a piece of continuation state
+// they can make smaller rather than be refused for -- an accelerator, such as
+// a membership summary, whose size is a choice and never a correctness
+// property. The budget is fixed at construction, so this needs no lock.
+func (s *Spools) ByteBudget() int64 { return s.maxBytes }
+
 // reserve claims n bytes of the shared budget for spool id or fails without
 // claiming any.
 func (s *Spools) reserve(id string, n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.used+n > s.maxBytes {
+	// An unlimited store (maxBytes zero) refuses nothing: the reservation is
+	// still recorded, so Release, Sweep and the resource envelope keep seeing
+	// the same numbers, but no page ends because of them.
+	if s.maxBytes > 0 && s.used+n > s.maxBytes {
 		return (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
 			Message:     "query spool exceeds its disk budget",
 			Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}).
@@ -146,6 +165,21 @@ func (s *Spools) reserve(id string, n int64) error {
 	r.bytes += n
 	s.reserved[id] = r
 	return nil
+}
+
+// recordCeiling bounds ONE assembled record on the way back in. It is the
+// shared budget while there is one -- no record can exceed what the budget
+// admitted when it was written -- and, on an unlimited store, no ceiling at
+// all: a reader that refused every record because nothing was capped would
+// turn "unlimited" into "reads nothing". The reassembly loop still terminates
+// on a corrupt length chain without it, because every continued chunk must be
+// a full maxSpoolChunkBytes and the file is finite, and each individual
+// allocation stays bounded by that chunk size.
+func (s *Spools) recordCeiling() int64 {
+	if s.maxBytes > 0 {
+		return s.maxBytes
+	}
+	return math.MaxInt64
 }
 
 // unreserve gives n bytes of spool id's reservation back after a failed write.
@@ -247,6 +281,12 @@ func (sp *Spool) discard() {
 // ID is the spool identifier a cursor carries.
 func (sp *Spool) ID() string { return sp.header.SpoolID }
 
+// Written is the byte offset one past everything appended so far, counting the
+// header frame Create wrote. It is the position a later OpenAt seeks to, which
+// is how a writer that lays two sections into one spool records where the
+// second begins without reading the file back.
+func (sp *Spool) Written() int64 { return sp.written }
+
 // Append writes one record, split across continuation frames when it exceeds
 // one frame. No record size is refused: the only limit is the shared byte
 // budget, and exceeding that is a typed limit, never a silent truncation.
@@ -274,12 +314,7 @@ func (sp *Spool) Append(record []byte) error {
 // still leaves a partial chain, but its bytes are unreserved and the spool is
 // discarded by its caller, exactly as before chunking.
 func (sp *Spool) writeFrame(p []byte) error {
-	chunks := int64(len(p))/maxSpoolChunkBytes + 1
-	if len(p) > 0 && len(p)%maxSpoolChunkBytes == 0 {
-		// An exact multiple needs no extra short chunk.
-		chunks--
-	}
-	need := int64(len(p)) + 4*chunks
+	need := frameBytes(int64(len(p)))
 	if err := sp.owner.reserve(sp.header.SpoolID, need); err != nil {
 		return err
 	}
@@ -301,6 +336,20 @@ func (sp *Spool) writeFrame(p []byte) error {
 	sp.written += need
 	sp.pending = 0
 	return nil
+}
+
+// frameBytes is how many bytes on disk one record of n payload bytes occupies:
+// its chunks plus their four-byte length prefixes. Writer and reader share it
+// -- writeFrame reserves it, OpenAt accounts a record read with it -- so a
+// byte offset a cursor carries is the same arithmetic on both sides and cannot
+// drift as the framing changes.
+func frameBytes(n int64) int64 {
+	chunks := n/maxSpoolChunkBytes + 1
+	if n > 0 && n%maxSpoolChunkBytes == 0 {
+		// An exact multiple needs no extra short chunk.
+		chunks--
+	}
+	return n + 4*chunks
 }
 
 // writeChunk emits one frame against the reservation writeFrame already took.
@@ -344,71 +393,112 @@ func (sp *Spool) Close() error {
 	return nil
 }
 
+// ErrStopSpool ends a spool read early from inside the record callback. It is
+// not a failure: OpenAt returns the offset it stopped at and a nil error, which
+// is what lets a reader take one PAGE off a spool without streaming the rest of
+// it -- the difference between O(page) and O(remaining) work per page.
+var ErrStopSpool = errors.New("pagination: stop reading this spool")
+
 // Open validates that the spool named by cursor c exists, was written for
 // exactly this lease, generation and query, and that its lease is still live
 // at now, then streams its records to fn in order. The header is checked
 // before any record is read; liveness comes from the lease store, so a renewed
 // lease keeps its spool and a released one ends it.
 func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(record []byte) error) error {
+	_, err := s.OpenAt(ctx, c, now, 0, fn)
+	return err
+}
+
+// OpenAt is Open starting at a byte offset rather than at the first record, and
+// it reports the offset one past the last record it handed to fn. An offset of
+// zero (or less) starts at the first record after the header.
+//
+// A spool is written once and read by many pages now: each page seeks to where
+// the previous one stopped, takes its own records and returns ErrStopSpool, so
+// a page's cost is its own page and never the remainder behind it. The offset
+// is server-minted state carried in a SIGNED cursor, never a caller's choice,
+// and it is only ever a position this store reported; a tampered one lands off
+// a frame boundary and readFrame reports corruption rather than serving
+// invented records.
+//
+// The header frame is always read and validated first -- binding, version and
+// lease liveness -- before the seek, so an offset can never be used to skip the
+// checks that decide whether this cursor may read this spool at all. The seek
+// then installs a FRESH bufio.Reader: the one that read the header has already
+// buffered past it, so reusing it would place the offset wrong.
+func (s *Spools) OpenAt(ctx context.Context, c Cursor, now time.Time, offset int64,
+	fn func(record []byte) error) (int64, error) {
 	if err := c.Validate(); err != nil {
-		return err
+		return 0, err
 	}
 	if c.SpoolID == "" {
-		return cursorInvalid("cursor names no spool")
+		return 0, cursorInvalid("cursor names no spool")
 	}
 	f, err := os.Open(filepath.Join(s.dir, spoolPrefix+c.SpoolID))
 	if errors.Is(err, os.ErrNotExist) {
-		return cursorInvalid("continuation state has expired or was released")
+		return 0, cursorInvalid("continuation state has expired or was released")
 	}
 	if err != nil {
-		return internalErr("spool open: " + err.Error())
+		return 0, internalErr("spool open: " + err.Error())
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)
-	h, err := readHeader(r, s.maxBytes)
+	h, at, err := readHeader(r, s.recordCeiling())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if h.SpoolID != c.SpoolID || h.LeaseID != c.LeaseID || h.GenerationID != c.GenerationID ||
 		h.AnalysisKey != c.AnalysisKey || h.QueryHash != c.QueryHash {
-		return cursorInvalid("spool does not belong to this cursor")
+		return 0, cursorInvalid("spool does not belong to this cursor")
 	}
 	expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if !now.Before(expiry) {
-		return cursorInvalid("continuation state has expired")
+		return 0, cursorInvalid("continuation state has expired")
+	}
+	if offset > at {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return 0, internalErr("spool seek: " + err.Error())
+		}
+		r, at = bufio.NewReader(f), offset
 	}
 	for {
-		rec, err := readFrame(r, s.maxBytes)
+		rec, err := readFrame(r, s.recordCeiling())
 		if errors.Is(err, io.EOF) {
-			return nil
+			return at, nil
 		}
 		if err != nil {
-			return err
+			return 0, err
 		}
+		at += frameBytes(int64(len(rec)))
 		if err := fn(rec); err != nil {
-			return err
+			if errors.Is(err, ErrStopSpool) {
+				return at, nil
+			}
+			return 0, err
 		}
 	}
 }
 
 // readHeader reads and validates the first frame. A file that ends before a
 // header is a typed corruption, never a bare io.EOF leaking to the caller.
-func readHeader(r *bufio.Reader, max int64) (SpoolHeader, error) {
+// It also reports the byte offset one past the header frame, which is where
+// the first record of the spool begins.
+func readHeader(r *bufio.Reader, max int64) (SpoolHeader, int64, error) {
 	head, err := readFrame(r, max)
 	if errors.Is(err, io.EOF) {
-		return SpoolHeader{}, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool has no header"}
+		return SpoolHeader{}, 0, &model.Error{Code: model.CodeStorageCorrupt, Message: "spool has no header"}
 	}
 	if err != nil {
-		return SpoolHeader{}, err
+		return SpoolHeader{}, 0, err
 	}
 	var h SpoolHeader
 	if err := json.Unmarshal(head, &h); err != nil || h.Version != spoolVersion {
-		return SpoolHeader{}, cursorInvalid("spool header is not readable")
+		return SpoolHeader{}, 0, cursorInvalid("spool header is not readable")
 	}
-	return h, nil
+	return h, frameBytes(int64(len(head))), nil
 }
 
 // readFrame reassembles one record from its chain of frames. It returns io.EOF
@@ -584,7 +674,7 @@ func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
 		return SpoolHeader{}, false
 	}
 	defer f.Close()
-	h, err := readHeader(bufio.NewReader(f), s.maxBytes)
+	h, _, err := readHeader(bufio.NewReader(f), s.recordCeiling())
 	return h, err == nil
 }
 

@@ -26,7 +26,17 @@ import (
 // bounds; an empty or wholly ambiguous scope is a discovery answer, never an
 // error (Section 15.2).
 type seedSet struct {
-	Candidates []candidate
+	// sink is where every admitted candidate goes AS IT IS FOUND (ruling C10).
+	// The candidate set is the repository-sized half of discovery -- the
+	// lexical tier and the changed-file step both page to exhaustion -- so it
+	// is never accumulated here; a producer pushes and the expansion's sorts
+	// hold it. Excluded below stays a slice because it is bounded by the
+	// REQUEST and by the step count: one row per unresolved token of a task
+	// clipped to model.MaxTaskBytes, and one per step that stopped at a bound.
+	sink seedSink
+	// Excluded is the disclosure set, pushed into the same sink after
+	// discovery returns so that the admission order the whole pipeline replays
+	// stays what it has always been: every candidate, then every exclusion.
 	Excluded   []candidate
 	Unresolved bool
 	// cutStages names the Section 15.2 steps already reported as having stopped
@@ -37,8 +47,20 @@ type seedSet struct {
 	cutStages map[string]bool
 }
 
-// noteCut records that a Section 15.2 discovery step stopped at a user-set
-// context.max_seeds bound with identities it never examined.
+// seedSink is what a Section 15.2 producer writes to. It is the boundary
+// ruling C10 draws: discovery pushes, the expansion's sorts hold, and nothing
+// between them grows with the number of seeds a repository answers.
+type seedSink interface {
+	// Admit takes one discovered seed, in discovery order.
+	Admit(candidate) error
+	// BeginStep names the step whose seeds follow, so a user-set
+	// context.max_seeds applied to the folded stream can still report WHICH
+	// steps it stopped.
+	BeginStep(origin originKind, step string)
+}
+
+// seedCut builds the exclusion row that discloses a Section 15.2 step stopped
+// by the user-set context.max_seeds bound.
 //
 // The bound is the operator's, not the build's: context.max_seeds defaults to
 // unlimited, so this row appears only when a user asked for a smaller plan than
@@ -48,16 +70,8 @@ type seedSet struct {
 // incomplete. A plan that saw the first N identities and a plan that saw all of
 // them are distinguishable by their manifest alone, which is what a caller
 // deciding whether to raise the key or narrow the task needs.
-func (s *seedSet) noteCut(origin originKind, step string, limit config.Limit) {
-	s.Unresolved = true
-	if s.cutStages == nil {
-		s.cutStages = map[string]bool{}
-	}
-	if s.cutStages[step] {
-		return
-	}
-	s.cutStages[step] = true
-	s.Excluded = append(s.Excluded, candidate{
+func seedCut(origin originKind, step string, limit config.Limit) candidate {
+	return candidate{
 		// The step is the exclusion's Path because ContextReference refuses a
 		// reference that names neither a node, a file nor a path, and the cut
 		// names no single entity -- it names the step that stopped. Without it
@@ -68,7 +82,7 @@ func (s *seedSet) noteCut(origin originKind, step string, limit config.Limit) {
 		Excluded: boundReason(fmt.Sprintf(
 			"seed discovery stopped at the context.max_seeds bound of %s while collecting %s; identities beyond it were never examined",
 			limit, step)),
-	})
+	}
 }
 
 // notePageEnd records that a Section 15.2 discovery step consumed one page of a
@@ -113,9 +127,15 @@ type seedToken struct {
 	Origin originKind
 }
 
-// seedsFull reports whether discovery has already admitted every seed a
-// user-set context.max_seeds allows. An unlimited bound -- the default -- is
-// never full, so discovery examines every identity the task names.
+// seedsFull reports whether a request-derived token list has already reached a
+// user-set context.max_seeds. An unlimited bound -- the default -- is never
+// full, so discovery examines every identity the task names.
+//
+// It bounds the TOKEN lists only. The bound over the admitted seeds themselves
+// is applied once, to the folded seed stream, by seedIngest.foldSeeds: a
+// producer counting its own admissions counts duplicates the fold has not
+// collapsed yet, and the same task cut at the same limit then answered
+// differently depending on how many of its identities two steps had both named.
 func seedsFull(limit config.Limit, n int) bool {
 	return !limit.IsUnlimited() && int64(n) >= limit.Value()
 }
@@ -146,7 +166,7 @@ func seedsFull(limit config.Limit, n int) bool {
 // disclosed as a cut when an operator sets one and it stops a step.
 //
 // Every repository read here is one page at a time, so the READ working set is
-// a page. The admitted seeds themselves accumulate in out.Candidates, which the
+// a page. The admitted seeds themselves go into the ingest sink, which the
 // whole compile pipeline -- expandScope, hydrateFiles, rank, buildPlan -- also
 // holds as one slice; making discovery alone stream would not lower the
 // compile's peak by a byte. Streaming the pipeline end to end is its own change.
@@ -155,10 +175,14 @@ func seedsFull(limit config.Limit, n int) bool {
 // downstream request so that an activation mid-compile can never split one
 // manifest across two generations (Section 15.1). reader is that same pinned
 // reader, so a path token is checked against visible facts only.
-func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, req model.ContextRequest) (seedSet, error) {
-	var out seedSet
+func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
+	req model.ContextRequest, sink seedSink,
+) (seedSet, error) {
+	if sink == nil {
+		return seedSet{}, argumentInvalid("seed discovery requires an open seed sink")
+	}
+	out := seedSet{sink: sink}
 	limit := c.cfg.Context.MaxSeeds
-	seen := map[string]bool{}
 	excluded := map[string]bool{}
 
 	tokens := make([]seedToken, 0, len(req.Seeds))
@@ -170,12 +194,9 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 	task := boundTask(req.Task)
 	tokens = append(tokens, taskTokens(task, limit)...)
 
+	sink.BeginStep(originExplicitSeed, "the identities the task names")
 	for _, tok := range tokens {
-		if seedsFull(limit, len(out.Candidates)) {
-			out.noteCut(tok.Origin, "the identities the task names", limit)
-			break
-		}
-		found, err := c.resolveIdentity(ctx, reader, gen, tok, seen, &out)
+		found, err := c.resolveIdentity(ctx, reader, gen, tok, &out)
 		if err != nil {
 			return seedSet{}, err
 		}
@@ -196,10 +217,10 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 		}
 	}
 
-	if err := c.freeTermSeeds(ctx, gen, task, tokens, seen, &out); err != nil {
+	if err := c.freeTermSeeds(ctx, gen, task, tokens, &out); err != nil {
 		return seedSet{}, err
 	}
-	if err := c.changedFileSeeds(ctx, reader, seen, &out); err != nil {
+	if err := c.changedFileSeeds(ctx, reader, &out); err != nil {
 		return seedSet{}, err
 	}
 	return out, nil
@@ -211,14 +232,14 @@ func (c *Compiler) extractSeeds(ctx context.Context, reader *sqlite.PinnedReader
 // candidate is kept. Ambiguity is preserved: two declarations of one name are
 // two candidates, each carrying the ambiguity in its reason, never a silent
 // first pick (Section 14.1).
-func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, tok seedToken, seen map[string]bool, out *seedSet) (bool, error) {
+func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID, tok seedToken, out *seedSet) (bool, error) {
 	if p := normalizeSeedPath(tok.Text); p != "" {
 		fv, err := c.snapshotFile(ctx, reader, p)
 		if err != nil {
 			return false, err
 		}
 		if fv.ID != "" {
-			add(out, seen, candidate{
+			if err := add(out, candidate{
 				FileID:      fv.ID,
 				Path:        fv.Path,
 				Requirement: model.RequirementFull,
@@ -226,7 +247,9 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 				Status:      fv.Status,
 				SizeBytes:   fv.Size,
 				Reasons:     []string{boundReason(fmt.Sprintf("the task names the path %q", fv.Path))},
-			})
+			}); err != nil {
+				return false, err
+			}
 			return true, nil
 		}
 	}
@@ -249,7 +272,9 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 			// hiding it behind one arbitrary winner.
 			reason = fmt.Sprintf("the task names the symbol %q, which has %d declarations in the pinned snapshot; this is one of them", tok.Text, len(nodes))
 		}
-		add(out, seen, nodeCandidate(n, tok.Origin, reason))
+		if err := add(out, nodeCandidate(n, tok.Origin, reason)); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -259,17 +284,14 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 // declaration, then the task text goes to Search.Search once for lexical hits.
 // A word that answers nothing is prose, not a failed identity, so it leaves no
 // exclusion and does not make the scope incomplete.
-func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, task string, claimed []seedToken, seen map[string]bool, out *seedSet) error {
+func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, task string, claimed []seedToken, out *seedSet) error {
 	limit := c.cfg.Context.MaxSeeds
 	taken := make(map[string]bool, len(claimed))
 	for _, tok := range claimed {
 		taken[tok.Text] = true
 	}
+	out.sink.BeginStep(originExactResolve, "the declarations the task's free terms name")
 	for _, term := range freeTerms(task, limit) {
-		if seedsFull(limit, len(out.Candidates)) {
-			out.noteCut(originExactResolve, "the declarations the task's free terms name", limit)
-			return nil
-		}
 		if taken[term] {
 			continue
 		}
@@ -281,14 +303,13 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			out.notePageEnd(originExactResolve, "the declarations the task's free terms name", next)
 		}
 		for _, n := range nodes {
-			add(out, seen, nodeCandidate(n, originExactResolve,
-				fmt.Sprintf("the task mentions %q, which names a declaration in the pinned snapshot", term)))
+			if err := add(out, nodeCandidate(n, originExactResolve,
+				fmt.Sprintf("the task mentions %q, which names a declaration in the pinned snapshot", term))); err != nil {
+				return err
+			}
 		}
 	}
-	if seedsFull(limit, len(out.Candidates)) {
-		out.noteCut(originLexical, "the lexical matches of the task text", limit)
-		return nil
-	}
+	out.sink.BeginStep(originLexical, "the lexical matches of the task text")
 	if strings.TrimSpace(task) == "" {
 		return nil
 	}
@@ -325,10 +346,6 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			return contextErr(ctx, err)
 		}
 		for _, hit := range page.Items {
-			if seedsFull(limit, len(out.Candidates)) {
-				out.noteCut(originLexical, "the lexical matches of the task text", limit)
-				return nil
-			}
 			cnd := candidate{
 				NodeID:      hit.NodeID,
 				FileID:      hit.FileID,
@@ -340,7 +357,9 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			if hit.Range != nil {
 				cnd.StartByte = int64(hit.Range.Start.Byte)
 			}
-			add(out, seen, cnd)
+			if err := add(out, cnd); err != nil {
+				return err
+			}
 		}
 		if page.Meta.NextCursor == "" || page.Meta.NextCursor == cursor {
 			// An unchanged cursor is a tier that cannot advance; continuing
@@ -379,20 +398,13 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 // The working set is one page of model.FileVersion at a time; the admitted
 // seeds accumulate in the compile's candidate slice, which is the shape the
 // whole compile pipeline shares (see the streaming note in extractSeeds).
-func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedReader, seen map[string]bool, out *seedSet) error {
-	limit := c.cfg.Context.MaxSeeds
+func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedReader, out *seedSet) error {
+	out.sink.BeginStep(originChangedFile, "the captured working-tree changes")
 	// Compiler.pageLimit only ever yields a value in (0, model.MaxPageItems],
 	// which is exactly the window sqlite.pageLimit passes through unchanged, so
 	// a page shorter than this limit is genuinely the last page and not a
 	// clamped read that still has rows behind it.
 	pageSize := c.pageLimit()
-	if seedsFull(limit, len(out.Candidates)) {
-		// An earlier step already filled the seed set, so this one never runs.
-		// A step that never examined a single changed file is exactly the cut
-		// row 20 forbids leaving silent.
-		out.noteCut(originChangedFile, "the captured working-tree changes", limit)
-		return nil
-	}
 	var after model.FileID
 	for {
 		files, err := reader.ChangedFiles(ctx, after, changedStatuses, pageSize)
@@ -400,15 +412,7 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 			return contextErr(ctx, err)
 		}
 		for _, fv := range files {
-			if seedsFull(limit, len(out.Candidates)) {
-				// Changed files remain that this plan never saw, exactly like a
-				// discovery step stopped at any other of its own bounds, so the
-				// scope is reported incomplete AND the cut is named in the
-				// exclusions rather than left as an unexplained flag.
-				out.noteCut(originChangedFile, "the captured working-tree changes", limit)
-				return nil
-			}
-			add(out, seen, candidate{
+			if err := add(out, candidate{
 				FileID:      fv.ID,
 				Path:        fv.Path,
 				Requirement: model.RequirementOptional,
@@ -416,7 +420,9 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 				Status:      fv.Status,
 				SizeBytes:   fv.Size,
 				Reasons:     []string{boundReason(fmt.Sprintf("%q is a captured change with status %q", fv.Path, fv.Status))},
-			})
+			}); err != nil {
+				return err
+			}
 		}
 		if len(files) < pageSize {
 			// A short page is the exhausted working tree. A page that fills the
@@ -539,18 +545,16 @@ func nodeCandidate(n model.Node, origin originKind, reason string) candidate {
 	return c
 }
 
-// add records a candidate once. The key is the entity identity, so the earliest
-// Section 15.2 step that found an entity keeps it: the order of the steps IS
-// the seed priority, and a later, weaker origin never overwrites a stronger
-// one.
-func add(out *seedSet, seen map[string]bool, c candidate) {
-	key := c.entityID()
-	if key == "" || seen[key] {
-		return
-	}
-	seen[key] = true
-	out.Candidates = append(out.Candidates, c)
-}
+// add pushes a candidate to the sink in discovery order.
+//
+// It no longer deduplicates, and holds no `seen` map to do it with: the sink's
+// scope-seed sort folds the same key (the entity identity) with foldMinSeq over
+// a seq assigned in discovery order, so the earliest Section 15.2 step that
+// found an entity still keeps it -- the order of the steps IS the seed
+// priority, and a later, weaker origin still never overwrites a stronger one.
+// The map was the second repository-sized structure discovery held, and the
+// fold does its job without holding anything.
+func add(out *seedSet, c candidate) error { return out.sink.Admit(c) }
 
 // boundTask clips the task text to model.MaxTaskBytes before any scanning, so
 // an oversized task bounds the work instead of the work bounding the task.

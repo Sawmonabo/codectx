@@ -736,7 +736,12 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 			"produced.\n\n" +
 			"The manifest is content-addressed: the same request against the same generation compiles " +
 			"to the same manifest, and a second actor asking for it gets its own session over that " +
-			"same manifest rather than a shared one.",
+			"same manifest rather than a shared one.\n\n" +
+			"A compile that runs out of query deadline ends the pass it is in rather than the " +
+			"answer: it reports `truncated deadline` with a continuation token, compiles no " +
+			"manifest and opens no session. Pass that token back as `--cursor`, with every other " +
+			"flag unchanged, and the compile resumes at the first unfinished pass; the plan it " +
+			"finally returns is the one an uninterrupted compile would have produced.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -761,9 +766,14 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			cursor, err := stringFlag(cmd, queryCursorFlag)
+			if err != nil {
+				return err
+			}
 			req := model.PlanRequest{
 				Context: model.ContextRequest{Task: task, Seeds: seeds, Phase: model.Phase(phase), Budget: budget},
 				ActorID: actor,
+				Cursor:  cursor,
 			}
 			if err := req.Validate(); err != nil {
 				return err
@@ -781,7 +791,12 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return emitContext(cmd, build, args, contextPlan{Plan: result, Session: status}, func(b *strings.Builder) {
 				writePlanResult(b, result)
-				writeSessionStatus(b, status)
+				// A truncated plan opened no session, so there is no status to
+				// print: writeSessionStatus over the zero value would render a
+				// blank session id as though one existed.
+				if !result.Truncated {
+					writeSessionStatus(b, status)
+				}
 			})
 		},
 	}
@@ -794,6 +809,7 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 	cmd.Flags().Int64(contextBudgetBytesFlag, 0, "bytes one slice may cost at most"+zeroBoundHelp)
 	cmd.Flags().Int(contextBudgetFilesFlag, 0, "distinct files the whole plan may select at most"+zeroBoundHelp)
 	cmd.Flags().Int(contextBudgetSlicesFlag, 0, "slices the plan may be split into at most"+zeroBoundHelp)
+	addCursorFlag(cmd)
 	return cmd
 }
 
@@ -802,8 +818,13 @@ func newContextPlanCommand(build model.BuildInfo) *cobra.Command {
 // Section 18.2 allows it -- otherwise the session it has to use next is only
 // reachable by a second round trip.
 type contextPlan struct {
-	Plan    model.PlanResult    `json:"plan"`
-	Session model.SessionStatus `json:"session"`
+	Plan model.PlanResult `json:"plan"`
+	// omitzero, not a bare tag: a truncated plan (ruling C9) opened no session,
+	// and a zero SessionStatus encoded as a real `session` object would show a
+	// machine consumer a blank session id and a "not ready" gate as though a
+	// session had been opened and found wanting. The field is absent on that
+	// path and present on every other.
+	Session model.SessionStatus `json:"session,omitzero"`
 }
 
 // contextBudgetValue reads the four budget flags. Section 18.1 keeps the
@@ -1830,6 +1851,17 @@ func contextVersionValue(cmd *cobra.Command, flag, kind, session string) (int, e
 // canonical hashes are shortened because nothing asks the operator to retype
 // them.
 func writePlanResult(b *strings.Builder, result model.PlanResult) {
+	// The truncated shape (ruling C9) carries no manifest at all, so the header
+	// lines below would print zeros that read like a plan that selected
+	// nothing. What the operator needs instead is why it stopped and how to
+	// continue, which is exactly what is printed here.
+	if result.Truncated {
+		fmt.Fprintf(b, "truncated   %s\n", tableCell(result.TruncationReason))
+		b.WriteString("plan        none: the compile stopped at a pass boundary and opened no session\n")
+		fmt.Fprintf(b, "continue    rerun `codectx context plan` with every flag unchanged plus --cursor %s\n",
+			result.NextCursor)
+		return
+	}
 	m := result.Manifest
 	fmt.Fprintf(b, "manifest    %s\nrequest     %s\ncanonical   %s\n",
 		m.ID, shortID(m.RequestHash), shortID(m.CanonicalHash))

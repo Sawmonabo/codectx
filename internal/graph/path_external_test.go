@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"reflect"
@@ -236,8 +237,11 @@ func TestShortestPathIsExactUnderATinyChunkBudget(t *testing.T) {
 			t.Fatalf("frontier %d: the answer is truncated (%q); a chunk budget must never truncate",
 				frontier, res.Meta.TruncationReason)
 		}
+		// NOT sorted: pathWalk.routes promises a served ORDER, and sorting
+		// here would assert only the set. referenceRoutes returns its routes in
+		// that same canonical order, so the comparison below is an order
+		// assertion as well as a set one.
 		got := routeSequences(res)
-		sort.Strings(got)
 		if len(got) == 0 || !strings.HasPrefix(got[0], fmt.Sprintf("%d:", wantCost)) {
 			t.Fatalf("frontier %d: got routes %v, want cost %d", frontier, got, wantCost)
 		}
@@ -340,7 +344,7 @@ func TestPathDeadlineTruncatesRatherThanFails(t *testing.T) {
 // continuations: a signer, a lease store and a spool store whose directory is
 // also where the retained search state lands, which is what the leak check
 // below reads.
-func pathPagingEngine(t *testing.T, g *pathGraph, dir string, store *fixtureLeases, maxVisited int) *Engine {
+func pathPagingEngine(t *testing.T, g Adjacency, dir string, store *fixtureLeases, maxVisited int) *Engine {
 	t.Helper()
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
@@ -467,18 +471,34 @@ func TestPathDeadlineMintsAResumableCursor(t *testing.T) {
 	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
 	dir := t.TempDir()
 	store := newFixtureLeases()
-	e := pathPagingEngine(t, g, dir, store, 0)
-	// A deadline that lands in the middle of the search rather than before it:
-	// long enough to settle something, far too short to reach the target.
-	e.limits.QueryTimeout = 300 * time.Microsecond
+	// The deadline is landed by the graph itself, not by racing the clock: the
+	// adjacency stalls past the whole query timeout on its second edge read, so
+	// the next checkDeadline ALWAYS fires and this proof can never be skipped.
+	// (`path` builds its deadline with context.WithDeadline from e.now(), which
+	// the runtime enforces against the real clock, so the traversal's
+	// clock-jumping slowAdjacency does not transfer here.) Landing the stop
+	// EARLIER than the stall would satisfy every assertion below just as well
+	// -- deadlineHit makes the walk resumable, so the page is truncated on the
+	// deadline and mints a cursor either way -- so there is no flake window in
+	// the other direction.
+	stalled := false
+	slow := slowPathGraph{pathGraph: g, calls: new(int), trigger: 2,
+		stall: 4 * pathDeadlineProofTimeout, fired: &stalled}
+	e := pathPagingEngine(t, slow, dir, store, 0)
+	e.limits.QueryTimeout = pathDeadlineProofTimeout
 
 	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
 		From: from, To: to, Relations: kinds})
 	if err != nil {
 		t.Fatalf("an expired deadline must end the page, not fail the request: %v", err)
 	}
+	// Which mechanism fired is a breadcrumb, not the contract: the reason check
+	// below is what makes this non-vacuous.
+	if !stalled {
+		t.Logf("the deadline landed before the stall; the page's own reason is the proof")
+	}
 	if first.Meta.TruncationReason != pathReasonDeadline {
-		t.Skipf("the deadline did not land inside the search (reason %q); the budget row proves the same contract",
+		t.Fatalf("a page whose search ran past the query timeout must be truncated on the deadline, got reason %q",
 			first.Meta.TruncationReason)
 	}
 	if first.Meta.NextCursor == "" {
@@ -543,4 +563,138 @@ func TestExpiredPathLeaseSweepsTheRetainedState(t *testing.T) {
 	if n := retainedDirs(t, dir); n != 0 {
 		t.Fatalf("the sweep left %d retained state directories behind an expired lease", n)
 	}
+}
+
+// pathDeadlineProofTimeout is the query timeout the deadline proofs run under.
+// It is short enough that stalling past it costs the test well under a second
+// and long enough that an ordinary scheduling hiccup cannot expire it before
+// the stall does.
+const pathDeadlineProofTimeout = 150 * time.Millisecond
+
+// slowPathGraph is the deterministic deadline hook for the path search. The
+// traversal has one already (slowAdjacency, frontier_test.go), but it works by
+// jumping the engine's injected clock, and the path search's stop is a real
+// context deadline -- so here the stall is real time, fired once at a fixed
+// edge read. It is passed by value like slowAdjacency, and embeds *pathGraph so
+// NodesByID, EvidenceFor, Capabilities and Binding are the fixture's own.
+type slowPathGraph struct {
+	*pathGraph
+	calls   *int
+	trigger int
+	stall   time.Duration
+	fired   *bool
+}
+
+func (s slowPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	*s.calls++
+	if !*s.fired && *s.calls >= s.trigger {
+		*s.fired = true
+		time.Sleep(s.stall)
+	}
+	return s.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+}
+
+// busyPathGraph fails one edge read of the RESUMED page with a retryable
+// CTX_WORKSPACE_BUSY, the way a contended store does.
+type busyPathGraph struct {
+	*pathGraph
+	armed *bool
+}
+
+func (b busyPathGraph) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	if *b.armed {
+		*b.armed = false
+		return nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+			Message: "storage: another writer holds the workspace"}
+	}
+	return b.pathGraph.Edges(ctx, nodes, dir, kinds, after, limit)
+}
+
+// TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
+// ShortestPath releases the continuation it consumed on the way out, and it
+// used to do so on EVERY exit: one transient CTX_WORKSPACE_BUSY on one page
+// then turned the next presentation of that same cursor into
+// CTX_CURSOR_INVALID, and an hours-long search behind it was unrecoverable --
+// while the error itself told the caller to retry.
+//
+// The retry must also see the state the failing page STARTED from, not a page
+// torn off halfway through, so the routes it finishes with are compared against
+// the same search run in a single page.
+//
+// Mutation (the terminalOutcome guard over the scratch in path.go removed): the
+// retry fails with CTX_CURSOR_INVALID, which is the assertion this test leads
+// with.
+func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+
+	whole := pathPagingEngine(t, g, t.TempDir(), newFixtureLeases(), 0)
+	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("single-page search: %v", err)
+	}
+
+	dir := t.TempDir()
+	armed := false
+	busy := busyPathGraph{pathGraph: g, armed: &armed}
+	// Three settled nodes per page, so the first page ends early and hands
+	// back a continuation over retained search state.
+	e := pathPagingEngine(t, busy, dir, newFixtureLeases(), 3)
+
+	first, err := e.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	cursor := first.Meta.NextCursor
+	if cursor == "" {
+		t.Fatal("the per-page budget must end this page with a continuation")
+	}
+
+	// The resumed page hits a contended store.
+	armed = true
+	resume := model.PathRequest{From: from, To: to, Relations: kinds,
+		Page: model.PageRequest{Cursor: cursor}}
+	_, err = e.ShortestPath(context.Background(), resume)
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		t.Fatalf("the resumed page must surface the store's retryable failure, got %v", err)
+	}
+	if armed {
+		t.Fatal("the busy failure was never reached: the page did not read an edge")
+	}
+	if n := retainedDirs(t, dir); n != 1 {
+		t.Fatalf("a retryable failure must leave the search's retained state in place, found %d directories", n)
+	}
+
+	// The SAME cursor, which is exactly what a retryable error tells the caller
+	// to present, and the search carries on to its answer.
+	for i := 0; i < 200; i++ {
+		res, err := e.ShortestPath(context.Background(), resume)
+		if err != nil {
+			t.Fatalf("retry %d after a retryable failure: %v", i, err)
+		}
+		if res.Meta.NextCursor == "" {
+			if len(res.Paths) == 0 {
+				t.Fatal("the retried continuation completed the search but found no route")
+			}
+			// The abandoned page was rolled back, so the retry resumed from the
+			// state the cursor names: the answer is the whole search's, not one
+			// missing the routes through the half-written page.
+			if gotSeq, wantSeq := routeSequences(res), routeSequences(want); !reflect.DeepEqual(gotSeq, wantSeq) {
+				t.Fatalf("the search retried through a busy page answered %v;\nthe uninterrupted single-page search says %v",
+					gotSeq, wantSeq)
+			}
+			if n := retainedDirs(t, dir); n != 0 {
+				t.Fatalf("the completed search left %d retained state directories behind", n)
+			}
+			return
+		}
+		resume.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+	t.Fatal("the retried continuation never completed the search")
 }

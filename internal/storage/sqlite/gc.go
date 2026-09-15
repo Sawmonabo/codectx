@@ -524,3 +524,69 @@ func (s *Store) CollectBlobs(ctx context.Context, deadline time.Time, limit int)
 	}
 	return deleted, restored, nil
 }
+
+// knownBlobsChunk bounds one IN(...) list so the statement stays inside
+// SQLite's host-parameter ceiling whatever batch the caller walks in. It is a
+// statement shape, not a bound on the work: KnownBlobs answers for every hash
+// it is given, one chunk at a time.
+const knownBlobsChunk = 500
+
+// KnownBlobs reports which of hashes the index still holds a blobs row for, as
+// a set: a hash present in the result is named by the store, and absence means
+// no row exists. It is the oracle (*snapshot.CAS).SweepOrphans asks before
+// removing a published object, so the direction of an error matters -- a
+// partial answer must never reach the sweep, and this returns nothing but a
+// complete set or an error.
+//
+// The chunking is a statement-shape bound only: every chunk is read inside ONE
+// read transaction, so the answer is a single consistent snapshot of blobs
+// rather than one stitched from as many snapshots as it took chunks. A set
+// assembled across snapshots could omit a hash a concurrent writer inserted
+// after an earlier chunk and report the object an orphan.
+//
+// No state filter: 'quarantined' and 'trash' rows are blobs mid-grace-protocol,
+// whose objects that protocol deletes after its own reachability recheck. Only
+// a file with no row at all is an orphan.
+func (s *Store) KnownBlobs(ctx context.Context, hashes []string) (map[string]struct{}, error) {
+	known := make(map[string]struct{}, len(hashes))
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		for start := 0; start < len(hashes); start += knownBlobsChunk {
+			chunk := hashes[start:min(start+knownBlobsChunk, len(hashes))]
+			args := make([]any, 0, len(chunk))
+			placeholders := make([]byte, 0, len(chunk)*2)
+			for _, h := range chunk {
+				raw, err := idBlob("content_hash", h)
+				if err != nil {
+					return err
+				}
+				args = append(args, raw)
+				if len(placeholders) > 0 {
+					placeholders = append(placeholders, ',')
+				}
+				placeholders = append(placeholders, '?')
+			}
+			rows, err := tx.QueryContext(ctx, `SELECT hash FROM blobs WHERE hash IN (`+string(placeholders)+`)`, args...)
+			if err != nil {
+				return wrap("blobs", err)
+			}
+			if err := func() error {
+				defer rows.Close()
+				for rows.Next() {
+					var raw []byte
+					if err := rows.Scan(&raw); err != nil {
+						return wrap("blobs", err)
+					}
+					known[idHex(raw)] = struct{}{}
+				}
+				return wrap("blobs", rows.Err())
+			}(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return known, nil
+}

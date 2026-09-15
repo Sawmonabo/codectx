@@ -23,6 +23,11 @@ import (
 // contextPlan answers codectx_context_plan. Plan returns both halves, so
 // planOutput carries the manifest and the opened session's status together and
 // a client needs no second round trip to learn the session it just opened.
+//
+// A compile that ran out of query deadline answers `truncated` with
+// `next_cursor` and no manifest (ruling C9). No session exists on that path, so
+// the status is omitted and the client continues by calling this tool again
+// with the same arguments plus `cursor`.
 func (h *handlers) contextPlan(ctx context.Context, _ *mcp.CallToolRequest, in model.PlanRequest) (*mcp.CallToolResult, result[planOutput], error) {
 	var zero result[planOutput]
 	if err := in.Validate(); err != nil {
@@ -32,7 +37,10 @@ func (h *handlers) contextPlan(ctx context.Context, _ *mcp.CallToolRequest, in m
 	if err != nil {
 		return nil, zero, toolFailure(h.log, err)
 	}
-	return nil, ok(h, planOutput{Plan: plan, Status: status}), nil
+	if plan.Truncated {
+		return nil, ok(h, planOutput{Plan: plan}), nil
+	}
+	return nil, ok(h, planOutput{Plan: plan, Status: &status}), nil
 }
 
 // contextStatus answers codectx_context_status, pairing the coverage page with

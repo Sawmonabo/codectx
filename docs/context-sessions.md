@@ -51,6 +51,33 @@ selection starts from — examines every identity the task names by default. The
 task that exceeds a value you set is not truncated in silence, but reported as an
 exclusion naming the key and the value.
 
+### A plan that runs out of query deadline continues, it does not fail
+
+A large repository can exhaust `resources.query_timeout` before the compile
+finishes. That is not the end of the answer: the compile ends the **pass** it is
+in, persists nothing, opens no session, and returns
+
+```
+truncated   deadline
+plan        none: the compile stopped at a pass boundary and opened no session
+continue    rerun `codectx context plan` with every flag unchanged plus --cursor <token>
+```
+
+Pass that token back as `--cursor`, repeating every other flag and argument of
+the original request unchanged, and the compile resumes at the first unfinished
+pass. The plan the final call returns is byte-for-byte the plan an uninterrupted
+compile would have produced — a continuation never changes the answer, it only
+splits the work that produces it.
+
+The token is bound to the question it was issued for: a cursor presented beside
+a different task, phase, seed set or budget is refused with `CTX_CURSOR_INVALID`
+rather than answered against the wrong request, and so is one that was altered
+or whose lease has expired. In JSON the same answer is `plan.truncated`,
+`plan.truncation_reason` and `plan.next_cursor`, with no `plan.manifest` and no
+`session` block, because there is no session yet. Over MCP,
+`codectx_context_plan` takes the same token as its optional `cursor` argument
+and answers the same three fields with `status` absent.
+
 A plan that excluded candidates says so in a `notice` line on its own output, and
 that notice names where the reasons are: the manifest header carries counts, not
 lists, so the exclusions themselves are a paged projection reached with

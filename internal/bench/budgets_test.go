@@ -150,6 +150,13 @@ func fixture(tb testing.TB) *budgetFixture {
 	return fixtureValue
 }
 
+// benchStartNodes is the seed width the traversal rows walk from. It is the
+// bench's OWN fixture constant and not a model or configuration bound: the row
+// has to measure the same walk from build to build, so widening the wire
+// ceiling (model.MaxStartNodes) or the operative context.max_start_nodes must
+// not move the baseline the budget is re-pinned against.
+const benchStartNodes = 64
+
 func buildFixture(tb testing.TB) *budgetFixture {
 	tb.Helper()
 	ctx := context.Background()
@@ -190,9 +197,8 @@ func buildFixture(tb testing.TB) *budgetFixture {
 	if err != nil {
 		tb.Fatalf("workspace symbols: %v", err)
 	}
-	// The traversal rows start from the widest seed set a request may carry
-	// (model.MaxStartNodes), led by the high-fanout symbol Section 23.1 asks
-	// for. A walk from one leaf visits two nodes and would measure nothing,
+	// The traversal rows start from benchStartNodes seeds, led by the
+	// high-fanout symbol Section 23.1 asks for. A walk from one leaf visits two nodes and would measure nothing,
 	// and the visited-node row has to state an upper bound the default budget
 	// is re-pinned against, not a best case. The exact-query row wants the
 	// opposite: one ordinary symbol, resolved by name.
@@ -216,7 +222,7 @@ func buildFixture(tb testing.TB) *budgetFixture {
 		}
 	}
 	for _, n := range symbols.Items {
-		if len(f.seeds) >= model.MaxStartNodes {
+		if len(f.seeds) >= benchStartNodes {
 			break
 		}
 		if n.Kind == model.NodeFunction || n.Kind == model.NodeMethod {
@@ -646,7 +652,15 @@ var budgetRows = []budgetRow{
 		}},
 	{name: "idle-mcp-rss", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIdleMCPRSSBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
-			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo)
+			// IDLE means idle. `mcp.watch` is on by default, so a server
+			// started plainly spends its first seconds running the initial
+			// refresh -- parser workers and all -- and a window opened at
+			// process start sampled that STARTUP peak, not the resting
+			// session. The row is the resting one, so the watcher is off for
+			// it (`--watch=false`) and the window opens only after the session
+			// has settled. The refresh peak is row 10's subject, measured
+			// there under `index --full`.
+			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo, "--watch=false")
 			cmd.Env = execEnv(f.execHome)
 			// A server with no stdin producer would see EOF and exit before it
 			// could be sampled, so the pipe is held open and closed to stop it.
@@ -657,10 +671,17 @@ var budgetRows = []budgetRow{
 			if err := cmd.Start(); err != nil {
 				t.Fatalf("start mcp serve: %v", err)
 			}
-			peak := treePeak(t, func() { time.Sleep(2 * time.Second) })
+			// Settle: opening the workspace and standing the server up is
+			// startup, not idle, so it happens outside the sampled window.
+			time.Sleep(idleMCPSettle)
+			peak := treePeak(t, func() { time.Sleep(idleMCPSample) })
 			_ = stdin.Close()
-			_ = cmd.Wait()
-			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes)
+			if err := cmd.Wait(); err != nil {
+				t.Fatalf("mcp serve exited non-zero (%v)", err)
+			}
+			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes) +
+				fmt.Sprintf(" (resting session: watcher off, sampled over %s after a %s settle)",
+					idleMCPSample, idleMCPSettle)
 		}},
 	{name: "interactive-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetInteractivePeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
@@ -932,8 +953,25 @@ func TestSessionStatusClamp(t *testing.T) {
 	// compiles every later manifest under the CURRENT manifest's budget: a
 	// planBudget-sized ceiling (200 files) would refuse with CTX_MINIMUM_BUDGET
 	// exactly as the session approached the page it exists to exercise.
-	budget := model.Budget{MaxFiles: 500, MaxSlices: 128,
-		MaxBytes: planBudget.MaxBytes, MaxEstimatedTokens: planBudget.MaxEstimatedTokens}
+	//
+	// Re-pinned to the walk this row now measures. The walk's root width is
+	// context.max_start_nodes and unlimited by default, so 24 task seeds resolve
+	// to every distinct entity they name rather than the first 64, and the
+	// required scope is legitimately wider than the constants above were sized
+	// for: MaxSlices 128 refuses it outright with CTX_MINIMUM_BUDGET.
+	//
+	// The byte and token terms are the SLICE-CUT terms, not headroom:
+	// packedSliceCountStream opens a new slice when the next group would take
+	// the running total past MaxBytes or MaxEstimatedTokens, with no per-slice
+	// divisor. planBudget's 4 MiB over a ~193 KB corpus never cuts, so the
+	// packer emits every admitted entry into ONE slice and
+	// model.ContextSlice.Validate refuses its 1508-record entry_ordinals against
+	// the 1000-record page width. 64 KiB / 128k tokens cuts the same required
+	// set into slices no page refuses; MaxSlices 512 is the ceiling that count
+	// has to clear. Widening MaxFiles alone does not help -- it is not the
+	// binding term at either setting.
+	budget := model.Budget{MaxFiles: 500, MaxSlices: 512,
+		MaxBytes: 64 << 10, MaxEstimatedTokens: 128_000}
 	// Batches are disjoint and small: sessionFilesSQL is INSERT OR IGNORE, so a
 	// repeated package adds nothing, and one batch's walk must stay inside the
 	// budget above.
