@@ -126,7 +126,25 @@ func verifyCursor(c pagination.Cursor, b model.Binding, queryHash string) error 
 // spooled hit. A model.SearchHit unmarshals into spoolMeta as zero values, so
 // without the marker a spool written by an older build would silently lose its
 // first hit instead of being refused.
-const spoolMetaMarker = "codectx.search.page.v1"
+const spoolMetaMarker = "codectx.search.page.v2"
+
+// spooledHit is one record of a search spool: the hit as it will be served,
+// and the byte interval its source range is hydrated FROM. The span travels
+// with the hit because hydration is deferred to the page that actually serves
+// it -- reading every tail hit's source out of the CAS, verifying its block
+// hashes and scanning it for line/column positions was the largest single cost
+// of a wide first page, paid for hits most callers never ask for. The answer
+// is unchanged either way: hydration is a pure function of (file, interval)
+// within a pinned generation, so a hit hydrated on page 3 is byte for byte the
+// hit page 1 would have written.
+//
+// The marker above is v2 for exactly this: a spool written by a build that
+// stored bare model.SearchHit records would unmarshal here into a zero hit
+// with no span, and readSpool refuses such a spool rather than serving it.
+type spooledHit struct {
+	Hit  model.SearchHit  `json:"hit"`
+	Span *model.ByteRange `json:"span,omitempty"`
+}
 
 // spoolMeta is the leading record of every search spool: the answer-level
 // facts a continuation must report as the first page did. QueryMeta.Truncated
@@ -161,7 +179,7 @@ type spoolMeta struct {
 // (offset-carrying cursors, once Cursor is unfrozen); what must never happen
 // is a silent failure, so exhausting the budget is Spools.reserve's typed
 // CTX_RESOURCE_LIMIT and it is returned from here unchanged.
-func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, tail func(func(model.SearchHit) error) error) (string, error) {
+func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, tail func(func(spooledHit) error) error) (string, error) {
 	if tail == nil {
 		return "", nil
 	}
@@ -190,7 +208,7 @@ func spoolHits(spools *pagination.Spools, c pagination.Cursor, meta spoolMeta, t
 		releaseSpool(spools, sp)
 		return "", err
 	}
-	if err := tail(func(h model.SearchHit) error { return append1(h) }); err != nil {
+	if err := tail(func(h spooledHit) error { return append1(h) }); err != nil {
 		releaseSpool(spools, sp)
 		return "", err
 	}
@@ -247,7 +265,7 @@ func releaseSpool(spools *pagination.Spools, sp *pagination.Spool) {
 // page are counted and dropped, and spoolTail walks them again straight into
 // the next spool. The walk is a sequential read of one file, which is what
 // tailOf does over the ranked run on the first page.
-func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, limit int) (spoolMeta, []model.SearchHit, int, error) {
+func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, limit int) (spoolMeta, []spooledHit, int, error) {
 	if spools == nil {
 		return spoolMeta{}, nil, 0, &model.Error{Code: model.CodeInternal, Message: "search: no spool store is configured"}
 	}
@@ -255,7 +273,7 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 	// The capacity is the page bound, which Service.pageLimit has already
 	// clamped to model.MaxPageItems, so this allocation cannot track the
 	// answer.
-	hits := make([]model.SearchHit, 0, limit)
+	hits := make([]spooledHit, 0, limit)
 	rest := 0
 	first := true
 	err := spools.Open(ctx, c, now, func(record []byte) error {
@@ -281,7 +299,7 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 			rest++
 			return nil
 		}
-		var h model.SearchHit
+		var h spooledHit
 		if err := json.Unmarshal(record, &h); err != nil {
 			return &model.Error{Code: model.CodeStorageCorrupt, Message: "a spooled result is not readable"}
 		}
@@ -299,8 +317,8 @@ func readSpool(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 // tailOf: the source spool is still live here -- the consumed cursor's spool
 // and lease are released only after the page validates -- so the remainder is
 // copied spool to spool without ever standing in heap.
-func spoolTail(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, skip int) func(func(model.SearchHit) error) error {
-	return func(yield func(model.SearchHit) error) error {
+func spoolTail(ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time, skip int) func(func(spooledHit) error) error {
+	return func(yield func(spooledHit) error) error {
 		at := 0
 		first := true
 		return spools.Open(ctx, c, now, func(record []byte) error {
@@ -316,7 +334,7 @@ func spoolTail(ctx context.Context, spools *pagination.Spools, c pagination.Curs
 			if at++; at <= skip {
 				return nil
 			}
-			var h model.SearchHit
+			var h spooledHit
 			if err := json.Unmarshal(record, &h); err != nil {
 				return &model.Error{Code: model.CodeStorageCorrupt, Message: "a spooled result is not readable"}
 			}
