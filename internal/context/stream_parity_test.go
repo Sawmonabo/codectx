@@ -17,7 +17,9 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"sort"
+	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -882,4 +884,178 @@ type plan struct {
 type drop struct {
 	index  int
 	reason string
+}
+
+// referenceCompile is Compile as this package ran it before the streamed passes
+// replaced it: seeds, expandScope, hydrateFiles, relationsOnPaths, rank,
+// resolveBudget, buildPlan, kept verbatim from the pre-stream compiler.go.
+//
+// It deliberately stops short of the two steps Compile does around the pipeline.
+// The manifest-reuse lookup is skipped because the reference is compared against
+// a Compile of the SAME store and a reference that reused would compare the
+// streamed plan with itself; and persistence is skipped because the reference
+// must not take the manifest identity the streamed compile is about to write.
+// The caller persists nothing here and compares against what Compile stored.
+func (c *Compiler) referenceCompile(ctx context.Context, req model.ContextRequest) (
+	plan, bool, []string, model.Budget, error) {
+	if err := req.Validate(); err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	reader, err := c.store.PinGeneration(ctx, c.repo, req.GenerationID, c.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	defer reader.Close()
+	gen := reader.Binding().GenerationID
+
+	seeds, err := c.extractSeeds(ctx, reader, gen, req)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	caps, err := reader.Capabilities(ctx)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	engine, release, err := c.graph(ctx, gen)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	defer release()
+
+	scoped, err := expandScope(ctx, engine, gen, c.cfg.Context,
+		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	scopeComplete := scoped.ScopeComplete && !seeds.Unresolved
+	files, err := c.hydrateFiles(ctx, reader, scoped.Candidates)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	relations, complete, err := c.relationsOnPaths(ctx, reader, scoped.Candidates)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	if !complete {
+		scopeComplete = false
+	}
+	ranked, err := c.rank(ctx, reader, scoped.Candidates, relations)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	resolved, err := resolveBudget(req.Budget, c.cfg.Context)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	packed, err := buildPlan(ranked, files, resolved)
+	if err != nil {
+		return plan{}, false, nil, model.Budget{}, err
+	}
+	stored := model.Budget{MaxEstimatedTokens: resolved.MaxTokens, MaxBytes: resolved.MaxBytes,
+		MaxFiles: resolved.MaxFiles, MaxSlices: resolved.MaxSlices}
+	return packed, scopeComplete, c.manifestNotices(scoped, partsOf(packed)), stored, nil
+}
+
+// parityRequests are the requests the parity proof compiles through both
+// pipelines. They are chosen to reach every branch the streamed passes rewrote:
+// an unbounded compile (every candidate survives to an entry), a compile whose
+// byte budget drops files in the packer (the P-H drop stream), one whose file
+// budget drops whole groups, one naming an identity the snapshot cannot resolve
+// (the pre-sort exclusion stream and an incomplete scope), and a phase that
+// scores a different requirement mix.
+var parityRequests = []struct {
+	name string
+	req  model.ContextRequest
+}{
+	{"unbounded", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}},
+	{"sweep phase", model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseSweep}},
+	{"byte budget drops files", model.ContextRequest{Task: "make `Place` idempotent",
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxBytes: 4096, MaxSlices: 2}}},
+	{"file budget drops groups", model.ContextRequest{Task: "make `Place` idempotent",
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 2}}},
+	{"unresolvable identity", model.ContextRequest{Task: "make `Place` and `NoSuchSymbol` idempotent",
+		Phase: model.PhaseVerify, Budget: model.Budget{MaxFiles: 1}}},
+	{"sweep phase, a different seed", model.ContextRequest{Task: "order placement", Phase: model.PhaseSweep}},
+}
+
+// TestTheStreamedCompileIsByteForByteTheWholeSetPlan is C-STREAM proof (1).
+//
+// The streamed passes are only correct insofar as they reproduce the whole-set
+// pipeline's answer, and every structure they replaced -- the admitted map, the
+// hydration map, the relation map, the routed slice, the group index lists --
+// was also the thing that decided an ordinal. A pass that drops a dedupe, folds
+// on the wrong key or emits in the wrong order still produces a plausible plan,
+// so the invariant is not "a plan came out" but "the SAME plan came out":
+// entries with their ordinals, reasons and evidence routes, the slice table with
+// its entry ordinals, every exclusion with its reason in its persisted order,
+// the compile's notices, and the canonical hash the manifest identity is built
+// on. Each is compared as canonical JSON, so a difference names the field.
+func TestTheStreamedCompileIsByteForByteTheWholeSetPlan(t *testing.T) {
+	for _, row := range parityRequests {
+		t.Run(row.name, func(t *testing.T) {
+			fx := newContextFixture(t)
+			c := intCompiler(t, fx, fx.Now)
+			ref, refScopeComplete, refNotices, refBudget, err := c.referenceCompile(fx.ctx, row.req)
+			if err != nil {
+				t.Fatalf("referenceCompile: %v", err)
+			}
+			m, err := intCompiler(t, fx, fx.Now).Compile(fx.ctx, row.req)
+			if err != nil {
+				t.Fatalf("Compile: %v", err)
+			}
+			entries, err := fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestEntries: %v", err)
+			}
+			slices, err := fx.Store.ManifestSlices(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestSlices: %v", err)
+			}
+			excluded, err := fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0)
+			if err != nil {
+				t.Fatalf("ManifestExcluded: %v", err)
+			}
+			// The plan must not be vacuously equal: a row that compiled to
+			// nothing would pass every comparison below without exercising one
+			// streamed pass.
+			if len(entries) == 0 && len(excluded) == 0 {
+				t.Fatalf("the compile produced neither an entry nor an exclusion, so this row proves nothing")
+			}
+			sameJSON(t, "entries", ref.Entries, entries)
+			sameJSON(t, "slices", ref.Slices, slices)
+			sameJSON(t, "exclusions", ref.Excluded, excluded)
+			sameJSON(t, "notices", refNotices, m.Notices)
+			if m.ScopeComplete != refScopeComplete {
+				t.Errorf("scope_complete is %v, the whole-set pipeline says %v", m.ScopeComplete, refScopeComplete)
+			}
+			if m.EntryCount != len(ref.Entries) || m.SliceCount != len(ref.Slices) {
+				t.Errorf("header counts %d entries / %d slices, the whole-set plan has %d / %d",
+					m.EntryCount, m.SliceCount, len(ref.Entries), len(ref.Slices))
+			}
+			_, reqHash := manifestIdentity(fx.Binding, row.req, fx.Cfg)
+			want := canonicalManifestHash(fx.Binding, reqHash, refBudget, refScopeComplete,
+				ref.Entries, ref.Slices, ref.Excluded)
+			if m.CanonicalHash != want {
+				t.Errorf("canonical hash %s, the whole-set plan hashes to %s", m.CanonicalHash, want)
+			}
+		})
+	}
+}
+
+// sameJSON compares two values by their canonical JSON encoding and reports the
+// first difference as the encodings themselves, so a divergence names the field rather
+// than the Go type.
+func sameJSON(t *testing.T, what string, want, got any) {
+	t.Helper()
+	a, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal reference %s: %v", what, err)
+	}
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal streamed %s: %v", what, err)
+	}
+	if string(a) != string(b) {
+		t.Errorf("%s differ\n whole-set: %s\n  streamed: %s", what, a, b)
+	}
 }
