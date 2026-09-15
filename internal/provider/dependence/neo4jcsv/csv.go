@@ -20,6 +20,12 @@ import (
 // since the last record boundary — before the csv reader has grown its buffer
 // to hold them. csv.Reader returns the underlying error unwrapped, so the
 // typed limit surfaces to the caller.
+//
+// A limit of zero is unlimited, which is the shipped default: the reader then
+// hands every byte through untouched. Without that arm a zero limit truncates
+// every Read to zero bytes, which is a reader that never progresses -- every
+// import would fail at the default configuration on an error naming neither
+// the bound nor the record.
 type boundedRecordReader struct {
 	r        io.Reader
 	limit    int64
@@ -29,7 +35,8 @@ type boundedRecordReader struct {
 }
 
 func (b *boundedRecordReader) Read(p []byte) (int, error) {
-	if int64(len(p)) > b.limit {
+	bounded := b.limit > 0
+	if bounded && int64(len(p)) > b.limit {
 		p = p[:b.limit]
 	}
 	n, err := b.r.Read(p)
@@ -43,7 +50,7 @@ func (b *boundedRecordReader) Read(p []byte) (int, error) {
 			}
 		}
 		b.since++
-		if b.since > b.limit {
+		if bounded && b.since > b.limit {
 			return 0, resourceLimit("an export record exceeds %d bytes", b.limit).WithDetail("limit", "max_provider_record_bytes")
 		}
 	}
