@@ -236,8 +236,11 @@ func TestShortestPathIsExactUnderATinyChunkBudget(t *testing.T) {
 			t.Fatalf("frontier %d: the answer is truncated (%q); a chunk budget must never truncate",
 				frontier, res.Meta.TruncationReason)
 		}
+		// NOT sorted: pathWalk.routes promises a served ORDER, and sorting
+		// here would assert only the set. referenceRoutes returns its routes in
+		// that same canonical order, so the comparison below is an order
+		// assertion as well as a set one.
 		got := routeSequences(res)
-		sort.Strings(got)
 		if len(got) == 0 || !strings.HasPrefix(got[0], fmt.Sprintf("%d:", wantCost)) {
 			t.Fatalf("frontier %d: got routes %v, want cost %d", frontier, got, wantCost)
 		}

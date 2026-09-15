@@ -20,7 +20,7 @@ const (
 // addQueryFlags declares the flags every query command shares. --repo reuses
 // the one spelling the rest of the tree already has. cursored says whether this
 // command also declares --cursor: the generation help may only mention a flag
-// the command actually has, so `path`, which issues no continuation, is not
+// the command actually has, so a command that issues no continuation is not
 // told about a combination it cannot make.
 func addQueryFlags(cmd *cobra.Command, cursored bool) {
 	addRepoFlag(cmd)
@@ -67,9 +67,19 @@ func addCursorFlag(cmd *cobra.Command) {
 // pageRequest reads the page flags of a command that declares them. A command
 // with --limit but no --cursor simply builds a page request with no cursor.
 func pageRequest(cmd *cobra.Command) (model.PageRequest, error) {
-	limit, err := intFlag(cmd, queryLimitFlag)
-	if err != nil {
-		return model.PageRequest{}, err
+	// Both reads are Lookup-guarded, because the two flags are declared
+	// independently: `path` declares --cursor and no --limit (a route set is
+	// bounded by the reason-path cap, not paged), and reading a flag the
+	// command never registered is a cobra error that kills the invocation
+	// before it reaches the workspace. A missing --limit leaves Limit zero,
+	// which is "take the configured page bound".
+	var limit int
+	if cmd.Flags().Lookup(queryLimitFlag) != nil {
+		v, err := intFlag(cmd, queryLimitFlag)
+		if err != nil {
+			return model.PageRequest{}, err
+		}
+		limit = v
 	}
 	if cmd.Flags().Lookup(queryCursorFlag) == nil {
 		return model.PageRequest{Limit: limit}, nil

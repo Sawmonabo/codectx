@@ -627,6 +627,61 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	return s, nil
 }
 
+// errRetentionBudget is the refusal a page raises when the shared continuation
+// byte budget cannot hold the state its next page would resume from.
+//
+// It is a REFUSAL, not a truncation. Both of these endpoints used to return an
+// empty token and a nil error here, so the answer ended mid-walk marked with
+// whichever reason had already been recorded -- "query deadline reached" for
+// impact, a work budget for path -- and a caller reading that reason was told
+// something false: raising the named budget was the only thing that could let
+// the walk continue, and the reason never named it. An answer that stops
+// because a user-set bound was reached must say so and name the key.
+//
+// Not retryable: repeating the request frees no bytes. That also keeps it
+// terminal for terminalOutcome, so the consumed continuation is released.
+func errRetentionBudget(what string) error {
+	return (&model.Error{
+		Code:        model.CodeResourceLimit,
+		Message:     "graph: the continuation state this " + what + " must keep to resume does not fit the shared continuation budget",
+		Remediation: "raise resources.max_temp_bytes, or narrow the query with --depth, --visited or --edges so the walk finishes within one page",
+	}).WithDetail("limit", "resources.max_temp_bytes")
+}
+
+// terminalOutcome reports whether a page's outcome ENDS the continuation the
+// page replayed. Only a terminal outcome may release the consumed state.
+//
+// Terminal: the page was served (err nil -- either the answer completed or a
+// fresh continuation was minted from it), or the request was refused for a
+// reason that repeating it cannot change (CTX_CURSOR_INVALID, an argument
+// rejection, an internal defect). Releasing then is what keeps a spool and a
+// retention lease from outliving the walk they belong to.
+//
+// NOT terminal: a RETRYABLE failure -- CTX_WORKSPACE_BUSY from a contended
+// store, a transient read error, the query deadline. Those tell the caller to
+// present the SAME cursor again, so the state that cursor names has to still be
+// adoptable; releasing it turned a busy page into CTX_CURSOR_INVALID and made
+// the whole walk behind it unrecoverable. The state is still bounded: it
+// expires with the cursor's own lease TTL.
+//
+// A budget-exhaustion refusal is deliberately NOT retryable (see
+// errRetentionBudget), so it releases like any other terminal refusal.
+func terminalOutcome(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return !typed.Retryable
+	}
+	// An untyped error is not a refusal this engine classified; keeping the
+	// state costs one TTL and losing it costs the walk.
+	return false
+}
+
 // releaseConsumed ends a replayed continuation's spool and its cursor-owned
 // lease. It takes the two identifiers rather than a cursor so EVERY paged
 // endpoint can end its own continuation whatever payload shape carries it --
@@ -713,12 +768,6 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		if err != nil {
 			return "", e.releaseLease(ctx, lease.ID, err)
 		}
-		if id == "" {
-			// The shared continuation budget cannot hold the input. The answer
-			// ends here, truncated and without a token, rather than continuing
-			// into a leg that would rank only itself.
-			return "", e.releaseLease(ctx, lease.ID, nil)
-		}
 		next.RetainID = id
 	}
 	if needsSpool {
@@ -766,7 +815,7 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		if pagination.IsBudgetExhausted(err) {
-			return "", nil
+			return "", errRetentionBudget("walk")
 		}
 		return "", err
 	}
