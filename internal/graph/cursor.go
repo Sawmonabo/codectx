@@ -772,6 +772,23 @@ func (e *Engine) releaseConsumed(ctx context.Context, spoolID, leaseID string) {
 // to spill into. In every one of those cases the caller reports Truncated with
 // no NextCursor, which is the same contract as running out of page items.
 func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuation) (string, error) {
+	// The mint runs on a context DETACHED from the request deadline, and this
+	// is what makes ruling P3 deliverable rather than merely intended. The
+	// continuation is the LAST thing a timed-out page does, so by definition
+	// the query deadline has already passed when the lease is acquired and the
+	// frontier spilled. Charged against that expired context, the lease write
+	// failed with the context's own error, the page returned it instead of a
+	// cursor, and a walk the engine had correctly decided to continue came back
+	// as ok:false with data:null and nothing to resume from -- measured on a
+	// 13 223-file repository, where every default-timeout impact query on a hub
+	// node ended that way.
+	//
+	// Detaching costs nothing the caller needed: a CANCELED request never
+	// reaches here (impactPhaseError answers a cancellation as CTX_CANCELED
+	// before any continuation is considered), and what runs under it is a
+	// bounded local write -- one lease row and one spill of a frontier that the
+	// frontier byte ceiling already bounds -- not another read of the graph.
+	ctx = context.WithoutCancel(ctx)
 	if e.signer == nil || e.leases == nil {
 		// No signer, or no lease store to retain the generation the resumed
 		// page will read: a token minted here would resume over facts nothing
