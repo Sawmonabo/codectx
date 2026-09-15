@@ -21,8 +21,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// This file is the Section 23.2 release gate and the published benchmark set
-// (lane T21-L2). It has no TestMain of its own: plateau_test.go's makes this
+// This file is the Section 23.2 release gate and the published benchmark set.
+// It has no TestMain of its own: plateau_test.go's makes this
 // test binary the parser worker, which is what lets a measurement here spawn
 // parsers the way the shipped binary does. The budget constants and the corpus
 // generator it measures against are corpus_test.go's; nothing is redeclared.
@@ -70,17 +70,29 @@ var corpusSmallReal = corpusSpec{Packages: 40, Seed: 2101}
 // count that has to clear the 200-record page is the SESSION's file count, not
 // the repository's, and neither one plan nor one repository size reaches it --
 // a plan over this generator saturates at ~161 files however large the tree is
-// (lane T21-L2), so the session is grown through `context include` instead. The
+// (the figures are in TestSessionStatusClamp), so the session is grown through
+// `context include` instead. The
 // repository still has to be large enough to hold a 200-file session with room
 // above it, which this repository and the 214-file shape are not: 3*120+4 files
 // leave the gate clear of its own fixture's ceiling.
 var corpusOver200Files = corpusSpec{Packages: 120, Seed: 2102}
 
-// corpusReference is the Section 23.1 reference fixture: 10,000 files. It is
-// the VERIFY lane's workload, never a lane's -- the cold-index row alone has a
-// 3-minute budget and -count=5 multiplies it -- and it is declared here so the
-// reference scale has exactly one definition.
-var corpusReference = corpusSpec{Packages: 3332, Seed: 2103}
+// corpusReference is the Section 23.1 reference fixture, and Section 23.1
+// states it in three numbers, not one: ~10,000 files, ~1M lines, ~80 MiB of
+// source. The package count reaches the file count (3P+4), and the wide filler
+// shape reaches the other two -- the original narrow shape gives 10,000 files
+// of ~0.5 KiB, which is a quarter of the lines and a fourteenth of the bytes,
+// and a cold index or a storage ratio measured over that describes a corpus
+// the budgets were not written for.
+//
+// Generated and counted at this shape (no index): 10,000 files, 1,052,933
+// lines, 86,064,203 bytes = 82.08 MiB. corpora.json records CLONED corpora --
+// it demands an https clone url and a pinned commit per entry -- so a
+// generated fixture is not one of its rows and it is unchanged. This is the
+// VERIFY lane's workload, never a lane's -- the cold-index row alone
+// has a 3-minute budget and -count=5 multiplies it -- and it is declared here
+// so the reference scale has exactly one definition.
+var corpusReference = corpusSpec{Packages: 3332, Seed: 2103, Helpers: 4, HelperLines: 17}
 
 // --- the shared fixture -----------------------------------------------------
 
@@ -114,16 +126,14 @@ var (
 	fixtureValue *budgetFixture
 )
 
-// sharedRoot is a stable path rather than a t.TempDir because the fixture
-// outlives the test or benchmark that happens to build it first: a TempDir
-// would be removed when that one function returned, taking the corpus out from
-// under every later row. It is cleared on entry, so a run leaves exactly one
-// tree behind and repeated runs never accumulate.
+// sharedRoot is the fixture's directory under benchRoot rather than a
+// t.TempDir because the fixture outlives the test or benchmark that happens to
+// build it first: a TempDir would be removed when that one function returned,
+// taking the corpus out from under every later row. Creating it is all this
+// does -- plateau_test.go's TestMain owns the root's lifetime, which is what
+// makes it outlive every row and be released at process exit.
 func sharedRoot(tb testing.TB) string {
-	root := filepath.Join(os.TempDir(), "codectx-bench-l2")
-	if err := os.RemoveAll(root); err != nil {
-		tb.Fatalf("clear shared fixture root: %v", err)
-	}
+	root := filepath.Join(benchRoot, "fixture")
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		tb.Fatalf("create shared fixture root: %v", err)
 	}
@@ -321,12 +331,13 @@ var (
 
 // releaseBinary builds the product the way Section 23.5 requires a measurement
 // to be taken: -trimpath, no race detector, no coverage instrumentation. It is
-// built once per test binary into a stable path, so repeated runs overwrite one
-// binary instead of leaving one behind per run.
+// built once per test binary, into this process's own root: two concurrent
+// bench binaries writing one output path would race the linker against a
+// running measurement.
 func releaseBinary(tb testing.TB) string {
 	tb.Helper()
 	binaryOnce.Do(func() {
-		dir := filepath.Join(os.TempDir(), "codectx-bench-l2-bin")
+		dir := filepath.Join(benchRoot, "bin")
 		if binaryErr = os.MkdirAll(dir, 0o700); binaryErr != nil {
 			return
 		}
@@ -371,6 +382,13 @@ func measure(t *testing.T, target time.Duration, n int, op func()) string {
 	}
 	got := p95(samples)
 	report := fmt.Sprintf("p95 %s over %d samples (target %s)", got.Round(time.Microsecond), n, target)
+	if raceDetector {
+		// Only a row that also asserts on work reaches this under the race
+		// detector; the ceiling-only rows skip before they are measured. The
+		// clock is still reported, and reported as ungated, so a log line can
+		// never read as a pass the gate did not give.
+		return report + " -- NOT GATED: " + raceSkipReason
+	}
 	if got > target {
 		t.Errorf("BUDGET MISSED: %s", report)
 	}
@@ -491,6 +509,13 @@ func touchFiles(tb testing.TB, repo string, n, round int) {
 
 // --- the release gate -------------------------------------------------------
 
+// raceSkipReason is what a skipped budget row says out loud. Section 23.5
+// forbids meeting a target by excluding the failing feature, so a row that is
+// not measured must say it was not measured and why.
+const raceSkipReason = "budgets are measured on release builds: under the race detector the " +
+	"instrumented build, and the parser workers this test binary spawns as itself, are not the " +
+	"product Section 23.2 states its latency and memory ceilings over"
+
 // budgetRow is one Section 23.2 ceiling: what is measured, the frozen target,
 // the corpus scale it is measured at, and the measurement itself. skip is set
 // on the one row this lane does not own.
@@ -499,6 +524,14 @@ type budgetRow struct {
 	target string
 	spec   corpusSpec
 	skip   string
+	// raceSkip marks a row whose whole assertion is a Section 23.2 latency or
+	// memory ceiling. Section 23.5 takes those measurements on release builds,
+	// so under the race detector the row skips with raceSkipReason rather than
+	// reporting the detector's overhead as the product's. Rows that also
+	// assert on WORK -- no-change-refresh's no-parse/no-FTS-rewrite pair, the
+	// visited-node count, the storage decomposition -- are not marked: they
+	// run under -race, and measure() reports their clock without gating it.
+	raceSkip bool
 	// measure takes the measurement, fails the row when it is over the
 	// ceiling, and returns the figure to log either way.
 	measure func(t *testing.T, f *budgetFixture) string
@@ -519,7 +552,7 @@ var planBudget = model.Budget{MaxFiles: 200, MaxSlices: 64, MaxBytes: 4 << 20, M
 // frozen constant rather than retyped, so a constant and a gate can never drift
 // apart: there is one number and both read it.
 var budgetRows = []budgetRow{
-	{name: "version-startup", target: budgetVersionP95.String(), spec: corpusSmallReal,
+	{name: "version-startup", raceSkip: true, target: budgetVersionP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			return measure(t, budgetVersionP95, 20, func() {
 				cmd := exec.Command(f.binary, "version", "--json")
@@ -529,7 +562,7 @@ var budgetRows = []budgetRow{
 				}
 			})
 		}},
-	{name: "exact-query", target: budgetExactQueryP95.String(), spec: corpusSmallReal,
+	{name: "exact-query", raceSkip: true, target: budgetExactQueryP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			ctx := context.Background()
 			return measure(t, budgetExactQueryP95, 50, func() {
@@ -539,7 +572,7 @@ var budgetRows = []budgetRow{
 				}
 			})
 		}},
-	{name: "lexical-search", target: budgetLexicalSearchP95.String(), spec: corpusSmallReal,
+	{name: "lexical-search", raceSkip: true, target: budgetLexicalSearchP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			ctx := context.Background()
 			return measure(t, budgetLexicalSearchP95, 50, func() {
@@ -548,7 +581,7 @@ var budgetRows = []budgetRow{
 				}
 			})
 		}},
-	{name: "one-hop", target: budgetOneHopP95.String(), spec: corpusSmallReal,
+	{name: "one-hop", raceSkip: true, target: budgetOneHopP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			ctx := context.Background()
 			return measure(t, budgetOneHopP95, 50, func() {
@@ -558,7 +591,7 @@ var budgetRows = []budgetRow{
 				}
 			})
 		}},
-	{name: "context-plan", target: budgetContextPlanP95.String(), spec: corpusSmallReal,
+	{name: "context-plan", raceSkip: true, target: budgetContextPlanP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			ctx := context.Background()
 			round := 0
@@ -581,7 +614,7 @@ var budgetRows = []budgetRow{
 	{name: "context-plan-visited", target: fmt.Sprintf("%d nodes", budgetContextPlanVisitedNodes),
 		spec:    corpusSmallReal,
 		measure: measureScopeWalk},
-	{name: "ten-file-refresh", target: budgetTenFileRefreshP95.String(), spec: corpusSmallReal,
+	{name: "ten-file-refresh", raceSkip: true, target: budgetTenFileRefreshP95.String(), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			ctx := context.Background()
 			round := 0
@@ -602,12 +635,12 @@ var budgetRows = []budgetRow{
 	{name: "cold-index-reference", target: budgetColdIndexReference.String(), spec: corpusReference,
 		skip: "ruling 2: the reference-fixture cold index is the wave's ONE full-scale pass and belongs to " +
 			"the VERIFY lane; a lane that ran it would contradict the never-cold-index proof tier"},
-	{name: "indexing-peak", target: fmt.Sprintf("%d MiB", budgetIndexingPeakBytes>>20), spec: corpusSmallReal,
+	{name: "indexing-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIndexingPeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			peak := treePeak(t, func() { runCLI(t, f, f.execHome, "index", "--full") })
 			return reportPeak(t, "indexing", peak, budgetIndexingPeakBytes)
 		}},
-	{name: "idle-mcp-rss", target: fmt.Sprintf("%d MiB", budgetIdleMCPRSSBytes>>20), spec: corpusSmallReal,
+	{name: "idle-mcp-rss", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetIdleMCPRSSBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			cmd := exec.Command(f.binary, "mcp", "serve", "--repo", f.repo)
 			cmd.Env = execEnv(f.execHome)
@@ -625,7 +658,7 @@ var budgetRows = []budgetRow{
 			_ = cmd.Wait()
 			return reportPeak(t, "idle mcp", peak, budgetIdleMCPRSSBytes)
 		}},
-	{name: "interactive-peak", target: fmt.Sprintf("%d MiB", budgetInteractivePeakBytes>>20), spec: corpusSmallReal,
+	{name: "interactive-peak", raceSkip: true, target: fmt.Sprintf("%d MiB", budgetInteractivePeakBytes>>20), spec: corpusSmallReal,
 		measure: func(t *testing.T, f *budgetFixture) string {
 			peak := treePeak(t, func() {
 				runCLI(t, f, f.execHome, "status")
@@ -667,8 +700,7 @@ var budgetRows = []budgetRow{
 }
 
 // measureScopeWalk is the Section 23.2 visited-node row and the measurement the
-// default context graph budgets are re-pinned from (obligation 8, the wave-e
-// VF2 ledger item).
+// default context graph budgets are re-pinned from (obligation 8).
 //
 // The plan's own scope walk is exactly this call: internal/context runs
 // eng.Impact with both directions and the three configured context bounds
@@ -765,6 +797,9 @@ func TestResourceBudgets(t *testing.T) {
 			if row.skip != "" {
 				t.Skip(row.skip)
 			}
+			if raceDetector && row.raceSkip {
+				t.Skip(raceSkipReason)
+			}
 			// Rows share one workspace and several mutate it (the refresh
 			// rows), so they run in sequence rather than in parallel: a
 			// measurement taken while another row was indexing would describe
@@ -839,9 +874,9 @@ func TestLowMemoryProfile(t *testing.T) {
 // coverageSummarySQL's required_full-only aggregate. Both are logged below;
 // only the paged total is gated.
 //
-// How the session gets past 200. A single plan cannot do it -- lane T21-L2
-// measured a plan over this generator saturating at ~161 files (131 required at
-// 214 repository files, 152 at 364, 161 at 724, 158 at 1204), because the scope
+// How the session gets past 200. A single plan cannot do it: a plan over this
+// generator was measured saturating at ~161 files (131 required at 214
+// repository files, 152 at 364, 161 at 724, 158 at 1204), because the scope
 // walk reaches one symbol per package and stops, and a path seed resolves a
 // file but no symbol. The session itself is what grows: `context include`
 // recompiles over further seeds under the session's own budget and unions the

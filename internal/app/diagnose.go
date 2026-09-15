@@ -88,6 +88,32 @@ func (r storeReader) SuppliedIndexes(ctx context.Context, gen model.GenerationID
 // build failure, not a doctor check that quietly reports unavailable forever.
 var _ diagnostics.SuppliedIndexReader = storeReader{}
 
+// WatchHeartbeat restates (*sqlite.Store).WatchHeartbeat in the doctor's own
+// vocabulary. It is written rather than embedded for the same reason
+// SuppliedIndexes is: the result type differs, and an embedded forward with the
+// wrong signature would satisfy nothing, fail no build, and leave both the
+// `watch_heartbeat` check and the resource block's pending-event count
+// permanently absent with nothing to show for it.
+//
+// The `found` bit is carried through unchanged: absent and expired are the two
+// answers the check renders differently, and collapsing them here would lose
+// the distinction before it reaches the renderer.
+func (r storeReader) WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (diagnostics.WatchHeartbeat, bool, error) {
+	hb, found, err := r.Store.WatchHeartbeat(ctx, repo)
+	if err != nil || !found {
+		return diagnostics.WatchHeartbeat{}, false, err
+	}
+	return diagnostics.WatchHeartbeat{
+		WriterPID:     hb.WriterPID,
+		LastPassAt:    hb.LastPassAt,
+		PendingEvents: hb.PendingEvents,
+		ExpiresAt:     hb.ExpiresAt,
+	}, true, nil
+}
+
+// The same compile-time assertion, for the same reason.
+var _ diagnostics.WatchHeartbeatReader = storeReader{}
+
 // toolchainReporter adapts *toolchain.Resolver to diagnostics.ToolchainReporter.
 // Resolver.Status returns its rows directly and reports no error; the interface
 // carries one because a reporter that has to read a store may fail, and

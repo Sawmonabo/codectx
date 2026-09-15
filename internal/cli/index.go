@@ -264,7 +264,9 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			"to the periodic pass alone. Which of the two is covering the workspace " +
 			"is reported by a status call made inside this process; a separate " +
 			"`codectx status` process cannot see this session's coverage and always " +
-			"reports the watch as off. Work an optional provider deferred keeps " +
+			"reports the watch as off, though `status --resources` and `doctor` do " +
+			"report this watch from its persisted heartbeat. Work an optional " +
+			"provider deferred keeps " +
 			"publishing for the whole session, and the workspace lock is held " +
 			"throughout: one writer, never two.",
 		Args:          cobra.NoArgs,
