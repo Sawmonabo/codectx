@@ -53,20 +53,28 @@ type Options struct {
 	// shutdown exchange and is the runner's grace before a forced stop.
 	StartTimeout time.Duration
 	StopTimeout  time.Duration
-	// MaxOverlayBytes bounds, separately, the materialized snapshot, the
-	// pinned bytes cached for coordinate conversion, and the bytes sent to
-	// and received from a server over its lifetime.
-	MaxOverlayBytes int64
+	// MaxOverlayBytes is the user's overlay bound and is unlimited by default.
+	// When set it bounds, separately, the materialized snapshot (files that do
+	// not fit are named and left out, never refused), one file admitted to the
+	// pinned coordinate cache, and the bytes sent to a server in one rolling
+	// window. It is a config.Limit so that the sentinel can never be used as a
+	// number: arithmetic on it does not compile.
+	MaxOverlayBytes config.Limit
 	// MaxFrameBytes bounds one protocol message.
 	MaxFrameBytes int64
 }
 
 // Package defaults for the bounds configuration does not name.
 const (
-	DefaultStartTimeout    = 60 * time.Second
-	DefaultStopTimeout     = 5 * time.Second
-	DefaultMaxOverlayBytes = 512 << 20
-	DefaultMaxFrameBytes   = 8 << 20
+	DefaultStartTimeout = 60 * time.Second
+	DefaultStopTimeout  = 5 * time.Second
+	// DefaultDocCacheBytes is the pinned coordinate cache's ceiling when the
+	// overlay bound is unlimited. The cache is lossless -- eviction costs a
+	// re-read of bytes the snapshot still holds -- so it keeps a finite
+	// ceiling, which is what makes the overlay's peak flat under an unlimited
+	// bound instead of repository-sized.
+	DefaultDocCacheBytes = 512 << 20
+	DefaultMaxFrameBytes = 8 << 20
 )
 
 // Manager starts trusted servers lazily, one per (snapshot, profile), shares
@@ -139,7 +147,6 @@ func New(opts Options) (*Manager, error) {
 		value *int64
 		def   int64
 	}{
-		{"max_overlay_bytes", &opts.MaxOverlayBytes, DefaultMaxOverlayBytes},
 		{"max_frame_bytes", &opts.MaxFrameBytes, DefaultMaxFrameBytes},
 	} {
 		if *b.value < 0 {
@@ -149,8 +156,13 @@ func New(opts Options) (*Manager, error) {
 			*b.value = b.def
 		}
 	}
-	if opts.MaxFrameBytes > opts.MaxOverlayBytes {
-		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %d", opts.MaxFrameBytes, opts.MaxOverlayBytes)
+	if opts.MaxOverlayBytes < 0 {
+		return nil, invalid("lsp max_overlay_bytes is %s; a bound must not be negative", opts.MaxOverlayBytes)
+	}
+	// Only a bound the user set can be exceeded; an unlimited one is the top of
+	// the lattice and no frame size is over it.
+	if opts.MaxOverlayBytes.Exceeded(opts.MaxFrameBytes) {
+		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
 	return &Manager{opts: opts, servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
 }

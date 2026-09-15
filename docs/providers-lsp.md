@@ -169,7 +169,8 @@ Bounds, all finite:
 | one request | `providers.lsp.request_timeout` | `$/cancelRequest` sent, `CTX_PROVIDER_TIMEOUT` |
 | idle server | `providers.lsp.idle_ttl` | shutdown/exit after the last overlay closes |
 | server lifetime | the definition's own `Timeout` (1 h) | the runner terminates the tree |
-| materialized bytes, cached pinned bytes, bytes sent, bytes received | `Options.MaxOverlayBytes` (default 512 MiB) | materialization refused; cache evicts LRU; the server is failed |
+| materialized bytes, one admitted file, bytes sent per rolling minute | `Options.MaxOverlayBytes` (default unlimited) | files that do not fit are named in the log and left out; a file over the bound is not admitted and the query answers about the rest; a sustained flood over the send budget fails the server |
+| cached pinned bytes | `Options.MaxOverlayBytes` when set, otherwise `DefaultDocCacheBytes` (512 MiB) | cache evicts least-recently-used; eviction costs a re-read, never an answer |
 | one inbound message | `Options.MaxFrameBytes` (default 8 MiB), checked against the declared `Content-Length` before the body buffer exists | the connection is failed |
 | one outbound message | `Options.MaxFrameBytes`; `didOpen` refuses a document that cannot fit before the text is copied | `CTX_RESOURCE_LIMIT` (`limit=max_frame_bytes`); nothing is written, so the connection stays usable — a request reports it to its caller, an answer to a server-initiated request is dropped and the writer goroutine continues |
 | header block, header line, JSON depth | 8 lines, 1 KiB, 64 levels — the line bound is applied to the chunk the reader holds before it is accumulated | protocol error, connection failed |
@@ -319,10 +320,16 @@ does not have to rediscover it.
   the next `Open` starts a fresh server. An operator approving a server for
   interactive use approves a `timeout` of that length.
 - **`Options.MaxOverlayBytes` is set from `providers.lsp.max_overlay_bytes`**
-  (default 512 MiB, validated to be at least
-  `resources.max_source_response_bytes`). It bounds the materialized snapshot,
-  the pinned bytes cached for coordinate conversion, and the bytes exchanged
-  with the server over its lifetime — all three separately.
+  (default unlimited; a value you set is validated to be at least
+  `resources.max_source_response_bytes`). When set it bounds, separately, the
+  materialized snapshot, admission of one file to the pinned coordinate cache,
+  and the bytes sent to the server in one rolling minute. The first two report
+  what they left out and answer about the rest; only a sustained flood over the
+  send budget fails a server, because a truncated frame would leave it
+  mid-message. Unlimited leaves the server's own streams unbounded — its stdout
+  is a framed protocol whose reader paces it, and its stderr is discarded — and
+  the pinned cache keeps a finite ceiling of its own so the overlay's peak stays
+  flat rather than becoming a function of the repository.
 - **`jdtls` writes into `work_dir` by design.** Its default argv is
   `-data ${work_dir}`, so the private working directory is also its workspace
   data directory and it accumulates state there across runs. Approving

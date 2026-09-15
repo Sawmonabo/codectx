@@ -57,10 +57,13 @@ var frontend = map[dependence.Family]string{
 // second parse at a higher limit.
 const maxNumDef = "40000"
 
-// Output bounds. The child's stdout is the engine's banner and is discarded;
-// its stderr is the classifier's only input and is bounded before it is read.
+// Output bounds. The child's stdout is the banner and is discarded, so it is
+// unbounded: bytes nobody keeps cost no memory, and bounding them once made a
+// talkative run a refusal. Its stderr is the classifier's only input and is
+// bounded before it is read -- what the bound drops is reported through
+// process.Result.OutputTruncated, never by failing the unit.
 const (
-	maxStdoutBytes int64 = 1 << 20
+	maxStdoutBytes int64 = 0
 	maxStderrBytes int64 = 8 << 20
 	grace                = 10 * time.Second
 )

@@ -161,12 +161,12 @@ func (o *Overlay) DocumentSymbols(ctx context.Context, file model.FileID, limit 
 	if err != nil {
 		return out, err
 	}
-	doc, notFound, err := o.s.document(ctx, file)
+	doc, missing, err := o.s.document(ctx, file)
 	if err != nil {
 		return out, err
 	}
-	if notFound {
-		return out, invalid("file %s is not in the pinned snapshot", file)
+	if missing != absentNone {
+		return out, invalid("file %s %s", file, missing.reason())
 	}
 	if err := o.s.ensureOpen(doc); err != nil {
 		return out, err
@@ -384,11 +384,11 @@ func (o *Overlay) calls(ctx context.Context, method string, item CallItem, limit
 		if incoming {
 			siteFile = peer.Location.File
 		}
-		doc, notFound, err := o.s.document(ctx, siteFile)
+		doc, missing, err := o.s.document(ctx, siteFile)
 		if err != nil {
 			return Result[Call]{}, err
 		}
-		if notFound {
+		if missing != absentNone {
 			out.Excluded++
 			continue
 		}
@@ -445,12 +445,12 @@ func (o *Overlay) begin(method string, supported bool, limit int) (int, error) {
 // position loads the queried document, synchronizes it to the server and
 // converts the byte offset to the negotiated encoding.
 func (o *Overlay) position(ctx context.Context, at At) (*document, position, error) {
-	doc, notFound, err := o.s.document(ctx, at.File)
+	doc, missing, err := o.s.document(ctx, at.File)
 	if err != nil {
 		return nil, position{}, err
 	}
-	if notFound {
-		return nil, position{}, invalid("file %s is not in the pinned snapshot", at.File)
+	if missing != absentNone {
+		return nil, position{}, invalid("file %s %s", at.File, missing.reason())
 	}
 	if !isText(doc.data) {
 		return nil, position{}, invalid("file %s is not UTF-8 text; a language server cannot address positions in it", doc.version.Path)
@@ -485,11 +485,11 @@ func (o *Overlay) locate(ctx context.Context, uri string, rng lspRange, selectio
 	if err != nil || !ok {
 		return Location{}, false, err
 	}
-	doc, notFound, err := o.s.document(ctx, model.NewFileID(o.s.view.Header().RepositoryID, rel))
+	doc, missing, err := o.s.document(ctx, model.NewFileID(o.s.view.Header().RepositoryID, rel))
 	if err != nil {
 		return Location{}, false, err
 	}
-	if notFound {
+	if missing != absentNone {
 		return Location{}, false, nil
 	}
 	r, err := doc.rangeOf(rng, o.s.enc)
