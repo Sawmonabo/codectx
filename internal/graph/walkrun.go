@@ -82,6 +82,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 	}
 	carried := outerVisited(o.Resume)
 	for {
+		spent := o.Budget.edges
 		state, err := expand(ctx, e.adjacency, seeds, o, wrapped)
 		if err != nil {
 			release()
@@ -89,6 +90,14 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 		}
 		state.Carried, state.ReleaseCarried = carried, release
 		switch {
+		case o.Budget.edges == spent:
+			// The link admitted nothing, so the next one would admit nothing
+			// either: the visitor is refusing every row on an ANSWER-level
+			// bound it carries itself (impactAccumulator's max_edges and
+			// max_visited), which no internal boundary can return. Chaining on
+			// would spin forever over the same frontier. The frontier is
+			// returned standing, and the caller reports the visitor's reason.
+			return state, nil
 		case len(state.Frontier) == 0 || state.DepthLimited:
 			// Exhausted, or stopped at the user-set depth bound -- the one stop
 			// that is an answer-level truncation rather than an internal page
@@ -431,5 +440,116 @@ func rankedRunTail[T any](ctx context.Context, run *pagination.SortedRun[T], ski
 			}
 			return yield(encoded)
 		})
+	}
+}
+
+// serveRankedSections reads ONE page out of a combined ranked spool: at most
+// limit records of the leading entity section and at most limit of the package
+// section that follows it. The header's Count is the boundary between the two
+// (cursor.go states the layout), so a record's section is a fact of its
+// position and never a guess at its bytes.
+//
+// It is impact's page reader. The endpoints that rank a single list use
+// servePage above; the two cannot be crossed, because a cursor is bound to the
+// endpoint that issued it.
+func serveRankedSections(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
+	now time.Time, limit int) ([]impactRecord, []pairRecord, rankedHeader, error) {
+	if spools == nil {
+		return nil, nil, rankedHeader{}, cursorInvalid("continuation state has expired or was released")
+	}
+	// Both capacities are the page bound the caller already clamped to
+	// model.MaxPageItems, so neither allocation can track the answer.
+	entries := make([]impactRecord, 0, limit)
+	pairs := make([]pairRecord, 0, limit)
+	var h rankedHeader
+	at, header := 0, true
+	err := spools.Open(ctx, c, now, func(record []byte) error {
+		if err := ctx.Err(); err != nil {
+			return typedContextError(ctx, err)
+		}
+		if header {
+			header = false
+			var err error
+			h, err = decodeRankedHeader(record)
+			return err
+		}
+		i := at
+		at++
+		if i < h.Count {
+			if len(entries) == limit {
+				// Past this page's entity records: neither decoded nor kept --
+				// rankedSpoolSections walks them again straight into the next
+				// spool.
+				return nil
+			}
+			v, err := decodeImpactRecord(record)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, v)
+			return nil
+		}
+		if len(pairs) == limit {
+			return nil
+		}
+		v, err := decodePairRecord(record)
+		if err != nil {
+			return err
+		}
+		pairs = append(pairs, v)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, rankedHeader{}, err
+	}
+	return entries, pairs, h, nil
+}
+
+// rankedSpoolSections is the combined counterpart of rankedSpoolTail: it
+// streams what follows the page in BOTH sections of a combined spool into the
+// sink that writes the next one, one record at a time, preserving the section
+// order the header describes.
+func rankedSpoolSections(ctx context.Context, spools *pagination.Spools, c pagination.Cursor,
+	now time.Time, h rankedHeader, skipEntries, skipPairs int) func(func([]byte) error) error {
+	return func(yield func([]byte) error) error {
+		at, header := 0, true
+		return spools.Open(ctx, c, now, func(record []byte) error {
+			if err := ctx.Err(); err != nil {
+				return typedContextError(ctx, err)
+			}
+			if header {
+				// The leading header is not a record: the new spool writes its
+				// own, so it is skipped rather than counted.
+				header = false
+				return nil
+			}
+			i := at
+			at++
+			if i < h.Count {
+				if i < skipEntries {
+					return nil
+				}
+				return yield(record)
+			}
+			if i-h.Count < skipPairs {
+				return nil
+			}
+			return yield(record)
+		})
+	}
+}
+
+// chainTails writes several record streams into one spool, in order. It is how
+// the FIRST page of an impact answer spills its two sorted runs -- the ranked
+// entities, then the ranked package pairs -- as the one sectioned spool the
+// reader above expects.
+func chainTails(tails ...func(func([]byte) error) error) func(func([]byte) error) error {
+	return func(yield func([]byte) error) error {
+		for _, tail := range tails {
+			if err := tail(yield); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 }

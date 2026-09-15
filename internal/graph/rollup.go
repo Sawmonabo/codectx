@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"errors"
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -56,6 +57,15 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth.Int(), limit)
 	var resume *resumeState
 	if req.Page.Cursor != "" {
+		c, rb, err := e.verifyContinuation(req.Page.Cursor, packageDepsEndpoint, queryHash, deadline)
+		if err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+		if c.Ranked {
+			// The walk is over and the order is settled: this page is a read of
+			// the ranked pair spool and expands nothing.
+			return e.serveRankedPairs(ctx, c, rb, limit, meta)
+		}
 		resume, err = e.resumeTraversal(ctx, req.Page.Cursor, packageDepsEndpoint, queryHash, deadline)
 		if err != nil {
 			return model.Page[model.PackageEdge]{}, err
@@ -66,20 +76,54 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		defer resume.Release()
 		b = resume.Budget
 	}
-	acc := // The rollup reads acc.Relations() and no impact record, so it emits
-		// none. Lane P-c replaces this with the pair sort of ruling P4.
-		newImpactAccumulator(req.Start, b, maxVisited, maxEdges, limit, nil)
-	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
-		Direction:     req.Direction,
-		Kinds:         kinds,
-		MaxDepth:      maxDepth,
-		Budget:        b,
-		BatchSize:     adjacencyBatch,
-		FrontierBytes: e.limits.FrontierBytes,
-		Resume:        resume,
-	}, acc.Visit)
-	if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+	// The accumulator enforces the per-page work budgets and records the keyset
+	// position a deadline continuation resumes from. It emits no impact record:
+	// this endpoint ranks pairs, not entities.
+	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil)
+	var state walkState
+	run, rollupErr := e.rollupRanked(ctx, &meta, func(sink edgeSink) error {
+		var walkErr error
+		state, walkErr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
+			Direction:     req.Direction,
+			Kinds:         kinds,
+			MaxDepth:      maxDepth,
+			Budget:        b,
+			BatchSize:     adjacencyBatch,
+			FrontierBytes: e.limits.FrontierBytes,
+			Resume:        resume,
+		}, func(fs frontierState, rel model.Relation) error {
+			// The accumulator FIRST: it is what refuses an edge the work
+			// budgets have no room for, and an edge it refused was never
+			// admitted, so the rollup must not count it.
+			if err := acc.Visit(fs, rel); err != nil {
+				return err
+			}
+			return sink.Visit(fs, rel)
+		})
+		return walkErr
+	}, nil)
+	if state.ReleaseCarried != nil {
+		// After the continuation below has been spilled: the spill is what
+		// reads the carried stream.
+		defer state.ReleaseCarried()
+	}
+	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
 		return model.Page[model.PackageEdge]{}, err
+	}
+	if run != nil {
+		defer run.Close()
+	}
+	if b.deadlineHit && len(state.Frontier) > 0 {
+		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
+		// ranked and nothing is served -- ranking a walk that is still running
+		// would publish an order the next page contradicts -- and the walk
+		// continuation carries the frontier forward.
+		markTruncated(&meta, reasonDeadline)
+		if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
+			state, acc.lastOwner, acc.lastKey, resume); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+		return validatedPairPage(meta, nil)
 	}
 	switch {
 	case acc.reason != "":
@@ -91,23 +135,73 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	case state.DepthLimited:
 		markTruncated(&meta, reasonDepth)
 	}
+	if run == nil {
+		// The deadline landed mid-RANK, after the walk had finished; walkImpact
+		// (impact.go) states why that is disclosed rather than paged.
+		markTruncated(&meta, reasonDeadline)
+		return validatedPairPage(meta, nil)
+	}
+	items := make([]model.PackageEdge, 0, limit)
+	if err := run.Each(func(r pairRecord) error {
+		if err := ctx.Err(); err != nil {
+			return typedContextError(ctx, err)
+		}
+		items = append(items, r.edge())
+		if len(items) == limit {
+			return errStopExpansion
+		}
+		return nil
+	}); err != nil && !errors.Is(err, errStopExpansion) {
+		return model.Page[model.PackageEdge]{}, err
+	}
+	// The page is cut from the globally ranked pairs and the remainder spooled
+	// behind the `r` cursor. The walk ran to COMPLETION, so each pair's counts
+	// are exact sums over every edge the walk admitted -- not over one page's
+	// -- and the union of the pages is the single-shot answer, in the
+	// single-shot order, with no pair listed twice.
+	if int64(len(items)) < run.Len() {
+		header := rankedHeader{Total: run.Len(), Count: int(run.Len()) - len(items)}
+		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, packageDepsEndpoint, queryHash, header,
+			int64(len(items)), 0, rankedRunTail(ctx, run, len(items), encodePairRecord)); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+	}
+	return validatedPairPage(meta, items)
+}
 
-	items, rollupErr := e.rollupPackages(ctx, acc.Relations(), &meta)
-	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
+// serveRankedPairs serves a LATER page of a package-dependency answer: it reads
+// the ranked pair spool the previous page left, copies what follows this page
+// into a fresh one, and walks nothing.
+func (e *Engine) serveRankedPairs(ctx context.Context, c traversalCursor, b *budget, limit int,
+	meta model.QueryMeta) (model.Page[model.PackageEdge], error) {
+	// The consumed spool is released only after the page is built: the copy
+	// below reads it.
+	defer e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+	tail := rankedTail{SpoolID: c.SpoolID, LeaseID: c.LeaseID,
+		Offset: c.RankOffset, Served: c.RankServed, Total: c.RankTotal}
+	records, rest, err := servePage(ctx, e.spools, c.spoolCursor(), e.now(), tail, limit, decodePairRecord)
+	if err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
-	// No page cut here, and no "further pairs were aggregated" notice: the walk
-	// itself stops at `limit` admitted edges, so the distinct pairs it rolls up
-	// can never exceed the page. The notice used to stand in for the
-	// continuation this endpoint refused to offer; the continuation below is
-	// now the honest channel, and each pair's counts are the counts of THIS
-	// page's edges -- summing a pair across pages reproduces the whole-walk
-	// total, because every edge is admitted on exactly one page.
-	if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
-		state, acc.lastOwner, acc.lastKey, resume); err != nil {
-		return model.Page[model.PackageEdge]{}, err
+	items := make([]model.PackageEdge, 0, len(records))
+	for _, r := range records {
+		items = append(items, r.edge())
 	}
-	page = model.Page[model.PackageEdge]{Meta: meta, Items: items}
+	if !rest.done() {
+		header := rankedHeader{Total: rest.Total, Count: int(rest.Total - rest.Served)}
+		if meta.NextCursor, err = e.nextRankedCursor(ctx, b, c.Endpoint, c.QueryHash, header,
+			rest.Served, 0, rankedSpoolTail(ctx, e.spools, c.spoolCursor(), e.now(), rest.Offset)); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+	}
+	return validatedPairPage(meta, items)
+}
+
+// validatedPairPage is the one place a package-dependency page checks its own
+// contract -- the page's bounds and every item's -- so no return path can serve
+// a page that has not been validated.
+func validatedPairPage(meta model.QueryMeta, items []model.PackageEdge) (model.Page[model.PackageEdge], error) {
+	page := model.Page[model.PackageEdge]{Meta: meta, Items: items}
 	if err := page.Validate(); err != nil {
 		return model.Page[model.PackageEdge]{}, err
 	}
@@ -269,10 +363,10 @@ func (s *rollupStats) observe(n int) {
 //
 // The caller closes the returned run. stats may be nil.
 //
-// This is the seam lane P-INT connects the completed walk's pages to: a served
-// page is read off this run and its remainder spooled behind the `r` cursor,
-// instead of being drained into a slice as rollupPackages does for today's
-// page-bounded callers.
+// It is what both ranked package answers are served from: PackageDependencies
+// reads its page off this run directly, and an impact answer tees its walk into
+// it alongside the entity ranking, so the two can never disagree about what a
+// pair means.
 func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
 	feed func(edgeSink) error, stats *rollupStats) (*pagination.SortedRun[pairRecord], error) {
 	return e.rankPairs(ctx, func(add func(pairRecord) error) error {
@@ -288,46 +382,6 @@ func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
 		}
 		return nil
 	})
-}
-
-// rollupPackages aggregates symbol-level relations into distinct package pairs.
-// It is the shared body behind ImpactResult.Packages and the standalone
-// PackageDependencies, so the two can never disagree about what a pair means.
-//
-// It is the SLICE ADAPTER over rollupRanked, for the callers whose walk is
-// still page-bounded: the relations it takes are one page's worth, so draining
-// the ranked run into a slice holds a page and not an answer. The streaming
-// path above is the one that survives the unbounded walk.
-func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation,
-	meta *model.QueryMeta) ([]model.PackageEdge, error) {
-	if len(relations) == 0 {
-		return nil, nil
-	}
-	run, err := e.rollupRanked(ctx, meta, func(sink edgeSink) error {
-		for _, r := range relations {
-			if err := sink.Visit(frontierState{}, r); err != nil {
-				return err
-			}
-		}
-		return nil
-	}, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer run.Close()
-	var out []model.PackageEdge
-	if err := run.Each(func(v pairRecord) error {
-		out = append(out, v.edge())
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	// No MaxRecordsPerResult cut here, and no page slice either. The walk that
-	// produced these relations stops at the page's item bound, so the pairs it
-	// aggregates are already page-sized: `limit` edges can yield at most
-	// `limit` distinct pairs. Nothing is discarded, so there is nothing to
-	// disclose by count.
-	return out, nil
 }
 
 // containmentCut is the containment-read cut state of ONE rollup: the nodes a
@@ -356,7 +410,7 @@ type containmentCut struct {
 // uses. Omission is what the old refusal was protecting: a node whose candidate
 // list is half-read would be attributed to the wrong package, not merely to
 // fewer, and an unattributed endpoint drops its edge from the rollup -- the
-// same treatment rollupPackages already gives an endpoint with no container at
+// same treatment the rollup already gives an endpoint with no container at
 // all. The pairs that remain are therefore measured pairs, and the answer says
 // it is not the whole rollup.
 func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID,

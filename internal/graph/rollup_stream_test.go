@@ -135,7 +135,7 @@ func TestPackagePairCountsAreExactAndOrderIndependent(t *testing.T) {
 		in   []model.Relation
 	}{{"declaration order", forward}, {"reversed order", reversed}} {
 		meta := model.QueryMeta{}
-		got, err := e.rollupPackages(context.Background(), leg.in, &meta)
+		got, err := rollupSlice(e, &meta, leg.in)
 		if err != nil {
 			t.Fatalf("%s: rollup: %v", leg.name, err)
 		}
@@ -225,4 +225,31 @@ func TestPackageRollupHoldsOneBatchOfEdges(t *testing.T) {
 		t.Fatalf("the ranked run holds %d pairs summing to %d edges, want %d pairs summing to %d",
 			pairs, count, pkgs, edges)
 	}
+}
+
+// rollupSlice drains the whole ranked pair run into a slice. It is a TEST-only
+// adapter: production serves the run one page at a time and never materializes
+// it, so the assertions below compare a whole-answer baseline the served pages
+// are then checked against elsewhere.
+func rollupSlice(e *Engine, meta *model.QueryMeta, relations []model.Relation) ([]model.PackageEdge, error) {
+	run, err := e.rollupRanked(context.Background(), meta, func(sink edgeSink) error {
+		for _, r := range relations {
+			if err := sink.Visit(frontierState{}, r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer run.Close()
+	var out []model.PackageEdge
+	if err := run.Each(func(v pairRecord) error {
+		out = append(out, v.edge())
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

@@ -300,7 +300,7 @@ func lessByPairKey(a, b pairRecord) int {
 }
 
 // lessByPair is pass 2's key and the served order, unchanged from the order
-// rollupPackages sorts by today: (FromPath, ToPath, FromNodeID, ToNodeID).
+// the rollup has always sorted by: (FromPath, ToPath, FromNodeID, ToNodeID).
 func lessByPair(a, b pairRecord) int {
 	if c := cmp.Compare(a.FromPath, b.FromPath); c != 0 {
 		return c
