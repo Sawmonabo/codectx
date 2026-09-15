@@ -86,22 +86,6 @@ func newInterner(opts Options) *dbInterner {
 	}
 }
 
-// internStats is the writer's diagnostic view of interner effectiveness: a low
-// hit rate means the batch is scattered across the identity space and each
-// fact costs an indexed lookup. Counts are cumulative over the interner's whole
-// life and are deliberately NOT cleared by reset(), so a run-level hit rate
-// survives the per-batch cache flush.
-type internStats struct {
-	Hits   uint64
-	Misses uint64
-}
-
-// stats reports the cumulative cache hit and miss counts. Consumed by the S1
-// writer's diagnostics.
-func (in *dbInterner) stats() internStats {
-	return internStats{Hits: in.hits, Misses: in.misses}
-}
-
 func (in *dbInterner) node(ctx context.Context, tx *sql.Tx, id model.NodeID, kind string, canonicalKey []byte) (nodeRef, error) {
 	if kind == "" {
 		return noRef, invalid("node kind: must not be empty")

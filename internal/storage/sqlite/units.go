@@ -187,14 +187,14 @@ func (s *Store) generationRow(ctx context.Context, tx *sql.Tx, gen model.Generat
 // building. Only the store hands one out; providers reach it through the Task
 // 6 sink and never see SQL.
 type UnitWriter struct {
-	s       *Store
-	rowID   int64
-	build   model.UnitBuild
-	unitKey []byte
-	repo    model.RepositoryID
-	gen     model.GenerationID
-	ftsDocs int64
-	done    bool
+	s          *Store
+	rowID      int64
+	build      model.UnitBuild
+	unitKey    []byte
+	repo       model.RepositoryID
+	gen        model.GenerationID
+	searchDocs int64
+	done       bool
 
 	// ids resolves a canonical identity or an interned string to the
 	// storage-internal surrogate every reference column now carries (ids.go),
@@ -681,7 +681,9 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 // transaction. The FTS insert is explicit: search_fts is contentless
 // (ADR-0003 §2.1), so nothing maintains it by cascade or by row counts and the
 // body text reaches the index from this document and nowhere else -- the
-// database keeps no second copy of it (Section 12.2).
+// database keeps no second copy of it (Section 12.2). Each posting's rowid is
+// recorded as the row's doc_id, which is what every read resolves a document
+// by and what a delta carry-over inherits instead of re-indexing.
 //
 // token_count is computed here with the index's own unicode61 tokenizer over
 // exactly the columns search_fts indexes, so the Section 12.4 length
@@ -708,13 +710,13 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	var inserted int64
 	err = w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count)
-				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
+				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer content.Close()
-			index, err := tx.PrepareContext(ctx, `INSERT INTO search_fts(rowid, name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?, ?)`)
+			index, err := tx.PrepareContext(ctx, `INSERT INTO search_fts(name, qualified_name, signature, path, body) VALUES(?, ?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
@@ -729,16 +731,23 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 						return err
 					}
 				}
-				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
-					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i])
+				// The posting is written FIRST so its rowid can be stored as
+				// the document's doc_id in the same insert: search_fts assigns
+				// it, search_units records it, and the carry-over copies it
+				// forward. The alternative -- insert the row, then update it
+				// with its own rowid -- costs a second b-tree write per
+				// document on the indexing hot path. A failure below rolls the
+				// whole transaction back, so an orphan posting cannot survive.
+				posting, err := index.ExecContext(ctx, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body)
 				if err != nil {
 					return err
 				}
-				rowid, err := res.LastInsertId()
+				docID, err := posting.LastInsertId()
 				if err != nil {
 					return err
 				}
-				if _, err := index.ExecContext(ctx, rowid, d.Name, d.QualifiedName, d.Signature, d.Path, d.Body); err != nil {
+				if _, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
+					int64(d.Bytes.Start), int64(d.Bytes.End), tokenCounts[i], docID); err != nil {
 					return err
 				}
 				inserted++
@@ -749,7 +758,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	if err != nil {
 		return err
 	}
-	w.ftsDocs += inserted
+	w.searchDocs += inserted
 	return nil
 }
 
@@ -1135,8 +1144,8 @@ func (s *Store) SealUnit(ctx context.Context, w *UnitWriter) error {
 		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM search_units WHERE unit_id = ?`, w.rowID).Scan(&docs); err != nil {
 			return wrap("search_units", err)
 		}
-		if docs != w.ftsDocs {
-			return corrupt("unit %s has %d search documents but emitted %d index rows", w.build.Spec.ID, docs, w.ftsDocs)
+		if docs != w.searchDocs {
+			return corrupt("unit %s has %d search document rows but the writer accounted for %d", w.build.Spec.ID, docs, w.searchDocs)
 		}
 		if err := exec1(ctx, tx, conflict("unit %s is no longer building", w.build.Spec.ID),
 			`UPDATE units SET state = ? WHERE id = ? AND state = ?`, string(model.UnitSealed), w.rowID, string(model.UnitBuilding)); err != nil {

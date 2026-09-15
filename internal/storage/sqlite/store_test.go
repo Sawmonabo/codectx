@@ -36,12 +36,11 @@ var _ retention.BlobStore = (*store.Store)(nil)
 // fixture is the smallest repository that can exercise unit reuse: two files,
 // one unit per file, one node with evidence and one search document per unit.
 type fixture struct {
-	t       *testing.T
-	ctx     context.Context
-	s       *store.Store
-	content fixtureContent
-	repo    model.RepositoryID
-	files   map[string]fileFixture
+	t     *testing.T
+	ctx   context.Context
+	s     *store.Store
+	repo  model.RepositoryID
+	files map[string]fileFixture
 }
 
 type fileFixture struct {
@@ -58,34 +57,15 @@ const (
 	actorID         = "agent-1"
 )
 
-// fixtureContent is the content store's range reader for these fixtures. The
-// database keeps no source body (ADR-0003 §2.1), so a carry-over resolves each
-// carried document's text through this reader, as the CAS serves it in
-// production; a range outside the blob is the integrity failure it would be
-// there, not an empty document.
-type fixtureContent struct{ byHash map[string][]byte }
-
-func (c fixtureContent) ReadRange(_ context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
-	b, ok := c.byHash[rec.Hash]
-	if !ok {
-		return nil, fmt.Errorf("fixture content store has no blob %s", rec.Hash)
-	}
-	if r.End > uint64(len(b)) || r.Start > r.End {
-		return nil, fmt.Errorf("range %d-%d is outside blob %s (%d bytes)", r.Start, r.End, rec.Hash, len(b))
-	}
-	return b[r.Start:r.End], nil
-}
-
 func newFixture(t *testing.T, dbPath string) *fixture {
 	t.Helper()
 	ctx := context.Background()
-	content := fixtureContent{byHash: map[string][]byte{}}
-	s, err := store.Open(ctx, dbPath, store.Options{Content: content})
+	s, err := store.Open(ctx, dbPath, store.Options{})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	f := &fixture{t: t, ctx: ctx, s: s, content: content, repo: model.RepositoryID(model.H("test-repo", "1")), files: map[string]fileFixture{}}
+	f := &fixture{t: t, ctx: ctx, s: s, repo: model.RepositoryID(model.H("test-repo", "1")), files: map[string]fileFixture{}}
 	if err := s.EnsureRepository(ctx, f.repo, "/repo"); err != nil {
 		t.Fatalf("EnsureRepository: %v", err)
 	}
@@ -106,7 +86,6 @@ func (f *fixture) file(path string, content string) fileFixture {
 	if err := f.s.PutBlob(f.ctx, rec); err != nil {
 		f.t.Fatalf("PutBlob(%s): %v", path, err)
 	}
-	f.content.byHash[ff.hash] = ff.content
 	f.files[path] = ff
 	return ff
 }
@@ -147,11 +126,26 @@ func (f *fixture) snapshot(tag string, files ...fileFixture) model.Snapshot {
 // document asserts; storage must compute its own from the indexed text.
 const providerTokenCount = 3
 
-// searchDoc is the lexical document fixture.unit publishes for ff.
+// docBody is the indexed text a producer publishes for a declaration. It is
+// deliberately NOT the source over the document's byte range: treesitter
+// publishes names, signature and attached documentation and never the body
+// (provider/treesitter/facts.go), and the filesystem provider publishes none.
+// The two zqx tokens appear in no fixture file, so a body is never the source
+// over the document's byte range and any path that indexes source text where
+// the published body belongs loses them -- a visibly different hit set. The
+// file's own text follows them so that the tests keying on a token of the
+// source ("changed") still address the document that quotes it.
+func docBody(ff fileFixture) string {
+	return "// zqxdocstring for F in " + ff.path + "\nfunc F() zqxsignature\n" + string(ff.content)
+}
+
+// searchDoc is the lexical document fixture.unit publishes for ff. Bytes is
+// the declaration's extent, as a real producer sets it; Body is what was
+// indexed. They are different text on purpose (see docBody).
 func (f *fixture) searchDoc(ff fileFixture) model.SearchUnit {
 	return model.SearchUnit{ID: model.H("search-test", ff.path, ff.hash), NodeID: f.nodeID(ff), FileID: ff.id, Path: ff.path,
 		Kind: model.NodeFunction, Name: "F", QualifiedName: ff.path + ".F",
-		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: string(ff.content), TokenCount: providerTokenCount}
+		Bytes: model.ByteRange{Start: 0, End: uint64(len(ff.content))}, Body: docBody(ff), TokenCount: providerTokenCount}
 }
 
 // begin opens a file-scoped unit for ff inside gen without sealing it.
