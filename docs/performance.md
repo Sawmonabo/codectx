@@ -314,13 +314,72 @@ the sink holds one run buffer whatever discovery finds. Both rows come from
 `TestACompileSortHoldsItsRunBudgetAndSpills`. Each figure is asserted by the
 test that produced it, so a regression fails rather than being noticed here.
 
-**Not measured, and owed:** the same peak across two WHOLE compiles (20 000 and
-40 000 entities) with the per-page read latencies beside it.
-`TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale` is written and opt-in
-behind `CODECTX_SCALE_PROOF=1`, but on this host publishing the 20 000-file
-fixture alone costs 76 s and the compile that follows it had not finished after
-twelve minutes. That is an unexplained figure, not a budget: it is recorded here
-so the next measurement pass starts from it rather than rediscovering it.
+**The whole-compile scale curve.** `TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale`
+publishes a fan-out fixture of N leaf entities, compiles it, and pages the
+persisted manifest back. Publication is timed separately from the compile: it is
+the fixture's cost and never the product's. The compile column below was taken
+under the DEFAULT admission (`resources.query_memory_bytes`, 32 MiB), where a
+sort of a few tens of thousands of these records never fills its 8 MiB run
+buffer and nothing spills; the peak/spill column comes from the committed proof,
+which sets a 1 MiB admission so both sizes are past the spill threshold, since
+"the peak is the run buffer" is only a claim once the buffer binds.
+
+| N (leaves) | Fixture publish | Compile | Page latency, persisted manifest (200 rows/page) |
+|---|---|---|---|
+| 500 | — | 105 ms | 0.27–0.56 ms |
+| 1 000 | — | 152 ms | 0.50–0.62 ms |
+| 2 000 | — | 247 ms | 0.52–0.70 ms |
+| 4 000 | — | 536 ms | 0.57–1.22 ms |
+| 8 000 | — | 1.272 s | 0.51–1.61 ms |
+| 16 000 | — | 4.116 s | 0.48–1.64 ms |
+| 2 000 (1 MiB admission) | 2.8 s | 469 ms | 0.48–0.88 ms |
+| 4 000 (1 MiB admission) | 6.8 s | 849 ms | 0.45–1.07 ms |
+
+Page latency is FLAT across the whole range — a page of the persisted plan costs
+about half a millisecond whether the plan holds 509 rows or 16 009 — which is the
+paging claim. The peak, at the 1 MiB admission, is likewise flat while the
+spilled-run count is the thing that grows:
+
+| N (leaves) | `scope-cand` / `scope-entity` peak | Spilled runs |
+|---|---|---|
+| 2 000 | 774 records | 3 |
+| 4 000 | 774 records | 6 |
+
+**The compile is superlinear, and where.** The per-doubling wall ratios are
+1.45, 1.62, 2.17, 2.37, 3.24 — increasing, not constant: the local exponent at
+the top of the measured range (8 000 → 16 000) is log₂ 3.24 ≈ **1.70**. The
+cause is the ranked-impact continuation in `internal/graph`, not the context
+compile's own sorts. `Engine.serveRankedImpact` (internal/graph/impact.go:378)
+serves each later page by opening the ranked spool FROM THE START — a spool
+cannot seek — and then copying every record after the page into a fresh spool
+(`nextRankedCursor` → `spillRanked`, impact.go:463/515, feeding
+`rankedSpoolSections`, walkrun.go:682). Each page therefore costs O(records
+remaining), so a walk of N entries read to exhaustion at a 200-row page costs
+Θ(N²/400) record reads and writes. A CPU profile of the 500/1 000/2 000 and
+4 000/8 000/16 000 runs attributes 0.69 s of the 1.13 s spent in
+`Engine.walkImpact` to `serveRankedImpact`, of which 0.55 s is
+`pagination.Spools.Open` — the re-read and the re-copy — and that share rises
+with N. The fix belongs to the graph endpoint (a resumable read offset that
+does not rewrite the remainder) and is tracked there; nothing in
+`internal/context` is quadratic.
+
+**What the fixture costs, and why it is not the product.** Publishing the
+fixture dominates the test's wall clock: at 16 000 leaves it is 74.3 s of the
+82.7 s of CPU the test spends, almost all of it in
+`storage/sqlite.(*Store).SealUnit` under `contextFixture.sealRelations` (44.2 s)
+and `sealUnit` (26.9 s), with `_sqlite3BtreeIndexMoveto` alone at 39.0 s. This
+is what C-FIX2 recorded as "the compile had not finished after twelve minutes":
+`t.Logf` output is buffered until the test ends, so the publication of two
+fixtures was indistinguishable from a hung compile. The compile at 16 000 leaves
+is 4.1 s.
+
+Reproduce with:
+
+```bash
+CODECTX_SCALE_PROOF=1 go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+CODECTX_SCALE_PROOF=1 CODECTX_SCALE_LEAVES=2000,4000,8000 \
+  go test ./internal/context -run TestTheStreamedCompilePeaks -count=1 -v -timeout 30m
+```
 
 ## 7. Reproducing this page
 
