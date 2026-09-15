@@ -2,11 +2,11 @@ package graph
 
 import (
 	"context"
-	"sort"
 	"unicode/utf8"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // PackageDependencies rolls a bounded symbol-level walk up to the package or
@@ -123,81 +123,219 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 // walk, and the two produce different answers from the same frontier.
 const packageDepsEndpoint = "graph.package_dependencies"
 
+// edgeSink accepts the edges a walk admits, ONE AT A TIME, in the shape
+// expand's visit callback delivers them. It is the seam ruling P2's completed
+// walk (lane P-b) hands its edges to: the walk streams, the sink folds each
+// batch into the pair sort as it fills, and neither side ever holds the
+// admitted set. A walk that runs to exhaustion can therefore feed a rollup
+// whose peak heap is one batch of edges rather than one of every edge the
+// walk admitted.
+//
+// The frontier state is part of the signature so a sink can be passed straight
+// to expand (or runWalkToCompletion) as its visit function. The package rollup
+// ignores it: a pair is a fact about the edge's endpoints alone.
+type edgeSink interface {
+	Visit(state frontierState, rel model.Relation) error
+}
+
+// pairRollupBatch is how many admitted edges one resolution batch holds. An
+// edge contributes at most two endpoints, so a batch's endpoint set is at most
+// adjacencyBatch -- one containment page -- which is what keeps the rollup's
+// live set a function of the batch and never of the walk.
+const pairRollupBatch = adjacencyBatch / 2
+
+// pairRollup is the streaming half of the rollup: it buffers one batch of
+// admitted edges, resolves THAT batch's containers and evidence counts, and
+// emits one pairRecord per surviving edge into the pair sort, which folds the
+// records of one pair into the exact sums ruling P4 requires.
+//
+// It holds the request context rather than taking one per edge because
+// edgeSink's signature is expand's visit callback, which carries none; the
+// sink is request-scoped and never outlives the call that built it.
+type pairRollup struct {
+	ctx  context.Context
+	e    *Engine
+	meta *model.QueryMeta
+	add  func(pairRecord) error
+
+	batch []model.Relation
+	// cut is the containment-cut state of the WHOLE rollup, not of one batch:
+	// a user-set edge allowance that stops a containment read must be
+	// disclosed once however many batches it stops, and a node it dropped must
+	// stay dropped rather than resolve from the candidates a later batch
+	// happens to add for it. Both are what keep the answer independent of
+	// where the batch boundaries fell.
+	cut containmentCut
+	// peak is the largest batch the sink ever held, the memory high-water mark
+	// rollupStats reports.
+	peak int
+}
+
+// newPairRollup opens a sink that emits into add.
+func newPairRollup(ctx context.Context, e *Engine, meta *model.QueryMeta,
+	add func(pairRecord) error) *pairRollup {
+	return &pairRollup{ctx: ctx, e: e, meta: meta, add: add,
+		batch: make([]model.Relation, 0, pairRollupBatch),
+		cut:   containmentCut{unattributed: map[model.NodeID]bool{}}}
+}
+
+// Visit buffers one admitted edge and resolves the batch once it is full.
+func (p *pairRollup) Visit(_ frontierState, rel model.Relation) error {
+	p.batch = append(p.batch, rel)
+	if len(p.batch) > p.peak {
+		p.peak = len(p.batch)
+	}
+	if len(p.batch) < pairRollupBatch {
+		return nil
+	}
+	return p.flush()
+}
+
+// flush resolves the buffered batch and empties it. It is called for every
+// full batch and once more for the remainder, so an edge is emitted exactly
+// once however the batches fell.
+func (p *pairRollup) flush() error {
+	if len(p.batch) == 0 {
+		return nil
+	}
+	batch := p.batch
+	// The buffer is emptied BEFORE the batch is resolved, not after: a feed
+	// that swallows a Visit error the way expand swallows errStopExpansion
+	// would otherwise let rollupRanked's trailing flush emit this batch a
+	// second time. Nothing appends to p.batch while batch is being read, so
+	// the two may alias.
+	p.batch = p.batch[:0]
+	endpoints := make([]model.NodeID, 0, 2*len(batch))
+	relationIDs := make([]model.RelationID, 0, len(batch))
+	for _, r := range batch {
+		endpoints = append(endpoints, r.From, r.To)
+		relationIDs = append(relationIDs, r.ID)
+	}
+	containers, err := p.e.containerPackages(p.ctx, endpoints, p.meta, &p.cut)
+	if err != nil {
+		return err
+	}
+	evidence, err := p.e.evidenceCounts(p.ctx, relationIDs)
+	if err != nil {
+		return err
+	}
+	for _, r := range batch {
+		from, okFrom := containers[r.From]
+		to, okTo := containers[r.To]
+		// An edge whose endpoints share a container contributes nothing: a
+		// package depending on itself is not a dependency. An edge with no
+		// resolvable container is dropped rather than attributed to a guessed
+		// package.
+		if !okFrom || !okTo || from.ID == to.ID {
+			continue
+		}
+		// The labels are clipped HERE, where the record is built: pairRecord's
+		// projection onto model.PackageEdge does no clipping, and an over-long
+		// path would fail the served item's own validation.
+		if err := p.add(pairRecord{
+			FromNodeID: from.ID, ToNodeID: to.ID,
+			FromPath: clipPath(packageLabel(from)), ToPath: clipPath(packageLabel(to)),
+			PairCount: 1, EvidenceCount: evidence[r.ID],
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rollupStats reports what the rollup held at once. It exists so the memory
+// invariant -- peak live edges is one batch, never the walk -- is asserted
+// against the production path rather than restated by a test, the shape
+// internal/search's collector uses for its own sort peak. Nothing in the
+// served answer depends on it.
+type rollupStats struct{ PeakLiveEdges int }
+
+// observe records a live-set high-water mark.
+func (s *rollupStats) observe(n int) {
+	if n > s.PeakLiveEdges {
+		s.PeakLiveEdges = n
+	}
+}
+
+// rollupRanked is the whole rollup as ruling P4 specifies it: feed streams the
+// walk's admitted edges into an edgeSink, each batch resolves its own
+// containers and evidence, and rankPairs folds and orders the pairs on disk.
+// The counts it reports are exact sums over every edge fed, not over one page
+// of them, and the order is the global (FromPath, ToPath, FromNodeID,
+// ToNodeID) one -- both facts of the whole feed and neither of where the
+// batches fell.
+//
+// The caller closes the returned run. stats may be nil.
+//
+// This is the seam lane P-INT connects the completed walk's pages to: a served
+// page is read off this run and its remainder spooled behind the `r` cursor,
+// instead of being drained into a slice as rollupPackages does for today's
+// page-bounded callers.
+func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
+	feed func(edgeSink) error, stats *rollupStats) (*pagination.SortedRun[pairRecord], error) {
+	return e.rankPairs(ctx, func(add func(pairRecord) error) error {
+		sink := newPairRollup(ctx, e, meta, add)
+		if err := feed(sink); err != nil {
+			return err
+		}
+		if err := sink.flush(); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.observe(sink.peak)
+		}
+		return nil
+	})
+}
+
 // rollupPackages aggregates symbol-level relations into distinct package pairs.
 // It is the shared body behind ImpactResult.Packages and the standalone
 // PackageDependencies, so the two can never disagree about what a pair means.
 //
-// An edge whose endpoints share a container contributes nothing: a package
-// depending on itself is not a dependency, and reporting it would drown the
-// real cross-package pairs. An edge with no resolvable container is dropped
-// rather than attributed to a guessed package.
+// It is the SLICE ADAPTER over rollupRanked, for the callers whose walk is
+// still page-bounded: the relations it takes are one page's worth, so draining
+// the ranked run into a slice holds a page and not an answer. The streaming
+// path above is the one that survives the unbounded walk.
 func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation,
 	meta *model.QueryMeta) ([]model.PackageEdge, error) {
 	if len(relations) == 0 {
 		return nil, nil
 	}
-	endpoints := make([]model.NodeID, 0, 2*len(relations))
-	relationIDs := make([]model.RelationID, 0, len(relations))
-	for _, r := range relations {
-		endpoints = append(endpoints, r.From, r.To)
-		relationIDs = append(relationIDs, r.ID)
-	}
-	containers, err := e.containerPackages(ctx, endpoints, meta)
-	if err != nil {
-		return nil, err
-	}
-	evidence, err := e.evidenceCounts(ctx, relationIDs)
-	if err != nil {
-		return nil, err
-	}
-
-	type pairKey struct{ from, to model.NodeID }
-	pairs := map[pairKey]*model.PackageEdge{}
-	var order []pairKey
-	for _, r := range relations {
-		from, okFrom := containers[r.From]
-		to, okTo := containers[r.To]
-		if !okFrom || !okTo || from.ID == to.ID {
-			continue
-		}
-		key := pairKey{from: from.ID, to: to.ID}
-		edge, ok := pairs[key]
-		if !ok {
-			edge = &model.PackageEdge{
-				FromNodeID: from.ID, ToNodeID: to.ID,
-				FromPath: clipPath(packageLabel(from)), ToPath: clipPath(packageLabel(to)),
+	run, err := e.rollupRanked(ctx, meta, func(sink edgeSink) error {
+		for _, r := range relations {
+			if err := sink.Visit(frontierState{}, r); err != nil {
+				return err
 			}
-			pairs[key] = edge
-			order = append(order, key)
 		}
-		edge.PairCount++
-		edge.EvidenceCount += evidence[r.ID]
+		return nil
+	}, nil)
+	if err != nil {
+		return nil, err
 	}
-
-	out := make([]model.PackageEdge, 0, len(order))
-	for _, key := range order {
-		out = append(out, *pairs[key])
+	defer run.Close()
+	var out []model.PackageEdge
+	if err := run.Each(func(v pairRecord) error {
+		out = append(out, v.edge())
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	sort.Slice(out, func(i, j int) bool {
-		x, y := out[i], out[j]
-		if x.FromPath != y.FromPath {
-			return x.FromPath < y.FromPath
-		}
-		if x.ToPath != y.ToPath {
-			return x.ToPath < y.ToPath
-		}
-		if x.FromNodeID != y.FromNodeID {
-			return x.FromNodeID < y.FromNodeID
-		}
-		return x.ToNodeID < y.ToNodeID
-	})
 	// No MaxRecordsPerResult cut here, and no page slice either. The walk that
 	// produced these relations stops at the page's item bound, so the pairs it
-	// aggregates are already page-sized: `limit` edges can yield at most `limit`
-	// distinct pairs. Nothing is discarded, so there is nothing to disclose by
-	// count -- the continuation the caller mints carries the rest of the walk,
-	// and a pair's counts sum across pages to the whole-walk total.
+	// aggregates are already page-sized: `limit` edges can yield at most
+	// `limit` distinct pairs. Nothing is discarded, so there is nothing to
+	// disclose by count.
 	return out, nil
+}
+
+// containmentCut is the containment-read cut state of ONE rollup: the nodes a
+// user-set edge allowance dropped, and whether the bound has been disclosed.
+// It is the caller's rather than containerPackages' own, because the rollup
+// resolves its endpoints in batches and both facts are facts of the whole
+// answer: disclosed once, and a dropped node dropped for good.
+type containmentCut struct {
+	unattributed map[model.NodeID]bool
+	disclosed    bool
 }
 
 // containerPackages maps each node to the package or module node that contains
@@ -220,29 +358,30 @@ func (e *Engine) rollupPackages(ctx context.Context, relations []model.Relation,
 // all. The pairs that remain are therefore measured pairs, and the answer says
 // it is not the whole rollup.
 func (e *Engine) containerPackages(ctx context.Context, ids []model.NodeID,
-	meta *model.QueryMeta) (map[model.NodeID]model.Node, error) {
+	meta *model.QueryMeta, state *containmentCut) (map[model.NodeID]model.Node, error) {
 	ids = dedupeNodes(append([]model.NodeID(nil), ids...))
 	candidates := map[model.NodeID][]model.NodeID{}
 	var lookup []model.NodeID
 	lookup = append(lookup, ids...)
-	// unattributed is the set cut has dropped. A node in it must not be
-	// resolved from the candidates a LATER batch happens to add for it, so the
-	// resolution loop below skips it outright.
-	unattributed := map[model.NodeID]bool{}
+	if state.unattributed == nil {
+		state.unattributed = map[model.NodeID]bool{}
+	}
+	unattributed := state.unattributed
 	// cut drops every candidate a stopped batch collected -- a half-read
 	// candidate list is a wrong attribution, not a short one -- and discloses
-	// the bound once however many batches it stops.
-	disclosed := false
+	// the bound once however many batches it stops, ACROSS the whole rollup:
+	// state outlives this call so a resolution split into batches discloses
+	// the same once and drops the same nodes as a single-shot one.
 	cut := func(batch []model.NodeID) {
 		for _, id := range batch {
 			delete(candidates, id)
 			unattributed[id] = true
 		}
 		markTruncated(meta, reasonEdgeBudget)
-		if disclosed {
+		if state.disclosed {
 			return
 		}
-		disclosed = true
+		state.disclosed = true
 		meta.Notices = appendNotice(meta.Notices,
 			"max_graph_edges: the configured edge bound stopped a containment read, so the "+
 				"relations of the nodes it covered are omitted from this rollup rather than "+
