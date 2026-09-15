@@ -192,10 +192,23 @@ type UnitWriter struct {
 	build   model.UnitBuild
 	unitKey []byte
 	repo    model.RepositoryID
-	repoRaw []byte
 	gen     model.GenerationID
 	ftsDocs int64
 	done    bool
+
+	// ids resolves a canonical identity or an interned string to the
+	// storage-internal surrogate every reference column now carries (ids.go),
+	// and nodes caches the lookup-only direction: a node that must ALREADY be
+	// registered -- a relation endpoint, an alias target, a search document's
+	// symbol -- is never minted here, so it is resolved by canonical lookup and
+	// an absent row is malformed provider output, exactly as the foreign key to
+	// node_ids used to report it.
+	//
+	// Both are bounded LRUs sized from the configured batch, and endBatch drops
+	// them at every batch boundary, so the writer's live set is a function of
+	// one batch and never of the repository.
+	ids   interner
+	nodes *refCache
 
 	// evidenceClipped records what SealUnit dropped to hold the evidence
 	// bound, so a caller can report the truncation instead of it being silent.
@@ -226,14 +239,15 @@ func (s *Store) BeginUnit(ctx context.Context, gen model.GenerationID, build mod
 	}
 	unitKey, _ := model.DecodeID(string(build.Spec.ID))
 	runRaw, _ := model.DecodeID(string(build.OriginRunID))
-	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen}
+	w := &UnitWriter{s: s, build: build, unitKey: unitKey, gen: gen,
+		ids: newInterner(s.opts.BatchRecords), nodes: newRefCache(s.opts.BatchRecords)}
 	var snapshot []byte
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		g, err := s.generationRow(ctx, tx, gen, model.GenerationStaging)
 		if err != nil {
 			return err
 		}
-		snapshot, w.repoRaw = g.snapshot, g.repo
+		snapshot = g.snapshot
 		w.repo = model.RepositoryID(idHex(g.repo))
 		var runGen sql.NullInt64
 		var runProvider, runVersion string
@@ -445,6 +459,17 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 			return &model.Error{Code: model.CodeProviderOutputInvalid,
 				Message: "node id does not derive from its repository, kind and canonical key", Details: map[string]string{"node_id": string(f.Node.ID)}}
 		}
+		// node_ids.canonical_key is BLOB(32) (S-4): the key is stored as the
+		// digest it is, not as its 64-character hex rendering. Every minted key
+		// comes from model.CanonicalNodeKey, so a key that is not a digest is
+		// a producer that bypassed the resolver, refused here rather than by a
+		// CHECK constraint that could name no fact.
+		if _, err := model.DecodeID(f.CanonicalKey); err != nil {
+			return &model.Error{Code: model.CodeProviderOutputInvalid,
+				Message:     "node canonical key is not a 64-character lowercase hex digest",
+				Details:     map[string]string{"node_id": string(f.Node.ID)},
+				Remediation: "derive the canonical key through the resolver (model.CanonicalNodeKey)"}
+		}
 		if err := w.checkEvidence(f.Evidence); err != nil {
 			return err
 		}
@@ -457,11 +482,7 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			ids, err := tx.PrepareContext(ctx, `INSERT INTO node_ids(id, repository_id, kind, canonical_key) VALUES(?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
-			if err != nil {
-				return err
-			}
-			defer ids.Close()
+			defer w.endBatch()
 			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
 			if err != nil {
 				return err
@@ -480,12 +501,19 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 			defer putKey.Close()
 			for i, f := range facts {
 				n := f.Node
-				nodeRaw, _ := model.DecodeID(string(n.ID))
-				if _, err := ids.ExecContext(ctx, nodeRaw, w.repoRaw, string(n.Kind), f.CanonicalKey); err != nil {
+				keyRaw, _ := model.DecodeID(f.CanonicalKey)
+				ref, err := w.ids.node(ctx, tx, n.ID, string(n.Kind), keyRaw)
+				if err != nil {
 					return err
 				}
+				w.nodes.put(string(n.ID), int64(ref))
+				// The kind registered under this identity is re-read rather
+				// than trusted from the cache: node_ids.canonical is unique and
+				// the identity derives from (repository, kind, canonical key),
+				// so a divergence here is the one thing that derivation cannot
+				// rule out, and it is a rowid point lookup.
 				var kind model.NodeKind
-				if err := kindOf.QueryRowContext(ctx, nodeRaw).Scan(&kind); err != nil {
+				if err := kindOf.QueryRowContext(ctx, int64(ref)).Scan(&kind); err != nil {
 					return err
 				}
 				if kind != n.Kind {
@@ -504,18 +532,18 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 					}
 					metadata = string(n.Metadata)
 				}
-				res, err := ins.ExecContext(ctx, w.rowID, nodeRaw, n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
+				res, err := ins.ExecContext(ctx, w.rowID, int64(ref), n.Language, n.Name, n.QualifiedName, n.Signature, fileRaw, start, end, metadata)
 				if err != nil {
 					return err
 				}
-				if err := w.checkRepeatedNode(ctx, tx, res, n, nodeRaw,
+				if err := w.checkRepeatedNode(ctx, tx, res, n, ref,
 					[]string{n.Language, n.Name, n.QualifiedName, n.Signature, blobText(fileRaw), intText(start), intText(end), metadata}); err != nil {
 					return err
 				}
-				if err := w.storeFactKeys(ctx, putKey, nodeRaw, nil, keysAt(keys, i)); err != nil {
+				if err := w.storeFactKeys(ctx, putKey, nullNode(ref), nil, keysAt(keys, i)); err != nil {
 					return err
 				}
-				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
+				if err := w.insertEvidence(ctx, tx, f.Evidence, ref, noRef); err != nil {
 					return err
 				}
 			}
@@ -563,11 +591,7 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			ids, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO relation_ids(id, repository_id, from_node_id, kind, to_node_id) VALUES(?, ?, ?, ?, ?)`)
-			if err != nil {
-				return err
-			}
-			defer ids.Close()
+			defer w.endBatch()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
 			if err != nil {
 				return err
@@ -580,19 +604,25 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 			defer putKey.Close()
 			for i, f := range facts {
 				r := f.Relation
-				relRaw, _ := model.DecodeID(string(r.ID))
-				fromRaw, _ := model.DecodeID(string(r.From))
-				toRaw, _ := model.DecodeID(string(r.To))
-				if _, err := ids.ExecContext(ctx, relRaw, w.repoRaw, fromRaw, string(r.Kind), toRaw); err != nil {
+				from, err := w.nodeRef(ctx, tx, r.From)
+				if err != nil {
 					return err
 				}
-				if _, err := ins.ExecContext(ctx, w.rowID, relRaw); err != nil {
+				to, err := w.nodeRef(ctx, tx, r.To)
+				if err != nil {
 					return err
 				}
-				if err := w.storeFactKeys(ctx, putKey, nil, relRaw, keysAt(keys, i)); err != nil {
+				ref, err := w.ids.relation(ctx, tx, r.ID, from, string(r.Kind), to)
+				if err != nil {
 					return err
 				}
-				if err := w.insertEvidence(ctx, tx, f.Evidence); err != nil {
+				if _, err := ins.ExecContext(ctx, w.rowID, int64(ref)); err != nil {
+					return err
+				}
+				if err := w.storeFactKeys(ctx, putKey, nil, nullRelation(ref), keysAt(keys, i)); err != nil {
+					return err
+				}
+				if err := w.insertEvidence(ctx, tx, f.Evidence, noRef, ref); err != nil {
 					return err
 				}
 			}
@@ -619,14 +649,26 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
 		return w.providerWrite(func() error {
-			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key, native_key, node_id) VALUES(?, ?, ?, ?)`)
+			defer w.endBatch()
+			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id) VALUES(?, ?, ?, ?)`)
 			if err != nil {
 				return err
 			}
 			defer stmt.Close()
 			for _, a := range aliases {
-				nodeRaw, _ := model.DecodeID(string(a.NodeID))
-				if _, err := stmt.ExecContext(ctx, w.rowID, a.ScopeKey, a.NativeKey, nodeRaw); err != nil {
+				node, err := w.nodeRef(ctx, tx, a.NodeID)
+				if err != nil {
+					return err
+				}
+				scope, err := w.ids.scopeKey(ctx, tx, a.ScopeKey)
+				if err != nil {
+					return err
+				}
+				native, err := w.ids.nativeKey(ctx, tx, a.NativeKey)
+				if err != nil {
+					return err
+				}
+				if _, err := stmt.ExecContext(ctx, w.rowID, int64(scope), int64(native), int64(node)); err != nil {
 					return err
 				}
 			}
@@ -675,11 +717,17 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 				return err
 			}
 			defer index.Close()
+			defer w.endBatch()
 			for i, d := range docs {
 				keyRaw, _ := model.DecodeID(d.ID)
 				fileRaw, _ := model.DecodeID(string(d.FileID))
-				nodeRaw, _ := optionalBlob("search_unit.node_id", string(d.NodeID))
-				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nodeRaw, fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
+				var node nodeRef
+				if d.NodeID != "" {
+					if node, err = w.nodeRef(ctx, tx, d.NodeID); err != nil {
+						return err
+					}
+				}
+				res, err := content.ExecContext(ctx, w.rowID, keyRaw, nullNode(node), fileRaw, d.Path, string(d.Kind), d.Name, d.QualifiedName, d.Signature,
 					int64(d.Bytes.Start), int64(d.Bytes.End), d.Body, tokenCounts[i])
 				if err != nil {
 					return err
@@ -743,8 +791,18 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 	return fileRaw, nil
 }
 
-func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence) error {
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key, detail, content_hash_bound)
+// insertEvidence writes the occurrences of ONE fact, whose surrogate the
+// caller has already resolved: NodeFact.Validate and RelationFact.Validate
+// both refuse evidence that names another fact than the one being published,
+// so node and rel are exactly the refs every row in list must carry and
+// resolving them again per row would buy nothing. Exactly one of them is
+// valid, which is what the evidence CHECK constraint requires.
+//
+// evidence.id stays the canonical 32-byte digest (S-6 dropped): the id is a
+// pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
+// what makes a republished occurrence idempotent.
+func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, content_hash_bound)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
 	if err != nil {
 		return err
@@ -752,19 +810,63 @@ func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []mode
 	defer stmt.Close()
 	for _, e := range list {
 		idRaw, _ := model.DecodeID(string(e.ID))
-		nodeRaw, _ := optionalBlob("evidence.node_id", string(e.NodeID))
-		relRaw, _ := optionalBlob("evidence.relation_id", string(e.RelationID))
 		fileRaw, err := w.inputFile(ctx, tx, e.FileID, e.ContentHash)
 		if err != nil {
 			return err
 		}
+		native, err := w.ids.nativeKey(ctx, tx, e.NativeKey)
+		if err != nil {
+			return err
+		}
 		start, end := rangeBytes(e.Range)
-		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nodeRaw, relRaw, string(e.Precision), fileRaw, start, end, e.NativeKey, e.Detail,
-			boolInt(e.ContentHash != "")); err != nil {
+		if _, err := stmt.ExecContext(ctx, idRaw, w.rowID, nullNode(node), nullRelation(rel), string(e.Precision), fileRaw, start, end,
+			int64(native), e.Detail, boolInt(e.ContentHash != "")); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// nodeRef resolves a canonical node identity that must ALREADY be registered
+// -- a relation endpoint, an alias target, a search document's symbol. The
+// node_ids row is never created here: publishing a fact under a new identity
+// goes through PutKeyedNodes, which alone carries the kind and canonical key
+// that identity derives from. An unregistered identity is malformed provider
+// output, which is precisely what the foreign key to node_ids reported before
+// the reference columns became surrogates.
+//
+// Hits are served from the writer's bounded LRU; a miss is one lookup on
+// node_ids.canonical (UNIQUE). Both are dropped at the batch boundary.
+func (w *UnitWriter) nodeRef(ctx context.Context, tx *sql.Tx, id model.NodeID) (nodeRef, error) {
+	raw, err := idBlob("node_id", string(id))
+	if err != nil {
+		return noRef, err
+	}
+	if ref, ok := w.nodes.get(string(id)); ok {
+		return nodeRef(ref), nil
+	}
+	var ref int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&ref)
+	if isNoRows(err) {
+		return noRef, &model.Error{Code: model.CodeProviderOutputInvalid,
+			Message:     "fact names a node identity that is not registered",
+			Details:     map[string]string{"node_id": string(id)},
+			Remediation: "publish the node fact through PutNodes before the facts that reference it"}
+	}
+	if err != nil {
+		return noRef, wrap("node_ids", err)
+	}
+	w.nodes.put(string(id), ref)
+	return nodeRef(ref), nil
+}
+
+// endBatch drops every cached surrogate. It runs at the end of each provider
+// batch and of each carry-over, so the writer's live set is a function of the
+// configured batch size and never of how many distinct identities or interned
+// strings a repository holds.
+func (w *UnitWriter) endBatch() {
+	w.ids.reset()
+	w.nodes.reset()
 }
 
 // canonicalDetails renders a capability's diagnostic pairs as the stored JSON
@@ -863,7 +965,7 @@ var nodeFactColumns = []string{"language", "name", "qualified_name", "signature"
 // over the same source would then hold different rows, which is the one thing
 // Section 11.4 requires a delta not to do. An identical repeat costs one
 // comparison and is free.
-func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.Result, n model.Node, raw []byte, incoming []string) error {
+func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.Result, n model.Node, ref nodeRef, incoming []string) error {
 	affected, err := res.RowsAffected()
 	if err != nil || affected != 0 {
 		return err
@@ -872,7 +974,7 @@ func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.
 	var file []byte
 	var start, end sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
-		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, raw).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
+		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, int64(ref)).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
 		return err
 	}
 	stored := []string{language, name, qualified, signature, optionalHex(file), nullIntText(start), nullIntText(end), metadata}
