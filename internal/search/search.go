@@ -5,6 +5,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"path"
 	"strconv"
@@ -56,10 +57,13 @@ type Service struct {
 	content ContentReader
 	lexical *lexicalTier
 	maxPage int
-	timeout time.Duration
-	ttl     time.Duration
-	now     func() time.Time
-	log     *slog.Logger
+	// runBytes is the in-memory run budget one query's ranking sort may hold,
+	// a share of resources.query_memory_bytes.
+	runBytes int64
+	timeout  time.Duration
+	ttl      time.Duration
+	now      func() time.Time
+	log      *slog.Logger
 }
 
 // New validates the options and builds the service.
@@ -104,18 +108,19 @@ func New(o Options) (*Service, error) {
 		logger = slog.Default()
 	}
 	return &Service{
-		store:   o.Store,
-		repo:    o.Repo,
-		signer:  o.Signer,
-		spools:  o.Spools,
-		leases:  o.Leases,
-		content: o.Content,
-		lexical: newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
-		maxPage: o.Resources.MaxPageItems,
-		timeout: timeout,
-		ttl:     ttl,
-		now:     now,
-		log:     logger,
+		store:    o.Store,
+		repo:     o.Repo,
+		signer:   o.Signer,
+		spools:   o.Spools,
+		leases:   o.Leases,
+		content:  o.Content,
+		lexical:  newLexicalTier(o.Store, o.Resources.MaxQueryTerms, defaultStatsCacheBytes),
+		maxPage:  o.Resources.MaxPageItems,
+		runBytes: pagination.SortRunBytes(o.Resources.QueryMemoryBytes),
+		timeout:  timeout,
+		ttl:      ttl,
+		now:      now,
+		log:      logger,
 	}, nil
 }
 
@@ -187,10 +192,15 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	defer reader.Close()
 	binding := reader.Binding()
 
+	limit := s.pageLimit(req.Page.Limit)
 	var (
 		hits      []model.SearchHit
 		truncated bool
 		reason    string
+		// tail streams the hits after this page into the continuation spool.
+		// restN is how many there are, which the spool-budget reason names.
+		tail  func(func(model.SearchHit) error) error
+		restN int
 	)
 	if req.Page.Cursor != "" {
 		if err := verifyCursor(cursor, binding, hash); err != nil {
@@ -205,21 +215,30 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		// of its own to compute it from and must carry it forward or report a
 		// complete answer for an answer that is not.
 		truncated, reason = meta.Truncated, meta.TruncationReason
-	} else if hits, truncated, reason, err = s.rank(ctx, reader, req, filter); err != nil {
-		return empty, err
+		if len(hits) > limit {
+			rest := hits[limit:]
+			hits, restN, tail = hits[:limit], len(rest), sliceTail(rest)
+		}
+	} else {
+		var run *pagination.SortedRun[scored]
+		if run, truncated, reason, err = s.rank(ctx, reader, req, filter); err != nil {
+			return empty, err
+		}
+		defer run.Close()
+		if hits, err = s.pageFrom(ctx, reader, run, limit); err != nil {
+			return empty, err
+		}
+		if restN = int(run.Len()) - len(hits); restN > 0 {
+			tail = s.tailOf(ctx, reader, run, len(hits))
+		}
 	}
 
-	limit := s.pageLimit(req.Page.Limit)
-	rest := []model.SearchHit(nil)
-	if len(hits) > limit {
-		hits, rest = hits[:limit], hits[limit:]
-	}
 	meta := model.QueryMeta{Binding: binding, Truncated: truncated, TruncationReason: reason,
 		Notices: clamps.Notices()}
 	if meta.Completeness, err = reader.Capabilities(ctx); err != nil {
 		return empty, err
 	}
-	if len(rest) > 0 {
+	if restN > 0 {
 		// A spool budget that is already full must end THIS page, never the
 		// query: the hits of page 1 are in hand and refusing to serve them
 		// because the tail could not be written is the class-D refusal the
@@ -227,7 +246,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		// carries no continuation because there is nothing to continue from.
 		// Every other spool failure -- a disk fault, a corrupt spool -- is a
 		// real fault and still surfaces.
-		meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, rest)
+		meta.NextCursor, err = s.spoolNext(ctx, binding, hash, now, spoolMeta{Truncated: truncated, TruncationReason: reason}, tail)
 		switch {
 		case err == nil:
 		case pagination.IsBudgetExhausted(err):
@@ -237,9 +256,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			// no continuation to reach them. Reporting only the tier would hide
 			// exactly the drop the posture forbids.
 			meta.Truncated, meta.NextCursor = true, ""
-			meta.TruncationReason = spoolBudgetFullReason(len(rest))
+			meta.TruncationReason = spoolBudgetFullReason(restN)
 			s.log.Warn("a search answer was cut short by the spool disk budget", "component", "search",
-				"generation_id", int64(binding.GenerationID), "dropped_hits", len(rest))
+				"generation_id", int64(binding.GenerationID), "dropped_hits", restN)
 		default:
 			return empty, err
 		}
@@ -269,13 +288,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 // continuation whose lease is gone is refused by the spool store and leaves
 // the generation free for retention to collect. The lease expires with the
 // cursor, so nothing here pins a generation for longer than the token lives.
-func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, rest []model.SearchHit) (string, error) {
+func (s *Service) spoolNext(ctx context.Context, b model.Binding, hash string, now time.Time, answer spoolMeta, tail func(func(model.SearchHit) error) error) (string, error) {
 	lease, err := s.leases.Acquire(ctx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
 	if err != nil {
 		return "", err
 	}
 	next := newCursor(endpointSearch, b, lease.ID, hash, now.Add(s.ttl))
-	id, err := spoolHits(s.spools, next, answer, rest)
+	id, err := spoolHits(s.spools, next, answer, tail)
 	if err != nil {
 		s.releaseLease(ctx, lease.ID)
 		return "", err
@@ -318,30 +337,31 @@ type hitFacts struct {
 // no byte intervals left to hydrate from -- a spool record is a SearchHit.
 // Hydration is therefore paid once per distinct result (at most maxRankedHits)
 // rather than once per page.
-func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest, filter hitFilter) ([]model.SearchHit, bool, string, error) {
-	c := newCollector()
-	facts := make(map[string]hitFacts)
+func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest, filter hitFilter) (*pagination.SortedRun[scored], bool, string, error) {
+	c, err := newCollector(s.spools.SortDir(), s.runBytes)
+	if err != nil {
+		return nil, false, "", err
+	}
+	defer c.Close()
 
 	// The exact tiers first. model.MaxPageItems is the READ size of one keyset
 	// step -- storage clamps any larger request to it (pageLimit), so asking for
 	// more would be a bound this code believes and the database does not -- and
 	// no longer a bound on how many candidates a tier may yield. Candidates are
-	// streamed into the collector, so the whole tier result never materialises
-	// as a slice; the collector's ranked set and its spool tail own the bound.
+	// streamed into the collector, so neither the whole tier result nor the
+	// distinct set ever materialises in heap.
 	if err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
 		func(e exactHit) error {
 			r, ok := exactRanked(e)
 			if !ok || !filter.keep(e.Path) {
 				return nil
 			}
-			record(facts, r, exactHitOf(e))
-			c.add(r, reasonFor(e.Tier))
-			return nil
+			return c.add(r, exactHitOf(e), reasonFor(e.Tier))
 		}); err != nil {
 		return nil, false, "", err
 	}
 
-	outcome, err := s.lexicalCandidates(ctx, reader, req, filter, c, facts)
+	outcome, err := s.lexicalCandidates(ctx, reader, req, filter, c)
 	if err != nil {
 		return nil, false, "", err
 	}
@@ -351,32 +371,132 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 		truncated, reason = true, outcome.Reason
 	}
 
-	items := c.results()
-	hits := make([]model.SearchHit, 0, len(items))
-	spans := make([]model.ByteRange, 0, len(items))
-	located := make([]int, 0, len(items))
-	for _, it := range items {
-		f, ok := facts[dedupKey(it.ranked)]
-		if !ok {
-			continue
-		}
-		hit := f.hit
-		hit.Tier, hit.ScoreMicros, hit.Reasons = it.Tier, it.ScoreMicros, it.Reasons
-		// A candidate that survived is one occurrence even when nothing folded
-		// into it: an exact-tier node contributes no lexical document of its
-		// own, and a served hit that reported zero occurrences would read as a
-		// result that was not actually found.
-		hit.OccurrenceCount = max(it.Occurrences, 1)
-		if f.span != nil {
-			located = append(located, len(hits))
-			spans = append(spans, *f.span)
-		}
-		hits = append(hits, hit)
-	}
-	if err := s.hydrate(ctx, reader, hits, located, spans); err != nil {
+	run, err := c.results()
+	if err != nil {
 		return nil, false, "", err
 	}
-	return hits, truncated, reason, nil
+	return run, truncated, reason, nil
+}
+
+// errStopWalk ends a sorted-run walk early. SortedRun.Each returns a
+// callback's error unchanged, so this never reaches a caller.
+var errStopWalk = errors.New("stop")
+
+// pageFrom reads the FIRST page out of the ranked run and hydrates it.
+func (s *Service) pageFrom(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], limit int) ([]model.SearchHit, error) {
+	chunk := make([]scored, 0, min(limit, model.MaxPageItems))
+	err := run.Each(func(it scored) error {
+		if err := ctx.Err(); err != nil {
+			return contextErr(err)
+		}
+		chunk = append(chunk, it)
+		if len(chunk) == limit {
+			return errStopWalk
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopWalk) {
+		return nil, err
+	}
+	return s.hydrated(ctx, reader, chunk)
+}
+
+// hydrated projects one chunk of ranked candidates into served hits and fills
+// their source ranges.
+//
+// Hydration is paid per chunk rather than once for the whole answer: a
+// hydrator caches one blob record per file, so hydrating a whole answer
+// through one of them would be a second structure sized by the answer in place
+// of the one this lane removed.
+func (s *Service) hydrated(ctx context.Context, reader *sqlite.PinnedReader, chunk []scored) ([]model.SearchHit, error) {
+	hits := make([]model.SearchHit, 0, len(chunk))
+	spans := make([]model.ByteRange, 0, len(chunk))
+	located := make([]int, 0, len(chunk))
+	for _, it := range chunk {
+		if it.Span != nil {
+			located = append(located, len(hits))
+			spans = append(spans, *it.Span)
+		}
+		hits = append(hits, servableHit(it))
+	}
+	if err := s.hydrate(ctx, reader, hits, located, spans); err != nil {
+		return nil, err
+	}
+	return hits, nil
+}
+
+// servableHit projects a ranked candidate into the hit that is served.
+func servableHit(it scored) model.SearchHit {
+	hit := it.Hit
+	hit.Tier, hit.ScoreMicros, hit.Reasons = it.Tier, it.ScoreMicros, it.Reasons
+	// A candidate that survived is one occurrence even when nothing folded
+	// into it: an exact-tier node contributes no lexical document of its own,
+	// and a served hit that reported zero occurrences would read as a result
+	// that was not actually found.
+	hit.OccurrenceCount = max(it.Occurrences, 1)
+	return hit
+}
+
+// tailOf streams the hits after the first page, hydrated one chunk at a time,
+// so the continuation spool is written without the answer's tail ever being
+// held in heap.
+//
+// It is ONE walk of the run. A file-backed sorted run reopens its file and
+// decodes from the first record on every walk, so a chunk loop that re-walked
+// it per chunk would cost a quadratic number of decodes and would surface on a
+// wide answer as a query-deadline failure -- on exactly the query this streams
+// for.
+func (s *Service) tailOf(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], skip int) func(func(model.SearchHit) error) error {
+	return func(yield func(model.SearchHit) error) error {
+		at := 0
+		chunk := make([]scored, 0, model.MaxPageItems)
+		flush := func() error {
+			if len(chunk) == 0 {
+				return nil
+			}
+			hits, err := s.hydrated(ctx, reader, chunk)
+			if err != nil {
+				return err
+			}
+			chunk = chunk[:0]
+			for _, h := range hits {
+				if err := yield(h); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		err := run.Each(func(it scored) error {
+			if err := ctx.Err(); err != nil {
+				return contextErr(err)
+			}
+			if at++; at <= skip {
+				return nil
+			}
+			chunk = append(chunk, it)
+			if len(chunk) < model.MaxPageItems {
+				return nil
+			}
+			return flush()
+		})
+		if err != nil {
+			return err
+		}
+		return flush()
+	}
+}
+
+// sliceTail streams an already-materialised tail, which is what a continuation
+// replayed from a spool still has.
+func sliceTail(hits []model.SearchHit) func(func(model.SearchHit) error) error {
+	return func(yield func(model.SearchHit) error) error {
+		for _, h := range hits {
+			if err := yield(h); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // hydrate fills the source range of every hit that has a byte interval. A node
@@ -430,7 +550,7 @@ func (s *Service) hydrateNodes(ctx context.Context, reader *sqlite.PinnedReader,
 // candidate documents in batches because the tier emits rowids and the sort
 // tuple needs a path, a start byte and an identity.
 func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedReader, req model.SearchRequest,
-	filter hitFilter, c *collector, facts map[string]hitFacts) (lexicalOutcome, error) {
+	filter hitFilter, c *collector) (lexicalOutcome, error) {
 	pending := make([]lexicalHit, 0, model.MaxPageItems)
 	flush := func() error {
 		if len(pending) == 0 {
@@ -463,9 +583,11 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 				// the occurrence count's.
 				Occurrences: 1}
 			bytes := d.Bytes
-			record(facts, r, hitFacts{span: &bytes, hit: model.SearchHit{NodeID: d.NodeID, FileID: d.FileID,
-				Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature}})
-			c.add(r, reasonFor(model.TierLexicalFTS))
+			if err := c.add(r, hitFacts{span: &bytes, hit: model.SearchHit{NodeID: d.NodeID, FileID: d.FileID,
+				Path: d.Path, Kind: d.Kind, Name: d.Name, QualifiedName: d.QualifiedName, Signature: d.Signature}},
+				reasonFor(model.TierLexicalFTS)); err != nil {
+				return err
+			}
 		}
 		pending = pending[:0]
 		return nil
@@ -481,17 +603,6 @@ func (s *Service) lexicalCandidates(ctx context.Context, reader *sqlite.PinnedRe
 		return outcome, err
 	}
 	return outcome, flush()
-}
-
-// record remembers the servable facts of a candidate the first time its
-// deduplication key is seen. The first writer wins: every candidate under one
-// key describes the same entity, and the survivor of the fold is decided by
-// the sort tuple, not by which tier was read first.
-func record(facts map[string]hitFacts, r ranked, f hitFacts) {
-	key := dedupKey(r)
-	if _, seen := facts[key]; !seen {
-		facts[key] = f
-	}
 }
 
 // exactRanked builds the sort tuple of one exact-tier candidate. Digest §4/Q6
