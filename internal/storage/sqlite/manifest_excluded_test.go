@@ -68,6 +68,7 @@ func TestPutManifestStreamsExclusionsRowAtATime(t *testing.T) {
 			t.Fatalf("PutManifest(%d exclusions): %v", n, err)
 		}
 		growth[n] = last - first
+		t.Logf("%d exclusions: live heap across the write grew %d bytes", n, growth[n])
 		// Every excluded row must be readable in ordinal order through the
 		// unchanged `--view excluded` keyset reader: streaming the write may
 		// not cost a row or reorder one.
