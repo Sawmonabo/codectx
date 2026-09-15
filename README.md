@@ -42,9 +42,11 @@ curl -fsSL https://github.com/Sawmonabo/codectx/releases/download/v1.2.3/install
   | sh -s -- --version v1.2.3 --prefix /usr/local
 ```
 
-`--bundle` installs the bundle archive instead — the same binary with the
-managed tool store already populated for your platform, so the install and every
-later index run touch the network zero times. See
+`--bundle` installs the bundle archive instead — the same binary plus the managed
+tool store already populated for your platform. The script installs the store but
+does not edit your configuration: it prints the `[tools] offline` and
+`[tools] cache_dir` block to add, and until you add it the binary resolves tools
+under the per-workspace default store and may still fetch on first use. See
 [docs/toolchain.md](docs/toolchain.md#offline-hosts-and-bundle-archives).
 
 ### Download, inspect, then run
