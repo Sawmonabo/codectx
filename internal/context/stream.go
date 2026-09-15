@@ -73,13 +73,15 @@ type candRec struct {
 	NodeID model.NodeID `json:"n,omitempty"`
 	FileID model.FileID `json:"f,omitempty"`
 
-	// PathAtRank and PathFinal are the SAME field in today's candidate, written
-	// twice with different rules, and ruling C3 keeps both because collapsing
-	// them is not behaviour-preserving. hydrateFiles writes the snapshot path
-	// only when the candidate carries none (compiler.go:339-343) and ranking
-	// reads THAT value for packageOf, centrality and its reason
-	// (rank.go:88,396); buildPlan overwrites unconditionally (budget.go:254)
-	// and the total order plus the persisted entry read THAT one. A candidate
+	// PathAtRank and PathFinal are the SAME field in the whole-set candidate,
+	// written twice with different rules, and ruling C3 keeps both because
+	// collapsing them is not behaviour-preserving. The whole-set
+	// hydrateFiles -- which now survives only as the reference implementation
+	// in stream_parity_test.go -- writes the snapshot path only when the
+	// candidate carries none, and ranking reads THAT value for packageOf
+	// (rank.go:265), centrality and its reason; the reference buildPlan
+	// overwrites unconditionally (stream_parity_test.go:438) and the total
+	// order plus the persisted entry read THAT one. A candidate
 	// whose pre-set path differs from its snapshot path is therefore bucketed
 	// for centrality under one package and sorted under another, so one field
 	// would change per-package edge counts, boosts and ScoreMicros. A follow-up
@@ -200,7 +202,7 @@ type groupRec struct {
 // record per file decides every candidate in it.
 //
 // A dropped group's reason does not travel here. Drops are written straight to
-// the excluded spool in appendDrops order (slice.go:141-146), which is the
+// the excluded spool in appendDrops order (stream_parity_test.go:777), which is the
 // exclusion order ruling C1 keeps.
 type decisionRec struct {
 	FileID     model.FileID `json:"f"`
@@ -238,8 +240,9 @@ func (r candRec) rankCandidate() candidate {
 }
 
 // finalCandidate rehydrates the candidate as BUDGETING sees it: Path is
-// PathFinal, the value buildPlan's unconditional overwrite leaves (budget.go:254)
-// and the one the total order and the persisted entry read (C3).
+// PathFinal, the value the reference buildPlan's unconditional overwrite
+// leaves (stream_parity_test.go:438) and the one the total order and the
+// persisted entry read (C3).
 func (r candRec) finalCandidate() candidate {
 	c := r.candidate()
 	c.Path = r.PathFinal
@@ -297,13 +300,14 @@ func (r relAttrRec) precision() int64 {
 //     fold or one merge-join works on, and the merge's stability is what keeps
 //     equal records in arrival order (extsort.go:130-140). Adding a tie-break
 //     to one of these changes the order its fold sees -- the same class of
-//     change internal/index/plan/plan.go:958-961 froze its comparator against.
+//     change internal/index/plan's compareInput froze its comparator against.
 
-// lessRank IS candidate.less (compiler.go:461-477) as a three-way comparator,
-// with Seq as a final key so the order is total.
+// lessRank IS candidate.less -- the whole-set comparator, kept as the
+// reference implementation at stream_parity_test.go:857 -- as a three-way
+// comparator, with Seq as a final key so the order is total.
 //
-// It reads PathFinal, because today's sort runs AFTER buildPlan's unconditional
-// path overwrite (budget.go:254,261). Reading PathAtRank instead would order
+// It reads PathFinal, because the whole-set sort runs AFTER buildPlan's
+// unconditional path overwrite (stream_parity_test.go:438). Reading PathAtRank instead would order
 // the plan by one path and bucket centrality by another; ruling C3 exists
 // because those two values can differ.
 //
@@ -678,7 +682,7 @@ func (s *compileSorts) observations() []sortObservation {
 // under the store's sort directory so they are swept and reported; silently
 // falling back to the process temporary directory would put them where nothing
 // reclaims them, and this package already refuses every missing dependency
-// eagerly (compiler.go:60-76) so a wiring defect surfaces as one.
+// eagerly (New, compiler.go:99) so a wiring defect surfaces as one.
 func newCompileSorts(cfg config.Config, sortDir string) (*compileSorts, error) {
 	if sortDir == "" {
 		return nil, argumentInvalid("a streamed context compile requires the store's sort directory")
@@ -778,7 +782,8 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 
 // passAIngest — §2 P-A, lane L1. expandScope appends to the candidate spool in
 // admission order with a seq on every record instead of building
-// res.Candidates, and its `admitted map[string]bool` becomes a sort under
+// the whole-set candidate list (refScope.Candidates, stream_parity_test.go),
+// and its `admitted map[string]bool` becomes a sort under
 // lessEntityID folded with foldMinSeq. Excluded candidates are NOT diverted:
 // they stay on the one spool with Excluded set, because relationsOnPaths
 // deliberately does not filter on it while hydrateFiles does, and P-I derives
@@ -1013,8 +1018,9 @@ func (c *Compiler) passGMeasure(ctx context.Context, s *compileSorts, in rankedS
 	if err != nil {
 		return nil, err
 	}
-	// Index counts SURVIVORS, never records of the ranked stream: today's `i`
-	// is a position in `sized` (budget.go:282), so counting a filtered record
+	// Index counts SURVIVORS, never records of the ranked stream: the
+	// whole-set `i` is a position in `sized` (stream_parity_test.go:465-466),
+	// so counting a filtered record
 	// would shift every later ordinal and every stored slice membership with it.
 	var index int64
 	if err := in.Ranked.Each(func(r candRec) error {

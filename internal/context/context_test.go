@@ -1789,7 +1789,7 @@ func (f *contextFixture) seedOf(path string) candidate {
 // entries carry no path of their own -- scope.go leaves candidate.Path for the
 // compiler's file hydration to fill -- so the match is by FileID, and falls back
 // to the path only for a discovery candidate that resolved to no file at all.
-func requirementFor(t *testing.T, fx *contextFixture, res scopeResult, path string) (candidate, bool) {
+func requirementFor(t *testing.T, fx *contextFixture, res refScope, path string) (candidate, bool) {
 	t.Helper()
 	id := fx.Files[path].ID
 	for _, c := range res.Candidates {
