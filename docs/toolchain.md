@@ -442,9 +442,12 @@ upstream project re-uploaded the assets of an already-published release three
 hours after the lock had recorded their digests, and the lock — honest when it
 was written — was discovered to be stale only by a user's index refusing to
 fetch the analyzer mid-run. A gate that runs only when we change the lock cannot
-see a change upstream makes, so this one runs on a clock. It aborts at the first
-payload whose served bytes disagree, naming the entry and platform; re-pin that
-one entry with `-tools <name>`.
+see a change upstream makes, so this one runs on a clock. It checks every
+pinned payload and names each one it could not confirm -- served bytes that
+disagree, or a payload it could not fetch at all -- on its own `DIFFERS
+<tool>/<platform>` line, then exits once with the count; re-pin each tool named
+there with `-tools <name>`. One run reports the whole drift, so a re-upload that
+moved all six platform keys of an entry is one re-pin, not six re-runs.
 
 The same drift is visible **locally, without a network call**, in
 `codectx tools verify`: each row carries `lock:` — the digest this binary pins
