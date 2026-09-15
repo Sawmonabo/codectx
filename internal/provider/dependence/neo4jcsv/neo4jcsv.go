@@ -119,6 +119,11 @@ type Options struct {
 	// Limits are the sink's per-batch bounds. MaxRecordBytes also bounds one
 	// CSV record before the decoder can allocate it.
 	Limits provider.Limits
+	// MaxEvidencePerFact is the effective per-fact evidence clip: the operator's
+	// index.max_evidence_per_fact, or the model's record ceiling when they set
+	// none. Zero selects the ceiling. Occurrences past it are counted and
+	// disclosed, never dropped in silence.
+	MaxEvidencePerFact int
 	// MaxStagedRows is the user's `providers.dependence.max_staged_rows`: how
 	// many rows the caller wants one import to stage. 0, the default, is
 	// unlimited. It is a reporting threshold and never a refusal -- crossing
@@ -270,6 +275,9 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	}
 	defer sc.close()
 
+	if opts.MaxEvidencePerFact <= 0 {
+		opts.MaxEvidencePerFact = model.MaxEvidencePerFact
+	}
 	e := &emitter{sc: sc, res: res, sink: sink, opts: opts, language: opts.Language}
 	if err := e.stageFiles(ctx); err != nil {
 		return rep, err

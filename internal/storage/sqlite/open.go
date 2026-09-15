@@ -39,6 +39,13 @@ type Options struct {
 	// ceiling (manifest requests, capsules). Default 8 MiB, the Section 20.1
 	// context.max_manifest_bytes / max_capsule_bytes default.
 	MaxJSONBytes int64
+	// MaxEvidencePerFact is the effective per-fact evidence clip the providers
+	// of this process emitted under: index.max_evidence_per_fact when the
+	// operator set one, otherwise the model's record ceiling. Seal enforces it
+	// over the union of fresh and carried occurrences, so a delta cannot leave
+	// a fact holding more than the run's providers were allowed to publish.
+	// Zero selects the record ceiling, which is what unlimited means here.
+	MaxEvidencePerFact int
 	// Synchronous is the synchronous mode of the WRITER connection:
 	// "normal" (the default, and what config.SynchronousNormal spells) or
 	// "full". Readers are pinned to FULL regardless -- they are query_only
@@ -126,6 +133,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.MaxJSONBytes <= 0 {
 		o.MaxJSONBytes = 8 << 20
+	}
+	if o.MaxEvidencePerFact <= 0 {
+		o.MaxEvidencePerFact = model.MaxEvidencePerFact
 	}
 	if o.Synchronous == "" {
 		o.Synchronous = config.SynchronousNormal

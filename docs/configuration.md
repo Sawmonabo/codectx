@@ -65,7 +65,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | Table | Keys defaulting to `0` / `"unlimited"` |
   |---|---|
   | `[workspace]` | `max_files`, `max_parse_file_bytes`, `max_search_file_bytes` |
-  | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone), `watch_max_directories` |
+  | `[index]` | `max_retained_bytes` (no byte budget; retention is then governed by `retain_refs` alone), `watch_max_directories`, `max_evidence_per_fact` |
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
@@ -162,8 +162,10 @@ walked and cannot fail the per-directory entry limit either.
 
 ## `[index]` — scheduling
 
-None of these are semantic inputs: they change how work is scheduled, never what
-it concludes. All are **user** trust.
+These are scheduling settings: they change how work is driven, never what it
+concludes, and all are **user** trust — with one exception noted in its row,
+`max_evidence_per_fact`, which is an analysis admission setting and is part of
+the analysis config hash.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -180,6 +182,7 @@ it concludes. All are **user** trust.
 | `max_retained_bytes` | `0` | Byte budget for the retained store. `0` means retention is governed by `retain_refs` alone. When set, least-recently-used refs are evicted first and never the active one. |
 | `watch_max_directories` | `0` (unlimited) | How many directories one watcher may watch. Unlimited by default: a repository's directory count is a property of the repository, and the host's own notification limit is the real ceiling — reaching that is refused by the host and reported as incomplete watch coverage with a reason. A set value stops the watch set at that many directories and reports coverage incomplete, never silently. |
 | `capture_max_retries` | `0` (unlimited) | Validation passes of a snapshot capture that may find the worktree changed under them before the capture is declared unstable. `0` (unlimited) is the default: a retry count that refuses a busy monorepo would be a scale refusal. Attempts are reported on the capture either way. |
+| `max_evidence_per_fact` | `0` (unlimited) | How many evidence occurrences one node or relation fact keeps. Unlimited by default: a fact carries every occurrence its providers found. Trust is **project (lower only)** — a repository may ask for a smaller retained set, never a larger one — and it is the one key here that is an analysis input, so changing it re-keys every unit. A value you set clips each fact at that many occurrences and the cut is reported on the unit's capability detail (`evidence_clipped`), never silently. Separately from this setting, one fact record holds at most 65536 occurrences: that is the ceiling of the record format itself, not a bound you configure, and a value above it is rejected. |
 | `capture_retry_deadline` | `"10m"` | Wall clock for the whole validated capture. Finite by design, and not a size bound: with `capture_max_retries` unlimited this is the only thing that ends a capture of a worktree that never quiesces. |
 
 ## `[resources]` — memory, concurrency, disk and response budgets
@@ -575,7 +578,7 @@ setting does not invalidate work that did not depend on it:
 | Fingerprint | Covers | Invalidates |
 |---|---|---|
 | **Source policy** | `follow_symlinks`, `include_untracked`, `index_generated`, `index_vendor`, `max_files`, and a digest of this build's built-in vendor and generated classification lists | the snapshot identity |
-| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes` and every `providers.*` selection | unit identity and the analysis key |
+| **Analysis config** | `max_parse_file_bytes`, `max_search_file_bytes`, `index.max_evidence_per_fact` and every `providers.*` selection | unit identity and the analysis key |
 | **Context policy** | the whole `[context]` table | manifest identity |
 
 `[tools]` is deliberately **not** in the analysis fingerprint: a store location
