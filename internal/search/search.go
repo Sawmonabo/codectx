@@ -225,7 +225,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		defer run.Close()
-		if hits, err = s.pageFrom(ctx, reader, run, 0, limit); err != nil {
+		if hits, err = s.pageFrom(ctx, reader, run, limit); err != nil {
 			return empty, err
 		}
 		if restN = int(run.Len()) - len(hits); restN > 0 {
@@ -382,38 +382,42 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 // callback's error unchanged, so this never reaches a caller.
 var errStopWalk = errors.New("stop")
 
-// pageFrom reads one page out of the ranked run -- the records at [skip,
-// skip+limit) -- and hydrates their source ranges.
-//
-// Hydration is paid per page rather than once for the whole answer: a hydrator
-// caches one blob record per file, so hydrating a whole answer through one of
-// them would be a second structure sized by the answer in place of the one
-// this lane removed.
-func (s *Service) pageFrom(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], skip, limit int) ([]model.SearchHit, error) {
-	hits := make([]model.SearchHit, 0, min(limit, model.MaxPageItems))
-	spans := make([]model.ByteRange, 0, cap(hits))
-	located := make([]int, 0, cap(hits))
-	at := 0
+// pageFrom reads the FIRST page out of the ranked run and hydrates it.
+func (s *Service) pageFrom(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], limit int) ([]model.SearchHit, error) {
+	chunk := make([]scored, 0, min(limit, model.MaxPageItems))
 	err := run.Each(func(it scored) error {
 		if err := ctx.Err(); err != nil {
 			return contextErr(err)
 		}
-		if at++; at <= skip {
-			return nil
-		}
-		if len(hits) == limit {
+		chunk = append(chunk, it)
+		if len(chunk) == limit {
 			return errStopWalk
 		}
-		hit := servableHit(it)
-		if it.Span != nil {
-			located = append(located, len(hits))
-			spans = append(spans, *it.Span)
-		}
-		hits = append(hits, hit)
 		return nil
 	})
 	if err != nil && !errors.Is(err, errStopWalk) {
 		return nil, err
+	}
+	return s.hydrated(ctx, reader, chunk)
+}
+
+// hydrated projects one chunk of ranked candidates into served hits and fills
+// their source ranges.
+//
+// Hydration is paid per chunk rather than once for the whole answer: a
+// hydrator caches one blob record per file, so hydrating a whole answer
+// through one of them would be a second structure sized by the answer in place
+// of the one this lane removed.
+func (s *Service) hydrated(ctx context.Context, reader *sqlite.PinnedReader, chunk []scored) ([]model.SearchHit, error) {
+	hits := make([]model.SearchHit, 0, len(chunk))
+	spans := make([]model.ByteRange, 0, len(chunk))
+	located := make([]int, 0, len(chunk))
+	for _, it := range chunk {
+		if it.Span != nil {
+			located = append(located, len(hits))
+			spans = append(spans, *it.Span)
+		}
+		hits = append(hits, servableHit(it))
 	}
 	if err := s.hydrate(ctx, reader, hits, located, spans); err != nil {
 		return nil, err
@@ -433,25 +437,52 @@ func servableHit(it scored) model.SearchHit {
 	return hit
 }
 
-// tailOf streams the hits after the first page, hydrated one page at a time,
+// tailOf streams the hits after the first page, hydrated one chunk at a time,
 // so the continuation spool is written without the answer's tail ever being
 // held in heap.
+//
+// It is ONE walk of the run. A file-backed sorted run reopens its file and
+// decodes from the first record on every walk, so a chunk loop that re-walked
+// it per chunk would cost a quadratic number of decodes and would surface on a
+// wide answer as a query-deadline failure -- on exactly the query this streams
+// for.
 func (s *Service) tailOf(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored], skip int) func(func(model.SearchHit) error) error {
 	return func(yield func(model.SearchHit) error) error {
-		for at := skip; ; at += model.MaxPageItems {
-			hits, err := s.pageFrom(ctx, reader, run, at, model.MaxPageItems)
+		at := 0
+		chunk := make([]scored, 0, model.MaxPageItems)
+		flush := func() error {
+			if len(chunk) == 0 {
+				return nil
+			}
+			hits, err := s.hydrated(ctx, reader, chunk)
 			if err != nil {
 				return err
 			}
+			chunk = chunk[:0]
 			for _, h := range hits {
 				if err := yield(h); err != nil {
 					return err
 				}
 			}
-			if len(hits) < model.MaxPageItems {
+			return nil
+		}
+		err := run.Each(func(it scored) error {
+			if err := ctx.Err(); err != nil {
+				return contextErr(err)
+			}
+			if at++; at <= skip {
 				return nil
 			}
+			chunk = append(chunk, it)
+			if len(chunk) < model.MaxPageItems {
+				return nil
+			}
+			return flush()
+		})
+		if err != nil {
+			return err
 		}
+		return flush()
 	}
 }
 
