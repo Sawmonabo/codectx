@@ -2,6 +2,7 @@ package pagination
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -93,4 +94,80 @@ func TestReadoptingAGrownDirectoryChargesItOnce(t *testing.T) {
 	if n := len(store.reserved); n != 1 {
 		t.Fatalf("the store holds %d reservations for one retained directory, want 1", n)
 	}
+}
+
+// TestARefusedReadoptionLeavesThePreviousCursorAbleToOpenIt is the ordering
+// invariant of the same call.
+//
+// A re-adoption can be REFUSED: a directory a page grew past what is left of
+// the shared byte budget answers CTX_RESOURCE_LIMIT, which is retryable -- the
+// caller is told to present the cursor it already holds again. That promise
+// only holds if a refused re-adoption changed nothing. Stamping the new id and
+// lease into the header before reserving broke it: the directory kept its old
+// NAME and its old reservation but carried the new BINDING, and OpenDir
+// compares the two, so the cursor the caller was told to retry with answered
+// "spool does not belong to this cursor" and the whole walk behind it was gone.
+//
+// Mutation (the stamp moved back ahead of the reservation, as it was): the
+// OpenDir below fails with CTX_CURSOR_INVALID.
+func TestARefusedReadoptionLeavesThePreviousCursorAbleToOpenIt(t *testing.T) {
+	const budget = 16 << 10
+	store, err := NewSpools(t.TempDir(), budget, liveLeases{})
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	c1 := Cursor{Endpoint: "graph", GenerationID: 3,
+		AnalysisKey: model.AnalysisKey(model.H("analysis", "r")),
+		QueryHash:   model.H("query", "r"), LeaseID: model.H("lease-1", "r"),
+		ExpiresAt: time.Now().Add(time.Minute)}
+	c2 := c1
+	c2.LeaseID = model.H("lease-2", "r")
+
+	dir := filepath.Join(t.TempDir(), "retained")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "visited"), make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevID, err := store.AdoptDir(c1, dir)
+	if err != nil {
+		t.Fatalf("AdoptDir: %v", err)
+	}
+	c1.SpoolID = prevID
+	if _, err := store.OpenDir(context.Background(), c1, time.Now()); err != nil {
+		t.Fatalf("the adopting cursor cannot open its own directory: %v", err)
+	}
+
+	// The page grows the retained state past what the budget can hold.
+	held := filepath.Join(store.dir, spoolPrefix+prevID)
+	if err := os.WriteFile(filepath.Join(held, "runs"), make([]byte, 4*budget), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	switch _, err := store.ReadoptDir(c2, prevID); {
+	case err == nil:
+		t.Fatal("the re-adoption of a directory four times the budget was allowed")
+	case !isCode(err, model.CodeResourceLimit):
+		t.Fatalf("the refusal is %v, want %s: only a retryable code tells the caller to present "+
+			"the same cursor again", err, model.CodeResourceLimit)
+	}
+
+	// The retry the refusal asks for.
+	if _, err := store.OpenDir(context.Background(), c1, time.Now()); err != nil {
+		t.Fatalf("after a refused re-adoption the previous cursor can no longer open its "+
+			"directory: %v", err)
+	}
+}
+
+// liveLeases is noLeases with an expiry a case that OPENS a directory can pass.
+type liveLeases struct{ noLeases }
+
+func (liveLeases) LeaseExpiry(context.Context, string) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
+
+// isCode reports whether err is a typed model error carrying code.
+func isCode(err error, code string) bool {
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == code
 }
