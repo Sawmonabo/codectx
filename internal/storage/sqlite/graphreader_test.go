@@ -151,10 +151,10 @@ func graphFixtureStoreFull(t *testing.T) (*store.Store, model.RepositoryID, stri
 // which supersedes the first. It republishes only one node, because its purpose
 // is to move the active pointer, not to be walked.
 func publishEmptyGeneration(t *testing.T, s *store.Store, repo model.RepositoryID,
-	snap model.Snapshot, ff fileFixture, previous model.GenerationID) {
+	snap model.Snapshot, ff fileFixture, previous model.GenerationID, tag string) {
 	t.Helper()
 	ctx := context.Background()
-	gen, err := s.BeginGeneration(ctx, repo, snap.ID, model.H("semantic-next"), "main")
+	gen, err := s.BeginGeneration(ctx, repo, snap.ID, model.H("semantic-next", tag), "main")
 	if err != nil {
 		t.Fatalf("BeginGeneration(next): %v", err)
 	}
@@ -162,7 +162,7 @@ func publishEmptyGeneration(t *testing.T, s *store.Store, repo model.RepositoryI
 	if err != nil {
 		t.Fatalf("BeginProviderRun(next): %v", err)
 	}
-	w := beginFixtureUnit(t, s, gen, run, ff, "next")
+	w := beginFixtureUnit(t, s, gen, run, ff, "next-"+tag)
 	ev := model.Evidence{UnitID: w.UnitID(), ProviderID: providerID, ProviderVersion: providerVersion,
 		OriginRunID: run, NodeID: graphtest.Orphan, Precision: model.PrecisionSyntax}
 	ev.ID = model.NewEvidenceID(ev)
@@ -311,14 +311,42 @@ func countGraphParts(t *testing.T, db *sql.DB, stream string) int {
 	return n
 }
 
-// Neither ordered scan of the build may build a temporary b-tree: the sort is
-// the whole visible relation set, and a temp b-tree over it is the defect
-// ADR-0005 exists to remove.
+// The three ordered scans of the packed adjacency build must never sort. Each
+// one's group order IS its output order, taken from an index; the moment the
+// planner substitutes a temporary b-tree the pass stops being linear in the
+// generation and becomes superlinear in the whole store's facts, which is the
+// failure that turned a 9 s build into a 223 s one on the reference repository.
+//
+// The store is carried to THREE published generations first, because that is
+// when the failure appears: every activation rewrites sqlite_stat1, so from the
+// second generation on the planner has statistics for the permanent tables and
+// none for the build's temp tables, and is free to re-choose a driving table it
+// did not choose on an empty-statistics first index.
 func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
-	_, _, dbPath := graphFixtureStore(t)
+	s, repo, dbPath, snap, ff := graphFixtureStoreFull(t)
+	ctx := context.Background()
+	gen, err := s.ActiveGeneration(ctx, repo)
+	if err != nil {
+		t.Fatalf("ActiveGeneration: %v", err)
+	}
+	publishEmptyGeneration(t, s, repo, snap, ff, gen, "a")
+	gen, err = s.ActiveGeneration(ctx, repo)
+	if err != nil {
+		t.Fatalf("ActiveGeneration: %v", err)
+	}
+	publishEmptyGeneration(t, s, repo, snap, ff, gen, "b")
 	db := openRawDB(t, dbPath)
-	if _, err := db.Exec(`CREATE TEMP TABLE tmp_graph_rel(id INTEGER PRIMARY KEY)`); err != nil {
-		t.Fatalf("tmp_graph_rel: %v", err)
+	var stats int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_stat1`).Scan(&stats); err != nil {
+		t.Fatalf("sqlite_stat1: %v", err)
+	}
+	if stats == 0 {
+		t.Fatal("three activations left no sqlite_stat1 rows, so this asserts the wrong planner state")
+	}
+	for _, tmp := range []string{"tmp_graph_rel", "tmp_graph_node", "tmp_graph_unit"} {
+		if _, err := db.Exec(`CREATE TEMP TABLE ` + tmp + `(id INTEGER PRIMARY KEY)`); err != nil {
+			t.Fatalf("%s: %v", tmp, err)
+		}
 	}
 	for _, q := range []struct {
 		name  string
@@ -326,6 +354,7 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 	}{
 		{"outgoing", store.OutgoingEdgeQuery()},
 		{"incoming", store.IncomingEdgeQuery()},
+		{"evidence", store.EvidenceCountQuery()},
 	} {
 		plan := explain(t, db, q.query)
 		t.Logf("%s plan:\n%s", q.name, plan)
@@ -373,7 +402,7 @@ func TestDeleteGenerationCascadesPackedGraph(t *testing.T) {
 	}
 	// A generation is collectable only once it is superseded, so a second one
 	// is published over the same snapshot first.
-	publishEmptyGeneration(t, s, repo, snap, ff, gen)
+	publishEmptyGeneration(t, s, repo, snap, ff, gen, "a")
 	if err := s.DeleteGeneration(ctx, gen); err != nil {
 		t.Fatalf("DeleteGeneration: %v", err)
 	}

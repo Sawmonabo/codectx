@@ -21,3 +21,6 @@ func IncomingEdgeQuery() string { return incomingEdgeQuery() }
 // LexicalInstanceQuery is the bare instance scan the packed-lexical build
 // streams, exported so the query-plan test asserts the SQL that ships.
 func LexicalInstanceQuery() string { return lexicalInstanceQuery }
+
+// EvidenceCountQuery is the build's third ordered scan.
+func EvidenceCountQuery() string { return evidenceCountQuery() }
