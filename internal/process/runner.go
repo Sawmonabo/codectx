@@ -339,8 +339,7 @@ func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 			return nil, model.Canceled(ctx.Err())
 		}
 	}
-	var once sync.Once
-	return func() { once.Do(func() { r.release(w) }) }, nil
+	return func() { r.release(w) }, nil
 }
 
 // promote grants queued runs in arrival order. It must be called with r.mu
