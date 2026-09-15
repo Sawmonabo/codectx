@@ -34,6 +34,16 @@ func (c Config) SourcePolicyHash() string {
 		quoteBool(c.Workspace.IndexGenerated),
 		quoteBool(c.Workspace.IndexVendor),
 		quoteLimit(c.Workspace.MaxFiles),
+		// The three traversal bounds are MaxFiles' siblings: each decides which
+		// files the walk reaches. A user-set MaxDirEntries leaves the entries of
+		// a wide directory out of the capture, MaxDepth leaves a deep subtree
+		// out, and an exceeded MaxIgnoredRoots degrades the policy to the base
+		// one, which walks trees the ignore set would have excluded. All three
+		// change the captured file set from the same bytes, so they belong to
+		// the snapshot's identity rather than to the analysis key.
+		quoteLimit(c.Workspace.MaxDirEntries),
+		quoteLimit(c.Workspace.MaxDepth),
+		quoteLimit(c.Workspace.MaxIgnoredRoots),
 		// The toggles above select built-in classification lists, so the lists
 		// themselves are policy: a build shipping a different one captures a
 		// different set of files from the same bytes.
@@ -73,6 +83,18 @@ func (c Config) AnalysisConfigHash() string {
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxSourceFileBytes))
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxMaterializeBytes))
 	h.AddString(quoteLimit(c.Providers.SCIP.MaxManifestBytes))
+	// The manifest list bounds and the tree-sitter callee bound cut FACTS: a
+	// unit sealed under a user-set value published a shorter dependency list, a
+	// shorter entry list or fewer callee nodes than the same bytes yield under a
+	// higher one, so raising the bound must invalidate it. The remaining keys
+	// added with them are deliberately absent. providers.dependence.max_export_files
+	// REFUSES an import rather than cutting it, and a failed unit is never reused
+	// as a complete one; index.capture_max_retries, index.capture_retry_deadline
+	// and index.watch_max_directories are scheduling and coverage policy, which
+	// changes how the work is driven and never what it concludes.
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxDependencies))
+	h.AddString(quoteLimit(c.Providers.Manifest.MaxEntries))
+	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxCalleeReferences))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
 	return h.Sum()
