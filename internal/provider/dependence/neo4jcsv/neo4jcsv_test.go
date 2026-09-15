@@ -808,3 +808,37 @@ func (o *carryOut) Seal(ctx context.Context) error {
 	}
 	return o.store.SealUnit(ctx, o.UnitWriter)
 }
+
+// TestStagedRowsOverAUserSetBoundImportsAndReports pins the one invariant of
+// providers.dependence.max_staged_rows: crossing it publishes the whole import
+// and says so. The bound used to fail the unit outright, which made a row
+// count — a property of the repository's source — refuse the repository. A
+// regression that restores the refusal, or that stops setting the flag, is the
+// silence the scale posture forbids, and neither shows in any other assertion.
+func TestStagedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
+	src, export := filepath.Join("testdata", "src", "gofix"), filepath.Join("testdata", "gofix")
+	whole, _, _, err := run(t, src, export, neo4jcsv.Options{Language: "go"})
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if whole.StagedRows == 0 {
+		t.Fatalf("the import staged no rows, so the bound below proves nothing")
+	}
+	if whole.OverStagedRows {
+		t.Fatalf("an import with no max_staged_rows reported crossing one")
+	}
+	bounded, _, state, err := run(t, src, export, neo4jcsv.Options{Language: "go", MaxStagedRows: 1})
+	if err != nil {
+		t.Fatalf("an import over max_staged_rows must not fail the unit: %v", err)
+	}
+	if state != model.UnitSealed {
+		t.Fatalf("unit state = %s, want sealed: crossing a reporting threshold may not fail the unit", state)
+	}
+	if !bounded.OverStagedRows {
+		t.Fatalf("an import of %d rows over max_staged_rows = 1 did not report crossing it", bounded.StagedRows)
+	}
+	if bounded.StagedRows != whole.StagedRows || bounded.Nodes != whole.Nodes || bounded.Relations != whole.Relations {
+		t.Fatalf("the bounded import published less than the unbounded one: rows %d/%d nodes %d/%d relations %d/%d",
+			bounded.StagedRows, whole.StagedRows, bounded.Nodes, whole.Nodes, bounded.Relations, whole.Relations)
+	}
+}

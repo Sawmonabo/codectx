@@ -90,6 +90,14 @@ type Options struct {
 	UnitMemoryCeilingBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
+	// MaxUnitsPerFamily and MaxStagedRows are the two user-set reporting
+	// thresholds of `[providers.dependence]`, 0 (the default) meaning no
+	// threshold at all. Neither refuses anything: a repository's project count
+	// and an export's row count are properties of the source, so exceeding
+	// either is published on the unit's capability rows -- never a plan
+	// refusal, never a silently truncated list, never a failed unit.
+	MaxUnitsPerFamily int64
+	MaxStagedRows     int64
 }
 
 // Provider is the dependence provider.Provider. One instance serves a process
@@ -123,6 +131,9 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	}
 	if opts.Timeout < 0 || opts.StallTimeout < 0 {
 		return nil, invalid("the dependence provider's unit timeout and stall timeout may not be negative")
+	}
+	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 {
+		return nil, invalid("the dependence provider's max_units_per_family and max_staged_rows may not be negative; 0 is no threshold")
 	}
 	if err := opts.Limits.Validate(); err != nil {
 		return nil, err
@@ -309,6 +320,22 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	// while that is true is false readiness, and the unit that ran is the only
 	// place with a capability row to say so.
 	pub.UnplannedProjects = plan.Unplanned[unit.Family]
+	pub.Family = unit.Family
+	// The plan holds every project of the family, whatever the count: a
+	// monorepo is not refused. A user who set the threshold is told which
+	// family crossed it and by how much, on the rows of the unit that ran.
+	// pub.OverUnitsPerFamily may already carry a subdivided unit's part count
+	// against the same threshold; the plan's count is the larger claim about
+	// the family and takes it.
+	if n := plan.Projects[unit.Family]; p.opts.MaxUnitsPerFamily > 0 && int64(n) > p.opts.MaxUnitsPerFamily && n > pub.OverUnitsPerFamily {
+		pub.OverUnitsPerFamily, pub.UnitsPerFamilyBound = n, p.opts.MaxUnitsPerFamily
+	}
+	// The unit's staged rows are the sum over its parts when it was subdivided,
+	// so the threshold is compared here rather than read off the flag: a unit
+	// can cross it in total without any one part crossing it alone.
+	if p.opts.MaxStagedRows > 0 && report.StagedRows > p.opts.MaxStagedRows {
+		pub.StagedRows, pub.StagedRowsBound = report.StagedRows, p.opts.MaxStagedRows
+	}
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
 	// source bytes are a different figure and are logged as source_bytes
@@ -326,6 +353,8 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"unplanned_projects", pub.UnplannedProjects,
+		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
+		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
 		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
 		"keys_removed", report.Removed)
@@ -454,11 +483,12 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	if outcome.Class == FailureEngine {
 		// A reproducible crash is the only thing subdivision is for. Every
 		// capability of the result then says so.
-		report, err := p.subdivide(ctx, req, unit, res, run, source, sink, outcome)
+		report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, outcome)
 		if err != nil {
 			return publication{}, ImportReport{}, err
 		}
-		return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(outcome)}, report, nil
+		return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(outcome),
+			OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily}, report, nil
 	}
 
 	exp, err := p.export(ctx, req, unit, res, run, graph)
@@ -654,7 +684,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	report, err := p.importer.Import(ctx, dir, req.Resolver, sink, neo4jcsv.Options{
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
-		Content: req.Content, ScratchDir: scratch,
+		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows,
 		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		return ImportReport{}, err
@@ -672,11 +702,22 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 // run: the caller publishes every capability as partial with the failed unit
 // and the backend failure. If no child produces anything, the unit fails.
 func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, source string, sink provider.Sink, crash Outcome) (ImportReport, error) {
+	run *runDir, source string, sink provider.Sink, crash Outcome) (ImportReport, int, error) {
 
 	children, err := childProjects(source, unit)
 	if err != nil {
-		return ImportReport{}, err
+		return ImportReport{}, 0, err
+	}
+	// The parts are all parsed and imported whatever the count. A user-set
+	// providers.dependence.max_units_per_family says how many parts of one
+	// unit the caller wanted to hear about, so crossing it is reported on
+	// every capability row this subdivided unit publishes.
+	overParts := 0
+	if p.opts.MaxUnitsPerFamily > 0 && int64(len(children)) > p.opts.MaxUnitsPerFamily {
+		overParts = len(children)
+		slog.Warn("a subdivided dependence unit has more parts than providers.dependence.max_units_per_family; every part is analysed",
+			"component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
+			"parts", len(children), "max_units_per_family", p.opts.MaxUnitsPerFamily)
 	}
 	slog.Warn("dependence unit subdivided after a reproducible backend crash", "component", component,
 		"unit", string(req.Unit.ID), "scope", unit.ScopeKey, "pass", crash.Pass, "exception", crash.Exception,
@@ -695,7 +736,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		graph := run.path("graph-" + itoa(int64(i)))
 		out, err := p.parse(ctx, req, unit, res, filepath.Join(source, child), graph, nil)
 		if err != nil {
-			return ImportReport{}, err
+			return ImportReport{}, 0, err
 		}
 		if out.Class != FailureNone {
 			continue
@@ -703,12 +744,12 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		dir := run.path("export-" + itoa(int64(i)))
 		timeout, err := remaining(ctx)
 		if err != nil {
-			return ImportReport{}, err
+			return ImportReport{}, 0, err
 		}
 		exp, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
 			HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
 		if err != nil {
-			return ImportReport{}, err
+			return ImportReport{}, 0, err
 		}
 		if exp.Class != FailureNone || !exp.Live {
 			continue
@@ -721,22 +762,28 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		report, err := p.importExport(ctx, req, unit, filepath.Join(source, child),
 			path.Join(unit.Root, child), dir, sink, ImportOptions{})
 		if err != nil {
-			return ImportReport{}, err
+			return ImportReport{}, 0, err
 		}
 		total = merge(total, report)
 		admitted++
 		_ = os.Remove(graph)
 	}
 	if admitted == 0 {
-		return ImportReport{}, failure(FailureEngine, unit.ScopeKey, crash, res).
+		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, res).
 			WithDetail("reason", "no subdivided part of the unit produced an honest result")
 	}
-	return total, nil
+	return total, overParts, nil
 }
 
 // childProjects lists the immediate subdirectories of a unit's root that hold
 // source, in a stable order. That is the next frontend-native boundary below a
 // project: the project's own top-level packages or source directories.
+//
+// Every one of them is returned. A truncated list would drop whole parts of a
+// crashed unit's source from the only run that can still analyse it, and would
+// do it without a word: the unit would seal, partial for the subdivision, with
+// no sign that the tail of its source was never parsed. The caller reports the
+// count against the user's threshold instead.
 func childProjects(source string, unit Unit) ([]string, error) {
 	entries, err := os.ReadDir(source)
 	if err != nil {
@@ -750,9 +797,6 @@ func childProjects(source string, unit Unit) ([]string, error) {
 		out = append(out, e.Name())
 	}
 	slices.Sort(out)
-	if len(out) > MaxUnitsPerFamily {
-		out = out[:MaxUnitsPerFamily]
-	}
 	if len(out) == 0 {
 		return nil, failure(FailureEngine, unit.ScopeKey, Outcome{}, Reservation{}).
 			WithDetail("reason", "the unit has no boundary below it to split along")
@@ -785,6 +829,13 @@ func merge(a, b ImportReport) ImportReport {
 	a.UnknownRows += b.UnknownRows
 	a.IgnoredFiles += b.IgnoredFiles
 	a.BytesRead += b.BytesRead
+	// Each part stages into its own scratch and compares its own rows against
+	// the threshold, so three parts of ten rows each cross a bound of fifteen
+	// that none of them crossed alone. The unit's count is the sum, and the
+	// caller compares that; the per-part flag is carried too, so a part that
+	// crossed on its own is never lost behind a sum.
+	a.StagedRows += b.StagedRows
+	a.OverStagedRows = a.OverStagedRows || b.OverStagedRows
 	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {

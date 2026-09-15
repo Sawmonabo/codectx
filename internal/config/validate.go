@@ -92,6 +92,8 @@ func (c Config) validate() error {
 		{"context.max_manifest_bytes", c.Context.MaxManifestBytes},
 		{"context.max_capsule_bytes", c.Context.MaxCapsuleBytes},
 		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
+		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
+		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
 	} {
 		if p.v < 0 {
 			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",
