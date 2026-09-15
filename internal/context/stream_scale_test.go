@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,10 +27,41 @@ import (
 // scaleProofEnv opts this file's at-scale proof in.
 const scaleProofEnv = "CODECTX_SCALE_PROOF"
 
-// scaledLeaves are the two fan-out sizes the proof compiles. They must differ
-// by a factor, so a peak that tracked the input could not possibly land on the
-// same number twice.
-var scaledLeaves = []int{20000, 40000}
+// scaleLeavesEnv overrides the fan-out sizes the proof compiles, as a
+// comma-separated list. It exists so a profiling run can walk a curve of sizes
+// (`CODECTX_SCALE_LEAVES=2000,5000,10000`) without editing this file; the
+// default below is the pair docs/performance.md reports.
+const scaleLeavesEnv = "CODECTX_SCALE_LEAVES"
+
+// defaultScaledLeaves are the two fan-out sizes the proof compiles. They must
+// differ by a factor, so a peak that tracked the input could not possibly land
+// on the same number twice.
+var defaultScaledLeaves = []int{20000, 40000}
+
+// scaledLeavesFor reads the sizes to compile, honouring scaleLeavesEnv.
+func scaledLeavesFor(t *testing.T) []int {
+	t.Helper()
+	raw := os.Getenv(scaleLeavesEnv)
+	if raw == "" {
+		return defaultScaledLeaves
+	}
+	out := make([]int, 0, 4)
+	for _, field := range strings.Split(raw, ",") {
+		field = strings.TrimSpace(field)
+		if field == "" {
+			continue
+		}
+		n, err := strconv.Atoi(field)
+		if err != nil || n <= 0 {
+			t.Fatalf("%s=%q: each field must be a positive leaf count", scaleLeavesEnv, raw)
+		}
+		out = append(out, n)
+	}
+	if len(out) < 2 {
+		t.Fatalf("%s=%q: the proof needs at least two sizes to compare", scaleLeavesEnv, raw)
+	}
+	return out
+}
 
 // scaledSpecs is generatedSpecs at an arbitrary fan-out: the same four
 // structural files and the same leaf shape, with the leaf count as a parameter.
@@ -74,6 +107,7 @@ type scaleObservation struct {
 	entries  int
 	peak     map[string]int
 	spilled  map[string]int
+	publish  time.Duration
 	compile  time.Duration
 	pages    []time.Duration
 	pageRows []int
@@ -100,15 +134,17 @@ func TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale(t *testing.T) {
 	// that under -race. The numbers it produces are recorded in
 	// docs/performance.md; run it with CODECTX_SCALE_PROOF=1 to reproduce them.
 	if os.Getenv(scaleProofEnv) == "" {
-		t.Skipf("set %s=1 to run the at-scale compile proof (it publishes %v files)", scaleProofEnv, scaledLeaves)
+		t.Skipf("set %s=1 to run the at-scale compile proof (it publishes %v files)", scaleProofEnv, defaultScaledLeaves)
 	}
+	scaledLeaves := scaledLeavesFor(t)
 	obs := make([]scaleObservation, 0, len(scaledLeaves))
 	for _, leaves := range scaledLeaves {
 		obs = append(obs, measureCompileAtScale(t, leaves))
 	}
 	for _, o := range obs {
-		t.Logf("leaves=%d entries=%d compile=%s pages=%v rows=%v",
-			o.leaves, o.entries, o.compile.Round(time.Millisecond), o.pages, o.pageRows)
+		t.Logf("leaves=%d entries=%d publish=%s compile=%s pages=%v rows=%v",
+			o.leaves, o.entries, o.publish.Round(time.Millisecond),
+			o.compile.Round(time.Millisecond), o.pages, o.pageRows)
 		for name, p := range o.peak {
 			t.Logf("  sort %-16s peak=%d records spilledRuns=%d", name, p, o.spilled[name])
 		}
@@ -125,7 +161,14 @@ func TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale(t *testing.T) {
 			t.Errorf("the %d-leaf compile opened sort %q and the %d-leaf one did not", small.leaves, name, large.leaves)
 			continue
 		}
-		if got != want {
+		// Not exact equality. The budget these sorts hold is a BYTE budget, so
+		// the record at which a run spills depends on the widths of the records
+		// before it, and two compiles whose entries carry different-length
+		// identifiers spill one record apart. What the claim forbids is a peak
+		// that TRACKS the input: over a doubling of the repository the peak must
+		// not move by more than a rounding of one run's worth of records.
+		const slack = 4
+		if d := got - want; d < -slack || d > slack {
 			t.Errorf("sort %q peaked at %d records over %d leaves and %d records over %d leaves: the "+
 				"compile's live working set tracks the repository, not the run budget",
 				name, want, small.leaves, got, large.leaves)
@@ -137,9 +180,23 @@ func TestTheStreamedCompilePeaksOnTheRunBufferAtEitherScale(t *testing.T) {
 // observer attached, and pages the persisted plan back.
 func measureCompileAtScale(t *testing.T, leaves int) scaleObservation {
 	t.Helper()
+	publishStart := time.Now()
 	fx := newFixtureFrom(t, scaledSpecs(leaves), scaledScope(leaves))
+	publish := time.Since(publishStart)
+	// The compile is given the smallest run budget the sort primitive honours,
+	// as the seed-sink proof gives its sorts. Under the default admission
+	// (resources.query_memory_bytes, 32 MiB, a quarter of it per run) a sort of
+	// a few tens of thousands of these records never fills its buffer, so every
+	// sort would peak at exactly the record count it was handed and the
+	// assertion below would compare two DIFFERENT repository-sized numbers and
+	// fail -- not because the working set tracks the repository but because
+	// neither size reached the regime the claim is about. Forcing the floor
+	// puts both sizes past the spill threshold, which is where "the peak is the
+	// run buffer" is a claim at all. It costs wall clock, and docs/performance.md
+	// says so beside the numbers.
+	fx.Cfg.Resources.QueryMemoryBytes = 1 << 20
 	c := intCompiler(t, fx, fx.Now)
-	out := scaleObservation{leaves: leaves, peak: map[string]int{}, spilled: map[string]int{}}
+	out := scaleObservation{leaves: leaves, publish: publish, peak: map[string]int{}, spilled: map[string]int{}}
 	c.observeSorts = func(o []sortObservation) {
 		for _, row := range o {
 			// A pass may open a sort of the same name once per compile; the
