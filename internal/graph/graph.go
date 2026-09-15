@@ -420,9 +420,8 @@ type expandOptions struct {
 	// runs out of depth with a frontier still standing reports reasonDepth;
 	// it is the one bound that is a property of the WALK rather than of the
 	// page, so it is not a per-page budget.
-	MaxDepth  config.Limit
-	Budget    *budget
-	BatchSize int
+	MaxDepth config.Limit
+	Budget   *budget
 	// FrontierBytes is Limits.FrontierBytes: the ceiling on the encoded edges
 	// one frontier level may hold in memory at once. A level that reaches it
 	// SPILLS the run it has collected to the retained directory and carries on

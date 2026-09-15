@@ -576,22 +576,15 @@ func cursorLevelPos(t *testing.T, e *Engine, token string) EdgePos {
 // the level-boundary rule.
 //
 // A deadline can stop a walk BETWEEN levels: the level just finished, the next
-// one is standing in the frontier and has not been read at all. The keyset
-// position the page last emitted belongs to the finished level, so a
-// continuation carrying it hands levelEdges a filter rather than a resume
-// point, and every row of the NEW level whose owner sorts below that node is
-// dropped. Dropped silently: those owners are already in the cumulative visited
-// set, so no later page can reach them, and the answer ends untruncated -- a
-// short answer presented as a whole one, which is the one failure the paging
-// contract may not have.
+// one is standing in the frontier and has not been read at all. The cursor then
+// names the new level in its COLLECTING state at no position, and the whole of
+// it must still be delivered -- an answer short by one level and presented as a
+// whole one is the one failure the paging contract may not have.
 //
-// traverse.go applies the rule to the traversal endpoint and walkrun.go to a
-// walk's internal links; continueWalk, which mints the impact and package
-// continuations, did not.
-//
-// Mutation (applied, run, reverted in one command): continueWalk's
-// LevelBoundary branch deleted -- the resumed walk serves 38 of the 56 entities
-// the unbounded walk serves, with no truncation reason, and this case fails.
+// Mutation (applied, run, reverted in one command): the collecting state's
+// zero position read as "this level is done" -- the resumed walk serves 38 of
+// the 56 entities the unbounded walk serves, with no truncation reason, and
+// this case fails.
 func TestALevelBoundaryDeadlineKeepsTheWholeAnswer(t *testing.T) {
 	// A seed whose whole level fits in ONE adjacency read: the deadline then
 	// lands after the level is finished and before the next is read, which is

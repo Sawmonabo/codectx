@@ -117,7 +117,6 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				Kinds:         kinds,
 				MaxDepth:      maxDepth,
 				Budget:        b,
-				BatchSize:     adjacencyBatch,
 				FrontierBytes: e.limits.FrontierBytes,
 				// Ruling P3, both halves: the deadline ends this page, and it
 				// does so even before the page admitted an edge, because the

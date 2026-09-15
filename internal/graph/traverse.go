@@ -178,8 +178,15 @@ func expand(ctx context.Context, r GraphReader, seeds []model.NodeID, o expandOp
 		c := o.Resume.Cursor
 		st = walkState{Level: c.Level, LevelState: c.LevelState, LevelPos: c.LevelPos,
 			RawBytes: c.RawBytes, LevelOffset: c.LevelOffset}
-		if c.LevelState == levelServing {
-			w.entryLevel = c.Level
+		w.entryLevel = c.Level
+		switch c.LevelState {
+		case levelServing:
+			// The sorted run this leg serves out of.
+			o.Retain.hold(levelFileName(sortedLevelPrefix, c.Level))
+		case levelCollecting:
+			// The run collected so far, and the frontier the scan reads.
+			o.Retain.hold(levelFileName(rawLevelPrefix, c.Level))
+			o.Retain.hold(levelFileName(admittedLevelPrefix, c.Level-1))
 		}
 	}
 	return w.run(ctx, st)
@@ -209,11 +216,12 @@ type levelWalk struct {
 	group     NodeRef
 	groupID   model.NodeID
 	groupOpen bool
-	// entryLevel is the SERVING level this leg was resumed into, or zero. Its
-	// sorted run is the one file the cursor the caller still holds names, so it
-	// outlives the serve and is released when the next cursor supersedes it: a
-	// RETRYABLE failure later in this page tells the caller to present that same
-	// cursor again, and a released run would answer it CTX_STORAGE_CORRUPT.
+	// entryLevel is the level this leg was RESUMED into, or zero. The files the
+	// cursor that named it resumes from are held for the whole page: a
+	// RETRYABLE failure later in this page tells the caller to present that
+	// same cursor again, and a walk that had already deleted them would answer
+	// CTX_STORAGE_CORRUPT -- or, where the deleted file is a frontier, report
+	// itself exhausted and serve a fraction of the answer as the whole of it.
 	entryLevel int
 }
 
@@ -309,6 +317,7 @@ func (w *levelWalk) collect(ctx context.Context, st *walkState) (bool, error) {
 	} else {
 		c = newLevelCollector(o.Retain, st.Level, o.FrontierBytes)
 	}
+	c.keepRaw = o.Retain.isHeld(levelFileName(rawLevelPrefix, st.Level))
 	pos, cut, err := w.scan(ctx, st, c)
 	if err != nil {
 		return false, err
@@ -324,11 +333,21 @@ func (w *levelWalk) collect(ctx context.Context, st *walkState) (bool, error) {
 		st.LevelPos, st.RawBytes, st.More = pos, c.rawBytes(), true
 		return true, nil
 	}
-	sorted, err := c.finish(ctx)
+	// The TRANSITION runs to completion whatever the clock says. It is the one
+	// step of the pipeline with no resumable half: the sort consumes the
+	// collected run and admitLevel writes the level's admitted file and then
+	// applies it to the bitsets, so a deadline landing between those leaves a
+	// frontier that is neither the level below nor the level above, and the
+	// walk that resumes on it cannot apply the direction rule (ADR-0005). It is
+	// bounded local work over records already read -- no adjacency read happens
+	// here -- and the page it overruns ends in the SERVING state immediately
+	// after, which IS resumable.
+	tctx := context.WithoutCancel(ctx)
+	sorted, err := c.finish(tctx)
 	if err != nil {
 		return false, err
 	}
-	admitted, err := o.Retain.admitLevel(ctx, sorted, st.Level, w.costs)
+	admitted, err := o.Retain.admitLevel(tctx, sorted, st.Level, w.costs)
 	if err != nil {
 		return false, err
 	}
@@ -575,7 +594,6 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 		stop  bool
 		at    = st.LevelOffset
 	)
-	st.LevelBoundary = false
 	// take names the batch and hands it to the visitor. A visitor stop leaves
 	// `at` on the record it refused, so the continuation delivers that record
 	// first and none is served twice or lost.
@@ -648,18 +666,20 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 		return false, err
 	}
 	// The level has been served whole: the frontier it was collected from is
-	// released, its own sorted run with it, and the level after it begins. The
-	// run this leg was RESUMED into is held back instead -- see entryLevel.
-	if st.Level == w.entryLevel {
-		o.Retain.holdServed(st.Level)
-	} else if err := w.sorted.release(); err != nil {
-		return false, err
+	// released, its own sorted run with it, and the level after it begins. What
+	// the cursor this leg was handed still names is held back -- see entryLevel.
+	if !o.Retain.isHeld(levelFileName(sortedLevelPrefix, st.Level)) {
+		if err := w.sorted.release(); err != nil {
+			return false, err
+		}
 	}
-	if err := o.Retain.releaseFrontier(st.Level - 1); err != nil {
-		return false, err
+	if frontier := levelFileName(admittedLevelPrefix, st.Level-1); !o.Retain.isHeld(frontier) {
+		if err := o.Retain.releaseFrontier(st.Level - 1); err != nil {
+			return false, err
+		}
 	}
 	w.sorted = nil
-	st.Level, st.LevelState, st.LevelOffset, st.LevelBoundary = st.Level+1, levelCollecting, 0, true
+	st.Level, st.LevelState, st.LevelOffset = st.Level+1, levelCollecting, 0
 	return false, nil
 }
 
@@ -801,11 +821,6 @@ type walkState struct {
 	// More reports that the walk stopped with work still in front of it. A walk
 	// that ran out of frontier leaves it false and mints no continuation.
 	More bool
-	// LevelBoundary records that the walk stopped at the END of a serving level
-	// rather than inside one: no record of the level the walk is now in has
-	// been taken. It is reported because a page that took nothing must not be
-	// read as one that made progress.
-	LevelBoundary bool
 	// DepthLimited records that the walk stopped because the user-set depth
 	// bound was reached, with those nodes' edges still unread.
 	//
@@ -1075,8 +1090,8 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	}
 	// The retained state of THIS walk, exactly as impact and the package rollup
 	// keep theirs: the frontier the walk commits level by level, the cumulative
-	// admitted-node bitset and the cumulative emitted-relation bitset. A
-	// resumed page reopens the one its predecessor left.
+	// admitted-node bitset it tests membership against. A resumed page reopens
+	// the one its predecessor left.
 	//
 	// It is opened UNCONDITIONALLY now, where a first page used to create one
 	// only if it actually minted a continuation. The bitset IS the membership
@@ -1156,7 +1171,6 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 		Kinds:         kinds,
 		MaxDepth:      maxDepth,
 		Budget:        b,
-		BatchSize:     adjacencyBatch,
 		FrontierBytes: e.limits.FrontierBytes,
 		DeadlineStops: true,
 		Resume:        resume,

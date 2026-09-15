@@ -219,8 +219,12 @@ type levelCollector struct {
 	resident [][]byte
 	bytes    int64
 	// raw is the spilled run, nil while resident.
-	raw   *retainFile
-	count int64
+	raw *retainFile
+	// keepRaw leaves the collected run in place when the level is sorted: it is
+	// the run the cursor this leg was HANDED resumes from, and a retryable
+	// failure later in the page sends the caller back to that cursor.
+	keepRaw bool
+	count   int64
 }
 
 // newLevelCollector starts a fresh level.
@@ -321,12 +325,12 @@ func (c *levelCollector) finish(ctx context.Context) (*sortedLevel, error) {
 	if err := out.close(); err != nil {
 		return nil, err
 	}
-	if c.raw != nil {
+	if c.raw != nil && !c.keepRaw {
 		if err := c.raw.remove(); err != nil {
 			return nil, err
 		}
-		c.raw = nil
 	}
+	c.raw = nil
 	return &sortedLevel{level: c.level, file: out, count: c.count}, nil
 }
 
