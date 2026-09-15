@@ -324,8 +324,13 @@ Every node goes through `req.Resolver`; the provider copies
 | the file node a file-level occurrence points out of | `workspace`, native key `file:<path>` | exactly the filesystem provider's file candidate: kind `file`, name `path.Base`, qualified name = path, no defining file, no range, no language. Resolving it against the declared `filesystem` dependency adopts that provider's identity instead of minting a second file node for one path; SCIP's own evidence row (`[0, size)` of the pinned file) stays on it |
 
 Name is `display_name`, else the last descriptor's name. Signature is
-`signature_documentation.text` when it fits the signature ceiling.
-Ambiguous resolutions become `may_refer_to` edges.
+`signature_documentation.text`, truncated to the signature ceiling when it is
+longer and flagged on the node as `"truncated_fields":{"signature":<original
+byte length>}` — the same index-time truncation attribute the structural
+provider publishes, never merged with a result page's transient truncation
+flag. Only the ceiling is ever read off the wire, so a signature of any size
+costs the ceiling and not itself. Ambiguous resolutions become `may_refer_to`
+edges.
 
 Node kind is `SymbolInformation.Kind` mapped to Section 9.2: Class, Object,
 SingletonClass, Mixin, Concept and the bare type kinds (Type, TypeAlias,
@@ -398,20 +403,40 @@ wrong range.
 
 ## Bounds
 
-`scip.Limits` (defaults in `DefaultLimits`): whole index 1 GiB; one record
-`resources.max_provider_record_bytes` (4 MiB); 1,000,000 documents; 4,000,000
-occurrences per document; 4 GiB spooled; one source file 5 MiB (a larger file
-is skipped, `partial` with `CTX_RESOURCE_LIMIT`); materialization 4 GiB;
-manifest 64 MiB.
+`scip.Limits` is seven `providers.scip.*` keys, **all unlimited by default**,
+and one constant. Nothing here refuses a repository for its size unless an
+operator asked for it: `max_index_bytes`, `max_manifest_bytes`,
+`max_documents`, `max_occurrences_per_document` and `max_spool_bytes` cut
+nothing at all, because the index streams record by record, documents and
+occurrences spool to an on-disk database and a manifest is scanned line by
+line. A value an operator sets and this run crossed is published on every
+capability row of the unit as `partial` with `CTX_RESOURCE_LIMIT`, under the
+detail `resource_limits_exceeded`, as a sorted `key=seen/bound` list — the run
+reports that the figure was passed and admits every fact regardless.
+
+Two of the seven do leave something out, because they are the two that bound
+memory and disk rather than counting them: `max_source_file_bytes` (a document
+whose source would be held whole is skipped, reported under the same detail)
+and `max_materialize_bytes` (files left out of an indexer's private copy,
+named in the materializer's own operator report with a complete count). Both
+are therefore part of the index fingerprint; the five reporting thresholds
+deliberately are not, so adjusting one never invalidates an index.
+
+`MaxRecordBytes` (4 MiB) is the one bound that stays product code. It is the
+wire reader's pre-allocation ceiling — the bytes one record may cause to be
+allocated before it is decoded — not a figure about the repository, and it
+must stay positive.
 
 The record buffer — the only buffer sized by untrusted index bytes — is
 charged against the sink's byte pool through `Reserve` when the sink offers
 it. One document's source bytes are **not** charged: `BatchSink.Reserve`
 refuses a reservation above `resources.max_provider_record_bytes` (4 MiB),
-while a source file is bounded by `MaxSourceFileBytes` (5 MiB), so the charge
-is impossible for exactly the largest case. At most one document's source is
-held at a time, so a unit retains up to `MaxSourceFileBytes` (5 MiB) outside
-the pool's accounting, on top of the pool's own budget. That buffer is sized
+while a source file is bounded only by what the operator set in
+`max_source_file_bytes`, so the charge is impossible for exactly the largest
+case. At most one document's source is held at a time, so a unit retains one
+document's source outside the pool's accounting, on top of the pool's own
+budget — the one place an unset bound leaves peak memory a function of the
+largest file the index describes, which is why this bound exists to be set. That buffer is sized
 by the pinned snapshot file, whose size is checked before the read.
 
 ## Payload resolution

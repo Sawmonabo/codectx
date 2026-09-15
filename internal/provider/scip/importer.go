@@ -518,10 +518,15 @@ func (im *importer) recordSymbol(ctx context.Context, doc int64, s symbolInfo) e
 	if name == "" {
 		name = sym.lastName
 	}
-	if err := im.sc.exec(ctx, `INSERT INTO sym(key, symbol, kind, name, sig) VALUES(?, ?, ?, ?, ?)
+	// sigcut follows sig through the same arm: the stored signature and the
+	// original length it was cut from are one fact, and a twice-seen symbol
+	// keeping one from each row would publish a flag about a value it does
+	// not hold.
+	if err := im.sc.exec(ctx, `INSERT INTO sym(key, symbol, kind, name, sig, sigcut) VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET kind = CASE WHEN sym.kind = 0 THEN excluded.kind ELSE sym.kind END,
 		name = CASE WHEN sym.name = '' THEN excluded.name ELSE sym.name END,
-		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature); err != nil {
+		sigcut = CASE WHEN sym.sig = '' THEN excluded.sigcut ELSE sym.sigcut END,
+		sig = CASE WHEN sym.sig = '' THEN excluded.sig ELSE sym.sig END`, key, s.symbol, s.kind, name, s.signature, s.signatureCut); err != nil {
 		return err
 	}
 	for _, rel := range s.relationships {
@@ -882,7 +887,8 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	key := symKey(ds.doc.idx, sym)
 	var kind int32
 	var name, sig, existing string
-	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &existing); err != nil {
+	var sigCut int64
+	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node, sigcut FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &existing, &sigCut); err != nil {
 		return err
 	}
 	if name == "" {
@@ -901,7 +907,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	}
 	loc := location{file: ds.doc.file, rng: rng}
 	if publish {
-		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false); err != nil {
+		if err := im.putNode(ctx, res, sym.raw, "definition", loc, false, sigCut); err != nil {
 			return err
 		}
 		if err := im.sink.PutAliases(ctx, []model.NativeAlias{{ScopeKey: cand.ScopeKey, NativeKey: sym.raw, NodeID: res.Node.ID}}); err != nil {
@@ -940,7 +946,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 // belong to one path's rows, and a refresh that changed a different document
 // would then publish a second evidence row for the same node on every pass
 // until the bound of Section 11.1 was reached.
-func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey, detail string, loc location, external bool) error {
+func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey, detail string, loc location, external bool, sigCut int64) error {
 	node := res.Node
 	meta := map[string]any{}
 	if im.unverify {
@@ -949,6 +955,13 @@ func (im *importer) putNode(ctx context.Context, res model.Resolution, nativeKey
 	if external {
 		meta["scip_external"] = true
 		loc = location{}
+	}
+	if sigCut > 0 {
+		// Index-time field truncation, on the fact itself and under the same
+		// attribute the structural provider publishes, so an answer built
+		// from either says which stored value was cut and how long it was.
+		// Never merged with a result page's transient truncation flag.
+		meta["truncated_fields"] = map[string]int64{"signature": sigCut}
 	}
 	if len(meta) > 0 {
 		raw, err := json.Marshal(meta)
@@ -1103,7 +1116,8 @@ func (im *importer) putCallsiteAlias(ctx context.Context, p string, rng *model.S
 func (im *importer) targetNode(ctx context.Context, key string, sym symbol, loc location) (model.NodeID, error) {
 	var kind int32
 	var name, sig, node string
-	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &node); err != nil {
+	var sigCut int64
+	if _, err := im.sc.row(ctx, `SELECT kind, name, sig, node, sigcut FROM sym WHERE key = ?`, []any{key}, &kind, &name, &sig, &node, &sigCut); err != nil {
 		return "", err
 	}
 	if node != "" {
@@ -1122,7 +1136,7 @@ func (im *importer) targetNode(ctx context.Context, key string, sym symbol, loc 
 	if err != nil {
 		return "", err
 	}
-	if err := im.putNode(ctx, res, sym.raw, "reference", loc, true); err != nil {
+	if err := im.putNode(ctx, res, sym.raw, "reference", loc, true, sigCut); err != nil {
 		return "", err
 	}
 	for _, other := range res.Ambiguous {
@@ -1172,7 +1186,7 @@ func (im *importer) enclosingNode(ctx context.Context, ds *docSource, rng *model
 	if err != nil {
 		return "", err
 	}
-	if err := im.putNode(ctx, res, cand.NativeKey, "document", location{file: ds.doc.file, rng: whole}, false); err != nil {
+	if err := im.putNode(ctx, res, cand.NativeKey, "document", location{file: ds.doc.file, rng: whole}, false, 0); err != nil {
 		return "", err
 	}
 	return res.Node.ID, im.sc.exec(ctx, `UPDATE docs SET file_node = ? WHERE idx = ?`, string(res.Node.ID), ds.doc.idx)
