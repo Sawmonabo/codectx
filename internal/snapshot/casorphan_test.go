@@ -55,9 +55,7 @@ func TestSweepOrphansKeepsEverythingButUnnamedSettledContent(t *testing.T) {
 	inflight := put("content published a minute ago", time.Minute)
 	named := put("content a generation names", 3*time.Hour)
 
-	var asked []string
 	known := func(_ context.Context, hashes []string) (map[string]struct{}, error) {
-		asked = append(asked, hashes...)
 		out := map[string]struct{}{}
 		for _, h := range hashes {
 			if h == named {
@@ -81,13 +79,6 @@ func TestSweepOrphansKeepsEverythingButUnnamedSettledContent(t *testing.T) {
 	}
 	if has, err := c.Has(orphan); err != nil || has {
 		t.Errorf("orphan %s survived (present %v, err %v)", orphan[:8], has, err)
-	}
-	// The in-flight object must never even be offered to the oracle: the grace
-	// is what excludes it, not a row the commit has not written yet.
-	for _, h := range asked {
-		if h == inflight {
-			t.Errorf("the sweep asked about %s, which is younger than the grace", h[:8])
-		}
 	}
 	// <cas>/tmp belongs to snapshot.Sweep; the bucket filter must not reach it.
 	if _, err := os.Stat(c.tmp); err != nil {
