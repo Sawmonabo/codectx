@@ -713,7 +713,7 @@ func legSpooledPage(t *testing.T, f *fixture) {
 	if rest != 0 {
 		t.Fatalf("readSpool reports %d hits past a page that holds the whole spool", rest)
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !reflect.DeepEqual(spooledHits(got), want) {
 		t.Fatalf("readSpool replayed %+v, want %+v", got, want)
 	}
 	if !meta.Truncated || meta.TruncationReason != testTruncationReason {
@@ -1479,13 +1479,23 @@ func legSymbolByCanonicalID(t *testing.T, f *fixture) {
 	}
 }
 
+// spooledHits projects replayed spool records back to the hits a page serves,
+// so a test that asserts the round trip compares hits with hits.
+func spooledHits(in []spooledHit) []model.SearchHit {
+	out := make([]model.SearchHit, len(in))
+	for i, h := range in {
+		out[i] = h.Hit
+	}
+	return out
+}
+
 // sliceTail streams an already-materialised tail into a spool sink. Only a
 // test has one: both production tails -- the ranked run on a first page, the
 // source spool on a continuation -- are walks, never slices.
-func sliceTail(hits []model.SearchHit) func(func(model.SearchHit) error) error {
-	return func(yield func(model.SearchHit) error) error {
+func sliceTail(hits []model.SearchHit) func(func(spooledHit) error) error {
+	return func(yield func(spooledHit) error) error {
 		for _, h := range hits {
-			if err := yield(h); err != nil {
+			if err := yield(spooledHit{Hit: h}); err != nil {
 				return err
 			}
 		}
@@ -1600,10 +1610,10 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
 		}
 		now := time.Now().UTC()
 		c := newCursor(endpointSearch, f.binding, lease.ID, searchQueryHash(model.SearchRequest{Query: "handle"}), now.Add(time.Minute))
-		id, err := spoolHits(spools, c, spoolMeta{}, func(yield func(model.SearchHit) error) error {
+		id, err := spoolHits(spools, c, spoolMeta{}, func(yield func(spooledHit) error) error {
 			for i := range n {
-				if err := yield(model.SearchHit{NodeID: model.NodeID("n" + strconv.Itoa(i)),
-					Path: "pkg/f.go", Name: "name" + strconv.Itoa(i), Tier: model.TierLexicalFTS}); err != nil {
+				if err := yield(spooledHit{Hit: model.SearchHit{NodeID: model.NodeID("n" + strconv.Itoa(i)),
+					Path: "pkg/f.go", Name: "name" + strconv.Itoa(i), Tier: model.TierLexicalFTS}}); err != nil {
 					return err
 				}
 			}
@@ -1678,9 +1688,9 @@ func legSpoolToSpoolIsReentrant(t *testing.T, f *fixture) {
 			Signature: "func n" + strconv.Itoa(i) + "()", Tier: model.TierLexicalFTS,
 			Reasons: []string{"matched the lexical tier"}, OccurrenceCount: 1}
 	}
-	id, err := spoolHits(spools, source, spoolMeta{}, func(yield func(model.SearchHit) error) error {
+	id, err := spoolHits(spools, source, spoolMeta{}, func(yield func(spooledHit) error) error {
 		for i := range total {
-			if err := yield(hitAt(i)); err != nil {
+			if err := yield(spooledHit{Hit: hitAt(i)}); err != nil {
 				return err
 			}
 		}
@@ -1708,7 +1718,7 @@ func legSpoolToSpoolIsReentrant(t *testing.T, f *fixture) {
 			len(page), rest, model.MaxPageItems, want)
 	}
 	for i := range page {
-		if !reflect.DeepEqual(page[i], hitAt(skip+i)) {
+		if !reflect.DeepEqual(page[i].Hit, hitAt(skip+i)) {
 			t.Fatalf("copied hit %d = %+v, want %+v", i, page[i], hitAt(skip+i))
 		}
 	}
@@ -1809,10 +1819,10 @@ func legPageClampIsReported(t *testing.T, f *fixture) {
 // an off-by-one in its skip, or a chunk flush that dropped its buffer --
 // would show up here and nowhere else.
 //
-// It asserts the WHOLE hit, field for field: a spool record is a
-// model.SearchHit and the continuation has no reader left to repair it from,
-// so Reasons, Range, Kind, Name, QualifiedName and Signature survive the round
-// trip or they are lost for every page but the first.
+// It asserts the WHOLE hit, field for field: Reasons, Kind, Name,
+// QualifiedName and Signature survive the spool round trip or they are lost
+// for every page but the first, and Range must come back identical although
+// the continuation -- not the first page -- is now what hydrates it.
 //
 // The corpus walk reaches one chunk; the second half drives tailOf itself past
 // its model.MaxPageItems chunk boundary, which is the arm a small corpus can
@@ -1855,12 +1865,11 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 		t.Fatalf("the walked answer differs from the whole one")
 	}
 
-	// The multi-chunk arm. tailOf flushes every model.MaxPageItems records, so
-	// a tail of 2.25 chunks crosses two flush boundaries and ends on a partial
-	// one. The reference is the run's own order projected through servableHit,
-	// which is what a page IS; nothing is hydrated here (no candidate carries a
-	// span), so the comparison is exactly the streaming, not the reader.
-	s2 := newService(t, f.opts)
+	// The wide arm. A tail of 2.25 page bounds walks well past any single
+	// page, which is where a skip that lost or repeated a record would hide.
+	// The reference is the run's own order projected through servableHit,
+	// which is what a page IS; tailOf hydrates nothing, so the comparison is
+	// exactly the streaming, not the reader.
 	c := collectorFor(t)
 	const wide = model.MaxPageItems*2 + model.MaxPageItems/4
 	for i := range wide {
@@ -1885,15 +1894,15 @@ func legStreamedWalkParity(t *testing.T, f *fixture) {
 	}
 	const skip = 3
 	var got []model.SearchHit
-	if err := s2.tailOf(f.ctx, nil, run, skip)(func(h model.SearchHit) error {
-		got = append(got, h)
+	if err := tailOf(f.ctx, run, skip)(func(h spooledHit) error {
+		got = append(got, h.Hit)
 		return nil
 	}); err != nil {
 		t.Fatalf("streaming the wide tail: %v", err)
 	}
 	if !reflect.DeepEqual(got, want[skip:]) {
-		t.Fatalf("the streamed tail is %d hits and the run past the skip is %d; across %d chunk flushes "+
-			"they must be the same hits in the same order", len(got), len(want)-skip, wide/model.MaxPageItems)
+		t.Fatalf("the streamed tail is %d hits and the run past the skip is %d; they must be "+
+			"the same hits in the same order", len(got), len(want)-skip)
 	}
 }
 

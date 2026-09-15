@@ -129,7 +129,7 @@ percentile over `n` samples.
 |---|---|---|---|---|
 | 1 | `version --json` startup | 50 ms | p95 **2.96 ms** / 20 | PASS |
 | 2 | Exact symbol/path query | 50 ms | p95 **1.09 ms** / 50 | PASS |
-| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS |
+| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS — at enterprise scale see the first-page table below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
 | 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
@@ -212,6 +212,30 @@ and one is not:
   would drop the one hop that still adds nodes on a deeper graph. Whether a
   work limit like this one should default to unlimited at all is a separate
   question and is not answered by this measurement.
+
+### Row 3 at enterprise scale — first-page latency on a 13 223-file repository
+
+Row 3's 150 ms target is measured at small-real scale. On a 13 223-file,
+1.36 GiB store the first page of a corpus-frequent term costs far more, and
+the dominant term was never the ranking: a first page hydrated the *whole*
+answer -- every hit past the page was read out of the CAS, block-hash
+verified and scanned for line and column positions on its way into the
+continuation spool. Hydration is now paid by the page that serves a hit.
+
+| Query | First page before | First page after |
+|---|---|---|
+| `search function` | 4.17 s | **1.71 s** |
+| `search Meteor` | 4.94 s | **2.10 s** |
+| `search return` | 1.49 s | **0.79 s** |
+| `search user` | 0.87 s | **0.40 s** |
+| `search createAccount` (6 hits) | 0.08 s | 0.11 s |
+| continuation page 2 | 0.17 s | 0.20 s |
+
+Pages 1 to 3 are byte-identical before and after: the set, the global
+ranking and every served field are unchanged, because hydration is a pure
+function of a file and a byte interval over the pinned generation. The
+residual on the two widest terms is candidate scoring and the external sort
+of the whole match set, not hydration.
 
 ## 4. Misses, skips and unproven platforms
 
