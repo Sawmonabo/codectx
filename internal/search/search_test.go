@@ -271,6 +271,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"rank/dedup_folds_occurrences_and_keeps_the_lowest_tier", legDedupFolds},
 		{"rank/dedup_falls_back_to_path_and_start_byte", legDedupFileKey},
 		{"rank/the_ranked_set_keeps_every_distinct_hit", legRankedSetLossless},
+		{"rank/the_answer_does_not_depend_on_the_order_candidates_arrive", legFoldOrderIndependent},
 		{"rank/the_ranked_set_is_bounded_by_its_run_budget", legRankedSetIsBoundedByItsRunBudget},
 		{"cursor/a_streamed_continuation_walk_reproduces_the_whole_answer", legStreamedWalkParity},
 		{"rank/reasons_stay_within_their_bounds", legReasonBounds},
@@ -402,6 +403,73 @@ func legLessChain(t *testing.T, _ *fixture) {
 // compares, which scoredOf leaves empty.
 func withQName(s scored, q string) scored     { s.Hit.QualifiedName = q; return s }
 func withSignature(s scored, v string) scored { s.Hit.Signature = v; return s }
+
+// legFoldOrderIndependent is the certification F9 invariant in one package:
+// the served answer must be a pure function of the candidates, never of the
+// order they arrive in. A delta re-index walks the lexical tier in a different
+// search_units.doc_id order than a fresh index of the same tree does -- a
+// delta carries doc ids forward, a fresh index assigns them anew -- so any
+// arrival-ordered choice makes the two indexes of one tree answer differently.
+//
+// The shape is the real one that broke: a Markdown file's headings all carry
+// that file's document node as their NodeID, so they share a deduplication key
+// while differing in name, range and score; and one group spans two tiers, the
+// case where folding the ACCUMULATED score made the survivor arrival-ordered.
+//
+// Mutation: restore `keep.Hit, keep.Span = a.Hit, a.Span` in fold, or compare
+// Folded instead of ScoreMicros in it, and this fails.
+func legFoldOrderIndependent(t *testing.T, _ *fixture) {
+	// Three headings of one Markdown file under the file's document node,
+	// plus a two-tier group: an exact-name hit and a lexical hit of one node.
+	group := []scored{
+		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 0, "n-doc", "k-h1"), model.NodeDocument, "Skill: Reverse-Proxy Config Hunt", 34),
+		scoredOf(rankedOf(model.TierLexicalFTS, 700, "docs/skill.md", 5474, "n-doc", "k-h2"), model.NodeDocument, "1. Map the config surface", 5504),
+		scoredOf(rankedOf(model.TierLexicalFTS, 900, "docs/skill.md", 5771, "n-doc", "k-h3"), model.NodeDocument, "2. Config failure patterns", 5802),
+		scoredOf(rankedOf(model.TierExactName, 0, "pkg/cfg.go", 12, "n-fn", "k-fn-x"), model.NodeFunction, "Config", 40),
+		scoredOf(rankedOf(model.TierLexicalFTS, 5000, "pkg/cfg.go", 12, "n-fn", "k-fn-y"), model.NodeFunction, "Config", 40),
+		scoredOf(rankedOf(model.TierLexicalFTS, 100, "pkg/other.go", 3, "n-o", "k-o"), model.NodeFunction, "configure", 20),
+	}
+	// Every permutation of six candidates is 720 orders. These five are chosen
+	// so that EVERY member of each deduplication group leads its group in at
+	// least one of them: an order that always offers the eventual survivor
+	// first would pass even with the arrival-ordered fold restored.
+	orders := [][]int{{0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {2, 0, 4, 1, 5, 3}, {1, 3, 5, 0, 2, 4}, {4, 5, 0, 2, 3, 1}}
+	var want []string
+	for _, order := range orders {
+		c := collectorFor(t)
+		for _, i := range order {
+			v := group[i]
+			if err := c.add(v.ranked, hitFacts{hit: v.Hit, span: v.Span}, "matched the "+string(v.Tier)+" tier"); err != nil {
+				t.Fatalf("order %v: adding a candidate: %v", order, err)
+			}
+		}
+		var got []string
+		for _, r := range resultsOf(t, c) {
+			got = append(got, fmt.Sprintf("%s|%d|%s|%s|%d|%v", r.Tier, r.ScoreMicros, r.Hit.Path, r.Hit.Name, r.Occurrences, r.Reasons))
+		}
+		if want == nil {
+			want = got
+			if len(want) != 3 {
+				t.Fatalf("the three deduplication keys folded to %d results: %v", len(want), want)
+			}
+			continue
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("arrival order %v served\n  %v\nbut the first order served\n  %v", order, got, want)
+		}
+	}
+	// The two-tier group ranks first -- it keeps the LOWER tier rank -- and it
+	// is served at the higher score, carrying the reasons of both sides in a
+	// fixed order.
+	if want[0] != "exact_name|5000|pkg/cfg.go|Config|2|[matched the exact_name tier matched the lexical_fts tier]" {
+		t.Errorf("the two-tier group served %q, want the exact tier at the lexical score", want[0])
+	}
+	// The survivor of the Markdown group is decided by content, not by which
+	// heading arrived first: highest score, then the earliest start byte.
+	if want[1] != "lexical_fts|900|docs/skill.md|Skill: Reverse-Proxy Config Hunt|3|[matched the lexical_fts tier]" {
+		t.Errorf("the Markdown group served %q, want the highest-scoring, earliest heading", want[1])
+	}
+}
 
 // legQuantization proves the one float boundary. Ranking compares int64 only;
 // a drifting or truncating quantizer would make two releases disagree on the
