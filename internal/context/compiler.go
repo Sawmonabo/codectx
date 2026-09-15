@@ -137,7 +137,10 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 			// The reused header knows its scope is partial but not how many
 			// candidates were excluded -- the count lives in the stored
 			// exclusion projection, not in the manifest -- so the pointer is
-			// emitted without a count rather than withheld. Without it a caller
+			// emitted without a count rather than withheld, and it does not
+			// claim exclusions exist: a scope also goes incomplete with none
+			// (an unreadable evidence route), so the count-less form promises
+			// only the surface, never rows. Without it a caller
 			// who hits the reuse path reads scope_complete=false with nothing
 			// naming the surface that says why.
 			m.Notices = append(m.Notices, excludedViewNotice)
@@ -276,7 +279,7 @@ func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
 // commands.
 const (
 	excludedViewPointer = "page them with `codectx context entries <session-id> --view excluded`"
-	excludedViewNotice  = "this plan's scope is incomplete and candidates were excluded with reasons; " + excludedViewPointer
+	excludedViewNotice  = "this plan's scope is incomplete; any excluded candidates and their reasons are paged there too -- " + excludedViewPointer
 )
 
 // Close releases the compiler's own resources. It does not close the injected
