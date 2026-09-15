@@ -26,11 +26,11 @@ import (
 // mirrors the generation semi-join the store's build performs.
 type MemoryGraph struct {
 	binding model.Binding
-	// nodes is indexed by surrogate-1, in ascending canonical-id order, which
-	// is how NewMemoryGraph assigns surrogates: deterministically from the
-	// content-derived ids alone, so the same fixture always yields the same
-	// refs. The store assigns its own surrogates (node_ids.id, no
-	// renumbering); nothing may assume the two agree.
+	// nodes is indexed by surrogate-1, in the order NewMemoryGraphOrdered was
+	// given -- ascending canonical id unless a MemoryGraphOrder says otherwise:
+	// deterministically from the content-derived ids alone, so the same fixture
+	// always yields the same refs. The store assigns its own surrogates
+	// (node_ids.id, no renumbering); nothing may assume the two agree.
 	nodes   []model.Node
 	refByID map[model.NodeID]NodeRef
 
@@ -79,11 +79,40 @@ func (t *memKindTable) Kind(code KindCode) (model.RelationKind, bool) {
 
 func (t *memKindTable) Len() int { return len(t.byCode) }
 
-// NewMemoryGraph builds a reader over the fixture. It never fails: a relation
-// naming a node the fixture does not carry is invisible and is dropped, which
-// is exactly what the generation semi-join does to a relation whose endpoints
-// are not in the generation.
+// MemoryGraphOrder chooses the sequence surrogates are handed out in. Both
+// fields are optional and default to ascending canonical order, which is what
+// NewMemoryGraph uses.
+//
+// It exists because the store assigns its own surrogates (node_ids.id,
+// relation_ids.id, no renumbering) and NOTHING may assume they ascend with the
+// canonical id. A fixture whose two orders always agree cannot tell an answer
+// keyed by the canonical id from one keyed by the surrogate, so every ordering
+// and tie-break test written against the default fixture passes whichever key
+// the code actually used. A test that supplies a reversed order here makes the
+// two orders diverge and the confusion observable.
+type MemoryGraphOrder struct {
+	// Nodes orders the canonical node ids; surrogate 1 goes to the first.
+	Nodes func(a, b model.NodeID) int
+	// Relations does the same for relation ids.
+	Relations func(a, b model.RelationID) int
+}
+
+// NewMemoryGraph builds a reader over the fixture, assigning surrogates in
+// ascending canonical-id order. It never fails: a relation naming a node the
+// fixture does not carry is invisible and is dropped, which is exactly what the
+// generation semi-join does to a relation whose endpoints are not in the
+// generation.
 func NewMemoryGraph(binding model.Binding, nodes []model.Node, relations []model.Relation) *MemoryGraph {
+	return NewMemoryGraphOrdered(binding, nodes, relations, MemoryGraphOrder{})
+}
+
+// NewMemoryGraphOrdered is NewMemoryGraph with the surrogate assignment order
+// chosen by the caller. Everything else -- visibility, the kind dictionary, the
+// per-list edge order, the side arrays and the container attribution -- is
+// unchanged, so the same fixture answers the same facts whatever order it is
+// built in, and the conformance suite runs against both.
+func NewMemoryGraphOrdered(binding model.Binding, nodes []model.Node, relations []model.Relation,
+	order MemoryGraphOrder) *MemoryGraph {
 	g := &MemoryGraph{binding: binding, refByID: map[model.NodeID]NodeRef{}, relByID: map[model.RelationID]RelRef{}}
 
 	byID := make(map[model.NodeID]model.Node, len(nodes))
@@ -94,7 +123,7 @@ func NewMemoryGraph(binding model.Binding, nodes []model.Node, relations []model
 	for id := range byID {
 		ids = append(ids, id)
 	}
-	slices.Sort(ids)
+	slices.SortFunc(ids, orderOr(order.Nodes, cmp.Compare[model.NodeID]))
 	g.nodes = make([]model.Node, 0, len(ids))
 	for i, id := range ids {
 		g.refByID[id] = NodeRef(i + 1)
@@ -117,7 +146,7 @@ func NewMemoryGraph(binding model.Binding, nodes []model.Node, relations []model
 	for id := range rels {
 		relIDs = append(relIDs, id)
 	}
-	slices.Sort(relIDs)
+	slices.SortFunc(relIDs, orderOr(order.Relations, cmp.Compare[model.RelationID]))
 	g.relIDs = relIDs
 	for i, id := range relIDs {
 		g.relByID[id] = RelRef(i + 1)
@@ -180,15 +209,15 @@ func NewMemoryGraph(binding model.Binding, nodes []model.Node, relations []model
 		// Several containers can claim one node; the LOWEST CANONICAL ID wins,
 		// which is the tie-break the package rollup uses today, so the
 		// attribution is reproducible from the facts and not from the order the
-		// adjacency returned. Surrogates here ascend with the canonical id, so
-		// the lowest surrogate is the lowest canonical id -- the store's build
-		// cannot take that shortcut and compares the ids themselves.
+		// adjacency returned. The CANONICAL ids are compared, never the
+		// surrogates: MemoryGraphOrder lets the two orders diverge, and the
+		// store's build cannot take that shortcut either.
 		var best NodeRef
 		for _, e := range g.in[ref] {
 			if e.Kind != containsCode || !memIsContainerKind(g.nodeKinds[e.Neighbour]) {
 				continue
 			}
-			if best == 0 || e.Neighbour < best {
+			if best == 0 || g.nodes[e.Neighbour-1].ID < g.nodes[best-1].ID {
 				best = e.Neighbour
 			}
 		}
@@ -463,4 +492,13 @@ func (g *MemoryGraph) EvidenceFor(ctx context.Context, relations []model.Relatio
 // Capabilities reports none: a fixture has no provider run behind it.
 func (g *MemoryGraph) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	return nil, ctx.Err()
+}
+
+// orderOr is the caller's comparator, or the canonical ascending one when it
+// supplied none.
+func orderOr[T any](order, fallback func(a, b T) int) func(a, b T) int {
+	if order != nil {
+		return order
+	}
+	return fallback
 }

@@ -47,7 +47,19 @@ with their evidence counts, which is a summary and never a precise symbol call.
 `refs` separates the two counts Section 9.2 requires: a symbol referenced twice
 inside one canonical relation is **one relation and two occurrences**. Each item
 is one occurrence and carries the precision class, file and byte range of the
-evidence row behind it.
+evidence row behind it. The order is the **canonical relation id ascending**,
+and a page ends on a relation boundary, so the pages of one `refs` answer
+concatenate to the single-shot answer: the same occurrences, in the same order,
+each listed exactly once. That order is a property of the facts alone — it does
+not move when a reindex renumbers the store's internal identifiers — so a
+`refs` cursor kept across pages resumes the list a caller already saw. The
+first page reads the symbol's whole list once and retains everything it did not
+serve; a list that fits one page retains nothing at all. Each `refs` page renews
+that retention and issues a cursor with a fresh `resources.cursor_ttl`, so a long
+reference list is not bounded by the TTL its first page was minted under. A
+`refs` cursor carries a versioned payload: one minted by a build that spelled it
+differently answers `CTX_CURSOR_INVALID` rather than being read with today's
+field meanings.
 
 **One unreadable blob costs one hit, not the answer.** A `search` hit's `range`
 is resolved by reading the file's bytes out of the content store. When the store
