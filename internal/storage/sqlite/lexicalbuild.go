@@ -72,6 +72,14 @@ func lexicalColumnCode(c SearchColumn) byte {
 	return 0
 }
 
+// lexicalInstanceQuery is the one bare scan the build folds. There is
+// deliberately no ORDER BY: the instance vocabulary emits its rows in term
+// order, and asking SQLite for that order materializes the whole vocabulary in
+// a temporary b-tree before the first row -- unbounded memory for a structure
+// whose point is that it is streamed. The order the scan actually delivers is
+// verified as it arrives rather than trusted.
+const lexicalInstanceQuery = `SELECT v.term, v.doc, v.col FROM search_vocab v`
+
 // buildLexical writes the packed term statistics for gen. It runs inside
 // Activate's transaction, after the packed adjacency and before the active
 // pointer flips, so a generation is published only with the structure every
@@ -108,12 +116,7 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 		text: newPartWriter(ctx, tx, gen, lexicalPartsTable, streamTermText),
 		list: newPartWriter(ctx, tx, gen, lexicalPartsTable, streamPostList),
 	}
-	// No ORDER BY: the instance vocabulary emits its rows in term order, and
-	// asking for that order makes the whole vocabulary materialize in a
-	// temporary b-tree before the first row -- unbounded memory for a structure
-	// whose point is that it is streamed. The order the scan actually delivers
-	// is verified below rather than trusted.
-	rows, err := tx.QueryContext(ctx, `SELECT v.term, v.doc, v.col FROM search_vocab v`)
+	rows, err := tx.QueryContext(ctx, lexicalInstanceQuery)
 	if err != nil {
 		return wrap("search_vocab", err)
 	}
