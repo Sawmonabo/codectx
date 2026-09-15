@@ -118,14 +118,11 @@ type scored struct {
 // fold is a function of that admission and not of how many matches the query
 // has.
 //
-// ONE candidate-sized heap structure survives upstream of this collector, and
-// it is named rather than denied: exactCandidates' `seen` set holds one
-// model.NodeID per distinct candidate across the exact tiers (exact.go), which
-// is what decides the cross-tier "most specific tier wins" rule and cannot be
-// decided from a streamed page. A one-character qualified_name_prefix that
-// range-scans a corpus-sized slice of node_ids therefore costs disk in this
-// fold and heap in `seen` -- the ledgered residual recorded for the exact
-// tiers, not a bound this collector removes.
+// No candidate-sized heap structure survives upstream of this collector
+// either: the exact tiers decide the cross-tier "most specific tier wins" rule
+// from predicates over the candidate in hand (exact.go), so a one-character
+// qualified_name_prefix that range-scans a corpus-sized slice of node_ids
+// costs disk in this fold and one page of stored nodes upstream.
 //
 // TWO PASSES ARE NECESSARY, not a shortcut. fold sets ScoreMicros = max(a, b)
 // and score is less's second key, so a fold MOVES its survivor's rank: two
