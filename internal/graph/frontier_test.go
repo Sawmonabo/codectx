@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -438,4 +439,73 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 			}
 		}
 	})
+}
+
+// exactFillAdjacency serves a fixed containment row set through the keyset
+// protocol so a read can be given a budget that its rows fill EXACTLY. The
+// fixture's own graph cannot express that: the rollup derives the budget from
+// the batch size, so no fixture shape makes the two land on the same number.
+type exactFillAdjacency struct {
+	*graphFixture
+	rows []model.Relation
+}
+
+func (a exactFillAdjacency) Edges(_ context.Context, _ []model.NodeID, _ model.Direction,
+	_ []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	out := a.rows
+	for len(out) > 0 && out[0].ID <= after {
+		out = out[1:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return append([]model.Relation(nil), out...), nil
+}
+
+// TestContainmentReadEndsOnTheEmptyPage is F7. streamContainsEdges used to exit
+// its loop the moment the budget was reached, so a containment set whose rows
+// fill the budget exactly reported complete=false -- and both callers (the
+// rollup and the repository map) refuse an incomplete containment read
+// outright, turning a whole answer into CTX_RESOURCE_LIMIT.
+//
+// Mutation: replace the one-row probe in streamContainsEdges with
+// `return false, nil` and the exact-fill leg below fails.
+func TestContainmentReadEndsOnTheEmptyPage(t *testing.T) {
+	f := newGraphFixture(t)
+	rows := make([]model.Relation, 4)
+	for i := range rows {
+		rows[i] = model.Relation{
+			ID:   fixtureRelationID(0xe00 + i),
+			From: fixtureNodeID("n-a"), To: fixtureNodeID("n-b"), Kind: model.RelContains,
+		}
+	}
+	e, err := New(Options{Adjacency: exactFillAdjacency{f, rows}, Limits: fixtureLimits()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	batch := []model.NodeID{fixtureNodeID("n-b")}
+	for _, tc := range []struct {
+		name     string
+		budget   int64
+		wantRead int
+		wantDone bool
+	}{
+		{name: "the budget is exactly filled", budget: int64(len(rows)), wantRead: len(rows), wantDone: true},
+		{name: "a row is left past the budget", budget: int64(len(rows)) - 1, wantRead: len(rows) - 1, wantDone: false},
+		{name: "the budget is unlimited", budget: 0, wantRead: len(rows), wantDone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			read := 0
+			done, err := e.streamContainsEdges(context.Background(), batch, model.DirectionIncoming,
+				[]model.RelationKind{model.RelContains}, config.Limit(tc.budget),
+				func(model.Relation) error { read++; return nil })
+			if err != nil {
+				t.Fatalf("streamContainsEdges: %v", err)
+			}
+			if read != tc.wantRead || done != tc.wantDone {
+				t.Fatalf("read %d row(s), complete=%v; want %d row(s), complete=%v",
+					read, done, tc.wantRead, tc.wantDone)
+			}
+		})
+	}
 }

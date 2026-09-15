@@ -1437,32 +1437,6 @@ func TestGraphScenarios(t *testing.T) {
 	}
 }
 
-// unreadableAdjacency answers every fact read with a failure while still
-// reporting the binding and the retention lease a continuation is bound to. An
-// answer served over it read nothing from the graph, which is how the impact
-// paging case observes that a continuation replays its spool instead of
-// walking again.
-type unreadableAdjacency struct{ *graphFixture }
-
-func (unreadableAdjacency) Edges(context.Context, []model.NodeID, model.Direction,
-	[]model.RelationKind, model.RelationID, int) ([]model.Relation, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) NodesByID(context.Context, []model.NodeID) ([]model.Node, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) EvidenceFor(context.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) Capabilities(context.Context) ([]model.CapabilityState, error) {
-	return nil, errUnreadableAdjacency
-}
-
-var errUnreadableAdjacency = errors.New("this adjacency answers no read")
-
 // blockingGate is the process gate with every slot permanently busy: Acquire
 // waits for the caller's deadline and reports it as the same CTX_RESOURCE_LIMIT
 // the shipped graphGate reports (internal/app/query.go). A context carrying no
