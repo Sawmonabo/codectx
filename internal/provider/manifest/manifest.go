@@ -217,6 +217,11 @@ type unit struct {
 	// one capability detail per bound this unit cut, keyed by bound name.
 	deps, entries config.Limit
 	over          map[string]string
+	// seen is the largest count recorded against each bound. Several
+	// independent lists share one bound name, so without it the last list to
+	// cross would overwrite a larger crossing and the unit would under-report
+	// what it cut.
+	seen map[string]int64
 }
 
 // fileNode resolves this manifest's own file node. The node is the
@@ -243,6 +248,14 @@ func (u *unit) malformed() { u.state, u.code = model.CapabilityFailed, model.Cod
 // bound -- is kept so the capability can report it. Nothing is cut when the
 // bound is unlimited, so this is never reached for a default configuration.
 func (u *unit) overBound(bound string, limit config.Limit, seen int64) {
+	if prev, recorded := u.seen[bound]; recorded && seen <= prev {
+		u.degraded(bound, strconv.FormatInt(prev, 10)+" over "+limit.String())
+		return
+	}
+	if u.seen == nil {
+		u.seen = map[string]int64{}
+	}
+	u.seen[bound] = seen
 	u.degraded(bound, strconv.FormatInt(seen, 10)+" over "+limit.String())
 }
 
