@@ -206,7 +206,7 @@ func internedPair(ctx context.Context, tx *sql.Tx, scopeKey, nativeKey string) (
 	// comparing the stored key at each step. A free slot on the chain means
 	// the key was never interned, which is the same noRef this function
 	// returned before.
-	native, found, err := lookupNativeKey(ctx, tx, nativeKey)
+	native, found, err := lookupNativeKey(ctx, tx, nil, nativeKey)
 	if err != nil || !found {
 		return scope, noRef, err
 	}

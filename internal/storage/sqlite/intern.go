@@ -49,6 +49,14 @@ type dbInterner struct {
 
 	hits   uint64
 	misses uint64
+
+	// stmts is the statement cache of the write transaction the writer is
+	// currently running (stmtcache.go). The interner's resolutions are issued
+	// once per fact and once per evidence row, so preparing their SQL per call
+	// re-parses the same handful of texts for every row. It is installed by
+	// UnitWriter.providerWrite for the life of one batch and is nil for every
+	// other caller, which then prepares on the transaction it passes.
+	stmts *stmtCache
 }
 
 // Table tags for the shared string cache. They are cache-local and never
@@ -215,7 +223,7 @@ func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (na
 	}
 	in.misses++
 	for {
-		id, found, err := lookupNativeKey(ctx, tx, key)
+		id, found, err := lookupNativeKey(ctx, tx, in.stmts, key)
 		if err != nil {
 			return noRef, err
 		}
@@ -229,7 +237,7 @@ func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (na
 		// suppressed and the next probe walks past it. Progress is guaranteed
 		// because a suppressed insert means the slot is now occupied, so the
 		// next lookup cannot return the same free id.
-		if _, err := tx.ExecContext(ctx,
+		if _, err := in.stmts.exec(ctx, tx,
 			`INSERT INTO native_keys(id, key) VALUES(?, ?) ON CONFLICT(id) DO NOTHING`, id, key); err != nil {
 			return noRef, wrap("native_keys", err)
 		}
@@ -270,11 +278,11 @@ func nextNativeKeyID(id int64) int64 {
 // digests agree are DETECTED by the string comparison and separated onto
 // different ids, never silently merged. Deleting that comparison merges them,
 // which is what TestNativeKeyHashCollisionIsDetected proves.
-func lookupNativeKey(ctx context.Context, tx *sql.Tx, key string) (int64, bool, error) {
+func lookupNativeKey(ctx context.Context, tx *sql.Tx, stmts *stmtCache, key string) (int64, bool, error) {
 	start := nativeKeyID(key)
 	for id := start; ; {
 		var stored string
-		err := tx.QueryRowContext(ctx, `SELECT key FROM native_keys WHERE id = ?`, id).Scan(&stored)
+		err := stmts.queryRow(ctx, tx, `SELECT key FROM native_keys WHERE id = ?`, id).Scan(&stored)
 		switch {
 		case isNoRows(err):
 			return id, false, nil
@@ -309,10 +317,10 @@ func lookupNativeKey(ctx context.Context, tx *sql.Tx, key string) (int64, bool, 
 // found is false when the insert was suppressed and the SELECT matched nothing;
 // each caller knows which of its table's constraints that implicates.
 func (in *dbInterner) resolve(ctx context.Context, tx *sql.Tx, table, insertSQL string, insertArgs []any, selectSQL string, selectArgs []any) (ref int64, found bool, err error) {
-	if _, err := tx.ExecContext(ctx, insertSQL, insertArgs...); err != nil {
+	if _, err := in.stmts.exec(ctx, tx, insertSQL, insertArgs...); err != nil {
 		return noRef, false, wrap(table, err)
 	}
-	switch err := tx.QueryRowContext(ctx, selectSQL, selectArgs...).Scan(&ref); {
+	switch err := in.stmts.queryRow(ctx, tx, selectSQL, selectArgs...).Scan(&ref); {
 	case errors.Is(err, sql.ErrNoRows):
 		return noRef, false, nil
 	case err != nil:
