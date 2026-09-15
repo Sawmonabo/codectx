@@ -175,11 +175,6 @@ type Plan struct {
 	// or workspace-scoped unit list is bounded by the scope count, never by
 	// the repository, so it stays in heap (H-L1b).
 	files *pagination.SortedRun[fileUnitRecord]
-	// peakUnitRecords is the high-water mark of spilled unit records held in
-	// heap at once while the plan was built. It is the structural memory
-	// assertion the live-set test reads: it must stay inside the run budget
-	// however many units the snapshot plans.
-	peakUnitRecords int
 }
 
 // Close releases the plan's two spilled runs: the shared input membership every
@@ -708,7 +703,6 @@ func (b *builder) emit(ctx context.Context) error {
 		return err
 	}
 	b.plan.files = files
-	b.plan.peakUnitRecords = b.allUnits.PeakLiveRecords()
 	// One slot per position in Selection.Active, holding that provider's
 	// semantic units; a file provider's slot stays empty because the merged
 	// run serves it. A duplicate entry in Active keeps its units at the first
