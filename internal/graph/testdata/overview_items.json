@@ -1,0 +1,46 @@
+[
+  {
+    "node_id": "48bd9cea6c247fbc77407872b27b86e79b310ebc167390b57a41635b2767b646",
+    "kind": "package",
+    "path": "lib",
+    "name": "lib",
+    "language": "go",
+    "depth": 0,
+    "file_count": 0,
+    "symbol_count": 5,
+    "source_bytes": 0
+  },
+  {
+    "node_id": "99521b4dd15604fc7958f681d0f905a0cc299a6ed13c01b0a134dc09238428ea",
+    "kind": "package",
+    "path": "wide-a",
+    "name": "wide-a",
+    "language": "go",
+    "depth": 0,
+    "file_count": 0,
+    "symbol_count": 1,
+    "source_bytes": 0
+  },
+  {
+    "node_id": "a64dfe69879338a72f76a591bbe70b91b8fb97645aba6f36a42934ee86c9e733",
+    "kind": "package",
+    "path": "wide-b",
+    "name": "wide-b",
+    "language": "go",
+    "depth": 0,
+    "file_count": 0,
+    "symbol_count": 260,
+    "source_bytes": 0
+  },
+  {
+    "node_id": "fe5f677bdec645ea0ba8b96061d1930fa6f4167003d229219d4fd59ae054587c",
+    "kind": "package",
+    "path": "app",
+    "name": "app",
+    "language": "go",
+    "depth": 0,
+    "file_count": 0,
+    "symbol_count": 5,
+    "source_bytes": 0
+  }
+]
