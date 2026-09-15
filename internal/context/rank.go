@@ -553,10 +553,6 @@ func pullRun[T any](r *pagination.SortedRun[T]) (next func() (T, bool, error), s
 	}, pullStop
 }
 
-// errStopRun ends a pulled walk early. It never escapes pullRun: the sentinel
-// is what Each returns to stop, and pullRun drops it.
-var errStopRun = errors.New("context: sorted run walk stopped")
-
 // routeWorkingSet is one candidate's rebuilt routes plus the two lookup maps
 // scoreRoutes and scorePath read. It is the per-candidate working set the plan
 // bounds P-D's heap by: it holds one candidate's hops and nothing else.

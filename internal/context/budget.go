@@ -7,9 +7,7 @@ package context
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"iter"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -587,11 +585,6 @@ type sliceMember struct {
 	tokens   int64
 }
 
-// lessCandSeq orders candidates by ingest sequence: the expansion order the
-// exclusion projection is persisted in (C1), and the key the route streams are
-// re-mapped on. Total -- one candidate owns one seq.
-func lessCandSeq(a, b candRec) int { return cmpInt(a.Seq, b.Seq) }
-
 // lessGroupFile groups per-candidate group contributions by file so foldGroup
 // reduces them to one groupRec per file. A join comparator: adding a tie-break
 // would make every record distinct and fold nothing.
@@ -626,66 +619,6 @@ func sortedRun[T any](s *compileSorts, sorter *pagination.ExternalSort[T]) (*pag
 	}
 	return trackRun(s, run), nil
 }
-
-// errStopRun unwinds a SortedRun walk that a pull cursor stopped early. It
-// never reaches a caller: runSeq swallows exactly this error and no other.
-var errStopRun = errors.New("context: a sorted-run walk was stopped by its reader")
-
-// runSeq presents a SortedRun as a pull-able sequence. SortedRun.Each pushes,
-// and a merge join needs to pull from one side while it walks the other, so the
-// two are bridged the way internal/index/delta/inputs.go already bridges its
-// own streams: iter.Pull2 over a Seq2 whose second element carries the walk's
-// error.
-func runSeq[T any](run *pagination.SortedRun[T]) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		err := run.Each(func(v T) error {
-			if !yield(v, nil) {
-				return errStopRun
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, errStopRun) {
-			var zero T
-			yield(zero, err)
-		}
-	}
-}
-
-// runCursor is one side of a merge join: the record currently under the cursor,
-// and a step that advances it. A cursor that has failed reports `ok` false, so
-// every join loop below terminates, and the caller checks err() before trusting
-// the join's result.
-type runCursor[T any] struct {
-	next func() (T, error, bool)
-	stop func()
-	cur  T
-	ok   bool
-	// failure is the walk's own error, kept so a join loop terminates on a
-	// read failure rather than spinning on a cursor that will never advance.
-	failure error
-}
-
-func newRunCursor[T any](run *pagination.SortedRun[T]) *runCursor[T] {
-	next, stop := iter.Pull2(runSeq(run))
-	c := &runCursor[T]{next: next, stop: stop}
-	c.advance()
-	return c
-}
-
-func (c *runCursor[T]) advance() {
-	if c.failure != nil {
-		c.ok = false
-		return
-	}
-	v, err, ok := c.next()
-	if err != nil {
-		c.failure, c.ok = err, false
-		return
-	}
-	c.cur, c.ok = v, ok
-}
-
-func (c *runCursor[T]) err() error { return c.failure }
 
 // routeCursors rebuilds one candidate's model.RelationPath values from the two
 // Index-keyed route streams. Both are ascending in the same key as the walk

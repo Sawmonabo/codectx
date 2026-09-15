@@ -215,6 +215,13 @@ func openSorts(t *testing.T, cfg config.Config) *compileSorts {
 	if err != nil {
 		t.Fatalf("newCompileSorts: %v", err)
 	}
+	// Releasing the area is idempotent, so a test that closes it explicitly to
+	// assert the error still gets its run files swept when it fails earlier.
+	t.Cleanup(func() {
+		if err := sorts.Close(); err != nil {
+			t.Fatalf("release sort area: %v", err)
+		}
+	})
 	return sorts
 }
 

@@ -22,7 +22,6 @@ package context
 
 import (
 	"context"
-	"errors"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -188,116 +187,6 @@ func foldMinNodeSeq(a, b nodeRec) (nodeRec, error) {
 // allowance for the struct and its string header, on the same convention as
 // stream.go's sizeOf family.
 func sizeOfNode(r nodeRec) int64 { return int64(len(r.NodeID)) + recordOverheadBytes }
-
-// ---------------------------------------------------------------------------
-// runCursor -- the pull side of a merge join
-// ---------------------------------------------------------------------------
-
-// runCursor turns pagination.SortedRun's push walk into a pull cursor, so a
-// merge join can advance one sorted side while the other side is driven by
-// something that cannot be inverted -- a paged store read, or another run's
-// own walk.
-//
-// P-C needs exactly that twice. The edge scan advances through the wanted
-// relation ids as the store hands back ascending keyset pages, and it must be
-// able to stop mid-run when the scan's budget ends; the attribute join advances
-// through the resolved attributes as the hop run is walked. Re-walking the
-// sorted run from the start for each page instead would make the scan quadratic
-// in the number of pages, which is the "complete but slow" outcome §5 exists to
-// prevent.
-//
-// The producer is a goroutine because SortedRun.Each owns the read loop. It is
-// bounded and joined: the channel is unbuffered so the producer is never more
-// than one record ahead (the cursor holds O(1) records, never a run), and Close
-// stops it with a sentinel and waits, so no walk outlives the pass that opened
-// it even when the pass returns early on an error.
-type runCursor[T any] struct {
-	ch   chan T
-	stop chan struct{}
-	done chan error
-
-	cur    T
-	valid  bool
-	index  int64
-	err    error
-	closed bool
-}
-
-// errCursorStopped ends the producer's walk when the consumer closes early. It
-// never escapes: Close swallows exactly this error and reports any other.
-var errCursorStopped = errors.New("the sorted-run cursor was closed before its run was consumed")
-
-func newRunCursor[T any](run *pagination.SortedRun[T]) *runCursor[T] {
-	c := &runCursor[T]{ch: make(chan T), stop: make(chan struct{}), done: make(chan error, 1), index: -1}
-	go func() {
-		err := run.Each(func(v T) error {
-			select {
-			case c.ch <- v:
-				return nil
-			case <-c.stop:
-				return errCursorStopped
-			}
-		})
-		close(c.ch)
-		c.done <- err
-	}()
-	return c
-}
-
-// next advances the cursor one record, reporting whether one was read.
-func (c *runCursor[T]) next() bool {
-	if c.err != nil || c.closed {
-		return false
-	}
-	v, ok := <-c.ch
-	if !ok {
-		c.valid = false
-		return false
-	}
-	c.cur, c.valid = v, true
-	c.index++
-	return true
-}
-
-// seek advances the cursor to the first record that is not less than the key
-// and reports it when it is equal, together with its ordinal in the run.
-//
-// The key sequence must be non-decreasing, which is what makes this a merge
-// join and not a lookup: the cursor never rewinds, so the whole join costs one
-// walk of each side.
-func (c *runCursor[T]) seek(key T, compare func(a, b T) int) (int64, bool) {
-	for {
-		if !c.valid && !c.next() {
-			return 0, false
-		}
-		cmp := compare(c.cur, key)
-		if cmp > 0 {
-			return 0, false
-		}
-		if cmp == 0 {
-			return c.index, true
-		}
-		c.valid = false
-	}
-}
-
-// Close stops the producer and returns the walk's error. It is idempotent and
-// always joins, so a pass that returns early leaves no goroutine reading a run
-// the compile is about to remove.
-func (c *runCursor[T]) Close() error {
-	if c.closed {
-		return c.err
-	}
-	c.closed = true
-	close(c.stop)
-	for range c.ch { //nolint:revive // drain so the producer can finish and report
-	}
-	err := <-c.done
-	if err != nil && !errors.Is(err, errCursorStopped) {
-		c.err = err
-	}
-	return c.err
-}
 
 // ---------------------------------------------------------------------------
 // P-C -- relation attributes
