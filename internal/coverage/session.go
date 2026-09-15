@@ -95,7 +95,6 @@ func checkLimits(l Limits) error {
 		{"max_receipts_per_confirmation", int64(l.MaxReceiptsPerConfirmation)},
 		{"max_page_items", int64(l.MaxPageItems)},
 		{"session_ttl", int64(l.SessionTTL)},
-		{"query_timeout", int64(l.QueryTimeout)},
 		{"receipt_ttl", int64(l.ReceiptTTL)},
 	} {
 		if b.value <= 0 {
@@ -103,6 +102,14 @@ func checkLimits(l Limits) error {
 				"coverage limit %s is %d; every bound must be resolved to a positive value before the service is built",
 				b.name, b.value)
 		}
+	}
+	// query_timeout is exempt from the positive check above: zero is its
+	// default and means no deadline (Limits). A negative one is a wiring
+	// defect, and model.QueryDeadline would silently ignore it, so it is
+	// refused here where it can still be attributed.
+	if l.QueryTimeout < 0 {
+		return typedErrf(model.CodeInternal,
+			"coverage limit query_timeout is %d; a bound cannot be negative", l.QueryTimeout)
 	}
 	// max_unconfirmed_chunks_per_session is exempt from the positive check
 	// above and only refuses a negative: zero is its default and means
@@ -154,7 +161,7 @@ func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manife
 		return "", err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	session, err := s.sessions.OpenSession(ctx, model.SessionOpen{
@@ -241,7 +248,7 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 		return emptyPage, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 	// statusLimit already keeps the request one record below the wire ceiling,
 	// so a clamp here would be a caller asking for more than the ceiling. It is

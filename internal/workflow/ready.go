@@ -25,7 +25,7 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest) (model.S
 	if err := req.Validate(); err != nil {
 		return model.SessionStatus{}, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 	// Session returns a partially populated record beside CTX_SESSION_EXPIRED
 	// rather than swallowing it, and describing an expired session honestly --

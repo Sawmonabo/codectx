@@ -42,10 +42,11 @@ func (s *Service) Read(ctx context.Context, req model.ReadChunkRequest) (model.R
 	}
 
 	// The one endpoint that touches the CAS and the filesystem runs under the
-	// same resources.query_timeout deadline as every other request: the CLI
-	// leaves a zero --timeout alone precisely so this applies, and checkLimits
-	// guarantees the bound is positive.
-	ctx, cancel := context.WithTimeout(ctx, s.limits.QueryTimeout)
+	// same resources.query_timeout deadline as every other request -- and
+	// under the same rule: the operator's own --timeout stays in charge if they
+	// set one, and a zero query_timeout (the default) installs no deadline at
+	// all, so an unbounded read serves the whole chunk.
+	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
 
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)

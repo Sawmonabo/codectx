@@ -162,7 +162,14 @@ type Limits struct {
 
 	// SessionTTL is coverage.session_ttl and also the retention lease duration.
 	// ReceiptTTL bounds how long an issued receipt may be echoed back.
-	SessionTTL, QueryTimeout, ReceiptTTL time.Duration
+	SessionTTL, ReceiptTTL time.Duration
+	// QueryTimeout carries resources.query_timeout: the DEFAULT per-request
+	// deadline, never a ceiling, and ZERO IS "NO DEADLINE", which is its
+	// default -- so it is the second Limits field the positive-value check in
+	// newService exempts. Every use goes through model.QueryDeadline, which
+	// leaves a caller's own deadline in charge and installs nothing at zero, so
+	// a request nobody bounded returns the complete answer.
+	QueryTimeout time.Duration
 }
 
 // unconfirmedCapped is the one place this package spells the

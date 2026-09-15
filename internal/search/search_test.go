@@ -294,6 +294,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_continuation_copies_its_tail_spool_to_spool", legSpoolToSpoolIsReentrant},
 		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
 		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
+		{"fix/an_unbounded_query_answers_in_full", legUnboundedQueryAnswersInFull},
 
 		// FX-H-U rows
 		{"fix/the_path_resolver_holds_one_read_page", legPathResolverHoldsOnePage},
@@ -1883,6 +1884,59 @@ func legDeadlineEndsThePage(t *testing.T, f *fixture) {
 	}
 	if err := got.Validate(); err != nil {
 		t.Fatalf("the deadline page does not validate: %v", err)
+	}
+}
+
+// legUnboundedQueryAnswersInFull is the other half of ruling Q4, and the half a
+// shipped default now depends on: resources.query_timeout is unlimited by
+// DEFAULT, and it is a default and never a ceiling.
+//
+// Both halves were broken here. search.New refused a non-positive timeout, so
+// the shipped configuration could not compose a search service at all; and
+// every request was wrapped in context.WithTimeout unconditionally, so a zero
+// timeout minted `now + 0` -- an instant already past, which would refuse every
+// query -- while a caller who had set a LONGER deadline of their own had it
+// silently cut back to the configured default and was told the query ran out
+// of time at a fraction of the budget they granted.
+//
+// The fixture needs no wall clock: a one-nanosecond configured timeout is
+// already spent by the time the tiers read, so "the deadline applied" is
+// observable as a truncated page (legDeadlineEndsThePage asserts that leg), and
+// its absence is observable as a complete one.
+//
+// Mutation: restore context.WithTimeout(ctx, s.timeout) in place of
+// model.QueryDeadline at either site and both sub-legs below fail on a page
+// that came back truncated.
+func legUnboundedQueryAnswersInFull(t *testing.T, f *fixture) {
+	// Zero is the shipped default and means NO deadline: the service composes,
+	// and the query is ranked to a complete answer.
+	opts := f.opts
+	opts.Resources.QueryTimeout = 0
+	got, err := newService(t, opts).Search(f.ctx, model.SearchRequest{Query: "handle"})
+	if err != nil {
+		t.Fatalf("an unbounded search failed: %v: query_timeout 0 means no deadline, not one already spent", err)
+	}
+	if got.Meta.Truncated {
+		t.Fatalf("an unbounded search answered truncated (%q); `now + 0` is being applied as a deadline",
+			got.Meta.TruncationReason)
+	}
+	if len(got.Items) == 0 {
+		t.Fatal("the unbounded search answered nothing: this leg cannot tell a complete answer from an empty fixture")
+	}
+	full := len(got.Items)
+
+	// A caller's own deadline is the request's, above the configured value as
+	// readily as below it. The configured one here is already spent, so a
+	// service that took the smaller of the two truncates.
+	opts.Resources.QueryTimeout = config.Duration(time.Nanosecond)
+	ctx, cancel := context.WithTimeout(f.ctx, time.Minute)
+	defer cancel()
+	if got, err = newService(t, opts).Search(ctx, model.SearchRequest{Query: "handle"}); err != nil {
+		t.Fatalf("a search under the caller's own minute-long deadline failed: %v", err)
+	}
+	if got.Meta.Truncated || len(got.Items) != full {
+		t.Fatalf("the caller's deadline is a minute away, yet the search answered %d of %d hit(s) truncated=%v: "+
+			"resources.query_timeout is being applied as a ceiling", len(got.Items), full, got.Meta.Truncated)
 	}
 }
 
