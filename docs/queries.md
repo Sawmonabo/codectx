@@ -159,6 +159,27 @@ flag in the table above. `--repo`, `--generation`, `--limit`, `--cursor`,
 `--timeout` and `--json` mean exactly what they mean for the five commands
 above.
 
+**Paging repeats the whole question.** A continuation token is bound to the
+request that minted it, so the second page is `--cursor <token>` *plus every
+other flag the first page carried* — `--depth` and `--limit` included:
+
+```sh
+codectx repo-map . --limit 100
+codectx repo-map . --limit 100 --cursor <token>   # not `--cursor <token>` alone
+```
+
+Dropping one of them is refused with `CTX_CURSOR_INVALID` naming the inputs the
+token is bound to, rather than silently answering a differently shaped question.
+
+**Names are canonical, not provider-spelled.** The `path` and `name` of a
+container are its canonical qualified name with any quoting the provider spelled
+the scope with removed, and `name` also drops the trailing separator: a Go
+package that is stored as a backquoted, slash-terminated scope is reported as
+`github.com/owner/repo/internal/x`, not as the scope string. A container whose
+children could not be counted inside the query's edge budget is **refused** with
+`CTX_RESOURCE_LIMIT` rather than reported with short totals — an under-counted
+package reads as the repository's shape, not as an incomplete answer.
+
 The repository is named either as a positional path — the Section 18.1 spelling
 — or with `--repo`. Naming it both ways is **refused** rather than resolved to
 one of them: either precedence silently ignores something the operator typed.
