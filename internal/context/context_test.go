@@ -47,6 +47,13 @@ type contextFixture struct {
 	Gen     model.GenerationID
 	Binding model.Binding
 	Now     func() time.Time
+	// Rels are the relations every engine this fixture builds through
+	// intCompiler walks. It is nil by default -- the scenario rows that
+	// predate it compile over an edgeless graph, and an edgeless graph is
+	// what they assert against -- and a row that needs a shaped scope sets
+	// it BEFORE it builds any compiler, so the two pipelines of a parity row
+	// walk the one graph rather than two.
+	Rels []model.Relation
 }
 
 // fixtureFiles is the deterministic content of the fixture snapshot, in the
@@ -1690,7 +1697,7 @@ func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compil
 			if gen != fx.Gen {
 				t.Fatalf("the graph factory was asked for generation %d, want the pinned %d", gen, fx.Gen)
 			}
-			return fx.scopeEngine(nil, fixtureCapabilities), func() error { return nil }, nil
+			return fx.scopeEngine(fx.Rels, fixtureCapabilities), func() error { return nil }, nil
 		},
 		Config: fx.Cfg,
 		Now:    now,
