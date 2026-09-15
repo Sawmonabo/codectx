@@ -687,18 +687,24 @@ func (s *Services) workflow() (*workflow.Service, error) {
 }
 
 // withEngine builds the graph engine for the pinned generation, runs one query
-// against it and releases the reader's lease on every path. A release failure
-// is reported only when the query itself succeeded: the query's own failure is
-// the one the caller needs.
+// against it and releases the reader's lease on every path.
+//
+// A release failure NEVER becomes the answer. The page is already computed and
+// correct by the time the lease is dropped, so promoting the release error
+// turned a good answer -- entries, cursor and all -- into a failed query and
+// left the caller nothing to page from; and when the query had failed too, the
+// release error was dropped silently. It is reported on the operator channel
+// instead, the same way a continuation lease that cannot be released is.
 func (s *Services) withEngine(ctx context.Context, gen model.GenerationID,
-	query func(*graph.Engine) error) (err error) {
+	query func(*graph.Engine) error) error {
 	engine, release, err := s.w.Query(ctx, gen)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if cerr := release(); cerr != nil && err == nil {
-			err = cerr
+		if cerr := release(); cerr != nil {
+			s.w.s.logger.Warn("a pinned query lease could not be released",
+				"component", "app", "error", cerr.Error())
 		}
 	}()
 	return query(engine)
