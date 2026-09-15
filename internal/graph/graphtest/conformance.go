@@ -24,8 +24,16 @@ const FixtureRepository = model.RepositoryID(
 	"00000000000000000000000000000000000000000000000000000000000000a1")
 
 func nodeID(kind model.NodeKind, key string) model.NodeID {
-	return model.NewNodeID(FixtureRepository, kind, key)
+	return model.NewNodeID(FixtureRepository, kind, NodeKey(key))
 }
+
+// NodeKey is the canonical key one fixture id derives from. A node identity is
+// derived from a 32-byte canonical key, never from free text -- model.NodeFact
+// refuses a key that is not a digest -- so an implementation backed by a store
+// must publish this key to compute the ids the suite resolves. It is exported
+// for exactly that: the store's fixture writes NodeKey("pkg/a") as the
+// canonical key of PkgA and the store then derives PkgA itself.
+func NodeKey(key string) string { return model.CanonicalNodeKey(key, "") }
 
 // The fixture's node identities. They are exported because an implementation
 // backed by a store must build its generation from the same facts and then
