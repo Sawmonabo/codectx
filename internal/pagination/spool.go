@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,9 +108,17 @@ func IsBudgetExhausted(err error) bool {
 // and the lease store that decides whether a spool is still live. Bytes
 // already on disk from a previous process count against the cap until Sweep
 // reconciles them.
+//
+// maxBytes of zero or less is UNLIMITED: nothing this store holds is refused
+// for want of budget. That is the scale posture's spelling of an unset bound --
+// only a bound an operator SET may refuse work -- and it is what lets
+// resources.max_temp_bytes default to unlimited without this constructor
+// rejecting the configuration it derives from. Accounting is unchanged either
+// way: used still tracks what is live, because that figure is reported by the
+// resource envelope whether or not anything is capped.
 func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
-	if maxBytes <= 0 {
-		return nil, &model.Error{Code: model.CodeConfigInvalid, Message: "spool byte cap must be positive"}
+	if maxBytes < 0 {
+		maxBytes = 0
 	}
 	if leases == nil {
 		return nil, &model.Error{Code: model.CodeConfigInvalid, Message: "spools require a lease store"}
@@ -131,7 +140,10 @@ func NewSpools(dir string, maxBytes int64, leases LeaseStore) (*Spools, error) {
 func (s *Spools) reserve(id string, n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.used+n > s.maxBytes {
+	// An unlimited store (maxBytes zero) refuses nothing: the reservation is
+	// still recorded, so Release, Sweep and the resource envelope keep seeing
+	// the same numbers, but no page ends because of them.
+	if s.maxBytes > 0 && s.used+n > s.maxBytes {
 		return (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
 			Message:     "query spool exceeds its disk budget",
 			Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}).
@@ -146,6 +158,21 @@ func (s *Spools) reserve(id string, n int64) error {
 	r.bytes += n
 	s.reserved[id] = r
 	return nil
+}
+
+// recordCeiling bounds ONE assembled record on the way back in. It is the
+// shared budget while there is one -- no record can exceed what the budget
+// admitted when it was written -- and, on an unlimited store, no ceiling at
+// all: a reader that refused every record because nothing was capped would
+// turn "unlimited" into "reads nothing". The reassembly loop still terminates
+// on a corrupt length chain without it, because every continued chunk must be
+// a full maxSpoolChunkBytes and the file is finite, and each individual
+// allocation stays bounded by that chunk size.
+func (s *Spools) recordCeiling() int64 {
+	if s.maxBytes > 0 {
+		return s.maxBytes
+	}
+	return math.MaxInt64
 }
 
 // unreserve gives n bytes of spool id's reservation back after a failed write.
@@ -365,7 +392,7 @@ func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(reco
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)
-	h, err := readHeader(r, s.maxBytes)
+	h, err := readHeader(r, s.recordCeiling())
 	if err != nil {
 		return err
 	}
@@ -381,7 +408,7 @@ func (s *Spools) Open(ctx context.Context, c Cursor, now time.Time, fn func(reco
 		return cursorInvalid("continuation state has expired")
 	}
 	for {
-		rec, err := readFrame(r, s.maxBytes)
+		rec, err := readFrame(r, s.recordCeiling())
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -584,7 +611,7 @@ func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
 		return SpoolHeader{}, false
 	}
 	defer f.Close()
-	h, err := readHeader(bufio.NewReader(f), s.maxBytes)
+	h, err := readHeader(bufio.NewReader(f), s.recordCeiling())
 	return h, err == nil
 }
 

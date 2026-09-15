@@ -288,3 +288,55 @@ func TestSpoolRecordsChunkAcrossFrames(t *testing.T) {
 		t.Fatalf("the record after a chunked one read back as %q", got[1])
 	}
 }
+
+// TestUnlimitedSpoolBudgetRefusesNothingAndStillReadsBack guards the one
+// invariant an unlimited budget has to keep on BOTH sides. A store opened with
+// a zero cap -- which is what resources.max_temp_bytes unset means -- must
+// refuse no write, and must still read its records back: the assembled-record
+// ceiling is the budget while there is one, so a reader that kept using the
+// zero would reject every frame and turn "no limit" into "reads nothing".
+func TestUnlimitedSpoolBudgetRefusesNothingAndStillReadsBack(t *testing.T) {
+	ctx := context.Background()
+	leases := &leaseTable{expiry: map[string]time.Time{}}
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	spools, err := pagination.NewSpools(t.TempDir(), 0, leases)
+	if err != nil {
+		t.Fatalf("an unlimited spool budget was refused at construction: %v", err)
+	}
+	lease := model.Lease{ID: model.H("lease", "unlimited"), GenerationID: 11, OwnerKind: model.LeaseQuery, ExpiresAt: now.Add(time.Hour)}
+	if err := leases.AcquireLease(ctx, lease, ""); err != nil {
+		t.Fatal(err)
+	}
+	cursor := pagination.Cursor{Endpoint: "search", GenerationID: 11, AnalysisKey: model.AnalysisKey(model.H("analysis", "u")),
+		QueryHash: model.H("query", "u"), LeaseID: lease.ID, ExpiresAt: lease.ExpiresAt}
+	sp, err := spools.Create(cursor)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cursor.SpoolID = sp.ID()
+	if err := leases.AcquireLease(ctx, lease, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Larger than one frame and larger than any cap a small store would carry:
+	// under a capped store of this size the write would be refused.
+	big := make([]byte, (1<<20)*3+11)
+	for i := range big {
+		big[i] = byte(i % 241)
+	}
+	if err := sp.Append(big); err != nil {
+		t.Fatalf("an unlimited budget refused a write: %v", err)
+	}
+	if err := sp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var got [][]byte
+	if err := spools.Open(ctx, cursor, now, func(rec []byte) error {
+		got = append(got, append([]byte(nil), rec...))
+		return nil
+	}); err != nil {
+		t.Fatalf("an unlimited store could not read its own spool back: %v", err)
+	}
+	if len(got) != 1 || !bytes.Equal(got[0], big) {
+		t.Fatalf("read back %d records; the single %d-byte record must reassemble whole", len(got), len(big))
+	}
+}
