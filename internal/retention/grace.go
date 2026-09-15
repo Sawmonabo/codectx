@@ -3,7 +3,14 @@ package retention
 import (
 	"context"
 	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/model"
 )
 
 // The Section 10.4 blob grace protocol, the one thing this package owns rather
@@ -131,11 +138,100 @@ func (c *Collector) grace(ctx context.Context, report Report) (Report, error) {
 	// them because it walks rows, and these files have none. The same window
 	// guards them -- an object younger than it may be a publication whose
 	// commit is still in flight -- and the sweep re-walks every bucket each
-	// pass, so the batch is a working-set size and not a cap on the reclaim.
-	swept, err := c.opts.Objects.SweepOrphans(ctx, c.opts.Blobs.KnownBlobs, now, window, limit)
-	report.OrphanObjectsSwept += swept
+	// time it runs, so the batch is a working-set size and not a cap on the
+	// reclaim.
+	//
+	// It runs on a CADENCE, not on every pass. The sweep is the one phase whose
+	// cost is the size of the whole store rather than the size of the change:
+	// it walks all 256 buckets and every object in them, under the workspace
+	// lock and the indexing mutex, while a collection pass runs after EVERY
+	// activation -- so an incremental refresh of one file paid for a full CAS
+	// walk. Nothing is given up by waiting: an orphan only appears after a
+	// rolled-back or crashed capture, and the grace window already holds every
+	// orphan that long before this phase may touch it, so a sweep once per
+	// window reclaims exactly the same objects a per-pass sweep did. The
+	// cadence is a schedule, never a cap -- when the sweep runs it still walks
+	// the whole store and reclaims everything it finds.
+	due, stamp, err := c.orphanSweepDue(now, window)
 	if err != nil {
 		errs = append(errs, err)
 	}
+	if due {
+		swept, err := c.opts.Objects.SweepOrphans(ctx, c.opts.Blobs.KnownBlobs, now, window, limit)
+		report.OrphanObjectsSwept += swept
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if err := writeStamp(stamp, now); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	return report, errors.Join(errs...)
+}
+
+// orphanSweepPath is the cadence stamp's name under the data directory. It sits
+// beside the CAS and the staging root rather than inside either: snapshot.Sweep
+// reclaims <data>/staging and <data>/cas/tmp by prefix and would not recognize
+// a file of this package's, and the CAS buckets are exactly what SweepOrphans
+// walks.
+const orphanSweepPath = "last-orphan-sweep"
+
+// orphanSweepDue reports whether the CAS orphan sweep is due this pass, and the
+// path of the stamp to rewrite when it has run.
+//
+// The direction of every uncertainty is "sweep": a missing stamp (the first
+// pass ever, or a data directory an operator cleaned), an unreadable one, a
+// malformed one, and a stamp dated in the FUTURE -- which a clock stepped
+// backwards produces and which a plain "now - stamp < window" test would read
+// as "not due" for an unbounded time -- all run the sweep and rewrite the
+// stamp. The failure mode of sweeping too often is the cost this cadence
+// exists to cut; the failure mode of never sweeping is disk that is never
+// reclaimed, so the gate never fails closed.
+func (c *Collector) orphanSweepDue(now time.Time, window time.Duration) (bool, string, error) {
+	stamp := filepath.Join(c.opts.Config.DataDir, orphanSweepPath)
+	raw, err := os.ReadFile(stamp)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return true, stamp, nil
+		}
+		// Reported, not swallowed: an operator whose data directory stopped
+		// being readable should see it, and the pass still sweeps.
+		return true, stamp, ioError("orphan sweep stamp", err)
+	}
+	last, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return true, stamp, nil
+	}
+	elapsed := now.Sub(last)
+	return elapsed < 0 || elapsed >= window, stamp, nil
+}
+
+// writeStamp records when the orphan sweep last ran. A torn or truncated write
+// is self-healing: orphanSweepDue reads anything it cannot parse as "due", so
+// the worst outcome of a failed write is the per-pass frequency this cadence
+// replaced.
+func writeStamp(path string, now time.Time) error {
+	if err := os.WriteFile(path, []byte(now.UTC().Format(time.RFC3339Nano)), 0o644); err != nil {
+		return ioError("orphan sweep stamp", err)
+	}
+	return nil
+}
+
+// ioError is this package's one filesystem-failure mapping: every error leaving
+// the collector is a *model.Error carrying a diagnostic code, and the path text
+// is never part of the message -- a data-directory path is not something an
+// error may carry into a log.
+func ioError(op string, err error) error {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return model.Canceled(err)
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return &model.Error{Code: model.CodeDiskFull, Message: op + ": the data directory's disk is full",
+			Remediation: "free disk space or move storage.data_dir to a larger volume"}
+	}
+	return &model.Error{Code: model.CodeInternal, Message: op + " could not be recorded"}
 }
