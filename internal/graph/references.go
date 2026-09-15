@@ -148,7 +148,12 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	// caller must see rather than an unbounded queue. `codectx refs` carries no
 	// deadline of its own unless --timeout is set, so acquiring first would
 	// block behind two concurrent graph queries forever.
-	ctx, cancel := context.WithDeadline(ctx, e.now().Add(e.limits.QueryTimeout))
+	var cancel context.CancelFunc
+	if deadline, bounded := e.queryDeadline(ctx); bounded {
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
 	if e.gate != nil {
 		if err := e.gate.Acquire(ctx); err != nil {
