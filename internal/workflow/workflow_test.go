@@ -681,6 +681,18 @@ type fakeStore struct {
 	// the source (count, hash, write) and retains no list between them, so a
 	// source that memoised a pass would drop this to one.
 	walks map[model.CapsuleList]int
+	// waiverPages records one entry per WaiversAfter call -- the cursor it was
+	// given, the page bound it was given and how many records it answered. It
+	// is how a row proves the waiver list is read a page at a time: a
+	// whole-list read is one call answering every record regardless of limit.
+	waiverPages []waiverPage
+}
+
+// waiverPage is one recorded WaiversAfter call.
+type waiverPage struct {
+	after model.FileID
+	limit int
+	got   int
 }
 
 var (
@@ -1268,19 +1280,38 @@ func (s *fakeStore) Coverage(_ context.Context, session model.SessionID, actor s
 	return out, err
 }
 
-// Waivers answers in file-id order, not insertion order: the store pages its
-// primary key and the capsule's identity is order-sensitive, so an
+// WaiversAfter answers in file-id order, not insertion order: the store pages
+// its primary key and the capsule's identity is order-sensitive, so an
 // append-ordered answer here would assert a determinism the store never gives.
-func (s *fakeStore) Waivers(_ context.Context, session model.SessionID, actor string) ([]model.WaiverRecord, error) {
+// It records every page call in waiverPages so a row can assert the seal reads
+// the list a page at a time rather than whole.
+func (s *fakeStore) WaiversAfter(_ context.Context, session model.SessionID, actor string,
+	after model.FileID, limit int) ([]model.WaiverRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.walks[model.CapsuleListWaivers]++
+	if after == "" {
+		s.walks[model.CapsuleListWaivers]++
+	}
 	fs, err := s.lookup(session, actor)
 	if fs == nil {
 		return nil, err
 	}
-	out := append([]model.WaiverRecord(nil), fs.waivers...)
-	sort.Slice(out, func(i, j int) bool { return out[i].FileID < out[j].FileID })
+	if limit <= 0 || limit > model.MaxPageItems {
+		limit = model.MaxPageItems
+	}
+	sorted := append([]model.WaiverRecord(nil), fs.waivers...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].FileID < sorted[j].FileID })
+	out := make([]model.WaiverRecord, 0, limit)
+	for _, w := range sorted {
+		if after != "" && w.FileID <= after {
+			continue
+		}
+		out = append(out, w)
+		if len(out) == limit {
+			break
+		}
+	}
+	s.waiverPages = append(s.waiverPages, waiverPage{after: after, limit: limit, got: len(out)})
 	return out, err
 }
 
