@@ -397,6 +397,15 @@ following the cursor reaches the same nodes an unbounded walk would. The
 pages of one walk, so a caller still sees the total the walk has spent, and a
 replayed cursor neither resets nor doubles it.
 
+`max_graph_edges` is read in one more place: the context compiler's scan that
+resolves the **kind** of every relation a selection's explanation routes name.
+That scan pages the store by keyset, one page of `resources.max_page_items`
+rows at a time, and under the unlimited default it pages **to exhaustion** --
+the page width is how much is read at once, never how much is read in total.
+Only a value you set stops it early, and a scan a set value cut reports the
+scope incomplete (`scope_complete=false`) rather than typing part of the graph
+silently.
+
 Two stops are not resumable, and both say so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
 out of depth is reported truncated with no continuation. And `impact` performs
