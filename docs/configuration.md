@@ -406,12 +406,12 @@ Only a value you set stops it early, and a scan a set value cut reports the
 scope incomplete (`scope_complete=false`) rather than typing part of the graph
 silently.
 
-Two stops are not resumable, and both say so rather than pretending otherwise.
+One stop is not resumable, and it says so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
-out of depth is reported truncated with no continuation. And `impact` performs
-its whole walk on the first page and then serves a spooled ranked tail, so a
-per-page budget it exhausts ends that one walk: the answer is truncated with
-the reason, and every later page repeats the same flag and reason.
+out of depth is reported truncated with no continuation. `impact` is bounded on
+the same terms as `callers` and `callees`: a per-page budget it exhausts ends
+that page, reports the reason and mints a continuation, and the next page
+resumes the walk from the persisted frontier.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.

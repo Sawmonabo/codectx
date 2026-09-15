@@ -324,7 +324,9 @@ func newHydrator(files fileReader, blobs blobReader, content ContentReader) *hyd
 
 // hydratePage fills the Range of every hit from the byte interval of the
 // document it was ranked from; spans[i] belongs to hits[i]. A failure is
-// returned rather than swallowed into a nil Range.
+// returned rather than swallowed into a nil Range, EXCEPT the one class
+// blobFault names: an integrity fault of the content store is charged to the
+// hit it belongs to and the rest of the page is still answered.
 func (h *hydrator) hydratePage(ctx context.Context, hits []model.SearchHit, spans []model.ByteRange) error {
 	if len(hits) != len(spans) {
 		return &model.Error{Code: model.CodeInternal,
@@ -336,11 +338,43 @@ func (h *hydrator) hydratePage(ctx context.Context, hits []model.SearchHit, span
 		}
 		rng, err := h.hydrate(ctx, hits[i].FileID, spans[i])
 		if err != nil {
+			if reason, ok := blobFault(err); ok {
+				hits[i].Range = nil
+				hits[i].MarkUnresolved(model.SearchHitFieldRange, reason)
+				continue
+			}
 			return err
 		}
 		hits[i].Range = rng
 	}
 	return nil
+}
+
+// blobFault reports whether err is an integrity fault of the CONTENT STORE --
+// the blob absent from the content-addressed store, a blob row the snapshot no
+// longer retains or that is not ready, a short read, or a block digest that
+// does not verify -- and, if so, the reason to publish on the hit.
+//
+// Exactly ONE typed code qualifies: model.CodeSourceIntegrity. Everything else
+// still fails the whole answer, deliberately:
+//   - model.CodeCanceled / model.CodeQueryDeadline -- the caller stopped asking
+//     or the query ran out of time; flagging those would publish a truncated
+//     answer as a complete one with a per-hit footnote.
+//   - model.CodeArgumentInvalid -- a document that claims bytes past its file,
+//     or blob metadata that does not validate. That is a corrupt index, not a
+//     silently clamped range, and it stays an error.
+//   - model.CodeInternal, model.CodeDiskFull, model.CodeResourceLimit and any
+//     untyped error -- a defect or an environment failure that is not a
+//     property of the one blob this hit names.
+//
+// One unreadable blob must not cost the caller every other hit; a corrupt
+// index, a cancelled query and a programmer error must still be loud.
+func blobFault(err error) (string, bool) {
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeSourceIntegrity {
+		return "", false
+	}
+	return typed.Code + ": " + typed.Message, true
 }
 
 // hydrate resolves one byte interval to a Section 9.3 source range. Each

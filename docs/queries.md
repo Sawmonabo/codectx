@@ -49,6 +49,27 @@ inside one canonical relation is **one relation and two occurrences**. Each item
 is one occurrence and carries the precision class, file and byte range of the
 evidence row behind it.
 
+**One unreadable blob costs one hit, not the answer.** A `search` hit's `range`
+is resolved by reading the file's bytes out of the content store. When the store
+no longer holds them — the blob is missing, a read comes back short, a block
+digest does not verify, or the snapshot no longer retains the row — that hit
+comes back with no `range` and an `unresolved_fields` object naming the field
+that could not be resolved against the typed reason it failed with:
+
+```json
+{ "path": "pkg/gone.go", "tier": "lexical_fts",
+  "unresolved_fields": { "range": "CTX_SOURCE_INTEGRITY: blob is missing from the content-addressed store" } }
+```
+
+Every other hit on the page keeps its real range. The field is absent from a hit
+that resolved normally, so a missing `range` is never ambiguous: either the hit
+says why it is missing, or the hit carries one. This applies to the content
+store alone. A document that claims bytes past the file it names is a corrupt
+index, not a clamped range, and still fails the query with
+`CTX_ARGUMENT_INVALID`; a cancelled query or an exhausted deadline still fails
+as itself rather than arriving as a complete answer with per-hit footnotes. Run
+`codectx doctor --deep` to verify the content store when hits carry this flag.
+
 ## Flags
 
 | Flag | Commands | Meaning |
