@@ -282,6 +282,40 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 	if err != nil {
 		return nil, err
 	}
+	// The two route sorts are opened here rather than in finishIngest because
+	// the walk emits into them AS EACH PAGE ARRIVES: retaining the pages'
+	// entries until the fold had spoken would make the pass hold the whole
+	// walk, which is the structure this wave removes. They therefore carry the
+	// routes of entries the fold later drops, and finishIngest filters them
+	// against the surviving candidate stream.
+	pathSort, err := newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath)
+	if err != nil {
+		return nil, err
+	}
+	hopSort, err := newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop)
+	if err != nil {
+		return nil, err
+	}
+	emitRoutes := func(seq int64, raw []model.RelationPath) error {
+		paths, _ := boundPaths(raw, cfg.MaxReasonPathsPerEntry)
+		for pi := range paths {
+			p := paths[pi]
+			if err := pathSort.Add(pathRec{
+				Seq: seq, PathIdx: int32(pi), CostUnits: p.CostUnits,
+				Evidence: p.Evidence, HopCount: int32(len(p.Relations)),
+			}); err != nil {
+				return err
+			}
+			for hi, rel := range p.Relations {
+				if err := hopSort.Add(hopRec{
+					RelationID: rel, Seq: seq, PathIdx: int32(pi), HopIdx: int32(hi),
+				}); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 
 	out := &ingested{Scope: scopeResult{ScopeComplete: true}}
 	resolved := 0
@@ -367,75 +401,128 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 		// Discovery: nothing resolved, so nothing is required and no walk is
 		// run. Seeds already carry their own exclusion reasons.
 		out.Scope.ScopeComplete = false
-		return finishIngest(s, out, entitySort, candSort, nil, 0, cfg.MaxReasonPathsPerEntry)
+		return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
 	case len(start) == 0:
 		// Files resolved but no symbol did, so no boundary can be walked from
 		// them. Each seed keeps the requirement its Section 15.2 step assigned;
 		// the scope is not complete.
 		out.Scope.ScopeComplete = false
 		out.Scope.Completeness = degradedCapabilities(caps, nil)
-		return finishIngest(s, out, entitySort, candSort, nil, 0, cfg.MaxReasonPathsPerEntry)
+		return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
 	}
 
-	impact, err := eng.Impact(ctx, model.ImpactRequest{
-		GenerationID: gen,
-		Start:        start,
-		Relations:    scopeRelations,
-		Direction:    model.DirectionBoth,
-		MaxDepth:     cfg.MaxGraphDepth.Int(),
-		MaxVisited:   cfg.MaxVisitedNodes.Int(),
-		MaxEdges:     cfg.MaxGraphEdges.Int(),
-	})
-	if err != nil {
-		return nil, contextErr(ctx, err)
+	// The walk is read TO EXHAUSTION. graph.Impact answers one globally ranked
+	// PAGE and hands back the cursor that continues it; reading that page and
+	// dropping the cursor delivered a fraction of the boundaries and reported
+	// the result as a whole scope. A page is the width of one read, never a
+	// ceiling on the walk: the only bounds that may end it are the user-set
+	// context.max_graph_depth / max_visited_nodes / max_graph_edges, which ride
+	// inside the request and are disclosed through Meta.Truncated.
+	//
+	// Every continuation repeats the issuing request byte for byte apart from
+	// the cursor, including the page limit: graph.Impact binds the limit into
+	// the continuation's query hash, and a page that asked for a different one
+	// would cut the ranked list somewhere the first page never stopped.
+	//
+	// Nothing accumulates across pages except the seq counter and the
+	// deduplicated capability rows: each page's entries go straight into the
+	// dedupe sort and their routes straight into the route sorts, so the pass
+	// holds one page and its sorts' run buffers however long the walk runs.
+	impactBase := int64(len(seeds))
+	seq := impactBase
+	pageSize := c.pageLimit()
+	var disclosed []model.CapabilityState
+	cursor := ""
+	for {
+		impact, err := eng.Impact(ctx, model.ImpactRequest{
+			// The generation is pinned by the cursor on a continuation, and
+			// naming both is refused: a cursor already carries the generation
+			// its first page was answered from.
+			GenerationID: pinnedGeneration(gen, cursor),
+			Start:        start,
+			Relations:    scopeRelations,
+			Direction:    model.DirectionBoth,
+			MaxDepth:     cfg.MaxGraphDepth.Int(),
+			MaxVisited:   cfg.MaxVisitedNodes.Int(),
+			MaxEdges:     cfg.MaxGraphEdges.Int(),
+			Page:         model.PageRequest{Limit: pageSize, Cursor: cursor},
+		})
+		if err != nil {
+			return nil, contextErr(ctx, err)
+		}
+		if impact.Meta.Truncated {
+			out.Scope.ScopeComplete = false
+		}
+		// Deduplicated per page rather than appended: the rows are a property
+		// of the generation and every page repeats the same disclosure, so
+		// folding them as they arrive keeps this bounded by the number of
+		// distinct capabilities instead of by the number of pages.
+		disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
+		for j := range impact.Entries {
+			e := impact.Entries[j]
+			cand := candidate{
+				NodeID: e.NodeID,
+				FileID: e.FileID,
+				// Path is deliberately left empty: candidate.Path is a FILE PATH
+				// everywhere else and ImpactEntry.Name is a qualified name.
+				Requirement: boundaryRequirement(e.Kind, e.Depth),
+				Origin:      originExpansion,
+				Depth:       e.Depth,
+			}
+			var dropped, truncated int64
+			cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
+			out.Scope.ReasonsDropped += dropped
+			out.Scope.ReasonsTruncated += truncated
+			// Only the disclosure count is kept on the record; the routes
+			// themselves go to the route sorts, and finishIngest keeps the ones
+			// whose candidate survived the fold.
+			_, cand.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
+			if err := entitySort.Add(candRecOf(cand, seq)); err != nil {
+				return nil, err
+			}
+			if err := emitRoutes(seq, e.Paths); err != nil {
+				return nil, err
+			}
+			seq++
+		}
+		if impact.Meta.NextCursor == "" {
+			break
+		}
+		cursor = impact.Meta.NextCursor
 	}
-	if impact.Meta.Truncated {
-		out.Scope.ScopeComplete = false
-	}
-	out.Scope.Completeness = degradedCapabilities(caps, impact.Meta.Completeness)
+	out.Scope.Completeness = degradedCapabilities(caps, disclosed)
 	if len(out.Scope.Completeness) > 0 {
 		out.Scope.ScopeComplete = false
 	}
+	return finishIngest(s, out, entitySort, candSort, pathSort, hopSort)
+}
 
-	impactBase := int64(len(seeds))
-	for j := range impact.Entries {
-		e := impact.Entries[j]
-		cand := candidate{
-			NodeID: e.NodeID,
-			FileID: e.FileID,
-			// Path is deliberately left empty: candidate.Path is a FILE PATH
-			// everywhere else and ImpactEntry.Name is a qualified name.
-			Requirement: boundaryRequirement(e.Kind, e.Depth),
-			Origin:      originExpansion,
-			Depth:       e.Depth,
-		}
-		var dropped, truncated int64
-		cand.Reasons, dropped, truncated = boundReasons(e.Reasons)
-		out.Scope.ReasonsDropped += dropped
-		out.Scope.ReasonsTruncated += truncated
-		// Only the disclosure count is kept here; the routes themselves are
-		// emitted below, once the fold has said which entries survived.
-		_, cand.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-		if err := entitySort.Add(candRecOf(cand, impactBase+int64(j))); err != nil {
-			return nil, err
-		}
+// pinnedGeneration is the generation a walk request carries: the pinned one on
+// the first page and none on a continuation, because a cursor already pins the
+// generation its walk was answered from and naming both is refused
+// (PageRequest.ValidatePinned).
+func pinnedGeneration(gen model.GenerationID, cursor string) model.GenerationID {
+	if cursor != "" {
+		return 0
 	}
-	return finishIngest(s, out, entitySort, candSort, impact.Entries, impactBase,
-		cfg.MaxReasonPathsPerEntry)
+	return gen
 }
 
 // finishIngest drains the dedupe survivors into the output sort, materializes
-// the candidate spool in seq order, and emits the two route streams for the
-// impact entries that survived.
+// the candidate spool in seq order, and keeps the routes of the entries that
+// survived.
 //
 // It is the ONE tail of expandScopeStream: the two early returns above reach it
 // as well, so no path hands the next pass an unfinalized sort.
 //
-// The route emission needs no join. Seq is the impact entry's own position
-// offset by len(seeds), so a surviving record indexes impact.Entries directly;
-// a record the fold dropped never reaches the walk and its routes are therefore
-// never emitted -- which is what keeps P-C's `wanted` set the survivors' set,
-// exactly as today's relationsOnPaths loop over res.Candidates does.
+// The route streams arrive holding a record for EVERY entry the walk delivered,
+// because they are written page by page, before the fold has said which entries
+// survive. Keeping only the survivors' routes is a forward merge-join on seq:
+// both the candidate spool and each route stream ascend in it, so one walk over
+// each, with no side buffered, reproduces exactly the set today's loop over the
+// admitted candidates emitted. The filter is not optional -- P-C reads the hop
+// stream as its `wanted` set, and a dropped duplicate's hops would inflate that
+// count, resize the bitset and move the scan's early exit.
 //
 // Only an expansion entry carries routes: a model.RelationPath is produced by a
 // graph walk, and every seed producer (seeds.go) resolves through search and
@@ -444,7 +531,8 @@ func (c *Compiler) expandScopeStream(ctx context.Context, s *compileSorts, eng *
 // through this same stream rather than on the candidate.
 func finishIngest(s *compileSorts, out *ingested,
 	entitySort, candSort *pagination.ExternalSort[candRec],
-	entries []model.ImpactEntry, impactBase int64, maxPaths config.Limit) (*ingested, error) {
+	pathSort *pagination.ExternalSort[pathRec], hopSort *pagination.ExternalSort[hopRec],
+) (*ingested, error) {
 	entityRun, err := entitySort.Sorted()
 	if err != nil {
 		return nil, err
@@ -459,47 +547,65 @@ func finishIngest(s *compileSorts, out *ingested,
 	}
 	trackRun(s, candRun)
 
-	pathSort, err := newSort[pathRec](s, "scope-path", lessPathSeq, sizeOfPath)
+	rawPaths, err := pathSort.Sorted()
 	if err != nil {
 		return nil, err
 	}
-	hopSort, err := newSort[hopRec](s, "scope-hop", lessHopSeq, sizeOfHop)
+	trackRun(s, rawPaths)
+	rawHops, err := hopSort.Sorted()
 	if err != nil {
 		return nil, err
 	}
-	if err := candRun.Each(func(r candRec) error {
-		if r.Seq < impactBase || r.Seq-impactBase >= int64(len(entries)) {
-			return nil
-		}
-		paths, _ := boundPaths(entries[r.Seq-impactBase].Paths, maxPaths)
-		for pi := range paths {
-			p := paths[pi]
-			if err := pathSort.Add(pathRec{
-				Seq: r.Seq, PathIdx: int32(pi), CostUnits: p.CostUnits,
-				Evidence: p.Evidence, HopCount: int32(len(p.Relations)),
-			}); err != nil {
+	trackRun(s, rawHops)
+	if out.Paths, err = keptBySeq(s, "scope-path-kept", rawPaths, candRun,
+		func(r pathRec) int64 { return r.Seq }, lessPathSeq, sizeOfPath); err != nil {
+		return nil, err
+	}
+	if out.Hops, err = keptBySeq(s, "scope-hop-kept", rawHops, candRun,
+		func(r hopRec) int64 { return r.Seq }, lessHopSeq, sizeOfHop); err != nil {
+		return nil, err
+	}
+	out.Cands = candRun
+	return out, nil
+}
+
+// keptBySeq writes the records of src whose Seq appears in cands, in src's own
+// order, and returns them as a run.
+//
+// It is a forward merge-join and holds two records: one candidate and one
+// source record. Seq is unique per candidate and both streams ascend in it, so
+// the candidate cursor only ever moves forward, and a source record whose seq
+// the fold dropped finds no candidate at its seq and is skipped.
+func keptBySeq[T any](s *compileSorts, name string, src *pagination.SortedRun[T],
+	cands *pagination.SortedRun[candRec], seqOf func(T) int64,
+	less func(a, b T) int, sizeOf func(T) int64) (*pagination.SortedRun[T], error) {
+	out, err := newSort(s, name, less, sizeOf)
+	if err != nil {
+		return nil, err
+	}
+	next, stop := pullRun(cands)
+	defer stop()
+	cur, have, err := next()
+	if err != nil {
+		return nil, err
+	}
+	if err := src.Each(func(v T) error {
+		seq := seqOf(v)
+		for have && cur.Seq < seq {
+			if cur, have, err = next(); err != nil {
 				return err
 			}
-			for hi, rel := range p.Relations {
-				if err := hopSort.Add(hopRec{
-					RelationID: rel, Seq: r.Seq, PathIdx: int32(pi), HopIdx: int32(hi),
-				}); err != nil {
-					return err
-				}
-			}
+		}
+		if have && cur.Seq == seq {
+			return out.Add(v)
 		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	if out.Paths, err = pathSort.Sorted(); err != nil {
+	run, err := out.Sorted()
+	if err != nil {
 		return nil, err
 	}
-	trackRun(s, out.Paths)
-	if out.Hops, err = hopSort.Sorted(); err != nil {
-		return nil, err
-	}
-	trackRun(s, out.Hops)
-	out.Cands = candRun
-	return out, nil
+	return trackRun(s, run), nil
 }

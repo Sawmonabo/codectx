@@ -1703,19 +1703,37 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 			QualifiedName: spec.path + "." + spec.symbol, FileID: fv.ID, ContentHash: fv.ContentHash}
 	}
 	sort.Slice(adj.relations, func(i, j int) bool { return adj.relations[i].ID < adj.relations[j].ID })
-	eng, err := graph.New(graph.Options{Adjacency: adj, Limits: graph.Limits{
-		MaxDepth:       f.Cfg.Context.MaxGraphDepth.Int(),
-		MaxVisited:     f.Cfg.Context.MaxVisitedNodes.Int(),
-		MaxEdges:       f.Cfg.Context.MaxGraphEdges.Int(),
-		MaxPageItems:   f.Cfg.Resources.MaxPageItems,
-		MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry.Int(),
-		QueryTimeout:   f.Cfg.Resources.QueryTimeout.Std(),
-		CursorTTL:      f.Cfg.Storage.QueryCursorTTL.Std(),
-		FrontierBytes:  f.Cfg.Resources.QueryMemoryBytes,
-		// Deliberately the real clock, not the fixture's frozen one: the engine
-		// derives a context deadline from it, and a frozen instant in the past
-		// would expire every walk before its first edge.
-	}})
+	// The continuation machinery is wired exactly as internal/app wires it
+	// (workspace.go). Without a signer, a spool area and a lease table,
+	// graph.Impact cannot mint the cursor that continues a ranked walk: it
+	// answers its first page and reports no continuation, so a fixture engine
+	// built without them caps every walk at one page and no test over it can
+	// observe a walk being read to exhaustion.
+	dir := f.t.TempDir()
+	signer, err := pagination.OpenSigner(dir)
+	if err != nil {
+		f.t.Fatalf("OpenSigner: %v", err)
+	}
+	spools, err := pagination.NewSpools(filepath.Join(dir, "spools"), 1<<20, f.Store)
+	if err != nil {
+		f.t.Fatalf("NewSpools: %v", err)
+	}
+	eng, err := graph.New(graph.Options{Adjacency: adj,
+		Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(f.Store, pagination.DefaultCursorTTL),
+		Limits: graph.Limits{
+			MaxDepth:       f.Cfg.Context.MaxGraphDepth.Int(),
+			MaxVisited:     f.Cfg.Context.MaxVisitedNodes.Int(),
+			MaxEdges:       f.Cfg.Context.MaxGraphEdges.Int(),
+			MaxPageItems:   f.Cfg.Resources.MaxPageItems,
+			MaxReasonPaths: f.Cfg.Context.MaxReasonPathsPerEntry.Int(),
+			QueryTimeout:   f.Cfg.Resources.QueryTimeout.Std(),
+			CursorTTL:      f.Cfg.Storage.QueryCursorTTL.Std(),
+			FrontierBytes:  f.Cfg.Resources.QueryMemoryBytes,
+			// Deliberately the real clock, not the fixture's frozen one: the engine
+			// derives a context deadline from it, and a frozen instant in the past
+			// would expire every walk before its first edge.
+		}})
 	if err != nil {
 		f.t.Fatalf("graph.New: %v", err)
 	}

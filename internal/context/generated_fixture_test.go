@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // generated_fixture_test.go holds the ONE generated fixture of this package and
@@ -161,11 +163,12 @@ func TestTheGeneratedFixtureCanDiscriminateTheStreamedPasses(t *testing.T) {
 	//     would leave routes untyped here; over the shared fixture's four
 	//     wanted relations it could not.
 	full := compileGenerated(t, fx, generatedFullBudget)
-	if len(full.entries) < 150 {
-		t.Errorf("the unbounded compile produced %d entries; the fan-out is not reaching the packer", len(full.entries))
+	if len(full.entries) < 300 {
+		t.Errorf("the unbounded compile produced %d entries, want at least 300; the walk is not being read to "+
+			"exhaustion, or the fan-out is not reaching the packer", len(full.entries))
 	}
-	if len(full.wanted) < 150 {
-		t.Errorf("the entries name %d distinct relations on retained routes, want at least 150; "+
+	if len(full.wanted) < 250 {
+		t.Errorf("the entries name %d distinct relations on retained routes, want at least 250; "+
 			"below this the unlimited edge scan of ruling C8 has no input that one page would truncate",
 			len(full.wanted))
 	}
@@ -218,12 +221,7 @@ func compileGenerated(t *testing.T, fx *contextFixture, b model.Budget) compiled
 	}
 	out := compiled{wanted: map[model.RelationID]bool{}, reasons: map[string]bool{},
 		byNode: map[model.NodeID]bool{}}
-	if out.entries, err = fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0); err != nil {
-		t.Fatalf("ManifestEntries: %v", err)
-	}
-	if out.excluded, err = fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0); err != nil {
-		t.Fatalf("ManifestExcluded: %v", err)
-	}
+	out.entries, _, out.excluded = readBackManifest(t, fx, m.ID)
 	for _, e := range out.entries {
 		out.byNode[e.NodeID] = true
 		for _, r := range e.Reasons {
@@ -255,4 +253,67 @@ func outOfFileOrder(rows []model.ExcludedContextEntry) bool {
 		prev = p
 	}
 	return false
+}
+
+// TestACompileSortHoldsItsRunBudgetAndSpills is the memory invariant the whole
+// streamed pipeline exists for, asserted on the primitive every pass builds on:
+// a sort's live working set is a function of the RUN BUDGET, not of how many
+// records it is given, and the records past that budget go to disk.
+//
+// It reads compileSorts.observations(), the per-sort peak/spill hook: without
+// it the invariant is unwritable from a test, because pagination.ExternalSort
+// is opaque once newSort has registered it for release.
+func TestACompileSortHoldsItsRunBudgetAndSpills(t *testing.T) {
+	// The smallest admission the primitive honours, so the run buffer is the
+	// documented floor and a few thousand records must outgrow it.
+	sorts, err := newCompileSorts(config.Defaults(), t.TempDir())
+	if err != nil {
+		t.Fatalf("newCompileSorts: %v", err)
+	}
+	sorts.runBytes = pagination.SortRunBytes(1)
+	sort, err := newSort(sorts, "probe", lessCandSeq, sizeOfCand)
+	if err != nil {
+		t.Fatalf("newSort: %v", err)
+	}
+	const records = 20000
+	for i := 0; i < records; i++ {
+		if err := sort.Add(candRec{Seq: int64(i), NodeID: model.NodeID(fmt.Sprintf("%040x", i)),
+			Requirement: model.RequirementFull}); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+	}
+	run, err := sort.Sorted()
+	if err != nil {
+		t.Fatalf("Sorted: %v", err)
+	}
+	defer run.Close()
+	if run.Len() != records {
+		t.Errorf("the sort answers %d records, want %d: the spill lost records", run.Len(), records)
+	}
+	if err := sorts.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	obs := sorts.observations()
+	if len(obs) != 1 {
+		t.Fatalf("the sort area observed %d sorts, want 1", len(obs))
+	}
+	if !obs[0].Spilled {
+		t.Errorf("%d records under a %d-byte run budget never spilled, so the peak below is not "+
+			"evidence of anything", records, sorts.runBytes)
+	}
+	// Peak is in RECORDS and the budget is in BYTES, so the assertion is on the
+	// bytes those records could have held: no more than one run buffer's worth,
+	// plus the one record whose arrival triggers the spill.
+	var peakBytes int64
+	for i := 0; i < obs[0].Peak; i++ {
+		peakBytes += sizeOfCand(candRec{Seq: int64(i), NodeID: model.NodeID(fmt.Sprintf("%040x", i)),
+			Requirement: model.RequirementFull})
+	}
+	if peakBytes > 2*sorts.runBytes {
+		t.Errorf("the sort held %d records (~%d bytes) at once under a %d-byte run budget: the peak "+
+			"tracks the input, not the budget", obs[0].Peak, peakBytes, sorts.runBytes)
+	}
+	if obs[0].Added != records {
+		t.Errorf("the observation counted %d added records, want %d", obs[0].Added, records)
+	}
 }

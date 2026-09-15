@@ -200,55 +200,75 @@ func expandScope(ctx context.Context, eng *graph.Engine, gen model.GenerationID,
 		return res, nil
 	}
 
-	impact, err := eng.Impact(ctx, model.ImpactRequest{
-		GenerationID: gen,
-		Start:        start,
-		Relations:    scopeRelations,
-		// Both directions: a caller reaches the seed through an incoming edge
-		// and a callee through an outgoing one, and Section 15.2 requires both.
-		Direction:  model.DirectionBoth,
-		MaxDepth:   cfg.MaxGraphDepth.Int(),
-		MaxVisited: cfg.MaxVisitedNodes.Int(),
-		MaxEdges:   cfg.MaxGraphEdges.Int(),
-	})
-	if err != nil {
-		return scopeResult{}, contextErr(ctx, err)
+	// The reference reads the walk to exhaustion, exactly as the streamed pass
+	// does: graph.Impact answers one globally ranked page plus the cursor that
+	// continues it, and a reference that stopped at page one would make parity
+	// prove only that the two pipelines agree on the first page.
+	var disclosed []model.CapabilityState
+	cursor := ""
+	for {
+		impact, err := eng.Impact(ctx, model.ImpactRequest{
+			// The generation is pinned by the cursor on a continuation, and
+			// naming both is refused: a cursor already carries the generation
+			// its first page was answered from.
+			GenerationID: pinnedGeneration(gen, cursor),
+			Start:        start,
+			Relations:    scopeRelations,
+			// Both directions: a caller reaches the seed through an incoming edge
+			// and a callee through an outgoing one, and Section 15.2 requires both.
+			Direction:  model.DirectionBoth,
+			MaxDepth:   cfg.MaxGraphDepth.Int(),
+			MaxVisited: cfg.MaxVisitedNodes.Int(),
+			MaxEdges:   cfg.MaxGraphEdges.Int(),
+			// No limit: the engine's own page width resolves on page one and
+			// every continuation is bound to it, so the reference reads the
+			// same globally ranked list whatever width the compiler configured.
+			Page: model.PageRequest{Cursor: cursor},
+		})
+		if err != nil {
+			return scopeResult{}, contextErr(ctx, err)
+		}
+		if impact.Meta.Truncated {
+			res.ScopeComplete = false
+		}
+		disclosed = degradedCapabilities(nil, append(disclosed, impact.Meta.Completeness...))
+
+		for _, e := range impact.Entries {
+			c := candidate{
+				NodeID: e.NodeID,
+				FileID: e.FileID,
+				// Path is deliberately left empty: candidate.Path is a FILE PATH
+				// everywhere else, and ImpactEntry.Name is a qualified name.
+				// Writing the name here made hydrateFiles (compiler.go) skip the
+				// entry -- it fills Path only when it is empty -- so the file path
+				// the FileID resolves to never reached the candidate, and
+				// rank.go's packageOf() bucketed qualified names instead of
+				// directories.
+				Requirement: boundaryRequirement(e.Kind, e.Depth),
+				Origin:      originExpansion,
+				Depth:       e.Depth,
+			}
+			var dropped, truncated int64
+			c.Reasons, dropped, truncated = boundReasons(e.Reasons)
+			res.ReasonsDropped += dropped
+			res.ReasonsTruncated += truncated
+			c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
+			if admitted[c.entityID()] {
+				// A seed the walk reached again keeps its seed requirement, which
+				// is the strongest one; re-adding it would double an entry.
+				continue
+			}
+			admitted[c.entityID()] = true
+			res.Candidates = append(res.Candidates, c)
+		}
+		if impact.Meta.NextCursor == "" {
+			break
+		}
+		cursor = impact.Meta.NextCursor
 	}
-	if impact.Meta.Truncated {
-		res.ScopeComplete = false
-	}
-	res.Completeness = degradedCapabilities(caps, impact.Meta.Completeness)
+	res.Completeness = degradedCapabilities(caps, disclosed)
 	if len(res.Completeness) > 0 {
 		res.ScopeComplete = false
-	}
-
-	for _, e := range impact.Entries {
-		c := candidate{
-			NodeID: e.NodeID,
-			FileID: e.FileID,
-			// Path is deliberately left empty: candidate.Path is a FILE PATH
-			// everywhere else, and ImpactEntry.Name is a qualified name.
-			// Writing the name here made hydrateFiles (compiler.go) skip the
-			// entry -- it fills Path only when it is empty -- so the file path
-			// the FileID resolves to never reached the candidate, and
-			// rank.go's packageOf() bucketed qualified names instead of
-			// directories.
-			Requirement: boundaryRequirement(e.Kind, e.Depth),
-			Origin:      originExpansion,
-			Depth:       e.Depth,
-		}
-		var dropped, truncated int64
-		c.Reasons, dropped, truncated = boundReasons(e.Reasons)
-		res.ReasonsDropped += dropped
-		res.ReasonsTruncated += truncated
-		c.Paths, c.MorePaths = boundPaths(e.Paths, cfg.MaxReasonPathsPerEntry)
-		if admitted[c.entityID()] {
-			// A seed the walk reached again keeps its seed requirement, which
-			// is the strongest one; re-adding it would double an entry.
-			continue
-		}
-		admitted[c.entityID()] = true
-		res.Candidates = append(res.Candidates, c)
 	}
 	return res, nil
 }
@@ -1038,34 +1058,60 @@ var generatedParityRequests = []struct {
 }{
 	// Every admitted candidate survives to an entry, over a scope naming far
 	// more than one page of distinct relations on retained routes.
-	// SKIPPED, and the skip is the finding: see openDefectStreamedEntriesStopAtOnePage.
 	{"the generated fan-out, unbounded", generatedFullBudget},
 	// The same scope under a file budget that drops more than a hundred files,
 	// so the packer's drop stream is emitted over many files and in rank order.
 	{"the generated fan-out, the file budget drops a hundred files", generatedDropBudget},
 }
 
-// openDefectStreamedEntriesStopAtOnePage records a MEASURED parity divergence
-// this lane found and could not fix: it is in production code lane C-P4 does
-// not own.
+// readBackManifest reads a persisted manifest's entries, slices and exclusions
+// TO EXHAUSTION.
 //
-// Over the generated fan-out under generatedFullBudget, the whole-set reference
-// pipeline plans 207 entries and the streamed pipeline plans 200 --
-// model.MaxPageItems exactly. The first 200 entries are byte-for-byte
-// identical, including ordinals, reasons and evidence routes, so this is not a
-// ranking or ordering difference: the streamed pipeline STOPS, and it stops at
-// a page. The shared seven-file fixture admits seven candidates and so can
-// never show it, which is why every existing parity row passes.
-//
-// Skipping rather than deleting keeps the reproduction in the tree: delete the
-// t.Skip below and the row fails again with the entry counts above. It is the
-// same class as ruling C8 -- a page read once instead of to exhaustion -- and
-// on a large repository it is a silently truncated plan, which is the one
-// outcome this product may not produce.
-const openDefectStreamedEntriesStopAtOnePage = "OPEN DEFECT (C-P4): the streamed compile plans " +
-	"model.MaxPageItems entries where the whole-set reference plans 207; the first 200 agree " +
-	"byte for byte, so the streamed pipeline reads one page of candidates instead of all of them. " +
-	"Owner: internal/context production code (not this lane). Delete this skip to reproduce."
+// The three store readers are keyset-paged and a limit of 0 means "one default
+// page" (model.MaxPageItems), not "everything": reading them once compared the
+// whole-set reference against the FIRST PAGE of the streamed plan, which is
+// what made the at-scale row report 207 against 200 entries. The plan itself
+// was never cut -- the proof was. Paging here is the assertion the product
+// requires of every caller: a page bounds one read, never the answer.
+func readBackManifest(t *testing.T, fx *contextFixture, id model.ManifestID) (
+	[]model.ContextEntry, []model.ContextSlice, []model.ExcludedContextEntry) {
+	t.Helper()
+	entries := readAllPages(t, "ManifestEntries", func(after int) ([]model.ContextEntry, error) {
+		return fx.Store.ManifestEntries(fx.ctx, id, after, 0)
+	}, func(e model.ContextEntry) int { return e.Ordinal })
+	slices := readAllPages(t, "ManifestSlices", func(after int) ([]model.ContextSlice, error) {
+		return fx.Store.ManifestSlices(fx.ctx, id, after, 0)
+	}, func(sl model.ContextSlice) int { return sl.Index })
+	excluded := readAllPages(t, "ManifestExcluded", func(after int) ([]model.ExcludedContextEntry, error) {
+		return fx.Store.ManifestExcluded(fx.ctx, id, after, 0)
+	}, func(e model.ExcludedContextEntry) int { return e.Ordinal })
+	return entries, slices, excluded
+}
+
+// readAllPages walks one keyset-paged reader from before its first row to its
+// end, advancing the cursor by the last row's own key. A short page ends the
+// walk; an empty one does too, so a reader that returns nothing cannot spin.
+func readAllPages[T any](t *testing.T, what string, page func(after int) ([]T, error),
+	key func(T) int) []T {
+	t.Helper()
+	var out []T
+	after := -1
+	for {
+		got, err := page(after)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if len(got) == 0 {
+			return out
+		}
+		out = append(out, got...)
+		next := key(got[len(got)-1])
+		if next <= after {
+			t.Fatalf("%s: the cursor did not advance past %d", what, after)
+		}
+		after = next
+	}
+}
 
 // TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale is the proof above
 // over the generated fixture. It is a separate test rather than two more rows
@@ -1075,9 +1121,6 @@ const openDefectStreamedEntriesStopAtOnePage = "OPEN DEFECT (C-P4): the streamed
 func TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale(t *testing.T) {
 	for _, row := range generatedParityRequests {
 		t.Run(row.name, func(t *testing.T) {
-			if row.budget == generatedFullBudget {
-				t.Skip(openDefectStreamedEntriesStopAtOnePage)
-			}
 			fx := newGeneratedFixture(t)
 			req := generatedRequest(row.budget)
 			c := intCompiler(t, fx, fx.Now)
@@ -1089,18 +1132,7 @@ func TestTheStreamedCompileIsByteForByteTheWholeSetPlanAtScale(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
-			entries, err := fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestEntries: %v", err)
-			}
-			slices, err := fx.Store.ManifestSlices(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestSlices: %v", err)
-			}
-			excluded, err := fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestExcluded: %v", err)
-			}
+			entries, slices, excluded := readBackManifest(t, fx, m.ID)
 			if len(entries) == 0 && len(excluded) == 0 {
 				t.Fatalf("the compile produced neither an entry nor an exclusion, so this row proves nothing")
 			}
@@ -1212,18 +1244,7 @@ func TestTheStreamedCompileIsByteForByteTheWholeSetPlan(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Compile: %v", err)
 			}
-			entries, err := fx.Store.ManifestEntries(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestEntries: %v", err)
-			}
-			slices, err := fx.Store.ManifestSlices(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestSlices: %v", err)
-			}
-			excluded, err := fx.Store.ManifestExcluded(fx.ctx, m.ID, -1, 0)
-			if err != nil {
-				t.Fatalf("ManifestExcluded: %v", err)
-			}
+			entries, slices, excluded := readBackManifest(t, fx, m.ID)
 			// The plan must not be vacuously equal: a row that compiled to
 			// nothing would pass every comparison below without exercising one
 			// streamed pass.
