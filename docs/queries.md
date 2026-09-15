@@ -295,6 +295,37 @@ A **phrase** — two or more tokens that must be adjacent — keeps reading the
 index directly, because testing adjacency needs the token offsets the packed
 form deliberately does not store.
 
+## How `search` serves its first page
+
+The first request scores every candidate the query matches — there is no
+candidate cap and no top-k approximation — and selects the page it serves
+through a **bounded heap** of one page plus one entry, ordered by exactly the
+comparator the full sort uses ([ADR-0007](adr/ADR-0007-lexical-first-page.md),
+Decision 3). The heap's page is therefore the fully ordered answer's first
+page by construction, not by approximation.
+
+**The order guarantee.** Results are served in the Section 14.2 order: tier,
+then descending score, then path, then start byte, then the keys derived from
+the file's bytes (end byte, kind, name, qualified name, signature), and last
+the identity keys. Every key is an integer or an exact string, and the order is
+a pure function of the repository's content — the same tree indexed at another
+root, or re-indexed as a delta, answers in the same order. Concatenating the
+pages of a walk yields exactly the fully ordered answer.
+
+**What a continuation resumes.** An answer that fits one page ends there: it
+writes no continuation state at all. An answer that runs past it is spooled
+whole, unordered, while the first page is served. The *first* continuation
+request sorts that spool once, writes the ordered remainder, and serves from
+it; every later page seeks straight to the byte offset its cursor carries. So
+the full sort is paid exactly once, by the request that needs it, and no page
+costs the remainder behind it.
+
+A cursor pins the generation, the analysis key and the query with its filters.
+Resubmitting a continuation with a different query or filter set, or against a
+re-analysed generation, is `CTX_CURSOR_INVALID` rather than a quietly different
+answer under a continued page number. Continuation state is retained by a lease
+that each page renews, and it is released as soon as the walk reaches its end.
+
 ## Configuration these commands read
 
 The engine reads no configuration itself; the values below are resolved once,
