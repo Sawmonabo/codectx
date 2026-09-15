@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -313,12 +314,25 @@ func TestDeadlineEndsThePageNotTheAnswer(t *testing.T) {
 	// A real starting instant: the engine builds a context.WithDeadline from
 	// this clock, and a fake epoch would make that context already expired
 	// against the real one the runtime enforces it on.
+	// Two round trips is level 0 (the rows, then the empty page that ends its
+	// keyset walk), so trigger 2 lands the deadline at level 1's loop-top check
+	// and 3 and 4 land it INSIDE level 1's reader loop -- the two stops are
+	// different code paths and each must keep the same contract.
+	for _, trigger := range []int{2, 3, 4} {
+		t.Run(fmt.Sprintf("deadline-after-%d-reads", trigger), func(t *testing.T) {
+			deadlinePageCase(t, f, signer, spools, store, limits, req, all, trigger)
+		})
+	}
+}
+
+func deadlinePageCase(t *testing.T, f *graphFixture, signer *pagination.Signer,
+	spools *pagination.Spools, store *fixtureLeases, limits Limits,
+	req model.GraphRequest, all model.GraphResult, trigger int) {
+	t.Helper()
 	clock := time.Now()
 	calls, fired := 0, false
 	slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
-		// Two round trips is level 0: the rows, then the empty page that ends
-		// its keyset walk. The deadline therefore lands with level 0 admitted.
-		trigger: 2, jump: 2 * time.Minute, fired: &fired}
+		trigger: trigger, jump: 2 * time.Minute, fired: &fired}
 	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})

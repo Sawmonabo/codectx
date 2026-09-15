@@ -246,7 +246,14 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			stopped := make([]frontierState, 0, len(frontier)+len(next))
 			stopped = append(stopped, frontier...)
 			stopped = append(stopped, next...)
-			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted}, nil
+			// A deadline can trip on this level's FIRST reader check, before it
+			// collected a row. Then nothing here advanced the keyset position
+			// and the one the page carries still names the previous level's
+			// last row -- which, applied to this level, would drop every row
+			// whose owner sorts below it. The frontier-byte spill cannot reach
+			// this: its `spent > 0` guard means it always collected a row.
+			return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
+				LevelBoundary: len(rows) == 0}, nil
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].Node < next[j].Node })
 		frontier = next
