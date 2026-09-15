@@ -88,5 +88,7 @@ open. In outline: the configuration `Limit` type with unlimited defaults (§2.1)
 traversal with a cursor for every stop and the visited set off the heap (§2.2); external merge in
 the planner with byte-identical order (§2.3); a lossless ranked set with a spooled tail (§2.4);
 field bounds that truncate and flag (§2.5); progress-based stall detection and waiting admission
-(§2.6); reports that drop nothing (§2.7); the storage redesign, accepted and scheduled (§2.8); and
-capsule pagination, accepted and since landed, which was the one known remaining default cap (§2.9).
+(§2.6); reports that drop nothing (§2.7); the storage redesign, accepted and since landed — integer
+surrogate identities and interned keys, 5 732.8 → 3 603.5 bytes per indexed symbol on a real
+4 019-file repository (§2.8); and capsule pagination, accepted and since landed, which was the one
+known remaining default cap (§2.9).
