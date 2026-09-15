@@ -272,9 +272,26 @@ CREATE TABLE scope_keys (
     id INTEGER PRIMARY KEY CHECK(id > 0),
     key TEXT NOT NULL UNIQUE
 );
+-- native_keys is a HASH-KEYED dictionary (ADR-0003 SS2.3). `key TEXT UNIQUE`
+-- built an automatic index that cost more than the table it indexed -- 38.8 MB
+-- against 34.5 MB on m32rimm, 47.1 against 41.2 on promptfoo -- because
+-- interning stored every distinct key twice: once as payload, once as the
+-- index key. Declaring the table WITHOUT ROWID PRIMARY KEY(key) does not fix
+-- it: both directions are needed (the writer resolves key->id, every reader
+-- id->key), so an id-keyed index survives, and a rowid-less table re-stores its
+-- whole primary key inside every secondary index, putting the full key back.
+-- Instead the id IS the key's digest -- the first 63 bits of SHA-256(key), zero
+-- clamped to 1 so that CHECK(id > 0) and the noRef sentinel both hold -- so the
+-- writer computes it without a lookup and one b-tree holds one copy of each
+-- key. Safety is DETECTION, not improbability: intern.go compares the stored
+-- key against the incoming one and probes the next id on disagreement, reusing
+-- the read-back the interner already performs, so two colliding keys can never
+-- merge into one id. scope_keys keeps its UNIQUE index: 403 distinct values on
+-- the control fixture is not an amplifier, and reconcile's scope lookup is by
+-- key.
 CREATE TABLE native_keys (
     id INTEGER PRIMARY KEY CHECK(id > 0),
-    key TEXT NOT NULL UNIQUE
+    key TEXT NOT NULL
 );
 -- No `paths` intern table: the only high-multiplicity path column is
 -- search_units.path, and search_fts declares it as an external-content FTS5

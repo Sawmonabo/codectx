@@ -194,20 +194,21 @@ func (s *Store) aliasChunk(ctx context.Context, tx *sql.Tx, keys [][]byte, scope
 // noRef, which every caller reads as "aliased to nothing" -- the dictionaries
 // are written only by the unit writer, so an unseen key genuinely has no alias.
 func internedPair(ctx context.Context, tx *sql.Tx, scopeKey, nativeKey string) (scope, native int64, err error) {
-	lookup := func(table, key string) (int64, error) {
-		var id int64
-		err := tx.QueryRowContext(ctx, `SELECT id FROM `+table+` WHERE key = ?`, key).Scan(&id)
-		if isNoRows(err) {
-			return noRef, nil
-		}
-		if err != nil {
-			return noRef, wrap(table, err)
-		}
-		return id, nil
+	err = tx.QueryRowContext(ctx, `SELECT id FROM scope_keys WHERE key = ?`, scopeKey).Scan(&scope)
+	switch {
+	case isNoRows(err):
+		return noRef, noRef, nil
+	case err != nil:
+		return noRef, noRef, wrap("scope_keys", err)
 	}
-	if scope, err = lookup("scope_keys", scopeKey); err != nil || scope == noRef {
-		return noRef, noRef, err
+	// native_keys is hash-keyed (ADR-0003 SS2.3), so there is no index over
+	// `key` to probe: resolving key->id walks the key's own hash chain by id,
+	// comparing the stored key at each step. A free slot on the chain means
+	// the key was never interned, which is the same noRef this function
+	// returned before.
+	native, found, err := lookupNativeKey(ctx, tx, nativeKey)
+	if err != nil || !found {
+		return scope, noRef, err
 	}
-	native, err = lookup("native_keys", nativeKey)
-	return scope, native, err
+	return scope, native, nil
 }
