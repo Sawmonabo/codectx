@@ -9,11 +9,10 @@ package context
 // reference that lives in production would be a second pipeline a caller could
 // reach by accident. Nothing here may be called from a non-test file.
 //
-// Lane C-INT2 moved the two functions below, whose production callers Compile's
-// wiring removed. `expandScope`, `rank` and `buildPlan` are still referenced by
-// tests in four files of this package and have NOT been moved yet; that
-// relocation, together with the helper sweep it needs, is the open half of
-// C-STREAM item 5 and is recorded in C-INT2-report.md.
+// The two functions below have no production caller and live here for that
+// reason. `expandScope`, `rank` and `buildPlan` are still referenced by tests in
+// four files of this package and stay where they are until those references
+// move with them.
 
 import (
 	"context"

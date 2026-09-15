@@ -1,9 +1,8 @@
-// This file is the C-STREAM interface freeze (lane L0). It holds the record
-// types, comparators, folds and sort factory every streaming pass of the
-// context compiler shares, plus one stub per pass P-A .. P-I of
-// .superpowers/sdd/implementation-plan/C-STREAM-plan.md §2.
+// This file holds the record types, comparators, folds and sort factory every
+// streaming pass of the context compiler shares, plus the entry point of each
+// pass P-A .. P-I.
 //
-// The goal of the wave is that the compiler's peak heap is a function of the
+// The design it serves is that the compiler's peak heap is a function of the
 // sort run budget, the page size and the resolved byte budget, and never of the
 // candidate count, while the plan it produces stays byte-for-byte the one
 // today's whole-set pipeline produces. Everything here exists to make that
@@ -777,8 +776,7 @@ func trackRun[T any](s *compileSorts, run *pagination.SortedRun[T]) *pagination.
 // One stub per pass of C-STREAM-plan.md §2, in pipeline order, so the lane
 // split is visible in the package before any of it is written. Each owning lane
 // completes its own body AND its own parameter list; what is frozen here is the
-// set of passes, their order and which lane owns each, not the arguments a pass
-// will need. None has a caller until L5 wires Compile.
+// set of passes and their order; the arguments each needs are its own.
 
 // passAIngest — §2 P-A, lane L1. expandScope appends to the candidate spool in
 // admission order with a seq on every record instead of building
