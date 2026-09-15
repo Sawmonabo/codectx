@@ -791,7 +791,7 @@ func TestStorePublicationScenario(t *testing.T) {
 	// has nothing to consolidate yet.
 	capsule := model.Capsule{SessionID: open.ID, ActorID: actorID, Binding: bind2, ManifestHash: manifest.CanonicalHash,
 		ScopeVersion: 1, CanonicalHash: model.H("capsule"), CreatedAt: time.Now().UTC()}
-	if _, err := f.s.PutCapsule(ctx, capsule); err == nil {
+	if _, err := f.s.PutCapsule(ctx, capsule, nil); err == nil {
 		t.Fatal("PutCapsule stored a capsule for a session that is not in consolidate_open")
 	} else {
 		wantCode(t, err, model.CodeVersionConflict)
@@ -1275,13 +1275,32 @@ func (f *fixture) fillIndexLevel(w *store.UnitWriter, run model.ProviderRunID, a
 // mints on insert and the evidence id, which folds the unit id by construction
 // (Section 9.3) and therefore cannot match across two units describing the
 // same occurrence.
+//
+// The identity and interned-string columns are surrogates (schema.sql S-1..S-3)
+// and are compared as they are stored. Both sides of the comparison are units
+// of the SAME database, where one surrogate is one canonical identity, so
+// comparing surrogates is exactly as strong as comparing the canonical ids --
+// and it is what proves the delta unit REFERENCES the same dictionary rows the
+// full import did, which hydrating back to hex would hide.
 var factColumns = []struct{ table, cols string }{
-	{"node_facts", "lower(hex(node_id)), language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
-	{"relation_facts", "lower(hex(relation_id))"},
-	{"fact_keys", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), fact_key"},
-	{"native_aliases", "scope_key, native_key, lower(hex(node_id))"},
-	{"search_units", "lower(hex(search_key)), lower(hex(coalesce(node_id, x''))), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
-	{"evidence", "lower(hex(coalesce(node_id, x''))), lower(hex(coalesce(relation_id, x''))), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key, detail, content_hash_bound"},
+	{"node_facts", "node_id, language, name, qualified_name, signature, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), metadata_json"},
+	{"relation_facts", "relation_id"},
+	{"fact_keys", "coalesce(node_id, 0), coalesce(relation_id, 0), fact_key"},
+	{"native_aliases", "scope_key_id, native_key_id, node_id"},
+	{"search_units", "lower(hex(search_key)), coalesce(node_id, 0), lower(hex(file_id)), path, kind, name, qualified_name, signature, start_byte, end_byte, body, token_count"},
+	{"evidence", "coalesce(node_id, 0), coalesce(relation_id, 0), precision, lower(hex(coalesce(file_id, x''))), coalesce(start_byte,-1), coalesce(end_byte,-1), native_key_id, detail, content_hash_bound"},
+}
+
+// nodeRowID resolves a canonical node identity to the node_ids surrogate the
+// fact tables reference, so a test can assert on the row a canonical id names.
+func nodeRowID(t *testing.T, db *sql.DB, id model.NodeID) int64 {
+	t.Helper()
+	raw, _ := model.DecodeID(string(id))
+	var row int64
+	if err := db.QueryRow(`SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&row); err != nil {
+		t.Fatalf("node row for %s: %v", id, err)
+	}
+	return row
 }
 
 // unitRowID resolves a unit key to the integer row the fact tables reference.
@@ -1521,7 +1540,8 @@ func TestDeltaImportInvariants(t *testing.T) {
 		defer raw.Close()
 		row := unitRowID(t, raw, w.UnitID())
 		var leaked int64
-		if err := raw.QueryRow(`SELECT count(*) FROM evidence WHERE unit_id = ? AND native_key = ?`, row, "divergent-occurrence").Scan(&leaked); err != nil {
+		if err := raw.QueryRow(`SELECT count(*) FROM evidence e JOIN native_keys nk ON nk.id = e.native_key_id
+			WHERE e.unit_id = ? AND nk.key = ?`, row, "divergent-occurrence").Scan(&leaked); err != nil {
 			t.Fatal(err)
 		}
 		if leaked != 0 {
@@ -1584,9 +1604,9 @@ func TestDeltaImportInvariants(t *testing.T) {
 			id      model.NodeID
 			carried bool
 		}{{"a fact with one replaced key", partly, false}, {"a fact with no replaced key", stable, true}} {
-			idRaw, _ := model.DecodeID(string(want.id))
+			nodeRow := nodeRowID(t, raw, want.id)
 			var n int64
-			if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+			if err := raw.QueryRow(`SELECT count(*) FROM node_facts WHERE unit_id = ? AND node_id = ?`, row, nodeRow).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			if (n != 0) != want.carried {
@@ -1594,7 +1614,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			}
 			// A carried fact keeps every key it was published under, or the
 			// successor holds facts no later refresh can replace or remove.
-			if err := raw.QueryRow(`SELECT count(*) FROM fact_keys WHERE unit_id = ? AND node_id = ?`, row, idRaw).Scan(&n); err != nil {
+			if err := raw.QueryRow(`SELECT count(*) FROM fact_keys WHERE unit_id = ? AND node_id = ?`, row, nodeRow).Scan(&n); err != nil {
 				t.Fatal(err)
 			}
 			wantKeys := int64(0)
