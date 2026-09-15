@@ -610,6 +610,12 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		if err := json.Unmarshal(record, &r); err != nil {
 			return cursorInvalid("continuation state is not readable")
 		}
+		if e.probe != nil {
+			// Every record this resume DECODES. The invariant the test reads it
+			// for: it is a function of the frontier the page stopped at, never
+			// of the cumulative set behind it.
+			e.probe.ResumeRecords++
+		}
 		switch r.Kind {
 		case spoolRecordFrontier:
 			s.Frontier = append(s.Frontier, frontierState{Depth: r.Depth, Cost: r.Cost, Node: r.Node, Via: r.Via, Route: r.Route})
