@@ -810,9 +810,15 @@ func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
 	relations := append([]model.Relation(nil), f.relations...)
 
+	// ONE reported route, not three. The fixture's two routes are equal-cost
+	// and the default reason-path bound reports BOTH, which breaks no tie at
+	// all: the answer would be the same whatever the settle order did.
+	limits := fixtureLimits()
+	limits.MaxReasonPaths = 1
+
 	route := func(order MemoryGraphOrder) []model.RelationID {
 		t.Helper()
-		e, err := New(Options{Adjacency: f, Limits: fixtureLimits(),
+		e, err := New(Options{Adjacency: f, Limits: limits,
 			Reader: NewMemoryGraphOrdered(f.binding, nodes, relations, order)})
 		if err != nil {
 			t.Fatalf("new engine: %v", err)
@@ -823,8 +829,9 @@ func TestPathTieBreakSettlesOnCanonicalIdNotSurrogate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ShortestPath: %v", err)
 		}
-		if len(res.Paths) == 0 {
-			t.Fatalf("no route from n-a to n-z; the tie-break has nothing to decide")
+		if len(res.Paths) != 1 {
+			t.Fatalf("got %d routes from n-a to n-z, want exactly one: two reported "+
+				"equal-cost routes break no tie", len(res.Paths))
 		}
 		return res.Paths[0].Relations
 	}

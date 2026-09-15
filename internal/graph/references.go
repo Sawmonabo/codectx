@@ -813,7 +813,7 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 		LeaseID: lease.ID, Served: int64(served), Total: total,
 		// The cursor expires with the retention lease it names: a token that
 		// outlived the lease would resume over facts nothing is holding.
-		ExpiresAt: e.now().Add(e.limits.CursorTTL),
+		ExpiresAt: e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second),
 	}
 	sp, err := e.spools.Create(next.spoolCursor())
 	if err != nil {
@@ -852,7 +852,7 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 // remainder behind it.
 func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 	pageLimit int) ([]model.ReferenceOccurrence, *referenceCursor, bool, bool, error) {
-	if e.spools == nil {
+	if e.spools == nil || e.leases == nil {
 		return nil, nil, false, false, cursorInvalid("continuation state has expired or was released")
 	}
 	sc := c.spoolCursor()
@@ -915,8 +915,18 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 		}
 		return b.items, nil, false, b.clipped, nil
 	}
+	// The spool's liveness is its lease's (pagination.Spools.OpenAt) and the
+	// token's is its own expiry, so a cursor that carried page one's expiry
+	// forward would bound the WHOLE answer by one CursorTTL: a long reference
+	// list would stop being reachable part way through, which is truncation by
+	// clock. Every page renews the lease and mints a fresh expiry, exactly as
+	// the ranked continuations do.
+	if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
+		return nil, nil, false, false, err
+	}
 	next := c
 	next.Offset, next.Served = offset, served
+	next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
 	return b.items, &next, true, b.clipped, nil
 }
 

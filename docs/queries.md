@@ -54,7 +54,12 @@ each listed exactly once. That order is a property of the facts alone — it doe
 not move when a reindex renumbers the store's internal identifiers — so a
 `refs` cursor kept across pages resumes the list a caller already saw. The
 first page reads the symbol's whole list once and retains everything it did not
-serve; a list that fits one page retains nothing at all.
+serve; a list that fits one page retains nothing at all. Each `refs` page renews
+that retention and issues a cursor with a fresh `resources.cursor_ttl`, so a long
+reference list is not bounded by the TTL its first page was minted under. A
+`refs` cursor carries a versioned payload: one minted by a build that spelled it
+differently answers `CTX_CURSOR_INVALID` rather than being read with today's
+field meanings.
 
 **One unreadable blob costs one hit, not the answer.** A `search` hit's `range`
 is resolved by reading the file's bytes out of the content store. When the store
