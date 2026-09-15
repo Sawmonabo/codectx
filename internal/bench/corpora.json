@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "corpora": [
+    {
+      "name": "codectx",
+      "url": "https://github.com/Sawmonabo/codectx",
+      "commit": "acfe80e9ddd1b3e677af8082bacc06d02f8ffc7e",
+      "description": "this repository at the wave-g base commit: a Go workspace with CGo, SQL, TOML and Markdown beside the sources; counted over the files Git tracks at that commit whose extension lang.Of recognizes as source",
+      "measured": true,
+      "files": 377,
+      "lines": 113269,
+      "bytes": 4978911,
+      "fixture_hash": "sha256:d8cab2e5bff9be95dbc13e2cc5d8ef00776ab897befe54319de5586e379eb1cd"
+    }
+  ]
+}
