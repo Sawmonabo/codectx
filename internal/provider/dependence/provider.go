@@ -328,6 +328,10 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, err
 	}
 	pub.UnknownLabels = report.UnknownLabels
+	// Storage fields the import had to cut to their model ceiling. Nothing was
+	// refused: the fact carries the clipped value, and the row says which
+	// fields were clipped and how many values each cut covered.
+	pub.TruncatedFields = report.TruncatedFields
 	// A project of this family the planner had to refuse has no unit of its
 	// own: its files were analysed by whichever unit encloses them, under a
 	// scope key that names a different project. Publishing this family fresh
@@ -369,6 +373,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"export_bytes_read", report.BytesRead, "dropped_methods", report.DroppedMethods,
 		"unlocated_facts", report.UnlocatedFacts, "unresolved_writes", report.UnresolvedWrites,
 		"clipped_evidence", report.ClippedEvidence, "ignored_export_files", report.IgnoredFiles,
+		"truncated_fields", len(report.TruncatedFields),
 		"external_methods", report.ExternalMethods, "unknown_labels", len(report.UnknownLabels),
 		"skipped_methods", pub.SkippedCount, "subdivided", pub.Subdivided != "",
 		"unplanned_projects", pub.UnplannedProjects,
@@ -871,6 +876,17 @@ func merge(a, b ImportReport) ImportReport {
 		}
 		for l, n := range b.UnknownLabels {
 			a.UnknownLabels[l] += n
+		}
+	}
+	// Each part cuts its own oversize descriptive fields, so the unit's count
+	// per field is the sum over its parts. Dropping this sum would lose the
+	// report for exactly the largest units, which are the ones subdivided.
+	if b.TruncatedFields != nil {
+		if a.TruncatedFields == nil {
+			a.TruncatedFields = map[string]int{}
+		}
+		for f, n := range b.TruncatedFields {
+			a.TruncatedFields[f] += n
 		}
 	}
 	return a
