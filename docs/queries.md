@@ -59,20 +59,26 @@ evidence row behind it.
 | `--limit` | all but `path` | Items in one page. |
 | `--cursor` | all but `path` | Continue a previous page. A cursor is bound to its endpoint, generation, analysis key and query; presenting it to a different query is `CTX_CURSOR_INVALID`. |
 | `--depth` | `callers`, `callees`, `path`, `impact` | Maximum hops from the nearest start node. |
-| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `impact` and `path`, which walk once, spending it truncates that walk. |
-| `--edges` | `callers`, `callees`, `impact` | Relations one page may admit. On `callers` and `callees` this is a per-page budget on the same terms as `--visited`; on `impact`, which walks once, spending it truncates that walk. |
+| `--visited` | `callers`, `callees`, `path`, `impact` | Nodes one page may admit. On `callers` and `callees` it is a **per-page work budget**: a page that spends it ends there and hands back a cursor. On `path`, which walks once, spending it truncates that walk; on `impact` it ends the page and mints a continuation. |
+| `--edges` | `callers`, `callees`, `impact` | Relations one page may admit. On `callers` and `callees` this is a per-page budget on the same terms as `--visited`; on `impact` it is a per-page budget too. |
 
 **`path` issues no continuation.** `search`, `symbol`, `refs`, `callers`,
 `callees` and `impact` print a `next` token when more remains. On `callers` and
 `callees` a continuation resumes the walk itself, from the frontier the previous
 page persisted, with a fresh per-page work allowance; the `walked` counts it
 reports stay cumulative across the pages of the one walk, so replaying a cursor
-neither resets nor doubles them. `impact` resumes differently from the traversal commands: it ranks the whole
-walk on the first page, serves the first `--limit` entries and keeps the ranked
-tail, so a continuation replays that tail in rank order without walking again
-and spends no further budget. Its `walked` counts and its package rollup are
-therefore the same on every page — they describe the one walk behind the whole
-answer. `path` is not paged at all — it declares neither flag, and its
+neither resets nor doubles them. `impact` resumes the walk itself as well, but its pages carry a different
+contract. Impact answers one page of the walk at a time. Each page ranks its own
+chunk of the affected set and carries the package rollup over that chunk's
+edges; `next_cursor` resumes the walk from the frontier the page stopped at. The
+pages together enumerate exactly the affected-entity set a single unbounded walk
+would, and a package pair's `pair_count` and `evidence_count` sum across pages to
+the whole-walk totals, but the ranking is per page and an entity reached again
+from a later page's frontier is listed again with that page's reasons.
+`visited_count` and `edge_count` are cumulative and grow across the pages of one
+answer. The same paragraph applies to the package-dependency rollup, which pages
+on identical terms; it has no CLI, app-facade or MCP surface today, so its
+continuation is reachable only from the engine API. `path` is not paged at all — it declares neither flag, and its
 `--visited` budget is spent by the one search it runs.
 
 **Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
@@ -94,9 +100,9 @@ next page carries on from where it stopped.
 
 Two stops end an answer rather than a page, and both say so. `--depth` is part
 of the query a cursor is bound to, so a walk that ran out of depth is truncated
-with `graph depth budget exhausted` and no continuation. And `impact` walks once
-on its first page, so a per-page budget it exhausts truncates that walk; the
-reason travels onto every later page of its spooled ranked tail. `path` is not
+with `graph depth budget exhausted` and no continuation. `impact` no longer walks once: a per-page
+budget it exhausts ends that page and mints a continuation, on the same terms as
+`callers` and `callees`. `path` is not
 paged at all and its budgets truncate the one search it runs; it reports
 truncation together with whatever routes it found — never as "no path exists",
 which is reserved for a target that is genuinely unreachable.

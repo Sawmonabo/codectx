@@ -38,7 +38,13 @@ import (
 // instance a pagination.Cursor token, whose JSON has no such field -- decodes
 // to zero and is rejected, so the two token shapes can never be interchanged
 // even though both are signed with pagination.PurposeCursor.
-const traversalCursorVersion = 1
+//
+// Version 2 retires the ranked spool vocabulary: a version-1 token issued by an
+// impact page that spilled a ranked tail names a spool this build cannot
+// replay, and resuming it would serve an empty continuation instead of the rest
+// of the answer. It is refused as CTX_CURSOR_INVALID, which a caller re-runs
+// the query for, rather than answered short.
+const traversalCursorVersion = 2
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -173,56 +179,30 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 	return h.Sum()
 }
 
-// The kinds of record a page spills. The first two are a traversal's: the
-// frontier it stopped at, and the nodes it already admitted (which a resumed
-// page must not admit again). The last three are a RANKED page's: impact ranks
-// its whole walk and cuts the ranked list, so its continuation replays the tail
-// it already computed instead of resuming a frontier.
+// The kinds of record a page spills, and the whole vocabulary: the frontier a
+// page stopped at, and the nodes it already admitted (which a resumed page must
+// not admit again). Every paged endpoint -- neighbours, impact and the package
+// rollup alike -- resumes a WALK, so there is one vocabulary and one replay.
 //
-// The two vocabularies are disjoint and each replay accepts only its own, so a
-// traversal cursor can never be resumed over a ranked spool, or the reverse.
+// A second, ranked vocabulary ("a", "e", "p", "c") existed while impact ranked
+// its whole walk on the first page and replayed the cut tail from the spool.
+// That shape is gone: impact answers one page of the walk at a time, so there
+// is no pre-computed tail to replay. The payload version below is bumped with
+// its removal, which is what stops a token minted by a build that wrote a
+// ranked spool from resuming over a reader that no longer understands one.
 const (
 	spoolRecordFrontier = "f"
 	spoolRecordVisited  = "v"
-	// spoolRecordAnswer is the LEADING record of a ranked spool: the
-	// answer-level facts every page must report identically.
-	spoolRecordAnswer = "a"
-	// spoolRecordEntry is one ranked impact entry, in rank order.
-	spoolRecordEntry = "e"
-	// spoolRecordPackage is one rollup pair. The pairs are individual records
-	// rather than a field of the answer record because a rollup bounded only
-	// by MaxRecordsPerResult can exceed the spool's per-record byte bound.
-	spoolRecordPackage = "p"
-	// spoolRecordCapability is one row of the generation's capability report,
-	// individual for the same reason a rollup pair is: a report may legally
-	// carry model.MaxCapabilityStates rows, each with a scope key, a
-	// diagnostic code and up to MaxCapabilityDetails bounded details, which is
-	// several megabytes against the spool's per-record byte bound.
-	spoolRecordCapability = "c"
 )
 
 // spoolRecord is one spilled record. The field names are short because the
 // spool byte budget is shared across every live continuation in the process.
-// A traversal record uses the node fields; a ranked record carries its own
-// already-encoded value in Payload, so adding a ranked kind does not widen the
-// struct every traversal record pays for.
 type spoolRecord struct {
-	Kind    string           `json:"k"`
-	Node    model.NodeID     `json:"n,omitempty"`
-	Depth   int              `json:"d,omitempty"`
-	Cost    int64            `json:"c,omitempty"`
-	Via     model.RelationID `json:"v,omitempty"`
-	Payload json.RawMessage  `json:"p,omitempty"`
-}
-
-// encodeSpoolRecord builds one ranked record around its payload.
-func encodeSpoolRecord(kind string, payload any) (spoolRecord, error) {
-	encoded, err := json.Marshal(payload)
-	if err != nil {
-		return spoolRecord{}, &model.Error{Code: model.CodeInternal,
-			Message: "continuation state encoding: " + err.Error()}
-	}
-	return spoolRecord{Kind: kind, Payload: encoded}, nil
+	Kind  string           `json:"k"`
+	Node  model.NodeID     `json:"n,omitempty"`
+	Depth int              `json:"d,omitempty"`
+	Cost  int64            `json:"c,omitempty"`
+	Via   model.RelationID `json:"v,omitempty"`
 }
 
 // resumeState is what a continuation restores: the decoded cursor, a budget
@@ -259,12 +239,6 @@ type continuation struct {
 	// spool they wrote. spill copies it forward without materializing it, so a
 	// walk of any size costs one spool block of heap here.
 	Carried visitedStream
-	// Records is the already-built state of a RANKED page -- the answer-level
-	// record, the ranked tail and the rollup pairs impact spills. A traversal
-	// leaves a frontier instead and sets none of these; a ranked page leaves
-	// records instead and has no frontier. Exactly one of the two is populated,
-	// which is what keeps the two replay vocabularies disjoint.
-	Records []spoolRecord
 }
 
 // verifyContinuation is the half of a resume every paging endpoint shares: it
@@ -432,15 +406,14 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
 	resumesWalk := len(c.Frontier) > 0 || c.LastKey != ""
-	if !resumesWalk && len(c.Records) == 0 {
+	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
 	}
-	// A frontier, an already-admitted visited set or a ranked tail has to
-	// survive the response, and all three live in the spool; with spilling
-	// disabled none can, so the answer stops here rather than resuming without
-	// them.
-	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0 || len(c.Records) > 0
+	// A frontier or an already-admitted visited set has to survive the
+	// response, and both live in the spool; with spilling disabled neither can,
+	// so the answer stops here rather than resuming without them.
+	needsSpool := len(c.Frontier) > 0 || len(c.Visited) > 0
 	if needsSpool && e.spools == nil {
 		return "", nil
 	}
@@ -521,11 +494,6 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 			return &model.Error{Code: model.CodeInternal, Message: "continuation state encoding: " + err.Error()}
 		}
 		return sp.Append(encoded)
-	}
-	for _, r := range c.Records {
-		if err := appendRecord(r); err != nil {
-			return "", e.releaseSpool(sp, err)
-		}
 	}
 	frontierNodes := make(map[model.NodeID]struct{}, len(c.Frontier))
 	for _, fs := range c.Frontier {

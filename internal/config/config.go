@@ -283,6 +283,17 @@ type TreeSitter struct {
 	// user-set value that is crossed counts every call past it into the
 	// file's dropped count and reports the file partial.
 	MaxCalleeReferences Limit `toml:"max_callee_references"`
+	// MaxRecordsPerFile is how many declarations, imports or references --
+	// each counted separately -- the user wants one file to yield. Unlimited
+	// by default: it replaces three hard-coded worker ceilings of 20000, 4000
+	// and 60000, and a generated or vendored file that crosses one is a
+	// property of the repository rather than a fault. What a file yields is
+	// bounded by its own size, which workspace.max_parse_file_bytes already
+	// bounds, so an unlimited value costs one file's heap and never the
+	// repository's. A user-set value that is crossed reports the file partial
+	// and its structural coverage truncated; the worker that extracts and the
+	// parent that reads its frames apply the same number.
+	MaxRecordsPerFile Limit `toml:"max_records_per_file"`
 }
 
 // SCIP configures the external index importer.
@@ -607,6 +618,7 @@ func Defaults() Config {
 				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
 				WorkerIdleTTL:       Duration(60 * time.Second),
 				MaxCalleeReferences: Unlimited,
+				MaxRecordsPerFile:   Unlimited,
 			},
 			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute),
 				MaxIndexBytes: Unlimited, MaxManifestBytes: Unlimited, MaxDocuments: Unlimited,

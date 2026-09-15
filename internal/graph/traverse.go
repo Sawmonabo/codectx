@@ -9,7 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // Truncation reasons. Each names the exact bound that stopped the walk, so a
@@ -477,27 +477,6 @@ func (e *Engine) Neighbors(ctx context.Context, req model.GraphRequest) (model.G
 // rejects it.
 const neighborsEndpoint = "graph.neighbors"
 
-// continuationUnavailable rejects a request carrying a traversal cursor.
-// Silently ignoring a cursor would restart the walk from the seeds while the
-// caller believed it was resuming, which would double-spend the cumulative
-// budget the cursor exists to carry, so a typed refusal is the honest answer.
-//
-// Every other operation DOES page: Neighbors mints and resumes
-// a traversalCursor from a keyset position, and Impact spills its ranked
-// tail into a spool and replays it. PackageDependencies is the one that remains:
-// it aggregates a whole walk into pairs, so it has neither a (owner, relation)
-// stop to resume from nor a ranked list to cut. Its CLI command declares no
-// --cursor flag; this refusal covers the API path, where a caller can still set
-// Page.Cursor.
-func continuationUnavailable(cursor string) error {
-	if cursor == "" {
-		return nil
-	}
-	return (&model.Error{Code: model.CodeCursorInvalid,
-		Message: "graph traversal continuations are not offered"}).
-		WithDetail("reason", "continuation_unavailable")
-}
-
 // resolveBound applies the Section 20.1 zero-value convention: zero takes the
 // configured default and a positive request value is honoured only as far as
 // that default, so a request can tighten a bound but never raise it.
@@ -584,7 +563,7 @@ func (e *Engine) traverse(ctx context.Context, req model.GraphRequest, endpoint 
 	// the wire ceiling; a read served at a size other than the one asked for is
 	// reported on the answer rather than applied silently. Only the observation
 	// sink is imported, never the store: facts still come through Adjacency.
-	ctx, clamps := sqlite.WithPageClamps(ctx)
+	ctx, clamps := pagination.WithPageClamps(ctx)
 	if len(kinds) == 0 {
 		kinds = DefaultRelations()
 	}
