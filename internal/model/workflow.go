@@ -657,28 +657,34 @@ func (r ObservationReference) Validate() error {
 // Capsule is the deterministic completion record of Section 17.3. It is
 // assembled only from stored facts and explicit observations; codectx generates
 // no summary of its own.
+//
+// It carries its identity and its eight record COUNTS, never the records. The
+// records are durable rows of their own, written at the seal and read one
+// keyset page at a time through CapsuleListSource and the store's paged reader,
+// so a session that observed a repository-sized record set seals and exports in
+// bounded memory instead of being refused for its size.
 type Capsule struct {
-	SessionID           SessionID              `json:"session_id"`
-	ActorID             string                 `json:"actor_id"`
-	Binding             Binding                `json:"binding"`
-	ManifestHash        string                 `json:"manifest_hash"`
-	ScopeVersion        int                    `json:"scope_version"`
-	Scope               []NodeID               `json:"scope"`
-	AcceptedFacts       []FactReference        `json:"accepted_facts"`
-	RejectedFacts       []FactReference        `json:"rejected_facts"`
-	Contradictions      []ObservationReference `json:"contradictions"`
-	Unresolved          []ObservationReference `json:"unresolved"`
-	ScopeReviewIDs      []string               `json:"scope_review_ids"`
-	Coverage            []FileCoverage         `json:"coverage"`
-	Waivers             []WaiverRecord         `json:"waivers"`
-	Completeness        []CapabilityState      `json:"completeness"`
-	StrictGateSatisfied bool                   `json:"strict_gate_satisfied"`
-	CanonicalHash       string                 `json:"canonical_hash"`
-	CreatedAt           time.Time              `json:"created_at"`
+	SessionID           SessionID         `json:"session_id"`
+	ActorID             string            `json:"actor_id"`
+	Binding             Binding           `json:"binding"`
+	ManifestHash        string            `json:"manifest_hash"`
+	ScopeVersion        int               `json:"scope_version"`
+	Counts              CapsuleCounts     `json:"counts"`
+	Completeness        []CapabilityState `json:"completeness"`
+	StrictGateSatisfied bool              `json:"strict_gate_satisfied"`
+	CanonicalHash       string            `json:"canonical_hash"`
+	CreatedAt           time.Time         `json:"created_at"`
 }
 
-// Validate enforces the capsule shape and the invariant that a capsule with
-// waivers can never claim a satisfied strict gate.
+// Validate enforces the capsule's own shape: identity, counts, completeness and
+// the invariant that a capsule with waivers can never claim a satisfied strict
+// gate.
+//
+// It validates A PAGE'S WORTH OF THE CAPSULE, never a whole capsule: the
+// records are rows, each validated once as it is streamed into storage at the
+// seal, and CapsulePage.Validate bounds what a read returns. A validator that
+// walked every record here would have to hold every record here, which is the
+// thing the counts exist to avoid.
 func (c Capsule) Validate() error {
 	if err := requireID("capsule.session_id", string(c.SessionID)); err != nil {
 		return err
@@ -698,78 +704,14 @@ func (c Capsule) Validate() error {
 	if c.ScopeVersion < 1 {
 		return invalid("capsule.scope_version is %d; versions start at 1", c.ScopeVersion)
 	}
-	// Section 17.3 requires every capsule list to be a bounded record set: the
-	// capsule is a durable artifact that a later session replays, so an
-	// unbounded list here becomes an unbounded read forever after.
-	if err := boundCount("capsule.scope", len(c.Scope), MaxRecordsPerResult); err != nil {
+	if err := c.Counts.Validate(); err != nil {
 		return err
-	}
-	for i, id := range c.Scope {
-		if err := requireID(indexed("capsule.scope", i), string(id)); err != nil {
-			return err
-		}
-	}
-	for _, group := range []struct {
-		field string
-		refs  []FactReference
-	}{
-		{"capsule.accepted_facts", c.AcceptedFacts},
-		{"capsule.rejected_facts", c.RejectedFacts},
-	} {
-		if err := boundCount(group.field, len(group.refs), MaxRecordsPerResult); err != nil {
-			return err
-		}
-		for _, f := range group.refs {
-			if err := f.Validate(); err != nil {
-				return err
-			}
-		}
-	}
-	for _, group := range []struct {
-		field string
-		refs  []ObservationReference
-	}{
-		{"capsule.contradictions", c.Contradictions},
-		{"capsule.unresolved", c.Unresolved},
-	} {
-		if err := boundCount(group.field, len(group.refs), MaxRecordsPerResult); err != nil {
-			return err
-		}
-		for _, o := range group.refs {
-			if err := o.Validate(); err != nil {
-				return err
-			}
-		}
-	}
-	if err := boundCount("capsule.scope_review_ids", len(c.ScopeReviewIDs), MaxRecordsPerResult); err != nil {
-		return err
-	}
-	for i, id := range c.ScopeReviewIDs {
-		if err := requireID(indexed("capsule.scope_review_ids", i), id); err != nil {
-			return err
-		}
-	}
-	if err := boundCount("capsule.coverage", len(c.Coverage), MaxCoverageFilesPerCapsule); err != nil {
-		return err
-	}
-	for _, f := range c.Coverage {
-		if err := f.Validate(); err != nil {
-			return err
-		}
-	}
-	if err := boundCount("capsule.waivers", len(c.Waivers), MaxRecordsPerResult); err != nil {
-		return err
-	}
-	for _, w := range c.Waivers {
-		if err := w.Validate(); err != nil {
-			return err
-		}
 	}
 	if err := validateCapabilityStates("capsule.completeness", c.Completeness); err != nil {
 		return err
 	}
-	if c.StrictGateSatisfied && len(c.Waivers) > 0 {
-		return invalid("capsule claims a satisfied strict gate with %d waivers recorded", len(c.Waivers))
+	if c.StrictGateSatisfied && c.Counts.Waivers > 0 {
+		return invalid("capsule claims a satisfied strict gate with %d waivers recorded", c.Counts.Waivers)
 	}
 	return nil
 }
