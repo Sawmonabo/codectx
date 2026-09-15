@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Proposed
+- **Status:** Partially accepted — §2.3 implemented (lane I-T2); §2.1, §2.2, §2.4, §2.5 still proposed
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -110,6 +110,19 @@ Strictly worse than today.
 probes the next id on disagreement, reusing the read-back the interner already performs.
 
 **Trade-off accepted.** Ids stop being dense and sequential, and a collision costs an extra probe.
+
+**Measured after implementation (lane I-T2), and it qualifies the projection.** Ids stop being
+dense, so every `native_key_id` reference widens from a 1–2 byte record field to an 8-byte one, and
+the dictionary's own rowid b-tree stops being densely packed. The projection above counted only the
+dropped automatic index and missed both costs. On a small fixture store (12 233 distinct keys,
+19 253 evidence rows, 12 274 alias rows) the automatic index's 618 496 B goes, but `native_keys`
+grows 552 960 → 696 320 B, `evidence` 1 957 888 → 2 080 768 B and `native_aliases` 204 800 →
+286 720 B: **a net 131 072 B larger store**. The saving scales with the number of distinct keys and
+the cost with the number of references to them, so the shape wins only where keys are many relative
+to references — on the m32rimm figures (≈201 k keys against ≈917 k references) it still projects a
+net ≈30 MB saving rather than the ≈38 MB claimed above. A narrower digest (fewer bits, more probes,
+the same detection) would keep the saving at both ends and is the obvious follow-up; it is not
+adopted here because it was not the option this record decided.
 
 ### 2.4 The content store compresses its blocks, under an explicit block index
 
