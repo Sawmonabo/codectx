@@ -4,8 +4,8 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"os"
 	"slices"
-	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -300,7 +300,7 @@ func lessByPairKey(a, b pairRecord) int {
 }
 
 // lessByPair is pass 2's key and the served order, unchanged from the order
-// rollupPackages sorts by today: (FromPath, ToPath, FromNodeID, ToNodeID).
+// the rollup has always sorted by: (FromPath, ToPath, FromNodeID, ToNodeID).
 func lessByPair(a, b pairRecord) int {
 	if c := cmp.Compare(a.FromPath, b.FromPath); c != 0 {
 		return c
@@ -346,78 +346,148 @@ type rankedTail struct {
 // this handle mints no continuation.
 func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total }
 
-// errNotImplemented marks the lane seams this freeze declares and does not
-// fill: runWalkToCompletion (lane P-b), rankImpact and rankPairs (P-b/P-c) and
-// servePage (P-INT). It is an internal error rather than a panic so a build
-// that wired one up early fails the request it was asked about instead of the
-// process.
-func errNotImplemented(op string) error {
-	return (&model.Error{Code: model.CodeInternal,
-		Message: "graph: this operation is not implemented in this build"}).WithDetail("operation", op)
-}
-
-// runWalkToCompletion expands seeds until the walk is EXHAUSTED, not until a
-// page is full, calling visit once per admitted edge exactly as expand does.
-//
-// It is the seam ruling P2 requires: the request that mints the answer must
-// see every admitted edge before anything is ranked, and the page-bounded
-// expand cannot. Internally it chains expand's own continuation -- the spooled
-// resumable frontier -- IN PROCESS, without minting or verifying a signed
-// token per internal page, so peak heap stays a function of one internal
-// page's frontier and never of the reachable set.
-//
-// The query deadline ends a PAGE and never the answer (ruling P3): a deadline
-// reached mid-walk returns the walkState the walk had built, with its frontier
-// intact for the caller to persist into the `f` cursor, and a nil error.
-//
-// Owned by lane P-b.
-func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) (walkState, error) {
-	_, _, _, _ = ctx, seeds, o, visit
-	return walkState{}, errNotImplemented("graph.run_walk_to_completion")
-}
-
-// rankImpact folds and orders every record the completed walk admitted, and
-// returns the whole ranked answer as a re-iterable sorted run on disk.
-//
-// emit is called once and streams the walk's records in; it is a callback
-// rather than a slice because the point of the pass is that no caller ever
-// holds the answer. Pass 1 keys lessByNode and folds foldImpact, pass 2 keys
-// lessByRank and does not fold. Close the returned run.
-//
-// Owned by lane P-b.
-func (e *Engine) rankImpact(ctx context.Context,
-	emit func(add func(impactRecord) error) error) (*pagination.SortedRun[impactRecord], error) {
-	_, _ = ctx, emit
-	return nil, errNotImplemented("graph.rank_impact")
-}
-
 // rankPairs is the same two passes over the package rollup (ruling P4): pass 1
 // keys lessByPairKey and folds foldPair, so the counts it reports are exact
 // sums over the whole walk rather than over one page; pass 2 keys lessByPair,
 // which is the order the rollup has always served. Close the returned run.
 //
+// The two passes are what make the answer independent of arrival order: the
+// fold runs once over the fully ordered stream of pass 1, so a pair split
+// across any number of emitting batches sums to the same counts a single-shot
+// rollup of the same edges would report, and pass 2 orders the distinct pairs
+// globally rather than one batch at a time.
+//
 // Owned by lane P-c.
 func (e *Engine) rankPairs(ctx context.Context,
-	emit func(add func(pairRecord) error) error) (*pagination.SortedRun[pairRecord], error) {
-	_, _ = ctx, emit
-	return nil, errNotImplemented("graph.rank_pairs")
+	emit func(add func(pairRecord) error) error,
+	stats *rankStats) (*pagination.SortedRun[pairRecord], error) {
+	byKey, err := e.newPairSort("graphpairkey-", lessByPairKey)
+	if err != nil {
+		return nil, err
+	}
+	byKey = byKey.WithFold(foldPair)
+	defer byKey.Close()
+	if err := emit(byKey.Add); err != nil {
+		return nil, err
+	}
+	folded, err := byKey.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	stats.observe(byKey.PeakLiveRecords())
+	defer folded.Close()
+	// The deadline ends a page and never the answer (ruling P3), but a
+	// cancelled request must not pay for a second pass over a set it will
+	// never serve.
+	if err := ctx.Err(); err != nil {
+		return nil, typedContextError(ctx, err)
+	}
+	byPair, err := e.newPairSort("graphpair-", lessByPair)
+	if err != nil {
+		return nil, err
+	}
+	defer byPair.Close()
+	if err := folded.Each(byPair.Add); err != nil {
+		return nil, err
+	}
+	run, err := byPair.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	stats.observe(byPair.PeakLiveRecords())
+	return run, nil
 }
 
-// servePage reads at most limit records out of the spool tail names, starting
-// at tail.Offset, and returns them with the handle the NEXT page continues
-// from. The records after the page are copied straight into a fresh spool, so
-// neither the page nor the continuation ever holds the remainder in heap.
+// newPairSort opens one pass of the pair sort with the frozen codec and the
+// query's own run budget. The budget is a share of resources.query_memory_bytes
+// -- the same number Limits.FrontierBytes carries into the engine -- so one
+// query's structures are all charged against the one admission it was granted
+// rather than against a second key that could oversubscribe it.
+func (e *Engine) newPairSort(prefix string,
+	compare func(a, b pairRecord) int) (*pagination.ExternalSort[pairRecord], error) {
+	sorter, err := pagination.NewExternalSort(e.pairSortDir(), prefix, 0,
+		encodePairRecord, decodePairRecord, compare)
+	if err != nil {
+		return nil, err
+	}
+	return sorter.WithRunBytes(pagination.SortRunBytes(e.limits.FrontierBytes), sizeOfPairRecord), nil
+}
+
+// pairSortDir is where the pair sort's runs spill: beside the store's
+// continuation spools when the engine has them, so an operator has one place
+// to look and the store's sweep reports and reclaims the files, and the
+// operating system's temporary directory otherwise -- an engine built without
+// Spools has no store directory of its own, and the sort removes every file it
+// creates when its runs and its output are closed.
+func (e *Engine) pairSortDir() string {
+	if e.spools == nil {
+		return os.TempDir()
+	}
+	return e.spools.SortDir()
+}
+
+// rankStats reports the largest in-memory record set a ranked answer's two
+// sort passes ever held. It is the entity-side counterpart of rollupStats: the
+// memory invariant a bound assertion is written against, read from
+// pagination.ExternalSort.PeakLiveRecords so a test asserts the sort's own
+// high-water mark rather than restating the design constant.
 //
-// c is the binding the spool was written under and now the clock the lease is
-// checked against, exactly as pagination.Spools.Open takes them. decode is the
-// record codec -- decodeImpactRecord or decodePairRecord -- which is what lets
-// one page reader serve both ranked answers; the two can never be crossed,
-// because a cursor is bound to the endpoint that issued it.
+// The two passes run SEQUENTIALLY -- pass 1 is closed before pass 2 opens --
+// so the peak of a ranking is their MAXIMUM and never their sum.
+type rankStats struct{ PeakLiveRecords int }
+
+// observe records a high-water mark. A nil stats is the production case and
+// costs one comparison.
+func (s *rankStats) observe(n int) {
+	if s != nil && n > s.PeakLiveRecords {
+		s.PeakLiveRecords = n
+	}
+}
+
+// heapProbe is the memory instrumentation an END-TO-END bound assertion reads.
+// The two ranked answers rank and serve inside one call, so the sorts they
+// build are created, observed and closed before the caller sees anything; a
+// probe the engine carries is the only way a test can assert on what they held
+// without the ranking handing its sorts out, which would let a caller keep one
+// alive past the request that owns it.
 //
-// Owned by lane P-INT.
-func servePage[T any](ctx context.Context, spools *pagination.Spools, c pagination.Cursor, now time.Time,
-	tail rankedTail, limit int, decode func([]byte) (T, error)) ([]T, rankedTail, error) {
-	_, _, _, _, _, _, _ = ctx, spools, c, now, tail, limit, decode
-	return nil, rankedTail{}, errNotImplemented("graph.serve_ranked_page")
+// Engine.probe is nil in production and every observation is a nil check.
+type heapProbe struct {
+	// Rank is the affected-entity ranking's peak, Pairs the package rollup
+	// ranking's, and Rollup the batch of edges the streaming rollup itself
+	// held above them.
+	Rank   rankStats
+	Pairs  rankStats
+	Rollup rollupStats
+	// AdoptedRuns is how many spilled runs of an interrupted ranking this
+	// request continued instead of re-sorting, and ReaddedRecords how many
+	// records it put into a sort that the adopted runs already held. The
+	// second is zero by construction and is counted anyway: it is what tells a
+	// resumed ranking that REUSES its runs from one that re-sorts the whole
+	// retained input and happens to reach the same answer.
+	AdoptedRuns    int
+	ReaddedRecords int64
+}
+
+// rankProbe, pairProbe and rollupProbe hand the ranking passes the counters to
+// observe into, or nil when nothing is probing.
+func (e *Engine) rankProbe() *rankStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Rank
+}
+
+func (e *Engine) pairProbe() *rankStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Pairs
+}
+
+func (e *Engine) rollupProbe() *rollupStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Rollup
 }
