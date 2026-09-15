@@ -129,12 +129,19 @@ func (s *ExternalSort[T]) spill() error {
 	return nil
 }
 
+// maxSortRecordBytes bounds one encoded sort record before its buffer is
+// allocated on read (a pre-allocation guard, not a work limit): a run file is
+// trusted only as far as its header, and a corrupt length must not allocate.
+// It equals the spool's chunk size; a planner input record is a few hundred
+// bytes, so the bound is never the reason a sort fails.
+const maxSortRecordBytes = maxSpoolChunkBytes
+
 func (s *ExternalSort[T]) writeRecord(w *bufio.Writer, v T) error {
 	b, err := s.encode(v)
 	if err != nil {
 		return err
 	}
-	if len(b) > maxSpoolRecordBytes {
+	if len(b) > maxSortRecordBytes {
 		return internalErr("external sort record exceeds the record ceiling")
 	}
 	var hdr [binary.MaxVarintLen64]byte
@@ -265,7 +272,7 @@ func (r *runReader[T]) next() (T, bool, error) {
 	if err != nil {
 		return zero, false, internalErr("external sort run: " + err.Error())
 	}
-	if n > maxSpoolRecordBytes {
+	if n > maxSortRecordBytes {
 		return zero, false, internalErr("external sort run record exceeds the record ceiling")
 	}
 	b := make([]byte, n)
