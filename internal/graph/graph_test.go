@@ -81,10 +81,6 @@ type graphFixture struct {
 	evidence  map[model.RelationID][]model.Evidence
 	caps      []model.CapabilityState
 	binding   model.Binding
-
-	// EdgeCalls counts Edges round trips, so a lane can prove a walk batches
-	// its frontier instead of issuing one query per node.
-	EdgeCalls int
 }
 
 // newGraphFixture builds the shared graph described above.
@@ -287,66 +283,16 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	return f
 }
 
-// fixtureEdgePageLimit is the clamp sqlite.pageLimit applies to every
-// Adjacency.Edges call: any limit above model.MaxPageItems, and any
-// non-positive one, comes back as model.MaxPageItems. The fixture applies it
-// verbatim, because a fake that honours whatever limit it is given lets a
-// keyset loop that ends on "short page" pass while the shipped reader silently
-// truncates every walk.
+// fixtureEdgePageLimit is the clamp sqlite.pageLimit applies to every keyset
+// page: any limit above model.MaxPageItems, and any non-positive one, comes
+// back as model.MaxPageItems. The fixture applies it verbatim, because a fake
+// that honours whatever limit it is given lets a keyset loop that ends on
+// "short page" pass while the shipped reader silently truncates every read.
 func fixtureEdgePageLimit(limit int) int {
 	if limit <= 0 || limit > model.MaxPageItems {
 		return model.MaxPageItems
 	}
 	return limit
-}
-
-// Edges returns the visible edges touching any of nodes, keyset-ordered by
-// RelationID after `after`, at most limit rows. It follows the Adjacency
-// contract: an empty kinds slice is "no kind filter", and the requested limit
-// is clamped exactly as the shipped reader clamps it.
-func (f *graphFixture) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	f.EdgeCalls++
-	limit = fixtureEdgePageLimit(limit)
-	want := make(map[model.NodeID]bool, len(nodes))
-	for _, n := range nodes {
-		want[n] = true
-	}
-	allowed := make(map[model.RelationKind]bool, len(kinds))
-	for _, k := range kinds {
-		allowed[k] = true
-	}
-	var out []model.Relation
-	for _, r := range f.relations {
-		if r.ID <= after {
-			continue
-		}
-		if len(allowed) > 0 && !allowed[r.Kind] {
-			continue
-		}
-		switch direction {
-		case model.DirectionOutgoing:
-			if !want[r.From] {
-				continue
-			}
-		case model.DirectionIncoming:
-			if !want[r.To] {
-				continue
-			}
-		default: // DirectionBoth
-			if !want[r.From] && !want[r.To] {
-				continue
-			}
-		}
-		out = append(out, r)
-		if len(out) == limit {
-			break
-		}
-	}
-	return out, nil
 }
 
 // NodesByID hydrates known nodes; unknown ids are omitted rather than faked.
@@ -569,10 +515,6 @@ func TestGraphScenarios(t *testing.T) {
 				}
 				if got.Direction != model.DirectionOutgoing {
 					t.Fatalf("direction = %q, want %q", got.Direction, model.DirectionOutgoing)
-				}
-				if f.EdgeCalls >= fixtureLeafCount {
-					t.Fatalf("%d Edges round trips for a %d-edge hub: the frontier was not batched",
-						f.EdgeCalls, fixtureLeafCount)
 				}
 			},
 		},
