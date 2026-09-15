@@ -272,48 +272,31 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		return CompileResult{}, err
 	}
 
-	// P-A through P-F, or the checkpoint a previous call left instead of them.
-	var (
-		ranked        rankedStreams
-		scoped        scopeResult
-		scopeComplete bool
-	)
+	// P-A through P-H, or the checkpoint a previous call left instead of the
+	// passes it finished. EVERY boundary between two passes is a checkpoint:
+	// the stop predicate is asked after each pass, and a true answer persists
+	// that boundary's carry and answers a continuation cursor instead of a
+	// plan. A deadline is therefore never a lost compile, whichever pass it
+	// lands behind (ruling C7).
+	st := &compileState{pass: passIngest}
 	if resumed != nil {
-		ranked, scoped, scopeComplete, err = c.restoreHalf(sorts, resumed)
-		if err != nil {
+		if err := c.restoreAt(sorts, resumed, st); err != nil {
 			return CompileResult{}, err
-		}
-	} else {
-		ranked, scoped, scopeComplete, err = c.frontHalf(ctx, reader, gen, req, sorts)
-		if err != nil {
-			return CompileResult{}, err
-		}
-		// The pass boundary ruling C7 names. Every stream the budget half reads
-		// is complete and nothing has been persisted, so this is where a
-		// compile that has run out of deadline can stop and be continued. The
-		// checkpoint is taken ONLY here, because this is the only boundary
-		// whose carry is persisted; a deadline anywhere else still ends the
-		// call as the error it was before.
-		if paging && c.deadlineReached(ctx) {
-			token, cerr := c.checkpointHalf(ctx, binding, requestHash, ranked, scoped, scopeComplete)
-			if cerr != nil {
-				return CompileResult{}, cerr
-			}
-			return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
 		}
 	}
+	if err := c.runPasses(ctx, reader, gen, req, sorts, resolved, st,
+		func(int) bool { return paging && c.deadlineReached(ctx) }); err != nil {
+		return CompileResult{}, err
+	}
+	if st.halted {
+		token, cerr := c.checkpointAt(ctx, binding, requestHash, st)
+		if cerr != nil {
+			return CompileResult{}, cerr
+		}
+		return CompileResult{Truncated: true, TruncationReason: truncationDeadline, NextCursor: token}, nil
+	}
+	scoped, scopeComplete := st.scope, st.scopeComplete
 
-	// P-G, P-H and P-I: what buildPlan did whole-set. Their errors are NOT
-	// reclassified through contextErr, because this is where CTX_MINIMUM_BUDGET
-	// is raised and a floor report must reach the caller as itself.
-	measured, err := c.passGMeasure(ctx, sorts, ranked)
-	if err != nil {
-		return CompileResult{}, err
-	}
-	packed, err := c.passHPack(ctx, sorts, measured, resolved)
-	if err != nil {
-		return CompileResult{}, err
-	}
 	// The exclusion projection is spooled, not collected. It is the one
 	// repository-sized list a compile produces, so P-I streams it into this
 	// sort and persistManifest replays the sorted run twice -- once to fold the
@@ -326,7 +309,7 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 		return CompileResult{}, err
 	}
 	sink := planBuffer{excluded: exclSort}
-	parts, err := c.passIEmit(ctx, sorts, measured, packed, resolved, &sink)
+	parts, err := c.passIEmit(ctx, sorts, st.measured, st.packed, resolved, &sink)
 	if err != nil {
 		return CompileResult{}, err
 	}
@@ -366,118 +349,274 @@ func (c *Compiler) compile(ctx context.Context, req model.ContextRequest, cursor
 	return CompileResult{Manifest: m}, nil
 }
 
-// frontHalf runs P-A through P-F: ingest, hydrate, relation attributes, route
-// scoring, centrality and the boosts. Its answer is the three sorted streams
-// the budget half consumes, plus the scope carry a manifest header and its
-// notices are built from.
+// compileState is one compile's live carry between two passes: the streams the
+// finished passes produced and the bounded scalars the manifest header is built
+// from. It is a struct rather than a chain of return values because EVERY pass
+// boundary is a checkpoint, and a checkpoint has to name what is live at it:
+// resume.go's passStreams table is that naming, and it reads these slots.
 //
-// It is a method of its own because it is exactly what a resumed compile does
-// NOT run: a continuation restores these three streams and this carry from its
-// checkpoint and enters the budget half directly. Keeping the boundary as a
-// function signature is what makes "the checkpoint holds everything the second
-// half reads" a thing the compiler checks rather than a comment.
-func (c *Compiler) frontHalf(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
-	req model.ContextRequest, sorts *compileSorts,
-) (rankedStreams, scopeResult, bool, error) {
+// A slot is cleared the moment the last pass that reads it is done, so a
+// checkpoint carries the boundary's carry and not the compile's history: P-C is
+// the last reader of the pre-hydration candidate stream, P-D of the hydrated
+// one, and so on down the table.
+type compileState struct {
+	// pass is the FIRST UNFINISHED pass: passIngest on a fresh compile, the
+	// checkpoint's recorded pass on a resumed one.
+	pass int
+	// halted records that the stop predicate ended this call at a boundary.
+	// The caller checkpoints and answers a continuation rather than a plan.
+	halted bool
+
+	// cands is P-A's candidate stream in ingest order, read by P-B and P-C.
+	cands *pagination.SortedRun[candRec]
+	// hydrated is P-B's output, read by P-D.
+	hydrated *pagination.SortedRun[candRec]
+	// paths and hops are P-A's route streams; hops is REPLACED by P-C's
+	// attributed hops, which is the same stream with its kinds resolved.
+	paths *pagination.SortedRun[pathRec]
+	hops  *pagination.SortedRun[hopRec]
+	// scored is P-D's output, read by P-F.
+	scored *pagination.SortedRun[scoredRec]
+	// counts is P-E's centrality aggregate, read by P-F.
+	counts *pagination.SortedRun[pkgCountRec]
+	// keptPaths and keptHops are the routes P-D retained, read by P-G.
+	keptPaths *pagination.SortedRun[pathRec]
+	keptHops  *pagination.SortedRun[hopRec]
+	// edges is the compile's ONE pre-fold carry: P-D has finished writing it,
+	// P-E merges it. It is checkpointed with its runs detached and restored
+	// with foldPkgEdgeDistinct re-attached (resume.go's two-class rule).
+	edges *pagination.ExternalSort[pkgEdgeRec]
+	// ranked is P-F's output in the Section 15.3 total order, read by P-G.
+	ranked *pagination.SortedRun[candRec]
+	// measured and packed are the back half's carry: P-G's five streams and
+	// P-H's per-file verdicts, both read by P-I.
+	measured *measuredPlan
+	packed   *packedPlan
+
+	// scope is the expansion verdict WITHOUT its Candidates slice, and
+	// scopeComplete the write-once-false flag P-A and P-C narrow. Both are
+	// bounded by something other than the repository, so they travel in the
+	// checkpoint's scalar record.
+	scope         scopeResult
+	scopeComplete bool
+}
+
+// compileStage is one pass of the pipeline: the index a checkpoint behind it
+// records, and the call that runs it.
+type compileStage struct {
+	pass int
+	run  func() error
+}
+
+// runPasses advances st from its current pass through P-H, asking stop after
+// each pass whether this call must end at that boundary.
+//
+// stop is a parameter and not the deadline read directly, because "stop HERE"
+// and "the deadline has passed" are two different questions: the compile asks
+// the second, and a test that must land a stop on one named boundary asks the
+// first. Both drive the identical checkpoint, which is what makes a test of one
+// boundary a test of the production path.
+//
+// P-I is NOT a stage here. It finishes the plan in the call that runs it, so
+// there is no boundary behind it and nothing to checkpoint; the caller runs it
+// once runPasses reports that nothing halted.
+func (c *Compiler) runPasses(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
+	req model.ContextRequest, sorts *compileSorts, b resolvedBudget, st *compileState,
+	stop func(pass int) bool,
+) error {
+	stages := []compileStage{
+		{passIngest, func() error { return c.stageIngest(ctx, reader, gen, req, sorts, st) }},
+		{passHydrate, func() error { return c.stageHydrate(ctx, reader, sorts, st) }},
+		{passAttributes, func() error { return c.stageAttributes(ctx, reader, sorts, st) }},
+		{passRoutes, func() error { return c.stageRouteScoring(ctx, sorts, st) }},
+		{passCentrality, func() error { return c.stageCentrality(ctx, sorts, st) }},
+		{passBoosts, func() error { return c.stageBoosts(ctx, sorts, st) }},
+		{passMeasure, func() error { return c.stageMeasure(ctx, sorts, st) }},
+		{passPack, func() error { return c.stagePack(ctx, sorts, b, st) }},
+	}
+	for _, stage := range stages {
+		if stage.pass < st.pass {
+			continue
+		}
+		if err := stage.run(); err != nil {
+			return err
+		}
+		// Recorded BEFORE the stop is asked: the pass is finished, so the
+		// boundary behind it is the one a checkpoint names.
+		st.pass = stage.pass + 1
+		if stop(st.pass) {
+			st.halted = true
+			return nil
+		}
+	}
+	return nil
+}
+
+// stageIngest is P-A. The graph engine is opened here and released when the
+// pass ends: it is the only pass that reads it, so a resumed compile that
+// re-enters past P-A opens no engine at all.
+//
+// An unresolved seed is carried INTO the expansion rather than around it: the
+// expansion is what decides whether an unresolvable identity is the discovery
+// answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an explicit boundary, and
+// it can only decide that if it sees the exclusions.
+func (c *Compiler) stageIngest(ctx context.Context, reader *sqlite.PinnedReader, gen model.GenerationID,
+	req model.ContextRequest, sorts *compileSorts, st *compileState,
+) error {
 	seeds, err := c.extractSeeds(ctx, reader, gen, req)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
 	caps, err := reader.Capabilities(ctx)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
-
 	engine, release, err := c.graph(ctx, gen)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
 	defer release()
 
-	// P-A ingest. An unresolved seed is carried INTO the expansion rather than
-	// around it: the expansion is what decides whether an unresolvable identity
-	// is the discovery answer of ruling Q7 or the CTX_SCOPE_INCOMPLETE of an
-	// explicit boundary, and it can only decide that if it sees the exclusions.
 	in, err := c.passAIngest(ctx, sorts, engine, gen,
 		append(append([]candidate(nil), seeds.Candidates...), seeds.Excluded...), caps)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
-	scopeComplete := in.Scope.ScopeComplete && !seeds.Unresolved
+	st.cands, st.paths, st.hops = in.Cands, in.Paths, in.Hops
+	st.scope = in.Scope
+	st.scopeComplete = in.Scope.ScopeComplete && !seeds.Unresolved
+	return nil
+}
 
-	// P-B hydrate.
-	hydrated, err := c.passBHydrate(ctx, sorts, reader, in.Cands)
+// stageHydrate is P-B. The pre-hydration stream stays live: P-C reads it.
+func (c *Compiler) stageHydrate(ctx context.Context, reader *sqlite.PinnedReader,
+	sorts *compileSorts, st *compileState,
+) error {
+	hydrated, err := c.passBHydrate(ctx, sorts, reader, st.cands)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
+	st.hydrated = hydrated
+	return nil
+}
 
-	// P-C relation attributes, over the PRE-hydration spool and before any
-	// scoring: that is what relationsOnPaths reads today, and running it here
-	// keeps the edge-scan reads ahead of the evidence reads exactly as today's
-	// call order does. Both passes may read `in.Cands` because a sorted run is
-	// replayable until the sort area is released.
-	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, in.Hops, in.Cands)
+// stageAttributes is P-C, over the PRE-hydration spool and before any scoring:
+// that is what relationsOnPaths reads today, and running it here keeps the
+// edge-scan reads ahead of the evidence reads exactly as today's call order
+// does. Both P-B and P-C may read the ingest stream because a sorted run is
+// replayable until the sort area is released.
+//
+// An incomplete edge scan narrows scopeComplete HERE rather than travelling as
+// a second flag: a route whose edges could not all be read is scored as
+// inadmissible, which changes the ranking, and ScopeComplete is write-once-
+// false, so folding the verdict in at the pass that produces it is exact and
+// leaves one scalar for every boundary behind this one to carry.
+func (c *Compiler) stageAttributes(ctx context.Context, reader *sqlite.PinnedReader,
+	sorts *compileSorts, st *compileState,
+) error {
+	attrs, err := c.passCRelationAttributes(ctx, sorts, reader, st.hops, st.cands)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
 	if !attrs.Complete {
-		// A route whose edges could not all be read is scored as inadmissible,
-		// which changes the ranking. Disclosing it keeps that from being a
-		// silent difference between two compiles of one generation.
-		scopeComplete = false
+		st.scopeComplete = false
 	}
+	st.hops = attrs.Hops
+	// P-C is the last reader of the pre-hydration stream.
+	st.cands = nil
+	return nil
+}
 
-	// P-D route scoring. The edge sort folds a repeated (package, relation)
-	// pair at insertion because P-E counts DISTINCT edges per package; without
-	// the fold a package reached twice over one edge would over-count its
-	// centrality boost.
+// stageRouteScoring is P-D. The edge sort folds a repeated (package, relation)
+// pair at insertion because P-E counts DISTINCT edges per package; without the
+// fold a package reached twice over one edge would over-count its centrality
+// boost.
+//
+// The two retained route streams are merged HERE rather than at the end of P-F.
+// Nothing adds to them after this pass and neither carries a fold, so the merge
+// is the same sequence wherever it is taken -- and taking it here makes them
+// already-folded runs at every boundary that carries them, which is the class
+// resume.go restores without re-attaching anything.
+func (c *Compiler) stageRouteScoring(ctx context.Context, sorts *compileSorts, st *compileState) error {
 	retainedPaths, err := newSort(sorts, "kept-path", lessPathSeq, sizeOfPath)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
+		return err
 	}
 	retainedHops, err := newSort(sorts, "kept-hop", lessHopSeq, sizeOfHop)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
+		return err
 	}
 	edges, err := newSort(sorts, "pkg-edge", lessPkgEdge, sizeOfPkgEdge)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
+		return err
 	}
-	scored, err := c.passDRouteScoring(ctx, sorts, hydrated, in.Paths, attrs.Hops,
-		retainedPaths, retainedHops, edges.WithFold(foldPkgEdgeDistinct))
+	edges = edges.WithFold(foldPkgEdgeDistinct)
+	scored, err := c.passDRouteScoring(ctx, sorts, st.hydrated, st.paths, st.hops,
+		retainedPaths, retainedHops, edges)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
+	if st.keptPaths, err = sortedRun(sorts, retainedPaths); err != nil {
+		return err
+	}
+	if st.keptHops, err = sortedRun(sorts, retainedHops); err != nil {
+		return err
+	}
+	st.scored, st.edges = scored, edges
+	st.hydrated, st.paths, st.hops = nil, nil, nil
+	return nil
+}
 
-	// P-E centrality, complete before P-F applies a single boost.
-	counts, err := c.passECentrality(ctx, sorts, edges)
+// stageCentrality is P-E: complete before P-F applies a single boost.
+func (c *Compiler) stageCentrality(ctx context.Context, sorts *compileSorts, st *compileState) error {
+	counts, err := c.passECentrality(ctx, sorts, st.edges)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+		return contextErr(ctx, err)
 	}
+	st.counts, st.edges = counts, nil
+	return nil
+}
 
-	// P-F boosts. The ranked sort's comparator IS the Section 15.3 total order,
-	// so draining it is the reading order the plan is packed and stored in.
+// stageBoosts is P-F. The ranked sort's comparator IS the Section 15.3 total
+// order, so draining it is the reading order the plan is packed and stored in.
+func (c *Compiler) stageBoosts(ctx context.Context, sorts *compileSorts, st *compileState) error {
 	rankedSort, err := newSort(sorts, "ranked", lessRank, sizeOfCand)
 	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
+		return err
 	}
-	if err := c.passFBoosts(ctx, scored, counts, rankedSort); err != nil {
-		return rankedStreams{}, scopeResult{}, false, contextErr(ctx, err)
+	if err := c.passFBoosts(ctx, st.scored, st.counts, rankedSort); err != nil {
+		return contextErr(ctx, err)
 	}
-	rankedRun, err := sortedRun(sorts, rankedSort)
-	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
+	if st.ranked, err = sortedRun(sorts, rankedSort); err != nil {
+		return err
 	}
-	keptPaths, err := sortedRun(sorts, retainedPaths)
-	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
-	}
-	keptHops, err := sortedRun(sorts, retainedHops)
-	if err != nil {
-		return rankedStreams{}, scopeResult{}, false, err
-	}
+	st.scored, st.counts = nil, nil
+	return nil
+}
 
-	return rankedStreams{Ranked: rankedRun, Paths: keptPaths, Hops: keptHops}, in.Scope, scopeComplete, nil
+// stageMeasure is P-G. Its errors are NOT reclassified through contextErr: this
+// is the half where CTX_MINIMUM_BUDGET is raised and a floor report must reach
+// the caller as itself.
+func (c *Compiler) stageMeasure(ctx context.Context, sorts *compileSorts, st *compileState) error {
+	measured, err := c.passGMeasure(ctx, sorts,
+		rankedStreams{Ranked: st.ranked, Paths: st.keptPaths, Hops: st.keptHops})
+	if err != nil {
+		return err
+	}
+	st.measured = measured
+	st.ranked, st.keptPaths, st.keptHops = nil, nil, nil
+	return nil
+}
+
+// stagePack is P-H, where the required floor is checked and CTX_MINIMUM_BUDGET
+// is raised.
+func (c *Compiler) stagePack(ctx context.Context, sorts *compileSorts, b resolvedBudget, st *compileState) error {
+	packed, err := c.passHPack(ctx, sorts, st.measured, b)
+	if err != nil {
+		return err
+	}
+	st.packed = packed
+	return nil
 }
 
 // planBuffer is the compile's planSink: it collects the entries P-I emits so
