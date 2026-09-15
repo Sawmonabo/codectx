@@ -201,7 +201,13 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				Budget:        b,
 				BatchSize:     adjacencyBatch,
 				FrontierBytes: e.limits.FrontierBytes,
-				Resume:        resume,
+				// Ruling P3, both halves: the deadline ends this page, and it
+				// does so even before the page admitted an edge, because the
+				// walk's frontier and every record it has admitted are
+				// retained across the request.
+				DeadlineStops:            true,
+				DeadlineResumesEmptyPage: true,
+				Resume:                   resume,
 			}, func(fs frontierState, rel model.Relation) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never

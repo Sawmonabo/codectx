@@ -151,7 +151,7 @@ so, in a notice reading `requested N, effective M`, rather than silently
 tightened. The configured bounds themselves default to unlimited.
 
 **Bounded per page, unlimited in total, user-set limits reported.**
-On `callers` and `callees` `--visited` and `--edges` are per-page work budgets.
+On `callers` and `callees` `--visited` and `--edges` are per-page work budgets:
 a page that exhausts one stops there, reports the reason (`visited node budget
 exhausted`, `edge budget exhausted`) and mints a continuation cursor; following
 that cursor reaches the same nodes an unbounded walk would, so a budget you set
@@ -175,10 +175,13 @@ and never because the search exceeded a memory ceiling.
 The query deadline ends a page and not an answer: a walk that runs out of time
 returns what it has, reports `query deadline reached` and hands back a cursor the
 next request carries on from, rather than failing with `CTX_QUERY_DEADLINE`, so a
-slow answer is never served as a complete one and never lost either. The one
-exception is an `impact` or package-rollup request whose deadline lands after the
-walk finished but during the ranking: that page is reported as truncated with no
-cursor, and the query is re-run. A capability that is still building is reported as an unavailable row plus a
+slow answer is never served as a complete one and never lost either. This holds
+for every deadline, including one that lands before the page has read a single
+edge: an `impact` or package-rollup request keeps its walk — the frontier it had
+reached and every entity it had already admitted — so the page is empty,
+reported as truncated, and its cursor carries the walk on. A deadline that lands
+after that walk finished but during the ranking keeps the same walk and mints
+the same kind of cursor; the next request ranks it and serves page 1. A capability that is still building is reported as an unavailable row plus a
 warning, so an incomplete answer never reads as a complete one.
 
 ## Configuration these commands read

@@ -284,9 +284,13 @@ type budget struct {
 	// deadline end a PAGE, not an answer, so -- like frontierHit -- it is a
 	// clean finish here and the caller turns it into the truncation reason and
 	// the continuation cursor. It is set only by a walk that opted in
-	// (expandOptions.DeadlineStops) and only once the page holds a row: a
-	// deadline that arrives before any edge has nothing partial to return, so
-	// there it stays the CTX_QUERY_DEADLINE error it always was.
+	// (expandOptions.DeadlineStops). For a PAGED traversal it is set only once
+	// the page holds a row -- a deadline before any edge has nothing partial to
+	// return there, and the caller still holds the cursor it arrived with, so
+	// it stays the CTX_QUERY_DEADLINE error it always was. For a walk whose
+	// progress is persisted independently of what this page served
+	// (expandOptions.DeadlineResumesEmptyPage) an empty page is not a lost one,
+	// and every deadline sets this.
 	deadlineHit bool
 }
 
@@ -319,12 +323,21 @@ type expandOptions struct {
 	// cap.
 	FrontierBytes int64
 	// DeadlineStops makes the query deadline END THIS PAGE instead of failing
-	// the walk, once the page has admitted at least one edge: expand returns
-	// the partial walkState and the caller mints a continuation from its
-	// frontier. Only the paged traversal sets it. The operations that
-	// aggregate a whole walk into one answer (impact, rollup) leave it false,
-	// because a partial aggregate is not a partial answer -- it is a wrong one.
+	// the walk: expand returns the partial walkState and the caller mints a
+	// continuation from its frontier. The paged traversal sets it on its own;
+	// the operations that aggregate a whole walk into one answer (impact, the
+	// package rollup) set it together with DeadlineResumesEmptyPage, because
+	// they serve nothing until the walk is exhausted.
 	DeadlineStops bool
+	// DeadlineResumesEmptyPage says the walk's progress survives this request
+	// whatever the page served: every record the walk admitted is in the
+	// retained input and the standing frontier becomes the continuation, so a
+	// page that admitted no edge at all still carries the walk forward. Ruling
+	// P3 then applies to EVERY deadline -- it ends the page, never the answer.
+	// Without it, a deadline that lands before the page's first edge fails the
+	// walk, and for an aggregating operation that failure is the whole retained
+	// walk thrown away with no continuation to reach its remainder.
+	DeadlineResumesEmptyPage bool
 	// Resume, when non-nil, is the state a continuation restored: the walk
 	// starts from the spooled frontier at the cursor's depth instead of from
 	// seeds, and skips the rows the issuing page already emitted.

@@ -89,7 +89,9 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// Discarded AFTER the continuation below has taken it.
 	defer retain.discard()
 
-	// The accumulator enforces the per-page work budgets and records the keyset
+	// The accumulator enforces the ANSWER-level visited and edge bounds
+	// (impactAccumulator.Visit states why they are the cumulative counters and
+	// not the per-page ones) and records the keyset
 	// position a deadline continuation resumes from. It emits no impact record:
 	// this endpoint ranks pairs, not entities.
 	var (
@@ -107,7 +109,13 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				Budget:        b,
 				BatchSize:     adjacencyBatch,
 				FrontierBytes: e.limits.FrontierBytes,
-				Resume:        resume,
+				// Ruling P3, both halves: the deadline ends this page, and it
+				// does so even before the page admitted an edge, because the
+				// walk's frontier and every record it has admitted are
+				// retained across the request.
+				DeadlineStops:            true,
+				DeadlineResumesEmptyPage: true,
+				Resume:                   resume,
 			}, func(fs frontierState, rel model.Relation) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never

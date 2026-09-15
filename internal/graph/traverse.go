@@ -35,13 +35,19 @@ const (
 // bare CTX_QUERY_DEADLINE.
 
 // deadlineStop reports whether err is the walk's own deadline AND this page has
-// something partial to hand back. Both halves matter: a cancellation is never a
-// stop (the caller is gone and wants nothing), and a deadline that arrives
-// before the page admitted an edge has no partial page to return -- converting
-// it would mint a cursor over an empty page, and a client that retried would
-// get another empty page, a chain that never returns a row.
+// something to hand back. A cancellation is never a stop (the caller is gone
+// and wants nothing). What counts as "something" depends on the walk: a PAGED
+// traversal must have admitted an edge, because a cursor over an empty page it
+// did not advance would let a client retry into a chain that never returns a
+// row -- and it loses nothing by failing, since the caller still holds the
+// cursor it arrived with. A walk that persists its progress outside the page
+// (DeadlineResumesEmptyPage) always has the standing frontier and the records
+// its earlier legs retained to hand back, so every deadline ends its page.
 func deadlineStop(err error, o expandOptions) bool {
-	if !o.DeadlineStops || o.Budget.pageEdges == 0 {
+	if !o.DeadlineStops {
+		return false
+	}
+	if o.Budget.pageEdges == 0 && !o.DeadlineResumesEmptyPage {
 		return false
 	}
 	var me *model.Error
