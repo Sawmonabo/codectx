@@ -478,15 +478,39 @@ type SessionRecord struct {
 	ClosedAt     *time.Time
 }
 
+// requirementRankSQL ranks a requirement so the STRONGEST is the smallest
+// number. It is one expression used twice -- once to collapse a manifest's own
+// entries for a file, once to compare an arriving requirement against the one
+// the session already holds -- so the two can never disagree about which of two
+// requirements is stronger.
+const requirementRankSQL = `CASE %s WHEN 'required_full' THEN 0 WHEN 'required_symbol' THEN 1 ` +
+	`WHEN 'recommended' THEN 2 ELSE 3 END`
+
 // sessionFilesSQL derives session_files from the manifest's entries joined to
 // the session's own snapshot, keeping the strongest requirement per file. The
 // snapshot join is what makes a file from another snapshot impossible here.
-const sessionFilesSQL = `INSERT OR IGNORE INTO session_files(session_id, snapshot_id, file_id, content_hash, requirement)
-	SELECT ?1, ?2, ce.file_id, sf.content_hash,
-		CASE min(CASE ce.requirement WHEN 'required_full' THEN 0 WHEN 'required_symbol' THEN 1 WHEN 'recommended' THEN 2 ELSE 3 END)
-			WHEN 0 THEN 'required_full' WHEN 1 THEN 'required_symbol' WHEN 2 THEN 'recommended' ELSE 'optional' END
-	FROM context_entries ce JOIN snapshot_files sf ON sf.snapshot_id = ?2 AND sf.file_id = ce.file_id AND sf.content_hash IS NOT NULL
-	WHERE ce.manifest_id = ?3 AND ce.file_id IS NOT NULL GROUP BY ce.file_id`
+//
+// It UPSERTS rather than INSERT OR IGNORE, and the upsert may only UPGRADE a
+// requirement. A session grows by `context include`, which recompiles over
+// further seeds and unions the result in: with OR IGNORE, whatever the FIRST
+// manifest said about a file was frozen forever, so a file that arrived as an
+// optional captured change stayed optional even after a later include named it
+// as a required seed. The session then under-reported its own required scope --
+// coverage read as smaller than the work the actor had actually been told to
+// do. The rank guard is what keeps the union monotonic in the other direction:
+// a later manifest that mentions a file only in passing can never weaken a
+// requirement an earlier one established.
+var sessionFilesSQL = `INSERT INTO session_files(session_id, snapshot_id, file_id, content_hash, requirement)
+	SELECT * FROM (
+		SELECT ?1, ?2, ce.file_id, sf.content_hash,
+			CASE min(` + fmt.Sprintf(requirementRankSQL, "ce.requirement") + `)
+				WHEN 0 THEN 'required_full' WHEN 1 THEN 'required_symbol' WHEN 2 THEN 'recommended' ELSE 'optional' END
+		FROM context_entries ce JOIN snapshot_files sf ON sf.snapshot_id = ?2 AND sf.file_id = ce.file_id AND sf.content_hash IS NOT NULL
+		WHERE ce.manifest_id = ?3 AND ce.file_id IS NOT NULL GROUP BY ce.file_id
+	) WHERE true ON CONFLICT(session_id, file_id, content_hash) DO UPDATE SET
+		requirement = CASE WHEN ` + fmt.Sprintf(requirementRankSQL, "excluded.requirement") +
+	` < ` + fmt.Sprintf(requirementRankSQL, "session_files.requirement") +
+	` THEN excluded.requirement ELSE session_files.requirement END`
 
 // OpenSession creates an actor-specific session over a manifest and populates
 // its file scope. With an idempotency key, a retry by the same actor with the

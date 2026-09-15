@@ -40,9 +40,9 @@ func addLimitFlag(cmd *cobra.Command) {
 
 // addCursorFlag declares --cursor, for the commands that actually MINT a
 // continuation token. It is separate from addLimitFlag because a command can
-// bound its page without being resumable: `path` returns its routes under the
-// reason-path cap and prints no token, and offering the flag there would
-// advertise a workflow the command refuses.
+// bound its page without being resumable, and `path` is the reverse: it is
+// resumable but takes no --limit, because a route set is bounded by the
+// reason-path cap rather than paged.
 func addCursorFlag(cmd *cobra.Command) {
 	// The repeat-every-flag clause is the first half of the help because it is
 	// the refusal an operator actually hits: the request's direction, relation

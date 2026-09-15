@@ -76,6 +76,7 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
 		FileCount: snap.FileCount, SourceBytes: snap.SourceBytes, Warnings: warnings}
 	c.watch.project(&st)
+	c.retention.project(&st)
 	return st, nil
 }
 

@@ -69,6 +69,12 @@ type Options struct {
 	// by default; past a user-set bound the call is counted into the file's
 	// dropped count and the file reports partial.
 	MaxCalleeReferences config.Limit
+	// MaxRecordsPerFile is tree_sitter.max_records_per_file: how many
+	// declarations, imports or references (each counted separately) one file
+	// may yield. Unlimited by default. It is carried on every parse request so
+	// the worker that extracts and the parent that reads the frames back apply
+	// the one number the operator set.
+	MaxRecordsPerFile config.Limit
 	// ParseTimeout bounds one parse; a worker past it is killed and the unit
 	// is CTX_PROVIDER_TIMEOUT.
 	ParseTimeout time.Duration
@@ -229,7 +235,8 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	if !utf8.Valid(src) {
 		return finish(model.CapabilityUnavailable, model.CodeProviderUnavailable)
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint32(len(src))}, src)
+	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: fv.Path, SourceBytes: uint32(len(src)),
+		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
 	if err != nil {
 		return model.ProviderResult{}, err
 	}
@@ -355,7 +362,8 @@ func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (
 	if p.opts.MaxParseFileBytes.Exceeded(int64(len(src))) || int64(len(src)) > wire.MaxSourceBytes {
 		return Probe{}, &model.Error{Code: model.CodeResourceLimit, Message: "the file exceeds max parse file bytes"}
 	}
-	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint32(len(src))}, src)
+	ex, err := p.parse(ctx, wire.Request{Language: l.Name, Path: relPath, SourceBytes: uint32(len(src)),
+		MaxRecordsPerFile: uint64(p.opts.MaxRecordsPerFile.Value())}, src)
 	if err != nil {
 		return Probe{}, err
 	}

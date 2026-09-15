@@ -131,8 +131,18 @@ type Carried struct {
 
 // Plan is one snapshot's complete unit plan.
 type Plan struct {
-	// Units are the units to run, in provider dependency order.
-	Units []Unit
+	// Units yields the units to run, in provider dependency order. It is a
+	// sequence and not a slice because a file-invalidated provider plans one
+	// unit per snapshot file: on a monorepo that list is repository-sized, so
+	// the file units are streamed from an external sort rather than held in
+	// heap (Section 6), exactly as a workspace unit's membership already is.
+	// A hand-built Plan may leave it nil, which is a plan that runs nothing.
+	//
+	// It is re-iterable, it must not be called after Plan.Close, and the
+	// order it answers is byte for byte the order the in-heap list answered:
+	// the sort key is (the provider's position in Selection.Active, arrival
+	// sequence), so every unit identity and every digest is unchanged.
+	Units func(yield func(Unit) error) error
 	// Reuse maps Key(providerID, scopeKey) to the sealed unit of the previous
 	// generation whose identity the fresh plan reproduces exactly. Those
 	// scopes have no entry in Units: there is nothing to run.
@@ -160,18 +170,28 @@ type Plan struct {
 	// shared is the spilled, sorted membership of every whole-snapshot unit,
 	// which their Unit.Inputs sequences stream from.
 	shared *pagination.SortedRun[model.UnitInput]
+	// files is the spilled, sorted run of every file-invalidated provider's
+	// unit, which Units streams from. Semantic units are not in it: a package-
+	// or workspace-scoped unit list is bounded by the scope count, never by
+	// the repository, so it stays in heap (H-L1b).
+	files *pagination.SortedRun[fileUnitRecord]
 }
 
-// Close releases the plan's spilled input run. Every whole-snapshot unit's
-// Unit.Inputs reads from it, so a caller closes the plan after executing it. A
-// plan whose inputs fit one run buffer holds no file and Close is then free; a
-// zero Plan may be closed.
+// Close releases the plan's two spilled runs: the shared input membership every
+// whole-snapshot unit's Unit.Inputs reads from, and the file units Plan.Units
+// streams. A caller closes the plan after executing it, and neither sequence may
+// be read afterwards. A plan small enough to fit its run buffers holds no file
+// and Close is then free; a zero Plan may be closed.
 func (p *Plan) Close() error {
 	if p == nil {
 		return nil
 	}
 	err := p.shared.Close()
 	p.shared = nil
+	if ferr := p.files.Close(); err == nil {
+		err = ferr
+	}
+	p.files = nil
 	return err
 }
 
@@ -226,7 +246,13 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	b := &builder{in: in, cfgHash: in.Config.AnalysisConfigHash(),
 		plan: Plan{Reuse: map[string]model.UnitID{}, Previous: map[string]model.UnitID{},
 			Unplanned: map[string]int{}, States: slices.Clone(in.Selection.States)},
-		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{}}
+		byProvider: map[string][]Unit{}, overBound: map[string]string{}, noInputs: map[string]string{},
+		providerOrder: make(map[string]int, len(in.Selection.Active))}
+	for i, p := range in.Selection.Active {
+		if _, dup := b.providerOrder[p.Descriptor().ID]; !dup {
+			b.providerOrder[p.Descriptor().ID] = i
+		}
+	}
 	dir := in.TempDir
 	if dir == "" {
 		dir = os.TempDir()
@@ -247,6 +273,17 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	// Sorted() removes the runs on the success path; this covers every early
 	// return, which would otherwise leave spill files behind.
 	defer func() { _ = sorter.Close() }()
+	units, err := pagination.NewExternalSort(dir, "plan-units-", 0, encodeUnit, decodeUnit, compareUnit)
+	if err != nil {
+		return Plan{}, err
+	}
+	// Charged in BYTES as well as records for the reason F37 settled for the
+	// input sort: a unit record carries a scope key, which is bounded by
+	// model.MaxScopeKeyBytes rather than fixed, so a record count alone would
+	// be a budget that means something different on every repository.
+	units = units.WithRunBytes(pagination.SortRunBytes(in.Config.Resources.QueryMemoryBytes), sizeOfUnit)
+	b.allUnits = units
+	defer func() { _ = units.Close() }()
 	if err := b.classifyProviders(ctx); err != nil {
 		return Plan{}, err
 	}
@@ -298,6 +335,20 @@ type builder struct {
 	// read block per run. The merged run is shared by every such unit -- one
 	// sequence, re-iterated -- rather than copied per unit.
 	allInputs *pagination.ExternalSort[model.UnitInput]
+	// allUnits accumulates every file-invalidated provider's unit. It is an
+	// external sort for the same reason allInputs is: a file provider plans
+	// one unit per snapshot file, so holding the list would make peak RSS a
+	// function of repository size. The records spill as the walk fills the run
+	// buffer and are merged once in emit; Plan.Units then streams the merged
+	// run, so the executor's peak is one batch of units and not the plan's.
+	allUnits *pagination.ExternalSort[fileUnitRecord]
+	// unitSeq is the arrival counter that, with the provider's position in
+	// Selection.Active, keys allUnits. Sorting by (position, arrival) is what
+	// reproduces the in-heap concatenation exactly.
+	unitSeq int64
+	// providerOrder is each active provider's position in Selection.Active,
+	// which is the dependency order Plan.Units answers in.
+	providerOrder map[string]int
 	// prior is the complete fold of Inputs.CarriedPage by Key, empty when
 	// there is no previous generation. It holds one entry per stale scope of
 	// that generation -- unit-scoped like Plan.Reuse and Plan.Previous, never
@@ -531,7 +582,16 @@ func (b *builder) fileUnits(ctx context.Context, fv model.FileVersion, deleted b
 			b.plan.Reuse[Key(fp.id, scopeKey)] = spec.ID
 			continue
 		}
-		b.byProvider[fp.id] = append(b.byProvider[fp.id], u)
+		rec := fileUnitRecord{Order: b.providerOrder[fp.id], Seq: b.unitSeq,
+			ProviderID: fp.id, ProviderVersion: fp.version, ScopeKey: scopeKey,
+			FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}
+		if len(u.DependsOn) == 1 {
+			rec.DependsOn = u.DependsOn[0]
+		}
+		b.unitSeq++
+		if err := b.allUnits.Add(rec); err != nil {
+			return false, false, err
+		}
 	}
 	if deleted {
 		// A tombstone the previous generation selected a filesystem unit for is
@@ -638,11 +698,72 @@ func (b *builder) emit(ctx context.Context) error {
 			b.byProvider[d.ID] = append(b.byProvider[d.ID], u)
 		}
 	}
-	for _, p := range b.in.Selection.Active {
-		b.plan.Units = append(b.plan.Units, b.byProvider[p.Descriptor().ID]...)
+	files, err := b.allUnits.Sorted()
+	if err != nil {
+		return err
 	}
+	b.plan.files = files
+	// One slot per position in Selection.Active, holding that provider's
+	// semantic units; a file provider's slot stays empty because the merged
+	// run serves it. A duplicate entry in Active keeps its units at the first
+	// position, which is the one providerOrder keyed its records to, so it is
+	// emitted once rather than twice.
+	slots := make([][]Unit, len(b.in.Selection.Active))
+	for i, p := range b.in.Selection.Active {
+		if id := p.Descriptor().ID; b.providerOrder[id] == i {
+			slots[i] = b.byProvider[id]
+		}
+	}
+	b.plan.Units = unitSequence(files, slots)
 	b.degradations()
 	return nil
+}
+
+// unitSequence is Plan.Units: one pass that interleaves the merged file-unit
+// run with the semantic units held in heap, in Selection.Active order.
+//
+// It reproduces the concatenation it replaced byte for byte. A provider is
+// either file-invalidated or larger-scoped and never both (classifyProviders
+// branches on InvalidationScope), so each position in the order is served by
+// exactly one of the two sources: the run's records for that position, in
+// arrival order, or that provider's bounded semantic list. Peak is one unit,
+// plus the run's own read block.
+func unitSequence(run *pagination.SortedRun[fileUnitRecord], slots [][]Unit) func(yield func(Unit) error) error {
+	return func(yield func(Unit) error) error {
+		next := 0
+		// flush emits every semantic provider strictly before position n. A
+		// file provider's position is skipped here: the run serves it.
+		flush := func(n int) error {
+			for ; next < n; next++ {
+				for _, u := range slots[next] {
+					if err := yield(u); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		}
+		if err := run.Each(func(rec fileUnitRecord) error {
+			if rec.Order >= len(slots) {
+				// Unreachable: every record is keyed by providerOrder, which
+				// is a position in the very slice slots was sized from. It is
+				// a typed refusal and not a skipped flush because skipping one
+				// would move that provider's semantic units silently to the
+				// tail -- a reordering, which is the one thing this sequence
+				// exists to preserve.
+				return internalErr("the plan's unit run names provider position " +
+					strconv.Itoa(rec.Order) + ", past the " + strconv.Itoa(len(slots)) +
+					" active providers it was planned against")
+			}
+			if err := flush(rec.Order); err != nil {
+				return err
+			}
+			return yield(rec.unit())
+		}); err != nil {
+			return err
+		}
+		return flush(len(slots))
+	}
 }
 
 // carry records the stale predecessor of a refreshing semantic scope with its
@@ -837,3 +958,90 @@ func sizeOfInput(in model.UnitInput) int64 {
 // same. File identities are unique within a snapshot (one manifest row per
 // path) and the hasher refuses a non-ascending pair, so no tie is reachable.
 func compareInput(a, b model.UnitInput) int { return compareID(a.FileID, b.FileID) }
+
+// fileUnitRecord is one file-invalidated provider's unit as the plan's unit
+// sort spills it. It is scalars only -- one file's identity, not an input list
+// -- which is what makes the record a fixed, small size: a unit carrying its
+// own membership would be variable-length, would charge the run buffer by the
+// scope's size, and a large enough one would exceed the sort's record ceiling
+// and fail the plan outright. Semantic units are never spilled for exactly
+// that reason; their lists are bounded by the scope count and stay in heap.
+type fileUnitRecord struct {
+	// Order is the provider's position in Selection.Active and Seq its arrival
+	// in the manifest walk. Together they are the sort key, and sorting on them
+	// reproduces the order the in-heap per-provider lists were concatenated in.
+	Order int   `json:"o"`
+	Seq   int64 `json:"q"`
+
+	ProviderID      string `json:"p"`
+	ProviderVersion string `json:"v"`
+	ScopeKey        string `json:"s"`
+
+	// FileID, ContentHash and Executable are the unit's single declared input.
+	FileID      model.FileID `json:"f"`
+	ContentHash string       `json:"c"`
+	Executable  bool         `json:"x,omitempty"`
+	// DependsOn is the filesystem unit of the same file, empty for a provider
+	// that does not depend on it. A file unit never has more than one
+	// dependency (fileUnits sets exactly the filesystem unit or none).
+	DependsOn model.UnitID `json:"d,omitempty"`
+}
+
+// unit rehydrates the record into the Unit the executor runs. Its identity is
+// unchanged: Spec folds the same single input and the same dependency list.
+func (r fileUnitRecord) unit() Unit {
+	u := Unit{ProviderID: r.ProviderID, ProviderVersion: r.ProviderVersion, ScopeKey: r.ScopeKey,
+		InputCount: 1, Inputs: staticInputs([]model.UnitInput{{FileID: r.FileID,
+			ContentHash: r.ContentHash, Executable: r.Executable}})}
+	if r.DependsOn != "" {
+		u.DependsOn = []model.UnitID{r.DependsOn}
+	}
+	return u
+}
+
+// encodeUnit / decodeUnit are the unit sort's codec, JSON for the same reason
+// the input codec is: the record never leaves this process, and a codec that
+// cannot drift from the struct is worth more than the bytes a packed one saves.
+func encodeUnit(r fileUnitRecord) ([]byte, error) {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return nil, internalErr("encoding a planned unit for the plan's external sort: " + err.Error())
+	}
+	return b, nil
+}
+
+func decodeUnit(b []byte) (fileUnitRecord, error) {
+	var r fileUnitRecord
+	if err := json.Unmarshal(b, &r); err != nil {
+		return fileUnitRecord{}, internalErr("decoding a planned unit from the plan's external sort: " + err.Error())
+	}
+	return r, nil
+}
+
+// sizeOfUnit charges one buffered unit record against the run's byte budget:
+// its five variable strings plus the struct's fixed fields and their headers.
+// It is the retained heap of one record, not its encoded length.
+func sizeOfUnit(r fileUnitRecord) int64 {
+	const overhead = 128
+	return int64(len(r.ProviderID)+len(r.ProviderVersion)+len(r.ScopeKey)+
+		len(r.FileID)+len(r.ContentHash)+len(r.DependsOn)) + overhead
+}
+
+// compareUnit orders the unit sort by (provider position, arrival), which is
+// the concatenation order Plan.Units answers in. Every pair differs in Seq --
+// it is a per-plan counter incremented once per record -- so no tie is
+// reachable and the merge needs no stable-sort guarantee to be deterministic.
+func compareUnit(a, b fileUnitRecord) int {
+	switch {
+	case a.Order != b.Order:
+		if a.Order < b.Order {
+			return -1
+		}
+		return 1
+	case a.Seq < b.Seq:
+		return -1
+	case a.Seq > b.Seq:
+		return 1
+	}
+	return 0
+}

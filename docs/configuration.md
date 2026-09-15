@@ -69,8 +69,8 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_capsule_records_per_list`, `max_capsule_coverage_files`, `max_seeds` |
-  | `[providers.tree_sitter]` | `max_callee_references` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds`, `max_capsule_records_per_list`, `max_capsule_coverage_files` |
+  | `[providers.tree_sitter]` | `max_callee_references`, `max_records_per_file` |
   | `[providers.manifest]` | `max_dependencies`, `max_entries`, `max_toml_lines`, `max_xml_elements` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |
   | `[workflow]` | `max_observation_references` |
@@ -218,6 +218,7 @@ All **user** trust.
 | `wal_high_water_bytes` | `67108864` | WAL size that triggers a checkpoint. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
 | `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |
+| `synchronous` | `"normal"` | SQLite synchronous mode of the single **writer** connection: `"normal"` or `"full"`. Any other value is refused with `storage.synchronous is "..."; use "normal" or "full"`. The store is rebuildable derived data and the database runs in WAL mode, where `"normal"` is safe from corruption and always consistent -- a power loss or hard reset can only roll back the most recent commits, leaving the previous generation active and some orphan blobs the retention sweep reclaims. `"full"` additionally fsyncs the write-ahead log after **every** commit, which buys durability of those last commits across a power loss and nothing else: transactions are durable across an application crash either way. Measured at ~10 ms per commit against ~0.11 ms on ext4, so `"full"` is materially slower to index. Readers are unaffected; they never write. See [ADR-0004](adr/ADR-0004-wal-synchronous-mode.md). |
 
 ### The data directory
 
@@ -286,6 +287,7 @@ directories and network posture are product code, not configuration.
 | `tree_sitter.languages` | `["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]` | project | Languages to parse. |
 | `tree_sitter.worker_idle_ttl` | `"60s"` | user | Idle time before a parser worker is stopped. |
 | `tree_sitter.max_callee_references` | `0` (unlimited) | user | How many distinct cross-file callee names one file may mint nodes for — the callees that are not declarations of that file. Unlimited by default: a generated or minified file names what it names, and the count is bounded by the file itself, whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory rather than the repository's. A set value mints no further placeholder node past the bound; each such call is counted and the file's `structure` capability is reported partial with `CTX_COVERAGE_INCOMPLETE`. |
+| `tree_sitter.max_records_per_file` | `0` (unlimited) | user | How many declarations, imports or references — each counted separately — one file may yield. Unlimited by default: it replaces three fixed worker ceilings (20000 declarations, 4000 imports, 60000 references), and a generated or vendored file that crosses one is a property of the repository rather than a fault. What a file yields is bounded by the file itself, whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory rather than the repository's. A set value stops that record set, reports the file's `structure` capability partial, and is applied by the extracting worker and by the parent that reads its frames from the one configured number, so raising it can never make the parent reject a healthy worker's output. |
 | `scip.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
 | `scip.timeout` | `"0s"` (no limit) | user | Wall-clock deadline for one SCIP indexer run. `0` by default: a monorepo's import is slow, not broken, and a deadline that fails an analysis unit refuses a repository for its size. |
 | `scip.stall_timeout` | `"5m"` | user | Hang detector, not a size limit. How long a subprocess may make **no progress at all** — no stdout, no stderr, no CPU, no growth of its output file — before the unit fails with reason `stalled` and is reported. Finite by default: a wedged process makes no progress however large the repository. |
@@ -399,24 +401,28 @@ following the cursor reaches the same nodes an unbounded walk would. The
 pages of one walk, so a caller still sees the total the walk has spent, and a
 replayed cursor neither resets nor doubles it.
 
-Two stops are not resumable, and both say so rather than pretending otherwise.
+One stop is not resumable, and it says so rather than pretending otherwise.
 `max_graph_depth` is part of the query a cursor is bound to, so a walk that ran
-out of depth is reported truncated with no continuation. And `impact` performs
-its whole walk on the first page and then serves a spooled ranked tail, so a
-per-page budget it exhausts ends that one walk: the answer is truncated with
-the reason, and every later page repeats the same flag and reason.
+out of depth is reported truncated with no continuation. `impact` is bounded on
+the same terms as `callers` and `callees`: a per-page budget it exhausts ends
+that page, reports the reason and mints a continuation, and the next page
+resumes the walk from the persisted frontier.
 
 `max_reason_paths_per_entry` bounds the explanation routes stored per entry;
 routes beyond it are reported as a count, never silently dropped.
 
 `max_seeds` bounds seed discovery — the Section 15.2 pass that turns a task's
 words into the candidates a plan starts from — and is unlimited by default. What
-bounds that pass with no value set is the **request**, not the repository: the
-task text is clipped to a fixed byte bound before any scanning, each identity it
-names is resolved by exactly one page of declarations, and the lowest-priority
-step that admits captured working-tree changes reads one page and discloses its
-continuation cursor rather than materialising a whole working tree. Peak memory
-is therefore a function of the task and the page size. A value you do set is
+bounds the identity steps with no value set is the **request**, not the
+repository: the task text is clipped to a fixed byte bound before any scanning,
+and each identity it names is resolved by exactly one page of declarations. The
+two steps that read the repository — the lexical matches of the task text and
+the captured working-tree changes — are paged to exhaustion on their own keyset
+cursors, so a branch with more changed files than one page contributes all of
+them rather than the prefix a page boundary happened to cut. What keeps those
+two from dominating a plan is the ranking (both score last) and
+`max_manifest_bytes`, which names every candidate it drops in the plan's
+excluded projection; every read is one page at a time. A value you do set is
 disclosed where it bites: the step that stopped is named in the manifest's
 exclusions, with the key and the value that stopped it, and the scope is reported
 incomplete.

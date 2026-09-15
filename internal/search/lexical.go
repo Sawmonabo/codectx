@@ -20,9 +20,53 @@ import (
 type lexicalSource interface {
 	SearchStats(ctx context.Context) (documents, tokens int64, err error)
 	DocumentFrequency(ctx context.Context, terms []string) ([]int64, error)
-	TermOccurrences(ctx context.Context, term string, after int64, limit int) ([]sqlite.TermOccurrence, error)
+	OpenPostings(ctx context.Context) (postingSession, error)
 	Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error)
 	SearchDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
+}
+
+// postingSession is one held-open read transaction over the posting lists of a
+// single query, and occurrenceStream one term's list inside it. They are
+// interfaces so the tier can be driven by a fake that counts the statements it
+// issues: re-opening a stream inside a walk is the regression this seam exists
+// to catch. *sqlite.PostingSession and *sqlite.OccurrenceStream satisfy them
+// through readerPostings below.
+type postingSession interface {
+	TermOccurrences(ctx context.Context, term string) (occurrenceStream, error)
+	Close() error
+}
+
+// occurrenceStream pulls one term's postings in page-sized refills from one
+// statement. Next returns nil, nil once the list is exhausted.
+type occurrenceStream interface {
+	Next(ctx context.Context, limit int) ([]sqlite.TermOccurrence, error)
+	Close() error
+}
+
+// readerPostings adapts *sqlite.PinnedReader to lexicalSource. Storage returns
+// concrete stream types, which Go does not match against the interfaces above,
+// so the two posting constructors are re-typed here and nothing else is.
+type readerPostings struct{ *sqlite.PinnedReader }
+
+// OpenPostings begins a posting session as the interface spells it.
+func (r readerPostings) OpenPostings(ctx context.Context) (postingSession, error) {
+	session, err := r.PinnedReader.OpenPostings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return storedPostings{session}, nil
+}
+
+// storedPostings re-types PostingSession.TermOccurrences the same way.
+type storedPostings struct{ *sqlite.PostingSession }
+
+// TermOccurrences opens one term's stream as the interface spells it.
+func (p storedPostings) TermOccurrences(ctx context.Context, term string) (occurrenceStream, error) {
+	stream, err := p.PostingSession.TermOccurrences(ctx, term)
+	if err != nil {
+		return nil, err
+	}
+	return stream, nil
 }
 
 // lexicalTokenizer is *sqlite.Store's Tokenize: the exact unicode61 tokenizer
@@ -121,7 +165,16 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 	}
 	avgdl := float64(tokens) / float64(n)
 
-	dfs, err := l.documentFrequencies(ctx, src, key, terms)
+	// One session for the whole walk: every term stream below is a statement
+	// held open inside it, so the candidate scan reads one snapshot and pays
+	// for each posting list exactly once.
+	session, err := src.OpenPostings(ctx)
+	if err != nil {
+		return out, err
+	}
+	defer session.Close()
+
+	dfs, err := l.documentFrequencies(ctx, src, session, key, terms)
 	if err != nil {
 		return out, err
 	}
@@ -132,7 +185,11 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 
 	streams := make([]*termStream, len(terms))
 	for i, t := range terms {
-		streams[i] = newTermStream(src, t)
+		streams[i], err = newTermStream(ctx, session, t)
+		if err != nil {
+			return out, err
+		}
+		defer streams[i].close()
 	}
 
 	expr := encodeFTS(terms)
@@ -297,7 +354,7 @@ func ftsQuote(s string) string {
 // documentFrequencies resolves df for every term, serving the statistics cache
 // first, batching the remaining single tokens into one DocumentFrequency call,
 // and streaming each phrase's own document frequency.
-func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource, key model.AnalysisKey, terms []lexicalTerm) ([]int64, error) {
+func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource, session postingSession, key model.AnalysisKey, terms []lexicalTerm) ([]int64, error) {
 	dfs := make([]int64, len(terms))
 	var pending []string
 	var pendingAt []int
@@ -308,7 +365,7 @@ func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource
 			continue
 		}
 		if t.phrase() {
-			df, err := phraseDocumentFrequency(ctx, src, t)
+			df, err := phraseDocumentFrequency(ctx, session, t)
 			if err != nil {
 				return nil, err
 			}
@@ -342,9 +399,18 @@ func (l *lexicalTier) documentFrequencies(ctx context.Context, src lexicalSource
 // The phrase can only occur where its first token occurs, so that token's
 // posting list drives the scan; the cost is O(df of the rarest-bound token),
 // which is why the answer is cached per (AnalysisKey, phrase).
-func phraseDocumentFrequency(ctx context.Context, src lexicalSource, t lexicalTerm) (int64, error) {
-	driver := &occurrenceCursor{src: src, term: t.tokens[0]}
-	stream := newTermStream(src, t)
+func phraseDocumentFrequency(ctx context.Context, session postingSession, t lexicalTerm) (int64, error) {
+	driving, err := session.TermOccurrences(ctx, t.tokens[0])
+	if err != nil {
+		return 0, err
+	}
+	defer driving.Close()
+	driver := &occurrenceCursor{stream: driving}
+	stream, err := newTermStream(ctx, session, t)
+	if err != nil {
+		return 0, err
+	}
+	defer stream.close()
 	var df, last int64
 	first := true
 	for {
@@ -370,17 +436,16 @@ func phraseDocumentFrequency(ctx context.Context, src lexicalSource, t lexicalTe
 }
 
 // occurrenceCursor streams one term's posting rows in ascending
-// (rowid, column), holding at most one page. TermOccurrences keys on rowid
-// while emitting one row per column, so a page that ends inside a document's
-// columns would lose the rest of them; the trailing partial document is
-// therefore dropped and re-read from the next page.
+// (document, column) from ONE statement held open for the whole walk. The
+// former cursor re-issued TermOccurrences per refill, and because fts5vocab
+// cannot seek into a term's instance list, every refill re-scanned the list
+// from its start and re-sorted it: for a corpus-frequent term that is
+// quadratic in the postings and was the dominant cost of a first page.
 type occurrenceCursor struct {
-	src   lexicalSource
-	term  string
-	buf   []sqlite.TermOccurrence
-	i     int
-	after int64
-	done  bool
+	stream occurrenceStream
+	buf    []sqlite.TermOccurrence
+	i      int
+	done   bool
 }
 
 // next yields the next posting row, or ok=false once the stream is exhausted.
@@ -389,32 +454,18 @@ func (c *occurrenceCursor) next(ctx context.Context) (sqlite.TermOccurrence, boo
 		if c.done {
 			return sqlite.TermOccurrence{}, false, nil
 		}
-		rows, err := c.src.TermOccurrences(ctx, c.term, c.after, occurrencePageSize)
+		rows, err := c.stream.Next(ctx, occurrencePageSize)
 		if err != nil {
 			return sqlite.TermOccurrence{}, false, err
 		}
-		if len(rows) < occurrencePageSize {
-			c.done = true
-		} else {
-			// Drop the trailing document, whose columns may continue on the
-			// next page, and rewind the keyset to just before it.
-			tail := rows[len(rows)-1].RowID
-			cut := len(rows)
-			for cut > 0 && rows[cut-1].RowID == tail {
-				cut--
-			}
-			// A single document cannot fill a page (five indexed columns), so
-			// cut > 0 always holds; keeping the page whole if it ever did not
-			// is what prevents an empty page from stalling the scan forever.
-			if cut > 0 {
-				rows = rows[:cut]
-			}
-		}
+		// Exhaustion is the statement running out of rows, never a short
+		// page: a refill ends on a document boundary, so its length says
+		// nothing about whether more documents follow.
 		if len(rows) == 0 {
 			c.done = true
 			return sqlite.TermOccurrence{}, false, nil
 		}
-		c.buf, c.i, c.after = rows, 0, rows[len(rows)-1].RowID
+		c.buf, c.i = rows, 0
 	}
 	row := c.buf[c.i]
 	c.i++
@@ -432,8 +483,9 @@ type termStream struct {
 	live    []bool
 }
 
-// newTermStream opens one posting cursor per token of t.
-func newTermStream(src lexicalSource, t lexicalTerm) *termStream {
+// newTermStream opens one posting cursor per token of t on session. Every
+// stream it opens is closed by close, which the caller must defer.
+func newTermStream(ctx context.Context, session postingSession, t lexicalTerm) (*termStream, error) {
 	s := &termStream{term: t,
 		cursors: make([]*occurrenceCursor, len(t.tokens)),
 		head:    make([]sqlite.TermOccurrence, len(t.tokens)),
@@ -441,10 +493,24 @@ func newTermStream(src lexicalSource, t lexicalTerm) *termStream {
 		live:    make([]bool, len(t.tokens)),
 	}
 	for i, tok := range t.tokens {
-		s.cursors[i] = &occurrenceCursor{src: src, term: tok}
+		stream, err := session.TermOccurrences(ctx, tok)
+		if err != nil {
+			s.close()
+			return nil, err
+		}
+		s.cursors[i] = &occurrenceCursor{stream: stream}
 		s.live[i] = true
 	}
-	return s
+	return s, nil
+}
+
+// close releases every statement the stream holds.
+func (s *termStream) close() {
+	for _, c := range s.cursors {
+		if c != nil && c.stream != nil {
+			c.stream.Close()
+		}
+	}
 }
 
 // at returns the column-weighted frequency, the raw occurrence count and

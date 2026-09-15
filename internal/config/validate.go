@@ -106,6 +106,7 @@ func (c Config) validate() error {
 		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
 		{"providers.manifest.max_xml_elements", c.Providers.Manifest.MaxXMLElements},
 		{"providers.tree_sitter.max_callee_references", c.Providers.TreeSitter.MaxCalleeReferences},
+		{"providers.tree_sitter.max_records_per_file", c.Providers.TreeSitter.MaxRecordsPerFile},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
 		{"workspace.max_depth", c.Workspace.MaxDepth},
@@ -166,6 +167,16 @@ func (c Config) validate() error {
 		if d.v < 0 {
 			return configInvalid("%s is %s; use 0 for no wall-clock limit", d.key, d.v)
 		}
+	}
+	// storage.synchronous is an enumeration, not a number: it is neither a
+	// reservation nor a bound, so it is checked here rather than in either
+	// loop above. An unrecognized spelling is refused at load time so the
+	// store never has to choose a fallback durability mode of its own.
+	switch c.Storage.Synchronous {
+	case SynchronousNormal, SynchronousFull:
+	default:
+		return configInvalid("storage.synchronous is %q; use %q or %q",
+			c.Storage.Synchronous, SynchronousNormal, SynchronousFull)
 	}
 	if err := c.validateStructuralCeilings(); err != nil {
 		return err

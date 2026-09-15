@@ -147,8 +147,8 @@ func writeSearchTable(b *strings.Builder, hits []model.SearchHit) {
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
 			tableCell(string(hit.Tier)), hit.ScoreMicros, hit.OccurrenceCount,
-			tableCell(string(hit.Kind)), rangeLine(hit.Range), tableCell(hit.Path),
-			tableCell(name), reasonCell(hit.Reasons))
+			tableCell(string(hit.Kind)), hitRangeCell(hit), tableCell(hit.Path),
+			tableCell(name), reasonCell(hit))
 	}
 	flushTableInto(tw)
 	fmt.Fprintf(b, "\n%d %s\n", len(hits), plural(len(hits), "hit", "hits"))
@@ -167,7 +167,17 @@ func flushTableInto(tw *tabwriter.Writer) {
 // report ScoreMicros 0 and say why in a reason, so a table without this column
 // would show those hits as scoring nothing with nothing to explain it. Only the
 // first reason fits a column; the rest are counted, and --json carries them all.
-func reasonCell(reasons []string) string {
+// It also carries the per-hit fault the JSON answer reports in
+// `unresolved_fields`: a hit whose range the content store could not supply
+// stays in the answer, so the reason it lost its position must reach an
+// operator reading the table and not only one reading --json.
+func reasonCell(hit model.SearchHit) string {
+	reasons := hit.Reasons
+	if why := hit.UnresolvedFields[model.SearchHitFieldRange]; why != "" {
+		// A fresh slice: the hit's own Reasons must not grow a rendering
+		// artifact that a later --json of the same page would then publish.
+		reasons = append([]string{"range unresolved: " + why}, reasons...)
+	}
 	if len(reasons) == 0 {
 		return "-"
 	}
@@ -176,6 +186,21 @@ func reasonCell(reasons []string) string {
 		cell += fmt.Sprintf(" (+%d more)", extra)
 	}
 	return cell
+}
+
+// hitRangeCell renders a search hit's LINE column. It separates the two ways a
+// hit can reach the table with no position: an entity that simply has no source
+// location renders "-", while a hit whose range the content store could not
+// supply renders "!" and states why in the REASON column. Rendering both as "-"
+// would present a lost location as "this hit has none", which is the silent
+// degradation the per-hit fault flag exists to prevent.
+func hitRangeCell(hit model.SearchHit) string {
+	if hit.Range == nil {
+		if _, unresolved := hit.UnresolvedFields[model.SearchHitFieldRange]; unresolved {
+			return "!"
+		}
+	}
+	return rangeLine(hit.Range)
 }
 
 // rangeLine renders a hit's one-based start line, or "-" for an entity with no

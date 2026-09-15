@@ -1047,12 +1047,17 @@ func TestStorePublicationScenario(t *testing.T) {
 	// unambiguous: evicting the published generation leaves the workspace
 	// serving nothing, and sweeping a generation a retained session still
 	// holds destroys the source a coverage receipt was issued against.
-	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 4}, time.Now())
+	//
+	// The window is spelled 0 here, which `retain_refs` documents as "retains
+	// every ref": the failure mode is a store that refuses its own documented
+	// unlimited spelling, which is not fatal to the run that published and so
+	// leaves retention never sweeping at all while the store grows.
+	r1, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 0}, time.Now())
 	if err != nil {
 		t.Fatalf("RetainByRef: %v", err)
 	}
 	if r1.RefsRetained != 4 || r1.GenerationsSwept != 2 || r1.BytesReclaimed <= 0 || r1.UnitsDeleted < 1 {
-		t.Fatalf("RetainByRef(4 refs) = %+v, want every ref retained and the two failed generations swept", r1)
+		t.Fatalf("RetainByRef(unlimited refs) = %+v, want every one of the four refs retained and the two failed generations swept", r1)
 	}
 	// Ruling Q10: max_retained_bytes = 0 is unlimited but still measures what a
 	// stricter limit could free, so `status` can warn before a disk fills. A
@@ -1065,6 +1070,18 @@ func TestStorePublicationScenario(t *testing.T) {
 		if _, err := f.s.GenerationStatus(ctx, gen); err != nil {
 			t.Fatalf("retention swept generation %d, which is its ref's most recent: %v", gen, err)
 		}
+	}
+	// A user-set finite window still prunes to exactly that window: unlimited
+	// is the default, not the only accepted value. "main" is the least
+	// recently activated of the four refs, so a window of three drops it from
+	// the retained set; the read session opened above still holds its
+	// generation, so it is reported reclaimable rather than deleted.
+	r1b, err := f.s.RetainByRef(ctx, f.repo, store.RetentionPolicy{RetainRefs: 3}, time.Now())
+	if err != nil {
+		t.Fatalf("RetainByRef(3 refs): %v", err)
+	}
+	if r1b.RefsRetained != 3 || r1b.BytesReclaimable <= 0 {
+		t.Fatalf("RetainByRef(3 refs) = %+v, want the window honoured at three refs with the dropped ref's generation reclaimable", r1b)
 	}
 	// The other half of the ranking-stability leg: three generations have now
 	// staged and activated over gen2 and two have been swept, and genOwn's

@@ -338,18 +338,24 @@ func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 			markTruncated(meta, reasonEdgeBudget)
 			break
 		}
-		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionIncoming,
-			[]model.RelationKind{model.RelContains}, remaining)
+		// Streamed, not collected: each containment row is folded into the
+		// candidate list of the node it names as it arrives, so the heap here
+		// is one adjacency page plus the candidate and lookup lists the map is
+		// built from -- never the whole containment fan-out of a batch on top
+		// of them.
+		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionIncoming,
+			[]model.RelationKind{model.RelContains}, remaining,
+			func(r model.Relation) error {
+				b.edges++
+				candidates[r.To] = append(candidates[r.To], r.From)
+				lookup = append(lookup, r.From)
+				return nil
+			})
 		if err != nil {
 			return nil, err
 		}
-		b.edges += int64(len(rels))
 		if !complete {
 			markTruncated(meta, reasonEdgeBudget)
-		}
-		for _, r := range rels {
-			candidates[r.To] = append(candidates[r.To], r.From)
-			lookup = append(lookup, r.From)
 		}
 	}
 	nodes, err := e.nodesByID(ctx, lookup)
@@ -402,6 +408,10 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	cut := func(batch []model.NodeID) {
 		for _, id := range batch {
 			unmeasured[id] = true
+			// Retract whatever chunks of this batch were already counted: a
+			// half-counted container is a wrong measurement, and the caller
+			// cannot tell one from a small container.
+			delete(out, id)
 		}
 		markTruncated(meta, reasonEdgeBudget)
 		if disclosed {
@@ -420,44 +430,70 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 			cut(batch)
 			continue
 		}
-		rels, complete, err := e.containsEdges(ctx, batch, model.DirectionOutgoing,
-			overviewRelationKinds(), remaining)
+		// Streamed in hydration-sized chunks rather than collected whole: the
+		// containment rows of a batch of containers are the page's largest
+		// intermediate, and nothing here needs a row once its child has been
+		// counted. Peak is one chunk of rows plus that chunk's hydrated nodes,
+		// whatever the fan-out of the batch.
+		chunk := make([]model.Relation, 0, adjacencyBatch)
+		flush := func() error {
+			if len(chunk) == 0 {
+				return nil
+			}
+			children := make([]model.NodeID, 0, len(chunk))
+			for _, r := range chunk {
+				children = append(children, r.To)
+			}
+			nodes, err := e.nodesByID(ctx, children)
+			if err != nil {
+				return err
+			}
+			for _, r := range chunk {
+				child, ok := nodes[r.To]
+				if !ok {
+					// A child that is not visible in this generation is not
+					// counted: an aggregate must rest on facts this answer
+					// could actually read.
+					continue
+				}
+				counts := out[r.From]
+				switch {
+				case child.Kind == model.NodeFile:
+					counts.files++
+					counts.bytes += nodeSourceBytes(child)
+				case isOverviewContainer(child.Kind):
+					// A nested container is structure, not a symbol; it appears
+					// in the map as its own item with its own counts.
+				default:
+					counts.symbols++
+				}
+				out[r.From] = counts
+			}
+			chunk = chunk[:0]
+			return nil
+		}
+		complete, err := e.streamContainsEdges(ctx, batch, model.DirectionOutgoing,
+			overviewRelationKinds(), remaining,
+			func(r model.Relation) error {
+				b.edges++
+				chunk = append(chunk, r)
+				if len(chunk) < adjacencyBatch {
+					return nil
+				}
+				return flush()
+			})
 		if err != nil {
 			return nil, nil, err
 		}
-		b.edges += int64(len(rels))
+		if err := flush(); err != nil {
+			return nil, nil, err
+		}
 		if !complete {
+			// The chunks already counted for this batch are a partial count of
+			// its containers, which is the one thing this map may not publish,
+			// so cut retracts them along with marking the batch unmeasured.
 			cut(batch)
 			continue
-		}
-		children := make([]model.NodeID, 0, len(rels))
-		for _, r := range rels {
-			children = append(children, r.To)
-		}
-		nodes, err := e.nodesByID(ctx, children)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, r := range rels {
-			child, ok := nodes[r.To]
-			if !ok {
-				// A child that is not visible in this generation is not
-				// counted: an aggregate must rest on facts this answer could
-				// actually read.
-				continue
-			}
-			counts := out[r.From]
-			switch {
-			case child.Kind == model.NodeFile:
-				counts.files++
-				counts.bytes += nodeSourceBytes(child)
-			case isOverviewContainer(child.Kind):
-				// A nested container is structure, not a symbol; it appears in
-				// the map as its own item with its own counts.
-			default:
-				counts.symbols++
-			}
-			out[r.From] = counts
 		}
 	}
 	return out, unmeasured, nil

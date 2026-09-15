@@ -317,10 +317,12 @@ Fact frames carry byte offsets and names only. The parent recomputes every
 line and column from the pinned bytes with `source.Cursor` (the single
 position implementation), rejects offsets inside a UTF-8 sequence, checks
 range containment and every string bound, and maps declaration kinds through
-a closed vocabulary. Per-file record bounds (`MaxDeclsPerFile` 20000,
-`MaxImportsPerFile` 4000, `MaxRefsPerFile` 60000) are applied by the worker
-when extracting and by the parent when reading, so a misbehaving child cannot
-make the parent buffer more than a healthy one would send. A record whose
+a closed vocabulary. The per-file record bound
+`providers.tree_sitter.max_records_per_file` -- unlimited by default -- is
+carried on the parse request and applied by the worker when extracting and by
+the parent when reading, from the one configured number, so a misbehaving child
+cannot make the parent buffer more than a healthy one would send and raising the
+bound can never make the parent reject a healthy worker's output. A record whose
 encoding would exceed the frame cap is dropped by the worker and reported as
 truncation, never sent oversize.
 

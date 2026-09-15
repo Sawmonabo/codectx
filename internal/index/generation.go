@@ -206,7 +206,9 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	if err != nil {
 		return model.IndexResult{}, err
 	}
-	g.coverage()
+	if err := g.coverage(); err != nil {
+		return model.IndexResult{}, err
+	}
 	if err := g.c.recordSuppliedIndexes(ctx, g.gen); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -289,65 +291,109 @@ func (g *generation) attachCarried(ctx context.Context) error {
 // whose declared dependency is not yet sealed.
 func (g *generation) build(ctx context.Context) ([]plan.Unit, error) {
 	var deferred []plan.Unit
-	for i := 0; i < len(g.plan.Units); {
-		id := g.plan.Units[i].ProviderID
-		j := i
-		for j < len(g.plan.Units) && g.plan.Units[j].ProviderID == id {
-			j++
-		}
-		group := g.plan.Units[i:j]
-		i = j
-		var run []plan.Unit
-		for _, u := range group {
-			if u.Deferred {
-				deferred = append(deferred, u)
-				continue
+	var group *unitGroup
+	current := ""
+	// The plan streams its units, so no provider's whole unit list is ever in
+	// heap: a group is opened when its first unit arrives and drained when the
+	// provider changes. The units arrive grouped by provider by construction --
+	// Plan.Units answers in Selection.Active order -- which is what makes a
+	// provider change the end of its group.
+	walkErr := g.eachUnit(func(u plan.Unit) error {
+		if u.ProviderID != current {
+			if group != nil {
+				err := group.wait()
+				group = nil
+				if err != nil {
+					return err
+				}
 			}
-			run = append(run, u)
+			current = u.ProviderID
 		}
-		if err := g.buildGroup(ctx, run); err != nil {
+		if u.Deferred {
+			deferred = append(deferred, u)
+			return nil
+		}
+		if group == nil {
+			group = g.newUnitGroup(ctx)
+		}
+		return group.submit(u)
+	})
+	if walkErr != nil {
+		// A group left running by the failing walk is drained before the error
+		// is reported, so no unit outlives the call that started it. Its own
+		// error is the one submit or wait already returned.
+		if group != nil {
+			_ = group.wait()
+		}
+		return nil, walkErr
+	}
+	if group != nil {
+		if err := group.wait(); err != nil {
 			return nil, err
 		}
 	}
 	return deferred, nil
 }
 
-// buildGroup builds one provider's units with bounded concurrency. The first
-// failure that must abort the generation cancels the rest; an optional
-// provider's failure is recorded and the group continues, because Section 13.3
-// forbids a disabled or failing optional tool from taking a healthy base
-// generation down with it.
-func (g *generation) buildGroup(ctx context.Context, units []plan.Unit) error {
-	if len(units) == 0 {
+// eachUnit walks the plan's units. A plan assembled by hand rather than by
+// plan.Build may carry no unit sequence at all, which is a plan that runs
+// nothing -- the late-seal work generation is exactly that.
+func (g *generation) eachUnit(yield func(plan.Unit) error) error {
+	if g.plan.Units == nil {
 		return nil
 	}
+	return g.plan.Units(yield)
+}
+
+// unitGroup runs one provider's units with bounded concurrency as the plan
+// hands them over. It is the streaming shape of what was one []plan.Unit per
+// provider: the same worker bound, the same first-fatal-failure-cancels-the
+// -rest precedence, and a live set of at most workers units.
+type unitGroup struct {
+	g      *generation
+	ctx    context.Context
+	cancel context.CancelFunc
+	sem    chan struct{}
+	wg     sync.WaitGroup
+	once   sync.Once
+	fatal  error
+}
+
+func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
 	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	sem := make(chan struct{}, g.c.workers)
-	var wg sync.WaitGroup
-	var once sync.Once
-	var fatal error
-	for _, u := range units {
-		select {
-		case sem <- struct{}{}:
-		case <-runCtx.Done():
-			wg.Wait()
-			if fatal != nil {
-				return fatal
-			}
-			return model.Canceled(runCtx.Err())
+	return &unitGroup{g: g, ctx: runCtx, cancel: cancel, sem: make(chan struct{}, g.c.workers)}
+}
+
+// submit admits one unit against the group's worker slots, blocking while they
+// are all busy. A group whose first fatal failure has already cancelled it
+// stops admitting and reports that failure, which ends the plan walk.
+func (u *unitGroup) submit(unit plan.Unit) error {
+	select {
+	case u.sem <- struct{}{}:
+	case <-u.ctx.Done():
+		u.wg.Wait()
+		if u.fatal != nil {
+			return u.fatal
 		}
-		wg.Add(1)
-		go func(u plan.Unit) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			if err := g.unit(runCtx, u); err != nil {
-				once.Do(func() { fatal = err; cancel() })
-			}
-		}(u)
+		return model.Canceled(u.ctx.Err())
 	}
-	wg.Wait()
-	return fatal
+	u.wg.Add(1)
+	go func() {
+		defer u.wg.Done()
+		defer func() { <-u.sem }()
+		if err := u.g.unit(u.ctx, unit); err != nil {
+			u.once.Do(func() { u.fatal = err; u.cancel() })
+		}
+	}()
+	return nil
+}
+
+// wait drains the group and reports its first fatal failure. It releases the
+// group's context whatever the outcome, so an abandoned group leaks nothing.
+func (u *unitGroup) wait() error {
+	u.wg.Wait()
+	u.cancel()
+	return u.fatal
 }
 
 // unit builds one unit. The returned error is nonnil only when the failure
@@ -593,8 +639,11 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 // invisible: a provider that is available and produced no unit at all
 // (residual 113). "Available, zero units" is not fresh coverage, and without a
 // row for it status would report a capability nothing answers as healthy.
-func (g *generation) coverage() {
-	covered, deferred := g.coveredProviders()
+func (g *generation) coverage() error {
+	covered, deferred, err := g.coveredProviders()
+	if err != nil {
+		return err
+	}
 	for _, p := range g.sel.Active {
 		d := p.Descriptor()
 		for _, capability := range d.Capabilities {
@@ -610,6 +659,7 @@ func (g *generation) coverage() {
 			}
 		}
 	}
+	return nil
 }
 
 // coveredProviders is the set of providers this generation actually holds a
@@ -620,10 +670,12 @@ func (g *generation) coverage() {
 // been written for it, which is the false readiness Section 11.6 forbids. The
 // Reuse key is the provider id and the scope key joined by NUL, which is the
 // frozen shape of plan.Key.
-func (g *generation) coveredProviders() (covered, deferred map[string]bool) {
+func (g *generation) coveredProviders() (covered, deferred map[string]bool, err error) {
 	out := make(map[string]bool, len(g.sel.Active))
 	deferred = make(map[string]bool, len(g.sel.Active))
-	for _, u := range g.plan.Units {
+	// Streamed, not ranged: the plan's unit list is repository-sized, and the
+	// two answers here are one bounded entry per provider whatever it holds.
+	if err := g.eachUnit(func(u plan.Unit) error {
 		if u.Deferred {
 			// A publication generation holds the deferred units that have
 			// already sealed; the rest are still background work.
@@ -632,9 +684,12 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool) {
 			} else {
 				deferred[u.ProviderID] = true
 			}
-			continue
+			return nil
 		}
 		out[u.ProviderID] = true
+		return nil
+	}); err != nil {
+		return nil, nil, err
 	}
 	for _, c := range g.plan.Carry {
 		out[c.ProviderID] = true
@@ -644,7 +699,7 @@ func (g *generation) coveredProviders() (covered, deferred map[string]bool) {
 			out[id] = true
 		}
 	}
-	return out, deferred
+	return out, deferred, nil
 }
 
 // capabilitiesOf is one provider's declared capability list, empty when the

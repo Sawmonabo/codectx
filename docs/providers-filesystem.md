@@ -200,7 +200,7 @@ scope:
 | Outcome | State | Diagnostic |
 |---|---|---|
 | parsed | `fresh` | |
-| a list was cut at `providers.manifest.max_dependencies` or `max_entries`, or the parse at `max_toml_lines` or `max_xml_elements` — all four unlimited by default | `partial` | `CTX_RESOURCE_LIMIT` |
+| a list was cut at a user-set `providers.manifest.max_dependencies` or `providers.manifest.max_entries`, or the parse at a user-set `providers.manifest.max_toml_lines` or `providers.manifest.max_xml_elements` (all four unlimited by default, so this outcome cannot arise from the shipped configuration); the capability names the key and the count that crossed it | `partial` | `CTX_RESOURCE_LIMIT` |
 | one entry was unusable (a dependency without a name, a path outside the workspace) | `partial` | `CTX_ARGUMENT_INVALID` |
 | the file does not parse as its format | `failed` | `CTX_ARGUMENT_INVALID` |
 | size over `workspace.max_parse_file_bytes` | `unavailable` | `CTX_RESOURCE_LIMIT` |
