@@ -15,6 +15,8 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // hashInt is the canonical decimal spelling of an integer inside a hash
@@ -75,8 +77,15 @@ func manifestIdentity(b model.Binding, req model.ContextRequest, cfg config.Conf
 // store is closed and reopened reproduces this digest exactly. A differing hash
 // under the same manifest id is the determinism alarm PutManifest raises as
 // CTX_VERSION_CONFLICT, not an error to work around.
+// The exclusion projection arrives as a count plus a sequence rather than as a
+// slice: the hash is folded incrementally as the rows stream past, so the one
+// repository-sized list a compile produces is never in heap. excludedCount is
+// what P-I reported it emitted, and the sequence is asserted against it by the
+// caller, so the length component of the preimage cannot be learned by
+// collecting the rows.
 func canonicalManifestHash(b model.Binding, reqHash string, budget model.Budget, scopeComplete bool,
-	entries []model.ContextEntry, slices []model.ContextSlice, excluded []model.ExcludedContextEntry) string {
+	entries []model.ContextEntry, slices []model.ContextSlice,
+	excludedCount int64, excluded sqlite.ExcludedEntries) (string, error) {
 	h := model.NewHasher(canonicalHashDomain)
 	h.AddString(string(b.SnapshotID))
 	h.AddString(string(b.AnalysisKey))
@@ -120,15 +129,20 @@ func canonicalManifestHash(b model.Binding, reqHash string, budget model.Budget,
 			h.AddString(hashInt(int64(o)))
 		}
 	}
-	h.AddString(hashInt(int64(len(excluded))))
-	for _, x := range excluded {
-		h.AddString(hashInt(int64(x.Ordinal)))
-		h.AddString(string(x.Reference.NodeID))
-		h.AddString(string(x.Reference.FileID))
-		h.AddString(x.Reference.Path)
-		h.AddString(x.Reason)
+	h.AddString(hashInt(excludedCount))
+	if excluded != nil {
+		if err := excluded(func(x model.ExcludedContextEntry) error {
+			h.AddString(hashInt(int64(x.Ordinal)))
+			h.AddString(string(x.Reference.NodeID))
+			h.AddString(string(x.Reference.FileID))
+			h.AddString(x.Reference.Path)
+			h.AddString(x.Reason)
+			return nil
+		}); err != nil {
+			return "", err
+		}
 	}
-	return h.Sum()
+	return h.Sum(), nil
 }
 
 // reuseManifest is the Section 15.1 immutable-reuse path: a request whose
@@ -164,28 +178,61 @@ func (c *Compiler) reuseManifest(ctx context.Context, id model.ManifestID) (mode
 // Persisting is the last step of a compile for a reason: a timeout or
 // cancellation must return an explicit incomplete answer and leave no manifest
 // behind, so nothing here is written incrementally.
+//
+// exclusions is the spooled exclusion projection, replayed TWICE -- once to
+// fold the canonical hash, once to write the rows inside the manifest
+// transaction -- never collected. Both replays run through the same guarded
+// sequence below, so a run that yielded a different number of rows to the hash
+// than to the writer fails instead of persisting a manifest whose hash is over
+// rows the store does not hold.
 func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req model.ContextRequest,
-	budget model.Budget, p plan, completeness []model.CapabilityState,
+	budget model.Budget, p planParts, entries []model.ContextEntry,
+	exclusions *pagination.SortedRun[model.ExcludedContextEntry], completeness []model.CapabilityState,
 	scopeComplete bool) (model.ContextManifest, error) {
-	entries, slices, exclusions := p.Entries, p.Slices, p.Excluded
-	for _, x := range exclusions {
-		// Every omission must be visible. A blank reason would persist as a
-		// row that says an entity was dropped and not why, which is exactly
-		// the silent omission Section 15.4 forbids; the pass that excluded it
-		// is the defect, and inventing a reason here would hide which pass.
-		if strings.TrimSpace(x.Reason) == "" {
-			return model.ContextManifest{}, &model.Error{Code: model.CodeInternal,
-				Message: "an excluded context entry carries no reason"}
+	slices := p.Slices
+	// P-I counts what it emitted independently of what the sink collected. A
+	// disagreement means a sink dropped a row, which would persist a manifest
+	// whose header counts are right and whose rows are not -- so it fails here,
+	// where the defect is, rather than as a puzzling count mismatch in storage.
+	if int64(len(entries)) != p.Entries {
+		return model.ContextManifest{}, &model.Error{Code: model.CodeInternal,
+			Message: "the compiled plan's emitted rows disagree with the counts the budget pass reported"}
+	}
+	excluded := func(yield func(model.ExcludedContextEntry) error) error {
+		var n int64
+		if err := exclusions.Each(func(x model.ExcludedContextEntry) error {
+			// Every omission must be visible. A blank reason would persist as a
+			// row that says an entity was dropped and not why, which is exactly
+			// the silent omission Section 15.4 forbids; the pass that excluded
+			// it is the defect, and inventing a reason here would hide which
+			// pass.
+			if strings.TrimSpace(x.Reason) == "" {
+				return &model.Error{Code: model.CodeInternal,
+					Message: "an excluded context entry carries no reason"}
+			}
+			n++
+			return yield(x)
+		}); err != nil {
+			return err
 		}
+		if n != p.Excluded {
+			return &model.Error{Code: model.CodeInternal,
+				Message: "the compiled plan's emitted rows disagree with the counts the budget pass reported"}
+		}
+		return nil
 	}
 	id, reqHash := manifestIdentity(b, req, c.cfg)
+	canonical, err := canonicalManifestHash(b, reqHash, budget, scopeComplete, entries, slices, p.Excluded, excluded)
+	if err != nil {
+		return model.ContextManifest{}, err
+	}
 	m := model.ContextManifest{
 		ID:             id,
 		Binding:        b,
 		Phase:          req.Phase,
 		RequestHash:    reqHash,
 		PolicyVersion:  compilerPolicyVersion,
-		CanonicalHash:  canonicalManifestHash(b, reqHash, budget, scopeComplete, entries, slices, exclusions),
+		CanonicalHash:  canonical,
 		Budget:         budget,
 		EntryCount:     len(entries),
 		SliceCount:     len(slices),
@@ -199,7 +246,7 @@ func (c *Compiler) persistManifest(ctx context.Context, b model.Binding, req mod
 		return model.ContextManifest{}, &model.Error{Code: model.CodeInternal,
 			Message: "context request is not serializable: " + err.Error()}
 	}
-	if err := c.store.PutManifest(ctx, m, requestJSON, entries, slices, exclusions); err != nil {
+	if err := c.store.PutManifest(ctx, m, requestJSON, entries, slices, excluded); err != nil {
 		return model.ContextManifest{}, contextErr(ctx, err)
 	}
 	return m, nil

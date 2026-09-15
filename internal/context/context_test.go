@@ -1205,7 +1205,7 @@ func TestContextCompilerScenario(t *testing.T) {
 				if err != nil {
 					t.Fatalf("buildPlan: %v", err)
 				}
-				m, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, true)
+				m, err := c.persistPlan(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, true)
 				if err != nil {
 					t.Fatalf("persistManifest: %v", err)
 				}
@@ -1276,13 +1276,13 @@ func TestContextCompilerScenario(t *testing.T) {
 				}
 
 				// Recompiling the same request is a no-op, not a second plan.
-				if again, err := c.persistManifest(fx.ctx, fx.Binding, req, budget, p,
+				if again, err := c.persistPlan(fx.ctx, fx.Binding, req, budget, p,
 					fixtureCapabilities, true); err != nil || again.CanonicalHash != m.CanonicalHash {
 					t.Fatalf("re-persisting the identical plan = %v (hash %s), want the immutable manifest unchanged", err, again.CanonicalHash)
 				}
 				// A different plan under the same identity is the determinism
 				// alarm, never a silent overwrite of what the actor is reading.
-				_, err = c.persistManifest(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, false)
+				_, err = c.persistPlan(fx.ctx, fx.Binding, req, budget, p, fixtureCapabilities, false)
 				var typed *model.Error
 				if !errors.As(err, &typed) || typed.Code != model.CodeVersionConflict {
 					t.Fatalf("persisting a different canonical plan under the same id = %v, want %s", err, model.CodeVersionConflict)
@@ -1695,6 +1695,9 @@ func intCompiler(t *testing.T, fx *contextFixture, now func() time.Time) *Compil
 		Config: fx.Cfg,
 		Now:    now,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Every compile of this fixture writes its sort runs here, as the
+		// workspace writes them under its spool area.
+		SortDir: t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
