@@ -103,27 +103,28 @@ func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.transfer(prevID, id, size); err != nil {
+	delta, err := s.transfer(prevID, id, size)
+	if err != nil {
 		return "", err
 	}
 	if err := os.Rename(from, filepath.Join(s.dir, spoolPrefix+id)); err != nil {
-		s.transferBack(id, prevID)
+		s.transferBack(id, prevID, delta)
 		return "", internalErr("spool adopt: " + err.Error())
 	}
 	return id, nil
 }
 
 // transfer moves prevID's reservation onto id and adjusts it to size, claiming
-// only the difference against the budget. A shrunk directory gives bytes back;
-// a grown one that does not fit is refused with the budget-exhausted detail,
-// and nothing is moved.
-func (s *Spools) transfer(prevID, id string, size int64) error {
+// only the difference against the budget. It returns that difference, which is
+// what transferBack needs to undo it. A shrunk directory gives bytes back; a
+// grown one that does not fit is refused with the budget-exhausted detail, and
+// nothing is moved.
+func (s *Spools) transfer(prevID, id string, size int64) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev := s.reserved[prevID].bytes
-	delta := size - prev
+	delta := size - s.reserved[prevID].bytes
 	if s.maxBytes > 0 && delta > 0 && s.used+delta > s.maxBytes {
-		return (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
+		return 0, (&model.Error{Code: model.CodeResourceLimit, Retryable: true,
 			Message:     "query spool exceeds its disk budget",
 			Remediation: "narrow the query, retry after outstanding cursors expire, or raise resources.max_temp_bytes"}).
 			WithDetail(budgetDetailKey, budgetDetailValue)
@@ -135,16 +136,23 @@ func (s *Spools) transfer(prevID, id string, size int64) error {
 	delete(s.reserved, prevID)
 	s.seq++
 	s.reserved[id] = reservation{seq: s.seq, bytes: size}
-	return nil
+	return delta, nil
 }
 
 // transferBack undoes transfer when the rename that was to follow it failed:
-// the directory is still where it was, still under its old id.
-func (s *Spools) transferBack(id, prevID string) {
+// the directory is still where it was, still under its old id, so the entry
+// must go back to that id AND the budget must give the delta back. Restoring
+// the map alone would leave s.used inflated by the delta until the next Sweep,
+// which is the accounting drift ReadoptDir exists to remove.
+func (s *Spools) transferBack(id, prevID string, delta int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	bytes := s.reserved[id].bytes
+	bytes := s.reserved[id].bytes - delta
 	delete(s.reserved, id)
+	s.used -= delta
+	if s.used < 0 {
+		s.used = 0
+	}
 	s.seq++
 	s.reserved[prevID] = reservation{seq: s.seq, bytes: bytes}
 }
