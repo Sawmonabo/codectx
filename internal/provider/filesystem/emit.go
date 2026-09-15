@@ -303,7 +303,7 @@ func (e *Emitter) Result() model.ProviderResult {
 		// built from these facts can say how much evidence it is missing.
 		states = make([]model.CapabilityState, len(e.states))
 		for i, cs := range e.states {
-			states[i] = cs.WithDetail("evidence_clipped", strconv.Itoa(e.clipped))
+			states[i] = cs.WithDetail(model.DetailEvidenceClipped, strconv.Itoa(e.clipped))
 		}
 	}
 	return model.ProviderResult{RunID: e.req.Run, State: model.RunSucceeded, Capabilities: states, RecordsEmitted: e.records, BytesProcessed: e.bytes}
