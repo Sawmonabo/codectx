@@ -16,6 +16,7 @@
 package process
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -148,11 +149,16 @@ type Limits struct {
 // their reservations. It is safe for concurrent use.
 type Runner struct {
 	limits Limits
-	slots  chan struct{}
 
 	mu         sync.Mutex
 	memoryUsed int64
 	diskUsed   int64
+	// running counts the admissions in flight, against MaxConcurrent.
+	running int
+	// queue holds the runs waiting for headroom, in arrival order. A run that
+	// does not fit the remaining budget waits in it rather than being refused;
+	// see reserve and promote.
+	queue list.List
 	// live counts the children that have been started and whose run has not
 	// returned. It is not the admission count: a run that is admitted and then
 	// fails before exec has no process, and reporting one would describe memory
@@ -161,7 +167,7 @@ type Runner struct {
 	// window in which the run holds an admission slot, so the two accounts
 	// cannot disagree -- including the one case where a child outlives the run
 	// (it could not be killed), which the run reports as an error and which
-	// this counter, like the slot, stops holding.
+	// this counter, like the admission, stops holding.
 	live int64
 }
 
@@ -199,7 +205,7 @@ func NewRunner(limits Limits) (*Runner, error) {
 		return nil, resourceLimit("runner limits are concurrency %d, memory %d and disk %d; every bound must be positive",
 			limits.MaxConcurrent, limits.MemoryBudgetBytes, limits.DiskBudgetBytes)
 	}
-	return &Runner{limits: limits, slots: make(chan struct{}, limits.MaxConcurrent)}, nil
+	return &Runner{limits: limits}, nil
 }
 
 // Run executes one child and returns when it and its whole process tree have
@@ -270,9 +276,36 @@ func (s Spec) validate() error {
 	return nil
 }
 
-// reserve admits one run against the runner's concurrency and byte budgets.
-// A reservation larger than the whole budget is refused immediately rather than
-// waiting for capacity that can never appear.
+// admission is one run's place in the admission queue. ready is closed when
+// the run has been granted its slot and its byte reservations.
+type admission struct {
+	mem, disk int64
+	ready     chan struct{}
+	granted   bool
+	elem      *list.Element
+}
+
+// reserve admits one run against the runner's concurrency and byte budgets. A
+// run that does not fit the remaining headroom WAITS for it -- the budgets are
+// memory admission, which schedules work rather than rejecting it. The only
+// refusal left is the one no amount of waiting can clear: a reservation larger
+// than the whole user-set budget, which is reported with both numbers.
+//
+// Why there is no deadlock. Concurrency and bytes are taken together under one
+// lock, so a run never holds a slot while waiting for memory -- the shape that
+// would let MaxConcurrent waiters block every runner that could free memory.
+// Admission is strictly head-of-line: only the queue's front is considered, so
+// a large reservation cannot starve behind an endless stream of small ones, and
+// nothing behind the head can consume the headroom the head is waiting for.
+// The head is always eventually satisfiable, because its reservations are
+// individually within the whole budget (checked above) and every admitted run
+// releases everything it took when it returns; once the last one does,
+// running, memoryUsed and diskUsed are all zero and the head fits by
+// construction. Nothing inside a run re-enters reserve, so no run waits on a
+// run behind it. A waiter that never reaches the head still leaves on ctx.
+//
+// The trade-off this accepts: head-of-line admission can leave headroom idle
+// while a large reservation waits. That is the cost of never starving one.
 func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 	if spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes {
 		return nil, resourceLimit("the run reserves %d bytes of memory, over the runner budget of %d",
@@ -282,30 +315,65 @@ func (r *Runner) reserve(ctx context.Context, spec Spec) (func(), error) {
 		return nil, resourceLimit("the run reserves %d bytes of disk, over the runner budget of %d",
 			spec.DiskReservationBytes, r.limits.DiskBudgetBytes)
 	}
-	select {
-	case r.slots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, model.Canceled(ctx.Err())
-	}
+	w := &admission{mem: spec.MemoryReservationBytes, disk: spec.DiskReservationBytes, ready: make(chan struct{})}
 	r.mu.Lock()
-	overMemory := r.memoryUsed+spec.MemoryReservationBytes > r.limits.MemoryBudgetBytes
-	overDisk := r.diskUsed+spec.DiskReservationBytes > r.limits.DiskBudgetBytes
-	if overMemory || overDisk {
-		r.mu.Unlock()
-		<-r.slots
-		return nil, resourceLimit("the run does not fit the remaining runner budget")
-	}
-	r.memoryUsed += spec.MemoryReservationBytes
-	r.diskUsed += spec.DiskReservationBytes
+	w.elem = r.queue.PushBack(w)
+	r.promote()
+	granted := w.granted
 	r.mu.Unlock()
+	if !granted {
+		select {
+		case <-w.ready:
+		case <-ctx.Done():
+			r.mu.Lock()
+			if !w.granted {
+				r.queue.Remove(w.elem)
+				w.elem = nil
+				r.mu.Unlock()
+				return nil, model.Canceled(ctx.Err())
+			}
+			r.mu.Unlock()
+			// Granted in the same moment the context ended: the reservation is
+			// held and must be handed back, or it leaks for the runner's life.
+			r.release(w)
+			return nil, model.Canceled(ctx.Err())
+		}
+	}
+	var once sync.Once
+	return func() { once.Do(func() { r.release(w) }) }, nil
+}
 
-	return func() {
-		r.mu.Lock()
-		r.memoryUsed -= spec.MemoryReservationBytes
-		r.diskUsed -= spec.DiskReservationBytes
-		r.mu.Unlock()
-		<-r.slots
-	}, nil
+// promote grants queued runs in arrival order. It must be called with r.mu
+// held, and stops at the first waiter that does not fit: see reserve for why
+// nothing behind the head may overtake it.
+func (r *Runner) promote() {
+	for e := r.queue.Front(); e != nil; {
+		w := e.Value.(*admission)
+		if r.running >= r.limits.MaxConcurrent ||
+			r.memoryUsed+w.mem > r.limits.MemoryBudgetBytes ||
+			r.diskUsed+w.disk > r.limits.DiskBudgetBytes {
+			return
+		}
+		r.running++
+		r.memoryUsed += w.mem
+		r.diskUsed += w.disk
+		w.granted = true
+		next := e.Next()
+		r.queue.Remove(e)
+		w.elem = nil
+		close(w.ready)
+		e = next
+	}
+}
+
+// release hands back one admission and wakes whatever now fits.
+func (r *Runner) release(w *admission) {
+	r.mu.Lock()
+	r.running--
+	r.memoryUsed -= w.mem
+	r.diskUsed -= w.disk
+	r.promote()
+	r.mu.Unlock()
 }
 
 func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {

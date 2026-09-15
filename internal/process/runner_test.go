@@ -432,3 +432,127 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 		t.Fatalf("after a non-zero exit the runner reports %d live children, want 0", got)
 	}
 }
+
+// TestAdmissionWaitsForHeadroom protects the class-C rule for the runner's
+// byte budgets: a run that does not fit the REMAINING budget waits for
+// headroom and then runs, and only a reservation larger than the whole
+// user-set budget is refused. The failure it guards against is the one the
+// budgets used to have -- a second analysis unit refused outright because a
+// first was still holding memory, which turns capacity that exists a second
+// later into a failed unit.
+func TestAdmissionWaitsForHeadroom(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, err := NewRunner(Limits{MaxConcurrent: 4, MemoryBudgetBytes: 1000, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	dir := t.TempDir()
+	// A deadline rather than Background: a regression that reintroduces a
+	// deadlock must fail this test, not hang the package under -race.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	spec := func(seconds string) Spec {
+		return Spec{Path: "/bin/sh", Args: []string{"-c", "sleep " + seconds}, Dir: dir,
+			Grace: time.Second, MemoryReservationBytes: 600}
+	}
+
+	// The first run holds 600 of 1000 bytes; the second needs 600 and cannot
+	// fit beside it.
+	held := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		close(held)
+		_, err := runner.Run(ctx, spec("1"))
+		first <- err
+	}()
+	<-held
+	// Wait until the first run actually holds its reservation, so the second
+	// is admitted through the queue rather than racing ahead of it.
+	for {
+		runner.mu.Lock()
+		used := runner.memoryUsed
+		runner.mu.Unlock()
+		if used == 600 {
+			break
+		}
+		if ctx.Err() != nil {
+			t.Fatal("the first run never took its reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	started := time.Now()
+	if _, err := runner.Run(ctx, spec("0")); err != nil {
+		t.Fatalf("a run that did not fit the remaining budget was refused instead of waiting: %v", err)
+	}
+	if waited := time.Since(started); waited < 100*time.Millisecond {
+		t.Fatalf("the second run was admitted after %s; it must have waited for the first to release 600 bytes", waited)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+
+	// Everything is handed back: no admission leaks past a completed run.
+	runner.mu.Lock()
+	used, running, queued := runner.memoryUsed, runner.running, runner.queue.Len()
+	runner.mu.Unlock()
+	if used != 0 || running != 0 || queued != 0 {
+		t.Fatalf("after both runs: %d bytes reserved, %d running, %d queued; want all zero", used, running, queued)
+	}
+
+	// The one refusal that remains: a request larger than the whole user-set
+	// budget, which no amount of waiting can satisfy. It is reported with
+	// both numbers rather than waiting forever.
+	_, err = runner.Run(ctx, Spec{Path: "/bin/sh", Args: []string{"-c", "true"}, Dir: dir,
+		Grace: time.Second, MemoryReservationBytes: 1001})
+	if err == nil || !strings.Contains(err.Error(), "over the runner budget of 1000") {
+		t.Fatalf("a reservation larger than the whole budget = %v; want it refused and reported", err)
+	}
+}
+
+// TestAdmissionLeavesTheQueueOnCancellation protects the waiter's exit path: a
+// queued run whose context ends must leave the queue, or the queue grows with
+// every abandoned caller and the head-of-line rule blocks on a run nobody is
+// waiting for any more.
+func TestAdmissionLeavesTheQueueOnCancellation(t *testing.T) {
+	requireExecutable(t, "/bin/sh")
+	runner, err := NewRunner(Limits{MaxConcurrent: 4, MemoryBudgetBytes: 1000, DiskBudgetBytes: 1 << 30})
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	dir := t.TempDir()
+	hold, release := context.WithCancel(context.Background())
+	defer release()
+	blocking := make(chan struct{})
+	go func() {
+		defer close(blocking)
+		_, _ = runner.Run(hold, Spec{Path: "/bin/sh", Args: []string{"-c", "sleep 30"}, Dir: dir,
+			Grace: time.Second, MemoryReservationBytes: 900})
+	}()
+	for {
+		runner.mu.Lock()
+		used := runner.memoryUsed
+		runner.mu.Unlock()
+		if used == 900 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = runner.Run(ctx, Spec{Path: "/bin/sh", Args: []string{"-c", "true"}, Dir: dir,
+		Grace: time.Second, MemoryReservationBytes: 900})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a queued run whose context ended returned %v, want the cancellation", err)
+	}
+	release()
+	<-blocking
+	runner.mu.Lock()
+	queued, used := runner.queue.Len(), runner.memoryUsed
+	runner.mu.Unlock()
+	if queued != 0 || used != 0 {
+		t.Fatalf("%d waiters and %d bytes left after a cancelled wait; want none", queued, used)
+	}
+}
