@@ -96,5 +96,6 @@ func (c Config) ContextPolicyHash() string {
 		quoteLimit(c.Context.MaxCapsuleBytes),
 		quoteBool(c.Context.StrictReadGate),
 		quoteBool(c.Context.AllowExploratoryWaiverConsolidation),
+		quoteLimit(c.Context.MaxSeeds),
 	)
 }

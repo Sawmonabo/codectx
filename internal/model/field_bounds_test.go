@@ -79,4 +79,19 @@ func TestResultPageWidthIsAProducerDefectNotAnAnswerRefusal(t *testing.T) {
 	if !strings.Contains(typed.Message, "cursor") {
 		t.Fatalf("the defect does not name the paging obligation: %q", typed.Message)
 	}
+
+	// The same rule on the one context list that still refused whole answers:
+	// a slice's entry ordinals are a PAGE of the plan, so a full page validates
+	// and an over-full one is the producer's failure to page, not a plan the
+	// caller may not have.
+	slice := ContextSlice{EntryOrdinals: make([]int, MaxRecordsPerResult), EstimatedBytes: 1, EstimatedTokens: 1}
+	if err := slice.Validate(); err != nil {
+		t.Fatalf("a full %d-ordinal slice page was refused: %v", MaxRecordsPerResult, err)
+	}
+	slice.EntryOrdinals = append(slice.EntryOrdinals, 0)
+	err = slice.Validate()
+	typed, ok = err.(*Error)
+	if !ok || typed.Code != CodeInternal {
+		t.Fatalf("an over-full slice page reported %v, want a %s producer defect", err, CodeInternal)
+	}
 }
