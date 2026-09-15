@@ -657,25 +657,6 @@ type slowAdjacency struct {
 	stallAfter int
 }
 
-func (s slowAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	*s.calls++
-	switch {
-	case s.stallAfter > 0:
-		if *s.calls > s.stallAfter {
-			*s.clock = s.clock.Add(s.jump)
-		}
-	case s.every > 0:
-		if *s.calls%s.every == 0 {
-			*s.clock = s.clock.Add(s.jump)
-		}
-	case !*s.fired && *s.calls >= s.trigger:
-		*s.fired = true
-		*s.clock = s.clock.Add(s.jump)
-	}
-	return s.graphFixture.Edges(ctx, nodes, dir, kinds, after, limit)
-}
-
 // TestDeadlineEndsThePageNotTheAnswer is the F8 proof. Ruling Q4 makes
 // query_timeout end a PAGE, not an answer: a walk that runs out of time with
 // edges already admitted must return them, say so, and hand back a cursor --

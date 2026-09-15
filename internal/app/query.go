@@ -60,11 +60,6 @@ type adjacency struct {
 	reader *sqlite.PinnedReader
 }
 
-func (a adjacency) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	return a.reader.EdgesBatch(ctx, nodes, direction, kinds, after, limit)
-}
-
 // NodesByID drops the storage-only fields of a StoredNode: the engine hydrates
 // the nodes a traversal admitted and has no use for their unit or byte range.
 func (a adjacency) NodesByID(ctx context.Context, ids []model.NodeID) ([]model.Node, error) {
