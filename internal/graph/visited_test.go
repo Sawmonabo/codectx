@@ -405,7 +405,7 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 // returned on `next >= len(sorted)` again): the first candidate below is
 // reported absent, which is the assertion this test leads with.
 func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
-	store, err := openVisitedStore(t.TempDir(), 0)
+	store, err := openVisitedStore(t.TempDir(), 0, nil)
 	if err != nil {
 		t.Fatalf("open visited store: %v", err)
 	}

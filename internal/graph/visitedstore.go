@@ -99,32 +99,77 @@ type visitedStore struct {
 	w       *bufio.Writer
 	filter  *visitedFilter
 	records int64
+	// filterBytes is the budget the membership summary's geometry is frozen
+	// at, and filterFrozen records that the freeze has already happened --
+	// either on this store's first appendRun, or on the page that created the
+	// directory this one reopened. A second freeze would rewrite the filter
+	// file with zeroes and answer "absent" for every node the walk has already
+	// admitted, which is the cross-page re-admission this whole file exists to
+	// prevent.
+	filterBytes  int64
+	filterFrozen bool
+	// probe is the engine's TEST-only memory instrumentation (impactrank.go),
+	// nil in production. It is held here rather than reported by the caller
+	// because the freeze is a ONE-TIME cost whose timing the store decides, and
+	// a counter wired only to the lazy path could not tell a lazy freeze from
+	// an eager one.
+	probe *heapProbe
 }
 
 // openVisitedStore creates the store under dir. filterBytes is the heap and
 // disk the membership summary may claim -- Limits.FrontierBytes divided by
 // visitedFilterBudgetShare, the same budget the per-page filter used -- and it
-// is spent in full, because the geometry is frozen here and the walk's size is
-// not yet known.
-func openVisitedStore(dir string, filterBytes int64) (*visitedStore, error) {
-	s := &visitedStore{dir: dir}
-	words := filterBytes / 8
-	if words > 0 {
-		s.filter = newFrozenVisitedFilter(uint64(words)*64, visitedFilterProbes)
-		if err := os.WriteFile(s.filterPath(), make([]byte, words*8), 0o600); err != nil {
-			return nil, visitedStoreErr(err)
-		}
-	}
+// is spent in full once it is spent at all, because the geometry is frozen in
+// one go and the walk's size is never known at that moment.
+//
+// Nothing is spent HERE. Every impact, deps and rollup query opens a retained
+// walk whether or not it will ever page, so a filter allocated at open is a
+// fixed per-request cost -- at the shipped query memory default, three times
+// four mebibytes of heap, buffer and zero-filled file -- charged to the many
+// queries that answer in one request and mint no cursor. The summary only ever
+// accelerates a RESUME, and a walk that never appends a run has no resume to
+// accelerate. See appendRun for where the freeze happens instead.
+func openVisitedStore(dir string, filterBytes int64, probe *heapProbe) (*visitedStore, error) {
+	s := &visitedStore{dir: dir, filterBytes: filterBytes, probe: probe}
 	if _, err := s.writeManifest(); err != nil {
 		return nil, err
 	}
 	return s, s.openRuns()
 }
 
+// freezeFilter creates the membership summary and its fixed-size file, and
+// freezes into the manifest the geometry every later page must read it under.
+// It runs exactly once per retained directory, on the first appendRun, because
+// that is the first moment this walk is known to have state a later page will
+// resume over.
+//
+// A zero budget freezes NO filter, which is a valid frozen state: a nil filter
+// is simply no information, and every level merge-joins the runs instead.
+func (s *visitedStore) freezeFilter() error {
+	s.filterFrozen = true
+	words := s.filterBytes / 8
+	if words <= 0 {
+		return nil
+	}
+	s.filter = newFrozenVisitedFilter(uint64(words)*64, visitedFilterProbes)
+	if err := os.WriteFile(s.filterPath(), make([]byte, words*8), 0o600); err != nil {
+		return visitedStoreErr(err)
+	}
+	if s.probe != nil {
+		s.probe.VisitedFilterWords += words
+	}
+	// The geometry is frozen only once it is on disk: an EMPTY first run
+	// returns before appendRun's own manifest write, and a manifest still
+	// naming zero bits would resume this walk with no summary over a filter
+	// file that holds real ones.
+	_, err := s.writeManifest()
+	return err
+}
+
 // reopenVisitedStore loads the store an earlier page left. It reads the
 // manifest and the filter -- both O(1) in the size of the walk -- and never the
 // runs: the runs are read only by a membership sweep, one level at a time.
-func reopenVisitedStore(dir string) (*visitedStore, error) {
+func reopenVisitedStore(dir string, probe *heapProbe) (*visitedStore, error) {
 	b, err := os.ReadFile(filepath.Join(dir, visitedManifestFile))
 	if err != nil {
 		return nil, visitedStoreErr(err)
@@ -135,7 +180,12 @@ func reopenVisitedStore(dir string) (*visitedStore, error) {
 		return nil, &model.Error{Code: model.CodeStorageCorrupt,
 			Message: "graph: the retained visited manifest is not readable"}
 	}
-	s := &visitedStore{dir: dir, records: m.Records}
+	// The geometry this directory was created under is already frozen: the
+	// page that wrote it appended a run before it minted the token that names
+	// it -- cursor.go nextTraversalCursor appends unconditionally over a
+	// non-nil store, and a directory reaches disk only through that path -- so
+	// the freeze this store must not repeat has already happened.
+	s := &visitedStore{dir: dir, records: m.Records, filterFrozen: true, probe: probe}
 	if m.FilterBits > 0 {
 		raw, err := os.ReadFile(s.filterPath())
 		if err != nil {
@@ -176,12 +226,26 @@ func (s *visitedStore) openRuns() error {
 // HAS admitted as absent -- the re-admission this store exists to prevent.
 //
 // It returns how many BYTES this leg wrote -- the run, the filter words its
-// probes dirtied and the manifest. That number is the whole point of the
+// probes dirtied and the manifest. The one-time freeze above is deliberately
+// NOT in that number: it is a function of the configured budget rather than of
+// this leg, and it is reported on its own counter
+// (heapProbe.VisitedFilterWords) so that neither quantity stands in for the
+// other. That number is the whole point of the
 // layout: it is a function of what this leg admitted and of nothing else, so a
 // page of a long walk writes what a page of a short one writes. The two call
 // sites hand it to the engine's memory probe, which is what a measurement test
 // asserts the constant on (impactrank.go heapProbe).
 func (s *visitedStore) appendRun(ids []model.NodeID) (int64, error) {
+	// The first run is the moment this walk is known to have state a later
+	// page will resume over, so it is the moment the summary is worth its
+	// budget. An EMPTY first run freezes it too: a page that admitted nothing
+	// can still mint a cursor over a standing frontier, and the page that
+	// resumes it must find a geometry rather than invent one of its own.
+	if !s.filterFrozen {
+		if err := s.freezeFilter(); err != nil {
+			return 0, err
+		}
+	}
 	if len(ids) == 0 {
 		return 0, nil
 	}
