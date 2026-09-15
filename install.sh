@@ -155,7 +155,11 @@ ctx_detect_platform() {
 # ctx_resolve_version turns "latest" into a concrete tag by following the
 # releases redirect, and normalises a pinned value so "1.2.3" and "v1.2.3" name
 # the same release. The resolved version goes into asset names, so anything
-# that is not a plain version token is refused before a URL is built.
+# that is not a plain version token is refused before a URL is built. A
+# character-class check alone is not enough: ".", ".." and a leading "-" are
+# all spelled with allowed characters, and "v../checksums.txt" would be
+# path-normalised by curl into a different release's asset. A version token
+# therefore has to start with a digit.
 ctx_resolve_version() {
 	if [ "$ctx_version" = latest ]; then
 		ctx_effective="$(curl -fsSL -o /dev/null -w '%{url_effective}' "$ctx_releases_url/latest")" ||
@@ -169,7 +173,7 @@ ctx_resolve_version() {
 		ctx_tag="v$ctx_version"
 	fi
 	case "$ctx_version" in
-	'' | *[!A-Za-z0-9._-]*)
+	'' | *[!A-Za-z0-9._-]* | [!0-9]*)
 		ctx_die "\"$ctx_version\" is not a valid version; expected a form like 1.2.3"
 		;;
 	esac

@@ -46,8 +46,8 @@ a run reproducible on any host.
 |---|---|---|---|
 | `corpusTiny` | (L0/L3 default) | small | the end-to-end scenario's sizing |
 | `corpusSmallReal` | `{Packages: 40, Seed: 2101}` | 124 | **every measured row in Section 3** |
-| `corpusOver200Files` | `{Packages: 70, Seed: 2102}` | 214 | the session-status clamp row (Section 4, obligation 7) |
-| `corpusReference` | `{Packages: 3332, Seed: 2103}` | 10 000 | the Section 23.1 reference workload — **VERIFY's pass, not measured here** |
+| `corpusOver200Files` | `{Packages: 120, Seed: 2102}` | 364 | the session-status clamp row (Section 3, row 15) |
+| `corpusReference` | `{Packages: 3332, Seed: 2103}` | 10 000 | the Section 23.1 reference workload — measured by the verification pass, not on a bench row (Section 3, rows 9 and 13) |
 
 Corpus naming is load-bearing rather than cosmetic: the workspace-symbol prefix
 tier matches on the *qualified* name, so Go package names carry the corpus
@@ -64,12 +64,20 @@ when they were actually measured. One entry is recorded today:
 |---|---|---|---|---|---|
 | `codectx` | `acfe80e9ddd1b3e677af8082bacc06d02f8ffc7e` | 377 | 113 269 | 4 978 911 | `sha256:d8cab2e5…79eb1cd` |
 
-### 1.2 Corpus shape actually exercised by Section 3
+### 1.2 Corpus shapes actually exercised by Section 3
 
-The `corpusSmallReal` workspace measured below: **124 files**, 40 packages,
-seed 2101, 66 032 eligible source bytes, 248 indexing units. The context-plan
-walk over it visits **103 nodes across 40 edges and selects 39 entries**, and is
-not truncated.
+Most of Section 3 runs on `corpusSmallReal`: **124 files**, 40 packages, seed
+2101, 66 032 eligible source bytes, 248 indexing units. The context-plan walk
+over it visits **103 nodes across 40 edges and selects 39 entries**, and is not
+truncated.
+
+Four rows do not. Rows 9 and 13 are defined over the Section 23.1 reference
+workload and run on `corpusReference` — 10 000 files, but 262 551 lines and
+5.70 MiB, which is short of the size Section 23.1 specifies (Section 4). Row 15
+runs on `corpusOver200Files`, because no plan over a small corpus reaches a
+200-file session. Row 16 is not a generated corpus at all: it is an 810-file
+real workspace, which is the only shape that can answer whether a depth bound
+is reached in practice.
 
 ## 2. Method
 
@@ -102,8 +110,11 @@ the pass below.
 
 ## 3. Section 23.2 — measured against target
 
-Measured at small-real scale (124 files) on the environment of Section 1.
-`p95 / n` is the 95th percentile over `n` samples.
+Measured at small-real scale (124 files) on the environment of Section 1,
+except rows 9 and 13, which are defined over the Section 23.1 reference
+workload and were taken by the verification pass on the reference corpus, and
+row 16, which was taken on a real 810-file workspace. `p95 / n` is the 95th
+percentile over `n` samples.
 
 | # | Row | Target | Measured | Status |
 |---|---|---|---|---|
@@ -115,14 +126,21 @@ Measured at small-real scale (124 files) on the environment of Section 1.
 | 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
 | 7 | Ten-file base refresh after debounce | 1.5 s | p95 **144 ms** / 5 | PASS |
 | 8 | No-change refresh: no parser work, no FTS body rewrite | 250 ms | p95 **52.6 ms**; **248 units reused, 0 files parsed**, lexical shape identical | PASS |
-| 9 | Cold base index of the reference fixture | 3 min | **SKIP — routed to VERIFY** (Section 4) | not measured here |
+| 9 | Cold base index of the reference fixture | 3 min | **1 min 14.8 s** over 10 000 files, process-tree peak **85.2 MiB** | PASS at 10 000 files; the corpus was short on lines and bytes — Section 4 |
 | 10 | Indexing process-tree peak | 768 MiB | **110.8 MiB** | PASS |
 | 11 | Idle MCP RSS | 128 MiB | **61.5 MiB** | PASS |
 | 12 | Interactive process-tree peak | 256 MiB | **60.5 MiB** | PASS |
-| 13 | Base storage vs eligible source bytes | 3.5× | **149.0×** at small-real scale (db 5 349 376 + wal 4 424 912 over 66 032 source bytes; **CAS alone 66 032 = 1.00×**) | **measured, not gated here** — Section 4 |
+| 13 | Base storage vs eligible source bytes | 3.5× | **75.00×** on the 10 000-file generated corpus: 427 282 345 stored over 5 697 273 eligible source bytes (db 421 560 320 + wal 24 752 + CAS 5 697 273; **CAS alone = 1.00×**); re-measured **73.86×**. 149.0× at small-real scale | **MISS by 21×** — Section 4 |
 | 14 | Low-memory profile (Section 23.3): one worker, 2 GiB | same results as the full profile | **fingerprint identical across 10 fact families**; index tree peak **47.9 MiB** | PASS |
-| 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | **UNMET** — Section 4 | blocker |
-| 16 | Default context-graph budget re-pin | measurement-driven | **measured; `max_graph_depth` pin not decided here** — Section 4 | open |
+| 15 | Session-status `statusLimit` >200-file clamp | clamp applied **and** reported | a **242-file** session with **216 required** files answered a first page of **199 records** and issued a cursor | PASS |
+| 16 | Default context-graph budget re-pin | measurement-driven | **`max_graph_depth` stays 3**: on a real 810-file workspace the walk saturates at depth 2 — **1 030 visited / 1 295 edges**, unchanged at depth 3, 4 and 5 | PASS |
+
+Row 15's two counts are the recorded run's, not a fixed point: plan selection
+order among equally scored candidates is not bit-stable at this scale, and a
+repeat on the same host reached 245 session files and 214 required. What the
+row asserts is the invariant, not the counts — both counts clear 200, the first
+page carries fewer than the 200-record ceiling, and a cursor is issued — so a
+different growth curve cannot make it pass vacuously.
 
 Retained unchanged generations adding no duplicate blobs, graph facts or FTS
 bodies is covered by row 8's instrument (248 units reused, 0 files parsed, the
@@ -163,26 +181,35 @@ and one is not:
   ceiling, so raising it would break a release gate by construction.
 - **No raise to `max_graph_edges`.** Measured edges-per-visited-node is 0.39
   against a pinned ratio of 2:1 — five times the headroom the walk uses.
-- **`max_graph_depth` cannot be decided from this evidence.** The generated
-  corpus saturates at depth 2, while the truncation that motivated the re-pin
-  came from real-repository fan-in the generator does not produce. Narrowing
-  3 → 2 here would pin a budget against the wrong workload, which is the thing
-  the ledger item exists to prevent. See Section 4.
+- **`max_graph_depth` stays 3.** The same sweep was repeated on a real
+  810-file workspace with 30 seeds at the configured bounds, and it saturates
+  at depth 2 there too — 1 030 visited nodes across 1 295 edges in 0.22 s,
+  unchanged at depth 3, 4 and 5. That is **2.1% of `max_visited_nodes`** and
+  **1.3% of `max_graph_edges`**. `Meta.Truncated` is true at every depth ≥ 2 on
+  that workspace, but `truncation_reason` is *"affected entity record limit
+  reached"* — the 200-record answer page, not a graph bound. Reading that flag
+  as a depth truncation is what motivated the re-pin in the first place, so the
+  premise is withdrawn: narrowing 3 → 2 would change nothing measured, and
+  would drop the one hop that still adds nodes on a deeper graph. Whether a
+  work limit like this one should default to unlimited at all is a separate
+  question and is not answered by this measurement.
 
 ## 4. Misses, skips and unproven platforms
 
-Nothing in this section is a pass.
+Nothing in this section clears the obligation as written. A row here may carry
+a measurement — some do — but the measurement does not answer the obligation,
+and the difference is stated rather than rounded away.
 
 | Item | State | What it would take |
 |---|---|---|
-| **Row 9 — cold index of the Section 23.1 reference fixture (1M lines / 10k files / ~80 MiB) within 3 min** | **Not measured.** Skipped at bench scale and routed to the wave's single verification pass, which is the only actor licensed to run a full-scale cold index. | One reference-fixture pass at `corpusReference` (10 000 files), reported with the elapsed time. |
-| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **Not asserted at the scale the budget is defined over.** Measured 149.0× at small-real scale; the CAS itself is exactly source-sized (1.00×), and the excess is the database's and the WAL's fixed cost, which ~0.5 KiB files cannot amortise while the reference fixture's ~8 KiB files can. Gating the absolute 3.5× at this scale would enforce Section 23.2 against a workload it is not defined over. | The verification pass asserts 3.5× at reference scale. Until it does, **this budget has no evidence either way.** |
-| **Row 15 — `statusLimit` >200-file clamp applied and reported** | **UNMET.** The count that must clear the 200-record page is the *session's required* files, and the scope walk reaches one symbol per package and then saturates: a plan required 131 files at 214 repository files, 152 at 364, 161 at 724 and 158 at 1204, so no corpus size alone reaches the clamp. Adding 63 disjoint path seeds moved it 161 → 163, because a path seed resolves a file but no symbol and so never becomes required. | **In progress in lane T21-L2b**, which grows the session's required set through `context include` over further manifests until it exceeds 200 files, then asserts the clamp is both applied and reported. |
-| **Row 16 — `max_graph_depth` default re-pin** | **Open.** Measured but not decided (Section 3.2). | **Decided by the verification pass on the real store**: one impact query at the configured depth over a ~745-file real workspace, reporting visited, edges and `Meta.Truncated`. The recommendation is applied in the fix round; no value is changed on this page's evidence. |
-| **`darwin/amd64` and `darwin/arm64`** | **UNPROVEN PLATFORM.** No macOS host was available to the measuring environment, and the release rule forbids a cross-built binary or bundle. Nothing on this page was measured on darwin, and no darwin archive or bundle was produced or exercised here. | The release workflow's native macOS legs. Until one runs, darwin is declared, not proved. |
-| **`windows/amd64`, `windows/arm64`, `linux/arm64`** | **Not measured here.** The Section 3 figures are `linux/amd64` only. The six-target build proof is the verification lane's and the release workflow's. | Native legs per target; no cross-compiled measurement is accepted. |
-| **Managed analyzer payloads under network isolation** | **Not exercised.** The every-push isolated job pairs an *empty* tool store with `[tools] offline = true`, so it covers the structural baseline only; no managed analyzer payload runs under isolation. | A prefetched store — the tools-matrix leg and the verification bundle leg, not the per-push job. |
-| **Race-build confirmation of the budget rows** | **Not run.** `-race` was not run over the Section 3 rows. The latency headroom is 10–50×, so a race build breaching a ceiling is unlikely — but that is a residual, not a measurement. | One `-race` pass over `TestResourceBudgets`, owned by the verification lane. |
+| **Row 9 — cold index of the Section 23.1 reference fixture (1M lines / 10k files / ~80 MiB) within 3 min** | **Measured at the file count, not at the line and byte count.** The verification pass cold-indexed `corpusReference` in 1 min 14.8 s with an 85.2 MiB process-tree peak — but that corpus yields **262 551 lines / 5.70 MiB**, where Section 23.1 specifies ≈1M lines and ≈80 MiB. The corpus is ~3.8× short on lines and ~14× short on bytes, so row 9's PASS stands for the 10 000-file shape only. | The generator is being re-specified to Section 23.1's size; one cold index at that size, re-run and re-recorded here. |
+| **Row 13 — base storage ≤ 3.5× eligible source bytes** | **MISS, by 21×.** On the 10 000-file generated corpus the store held 427 282 345 bytes over 5 697 273 eligible source bytes — **75.00×**, re-measured at **73.86×**: a 421 MB database over 5.70 MiB of source. The content store itself is exactly source-sized (1.00×). Two facts bound how this number should be read. The corpus averages ~570 bytes per file where Section 23.1's reference is ~8 KiB per file, so per-file fixed cost dominates it more than it would at the specified size (see row 9). And the amplifier is identified, not guessed: **per-row identity width** — 32-byte BLOB identities and wide TEXT keys replicated into every secondary index, with `WITHOUT ROWID` secondary indexes re-storing the full primary key. Per-table accounting puts relations at ~22% of the file, evidence ~22%, native_aliases ~20% and nodes ~20%. FTS content duplication, JSON payloads, WAL size and page fill were each measured and ruled out. The earlier explanation on this page — that small generated files simply cannot amortise a fixed cost — is withdrawn; it does not survive a 421 MB database. | A storage-layout redesign (integer surrogate identities and key interning), scheduled as its own task in the next wave. The ratio is then re-measured on the corrected reference corpus **and** on real repositories, and this row is re-recorded from those runs. |
+| **`darwin/amd64` and `darwin/arm64`** | **UNPROVEN PLATFORM.** No macOS SDK or macOS host was available to the measuring environment, and the release rule forbids a cross-built binary or bundle. Nothing on this page was measured on darwin, and no darwin archive or bundle was produced or exercised here. These targets are **built only by the release workflow's native legs; unproven on the measuring host.** | A native macOS leg of the release workflow. Until one runs, darwin is declared, not proved. |
+| **`windows/arm64`** | **UNPROVEN PLATFORM.** The structural parser is CGo, so every target needs a native C toolchain, and the measuring host's toolchain set carries no aarch64 Windows cross-compiler — only the i686 and x86_64 ones. The target is therefore **built only by the release workflow's native legs; unproven on the measuring host.** | A native `windows/arm64` leg of the release workflow. |
+| **Section 3 figures on any platform but `linux/amd64`** | **Not measured.** Every latency and memory number in Section 3 is `linux/amd64`. Of the build proof: `linux/amd64` was built and run natively, `linux/arm64` was built and run under emulation, and `windows/amd64` was built but not executed. No Section 3 figure was taken on any of them, and none is accepted from a cross-compiled binary. | Native legs per target, each reporting its own figures. |
+| **Managed analyzer payloads under network isolation** | **Not exercised.** The every-push isolated job pairs an *empty* tool store with `[tools] offline = true`, so it covers the structural baseline only; no managed analyzer payload runs under isolation. | A prefetched store — the tools-matrix leg and the release workflow's bundle legs, not the per-push job. |
+| **`codectx tools prefetch --all` into a fresh store** | **Not performed here.** Everything *downstream* of the store was proved: an extracted bundle indexed, queried, planned and served MCP under network isolation with zero outbound connections and an unchanged store. Filling a fresh store is the one step that was not, because on this host it refuses offline as designed and completing it would mean downloading twelve payloads, including the largest at roughly 1.9 GB — which the offline rule for this measurement forbids. | The release workflow's bundle legs, which prefetch natively per target. |
+| **Race-build confirmation of the budget rows** | **Run, and it does not confirm them — as expected.** Under `-race`, five Section 23.2 latency rows exceeded their targets (lexical search 641 ms, one-hop 156 ms, context plan 2.40 s, ten-file refresh 3.71 s, no-change refresh 1.74 s). Section 23.2 is defined over uninstrumented release builds, which is why Section 1 says so; a race build is a correctness run and its timings are not evidence about a budget either way. The budget rows are being changed to skip under `-race` with that reason stated, so the correctness rows still run. | Nothing further. The race build's job is data races, and it is run for that. |
 | **Sensitivity of row 8's no-change instrument** | **Partially unproved.** Three product mutations were attempted against the reuse decision and all were absorbed: the refresh still reused 248 units and parsed 0 files, because the reuse decision is content-addressed at the unit level. That is evidence the fast path is real, but it leaves the row's mutation sensitivity unproved. | Mutate unit *identity* (a provider fingerprint) rather than the reuse decision. Untried. |
 
 ## 5. Fingerprint parity — the method, and why it is a gate
@@ -255,9 +282,16 @@ Two rules bind the interpretation:
 ```bash
 go build -trimpath -o ./bin/codectx ./cmd/codectx
 go test ./internal/bench -run TestResourceBudgets -count=1
+go test ./internal/bench -run TestSessionStatusClamp -count=1 -v
 go test ./internal/bench -run '^$' -bench . -benchmem -count=5
 go test ./internal/bench -run 'TestFingerprintParity|TestCorporaManifest' -count=1 -v
 ```
+
+That block produces every row of Section 3 except three. Rows 9 and 13 need a
+cold index of the reference corpus, and row 16 needs a real workspace; both are
+run by the verification pass and neither is reproduced by a bench selector. Row
+15's two counts are reproduced as an invariant, not as numbers — see the note
+under Section 3's table.
 
 Under `-short` the whole package skips: these rows build real workspaces and are
 not unit tests. Re-record Section 1 whenever the host, the filesystem, the

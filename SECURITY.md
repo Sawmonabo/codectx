@@ -59,8 +59,19 @@ files, and requests engineered to exhaust memory, disk or file descriptors.
   Remediation text is generated from the typed error code, never from an
   analyzer's message.
 
-Run `codectx doctor --offline` to see which of these an installation currently
-reports, including whether an OS-level restriction is actually active.
+Run `codectx doctor --offline` to see what an installation currently reports
+under the offline policy. It opens no socket itself, and it names, payload by
+payload, which lock-pinned analyzer is installed in a verified state and which
+is only pinned — alongside the build, the data directory's permissions, source
+retention and the temporary state it holds.
+
+It will not tell you whether an OS-level restriction is active. That question
+is asked — `doctor` runs a check named `analyzer_restriction` — and on every
+platform this build ships it is answered `unavailable`, because nothing in this
+build measures a container, namespace, seccomp or Job Object policy. Reporting
+the question as unmeasured is deliberate: a security document must not offer a
+confirmation the product cannot give. Whether such a restriction is in force is
+a property of your deployment, and it is yours to verify.
 
 ## Known limitations
 
