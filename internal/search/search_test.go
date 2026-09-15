@@ -289,6 +289,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		// FX-H-G rows
 		{"fix/a_continuation_copies_its_tail_spool_to_spool", legSpoolToSpoolIsReentrant},
 		{"fix/a_clamped_page_bound_is_reported_on_the_answer", legPageClampIsReported},
+		{"fix/the_query_deadline_ends_a_page_not_the_answer", legDeadlineEndsThePage},
 	}
 	f := newFixture(t)
 	for _, l := range legs {
@@ -1458,6 +1459,50 @@ func legSpoolToSpoolIsReentrant(t *testing.T, f *fixture) {
 	}
 	if err := spools.Release(nextID); err != nil {
 		t.Fatalf("Release(next): %v", err)
+	}
+}
+
+// legDeadlineEndsThePage is ruling Q4 for search: resources.query_timeout ends
+// a PAGE, not an answer. On a real repository this endpoint answered
+// CTX_QUERY_DEADLINE with no page and no cursor, so the widest queries -- the
+// only ones that ever reach the deadline -- were unanswerable rather than
+// partially answered.
+//
+// The ranking phase runs under a budget that has already expired here, so
+// every tier stops at its first read; what the collector holds is served as a
+// page that says it is truncated and why. Nothing else in the answer may
+// degrade: the binding, the completeness report and the page's own validation
+// are the same as any other answer's.
+//
+// Mutation: return the tier error from Service.rank instead of converting a
+// deadline into a truncated page (drop the isQueryDeadline arms) and this leg
+// fails with CTX_QUERY_DEADLINE where it wants a page.
+func legDeadlineEndsThePage(t *testing.T, f *fixture) {
+	opts := f.opts
+	opts.Resources.QueryTimeout = config.Duration(time.Nanosecond)
+	s := newService(t, opts)
+	got, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
+	if err != nil {
+		t.Fatalf("Search under an expired budget: %v: the time budget ends a page, not the answer", err)
+	}
+	if !got.Meta.Truncated {
+		t.Fatal("the answer is not marked truncated; a page that stopped at the deadline must say so")
+	}
+	if !strings.Contains(got.Meta.TruncationReason, "resources.query_timeout") {
+		t.Fatalf("the truncation reason is %q, want it to name resources.query_timeout", got.Meta.TruncationReason)
+	}
+	if got.Meta.Binding.GenerationID != f.binding.GenerationID {
+		t.Fatalf("the deadline page is bound to generation %d, want %d",
+			got.Meta.Binding.GenerationID, f.binding.GenerationID)
+	}
+	// Whatever was ranked before the deadline is served, and a page that
+	// leaves hits unserved carries the continuation to reach them.
+	if len(got.Items) > 0 && len(got.Items) < len(fixtureDocs) && got.Meta.NextCursor == "" {
+		t.Fatalf("a deadline page served %d of at most %d hits with no continuation",
+			len(got.Items), len(fixtureDocs))
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("the deadline page does not validate: %v", err)
 	}
 }
 
