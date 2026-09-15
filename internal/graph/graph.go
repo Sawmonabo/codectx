@@ -129,11 +129,14 @@ type Limits struct {
 	FrontierBytes int64
 }
 
-// Depth, Visited and Edges are the three unlimited-capable count bounds read
-// through config.Limit, which owns the 0-means-unlimited semantics.
-func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
-func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
-func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
+// Depth, Visited, Edges and ReasonPaths are the unlimited-capable count bounds
+// read through config.Limit, which owns the 0-means-unlimited semantics. Every
+// consumer must go through them: reading the int field directly turns an
+// unlimited bound into a zero-sized budget that stops the walk immediately.
+func (l Limits) Depth() config.Limit       { return config.Limit(l.MaxDepth) }
+func (l Limits) Visited() config.Limit     { return config.Limit(l.MaxVisited) }
+func (l Limits) Edges() config.Limit       { return config.Limit(l.MaxEdges) }
+func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPaths) }
 
 // Engine answers graph queries against one pinned generation. One Engine is
 // built per request, which is why the concurrency Gate is passed in rather than

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
@@ -1479,6 +1480,61 @@ func TestGraphScenarios(t *testing.T) {
 						t.Fatalf("page 2 lists %s at or before page 1's last container %s: the keyset restarted",
 							item.NodeID, last)
 					}
+				}
+			},
+		},
+		{
+			// Protects the HANG failure mode that the unlimited depth default
+			// creates. containerAncestry used to be made finite by the depth
+			// ceiling alone -- its own comment said so -- so once
+			// context.max_graph_depth defaults to unlimited, a containment
+			// cycle climbs for ever and the repository map never returns. The
+			// per-chain ancestor set is what ends it now, and a cyclic
+			// container is dropped from the map exactly as an over-deep one is,
+			// while the rest of the map is still answered.
+			name: "overview/a containment cycle ends under an unlimited depth instead of hanging",
+			run: func(t *testing.T, f *graphFixture) {
+				for _, name := range []string{"pkg-loop-a", "pkg-loop-b"} {
+					id := fixtureNodeID(name)
+					f.nodes[id] = model.Node{ID: id, Kind: model.NodePackage, Name: name,
+						QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
+				}
+				for _, pair := range [][2]string{{"pkg-loop-a", "pkg-loop-b"}, {"pkg-loop-b", "pkg-loop-a"}} {
+					f.relations = append(f.relations, model.Relation{
+						ID: fixtureRelationID(len(f.relations)), Kind: model.RelContains,
+						From: fixtureNodeID(pair[0]), To: fixtureNodeID(pair[1])})
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = int(config.Unlimited)
+				e, err := New(Options{Adjacency: f, Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				done := make(chan struct{})
+				var got model.Page[model.OverviewItem]
+				go func() {
+					defer close(done)
+					got, err = e.Overview(context.Background(), model.OverviewRequest{
+						GenerationID: f.binding.GenerationID})
+				}()
+				select {
+				case <-done:
+				case <-time.After(30 * time.Second):
+					t.Fatalf("Overview has not returned 30s into a containment cycle under an unlimited depth: the climb has no cycle guard")
+				}
+				if err != nil {
+					t.Fatalf("Overview: %v", err)
+				}
+				if err := got.Validate(); err != nil {
+					t.Fatalf("result does not satisfy its own contract: %v", err)
+				}
+				listed := map[model.NodeID]bool{}
+				for _, item := range got.Items {
+					listed[item.NodeID] = true
+				}
+				if !listed[fixtureNodeID("pkg-app")] {
+					t.Fatalf("pkg-app is absent from a map of %d containers: a cycle elsewhere lost the whole answer",
+						len(got.Items))
 				}
 			},
 		},
