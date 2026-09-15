@@ -568,3 +568,103 @@ func TestNoDefaultBoundDegradesARealManifest(t *testing.T) {
 		}
 	}
 }
+
+// TestParseBoundsAreUnlimitedByDefaultAndDegradeOnlyPastTheBound covers the
+// two parse bounds — the TOML line layout and the POM token walk. Both were
+// hard-coded 200000 constants that cut a repository's own data with nothing
+// the operator could set, and the TOML one discarded the layout WHOLE past
+// its cap, so one long manifest cost every fact of that file its byte range,
+// not only the facts past the bound. Those are the two failures asserted
+// here: a default build cuts neither, and a set bound leaves the facts before
+// it fully ranged while reporting the count that crossed it.
+func TestParseBoundsAreUnlimitedByDefaultAndDegradeOnlyPastTheBound(t *testing.T) {
+	var cargo strings.Builder
+	cargo.WriteString("[package]\nname = \"wide\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+	for i := range 4000 {
+		fmt.Fprintf(&cargo, "dep%d = \"1.0.0\"\n", i)
+	}
+	var pom strings.Builder
+	pom.WriteString("<project><groupId>org.acme</groupId><artifactId>wide</artifactId><version>1</version><modules>\n")
+	for i := range 4000 {
+		fmt.Fprintf(&pom, "<module>m%d</module>\n", i)
+	}
+	pom.WriteString("</modules></project>\n")
+	files := map[string]string{"Cargo.toml": cargo.String(), "pom.xml": pom.String()}
+
+	run := func(t *testing.T, opts manifest.Options, path string) (*capture, model.CapabilityState) {
+		t.Helper()
+		mf, err := manifest.New(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := providertest.New(t, files)
+		cap := &capture{}
+		states := map[string]model.CapabilityState{}
+		runUnit(t, h, mf, path, cap, states)
+		return cap, states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey(path)]
+	}
+	// ranged counts the dependency evidence occurrences that carry a byte
+	// range. The layout is the only thing that gives them one, so it is the
+	// discriminator between "the layout was built" and "it was discarded".
+	ranged := func(c *capture) (withRange, total int) {
+		for _, r := range c.relations {
+			if r.Relation.Kind != model.RelDependsOn {
+				continue
+			}
+			for _, ev := range r.Evidence {
+				total++
+				if ev.Range != nil {
+					withRange++
+				}
+			}
+		}
+		return withRange, total
+	}
+
+	unlimited := manifest.Options{MaxParseFileBytes: 1 << 24}
+	c, cs := run(t, unlimited, "Cargo.toml")
+	if cs.State != model.CapabilityFresh {
+		t.Fatalf("the default configuration reported %s/%s for a 4000-line Cargo.toml; no parse bound has a default", cs.State, cs.DiagnosticCode)
+	}
+	withRange, total := ranged(c)
+	if total == 0 || withRange != total {
+		t.Fatalf("the default configuration ranged %d of %d dependency occurrences, want all of them", withRange, total)
+	}
+
+	// A bound that stops the scan a few lines into the dependency table: the
+	// dependencies before it keep their ranges, the ones past it do not, and
+	// the capability says how many lines the file really had.
+	c, cs = run(t, manifest.Options{MaxParseFileBytes: 1 << 24, MaxTOMLLines: 10}, "Cargo.toml")
+	if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeResourceLimit {
+		t.Fatalf("a cut layout reported %s/%s, want partial/%s", cs.State, cs.DiagnosticCode, model.CodeResourceLimit)
+	}
+	if got := cs.Details[manifest.BoundTOMLLines]; got != "4006 over 10" {
+		t.Fatalf("capability detail %q = %q, want the file's line count over the bound", manifest.BoundTOMLLines, got)
+	}
+	withRange, total = ranged(c)
+	if withRange == 0 {
+		t.Fatalf("a cut layout ranged 0 of %d dependency occurrences: the bound discarded the whole layout instead of degrading only the facts past it", total)
+	}
+	if withRange == total {
+		t.Fatalf("a bound of 10 lines ranged all %d occurrences; this leg is not exercising the cut", total)
+	}
+
+	c, cs = run(t, unlimited, "pom.xml")
+	if cs.State != model.CapabilityFresh {
+		t.Fatalf("the default configuration reported %s/%s for a 4000-module pom.xml; no parse bound has a default", cs.State, cs.DiagnosticCode)
+	}
+	full := len(c.relations)
+	if full == 0 {
+		t.Fatal("the default configuration published no relations for pom.xml")
+	}
+	c, cs = run(t, manifest.Options{MaxParseFileBytes: 1 << 24, MaxXMLElements: 100}, "pom.xml")
+	if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeResourceLimit {
+		t.Fatalf("a cut token stream reported %s/%s, want partial/%s: a large POM is large, not malformed", cs.State, cs.DiagnosticCode, model.CodeResourceLimit)
+	}
+	if got := cs.Details[manifest.BoundXMLElements]; got != "101 over 100" {
+		t.Fatalf("capability detail %q = %q, want the element count that crossed the bound", manifest.BoundXMLElements, got)
+	}
+	if got := len(c.relations); got >= full {
+		t.Fatalf("a 100-element bound published %d relations against %d unbounded; the walk did not stop", got, full)
+	}
+}
