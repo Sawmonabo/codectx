@@ -120,13 +120,24 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 	return res, nil
 }
 
+// captureBuilder is the snapshot builder this generation captures with. It is
+// its own function so the operator settings it carries -- index.capture_max_retries
+// and index.capture_retry_deadline, the only escape hatch from a worktree that
+// never settles -- are reachable by a test without running a capture.
+func (g *generation) captureBuilder() *snapshot.Builder {
+	c := g.c
+	return &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
+		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
+		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log,
+		MaxRetries:    c.opts.Config.Index.CaptureMaxRetries.Value(),
+		RetryDeadline: c.opts.Config.Index.CaptureRetryDeadline.Std()}
+}
+
 // capture builds the immutable snapshot this generation is about and reads the
 // active pointer it will publish over.
 func (g *generation) capture(ctx context.Context) error {
 	c := g.c
-	b := &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
-		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
-		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log}
+	b := g.captureBuilder()
 	snap, err := b.Build(ctx)
 	if err != nil {
 		return err
@@ -212,11 +223,22 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	// readiness, and ruling Q9 makes the background tick run it even when no
 	// query ever asks.
 	g.c.late.enqueue(g, deferred)
+	runs, omitted := g.runsPage()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
-		Runs: g.runs, RunsOmitted: g.runsTotal - int64(len(g.runs)),
+		Runs: runs, RunsOmitted: omitted,
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
+}
+
+// runsPage is the run list the result publishes and the number of runs that
+// did not fit it. Runs is a wire-sized page -- at most model.MaxRecordsPerResult
+// summaries -- and a generation with more runs than that must say so rather
+// than serve a short list as the whole of it. It is a method and not two
+// expressions at the publish site so the honesty of the count is reachable by
+// a test without rebuilding a generation's whole publish path.
+func (g *generation) runsPage() ([]model.ProviderResult, int64) {
+	return g.runs, g.runsTotal - int64(len(g.runs))
 }
 
 // attachReused makes every unit the plan proved identical a member of this

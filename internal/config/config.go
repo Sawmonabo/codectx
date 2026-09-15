@@ -177,6 +177,17 @@ type Index struct {
 	// coverage. A user-set value stops the watch set at that many directories
 	// and reports coverage incomplete with the reason, never silently.
 	WatchMaxDirectories Limit `toml:"watch_max_directories"`
+	// CaptureMaxRetries bounds how many validation passes of a snapshot
+	// capture may find the worktree changed under them before the capture is
+	// declared unstable. 0 -- the default -- is unlimited, and the capture is
+	// then ended by CaptureRetryDeadline alone: a retry count that refuses a
+	// busy monorepo would be a scale refusal, whereas a deadline ends a
+	// worktree that genuinely never settles. Attempts are reported either way.
+	CaptureMaxRetries Limit `toml:"capture_max_retries"`
+	// CaptureRetryDeadline bounds the whole validated capture. It is finite by
+	// design and not a size bound: with CaptureMaxRetries unlimited it is the
+	// only thing that ends a capture of a worktree that is always changing.
+	CaptureRetryDeadline Duration `toml:"capture_retry_deadline"`
 }
 
 // Resources is the memory, concurrency, disk and response policy.
@@ -541,7 +552,10 @@ func Defaults() Config {
 			WatchDebounce:     Duration(250 * time.Millisecond),
 			ReconcileInterval: Duration(30 * time.Second),
 			RetainRefs:        8,
-			MaxRetainedBytes:  0,
+			// 0 = unlimited retries, bounded by the deadline below.
+			CaptureMaxRetries:    Unlimited,
+			CaptureRetryDeadline: Duration(10 * time.Minute),
+			MaxRetainedBytes:     0,
 			// Unlimited: only a user-set bound stops the watch set.
 			WatchMaxDirectories: Unlimited,
 		},
