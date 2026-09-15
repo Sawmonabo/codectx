@@ -517,13 +517,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, perr
 		}
 		if s.watcher, err = watch.New(watch.Options{
-			Root:      root,
-			Policy:    policy,
-			Debounce:  cfg.Index.WatchDebounce.Std(),
-			Reconcile: cfg.Index.ReconcileInterval.Std(),
-			MaxPaths:  cfg.Index.WatchPendingPaths,
-			MaxBytes:  cfg.Index.WatchPendingBytes,
-			Logger:    s.logger,
+			Root:           root,
+			Policy:         policy,
+			Debounce:       cfg.Index.WatchDebounce.Std(),
+			Reconcile:      cfg.Index.ReconcileInterval.Std(),
+			MaxPaths:       cfg.Index.WatchPendingPaths,
+			MaxBytes:       cfg.Index.WatchPendingBytes,
+			MaxWatchedDirs: cfg.Index.WatchMaxDirectories,
+			Logger:         s.logger,
 		}); err != nil {
 			return nil, err
 		}
@@ -624,9 +625,10 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				CacheBytes:             s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes:   s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,
-				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily.Value(),
-				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows.Value(),
-				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows.Value(),
+				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily,
+				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
+				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
+				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,

@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 )
@@ -62,9 +63,6 @@ const (
 const (
 	// maxFields bounds the columns of one CSV header.
 	maxFields = 128
-	// maxExportFiles bounds the entries of one export directory. The engine
-	// writes three files per label and has well under a hundred labels.
-	maxExportFiles = 4096
 	// maxLabelBytes bounds a node label or edge type.
 	maxLabelBytes = 128
 	// maxUnknownLabels bounds the distinct unknown labels reported by name;
@@ -125,13 +123,19 @@ type Options struct {
 	// many rows the caller wants one import to stage. 0, the default, is
 	// unlimited. It is a reporting threshold and never a refusal -- crossing
 	// it stages, publishes and reports everything (Report.OverStagedRows).
-	MaxStagedRows int64
+	MaxStagedRows config.Limit
 	// MaxDerivedRows is the user's `providers.dependence.max_derived_rows`:
 	// how many relation occurrences the caller wants one import to project
 	// from its staged rows. 0, the default, is unlimited. Like MaxStagedRows
 	// it is a reporting threshold and never a refusal -- crossing it projects,
 	// publishes and reports everything (Report.OverDerivedRows).
-	MaxDerivedRows int64
+	MaxDerivedRows config.Limit
+	// MaxExportFiles is the user's `providers.dependence.max_export_files`:
+	// how many entries one export directory may hold. Unlimited by default --
+	// the file count is a property of the export's label vocabulary, not of
+	// the repository, and the directory is read one entry at a time -- so only
+	// a user-set bound refuses an import, and it says so.
+	MaxExportFiles config.Limit
 	// PreviousKeys is the key set the previous sealed run of this unit
 	// published. The zero value is the absent set and means a full import.
 	PreviousKeys KeySet
@@ -262,7 +266,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err := e.stageFiles(ctx); err != nil {
 		return rep, err
 	}
-	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes)
+	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes, opts.MaxExportFiles)
 	rep.BytesRead = uint64(n)
 	if err != nil {
 		return rep, err
@@ -310,7 +314,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	rep.ClippedEvidence, rep.UnknownRows, rep.IgnoredFiles = e.clipped, sc.unknownN, sc.ignoredFiles
 	rep.StagedRows, rep.OverStagedRows = sc.rows, sc.overRows
 	rep.DerivedRows = sc.derivedRows
-	rep.OverDerivedRows = opts.MaxDerivedRows > 0 && sc.derivedRows > opts.MaxDerivedRows
+	rep.OverDerivedRows = opts.MaxDerivedRows.Exceeded(sc.derivedRows)
 	rep.Changed, rep.Unchanged, rep.Removed = delta.Changed, delta.Unchanged, delta.Removed
 	rep.Keys = fresh
 	for label, n := range sc.unknown {
