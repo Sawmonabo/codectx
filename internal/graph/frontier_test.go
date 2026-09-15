@@ -351,6 +351,7 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 				t.Fatalf("at rank %d the pages carry %+v, the single-shot answer %+v", i, concatenated[i], want)
 			}
 		}
+		assertPairOrder(t, concatenated)
 	})
 
 	t.Run("impact", func(t *testing.T) {
@@ -435,7 +436,41 @@ func TestImpactAndPackageDepsResumeAcrossPages(t *testing.T) {
 				t.Fatalf("at rank %d the pages carry the pair %+v, the single-shot answer %+v", i, packages[i], want)
 			}
 		}
+		assertPairOrder(t, packages)
+		// The rank KEY, not merely agreement with a single-shot run of the same
+		// build: comparing the pages against a baseline the same code produced
+		// cannot see an order that is wrong in both. Ruling P1 freezes
+		// (ScoreMicros desc, Depth asc, NodeID asc), with Name no longer a
+		// tie-break.
+		for i := 1; i < len(entries); i++ {
+			prev, cur := entries[i-1], entries[i]
+			ordered := prev.ScoreMicros > cur.ScoreMicros ||
+				(prev.ScoreMicros == cur.ScoreMicros && (prev.Depth < cur.Depth ||
+					(prev.Depth == cur.Depth && prev.NodeID < cur.NodeID)))
+			if !ordered {
+				t.Fatalf("ranks %d and %d are out of ruling P1's order: (score %d, depth %d, %s) then (score %d, depth %d, %s)",
+					i-1, i, prev.ScoreMicros, prev.Depth, prev.NodeID, cur.ScoreMicros, cur.Depth, cur.NodeID)
+			}
+		}
 	})
+}
+
+// assertPairOrder checks the frozen package-pair order -- (FromPath, ToPath,
+// FromNodeID, ToNodeID) ascending -- against the key itself rather than against
+// a baseline the same build produced, which is what makes it sensitive to a
+// rank pass that was skipped on both sides.
+func assertPairOrder(t *testing.T, pairs []model.PackageEdge) {
+	t.Helper()
+	for i := 1; i < len(pairs); i++ {
+		prev, cur := pairs[i-1], pairs[i]
+		if lessByPair(pairRecord{FromNodeID: prev.FromNodeID, ToNodeID: prev.ToNodeID,
+			FromPath: prev.FromPath, ToPath: prev.ToPath},
+			pairRecord{FromNodeID: cur.FromNodeID, ToNodeID: cur.ToNodeID,
+				FromPath: cur.FromPath, ToPath: cur.ToPath}) >= 0 {
+			t.Fatalf("ranks %d and %d are out of the frozen pair order: %s -> %s then %s -> %s",
+				i-1, i, prev.FromPath, prev.ToPath, cur.FromPath, cur.ToPath)
+		}
+	}
 }
 
 // exactFillAdjacency serves a fixed containment row set through the keyset
