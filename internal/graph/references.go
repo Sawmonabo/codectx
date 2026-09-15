@@ -184,7 +184,13 @@ func (e *Engine) References(ctx context.Context, req model.ReferenceRequest) (pa
 	// is the class-G defect this wave removes.
 	pageLimit, notice := resolvePageItems(req.Page.Limit, e.limits.MaxPageItems)
 	notices = appendNotice(notices, notice)
-	if pageLimit > model.MaxPageItems {
+	// Only a page bound the CALLER chose is reported against the wire ceiling.
+	// A request that named none is "no caller-side bound" and its resolution is
+	// not news -- reporting it would put a notice on every answer, which is the
+	// rule pageclamp.go states for the same reason. model.PageRequest.Validate
+	// already refuses a limit above the wire ceiling, so after this gate the
+	// branch is reachable only from an API caller that bypasses it.
+	if req.Page.Limit > 0 && pageLimit > model.MaxPageItems {
 		notices = appendNotice(notices, fmt.Sprintf(
 			"page.limit: effective %d, served %d (the wire ceiling)", pageLimit, model.MaxPageItems))
 		pageLimit = model.MaxPageItems
