@@ -6,8 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -607,5 +609,84 @@ func TestCaptureReportsSkippedAndOverBoundPaths(t *testing.T) {
 	if !slices.Contains(notes.BoundsExceeded, workspace.SkipFileBudget) {
 		t.Fatalf("Notes.BoundsExceeded = %q, want %s: a passed budget the operator cannot see is a silent limit",
 			notes.BoundsExceeded, workspace.SkipFileBudget)
+	}
+}
+
+// barrierStore wraps the real store and records, at the instant the snapshot
+// is committed, which blobs the CAS batch had already made durable. The
+// manifest is streamed through unchanged, so the two sets are captured from
+// the same commit.
+type barrierStore struct {
+	Store
+	synced *map[string]bool
+	// atCommit is the synced set as it stood when PutSnapshot was entered, and
+	// named is every content hash the committed manifest carries.
+	atCommit map[string]bool
+	named    map[string]bool
+}
+
+func (s *barrierStore) PutSnapshot(ctx context.Context, snap model.Snapshot, files func(yield func(model.FileVersion) error) error) error {
+	s.atCommit = maps.Clone(*s.synced)
+	s.named = map[string]bool{}
+	return s.Store.PutSnapshot(ctx, snap, func(yield func(model.FileVersion) error) error {
+		return files(func(fv model.FileVersion) error {
+			if fv.ContentHash != "" {
+				s.named[fv.ContentHash] = true
+			}
+			return yield(fv)
+		})
+	})
+}
+
+// TestEveryBlobIsDurableBeforeTheSnapshotNamesIt is the durability barrier of
+// Section 10.3 stated as a test: the capture batches its fsyncs, so the thing
+// that must hold is that the batch has synced and published every blob the
+// committed manifest names, before the commit. Removing the Barrier call in
+// Build fails it: the fixture is smaller than one sync window, so without the
+// barrier nothing is ever flushed.
+func TestEveryBlobIsDurableBeforeTheSnapshotNamesIt(t *testing.T) {
+	f := newFixture(t, true)
+	distinct := 8
+	for i := range distinct {
+		f.write(fmt.Sprintf("pkg/file%d.go", i), []byte(fmt.Sprintf("package p\n\nconst N = %d\n", i)), 0o644)
+	}
+	// A duplicate of the first file: same content, one blob. It proves the
+	// synced set counts blobs and not paths.
+	f.write("pkg/copy.go", []byte("package p\n\nconst N = 0\n"), 0o644)
+	f.gitCmd("add", "-A")
+
+	synced := map[string]bool{}
+	spy := &barrierStore{Store: f.store, synced: &synced}
+	b := f.builder()
+	b.Store = spy
+	b.onBatch = func(batch *Batch) {
+		batch.onSync = func(hash string) { synced[hash] = true }
+	}
+	snap, err := b.Build(f.ctx)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	if len(spy.named) != distinct {
+		t.Fatalf("manifest names %d distinct blobs, want %d", len(spy.named), distinct)
+	}
+	if len(spy.atCommit) != distinct {
+		t.Fatalf("%d blobs were durable at the commit, want %d; a vacuous set would pass the check below", len(spy.atCommit), distinct)
+	}
+	for hash := range spy.named {
+		if !spy.atCommit[hash] {
+			t.Errorf("snapshot %s names blob %s, which was not durable when the snapshot was committed", snap.ID, hash)
+		}
+	}
+	// And the bytes are readable afterwards, so publication was real and not
+	// merely recorded.
+	v, err := OpenView(f.ctx, f.store, f.cas, snap.ID)
+	if err != nil {
+		t.Fatalf("OpenView: %v", err)
+	}
+	for _, fv := range f.manifest(v) {
+		if _, err := f.readAll(v, fv.ID); err != nil {
+			t.Fatalf("read %s: %v", fv.Path, err)
+		}
 	}
 }
