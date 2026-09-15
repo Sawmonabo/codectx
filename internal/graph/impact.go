@@ -246,6 +246,13 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND the records this leg admitted
 		// forward, so the request that finishes the walk ranks all of them.
+		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
+			// No continuation: it would be the one this request was given.
+			markTruncated(&meta, reasonDeadlineStalled)
+			answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
+				Notices: answer.Notices, Completeness: meta.Completeness}
+			return answer, nil, b, "", nil
+		}
 		markTruncated(&meta, reasonDeadline)
 		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state,
 			acc.lastOwner, acc.lastKey, resume, retain)
@@ -574,6 +581,34 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 	})
 }
 
+// walkStalled reports that this page ended on the deadline having made NO
+// progress: it admitted no edge and no node, and the continuation it is about
+// to mint names the same frontier and the same keyset position as the one it
+// was handed. Minting it would hand the caller back the cursor they arrived
+// with, and a client that follows the chain pages forever without ever
+// reaching a new edge -- observed as a visited_count frozen for thousands of
+// pages when every page's first adjacency read already ran past the deadline.
+//
+// The walk cannot simply read one more batch first: the request context
+// carries the SAME deadline (beginImpactQuery), so no adjacency read can
+// succeed past it. So the honest answer is the other one ruling P3's page rule
+// allows -- the deadline is terminal for this answer, reported with its own
+// truncation reason, and the caller's remedy is to raise
+// resources.query_timeout. Nothing is lost that the caller did not already
+// hold: this page served nothing.
+//
+// It is only ever true on a RESUMED page. The request that mints the answer
+// has no earlier continuation to repeat, and a deadline there always leaves a
+// frontier the caller has never seen.
+func walkStalled(b *budget, state walkState, lastOwner model.NodeID, lastKey model.RelationID,
+	resume *resumeState) bool {
+	if resume == nil || b.pageEdges != 0 || b.pageVisited != 0 {
+		return false
+	}
+	return len(state.Frontier) == len(resume.Frontier) &&
+		lastOwner == resume.Cursor.LastOwner && lastKey == resume.Cursor.LastKey
+}
+
 // continueRank mints ruling P7's continuation: the walk is EXHAUSTED and the
 // deadline cut the ranking short, so the token names the retained pass-1 input
 // alone -- no frontier, no keyset position -- and the next request runs both
@@ -677,6 +712,11 @@ const reasonDeadline = "query deadline reached"
 // would hand the rest of them back, so the page that is served is a prefix and
 // must say it is one.
 const reasonNoContinuation = "continuation state is unavailable in this workspace"
+
+// reasonDeadlineStalled is the truncation reason for a page that ran out of
+// time WITHOUT moving the walk on: it admitted nothing and left the frontier
+// and the keyset position exactly where it found them. See walkStalled.
+const reasonDeadlineStalled = "query deadline reached before the walk could advance"
 
 // markTruncated records the first reason an answer fell short. The first reason
 // wins because it is the bound that actually stopped the work; overwriting it

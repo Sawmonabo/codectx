@@ -141,6 +141,11 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND this leg's pair records forward.
+		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
+			// No continuation: it would be the one this request was given.
+			markTruncated(&meta, reasonDeadlineStalled)
+			return validatedPairPage(meta, nil)
+		}
 		markTruncated(&meta, reasonDeadline)
 		if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
 			state, acc.lastOwner, acc.lastKey, resume, retain); err != nil {
