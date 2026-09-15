@@ -46,6 +46,9 @@ type pathScratch struct {
 	dir string
 	db  *sql.DB
 	tx  *sql.Tx
+	// retained marks state reopened from a previous page's retention. The
+	// engine reads it to decide whether the search is being seeded or resumed.
+	retained bool
 }
 
 // pathScratchCacheKiB is the SQLite page-cache ceiling for one path search, in
@@ -62,7 +65,27 @@ CREATE INDEX parent_out ON parent(frm, rel);
 CREATE TABLE bucket(cost INTEGER NOT NULL, node TEXT NOT NULL, rel TEXT NOT NULL, frm TEXT NOT NULL,
 	kind TEXT NOT NULL, depth INTEGER NOT NULL, PRIMARY KEY(cost, node, rel)) WITHOUT ROWID;
 CREATE TABLE reach(node TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE pending(node TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE progress(k INTEGER PRIMARY KEY, expand_after TEXT NOT NULL, depth_pruned INTEGER NOT NULL);
+INSERT INTO progress(k, expand_after, depth_pruned) VALUES(0, '', 0);
 `
+
+// pending and progress are what make the search RESUMABLE, and they are here
+// rather than in the continuation token because neither is a position a token
+// can name.
+//
+// pending holds every node that has been settled but whose outgoing edges have
+// not all been read yet. A page that stops between settling a node and
+// expanding it -- the deadline, the per-page visited budget, the per-page edge
+// budget all land there -- would otherwise lose that node's edges forever: the
+// next page re-reads the same cost bucket and settle's staleness check skips
+// it, because it IS settled. The routes through it would simply be missing.
+// A node's row is deleted only once its whole keyset walk is done.
+//
+// progress carries the expansion's keyset position inside the batch in flight,
+// so a resumed page does not re-read edges it has already charged against the
+// edge budget, and the depth-pruned flag, which is an answer-level disclosure
+// that must survive the page that discovered it.
 
 // openPathScratch creates the search's database in a fresh private directory
 // under parent.
@@ -87,16 +110,48 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 		return nil, internalErr("path scratch directory: " + err.Error())
 	}
 	s := &pathScratch{dir: dir}
+	if err := s.open(ctx); err != nil {
+		s.close()
+		return nil, err
+	}
+	if _, err := s.db.ExecContext(ctx, pathScratchSchema); err != nil {
+		s.close()
+		return nil, internalErr("path scratch schema: " + err.Error())
+	}
+	if err := s.begin(ctx); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// reopenPathScratch reattaches to the state a previous page retained. The
+// schema is NOT re-applied: the tables, and everything the earlier pages put
+// in them, are the point.
+func reopenPathScratch(ctx context.Context, dir string) (*pathScratch, error) {
+	s := &pathScratch{dir: dir, retained: true}
+	if err := s.open(ctx); err != nil {
+		s.close()
+		return nil, err
+	}
+	if err := s.begin(ctx); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// open attaches the database handle to s.dir's file, creating it if it is not
+// there. It is shared by the fresh and the resumed path so both searches run
+// under exactly the same page-cache ceiling and pragma set.
+func (s *pathScratch) open(ctx context.Context) error {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "mmap_size(0)",
 		"cache_size(-" + strconv.Itoa(pathScratchCacheKiB) + ")"} {
 		q.Add("_pragma", p)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(dir, "path.db"), RawQuery: q.Encode()}).String()
+	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(s.dir, "path.db"), RawQuery: q.Encode()}).String()
 	connector, err := sqlite.NewConnector(dsn)
 	if err != nil {
-		s.close()
-		return nil, internalErr("path scratch connector: " + err.Error())
+		return internalErr("path scratch connector: " + err.Error())
 	}
 	s.db = sql.OpenDB(connector)
 	// One connection, one transaction: every read below streams rows on that
@@ -104,15 +159,45 @@ func openPathScratch(ctx context.Context, parent string) (*pathScratch, error) {
 	// Callers materialize a bounded chunk and close the rows before writing.
 	s.db.SetMaxOpenConns(1)
 	s.db.SetMaxIdleConns(1)
-	if _, err := s.db.ExecContext(ctx, pathScratchSchema); err != nil {
-		s.close()
-		return nil, internalErr("path scratch schema: " + err.Error())
+	if err := s.db.PingContext(ctx); err != nil {
+		return internalErr("path scratch open: " + err.Error())
 	}
-	if s.tx, err = s.db.BeginTx(ctx, nil); err != nil {
+	return nil
+}
+
+// begin opens the search's single transaction.
+func (s *pathScratch) begin(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
 		s.close()
-		return nil, internalErr("path scratch transaction: " + err.Error())
+		return internalErr("path scratch transaction: " + err.Error())
 	}
-	return s, nil
+	s.tx = tx
+	return nil
+}
+
+// detach COMMITS the page's writes, closes the database and hands the caller
+// the directory, which is now the caller's to retain. close() afterwards is a
+// no-op on the directory, so the ordinary defer cannot remove state a
+// continuation was just minted for.
+func (s *pathScratch) detach() (string, error) {
+	if s.tx != nil {
+		err := s.tx.Commit()
+		s.tx = nil
+		if err != nil {
+			return "", internalErr("path scratch commit: " + err.Error())
+		}
+	}
+	if s.db != nil {
+		err := s.db.Close()
+		s.db = nil
+		if err != nil {
+			return "", internalErr("path scratch close: " + err.Error())
+		}
+	}
+	dir := s.dir
+	s.dir = ""
+	return dir, nil
 }
 
 // close discards the transaction and removes the directory. It is safe to call
