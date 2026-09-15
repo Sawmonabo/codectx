@@ -277,6 +277,24 @@ the next request carries on settling buckets. A `path` request never fails with
 A capability that is still building is reported as an unavailable row plus a
 warning, so an incomplete answer never reads as a complete one.
 
+## What `search` reads for the lexical tier
+
+The lexical tier scores a single-token term from the generation's packed term
+statistics — the term's document frequency, the visible-document count and
+total token length, and the term's per-document, column-ascending
+`(column, count)` sequence — which activation wrote once
+([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1;
+[storage.md](storage.md) describes the streams). A request therefore steps no
+vocabulary row, no document row and no generation-membership probe per posting
+instance, and builds no temporary index for a document frequency. Nothing about
+the answer changes: the packed values are the scorer's inputs, not its outputs,
+and every floating-point operation stays where it was, consuming the same
+numbers in the same order.
+
+A **phrase** — two or more tokens that must be adjacent — keeps reading the
+index directly, because testing adjacency needs the token offsets the packed
+form deliberately does not store.
+
 ## Configuration these commands read
 
 The engine reads no configuration itself; the values below are resolved once,
