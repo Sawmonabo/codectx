@@ -180,8 +180,11 @@ func (f *fixture) fill(w *store.UnitWriter, run model.ProviderRunID, ff fileFixt
 		FileID: ff.id, ContentHash: ff.hash, Range: rng}
 	// A fact whose ID does not derive from (repository, kind, canonical key) is
 	// malformed provider output: accepting it would let two keys share one
-	// identity row.
-	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: "other-key", Evidence: []model.Evidence{ev}}}); err == nil {
+	// identity row. The key is a well-formed digest -- a free-text key is
+	// refused one layer earlier, by model.NodeFact.Validate, and would prove
+	// that rejection instead of this one.
+	otherKey := model.H("canonical-entity-key-v1", "pkg.Other")
+	if err := w.PutNodes(f.ctx, []model.NodeFact{{Node: node, CanonicalKey: otherKey, Evidence: []model.Evidence{ev}}}); err == nil {
 		f.t.Fatal("PutNodes accepted a node whose ID does not derive from its canonical key")
 	} else {
 		wantCode(f.t, err, model.CodeProviderOutputInvalid)

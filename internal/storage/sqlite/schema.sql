@@ -480,7 +480,13 @@ CREATE INDEX idx_unit_input_file ON unit_inputs(file_id, unit_id);
 CREATE INDEX idx_unit_dependencies_reverse ON unit_dependencies(dependency_id, unit_id);
 CREATE INDEX idx_nodes_name ON node_facts(name, unit_id, node_id);
 CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
-CREATE INDEX idx_nodes_file ON node_facts(file_id, start_byte, unit_id);
+-- idx_nodes_file is narrowed to the one column it probes. start_byte was a
+-- dead middle column: search.go keysets on coalesce(nf.start_byte, 0), which no
+-- plain column index can serve, and unit_id is already the leading column of
+-- the PRIMARY KEY suffix every index key carries. Re-audited on a rebuilt store
+-- (S-INT): both consumers keep their plan, gc.go's file probe stays COVERING,
+-- and the index is 20.5% smaller.
+CREATE INDEX idx_nodes_file ON node_facts(file_id);
 CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 -- No idx_relations_from: dropping the constant repository_id (S-5) leaves
 -- relation_ids with UNIQUE(from_node_id, kind, to_node_id), whose autoindex is
