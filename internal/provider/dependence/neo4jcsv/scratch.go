@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
-	"strconv"
 
 	"modernc.org/sqlite"
 )
@@ -106,8 +105,13 @@ type scratch struct {
 	// maxRows is the user's `providers.dependence.max_staged_rows`, 0 for
 	// unlimited. It never stops the staging: crossing it sets overRows once,
 	// which the import reports.
-	maxRows      int64
-	overRows     bool
+	maxRows  int64
+	overRows bool
+	// derivedRows is how many relation occurrences project() derived. It is a
+	// count, never a bound: the projection is not truncated and the unit is
+	// not failed for it. Import compares it against the user's
+	// `providers.dependence.max_derived_rows` and reports the crossing.
+	derivedRows  int64
 	unknown      map[string]uint64
 	unknownN     uint64
 	ignoredFiles int
@@ -434,21 +438,25 @@ func (s *scratch) projectDataFlow(ctx context.Context) error {
 				OR EXISTS (SELECT 1 FROM nodes n WHERE n.id IN (a1.target, a2.target) AND n.closure_binding <> '')
 			THEN '`+detailReachDefCB+`' ELSE '`+detailReachDef+`' END, ''
 		FROM walk w JOIN anchors a1 ON a1.node = w.start JOIN anchors a2 ON a2.node = w.node
-		WHERE a1.target <> a2.target LIMIT `+strconv.Itoa(maxDerivedRows+1))
+		WHERE a1.target <> a2.target`)
 	if err != nil {
 		return internalErr("import projection: %v", err)
 	}
 	return nil
 }
 
-// checkDerived refuses an export that projects past the occurrence bound.
-func (s *scratch) checkDerived(ctx context.Context) error {
-	var n int64
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM proj`).Scan(&n); err != nil {
+// countDerived records how many relation occurrences the projection derived.
+//
+// An occurrence count is a property of the analysed source, so it never
+// refuses the export and never truncates the projection: the occurrences live
+// in the same on-disk staging database as the rows they came from and are read
+// back one keyset page at a time, so the count bounds disk, not heap. A user
+// who set `providers.dependence.max_derived_rows` is told the import crossed
+// it -- Report.DerivedRows and Report.OverDerivedRows carry it out to the
+// provider, which logs it and publishes it on the unit's capability rows.
+func (s *scratch) countDerived(ctx context.Context) error {
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM proj`).Scan(&s.derivedRows); err != nil {
 		return internalErr("import projection: %v", err)
-	}
-	if n > maxDerivedRows {
-		return resourceLimit("the export projects to more than %d relation occurrences", maxDerivedRows).WithDetail("limit", "max_derived_rows")
 	}
 	return nil
 }

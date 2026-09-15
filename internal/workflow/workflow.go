@@ -143,9 +143,13 @@ type Limits struct {
 	// MaxPageItems bounds every page this service returns
 	// (resources.max_page_items).
 	MaxPageItems int
-	// MaxObservationReferences bounds the references on one observation
-	// (model.MaxObservationReferences).
-	MaxObservationReferences int
+	// MaxObservationReferences is the CALLER's ceiling on the references one
+	// observation carries, and on the references a scope review carries across
+	// all eight of its categories (workflow.max_observation_references). It is
+	// unlimited by default: an attestation over a large scope cites what it
+	// read, and it is never refused for the size of the repository. A caller
+	// that set a ceiling is told the ceiling and the count, never trimmed.
+	MaxObservationReferences config.Limit
 	// MaxCapsuleBytes is the CALLER's budget for the serialized capsule
 	// (context.max_capsule_bytes). It is unlimited by default and a request may
 	// raise it: a capsule is reported as over budget only because the caller
@@ -209,16 +213,16 @@ func New(o Options) (*Service, error) {
 
 // checkLimits rejects a Limits that cannot bound a request. Zero on a request
 // field means the configured default, so a zero default means "unlimited",
-// which Section 20.2 forbids for the page, reference and deadline bounds below.
-// MaxCapsuleBytes is deliberately absent: it is a config.Limit whose zero is
-// the documented "no caller ceiling", not a missing bound.
+// which Section 20.2 forbids for the page and deadline bounds below.
+// MaxCapsuleBytes and MaxObservationReferences are deliberately absent: each is
+// a config.Limit whose zero is the documented "no caller ceiling", not a
+// missing bound.
 func checkLimits(l Limits) error {
 	for _, b := range []struct {
 		name  string
 		value int64
 	}{
 		{"max_page_items", int64(l.MaxPageItems)},
-		{"max_observation_references", int64(l.MaxObservationReferences)},
 		{"query_timeout", int64(l.QueryTimeout)},
 	} {
 		if b.value <= 0 {
