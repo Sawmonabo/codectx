@@ -733,7 +733,9 @@ func TestCarryDistancesPageToTheEnd(t *testing.T) {
 	}
 	for i := 0; i < carried; i++ {
 		u := plan.Unit{ProviderID: "dependence", ProviderVersion: "v1", ScopeKey: fmt.Sprintf("project:%04d", i),
-			Inputs: []model.UnitInput{{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable}}}
+			InputCount: 1, Inputs: func(yield func(model.UnitInput) error) error {
+				return yield(model.UnitInput{FileID: fv.ID, ContentHash: fv.ContentHash, Executable: fv.Executable})
+			}}
 		spec, err := u.Spec(f.c.cfgHash)
 		if err != nil {
 			t.Fatal(err)
@@ -744,7 +746,7 @@ func TestCarryDistancesPageToTheEnd(t *testing.T) {
 		}
 		build := model.UnitBuild{Spec: spec, AnalysisConfigHash: f.c.cfgHash, OriginRunID: run,
 			SourceBinding: model.SourceBindingVerified}
-		w, err := f.store.BeginUnit(ctx, gen, build, inputsOf(u.Inputs))
+		w, err := f.store.BeginUnit(ctx, gen, build, u.Inputs)
 		if err != nil {
 			t.Fatal(err)
 		}
