@@ -79,10 +79,11 @@ const parserWorkerReservationBytes int64 = 256 << 20
 
 // collectorBatchLimit bounds every phase of one retention pass. It restates
 // internal/storage/sqlite's own collection batch (gcBatchUnits, unexported
-// there) so both halves of a pass agree about how much work one transaction is,
-// and it is stated explicitly rather than left at zero: retention.New accepts a
-// zero, and a zero limit would make every phase collect nothing, forever, while
-// reporting success.
+// there) so both halves of a pass agree about how much work one transaction is.
+// retention.New defaults a non-positive limit to a bound of its own, which is a
+// safety net for a collector composed without one; this constant is the value
+// this composition chooses, and it is stated because agreeing with the store's
+// batch is a decision, not a default.
 const collectorBatchLimit = 200
 
 // sharedRunnerHeadroom is how many children beyond the heavy-analyzer budget
@@ -708,6 +709,7 @@ func (s *stack) openDiagnostics() error {
 		// second spelling of a fact this process can always answer for itself.
 		Build:     model.CurrentBuildInfo(),
 		Repo:      s.repo,
+		Root:      s.root.Path,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
 		Toolchain: toolchainReporter{r: s.resolver},
