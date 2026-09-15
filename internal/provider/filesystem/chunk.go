@@ -21,9 +21,16 @@ const (
 	ChunkBytes      = model.MaxSearchBodyBytes
 	MaxOverlapLines = 2
 	MaxOverlapBytes = 1024
-	// binarySniffBytes is how much of a file's head is inspected for a NUL
-	// byte, Git's own heuristic for binary content.
+	// binarySniffBytes is how much of a file's head the binary decision
+	// inspects.
 	binarySniffBytes = 8000
+	// binaryNonTextPercent is the share of the sniffed head that must be
+	// bytes no text encoding the index reads can produce before the file is
+	// judged binary and left without a lexical index.
+	binaryNonTextPercent = 30
+	// binaryNULRun is a run of NUL bytes long enough to be a binary
+	// container's padding rather than a stray byte in a text file.
+	binaryNULRun = 4
 )
 
 // chunker streams one file through a window of ChunkBytes and emits the
@@ -79,6 +86,11 @@ func (c *chunker) fill() error {
 type lossy struct {
 	Chunks int
 	Bytes  int
+	// NULs counts NUL bytes replaced across the emitted chunks. They are
+	// counted apart from Bytes because a NUL is well-formed UTF-8: the file
+	// is not mis-encoded, it simply carries a byte a text index cannot hold,
+	// and the two disclosures answer different questions.
+	NULs int
 }
 
 // each emits every chunk of the file through emit. Every byte of the file is
@@ -106,12 +118,16 @@ func (c *chunker) each(ctx context.Context, emit func(model.ByteRange, []byte) e
 		// sanitized copy held in scratch instead.
 		body := window[:chunk.Range.End-chunk.Range.Start]
 		text := body
-		if chunk.Encoding != model.EncodingUTF8 {
-			var substituted int
-			c.scratch, substituted = sanitizeUTF8(c.scratch, body)
+		// A NUL is valid UTF-8, so the encoding alone does not say whether a
+		// chunk needs sanitising: a text file with a stray NUL would carry it
+		// straight into the index body. Both conditions are checked.
+		if chunk.Encoding != model.EncodingUTF8 || bytes.IndexByte(body, 0) >= 0 {
+			var substituted, nuls int
+			c.scratch, substituted, nuls = sanitizeUTF8(c.scratch, body)
 			text = c.scratch
 			lost.Chunks++
 			lost.Bytes += substituted
+			lost.NULs += nuls
 		}
 		if err := emit(chunk.Range, text); err != nil {
 			return lost, err
@@ -162,8 +178,9 @@ func overlap(body []byte) int {
 }
 
 // sanitizeUTF8 returns a valid-UTF-8 copy of src in which every byte that is
-// not part of a well-formed UTF-8 sequence is replaced, byte for byte, by a
-// space, along with how many bytes were replaced. dst is reused as the buffer.
+// not part of a well-formed UTF-8 sequence, and every NUL, is replaced byte
+// for byte by a space, along with how many bytes of each kind were replaced.
+// dst is reused as the buffer.
 //
 // The substitution is byte-for-byte, not U+FFFD, for two reasons. A search
 // document's body is bounded at model.MaxSearchBodyBytes, which is exactly
@@ -175,10 +192,15 @@ func overlap(body []byte) int {
 // substitute: the replaced bytes are text in no encoding the index claims to
 // read, and a space can only separate tokens, never join two into one that the
 // file does not contain.
-func sanitizeUTF8(dst, src []byte) ([]byte, int) {
+func sanitizeUTF8(dst, src []byte) (out []byte, substituted, nuls int) {
 	dst = append(dst[:0], src...)
-	substituted := 0
 	for i := 0; i < len(dst); {
+		if dst[i] == 0 {
+			dst[i] = ' '
+			nuls++
+			i++
+			continue
+		}
 		if dst[i] < utf8.RuneSelf {
 			i++
 			continue
@@ -192,15 +214,64 @@ func sanitizeUTF8(dst, src []byte) ([]byte, int) {
 		}
 		i += size
 	}
-	return dst, substituted
+	return dst, substituted, nuls
 }
 
-// looksBinary applies the NUL heuristic to a file's head.
+// looksBinary decides whether a file's head is content no text index can
+// read. A single NUL byte does not decide it: a source file can carry one and
+// still be text the caller expects to search, and refusing it a lexical index
+// skips that file's content under default settings. What decides it is the
+// proportion of the sniffed head that is not text under any encoding the index
+// reads -- NUL, a C0 control that is not whitespace, DEL, or a byte that is
+// not part of a well-formed UTF-8 sequence -- or a run of NULs long enough to
+// be a container's padding.
+//
+// Counting invalid UTF-8 towards the proportion is what separates a binary
+// from a legacy single-byte encoding: a Windows-1252 document has a fraction
+// of a percent of such bytes, while arbitrary binary content is roughly half
+// of them. A UTF-16 file is caught by the proportion too, its NULs being
+// interleaved rather than in a run.
 func looksBinary(head []byte) bool {
 	if len(head) > binarySniffBytes {
 		head = head[:binarySniffBytes]
 	}
-	return bytes.IndexByte(head, 0) >= 0
+	if len(head) == 0 {
+		return false
+	}
+	nonText, run := 0, 0
+	for i := 0; i < len(head); {
+		b := head[i]
+		switch {
+		case b == 0:
+			run++
+			if run >= binaryNULRun {
+				return true
+			}
+			nonText++
+			i++
+			continue
+		case b == 0x7f || (b < 0x20 && b != '\t' && b != '\n' && b != '\r' && b != '\f' && b != '\v' && b != '\b' && b != 0x1b):
+			nonText++
+			i++
+		case b < utf8.RuneSelf:
+			i++
+		default:
+			r, size := utf8.DecodeRune(head[i:])
+			if r == utf8.RuneError && size <= 1 {
+				// A sequence cut short by the edge of the sniffed head is the
+				// window's doing, not the file's, so it ends the count here
+				// rather than being charged against the file.
+				if len(head)-i < utf8.UTFMax && utf8.RuneStart(b) {
+					i = len(head)
+					break
+				}
+				nonText++
+			}
+			i += size
+		}
+		run = 0
+	}
+	return nonText*100 > len(head)*binaryNonTextPercent
 }
 
 // chunkDocument is the search document of one source chunk. Its key derives

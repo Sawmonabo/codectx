@@ -90,7 +90,7 @@ var fixture = map[string]string{
 	// 600 lines of 59 bytes = 35400 bytes: over one chunk, and cut on a
 	// line boundary, so consecutive chunks must overlap by whole lines.
 	"docs/wide.txt":   strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing elit sed\n", 600),
-	"assets/logo.bin": "PNG\x00\x00binary",
+	"assets/logo.bin": "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR",
 }
 
 func newProviders(t *testing.T) (*filesystem.Provider, *manifest.Provider) {
@@ -354,7 +354,7 @@ node document docs/README.md lang=markdown located {"format":"markdown"}
 node document docs/long.txt lang=text located {"format":"text"}
 node document docs/wide.txt lang=text located {"format":"text"}
 node file Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":75}
-node file assets/logo.bin located {"binary":true,"executable":false,"size":11}
+node file assets/logo.bin located {"binary":true,"executable":false,"size":16}
 node file broken/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":23}
 node file crates/core/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":190}
 node file docs/README.md lang=markdown located {"binary":false,"executable":false,"format":"markdown","size":142}
