@@ -2,6 +2,9 @@ package graph
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +48,8 @@ func TestTheMembershipSummaryIsFrozenOnlyByAWalkThatPages(t *testing.T) {
 		t.Fatalf("open signer: %v", err)
 	}
 	leases := newFixtureLeases()
-	spools, err := pagination.NewSpools(t.TempDir(), 0, leases)
+	spoolRoot := t.TempDir()
+	spools, err := pagination.NewSpools(spoolRoot, 0, leases)
 	if err != nil {
 		t.Fatalf("new spools: %v", err)
 	}
@@ -75,7 +79,16 @@ func TestTheMembershipSummaryIsFrozenOnlyByAWalkThatPages(t *testing.T) {
 	}
 
 	t.Run("one request, no cursor, no filter", func(t *testing.T) {
-		e, probe := newEngine(f, nil)
+		// The counter alone is a proxy: the finding's words were "writes no
+		// filter file", and the file is written and then carried away with the
+		// walk's scratch directory when the query mints no cursor, so a check
+		// made after Impact returns would pass over a walk that DID write one.
+		// watch looks while the walk is running -- an eager freeze happens in
+		// openVisitedStore, before the first edge is read -- and it records the
+		// retained directory it looked in, so "no filter file" cannot be
+		// satisfied by having looked nowhere.
+		watch := &filterWatch{root: spoolRoot}
+		e, probe := newEngine(watchAdjacency{Adjacency: f, watch: watch}, nil)
 		res, err := e.Impact(context.Background(), base)
 		if err != nil {
 			t.Fatalf("impact: %v", err)
@@ -89,6 +102,16 @@ func TestTheMembershipSummaryIsFrozenOnlyByAWalkThatPages(t *testing.T) {
 		}
 		if res.VisitedCount != admitted {
 			t.Fatalf("the walk admitted %d nodes; the fixture holds %d", res.VisitedCount, admitted)
+		}
+		if watch.dirs == 0 {
+			t.Fatalf("the walk read %d edge batches but no retained walk directory was open under the "+
+				"spool root while it ran, so finding no membership filter there proves nothing",
+				watch.calls)
+		}
+		if watch.filters != 0 {
+			t.Fatalf("a query that answered in one request and minted no cursor had already written "+
+				"%s in its retained walk directory before the first edge was read; the summary only "+
+				"ever accelerates a resume, and this query has none", visitedFilterFile)
 		}
 		if probe.VisitedFilterWords != 0 {
 			t.Fatalf("a query that answered in one request and minted no cursor froze %d words of "+
@@ -154,4 +177,49 @@ func TestTheMembershipSummaryIsFrozenOnlyByAWalkThatPages(t *testing.T) {
 		}
 		t.Logf("%d pages, %d nodes, membership summary frozen once at %d words", pages, visited, want)
 	})
+}
+
+// filterWatch records, while a walk is RUNNING, whether the retained walk
+// directory under the spool root carries a membership filter file. It counts
+// the directories it found as well: an assertion that no filter file exists is
+// vacuous unless the directory it would live in was there to look in.
+type filterWatch struct {
+	root    string
+	calls   int
+	dirs    int
+	filters int
+}
+
+func (w *filterWatch) look() {
+	w.calls++
+	if w.calls > 1 {
+		return
+	}
+	entries, err := os.ReadDir(w.root)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "walkretain-") {
+			continue
+		}
+		w.dirs++
+		if _, err := os.Stat(filepath.Join(w.root, e.Name(), visitedFilterFile)); err == nil {
+			w.filters++
+		}
+	}
+}
+
+// watchAdjacency runs the watch on the first edge batch, which is the first
+// moment the walk is past openVisitedStore and the last one before an eager
+// freeze could be mistaken for a lazy one.
+type watchAdjacency struct {
+	Adjacency
+	watch *filterWatch
+}
+
+func (a watchAdjacency) Edges(ctx context.Context, nodes []model.NodeID, dir model.Direction,
+	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+	a.watch.look()
+	return a.Adjacency.Edges(ctx, nodes, dir, kinds, after, limit)
 }
