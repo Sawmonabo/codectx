@@ -282,6 +282,16 @@ func (s *Store) countUnits(ctx context.Context, repoRaw []byte) (int64, error) {
 // own record accounting (recordOverhead per row plus the stored text, in
 // bytes: length() counts characters, so text columns are cast to BLOB first).
 //
+// The alias and evidence rows no longer carry their scope key and native key as
+// text: S-3 interned both into scope_keys / native_keys and the rows hold an
+// INTEGER reference, which recordOverhead already covers. Those strings are
+// therefore no longer counted here, and deliberately not replaced by a join
+// back to the dictionary: a dictionary row is shared by every generation that
+// ever used the key, so charging its bytes to one generation would both
+// over-count what that generation holds and claim as reclaimable bytes that
+// deleting it cannot free. The figures this returns are smaller than before the
+// interning for exactly the reason the store is smaller.
+//
 // With exclusive set it counts only the units no other generation selects —
 // exactly the units that become collectable when this generation is deleted,
 // which is what "reclaimed" and "reclaimable" mean. Without it, it counts
@@ -301,12 +311,11 @@ func (s *Store) generationBytes(ctx context.Context, gen int64, exclusive bool) 
 			+ length(cast(qualified_name AS BLOB)) + length(cast(signature AS BLOB)) + length(cast(metadata_json AS BLOB))), 0)
 			FROM node_facts WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 FROM relation_facts WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(native_key AS BLOB)) + length(cast(detail AS BLOB))), 0)
+	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(detail AS BLOB))), 0)
 			FROM evidence WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(fact_key AS BLOB))), 0)
 			FROM fact_keys WHERE unit_id IN (SELECT id FROM ex))
-	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(scope_key AS BLOB)) + length(cast(native_key AS BLOB))), 0)
-			FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
+	  + (SELECT count(*) * ?2 FROM native_aliases WHERE unit_id IN (SELECT id FROM ex))
 	  + (SELECT count(*) * ?2 + coalesce(sum(length(cast(name AS BLOB)) + length(cast(qualified_name AS BLOB))
 			+ length(cast(signature AS BLOB)) + length(cast(path AS BLOB)) + length(cast(body AS BLOB))), 0)
 			FROM search_units WHERE unit_id IN (SELECT id FROM ex))
