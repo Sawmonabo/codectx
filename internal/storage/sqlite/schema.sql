@@ -520,6 +520,12 @@ CREATE INDEX idx_alias_lookup ON native_aliases(scope_key_id, native_key_id, uni
 -- deleted; the same holds for a manifest entry's node.
 CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
 CREATE INDEX idx_context_entries_node ON context_entries(node_id);
+-- The file arm of the same sweep: gc.go's files collection asks, per candidate
+-- file, whether any manifest entry still names it. context_entries carries
+-- node_id and file_id side by side and only node_id was indexed, so that arm
+-- was a full scan of context_entries per candidate file -- exactly the
+-- pathology idx_context_entries_node exists to prevent, on the sibling column.
+CREATE INDEX idx_context_entries_file ON context_entries(file_id);
 CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
