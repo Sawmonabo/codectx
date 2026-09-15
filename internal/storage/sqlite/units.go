@@ -202,7 +202,7 @@ type UnitWriter struct {
 	// registered -- a relation endpoint, an alias target, a search document's
 	// symbol -- is never minted here, so it is resolved by canonical lookup and
 	// an absent row is malformed provider output, exactly as the foreign key to
-	// node_ids used to report it.
+	// node_ids reports it.
 	//
 	// Both are bounded LRUs sized from the configured batch, and endBatch drops
 	// them at every batch boundary, so the writer's live set is a function of

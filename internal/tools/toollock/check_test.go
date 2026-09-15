@@ -9,12 +9,14 @@ import (
 
 // TestCheckReportsEveryDifferingEntry protects the release gate's completeness.
 //
-// The failure mode: -check is the only thing that says "the lock describes what
-// is actually published". It used to return on the first entry that differed,
-// so a re-pin that moved several payloads reported one of them, and whoever
-// read the failure could not tell a single moved asset from a whole release
-// republished under different bytes -- each hidden entry costing another
-// multi-gigabyte run of the job to discover.
+// Requirement: -check is the only thing that says "the lock describes what is
+// actually published", so it reports EVERY entry that differs.
+//
+// Mutation that fails it: return on the first differing entry. A re-pin that
+// moved several payloads then reports one of them, and whoever reads the
+// failure cannot tell a single moved asset from a whole release republished
+// under different bytes -- each hidden entry costing another multi-gigabyte run
+// of the job to discover.
 func TestCheckReportsEveryDifferingEntry(t *testing.T) {
 	lock := Lock{LockVersion: 1, Tools: map[string]Entry{
 		"alpha": {Name: "alpha", Platforms: map[string]Payload{

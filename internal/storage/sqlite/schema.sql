@@ -532,7 +532,7 @@ CREATE INDEX idx_nodes_file ON node_facts(file_id);
 CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
 -- No idx_relations_from: dropping the constant repository_id leaves
 -- relation_ids with UNIQUE(from_node_id, kind, to_node_id), whose autoindex is
--- column-for-column the index this used to be. Its call sites (query.go:380,
+-- column-for-column what idx_relations_from would be. Its call sites (query.go:380,
 -- adjacency.go:194, gc.go:196) keep an identical access path. idx_relations_to
 -- stays: nothing else on relation_ids leads with to_node_id, and it is the
 -- reverse-traversal ("who calls X") path.

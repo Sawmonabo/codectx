@@ -10,11 +10,11 @@ import (
 
 // Storage-internal surrogate identities (scale-posture-plan.md S-1..S-3).
 //
-// The store used to carry a 32-byte canonical BLOB at every reference site.
-// A BLOB record field costs 2N+12 as its serial type plus the varint that
-// encodes it -- ~33 B for a 32-byte id -- and, because node_facts,
+// A reference site holds an INTEGER surrogate, never the 32-byte canonical
+// BLOB it names. A BLOB record field costs 2N+12 as its serial type plus the
+// varint that encodes it -- ~33 B for a 32-byte id -- and, because node_facts,
 // relation_facts and native_aliases are WITHOUT ROWID tables, every secondary
-// index re-stores the whole primary key, so each of those bytes was paid once
+// index re-stores the whole primary key, so each of those bytes is paid once
 // per index. An INTEGER PRIMARY KEY is the b-tree key itself and costs zero
 // payload bytes in its own table; as a reference it is a 1-8 byte varint.
 //
