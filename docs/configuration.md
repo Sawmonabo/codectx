@@ -69,7 +69,7 @@ default are recorded in [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.
   | `[resources]` | `max_query_terms`, `max_provider_record_bytes` |
   | `[providers.lsp]` | `max_overlay_bytes` |
   | `[providers.dependence]` | `max_units_per_family`, `max_staged_rows`, `max_derived_rows`, `max_export_files` |
-  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_seeds` |
+  | `[context]` | `max_graph_depth`, `max_visited_nodes`, `max_graph_edges`, `max_reason_paths_per_entry`, `max_manifest_bytes`, `max_capsule_bytes`, `max_capsule_records_per_list`, `max_capsule_coverage_files`, `max_seeds` |
   | `[providers.tree_sitter]` | `max_callee_references` |
   | `[providers.manifest]` | `max_dependencies`, `max_entries` |
   | `[coverage]` | `max_unconfirmed_chunks_per_session` |

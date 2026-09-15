@@ -547,7 +547,7 @@ that cannot be expressed as unlimited without a configuration key that does not 
 its enforcement without adding the key would leave an inbound request unbounded with no operator
 control — strictly worse than today — so it was left, with the exact three-line change recorded.
 
-### 2.8 Storage: identity width is the amplifier *(accepted; scheduled)*
+### 2.8 Storage: identity width is the amplifier *(accepted; landed)*
 
 **Decision.** The store's amplification is attributed, not guessed, and the redesign follows the
 attribution: **integer surrogate identities and interned keys**, with bytes-per-indexed-symbol as
@@ -643,6 +643,14 @@ projects to a multi-gigabyte store — bad, but not an out-of-memory failure on 
 host. Blocking the unlimited posture on a 10 000-line package rewrite would trade a measured,
 reported risk for a long stall. The verification lane for this record therefore **reports** the
 ratio and the per-symbol cost; the storage wave's own verification is where they gate.
+
+**Landed.** The redesign shipped as recorded in
+[`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md): integer surrogate identities and
+two interned string dictionaries. Measured on the same real 4 019-file repository indexed twice,
+once by each binary, with identical row counts in every identity table: 1 005 887 488 →
+632 266 752 stored bytes and **5 732.8 → 3 603.5 bytes per indexed symbol, −37.1 %**. The ratio
+gate itself is still owed its re-measurement on the corrected reference corpus and on real
+repositories, and is what re-records `docs/performance.md` row 13.
 
 ### 2.9 Capsule pagination *(accepted; closed)*
 
