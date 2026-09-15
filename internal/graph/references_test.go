@@ -14,11 +14,11 @@ import (
 )
 
 // TestReferencePageBoundIsDisclosedNotClamped is the class-G proof for
-// References. Its page bound used to be clamped twice in silence -- once
+// References. The failure mode: a page bound clamped twice in silence -- once
 // against the configured ceiling, once against the wire ceiling -- so a caller
-// that asked for 50 occurrences and was served 200 could not tell a clamped
-// page from the end of the answer. It is now RESOLVED and disclosed, the same
-// way a traversal's bounds are.
+// that asked for 50 occurrences and was served 200 cannot tell a clamped page
+// from the end of the answer. The bound is RESOLVED and disclosed, the same way
+// a traversal's bounds are.
 //
 // Mutation (resolvePageItems replaced by the old `if pageLimit <= 0 ||
 // pageLimit > e.limits.MaxPageItems` clamp): Notices is empty and this fails.

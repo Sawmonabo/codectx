@@ -298,12 +298,12 @@ func TestPathWalkHeapIsBoundedByTheChunk(t *testing.T) {
 // whatever the search found, never as a failed request.
 //
 // It is not a restatement of the traversal deadline test: the path search is
-// the one walk whose state is a DATABASE, and every statement it issues used to
-// carry the request context. A deadline landing between two of those statements
-// -- which on a large graph is the common case, not the edge case -- surfaced
-// as CTX_INTERNAL ("path scratch read: context deadline exceeded") instead of
-// the truncated answer, so whether the contract held was a race on where the
-// clock landed. The scratch is driven on an uncancellable context now and
+// the one walk whose state is a DATABASE. Were every statement it issues to
+// carry the request context, a deadline landing between two of them -- which on
+// a large graph is the common case, not the edge case -- would surface as
+// CTX_INTERNAL ("path scratch read: context deadline exceeded") instead of the
+// truncated answer, and whether the contract held would be a race on where the
+// clock landed. The scratch is driven on an uncancellable context and
 // pathWalk.checkDeadline is the only stop; this row is what holds that.
 //
 // Mutation: pass ctx instead of w.scCtx to a scratch statement the walk reaches
@@ -605,11 +605,11 @@ func (b busyPathGraph) Neighbours(ctx context.Context, refs []NodeRef, dir model
 }
 
 // TestRetryableFailureLeavesAPathContinuationAdoptable is the SK3/A15 proof.
-// ShortestPath releases the continuation it consumed on the way out, and it
-// used to do so on EVERY exit: one transient CTX_WORKSPACE_BUSY on one page
-// then turned the next presentation of that same cursor into
-// CTX_CURSOR_INVALID, and an hours-long search behind it was unrecoverable --
-// while the error itself told the caller to retry.
+// ShortestPath releases the continuation it consumed on the way out. The
+// failure mode: releasing it on EVERY exit, so one transient
+// CTX_WORKSPACE_BUSY on one page turns the next presentation of that same
+// cursor into CTX_CURSOR_INVALID and an hours-long search behind it is
+// unrecoverable -- while the error itself tells the caller to retry.
 //
 // The retry must also see the state the failing page STARTED from, not a page
 // torn off halfway through, so the routes it finishes with are compared against

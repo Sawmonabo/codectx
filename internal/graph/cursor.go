@@ -35,81 +35,24 @@ import (
 // another endpoint, generation, analysis key or query -- is CTX_CURSOR_INVALID,
 // and no message ever echoes the token.
 
-// traversalCursorVersion is the payload version. A payload without it -- for
-// instance a pagination.Cursor token, whose JSON has no such field -- decodes
-// to zero and is rejected, so the two token shapes can never be interchanged
-// even though both are signed with pagination.PurposeCursor.
+// traversalCursorVersion is the payload version this build mints and the only
+// one it reads. A payload without it -- for instance a pagination.Cursor token,
+// whose JSON has no such field -- decodes to zero and is rejected, so the two
+// token shapes can never be interchanged even though both are signed with
+// pagination.PurposeCursor.
 //
-// Version 2 retires the ranked spool vocabulary: a version-1 token issued by an
-// impact page that spilled a ranked tail names a spool this build cannot
-// replay, and resuming it would serve an empty continuation instead of the rest
-// of the answer. It is refused as CTX_CURSOR_INVALID, which a caller re-runs
-// the query for, rather than answered short.
+// A token of any other version is refused as CTX_CURSOR_INVALID rather than
+// interpreted. What a traversal continuation NAMES is this version's whole
+// vocabulary -- a retained state directory, the level inside it, a scan
+// position in the generation's packed adjacency, and a bitset over that
+// generation's surrogate range -- and nothing in a foreign token's shape says
+// which of those it meant. Answering one would resume a walk over state this
+// build does not keep and serve a fraction of an answer as the whole of it. A
+// cursor is short-lived and the remedy is to re-run the query, which returns
+// the whole answer under one contract.
 //
-// Version 3 also reintroduces a ranked spool vocabulary -- a different one: ruling P2's ranked tail, where the walk
-// has already run to completion and the spool holds the globally RANKED
-// remainder of the answer rather than a per-page chunk.
-//
-// The version is bumped even though the ranked fields below are purely
-// additive -- a version-2 token would decode with Ranked false and route to the
-// walk replay perfectly well -- because what an impact or rollup continuation
-// MEANS changed, and nothing in a token's shape distinguishes the two
-// contracts. A version-2 impact cursor was minted by a page that ranked its own
-// chunk and left the walk unfinished; resuming it here would finish the walk
-// and rank only what is left, so the caller would receive one answer ordered
-// two different ways and never be told. The version is therefore the only
-// honest refusal. It ends in-flight neighbours and traversal cursors too, which
-// is accepted: a cursor is short-lived, and CTX_CURSOR_INVALID's remedy is to
-// re-run the query, which returns the whole answer under one contract.
-//
-// Version 3 additionally orders the spool's visited section by NodeID. Membership is a
-// MERGE-JOIN over that order now (visited.go), and a merge-join over a
-// version-2 spool -- whose visited records are in admission order -- would
-// walk past a node the spool holds and report it absent. That is a
-// cross-page RE-ADMISSION: the node would be emitted on two pages. The
-// version is what refuses such a token instead of answering it wrong.
-//
-// Version 4 adds the RETAINED pass-1 input a walk continuation names
-// (walkretain.go). A version-3 `f` token names a frontier and a cumulative
-// visited set and nothing else, so a build that resumed it would carry the walk
-// on, rank what THIS leg admitted, and serve that as the whole blast radius --
-// the earlier legs' entities are unreachable, because the carried visited set
-// guarantees they are never admitted again. There is no shape in a version-3
-// token that says so, so the version is the only honest refusal; a caller
-// re-runs the query and receives the whole answer under one contract.
-//
-// Version 5 moves the cumulative visited set OUT of the spool and into the
-// retained state directory, as append-only ascending runs beside a persisted
-// membership filter of frozen geometry (visitedstore.go). A version-4 `f` token
-// names a spool whose visited SECTION is the whole cumulative set and a
-// directory with no run store in it; resuming it here would find an empty run
-// store, believe the walk had admitted nothing, and re-admit every node every
-// earlier page already reported -- the same entity on page after page. There is
-// no shape in a version-4 token that says so, so the version is the only honest
-// refusal.
-//
-// Version 6 makes the ranked tail's continuation a BYTE OFFSET into one spool
-// written once by the page that settled the order.
-//
-// Version 7 gives the paged TRAVERSAL -- neighbours -- the same run store every
-// other walk endpoint already had, and with it the spool's visited section is
-// gone: a version-7 continuation spool holds frontier records and nothing else.
-// A version-6 neighbours token names a spool whose cumulative set lives in a
-// `v` section this build no longer reads, so resuming it would walk on with an
-// empty membership set and report every node its earlier pages already
-// reported. Nothing in a version-6 token's shape says which endpoint minted it,
-// so the version is the only honest refusal.
-// Version 8 is the SURROGATE walk (ADR-0005). Three things changed under it at
-// once, and no version-7 token can be read as any of them: the frontier a
-// continuation resumes from is no longer a spool of canonical ids but the
-// retained level file, whose records are generation-local surrogates; the
-// mid-level position is a scan position in the packed adjacency
-// (graph.EdgePos) rather than a (last owner, last relation) keyset pair; and
-// the cumulative admitted-node set is a bitset over the generation's surrogate
-// range rather than sorted runs behind a Bloom filter. A version-7 token names
-// state none of this build's readers can interpret, and a surrogate is
-// meaningful only inside the generation that minted it -- which is why the
-// GENERATION FENCE below is checked before any of that state is adopted.
+// The GENERATION FENCE below is checked before any of that state is adopted: a
+// surrogate is meaningful only inside the generation that minted it.
 const traversalCursorVersion = 8
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
@@ -118,10 +61,10 @@ const queryHashDomain = "graph.cursor.query"
 
 // traversalCursor is the signed continuation payload.
 //
-// It is NOT a pagination.Cursor: that type rejects a LastKey and a SpoolID
+// It is NOT a pagination.Cursor: that type rejects a sort key and a SpoolID
 // together and has no field for a cumulative budget, and both are required
-// here -- a spooled page still needs its keyset position and its spent
-// counters. The payload is signed with the shared pagination.Signer under
+// here -- a spooled page still needs its position and its spent counters. The
+// payload is signed with the shared pagination.Signer under
 // PurposeCursor, so it inherits the installation key, the bounded token size
 // and the expiry check, and spoolCursor projects it onto a pagination.Cursor
 // for the spool calls.
@@ -161,14 +104,13 @@ type traversalCursor struct {
 	// therefore a seek and its own records, never a replay of the level behind
 	// it.
 	LevelOffset int64 `json:"level_offset,omitempty"`
-	// LastOwner and LastKey are the keyset position of the endpoints that page
-	// a LIST rather than walk it -- the workspace overview, which reads nodes
-	// in canonical order and has no frontier at all. The WALK vocabulary no
-	// longer uses them: a walk resumes at LevelPos, inside the packed
-	// adjacency, which is exact where a pair of canonical ids could only name a
-	// row in an order several independent reads had to be stitched into.
-	LastOwner model.NodeID     `json:"last_owner,omitempty"`
-	LastKey   model.RelationID `json:"last_key,omitempty"`
+	// LastNode is the position of the endpoint that pages a LIST rather than
+	// walking it -- the workspace overview, which enumerates container nodes
+	// and has no frontier at all. It is a READER POSITION, the same
+	// generation-local surrogate vocabulary LevelPos is written in, so one
+	// generation fence covers every position a traversal token can carry and a
+	// canonical id never travels in a token as a sort key.
+	LastNode NodeRef `json:"last_node,omitempty"`
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
@@ -257,14 +199,11 @@ func (c traversalCursor) validate() error {
 	if c.LevelPos.Node == 0 && c.LevelPos.Index != 0 {
 		return cursorInvalid("cursor level position names no owner")
 	}
-	if len(c.LastKey) > model.MaxIdentifierBytes || len(c.LastOwner) > model.MaxIdentifierBytes {
-		return cursorInvalid("cursor sort key exceeds its bound")
-	}
-	if !c.LevelPos.IsZero() && (c.LastOwner != "" || c.LastKey != "") {
+	if !c.LevelPos.IsZero() && c.LastNode != 0 {
 		// The two vocabularies are disjoint: a scan position belongs to a walk
-		// and a keyset pair to a list. A token carrying both would be read one
-		// way by the resume and another by the mint.
-		return cursorInvalid("cursor carries both a scan position and a keyset position")
+		// and an enumeration position to a list. A token carrying both would be
+		// read one way by the resume and another by the mint.
+		return cursorInvalid("cursor carries both a scan position and an enumeration position")
 	}
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
@@ -323,10 +262,10 @@ func (c traversalCursor) validateRanked() error {
 			c.PairOffset != 0 || c.PairServed != 0 || c.PairTotal != 0 {
 			return cursorInvalid("a walk continuation carries a ranked position")
 		}
-		if c.LastKey != "" || c.LastOwner != "" {
-			// The overview's keyset vocabulary: it walks nothing, so it names
-			// neither retained state nor a spool, and the checks below -- which
-			// are the WALK's -- do not apply to it.
+		if c.LastNode != 0 {
+			// The overview's enumeration vocabulary: it walks nothing, so it
+			// names neither retained state nor a spool, and the checks below --
+			// which are the WALK's -- do not apply to it.
 			return nil
 		}
 		if c.SpoolID != "" {
@@ -360,7 +299,7 @@ func (c traversalCursor) validateRanked() error {
 			if c.RetainID == "" {
 				return cursorInvalid("a completed walk names no retained input")
 			}
-			if c.SpoolID != "" || !c.LevelPos.IsZero() || c.LastKey != "" || c.LevelState != "" {
+			if c.SpoolID != "" || !c.LevelPos.IsZero() || c.LastNode != 0 || c.LevelState != "" {
 				return cursorInvalid("a completed walk carries a frontier to resume")
 			}
 		}
@@ -374,7 +313,7 @@ func (c traversalCursor) validateRanked() error {
 	if c.SpoolID == "" {
 		return cursorInvalid("a ranked continuation names no result spool")
 	}
-	if !c.LevelPos.IsZero() || c.LastOwner != "" || c.LastKey != "" || c.LevelState != "" {
+	if !c.LevelPos.IsZero() || c.LastNode != 0 || c.LevelState != "" {
 		return cursorInvalid("a ranked continuation carries a traversal position")
 	}
 	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
@@ -400,9 +339,9 @@ func (c traversalCursor) validateRanked() error {
 }
 
 // spoolCursor projects the payload onto the pagination.Cursor the spool API
-// takes. LastKey is deliberately dropped: pagination.Cursor.Validate rejects a
-// sort key and a spool together, and the spool binding is the other five
-// fields, which Spools.Open compares against the spool header.
+// takes. It carries no sort key: pagination.Cursor.Validate rejects a sort key
+// and a spool together, and the spool binding is the other five fields, which
+// Spools.Open compares against the spool header.
 func (c traversalCursor) spoolCursor() pagination.Cursor {
 	return pagination.Cursor{
 		Endpoint:     c.Endpoint,
@@ -588,11 +527,10 @@ type continuation struct {
 	RawBytes    int64
 	LevelOffset int64
 	More        bool
-	// LastOwner and LastKey are the keyset position of an endpoint that pages a
-	// LIST rather than walking it (the workspace overview). A walk leaves them
-	// empty and carries LevelPos instead.
-	LastOwner model.NodeID
-	LastKey   model.RelationID
+	// LastNode is the enumeration position of an endpoint that pages a LIST
+	// rather than walking it (the workspace overview). A walk leaves it zero
+	// and carries LevelPos instead.
+	LastNode NodeRef
 	// Retain is the state this page appended to, handed over for the store to
 	// adopt (walkretain.go): the cumulative visited set every walk keeps, and
 	// the pass-1 input the two ranking endpoints add to it.
@@ -703,12 +641,11 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 // errRetentionBudget is the refusal a page raises when the shared continuation
 // byte budget cannot hold the state its next page would resume from.
 //
-// It is a REFUSAL, not a truncation. Both of these endpoints used to return an
-// empty token and a nil error here, so the answer ended mid-walk marked with
-// whichever reason had already been recorded -- "query deadline reached" for
-// impact, a work budget for path -- and a caller reading that reason was told
-// something false: raising the named budget was the only thing that could let
-// the walk continue, and the reason never named it. An answer that stops
+// It is a REFUSAL, not a truncation. An empty token and a nil error here would
+// end the answer mid-walk under whichever reason had already been recorded --
+// "query deadline reached" for impact, a work budget for path -- and a caller
+// reading that reason would be told something false: raising the named budget
+// is the only thing that can let the walk continue. An answer that stops
 // because a user-set bound was reached must say so and name the key.
 //
 // Not retryable: repeating the request frees no bytes. That also keeps it
@@ -788,11 +725,11 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// continuation is the LAST thing a timed-out page does, so by definition
 	// the query deadline has already passed when the lease is acquired and the
 	// frontier spilled. Charged against that expired context, the lease write
-	// failed with the context's own error, the page returned it instead of a
-	// cursor, and a walk the engine had correctly decided to continue came back
-	// as ok:false with data:null and nothing to resume from -- measured on a
-	// 13 223-file repository, where every default-timeout impact query on a hub
-	// node ended that way.
+	// fails with the context's own error, the page returns it instead of a
+	// cursor, and a walk the engine had correctly decided to continue comes
+	// back as ok:false with data:null and nothing to resume from -- measured on
+	// a 13 223-file repository, where every default-timeout impact query on a
+	// hub node ended that way.
 	//
 	// Detaching costs nothing the caller needed: a CANCELED request never
 	// reaches here (impactPhaseError answers a cancellation as CTX_CANCELED
@@ -806,13 +743,13 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		// is holding.
 		return "", nil
 	}
-	// The visited and edge bounds are PER-PAGE work budgets now, so they no
-	// longer decide whether a walk may continue -- spending one is exactly the
+	// The visited and edge bounds are PER-PAGE work budgets, so they do not
+	// decide whether a walk may continue -- spending one is exactly the
 	// condition that mints this cursor. A walk ends when its frontier is empty,
 	// when the depth bound is reached (reported, not resumed) or when the
 	// request deadline passes; nothing here silently withholds a continuation
 	// from a walk that still has work.
-	resumesWalk := c.More || c.LastKey != "" || c.WalkDone
+	resumesWalk := c.More || c.LastNode != 0 || c.WalkDone
 	if !resumesWalk {
 		// Nothing left to resume from: the answer is complete.
 		return "", nil
@@ -851,8 +788,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		LevelState:   c.LevelState,
 		RawBytes:     c.RawBytes,
 		LevelOffset:  c.LevelOffset,
-		LastOwner:    c.LastOwner,
-		LastKey:      c.LastKey,
+		LastNode:     c.LastNode,
 		Depth:        c.Depth,
 		WalkDone:     c.WalkDone,
 		Visited:      b.visited,
