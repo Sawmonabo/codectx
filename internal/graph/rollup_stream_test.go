@@ -197,8 +197,8 @@ func TestPackageRollupHoldsOneBatchOfEdges(t *testing.T) {
 	meta := model.QueryMeta{}
 	var stats rollupStats
 	run, err := e.rollupRanked(context.Background(), &meta, func(sink edgeSink) error {
-		for _, rel := range calls {
-			if err := sink.Visit(frontierState{}, rel); err != nil {
+		for _, edge := range fixtureEdges(t, e, calls) {
+			if err := sink.Visit(frontierState{}, edge); err != nil {
 				return err
 			}
 		}
@@ -233,8 +233,8 @@ func TestPackageRollupHoldsOneBatchOfEdges(t *testing.T) {
 // are then checked against elsewhere.
 func rollupSlice(e *Engine, meta *model.QueryMeta, relations []model.Relation) ([]model.PackageEdge, error) {
 	run, err := e.rollupRanked(context.Background(), meta, func(sink edgeSink) error {
-		for _, r := range relations {
-			if err := sink.Visit(frontierState{}, r); err != nil {
+		for _, edge := range fixtureEdges(nil, e, relations) {
+			if err := sink.Visit(frontierState{}, edge); err != nil {
 				return err
 			}
 		}
@@ -252,4 +252,62 @@ func rollupSlice(e *Engine, meta *model.QueryMeta, relations []model.Relation) (
 		return nil, err
 	}
 	return out, nil
+}
+
+// fixtureEdges turns a fixture's model.Relation list into the packed Edge the
+// walk now hands the rollup, by reading the pinned generation's own adjacency
+// once and indexing it by canonical relation id.
+//
+// It exists because the rollup's SINK takes surrogates: the walk that feeds it
+// carries refs, and resolving them back to canonical ids only so a fixture
+// could hand them over was the round trip ADR-0005 removed. A fixture that
+// wants to drive the sink directly therefore has to speak the reader's
+// vocabulary, and this is the one place that translation lives.
+func fixtureEdges(t *testing.T, e *Engine, relations []model.Relation) []Edge {
+	fail := func(format string, args ...any) {
+		if t != nil {
+			t.Helper()
+			t.Fatalf(format, args...)
+		}
+		panic(fmt.Sprintf(format, args...))
+	}
+	ctx := context.Background()
+	reader, err := e.consumerReader()
+	if err != nil {
+		fail("the fixture engine has no packed reader: %v", err)
+	}
+	refs := make([]NodeRef, 0, reader.MaxNode())
+	for ref := NodeRef(1); ref <= reader.MaxNode(); ref++ {
+		refs = append(refs, ref)
+	}
+	byRel := map[RelRef]Edge{}
+	if _, err := reader.Neighbours(ctx, refs, model.DirectionOutgoing, nil, EdgePos{},
+		func(edge Edge) error {
+			byRel[edge.Rel] = edge
+			return nil
+		}); err != nil {
+		fail("reading the fixture adjacency: %v", err)
+	}
+	rels := make([]RelRef, 0, len(byRel))
+	for ref := range byRel {
+		rels = append(rels, ref)
+	}
+	rels = ascending(rels)
+	ids, err := reader.RelationIDs(ctx, rels)
+	if err != nil {
+		fail("naming the fixture relations: %v", err)
+	}
+	byID := make(map[model.RelationID]Edge, len(rels))
+	for i, ref := range rels {
+		byID[ids[i]] = byRel[ref]
+	}
+	out := make([]Edge, 0, len(relations))
+	for _, rel := range relations {
+		edge, ok := byID[rel.ID]
+		if !ok {
+			fail("the fixture generation carries no edge for relation %q", rel.ID)
+		}
+		out = append(out, edge)
+	}
+	return out
 }

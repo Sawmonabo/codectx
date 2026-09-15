@@ -23,24 +23,29 @@ import (
 // this fails on the retry with
 //
 //	the retry of a busy page was refused: CTX_CURSOR_INVALID
-type busyOnceAdjacency struct {
-	Adjacency
+//
+// It is injected on the PACKED reader rather than on the delivery adjacency:
+// the walk reads structure through GraphReader, so a failure on
+// Adjacency.Edges is a failure on a port the resumed page never calls and the
+// case would prove nothing.
+type busyOnceReader struct {
+	GraphReader
 	fail bool
 }
 
-func (b *busyOnceAdjacency) Edges(ctx context.Context, nodes []model.NodeID, direction model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
+func (b *busyOnceReader) Neighbours(ctx context.Context, refs []NodeRef, direction model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
 	if b.fail {
 		b.fail = false
-		return nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		return EdgePos{}, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
 			Message: "the adjacency store was contended for this read"}
 	}
-	return b.Adjacency.Edges(ctx, nodes, direction, kinds, after, limit)
+	return b.GraphReader.Neighbours(ctx, refs, direction, kinds, from, fn)
 }
 
 func TestBusyResumedTraversalPageKeepsItsContinuation(t *testing.T) {
 	f := newGraphFixture(t)
-	adj := &busyOnceAdjacency{Adjacency: f}
+	adj := &busyOnceReader{GraphReader: memGraphFor(f)}
 	signer, err := pagination.OpenSigner(t.TempDir())
 	if err != nil {
 		t.Fatalf("open signer: %v", err)
@@ -55,7 +60,7 @@ func TestBusyResumedTraversalPageKeepsItsContinuation(t *testing.T) {
 	// the page under test is a RESUMED one.
 	limits.MaxPageItems = 1
 	limits.QueryTimeout = time.Minute
-	e, err := New(Options{Adjacency: adj, Reader: memGraphFor(f), Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: f, Reader: adj, Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 	if err != nil {
 		t.Fatalf("new engine: %v", err)

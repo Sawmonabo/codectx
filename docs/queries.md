@@ -149,6 +149,20 @@ cursor that carries the walk's own frontier: the next request continues the walk
 from where it stopped, and once the walk completes the pages come from the
 ranked spool as above.
 
+The state that cursor names is internal to the generation it pins, and this is
+what that means for you. A walk carries two sets it has already admitted — the
+nodes it counted and the relations it served — and it carries the position it
+had reached in the level it was reading. All three are expressed in the
+generation's own internal numbering, so a cursor is **bound to one generation**
+and is refused with `CTX_CURSOR_INVALID` by any other, exactly as a cursor
+issued for a different query or a different endpoint is. Re-indexing between two
+pages of an answer therefore ends that answer: present the cursor and it is
+refused, rather than silently continued against a numbering in which the same
+values mean different code. Re-run the query. The two sets are what make the
+pages of one answer disjoint: `visited_count` and `edge_count` count distinct
+nodes and distinct relations, so a node reached again by a second route, a cycle
+or a `both`-direction edge is counted once, however many pages the answer takes.
+
 *Mid-ranking.* A deadline that lands after the walk finished but while the
 ranking is still running is reported the same way, and its cursor resumes the
 interrupted sort itself: the runs the ranking had already spilled are adopted by

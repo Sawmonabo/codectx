@@ -54,34 +54,23 @@ import (
 //
 // Owned by lane P-b.
 func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, o expandOptions,
-	visit func(frontierState, model.Relation) error) (walkState, error) {
+	visit func(frontierState, Edge) error) (walkState, error) {
 	if o.Budget == nil {
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
 			Message: "graph expansion requires a budget"}).WithDetail("operation", "run_walk_to_completion")
 	}
-	var (
-		lastOwner model.NodeID
-		lastKey   model.RelationID
-	)
-	// The keyset position is taken AFTER the visitor accepted the row, which is
-	// exactly when impactAccumulator records it: a row the visitor refused with
-	// errStopExpansion was not admitted, and resuming past it would drop it.
-	wrapped := func(fs frontierState, rel model.Relation) error {
-		if err := visit(fs, rel); err != nil {
-			return err
-		}
-		lastOwner, lastKey = fs.Node, rel.ID
-		return nil
-	}
-
-	if o.Visited == nil {
+	if o.Retain == nil {
 		return walkState{}, (&model.Error{Code: model.CodeInternal,
-			Message: "graph expansion requires a persistent visited set"}).
+			Message: "graph expansion requires a retained walk directory"}).
 			WithDetail("operation", "run_walk_to_completion")
+	}
+	reader, err := e.consumerReader()
+	if err != nil {
+		return walkState{}, err
 	}
 	for {
 		spent := o.Budget.edges
-		state, err := expand(ctx, e.adjacency, seeds, o, wrapped)
+		state, err := expand(ctx, reader, seeds, o, visit)
 		if err != nil {
 			return walkState{}, err
 		}
@@ -124,36 +113,19 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			o.Budget.deadlineHit = true
 			return state, nil
 		}
-		// This link's OWN admissions, as one ascending run of the persistent
-		// store. Only its own: the frontier it resumed belongs to the run the
-		// previous link wrote. The store is flushed by the append, so the next
-		// link's membership sweep reads what this one just admitted.
-		grown, err := o.Visited.appendRun(state.Admitted.addedNodes())
-		if err != nil {
-			return walkState{}, err
-		}
-		if e.probe != nil {
-			e.probe.VisitedBytes += grown
-		}
-		// The next link resumes from this one exactly as a signed continuation
-		// would -- same frontier, same keyset position, same cumulative visited
-		// set -- with the signer, the lease and the spool left out, because
-		// nothing here outlives the request.
-		resume := &resumeState{
-			Cursor:   traversalCursor{Depth: state.Depth, LastOwner: lastOwner, LastKey: lastKey},
+		// Each link COMMITTED its own levels as it closed them -- records to
+		// the retained level file, then bits -- so there is nothing to copy
+		// forward here. The next link resumes from this one exactly as a signed
+		// continuation would: same frontier, same scan position, same
+		// cumulative sets, with the signer, the lease and the store handover
+		// left out, because nothing here outlives the request.
+		o.Resume = &resumeState{
+			Cursor:   traversalCursor{Depth: state.Depth, LevelPos: state.LevelPos},
 			Budget:   o.Budget,
 			Frontier: state.Frontier,
-			Visited:  o.Visited.stream,
-			Filter:   o.Visited.filter,
+			Retain:   o.Retain,
 			Release:  func() {},
 		}
-		if state.LevelBoundary {
-			// The frontier has not been read at all yet, so the keyset position
-			// names the level BEFORE it; carrying it would drop every row whose
-			// owner sorts below that node (traverse.go states the rule).
-			resume.Cursor.LastOwner, resume.Cursor.LastKey = "", ""
-		}
-		o.Resume = resume
 		// Seeds are not re-entered on a resume; expand reads the frontier
 		// instead. Passing them again would be harmless but misleading.
 		seeds = nil
