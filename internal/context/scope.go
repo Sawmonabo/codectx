@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/graph"
@@ -671,16 +672,25 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			next = cursor
 		}
 		halt := stop != nil && stop() && (next != "" || stalled)
-		if impact.Meta.Truncated && !halt {
+		// A page whose truncation is the DEADLINE'S OWN does not narrow the
+		// scope when this call halts on it: the continuation is what answers
+		// that truncation, and narrowing would make a resumed plan report an
+		// incomplete scope the uninterrupted compile never reports.
+		//
+		// The reason is what decides it, and only the deadline's reason
+		// qualifies: a page can carry a user-set depth, frontier or visited
+		// bound AND arrive exactly as the halt fires, and suppressing THAT
+		// would publish a plan claiming a complete scope over a walk the
+		// operator's own bound cut. markTruncated keeps the FIRST reason, so a
+		// bound that fired before the deadline is the one on the page.
+		//
+		// Matched on the documented wire string (docs/queries.md) rather than
+		// imported: graph's reason constants are unexported, and the reason a
+		// caller reads is the contract both sides share.
+		deadlineCut := strings.HasPrefix(impact.Meta.TruncationReason, walkDeadlineReason)
+		if impact.Meta.Truncated && !(halt && deadlineCut) {
 			in.scope.ScopeComplete = false
 		}
-		// The page this call halts on is NOT a narrowed scope: its truncation
-		// is this compile's own deadline, and the continuation is what answers
-		// it. A page the deadline ends returns before graph.Impact marks any
-		// user-set bound (impact.go:265-280), so the depth, frontier or visited
-		// bound that ends the walk is reported by the leg that actually reaches
-		// it; a degraded provider still narrows the verdict, through the
-		// capability rows the deadline answer carries forward.
 		// Deduplicated per page rather than appended: the rows are a property
 		// of the generation and every page repeats the same disclosure, so
 		// folding them as they arrive keeps this bounded by the number of
@@ -734,6 +744,11 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	}
 	return finish()
 }
+
+// walkDeadlineReason is graph.Impact's truncation reason for a page the query
+// deadline ended. It is matched as a PREFIX: the variant for a page that
+// stalled before it could advance extends it.
+const walkDeadlineReason = "query deadline reached"
 
 // pinnedGeneration is the generation a walk request carries: the pinned one on
 // the first page and none on a continuation, because a cursor already pins the
