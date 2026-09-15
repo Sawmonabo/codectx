@@ -1029,8 +1029,13 @@ func (s *stack) openCompiler(graph contextpkg.GraphFactory) error {
 		Logger: s.logger,
 		// The compile's external-sort runs live beside the query spools, under
 		// the same resources.max_temp_bytes area the workspace already sweeps
-		// and reports (ruling C5').
-		SortDir: s.spools.SortDir(),
+		// and reports (ruling C5'), and SortDir is derived from the same store
+		// rather than named twice. The spool store also holds the leased state
+		// directory a deadline-interrupted compile continues from (ruling C7),
+		// which is why the signer and the lease store come with it.
+		Spools: s.spools,
+		Signer: s.signer,
+		Leases: s.leases,
 	})
 	if err != nil {
 		return err

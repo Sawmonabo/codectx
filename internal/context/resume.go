@@ -1,12 +1,14 @@
 package context
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -310,4 +312,151 @@ func moveRuns(dir, name string, runs []string) ([]string, error) {
 		out = append(out, base)
 	}
 	return out, nil
+}
+
+// The Compile-side half of ruling C7: WHEN a compile stops, what it writes at
+// that boundary, and how the call after it comes back.
+//
+// There is exactly ONE checkpointed boundary, between P-F and P-G. It is the
+// boundary where the expansion, the ranking and every stream the budget half
+// reads are complete, where nothing has been persisted, and where the carry is
+// three already-merged, already-folded sorted runs plus a bounded scalar
+// record. A deadline at any other boundary still ends the call as the error it
+// was before ruling C7: the compiler never checks a deadline at a boundary it
+// cannot checkpoint, because a stop it cannot resume is a lost compile and not
+// a continuation.
+
+// checkpointPassBudget is the pass index the boundary's checkpoint records and
+// a resuming call re-enters at: the budget half, P-G.
+const checkpointPassBudget = 7
+
+// stream names inside a checkpoint. They are the state file's keys, so they are
+// constants rather than literals at two call sites.
+const (
+	streamRanked = "ranked"
+	streamPaths  = "kept-path"
+	streamHops   = "kept-hop"
+)
+
+// deadlineReached reports whether ctx has nothing left to spend. It is checked
+// only at a checkpointed boundary, where a true answer means "stop and
+// continue" rather than "fail".
+func deadlineReached(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	dl, ok := ctx.Deadline()
+	return ok && !time.Now().Before(dl)
+}
+
+// resumedHalf is an opened continuation: the verified cursor, the leased state
+// directory and the state file it carries.
+type resumedHalf struct {
+	Cursor contextCursor
+	Dir    string
+	State  checkpointState
+}
+
+// openResumed verifies token against this compile's binding and request
+// identity, opens the leased state directory and reads its state file. The
+// state file's own pass and request hash are re-checked against the token's:
+// the two are written at the same instant, and a disagreement means the
+// directory is not the one the token was minted for.
+func (c *Compiler) openResumed(ctx context.Context, token string, b model.Binding, requestHash string) (*resumedHalf, error) {
+	cur, dir, err := c.resumeState(ctx, token, b, requestHash)
+	if err != nil {
+		return nil, err
+	}
+	st, err := readCheckpointState(dir)
+	if err != nil {
+		return nil, err
+	}
+	if st.Pass != cur.Pass || st.RequestHash != requestHash {
+		return nil, cursorExpired("the continuation state does not belong to this cursor")
+	}
+	if st.Pass != checkpointPassBudget {
+		return nil, cursorExpired("the continuation state was written at a boundary this build does not resume")
+	}
+	return &resumedHalf{Cursor: cur, Dir: dir, State: st}, nil
+}
+
+// checkpointHalf writes the P-F boundary's carry into a fresh state directory
+// beside the compile's runs, hands it to the spool store under a fresh
+// cursor-owned lease and answers the signed token.
+//
+// The directory is staged in the sort area so adoption is an O(1)
+// same-filesystem rename, and the state file is written LAST so a directory a
+// cursor names always carries the runs it names.
+//
+// All three streams are the ALREADY-SORTED, already-folded class, so they are
+// restored with their comparator and no fold: see the two-class rule at the top
+// of this file.
+func (c *Compiler) checkpointHalf(ctx context.Context, b model.Binding, requestHash string,
+	ranked rankedStreams, scoped scopeResult, scopeComplete bool,
+) (string, error) {
+	if !c.continuationsAvailable() {
+		// No continuation is on offer, so the deadline is what it always was.
+		return "", contextErr(ctx, context.DeadlineExceeded)
+	}
+	dir, err := os.MkdirTemp(c.sortDir, "ctx-state-")
+	if err != nil {
+		return "", &model.Error{Code: model.CodeInternal, Message: "context checkpoint: " + err.Error()}
+	}
+	runBytes := pagination.SortRunBytes(int64(c.cfg.Resources.QueryMemoryBytes))
+	st := checkpointState{
+		Pass:        checkpointPassBudget,
+		RequestHash: requestHash,
+		Streams:     map[string][]string{},
+		Scalars: checkpointScalars{
+			Completeness:     scoped.Completeness,
+			ScopeComplete:    scopeComplete,
+			ReasonsDropped:   scoped.ReasonsDropped,
+			ReasonsTruncated: scoped.ReasonsTruncated,
+		},
+	}
+	fail := func(err error) (string, error) {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	if st.Streams[streamRanked], err = checkpointRun(dir, streamRanked, runBytes, ranked.Ranked, lessRank, sizeOfCand); err != nil {
+		return fail(err)
+	}
+	if st.Streams[streamPaths], err = checkpointRun(dir, streamPaths, runBytes, ranked.Paths, lessPathSeq, sizeOfPath); err != nil {
+		return fail(err)
+	}
+	if st.Streams[streamHops], err = checkpointRun(dir, streamHops, runBytes, ranked.Hops, lessHopSeq, sizeOfHop); err != nil {
+		return fail(err)
+	}
+	if err := writeCheckpointState(dir, st); err != nil {
+		return fail(err)
+	}
+	return c.nextStateCursor(ctx, b, requestHash, st.Pass, dir)
+}
+
+// restoreHalf adopts a checkpoint's three streams into this call's sort area
+// and answers them together with the scope carry the budget half and the
+// manifest header read, exactly as frontHalf would have produced them.
+func (c *Compiler) restoreHalf(s *compileSorts, r *resumedHalf) (rankedStreams, scopeResult, bool, error) {
+	fail := func(err error) (rankedStreams, scopeResult, bool, error) {
+		return rankedStreams{}, scopeResult{}, false, err
+	}
+	rankedRun, err := restoreRun(s, r.Dir, streamRanked, r.State.Streams[streamRanked], lessRank)
+	if err != nil {
+		return fail(err)
+	}
+	paths, err := restoreRun(s, r.Dir, streamPaths, r.State.Streams[streamPaths], lessPathSeq)
+	if err != nil {
+		return fail(err)
+	}
+	hops, err := restoreRun(s, r.Dir, streamHops, r.State.Streams[streamHops], lessHopSeq)
+	if err != nil {
+		return fail(err)
+	}
+	scoped := scopeResult{
+		Completeness:     r.State.Scalars.Completeness,
+		ReasonsDropped:   r.State.Scalars.ReasonsDropped,
+		ReasonsTruncated: r.State.Scalars.ReasonsTruncated,
+	}
+	return rankedStreams{Ranked: rankedRun, Paths: paths, Hops: hops}, scoped,
+		r.State.Scalars.ScopeComplete, nil
 }
