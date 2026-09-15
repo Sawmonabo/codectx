@@ -321,6 +321,15 @@ functional for every entry it holds and honestly unavailable for the rest —
 reports the offline-policy checks. What that report says is what those checks
 found; the flag itself asserts nothing about the installation.
 
+`codectx doctor`'s `toolchain:` rows are the **actionable subset**, not an
+inventory: one row per pinned tool this repository selects -- the same selection
+`prefetch --for-repo` installs -- and cannot currently use. A tool the
+repository does not select is not listed, because nothing will ever run it
+here; a selected tool that is installed is not listed either, because there is
+nothing to do about it. A selected payload that is damaged **is** listed, and
+fails the report, although it is installed: doctor is the only place a corrupt
+store surfaces. `codectx tools status` is the inventory.
+
 `[tools] mirror` is the third option, for a host that has a network but not the
 publishers': it relocates bytes and never changes which bytes are accepted,
 because the digests stay the lock's. See
