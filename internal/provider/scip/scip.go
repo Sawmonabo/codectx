@@ -66,7 +66,7 @@ import (
 // the document hash covers changes, which forces a bump here in turn.
 const (
 	ID      = "scip"
-	Version = "3"
+	Version = "4"
 )
 
 // Capabilities this provider offers. Definitions covers symbol nodes and
