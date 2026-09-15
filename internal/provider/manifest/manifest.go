@@ -16,6 +16,7 @@ package manifest
 
 import (
 	"context"
+	"github.com/Sawmonabo/codectx/internal/config"
 	"io"
 	"path"
 	"strings"
@@ -64,7 +65,7 @@ type Options struct {
 	// MaxParseFileBytes is the largest manifest or document parsed. A
 	// larger file stays retained and searchable; its capability here is
 	// unavailable.
-	MaxParseFileBytes int64
+	MaxParseFileBytes config.Limit
 }
 
 // Provider is the manifest provider.
@@ -74,9 +75,6 @@ type Provider struct {
 
 // New validates the options and returns the provider.
 func New(opts Options) (*Provider, error) {
-	if opts.MaxParseFileBytes <= 0 {
-		return nil, &model.Error{Code: model.CodeArgumentInvalid, Message: "manifest provider needs a positive max_parse_file_bytes; zero would mean unlimited"}
-	}
 	return &Provider{opts: opts}, nil
 }
 
@@ -138,7 +136,7 @@ func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink
 	}
 	defer rc.Close()
 	e := filesystem.NewEmitter(req, sink, fv)
-	if fv.Size > p.opts.MaxParseFileBytes {
+	if p.opts.MaxParseFileBytes.Exceeded(fv.Size) {
 		e.Capability(capability, model.CapabilityUnavailable, model.CodeResourceLimit)
 		return e.Result(), nil
 	}

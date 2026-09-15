@@ -120,11 +120,11 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 // by the caller.
 func (f *fixture) providers(withSCIP bool) []provider.Provider {
 	f.t.Helper()
-	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: f.cfg.Workspace.MaxSearchFileBytes.Value()})
+	fs, err := filesystem.New(filesystem.Options{MaxSearchFileBytes: f.cfg.Workspace.MaxSearchFileBytes})
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes.Value()})
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes})
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func (f *fixture) treesitter() provider.Provider {
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		f.t.Fatal(err)
 	}
-	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes.Value(),
+	p, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: f.cfg.Workspace.MaxParseFileBytes,
 		WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: workDir})
 	if err != nil {
