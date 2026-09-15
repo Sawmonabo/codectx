@@ -1,6 +1,7 @@
 package search
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -30,31 +31,81 @@ type ranked struct {
 	Occurrences int64
 }
 
-// less is the total Section 14.2 tie-break order: tier rank, descending
-// ScoreMicros, path, start byte, NodeID, search key.
+// cmpBounded compares two candidates on the bounded part of the Section 14.2
+// tie-break order: tier rank, descending ScoreMicros, path, start byte. It
+// returns 0 when those four keys are equal; cmpScored below breaks that tie on
+// the candidate's content, and only then on the identity keys.
 //
 // Every comparison is on an int, an int64, a uint64 or an exact string in Go's
 // byte order. The struct carries no float field at all, which is what makes
 // "nothing compares floats" (digest §4) structural rather than a convention a
 // later edit could break: a score reaches this function only after
 // quantizeScore has turned it into an int64.
-func (a ranked) less(b ranked) bool {
+func (a ranked) cmpBounded(b ranked) int {
 	if ar, br := a.Tier.Rank(), b.Tier.Rank(); ar != br {
-		return ar < br
+		return cmp.Compare(ar, br)
 	}
 	if a.ScoreMicros != b.ScoreMicros {
-		return a.ScoreMicros > b.ScoreMicros
+		return cmp.Compare(b.ScoreMicros, a.ScoreMicros)
 	}
 	if a.Path != b.Path {
-		return a.Path < b.Path
+		return cmp.Compare(a.Path, b.Path)
 	}
-	if a.StartByte != b.StartByte {
-		return a.StartByte < b.StartByte
+	return cmp.Compare(a.StartByte, b.StartByte)
+}
+
+// cmpScored is the TOTAL order the answer is served in, and it is a pure
+// function of the repository's CONTENT. That is the whole point of the keys
+// that follow the bounded four.
+//
+// NodeID and SearchKey cannot carry the tail of this order on their own:
+// model.NewFileID hashes the repository together with the path, so a node id
+// and a heading's search key both change when the same tree is indexed at a
+// different root. Ordering on them made the served sequence a function of
+// WHERE the tree lived and of the order documents happened to be interned,
+// which is how a delta re-index and a fresh index of a byte-identical tree
+// came to serve different pages. End byte, kind, name, qualified name and
+// signature are derived from the file's bytes alone, so they order two
+// candidates the same way in every index of the same content. NodeID and
+// SearchKey stay last purely as a totality backstop.
+//
+// Comparing the served strings costs no extra memory: scored already embeds
+// the SearchHit it will serve. The bounded `ranked` tuple still carries none
+// of them, so the external sort's run buffer is unchanged.
+func cmpScored(a, b scored) int {
+	if c := a.ranked.cmpBounded(b.ranked); c != 0 {
+		return c
 	}
-	if a.NodeID != b.NodeID {
-		return a.NodeID < b.NodeID
+	if c := cmp.Compare(spanEnd(a.Span), spanEnd(b.Span)); c != 0 {
+		return c
 	}
-	return a.SearchKey < b.SearchKey
+	if c := cmp.Compare(a.Hit.Kind, b.Hit.Kind); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.Hit.Name, b.Hit.Name); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.Hit.QualifiedName, b.Hit.QualifiedName); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.Hit.Signature, b.Hit.Signature); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(a.NodeID, b.NodeID); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.SearchKey, b.SearchKey)
+}
+
+// spanEnd is the hydration interval's end byte, or -1 when a candidate carries
+// no span. An exact-tier candidate may have none; -1 is below every real end
+// byte and is the same value in every index, so the order stays total and
+// content-derived either way.
+func spanEnd(s *model.ByteRange) int64 {
+	if s == nil {
+		return -1
+	}
+	return int64(s.End)
 }
 
 // dedupKey is the digest §4 deduplication key: the node id when the candidate
@@ -102,6 +153,15 @@ type scored struct {
 	Reasons []string         `json:"reasons,omitempty"`
 	Hit     model.SearchHit  `json:"hit"`
 	Span    *model.ByteRange `json:"span,omitempty"`
+	// Folded is the highest ScoreMicros seen under this candidate's
+	// deduplication key so far. It is kept SEPARATE from ranked.ScoreMicros
+	// on purpose: ranked.ScoreMicros stays the candidate's OWN score for the
+	// whole deduplication pass, so fold picks its survivor from a key that
+	// never moves, and the fold is therefore a commutative, associative
+	// minimum over the group instead of a left-to-right reduction whose
+	// result depends on arrival order. results() promotes Folded into
+	// ScoreMicros once the pass is closed, before the set is ordered by rank.
+	Folded int64 `json:"folded_score,omitempty"`
 }
 
 // collector deduplicates candidates as they arrive and orders the distinct
@@ -124,7 +184,7 @@ type scored struct {
 // costs disk in this fold and one page of stored nodes upstream.
 //
 // TWO PASSES ARE NECESSARY, not a shortcut. fold sets ScoreMicros = max(a, b)
-// and score is less's second key, so a fold MOVES its survivor's rank: two
+// and score is cmpScored's second key, so a fold MOVES its survivor's rank: two
 // records with one deduplication key can sit arbitrarily far apart in rank
 // order and folding equal-ranked neighbours would be wrong. Pass 1 sorts by
 // the deduplication key and folds; pass 2 sorts the folded stream by rank with
@@ -199,33 +259,60 @@ func sizeOfScored(v scored) int64 {
 // add folds one candidate into the set. A repeat of a key folds into the
 // entry already held; a new key is always admitted.
 func (c *collector) add(r ranked, f hitFacts, reasons ...string) error {
-	return c.dedup.Add(scored{ranked: r, Reasons: boundReasons(nil, reasons), Hit: f.hit, Span: f.span})
+	return c.dedup.Add(scored{ranked: r, Reasons: boundReasons(nil, reasons), Hit: f.hit, Span: f.span, Folded: r.ScoreMicros})
 }
 
 // Close releases the deduplication pass's spill files.
 func (c *collector) Close() error { return c.dedup.Close() }
 
-// fold merges two candidates for the same entity. The survivor is whichever
-// sorts first, so it keeps the LOWEST tier rank seen (tier rank is less's
-// first key). Its ScoreMicros is the highest of the two: digest §4 zeroes the
-// exact tiers "unless the document also matched lexically, keeping that
-// score", and the lexical score is the non-zero one. Occurrences sum, and the
-// reasons of both sides survive up to the Section 14.3 bound.
+// fold merges two candidates for the same entity. It is a MINIMUM over the
+// group under cmpScored plus three accumulators, so it is commutative and
+// associative: the survivor and everything it carries are the same whatever
+// order the external sort happens to present a key's arrivals in. That is what
+// makes the served answer a pure function of the repository's content, and it
+// is why nothing here reads an accumulated field.
 //
-// The SERVABLE facts come from the left side always: every candidate under one
-// key describes the same entity, and the first writer wins exactly as the side
-// map it replaces did. a is the accumulated left because the external sort
-// folds a key's arrivals left to right in arrival order.
+//   - The survivor is whichever sorts first, so it keeps the LOWEST tier rank
+//     seen (tier rank is cmpScored's first key) and, within a tier, the highest
+//     OWN score. Comparing accumulated scores instead would let a low-scoring
+//     candidate that had already absorbed a high score out-rank a genuinely
+//     higher-scoring sibling, which is order-dependent.
+//   - Folded is the highest score of the two: digest §4 zeroes the exact tiers
+//     "unless the document also matched lexically, keeping that score", and the
+//     lexical score is the non-zero one. results() promotes it.
+//   - Occurrences sum, and the reasons of both sides survive up to the Section
+//     14.3 bound.
+//
+// The SERVABLE facts travel with the survivor -- they are not taken from the
+// left side. Two candidates under one deduplication key do NOT always describe
+// the same servable entity: every Markdown heading of a file carries that
+// file's document node as its NodeID (internal/provider/manifest/markdown.go),
+// so a whole file's headings fold into one key while differing in name, range
+// and score. Serving the left side's facts served whichever heading the
+// lexical walk reached first, which is doc_id order -- and a delta re-index
+// carries doc_ids forward while a fresh index assigns them anew, so the same
+// tree answered with different rows depending on how it had been indexed.
 func fold(a, b scored) scored {
-	keep := a
-	if b.ranked.less(a.ranked) {
-		keep = b
+	keep, other := a, b
+	if cmpScored(b, a) < 0 {
+		keep, other = b, a
 	}
-	keep.ScoreMicros = max(a.ScoreMicros, b.ScoreMicros)
+	keep.Folded = max(a.Folded, b.Folded)
 	keep.Occurrences = a.Occurrences + b.Occurrences
-	keep.Reasons = boundReasons(a.Reasons, b.Reasons)
-	keep.Hit, keep.Span = a.Hit, a.Span
+	keep.Reasons = mergeReasons(keep.Reasons, other.Reasons)
 	return keep
+}
+
+// mergeReasons unions two reason lists in a fixed order. The union is sorted
+// before it is bounded so that WHICH reasons survive an overflow -- and the
+// order they are served in -- depend on the reasons themselves and not on the
+// order the fold happened to see them in. Reasons are part of the served hit,
+// so an arrival-ordered list would leave the very non-determinism the fold
+// above removes.
+func mergeReasons(a, b []string) []string {
+	all := slices.Concat(a, b)
+	slices.Sort(all)
+	return boundReasons(nil, all)
 }
 
 // foldScored adapts fold to the sort's fold signature. It cannot fail: every
@@ -246,20 +333,17 @@ func (c *collector) results() (*pagination.SortedRun[scored], error) {
 		return nil, err
 	}
 	defer deduped.Close()
-	byRank, err := c.newSort("searchrank-", func(a, b scored) int {
-		switch {
-		case a.ranked.less(b.ranked):
-			return -1
-		case b.ranked.less(a.ranked):
-			return 1
-		}
-		return 0
-	})
+	byRank, err := c.newSort("searchrank-", cmpScored)
 	if err != nil {
 		return nil, err
 	}
 	defer byRank.Close()
-	if err := deduped.Each(byRank.Add); err != nil {
+	// The deduplication pass is closed, so a survivor's folded score is final
+	// and becomes the score it is ranked and served with.
+	if err := deduped.Each(func(v scored) error {
+		v.ScoreMicros = v.Folded
+		return byRank.Add(v)
+	}); err != nil {
 		return nil, err
 	}
 	run, err := byRank.Sorted()
