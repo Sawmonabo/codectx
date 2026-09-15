@@ -210,6 +210,12 @@ type UnitWriter struct {
 	ids   interner
 	nodes *refCache
 
+	// stmts holds the prepared statements of the write transaction currently
+	// running, so the dozen SQL texts the per-row helpers issue are parsed
+	// once per transaction instead of once per row (stmtcache.go). It is
+	// installed by inTx for the life of one transaction and nil outside one.
+	stmts *stmtCache
+
 	// evidenceClipped records what SealUnit dropped to hold the evidence
 	// bound, so a caller can report the truncation instead of it being silent.
 	evidenceClipped int64
@@ -481,7 +487,7 @@ func (w *UnitWriter) PutKeyedNodes(ctx context.Context, facts []model.NodeFact, 
 		return err
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
+		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			kindOf, err := tx.PrepareContext(ctx, `SELECT kind FROM node_ids WHERE id = ?`)
 			if err != nil {
@@ -590,7 +596,7 @@ func (w *UnitWriter) PutKeyedRelations(ctx context.Context, facts []model.Relati
 		return err
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
+		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			ins, err := tx.PrepareContext(ctx, `INSERT INTO relation_facts(unit_id, relation_id) VALUES(?, ?) ON CONFLICT(unit_id, relation_id) DO NOTHING`)
 			if err != nil {
@@ -648,7 +654,7 @@ func (w *UnitWriter) PutAliases(ctx context.Context, aliases []model.NativeAlias
 		return err
 	}
 	return w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
+		return w.providerWrite(tx, func() error {
 			defer w.endBatch()
 			stmt, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO native_aliases(unit_id, scope_key_id, native_key_id, node_id) VALUES(?, ?, ?, ?)`)
 			if err != nil {
@@ -709,7 +715,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 	}
 	var inserted int64
 	err = w.s.write(ctx, func(tx *sql.Tx) error {
-		return w.providerWrite(func() error {
+		return w.providerWrite(tx, func() error {
 			content, err := tx.PrepareContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind, name, qualified_name, signature, start_byte, end_byte, token_count, doc_id)
 				VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 			if err != nil {
@@ -766,7 +772,27 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 // CTX_PROVIDER_OUTPUT_INVALID: an unregistered endpoint, an input file the
 // unit did not declare or a duplicated fact is malformed provider output, not
 // a caller argument error.
-func (w *UnitWriter) providerWrite(fn func() error) error {
+// providerWrite runs one provider batch inside tx and translates what the
+// batch reports.
+//
+// It also installs the transaction's statement cache for the duration of the
+// batch and finalises every statement that cache prepared on the way out, so
+// the dozen SQL texts the per-row helpers issue are parsed once per batch
+// rather than once per row. Every per-row helper reaches the cache through
+// w.stmts; outside a batch it is nil and those helpers prepare on the
+// transaction they are handed, which is what every non-writer caller of the
+// same code does.
+func (w *UnitWriter) providerWrite(tx *sql.Tx, fn func() error) error {
+	cache := newStmtCache(tx)
+	w.stmts = cache
+	if in, ok := w.ids.(*dbInterner); ok {
+		in.stmts = cache
+		defer func() { in.stmts = nil }()
+	}
+	defer func() {
+		w.stmts = nil
+		cache.close()
+	}()
 	err := fn()
 	if err == nil {
 		return nil
@@ -787,7 +813,7 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 	}
 	fileRaw, _ := model.DecodeID(string(file))
 	var stored []byte
-	err := tx.QueryRowContext(ctx, `SELECT content_hash FROM unit_inputs WHERE unit_id = ? AND file_id = ?`, w.rowID, fileRaw).Scan(&stored)
+	err := w.stmts.queryRow(ctx, tx, `SELECT content_hash FROM unit_inputs WHERE unit_id = ? AND file_id = ?`, w.rowID, fileRaw).Scan(&stored)
 	if isNoRows(err) {
 		return nil, &model.Error{Code: model.CodeProviderOutputInvalid,
 			Message: "fact names a file the unit did not declare as an input", Details: map[string]string{"file_id": string(file)}}
@@ -813,12 +839,15 @@ func (w *UnitWriter) inputFile(ctx context.Context, tx *sql.Tx, file model.FileI
 // pure function of the occurrence's fields and ON CONFLICT(id) DO NOTHING is
 // what makes a republished occurrence idempotent.
 func (w *UnitWriter) insertEvidence(ctx context.Context, tx *sql.Tx, list []model.Evidence, node nodeRef, rel relRef) error {
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, content_hash_bound)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`)
+	const insert = `INSERT INTO evidence(id, unit_id, node_id, relation_id, precision, file_id, start_byte, end_byte, native_key_id, detail, content_hash_bound)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`
+	stmt, cached, err := w.stmts.prepare(ctx, tx, insert)
 	if err != nil {
 		return err
 	}
-	defer stmt.Close()
+	if !cached {
+		defer stmt.Close()
+	}
 	for _, e := range list {
 		idRaw, _ := model.DecodeID(string(e.ID))
 		fileRaw, err := w.inputFile(ctx, tx, e.FileID, e.ContentHash)
@@ -857,7 +886,7 @@ func (w *UnitWriter) nodeRef(ctx context.Context, tx *sql.Tx, id model.NodeID) (
 		return nodeRef(ref), nil
 	}
 	var ref int64
-	err = tx.QueryRowContext(ctx, `SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&ref)
+	err = w.stmts.queryRow(ctx, tx, `SELECT id FROM node_ids WHERE canonical = ?`, raw).Scan(&ref)
 	if isNoRows(err) {
 		return noRef, &model.Error{Code: model.CodeProviderOutputInvalid,
 			Message:     "fact names a node identity that is not registered",
@@ -984,7 +1013,7 @@ func (w *UnitWriter) checkRepeatedNode(ctx context.Context, tx *sql.Tx, res sql.
 	var language, name, qualified, signature, metadata string
 	var file []byte
 	var start, end sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
+	if err := w.stmts.queryRow(ctx, tx, `SELECT language, name, qualified_name, signature, file_id, start_byte, end_byte, metadata_json
 		FROM node_facts WHERE unit_id = ? AND node_id = ?`, w.rowID, int64(ref)).Scan(&language, &name, &qualified, &signature, &file, &start, &end, &metadata); err != nil {
 		return err
 	}
