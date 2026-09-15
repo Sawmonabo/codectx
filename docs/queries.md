@@ -150,16 +150,16 @@ from where it stopped, and once the walk completes the pages come from the
 ranked spool as above.
 
 The state that cursor names is internal to the generation it pins, and this is
-what that means for you. A walk carries two sets it has already admitted — the
-nodes it counted and the relations it served — and it carries the position it
-had reached in the level it was reading. All three are expressed in the
-generation's own internal numbering, so a cursor is **bound to one generation**
+what that means for you. A walk carries the set of nodes it has already
+admitted, the level it had reached, and its position inside that level. All
+three are expressed in the generation's own internal numbering, so a cursor is
+**bound to one generation**
 and is refused with `CTX_CURSOR_INVALID` by any other, exactly as a cursor
 issued for a different query or a different endpoint is. Re-indexing between two
 pages of an answer therefore ends that answer: present the cursor and it is
 refused, rather than silently continued against a numbering in which the same
-values mean different code. Re-run the query. The two sets are what make the
-pages of one answer disjoint: `visited_count` and `edge_count` count distinct
+values mean different code. Re-run the query. That admitted set is what makes
+the pages of one answer disjoint: `visited_count` and `edge_count` count distinct
 nodes and distinct relations, so a node reached again by a second route, a cycle
 or a `both`-direction edge is counted once, however many pages the answer takes.
 
@@ -212,9 +212,25 @@ a page that exhausts one stops there, reports the reason (`visited node budget
 exhausted`, `edge budget exhausted`) and mints a continuation cursor; following
 that cursor reaches the same nodes an unbounded walk would, so a budget you set
 shapes the size of a page and never the completeness of the answer. The
-frontier memory budget behaves the same way: a level that reaches it spills to
-the continuation spool, reports `frontier memory budget exhausted`, and the
-next page carries on from where it stopped.
+frontier memory budget is not one of them: it bounds how much of a level is
+held in memory at once, and a level past it spills to the walk's own scratch and
+carries on, so it changes where the level lives and never which edges the answer
+holds.
+
+A walk delivers one level at a time, through two states a cursor can name. While
+**collecting**, it reads the adjacency of the level before it and keeps every
+edge exactly once — under `--direction both` an edge whose two ends are on the
+same level is kept from its source, and one that reaches back to an earlier
+level was already delivered there. Nothing is served from a level being
+collected; a deadline here hands back the position the read reached. The level
+is then sorted **once**, by the node an entry reaches, then the node it was
+reached from, then the relation — all three identifiers of the facts themselves,
+so two indexes of the same tree serve one order — and every page of that level
+is a read straight out of the sorted level at the byte offset the cursor
+carries. A continuation therefore resumes either the read that was collecting
+the level or the offset that was serving it, and in both cases it neither
+repeats an edge nor loses one. `visited_count` counts the nodes each level
+admits as the level closes, which is when the walk admits them.
 
 Two stops end an answer rather than a page, and both say so. `--depth` is part
 of the query a cursor is bound to, so a walk that ran out of depth is truncated
@@ -291,7 +307,7 @@ where the workspace is composed, and handed to it.
 | `resources.max_page_items` | Default and ceiling for `--limit`. |
 | `resources.query_timeout` | The default deadline a walk runs under, taken only by a call that carries none of its own. Unlimited by default, so an unbounded walk answers in full. |
 | `resources.max_concurrent_graph_queries` | Process-wide limit on concurrent graph queries. Waiting past the request deadline is `CTX_RESOURCE_LIMIT`. |
-| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills to the continuation spool, the page stops there, reports `frontier memory budget exhausted` and hands back a cursor the next page resumes the walk from. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
+| `resources.query_memory_bytes` | The one query memory admission, and two structures draw on it. For a traversal it is the ceiling on the edges one frontier level may hold at once: a level that reaches it spills the edges it has collected to the walk's own scratch and carries on reading, so it bounds the memory a level costs and never the edges the answer holds. For `path` it is the ceiling on one slice of the cost bucket being settled — the rest of that search's state is on disk — so reaching it costs another slice and never truncates the route list. For `search` it also sets the external sort's in-memory run budget — a quarter of this number, floored so a small setting slows the sort rather than failing the query — which is what keeps the deduplicated and ranked sets off the heap: runs spill to disk and merge. It is a share of the one admission rather than a key of its own, so the parts can never oversubscribe the whole. Peak heap on both paths is a function of this number rather than of the graph or the match count. |
 | `storage.query_cursor_ttl` | Lifetime of a `--cursor` token and of the retention lease it names. It is also the lifetime of a source receipt: a receipt `codectx context read` issued is refused with `CTX_CURSOR_INVALID` once this has elapsed. |
 
 ## Context compilation reads the same facts
