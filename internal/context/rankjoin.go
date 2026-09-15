@@ -22,7 +22,6 @@ package context
 
 import (
 	"context"
-	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -75,96 +74,6 @@ func (c *Compiler) edgeScanBudget() (int, bool) {
 		return 0, false
 	}
 	return l.Int(), true
-}
-
-func (c *Compiler) relationsOnPathsWholeSet(ctx context.Context, reader relationReader,
-	cands []candidate) (map[model.RelationID]model.Relation, bool, error) {
-	wanted := map[model.RelationID]struct{}{}
-	nodes := make([]model.NodeID, 0, len(cands))
-	seenNode := map[model.NodeID]struct{}{}
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, rel := range p.Relations {
-				wanted[rel] = struct{}{}
-			}
-		}
-		if cand.NodeID == "" {
-			continue
-		}
-		if _, dup := seenNode[cand.NodeID]; dup {
-			continue
-		}
-		seenNode[cand.NodeID] = struct{}{}
-		nodes = append(nodes, cand.NodeID)
-	}
-	out := make(map[model.RelationID]model.Relation, len(wanted))
-	if len(wanted) == 0 || len(nodes) == 0 {
-		return out, len(wanted) == 0, nil
-	}
-
-	limit := c.pageLimit()
-	budget, bounded := c.edgeScanBudget()
-	scanned := 0
-	for start := 0; start < len(nodes) && len(out) < len(wanted); start += limit {
-		batch := nodes[start:min(start+limit, len(nodes))]
-		var after model.RelationID
-		for len(out) < len(wanted) {
-			page, err := reader.EdgesBatch(ctx, batch, model.DirectionBoth, scopeRelations, after, limit)
-			if err != nil {
-				return nil, false, err
-			}
-			for _, rel := range page {
-				if _, want := wanted[rel.ID]; want {
-					out[rel.ID] = rel
-				}
-				after = rel.ID
-			}
-			scanned += len(page)
-			if len(page) < limit || (bounded && scanned >= budget) {
-				break
-			}
-		}
-		if bounded && scanned >= budget {
-			break
-		}
-	}
-	return out, len(out) == len(wanted), nil
-}
-
-// resolvePrecisionWholeSet is today's resolvePrecision (rank.go), moved here
-// unchanged except for the reader type, for the same reason.
-func (c *Compiler) resolvePrecisionWholeSet(ctx context.Context, reader relationReader,
-	cands []candidate) (map[model.RelationID]int64, error) {
-	seen := map[model.RelationID]struct{}{}
-	ids := make([]model.RelationID, 0, len(cands))
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, id := range p.Relations {
-				if _, dup := seen[id]; dup || id == "" {
-					continue
-				}
-				seen[id] = struct{}{}
-				ids = append(ids, id)
-			}
-		}
-	}
-	out := make(map[model.RelationID]int64, len(ids))
-	if len(ids) == 0 {
-		return out, nil
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	batch := c.pageLimit()
-	for start := 0; start < len(ids); start += batch {
-		end := min(start+batch, len(ids))
-		rows, err := reader.EvidenceBatch(ctx, ids[start:end], evidencePerRelation)
-		if err != nil {
-			return nil, contextErr(ctx, err)
-		}
-		for id, evidence := range rows {
-			out[id] = mostPrecise(evidence)
-		}
-	}
-	return out, nil
 }
 
 // ---------------------------------------------------------------------------
