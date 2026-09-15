@@ -767,3 +767,54 @@ func TestManagedToolIdentity(t *testing.T) {
 		}
 	})
 }
+
+// TestOverLimitFieldsAreDroppedAndCounted protects plan row 26: a value over a
+// wire field bound is degradation of that record, never a refusal of the
+// index. One 128-KiB generated symbol name in a monorepo's index used to abort
+// the whole import, so the unit published nothing at all -- the maximal
+// version of the loss it was guarding against.
+//
+// The two halves the split rests on are asserted together: an over-limit
+// IDENTIFYING field (the occurrence's symbol) drops that RECORD, because a
+// symbol-less occurrence is a fact about nothing; an over-limit DECORATIVE
+// field (the symbol's display name) drops only the FIELD and the record is
+// still published. Both are counted per bound on the unit's capability row --
+// silence there is the class-G defect this replaces.
+func TestOverLimitFieldsAreDroppedAndCounted(t *testing.T) {
+	files := fixture(t)
+	longSymbol := "scip-fixture . . " + strings.Repeat("x", model.MaxNativeKeyBytes)
+	longName := strings.Repeat("n", model.MaxNameBytes+1)
+	symbolRecord := appendBytes(appendBytes(nil, 1, []byte(symBar)), 6, []byte(longName))
+	doc := documentRecord("pkg/d.go", "go", 1,
+		occurrenceRecord(longSymbol, 1, 2, 5, 8),
+		occurrenceRecord(symBar, 1, 2, 5, 8))
+	doc = appendBytes(doc, 3, symbolRecord)
+	files["drops.scip"] = string(miniIndex("scip-fixture", "0.1.0", doc))
+	inputs := append([]string{"drops.scip"}, sourcePaths...)
+	got, rep := importDelta(t, providertest.New(t, files), newProvider(t, "drops.scip"),
+		scip.ImportScope("drops.scip"), inputs, nil)
+
+	if rep.Result.State != model.RunSucceeded {
+		t.Fatalf("an index carrying an over-limit symbol failed the unit: state=%s", rep.Result.State)
+	}
+	if len(got.nodes) == 0 {
+		t.Fatal("the in-bound occurrence published nothing; an over-limit sibling must not take the record with it")
+	}
+	if len(rep.Result.Capabilities) == 0 {
+		t.Fatal("the run reported no capability states")
+	}
+	d := rep.Result.Capabilities[0].Details
+	if want := "occurrence symbol=1"; d["decode_dropped_records"] != want {
+		t.Fatalf("decode_dropped_records = %q, want %q: an over-limit identifying field drops the record and says so", d["decode_dropped_records"], want)
+	}
+	if want := "display name=1"; d["decode_dropped_fields"] != want {
+		t.Fatalf("decode_dropped_fields = %q, want %q: an over-limit decorative field drops alone and says so", d["decode_dropped_fields"], want)
+	}
+	if d["decode_drop_reason"] == "" {
+		t.Fatalf("the capability row names no reason for the drops: %v", d)
+	}
+	if rep.Result.Capabilities[0].DiagnosticCode != model.CodeResourceLimit &&
+		rep.Result.Capabilities[0].State != model.CapabilityPartial {
+		t.Fatalf("a run that dropped records reported %+v; it must be partial under a resource-limit reason", rep.Result.Capabilities[0])
+	}
+}
