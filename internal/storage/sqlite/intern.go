@@ -2,9 +2,12 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -175,38 +178,23 @@ func (in *dbInterner) relation(ctx context.Context, tx *sql.Tx, id model.Relatio
 	return relRef(ref), nil
 }
 
+// scopeKey resolves into scope_keys, which keeps `key TEXT UNIQUE` and so
+// keeps the upsert-and-read shape: 403 distinct scope keys on the control
+// fixture is not an amplifier, and reconcile resolves a scope key BY key.
 func (in *dbInterner) scopeKey(ctx context.Context, tx *sql.Tx, key string) (scopeRef, error) {
-	ref, err := in.stringKey(ctx, tx, scopeKeyTag, "scope key", "scope_keys", key, false)
-	return scopeRef(ref), err
-}
-
-// nativeKey accepts the empty string: model.Evidence.NativeKey is optional and
-// evidence.native_key_id is NOT NULL, so unlocated evidence interns the empty
-// key like any other. A scope key stays non-empty (model.NativeAlias.Validate
-// requires it), which is why the check lives in scopeKey's caller path only.
-func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (nativeRef, error) {
-	ref, err := in.stringKey(ctx, tx, nativeKeyTag, "native key", "native_keys", key, true)
-	return nativeRef(ref), err
-}
-
-// stringKey resolves one S-3 dictionary string. The two dictionaries have
-// identical shape (id INTEGER PRIMARY KEY, key TEXT UNIQUE) and share one
-// bounded cache keyed by (table tag, string). allowEmpty is true only for the
-// native-key dictionary.
-func (in *dbInterner) stringKey(ctx context.Context, tx *sql.Tx, tag byte, field, table, key string, allowEmpty bool) (int64, error) {
-	if key == "" && !allowEmpty {
-		return noRef, invalid("%s: must not be empty", field)
+	if key == "" {
+		return noRef, invalid("scope key: must not be empty")
 	}
-	cacheKey := string(tag) + key
+	cacheKey := string(scopeKeyTag) + key
 	if ref, ok := in.strings.get(cacheKey); ok {
 		in.hits++
-		return ref, nil
+		return scopeRef(ref), nil
 	}
 	in.misses++
-	ref, found, err := in.resolve(ctx, tx, table,
-		"INSERT INTO "+table+"(key) VALUES(?) ON CONFLICT DO NOTHING",
+	ref, found, err := in.resolve(ctx, tx, "scope_keys",
+		`INSERT INTO scope_keys(key) VALUES(?) ON CONFLICT DO NOTHING`,
 		[]any{key},
-		"SELECT id FROM "+table+" WHERE key = ?",
+		`SELECT id FROM scope_keys WHERE key = ?`,
 		[]any{key})
 	if err != nil {
 		return noRef, err
@@ -216,10 +204,109 @@ func (in *dbInterner) stringKey(ctx context.Context, tx *sql.Tx, tag byte, field
 		// suppressed insert whose key then reads back as absent cannot happen
 		// inside one transaction. Reaching here means the row vanished under
 		// us, which is a corrupt store, not a caller error.
-		return noRef, corrupt("%s %q was neither inserted into %s nor found there", field, key, table)
+		return noRef, corrupt("scope key %q was neither inserted into scope_keys nor found there", key)
 	}
 	in.strings.put(cacheKey, ref)
-	return ref, nil
+	return scopeRef(ref), nil
+}
+
+// nativeKey resolves into the hash-keyed native dictionary (ADR-0003 SS2.3).
+// It accepts the empty string: model.Evidence.NativeKey is optional and
+// evidence.native_key_id is NOT NULL, so unlocated evidence interns the empty
+// key like any other. A scope key stays non-empty (model.NativeAlias.Validate
+// requires it), which is why that check lives in scopeKey only.
+//
+// The id is computed, not allocated, so the resolution is a probe of the hash
+// chain rather than an insert-then-select over a UNIQUE index: the chain is
+// walked until the stored key equals the incoming key (a hit) or a free id is
+// reached (a miss, which this method then claims). Ids are therefore stable for
+// the life of the database and across a cache flush, exactly as the contract in
+// ids.go requires -- more strongly than before, since they no longer depend on
+// insertion order at all.
+func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (nativeRef, error) {
+	cacheKey := string(nativeKeyTag) + key
+	if ref, ok := in.strings.get(cacheKey); ok {
+		in.hits++
+		return nativeRef(ref), nil
+	}
+	in.misses++
+	for {
+		id, found, err := lookupNativeKey(ctx, tx, key)
+		if err != nil {
+			return noRef, err
+		}
+		if found {
+			in.strings.put(cacheKey, id)
+			return nativeRef(id), nil
+		}
+		// id is a free slot on this key's chain. Claim it. ON CONFLICT(id) DO
+		// NOTHING keeps the upsert-and-read convergence the interner contract
+		// mandates: if another writer claimed the slot first, this insert is
+		// suppressed and the next probe walks past it. Progress is guaranteed
+		// because a suppressed insert means the slot is now occupied, so the
+		// next lookup cannot return the same free id.
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO native_keys(id, key) VALUES(?, ?) ON CONFLICT(id) DO NOTHING`, id, key); err != nil {
+			return noRef, wrap("native_keys", err)
+		}
+	}
+}
+
+// nativeKeyID is the dictionary's id derivation: the first 63 bits of the
+// key's SHA-256, big-endian. The top bit is cleared so the value is always a
+// positive int64 (SQLite has no unsigned integer type), and zero is clamped to
+// 1 so that CHECK(id > 0) holds and noRef keeps meaning "absent" -- the empty
+// native key is a real, frequently interned value and must not land on the
+// sentinel.
+func nativeKeyID(key string) int64 {
+	sum := sha256.Sum256([]byte(key))
+	id := int64(binary.BigEndian.Uint64(sum[:8]) & math.MaxInt64)
+	if id == 0 {
+		id = 1
+	}
+	return id
+}
+
+// nextNativeKeyID is the collision probe: the next id on a key's chain. It
+// wraps past the largest positive int64 back to 1 rather than overflowing into
+// the negative range the CHECK forbids.
+func nextNativeKeyID(id int64) int64 {
+	if id == math.MaxInt64 {
+		return 1
+	}
+	return id + 1
+}
+
+// lookupNativeKey walks one key's hash chain. It returns (id, true) for the id
+// whose stored key equals key, and (id, false) for the first free id on the
+// chain -- which is where a writer must place the key and which a reader reads
+// as "this key has never been interned".
+//
+// This is the collision handling ADR-0003 SS2.3 requires: two keys whose
+// digests agree are DETECTED by the string comparison and separated onto
+// different ids, never silently merged. Deleting that comparison merges them,
+// which is what TestNativeKeyHashCollisionIsDetected proves.
+func lookupNativeKey(ctx context.Context, tx *sql.Tx, key string) (int64, bool, error) {
+	start := nativeKeyID(key)
+	for id := start; ; {
+		var stored string
+		err := tx.QueryRowContext(ctx, `SELECT key FROM native_keys WHERE id = ?`, id).Scan(&stored)
+		switch {
+		case isNoRows(err):
+			return id, false, nil
+		case err != nil:
+			return noRef, false, wrap("native_keys", err)
+		case stored == key:
+			return id, true, nil
+		}
+		// Not a free slot and not this key: a digest collision (or a chain
+		// displaced by one). Probe on. The wrap back to the starting id can
+		// only be reached by a dictionary holding 2^63-1 distinct keys, so it
+		// is a corruption report, not a bound on the user's work.
+		if id = nextNativeKeyID(id); id == start {
+			return noRef, false, corrupt("native key dictionary is full: %q has no free id", key)
+		}
+	}
 }
 
 // resolve is the upsert-and-read the interner contract mandates: an
