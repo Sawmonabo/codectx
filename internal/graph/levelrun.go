@@ -219,8 +219,12 @@ type levelCollector struct {
 	resident [][]byte
 	bytes    int64
 	// raw is the spilled run, nil while resident.
-	raw   *retainFile
-	count int64
+	raw *retainFile
+	// keepRaw leaves the collected run in place when the level is sorted: it is
+	// the run the cursor this leg was HANDED resumes from, and a retryable
+	// failure later in the page sends the caller back to that cursor.
+	keepRaw bool
+	count   int64
 }
 
 // newLevelCollector starts a fresh level.
@@ -275,6 +279,19 @@ func (c *levelCollector) spill() error {
 	return nil
 }
 
+// persist puts the whole collected run on disk and commits it. A COLLECTING
+// continuation is minted from it, so the byte count it carries has to name
+// bytes that are there: a resident run the cursor reported as zero would
+// resume the level with everything the scan had already delivered dropped.
+func (c *levelCollector) persist() error {
+	if c.raw == nil {
+		if err := c.spill(); err != nil {
+			return err
+		}
+	}
+	return c.raw.close()
+}
+
 // records is how many records this level holds.
 func (c *levelCollector) records() int64 { return c.count }
 
@@ -308,12 +325,12 @@ func (c *levelCollector) finish(ctx context.Context) (*sortedLevel, error) {
 	if err := out.close(); err != nil {
 		return nil, err
 	}
-	if c.raw != nil {
+	if c.raw != nil && !c.keepRaw {
 		if err := c.raw.remove(); err != nil {
 			return nil, err
 		}
-		c.raw = nil
 	}
+	c.raw = nil
 	return &sortedLevel{level: c.level, file: out, count: c.count}, nil
 }
 
