@@ -259,8 +259,16 @@ into misleading independently complete slices, or dropped to fit.
 `resources.max_page_items` bounds every batch the compile issues — seed
 resolution, file hydration, the edge read behind per-edge precision and the
 evidence batch — and `resources.query_timeout` is the deadline around the whole
-compile. A deadline or a cancellation returns an explicit incomplete answer
-(`CTX_QUERY_DEADLINE` / `CTX_CANCELED`) and persists no manifest.
+compile. A deadline or a cancellation persists no manifest. A **cancellation**
+is an explicit incomplete answer (`CTX_CANCELED`); a **deadline** ends the pass
+the compile is in rather than the answer, and `context plan` returns
+`truncated = deadline` with a `next_cursor` you present back as `--cursor` to
+resume at the first unfinished pass. The plan the final call returns is the one
+an uninterrupted compile would have produced. See
+[Context sessions](context-sessions.md#a-plan-that-runs-out-of-query-deadline-continues-it-does-not-fail).
+`CTX_QUERY_DEADLINE` is still raised for the compile callers that have no
+continuation to hand back, such as the workflow service's own consolidate
+compile.
 
 See [Configuration](configuration.md) for the full tables.
 

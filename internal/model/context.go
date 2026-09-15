@@ -160,6 +160,13 @@ type PlanRequest struct {
 	Context        ContextRequest `json:"context"`
 	ActorID        string         `json:"actor_id"`
 	IdempotencyKey string         `json:"idempotency_key,omitempty"`
+
+	// Cursor continues a compile that ended on its query deadline at a pass
+	// boundary (ruling C9). It is the token the previous PlanResult printed as
+	// NextCursor, and it is presented beside the SAME request: the token is
+	// bound to the compile's request identity, so a cursor offered with any
+	// other request is refused rather than answered.
+	Cursor string `json:"cursor,omitempty"`
 }
 
 // Validate enforces the plan shape, including the Section 17.1 rule that direct
@@ -179,6 +186,12 @@ func (r PlanRequest) Validate() error {
 		if err := requireTrimmed("plan.idempotency_key", r.IdempotencyKey, MaxIdentifierBytes); err != nil {
 			return err
 		}
+	}
+	// A wire-class bound, not a limit: the token is signed and self-describing,
+	// so anything past MaxTokenBytes is a forged or corrupted argument rather
+	// than a large legitimate request. It is the same bound page.cursor carries.
+	if err := boundField("plan.cursor", r.Cursor, MaxTokenBytes); err != nil {
+		return err
 	}
 	return nil
 }
@@ -426,23 +439,62 @@ func (m ContextManifest) Validate() error {
 	return nil
 }
 
-// PlanResult is the answer to a plan request: the immutable manifest plus the
-// operational session binding the actor uses from here on.
+// PlanResult is the answer to a plan request. It is ONE type with two shapes
+// (ruling C9): either the finished plan -- the immutable manifest plus the
+// operational session binding the actor uses from here on -- or the report that
+// this call ended on its query deadline at a pass boundary, carrying the token
+// the next call resumes from and nothing else.
+//
+// It is widened rather than split because a continuation is the same answer to
+// the same question, not a different endpoint: a client decodes one type and
+// branches on Truncated. A truncated result carries the ZERO manifest and no
+// session id, because a partial plan is never persisted and no session may bind
+// to one -- which is exactly what the exactly-one-of rule in Validate enforces.
 type PlanResult struct {
 	Manifest  ContextManifest `json:"manifest"`
 	SessionID SessionID       `json:"session_id"`
 	ActorID   string          `json:"actor_id"`
+
+	// Truncated says this call stopped at a pass boundary and compiled no
+	// manifest. TruncationReason names why ("deadline" is the only reason a
+	// compile ends this way) and NextCursor is the token that continues it.
+	Truncated        bool   `json:"truncated,omitempty"`
+	TruncationReason string `json:"truncation_reason,omitempty"`
+	NextCursor       string `json:"next_cursor,omitempty"`
 }
 
-// Validate enforces the result shape.
+// Validate enforces the result shape: exactly one of (Manifest + SessionID) or
+// (NextCursor + Truncated). A result carrying both would let a reader treat a
+// continuation as an answer; a result carrying neither is an empty answer no
+// caller can act on. ActorID is required on both shapes -- it is who asked, and
+// a continuation is resumed by the same actor.
 func (r PlanResult) Validate() error {
+	if err := requireTrimmed("plan_result.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	continuation := r.Truncated || r.NextCursor != "" || r.TruncationReason != ""
+	if continuation {
+		if r.SessionID != "" || r.Manifest.ID != "" {
+			return invalid("plan_result names both a compiled plan and a continuation cursor; a truncated compile persists no manifest and opens no session")
+		}
+		if !r.Truncated {
+			return invalid("plan_result carries a continuation cursor without truncated")
+		}
+		if err := requireField("plan_result.truncation_reason", r.TruncationReason, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := requireField("plan_result.next_cursor", r.NextCursor, MaxTokenBytes); err != nil {
+			return err
+		}
+		return nil
+	}
+	if r.Manifest.ID == "" && r.SessionID == "" {
+		return invalid("plan_result names neither a compiled plan nor a continuation cursor")
+	}
 	if err := r.Manifest.Validate(); err != nil {
 		return err
 	}
 	if err := requireID("plan_result.session_id", string(r.SessionID)); err != nil {
-		return err
-	}
-	if err := requireTrimmed("plan_result.actor_id", r.ActorID, MaxIdentifierBytes); err != nil {
 		return err
 	}
 	return nil
