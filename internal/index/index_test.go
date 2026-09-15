@@ -91,7 +91,14 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	cfg.Providers.Dependence.Enabled = config.Disabled
 	f.cfg = cfg
 
-	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{})
+	cas, err := snapshot.OpenCAS(snapshot.CASDir(f.dataDir))
+	if err != nil {
+		t.Fatalf("OpenCAS: %v", err)
+	}
+	f.cas = cas
+	// Carried lexical documents are re-indexed through the content store's
+	// range reader: the database keeps no body (ADR-0003 §2.1).
+	store, err := sqlite.Open(ctx, filepath.Join(f.dataDir, "codectx.db"), sqlite.Options{Content: cas})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -99,9 +106,6 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 	f.store = store
 	if err := store.Recover(ctx, time.Now()); err != nil {
 		t.Fatalf("Recover: %v", err)
-	}
-	if f.cas, err = snapshot.OpenCAS(snapshot.CASDir(f.dataDir)); err != nil {
-		t.Fatalf("OpenCAS: %v", err)
 	}
 	// One lock per workspace, taken once and handed to every coordinator the
 	// scenario builds: it is the cross-process owner, and a second acquisition

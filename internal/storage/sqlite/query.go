@@ -741,16 +741,19 @@ func (r *PinnedReader) Match(ctx context.Context, expression string, after int64
 	return out, err
 }
 
-// SearchUnit reads one visible document by rowid, including its bounded body.
+// SearchUnit reads one visible document by rowid. Body is always empty: the
+// database stores no source body (ADR-0003 §2.1), and a caller that needs the
+// text reads it from the content store over the returned file identity and
+// byte range.
 func (r *PinnedReader) SearchUnit(ctx context.Context, rowid int64) (model.SearchUnit, error) {
 	var d model.SearchUnit
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		var key, node, file []byte
 		var start, end int64
 		err := tx.QueryRowContext(ctx, `SELECT su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name, su.qualified_name, su.signature,
-			su.start_byte, su.end_byte, su.body, su.token_count FROM search_units su`+r.visible("su")+
+			su.start_byte, su.end_byte, su.token_count FROM search_units su`+r.visible("su")+
 			`LEFT JOIN node_ids ni ON ni.id = su.node_id WHERE su.rowid = ?2`, r.gen, rowid).
-			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.Body, &d.TokenCount)
+			Scan(&key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName, &d.Signature, &start, &end, &d.TokenCount)
 		if isNoRows(err) {
 			return invalid("search document %d is not visible in generation %d", rowid, r.gen)
 		}

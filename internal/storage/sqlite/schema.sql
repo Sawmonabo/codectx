@@ -318,15 +318,23 @@ CREATE TABLE search_units (
     signature TEXT NOT NULL DEFAULT '',
     start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
     end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
-    body TEXT NOT NULL,
     token_count INTEGER NOT NULL CHECK(token_count >= 0),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, file_id) REFERENCES unit_inputs(unit_id, file_id)
 );
+-- S-4 (ADR-0003 §2.1): the lexical tier stores no second copy of the source.
+-- search_units carries no `body` column and search_fts is CONTENTLESS, so the
+-- indexed body text exists only as index postings. `contentless_delete=1` is
+-- what keeps DELETE and INSERT OR REPLACE available on unit invalidation
+-- (https://sqlite.org/fts5.html#contentless_tables, engine floor 3.43.0; the
+-- embedded engine is 3.53.4). Snippets and highlights are served from the
+-- content store through the verified range reader, over the file_id and byte
+-- range each row already carries -- never from this index. The index's rebuild
+-- source is therefore the content store, not the database (docs/storage.md).
 CREATE VIRTUAL TABLE search_fts USING fts5(
     name, qualified_name, signature, path, body,
-    content='search_units', content_rowid='rowid', tokenize='unicode61', detail='full'
+    content='', contentless_delete=1, tokenize='unicode61', detail='full'
 );
 CREATE VIRTUAL TABLE search_vocab USING fts5vocab(search_fts, 'instance');
 CREATE TABLE context_manifests (

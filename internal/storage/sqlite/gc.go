@@ -313,8 +313,8 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 	}
 }
 
-// deleteUnit is the one unit deletion procedure (Section 12.4). It issues the
-// FTS delete with each document's indexed values before the content rows go,
+// deleteUnit is the one unit deletion procedure (Section 12.4). It deletes the
+// unit's FTS documents by rowid before the search_units rows go,
 // removes facts, then the identities only this unit referenced, then the unit.
 // Callers never `DELETE FROM units` directly. Membership rows are deliberately
 // not touched: every caller has already established the unit is unreachable,
@@ -332,8 +332,10 @@ func (s *Store) deleteUnit(ctx context.Context, tx *sql.Tx, unitRow int64) error
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM node_facts WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_nodes SELECT node_id FROM native_aliases WHERE unit_id = ?1`,
 		`INSERT OR IGNORE INTO gc_relations SELECT relation_id FROM relation_facts WHERE unit_id = ?1`,
-		`INSERT INTO search_fts(search_fts, rowid, name, qualified_name, signature, path, body)
-			SELECT 'delete', rowid, name, qualified_name, signature, path, body FROM search_units WHERE unit_id = ?1`,
+		// search_fts is contentless with contentless_delete=1 (ADR-0003 §2.1),
+		// so a plain DELETE by rowid removes the document: no column values are
+		// read back and no body is stored to read.
+		`DELETE FROM search_fts WHERE rowid IN (SELECT rowid FROM search_units WHERE unit_id = ?1)`,
 		`DELETE FROM search_units WHERE unit_id = ?1`,
 		`DELETE FROM evidence WHERE unit_id = ?1`,
 		`DELETE FROM fact_keys WHERE unit_id = ?1`,

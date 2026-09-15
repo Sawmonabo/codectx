@@ -1,6 +1,6 @@
 # ADR-0003 — Storage tier 2: the lexical and provenance tiers, and the gate
 
-- **Status:** Partially accepted — §2.3 implemented (lane I-T2); §2.1, §2.2, §2.4, §2.5 still proposed
+- **Status:** Partially accepted — §2.1 (lane I-T1) and §2.3 (lane I-T2) implemented; §2.2 rejected for now (narrows the public evidence identity and moves the pinned capsule digest — needs an explicit product decision); §2.4, §2.5 still proposed
 - **Date:** 2026-09-15
 - **Follows:** [`ADR-0002 — Storage identities`](ADR-0002-storage-identities.md), which removed
   identity width as the amplifier and left the lexical and provenance tiers as the remaining cost
@@ -276,4 +276,15 @@ over 420 MB); the external reference point for the lexical-tier budget.
 
 *Every figure in this record is quoted from the wave-I verification run's per-b-tree attribution or
 derived in [`docs/research/16-storage-tier2.md`](../research/16-storage-tier2.md), where the
-arithmetic is shown. Nothing here has been implemented.*
+arithmetic is shown. §2.1 has been implemented; §2.2–§2.5 have not.*
+
+**Implementation note on §2.1.** The record says `body`'s only database readers are the insert and
+the two paths that feed the index a delete. There is a third: the delta carry-over copies a previous
+unit's lexical documents and re-indexes them at their new rowids, and it read `body` back to do so.
+Contentless, there is nothing to read back, so the carry-over now resolves each carried document's
+text from the content store through the verified range reader — over the byte range the copied row
+carries and the content hash this unit declares for that file, which `checkCarriedInputs` has
+already proved — in bounded pages, so its working set is one page of documents. A store opened
+without a range reader refuses that carry-over with a typed error rather than indexing a document
+without its body. This is the same "rebuild source becomes the content store" consequence the
+trade-off names, reaching one more path than the record anticipated.
