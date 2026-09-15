@@ -56,6 +56,32 @@ ctx_store_dir() {
 	esac
 }
 
+# ctx_config_dir echoes the user configuration directory by exactly the rule the
+# product uses (Go's os.UserConfigDir, reached through internal/config): an
+# absolute XDG_CONFIG_HOME is honoured, an unset or empty one falls back to
+# $HOME/.config, and a RELATIVE one is not a directory at all -- the product
+# refuses to resolve a user configuration file rather than silently reading
+# $HOME/.config. That last case is why this returns a status instead of always
+# echoing a path: naming a file the product would never read is the divergence
+# this function exists to avoid.
+ctx_config_dir() {
+	case "${XDG_CONFIG_HOME-}" in
+	/*) printf '%s\n' "$XDG_CONFIG_HOME/codectx" ;;
+	"") printf '%s\n' "${HOME:-}/.config/codectx" ;;
+	*) return 1 ;;
+	esac
+}
+
+# ctx_config_hint echoes the sentence telling the operator where to put a
+# setting, or, when XDG_CONFIG_HOME is relative, why there is no such file yet.
+ctx_config_hint() {
+	if ctx_config_target="$(ctx_config_dir)"; then
+		printf 'add to %s/config.toml:\n' "$ctx_config_target"
+	else
+		printf 'XDG_CONFIG_HOME is relative, so codectx resolves no user configuration file; make it absolute or unset it, then add to its codectx/config.toml:\n'
+	fi
+}
+
 # ctx_usage is inline text, not a slice of this file: the script is normally
 # run by piping it into sh, where $0 is not a readable path.
 ctx_usage() {
@@ -321,6 +347,10 @@ ctx_main() {
 	# step, which is the part an operator sizing an install wants to see.
 	if [ "$ctx_dry_run" = yes ]; then
 		ctx_log "dry run: would install codectx $ctx_version for $ctx_os/$ctx_arch into $ctx_prefix"
+		if [ "$ctx_bundle" = yes ]; then
+			ctx_log "dry run: would install the bundled tool store to $(ctx_store_dir)"
+			ctx_log "dry run: to refuse every network fetch, $(ctx_config_hint)"
+		fi
 		ctx_install_tools
 		return 0
 	fi
@@ -370,7 +400,7 @@ ctx_main() {
 		chmod 0700 "$ctx_store_target"
 		ctx_log "installed the bundled tool store to $ctx_store_target"
 		ctx_log "that is the store codectx reads by default, so nothing needs configuring.
-To refuse every network fetch as well, add to ${XDG_CONFIG_HOME:-${HOME:-}/.config}/codectx/config.toml:
+To refuse every network fetch as well, $(ctx_config_hint)
 
   [tools]
   offline = true
