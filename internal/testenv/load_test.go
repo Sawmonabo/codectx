@@ -27,7 +27,7 @@ func TestTheLoadGuardRunsOnAQuietHost(t *testing.T) {
 		{load: 0, cpus: 8, want: false},
 		{load: 3.9, cpus: 8, want: false},
 		{load: 4.1, cpus: 8, want: true},
-		{load: 6.4, cpus: 8, want: true}, // the load that flaked the seal ratio
+		{load: 6.4, cpus: 8, want: true}, // a host at 80 % of its cores
 	} {
 		if got := overloaded(c.load, c.cpus); got != c.want {
 			t.Errorf("overloaded(%v, %d) = %v, want %v", c.load, c.cpus, got, c.want)
