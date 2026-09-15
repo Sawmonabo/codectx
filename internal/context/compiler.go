@@ -127,6 +127,12 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if m, ok, err := c.reuseManifest(ctx, id); err != nil {
 		return model.ContextManifest{}, err
 	} else if ok {
+		// Notices are not persisted (model.ContextManifest.Notices says why),
+		// so the reused header carries none. The configuration-derived one is
+		// re-emitted here: it is a fact about THIS request's bounds, and a
+		// caller who hit the reuse path asked for the same page size as the
+		// caller who compiled.
+		m.Notices = c.manifestNotices(scopeResult{}, plan{})
 		return m, nil
 	}
 
@@ -201,9 +207,46 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
+	// Set after persistence, deliberately: the notices describe how THIS
+	// compile was bounded, not what the plan is, and they are neither hashed
+	// nor stored.
+	m.Notices = c.manifestNotices(scoped, packed)
 	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
 	return m, nil
+}
+
+// manifestNotices is every non-fatal disclosure this compile owes the caller:
+// the page size the configuration asked for and could not have, and the counts
+// of the Section 15.3 explanation cuts the expansion and the budget pass
+// applied. Each is a COUNT and not an entry-sized list -- a per-entry
+// disclosure list is repository-sized in heap, which is precisely the shape a
+// manifest header may not have -- and each goes through model.TruncateField so
+// ContextManifest.Validate never has to refuse a compile over its own notice.
+//
+// An empty result is the honest answer that nothing was cut, and the field is
+// omitempty, so a compile under no bound reads exactly as it did before.
+func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
+	var out []string
+	add := func(format string, args ...any) {
+		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
+		out = append(out, note)
+	}
+	if note := c.pageLimitNotice(); note != "" {
+		out = append(out, note)
+	}
+	if n := scoped.ReasonsDropped; n > 0 {
+		add("%d selection reason(s) past the %d-per-entry bound were not stored; the entries they explain are still listed in full",
+			n, model.MaxReasonsPerEntry)
+	}
+	if n := scoped.ReasonsTruncated; n > 0 {
+		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
+	}
+	if n := packed.RelationsClipped; n > 0 {
+		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
+			n, model.MaxRelationsPerPath)
+	}
+	return out
 }
 
 // Close releases the compiler's own resources. It does not close the injected

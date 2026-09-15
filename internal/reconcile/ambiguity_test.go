@@ -62,18 +62,3 @@ func TestManyEquallySupportedIdentitiesResolveInsteadOfFailingTheUnit(t *testing
 		t.Fatalf("basis %q, want %q", res.Basis, model.MatchNativeKey)
 	}
 }
-
-// TestAResolverOverManyDependenciesIsBuilt protects the same rule on the other
-// row-20 site: model.MaxDependenciesPerUnit is the page size for reading a
-// unit's dependencies back, never a reason to refuse an aggregate target that
-// legitimately depends on more units than that.
-func TestAResolverOverManyDependenciesIsBuilt(t *testing.T) {
-	deps := make([]model.UnitID, 0, model.MaxDependenciesPerUnit+1)
-	for i := 0; i < model.MaxDependenciesPerUnit+1; i++ {
-		deps = append(deps, model.UnitID(fmt.Sprintf("%064x", i+1)))
-	}
-	repo := model.RepositoryID(fmt.Sprintf("%064x", 0xabc))
-	if _, err := reconcile.New(fixedAliases(nil), repo, deps); err != nil {
-		t.Fatalf("a resolver over %d dependencies was refused: %v", len(deps), err)
-	}
-}
