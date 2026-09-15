@@ -49,7 +49,7 @@ a run reproducible on any host.
 
 | Scale | Spec | Files | Used by |
 |---|---|---|---|
-| `corpusTiny` | (L0/L3 default) | small | the end-to-end scenario's sizing |
+| `corpusTiny` | `{Packages: 4, Seed: 21}` | small | the end-to-end scenario's sizing |
 | `corpusSmallReal` | `{Packages: 40, Seed: 2101}` | 124 | **every measured row in Section 3** |
 | `corpusOver200Files` | `{Packages: 120, Seed: 2102}` | 364 | the session-status clamp row (Section 3, row 15) |
 | `corpusReference` | `{Packages: 3332, Seed: 2103}` | 10 000 | the Section 23.1 reference workload — measured by the verification pass, not on a bench row (Section 3, rows 9 and 13) |
@@ -92,14 +92,14 @@ Each row builds its own workspace from the generator, opens it through
 measurement describes the product and not a private helper — and samples the
 operation `n` times. Latency rows report **p95 over the stated sample count**;
 memory rows report the sampled peak of the **whole process tree** (parent plus
-parser workers), read by the Task 20 host sampler.
+parser workers), read by the host sampler.
 
 ### What one parser worker costs
 
-`index.max_parser_workers` is a CONCURRENCY ceiling, not a resident cost: the
-pool starts no process until a unit demands one and reaps an idle worker after
-`tree_sitter.worker_idle_ttl`, so a process that parses nothing holds no worker
-(`TestPoolLazyAndReaped`), and the number alive at any moment is the concurrent
+The parser worker count is a CONCURRENCY figure, not a resident cost: the
+pool starts no process until a unit demands one and drains every worker when the
+last unit returns, so a process that has stopped parsing holds no worker at all
+(`TestPoolLazyAndDrainedWhenTheStageEnds`), and the number alive is the concurrent
 parse demand rather than the ceiling. What one live worker costs was measured on
 the measuring host from `/proc/<pid>/smaps_rollup`, on a worker that had sent its
 hello and parsed nothing: **18.2 MiB RSS, 9.4 MiB PSS**.
@@ -129,7 +129,7 @@ percentile over `n` samples.
 |---|---|---|---|---|
 | 1 | `version --json` startup | 50 ms | p95 **2.96 ms** / 20 | PASS |
 | 2 | Exact symbol/path query | 50 ms | p95 **1.09 ms** / 50 | PASS |
-| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS |
+| 3 | Lexical (FTS) search | 150 ms | p95 **28.7 ms** / 50 | PASS — at enterprise scale see the first-page table below |
 | 4 | One-hop caller/callee | 100 ms | p95 **5.72 ms** / 50 | PASS |
 | 5 | Context plan, ≤50k visited nodes | 1 s | p95 **74.8 ms** / 10 | PASS |
 | 6 | Context plan visited nodes | ≤ 50 000 | **103 visited / 40 edges / 39 entries**, not truncated | PASS |
@@ -147,7 +147,7 @@ percentile over `n` samples.
 Row 11 measures a RESTING session, which is what "idle" claims. It used to open
 its sampling window at process start with `mcp.watch` at its default, so the
 window covered the initial refresh and its parser workers — a startup peak
-reported under an idle label, and a default `max_parser_workers` was once
+reported under an idle label, and a low default worker count was once
 reverted on the strength of it. The row now starts the session with
 `--watch=false` and samples a 2 s window after a 2 s settle, so the figure is
 the server at rest: workspace open, no refresh running. The refresh peak is row
@@ -212,6 +212,59 @@ and one is not:
   would drop the one hop that still adds nodes on a deeper graph. Whether a
   work limit like this one should default to unlimited at all is a separate
   question and is not answered by this measurement.
+
+### Row 3 at enterprise scale — first-page latency on a 13 223-file repository
+
+Row 3's 150 ms target is measured at small-real scale. On a 13 223-file,
+1.36 GiB store the first page of a corpus-frequent term costs far more, and
+the dominant term was never the ranking: a first page hydrated the *whole*
+answer -- every hit past the page was read out of the CAS, block-hash
+verified and scanned for line and column positions on its way into the
+continuation spool. Hydration is now paid by the page that serves a hit.
+
+Two further costs have since been taken out of the ranking itself. The
+lexical tier read every column of a candidate page to get its token count
+and then threw the row away, so the ranker re-read the identical page for
+path, kind, name and identity: one read per page now carries both. And the
+two-pass external sort that deduplicates and orders the candidate set
+encoded every candidate as JSON; a packed, fixed-order codec replaced it.
+
+| Query | Before hydration fix | After hydration fix | After one read + packed sort |
+|---|---|---|---|
+| `search function` | 4.17 s | 1.71 s | **1.27 s** |
+| `search <global>` (a framework global name) | 4.94 s | 2.10 s | **1.18 s** |
+| `search return` | 1.49 s | 0.79 s | **0.60 s** |
+| `search user` | 0.87 s | 0.40 s | **0.38 s** |
+| `search <rare>` (an application identifier, 6 hits) | 0.08 s | 0.11 s | **0.14 s** |
+| continuation page 2 | 0.17 s | 0.20 s | not re-measured |
+
+Warm, median of three, default config, same store and same battery in every
+column. `<rare>` matches six hits and never reaches the ranking work
+these two changes touch; its three runs spread 0.11-0.17 s, so its column is
+run-to-run noise on a query that is already two orders of magnitude inside
+the target. Peak RSS is unchanged within noise (32-125 MB across the five
+terms); the ranking fold holds one candidate page less than it did.
+
+Every page of every one of the five queries is byte-identical before and
+after -- each was paged to completion and the ordered item sequence
+compared byte for byte (30 022 items over 151 pages for `function`, 44 448
+over 223 for `<global>`), together with each page's meta minus `next_cursor`,
+whose per-run lease id and expiry can never match across processes. The set,
+the global ranking, every served field, every reason and every page boundary
+are unchanged.
+
+`function` and `<global>` still miss the 1 s first-page target. What is left
+is measured, and it is not addressable inside the search package: of the
+1.27 s `function` profile, 0.33 s is the posting-list walk that scores each
+candidate, 0.18 s the per-term document frequencies, 0.16 s the candidate
+page read, 0.09 s the match page and 0.09 s the corpus statistics -- all of
+it stepping the index, and none of it absorbed by the tier's statistics
+cache, which a one-shot process always starts cold -- and 0.21 s the
+two-pass external sort. The two
+schema-level alternatives that would touch the posting walk (pushing the
+ranking function down into the index, and a persisted per-term index) were
+measured earlier and rejected: neither can reproduce the served ranking
+byte for byte.
 
 ## 4. Misses, skips and unproven platforms
 
@@ -304,7 +357,7 @@ from `internal/context`:
 
 | What was pushed | Records | Peak live records per sort | Heap in use, live, after the push | Spilled runs |
 |---|---|---|---|---|
-| Seed push sink (ruling C10), 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
+| Seed push sink, 5 000 entities offered twice | 10 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +72 KiB | seed sorts spill |
 | Seed push sink, 50 000 entities offered twice | 100 000 | scope-seed 401 · scope-seedseq 395 · scope-entity 395 | +144 KiB | seed sorts spill |
 | One compile sort at the primitive's floor run budget | 20 000 | 401 (~2× the run budget in bytes, the record that triggers the spill included) | — | 50 |
 
