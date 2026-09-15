@@ -91,6 +91,8 @@ func (c Config) validate() error {
 		{"context.max_reason_paths_per_entry", c.Context.MaxReasonPathsPerEntry},
 		{"context.max_manifest_bytes", c.Context.MaxManifestBytes},
 		{"context.max_capsule_bytes", c.Context.MaxCapsuleBytes},
+		{"context.max_capsule_records_per_list", c.Context.MaxCapsuleRecordsPerList},
+		{"context.max_capsule_coverage_files", c.Context.MaxCapsuleCoverageFiles},
 		{"coverage.max_unconfirmed_chunks_per_session", c.Coverage.MaxUnconfirmedChunksPerSession},
 		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
 		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},

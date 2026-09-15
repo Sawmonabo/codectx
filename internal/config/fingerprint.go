@@ -84,6 +84,8 @@ func (c Config) ContextPolicyHash() string {
 		quoteLimit(c.Context.MaxReasonPathsPerEntry),
 		quoteLimit(c.Context.MaxManifestBytes),
 		quoteLimit(c.Context.MaxCapsuleBytes),
+		quoteLimit(c.Context.MaxCapsuleRecordsPerList),
+		quoteLimit(c.Context.MaxCapsuleCoverageFiles),
 		quoteBool(c.Context.StrictReadGate),
 		quoteBool(c.Context.AllowExploratoryWaiverConsolidation),
 	)

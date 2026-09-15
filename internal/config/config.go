@@ -354,7 +354,14 @@ type Context struct {
 	MaxReasonPathsPerEntry Limit  `toml:"max_reason_paths_per_entry"`
 	MaxManifestBytes       Limit  `toml:"max_manifest_bytes"`
 	MaxCapsuleBytes        Limit  `toml:"max_capsule_bytes"`
-	StrictReadGate         bool   `toml:"strict_read_gate"`
+	// MaxCapsuleRecordsPerList bounds one sealing capsule list; zero is
+	// unlimited and is the default, so a completion is never refused for the
+	// number of observations a session recorded.
+	MaxCapsuleRecordsPerList Limit `toml:"max_capsule_records_per_list"`
+	// MaxCapsuleCoverageFiles is the same bound for the capsule's coverage
+	// list alone, which grows with the session's pinned file set.
+	MaxCapsuleCoverageFiles Limit `toml:"max_capsule_coverage_files"`
+	StrictReadGate          bool  `toml:"strict_read_gate"`
 	// AllowExploratoryWaiverConsolidation is user-only and never weakens strict
 	// read readiness (Section 20.2).
 	AllowExploratoryWaiverConsolidation bool `toml:"allow_exploratory_waiver_consolidation"`
@@ -495,6 +502,8 @@ func Defaults() Config {
 			MaxReasonPathsPerEntry:              Unlimited,
 			MaxManifestBytes:                    Unlimited,
 			MaxCapsuleBytes:                     Unlimited,
+			MaxCapsuleRecordsPerList:            Unlimited,
+			MaxCapsuleCoverageFiles:             Unlimited,
 			StrictReadGate:                      true,
 			AllowExploratoryWaiverConsolidation: false,
 		},
