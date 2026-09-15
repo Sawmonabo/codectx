@@ -17,6 +17,11 @@ import (
 // `LIMIT 256`, which silently dropped the tail of the report that
 // QueryMeta.Completeness is derived from -- so every answer over-claimed.
 //
+// What it proves is exactly publish + one full read: Capabilities has no page
+// API and none is asserted here. The report is bounded on the WRITE side, by
+// the index's fold to one row per (provider, capability, scope), so the read
+// being unpaged is the design and not a gap this test covers over.
+//
 // Mutation proof: restore either bound (the `len(capabilities) >
 // model.MaxCapabilityStates` refusal in units.go Activate, or `LIMIT ?` with
 // model.MaxCapabilityStates in query.go Capabilities) and this test fails --

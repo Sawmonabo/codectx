@@ -13,12 +13,12 @@ import (
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
-// ranked is one candidate in the bounded top-K heap: the Section 14.2 sort
+// ranked is one candidate in the external sort's record: the Section 14.2 sort
 // tuple, the rowid that hydrates it, and the folded occurrence count. Nothing
-// else -- name/qualified name/signature would make 2000 entries ~30 MB against
-// a 33 MB query_memory_bytes ceiling, and SearchDocuments exists to hydrate
-// one page instead. Ordering compares only integers and exact strings; no
-// float reaches a comparison (digest §4).
+// else -- carrying name/qualified name/signature on every candidate would size
+// the sort's run buffer by the widest symbol in the corpus, and
+// SearchDocuments exists to hydrate one chunk instead. Ordering compares only
+// integers and exact strings; no float reaches a comparison (digest §4).
 type ranked struct {
 	Tier        model.SearchTier
 	ScoreMicros int64
@@ -111,12 +111,20 @@ type scored struct {
 // at the end rather than maintained as a partial order while it mutates.
 //
 // Neither the number of distinct keys nor the number of candidates is bounded,
-// and neither is held in heap. Candidates stream into a disk-backed external
-// sort whose working set is the run budget derived from
-// resources.query_memory_bytes plus a capped merge fan-in, so peak RSS is a
-// function of that admission and not of how many matches the query has. A
-// one-character qualified_name_prefix that range-scans a corpus-sized slice of
-// node_ids (H-L5b concern 2) therefore costs disk, not heap.
+// and neither is held in heap HERE. Candidates stream into a disk-backed
+// external sort whose working set is the run budget derived from
+// resources.query_memory_bytes plus a capped merge fan-in, so peak RSS of the
+// fold is a function of that admission and not of how many matches the query
+// has.
+//
+// ONE candidate-sized heap structure survives upstream of this collector, and
+// it is named rather than denied: exactCandidates' `seen` set holds one
+// model.NodeID per distinct candidate across the exact tiers (exact.go), which
+// is what decides the cross-tier "most specific tier wins" rule and cannot be
+// decided from a streamed page. A one-character qualified_name_prefix that
+// range-scans a corpus-sized slice of node_ids therefore costs disk in this
+// fold and heap in `seen` -- the ledgered residual recorded for the exact
+// tiers, not a bound this collector removes.
 //
 // TWO PASSES ARE NECESSARY, not a shortcut. fold sets ScoreMicros = max(a, b)
 // and score is less's second key, so a fold MOVES its survivor's rank: two

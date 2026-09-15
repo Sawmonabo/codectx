@@ -616,8 +616,14 @@ func scanFile(rows *sql.Rows) (model.FileVersion, error) {
 // tail of a large generation's report, and QueryMeta.Completeness is derived
 // from what this returns on every answer, so the drop made every answer
 // over-claim. The scan streams in one read transaction under the primary key's
-// order; peak is one row, and the returned slice is the report the caller asked
-// for.
+// order, but the ANSWER is the whole report and so is the peak: every row is
+// decoded into the returned slice and there is no page API here. That is
+// deliberate rather than an omission -- the report is written pre-folded. The
+// index publishes it through capabilityReport.finish, which collapses the rows
+// to one per (provider, capability, scope) in foldCollapsed and bounds what
+// survives in boundStates (internal/index/status.go), so a generation's stored
+// report is bounded by the provider/capability/scope product and not by the
+// repository. A page API would page a set whose size the writer already fixed.
 func (r *PinnedReader) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	var out []model.CapabilityState
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
