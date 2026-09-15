@@ -359,7 +359,8 @@ func (t rankedTail) done() bool { return t.SpoolID == "" || t.Served >= t.Total 
 //
 // Owned by lane P-c.
 func (e *Engine) rankPairs(ctx context.Context,
-	emit func(add func(pairRecord) error) error) (*pagination.SortedRun[pairRecord], error) {
+	emit func(add func(pairRecord) error) error,
+	stats *rankStats) (*pagination.SortedRun[pairRecord], error) {
 	byKey, err := e.newPairSort("graphpairkey-", lessByPairKey)
 	if err != nil {
 		return nil, err
@@ -373,6 +374,7 @@ func (e *Engine) rankPairs(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	stats.observe(byKey.PeakLiveRecords())
 	defer folded.Close()
 	// The deadline ends a page and never the answer (ruling P3), but a
 	// cancelled request must not pay for a second pass over a set it will
@@ -388,7 +390,12 @@ func (e *Engine) rankPairs(ctx context.Context,
 	if err := folded.Each(byPair.Add); err != nil {
 		return nil, err
 	}
-	return byPair.Sorted()
+	run, err := byPair.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	stats.observe(byPair.PeakLiveRecords())
+	return run, nil
 }
 
 // newPairSort opens one pass of the pair sort with the frozen codec and the
@@ -417,4 +424,62 @@ func (e *Engine) pairSortDir() string {
 		return os.TempDir()
 	}
 	return e.spools.SortDir()
+}
+
+// rankStats reports the largest in-memory record set a ranked answer's two
+// sort passes ever held. It is the entity-side counterpart of rollupStats: the
+// memory invariant a bound assertion is written against, read from
+// pagination.ExternalSort.PeakLiveRecords so a test asserts the sort's own
+// high-water mark rather than restating the design constant.
+//
+// The two passes run SEQUENTIALLY -- pass 1 is closed before pass 2 opens --
+// so the peak of a ranking is their MAXIMUM and never their sum.
+type rankStats struct{ PeakLiveRecords int }
+
+// observe records a high-water mark. A nil stats is the production case and
+// costs one comparison.
+func (s *rankStats) observe(n int) {
+	if s != nil && n > s.PeakLiveRecords {
+		s.PeakLiveRecords = n
+	}
+}
+
+// heapProbe is the memory instrumentation an END-TO-END bound assertion reads.
+// The two ranked answers rank and serve inside one call, so the sorts they
+// build are created, observed and closed before the caller sees anything; a
+// probe the engine carries is the only way a test can assert on what they held
+// without the ranking handing its sorts out, which would let a caller keep one
+// alive past the request that owns it.
+//
+// Engine.probe is nil in production and every observation is a nil check.
+type heapProbe struct {
+	// Rank is the affected-entity ranking's peak, Pairs the package rollup
+	// ranking's, and Rollup the batch of edges the streaming rollup itself
+	// held above them.
+	Rank   rankStats
+	Pairs  rankStats
+	Rollup rollupStats
+}
+
+// rankProbe, pairProbe and rollupProbe hand the ranking passes the counters to
+// observe into, or nil when nothing is probing.
+func (e *Engine) rankProbe() *rankStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Rank
+}
+
+func (e *Engine) pairProbe() *rankStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Pairs
+}
+
+func (e *Engine) rollupProbe() *rollupStats {
+	if e.probe == nil {
+		return nil
+	}
+	return &e.probe.Rollup
 }

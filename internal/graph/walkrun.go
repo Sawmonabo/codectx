@@ -284,7 +284,8 @@ func (e *Engine) walkScratchDir() string {
 //
 // Owned by lane P-b.
 func (e *Engine) rankImpact(ctx context.Context,
-	emit func(add func(impactRecord) error) error) (*pagination.SortedRun[impactRecord], error) {
+	emit func(add func(impactRecord) error) error,
+	stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
 	dir, runBytes := e.walkScratchDir(), pagination.SortRunBytes(e.limits.FrontierBytes)
 	pass1, err := pagination.NewExternalSort(dir, "graph-impact-fold-", 0,
 		encodeImpactRecord, decodeImpactRecord, lessByNode)
@@ -300,6 +301,7 @@ func (e *Engine) rankImpact(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	stats.observe(pass1.PeakLiveRecords())
 	// The folded run is the input to pass 2 and nothing else; it is closed as
 	// soon as pass 2 has read it, so only ONE of the two sorted files is on
 	// disk by the time the answer is served.
@@ -320,7 +322,12 @@ func (e *Engine) rankImpact(ctx context.Context,
 	}); err != nil {
 		return nil, err
 	}
-	return pass2.Sorted()
+	run, err := pass2.Sorted()
+	if err != nil {
+		return nil, err
+	}
+	stats.observe(pass2.PeakLiveRecords())
+	return run, nil
 }
 
 // servePage reads at most limit records out of the spool tail names, starting

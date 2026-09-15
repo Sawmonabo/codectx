@@ -151,6 +151,9 @@ type Engine struct {
 	gate      Gate
 	limits    Limits
 	now       func() time.Time
+	// probe is TEST-only memory instrumentation (heapProbe in impactrank.go):
+	// nil in production, and every ranking pass's observation is a nil check.
+	probe *heapProbe
 }
 
 // New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases
