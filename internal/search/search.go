@@ -182,8 +182,17 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	if err != nil {
 		return empty, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	// resources.query_timeout bounds the CANDIDATE SEARCH and nothing else.
+	// That is the only unbounded part of this answer -- the tiers walk their
+	// keysets to the end -- and ruling Q4 says the timeout ends a PAGE, not an
+	// answer: the hits ranked before it are a real ordered prefix, and a query
+	// that returned nothing at all because it took too long to look is the
+	// refusal the scale posture forbids. Everything after the search (pinning,
+	// hydrating one page, writing the tail into the continuation spool) is
+	// work over a set already in hand, bounded by one page and one spool
+	// write, and runs under the CALLER's context -- so a search that ended on
+	// its deadline still has a live context to serve its page with, and a
+	// caller who stopped asking still stops all of it.
 	// Every storage read this answer makes resolves its page bound against the
 	// wire ceiling; a request the storage layer served at a different size than
 	// it was asked for is reported on the answer rather than applied silently.
@@ -237,7 +246,10 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		}
 	} else {
 		var run *pagination.SortedRun[scored]
-		if run, truncated, reason, err = s.rank(ctx, reader, req, filter); err != nil {
+		searchCtx, searchCancel := context.WithTimeout(ctx, s.timeout)
+		run, truncated, reason, err = s.rank(searchCtx, reader, req, filter)
+		searchCancel()
+		if err != nil {
 			return empty, err
 		}
 		defer run.Close()
@@ -371,6 +383,7 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 	// no longer a bound on how many candidates a tier may yield. Candidates are
 	// streamed into the collector, so neither the whole tier result nor the
 	// distinct set ever materialises in heap.
+	deadline := false
 	if err := exactCandidates(ctx, reader, req.Query, req.Kinds, model.MaxPageItems,
 		func(e exactHit) error {
 			r, ok := exactRanked(e)
@@ -379,17 +392,36 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 			}
 			return c.add(r, exactHitOf(e), reasonFor(e.Tier))
 		}); err != nil {
-		return nil, false, "", err
+		// Ruling Q4: the time budget ends a PAGE, not an answer. What the
+		// collector already holds is a real ordered prefix of the answer, and
+		// throwing it away to return an error means the widest queries -- the
+		// only ones that ever reach the deadline -- have no servable answer at
+		// all. The deadline stops the tiers; everything below still runs.
+		if !isQueryDeadline(err) {
+			return nil, false, "", err
+		}
+		deadline = true
 	}
 
-	outcome, err := s.lexicalCandidates(ctx, reader, req, filter, c)
-	if err != nil {
-		return nil, false, "", err
+	var outcome lexicalOutcome
+	if !deadline {
+		var err error
+		if outcome, err = s.lexicalCandidates(ctx, reader, req, filter, c); err != nil {
+			if !isQueryDeadline(err) {
+				return nil, false, "", err
+			}
+			deadline = true
+		}
 	}
 
 	truncated, reason := c.truncation()
 	if !truncated && outcome.Truncated {
 		truncated, reason = true, outcome.Reason
+	}
+	if deadline {
+		// The deadline OVERWRITES a tier's reason: a tier's truncation says the
+		// candidate set was bounded, this says the query stopped looking.
+		truncated, reason = true, deadlineReason
 	}
 
 	run, err := c.results()
@@ -397,6 +429,26 @@ func (s *Service) rank(ctx context.Context, reader *sqlite.PinnedReader, req mod
 		return nil, false, "", err
 	}
 	return run, truncated, reason, nil
+}
+
+// deadlineReason is the truncation a page carries when resources.query_timeout
+// ended the candidate search. It names the key the operator can act on, and
+// the answer still carries its continuation: the hits ranked before the
+// deadline are paged and their tail is spooled like any other answer's.
+const deadlineReason = "the query time budget (resources.query_timeout) ended the candidate search; " +
+	"this page holds the hits ranked before it, and the cursor continues them"
+
+// isQueryDeadline reports whether err is a time-budget failure. It is the one
+// error the candidate search converts into a truncated page rather than a
+// failed query.
+func isQueryDeadline(err error) bool {
+	var typed *model.Error
+	if errors.As(err, &typed) {
+		return typed.Code == model.CodeQueryDeadline
+	}
+	// A storage read returns the bare context error; only this package maps it
+	// to the typed answer, and the tiers are below that mapping.
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // errStopWalk ends a sorted-run walk early. SortedRun.Each returns a
