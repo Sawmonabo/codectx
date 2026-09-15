@@ -352,6 +352,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[impactRecord],
 	pairRun *pagination.SortedRun[pairRecord], queryHash string, b *budget, limit int,
 	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, string, error) {
+	// Delivery, for serveRankedImpact's reason: both runs are ranked and this
+	// reads one page off them and spills the remainder.
+	ctx = deliverCtx(ctx)
 	page := make([]impactRecord, 0, limit)
 	if err := run.Each(func(r impactRecord) error {
 		if err := ctx.Err(); err != nil {
@@ -410,9 +413,17 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	// renewal, signing or marshal failure also mints no cursor and must leave
 	// this cursor adoptable so the caller can present it again.
 	complete := false
+	// Serving a ranked page is DELIVERY, so it runs deadline-detached like
+	// every other delivery step: the walk is over, the order is settled, and
+	// what is left is one bounded read of at most `limit` records off a local
+	// spool plus the token that names the rest. Charged against the request
+	// deadline these reads returned the context's own error and the page came
+	// back as ok:false with data:null -- the whole answer unreachable because
+	// the clock ran out while handing back records already on disk.
+	ctx = deliverCtx(ctx)
 	defer func() {
 		if terminalOutcome(err) && complete {
-			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+			e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 		}
 	}()
 	if e.spools == nil {

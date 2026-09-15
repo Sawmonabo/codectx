@@ -19,12 +19,11 @@ import (
 // from below -- which is why the engine shipped treating it as fatal and threw
 // away the page, the frontier and the cursor with it.
 //
-// The sleep is what makes the deadline land INSIDE a read rather than on a
-// checkWalk between reads: the engine's own checks synthesize a typed error and
-// were always handled.
+// Checking the context at the TOP of the read is what makes the deadline land
+// inside it rather than on a checkWalk between reads: the engine's own checks
+// synthesize a typed error and were always handled.
 type ctxAdjacency struct {
 	*graphFixture
-	delay time.Duration
 	mu    sync.Mutex
 	calls int
 }
@@ -34,7 +33,6 @@ func (a *ctxAdjacency) Edges(ctx context.Context, nodes []model.NodeID, directio
 	a.mu.Lock()
 	a.calls++
 	a.mu.Unlock()
-	time.Sleep(a.delay)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -129,17 +127,26 @@ func TestImpactPagesOnRawStorageDeadline(t *testing.T) {
 			Page: model.PageRequest{Limit: 200, Cursor: cursor}}
 	}
 
-	// The reference: the same walk with a deadline no read can reach.
+	// The reference: the same walk with a deadline no read can reach. Its wall
+	// clock also CALIBRATES the subject's budget, so the case holds its shape
+	// under -race and on a loaded machine instead of pinning a constant that a
+	// ten-times-slower build turns into a walk that cannot advance at all.
 	ref := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, 10*time.Minute)
+	start := time.Now()
 	want := drainImpact(t, ref, req, "reference")
+	budget := time.Since(start) / 6
 	if len(want) == 0 {
 		t.Fatalf("reference answer is empty; the fixture proves nothing")
 	}
+	if budget < 5*time.Millisecond {
+		budget = 5 * time.Millisecond
+	}
 
-	// The subject: 2ms per adjacency read against a 120ms budget, so the
-	// deadline lands inside a read on every page and the walk needs several.
-	adj := &ctxAdjacency{graphFixture: f, delay: 2 * time.Millisecond}
-	e := newStorageDeadlineEngine(t, adj, 120*time.Millisecond)
+	// The subject: a sixth of the whole answer's wall clock per request, so the
+	// deadline lands inside a read on every page and the walk needs several --
+	// while every page still advances, which is the condition under which a
+	// continuation, not the terminal stalled reason, is the right answer.
+	e := newStorageDeadlineEngine(t, &ctxAdjacency{graphFixture: f}, budget)
 	got := drainImpact(t, e, req, "deadline-split")
 
 	if len(got) != len(want) {
