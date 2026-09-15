@@ -66,7 +66,9 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		defer resume.Release()
 		b = resume.Budget
 	}
-	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges, limit)
+	acc := // The rollup reads acc.Relations() and no impact record, so it emits
+		// none. Lane P-c replaces this with the pair sort of ruling P4.
+		newImpactAccumulator(req.Start, b, maxVisited, maxEdges, limit, nil)
 	state, walkErr := expand(ctx, e.adjacency, acc.Seeds(), expandOptions{
 		Direction:     req.Direction,
 		Kinds:         kinds,
