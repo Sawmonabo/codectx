@@ -2,7 +2,6 @@ package graph
 
 import (
 	"context"
-	"errors"
 	"os"
 	"time"
 
@@ -119,8 +118,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			// Handled here rather than by deadlineStop, whose "this page
 			// admitted an edge" guard reads the per-page counter this boundary
 			// has just reset.
-			var typed *model.Error
-			if !errors.As(err, &typed) || typed.Code != model.CodeQueryDeadline {
+			if !isDeadline(err) {
 				return walkState{}, err
 			}
 			o.Budget.deadlineHit = true
@@ -380,15 +378,10 @@ func (e *Engine) detachRankPass(retain *retainedWalk, sorter *pagination.Externa
 }
 
 // isRankDeadline reports the one interruption a ranking pass may be resumed
-// from. It is the same test impactPhaseError applies, kept here so the two
-// cannot disagree about which stop mints a continuation.
-func isRankDeadline(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-	var typed *model.Error
-	return errors.As(err, &typed) && typed.Code == model.CodeQueryDeadline
-}
+// from. It is isDeadline, named here so the ranking phase reads as what it is;
+// sharing the one classifier keeps it from disagreeing with impactPhaseError
+// and the walk about which stop mints a continuation.
+func isRankDeadline(err error) bool { return isDeadline(err) }
 
 // rankedSpoolHeader reads the leading rankedHeader record of a ranked spool and
 // reports where the records after it begin, plus the bytes this read took off

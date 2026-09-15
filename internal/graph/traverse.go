@@ -50,8 +50,10 @@ func deadlineStop(err error, o expandOptions) bool {
 	if o.Budget.pageEdges == 0 && !o.DeadlineResumesEmptyPage {
 		return false
 	}
-	var me *model.Error
-	return errors.As(err, &me) && me.Code == model.CodeQueryDeadline
+	// isDeadline, not a typed-only test: a deadline that fell inside a STORAGE
+	// read arrives as the context's own untyped error and ends the page exactly
+	// as the engine's own typed one does.
+	return isDeadline(err)
 }
 
 // edgeRowOverheadBytes is the fixed per-row cost of holding one edge of a
@@ -207,7 +209,16 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 			candidates = append(candidates, row.neighbor)
 		}
 		if err := admitted.warm(ctx, candidates); err != nil {
-			return walkState{}, err
+			if !deadlineStop(err, o) {
+				return walkState{}, err
+			}
+			// The membership sweep reads the cumulative set off its spool and
+			// so can run out of time like any other I/O. Nothing of this level
+			// has been taken, so the page ends here with the level standing.
+			o.Budget.deadlineHit = true
+			return walkState{Depth: depth, Frontier: append(append(
+				make([]frontierState, 0, len(frontier)+len(carry)), frontier...), carry...),
+				Admitted: admitted, LevelBoundary: true}, nil
 		}
 
 		next := carry
@@ -219,6 +230,23 @@ func expand(ctx context.Context, a Adjacency, seeds []model.NodeID, o expandOpti
 		taken := 0
 		for _, row := range rows {
 			if err := visit(row.owner, row.rel); err != nil {
+				if deadlineStop(err, o) {
+					// The VISITOR ran out of time. It is not a pure predicate:
+					// the impact rollup batches the edges it is given and
+					// resolves their containing packages with its own adjacency
+					// reads, so the request deadline lands inside the visitor as
+					// often as inside the walk's own reads -- and on a real
+					// repository it landed there FIRST, which is how a walk the
+					// engine was ready to continue came back as a bare
+					// CTX_QUERY_DEADLINE with its frontier discarded. The page
+					// ends exactly as the deliberate stop below does.
+					o.Budget.deadlineHit = true
+					stopped := make([]frontierState, 0, len(frontier)+len(next))
+					stopped = append(stopped, frontier...)
+					stopped = append(stopped, next...)
+					return walkState{Depth: depth, Frontier: stopped, Admitted: admitted,
+						LevelBoundary: taken == 0}, nil
+				}
 				if errors.Is(err, errStopExpansion) {
 					// A deliberate mid-level stop. The continuation re-reads
 					// THIS level from the row just admitted and keeps the next
@@ -406,7 +434,18 @@ func levelEdges(ctx context.Context, a Adjacency, nodes []model.NodeID, level ma
 			}
 			page, err := a.Edges(ctx, chunk, o.Direction, o.Kinds, after, rowLimit)
 			if err != nil {
-				return false, err
+				if !deadlineStop(err, o) {
+					return false, err
+				}
+				// The deadline fell INSIDE the read rather than on the check
+				// above it: the reader returned the context's own error and no
+				// rows. Identical outcome to the check -- the rows this chunk
+				// already appended are facts, the level stops here and the
+				// caller mints a continuation from the keyset position -- and
+				// the read that was cut short returned nothing, so nothing is
+				// lost by not counting it.
+				o.Budget.deadlineHit = true
+				return true, nil
 			}
 			for _, rel := range page {
 				if admittedRel[rel.ID] || collected[rel.ID] {

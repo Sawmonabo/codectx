@@ -333,7 +333,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	if err != nil {
 		return answer, nil, nil, "", err
 	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
+	if err := impactPhaseError(ctx, e.attachImpactEvidence(deliverCtx(ctx), entries), &meta); err != nil {
 		return answer, nil, nil, "", err
 	}
 	answer.Truncated, answer.Reason = meta.Truncated, meta.TruncationReason
@@ -352,6 +352,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 func (e *Engine) serveRankedRun(ctx context.Context, run *pagination.SortedRun[impactRecord],
 	pairRun *pagination.SortedRun[pairRecord], queryHash string, b *budget, limit int,
 	answer *impactAnswer, meta *model.QueryMeta) ([]model.ImpactEntry, string, error) {
+	// Delivery, for serveRankedImpact's reason: both runs are ranked and this
+	// reads one page off them and spills the remainder.
+	ctx = deliverCtx(ctx)
 	page := make([]impactRecord, 0, limit)
 	if err := run.Each(func(r impactRecord) error {
 		if err := ctx.Err(); err != nil {
@@ -410,9 +413,17 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	// renewal, signing or marshal failure also mints no cursor and must leave
 	// this cursor adoptable so the caller can present it again.
 	complete := false
+	// Serving a ranked page is DELIVERY, so it runs deadline-detached like
+	// every other delivery step: the walk is over, the order is settled, and
+	// what is left is one bounded read of at most `limit` records off a local
+	// spool plus the token that names the rest. Charged against the request
+	// deadline these reads returned the context's own error and the page came
+	// back as ok:false with data:null -- the whole answer unreachable because
+	// the clock ran out while handing back records already on disk.
+	ctx = deliverCtx(ctx)
 	defer func() {
 		if terminalOutcome(err) && complete {
-			e.releaseConsumed(context.WithoutCancel(ctx), c.SpoolID, c.LeaseID)
+			e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 		}
 	}()
 	if e.spools == nil {
@@ -441,7 +452,7 @@ func (e *Engine) serveRankedImpact(ctx context.Context, c traversalCursor, b *bu
 	if err != nil {
 		return answer, nil, nil, "", err
 	}
-	if err := impactPhaseError(ctx, e.attachImpactEvidence(ctx, entries), &meta); err != nil {
+	if err := impactPhaseError(ctx, e.attachImpactEvidence(deliverCtx(ctx), entries), &meta); err != nil {
 		return answer, nil, nil, "", err
 	}
 	var next string
@@ -487,7 +498,7 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 		}
 		entries = append(entries, entry)
 	}
-	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(ctx, entries)
+	entries, unhydratable, hydrateErr := e.hydrateImpactEntries(deliverCtx(ctx), entries)
 	if err := impactPhaseError(ctx, hydrateErr, meta); err != nil {
 		return nil, err
 	}
@@ -502,6 +513,24 @@ func (e *Engine) impactPage(ctx context.Context, page []impactRecord, answer *im
 	}
 	return entries, nil
 }
+
+// deliverCtx detaches the request deadline from the work that DELIVERS a page
+// the engine has already decided the contents of: hydrating the page's nodes
+// and attaching its evidence.
+//
+// Those reads are bounded by the page, never by the reachable set -- at most
+// Page.Limit nodes and their evidence, in batched round trips -- and the
+// records they describe are already CONSUMED: serveRankedImpact advances
+// RankServed by the records it took off the spool, so a hydration read that
+// fails past the deadline does not truncate the answer, it deletes those
+// entities from it with no notice and no cursor that would ever hand them back.
+// Measured on a deadline-split fixture walk: 2 176 of 2 440 affected entities
+// served, the chain reporting itself complete.
+//
+// Cancellation is dropped with the deadline, which costs nothing here: a
+// canceled request is answered as CTX_CANCELED by impactPhaseError before any
+// page is delivered, and what runs under this context is a bounded local read.
+func deliverCtx(ctx context.Context) context.Context { return context.WithoutCancel(ctx) }
 
 // spillRankedCursor writes the ranked remainder of the FIRST page into ONE
 // spool -- the two sorted runs laid down in section order -- and signs the
