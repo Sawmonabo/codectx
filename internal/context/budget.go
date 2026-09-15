@@ -455,7 +455,7 @@ func (r *routeCursors) take(index int64) ([]model.RelationPath, error) {
 // bound and counts the rest, so the list is f(model.MaxDetailBytes) and never
 // f(required scope).
 //
-// moreReserve is held back from the bound so the "and N more" tail always fits
+// moreReserve is held back from the bound so the "… and N more" tail always fits
 // inside it: appending the tail at the bound would push the join past
 // MaxDetailBytes and Error.WithDetail would clip away the very count that says
 // the list is partial.
@@ -494,7 +494,7 @@ func (m *missingList) detail() []string {
 	if m.more == 0 {
 		return m.paths
 	}
-	return append(m.paths[:len(m.paths):len(m.paths)], fmt.Sprintf("and %d more", m.more))
+	return append(m.paths[:len(m.paths):len(m.paths)], fmt.Sprintf("… and %d more", m.more))
 }
 
 // checkRequiredFitsStream is checkRequiredFits over a sorted run. It walks the
