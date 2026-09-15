@@ -237,3 +237,7 @@ func notFound(format string, args ...any) *model.Error {
 func resourceLimit(format string, args ...any) *model.Error {
 	return &model.Error{Code: model.CodeResourceLimit, Message: fmt.Sprintf(format, args...)}
 }
+
+func internalError(format string, args ...any) *model.Error {
+	return &model.Error{Code: model.CodeInternal, Message: fmt.Sprintf(format, args...)}
+}
