@@ -82,7 +82,23 @@ const (
 	// at a time and bounded only by the two user-set context.max_capsule_* keys,
 	// unlimited by default.
 	MaxRecordsPerResult = 1000
-	MaxEvidencePerFact  = 64 // Section 11.1: a fact carries bounded evidence
+	// MaxEvidencePerFact is a wire and record ceiling on the evidence one
+	// fact hands over in a single batch, not a bound on how much evidence a
+	// fact HAS. At 64 it was the latter: a provider clipped a fact's 65th
+	// occurrence under default settings and storage deleted the surplus rows,
+	// so an identity referenced 200 times in one file reported 64 of them
+	// however the caller asked. Nothing downstream needs the small value --
+	// evidence is stored as rows and every read of it is paged (the keyset
+	// page in storage, the caller's per-relation limit in the graph), so a
+	// large ceiling costs a reader nothing.
+	//
+	// 65536 is chosen to be unreachable by a unit a real file produces: it
+	// would take a file with more than 65536 occurrences of one single
+	// identity to reach it. What actually bounds a batch's memory is the
+	// user-set resources.max_provider_record_bytes and the sink's batch
+	// reservation, both of which apply whatever this value is. Exceeding it
+	// is still disclosed, never silent.
+	MaxEvidencePerFact = 65536
 )
 
 // maxSigned64 is the largest value SQLite stores in an INTEGER column. Section
