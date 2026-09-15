@@ -358,14 +358,34 @@ func (s *Services) Impact(ctx context.Context, req model.ImpactRequest) (model.I
 // publishes the manifest on its own and OpenSession is idempotent per actor and
 // idempotency key, so a session that fails to open leaves a reusable manifest
 // rather than a half-written one.
+//
+// The compile is CONTINUABLE (rulings C7 and C9): when it runs out of query
+// deadline it ends the pass it is in and answers a truncated PlanResult
+// carrying the token the caller presents back as PlanRequest.Cursor. No session
+// is opened on that path -- see the truncation branch below.
 func (s *Services) Plan(ctx context.Context, req model.PlanRequest) (model.PlanResult, model.SessionStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, err
 	}
-	manifest, err := s.w.Compile(ctx, req.Context)
+	res, err := s.w.CompilePage(ctx, req.Context, req.Cursor)
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
 	}
+	// Ruling C9: a compile that ended at a pass boundary is returned BEFORE any
+	// session is opened. There is no manifest for a session to bind to -- a
+	// partial plan is never persisted -- so opening one here would leave a
+	// session row pointing at a manifest that does not exist, and the actor
+	// would have to close it before continuing. The status is the zero one on
+	// purpose: there is no session to describe yet.
+	if res.Truncated {
+		return model.PlanResult{
+			ActorID:          req.ActorID,
+			Truncated:        true,
+			TruncationReason: res.TruncationReason,
+			NextCursor:       res.NextCursor,
+		}, model.SessionStatus{}, nil
+	}
+	manifest := res.Manifest
 	id, err := s.w.s.coverage.OpenSession(ctx, req, manifest.ID)
 	if err != nil {
 		return model.PlanResult{}, model.SessionStatus{}, s.fail("context plan", err)
