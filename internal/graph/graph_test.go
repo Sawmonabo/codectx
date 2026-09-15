@@ -540,7 +540,7 @@ func TestGraphScenarios(t *testing.T) {
 			name: "traverse/hub at max edges truncates without dropping",
 			run: func(t *testing.T, f *graphFixture) {
 				const maxEdges = 10
-				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -593,7 +593,7 @@ func TestGraphScenarios(t *testing.T) {
 				// The page bound must sit above the fan-out, so the only thing
 				// that can cut the answer short is the keyset loop itself.
 				limits.MaxPageItems = fixtureWideCount + 1
-				e, err := New(Options{Adjacency: f, Limits: limits})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -649,7 +649,7 @@ func TestGraphScenarios(t *testing.T) {
 				// n-wide's fan-out can reach.
 				limits.MaxPageItems = fixtureWideCount + 1
 				limits.FrontierBytes = 4096
-				e, err := New(Options{Adjacency: f, Limits: limits})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -685,7 +685,7 @@ func TestGraphScenarios(t *testing.T) {
 			// because a map-order defect surfaces across runs, not within one.
 			name: "path/equal_cost_routes_keep_the_frozen_order",
 			run: func(t *testing.T, f *graphFixture) {
-				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				engine, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -729,7 +729,7 @@ func TestGraphScenarios(t *testing.T) {
 			// only proof.
 			name: "impact entries are explained, directed and deduplicated across a cycle",
 			run: func(t *testing.T, f *graphFixture) {
-				engine, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				engine, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -814,7 +814,7 @@ func TestGraphScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("open signer: %v", err)
 			}
-			e, err := New(Options{Adjacency: f, Signer: signer,
+			e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer,
 				Leases: pagination.NewLeases(newFixtureLeases(), fixtureLimits().CursorTTL), Limits: fixtureLimits()})
 			if err != nil {
 				t.Fatalf("new engine: %v", err)
@@ -896,7 +896,7 @@ func TestGraphScenarios(t *testing.T) {
 				// whole one this row compares against.
 				limits.MaxDepth = 0
 				limits.MaxPageItems = 400
-				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 				if err != nil {
 					t.Fatalf("new engine: %v", err)
@@ -982,7 +982,7 @@ func TestGraphScenarios(t *testing.T) {
 				limits := fixtureLimits()
 				limits.MaxDepth = 2
 				limits.MaxPageItems = 400
-				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
 				if err != nil {
 					t.Fatalf("new engine: %v", err)
@@ -1049,7 +1049,7 @@ func TestGraphScenarios(t *testing.T) {
 				limits.MaxDepth = 2
 				limits.MaxPageItems = 120
 				leases := pagination.NewLeases(store, limits.CursorTTL)
-				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer, Spools: spools,
 					Leases: leases, Limits: limits})
 				if err != nil {
 					t.Fatalf("new engine: %v", err)
@@ -1101,7 +1101,7 @@ func TestGraphScenarios(t *testing.T) {
 			// Both are silent wrong answers a caller cannot detect.
 			name: "references keeps relation count and occurrence count distinct",
 			run: func(t *testing.T, f *graphFixture) {
-				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1149,7 +1149,7 @@ func TestGraphScenarios(t *testing.T) {
 				// has nothing to do with the keyset loop under test.
 				limits := fixtureLimits()
 				limits.MaxPageItems = 2 * fixtureWideCount
-				e, err := New(Options{Adjacency: f, Limits: limits})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1204,7 +1204,7 @@ func TestGraphScenarios(t *testing.T) {
 				const timeout = 50 * time.Millisecond
 				limits := fixtureLimits()
 				limits.QueryTimeout = timeout
-				e, err := New(Options{Adjacency: f, Limits: limits, Gate: blockingGate{}})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits, Gate: blockingGate{}})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1262,7 +1262,7 @@ func TestGraphScenarios(t *testing.T) {
 			// not read as incomplete; it is read as the repository's shape.
 			name: "overview/a container past the storage page clamp is rolled up completely",
 			run: func(t *testing.T, f *graphFixture) {
-				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: fixtureLimits()})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1314,7 +1314,7 @@ func TestGraphScenarios(t *testing.T) {
 				// containers it could not measure and discloses the bound.
 				starved := fixtureLimits()
 				starved.MaxEdges = 1
-				se, err := New(Options{Adjacency: f, Limits: starved})
+				se, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: starved})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1358,7 +1358,7 @@ func TestGraphScenarios(t *testing.T) {
 					t.Fatalf("open signer: %v", err)
 				}
 				limits := fixtureLimits()
-				e, err := New(Options{Adjacency: f, Signer: signer,
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Signer: signer,
 					Leases: pagination.NewLeases(newFixtureLeases(), limits.CursorTTL), Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
@@ -1418,7 +1418,7 @@ func TestGraphScenarios(t *testing.T) {
 				}
 				limits := fixtureLimits()
 				limits.MaxDepth = int(config.Unlimited)
-				e, err := New(Options{Adjacency: f, Limits: limits})
+				e, err := New(Options{Adjacency: f, Reader: memGraphFor(f), Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}

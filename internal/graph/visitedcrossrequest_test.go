@@ -93,7 +93,7 @@ func TestABackEdgeReachedByALaterRequestIsNeverReadmitted(t *testing.T) {
 	slow := slowConvergent{convergentAdjacency: f, clock: &clock, calls: &calls,
 		jump: 2 * time.Minute, every: 64}
 	probe := &heapProbe{}
-	e, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+	e, err := New(Options{Adjacency: slow, Reader: f.reader(), Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(leases, limits.CursorTTL), Limits: limits,
 		Now: func() time.Time { return clock }})
 	if err != nil {
