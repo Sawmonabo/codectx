@@ -3,6 +3,8 @@ package graph
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,9 +319,33 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 			}
 			req.Page, req.GenerationID = model.PageRequest{Cursor: res.Meta.NextCursor}, 0
 		}
-		assertNoRetainedState(t, spoolDir)
+		// NOT swept. reasonDeadlineStalled ends the ANSWER, not the walk: the
+		// page that reports it mints no cursor, so the one the caller is
+		// holding is the whole remedy the reason offers and the state it names
+		// has to outlive this request. It is reclaimed by its lease, like every
+		// other continuation the caller never comes back for; the resume half
+		// of the remedy is exercised in TestAMidLevelStallEndsTheAnswer.
+		if !hasRetainedState(t, spoolDir) {
+			t.Fatal("the stalled answer released the state its own cursor names: the remedy it " +
+				"reports -- present that cursor again under a longer timeout -- cannot work")
+		}
 	})
 
+}
+
+// hasRetainedState reports whether any continuation state is still on disk.
+func hasRetainedState(t *testing.T, dir string) bool {
+	t.Helper()
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the spool store: %v", err)
+	}
+	for _, e := range left {
+		if strings.HasPrefix(e.Name(), "spool-") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestAMidLevelStallEndsTheAnswer is the other half of the livelock proof, and
@@ -349,7 +375,10 @@ func TestADeadlineSplitWalkAlwaysAdvances(t *testing.T) {
 // beginning -- and page 3 is where the (now matching, because both are empty)
 // guard fires. The case fails with "reported it could not advance on page 3".
 func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
-	const mids, fanOut = 8, 6
+	// The seed's own level must be WIDER than one adjacency read, so that the
+	// first page stops inside it and the continuation carries a real keyset
+	// position rather than the empty one a level boundary mints.
+	const mids, fanOut = 300, 2
 	const pageCap = 400
 
 	f := newReachableFixture(t, mids, fanOut)
@@ -365,9 +394,14 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 	}
 	limits := fixtureLimits()
 	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
-	limits.MaxPageItems = 8
+	limits.MaxPageItems = 50
 	limits.QueryTimeout = time.Minute
 	limits.FrontierBytes = 8 << 20
+	// The stall jumps the clock two minutes per adjacency read, and the state
+	// the remedy adopts stays adoptable only while its LEASE lives. That bound
+	// is real and documented (docs/queries.md); it is not what this case is
+	// measuring, so the TTL is put well clear of the jumps.
+	limits.CursorTTL = time.Hour
 
 	clock := time.Now()
 	calls, fired := 0, false
@@ -425,6 +459,84 @@ func TestAMidLevelStallEndsTheAnswer(t *testing.T) {
 			break
 		}
 		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+	}
+
+	// The remedy the reason promises, exercised. reasonDeadlineStalled ends the
+	// ANSWER but not the walk: the page that reports it mints no cursor of its
+	// own, so the one the caller is still holding has to stay adoptable. A
+	// fresh request gets a fresh deadline, and here also a reader that does not
+	// run past it, so the same cursor carries the walk to exhaustion instead of
+	// costing it from the seed.
+	//
+	// Mutation (applied, run, reverted in one command): the stalled path's flag
+	// dropped, so the named-return defer's terminalOutcome(nil) releases the
+	// retained walk and its lease -- `resume: CTX_CURSOR_INVALID: continuation
+	// state has expired or was released`.
+	warm, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+		Now: func() time.Time { return clock }})
+	if err != nil {
+		t.Fatalf("new warm engine: %v", err)
+	}
+	served, resumed := 0, model.ImpactRequest{
+		Start: req.Start, Direction: req.Direction, Relations: req.Relations,
+		Page: model.PageRequest{Cursor: first.Meta.NextCursor}}
+	for pages := 1; ; pages++ {
+		if pages > pageCap {
+			t.Fatalf("the resumed walk never reached exhaustion in %d pages", pageCap)
+		}
+		res, err := warm.Impact(context.Background(), resumed)
+		if err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		served += len(res.Entries)
+		if res.Meta.NextCursor == "" {
+			if res.Meta.Truncated {
+				t.Fatalf("the resumed walk ended truncated with %q; the remedy must reach the whole answer",
+					res.Meta.TruncationReason)
+			}
+			t.Logf("the held cursor resumed and served %d entities over %d page(s)", served, pages)
+			break
+		}
+		resumed.Page, resumed.GenerationID = model.PageRequest{Cursor: res.Meta.NextCursor}, 0
+	}
+	// The remedy must not lose the leg that ran before the stall: the answer it
+	// reaches is the whole one, not the remainder.
+	if want := unboundedImpactCount(t, f, signer, store, spoolDir, limits, req.Start); served != want {
+		t.Fatalf("the resumed walk served %d entities; the unbounded walk serves %d", served, want)
+	}
+}
+
+// unboundedImpactCount is how many entities the same query answers with no
+// deadline in its way, paged to exhaustion.
+func unboundedImpactCount(t *testing.T, f *graphFixture, signer *pagination.Signer,
+	store pagination.LeaseStore, spoolDir string, limits Limits, start []model.NodeID) int {
+	t.Helper()
+	spools, err := pagination.NewSpools(t.TempDir(), 0, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	req := model.ImpactRequest{GenerationID: 1, Start: start,
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+	total := 0
+	for {
+		res, err := e.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("unbounded impact: %v", err)
+		}
+		total += len(res.Entries)
+		if res.Meta.NextCursor == "" {
+			if res.Meta.Truncated {
+				t.Fatalf("the unbounded walk is truncated with %q", res.Meta.TruncationReason)
+			}
+			return total
+		}
+		req.Page, req.GenerationID = model.PageRequest{Cursor: res.Meta.NextCursor}, 0
 	}
 }
 
