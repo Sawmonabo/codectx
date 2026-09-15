@@ -160,16 +160,23 @@ CREATE TABLE generation_capabilities (
     details_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(generation_id, provider_id, capability, scope_key)
 ) WITHOUT ROWID;
+-- node_ids is the node identity dictionary (Section 12.2, S-1/S-4/S-5).
+-- id is a storage-internal surrogate: an INTEGER PRIMARY KEY is the b-tree key
+-- itself, so it costs zero payload bytes in the table and 1-4 varint bytes
+-- wherever it is referenced, against ~33 B for a 32-byte BLOB reference.
+-- The surrogate NEVER leaves the store: model.NodeID on the wire, in cursors
+-- and in every canonical hash is `canonical`, which is stored exactly once.
+-- repository_id is dropped: one store is one repository (schema.sql repositories).
 CREATE TABLE node_ids (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
-    repository_id BLOB NOT NULL REFERENCES repositories(id),
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
     kind TEXT NOT NULL,
-    canonical_key TEXT NOT NULL,
-    UNIQUE(repository_id, kind, canonical_key)
+    canonical_key BLOB NOT NULL CHECK(length(canonical_key) = 32),
+    UNIQUE(kind, canonical_key)
 );
 CREATE TABLE node_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB NOT NULL REFERENCES node_ids(id),
+    node_id INTEGER NOT NULL REFERENCES node_ids(id),
     language TEXT NOT NULL DEFAULT '',
     name TEXT NOT NULL,
     qualified_name TEXT NOT NULL DEFAULT '',
@@ -184,17 +191,21 @@ CREATE TABLE node_facts (
        OR (file_id IS NOT NULL AND start_byte IS NOT NULL AND end_byte IS NOT NULL
            AND start_byte >= 0 AND end_byte >= start_byte))
 ) WITHOUT ROWID;
+-- relation_ids mirrors node_ids (S-2/S-5): an INTEGER surrogate, the canonical
+-- 32-byte RelationID stored once in `canonical`, and the endpoints carried as
+-- node surrogates. Today this row holds four 32-byte BLOBs and is replicated by
+-- two autoindexes plus idx_relations_from/_to.
 CREATE TABLE relation_ids (
-    id BLOB PRIMARY KEY CHECK(length(id) = 32),
-    repository_id BLOB NOT NULL REFERENCES repositories(id),
-    from_node_id BLOB NOT NULL REFERENCES node_ids(id),
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    canonical BLOB NOT NULL UNIQUE CHECK(length(canonical) = 32),
+    from_node_id INTEGER NOT NULL REFERENCES node_ids(id),
     kind TEXT NOT NULL,
-    to_node_id BLOB NOT NULL REFERENCES node_ids(id),
-    UNIQUE(repository_id, from_node_id, kind, to_node_id)
+    to_node_id INTEGER NOT NULL REFERENCES node_ids(id),
+    UNIQUE(from_node_id, kind, to_node_id)
 );
 CREATE TABLE relation_facts (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    relation_id BLOB NOT NULL REFERENCES relation_ids(id),
+    relation_id INTEGER NOT NULL REFERENCES relation_ids(id),
     PRIMARY KEY(unit_id, relation_id)
 ) WITHOUT ROWID;
 -- fact_keys carries the producer's own id-independent delta keys for one fact
@@ -207,23 +218,30 @@ CREATE TABLE relation_facts (
 -- and can only be replaced by its retention bucket.
 CREATE TABLE fact_keys (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB,
-    relation_id BLOB,
+    node_id INTEGER,
+    relation_id INTEGER,
     fact_key TEXT NOT NULL,
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
     FOREIGN KEY(unit_id, relation_id) REFERENCES relation_facts(unit_id, relation_id),
     CHECK((node_id IS NOT NULL AND relation_id IS NULL) OR (node_id IS NULL AND relation_id IS NOT NULL))
 );
+-- evidence.id stays a PRIMARY KEY: S-6 is REFUSED by call site, not by size.
+-- units.go:748 and delta.go:437 upsert with ON CONFLICT(id) DO NOTHING, which
+-- SQLite only accepts against a PRIMARY KEY or UNIQUE index, and delta.go:573
+-- clips surplus evidence BY id value. The id is a pure function of the evidence
+-- fields (model.NewEvidenceID), so this uniqueness is a derived invariant, not
+-- an arbitrary surrogate, and the value reaches the wire as
+-- ReferenceOccurrence.evidence_id and FactReference.evidence_ids.
 CREATE TABLE evidence (
     id BLOB PRIMARY KEY CHECK(length(id) = 32),
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    node_id BLOB,
-    relation_id BLOB,
+    node_id INTEGER,
+    relation_id INTEGER,
     precision TEXT NOT NULL CHECK(precision IN ('compiler','language_server','static_analysis','syntax','heuristic')),
     file_id BLOB,
     start_byte INTEGER,
     end_byte INTEGER,
-    native_key TEXT NOT NULL DEFAULT '',
+    native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
     detail TEXT NOT NULL DEFAULT '',
     content_hash_bound INTEGER NOT NULL DEFAULT 0 CHECK(content_hash_bound IN (0,1)),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
@@ -241,19 +259,41 @@ CREATE TABLE unit_delta_state (
     payload BLOB NOT NULL,
     PRIMARY KEY(unit_id, kind)
 ) WITHOUT ROWID;
+-- S-3 intern dictionaries. A WITHOUT ROWID table re-stores its whole primary
+-- key inside every secondary index, so a wide PK is paid for once per index.
+-- Interning replaces the wide text columns with surrogates so that the PK, and
+-- therefore each index built over it, is a handful of varints.
+-- Measured on the wave-g2 fixture: 274 807 alias rows carry only 403 distinct
+-- scope keys (avg 34 B) and 216 385 distinct native keys (avg 52 B), each
+-- replicated three times (table + idx_alias_lookup + idx_alias_node); evidence
+-- adds 477 388 native-key copies drawn from the same 52 711-value vocabulary.
+-- The writer resolves these through a bounded LRU flushed with each batch
+-- (ids.go) -- never a whole-repository dictionary in heap.
+CREATE TABLE scope_keys (
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    key TEXT NOT NULL UNIQUE
+);
+CREATE TABLE native_keys (
+    id INTEGER PRIMARY KEY CHECK(id > 0),
+    key TEXT NOT NULL UNIQUE
+);
+-- No `paths` intern table: the only high-multiplicity path column is
+-- search_units.path, and search_fts declares it as an external-content FTS5
+-- column (content='search_units'), so it must stay a TEXT column of that name
+-- or the path field leaves the full-text index. files.path is 818 rows /
+-- 114 KiB on the wave-g2 fixture and is not an amplifier.
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    scope_key TEXT NOT NULL,
-    native_key TEXT NOT NULL,
-    node_id BLOB NOT NULL,
-    PRIMARY KEY(unit_id, scope_key, native_key, node_id),
-    FOREIGN KEY(node_id) REFERENCES node_ids(id)
+    scope_key_id INTEGER NOT NULL REFERENCES scope_keys(id),
+    native_key_id INTEGER NOT NULL REFERENCES native_keys(id),
+    node_id INTEGER NOT NULL REFERENCES node_ids(id),
+    PRIMARY KEY(unit_id, scope_key_id, native_key_id, node_id)
 ) WITHOUT ROWID;
 CREATE TABLE search_units (
     rowid INTEGER PRIMARY KEY,
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     search_key BLOB NOT NULL CHECK(length(search_key) = 32),
-    node_id BLOB,
+    node_id INTEGER,
     file_id BLOB NOT NULL,
     path TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -290,7 +330,7 @@ CREATE TABLE context_manifests (
 CREATE TABLE context_entries (
     manifest_id BLOB NOT NULL REFERENCES context_manifests(id) ON DELETE CASCADE,
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-    node_id BLOB REFERENCES node_ids(id),
+    node_id INTEGER REFERENCES node_ids(id),
     file_id BLOB REFERENCES files(id),
     requirement TEXT NOT NULL CHECK(requirement IN ('required_full','required_symbol','recommended','optional')),
     score_micros INTEGER NOT NULL,
@@ -442,16 +482,38 @@ CREATE INDEX idx_nodes_name ON node_facts(name, unit_id, node_id);
 CREATE INDEX idx_nodes_qname ON node_facts(qualified_name, unit_id, node_id);
 CREATE INDEX idx_nodes_file ON node_facts(file_id, start_byte, unit_id);
 CREATE INDEX idx_node_facts_id ON node_facts(node_id, unit_id);
-CREATE INDEX idx_relations_from ON relation_ids(from_node_id, kind, to_node_id);
+-- No idx_relations_from: dropping the constant repository_id (S-5) leaves
+-- relation_ids with UNIQUE(from_node_id, kind, to_node_id), whose autoindex is
+-- column-for-column the index this used to be. Its call sites (query.go:380,
+-- adjacency.go:194, gc.go:196) keep an identical access path. idx_relations_to
+-- stays: nothing else on relation_ids leads with to_node_id, and it is the
+-- reverse-traversal ("who calls X") path.
 CREATE INDEX idx_relations_to ON relation_ids(to_node_id, kind, from_node_id);
 CREATE INDEX idx_relation_facts_id ON relation_facts(relation_id, unit_id);
-CREATE UNIQUE INDEX idx_fact_keys ON fact_keys(unit_id, fact_key, coalesce(node_id, x''), coalesce(relation_id, x''));
-CREATE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id);
-CREATE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id);
+-- fact_keys uniqueness, re-specified for INTEGER node_id/relation_id.
+-- The old expression index UNIQUE(unit_id, fact_key, coalesce(node_id, x''),
+-- coalesce(relation_id, x'')) used an empty BLOB as the "absent" sentinel over
+-- two columns that are now INTEGER. A coalesce(...,0) sentinel would work --
+-- CHECK(id > 0) on node_ids/relation_ids makes 0 unreachable -- but a sentinel
+-- is not needed at all. The table's CHECK guarantees exactly one of node_id /
+-- relation_id is non-NULL, and SQLite treats NULLs in a UNIQUE index as
+-- distinct, so UNIQUE(unit_id, node_id, fact_key) constrains exactly the
+-- node-backed rows and never collides across the relation-backed ones (every
+-- one of which carries node_id NULL). Two such indexes enforce precisely what
+-- the sentinel expression enforced, over narrower keys, and -- ordered
+-- (unit_id, <ref>, fact_key) -- each also subsumes the (unit_id, <ref>) probe
+-- index it replaces (delta.go:318 keySurvives). Three indexes become two.
+-- They are deliberately NOT partial: a partial index cannot serve the units
+-- ON DELETE CASCADE (DELETE FROM fact_keys WHERE unit_id = ?), which would then
+-- degrade to a table scan. Both claims are proven by EXPLAIN QUERY PLAN in
+-- I-S0-report.md. The target-less ON CONFLICT DO NOTHING at units.go:840 and
+-- delta.go:365 binds to any unique index, so it keeps working unchanged.
+CREATE UNIQUE INDEX idx_fact_keys_node ON fact_keys(unit_id, node_id, fact_key);
+CREATE UNIQUE INDEX idx_fact_keys_relation ON fact_keys(unit_id, relation_id, fact_key);
 CREATE INDEX idx_evidence_unit ON evidence(unit_id, id);
 CREATE INDEX idx_evidence_node ON evidence(node_id, unit_id);
 CREATE INDEX idx_evidence_relation ON evidence(relation_id, unit_id);
-CREATE INDEX idx_alias_lookup ON native_aliases(scope_key, native_key, unit_id);
+CREATE INDEX idx_alias_lookup ON native_aliases(scope_key_id, native_key_id, unit_id);
 -- The identity sweep in unit deletion asks, per candidate node, whether any
 -- alias still points at it. Without this index that question is a full scan of
 -- native_aliases per node, which is quadratic in the size of the unit being
