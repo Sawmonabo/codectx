@@ -459,6 +459,14 @@ type heapProbe struct {
 	Rank   rankStats
 	Pairs  rankStats
 	Rollup rollupStats
+	// AdoptedRuns is how many spilled runs of an interrupted ranking this
+	// request continued instead of re-sorting, and ReaddedRecords how many
+	// records it put into a sort that the adopted runs already held. The
+	// second is zero by construction and is counted anyway: it is what tells a
+	// resumed ranking that REUSES its runs from one that re-sorts the whole
+	// retained input and happens to reach the same answer.
+	AdoptedRuns    int
+	ReaddedRecords int64
 }
 
 // rankProbe, pairProbe and rollupProbe hand the ranking passes the counters to

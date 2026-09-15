@@ -266,7 +266,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// The walk is exhausted. Both passes now run over every record EVERY leg of
 	// it appended, which is what makes the served order the single unbounded
 	// walk's order however many requests the walk was spread over.
-	ranked, rankErr := e.rankImpact(ctx, retain.eachEntry, e.rankProbe())
+	ranked, rankErr := e.rankImpact(ctx, retain, e.rankProbe())
 	if ranked != nil {
 		defer ranked.Close()
 	}

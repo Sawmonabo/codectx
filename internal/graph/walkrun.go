@@ -277,50 +277,102 @@ func (e *Engine) walkScratchDir() string {
 // rankImpact folds and orders every record the completed walk admitted, and
 // returns the whole ranked answer as a re-iterable sorted run on disk.
 //
-// emit is called once and streams the walk's records in; it is a callback
-// rather than a slice because the point of the pass is that no caller ever
-// holds the answer. Pass 1 keys lessByNode and folds foldImpact, pass 2 keys
-// lessByRank and does not fold. Close the returned run.
+// It reads its input from, and persists its own progress into, the RETAINED
+// walk state (walkretain.go): pass 1 keys lessByNode and folds foldImpact,
+// pass 2 keys lessByRank and does not fold, and either pass may be cut short by
+// the query deadline and resumed by the next request over the runs it had
+// already spilled. Ruling P7 used to re-sort the whole retained input on every
+// resumed request; it now adopts those runs instead, so a ranking split across
+// requests does the work of ONE ranking and serves the identical answer.
+//
+// Close the returned run.
 //
 // Owned by lane P-b.
-func (e *Engine) rankImpact(ctx context.Context,
-	emit func(add func(impactRecord) error) error,
+func (e *Engine) rankImpact(ctx context.Context, retain *retainedWalk,
 	stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
-	dir, runBytes := e.walkScratchDir(), pagination.SortRunBytes(e.limits.FrontierBytes)
-	pass1, err := pagination.NewExternalSort(dir, "graph-impact-fold-", 0,
-		encodeImpactRecord, decodeImpactRecord, lessByNode)
+	prog, err := retain.rankProgress()
 	if err != nil {
 		return nil, err
 	}
+	if prog.Pass < 2 {
+		if prog, err = e.foldImpactPass(ctx, retain, prog, stats); err != nil {
+			return nil, err
+		}
+	}
+	return e.rankImpactPass(ctx, retain, prog, stats)
+}
+
+// foldImpactPass is pass 1: every record every leg of the walk appended, folded
+// by node identity. Its output -- the input pass 2 reads -- is retained before
+// the manifest advances, because the sort removes its own output as soon as it
+// has been read and a pass-2 resume would otherwise have nothing to read.
+func (e *Engine) foldImpactPass(ctx context.Context, retain *retainedWalk,
+	prog rankProgress, stats *rankStats) (rankProgress, error) {
+	pass1, err := e.openImpactSort(retain, "graph-impact-fold-", lessByNode, prog.Runs)
+	if err != nil {
+		return prog, err
+	}
 	defer pass1.Close()
-	pass1.WithFold(foldImpact).WithRunBytes(runBytes, sizeOfImpactRecord)
-	if err := emit(pass1.Add); err != nil {
-		return nil, err
+	// The fold must be re-applied on every resumed request: pagination.AdoptRuns
+	// carries the runs, never the functions, and a resumed pass without it would
+	// serve one entry per admission instead of one per node.
+	pass1.WithFold(foldImpact)
+
+	seen, err := feedRankPass(ctx, e, pass1, prog.Added, retain.eachEntry)
+	if err != nil {
+		return prog, e.detachRankPass(retain, pass1, 1, seen, err)
 	}
 	folded, err := pass1.Sorted()
 	if err != nil {
-		return nil, err
+		return prog, err
 	}
-	stats.observe(pass1.PeakLiveRecords())
-	// The folded run is the input to pass 2 and nothing else; it is closed as
-	// soon as pass 2 has read it, so only ONE of the two sorted files is on
-	// disk by the time the answer is served.
 	defer folded.Close()
-
-	pass2, err := pagination.NewExternalSort(dir, "graph-impact-rank-", 0,
-		encodeImpactRecord, decodeImpactRecord, lessByRank)
-	if err != nil {
-		return nil, err
+	stats.observe(pass1.PeakLiveRecords())
+	// Sorted CONSUMED the adopted runs, so the manifest must stop naming them
+	// before anything else can fail: a manifest pointing at a removed run
+	// resumes into a missing file instead of re-running a pass that is cheap
+	// to re-run.
+	if err := retain.setRankProgress(rankProgress{Pass: 1}); err != nil {
+		return prog, err
 	}
-	defer pass2.Close()
-	pass2.WithRunBytes(runBytes, sizeOfImpactRecord)
+	out, err := retain.openFolded()
+	if err != nil {
+		return prog, err
+	}
 	if err := folded.Each(func(r impactRecord) error {
 		if err := ctx.Err(); err != nil {
 			return typedContextError(ctx, err)
 		}
-		return pass2.Add(r)
+		b, err := encodeImpactRecord(r)
+		if err != nil {
+			return err
+		}
+		return out.append(b)
 	}); err != nil {
+		_ = out.close()
+		return prog, err
+	}
+	if err := out.close(); err != nil {
+		return prog, err
+	}
+	next := rankProgress{Pass: 2}
+	if err := retain.setRankProgress(next); err != nil {
+		return prog, err
+	}
+	return next, nil
+}
+
+// rankImpactPass is pass 2: the folded records in ruling P1's served order.
+func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
+	prog rankProgress, stats *rankStats) (*pagination.SortedRun[impactRecord], error) {
+	pass2, err := e.openImpactSort(retain, "graph-impact-rank-", lessByRank, prog.Runs)
+	if err != nil {
 		return nil, err
+	}
+	defer pass2.Close()
+	seen, err := feedRankPass(ctx, e, pass2, prog.Added, retain.eachFolded)
+	if err != nil {
+		return nil, e.detachRankPass(retain, pass2, 2, seen, err)
 	}
 	run, err := pass2.Sorted()
 	if err != nil {
@@ -328,6 +380,114 @@ func (e *Engine) rankImpact(ctx context.Context,
 	}
 	stats.observe(pass2.PeakLiveRecords())
 	return run, nil
+}
+
+// openImpactSort opens one ranking pass with the frozen codec and the query's
+// own run budget, continuing the runs an interrupted request left when there
+// are any. New runs still spill into the engine's sort directory; only the runs
+// an interruption hands over live in the retained state.
+func (e *Engine) openImpactSort(retain *retainedWalk, prefix string,
+	compare func(a, b impactRecord) int, runs []string) (*pagination.ExternalSort[impactRecord], error) {
+	dir := e.walkScratchDir()
+	var (
+		sorter *pagination.ExternalSort[impactRecord]
+		err    error
+	)
+	if len(runs) > 0 {
+		if e.probe != nil {
+			e.probe.AdoptedRuns += len(runs)
+		}
+		sorter, err = pagination.AdoptRuns(dir, prefix, 0, retain.runPaths(runs),
+			encodeImpactRecord, decodeImpactRecord, compare)
+	} else {
+		sorter, err = pagination.NewExternalSort(dir, prefix, 0,
+			encodeImpactRecord, decodeImpactRecord, compare)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sorter.WithRunBytes(pagination.SortRunBytes(e.limits.FrontierBytes), sizeOfImpactRecord), nil
+}
+
+// feedRankPass replays one pass's input into the sort, SKIPPING the prefix the
+// adopted runs already hold, and returns how many input records the sort now
+// covers -- the skipped prefix plus what this request added. A deadline ends
+// the replay; the count is still the honest one, because the record the
+// deadline stopped on was not added.
+func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSort[impactRecord],
+	adopted int64, replay func(func(impactRecord) error) error) (int64, error) {
+	seen, addedHere := int64(0), 0
+	err := replay(func(r impactRecord) error {
+		seen++
+		if seen <= adopted {
+			// Already inside an adopted run. Re-adding it would fold a record
+			// into itself and double every count the fold carries.
+			return nil
+		}
+		if err := e.rankInterrupted(ctx, addedHere); err != nil {
+			seen--
+			return err
+		}
+		if seen <= adopted && e.probe != nil {
+			e.probe.ReaddedRecords++
+		}
+		addedHere++
+		return sorter.Add(r)
+	})
+	return seen, err
+}
+
+// rankInterrupted reports the query deadline mid-ranking (ruling P7). added is
+// how many records THIS request has put into the current pass, which is what
+// the test hook counts: a hook that counted the whole pass would stop a resumed
+// request at the same record it stopped the first one at and never finish.
+func (e *Engine) rankInterrupted(ctx context.Context, added int) error {
+	if err := ctx.Err(); err != nil {
+		return typedContextError(ctx, err)
+	}
+	if e.rankStopAfter > 0 && added >= e.rankStopAfter {
+		return &model.Error{Code: model.CodeQueryDeadline,
+			Message: "graph: the query deadline reached the ranking pass"}
+	}
+	return nil
+}
+
+// detachRankPass persists an interrupted pass and returns the error that
+// interrupted it. A stop that is NOT the deadline persists nothing: the
+// continuation is never minted for it, so state it left behind would be state
+// nothing ever adopts.
+//
+// The runs and the count are written in ONE manifest, and Runs is the Detach
+// return verbatim rather than an append to what was adopted -- an adopting sort
+// spills after the runs it took over, so its own Detach already returns both.
+func (e *Engine) detachRankPass(retain *retainedWalk, sorter *pagination.ExternalSort[impactRecord],
+	pass int, seen int64, cause error) error {
+	if !isRankDeadline(cause) {
+		return cause
+	}
+	spilled, err := sorter.Detach()
+	if err != nil {
+		return err
+	}
+	names, err := retain.adoptRunFiles(spilled)
+	if err != nil {
+		return err
+	}
+	if err := retain.setRankProgress(rankProgress{Pass: pass, Runs: names, Added: seen}); err != nil {
+		return err
+	}
+	return cause
+}
+
+// isRankDeadline reports the one interruption a ranking pass may be resumed
+// from. It is the same test impactPhaseError applies, kept here so the two
+// cannot disagree about which stop mints a continuation.
+func isRankDeadline(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var typed *model.Error
+	return errors.As(err, &typed) && typed.Code == model.CodeQueryDeadline
 }
 
 // servePage reads at most limit records out of the spool tail names, starting
