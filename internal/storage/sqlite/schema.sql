@@ -471,3 +471,16 @@ CREATE UNIQUE INDEX idx_lease_owner ON retention_leases(owner_kind, owner_ref) W
 -- The grace pass asks for the trashed blobs whose window has elapsed; without
 -- this index that question is a full scan of blobs on every collection pass.
 CREATE INDEX idx_blob_trash ON blobs(state, trashed_at);
+-- The supplied `--scip-index` paths one generation was built with, recorded
+-- whether or not the path resolved to anything. An unresolved path leaves no
+-- unit behind, so the absence of a unit is precisely the observation this table
+-- exists to preserve: without the row, "no index was supplied" and "the
+-- supplied path matched nothing" are indistinguishable after the fact, and the
+-- second silently ships a repository with no cross-file symbols. The path is
+-- root-relative by construction, so the row discloses no private absolute root.
+CREATE TABLE generation_supplied_indexes (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    path TEXT NOT NULL CHECK(length(path) > 0),
+    resolved INTEGER NOT NULL CHECK(resolved IN (0, 1)),
+    PRIMARY KEY(generation_id, path)
+);

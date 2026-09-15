@@ -61,15 +61,32 @@ func (r storeReader) Stats(ctx context.Context) (diagnostics.StoreStats, error) 
 // the doctor's content-addressed-store sample a real check rather than a
 // permanently unavailable one: the check discovers the capability by asserting
 // it on the reader it was handed.
-//
-// The other optional probe the doctor asserts for, SuppliedIndexes, is
-// deliberately NOT implemented here. Nothing in this tree records the supplied
-// --scip-index path on a generation yet, so an implementation could only return
-// an empty list, and an empty list is the answer "this build imported no
-// supplied index" -- a claim, not a measurement. Left unimplemented, the check
-// reports `unavailable` with its reason, which is the truthful answer until the
-// recording half lands. See the report's INT-B list.
 var _ diagnostics.StoreReader = storeReader{}
+
+// SuppliedIndexes restates (*sqlite.Store).SuppliedIndexes in the doctor's own
+// vocabulary, for the same reason Stats does: internal/diagnostics must not
+// import a storage package, so the two structurally identical types meet here.
+//
+// It is a written adapter rather than an embedded forward because the return
+// element type differs, and an embedded method with the wrong signature would
+// silently fail the optional-interface assertion in checkSuppliedIndex and
+// leave the check `unavailable` forever with nothing failing to compile. The
+// assertion below is what makes that a build error instead.
+func (r storeReader) SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]diagnostics.SuppliedIndex, error) {
+	rows, err := r.Store.SuppliedIndexes(ctx, gen)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]diagnostics.SuppliedIndex, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, diagnostics.SuppliedIndex{Path: row.Path, Resolved: row.Resolved})
+	}
+	return out, nil
+}
+
+// The assertion the exported interface exists for: a signature drift here is a
+// build failure, not a doctor check that quietly reports unavailable forever.
+var _ diagnostics.SuppliedIndexReader = storeReader{}
 
 // toolchainReporter adapts *toolchain.Resolver to diagnostics.ToolchainReporter.
 // Resolver.Status returns its rows directly and reports no error; the interface
