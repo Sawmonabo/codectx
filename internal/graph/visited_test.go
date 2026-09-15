@@ -403,10 +403,10 @@ func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
 	defer store.close()
 	// Link 1 admitted the high ids, link 2 the low ones. Each run is
 	// ascending; the stream is not.
-	if err := store.appendRun([]model.NodeID{"n-0500", "n-0600"}); err != nil {
+	if _, err := store.appendRun([]model.NodeID{"n-0500", "n-0600"}); err != nil {
 		t.Fatalf("append link 1: %v", err)
 	}
-	if err := store.appendRun([]model.NodeID{"n-0100", "n-0200"}); err != nil {
+	if _, err := store.appendRun([]model.NodeID{"n-0100", "n-0200"}); err != nil {
 		t.Fatalf("append link 2: %v", err)
 	}
 	v := newVisitedSet(store.stream)

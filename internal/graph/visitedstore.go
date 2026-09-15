@@ -115,7 +115,7 @@ func openVisitedStore(dir string, filterBytes int64) (*visitedStore, error) {
 			return nil, visitedStoreErr(err)
 		}
 	}
-	if err := s.writeManifest(); err != nil {
+	if _, err := s.writeManifest(); err != nil {
 		return nil, err
 	}
 	return s, s.openRuns()
@@ -174,35 +174,49 @@ func (s *visitedStore) openRuns() error {
 // walk does is stream it: an internal link's membership sweep reads the run the
 // previous link just wrote, and a buffered tail would report a node the walk
 // HAS admitted as absent -- the re-admission this store exists to prevent.
-func (s *visitedStore) appendRun(ids []model.NodeID) error {
+//
+// It returns how many BYTES this leg wrote -- the run, the filter words its
+// probes dirtied and the manifest. That number is the whole point of the
+// layout: it is a function of what this leg admitted and of nothing else, so a
+// page of a long walk writes what a page of a short one writes. The two call
+// sites hand it to the engine's memory probe, which is what a measurement test
+// asserts the constant on (impactrank.go heapProbe).
+func (s *visitedStore) appendRun(ids []model.NodeID) (int64, error) {
 	if len(ids) == 0 {
-		return nil
+		return 0, nil
 	}
+	var written int64
 	for _, id := range ids {
 		if _, err := s.w.WriteString(string(id)); err != nil {
-			return visitedStoreErr(err)
+			return 0, visitedStoreErr(err)
 		}
 		if err := s.w.WriteByte('\n'); err != nil {
-			return visitedStoreErr(err)
+			return 0, visitedStoreErr(err)
 		}
+		written += int64(len(id)) + 1
 	}
 	if err := s.w.Flush(); err != nil {
-		return visitedStoreErr(err)
+		return 0, visitedStoreErr(err)
 	}
 	s.records += int64(len(ids))
-	if err := s.addToFilter(ids); err != nil {
-		return err
+	filterBytes, err := s.addToFilter(ids)
+	if err != nil {
+		return 0, err
 	}
-	return s.writeManifest()
+	manifestBytes, err := s.writeManifest()
+	if err != nil {
+		return 0, err
+	}
+	return written + filterBytes + manifestBytes, nil
 }
 
 // addToFilter records ids in the persisted summary, rewriting only the WORDS
 // the probes changed. A full rewrite would cost the filter's whole size on
 // every page, which is constant in the page number but needlessly large; the
 // dirty set is bounded by the run's own length times the probe count.
-func (s *visitedStore) addToFilter(ids []model.NodeID) error {
+func (s *visitedStore) addToFilter(ids []model.NodeID) (int64, error) {
 	if s.filter == nil {
-		return nil
+		return 0, nil
 	}
 	dirty := make(map[uint64]struct{}, len(ids)*int(s.filter.k))
 	for _, id := range ids {
@@ -210,43 +224,43 @@ func (s *visitedStore) addToFilter(ids []model.NodeID) error {
 	}
 	f, err := os.OpenFile(s.filterPath(), os.O_WRONLY, 0o600)
 	if err != nil {
-		return visitedStoreErr(err)
+		return 0, visitedStoreErr(err)
 	}
 	var word [8]byte
 	for w := range dirty {
 		binary.LittleEndian.PutUint64(word[:], s.filter.bits[w])
 		if _, err := f.WriteAt(word[:], int64(w)*8); err != nil {
 			_ = f.Close()
-			return visitedStoreErr(err)
+			return 0, visitedStoreErr(err)
 		}
 	}
 	if err := f.Close(); err != nil {
-		return visitedStoreErr(err)
+		return 0, visitedStoreErr(err)
 	}
-	return nil
+	return int64(len(dirty)) * 8, nil
 }
 
 // writeManifest replaces the manifest atomically: a torn one would resume a
 // walk against a filter geometry that never existed, and bits probed under the
 // wrong geometry produce false negatives.
-func (s *visitedStore) writeManifest() error {
+func (s *visitedStore) writeManifest() (int64, error) {
 	m := visitedManifest{Version: visitedStoreVersion, Records: s.records}
 	if s.filter != nil {
 		m.FilterBits, m.FilterProbes = s.filter.m, s.filter.k
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
-		return internalErr("graph: encoding the retained visited manifest: " + err.Error())
+		return 0, internalErr("graph: encoding the retained visited manifest: " + err.Error())
 	}
 	tmp := filepath.Join(s.dir, visitedManifestFile+".tmp")
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return visitedStoreErr(err)
+		return 0, visitedStoreErr(err)
 	}
 	if err := os.Rename(tmp, filepath.Join(s.dir, visitedManifestFile)); err != nil {
 		_ = os.Remove(tmp)
-		return visitedStoreErr(err)
+		return 0, visitedStoreErr(err)
 	}
-	return nil
+	return int64(len(b)), nil
 }
 
 // stream replays every node every run holds, in run order. It is the
