@@ -12,18 +12,21 @@ import (
 // workflow.max_observation_references is a caller ceiling and not a scale
 // refusal.
 //
-// The count that matters is the scope review's aggregate: ScopeReviewEntry
-// validation caps each of the eight categories at the model's own ceiling, so a
-// complete review of a large scope legitimately carries eight times that number
-// of references. The service used to compare that aggregate against a hard 64
-// and refuse the attestation -- which refused a review for the size of the scope
-// it attested to, and no other assertion in this package sees it because every
-// fixture review cites a handful of files.
+// The count that matters is the scope review's aggregate: a review carries its
+// references inside its eight categories, and a complete review of a large
+// scope legitimately carries hundreds. The service used to compare that
+// aggregate against a hard 64 and refuse the attestation -- which refused a
+// review for the size of the scope it attested to, and no other assertion in
+// this package sees it because every fixture review cites a handful of files.
+//
+// This service ceiling is now the ONLY one: the model's per-list ceiling is
+// gone, and TestObservationReferencesCarryNoModelCeiling in internal/model
+// holds that half.
 //
 // Second failure mode: a caller that DID set a ceiling must be told the ceiling
 // and the count, or raising it is a guess.
 func TestObservationReferencesAreUnlimitedByDefault(t *testing.T) {
-	const aggregate = 8 * model.MaxObservationReferences // 512, a complete review of a large scope
+	const aggregate = 512 // eight review categories citing 64 read files each
 
 	unlimited := &Service{limits: Limits{MaxObservationReferences: config.Unlimited}}
 	if err := unlimited.checkReferenceCount(aggregate, "scope review"); err != nil {
