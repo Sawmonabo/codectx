@@ -87,7 +87,19 @@ import (
 // earlier page already reported -- the same entity on page after page. There is
 // no shape in a version-4 token that says so, so the version is the only honest
 // refusal.
-const traversalCursorVersion = 6
+//
+// Version 6 makes the ranked tail's continuation a BYTE OFFSET into one spool
+// written once by the page that settled the order.
+//
+// Version 7 gives the paged TRAVERSAL -- neighbours -- the same run store every
+// other walk endpoint already had, and with it the spool's visited section is
+// gone: a version-7 continuation spool holds frontier records and nothing else.
+// A version-6 neighbours token names a spool whose cumulative set lives in a
+// `v` section this build no longer reads, so resuming it would walk on with an
+// empty membership set and report every node its earlier pages already
+// reported. Nothing in a version-6 token's shape says which endpoint minted it,
+// so the version is the only honest refusal.
+const traversalCursorVersion = 7
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -235,6 +247,15 @@ func (c traversalCursor) validateRanked() error {
 			c.PairOffset != 0 || c.PairServed != 0 || c.PairTotal != 0 {
 			return cursorInvalid("a walk continuation carries a ranked position")
 		}
+		if c.SpoolID != "" && c.RetainID == "" {
+			// Every walk continuation keeps its cumulative admitted-node set in
+			// the retained state directory (visitedstore.go), so a token that
+			// names a frontier spool without one would resume a walk with no
+			// membership set at all and re-admit every node the pages behind it
+			// already reported. (A page that mints no spool retains nothing
+			// either: the engine offers no continuation without a spool store.)
+			return cursorInvalid("a walk continuation names no retained state")
+		}
 		if c.WalkDone {
 			// Ruling P7's shape: nothing left to walk, the whole answer still
 			// to rank. A token that claimed it while naming a frontier spool or
@@ -344,9 +365,12 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 }
 
 // The kinds of record a page spills, and the whole vocabulary: the frontier a
-// page stopped at, and the nodes it already admitted (which a resumed page must
-// not admit again). Every paged endpoint -- neighbours, impact and the package
-// rollup alike -- resumes a WALK, so there is one vocabulary and one replay.
+// page stopped at, and nothing else. Every paged endpoint -- neighbours,
+// impact and the package rollup alike -- resumes a WALK, so there is one
+// vocabulary and one replay, and every one of them keeps its cumulative
+// admitted-node set as append-only runs in its retained state directory
+// (visitedstore.go) rather than as a section of this spool. A page therefore
+// writes what its frontier costs, never what the walk behind it costs.
 //
 // Ruling P2 adds a THIRD kind, and one spool shape that is not a walk at all.
 // An impact or rollup request runs its walk to completion, ranks the whole
@@ -355,7 +379,7 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // record (impactrank.go's codec), not one of these envelopes. The marker is
 // what makes the two spool shapes self-identifying: the traversal replay below
 // refuses an `r` record through its default branch, so a ranked spool can never
-// be replayed as a frontier, and readRankedHeader refuses an `f` or `v` one.
+// be replayed as a frontier, and readRankedHeader refuses an `f` one.
 //
 // "p" is the ShortestPath continuation's discriminator. It names no spool
 // RECORD -- a path search retains its whole external-memory state as a
@@ -368,7 +392,6 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // ruling P2 replaces.
 const (
 	spoolRecordFrontier = "f"
-	spoolRecordVisited  = "v"
 	spoolRecordRanked   = "r"
 	spoolRecordPath     = "p"
 )
@@ -460,21 +483,20 @@ type resumeState struct {
 	Cursor   traversalCursor
 	Budget   *budget
 	Frontier []frontierState
-	// Visited streams the VISITED SECTION of the spool the earlier pages
-	// wrote, ascending by NodeID: every node they admitted except the frontier
-	// they stopped at, which Frontier above already carries into this page's
-	// front. It is a STREAM and not a map because the cumulative set is sized
-	// by the walk: materializing it here was the last repository-sized heap
-	// structure on the traversal path (visited.go).
+	// Visited streams every node the earlier pages admitted, run by run, out
+	// of the retained store (visitedstore.go). It is a STREAM and not a map
+	// because the cumulative set is sized by the walk: materializing it here
+	// was the last repository-sized heap structure on the traversal path
+	// (visited.go).
 	Visited visitedStream
-	// Filter summarizes the nodes Visited will replay. It is built during the
-	// replay below -- which already decodes every record to rebuild the
-	// frontier -- so it costs no extra I/O, and it lets a level whose
-	// candidates are all freshly reached skip the stream entirely.
+	// Filter summarizes the nodes Visited will replay. It is the store's own
+	// persisted summary, of frozen geometry, loaded with the manifest and
+	// nothing else, and it lets a level whose candidates are all freshly
+	// reached skip the stream entirely.
 	Filter *visitedFilter
-	// Retain is the retained pass-1 input the earlier legs appended to, reopened
-	// for append. It is nil on a continuation that retained none (a neighbours
-	// traversal), and the caller discards it.
+	// Retain is the retained state the earlier pages appended to, reopened for
+	// append: the cumulative visited set of every walk, and the pass-1 input of
+	// the two ranking endpoints.
 	Retain *retainedWalk
 	// Release ends the replayed continuation's spool, its retained input and
 	// its lease. The caller defers it: the spool must outlive the walk, because
@@ -491,28 +513,19 @@ type continuation struct {
 	Depth     int
 	LastOwner model.NodeID
 	LastKey   model.RelationID
-	// Frontier is where the walk stopped, and Visited the nodes this page
-	// contributes to the cumulative admitted set, ascending. Both are bounded
-	// by the page and the frontier ceiling, never by the walk.
+	// Frontier is where the walk stopped, and Visited the nodes THIS page
+	// admitted, ascending -- its own admissions and nothing the pages behind
+	// it contributed. Both are bounded by the page and the frontier ceiling,
+	// never by the walk.
 	//
-	// Where Visited GOES depends on which state this endpoint keeps. A walk
-	// with a retained run store (Retain below) appends it there as one more
-	// ascending run and spills no visited section at all. The paged traversal,
-	// which retains nothing, still writes it into the fresh spool's visited
-	// section merged with Carried, and its Visited therefore carries the
-	// resumed frontier too -- the previous spool's section excluded those
-	// nodes, so nothing else would carry them forward.
+	// Visited goes to Retain's run store as one more ascending run. Nothing is
+	// copied forward: every earlier page's run is still where that page wrote
+	// it, which is what keeps a page's write a function of its own admissions.
 	Frontier []frontierState
 	Visited  []model.NodeID
-	// Carried streams the visited SECTION of the spool the earlier pages
-	// wrote, ascending. spill merges it with Visited without materializing it,
-	// so a walk of any size costs one spool block of heap here. It is IGNORED
-	// -- and left nil by its callers -- whenever Retain holds a run store,
-	// because nothing is copied forward on that path.
-	Carried visitedStream
-	// Retain is the pass-1 input this leg appended to, handed over for the
-	// store to adopt (walkretain.go). It is nil for the endpoints that rank
-	// nothing -- a neighbours page has no pass-1 input to retain.
+	// Retain is the state this page appended to, handed over for the store to
+	// adopt (walkretain.go): the cumulative visited set every walk keeps, and
+	// the pass-1 input the two ranking endpoints add to it.
 	Retain *retainedWalk
 	// WalkDone says the frontier is empty because the walk FINISHED, not
 	// because there is nothing to continue: ruling P7's mid-rank deadline. It
@@ -521,8 +534,9 @@ type continuation struct {
 	WalkDone bool
 }
 
-// retainedVisited is c's append-only cumulative admitted-node set, or nil on an
-// endpoint that keeps its set in the continuation spool instead.
+// retainedVisited is c's append-only cumulative admitted-node set, or nil when
+// this page has no state to hand over -- a walk the engine cannot retain at all
+// because it has no spool store, which is also a walk it mints no cursor for.
 func (c continuation) retainedVisited() *visitedStore {
 	if c.Retain == nil {
 		return nil
@@ -632,15 +646,14 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	// against the other refused the third page of any walk whose budget it was
 	// working correctly. A tampered or oversized spool is caught by the byte
 	// budget, which is also what keeps peak heap a function of page size.
-	// The paged traversal still carries its cumulative set in the spool, so its
-	// membership summary is still built here, inside the replay that is already
-	// decoding every record to rebuild the frontier. A walk with a retained run
-	// store has both already and adds nothing per record.
-	var spoolFilter *visitedFilter
+	// The cumulative set and its membership summary came from the retained
+	// store above, which costs the manifest and the filter to load and nothing
+	// per admitted node. A spool this build replays holds FRONTIER records
+	// only, so a token that named one without that store would resume with no
+	// membership set at all; validate refuses it, and this is the second half
+	// of that guard, at the point the state is actually used.
 	if s.Visited == nil {
-		spoolFilter = newFrozenVisitedFilter(spoolFilterBits(c.Visited,
-			e.limits.FrontierBytes/visitedFilterBudgetShare), visitedFilterProbes)
-		s.Filter = spoolFilter
+		return nil, cursorInvalid("continuation state has expired or was released")
 	}
 	err = e.spools.Open(ctx, c.spoolCursor(), now, func(record []byte) error {
 		var r spoolRecord
@@ -656,13 +669,6 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 		switch r.Kind {
 		case spoolRecordFrontier:
 			s.Frontier = append(s.Frontier, frontierState{Depth: r.Depth, Cost: r.Cost, Node: r.Node, Via: r.Via, Route: r.Route})
-		case spoolRecordVisited:
-			// Deliberately not accumulated: the cumulative set stays on disk
-			// and is streamed by s.Visited. The summary describes exactly what
-			// that stream replays, so a miss is a proof the stream holds
-			// nothing; a frontier record's node is answered from the front
-			// instead.
-			spoolFilter.addWords(r.Node, nil)
 		default:
 			return cursorInvalid("continuation state is not readable")
 		}
@@ -680,33 +686,6 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	// for state nothing will read again; presenting the same token twice is
 	// CTX_CURSOR_INVALID rather than a replayed page, which is the deliberate
 	// trade: the caller's remedy is the continuation this page hands it.
-	if s.Visited != nil {
-		// The retained run store is the authoritative set: the walk endpoints
-		// spill no visited section at all, so there is nothing here to stream.
-		return s, nil
-	}
-	s.Visited = func(ctx context.Context, fn func(model.NodeID) error) error {
-		return e.spools.Open(ctx, c.spoolCursor(), e.now(), func(record []byte) error {
-			var r spoolRecord
-			if err := json.Unmarshal(record, &r); err != nil {
-				return cursorInvalid("continuation state is not readable")
-			}
-			switch r.Kind {
-			case spoolRecordVisited:
-				// The visited SECTION only, and it is written in ascending
-				// NodeID order (spill below), which is what lets warm()
-				// merge-join against it. The frontier records ahead of it are
-				// deliberately skipped: their nodes are carried in heap by the
-				// page that resumes them (visited.go carry), so replaying them
-				// here would both break the order and answer what the front
-				// already answers.
-				return fn(r.Node)
-			case spoolRecordFrontier:
-				return nil
-			}
-			return cursorInvalid("continuation state is not readable")
-		})
-	}
 	return s, nil
 }
 
@@ -952,8 +931,12 @@ func (e *Engine) releaseLease(ctx context.Context, id string, cause error) error
 	return cause
 }
 
-// spill writes one fresh spool holding c's records, frontier and visited set
-// and returns its id. The spool is bound to next's lease, generation, analysis key and
+// spill writes one fresh spool holding c's frontier and returns its id. The
+// cumulative visited set is NOT copied into it: it is append-only state in the
+// retained directory (visitedstore.go), where this page has already added its
+// own run and every earlier page's run is still where that page wrote it.
+// Copying it forward here is exactly the O(visited) per-page write that made
+// paging a walk to completion quadratic. The spool is bound to next's lease, generation, analysis key and
 // query hash, which is what Spools.Open checks before it replays a record.
 func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation) (string, error) {
 	sp, err := e.spools.Create(next.spoolCursor())
@@ -967,77 +950,9 @@ func (e *Engine) spill(ctx context.Context, next traversalCursor, c continuation
 		}
 		return sp.Append(encoded)
 	}
-	frontierNodes := make(map[model.NodeID]struct{}, len(c.Frontier))
 	for _, fs := range c.Frontier {
 		if err := appendRecord(spoolRecord{Kind: spoolRecordFrontier, Node: fs.Node,
 			Depth: fs.Depth, Cost: fs.Cost, Via: fs.Via, Route: fs.Route}); err != nil {
-			return "", e.releaseSpool(sp, err)
-		}
-		frontierNodes[fs.Node] = struct{}{}
-	}
-	// The visited section follows the frontier records and is written in
-	// ASCENDING NodeID order, which is what makes membership a merge-join with
-	// an early exit instead of a scan (visited.go). It is produced by a two-way
-	// merge of the carried stream -- already ascending, because the page that
-	// wrote it ran this same merge -- with this page's own ascending
-	// contribution: one record in flight, never the whole set, so a walk of any
-	// size costs one spool block of heap here.
-	//
-	// A node that is on THIS page's frontier is skipped: its frontier record
-	// already marks it visited, and writing it twice would spend the shared
-	// spool budget for nothing. Equal keys are emitted once for the same
-	// reason -- the two sources are disjoint by construction, so this is a
-	// guard, not a correction.
-	if c.retainedVisited() != nil {
-		// The cumulative set is append-only state in the retained directory
-		// (visitedstore.go): this page already added its own run there, every
-		// earlier page's run is still where that page wrote it, and c.Carried
-		// is nil. Copying anything forward here is exactly the O(visited)
-		// per-page write that made paging a walk to completion quadratic.
-		if err := sp.Close(); err != nil {
-			return "", e.releaseSpool(sp, err)
-		}
-		return sp.ID(), nil
-	}
-	var (
-		pending  = c.Visited
-		lastNode model.NodeID
-		haveLast bool
-	)
-	writeVisited := func(n model.NodeID) error {
-		if _, ok := frontierNodes[n]; ok {
-			return nil
-		}
-		if haveLast && n == lastNode {
-			return nil
-		}
-		lastNode, haveLast = n, true
-		return appendRecord(spoolRecord{Kind: spoolRecordVisited, Node: n})
-	}
-	// drainBelow emits every pending node that sorts before n, which is what
-	// keeps the merged output ascending.
-	drainBelow := func(n model.NodeID) error {
-		for len(pending) > 0 && pending[0] < n {
-			if err := writeVisited(pending[0]); err != nil {
-				return err
-			}
-			pending = pending[1:]
-		}
-		return nil
-	}
-	if c.Carried != nil {
-		err := c.Carried(ctx, func(n model.NodeID) error {
-			if err := drainBelow(n); err != nil {
-				return err
-			}
-			return writeVisited(n)
-		})
-		if err != nil {
-			return "", e.releaseSpool(sp, err)
-		}
-	}
-	for _, n := range pending {
-		if err := writeVisited(n); err != nil {
 			return "", e.releaseSpool(sp, err)
 		}
 	}
