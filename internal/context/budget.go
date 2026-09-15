@@ -652,15 +652,17 @@ func runSeq[T any](run *pagination.SortedRun[T]) iter.Seq2[T, error] {
 }
 
 // runCursor is one side of a merge join: the record currently under the cursor,
-// and a step that advances it. A cursor that has failed reports `ok` false and
-// keeps its error, so a join loop terminates on a read failure rather than
-// spinning, and the caller checks err() before trusting the join's result.
+// and a step that advances it. A cursor that has failed reports `ok` false, so
+// every join loop below terminates, and the caller checks err() before trusting
+// the join's result.
 type runCursor[T any] struct {
 	next func() (T, error, bool)
 	stop func()
 	cur  T
 	ok   bool
-	err  error
+	// failure is the walk's own error, kept so a join loop terminates on a
+	// read failure rather than spinning on a cursor that will never advance.
+	failure error
 }
 
 func newRunCursor[T any](run *pagination.SortedRun[T]) *runCursor[T] {
@@ -671,19 +673,19 @@ func newRunCursor[T any](run *pagination.SortedRun[T]) *runCursor[T] {
 }
 
 func (c *runCursor[T]) advance() {
-	if c.err != nil {
+	if c.failure != nil {
 		c.ok = false
 		return
 	}
 	v, err, ok := c.next()
 	if err != nil {
-		c.err, c.ok = err, false
+		c.failure, c.ok = err, false
 		return
 	}
 	c.cur, c.ok = v, ok
 }
 
-func (c *runCursor[T]) err2() error { return c.err }
+func (c *runCursor[T]) err() error { return c.failure }
 
 // routeCursors rebuilds one candidate's model.RelationPath values from the two
 // Index-keyed route streams. Both are ascending in the same key as the walk
@@ -731,10 +733,10 @@ func (r *routeCursors) take(index int64) ([]model.RelationPath, error) {
 		}
 		out = append(out, model.RelationPath{Relations: rels, Evidence: p.Evidence, CostUnits: p.CostUnits})
 	}
-	if err := r.paths.err2(); err != nil {
+	if err := r.paths.err(); err != nil {
 		return nil, err
 	}
-	return out, r.hops.err2()
+	return out, r.hops.err()
 }
 
 // checkRequiredFitsStream is checkRequiredFits over a sorted run. It walks the
