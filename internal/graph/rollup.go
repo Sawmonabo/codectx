@@ -126,7 +126,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 				return sink.Visit(fs, rel)
 			})
 			return werr
-		}, retain.addPair, nil)
+		}, retain.addPair, e.rollupProbe())
 		if state.ReleaseCarried != nil {
 			// After the continuation below has been spilled: the spill is what
 			// reads the carried stream.
@@ -161,7 +161,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// The walk is exhausted: the ranking runs over every pair record EVERY leg
 	// appended, so the counts are exact sums over the whole walk and the order
 	// is the single unbounded walk's order.
-	run, rollupErr := e.rankPairs(ctx, retain.eachPair)
+	run, rollupErr := e.rankPairs(ctx, retain.eachPair, e.pairProbe())
 	if run != nil {
 		defer run.Close()
 	}
@@ -408,7 +408,7 @@ func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
 	feed func(edgeSink) error, stats *rollupStats) (*pagination.SortedRun[pairRecord], error) {
 	return e.rankPairs(ctx, func(add func(pairRecord) error) error {
 		return e.rollupInto(ctx, meta, feed, add, stats)
-	})
+	}, e.pairProbe())
 }
 
 // rollupInto is the streaming half alone: feed's admitted edges are batched,

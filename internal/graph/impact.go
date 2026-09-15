@@ -221,7 +221,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				return sink.Visit(fs, rel)
 			})
 			return werr
-		}, retain.addPair, nil)
+		}, retain.addPair, e.rollupProbe())
 		if state.ReleaseCarried != nil {
 			// After the continuation below has been spilled: the spill is what
 			// reads the carried stream.
@@ -266,7 +266,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// The walk is exhausted. Both passes now run over every record EVERY leg of
 	// it appended, which is what makes the served order the single unbounded
 	// walk's order however many requests the walk was spread over.
-	ranked, rankErr := e.rankImpact(ctx, retain.eachEntry)
+	ranked, rankErr := e.rankImpact(ctx, retain.eachEntry, e.rankProbe())
 	if ranked != nil {
 		defer ranked.Close()
 	}
@@ -276,7 +276,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	var pairs *pagination.SortedRun[pairRecord]
 	if ranked != nil {
 		var pairErr error
-		pairs, pairErr = e.rankPairs(ctx, retain.eachPair)
+		pairs, pairErr = e.rankPairs(ctx, retain.eachPair, e.pairProbe())
 		if pairs != nil {
 			defer pairs.Close()
 		}
