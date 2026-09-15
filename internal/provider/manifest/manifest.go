@@ -32,7 +32,7 @@ import (
 // Provider identity and capabilities.
 const (
 	ID      = "manifest"
-	Version = "2"
+	Version = "3"
 
 	// CapabilityManifests covers the parsed package and build formats.
 	CapabilityManifests = "manifests"

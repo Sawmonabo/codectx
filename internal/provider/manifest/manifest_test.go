@@ -83,7 +83,7 @@ var fixture = map[string]string{
 </project>
 `,
 	"broken/Cargo.toml": "[package\nname = \"oops\"\n",
-	"docs/README.md":    "# Service\n\nSee [go.mod](../go.mod) and [the web app](../web/) or <https://example.com>.\n\n```\n# not a heading\n[nope](../nope.go)\n```\n\n## Usage\n",
+	"docs/README.md":    "# Service\n\nSee [go.mod](../go.mod) and [the web app](../web/) or <https://example.com>.\n\n```\n# not a heading\n[nope](../nope.go)\n```\n\n## Usage\n\nMore.\n\n## Usage\n",
 	// One 40001-byte line: the 32 KiB budget falls inside a two-byte rune,
 	// so the split must back off to the rune boundary at 32767.
 	"docs/long.txt": "x" + strings.Repeat("é", 20000),
@@ -137,7 +137,10 @@ func TestManifestConform(t *testing.T) {
 // <exclusions> coordinate overwriting the dependency that encloses it, and a
 // chunk whose body is not the exact source bytes of its range or whose
 // overlap with the previous chunk is unbounded or leaves a gap (wrong chunk
-// bytes is wrong source served).
+// bytes is wrong source served). It also pins that every heading of a
+// document is its own section node contained by the document -- the README
+// fixture repeats `## Usage` deliberately -- because headings sharing the
+// document's node id collapse a whole file's headings into one search hit.
 func TestCanonicalFacts(t *testing.T) {
 	fs, mf := newProviders(t)
 	h := providertest.New(t, fixture)
@@ -357,7 +360,7 @@ node file Cargo.toml lang=toml located {"binary":false,"executable":false,"forma
 node file assets/logo.bin located {"binary":true,"executable":false,"size":16}
 node file broken/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":23}
 node file crates/core/Cargo.toml lang=toml located {"binary":false,"executable":false,"format":"cargo","size":190}
-node file docs/README.md lang=markdown located {"binary":false,"executable":false,"format":"markdown","size":142}
+node file docs/README.md lang=markdown located {"binary":false,"executable":false,"format":"markdown","size":159}
 node file docs/long.txt lang=text located {"binary":false,"executable":false,"format":"text","size":40001}
 node file docs/wide.txt lang=text located {"binary":false,"executable":false,"format":"text","size":35400}
 node file go.mod located {"binary":false,"executable":false,"format":"gomod","size":135}
@@ -371,6 +374,9 @@ node package maven:org.acme:svc lang=java located {"inherited":["groupId","versi
 node package npm:@acme/web lang=javascript located {"scripts":{"build":"tsc"},"version":"1.0.0"}
 node package pypi:my-service lang=python located {"build_backend":"hatchling.build","dynamic":["version"]}
 node repository .
+node section docs/README.md#Service > Usage lang=markdown located
+node section docs/README.md#Service > Usage~2 lang=markdown located
+node section docs/README.md#Service lang=markdown located
 rel builds package maven:org.acme:svc -> directory java/sub [268,288) syntax {"module":"sub"}
 rel configures configuration go:work:go.work -> directory tools [19,26) syntax {"use":"./tools"}
 rel configures configuration go:work:go.work -> repository . [16,17) syntax {"use":"."}
@@ -385,6 +391,9 @@ rel contains directory docs -> file docs/wide.txt syntax
 rel contains directory java -> file java/pom.xml syntax
 rel contains directory py -> file py/pyproject.toml syntax
 rel contains directory web -> file web/package.json syntax
+rel contains document docs/README.md -> section docs/README.md#Service > Usage [133,141) syntax
+rel contains document docs/README.md -> section docs/README.md#Service > Usage~2 [150,158) syntax
+rel contains document docs/README.md -> section docs/README.md#Service [0,9) syntax
 rel contains repository . -> directory assets syntax
 rel contains repository . -> directory broken syntax
 rel contains repository . -> directory crates syntax
@@ -452,14 +461,12 @@ search dependency web/package.json [208,230) name=react-dom qn=npm:react-dom
 search dependency web/package.json [260,280) name=fsevents qn=npm:fsevents
 search dependency web/package.json [97,115) name=react qn=npm:react
 search document docs/README.md [0,0) name=README.md qn=docs/README.md
-search document docs/README.md [0,9) name=Service
-search document docs/README.md [133,141) name=Usage
 search document docs/long.txt [0,0) name=long.txt qn=docs/long.txt
 search document docs/wide.txt [0,0) name=wide.txt qn=docs/wide.txt
 search file Cargo.toml [0,75)
 search file broken/Cargo.toml [0,23)
 search file crates/core/Cargo.toml [0,190)
-search file docs/README.md [0,142)
+search file docs/README.md [0,159)
 search file docs/long.txt [0,32767)
 search file docs/long.txt [32767,40001)
 search file docs/wide.txt [0,32745)
@@ -474,6 +481,9 @@ search package crates/core/Cargo.toml [10,23) name=core qn=cargo:core
 search package java/pom.xml [0,0) name=svc qn=maven:org.acme:svc
 search package py/pyproject.toml [10,29) name=My_Service qn=pypi:my-service
 search package web/package.json [4,23) name=@acme/web qn=npm:@acme/web
+search section docs/README.md [0,9) name=Service qn=docs/README.md#Service
+search section docs/README.md [133,141) name=Usage qn=docs/README.md#Service > Usage
+search section docs/README.md [150,158) name=Usage qn=docs/README.md#Service > Usage~2
 `
 
 // TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet is the one test of
