@@ -101,6 +101,7 @@ func (c Config) validate() error {
 		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
 		{"providers.dependence.max_export_files", c.Providers.Dependence.MaxExportFiles},
 		{"index.watch_max_directories", c.Index.WatchMaxDirectories},
+		{"index.max_evidence_per_fact", c.Index.MaxEvidencePerFact},
 		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
 		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
 		{"providers.manifest.max_toml_lines", c.Providers.Manifest.MaxTOMLLines},
@@ -123,6 +124,14 @@ func (c Config) validate() error {
 			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",
 				p.key, int64(p.v), unlimitedSpelling)
 		}
+	}
+	// index.max_evidence_per_fact is the operator's clip BELOW the record
+	// ceiling: a fact can never carry more occurrences than model tolerates on
+	// the wire, so a value above it would be a setting that does nothing. It is
+	// refused rather than silently reduced.
+	if c.Index.MaxEvidencePerFact.Value() > model.MaxEvidencePerFact {
+		return configInvalid("index.max_evidence_per_fact is %d; a fact record holds at most %d evidence occurrences",
+			c.Index.MaxEvidencePerFact.Value(), model.MaxEvidencePerFact)
 	}
 	// providers.dependence.unit_memory_ceiling_bytes is a reservation ceiling
 	// whose 0 means "derive the allocation from the machine", not "unlimited",

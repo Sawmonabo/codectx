@@ -104,6 +104,12 @@ func (c Config) AnalysisConfigHash() string {
 	h.AddString(quoteLimit(c.Providers.TreeSitter.MaxRecordsPerFile))
 	h.AddString(c.Providers.LSP.Enabled.String())
 	h.AddString(c.Providers.Dependence.Enabled.String())
+	// index.max_evidence_per_fact cuts evidence rows out of the sealed facts:
+	// a unit sealed under a user-set clip carries fewer occurrences of the same
+	// fact than the same bytes yield under a higher one, so raising it must
+	// invalidate the unit. The rest of the index section is scheduling policy
+	// and stays out.
+	h.AddString(quoteLimit(c.Index.MaxEvidencePerFact))
 	return h.Sum()
 }
 
