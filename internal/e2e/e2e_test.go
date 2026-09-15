@@ -406,11 +406,11 @@ func TestE2ESearchParity(t *testing.T) {
 // ---------------------------------------------------------------------------
 // L1 rows
 //
-// Lane T21-L1 fills the one Section 25.1 product-boundary scenario in here, as
-// four rows of one table over ONE pass of the harness above -- not four
-// walkthroughs. The seams it builds on are newSandbox, sandbox.run, data,
-// sandbox.mcpSession, callTool and generateTinyRepo; it adds no second TestMain
-// and no second fixture generator.
+// The one Section 25.1 product-boundary scenario is filled in here as four rows
+// of one table over ONE pass of the harness above -- not four walkthroughs. The
+// seams they build on are newSandbox, sandbox.run, data, sandbox.mcpSession,
+// callTool and generateTinyRepo; they add no second TestMain and no second
+// fixture generator.
 //
 //	(a) TestE2EProductBoundary  -- index -> search -> impact -> context plan ->
 //	    context read -> context acknowledge (receipt) -> context acknowledge

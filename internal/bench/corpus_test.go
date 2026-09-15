@@ -23,16 +23,15 @@ import (
 )
 
 // This file is the Section 23.5 fingerprint-parity harness and the pinned
-// corpora manifest (lane T21-L3). It has no TestMain of its own: the one in
+// corpora manifest. It has no TestMain of its own: the one in
 // plateau_test.go makes this test binary the parser worker, which is what lets
 // the workspace composed below spawn parsers through os.Executable. The two
 // files are therefore a set, not independent units.
 //
-// L0 seam note: lane T21-L0 had not run when this landed, so the corpus
-// generator seam and the frozen Section 23.2 budget table below are defined
-// here, minimally, by L3. L0/L2 widen corpusSpec with the small-real and
-// reference scales and the >200-file shape; the budget constants are the ones
-// budgets_test.go reads.
+// Seam note: the corpus generator seam and the frozen Section 23.2 budget
+// table are defined here because the parity rows are their first consumer;
+// budgets_test.go widens corpusSpec with the small-real, >200-file and
+// reference scales and reads the budget constants.
 
 // --- Section 23.2 budget table (frozen; read by budgets_test.go) ------------
 //
