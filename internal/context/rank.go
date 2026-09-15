@@ -167,38 +167,12 @@ func (c *Compiler) reasonPathLimit() config.Limit {
 // store sees is a function of the candidate set and not of discovery order. A
 // set larger than one batch is chunked rather than truncated: a silently
 // dropped edge would score a real route as heuristic.
+// It is a thin wrapper: the body moved to rankjoin.go, beside the streamed pass
+// that must reproduce its read log. Lane L5 removes this wrapper when rank
+// stops calling it.
 func (c *Compiler) resolvePrecision(ctx context.Context, reader *sqlite.PinnedReader,
 	cands []candidate) (map[model.RelationID]int64, error) {
-	seen := map[model.RelationID]struct{}{}
-	ids := make([]model.RelationID, 0, len(cands))
-	for _, cand := range cands {
-		for _, p := range cand.Paths {
-			for _, id := range p.Relations {
-				if _, dup := seen[id]; dup || id == "" {
-					continue
-				}
-				seen[id] = struct{}{}
-				ids = append(ids, id)
-			}
-		}
-	}
-	out := make(map[model.RelationID]int64, len(ids))
-	if len(ids) == 0 {
-		return out, nil
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	batch := c.pageLimit()
-	for start := 0; start < len(ids); start += batch {
-		end := min(start+batch, len(ids))
-		rows, err := reader.EvidenceBatch(ctx, ids[start:end], evidencePerRelation)
-		if err != nil {
-			return nil, contextErr(ctx, err)
-		}
-		for id, evidence := range rows {
-			out[id] = mostPrecise(evidence)
-		}
-	}
-	return out, nil
+	return c.resolvePrecisionWholeSet(ctx, reader, cands)
 }
 
 // mostPrecise picks the multiplier of the most precise evidence row backing one
