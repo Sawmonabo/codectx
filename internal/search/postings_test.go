@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -17,6 +18,8 @@ type fakePostings struct {
 	opened   map[string]int  // TermOccurrences calls per term
 	sessions int             // OpenPostings calls
 	live     map[string]bool // streams still open
+	docCalls int             // SearchDocuments calls
+	docRows  int             // rowids asked for across those calls
 }
 
 func newFakePostings(docs, perDoc int64) *fakePostings {
@@ -44,9 +47,13 @@ func (f *fakePostings) Match(_ context.Context, _ string, after int64, limit int
 }
 
 func (f *fakePostings) SearchDocuments(_ context.Context, rowids []int64) ([]sqlite.SearchDocument, error) {
+	f.docCalls++
+	f.docRows += len(rowids)
 	out := make([]sqlite.SearchDocument, 0, len(rowids))
 	for _, id := range rowids {
-		out = append(out, sqlite.SearchDocument{RowID: id, TokenCount: f.perDoc})
+		out = append(out, sqlite.SearchDocument{RowID: id, TokenCount: f.perDoc,
+			Path: "pkg/f" + strconv.FormatInt(id, 10) + ".go", Kind: "function",
+			Name: "n" + strconv.FormatInt(id, 10)})
 	}
 	return out, nil
 }
@@ -146,6 +153,52 @@ func TestWalkHoldsOnePostingStatementPerToken(t *testing.T) {
 	for term, open := range src.live {
 		if open {
 			t.Fatalf("term %q stream left open after the walk", term)
+		}
+	}
+}
+
+// TestOneDocumentReadPerRowidPage is the regression guard for the duplicated
+// hydration: the tier and its consumer used to fetch the SAME rowid page from
+// SearchDocuments twice, once for TokenCount and once for path/kind/name. One
+// read per rowid page must now carry both, so the walk issues exactly as many
+// document reads as it has candidate pages, and the emitted hit carries the
+// document's servable facts as well as the length its score was computed from.
+func TestOneDocumentReadPerRowidPage(t *testing.T) {
+	const docs = 3 * matchPageSize
+	src := newFakePostings(docs, 2)
+	tier := newLexicalTier(fakeTokenizer{}, config.Limit(0), 1<<20)
+
+	var hits []lexicalHit
+	if _, err := tier.search(context.Background(), src, "key", "alpha", func(h lexicalHit) error {
+		hits = append(hits, h)
+		return nil
+	}); err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != docs {
+		t.Fatalf("scored %d documents, want %d", len(hits), docs)
+	}
+	// docs is an exact multiple of matchPageSize, so the walk asks for one
+	// trailing empty page to learn it is done: 3 full pages + 1 empty, and the
+	// empty one short-circuits before any read.
+	if src.docCalls != 3 {
+		t.Fatalf("issued %d document reads for 3 rowid pages, want 3", src.docCalls)
+	}
+	if src.docRows != docs {
+		t.Fatalf("document reads asked for %d rowids, want %d", src.docRows, docs)
+	}
+	for i, h := range hits {
+		want := int64(i + 1)
+		if h.RowID != want || h.Doc.RowID != want {
+			t.Fatalf("hit %d is rowid %d / doc %d, want %d", i, h.RowID, h.Doc.RowID, want)
+		}
+		if h.Doc.TokenCount != 2 {
+			t.Fatalf("hit %d carries token count %d, want 2", i, h.Doc.TokenCount)
+		}
+		if h.Doc.Path != "pkg/f"+strconv.FormatInt(want, 10)+".go" || h.Doc.Kind != "function" ||
+			h.Doc.Name != "n"+strconv.FormatInt(want, 10) {
+			t.Fatalf("hit %d carries path %q kind %q name %q, want the document's own",
+				i, h.Doc.Path, h.Doc.Kind, h.Doc.Name)
 		}
 	}
 }
