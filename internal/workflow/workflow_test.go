@@ -15,6 +15,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"sync"
@@ -1458,6 +1459,75 @@ func capsuleIsDeterministic(t *testing.T, h *harness) {
 	}
 	if !second.CreatedAt.Equal(first.CreatedAt) {
 		t.Fatalf("a second completion returned %s, not the first capsule's %s", second.CreatedAt, first.CreatedAt)
+	}
+
+	// A FRESH STORE, sealed independently. The two seals above share one store,
+	// so they cannot tell a reproducible identity from a memoised one: the
+	// second returns the stored capsule by design. The capsule is the durable
+	// artifact a later session replays, so the identity must be a function of
+	// what the session recorded and nothing else -- not of insertion order, not
+	// of any per-store counter -- and the ROW KEYS must match too, because they
+	// are the cursors a reader of the exported capsule follows.
+	other := newHarness(t)
+	if _, err := other.store.AdvanceSession(ctx, model.AdvanceRequest{
+		SessionID: fixtureSession, ActorID: fixtureActor,
+		Target: model.StateConsolidateOpen, ExpectedVersion: 1,
+	}); err != nil {
+		t.Fatalf("open consolidate on the second store: %v", err)
+	}
+	other.file(fixtureSession, fileWaived).waived = false
+	other.store.sessions[fixtureSession].waivers = nil
+	elsewhere, err := other.svc.buildCapsule(ctx, other.session(fixtureSession), g)
+	if err != nil {
+		t.Fatalf("seal the same session on a second store: %v", err)
+	}
+	if elsewhere.CanonicalHash != first.CanonicalHash {
+		t.Fatalf("the same session sealed %s on one store and %s on another; a capsule identity is not reproducible",
+			first.CanonicalHash, elsewhere.CanonicalHash)
+	}
+	if elsewhere.Counts != first.Counts {
+		t.Fatalf("the two seals counted %+v and %+v", first.Counts, elsewhere.Counts)
+	}
+	for _, list := range model.CapsuleListOrder {
+		want := capsuleRowKeys(t, h.svc, list)
+		got := capsuleRowKeys(t, other.svc, list)
+		if !slices.Equal(want, got) {
+			t.Fatalf("the %s list sealed row keys %v on one store and %v on another", list, want, got)
+		}
+	}
+}
+
+// capsuleRowKeys reads one sealed list's keys by following the service's own
+// continuations to exhaustion, which is exactly what `codectx context export`
+// does to render a capsule whole. It walks Service.CapsuleRows rather than the
+// store so the continuation rule -- a cursor is offered only while the sealed
+// count says records remain -- is exercised by the seal's own determinism row
+// instead of being asserted nowhere: a rule that is off by one either truncates
+// the export or never terminates it.
+func capsuleRowKeys(t *testing.T, svc *Service, list model.CapsuleList) []string {
+	t.Helper()
+	req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+	var keys []string
+	var cursor string
+	for calls := 0; ; calls++ {
+		rows, next, err := svc.CapsuleRows(context.Background(), req, list, cursor, 2)
+		if err != nil {
+			t.Fatalf("page the sealed %s list after %q: %v", list, cursor, err)
+		}
+		if len(rows) == 0 && cursor != "" {
+			t.Fatalf("the %s continuation %q fetched an empty page", list, cursor)
+		}
+		for _, row := range rows {
+			keys = append(keys, row.Key)
+		}
+		if next == "" {
+			return keys
+		}
+		if calls > len(keys) {
+			t.Fatalf("the %s walk made %d calls for %d keys; the continuation does not terminate",
+				list, calls, len(keys))
+		}
+		cursor = next
 	}
 }
 

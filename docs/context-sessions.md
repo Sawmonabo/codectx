@@ -166,9 +166,37 @@ codectx context close   <session-id> --actor lead-session-1 --expected-version 9
 
 The capsule is the deterministic completion record: what was planned, what was
 served, what was reviewed, what was waived and with which reason, and every
-observation with its citations. `capsule` pages one projection of it; `export`
-writes the whole sealed capsule to a file **outside the repository**, and never
-overwrites an existing file.
+observation with its citations.
+
+**The capsule is paged.** The sealed record itself carries the session's
+identity, both hashes and a *count* per list; the records live beside it as
+durable rows and are read one page at a time. So a completion is never refused,
+truncated or held whole in memory because of how much a session recorded, on a
+repository of any size.
+
+- `capsule --view <list>` returns **one keyset page of one list**, with
+  `meta.next_cursor` when records remain. Pass that value back as `--cursor` to
+  continue; an empty `next_cursor` means the list is finished, and a cursor is
+  never offered for a page that would come back empty. A cursor that names no
+  record in the projection is `CTX_CURSOR_INVALID` — a continuation never
+  silently restarts a list. The six pageable views are `accepted_facts`,
+  `rejected_facts`, `contradictions`, `unresolved`, `coverage` and `waivers`.
+- `export` writes the capsule **whole** to a file **outside the repository**,
+  and never overwrites an existing file. It streams: the identity and the counts
+  under `capsule`, then every record of all eight lists under `records` — the
+  six views above plus `scope` and `scope_review_ids`, which have no view
+  spelling and are carried only by the file. Each list is checked against the
+  count the seal pinned, and a list that comes back short removes the file and
+  fails rather than leaving an artifact that reads as a complete capsule of a
+  smaller session.
+
+Two configuration keys bound the lists, and **both default to unlimited**:
+`context.max_capsule_records_per_list` and `context.max_capsule_coverage_files`
+(the same bound for the `coverage` list alone, which grows with the session's
+pinned file set rather than with what the actor observed). On stock
+configuration neither refuses anything. A value *you* set refuses the seal and
+names the key and the count the list reached — it never truncates a list, and
+a capsule is never sealed with records silently omitted.
 
 `close` takes the final version-checked transition.
 

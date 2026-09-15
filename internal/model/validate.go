@@ -48,15 +48,11 @@ const (
 	MaxCapabilityStates        = 256
 	MaxObservationReferences   = 64
 	MaxReceiptsPerConfirmation = 16 // Section 20.1 coverage.max_receipts_per_confirmation
-	// MaxCoverageFilesPerCapsule is a structural ceiling only: a capsule may
-	// honestly record coverage for every file a context session could touch, and
-	// Section 20.1's workspace.max_files tops out at 250000. The operative limit
-	// is the configured max_capsule_bytes byte budget, which the workflow layer
-	// enforces; this constant exists so the list is finite, not to size it.
-	MaxCoverageFilesPerCapsule = 250000
 	// MaxRecordsPerResult bounds any list a single result carries that is not
 	// itself a Page: Section 6 requires an explicit finite bound on every
-	// response, and Section 17.3 requires the capsule's lists to be bounded.
+	// response. It no longer reaches the capsule, whose lists are durable rows
+	// read a page at a time and bounded only by the two user-set
+	// context.max_capsule_* keys, unlimited by default.
 	MaxRecordsPerResult = 1000
 	MaxEvidencePerFact  = 64 // Section 11.1: a fact carries bounded evidence
 )

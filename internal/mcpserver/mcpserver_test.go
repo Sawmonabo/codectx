@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -212,6 +214,15 @@ func (f *fakeServices) Capsule(ctx context.Context, r model.CapsuleRequest) (mod
 		return model.CapsulePage{}, unset("Capsule")
 	}
 	return f.capsuleFn(ctx, r)
+}
+
+// CapsuleRows is on app.ContextService for the CLI's whole-capsule export. No
+// tool reaches it -- codectx_context_capsule pages through Capsule and projects
+// Export -- so the fake refuses it rather than answering a page a tool would
+// then be believed to serve.
+func (f *fakeServices) CapsuleRows(_ context.Context, _ model.SessionRequest, _ model.CapsuleList,
+	_ string, _ int) ([]model.CapsuleRow, string, error) {
+	return nil, "", unset("CapsuleRows")
 }
 
 func (f *fakeServices) Export(ctx context.Context, r model.SessionRequest) (model.Capsule, error) {
@@ -1155,5 +1166,91 @@ func oversizedArgumentsRow() scenario {
 				t.Errorf("the facade was entered for a frame the bound refuses")
 			}
 		},
+	}
+}
+
+// TestCapsuleCursorWalkReachesEveryRecord protects the capsule tool's
+// continuation across CALLS, which the single-call scenario table above cannot
+// reach.
+//
+// A sealed capsule's records are rows read one keyset page at a time, so a
+// client only ever sees the whole list by following meta.next_cursor. Two
+// failure modes are silent at the tool boundary and both lose records for good:
+// a continuation that is dropped on the last page it should have been offered
+// truncates the list, and one that is offered on the last page hands the client
+// a cursor onto an empty page. Walking a multi-page list to exhaustion and
+// comparing the records to the sealed list catches both.
+func TestCapsuleCursorWalkReachesEveryRecord(t *testing.T) {
+	sessionID := model.SessionID(strings.Repeat("a", 64))
+	sealed := make([]model.FactReference, 5)
+	for i := range sealed {
+		sealed[i] = model.FactReference{
+			RelationID:    model.RelationID(strings.Repeat(strconv.Itoa(i), 64)),
+			ObservationID: model.ObservationID(strings.Repeat("b", 63) + strconv.Itoa(i)),
+		}
+	}
+	const pageSize = 2
+	f := &fakeServices{capsuleFn: func(_ context.Context, r model.CapsuleRequest) (model.CapsulePage, error) {
+		start := 0
+		if r.Page.Cursor != "" {
+			for i, fact := range sealed {
+				if string(fact.ObservationID) == r.Page.Cursor {
+					start = i + 1
+					break
+				}
+			}
+		}
+		end := min(start+pageSize, len(sealed))
+		page := model.CapsulePage{
+			SessionID: sessionID, View: r.View,
+			ManifestHash:  strings.Repeat("d", 64),
+			CanonicalHash: strings.Repeat("e", 64),
+			AcceptedFacts: sealed[start:end],
+		}
+		if end < len(sealed) {
+			page.Meta.NextCursor = string(sealed[end-1].ObservationID)
+		}
+		return page, nil
+	}}
+	cs := connectSession(t, newTestServer(f), true)
+
+	var walked []model.FactReference
+	cursor := ""
+	for calls := 0; ; calls++ {
+		if calls > len(sealed) {
+			t.Fatalf("the capsule walk made %d calls for %d records; the continuation does not terminate", calls, len(sealed))
+		}
+		res, err := cs.CallTool(t.Context(), &mcp.CallToolParams{
+			Name: "codectx_context_capsule",
+			Arguments: model.CapsuleRequest{
+				SessionID: sessionID, ActorID: "actor-1",
+				View: model.CapsuleViewAcceptedFacts,
+				Page: model.PageRequest{Limit: pageSize, Cursor: cursor},
+			},
+		})
+		if err != nil {
+			t.Fatalf("tools/call codectx_context_capsule after %q: %v", cursor, err)
+		}
+		if res.IsError {
+			t.Fatalf("codectx_context_capsule after %q reported a tool error: %s", cursor, firstText(res))
+		}
+		var got result[capsuleOutput]
+		decode(t, res, &got)
+		if got.Data.Page == nil {
+			t.Fatalf("a capsule view answered with no page after %q", cursor)
+		}
+		if len(got.Data.Page.AcceptedFacts) == 0 {
+			t.Fatalf("the continuation %q fetched an empty page; a cursor is offered only when records remain", cursor)
+		}
+		walked = append(walked, got.Data.Page.AcceptedFacts...)
+		if got.Data.Page.Meta.NextCursor == "" {
+			break
+		}
+		cursor = got.Data.Page.Meta.NextCursor
+	}
+	if !slices.EqualFunc(walked, sealed, func(a, b model.FactReference) bool {
+		return a.RelationID == b.RelationID && a.ObservationID == b.ObservationID
+	}) {
+		t.Fatalf("the walk read %d records, the capsule sealed %d: %+v", len(walked), len(sealed), walked)
 	}
 }
