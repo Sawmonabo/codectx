@@ -104,9 +104,9 @@ type Options struct {
 
 // Limits is the resolved budget list for one request.
 //
-// MaxDepth, MaxVisited, MaxEdges, MaxReasonPaths and FrontierBytes carry the
-// config.Limit convention verbatim: 0 is UNLIMITED, and only a negative value
-// is a wiring defect. They are stored as plain integers because that is what
+// MaxDepth, MaxVisited, MaxEdges and MaxReasonPaths carry the config.Limit
+// convention verbatim: 0 is UNLIMITED, and only a negative value is a wiring
+// defect. FrontierBytes does NOT: it is a memory ceiling and must be positive. They are stored as plain integers because that is what
 // the composition root hands over (config.Limit.Int()), and every comparison
 // below goes through config.Limit's own accessors -- Depth/Visited/Edges --
 // rather than re-inventing a zero test.
@@ -116,8 +116,9 @@ type Options struct {
 // walk resumes on the next page. The cumulative counts are still carried by the
 // cursor and reported, so a caller sees the total the walk has spent.
 //
-// MaxPageItems, QueryTimeout and CursorTTL stay strictly positive: a page with
-// no item ceiling is a wire-security bound (class B), not a scale bound.
+// MaxPageItems, QueryTimeout, CursorTTL and FrontierBytes stay strictly
+// positive: a page with no item ceiling is a wire-security bound (class B), not
+// a scale bound, and a frontier with no byte ceiling has no heap bound at all.
 type Limits struct {
 	MaxDepth, MaxVisited, MaxEdges, MaxPageItems, MaxReasonPaths int
 	QueryTimeout, CursorTTL                                      time.Duration
@@ -129,15 +130,13 @@ type Limits struct {
 	FrontierBytes int64
 }
 
-// Depth, Visited and Edges are the three unlimited-capable count bounds read
-// through config.Limit, which owns the 0-means-unlimited semantics.
-func (l Limits) Depth() config.Limit   { return config.Limit(l.MaxDepth) }
-func (l Limits) Visited() config.Limit { return config.Limit(l.MaxVisited) }
-func (l Limits) Edges() config.Limit   { return config.Limit(l.MaxEdges) }
-
-// ReasonPaths is the fourth: how many reason paths one entry may carry. It is
-// read the same way, because an unlimited bound spelled 0 read as a plain
-// integer is a request for no paths at all.
+// Depth, Visited, Edges and ReasonPaths are the unlimited-capable count bounds
+// read through config.Limit, which owns the 0-means-unlimited semantics. Every
+// consumer must go through them: reading the int field directly turns an
+// unlimited bound into a zero-sized budget that stops the walk immediately.
+func (l Limits) Depth() config.Limit       { return config.Limit(l.MaxDepth) }
+func (l Limits) Visited() config.Limit     { return config.Limit(l.MaxVisited) }
+func (l Limits) Edges() config.Limit       { return config.Limit(l.MaxEdges) }
 func (l Limits) ReasonPaths() config.Limit { return config.Limit(l.MaxReasonPaths) }
 
 // Engine answers graph queries against one pinned generation. One Engine is
@@ -159,8 +158,9 @@ type Engine struct {
 // time.Now.
 //
 // The scale bounds accept 0 = unlimited (the config.Limit convention); only a
-// negative value is a wiring defect. The three that are not scale bounds --
-// the page item ceiling and the two durations -- stay strictly positive,
+// negative value is a wiring defect. The four that are not scale bounds --
+// the page item ceiling, the two durations and the frontier memory ceiling --
+// stay strictly positive,
 // because an absent page ceiling or an absent deadline is a missing mechanism
 // rather than a generous one.
 func New(o Options) (*Engine, error) {
@@ -176,7 +176,6 @@ func New(o Options) (*Engine, error) {
 		{"max_visited", int64(o.Limits.MaxVisited)},
 		{"max_edges", int64(o.Limits.MaxEdges)},
 		{"max_reason_paths", int64(o.Limits.MaxReasonPaths)},
-		{"frontier_bytes", o.Limits.FrontierBytes},
 	} {
 		if b.value < 0 {
 			return nil, (&model.Error{Code: model.CodeArgumentInvalid,
@@ -188,6 +187,14 @@ func New(o Options) (*Engine, error) {
 		value int64
 	}{
 		{"max_page_items", int64(o.Limits.MaxPageItems)},
+		// frontier_bytes is a MEMORY ceiling, not a scale cap: zero would not
+		// mean "read as much as you like", it would remove the only bound on
+		// how much of one frontier level is held in heap at once, which is the
+		// OOM the scale posture forbids rather than the generosity it asks
+		// for. resources.query_memory_bytes -- the key it is resolved from --
+		// already refuses 0 at config load as a reservation, so this is the
+		// engine-side half of the same rule.
+		{"frontier_bytes", o.Limits.FrontierBytes},
 		{"query_timeout", int64(o.Limits.QueryTimeout)},
 		{"cursor_ttl", int64(o.Limits.CursorTTL)},
 	} {
@@ -246,6 +253,15 @@ type budget struct {
 	// caller turns this into the truncation reason, because only it owns the
 	// answer's meta.
 	frontierHit bool
+	// deadlineHit records that the walk stopped because the request's
+	// query_timeout ran out with edges already admitted. Ruling Q4 makes the
+	// deadline end a PAGE, not an answer, so -- like frontierHit -- it is a
+	// clean finish here and the caller turns it into the truncation reason and
+	// the continuation cursor. It is set only by a walk that opted in
+	// (expandOptions.DeadlineStops) and only once the page holds a row: a
+	// deadline that arrives before any edge has nothing partial to return, so
+	// there it stays the CTX_QUERY_DEADLINE error it always was.
+	deadlineHit bool
 }
 
 // clock is the budget's own clock, defaulting to time.Now.
@@ -272,8 +288,17 @@ type expandOptions struct {
 	// reading; the frontier it had built is spilled to the continuation spool
 	// and the next page resumes from the keyset position, rather than
 	// accumulating a whole hub's fan-out with no bound in front of it.
-	// Zero leaves the accumulation unbounded (config.Limit's convention).
+	// It is strictly positive (New refuses 0): it is a memory ceiling, so a
+	// zero would remove the level's only heap bound rather than lift a scale
+	// cap.
 	FrontierBytes int64
+	// DeadlineStops makes the query deadline END THIS PAGE instead of failing
+	// the walk, once the page has admitted at least one edge: expand returns
+	// the partial walkState and the caller mints a continuation from its
+	// frontier. Only the paged traversal sets it. The operations that
+	// aggregate a whole walk into one answer (impact, rollup) leave it false,
+	// because a partial aggregate is not a partial answer -- it is a wrong one.
+	DeadlineStops bool
 	// Resume, when non-nil, is the state a continuation restored: the walk
 	// starts from the spooled frontier at the cursor's depth instead of from
 	// seeds, and skips the rows the issuing page already emitted.

@@ -36,6 +36,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 )
@@ -62,9 +63,6 @@ const (
 const (
 	// maxFields bounds the columns of one CSV header.
 	maxFields = 128
-	// maxExportFiles bounds the entries of one export directory. The engine
-	// writes three files per label and has well under a hundred labels.
-	maxExportFiles = 4096
 	// maxLabelBytes bounds a node label or edge type.
 	maxLabelBytes = 128
 	// maxUnknownLabels bounds the distinct unknown labels reported by name;
@@ -75,8 +73,6 @@ const (
 	// maxOperandDepth bounds the descent into one assignment's written
 	// operand and into its read operands.
 	maxOperandDepth = 16
-	// maxDerivedRows bounds the projected relation occurrences of one unit.
-	maxDerivedRows = 4_000_000
 	// pageSize bounds every keyset page read from the scratch.
 	pageSize = 512
 	// maxRangeFileBytes bounds the source held in memory at once: one file's
@@ -127,7 +123,19 @@ type Options struct {
 	// many rows the caller wants one import to stage. 0, the default, is
 	// unlimited. It is a reporting threshold and never a refusal -- crossing
 	// it stages, publishes and reports everything (Report.OverStagedRows).
-	MaxStagedRows int64
+	MaxStagedRows config.Limit
+	// MaxDerivedRows is the user's `providers.dependence.max_derived_rows`:
+	// how many relation occurrences the caller wants one import to project
+	// from its staged rows. 0, the default, is unlimited. Like MaxStagedRows
+	// it is a reporting threshold and never a refusal -- crossing it projects,
+	// publishes and reports everything (Report.OverDerivedRows).
+	MaxDerivedRows config.Limit
+	// MaxExportFiles is the user's `providers.dependence.max_export_files`:
+	// how many entries one export directory may hold. Unlimited by default --
+	// the file count is a property of the export's label vocabulary, not of
+	// the repository, and the directory is read one entry at a time -- so only
+	// a user-set bound refuses an import, and it says so.
+	MaxExportFiles config.Limit
 	// PreviousKeys is the key set the previous sealed run of this unit
 	// published. The zero value is the absent set and means a full import.
 	PreviousKeys KeySet
@@ -207,6 +215,14 @@ type Report struct {
 	// carries model.MaxEvidencePerFact of them. The fact is still published;
 	// the count is what keeps that truncation from being silent.
 	ClippedEvidence int
+	// TruncatedFields counts, by field name, the descriptive storage values
+	// this import cut to their model ceiling before writing them: name,
+	// qualified_name, signature and evidence detail. The model accepts an
+	// oversize storage field, so the cut is this producer's to make; the count
+	// is what keeps it from being silent. Identity fields are never cut — an
+	// entity whose native key or scope key is over its ceiling is counted in
+	// DroppedMethods instead.
+	TruncatedFields map[string]int
 	// UnknownRows is the total rows of unmapped labels, including the labels
 	// past the maxUnknownLabels distinct names UnknownLabels can name.
 	UnknownRows uint64
@@ -223,13 +239,19 @@ type Report struct {
 	// crossing from being silent.
 	StagedRows     int64
 	OverStagedRows bool
+	// DerivedRows is how many relation occurrences this import projected, and
+	// OverDerivedRows whether that crossed a user-set Options.MaxDerivedRows.
+	// The projection is neither truncated nor refused when it does; the flag
+	// is what keeps the crossing from being silent.
+	DerivedRows     int64
+	OverDerivedRows bool
 }
 
 // Import streams one export directory into sink and reports what it
 // published. The sink receives records in reference order: every node fact
 // before the aliases and relations that name its identity.
 func Import(ctx context.Context, exportDir string, res provider.Resolver, sink provider.Sink, opts Options) (Report, error) {
-	rep := Report{UnknownLabels: map[string]int{}}
+	rep := Report{UnknownLabels: map[string]int{}, TruncatedFields: map[string]int{}}
 	if err := opts.validate(); err != nil {
 		return rep, err
 	}
@@ -252,7 +274,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err := e.stageFiles(ctx); err != nil {
 		return rep, err
 	}
-	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes)
+	n, err := importExport(ctx, sc, exportDir, opts.Limits.MaxRecordBytes, opts.MaxExportFiles)
 	rep.BytesRead = uint64(n)
 	if err != nil {
 		return rep, err
@@ -299,10 +321,15 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	rep.UnlocatedFacts, rep.UnresolvedWrites = e.noRange, e.unresolved
 	rep.ClippedEvidence, rep.UnknownRows, rep.IgnoredFiles = e.clipped, sc.unknownN, sc.ignoredFiles
 	rep.StagedRows, rep.OverStagedRows = sc.rows, sc.overRows
+	rep.DerivedRows = sc.derivedRows
+	rep.OverDerivedRows = opts.MaxDerivedRows.Exceeded(sc.derivedRows)
 	rep.Changed, rep.Unchanged, rep.Removed = delta.Changed, delta.Unchanged, delta.Removed
 	rep.Keys = fresh
 	for label, n := range sc.unknown {
 		rep.UnknownLabels[label] = int(n)
+	}
+	for field, n := range e.truncatedFields {
+		rep.TruncatedFields[field] = n
 	}
 	return rep, nil
 }

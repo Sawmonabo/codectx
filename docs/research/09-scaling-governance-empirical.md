@@ -1,6 +1,6 @@
 # Scaling, memory governance, call-join coverage, reads/writes (2026-09-13, this machine: 16 cores, 47 GiB)
 
-Engine: Joern 4.0.627, JDK 21.0.12. All numbers from /usr/bin/time (%M = peak RSS of the largest
+Engine: engine 4.0.627, JDK 21.0.12. All numbers from /usr/bin/time (%M = peak RSS of the largest
 process in the tree).
 
 ## 1. Scaling on real repositories, default JVM heap (25% of RAM ≈ 12 GB)
@@ -17,15 +17,15 @@ process in the tree).
 | r3/app/client | TS/JS | 324k | — | 108 s | 8.9 GB, **engine crash** | 46 MB | — | — | — | — |
 | scip-go on x/tools (for contrast) | Go | 239k | 1,283 | 7.3 s | 0.4 GB | 21 MB index | — | — | — | — |
 
-The r3 crash is inside Joern (`ObjectPropertyCallLinker` → `AssignmentMethods.source`:
+The r3 crash is inside the engine (`ObjectPropertyCallLinker` → `AssignmentMethods.source`:
 "Assignment statement with 3 arguments"), reproduced with vendored amcharts excluded, so it is a
-code-shape bug in jssrc2cpg, not a memory failure. A crashed unit leaves a pre-overlay cpg.bin
+code-shape bug in the engine's JS/TS frontend, not a memory failure. A crashed unit leaves a pre-overlay cpg.bin
 that cannot be exported (schema violation in ReachingDefPass). Per-directory bisect result is in
 `bisect.txt` (appended below when finished).
 
 ## 2. Memory governance: the JVM heap cap is honored and lossless
 
-`JAVA_OPTS=-Xmx<N>` reaches the frontend JVM (joern-parse's own `-J-Xmx` does not; that JVM only
+`JAVA_OPTS=-Xmx<N>` reaches the frontend JVM (the parse command's own `-J-Xmx` does not; that JVM only
 orchestrates). Results on x/tools (239k Go LOC), cpg.bin byte-identical (14,308 KB) in every
 successful run:
 
@@ -46,7 +46,7 @@ unit's byte count and the configured envelope, retry once at 2x on OOM, and repo
 `failed: memory` beyond that. Nothing is silently dropped at any cap.
 
 ## 3. Two-phase parse works in 4.0.627
-`joern-parse <dir> --language golang --overlaysonly --output <existing cpg.bin>` applies overlays
+The parse command with `--language golang --overlaysonly --output <existing cpg.bin>` applies overlays
 to an existing graph in place (0.68 s when already applied). Report 06's NPE is a 4.0.100 defect
 fixed by 4.0.627. Not needed for the design, but it means a cached frontend graph can have
 overlays re-applied without re-parsing.
@@ -70,13 +70,13 @@ overlays re-applied without re-parsing.
 
 Every miss is either a builtin/conversion (not a call to user code), a build-configuration gap
 (SCIP indexes one GOOS/GOARCH), or a call through a value. Calls through a function value
-(`f := helper; f(2)`) resolve to the *local* `f`, which is the honest answer; Joern's CALL for
+(`f := helper; f(2)`) resolve to the *local* `f`, which is the honest answer; the engine's CALL for
 the same site also names no method. 84 sites resolved to `local` symbols this way. Coverage of
 user-code calls is effectively complete; the residual gaps are labelled, not hidden.
 
-Richness check against Joern on the same corpus: Joern has 10,366 non-operator CALL nodes, 196
-with unresolved full names, all STATIC_DISPATCH; the extra count is test files, builtins and
-conversions. Nothing Joern's CALL edge carries is missing from the join except the argument
+Richness check against the engine on the same corpus: the engine has 10,366 non-operator CALL
+nodes, 196 with unresolved full names, all STATIC_DISPATCH; the extra count is test files, builtins
+and conversions. Nothing the engine's CALL edge carries is missing from the join except the argument
 subtree, which we do not publish as a fact.
 
 ## 6. Reads / writes are derivable from the CPG

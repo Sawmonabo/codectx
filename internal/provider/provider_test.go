@@ -309,13 +309,14 @@ func TestOversizeRecordSealsTheUnitAndReportsTheBound(t *testing.T) {
 		t.Fatalf("capabilities = %v, want one synthesized row for the declared capability", result.Capabilities)
 	}
 	got := result.Capabilities[0]
-	// Partial, not fresh: internal/index/status.go:269-272 discards a fresh
-	// row's details, so a fresh row here would report the bound to nobody.
-	if got.State != model.CapabilityPartial || got.Capability != "structure" || got.Scope != u.Request.Unit.ScopeKey {
-		t.Fatalf("capability row = %+v, want a partial structure row for the unit's scope", got)
+	// Fresh, not partial: the record was admitted, so nothing was dropped and
+	// nothing failed. The bound reaches the reader as details, which the
+	// generation's capability fold merges rather than discards.
+	if got.State != model.CapabilityFresh || got.Capability != "structure" || got.Scope != u.Request.Unit.ScopeKey {
+		t.Fatalf("capability row = %+v, want a fresh structure row for the unit's scope: the oversize record was admitted", got)
 	}
-	if got.DiagnosticCode != model.CodeResourceLimit {
-		t.Fatalf("diagnostic code = %q, want the resource-limit code", got.DiagnosticCode)
+	if got.DiagnosticCode != "" {
+		t.Fatalf("diagnostic code = %q, want none: an admitted record is not a partial outcome", got.DiagnosticCode)
 	}
 	if got.Details["over_max_provider_record_bytes"] != "1" || got.Details["max_provider_record_bytes"] != "256" {
 		t.Fatalf("capability details = %v, want the count and the bound the user set", got.Details)

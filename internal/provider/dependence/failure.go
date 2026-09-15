@@ -168,6 +168,18 @@ type publication struct {
 	// unless it crossed. The import staged and published every row regardless.
 	StagedRows      int64
 	StagedRowsBound int64
+	// DerivedRows is the count of relation occurrences the import projected
+	// and DerivedRowsBound the user-set providers.dependence.max_derived_rows
+	// it crossed; both are zero unless it crossed. The projection was neither
+	// truncated nor refused.
+	DerivedRows      int64
+	DerivedRowsBound int64
+	// TruncatedFields counts, by field name, the descriptive storage values
+	// the import cut to their model ceiling before writing them. The facts
+	// were published whole apart from those values; the map is what keeps the
+	// clipping from being silent, and it is bounded by the fixed set of
+	// descriptive field names, never by the repository.
+	TruncatedFields map[string]int
 }
 
 // capabilities renders the publication as the result's capability list: the
@@ -223,6 +235,17 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 			row = row.WithDetail("staged_rows", strconv.FormatInt(p.StagedRows, 10)).
 				WithDetail("max_staged_rows", strconv.FormatInt(p.StagedRowsBound, 10))
 		}
+		if p.DerivedRows > 0 {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("derived_rows", strconv.FormatInt(p.DerivedRows, 10)).
+				WithDetail("max_derived_rows", strconv.FormatInt(p.DerivedRowsBound, 10))
+		}
+		// A clipped stored value degrades every capability alike: any pass can
+		// be the one that published the fact whose name or signature was cut.
+		if names := p.truncatedFields(); names != "" {
+			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeResourceLimit
+			row = row.WithDetail("truncated_fields", names)
+		}
 		if p.Subdivided != "" {
 			row.State, row.DiagnosticCode = model.CapabilityPartial, model.CodeProviderOutputInvalid
 			row = row.WithDetail("subdivided", truncate(p.Subdivided, model.MaxDetailBytes))
@@ -236,6 +259,37 @@ func (p publication) capabilities(scopeKey string) []model.CapabilityState {
 		out = append(out, p.unsupportedLabels(scopeKey))
 	}
 	return out
+}
+
+// truncatedFields renders the cut storage fields as one detail value,
+// "field=count" in field order, empty when nothing was cut. The field names
+// are a fixed set, so the value is bounded by this code; the ceiling is
+// honoured all the same, on a separator boundary, because a value clipped
+// mid-pair would report a count nobody measured.
+func (p publication) truncatedFields() string {
+	fields := make([]string, 0, len(p.TruncatedFields))
+	for f, n := range p.TruncatedFields {
+		if n > 0 {
+			fields = append(fields, f)
+		}
+	}
+	slices.Sort(fields)
+	var b strings.Builder
+	for _, f := range fields {
+		pair := f + "=" + strconv.Itoa(p.TruncatedFields[f])
+		sep := 0
+		if b.Len() > 0 {
+			sep = 1
+		}
+		if b.Len()+sep+len(pair) > model.MaxDetailBytes {
+			break
+		}
+		if sep > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(pair)
+	}
+	return b.String()
 }
 
 // skippedNames is the sorted, deduplicated sample of skipped method names as

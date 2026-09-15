@@ -271,6 +271,12 @@ func (s *ExternalSort[T]) writeRecord(w *bufio.Writer, v T) error {
 // files are removed. Close the result to remove that file.
 //
 // Add must not be called afterwards.
+//
+// On the ERROR path the run files are not always removed: a failure before the
+// merge (spill, collapse, output creation) leaves the spilled runs on disk, so
+// the caller keeps its obligation to Close this sort whether Sorted succeeded
+// or failed. Every caller already defers Close, and that is the contract, not
+// an accident: Sorted owns removal only on the path that consumed the runs.
 func (s *ExternalSort[T]) Sorted() (*SortedRun[T], error) {
 	if s.err != nil {
 		return nil, s.err
@@ -621,9 +627,14 @@ func (r *SortedRun[T]) Close() error {
 // beside the continuation spools of the same store rather than in a second
 // place an operator has to know about.
 //
-// Run bytes are NOT charged against the store's shared reservation: a run is
-// created and removed inside one request, while the reservation accounts for
-// state that outlives it. Sweep and diskBytes still see the files, so a
-// crashed process's runs are visible as real disk. Charging them to the shared
-// budget is a ledgered residual, not an oversight.
+// Run bytes are NOT charged against the store's shared reservation, and that
+// is a decision rather than an oversight. resources.max_temp_bytes bounds
+// continuation state: bytes that outlive the request that wrote them and pin a
+// generation against retention until a lease expires. A sort run is sized by
+// the match count and is created and removed inside one request, so charging
+// it there would silently repurpose the key -- one query's ranking could
+// exhaust the budget another query's continuation needs, and an operator
+// raising it to hold more pages would instead be raising how wide a query a
+// single request may rank. Sweep and diskBytes still see the files, so runs
+// are reported and reclaimed as real disk exactly as a spool is.
 func (s *Spools) SortDir() string { return s.dir }

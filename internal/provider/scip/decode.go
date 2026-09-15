@@ -104,8 +104,14 @@ const (
 // symbolInfo is one decoded SymbolInformation.
 type symbolInfo struct {
 	symbol, displayName, signature string
-	kind                           int32
-	relationships                  []relationship
+	// signatureCut is the ORIGINAL encoded byte length of a signature the
+	// field ceiling shortened, and 0 when nothing was cut. It cannot come
+	// from model.TruncateField's second result the way treesitter/facts.go
+	// derives it: the decoder never holds the whole value, so the length is
+	// taken from the wire, which is the only place it exists.
+	signatureCut  int64
+	kind          int32
+	relationships []relationship
 }
 
 // document is the summary the walker reports when a Document record ends:
@@ -228,6 +234,9 @@ type walker struct {
 	onSymbol     func(doc int64, s symbolInfo, recordBytes int64) error
 	onDocument   func(document) error
 	onExternal   func(s symbolInfo, recordBytes int64) error
+	// seen tallies the largest figure this walk observed at each counted
+	// bound; the importer compares it with the configuration once, at the end.
+	seen *limitSeen
 }
 
 // record reads one bounded record into the walker's buffer and reports a
@@ -280,9 +289,12 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 				err = w.onMetadata(m)
 			}
 		case fieldIndexDocuments:
-			if docs++; docs > w.limits.MaxDocuments {
-				return *r.consumed, overLimit("documents", docs, w.limits.MaxDocuments)
-			}
+			// A document count refuses nothing: documents stream past a
+			// bounded record buffer into an on-disk spool, so the figure
+			// bounds no allocation. A user-set bound is recorded and
+			// reported once the run ends.
+			docs++
+			w.seen.note(limitDocuments, docs)
 			var doc *reader
 			if doc, err = r.sub(n); err == nil {
 				err = w.document(ctx, doc, docs-1)
@@ -360,9 +372,10 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 				return err
 			}
 		case fieldDocumentOccurrences:
-			if d.occurrences++; d.occurrences > w.limits.MaxOccurrencesPerDocument {
-				return overLimit("occurrences per document", d.occurrences, w.limits.MaxOccurrencesPerDocument)
-			}
+			// Same shape as the document count: spooled, never resident,
+			// so the largest per-document figure is reported, not refused.
+			d.occurrences++
+			w.seen.note(limitOccurrencesPerDocument, d.occurrences)
 			if w.onOccurrence == nil {
 				if err := r.discardSub(n); err != nil {
 					return err
@@ -593,10 +606,9 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 			if err != nil {
 				return s, false, err
 			}
-			var dropped bool
-			if s.signature, dropped, err = decodeSignature(sig); err != nil {
+			if s.signature, s.signatureCut, err = decodeSignature(sig); err != nil {
 				return s, false, err
-			} else if dropped {
+			} else if s.signatureCut > 0 {
 				drops.dropField(boundSignature)
 			}
 		case field == fieldSymbolInfoRelationships && wt == wireBytes:
@@ -638,42 +650,52 @@ func decodeSymbolInfo(buf []byte, drops *decodeDrops) (symbolInfo, bool, error) 
 	return s, false, nil
 }
 
-// decodeSignature reads Signature.text, bounded at the signature ceiling;
-// a longer signature is dropped rather than truncated into a wrong one.
-// The second result reports that the text was dropped for exceeding the
-// signature bound, which the caller counts as a field drop.
-func decodeSignature(r *reader) (string, bool, error) {
+// decodeSignature reads Signature.text, bounded at the signature ceiling. A
+// longer signature is TRUNCATED and flagged, not discarded: a 4 096-byte
+// prefix of a signature answers most questions about the symbol, and this
+// producer yielding nothing where treesitter/facts.go:220 yields a prefix was
+// the whole of F26. Only the prefix is ever read, so a signature of any size
+// costs the ceiling and not itself.
+//
+// The second result is the ORIGINAL encoded length when the text was cut, and
+// 0 when it was not; the caller records it on the symbol and counts one field
+// truncation.
+func decodeSignature(r *reader) (string, int64, error) {
 	var text string
-	var dropped bool
+	var cut int64
 	for !r.done() {
 		field, wt, err := r.tag()
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
 		if field != fieldSignatureText || wt != wireBytes {
 			if err := r.skip(wt); err != nil {
-				return "", false, err
+				return "", 0, err
 			}
 			continue
 		}
 		n, err := r.length()
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
-		if n > int64(model.MaxSignatureBytes) {
-			if err := r.discardSub(n); err != nil {
-				return "", false, err
-			}
-			dropped = true
-			continue
+		keep := n
+		if max := int64(model.MaxSignatureBytes); n > max {
+			keep, cut = max, n
 		}
-		buf, err := r.bytes(n, n, boundSignature, nil)
+		buf, err := r.bytes(keep, keep, boundSignature, nil)
 		if err != nil {
-			return "", false, err
+			return "", 0, err
 		}
-		text = string(buf)
+		if keep < n {
+			if err := r.discardSub(n - keep); err != nil {
+				return "", 0, err
+			}
+		}
+		// The prefix is cut at a byte offset, so the last rune of it may be
+		// half a UTF-8 sequence; TruncateField is what removes it.
+		text, _ = model.TruncateField(string(buf), model.MaxSignatureBytes)
 	}
-	return text, dropped, nil
+	return text, cut, nil
 }
 
 // The second result reports that the relationship was DROPPED: its symbol was

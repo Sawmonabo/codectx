@@ -442,19 +442,21 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
-	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes})
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
+		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries})
 	if err != nil {
 		return nil, err
 	}
 	if s.ts, err = treesitter.New(treesitter.Options{
-		Languages:         cfg.Providers.TreeSitter.Languages,
-		MaxWorkers:        parserWorkers,
-		MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL:     cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
-		WorkerMemoryBytes: parserWorkerReservationBytes,
-		Worker:            treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
-		Runner:            parsers,
-		WorkDir:           tsWorkDir,
+		Languages:           cfg.Providers.TreeSitter.Languages,
+		MaxWorkers:          parserWorkers,
+		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
+		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
+		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
+		WorkerMemoryBytes:   parserWorkerReservationBytes,
+		Worker:              treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
+		Runner:              parsers,
+		WorkDir:             tsWorkDir,
 	}); err != nil {
 		return nil, err
 	}
@@ -469,6 +471,18 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Timeout:      cfg.Providers.SCIP.Timeout.Std(),
 		StallTimeout: cfg.Providers.SCIP.StallTimeout.Std(),
 		WorkDir:      scipWorkDir,
+		// MaxRecordBytes is deliberately absent: it is the wire reader's
+		// pre-allocation ceiling, product code rather than configuration, and
+		// taking it from an unlimited resources key would silently clamp it.
+		Limits: scip.Limits{
+			MaxIndexBytes:             cfg.Providers.SCIP.MaxIndexBytes,
+			MaxDocuments:              cfg.Providers.SCIP.MaxDocuments,
+			MaxOccurrencesPerDocument: cfg.Providers.SCIP.MaxOccurrencesPerDocument,
+			MaxSpoolBytes:             cfg.Providers.SCIP.MaxSpoolBytes,
+			MaxSourceFileBytes:        cfg.Providers.SCIP.MaxSourceFileBytes,
+			MaxMaterializeBytes:       cfg.Providers.SCIP.MaxMaterializeBytes,
+			MaxManifestBytes:          cfg.Providers.SCIP.MaxManifestBytes,
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -517,13 +531,14 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, perr
 		}
 		if s.watcher, err = watch.New(watch.Options{
-			Root:      root,
-			Policy:    policy,
-			Debounce:  cfg.Index.WatchDebounce.Std(),
-			Reconcile: cfg.Index.ReconcileInterval.Std(),
-			MaxPaths:  cfg.Index.WatchPendingPaths,
-			MaxBytes:  cfg.Index.WatchPendingBytes,
-			Logger:    s.logger,
+			Root:           root,
+			Policy:         policy,
+			Debounce:       cfg.Index.WatchDebounce.Std(),
+			Reconcile:      cfg.Index.ReconcileInterval.Std(),
+			MaxPaths:       cfg.Index.WatchPendingPaths,
+			MaxBytes:       cfg.Index.WatchPendingBytes,
+			MaxWatchedDirs: cfg.Index.WatchMaxDirectories,
+			Logger:         s.logger,
 		}); err != nil {
 			return nil, err
 		}
@@ -624,8 +639,10 @@ func (s *stack) openDependence(ctx context.Context, runner *process.Runner) prov
 				CacheBytes:             s.cfg.Providers.Dependence.CacheBytes,
 				UnitMemoryFloorBytes:   s.cfg.Providers.Dependence.UnitMemoryFloorBytes,
 				UnitMemoryCeilingBytes: s.cfg.Providers.Dependence.UnitMemoryCeilingBytes,
-				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily.Value(),
-				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows.Value(),
+				MaxUnitsPerFamily:      s.cfg.Providers.Dependence.MaxUnitsPerFamily,
+				MaxStagedRows:          s.cfg.Providers.Dependence.MaxStagedRows,
+				MaxDerivedRows:         s.cfg.Providers.Dependence.MaxDerivedRows,
+				MaxExportFiles:         s.cfg.Providers.Dependence.MaxExportFiles,
 				Limits: provider.Limits{
 					BatchRecords:   s.cfg.Index.BatchRecords,
 					BatchBytes:     s.cfg.Index.BatchBytes,
@@ -879,19 +896,22 @@ func (s *stack) openWorkflow() error {
 // enforces. It is the only place configuration is turned into those bounds, so
 // the service itself never reads config.Config.
 //
-// MaxObservationReferences has no configuration key: it is the model's own
-// ceiling on one observation's reference list (model.MaxObservationReferences),
-// and an operator-settable second ceiling would be a bound the model already
-// refuses to exceed.
+// MaxObservationReferences is workflow.max_observation_references, unlimited by
+// default: the model keeps its own structural ceiling on one reference list,
+// and this is the operator's separate ceiling on an attestation as a whole,
+// which is what a scope review's eight categories are counted against.
 func workflowLimits(cfg config.Config) workflow.Limits {
 	return workflow.Limits{
 		MaxPageItems:                        cfg.Resources.MaxPageItems,
-		MaxObservationReferences:            model.MaxObservationReferences,
+		MaxObservationReferences:            cfg.Workflow.MaxObservationReferences,
 		MaxCapsuleBytes:                     cfg.Context.MaxCapsuleBytes,
 		MaxCapsuleRecordsPerList:            cfg.Context.MaxCapsuleRecordsPerList,
 		MaxCapsuleCoverageFiles:             cfg.Context.MaxCapsuleCoverageFiles,
 		QueryTimeout:                        cfg.Resources.QueryTimeout.Std(),
 		AllowExploratoryWaiverConsolidation: cfg.Context.AllowExploratoryWaiverConsolidation,
+		// Inverted deliberately: context.strict_read_gate defaults to true, and
+		// the service's zero value must be the enforcing one.
+		StrictReadGateDisabled: !cfg.Context.StrictReadGate,
 	}
 }
 

@@ -127,6 +127,24 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if m, ok, err := c.reuseManifest(ctx, id); err != nil {
 		return model.ContextManifest{}, err
 	} else if ok {
+		// Notices are not persisted (model.ContextManifest.Notices says why),
+		// so the reused header carries none. The configuration-derived one is
+		// re-emitted here: it is a fact about THIS request's bounds, and a
+		// caller who hit the reuse path asked for the same page size as the
+		// caller who compiled.
+		m.Notices = c.manifestNotices(scopeResult{}, plan{})
+		if !m.ScopeComplete {
+			// The reused header knows its scope is partial but not how many
+			// candidates were excluded -- the count lives in the stored
+			// exclusion projection, not in the manifest -- so the pointer is
+			// emitted without a count rather than withheld, and it does not
+			// claim exclusions exist: a scope also goes incomplete with none
+			// (an unreadable evidence route), so the count-less form promises
+			// only the surface, never rows. Without it a caller
+			// who hits the reuse path reads scope_complete=false with nothing
+			// naming the surface that says why.
+			m.Notices = append(m.Notices, excludedViewNotice)
+		}
 		return m, nil
 	}
 
@@ -201,10 +219,68 @@ func (c *Compiler) Compile(ctx context.Context, req model.ContextRequest) (model
 	if err != nil {
 		return model.ContextManifest{}, err
 	}
+	// Set after persistence, deliberately: the notices describe how THIS
+	// compile was bounded, not what the plan is, and they are neither hashed
+	// nor stored.
+	m.Notices = c.manifestNotices(scoped, packed)
 	c.logger().Debug("compiled a context manifest", "component", "context", "manifest_id", string(m.ID),
 		"entries", m.EntryCount, "slices", m.SliceCount, "scope_complete", m.ScopeComplete)
 	return m, nil
 }
+
+// manifestNotices is every non-fatal disclosure this compile owes the caller:
+// the page size the configuration asked for and could not have, and the counts
+// of the Section 15.3 explanation cuts the expansion and the budget pass
+// applied. Each is a COUNT and not an entry-sized list -- a per-entry
+// disclosure list is repository-sized in heap, which is precisely the shape a
+// manifest header may not have -- and each goes through model.TruncateField so
+// ContextManifest.Validate never has to refuse a compile over its own notice.
+//
+// An empty result is the honest answer that nothing was cut, and the field is
+// omitempty, so a compile under no bound reads exactly as it did before.
+func (c *Compiler) manifestNotices(scoped scopeResult, packed plan) []string {
+	var out []string
+	add := func(format string, args ...any) {
+		note, _ := model.TruncateField(fmt.Sprintf(format, args...), model.MaxReasonBytes)
+		out = append(out, note)
+	}
+	if note := c.pageLimitNotice(); note != "" {
+		out = append(out, note)
+	}
+	if n := scoped.ReasonsDropped; n > 0 {
+		add("%d selection reason(s) past the %d-per-entry bound were not stored; the entries they explain are still listed in full",
+			n, model.MaxReasonsPerEntry)
+	}
+	if n := scoped.ReasonsTruncated; n > 0 {
+		add("%d selection reason(s) were truncated to the %d-byte reason bound", n, model.MaxReasonBytes)
+	}
+	if n := len(packed.Excluded); n > 0 {
+		// The manifest header carries no exclusion list -- exclusions are a
+		// paged projection, and embedding them would make the header
+		// repository-sized -- so scope_complete=false on its own leaves the
+		// caller with no route to the reasons. This notice is that route. Its
+		// condition is deliberately NOT scope_complete: a plan can exclude
+		// candidates with its scope complete (a budget drop is an exclusion,
+		// not a gap), and a scope can be incomplete with nothing excluded, so
+		// the count-bearing notice keys on the exclusions it counts.
+		add("%d candidate(s) were excluded from this plan, each with a reason; %s",
+			n, excludedViewPointer)
+	}
+	if n := packed.RelationsClipped; n > 0 {
+		add("%d evidence route(s) were stored clipped to the first %d relations; the route reaches further than the manifest records",
+			n, model.MaxRelationsPerPath)
+	}
+	return out
+}
+
+// excludedViewPointer names the projection that pages the exclusions a manifest
+// header only counts, and excludedViewNotice is the count-less form the manifest
+// reuse path emits. One spelling, so the two notices can never name different
+// commands.
+const (
+	excludedViewPointer = "page them with `codectx context entries <session-id> --view excluded`"
+	excludedViewNotice  = "this plan's scope is incomplete; any excluded candidates and their reasons are paged there too -- " + excludedViewPointer
+)
 
 // Close releases the compiler's own resources. It does not close the injected
 // Store or Search service, which the composition root owns.

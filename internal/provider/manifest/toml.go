@@ -25,15 +25,16 @@ type tomlSection struct {
 
 // maxTOMLLines bounds the layout: one line span is 16 bytes, so a manifest
 // of many very short lines would otherwise amplify max_parse_file_bytes
-// several times over in the unit's heap. Over the cap the layout is empty,
-// and every fact of that manifest carries evidence without a range — the
-// documented degradation, never a guessed range.
+// several times over in the unit's heap. Over the cap the layout is empty
+// and every fact of that manifest carries evidence without a range — never a
+// guessed range. The second result reports that cut, so the unit says its
+// facts lost their coordinates instead of degrading in silence.
 const maxTOMLLines = 200000
 
-func layoutTOML(data []byte) tomlLayout {
+func layoutTOML(data []byte) (tomlLayout, bool) {
 	var l tomlLayout
 	if bytes.Count(data, []byte("\n")) >= maxTOMLLines {
-		return l
+		return l, true
 	}
 	for off := 0; off <= len(data); {
 		next := bytes.IndexByte(data[off:], '\n')
@@ -55,7 +56,7 @@ func layoutTOML(data []byte) tomlLayout {
 		l.sections = append(l.sections, tomlSection{name: tomlHeader(text), first: i + 1})
 	}
 	l.sections[len(l.sections)-1].end = len(l.lines)
-	return l
+	return l, false
 }
 
 // tomlHeader extracts the dotted table name from a header line, stripping

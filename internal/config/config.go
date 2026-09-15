@@ -110,6 +110,7 @@ type Config struct {
 	Providers Providers `toml:"providers"`
 	Context   Context   `toml:"context"`
 	Coverage  Coverage  `toml:"coverage"`
+	Workflow  Workflow  `toml:"workflow"`
 	MCP       MCP       `toml:"mcp"`
 }
 
@@ -124,6 +125,23 @@ type Workspace struct {
 	MaxFiles           Limit `toml:"max_files"`
 	MaxParseFileBytes  Limit `toml:"max_parse_file_bytes"`
 	MaxSearchFileBytes Limit `toml:"max_search_file_bytes"`
+	// MaxDirEntries bounds how many children one directory may hold and
+	// MaxDepth how deeply directories may nest. Both unlimited by default:
+	// one generated directory or one deep vendored tree must never refuse a
+	// capture. A user-set value that is exceeded is reported through the
+	// traversal's skip sink -- which the capture records in its notes -- and
+	// the walk continues to completion. They are the operator's escape hatch
+	// over a directory so wide that sorting it spills to disk.
+	MaxDirEntries Limit `toml:"max_dir_entries"`
+	MaxDepth      Limit `toml:"max_depth"`
+	// MaxIgnoredRoots bounds the ignored-root set the shared traversal policy
+	// holds. Unlimited by default: the set is one entry per OUTERMOST ignored
+	// path of the worktree and every lookup is a random-access ancestor probe,
+	// so it is resident by construction and small on any real checkout. A
+	// user-set value that is exceeded does not refuse the workspace: the
+	// policy degrades to the base policy -- the ignored trees are walked
+	// rather than excluded -- and the degradation is logged.
+	MaxIgnoredRoots Limit `toml:"max_ignored_roots"`
 }
 
 // Index is operational scheduling policy: none of it is a semantic input.
@@ -152,6 +170,24 @@ type Index struct {
 	// by RetainRefs alone. A user-set value evicts least-recently-used refs
 	// first and never the active one.
 	MaxRetainedBytes Limit `toml:"max_retained_bytes"`
+	// WatchMaxDirectories is how many directories one watcher may watch.
+	// Unlimited by default: a repository's directory count is a property of
+	// the repository, and the host's own notification limit is the real
+	// ceiling -- reaching it is refused by the host and reported as incomplete
+	// coverage. A user-set value stops the watch set at that many directories
+	// and reports coverage incomplete with the reason, never silently.
+	WatchMaxDirectories Limit `toml:"watch_max_directories"`
+	// CaptureMaxRetries bounds how many validation passes of a snapshot
+	// capture may find the worktree changed under them before the capture is
+	// declared unstable. 0 -- the default -- is unlimited, and the capture is
+	// then ended by CaptureRetryDeadline alone: a retry count that refuses a
+	// busy monorepo would be a scale refusal, whereas a deadline ends a
+	// worktree that genuinely never settles. Attempts are reported either way.
+	CaptureMaxRetries Limit `toml:"capture_max_retries"`
+	// CaptureRetryDeadline bounds the whole validated capture. It is finite by
+	// design and not a size bound: with CaptureMaxRetries unlimited it is the
+	// only thing that ends a capture of a worktree that is always changing.
+	CaptureRetryDeadline Duration `toml:"capture_retry_deadline"`
 }
 
 // Resources is the memory, concurrency, disk and response policy.
@@ -205,12 +241,31 @@ type Retention struct {
 	BlobGrace Duration `toml:"blob_grace"`
 }
 
-// Providers groups the four provider families of Section 20.1.
+// Providers groups the provider families of Section 20.1.
 type Providers struct {
 	TreeSitter TreeSitter `toml:"tree_sitter"`
 	SCIP       SCIP       `toml:"scip"`
 	LSP        LSP        `toml:"lsp"`
 	Dependence Dependence `toml:"dependence"`
+	Manifest   Manifest   `toml:"manifest"`
+}
+
+// Manifest configures the build-metadata and documentation provider of
+// Section 11.2. Both bounds are how much of one manifest the user wants
+// indexed; neither has a default, because how many dependencies a manifest
+// declares is a property of the repository. A manifest is parsed as a whole
+// file whose size workspace.max_parse_file_bytes already bounds, so an
+// unlimited list bound costs one file's heap, never the repository's.
+type Manifest struct {
+	// MaxDependencies is how many dependencies the user wants one manifest to
+	// declare. Unlimited by default; a user-set value that is crossed cuts
+	// the list and is reported on the file's capability row with the count
+	// that crossed it and this bound.
+	MaxDependencies Limit `toml:"max_dependencies"`
+	// MaxEntries is the same contract for a manifest's modules, replaced and
+	// excluded modules, workspace members, properties, and a document's
+	// headings and links.
+	MaxEntries Limit `toml:"max_entries"`
 }
 
 // TreeSitter configures the bundled structural provider. It runs as a private
@@ -220,6 +275,14 @@ type TreeSitter struct {
 	Enabled       bool     `toml:"enabled"`
 	Languages     []string `toml:"languages"`
 	WorkerIdleTTL Duration `toml:"worker_idle_ttl"`
+	// MaxCalleeReferences is how many distinct cross-file callee names the
+	// user wants one file to mint nodes for. Unlimited by default: a
+	// generated file names what it names, and the count is bounded by the
+	// file, whose size workspace.max_parse_file_bytes already bounds, so an
+	// unlimited bound costs one file's heap and never the repository's. A
+	// user-set value that is crossed counts every call past it into the
+	// file's dropped count and reports the file partial.
+	MaxCalleeReferences Limit `toml:"max_callee_references"`
 }
 
 // SCIP configures the external index importer.
@@ -234,6 +297,44 @@ type SCIP struct {
 	// with reason `stalled` and reporting it. It is finite by default because
 	// a wedged process makes no progress no matter how large the repository.
 	StallTimeout Duration `toml:"stall_timeout"`
+	// MaxIndexBytes is how large an index the user wants one unit to import.
+	// Unlimited by default: an index is streamed record by record and never
+	// held whole, so its size bounds nothing in heap. A user-set value never
+	// refuses the import -- exceeding it is reported on the unit's capability
+	// rows with the size seen and this bound.
+	MaxIndexBytes Limit `toml:"max_index_bytes"`
+	// MaxManifestBytes is how large a supplied input-hash manifest, or a
+	// compilation database the C/C++ profile normalizes, the user wants read.
+	// Unlimited by default. A manifest is scanned line by line, so the bound
+	// is a reporting threshold; a compilation database is parsed whole, and a
+	// user-set value there skips the normalization and reports the skip.
+	MaxManifestBytes Limit `toml:"max_manifest_bytes"`
+	// MaxDocuments is how many documents the user wants one index to describe.
+	// Unlimited by default: documents stream past a bounded record buffer and
+	// spool to disk. A user-set value never drops a document and never fails
+	// the unit -- exceeding it is reported with the count and this bound.
+	MaxDocuments Limit `toml:"max_documents"`
+	// MaxOccurrencesPerDocument is how many occurrences the user wants one
+	// document to carry. Unlimited by default and reported the same way: the
+	// largest per-document count seen is published beside this bound.
+	MaxOccurrencesPerDocument Limit `toml:"max_occurrences_per_document"`
+	// MaxSpoolBytes is how many bytes the user wants one import to spool to
+	// its private scratch database. Unlimited by default: the spool is an
+	// on-disk, keyset-paged database, so the figure bounds disk rather than
+	// heap and is already covered by resources.max_temp_bytes. A user-set
+	// value never fails the import -- exceeding it is reported.
+	MaxSpoolBytes Limit `toml:"max_spool_bytes"`
+	// MaxSourceFileBytes is how large a document's source the user allows to
+	// be held whole while its positions are converted. Unlimited by default,
+	// as workspace.max_parse_file_bytes is. This one bounds heap, so a
+	// user-set value does skip the document -- and every skip is reported on
+	// the capability row with this bound named.
+	MaxSourceFileBytes Limit `toml:"max_source_file_bytes"`
+	// MaxMaterializeBytes is how much content the user allows a profile's
+	// private materialization to copy. Unlimited by default; a user-set value
+	// leaves files out of the copy, which the materializer reports, and is
+	// published on the capability row with this bound named.
+	MaxMaterializeBytes Limit `toml:"max_materialize_bytes"`
 }
 
 // LSP configures the snapshot-qualified working-tree overlay.
@@ -292,6 +393,21 @@ type Dependence struct {
 	// reported on the unit's capability rows with the staged count and this
 	// bound.
 	MaxStagedRows Limit `toml:"max_staged_rows"`
+	// MaxDerivedRows is how many relation occurrences the user wants one
+	// unit's import to project from its staged rows. Unlimited by default: the
+	// projection is computed and paged inside the same on-disk staging
+	// database, so the occurrence count bounds disk rather than heap. A
+	// user-set value never fails the unit and never truncates the projection --
+	// exceeding it is reported on the unit's capability rows with the derived
+	// count and this bound.
+	MaxDerivedRows Limit `toml:"max_derived_rows"`
+	// MaxExportFiles is how many entries the user allows in one analysis
+	// export directory before the import refuses it. Unlimited by default: the
+	// count is a property of the export's label vocabulary rather than of the
+	// repository, and the directory is read one entry at a time. A user-set
+	// value is the only thing that refuses an import here, and the refusal
+	// names this key.
+	MaxExportFiles Limit `toml:"max_export_files"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -365,6 +481,11 @@ type Context struct {
 	// AllowExploratoryWaiverConsolidation is user-only and never weakens strict
 	// read readiness (Section 20.2).
 	AllowExploratoryWaiverConsolidation bool `toml:"allow_exploratory_waiver_consolidation"`
+	// MaxSeeds bounds Section 15.2 seed discovery: the identities a context
+	// compile examines before it stops. Unlimited by default, so every identity
+	// the task names is examined; a user-set value that a task exceeds is
+	// reported as a named exclusion on the manifest, never applied silently.
+	MaxSeeds Limit `toml:"max_seeds"`
 }
 
 // Coverage is the source-read chunking and receipt policy.
@@ -374,6 +495,18 @@ type Coverage struct {
 	SessionTTL                     Duration `toml:"session_ttl"`
 	MaxReceiptsPerConfirmation     int      `toml:"max_receipts_per_confirmation"`
 	MaxUnconfirmedChunksPerSession Limit    `toml:"max_unconfirmed_chunks_per_session"`
+}
+
+// Workflow is the Section 17 workflow-service policy.
+type Workflow struct {
+	// MaxObservationReferences is how many references the user wants one
+	// recorded observation -- or one scope review, counted across all eight of
+	// its categories -- to carry. Unlimited by default: a review of a large
+	// scope cites what it read, and an attestation is not refused for the size
+	// of the repository it attests to. A user-set value is the operator's own
+	// ceiling and exceeding it is reported with the count and this bound,
+	// never silently trimmed.
+	MaxObservationReferences Limit `toml:"max_observation_references"`
 }
 
 // MCP is the server transport policy.
@@ -396,6 +529,9 @@ func (c Config) TraversalPolicy() workspace.Policy {
 		IndexGenerated:   c.Workspace.IndexGenerated,
 		IncludeUntracked: c.Workspace.IncludeUntracked,
 		MaxFiles:         c.Workspace.MaxFiles.Value(),
+		MaxDirEntries:    c.Workspace.MaxDirEntries.Value(),
+		MaxDepth:         c.Workspace.MaxDepth.Value(),
+		MaxIgnoredRoots:  c.Workspace.MaxIgnoredRoots.Value(),
 		DataDir:          c.Storage.DataDir,
 	}
 }
@@ -413,6 +549,9 @@ func Defaults() Config {
 			MaxFiles:           Unlimited,
 			MaxParseFileBytes:  Unlimited,
 			MaxSearchFileBytes: Unlimited,
+			MaxDirEntries:      Unlimited,
+			MaxDepth:           Unlimited,
+			MaxIgnoredRoots:    Unlimited,
 		},
 		Index: Index{
 			Workers:           0,
@@ -425,7 +564,12 @@ func Defaults() Config {
 			WatchDebounce:     Duration(250 * time.Millisecond),
 			ReconcileInterval: Duration(30 * time.Second),
 			RetainRefs:        8,
-			MaxRetainedBytes:  0,
+			// 0 = unlimited retries, bounded by the deadline below.
+			CaptureMaxRetries:    Unlimited,
+			CaptureRetryDeadline: Duration(10 * time.Minute),
+			MaxRetainedBytes:     0,
+			// Unlimited: only a user-set bound stops the watch set.
+			WatchMaxDirectories: Unlimited,
 		},
 		Resources: Resources{
 			BaseMemoryBudgetBytes:     805306368,
@@ -466,11 +610,15 @@ func Defaults() Config {
 		},
 		Providers: Providers{
 			TreeSitter: TreeSitter{
-				Enabled:       true,
-				Languages:     []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
-				WorkerIdleTTL: Duration(60 * time.Second),
+				Enabled:             true,
+				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
+				WorkerIdleTTL:       Duration(60 * time.Second),
+				MaxCalleeReferences: Unlimited,
 			},
-			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute)},
+			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute),
+				MaxIndexBytes: Unlimited, MaxManifestBytes: Unlimited, MaxDocuments: Unlimited,
+				MaxOccurrencesPerDocument: Unlimited, MaxSpoolBytes: Unlimited,
+				MaxSourceFileBytes: Unlimited, MaxMaterializeBytes: Unlimited},
 			LSP: LSP{
 				Enabled:                Auto,
 				RequestTimeout:         Duration(15 * time.Second),
@@ -488,7 +636,10 @@ func Defaults() Config {
 				UnitMemoryCeilingBytes: 0,
 				MaxUnitsPerFamily:      Unlimited,
 				MaxStagedRows:          Unlimited,
+				MaxDerivedRows:         Unlimited,
+				MaxExportFiles:         Unlimited,
 			},
+			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited},
 		},
 		Context: Context{
 			DefaultPhase:                        "sweep",
@@ -506,6 +657,7 @@ func Defaults() Config {
 			MaxCapsuleCoverageFiles:             Unlimited,
 			StrictReadGate:                      true,
 			AllowExploratoryWaiverConsolidation: false,
+			MaxSeeds:                            Unlimited,
 		},
 		Coverage: Coverage{
 			ChunkBytes:                     65536,
@@ -514,7 +666,8 @@ func Defaults() Config {
 			MaxReceiptsPerConfirmation:     16,
 			MaxUnconfirmedChunksPerSession: Unlimited,
 		},
-		MCP: MCP{Transport: "stdio", Watch: true},
+		Workflow: Workflow{MaxObservationReferences: Unlimited},
+		MCP:      MCP{Transport: "stdio", Watch: true},
 	}
 }
 

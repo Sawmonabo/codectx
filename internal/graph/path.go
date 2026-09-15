@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"context"
 	"errors"
-	"math"
 	"sort"
 
 	"github.com/Sawmonabo/codectx/internal/config"
@@ -27,6 +26,7 @@ const (
 	pathReasonEdges    = "the edge budget was exhausted before the path search completed"
 	pathReasonDepth    = "the max-depth bound stopped the path search; the routes returned are the cheapest within that depth"
 	pathReasonRoutes   = "the route-enumeration budget was exhausted before every equal-cost route was collected"
+	pathReasonMemory   = "the query memory budget was exhausted before the path search completed"
 	pathReasonDeferred = "dependence units are still building"
 )
 
@@ -87,8 +87,9 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		adjacency:  e.adjacency,
 		kinds:      kinds,
 		maxDepth:   pathBound(req.MaxDepth, e.limits.Depth()),
-		maxVisited: int64(pathBound(req.MaxVisited, e.limits.Visited())),
-		maxEdges:   e.limits.Edges().ValueOr(math.MaxInt64),
+		maxVisited: pathBound(req.MaxVisited, e.limits.Visited()),
+		maxEdges:   e.limits.Edges(),
+		maxBytes:   e.limits.FrontierBytes,
 		dist:       map[model.NodeID]int64{},
 		depth:      map[model.NodeID]int{},
 		settled:    map[model.NodeID]bool{},
@@ -101,11 +102,13 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 	var routes [][]model.Relation
 	if w.settled[req.To] {
-		// ValueOr before min: an unlimited bound is the top of the lattice, so
-		// it must fall back to the wire ceiling rather than min to zero routes.
-		want := min(int(e.limits.ReasonPaths().ValueOr(model.MaxReasonPathsPerEntry)), model.MaxReasonPathsPerEntry)
+		// model.MaxReasonPathsPerEntry is still the wire bound PathResult's
+		// Validate enforces, so it floors the configured setting rather than
+		// being floored by it; an unlimited setting yields the wire bound, not
+		// zero routes. A cut is reported as pathReasonRoutes below.
+		want := e.limits.ReasonPaths().Min(config.Limit(model.MaxReasonPathsPerEntry))
 		var capped bool
-		routes, capped = w.routes(req.From, req.To, want)
+		routes, capped = w.routes(req.From, req.To, want.Int())
 		if capped {
 			pathTruncate(&res.Meta, pathReasonRoutes)
 		}
@@ -114,6 +117,8 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 	// found under an exhausted budget is the cheapest one seen, not provably the
 	// cheapest one there is.
 	switch {
+	case w.memoryHit:
+		pathTruncate(&res.Meta, pathReasonMemory)
 	case w.deadlineHit:
 		pathTruncate(&res.Meta, pathReasonDeadline)
 	case w.visitedHit:
@@ -154,24 +159,20 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 
 // pathBound resolves a request bound: zero means "the configured default", and
 // a request may only narrow the engine's limit, never widen it.
-//
-// The configured bound is a Section 20.1 Limit, where zero is unlimited and
-// therefore the TOP of the lattice: it never narrows the request, and with no
-// request it is no bound at all. Read as a plain integer it would be the
-// bottom instead, and the walk's counters -- every one of them a `>=` against
-// this value -- would stop before their first edge. Unlimited resolves to the
-// largest representable count rather than to a flag because all three counters
-// are compared, never reported, and a flag on each would have to be threaded
-// through every comparison to say the same thing.
-func pathBound(requested int, limit config.Limit) int {
+// A request may only narrow the configured bound, never widen it, and an
+// unlimited configured bound is the top of the lattice: any finite request
+// lowers it, and an absent request leaves the walk unbounded.
+func pathBound(requested int, limit config.Limit) config.Limit {
 	if requested <= 0 {
-		return int(limit.ValueOr(math.MaxInt))
+		return limit
 	}
-	if limit.Exceeded(int64(requested)) {
-		return limit.Int()
-	}
-	return requested
+	return config.Limit(requested).Min(limit)
 }
+
+// atBound reports whether a walk that has already taken n steps has reached
+// bound, so the step after it would cross. An unlimited bound is never reached:
+// reading the zero Limit as a numeric ceiling would stop every walk at once.
+func atBound(bound config.Limit, n int) bool { return bound.Exceeded(int64(n) + 1) }
 
 // pathTruncate marks the answer incomplete. The first reason wins, so the
 // budget that actually stopped the search is the one reported.
@@ -252,9 +253,20 @@ func (h *pathHeap) Pop() any     { old := *h; it := old[len(old)-1]; *h = old[:l
 type pathWalk struct {
 	adjacency  Adjacency
 	kinds      []model.RelationKind
-	maxDepth   int
-	maxVisited int64
-	maxEdges   int64
+	maxDepth   config.Limit
+	maxVisited config.Limit
+	maxEdges   config.Limit
+	// maxBytes is Limits.FrontierBytes: the ceiling on what the walk's own
+	// state -- dist, depth, settled, the cached edges and the priority queue --
+	// may hold at once. Before it, those four maps grew with the REACHABLE SET
+	// and the finite default budgets were the only thing bounding them; with
+	// every count bound unlimited by default there was nothing left. Unlike the
+	// BFS frontier this state cannot spill: a Dijkstra resumed from a persisted
+	// frontier also needs its settled distances, and that is a continuation
+	// this endpoint does not have. So the ceiling is REPORTED as truncation
+	// (pathReasonMemory) with the cheapest routes found so far, and the
+	// operator's remedy is resources.query_memory_bytes.
+	maxBytes int64
 
 	dist    map[model.NodeID]int64
 	depth   map[model.NodeID]int
@@ -267,8 +279,12 @@ type pathWalk struct {
 	pq      pathHeap
 	visited int64
 	spent   int64
+	// bytes is the running estimate of what the four maps and the heap hold,
+	// charged with the same conservative per-row overhead the BFS frontier uses.
+	bytes int64
 
 	depthPruned bool
+	memoryHit   bool
 	visitedHit  bool
 	edgesHit    bool
 	deadlineHit bool
@@ -281,6 +297,7 @@ type pathWalk struct {
 func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 	w.dist[from] = 0
 	w.depth[from] = 0
+	w.charge(pathNodeBytes(from) + pathQueueBytes(from))
 	heap.Push(&w.pq, pathHeapItem{node: from})
 
 	for w.pq.Len() > 0 {
@@ -309,7 +326,7 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 		}
 		var expand []model.NodeID
 		for _, it := range bucket {
-			if it.depth >= w.maxDepth {
+			if atBound(w.maxDepth, it.depth) {
 				// Cheapest-by-cost may still need more hops than the depth
 				// bound allows; the answer is then the cheapest route WITHIN
 				// the depth bound, and that is reported as truncation.
@@ -324,7 +341,7 @@ func (w *pathWalk) run(ctx context.Context, from, to model.NodeID) error {
 		if err := w.expandBatch(ctx, expand); err != nil {
 			return err
 		}
-		if w.edgesHit {
+		if w.edgesHit || w.memoryHit {
 			return nil
 		}
 	}
@@ -341,7 +358,7 @@ func (w *pathWalk) popBucket() []pathHeapItem {
 		if w.settled[it.node] || it.cost != w.dist[it.node] {
 			continue // a stale entry superseded by a cheaper relaxation
 		}
-		if w.visited >= w.maxVisited {
+		if atBound(w.maxVisited, int(w.visited)) {
 			w.visitedHit = true
 			break
 		}
@@ -373,12 +390,16 @@ func (w *pathWalk) expandBatch(ctx context.Context, nodes []model.NodeID) error 
 		for _, r := range rels {
 			after = r.ID
 			w.spent++
-			if w.spent > w.maxEdges {
+			if w.maxEdges.Exceeded(w.spent) {
 				w.edgesHit = true
 				return nil
 			}
+			w.charge(pathEdgeBytes(r))
 			w.edges[r.From] = append(w.edges[r.From], r)
 			w.relax(r)
+			if w.memoryHit {
+				return nil
+			}
 		}
 		// Only an empty page ends the keyset walk: the reader clamps the
 		// requested limit down to model.MaxPageItems, so a short page is the
@@ -403,13 +424,45 @@ func (w *pathWalk) relax(r model.Relation) {
 	known, seen := w.dist[r.To]
 	switch {
 	case !seen || cost < known:
+		if !seen {
+			w.charge(pathNodeBytes(r.To))
+		}
 		w.dist[r.To] = cost
 		w.depth[r.To] = depth
+		w.charge(pathQueueBytes(r.To))
 		heap.Push(&w.pq, pathHeapItem{cost: cost, depth: depth, node: r.To})
 	case cost == known && depth < w.depth[r.To]:
 		w.depth[r.To] = depth
+		w.charge(pathQueueBytes(r.To))
 		heap.Push(&w.pq, pathHeapItem{cost: cost, depth: depth, node: r.To})
 	}
+}
+
+// charge adds n bytes to the walk's estimate and trips memoryHit once the
+// ceiling is crossed. An unlimited ceiling (0) never trips, which is what keeps
+// `query_memory_bytes = 0` meaning "bounded by the graph and the count budgets
+// alone" rather than "stop immediately".
+func (w *pathWalk) charge(n int64) {
+	w.bytes += n
+	if w.maxBytes > 0 && w.bytes > w.maxBytes {
+		w.memoryHit = true
+	}
+}
+
+// pathNodeBytes, pathQueueBytes and pathEdgeBytes estimate what one settled
+// node, one queue entry and one cached edge cost. Like edgeRowOverheadBytes
+// they are deliberate over-estimates: the ceiling is a memory ceiling, and an
+// estimate that read low would let it be crossed before the walk noticed.
+//
+// A node is charged once for its three map entries (dist, depth, settled) and
+// again for every queue entry it takes, because a node relaxed twice occupies
+// the heap twice.
+func pathNodeBytes(n model.NodeID) int64 { return 3 * (edgeRowOverheadBytes + int64(len(n))) }
+
+func pathQueueBytes(n model.NodeID) int64 { return edgeRowOverheadBytes + int64(len(n)) }
+
+func pathEdgeBytes(r model.Relation) int64 {
+	return edgeRowOverheadBytes + int64(len(r.ID)+len(r.From)+len(r.To)+len(r.Kind))
 }
 
 // routes enumerates up to want equal-cost shortest routes from the shortest-path
@@ -457,7 +510,7 @@ func (w *pathWalk) routes(from, to model.NodeID, want int) ([][]model.Relation, 
 			out = append(out, append([]model.Relation(nil), cur...))
 			return
 		}
-		if len(cur) >= w.maxDepth || len(cur) >= model.MaxRelationsPerPath {
+		if atBound(w.maxDepth, len(cur)) || len(cur) >= model.MaxRelationsPerPath {
 			return
 		}
 		for _, r := range w.admitted(n) {

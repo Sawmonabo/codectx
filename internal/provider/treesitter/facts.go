@@ -8,6 +8,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/treesitter/lang"
@@ -26,14 +27,6 @@ const (
 	maxDocBytes    = 8 << 10
 	capabilityName = "structure"
 	searchDomain   = "treesitter-search-v1"
-	// maxCalleeReferences bounds the distinct callee reference nodes one file
-	// may mint: the callees no single declaration of this file can be. A
-	// generated or minified file can hold tens of thousands of distinct such
-	// names, each of which would be a node, a relation and evidence; past the
-	// bound the call is counted and the file's structural coverage is reported
-	// partial instead. The call-site aliases a file publishes are bounded with
-	// it and by wire.MaxRefsPerFile, which bounds its references outright.
-	maxCalleeReferences = 2000
 	// maxPutRecords bounds one hand-off to the sink, so a unit's facts stream
 	// through it in bounded slices rather than one slice the size of the whole
 	// file's output. provider.Sink does not expose the sink's Limits, so this
@@ -78,6 +71,14 @@ type builder struct {
 	// callee-reference bound, and declaration or call-site keys over
 	// MaxNativeKeyBytes. Any of it makes the file's coverage partial.
 	dropped int
+
+	// maxCallees is tree_sitter.max_callee_references, the bound on the
+	// distinct callee reference nodes this file may mint: the callees no
+	// single declaration of this file can be. Unlimited by default -- a
+	// generated file names what it names -- and bounded in any case by the
+	// file's own references. Past a user-set bound the call is counted into
+	// dropped and the file reports partial.
+	maxCallees config.Limit
 }
 
 // declFact is one validated declaration and its resolved identity.
@@ -93,6 +94,11 @@ type declFact struct {
 	// a stored value and is published as its own attribute, never merged
 	// with a result page's transient truncation flag.
 	truncated map[string]int
+
+	// body is the search document's text: the attached documentation and the
+	// signature, composed and bounded once at extraction so a cut is recorded
+	// in truncated before the node's metadata is built.
+	body string
 }
 
 // truncate bounds one of this declaration's fields and records the cut.
@@ -227,6 +233,12 @@ func (b *builder) validateDecls() error {
 			}
 			f.doc = f.truncate("doc", cleanDoc(string(b.src[d.DocStart:d.DocEnd])), maxDocBytes)
 		}
+		// The search body is composed and bounded here, not in searchUnit,
+		// because the node's metadata is built before searchUnit runs: a cut
+		// made later would never reach truncated_fields. A doc and a
+		// signature each at their own ceiling compose to more than one body
+		// holds, so this bound really does cut and must disclose it.
+		f.body = f.truncate("body", searchBody(f.doc, f.sig), maxDocBytes)
 		b.decls = append(b.decls, f)
 		b.byName[f.Name] = append(b.byName[f.Name], i)
 	}
@@ -546,7 +558,7 @@ func (b *builder) refs() error {
 			resolution, candidates := calleeResolution(r, targets)
 			res, ok := callees[key]
 			if !ok {
-				if len(callees) >= maxCalleeReferences {
+				if b.maxCallees.Exceeded(int64(len(callees) + 1)) {
 					// Past the bound the call is counted, not minted: a file
 					// with more distinct cross-file callees than this is
 					// reported partial rather than allowed to publish an
@@ -565,7 +577,16 @@ func (b *builder) refs() error {
 			}
 			callee = res.Node.ID
 			b.putRelation(from, model.RelCalls, callee, rng, key, resolution)
-			for _, t := range targets[:min(len(targets), model.MaxAmbiguousCandidates)] {
+			kept := min(len(targets), model.MaxAmbiguousCandidates)
+			if kept < len(targets) {
+				// The candidate list is cut to the model's ambiguity bound.
+				// Each candidate past it is a `may_refer_to` edge this file
+				// should have published and did not, so it is counted like
+				// every other loss and the file reports partial rather than
+				// claiming complete structural coverage.
+				b.dropped += len(targets) - kept
+			}
+			for _, t := range targets[:kept] {
 				b.putRelation(from, model.RelMayReferTo, b.decls[t].res.Node.ID, rng, r.Name, "ambiguous call target")
 			}
 		}
@@ -743,11 +764,7 @@ func (b *builder) putRelation(from model.NodeID, kind model.RelationKind, to mod
 // attached documentation, never the body (Section 11.2 stores bodies once, in
 // the filesystem unit).
 func (b *builder) searchUnit(d *declFact) model.SearchUnit {
-	body := d.sig
-	if d.doc != "" {
-		body = d.doc + "\n" + d.sig
-	}
-	body = bound(body, maxDocBytes)
+	body := d.body
 	return model.SearchUnit{
 		ID: model.H(searchDomain, string(b.fv.ID), string(d.res.Node.ID)), NodeID: d.res.Node.ID, FileID: b.fv.ID, Path: b.fv.Path,
 		Kind: d.res.Node.Kind, Name: d.Name, QualifiedName: d.Qualified, Signature: d.sig,
@@ -866,4 +883,14 @@ func lastPathSegment(p string) string {
 		return "."
 	}
 	return bound(p, model.MaxNameBytes)
+}
+
+// searchBody composes a declaration's search text: its attached documentation
+// above its signature, or the signature alone when it has none. The caller
+// bounds the result through declFact.truncate so a cut is flagged.
+func searchBody(doc, sig string) string {
+	if doc == "" {
+		return sig
+	}
+	return doc + "\n" + sig
 }

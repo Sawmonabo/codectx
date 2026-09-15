@@ -18,10 +18,12 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
@@ -440,6 +442,62 @@ func TestWorkflowScenarios(t *testing.T) {
 					st.StrictGateSatisfied, st.ReadyForImplementation)
 			}
 		}},
+		// Failure mode: context.strict_read_gate is documented as the switch
+		// for confirmed source coverage, and a key nothing reads is a promise
+		// the product does not keep. The row asserts both halves of what the
+		// switch may do: with it off the coverage shortfall no longer shuts the
+		// gate (precondition 3 is skipped, and the reason stops naming files
+		// the configuration excused), and it still never buys a strict claim --
+		// StrictGateSatisfied is what the capsule seals, and sealing it over a
+		// read nothing confirmed is the false attestation the gate exists to
+		// refuse. The marker is the only way a reader can tell the two apart.
+		{name: "readiness/a disabled strict read gate skips precondition 3 and never claims a strict gate", run: func(t *testing.T, h *harness) {
+			h.file(fixtureSession, fileWaived).served = []model.ByteRange{{Start: 0, End: 50}}
+			h.store.mu.Lock()
+			// No waiver and a current-scope review, so precondition 3 is the
+			// only one left unsatisfied: filePartial stays partly served.
+			fs := h.store.sessions[fixtureSession]
+			fs.files[fileWaived].waived = false
+			fs.waivers = nil
+			fs.obs = append(fs.obs, fixtureScopeReview(fixtureSession, fixtureActor, 1))
+			h.store.mu.Unlock()
+
+			req := model.SessionRequest{SessionID: fixtureSession, ActorID: fixtureActor}
+			enforced, err := h.svc.Status(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Status with the gate enforced: %v (code %q)", err, code(err))
+			}
+			if enforced.ReadCompleteForSnapshot || enforced.WaivedFiles != 0 || enforced.Superseded {
+				t.Fatalf("the fixture does not isolate precondition 3: read_complete=%v waived=%d superseded=%v",
+					enforced.ReadCompleteForSnapshot, enforced.WaivedFiles, enforced.Superseded)
+			}
+			if !strings.Contains(enforced.GuaranteeLimit, "required files are not all fully served") {
+				t.Fatalf("the enforced gate must shut on the coverage shortfall, reason %q", enforced.GuaranteeLimit)
+			}
+
+			relaxed, err := h.serviceWithReadGateDisabled(t).Status(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Status with the gate disabled: %v (code %q)", err, code(err))
+			}
+			if strings.Contains(relaxed.GuaranteeLimit, "required files are not all fully served") {
+				t.Fatalf("precondition 3 still shut the gate although context.strict_read_gate is false: reason %q",
+					relaxed.GuaranteeLimit)
+			}
+			if !strings.Contains(relaxed.GuaranteeLimit, "strict_read_gate=disabled") {
+				t.Fatalf("a disabled read gate must say so in its reason, got %q", relaxed.GuaranteeLimit)
+			}
+			if relaxed.StrictGateSatisfied || relaxed.ReadyForImplementation {
+				t.Fatalf("a disabled read gate claimed strict readiness over an unconfirmed read: strict=%v ready=%v",
+					relaxed.StrictGateSatisfied, relaxed.ReadyForImplementation)
+			}
+			// The reported facts are untouched by the switch: it decides what
+			// shuts the gate, never what the counts say.
+			if relaxed.ReadCompleteForSnapshot || relaxed.RequiredFiles != enforced.RequiredFiles ||
+				relaxed.FullyServedFiles != enforced.FullyServedFiles {
+				t.Fatalf("the switch changed the reported coverage: read_complete=%v required=%d served=%d",
+					relaxed.ReadCompleteForSnapshot, relaxed.RequiredFiles, relaxed.FullyServedFiles)
+			}
+		}},
 		// Failure mode: expiry is lazy, so a lapsed session is still recorded
 		// as verify_open and the store hands back the record beside
 		// CTX_SESSION_EXPIRED -- which status deliberately swallows to stay
@@ -662,7 +720,7 @@ func newHarness(t *testing.T) *harness {
 		Validate: store,
 		Limits: Limits{
 			MaxPageItems:             model.MaxPageItems,
-			MaxObservationReferences: model.MaxObservationReferences,
+			MaxObservationReferences: config.Unlimited,
 			MaxCapsuleBytes:          8 << 20,
 			QueryTimeout:             10 * time.Second,
 		},
@@ -687,7 +745,7 @@ func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 		Validate: h.store,
 		Limits: Limits{
 			MaxPageItems:                        model.MaxPageItems,
-			MaxObservationReferences:            model.MaxObservationReferences,
+			MaxObservationReferences:            config.Unlimited,
 			MaxCapsuleBytes:                     8 << 20,
 			QueryTimeout:                        10 * time.Second,
 			AllowExploratoryWaiverConsolidation: true,
@@ -697,6 +755,33 @@ func (h *harness) serviceWithWaiverConsolidation(t *testing.T) *Service {
 	})
 	if err != nil {
 		t.Fatalf("build the workflow service with the waiver flag: %v", err)
+	}
+	return svc
+}
+
+// serviceWithReadGateDisabled is the same fake store behind a service whose
+// user-level context.strict_read_gate is off. Like the waiver flag it is a
+// Limits field read during the one readiness evaluation, so exercising both
+// sides of the switch against one fixture needs a second service over the same
+// store.
+func (h *harness) serviceWithReadGateDisabled(t *testing.T) *Service {
+	t.Helper()
+	svc, err := New(Options{
+		Sessions: h.store,
+		Compile:  h.store,
+		Validate: h.store,
+		Limits: Limits{
+			MaxPageItems:             model.MaxPageItems,
+			MaxObservationReferences: config.Unlimited,
+			MaxCapsuleBytes:          8 << 20,
+			QueryTimeout:             10 * time.Second,
+			StrictReadGateDisabled:   true,
+		},
+		Now:    func() time.Time { return fixtureNow },
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("build the workflow service with the read gate disabled: %v", err)
 	}
 	return svc
 }

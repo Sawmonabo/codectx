@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"sort"
+	"strconv"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -29,12 +30,11 @@ func (s *Service) Record(ctx context.Context, req model.ObservationRequest) (mod
 	if err := req.Validate(); err != nil {
 		return model.Observation{}, model.SessionStatus{}, err
 	}
-	// Validate already bounds references by model.MaxObservationReferences;
-	// this is the configured bound, which may be lower and is the operator's.
-	if len(req.References) > s.limits.MaxObservationReferences {
-		return model.Observation{}, model.SessionStatus{}, typedErrf(model.CodeResourceLimit,
-			"observation carries %d references; the configured bound is %d",
-			len(req.References), s.limits.MaxObservationReferences)
+	// The model carries no count ceiling of its own: this is the only ceiling
+	// on an observation's references, it is the operator's, and it is unlimited
+	// by default.
+	if err := s.checkReferenceCount(len(req.References), "observation"); err != nil {
+		return model.Observation{}, model.SessionStatus{}, err
 	}
 	rec, err := s.sessions.Session(ctx, req.SessionID, req.ActorID)
 	if err != nil {
@@ -219,19 +219,17 @@ func (s *Service) reviewSupported(ctx context.Context, rec sqlite.SessionRecord,
 		return typedErrf(model.CodeScopeChanged,
 			"the scope review binds a manifest this session's scope no longer comes from")
 	}
-	// Section 20.1 bounds references per observation, and a review carries
-	// them inside its entries rather than on the request, so the aggregate is
-	// what the configured bound has to hold: ScopeReviewEntry.Validate caps
-	// each category at the model ceiling and eight capped categories are still
-	// eight times the bound an operator asked for.
+	// A review carries its references inside its entries rather than on the
+	// request, so the aggregate across the eight categories is what the
+	// configured ceiling has to hold. Neither the entries nor this total are
+	// bounded by the model; unlimited -- the default -- admits all eight
+	// categories however much of a large scope they cite.
 	total := 0
 	for _, entry := range review.Entries {
 		total += len(entry.References)
 	}
-	if total > s.limits.MaxObservationReferences {
-		return typedErrf(model.CodeResourceLimit,
-			"the scope review carries %d references across its categories; the configured bound is %d",
-			total, s.limits.MaxObservationReferences)
+	if err := s.checkReferenceCount(total, "scope review"); err != nil {
+		return err
 	}
 
 	var read []model.FileID
@@ -313,4 +311,29 @@ func (s *Service) filesFullyRead(ctx context.Context, rec sqlite.SessionRecord, 
 		}
 	}
 	return nil
+}
+
+// checkReferenceCount applies workflow.max_observation_references as a CALLER
+// CEILING to one attestation's reference count: the observation's own list, or
+// a scope review's total across its eight categories.
+//
+// The key is unlimited by default, and this never refuses a count for being
+// large: a session over a big scope cites what it read, and the model's own
+// per-list ceiling is the only structural bound. A caller that did set a
+// ceiling is told the ceiling it set and the count the attestation reached, so
+// raising it is a decision with both numbers in hand rather than a retry
+// against an unnamed bound. Nothing is ever trimmed to fit: dropping a citation
+// would falsify the attestation it belongs to.
+func (s *Service) checkReferenceCount(n int, what string) error {
+	if !s.limits.MaxObservationReferences.Exceeded(int64(n)) {
+		return nil
+	}
+	return (&model.Error{Code: model.CodeResourceLimit,
+		Message: "the " + what + " carries more references than the caller's workflow.max_observation_references ceiling",
+		Details: map[string]string{
+			"limit":       "workflow.max_observation_references",
+			"limit_value": s.limits.MaxObservationReferences.String(),
+			"references":  strconv.Itoa(n),
+		}}).
+		WithRemediation("record the attestation in smaller observations, or raise workflow.max_observation_references (0 or \"unlimited\" removes the ceiling)")
 }

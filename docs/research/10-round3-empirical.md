@@ -220,7 +220,7 @@ doubled cost), the value is part of the cache key, and a body that still exceeds
 
 ## 9b. Engine run-to-run variance (the band every parity claim is bounded by)
 The engine is not run-to-run deterministic. Two runs of the same pinned argv over the same
-unmodified tree (this repository, 161 files, Go frontend, wave B) produced:
+unmodified tree (this repository, 161 files, Go frontend) produced:
 
 | run | nodes | relations | aliases | dropped methods | external methods |
 |---|---|---|---|---|---|
@@ -230,7 +230,7 @@ unmodified tree (this repository, 161 files, Go frontend, wave B) produced:
 About 0.01%, and the same order as the CDG −4 / REACHING_DEF −6 seen on spring in §4. Recorded
 here so that no later reviewer re-litigates a non-zero diff between two engine runs as a defect,
 and so that every parity claim in §4, §8 and §9a is read as "no systematic loss and no fact class
-missing, within this band" rather than as equality. Source: lane-B3 report §4.2/§5.3.
+missing, within this band" rather than as equality.
 
 ## 10. Per-frontend memory model for the governor (measured)
 | frontend | RSS above heap cap | notes |
