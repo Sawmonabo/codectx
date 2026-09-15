@@ -102,10 +102,10 @@ const utilGo = "package main\n" +
 //   - a crashed server releases the pending call and the overlay reports
 //     failure (resource leak, false readiness);
 //   - a server that reports no serverInfo still opens, bound to the version of
-//     the payload the lock pinned (false readiness: pyright and
-//     typescript-language-server both answer initialize with no serverInfo, and
-//     an empty ProviderVersion fails OverlayBinding.Validate, which made the
-//     overlay permanently unavailable for four of the nine languages).
+//     the payload the lock pinned (false readiness: typescript-language-server
+//     answers initialize with no serverInfo, and an empty ProviderVersion fails
+//     OverlayBinding.Validate, which made the overlay permanently unavailable
+//     for the languages it serves).
 func TestFakeServerLifecycle(t *testing.T) {
 	for _, enc := range []string{"utf-16", "utf-8", "utf-32"} {
 		t.Run(enc, func(t *testing.T) { runScenario(t, enc) })
