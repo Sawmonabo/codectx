@@ -235,6 +235,44 @@ type SCIP struct {
 	// with reason `stalled` and reporting it. It is finite by default because
 	// a wedged process makes no progress no matter how large the repository.
 	StallTimeout Duration `toml:"stall_timeout"`
+	// MaxIndexBytes is how large an index the user wants one unit to import.
+	// Unlimited by default: an index is streamed record by record and never
+	// held whole, so its size bounds nothing in heap. A user-set value never
+	// refuses the import -- exceeding it is reported on the unit's capability
+	// rows with the size seen and this bound.
+	MaxIndexBytes Limit `toml:"max_index_bytes"`
+	// MaxManifestBytes is how large a supplied input-hash manifest, or a
+	// compilation database the C/C++ profile normalizes, the user wants read.
+	// Unlimited by default. A manifest is scanned line by line, so the bound
+	// is a reporting threshold; a compilation database is parsed whole, and a
+	// user-set value there skips the normalization and reports the skip.
+	MaxManifestBytes Limit `toml:"max_manifest_bytes"`
+	// MaxDocuments is how many documents the user wants one index to describe.
+	// Unlimited by default: documents stream past a bounded record buffer and
+	// spool to disk. A user-set value never drops a document and never fails
+	// the unit -- exceeding it is reported with the count and this bound.
+	MaxDocuments Limit `toml:"max_documents"`
+	// MaxOccurrencesPerDocument is how many occurrences the user wants one
+	// document to carry. Unlimited by default and reported the same way: the
+	// largest per-document count seen is published beside this bound.
+	MaxOccurrencesPerDocument Limit `toml:"max_occurrences_per_document"`
+	// MaxSpoolBytes is how many bytes the user wants one import to spool to
+	// its private scratch database. Unlimited by default: the spool is an
+	// on-disk, keyset-paged database, so the figure bounds disk rather than
+	// heap and is already covered by resources.max_temp_bytes. A user-set
+	// value never fails the import -- exceeding it is reported.
+	MaxSpoolBytes Limit `toml:"max_spool_bytes"`
+	// MaxSourceFileBytes is how large a document's source the user allows to
+	// be held whole while its positions are converted. Unlimited by default,
+	// as workspace.max_parse_file_bytes is. This one bounds heap, so a
+	// user-set value does skip the document -- and every skip is reported on
+	// the capability row with this bound named.
+	MaxSourceFileBytes Limit `toml:"max_source_file_bytes"`
+	// MaxMaterializeBytes is how much content the user allows a profile's
+	// private materialization to copy. Unlimited by default; a user-set value
+	// leaves files out of the copy, which the materializer reports, and is
+	// published on the capability row with this bound named.
+	MaxMaterializeBytes Limit `toml:"max_materialize_bytes"`
 }
 
 // LSP configures the snapshot-qualified working-tree overlay.
@@ -484,7 +522,10 @@ func Defaults() Config {
 				Languages:     []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
 				WorkerIdleTTL: Duration(60 * time.Second),
 			},
-			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute)},
+			SCIP: SCIP{Enabled: Auto, Timeout: 0, StallTimeout: Duration(5 * time.Minute),
+				MaxIndexBytes: Unlimited, MaxManifestBytes: Unlimited, MaxDocuments: Unlimited,
+				MaxOccurrencesPerDocument: Unlimited, MaxSpoolBytes: Unlimited,
+				MaxSourceFileBytes: Unlimited, MaxMaterializeBytes: Unlimited},
 			LSP: LSP{
 				Enabled:                Auto,
 				RequestTimeout:         Duration(15 * time.Second),

@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/source"
@@ -100,6 +103,72 @@ type importer struct {
 	// drops is the one account of everything the wire decoder discarded for
 	// exceeding a field bound, across every pass of this import.
 	drops decodeDrops
+	// seen is the one account of the largest figure this import observed at
+	// each user-settable bound, across every pass. It is compared with the
+	// configured bounds once, in result.
+	seen limitSeen
+}
+
+// Bound names the seven providers.scip.* bounds are reported under. They are
+// the configuration keys themselves, so an operator reading a capability row
+// reads the name of the key to raise.
+const (
+	limitIndexBytes             = "max_index_bytes"
+	limitManifestBytes          = "max_manifest_bytes"
+	limitDocuments              = "max_documents"
+	limitOccurrencesPerDocument = "max_occurrences_per_document"
+	limitSpoolBytes             = "max_spool_bytes"
+	limitSourceFileBytes        = "max_source_file_bytes"
+)
+
+// detailLimitsExceeded is the capability-row detail the crossed bounds are
+// published under, as one sorted `key=seen/bound` list so the value is
+// reproducible across runs of the same index and costs one detail slot
+// whatever crossed.
+const detailLimitsExceeded = "resource_limits_exceeded"
+
+// limitSeen records the largest figure observed at each bound. It is a
+// measurement, not a gate: nothing consults it until the run is over, which
+// is what makes an unset bound cost nothing and a set one report rather than
+// refuse.
+type limitSeen struct{ m map[string]int64 }
+
+func (l *limitSeen) note(bound string, v int64) {
+	if l == nil {
+		return
+	}
+	if l.m == nil {
+		l.m = map[string]int64{}
+	}
+	if v > l.m[bound] {
+		l.m[bound] = v
+	}
+}
+
+// exceeded renders the bounds a user set and this run crossed, sorted, or "".
+func (l *limitSeen) exceeded(lim Limits) string {
+	bounds := []struct {
+		name string
+		v    config.Limit
+	}{{limitIndexBytes, lim.MaxIndexBytes}, {limitManifestBytes, lim.MaxManifestBytes},
+		{limitDocuments, lim.MaxDocuments}, {limitOccurrencesPerDocument, lim.MaxOccurrencesPerDocument},
+		{limitSpoolBytes, lim.MaxSpoolBytes}, {limitSourceFileBytes, lim.MaxSourceFileBytes}}
+	sort.Slice(bounds, func(i, j int) bool { return bounds[i].name < bounds[j].name })
+	var b strings.Builder
+	for _, bd := range bounds {
+		seen := int64(0)
+		if l != nil && l.m != nil {
+			seen = l.m[bd.name]
+		}
+		if !bd.v.Exceeded(seen) {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s=%d/%d", bd.name, seen, int64(bd.v))
+	}
+	return b.String()
 }
 
 // location is a pinned file plus a byte range on it: where evidence points.
@@ -186,7 +255,7 @@ func (im *importer) run(ctx context.Context, open opener) error {
 func (im *importer) scanBinding(ctx context.Context, open opener) (model.SourceBinding, metadata, error) {
 	var meta metadata
 	var verified, unverified int64
-	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops,
+	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onMetadata: func(m metadata) error { meta = m; return nil },
 		onDocument: func(d document) error {
 			admitted, err := im.seeDocument(ctx, d)
@@ -232,9 +301,7 @@ func (im *importer) walk(ctx context.Context, open opener, w *walker) error {
 		return err
 	}
 	defer rc.Close()
-	if size > im.p.limits.MaxIndexBytes {
-		return overLimit("index bytes", size, im.p.limits.MaxIndexBytes)
-	}
+	im.seen.note(limitIndexBytes, size)
 	consumed, err := w.walk(ctx, bufio.NewReaderSize(rc, 64<<10), size)
 	im.indexBytes += uint64(consumed)
 	return err
@@ -319,9 +386,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 	if !ok {
 		return nil
 	}
-	if fv.Size > im.p.limits.MaxManifestBytes {
-		return overLimit("manifest bytes", fv.Size, im.p.limits.MaxManifestBytes)
-	}
+	im.seen.note(limitManifestBytes, fv.Size)
 	rc, _, err := im.req.Content.Open(ctx, fv.ID)
 	if err != nil {
 		return err
@@ -382,7 +447,7 @@ func (im *importer) loadManifest(ctx context.Context) error {
 // passDefinitions is pass 1: spool occurrences and symbols, bind each
 // document to its snapshot file when it ends, and publish its definitions.
 func (im *importer) passDefinitions(ctx context.Context, open opener) error {
-	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops,
+	w := &walker{limits: im.p.limits, onGrow: im.reserve, drops: &im.drops, seen: &im.seen,
 		onOccurrence: func(doc, seq int64, o occurrence, n int64) error {
 			if err := im.sc.charge(n); err != nil {
 				return err
@@ -503,7 +568,12 @@ func (im *importer) endDocument(d document) error {
 		im.skippedDocs++
 		im.degrade(model.CodeProviderOutputInvalid)
 		return im.dropSpool(ctx, d.index)
-	case fv.Size > im.p.limits.MaxSourceFileBytes:
+	case im.p.limits.MaxSourceFileBytes.Exceeded(fv.Size):
+		// The one bound that still leaves something out, because it is the
+		// one that bounds heap: the source is held whole while positions are
+		// converted. Unlimited by default, so this arm is unreachable until
+		// an operator asks for it, and the skip is reported under the key.
+		im.seen.note(limitSourceFileBytes, fv.Size)
 		im.skippedDocs++
 		im.degrade(model.CodeResourceLimit)
 		return im.dropSpool(ctx, d.index)
@@ -1272,6 +1342,13 @@ func (im *importer) result() model.ProviderResult {
 	if im.drops.any() {
 		im.degrade(model.CodeResourceLimit)
 	}
+	if im.sc != nil {
+		im.seen.note(limitSpoolBytes, im.sc.bytes)
+	}
+	crossed := im.seen.exceeded(im.p.limits)
+	if crossed != "" {
+		im.degrade(model.CodeResourceLimit)
+	}
 	state := model.CapabilityFresh
 	if im.partialCode != "" {
 		state = model.CapabilityPartial
@@ -1297,6 +1374,14 @@ func (im *importer) result() model.ProviderResult {
 		}
 		if im.drops.any() {
 			cs = cs.WithDetail(detailDropReason, dropReason)
+		}
+		// Every providers.scip.* bound the operator set that this run crossed,
+		// as `key=seen/bound`. Nothing was refused and, apart from
+		// max_source_file_bytes and max_materialize_bytes, nothing was left
+		// out: the row says the figure was passed, which is what a threshold
+		// the product does not enforce on the user's behalf can honestly say.
+		if crossed != "" {
+			cs = cs.WithDetail(detailLimitsExceeded, crossed)
 		}
 		r.Capabilities = append(r.Capabilities, cs)
 	}

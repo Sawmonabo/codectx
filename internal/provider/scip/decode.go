@@ -228,6 +228,9 @@ type walker struct {
 	onSymbol     func(doc int64, s symbolInfo, recordBytes int64) error
 	onDocument   func(document) error
 	onExternal   func(s symbolInfo, recordBytes int64) error
+	// seen tallies the largest figure this walk observed at each counted
+	// bound; the importer compares it with the configuration once, at the end.
+	seen *limitSeen
 }
 
 // record reads one bounded record into the walker's buffer and reports a
@@ -280,9 +283,12 @@ func (w *walker) walk(ctx context.Context, src byteSource, size int64) (consumed
 				err = w.onMetadata(m)
 			}
 		case fieldIndexDocuments:
-			if docs++; docs > w.limits.MaxDocuments {
-				return *r.consumed, overLimit("documents", docs, w.limits.MaxDocuments)
-			}
+			// A document count refuses nothing: documents stream past a
+			// bounded record buffer into an on-disk spool, so the figure
+			// bounds no allocation. A user-set bound is recorded and
+			// reported once the run ends.
+			docs++
+			w.seen.note(limitDocuments, docs)
 			var doc *reader
 			if doc, err = r.sub(n); err == nil {
 				err = w.document(ctx, doc, docs-1)
@@ -360,9 +366,10 @@ func (w *walker) document(ctx context.Context, r *reader, index int64) error {
 				return err
 			}
 		case fieldDocumentOccurrences:
-			if d.occurrences++; d.occurrences > w.limits.MaxOccurrencesPerDocument {
-				return overLimit("occurrences per document", d.occurrences, w.limits.MaxOccurrencesPerDocument)
-			}
+			// Same shape as the document count: spooled, never resident,
+			// so the largest per-document figure is reported, not refused.
+			d.occurrences++
+			w.seen.note(limitOccurrencesPerDocument, d.occurrences)
 			if w.onOccurrence == nil {
 				if err := r.discardSub(n); err != nil {
 					return err

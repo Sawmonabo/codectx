@@ -34,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
@@ -103,55 +104,65 @@ func ImportScope(path string) string { return scopeImport + path }
 // ProfileScope is the unit scope key of an approved indexer profile.
 func ProfileScope(name string) string { return scopeProfile + name }
 
-// Limits bound one import. Every field is required to be positive; nothing
-// here means unlimited (Section 6).
+// Limits bound one import. Every field is a user-set bound
+// (providers.scip.*) whose zero value is unlimited, which is the default:
+// nothing here refuses a repository on the user's behalf (Section 6).
+//
+// Five of the seven cut nothing at all. An index is streamed record by record,
+// documents and occurrences spool to an on-disk database, and a manifest is
+// scanned line by line, so those figures bound neither heap nor the facts the
+// unit emits: a user-set value is a REPORTING threshold, published on the
+// unit's capability rows as `partial` + CTX_RESOURCE_LIMIT and never a refusal.
+// MaxSourceFileBytes and MaxMaterializeBytes are the two that bound heap and
+// disk respectively, so a user-set value there does leave a document or a file
+// out -- and that skip is reported under the same detail.
 type Limits struct {
 	// MaxIndexBytes bounds the whole index file.
-	MaxIndexBytes int64
+	MaxIndexBytes config.Limit
 	// MaxRecordBytes bounds one metadata, occurrence or symbol record. It is
-	// resources.max_provider_record_bytes: the bound a single fact must fit.
+	// the wire reader's pre-allocation ceiling -- the bytes a single record
+	// may cause to be allocated before it is decoded -- not a user-set bound,
+	// so it stays positive and stays out of the configuration (plan class B).
 	MaxRecordBytes int64
 	// MaxDocuments and MaxOccurrencesPerDocument bound the walk.
-	MaxDocuments              int64
-	MaxOccurrencesPerDocument int64
+	MaxDocuments              config.Limit
+	MaxOccurrencesPerDocument config.Limit
 	// MaxSpoolBytes bounds the bytes spooled to the scratch database.
-	MaxSpoolBytes int64
+	MaxSpoolBytes config.Limit
 	// MaxSourceFileBytes bounds one document's source, which is held whole
 	// while its positions are converted, as the parse limit does for
 	// tree-sitter.
-	MaxSourceFileBytes int64
+	MaxSourceFileBytes config.Limit
 	// MaxMaterializeBytes bounds the private materialization a profile runs
 	// against.
-	MaxMaterializeBytes int64
-	// MaxManifestBytes bounds a supplied input-hash manifest.
-	MaxManifestBytes int64
+	MaxMaterializeBytes config.Limit
+	// MaxManifestBytes bounds a supplied input-hash manifest and the
+	// compilation database the C/C++ profile normalizes.
+	MaxManifestBytes config.Limit
 }
 
-// DefaultLimits are the Section 20.1 defaults this provider derives from.
-func DefaultLimits() Limits {
-	return Limits{
-		MaxIndexBytes:             1 << 30,
-		MaxRecordBytes:            4 << 20,
-		MaxDocuments:              1_000_000,
-		MaxOccurrencesPerDocument: 4_000_000,
-		MaxSpoolBytes:             4 << 30,
-		MaxSourceFileBytes:        5 << 20,
-		MaxMaterializeBytes:       4 << 30,
-		MaxManifestBytes:          64 << 20,
-	}
-}
+// defaultRecordBytes is the wire reader's pre-allocation ceiling when the
+// caller names none. It is the only bound this provider still defaults to a
+// finite figure, and it bounds an allocation rather than the work.
+const defaultRecordBytes = 4 << 20
 
-// Validate rejects a non-positive bound.
+// Validate rejects a negative bound. Zero is unlimited at every user-set
+// bound, which is what the defaults are; only MaxRecordBytes, the wire
+// reader's pre-allocation ceiling, must be positive.
 func (l Limits) Validate() error {
 	for _, b := range []struct {
 		name string
-		v    int64
-	}{{"max_index_bytes", l.MaxIndexBytes}, {"max_record_bytes", l.MaxRecordBytes}, {"max_documents", l.MaxDocuments},
+		v    config.Limit
+	}{{"max_index_bytes", l.MaxIndexBytes}, {"max_documents", l.MaxDocuments},
 		{"max_occurrences_per_document", l.MaxOccurrencesPerDocument}, {"max_spool_bytes", l.MaxSpoolBytes},
-		{"max_source_file_bytes", l.MaxSourceFileBytes}, {"max_materialize_bytes", l.MaxMaterializeBytes}, {"max_manifest_bytes", l.MaxManifestBytes}} {
-		if b.v <= 0 {
-			return invalid(fmt.Sprintf("scip limit %s is %d; every bound must be positive", b.name, b.v))
+		{"max_source_file_bytes", l.MaxSourceFileBytes}, {"max_materialize_bytes", l.MaxMaterializeBytes},
+		{"max_manifest_bytes", l.MaxManifestBytes}} {
+		if b.v < 0 {
+			return invalid(fmt.Sprintf("scip limit %s is %d; a bound is a positive value, or 0 for no bound at all", b.name, int64(b.v)))
 		}
+	}
+	if l.MaxRecordBytes <= 0 {
+		return invalid(fmt.Sprintf("scip limit max_record_bytes is %d; the wire reader's pre-allocation ceiling must be positive", l.MaxRecordBytes))
 	}
 	return nil
 }
@@ -183,7 +194,8 @@ type Options struct {
 	StallTimeout time.Duration
 	// WorkDir is the absolute private directory for import scratch state.
 	WorkDir string
-	// Limits bound the import; zero selects DefaultLimits.
+	// Limits bound the import. Every field is unlimited by default; a zero
+	// MaxRecordBytes selects the pre-allocation ceiling above.
 	Limits Limits
 	// LookupEnv supplies allowlisted environment values; nil means
 	// os.LookupEnv.
@@ -239,8 +251,8 @@ var _ provider.Provider = (*Provider)(nil)
 // with the toolchain's own CTX_TOOL_* code and reported as honest absence, so
 // a machine whose platform has no C++ payload still indexes Go.
 func New(ctx context.Context, o Options) (*Provider, error) {
-	if o.Limits == (Limits{}) {
-		o.Limits = DefaultLimits()
+	if o.Limits.MaxRecordBytes == 0 {
+		o.Limits.MaxRecordBytes = defaultRecordBytes
 	}
 	if err := o.Limits.Validate(); err != nil {
 		return nil, err
@@ -411,7 +423,7 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 	if err != nil {
 		return "", err
 	}
-	sc, err := openScratch(ctx, p.workDir, p.limits.MaxSpoolBytes)
+	sc, err := openScratch(ctx, p.workDir)
 	if err != nil {
 		return "", err
 	}
@@ -516,7 +528,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		}
 		defer os.RemoveAll(runDir)
 		workDir = runDir
-		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir)
+		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir, &im.seen)
 		if err != nil {
 			return Report{}, err
 		}
@@ -538,9 +550,10 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if ferr != nil {
 			return Report{}, ferr
 		}
+		im.seen.note(limitIndexBytes, fv.Size)
 		im.indexHash, open = fv.ContentHash, p.fileOpener(req.Content, fv)
 	}
-	if im.sc, err = openScratch(ctx, workDir, p.limits.MaxSpoolBytes); err != nil {
+	if im.sc, err = openScratch(ctx, workDir); err != nil {
 		return Report{}, im.decorate(err)
 	}
 	defer im.sc.close()
@@ -667,9 +680,6 @@ func (p *Provider) importFile(ctx context.Context, view model.SnapshotView, scop
 	}
 	if !found {
 		return model.FileVersion{}, &model.Error{Code: model.CodeProviderUnavailable, Message: "the snapshot holds no scip index at " + path}
-	}
-	if fv.Size > p.limits.MaxIndexBytes {
-		return model.FileVersion{}, overLimit("index bytes", fv.Size, p.limits.MaxIndexBytes)
 	}
 	return fv, nil
 }
