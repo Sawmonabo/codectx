@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 	"github.com/fsnotify/fsnotify"
@@ -43,13 +44,6 @@ const (
 	DefaultMaxPaths  = 10000
 	DefaultMaxBytes  = 2 << 20
 )
-
-// maxWatchedDirs bounds the directory watches one watcher holds. It is a
-// product-owned structural bound, not a configuration knob: it exists so the
-// watch set is finite on a pathological tree, and it is deliberately near the
-// order of a stock Linux `fs.inotify.max_user_watches` so the product refuses
-// before the kernel does and can say so in Coverage.
-const maxWatchedDirs = 65536
 
 // Reasons a batch is a full reconciliation. They are operator-facing text on a
 // bounded surface: none of them names a path, because Section 20.1 keeps
@@ -105,7 +99,15 @@ type Options struct {
 	// what the bound exists to cap.
 	MaxPaths int
 	MaxBytes int64
-	Logger   *slog.Logger
+	// MaxWatchedDirs is index.watch_max_directories: how many directories the
+	// user allows one watcher to watch. Unlimited by default -- a repository's
+	// directory count is a property of the repository, and the kernel's own
+	// per-user watch limit is the real ceiling, which is refused and reported
+	// as ReasonWatchLimit when it is reached. A user-set bound stops the
+	// traversal at that many directories and reports coverage incomplete with
+	// ReasonWatchSetLimit, so what it costs is never silent.
+	MaxWatchedDirs config.Limit
+	Logger         *slog.Logger
 }
 
 // Watcher turns notifications into batches. One Watcher runs one Run at a
@@ -156,6 +158,9 @@ func New(o Options) (*Watcher, error) {
 		if *b.value == 0 {
 			*b.value = b.def
 		}
+	}
+	if o.MaxWatchedDirs < 0 {
+		return nil, invalid("index.watch_max_directories is negative; zero means unlimited")
 	}
 	if o.MaxPaths < 0 || o.MaxBytes < 0 {
 		return nil, invalid("index.watch_pending_paths and index.watch_pending_bytes must not be negative")
@@ -474,11 +479,13 @@ func (w *Watcher) loop(ctx context.Context, fsw *fsnotify.Watcher, emit func(Bat
 // an excluded `node_modules` produces no watches, no events and no full
 // reconciliation of a tree that is not indexed at all.
 // Peak RSS: `want` is one entry per ADMITTED DIRECTORY, never one per file,
-// and the loop below refuses past maxWatchedDirs (65536), so the map is capped
-// at 65536 short relative paths -- on the order of a few megabytes -- however
-// many files the tree holds. A 300 000-file monorepo at a realistic 10 files
-// per directory wants ~30 000 entries, well inside that bound; a tree that
-// exceeds it stops at the cap, reports coverage incomplete and keeps working.
+// and the loop below stops at a user-set index.watch_max_directories, so the
+// map holds one short relative path per admitted directory -- a 300 000-file
+// monorepo at a realistic 10 files per directory wants ~30 000 entries, a few
+// megabytes. Unlimited is the default: the kernel's own per-user watch limit
+// is the real ceiling, and reaching it is refused and reported rather than
+// pre-empted here. A tree that exceeds a user-set bound stops at it, reports
+// coverage incomplete and keeps working.
 // It is therefore already bounded by watch-set size rather than repository
 // size, and a streamed diff against a spooled directory list would trade a
 // bounded map for a temp file and buy nothing. (Row 12b asks for a diff
@@ -496,7 +503,7 @@ func (w *Watcher) rescan(ctx context.Context, fsw *fsnotify.Watcher, watched map
 		if want[dir] {
 			return nil
 		}
-		if len(want) >= maxWatchedDirs {
+		if w.opts.MaxWatchedDirs.Exceeded(int64(len(want))) {
 			overLimit = true
 			return errWatchSetFull
 		}
