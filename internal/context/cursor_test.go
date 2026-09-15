@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,7 +20,10 @@ import (
 // store that owns the retention. It is a separate constructor rather than a
 // flag on intCompiler so every other row keeps proving that a compiler composed
 // WITHOUT them behaves exactly as it did before ruling C7.
-func pagedCompiler(t *testing.T, fx *contextFixture, now func() time.Time) (*Compiler, *pagination.Spools) {
+// release, when non-nil, replaces the graph engine's release. frontHalf defers
+// it, so it runs exactly at the P-F/P-G boundary: that is the seam a row uses
+// to make the deadline fire THERE rather than in the middle of a pass.
+func pagedCompiler(t *testing.T, fx *contextFixture, now func() time.Time, release func() error) (*Compiler, *pagination.Spools) {
 	t.Helper()
 	dir := t.TempDir()
 	signer, err := pagination.OpenSigner(dir)
@@ -35,7 +39,10 @@ func pagedCompiler(t *testing.T, fx *contextFixture, now func() time.Time) (*Com
 		Repo:   fx.Repo,
 		Search: searchService(t, fx),
 		Graph: func(ctx stdcontext.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
-			return fx.scopeEngine(nil, fixtureCapabilities), func() error { return nil }, nil
+			if release == nil {
+				release = func() error { return nil }
+			}
+			return fx.scopeEngine(nil, fixtureCapabilities), release, nil
 		},
 		Config: fx.Cfg,
 		Now:    now,
@@ -86,7 +93,7 @@ func TestAResumedCompileProducesTheUninterruptedPlan(t *testing.T) {
 	// The interrupted one: the front half runs, the boundary checkpoints, and
 	// the token is what a deadline at that boundary would have answered.
 	fx := newContextFixture(t)
-	c, spools := pagedCompiler(t, fx, now)
+	c, spools := pagedCompiler(t, fx, now, nil)
 	token := checkpointAtBoundary(t, c, fx, req)
 
 	got, err := c.CompilePage(fx.ctx, req, token)
@@ -131,7 +138,7 @@ func TestAResumedCompileProducesTheUninterruptedPlan(t *testing.T) {
 func TestAContinuationRefusesAnotherRequest(t *testing.T) {
 	t.Parallel()
 	fx := newContextFixture(t)
-	c, _ := pagedCompiler(t, fx, fx.Now)
+	c, _ := pagedCompiler(t, fx, fx.Now, nil)
 	token := checkpointAtBoundary(t, c, fx,
 		model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify})
 
@@ -179,4 +186,113 @@ func checkpointAtBoundary(t *testing.T, c *Compiler, fx *contextFixture, req mod
 		t.Fatalf("the boundary minted no continuation token")
 	}
 	return token
+}
+
+// boundaryClock is the compiler's clock with a halt: it reads as the ordinary
+// clock until halt() is called and one query timeout later afterwards.
+//
+// Its base is the real clock, deliberately. compile bounds itself with
+// context.WithTimeout, whose deadline is a real instant, so a clock based
+// anywhere else could never be compared with it; jumping by MORE than
+// resources.query_timeout (10s) and far LESS than storage.query_cursor_ttl
+// (15m) is what makes "the deadline has passed, the cursor has not" the state
+// at the boundary, deterministically and without any sleep.
+type boundaryClock struct {
+	mu     sync.Mutex
+	base   time.Time
+	tick   int
+	halted bool
+}
+
+func newBoundaryClock() *boundaryClock { return &boundaryClock{base: time.Now().UTC()} }
+
+func (b *boundaryClock) now() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tick++
+	t := b.base.Add(time.Duration(b.tick) * time.Millisecond)
+	if b.halted {
+		t = t.Add(time.Minute)
+	}
+	return t
+}
+
+func (b *boundaryClock) halt() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.halted = true
+	return nil
+}
+
+// The deadline branch itself, executed: a compile whose query deadline has
+// passed by the time the front half returns must answer truncated=deadline with
+// a resumable cursor, an EMPTY manifest, and -- the invariant Section 14.4 puts
+// above every other -- nothing written to the store. A partial plan that
+// reached persistence would be indistinguishable to every later reader from a
+// complete one, because a manifest header carries no "this is a fragment" bit.
+//
+// This is the row C-D3 could not write: it drove the checkpoint by calling it,
+// so compile's own deadline branch never ran and "the deadline path persists no
+// manifest" was an argument about the code rather than a fact about it.
+func TestTheDeadlineBranchAnswersACursorAndStoresNoManifest(t *testing.T) {
+	t.Parallel()
+	req := model.ContextRequest{Task: "make `Place` idempotent", Phase: model.PhaseVerify}
+	fx := newContextFixture(t)
+	clock := newBoundaryClock()
+	c, spools := pagedCompiler(t, fx, clock.now, clock.halt)
+
+	res, err := c.CompilePage(fx.ctx, req, "")
+	if err != nil {
+		t.Fatalf("a compile that ran out of deadline at the boundary failed instead of continuing: %v", err)
+	}
+	if !res.Truncated || res.TruncationReason != truncationDeadline || res.NextCursor == "" {
+		t.Fatalf("the deadline boundary answered truncated=%v reason=%q cursor=%q, want a deadline continuation",
+			res.Truncated, res.TruncationReason, res.NextCursor)
+	}
+	if res.Manifest.ID != "" || res.Manifest.EntryCount != 0 {
+		t.Fatalf("a truncated compile answered manifest %+v, want the zero header", res.Manifest)
+	}
+
+	// Nothing persisted. The identity is computable without compiling, which is
+	// what lets this assert on the STORE rather than on the returned value.
+	id := requestManifestID(t, c, fx, req)
+	if _, stored, err := c.reuseManifest(fx.ctx, id); err != nil {
+		t.Fatalf("reuseManifest: %v", err)
+	} else if stored {
+		t.Fatalf("the deadline path persisted manifest %s; a partial plan must never reach the store", id)
+	}
+
+	// And the continuation finishes it.
+	got, err := c.CompilePage(fx.ctx, req, res.NextCursor)
+	if err != nil {
+		t.Fatalf("resuming the deadline continuation failed: %v", err)
+	}
+	if got.Truncated || got.NextCursor != "" || got.Manifest.ID != id {
+		t.Fatalf("the continuation answered truncated=%v cursor=%q manifest=%s, want the finished plan %s",
+			got.Truncated, got.NextCursor, got.Manifest.ID, id)
+	}
+	if got.Manifest.EntryCount == 0 {
+		t.Fatalf("the continuation selected nothing; the row above would have passed over an empty plan")
+	}
+	live, err := spools.Sweep(fx.ctx, clock.now())
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("the spool store still holds %d byte(s) after the continuation was consumed, want 0", live)
+	}
+}
+
+// requestManifestID is the identity a request compiles to under this compiler's
+// pinned generation and configuration -- the same value compile computes before
+// its first pass.
+func requestManifestID(t *testing.T, c *Compiler, fx *contextFixture, req model.ContextRequest) model.ManifestID {
+	t.Helper()
+	reader, err := c.store.PinGeneration(fx.ctx, c.repo, 0, c.cfg.Storage.QueryCursorTTL.Std())
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	defer reader.Close()
+	id, _ := manifestIdentity(reader.Binding(), req, c.cfg)
+	return id
 }
