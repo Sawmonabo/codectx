@@ -212,9 +212,12 @@ func streamScope(t *testing.T, fx *contextFixture, eng *graph.Engine, seeds []ca
 			t.Fatalf("Admit: %v", err)
 		}
 	}
-	got, err := c.passAIngest(fx.ctx, ingest, eng, fx.Gen, fixtureCapabilities)
+	got, halted, err := c.passAIngest(fx.ctx, ingest, eng, fx.Gen, fixtureCapabilities, nil)
 	if err != nil {
 		t.Fatalf("passAIngest: %v", err)
+	}
+	if halted {
+		t.Fatalf("passAIngest halted with no stop predicate")
 	}
 	return got, sorts
 }

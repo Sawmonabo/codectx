@@ -289,6 +289,21 @@ type seedIngest struct {
 	resolved int
 	stages   []seedStage
 	scope    scopeResult
+
+	// start, cursor and started are P-A's mid-walk carry. start is the walk's
+	// root list, cursor the graph walk's continuation and started the record
+	// that foldSeeds has already run.
+	//
+	// They are fields rather than locals because a plan deadline may end this
+	// pass INSIDE the walk: the checkpoint that boundary writes carries these
+	// three, and the call that resumes rebuilds a sink out of them. start
+	// cannot be recomputed on the continuation -- seedSort is consumed by
+	// foldSeeds and nothing after it reads seedSort, stages or resolved -- and
+	// it must be repeated byte for byte anyway, because graph.Impact binds the
+	// start list into the walk's own query hash.
+	start   []model.NodeID
+	cursor  string
+	started bool
 }
 
 // newSeedIngest opens the sort area's seed-side sorts and returns the sink the
@@ -551,43 +566,57 @@ func (in *seedIngest) discloseCut(cutAt int64, limit config.Limit) error {
 // It takes the sink the seeds were pushed into rather than a slice of them:
 // the seeds are already inside the sorts by the time this runs, and seq is the
 // sink's arrival counter continued by the walk.
+// stop is the pass's own halt question, asked after each page of the walk: a
+// true answer with more walk left ends the PASS with its carry intact instead
+// of ending the compile, and the caller checkpoints it (ruling C7). It is the
+// same predicate runPasses asks at a pass boundary, so a deadline that lands
+// inside the walk and one that lands behind it drive the identical continuation.
 func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *graph.Engine,
-	gen model.GenerationID, caps []model.CapabilityState) (*ingested, error) {
+	gen model.GenerationID, caps []model.CapabilityState, stop func() bool) (*ingested, bool, error) {
 	if in == nil {
-		return nil, argumentInvalid("a streamed scope expansion requires an open seed sink")
+		return nil, false, argumentInvalid("a streamed scope expansion requires an open seed sink")
 	}
 	if eng == nil {
-		return nil, argumentInvalid("scope expansion requires a graph engine")
+		return nil, false, argumentInvalid("scope expansion requires a graph engine")
 	}
 	if gen == 0 {
-		return nil, argumentInvalid("scope expansion requires an explicit pinned generation")
+		return nil, false, argumentInvalid("scope expansion requires an explicit pinned generation")
 	}
 	cfg := in.cfg
 	s := in.sorts
 	out := &ingested{}
-	start, err := in.foldSeeds()
-	if err != nil {
-		return nil, err
-	}
-	finish := func() (*ingested, error) {
+	finish := func() (*ingested, bool, error) {
 		out.Scope = in.scope
-		return finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
+		done, err := finishIngest(s, out, in.entitySort, in.candSort, in.pathSort, in.hopSort)
+		return done, false, err
 	}
 
-	switch {
-	case in.resolved == 0:
-		// Discovery: nothing resolved, so nothing is required and no walk is
-		// run. Seeds already carry their own exclusion reasons.
-		in.scope.ScopeComplete = false
-		return finish()
-	case len(start) == 0:
-		// Files resolved but no symbol did, so no boundary can be walked from
-		// them. Each seed keeps the requirement its Section 15.2 step assigned;
-		// the scope is not complete.
-		in.scope.ScopeComplete = false
-		in.scope.Completeness = degradedCapabilities(caps, nil)
-		return finish()
+	// A resumed sink has already folded its seeds and carries the root list it
+	// built, so the fold and the two no-walk verdicts below run once per walk
+	// and never again on a continuation.
+	if !in.started {
+		start, err := in.foldSeeds()
+		if err != nil {
+			return nil, false, err
+		}
+		in.start, in.started = start, true
+
+		switch {
+		case in.resolved == 0:
+			// Discovery: nothing resolved, so nothing is required and no walk is
+			// run. Seeds already carry their own exclusion reasons.
+			in.scope.ScopeComplete = false
+			return finish()
+		case len(in.start) == 0:
+			// Files resolved but no symbol did, so no boundary can be walked from
+			// them. Each seed keeps the requirement its Section 15.2 step assigned;
+			// the scope is not complete.
+			in.scope.ScopeComplete = false
+			in.scope.Completeness = degradedCapabilities(caps, nil)
+			return finish()
+		}
 	}
+	start := in.start
 
 	// The walk is read TO EXHAUSTION. graph.Impact answers one globally ranked
 	// PAGE and hands back the cursor that continues it; reading that page and
@@ -607,8 +636,12 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 	// dedupe sort and their routes straight into the route sorts, so the pass
 	// holds one page and its sorts' run buffers however long the walk runs.
 	pageSize := c.pageLimit()
-	var disclosed []model.CapabilityState
-	cursor := ""
+	// The per-page capability rows are the one thing the walk accumulates, so
+	// they are seeded from the carry a continuation restored: degradedCapabilities
+	// folds an already-folded list to itself, which is what makes resuming the
+	// walk leave the disclosure exactly where an uninterrupted walk leaves it.
+	disclosed := in.scope.Completeness
+	cursor := in.cursor
 	for {
 		impact, err := eng.Impact(ctx, model.ImpactRequest{
 			// The generation is pinned by the cursor on a continuation, and
@@ -624,11 +657,30 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			Page:         model.PageRequest{Limit: pageSize, Cursor: cursor},
 		})
 		if err != nil {
-			return nil, contextErr(ctx, err)
+			return nil, false, contextErr(ctx, err)
 		}
-		if impact.Meta.Truncated {
+		// A page the deadline cut comes back truncated with neither a cursor
+		// nor an entry: the walk stalled before it could advance, and
+		// graph.Impact deliberately answers no continuation because it would be
+		// the cursor this request already carried (impact.go:243-253). Reading
+		// that empty cursor as exhaustion would serve a fraction of the walk as
+		// a whole scope, so the halt below re-issues this same page instead.
+		stalled := impact.Meta.Truncated && impact.Meta.NextCursor == "" && len(impact.Entries) == 0
+		next := impact.Meta.NextCursor
+		if stalled {
+			next = cursor
+		}
+		halt := stop != nil && stop() && (next != "" || stalled)
+		if impact.Meta.Truncated && !halt {
 			in.scope.ScopeComplete = false
 		}
+		// The page this call halts on is NOT a narrowed scope: its truncation
+		// is this compile's own deadline, and the continuation is what answers
+		// it. A page the deadline ends returns before graph.Impact marks any
+		// user-set bound (impact.go:265-280), so the depth, frontier or visited
+		// bound that ends the walk is reported by the leg that actually reaches
+		// it; a degraded provider still narrows the verdict, through the
+		// capability rows the deadline answer carries forward.
 		// Deduplicated per page rather than appended: the rows are a property
 		// of the generation and every page repeats the same disclosure, so
 		// folding them as they arrive keeps this bounded by the number of
@@ -656,11 +708,20 @@ func (c *Compiler) expandScopeStream(ctx context.Context, in *seedIngest, eng *g
 			seq := in.seq
 			in.seq++
 			if err := in.entitySort.Add(candRecOf(cand, seq)); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if err := in.emitRoutes(seq, e.Paths); err != nil {
-				return nil, err
+				return nil, false, err
 			}
+		}
+		if halt {
+			// The pass ends here with its four pre-fold sorts unfolded and the
+			// walk's place in hand. Nothing is finished and nothing is dropped:
+			// the caller checkpoints this sink and the next call re-enters the
+			// loop at `next`.
+			in.cursor = next
+			in.scope.Completeness = disclosed
+			return nil, true, nil
 		}
 		if impact.Meta.NextCursor == "" {
 			break
