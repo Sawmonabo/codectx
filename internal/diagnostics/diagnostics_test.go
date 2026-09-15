@@ -254,6 +254,74 @@ var scenarios = []scenario{
 			}
 		},
 	},
+	{
+		// Failure mode: a watch process dies, its heartbeat row stays behind,
+		// and every other process keeps reporting its last pending-event
+		// count as live watch coverage -- "0 pending" from a watcher that
+		// stopped watching reads as "this workspace is caught up" forever,
+		// which is false readiness of exactly the kind Section 13.2 forbids.
+		// The writer's own expiry is the only death signal, so a row past it
+		// must report no figure at all and must warn, while a live one
+		// reports the figure and a never-watched workspace says so without
+		// warning.
+		name: "an expired watch heartbeat is never reported as live coverage",
+		run: func(t *testing.T) {
+			now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			pending := int64(7)
+			pass := now.Add(-time.Second)
+			at := func(d time.Duration) *WatchHeartbeat {
+				return &WatchHeartbeat{WriterPID: 4321, LastPassAt: &pass,
+					PendingEvents: &pending, ExpiresAt: now.Add(d)}
+			}
+			run := func(t *testing.T, hb *WatchHeartbeat) (model.ResourceReport, model.DoctorCheck) {
+				t.Helper()
+				svc := newTestService(t, Options{Store: &fakeStore{heartbeat: hb}})
+				res, err := svc.Resources(context.Background())
+				if err != nil {
+					t.Fatalf("Resources: %v", err)
+				}
+				rep, err := svc.Doctor(context.Background(), model.DoctorRequest{})
+				if err != nil {
+					t.Fatalf("Doctor: %v", err)
+				}
+				return res, checkNamed(t, rep, checkWatchHeartbeat)
+			}
+
+			liveRes, liveCheck := run(t, at(time.Minute))
+			if liveRes.PendingEvents == nil || *liveRes.PendingEvents != pending {
+				t.Fatalf("a live heartbeat must report its pending count, got %v", liveRes.PendingEvents)
+			}
+			if liveCheck.State != model.CheckPass || !strings.Contains(liveCheck.Detail, "4321") {
+				t.Fatalf("a live watch must pass and name the process holding it: %+v", liveCheck)
+			}
+
+			deadRes, deadCheck := run(t, at(-time.Second))
+			if deadRes.PendingEvents != nil {
+				t.Fatalf("an expired heartbeat reported %d pending events as live coverage", *deadRes.PendingEvents)
+			}
+			if deadCheck.State != model.CheckWarn || deadCheck.Code != model.CodeSnapshotChanged {
+				t.Fatalf("a watch that stopped refreshing must warn: %+v", deadCheck)
+			}
+
+			noneRes, noneCheck := run(t, nil)
+			if noneRes.PendingEvents != nil {
+				t.Fatalf("a workspace with no heartbeat reported %d pending events", *noneRes.PendingEvents)
+			}
+			if noneCheck.State != model.CheckUnavailable {
+				t.Fatalf("a workspace nobody watches is unavailable, not a defect: %+v", noneCheck)
+			}
+			// A composition root that forgets to forward the probe must say
+			// so rather than report a workspace as unwatched.
+			svc := newTestService(t, Options{Store: bareStore{}})
+			rep, err := svc.Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("Doctor: %v", err)
+			}
+			if bare := checkNamed(t, rep, checkWatchHeartbeat); bare.State != model.CheckUnavailable {
+				t.Fatalf("a store with no heartbeat probe reports %q, want %q", bare.State, model.CheckUnavailable)
+			}
+		},
+	},
 	// L3a rows
 	// L3b rows
 	// L4 rows
@@ -291,6 +359,8 @@ type fakeStore struct {
 	// asked for, so a row can prove --deep widens it.
 	supplied    []SuppliedIndex
 	sampleLimit int
+	// heartbeat is the watch heartbeat the store holds, absent when nil.
+	heartbeat *WatchHeartbeat
 }
 
 // SampleBlobs is the optional hash source for the content-addressed-storage
@@ -304,6 +374,16 @@ func (f *fakeStore) SampleBlobs(_ context.Context, limit int) ([]string, error) 
 // SuppliedIndexes is the optional supplied-index probe (L1).
 func (f *fakeStore) SuppliedIndexes(context.Context, model.GenerationID) ([]SuppliedIndex, error) {
 	return f.supplied, f.err
+}
+
+// WatchHeartbeat is the optional watch-liveness probe. A nil heartbeat is a
+// workspace no watch ever ran in, which is a different answer from an expired
+// one.
+func (f *fakeStore) WatchHeartbeat(context.Context, model.RepositoryID) (WatchHeartbeat, bool, error) {
+	if f.heartbeat == nil {
+		return WatchHeartbeat{}, false, f.err
+	}
+	return *f.heartbeat, true, f.err
 }
 
 // bareStore is a StoreReader implementing the frozen four methods and none of
