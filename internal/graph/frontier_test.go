@@ -1010,6 +1010,15 @@ func assertNoRetainedState(t *testing.T, dir string) {
 				e.Name(), e.IsDir())
 		}
 	}
+	// The retained pass-1 input and the walk's scratch file are state of the
+	// same kind -- they live in the store's sort directory, which is the store
+	// directory itself -- and a served answer must leave neither behind.
+	for _, e := range left {
+		if strings.HasPrefix(e.Name(), "walkretain-") || strings.HasPrefix(e.Name(), "graph-visited-") {
+			t.Errorf("the fully served answer left walk state behind: %s (directory=%v)",
+				e.Name(), e.IsDir())
+		}
+	}
 }
 
 // TestFrontierCeilingDoesNotShrinkTheImpactAnswer is D15: the blast radius a
