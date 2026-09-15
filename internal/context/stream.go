@@ -20,8 +20,10 @@ import (
 	"encoding/json"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/graph"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // ---------------------------------------------------------------------------
@@ -734,16 +736,27 @@ func errNotImplemented(pass string) error {
 // they stay on the one spool with Excluded set, because relationsOnPaths
 // deliberately does not filter on it while hydrateFiles does, and P-I derives
 // the exclusion projection by replaying this spool in seq order.
-func (c *Compiler) passAIngest(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-A ingest")
+//
+// The parameter list and result are completed here, as this freeze reserves to
+// the owning lane: the pass cannot receive its seeds, engine, generation and
+// capability report, nor hand on the three runs and the scope verdict, through
+// (ctx, s) alone. Name, receiver and position in the pass order are unchanged.
+func (c *Compiler) passAIngest(ctx context.Context, s *compileSorts, eng *graph.Engine,
+	gen model.GenerationID, seeds []candidate, caps []model.CapabilityState) (*ingested, error) {
+	return c.expandScopeStream(ctx, s, eng, gen, seeds, caps)
 }
 
 // passBHydrate — §2 P-B, lane L1. Streams the candidate spool in pageLimit()
 // batches, resolves each batch's distinct FileIDs through one FilesByID, and
 // writes SizeBytes, Status, BOTH path fields (C3) and the FileMissing flag onto
 // the record. The accumulating `out`/`byID` of hydrateFiles go away.
-func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts) error {
-	return errNotImplemented("P-B hydrate")
+//
+// As with P-A, the parameter list and result are completed by the owning lane:
+// the pass needs the pinned reader and the candidate spool and yields the
+// hydrated spool.
+func (c *Compiler) passBHydrate(ctx context.Context, s *compileSorts,
+	reader *sqlite.PinnedReader, in *pagination.SortedRun[candRec]) (*pagination.SortedRun[candRec], error) {
+	return c.hydrateStream(ctx, reader, s, in)
 }
 
 // passCRelationAttributes — §2 P-C, lane L2. Explodes the hop stream into a
