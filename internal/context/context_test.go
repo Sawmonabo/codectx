@@ -1715,6 +1715,18 @@ func (a *scopeAdjacency) EvidenceFor(stdcontext.Context, []model.RelationID, int
 	return map[model.RelationID][]model.EvidenceID{}, nil
 }
 
+// scopeMemoryGraph is the packed reader the fixture's traversals read
+// structure through, built from the delivery fake's own nodes and relations so
+// the two describe one graph.
+func scopeMemoryGraph(a *scopeAdjacency) *graph.MemoryGraph {
+	nodes := make([]model.Node, 0, len(a.nodes))
+	for _, n := range a.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return graph.NewMemoryGraph(a.binding, nodes, append([]model.Relation(nil), a.relations...))
+}
+
 // scopeEngine builds an engine over the fixture's nodes and the edges a row
 // declares. The limits mirror internal/app's graphLimits, so a row exercises
 // the same bounds production resolves.
@@ -1749,6 +1761,11 @@ func (f *contextFixture) scopeEngine(rels []model.Relation, caps []model.Capabil
 		f.t.Fatalf("NewSpools: %v", err)
 	}
 	eng, err := graph.New(graph.Options{Adjacency: adj,
+		// The packed per-generation adjacency every traversal reads structure
+		// through (ADR-0005), built over the SAME nodes and edges the delivery
+		// fake serves, exactly as internal/app opens one on the same pinned
+		// generation as its delivery reader.
+		Reader: scopeMemoryGraph(adj),
 		Signer: signer, Spools: spools,
 		Leases: pagination.NewLeases(f.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{

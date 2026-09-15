@@ -30,6 +30,29 @@ type stallingAdjacency struct {
 	after int
 }
 
+// stallingReader is the same stall on the PACKED reader, which is the port the
+// walk reads structure through: a clock advanced only by Adjacency.Edges never
+// moved once the walk moved off it, so the stall this case exists for never
+// happened. One packed scan covers a whole level where the old port made one
+// round trip per node chunk, so the clock is charged per SCAN here -- the
+// opening page still reaches a position before any page after it stalls.
+type stallingReader struct {
+	graph.GraphReader
+	clock *time.Time
+	calls *int
+	jump  time.Duration
+	after int
+}
+
+func (r stallingReader) Neighbours(ctx stdcontext.Context, refs []graph.NodeRef, dir model.Direction,
+	kinds []graph.KindCode, from graph.EdgePos, fn func(graph.Edge) error) (graph.EdgePos, error) {
+	*r.calls++
+	if *r.calls > r.after {
+		*r.clock = r.clock.Add(r.jump)
+	}
+	return r.GraphReader.Neighbours(ctx, refs, dir, kinds, from, fn)
+}
+
 func (a stallingAdjacency) Edges(ctx stdcontext.Context, nodes []model.NodeID, dir model.Direction,
 	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
 	*a.calls++
@@ -159,6 +182,7 @@ func stalledScopeEngine(t *testing.T, fx *contextFixture, rels []model.Relation,
 	}
 	eng, err := graph.New(graph.Options{
 		Adjacency: stallingAdjacency{Adjacency: inner, clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
+		Reader:    stallingReader{GraphReader: scopeMemoryGraph(inner), clock: clock, calls: calls, jump: 2 * time.Minute, after: after},
 		Signer:    signer, Spools: spools,
 		Leases: pagination.NewLeases(fx.Store, pagination.DefaultCursorTTL),
 		Limits: graph.Limits{
