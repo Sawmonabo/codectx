@@ -152,6 +152,31 @@ func (w *watchState) reconciledAt(t time.Time) {
 	w.mu.Unlock()
 }
 
+// observe reads what the running watch loops know, under w.mu: whether a watch
+// is active, whether its coverage is complete notification coverage, how many
+// notification events are pending, and when a pass last completed.
+//
+// pending and at are absent rather than zero when nothing measured them. A
+// periodic-only watch has no notification queue to count and a watch that has
+// completed no pass has no pass time; `0` and the epoch would state that the
+// watch is caught up. The two readers below -- the in-process status projection
+// and the cross-process heartbeat -- must answer from one rule, because a
+// second copy of it would let `codectx status` in this process and `codectx
+// status` in another disagree about the same watch.
+func (w *watchState) observe() (active bool, complete bool, pending *int64, at time.Time) {
+	at = w.reconciled
+	if w.source != nil {
+		coverageComplete, pendingPaths, lastReconciled := w.source.Coverage()
+		complete = coverageComplete
+		n := int64(pendingPaths)
+		pending = &n
+		if lastReconciled.After(at) {
+			at = lastReconciled
+		}
+	}
+	return w.active > 0, complete, pending, at
+}
+
 // project fills the Section 13.2 watch fields. With a notification watcher
 // running they are the watcher's own Coverage(); without one WatchComplete is
 // false and the warning says so, because reporting complete coverage for
@@ -160,15 +185,11 @@ func (w *watchState) reconciledAt(t time.Time) {
 func (w *watchState) project(st *model.IndexStatus) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	st.WatchActive = w.active > 0
-	at := w.reconciled
-	if w.source != nil {
-		complete, pending, lastReconciled := w.source.Coverage()
-		st.WatchComplete = complete
-		st.PendingPaths = int64(pending)
-		if lastReconciled.After(at) {
-			at = lastReconciled
-		}
+	active, complete, pending, at := w.observe()
+	st.WatchActive = active
+	st.WatchComplete = complete
+	if pending != nil {
+		st.PendingPaths = *pending
 	}
 	if !at.IsZero() {
 		st.LastReconciledAt = &at
@@ -177,6 +198,19 @@ func (w *watchState) project(st *model.IndexStatus) {
 		st.Warnings = append(st.Warnings,
 			"watch coverage is incomplete: not every directory the traversal admits carries a filesystem notification watch, so changes under the rest are seen only at the next periodic reconciliation")
 	}
+}
+
+// heartbeat is what this watch publishes for another process to read: when its
+// last pass completed and how many events are pending, both absent when nothing
+// measured them.
+func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, _, pending, at := w.observe()
+	if !at.IsZero() {
+		lastPass = &at
+	}
+	return lastPass, pending
 }
 
 // capabilityReport accumulates one generation's capability rows and publishes

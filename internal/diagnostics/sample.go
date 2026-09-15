@@ -97,11 +97,13 @@ func NewHostSampler(opts HostSamplerOptions) *HostSampler {
 // it cannot read: the nil field is the answer, and an error would make an
 // unmeasurable figure fail a call that is otherwise complete.
 //
-// The fields left nil here and not by absence of a reading are the ones no
-// process-wide source exists for at this commit: pending watch events belong to
-// a live watcher in this process only, and the unit reuse and parse counts are
-// per-index-run figures on model.IndexResult, not running totals. Reporting
-// them as zero would state that nothing is pending and nothing was parsed.
+// The fields left nil here and not by absence of a reading are the ones this
+// sampler has no source for: it measures the host, so the unit reuse and parse
+// counts -- per-index-run figures on model.IndexResult, not running totals --
+// and the pending watch events are not its to report. Reporting them as zero
+// would state that nothing was parsed and that the watch is caught up. The
+// pending count is filled one level up, from the heartbeat a running watch
+// publishes to the store (Resources), and stays nil here.
 func (h *HostSampler) Sample(_ context.Context) (model.ResourceReport, error) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
