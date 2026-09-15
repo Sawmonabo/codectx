@@ -20,7 +20,10 @@ func main() {
 	// dispatched before any flag parsing, logging or configuration so a worker
 	// never inherits parent state or writes to the parent's streams.
 	if len(os.Args) > 1 && os.Args[1] == wire.Subcommand {
-		os.Exit(worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr))
+		stop := startProfiling("worker")
+		code := worker.Main(context.Background(), os.Stdin, os.Stdout, os.Stderr)
+		stop()
+		os.Exit(code)
 	}
 
 	// A write to fd 1 or 2 that returns EPIPE raises SIGPIPE, whose default
@@ -34,9 +37,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
+	stopProfiling := startProfiling("main")
+
 	build := model.CurrentBuildInfo()
 	root := cli.NewRoot(build, os.Stdout, os.Stderr)
 	err := cli.Execute(ctx, build, root, os.Args[1:])
 	stop()
+	stopProfiling()
 	os.Exit(cli.ExitCode(err))
 }
