@@ -53,7 +53,12 @@ func (u *unit) pyproject(ctx context.Context) error {
 		u.malformed()
 		return nil
 	}
-	layout := layoutTOML(u.data)
+	layout, overLines := layoutTOML(u.data)
+	if overLines {
+		// The layout was not built, so every fact of this manifest is
+		// published without a range. That is a cut, and it is reported.
+		u.overBound()
+	}
 	poetry := doc.Tool.Poetry
 	var name, version string
 	meta := map[string]any{}

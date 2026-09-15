@@ -51,10 +51,17 @@ type pomEntry struct {
 // `${property}` references are carried verbatim and marked unresolved, never
 // evaluated.
 func (u *unit) pom(ctx context.Context) error {
-	m, ok := parsePom(u.data)
+	m, ok, overElements := parsePom(u.data)
 	if !ok {
 		u.malformed()
 		return nil
+	}
+	if overElements {
+		// The element bound cut the token stream. What was parsed before the
+		// cut is published; the file is reported partial with
+		// CTX_RESOURCE_LIMIT rather than malformed, because a large POM is
+		// large, not invalid.
+		u.overBound()
 	}
 	group, version := m.group, m.version
 	var inherited []string
@@ -168,7 +175,7 @@ func mavenKind(d pomDependency) string {
 // offset before a StartElement token is the start of its tag (the preceding
 // character data is its own token), and the offset after an EndElement is
 // the end of the element.
-func parsePom(data []byte) (pomModel, bool) {
+func parsePom(data []byte) (pomModel, bool, bool) {
 	m := pomModel{properties: map[string]string{}}
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	var stack []string
@@ -176,23 +183,28 @@ func parsePom(data []byte) (pomModel, bool) {
 	var cur *pomDependency
 	var entryStart int
 	elements := 0
-	for {
+	overElements := false
+	for !overElements {
 		before := int(dec.InputOffset())
 		tok, err := dec.Token()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return m, false
+			return m, false, false
 		}
 		switch t := tok.(type) {
 		case xml.StartElement:
 			stack = append(stack, t.Name.Local)
 			if len(stack) > maxXMLDepth || (len(stack) == 1 && t.Name.Local != "project") {
-				return m, false
+				return m, false, false
 			}
 			if elements++; elements > maxXMLElements {
-				return m, false
+				// Stop reading and report the cut. Refusing here said the
+				// file was malformed, which a large but perfectly valid POM
+				// is not.
+				overElements = true
+				break
 			}
 			text.Reset()
 			switch strings.Join(stack, "/") {
@@ -247,7 +259,13 @@ func parsePom(data []byte) (pomModel, bool) {
 			text.Reset()
 		}
 	}
-	return m, len(stack) == 0 && elements > 0
+	if overElements {
+		// A cut stream leaves the element stack open, which is the
+		// well-formedness test below. The file parsed cleanly up to the
+		// bound, so it is valid and partial, not malformed.
+		return m, true, true
+	}
+	return m, len(stack) == 0 && elements > 0, false
 }
 
 func setCoordinate(d *pomDependency, field, val string) {

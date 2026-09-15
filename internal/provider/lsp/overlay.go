@@ -400,6 +400,12 @@ func (o *Overlay) calls(ctx context.Context, method string, item CallItem, limit
 			}
 			call.Sites = append(call.Sites, Location{File: doc.version.ID, Path: doc.version.Path, ContentHash: doc.version.ContentHash, Range: rng})
 			if len(call.Sites) >= model.MaxRecordsPerResult {
+				// The remaining ranges of this call are cut by the per-result
+				// record bound. That is truncation, not exclusion: the sites
+				// are inside the pinned snapshot and the server did name
+				// them, so the answer says it had more to say rather than
+				// counting them as locations outside the snapshot.
+				out.Truncated = true
 				break
 			}
 		}
