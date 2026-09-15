@@ -108,6 +108,8 @@ type Options struct {
 	// StoreDir, when set, is the tool store itself, used verbatim. Otherwise the
 	// store is StoreDir(DataDir), i.e. <data_dir>/tools. tools.cache_dir names a
 	// store, not a parent of one, so the configuration key and the option agree.
+	// The product always sets this: tools.cache_dir defaults to one shared
+	// machine-wide store rather than to a per-workspace one.
 	StoreDir string
 	// Offline turns every fetch into a typed refusal without opening a socket.
 	Offline bool

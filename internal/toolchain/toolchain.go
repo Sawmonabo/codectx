@@ -32,10 +32,12 @@
 //	<data>/tools/.staging/<name>/<id>/ a payload being fetched and extracted
 //	<data>/tools/.locks/<name>.lock   cross-process serialization of one tool's installs
 //
-// The store root is <data>/tools by default and is whatever Options.StoreDir
-// names when that is set, which is how tools.cache_dir gives every checkout on
-// a machine one shared store. Nothing below it is created until the first
-// install: a resolver built only to report touches no filesystem at all.
+// The store root is whatever Options.StoreDir names, and in the product that
+// is always set: a resolved configuration carries tools.cache_dir, which
+// defaults to one machine-wide store every checkout on the host shares.
+// StoreDir(DataDir) is the fallback for a caller that supplies only a data
+// directory. Nothing below the root is created until the first install: a
+// resolver built only to report touches no filesystem at all.
 //
 // The marker lives inside the version directory so that removing the directory
 // removes the publication, and an archive entry named ".complete" at the
