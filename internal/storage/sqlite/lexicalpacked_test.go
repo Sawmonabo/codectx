@@ -19,38 +19,62 @@ import (
 // (column, count) sequence between the packed form and the same statements the
 // live path issues over the index tables. One mismatched document is a wrong
 // score on a page nobody can tell apart from a right one.
-// packedLexicalFixture publishes one generation over two files and returns the
-// pinned reader, the fixture and the database path.
-func packedLexicalFixture(t *testing.T) (*fixture, *store.PinnedReader, model.GenerationID, string) {
+// packedLexicalFixture publishes two generations through the normal seal and
+// activation path: the first merges THREE units' packed lists, and the second
+// is a delta over the same tree that rebuilds one of them and reuses the other
+// two, which is the merge input shape a one-file edit produces.
+func packedLexicalFixture(t *testing.T) (*fixture, []model.GenerationID, string) {
 	t.Helper()
 	dbPath := t.TempDir() + "/codectx.db"
 	f := newFixture(t, dbPath)
 	a := f.file("pkg/a.go", "package pkg\nfunc Alpha() { Alpha() }\n")
 	b := f.file("pkg/b.go", "package pkg\nfunc Beta() { Alpha() }\n")
-	snap := f.snapshot("one", a, b)
-	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	c := f.file("pkg/c.go", "package pkg\nfunc Gamma() { Beta() }\n")
+	snap := f.snapshot("one", a, b, c)
+	gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := f.run(gen)
-	w := f.beginScope(gen, run, configHash, a, b)
-	f.fillScope(w, run, a, b)
-	if err := f.s.SealUnit(f.ctx, w); err != nil {
-		t.Fatalf("SealUnit: %v", err)
-	}
-	f.activate(gen, 0)
-	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+	run1 := f.run(gen1)
+	units := []model.UnitID{f.unit(gen1, run1, a), f.unit(gen1, run1, b), f.unit(gen1, run1, c)}
+	f.activate(gen1, 0)
+
+	// One file is edited: its unit is rebuilt and sealed, the two untouched
+	// units are reused exactly as they were sealed.
+	a2 := f.file("pkg/a.go", "package pkg\nfunc Alpha() { Alpha(); Alpha() }\n")
+	snap2 := f.snapshot("two", a2, b, c)
+	gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
 	if err != nil {
-		t.Fatalf("PinGeneration: %v", err)
+		t.Fatal(err)
 	}
-	return f, r, gen, dbPath
+	run2 := f.run(gen2)
+	f.unit(gen2, run2, a2)
+	for _, u := range units[1:] {
+		if err := f.s.AttachUnit(f.ctx, gen2, u); err != nil {
+			t.Fatalf("AttachUnit: %v", err)
+		}
+	}
+	f.activate(gen2, gen1)
+	return f, []model.GenerationID{gen1, gen2}, dbPath
 }
 
 func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
-	f, r, gen, dbPath := packedLexicalFixture(t)
+	f, gens, dbPath := packedLexicalFixture(t)
 	db := openRawDB(t, dbPath)
-	genID := int64(gen)
+	for _, gen := range gens {
+		r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+		if err != nil {
+			t.Fatalf("PinGeneration(%d): %v", gen, err)
+		}
+		comparePackedToLive(t, f, r, db, int64(gen))
+		if err := r.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+}
 
+func comparePackedToLive(t *testing.T, f *fixture, r *store.PinnedReader, db *sql.DB, genID int64) {
+	t.Helper()
 	var liveDocs, liveTokens int64
 	if err := db.QueryRow(`SELECT count(*), coalesce(sum(su.token_count), 0) FROM search_units su
 		JOIN units u ON u.id = su.unit_id
@@ -63,10 +87,10 @@ func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 		t.Fatalf("SearchStats: %v", err)
 	}
 	if packedDocs != liveDocs || packedTokens != liveTokens {
-		t.Fatalf("packed statistics %d/%d, live %d/%d", packedDocs, packedTokens, liveDocs, liveTokens)
+		t.Fatalf("generation %d packed statistics %d/%d, live %d/%d", genID, packedDocs, packedTokens, liveDocs, liveTokens)
 	}
-	if liveDocs == 0 {
-		t.Fatal("the fixture published no visible document; the comparison below would prove nothing")
+	if liveDocs < 3 {
+		t.Fatalf("generation %d published %d documents; too few to prove a merge across units", genID, liveDocs)
 	}
 
 	terms := vocabularyTerms(t, db)
@@ -91,7 +115,7 @@ func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 			t.Fatalf("live df(%q): %v", term, err)
 		}
 		if packedDF[i] != liveDF {
-			t.Fatalf("term %q packed df %d, live df %d", term, packedDF[i], liveDF)
+			t.Fatalf("generation %d term %q packed df %d, live df %d", genID, term, packedDF[i], liveDF)
 		}
 		live, err := session.TermOccurrences(f.ctx, term)
 		if err != nil {
@@ -104,8 +128,63 @@ func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 		}
 		packedSeq := drainCounts(t, f, packed, term)
 		if packedSeq != liveSeq {
-			t.Fatalf("term %q packed occurrences\n%s\nlive occurrences\n%s", term, packedSeq, liveSeq)
+			t.Fatalf("generation %d term %q packed occurrences\n%s\nlive occurrences\n%s", genID, term, packedSeq, liveSeq)
 		}
+	}
+	comparePackedDocuments(t, f, r, db, genID)
+}
+
+// comparePackedDocuments is the Decision 2 half: every field the ranker, the
+// tie-break, the deduplication key and the filters read now comes from the
+// packed attribute stream instead of a document row, so a field that drifts
+// there serves a wrong path, a wrong byte range or a wrong identity on a page
+// nobody can tell apart from a right one.
+func comparePackedDocuments(t *testing.T, f *fixture, r *store.PinnedReader, db *sql.DB, genID int64) {
+	t.Helper()
+	rows, err := db.Query(`SELECT su.doc_id, lower(hex(su.search_key)), coalesce(lower(hex(ni.canonical)), ''),
+		lower(hex(su.file_id)), su.path, su.kind, su.name, su.qualified_name, su.signature,
+		su.start_byte, su.end_byte, su.token_count
+		FROM search_units su LEFT JOIN node_ids ni ON ni.id = su.node_id
+		JOIN generation_units gu ON gu.unit_id = su.unit_id AND gu.generation_id = ?
+		ORDER BY su.doc_id`, genID)
+	if err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	defer rows.Close()
+	var rowids []int64
+	var live []string
+	for rows.Next() {
+		var id, start, end, tokens int64
+		var key, node, file, path, kind, name, qname, sig string
+		if err := rows.Scan(&id, &key, &node, &file, &path, &kind, &name, &qname, &sig, &start, &end, &tokens); err != nil {
+			t.Fatalf("scan live document: %v", err)
+		}
+		rowids = append(rowids, id)
+		live = append(live, fmt.Sprintf("%d %s %s %s %s %s %s %s %q [%d,%d) len=%d",
+			id, key, node, file, path, kind, name, qname, sig, start, end, tokens))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	packed, err := r.PackedDocuments(f.ctx, rowids)
+	if err != nil {
+		t.Fatalf("PackedDocuments: %v", err)
+	}
+	if len(packed) != len(live) {
+		t.Fatalf("generation %d hydrated %d of %d documents from the packed stream", genID, len(packed), len(live))
+	}
+	for i, d := range packed {
+		got := fmt.Sprintf("%d %s %s %s %s %s %s %s %q [%d,%d) len=%d",
+			d.RowID, d.ID, string(d.NodeID), string(d.FileID), d.Path, string(d.Kind), d.Name, d.QualifiedName,
+			d.Signature, d.Bytes.Start, d.Bytes.End, d.TokenCount)
+		if got != live[i] {
+			t.Fatalf("generation %d packed document\n%s\nlive document\n%s", genID, got, live[i])
+		}
+	}
+	// A rowid of another generation must be omitted, not hydrated: the stream
+	// carries the generation's documents and nothing else.
+	if out, err := r.PackedDocuments(f.ctx, []int64{rowids[len(rowids)-1] + 1000}); err != nil || len(out) != 0 {
+		t.Fatalf("PackedDocuments of an absent rowid = %v, %v; want no document and no error", out, err)
 	}
 }
 
@@ -162,7 +241,7 @@ func vocabularyTerms(t *testing.T, db *sql.DB) []string {
 // unit, and a sorter over either set is unbounded memory at index time -- the
 // defect ADR-0007 Decision 1 exists to avoid.
 func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
-	_, _, _, dbPath := packedLexicalFixture(t)
+	_, _, dbPath := packedLexicalFixture(t)
 	db := openRawDB(t, dbPath)
 	if _, err := db.Exec(`CREATE VIRTUAL TABLE temp.unit_fts_1 USING fts5(name, qualified_name, signature, path, body, content='', tokenize='unicode61', detail='full')`); err != nil {
 		t.Fatalf("unit index: %v", err)
