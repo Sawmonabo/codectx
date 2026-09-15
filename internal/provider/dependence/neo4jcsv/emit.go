@@ -654,7 +654,7 @@ func (e *emitter) evidence(node model.NodeID, rel model.RelationID, file model.F
 // stageRelations turns every projected occurrence whose endpoints both
 // resolved into a relation identity with one evidence row per occurrence.
 func (e *emitter) stageRelations(ctx context.Context) error {
-	if err := e.sc.checkDerived(ctx); err != nil {
+	if err := e.sc.countDerived(ctx); err != nil {
 		return err
 	}
 	type key struct{ kind, from, to, site, op, target string }
@@ -835,7 +835,7 @@ func (e *emitter) emitNodes(ctx context.Context) error {
 // refuses a list that holds one. There is deliberately no per-fact bound:
 // dropping a key would blind removal detection for that fact, and every key is
 // one of the export's rows, so a fact's key list is bounded by what the export
-// holds — the staged rows for a node fact's keys, maxDerivedRows for a
+// holds — the staged rows for a node fact's keys, the projected occurrences for a
 // relation's (51 keys on one relation was the measured peak on this
 // repository).
 func sortedKeys(keys []string) []string {

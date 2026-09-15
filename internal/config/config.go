@@ -110,6 +110,7 @@ type Config struct {
 	Providers Providers `toml:"providers"`
 	Context   Context   `toml:"context"`
 	Coverage  Coverage  `toml:"coverage"`
+	Workflow  Workflow  `toml:"workflow"`
 	MCP       MCP       `toml:"mcp"`
 }
 
@@ -292,6 +293,14 @@ type Dependence struct {
 	// reported on the unit's capability rows with the staged count and this
 	// bound.
 	MaxStagedRows Limit `toml:"max_staged_rows"`
+	// MaxDerivedRows is how many relation occurrences the user wants one
+	// unit's import to project from its staged rows. Unlimited by default: the
+	// projection is computed and paged inside the same on-disk staging
+	// database, so the occurrence count bounds disk rather than heap. A
+	// user-set value never fails the unit and never truncates the projection --
+	// exceeding it is reported on the unit's capability rows with the derived
+	// count and this bound.
+	MaxDerivedRows Limit `toml:"max_derived_rows"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -367,6 +376,18 @@ type Coverage struct {
 	SessionTTL                     Duration `toml:"session_ttl"`
 	MaxReceiptsPerConfirmation     int      `toml:"max_receipts_per_confirmation"`
 	MaxUnconfirmedChunksPerSession Limit    `toml:"max_unconfirmed_chunks_per_session"`
+}
+
+// Workflow is the Section 17 workflow-service policy.
+type Workflow struct {
+	// MaxObservationReferences is how many references the user wants one
+	// recorded observation -- or one scope review, counted across all eight of
+	// its categories -- to carry. Unlimited by default: a review of a large
+	// scope cites what it read, and an attestation is not refused for the size
+	// of the repository it attests to. A user-set value is the operator's own
+	// ceiling and exceeding it is reported with the count and this bound,
+	// never silently trimmed.
+	MaxObservationReferences Limit `toml:"max_observation_references"`
 }
 
 // MCP is the server transport policy.
@@ -481,6 +502,7 @@ func Defaults() Config {
 				UnitMemoryCeilingBytes: 0,
 				MaxUnitsPerFamily:      Unlimited,
 				MaxStagedRows:          Unlimited,
+				MaxDerivedRows:         Unlimited,
 			},
 		},
 		Context: Context{
@@ -505,7 +527,8 @@ func Defaults() Config {
 			MaxReceiptsPerConfirmation:     16,
 			MaxUnconfirmedChunksPerSession: Unlimited,
 		},
-		MCP: MCP{Transport: "stdio", Watch: true},
+		Workflow: Workflow{MaxObservationReferences: Unlimited},
+		MCP:      MCP{Transport: "stdio", Watch: true},
 	}
 }
 

@@ -90,14 +90,20 @@ type Options struct {
 	UnitMemoryCeilingBytes int64
 	// Limits are the sink bounds the importer enforces before it allocates.
 	Limits provider.Limits
-	// MaxUnitsPerFamily and MaxStagedRows are the two user-set reporting
-	// thresholds of `[providers.dependence]`, 0 (the default) meaning no
-	// threshold at all. Neither refuses anything: a repository's project count
-	// and an export's row count are properties of the source, so exceeding
-	// either is published on the unit's capability rows -- never a plan
-	// refusal, never a silently truncated list, never a failed unit.
+	// MaxUnitsPerFamily, MaxStagedRows and MaxDerivedRows are the three
+	// user-set reporting thresholds of `[providers.dependence]`, 0 (the
+	// default) meaning no threshold at all. None refuses anything: a
+	// repository's project count, an export's row count and the occurrences
+	// that project from it are properties of the source, so exceeding one is
+	// published on the unit's capability rows -- never a plan refusal, never a
+	// silently truncated list, never a failed unit.
+	//
+	// These are the resolved values of config.Limit keys; the composition root
+	// reads the Limit and hands the int64 over, because this package does not
+	// import internal/config.
 	MaxUnitsPerFamily int64
 	MaxStagedRows     int64
+	MaxDerivedRows    int64
 }
 
 // Provider is the dependence provider.Provider. One instance serves a process
@@ -132,8 +138,8 @@ func NewWithImporter(backend Backend, importer Importer, opts Options) (*Provide
 	if opts.Timeout < 0 || opts.StallTimeout < 0 {
 		return nil, invalid("the dependence provider's unit timeout and stall timeout may not be negative")
 	}
-	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 {
-		return nil, invalid("the dependence provider's max_units_per_family and max_staged_rows may not be negative; 0 is no threshold")
+	if opts.MaxUnitsPerFamily < 0 || opts.MaxStagedRows < 0 || opts.MaxDerivedRows < 0 {
+		return nil, invalid("the dependence provider's max_units_per_family, max_staged_rows and max_derived_rows may not be negative; 0 is no threshold")
 	}
 	if err := opts.Limits.Validate(); err != nil {
 		return nil, err
@@ -336,6 +342,11 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 	if p.opts.MaxStagedRows > 0 && report.StagedRows > p.opts.MaxStagedRows {
 		pub.StagedRows, pub.StagedRowsBound = report.StagedRows, p.opts.MaxStagedRows
 	}
+	// The projected occurrences are summed over a subdivided unit's parts for
+	// the same reason, and compared here for the same one.
+	if p.opts.MaxDerivedRows > 0 && report.DerivedRows > p.opts.MaxDerivedRows {
+		pub.DerivedRows, pub.DerivedRowsBound = report.DerivedRows, p.opts.MaxDerivedRows
+	}
 	// BytesProcessed is the export bytes the import actually read, which is
 	// what this run processed and what the importer measured. The unit's
 	// source bytes are a different figure and are logged as source_bytes
@@ -355,6 +366,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		"unplanned_projects", pub.UnplannedProjects,
 		"projects_in_family", plan.Projects[unit.Family], "over_max_units_per_family", pub.OverUnitsPerFamily > 0,
 		"staged_rows", report.StagedRows, "over_max_staged_rows", report.OverStagedRows,
+		"derived_rows", report.DerivedRows, "over_max_derived_rows", report.OverDerivedRows,
 		"heap_cap_bytes", res.HeapCapBytes, "reservation_bytes", res.Bytes(), "allocation_bytes", res.AllocationBytes,
 		"keys", report.Keys.Count(), "keys_changed", report.Changed, "keys_unchanged", report.Unchanged,
 		"keys_removed", report.Removed)
@@ -685,7 +697,8 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows,
-		PreviousKeys: opts.PreviousKeys, KeysPath: opts.KeysPath})
+		MaxDerivedRows: p.opts.MaxDerivedRows,
+		PreviousKeys:   opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {
 		return ImportReport{}, err
 	}
@@ -836,6 +849,8 @@ func merge(a, b ImportReport) ImportReport {
 	// crossed on its own is never lost behind a sum.
 	a.StagedRows += b.StagedRows
 	a.OverStagedRows = a.OverStagedRows || b.OverStagedRows
+	a.DerivedRows += b.DerivedRows
+	a.OverDerivedRows = a.OverDerivedRows || b.OverDerivedRows
 	a.Keys = neo4jcsv.KeySet{}
 	if b.UnknownLabels != nil {
 		if a.UnknownLabels == nil {
