@@ -159,27 +159,42 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	maxEdges, edgeNotice := resolveLimit("max_edges", req.MaxEdges, e.limits.Edges())
 	answer.Notices = appendNotice(appendNotice(answer.Notices, visitedNotice), edgeNotice)
 
+	// The pass-1 INPUT of this answer is RETAINED across requests: ruling P3
+	// lets the deadline split one walk over several of them, and a sort built
+	// inside one request can only rank that request's leg -- the carried
+	// visited set guarantees the earlier legs are never admitted again, so
+	// their entities would be lost with no disclosure at all (walkretain.go).
+	// Every admitted record is appended to it, and both ranking passes run over
+	// the WHOLE retained input once the walk is exhausted.
+	retain := resumeRetained(resume)
+	if retain == nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir()); err != nil {
+			return answer, nil, nil, "", err
+		}
+	}
+	// Discarded AFTER the continuation below has taken it: a leg that mints a
+	// walk cursor detaches the directory, and this then finds nothing to remove.
+	defer retain.discard()
+
 	var (
-		acc     *impactAccumulator
-		state   walkState
-		pairs   *pagination.SortedRun[pairRecord]
-		pairErr error
+		acc   *impactAccumulator
+		state walkState
 	)
-	// ONE streamed pass, TEED: the impact sort's emit callback drives the pair
-	// rollup, which drives the walk, so every admitted edge reaches both
-	// rankings as it is read and no record is held between the edge that
-	// produced it and the run buffer it lands in. The rollup is nested inside
-	// the rank rather than run again afterwards because the walk may be
-	// replayed only by re-reading the whole graph.
-	ranked, rankErr := e.rankImpact(ctx, func(add func(impactRecord) error) error {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, add)
-		pairs, pairErr = e.rollupRanked(ctx, &meta, func(sink edgeSink) error {
-			var walkErr error
+	if resume == nil || !resume.Cursor.WalkDone {
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, retain.addEntry)
+		// ONE streamed pass, TEED: the rollup's batching drives the walk, so
+		// every admitted edge reaches the entity record and the package pair as
+		// it is read and nothing is held between the edge that produced it and
+		// the retained input it lands in. The rollup is nested inside the walk
+		// rather than run again afterwards because the walk may be replayed only
+		// by re-reading the whole graph.
+		walkErr := e.rollupInto(ctx, &meta, func(sink edgeSink) error {
+			var werr error
 			// The walk is bounded by the frontier byte ceiling and the per-page
 			// work budgets, which runWalkToCompletion returns at every internal
 			// boundary, and it ends only when the frontier is empty, the depth
 			// bound is reached or the deadline passes.
-			state, walkErr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
+			state, werr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
 				Direction:     req.Direction,
 				Kinds:         kinds,
 				MaxDepth:      maxDepth,
@@ -199,31 +214,26 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				}
 				return sink.Visit(fs, rel)
 			})
-			return walkErr
-		}, nil)
-		return pairErr
-	})
-	if pairs != nil {
-		defer pairs.Close()
-	}
-	if state.ReleaseCarried != nil {
-		// After the continuation below has been spilled: the spill is what
-		// reads the carried stream.
-		defer state.ReleaseCarried()
-	}
-	if err := impactPhaseError(ctx, rankErr, &meta); err != nil {
-		return answer, nil, nil, "", err
-	}
-	if ranked != nil {
-		defer ranked.Close()
+			return werr
+		}, retain.addPair, nil)
+		if state.ReleaseCarried != nil {
+			// After the continuation below has been spilled: the spill is what
+			// reads the carried stream.
+			defer state.ReleaseCarried()
+		}
+		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+			return answer, nil, nil, "", err
+		}
 	}
 	if b.deadlineHit && len(state.Frontier) > 0 {
 		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
-		// continuation carries the frontier forward.
+		// continuation carries the frontier AND the records this leg admitted
+		// forward, so the request that finishes the walk ranks all of them.
 		markTruncated(&meta, reasonDeadline)
-		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state, acc.lastOwner, acc.lastKey, resume)
+		next, err := e.continueWalk(ctx, b, impactEndpoint, queryHash, state,
+			acc.lastOwner, acc.lastKey, resume, retain)
 		if err != nil {
 			return answer, nil, nil, "", err
 		}
@@ -232,7 +242,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		return answer, nil, b, next, nil
 	}
 	switch {
-	case acc.reason != "":
+	case acc != nil && acc.reason != "":
 		// The LAST link's stop, and so the one that ended the answer: an
 		// internal boundary's reason is cleared by the first edge the next link
 		// admits (impactAccumulator.Visit).
@@ -247,18 +257,40 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		markTruncated(&meta, reasonDepth)
 	}
 
+	// The walk is exhausted. Both passes now run over every record EVERY leg of
+	// it appended, which is what makes the served order the single unbounded
+	// walk's order however many requests the walk was spread over.
+	ranked, rankErr := e.rankImpact(ctx, retain.eachEntry)
+	if ranked != nil {
+		defer ranked.Close()
+	}
+	if err := impactPhaseError(ctx, rankErr, &meta); err != nil {
+		return answer, nil, nil, "", err
+	}
+	var pairs *pagination.SortedRun[pairRecord]
+	if ranked != nil {
+		var pairErr error
+		pairs, pairErr = e.rankPairs(ctx, retain.eachPair)
+		if pairs != nil {
+			defer pairs.Close()
+		}
+		if err := impactPhaseError(ctx, pairErr, &meta); err != nil {
+			return answer, nil, nil, "", err
+		}
+	}
 	if ranked == nil || pairs == nil {
-		// The deadline landed mid-RANK, after the walk had finished: ruling P7
-		// wants the walk spool retained and the sort re-run on the next page,
-		// and pagination.ExternalSort has no adopt-existing-runs constructor to
-		// build that on (P-a's G2). What is honest without one is to disclose
-		// the deadline and serve nothing, rather than to page an order that was
-		// never established. The remedy is to re-run the query, or to raise
-		// resources.query_timeout.
+		// Ruling P7: the deadline landed mid-RANK, after the walk had finished.
+		// Nothing extra is persisted -- the input both passes read is already
+		// retained -- so the continuation names it with the walk marked
+		// complete and the next request re-sorts from it and serves page 1.
 		markTruncated(&meta, reasonDeadline)
+		next, err := e.continueRank(ctx, b, impactEndpoint, queryHash, retain)
+		if err != nil {
+			return answer, nil, nil, "", err
+		}
 		answer = impactAnswer{Truncated: true, Reason: meta.TruncationReason,
 			Notices: answer.Notices, Completeness: meta.Completeness}
-		return answer, nil, b, "", nil
+		return answer, nil, b, next, nil
 	}
 	entries, nextCursor, err := e.serveRankedRun(ctx, ranked, pairs, queryHash, b, limit, &answer, &meta)
 	if err != nil {
@@ -483,8 +515,19 @@ func (e *Engine) spillRanked(next traversalCursor, h rankedHeader, tail func(fun
 // single exception -- it is part of the query hash a cursor is bound to, so a
 // token minted for it would resume a walk already past it, stop at once and
 // mint another.
+//
+// A resumable frontier is NOT enough on these two endpoints, and that is what
+// retain carries. Their answers are globally RANKED, so the request that
+// finishes the walk must rank every record every leg admitted, not just its
+// own: the cumulative visited set this cursor carries guarantees the earlier
+// legs' nodes are never admitted a second time, so a continuation that named
+// only a frontier would serve the last leg's ranking as the whole blast radius
+// and disclose nothing. retain is the retained pass-1 input the store adopts
+// alongside the frontier spool (walkretain.go); the token names both, and the
+// leg that exhausts the walk ranks the whole of it.
 func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHash string,
-	state walkState, lastOwner model.NodeID, lastKey model.RelationID, resume *resumeState) (string, error) {
+	state walkState, lastOwner model.NodeID, lastKey model.RelationID,
+	resume *resumeState, retain *retainedWalk) (string, error) {
 	if len(state.Frontier) == 0 || state.DepthLimited {
 		return "", nil
 	}
@@ -503,7 +546,32 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 		Frontier:  state.Frontier,
 		Visited:   state.Admitted.newlyAdmitted(),
 		Carried:   carried,
+		Retain:    retain,
 	})
+}
+
+// continueRank mints ruling P7's continuation: the walk is EXHAUSTED and the
+// deadline cut the ranking short, so the token names the retained pass-1 input
+// alone -- no frontier, no keyset position -- and the next request runs both
+// passes over it and serves page 1. Nothing extra is persisted: the input the
+// sort would re-read is what every leg has been appending to all along.
+func (e *Engine) continueRank(ctx context.Context, b *budget, endpoint, queryHash string,
+	retain *retainedWalk) (string, error) {
+	return e.nextTraversalCursor(ctx, b, continuation{
+		Endpoint:  endpoint,
+		QueryHash: queryHash,
+		Retain:    retain,
+		WalkDone:  true,
+	})
+}
+
+// resumeRetained is the pass-1 input a continuation arrived with, or nil when
+// this is the request that mints the answer.
+func resumeRetained(r *resumeState) *retainedWalk {
+	if r == nil {
+		return nil
+	}
+	return r.Retain
 }
 
 // beginImpactQuery applies the per-request deadline and the process-scoped

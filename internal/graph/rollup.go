@@ -76,57 +76,72 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		defer resume.Release()
 		b = resume.Budget
 	}
+	// The pass-1 INPUT is retained across requests for the reason walkretain.go
+	// states: this answer is globally ranked, and a walk the deadline splits
+	// over several requests can only be ranked as one walk if every leg's
+	// records survive the request that produced them.
+	retain := resumeRetained(resume)
+	if retain == nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir()); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
+	}
+	// Discarded AFTER the continuation below has taken it.
+	defer retain.discard()
+
 	// The accumulator enforces the per-page work budgets and records the keyset
 	// position a deadline continuation resumes from. It emits no impact record:
 	// this endpoint ranks pairs, not entities.
-	acc := newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil)
-	var state walkState
-	run, rollupErr := e.rollupRanked(ctx, &meta, func(sink edgeSink) error {
-		var walkErr error
-		state, walkErr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
-			Direction:     req.Direction,
-			Kinds:         kinds,
-			MaxDepth:      maxDepth,
-			Budget:        b,
-			BatchSize:     adjacencyBatch,
-			FrontierBytes: e.limits.FrontierBytes,
-			Resume:        resume,
-		}, func(fs frontierState, rel model.Relation) error {
-			// The accumulator FIRST: it is what refuses an edge the work
-			// budgets have no room for, and an edge it refused was never
-			// admitted, so the rollup must not count it.
-			if err := acc.Visit(fs, rel); err != nil {
-				return err
-			}
-			return sink.Visit(fs, rel)
-		})
-		return walkErr
-	}, nil)
-	if state.ReleaseCarried != nil {
-		// After the continuation below has been spilled: the spill is what
-		// reads the carried stream.
-		defer state.ReleaseCarried()
-	}
-	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
-		return model.Page[model.PackageEdge]{}, err
-	}
-	if run != nil {
-		defer run.Close()
+	var (
+		acc   *impactAccumulator
+		state walkState
+	)
+	if resume == nil || !resume.Cursor.WalkDone {
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil)
+		walkErr := e.rollupInto(ctx, &meta, func(sink edgeSink) error {
+			var werr error
+			state, werr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
+				Direction:     req.Direction,
+				Kinds:         kinds,
+				MaxDepth:      maxDepth,
+				Budget:        b,
+				BatchSize:     adjacencyBatch,
+				FrontierBytes: e.limits.FrontierBytes,
+				Resume:        resume,
+			}, func(fs frontierState, rel model.Relation) error {
+				// The accumulator FIRST: it is what refuses an edge the work
+				// budgets have no room for, and an edge it refused was never
+				// admitted, so the rollup must not count it.
+				if err := acc.Visit(fs, rel); err != nil {
+					return err
+				}
+				return sink.Visit(fs, rel)
+			})
+			return werr
+		}, retain.addPair, nil)
+		if state.ReleaseCarried != nil {
+			// After the continuation below has been spilled: the spill is what
+			// reads the carried stream.
+			defer state.ReleaseCarried()
+		}
+		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
 	}
 	if b.deadlineHit && len(state.Frontier) > 0 {
 		// Ruling P3: the deadline ended this PAGE, not the answer. Nothing is
 		// ranked and nothing is served -- ranking a walk that is still running
 		// would publish an order the next page contradicts -- and the walk
-		// continuation carries the frontier forward.
+		// continuation carries the frontier AND this leg's pair records forward.
 		markTruncated(&meta, reasonDeadline)
 		if meta.NextCursor, err = e.continueWalk(ctx, b, packageDepsEndpoint, queryHash,
-			state, acc.lastOwner, acc.lastKey, resume); err != nil {
+			state, acc.lastOwner, acc.lastKey, resume, retain); err != nil {
 			return model.Page[model.PackageEdge]{}, err
 		}
 		return validatedPairPage(meta, nil)
 	}
 	switch {
-	case acc.reason != "":
+	case acc != nil && acc.reason != "":
 		markTruncated(&meta, acc.reason)
 	case b.frontierHit:
 		// The rollup summarises the edges the walk read; a level the frontier
@@ -135,10 +150,24 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	case state.DepthLimited:
 		markTruncated(&meta, reasonDepth)
 	}
+	// The walk is exhausted: the ranking runs over every pair record EVERY leg
+	// appended, so the counts are exact sums over the whole walk and the order
+	// is the single unbounded walk's order.
+	run, rollupErr := e.rankPairs(ctx, retain.eachPair)
+	if run != nil {
+		defer run.Close()
+	}
+	if err := impactPhaseError(ctx, rollupErr, &meta); err != nil {
+		return model.Page[model.PackageEdge]{}, err
+	}
 	if run == nil {
-		// The deadline landed mid-RANK, after the walk had finished; walkImpact
-		// (impact.go) states why that is disclosed rather than paged.
+		// Ruling P7: the deadline landed mid-RANK, after the walk had finished.
+		// walkImpact (impact.go) states why the retained input is named rather
+		// than re-walked.
 		markTruncated(&meta, reasonDeadline)
+		if meta.NextCursor, err = e.continueRank(ctx, b, packageDepsEndpoint, queryHash, retain); err != nil {
+			return model.Page[model.PackageEdge]{}, err
+		}
 		return validatedPairPage(meta, nil)
 	}
 	items := make([]model.PackageEdge, 0, limit)
@@ -370,18 +399,33 @@ func (s *rollupStats) observe(n int) {
 func (e *Engine) rollupRanked(ctx context.Context, meta *model.QueryMeta,
 	feed func(edgeSink) error, stats *rollupStats) (*pagination.SortedRun[pairRecord], error) {
 	return e.rankPairs(ctx, func(add func(pairRecord) error) error {
-		sink := newPairRollup(ctx, e, meta, add)
-		if err := feed(sink); err != nil {
-			return err
-		}
-		if err := sink.flush(); err != nil {
-			return err
-		}
-		if stats != nil {
-			stats.observe(sink.peak)
-		}
-		return nil
+		return e.rollupInto(ctx, meta, feed, add, stats)
 	})
+}
+
+// rollupInto is the streaming half alone: feed's admitted edges are batched,
+// each batch resolves its own containers and evidence, and one pairRecord per
+// surviving edge is appended to add. It is factored out of rollupRanked
+// because the sink's destination is no longer always a sort -- a walk that is
+// split across requests appends its pairs to the RETAINED pass-1 input
+// instead (walkretain.go) and ranks them only once the walk is exhausted -- and
+// the batching, the cut state and the exactness of the counts must be the same
+// either way.
+//
+// stats may be nil.
+func (e *Engine) rollupInto(ctx context.Context, meta *model.QueryMeta,
+	feed func(edgeSink) error, add func(pairRecord) error, stats *rollupStats) error {
+	sink := newPairRollup(ctx, e, meta, add)
+	if err := feed(sink); err != nil {
+		return err
+	}
+	if err := sink.flush(); err != nil {
+		return err
+	}
+	if stats != nil {
+		stats.observe(sink.peak)
+	}
+	return nil
 }
 
 // containmentCut is the containment-read cut state of ONE rollup: the nodes a
