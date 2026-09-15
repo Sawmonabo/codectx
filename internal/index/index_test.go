@@ -555,7 +555,7 @@ func TestIncrementalScenario(t *testing.T) {
 			for _, i := range order {
 				r.addFailure(scip.ID, "references", failures[i].scope, failures[i].code)
 			}
-			states, _ := r.finish(f.c.log)
+			states := r.finish(f.c.log)
 			for _, st := range states {
 				if st.ProviderID == scip.ID {
 					return st
@@ -598,7 +598,7 @@ func TestIncrementalScenario(t *testing.T) {
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 		r.addCarried(scip.ID, "references", provider.ScopeWorkspace, 1, 2)
 		r.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
-		states, _ := r.finish(f.c.log)
+		states := r.finish(f.c.log)
 		var rows []model.CapabilityState
 		for _, s := range states {
 			if s.ProviderID == scip.ID && s.Capability == "references" {
@@ -629,7 +629,7 @@ func TestIncrementalScenario(t *testing.T) {
 				DiagnosticCode: model.CodeProviderOutputInvalid})
 		}
 		big.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
-		bounded, _ := big.finish(f.c.log)
+		bounded := big.finish(f.c.log)
 		seen := map[string]int{}
 		for _, s := range bounded {
 			seen[s.ProviderID+"\x00"+s.Capability+"\x00"+s.Scope]++
@@ -641,6 +641,16 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 		if len(bounded) != 1 || bounded[0].State != model.CapabilityFailed {
 			t.Fatalf("the bounded report is %+v, want one failed row for the capability", bounded)
+		}
+		// The aggregate is lossless: the surviving row stands for every scope
+		// both folds represented. Keeping only the winner's own `scopes`
+		// under-counted the set while the report claimed nothing was omitted
+		// -- an under-count with no flag is exactly what the count prevents.
+		if got, want := bounded[0].Details["scopes"], strconv.Itoa(model.MaxCapabilityStates+45); got != want {
+			t.Fatalf("the surviving row reports scopes=%q, want %q: the fold dropped the less severe row's count", got, want)
+		}
+		if got := bounded[0].Details["units_failed"]; got != "1" {
+			t.Fatalf("the surviving row reports units_failed=%q, want \"1\"", got)
 		}
 	})
 
@@ -856,7 +866,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan: plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}}}
 	g.coverage()
-	published, _ := g.caps.finish(f.c.log)
+	published := g.caps.finish(f.c.log)
 	for _, s := range published {
 		if s.ProviderID != d.ID {
 			continue
@@ -874,7 +884,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 		plan:   plan.Plan{Units: []plan.Unit{{ProviderID: d.ID, ScopeKey: "scope", Deferred: true}}},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
 	g.coverage()
-	published, _ = g.caps.finish(f.c.log)
+	published = g.caps.finish(f.c.log)
 	for _, s := range published {
 		if s.ProviderID == d.ID && s.State != model.CapabilityFresh {
 			t.Fatalf("%s/%s reported %q after its deferred unit sealed into this generation",
