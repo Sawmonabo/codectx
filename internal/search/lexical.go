@@ -229,9 +229,9 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 		// One read per rowid page, carrying everything both consumers need:
 		// TokenCount for the score here, path/kind/name/identity for the ranker
 		// downstream. SearchDocuments answers in the requested order and omits
-		// rowids the generation no longer makes visible, so walking docs is the
-		// rowid walk minus exactly the rows that had no document length to score
-		// against -- which is what the dropped lengths lookup used to skip.
+		// rowids the generation does not make visible, so walking docs is the
+		// rowid walk minus exactly the rows that have no document length to score
+		// against.
 		docs, err := src.SearchDocuments(ctx, rowids)
 		if err != nil {
 			return out, err

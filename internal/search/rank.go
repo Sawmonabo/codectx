@@ -311,7 +311,7 @@ func foldScored(a, b scored) (scored, error) { return fold(a, b), nil }
 // deduped ends the deduplication pass and answers the distinct candidate set
 // as a re-iterable sorted run on disk, in DEDUPLICATION-KEY order.
 //
-// It no longer ranks. ADR-0007 Decision 3 moves the rank order off the first
+// It does not rank. ADR-0007 Decision 3 keeps the rank order off the first
 // page's critical path: the caller streams this run once, selects the page
 // through a bounded heap under cmpScored and lays the same records into the
 // raw continuation spool, and the external sort by rank runs at most once,
@@ -509,7 +509,7 @@ func (h *hydrator) hydrate(ctx context.Context, file model.FileID, span model.By
 	// positionAt with an offset the window loop can never advance to -- the
 	// window clamps at rec.Size while w.At() stays below Start, so the loop
 	// computes an empty window, passes the length check and spins forever.
-	// A typed refusal is what this used to return and what it owes.
+	// A typed refusal is what it owes.
 	if span.End > uint64(rec.Size) || span.Start > span.End {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "search: a search document spans bytes " + strconv.FormatUint(span.Start, 10) +
@@ -537,12 +537,11 @@ func (h *hydrator) hydrate(ctx context.Context, file model.FileID, span model.By
 // positionAt converts one byte offset to a line and byte column, holding one
 // window of the file at a time however far the nearest line checkpoint is.
 //
-// Resolving the offset in ONE read used to be a typed CTX_RESOURCE_LIMIT
-// whenever the span exceeded the CAS read ceiling, which failed the WHOLE
-// answer -- observed on real repositories as `search` refusing every hit
-// because one file (a minified bundle, a generated data file, anything that is
-// one line of megabytes) put 4.2 M bytes between the nearest checkpoint and a
-// hit. Checkpoints are placed at line starts, so a file with no line boundary
+// Resolving the offset in ONE read would be a typed CTX_RESOURCE_LIMIT
+// whenever the span exceeded the CAS read ceiling, and it would fail the WHOLE
+// answer: on real repositories one file (a minified bundle, a generated data
+// file, anything that is one line of megabytes) puts 4.2 M bytes between the
+// nearest checkpoint and a hit. Checkpoints are placed at line starts, so a file with no line boundary
 // for megabytes genuinely has no nearer anchor, and no indexing setting can
 // create one. The span is therefore STREAMED: source.Walker keeps only the
 // current line and where it started while each window is read, counted and
