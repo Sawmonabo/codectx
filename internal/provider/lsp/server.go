@@ -267,11 +267,12 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	}
 	s.enc = enc
 	// A server that declines to name itself is still identified by the payload
-	// the lock pinned: pyright and typescript-language-server both answer
-	// initialize with no serverInfo at all (measured), and an empty
-	// ProviderVersion fails OverlayBinding.Validate, which made the overlay
-	// permanently unavailable for python, typescript, tsx and javascript with
-	// an error in the argument class. The *reported* string keeps feeding
+	// the lock pinned: typescript-language-server answers initialize with no
+	// serverInfo at all (measured), and since the python server became a native
+	// binary that reports one (ADR-0006) it is the only pinned server that
+	// does. An empty ProviderVersion fails OverlayBinding.Validate, which made
+	// the overlay permanently unavailable for typescript, tsx and javascript
+	// with an error in the argument class. The *reported* string keeps feeding
 	// inputDigest unchanged, so a payload that starts reporting a version later
 	// is still a different question.
 	version := ""

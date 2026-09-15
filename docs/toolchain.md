@@ -62,7 +62,7 @@ where none does.
 | Hosted on `tools-v1` (no upstream binary exists) | Pinned at the upstream URL |
 |---|---|
 | `gopls` — upstream ships no binaries; cross-built for all six | `node`, `jdk`, `joern`, `jdtls`, `clangd`, `scip-java`, `scip-clang`, `rust-analyzer` |
-| `scip-typescript`, `scip-python`, `typescript-language-server`, `pyright` — npm packages, prebuilt so the user never runs npm | |
+| `scip-typescript`, `scip-python`, `typescript-language-server` — npm packages, prebuilt so the user never runs npm | `ty` — a static binary per platform, with a per-asset `.sha256` sidecar |
 | `scip-go` — darwin amd64 and both Windows targets only; cross-built | `scip-go` — linux amd64/arm64 and darwin arm64 |
 
 The hosted payloads are normalized deterministically: entries sorted by
@@ -105,11 +105,11 @@ and a path, which the lock's own validation enforces. The hosts in use are
 | `scip-typescript` | 0.4.0 | indexer | node | typescript, tsx, javascript | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-python` | 0.6.6 | indexer | node | python | all six | hosted; `npm ci --omit=dev` at release time |
 | `scip-java` | 0.13.1 | indexer | jdk | java | all six | upstream launcher jar, sidecar `.sha256` |
-| `rust-analyzer` | 2026-08-17.4 | indexer (also the Rust server) | — | rust | all six | upstream; upstream publishes no digest |
+| `rust-analyzer` | 2026-09-14 | indexer (also the Rust server) | — | rust | all six | upstream; upstream publishes no digest |
 | `scip-clang` | 0.4.0 | indexer | — | c, cpp | linux amd64, darwin arm64 | upstream; upstream publishes no digest |
 | `gopls` | 0.23.0 | server | — | go | all six | hosted; cross-built, upstream ships no binaries |
 | `typescript-language-server` | 6.0.0 | server | node | typescript, tsx, javascript | all six | hosted; with TypeScript 5.9.3 |
-| `pyright` | 1.1.414 | server | node | python | all six | hosted; `npm ci --omit=dev` at release time |
+| `ty` | 0.0.81 | server | — | python | all six | upstream; per-asset `.sha256` sidecar |
 | `clangd` | 22.1.6 | server | — | c, cpp | linux amd64, darwin amd64, windows amd64 | upstream; upstream publishes no digest |
 | `jdtls` | 1.61.0 | server | jdk | java | all six | upstream Eclipse tarball, sidecar `.sha256` |
 | `joern` | 4.0.627 | cpg | jdk | all nine | all six | upstream `joern-cli` archives, sidecar `.sha512` |
@@ -143,6 +143,18 @@ the engine is a backend swap rather than a product change.
   The module declares itself as `github.com/scip-code/scip-go` while the release
   assets still live under `github.com/sourcegraph/scip-go`; the project moved
   owner and both spellings name scip-go 0.2.7.
+- **`ty` is the Python server, and it runs as itself.** The Python row was
+  moved from a Node-hosted npm package to this native checker by
+  [ADR-0006](adr/ADR-0006-language-servers.md): on a cold session — the only
+  kind the overlay has — it answers whole-workspace `references` where the
+  previous server answered only the opened file's import closure, at less
+  memory and with no settle window. Upstream ships one static binary per
+  target, each with a `.sha256` sidecar, so all six platform keys are pinned
+  upstream with a publisher-declared `upstream_digest` and none needs hosting.
+  It is pre-1.0 and warns that any two releases may differ incompatibly, so
+  this is the one entry whose pin is re-cut on a faster cadence than the rest
+  of the lock; the pin is exact, so the product never sees an unreviewed
+  change. `node` stays pinned for the three payloads that still need it.
 - **`rust-analyzer`, `clangd`, `scip-clang`: no upstream digest.** These
   projects publish release assets with no checksum sidecar. The lock pins the
   SHA-256 observed at generation time, which from that point forward is what

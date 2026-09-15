@@ -70,7 +70,8 @@ const (
 	nodeVersion   = "22.23.2"
 	jdkVersion    = "21.0.12.1+1"
 	jdkTag        = "jdk-21.0.12.1%2B1"
-	raVersion     = "2026-08-17.4"
+	raVersion     = "2026-09-14"
+	tyVersion     = "0.0.81"
 	clangdVersion = "22.1.6"
 	jdtlsVersion  = "1.61.0"
 	jdtlsStamp    = "202609031315"
@@ -106,11 +107,6 @@ var npmBuilds = map[string]npmBuild{
 			"node_modules/typescript-language-server/lib/cli.mjs",
 			"node_modules/typescript/lib/tsserver.js",
 		},
-	},
-	"pyright": {
-		ID:      "pyright",
-		Deps:    map[string]string{"pyright": "1.1.414"},
-		Entries: []string{"node_modules/pyright/langserver.index.js"},
 	},
 }
 
@@ -327,11 +323,18 @@ func catalog() []toolSpec {
 			Platforms: npmAll("typescript-language-server", "node_modules/typescript-language-server/lib/cli.mjs"),
 		},
 		{
-			Name: "pyright", Version: "1.1.414", Kind: "server",
-			License: "MIT", Upstream: "https://www.npmjs.com/package/pyright",
-			Runtime: "node", Entry: "node_modules/pyright/langserver.index.js",
-			Languages: []string{"python"},
-			Platforms: npmAll("pyright", "node_modules/pyright/langserver.index.js"),
+			Name: "ty", Version: tyVersion, Kind: "server",
+			License: "MIT", Upstream: "https://github.com/astral-sh/ty",
+			Entry: "ty-x86_64-unknown-linux-gnu/ty", Languages: []string{"python"},
+			Notes: "Native Python checker and language server (ADR-0006); a single static binary per platform, so no managed runtime hosts it. Upstream publishes a per-asset .sha256 sidecar, recorded as upstream_digest.",
+			Platforms: map[string]platformPayload{
+				"linux_amd64":   {Entry: "ty-x86_64-unknown-linux-gnu/ty", Src: ty("ty-x86_64-unknown-linux-gnu.tar.gz", archiveTarGz)},
+				"linux_arm64":   {Entry: "ty-aarch64-unknown-linux-gnu/ty", Src: ty("ty-aarch64-unknown-linux-gnu.tar.gz", archiveTarGz)},
+				"darwin_amd64":  {Entry: "ty-x86_64-apple-darwin/ty", Src: ty("ty-x86_64-apple-darwin.tar.gz", archiveTarGz)},
+				"darwin_arm64":  {Entry: "ty-aarch64-apple-darwin/ty", Src: ty("ty-aarch64-apple-darwin.tar.gz", archiveTarGz)},
+				"windows_amd64": {Entry: "ty.exe", Src: ty("ty-x86_64-pc-windows-msvc.zip", archiveZip)},
+				"windows_arm64": {Entry: "ty.exe", Src: ty("ty-aarch64-pc-windows-msvc.zip", archiveZip)},
+			},
 		},
 		{
 			Name: "clangd", Version: clangdVersion, Kind: "server",
@@ -372,5 +375,19 @@ func catalog() []toolSpec {
 				"windows_arm64": {Entry: "*/joern-parse.bat", Src: joern("joern-cli-windows-arm64.zip")},
 			},
 		},
+	}
+}
+
+// ty pins one upstream asset of the native Python server. Unlike every other
+// upstream-pinned tool in this catalog, each asset carries its own `.sha256`
+// sidecar, so the generator verifies the bytes it downloads against a digest
+// the publisher declared and records it as upstream_digest.
+func ty(file string, kind archiveKind) *source {
+	url := "https://github.com/astral-sh/ty/releases/download/" + tyVersion + "/" + file
+	return &source{
+		URL:    url,
+		Kind:   kind,
+		Strip:  0,
+		Digest: digestSpec{Algo: "sha256", URL: url + ".sha256"},
 	}
 }
