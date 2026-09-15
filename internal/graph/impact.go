@@ -100,12 +100,11 @@ type impactAnswer struct {
 //
 // What that buys, and what the page-bounded predecessor could not give: the
 // union of the pages is exactly the single-shot answer, in exactly the
-// single-shot ORDER, with every node reported once. A node reached again from
-// a later frontier used to be listed a second time with that page's reasons,
-// because the accumulator was page-scoped; it is now one record that pass 1
-// folds.
+// single-shot ORDER, with every node reported once: a node reached again from
+// a later frontier is one record that pass 1 folds, not a second listing
+// carrying that page's reasons.
 //
-// Peak heap is unchanged in KIND and bounded by the same things it always was:
+// Peak heap is bounded by three things and none of them is the answer:
 // one internal page's frontier (Limits.FrontierBytes), the sort's run buffer
 // (a quarter of the query memory admission) plus its merge fan-in, and one
 // served page. None of the three is a function of the reachable set.
@@ -876,10 +875,10 @@ type impactAccumulator struct {
 	seeds  []model.NodeID
 	isSeed map[model.NodeID]bool
 	// emit streams one record per ADMITTED EDGE straight into the ranking
-	// sort. There is no byNode map and no order slice any more: ruling P2 runs
-	// the walk to completion, so both would have been sized by the reachable
-	// set rather than by the page, and the per-node merge they used to do is
-	// foldImpact's job inside pass 1 of the sort.
+	// sort. There is no byNode map and no order slice: ruling P2 runs the walk
+	// to completion, so either would be sized by the reachable set rather than
+	// by the page, and merging a node's records is foldImpact's job inside
+	// pass 1 of the sort.
 	emit       func(impactRecord) error
 	budget     *budget
 	maxVisited config.Limit
@@ -1059,10 +1058,10 @@ func (e *Engine) hydrateImpactEntries(ctx context.Context, entries []model.Impac
 	}
 	// The page arrives ALREADY ordered, by ruling P1's (ScoreMicros desc,
 	// Depth asc, NodeID asc), which the ranking pass applied over the whole
-	// answer. The Name tie-break that used to be re-applied here is gone with
-	// that ruling: Name is known only after hydration, so re-sorting a page by
-	// it would reorder one page of a globally ordered answer and no two pages
-	// would agree on where a record belongs.
+	// answer. No tie-break is re-applied here: Name is known only after
+	// hydration, so re-sorting a page by it would reorder one page of a
+	// globally ordered answer and no two pages would agree on where a record
+	// belongs.
 	return out, dropped, nil
 }
 

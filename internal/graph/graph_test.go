@@ -1338,11 +1338,10 @@ func TestGraphScenarios(t *testing.T) {
 		},
 		{
 			// Protects the HANG failure mode that the unlimited depth default
-			// creates. containerAncestry used to be made finite by the depth
-			// ceiling alone -- its own comment said so -- so once
-			// context.max_graph_depth defaults to unlimited, a containment
-			// cycle climbs for ever and the repository map never returns. The
-			// per-chain ancestor set is what ends it now, and a cyclic
+			// creates. A containerAncestry made finite by the depth ceiling
+			// alone climbs a containment cycle for ever once
+			// context.max_graph_depth defaults to unlimited, and the repository
+			// map never returns. The per-chain ancestor set ends it, and a cyclic
 			// container is dropped from the map exactly as an over-deep one is,
 			// while the rest of the map is still answered.
 			name: "overview/a containment cycle ends under an unlimited depth instead of hanging",

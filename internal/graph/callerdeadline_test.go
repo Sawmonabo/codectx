@@ -14,11 +14,11 @@ import (
 // TestTheCallersDeadlineIsTheRequestsDeadline protects the rule that
 // resources.query_timeout is a DEFAULT and never a ceiling.
 //
-// Every graph entry point used to compute its own deadline as
-// now+query_timeout and never look at the context it was handed, so a
-// `--timeout 120s` the operator typed was silently clamped to the configured
-// 10s: the answer came back out of time at a twelfth of the time asked for,
-// and no bound the operator could set would widen it.
+// The failure mode: an entry point that computes its own deadline as
+// now+query_timeout and never looks at the context it was handed silently
+// clamps a `--timeout 120s` the operator typed to the configured 10s -- the
+// answer comes back out of time at a twelfth of the time asked for, and no
+// bound the operator could set would widen it.
 //
 // The fixture makes that observable without any wall-clock waiting: the engine
 // clock is FROZEN AN HOUR IN THE PAST, so a deadline derived from

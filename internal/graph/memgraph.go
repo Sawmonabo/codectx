@@ -253,9 +253,6 @@ func (g *MemoryGraph) Binding() model.Binding { return g.binding }
 
 func (g *MemoryGraph) MaxNode() NodeRef { return NodeRef(len(g.nodes)) }
 
-// MaxRelation is the largest relation surrogate this fixture generation holds.
-func (g *MemoryGraph) MaxRelation() RelRef { return RelRef(len(g.relIDs)) }
-
 func (g *MemoryGraph) Kinds() KindTable { return g.kinds }
 
 func (g *MemoryGraph) Resolve(ctx context.Context, ids []model.NodeID) ([]NodeRef, error) {
