@@ -703,7 +703,7 @@ func (c Capsule) Validate() error {
 	// Section 17.3 requires every capsule list to be a bounded record set: the
 	// capsule is a durable artifact that a later session replays, so an
 	// unbounded list here becomes an unbounded read forever after.
-	if err := boundCount("capsule.scope", len(c.Scope), MaxRecordsPerResult); err != nil {
+	if err := boundPage("capsule.scope", len(c.Scope)); err != nil {
 		return err
 	}
 	for i, id := range c.Scope {
@@ -718,7 +718,7 @@ func (c Capsule) Validate() error {
 		{"capsule.accepted_facts", c.AcceptedFacts},
 		{"capsule.rejected_facts", c.RejectedFacts},
 	} {
-		if err := boundCount(group.field, len(group.refs), MaxRecordsPerResult); err != nil {
+		if err := boundPage(group.field, len(group.refs)); err != nil {
 			return err
 		}
 		for _, f := range group.refs {
@@ -734,7 +734,7 @@ func (c Capsule) Validate() error {
 		{"capsule.contradictions", c.Contradictions},
 		{"capsule.unresolved", c.Unresolved},
 	} {
-		if err := boundCount(group.field, len(group.refs), MaxRecordsPerResult); err != nil {
+		if err := boundPage(group.field, len(group.refs)); err != nil {
 			return err
 		}
 		for _, o := range group.refs {
@@ -743,7 +743,7 @@ func (c Capsule) Validate() error {
 			}
 		}
 	}
-	if err := boundCount("capsule.scope_review_ids", len(c.ScopeReviewIDs), MaxRecordsPerResult); err != nil {
+	if err := boundPage("capsule.scope_review_ids", len(c.ScopeReviewIDs)); err != nil {
 		return err
 	}
 	for i, id := range c.ScopeReviewIDs {
@@ -759,7 +759,7 @@ func (c Capsule) Validate() error {
 			return err
 		}
 	}
-	if err := boundCount("capsule.waivers", len(c.Waivers), MaxRecordsPerResult); err != nil {
+	if err := boundPage("capsule.waivers", len(c.Waivers)); err != nil {
 		return err
 	}
 	for _, w := range c.Waivers {

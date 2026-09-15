@@ -1,16 +1,23 @@
 package model
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 )
 
-// Structural bounds enforced by this package. They are absolute contract
-// ceilings, not the tunable resource policy of Section 20.1: configuration may
-// lower an effective limit but never raise one past the value a stored column
-// or a bounded response can hold. Sizes are byte counts, not rune counts.
+// Structural bounds enforced by this package, not the tunable resource policy
+// of Section 20.1: configuration may lower an effective limit but never raise
+// one past the value a stored column or a bounded response can hold. Sizes are
+// byte counts, not rune counts.
+//
+// They are not all enforced the same way. A ceiling on a value that is matched,
+// joined or addressed by its exact bytes is a REJECTION; a ceiling on a
+// descriptive or explanatory field is a storage width its producer shortens and
+// flags, and this package admits an over-wide value rather than failing the unit
+// or the answer that carries it. truncatingField is that classification.
 const (
 	MaxIdentifierBytes    = 256   // provider/capability/actor/policy identifiers
 	MaxLanguageBytes      = 64    // language tag
@@ -53,9 +60,15 @@ const (
 	// is the configured max_capsule_bytes byte budget, which the workflow layer
 	// enforces; this constant exists so the list is finite, not to size it.
 	MaxCoverageFilesPerCapsule = 250000
-	// MaxRecordsPerResult bounds any list a single result carries that is not
-	// itself a Page: Section 6 requires an explicit finite bound on every
+	// MaxRecordsPerResult bounds ONE PAGE of any list a result carries that is
+	// not itself a Page: Section 6 requires an explicit finite bound on every
 	// response, and Section 17.3 requires the capsule's lists to be bounded.
+	//
+	// It is a page width, never a ceiling on the ANSWER. A repository whose
+	// impact set is 1284 packages has an impact answer of 1284 packages; the
+	// producer owes the caller two pages and a cursor, and boundPage says so
+	// when it does not. Refusing the answer for its size is the failure the
+	// bound exists to prevent, not the bound.
 	MaxRecordsPerResult = 1000
 	MaxEvidencePerFact  = 64 // Section 11.1: a fact carries bounded evidence
 )
@@ -187,16 +200,35 @@ var truncatedFields = map[string]bool{
 	"reasons": true, "warnings": true, "notices": true, "truncation_reason": true,
 }
 
+// fieldVerdictOverrides settles the three fields whose last name segment gives
+// the wrong verdict, so the segment rule stays simple and the exceptions are
+// visible rather than implied.
+var fieldVerdictOverrides = map[string]bool{
+	// A doctor check is addressed by its name -- an operator and a script both
+	// match on it -- so it is an identifier that happens to be spelled "name".
+	"doctor_check.name": false,
+	// Both of these are answer-carried explanation, not the actor request text
+	// the other `reason`-shaped fields are: nobody can resubmit the compiled
+	// context an entry was excluded from, or the session status that names
+	// which guarantee limited it.
+	"session_status.guarantee_limit": true,
+	"excluded_context_entry.reason":  true,
+}
+
 // truncatingField reports whether a value over its ceiling is shortened and
 // flagged by its producer rather than rejected here. field is a dotted path
 // such as "node.qualified_name" or "search_hit.reasons[2]"; the verdict is
-// carried by its last segment, so a new record type inherits it.
+// carried by its last segment unless fieldVerdictOverrides settles the whole
+// path, so a new record type inherits the verdict its fields already carry.
 func truncatingField(field string) bool {
-	if i := strings.LastIndexByte(field, '.'); i >= 0 {
-		field = field[i+1:]
-	}
 	if i := strings.IndexByte(field, '['); i >= 0 {
 		field = field[:i]
+	}
+	if verdict, ok := fieldVerdictOverrides[field]; ok {
+		return verdict
+	}
+	if i := strings.LastIndexByte(field, '.'); i >= 0 {
+		field = field[i+1:]
 	}
 	return truncatedFields[field]
 }
@@ -236,6 +268,25 @@ func boundCount(field string, n, max int) *Error {
 		return invalid("%s has %d entries, limit %d", field, n, max)
 	}
 	return nil
+}
+
+// boundPage bounds ONE PAGE of a result list at MaxRecordsPerResult.
+//
+// Over-length here is a PRODUCER defect, not a client error and never a verdict
+// on the size of the repository: the caller asked a question whose honest
+// answer has more rows than one page holds, and the producer owed it a page
+// plus a cursor. So this reports CodeInternal and names the obligation, rather
+// than handing the caller a CTX_ARGUMENT_INVALID they can do nothing about --
+// which is what refused a whole 1284-package impact answer on a 4019-file
+// repository.
+func boundPage(field string, n int) *Error {
+	if n <= MaxRecordsPerResult {
+		return nil
+	}
+	return &Error{Code: CodeInternal, Message: fmt.Sprintf(
+		"%s carries %d records in one page, over the %d-record page width; "+
+			"the producer must return one page and a cursor for the rest",
+		field, n, MaxRecordsPerResult)}
 }
 
 // boundSigned64 enforces the Section 9.3 rule that an unsigned byte quantity
