@@ -365,7 +365,18 @@ func (e *Engine) rankPairs(ctx context.Context,
 	}
 	byKey = byKey.WithFold(foldPair)
 	defer byKey.Close()
-	if err := emit(byKey.Add); err != nil {
+	added := 0
+	if err := emit(func(r pairRecord) error {
+		// The same deadline report the impact ranking makes, for the same
+		// reason: this pass folds the whole retained pair input, so a request
+		// that ran out of time must stop here rather than pay for it, and
+		// `pairs == nil` is ruling P7's branch that mints the continuation.
+		if err := e.rankInterrupted(ctx, added, e.pairStopAfter); err != nil {
+			return err
+		}
+		added++
+		return byKey.Add(r)
+	}); err != nil {
 		return nil, err
 	}
 	folded, err := byKey.Sorted()

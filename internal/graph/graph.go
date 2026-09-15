@@ -160,6 +160,12 @@ type Engine struct {
 	// a fixture's ranking is far too fast to be caught by a clock that advances
 	// on adjacency round trips.
 	rankStopAfter int
+	// pairStopAfter is the same TEST-only hook for the package-pair ranking,
+	// which is the phase that runs AFTER the impact ranking has produced its
+	// answer. It is separate from rankStopAfter so a fixture can cut one phase
+	// without cutting the other, which is what reaches the one window in which
+	// a request completes the impact rank and still mints a rank continuation.
+	pairStopAfter int
 }
 
 // New builds an Engine. Adjacency is required; Promoter, Signer, Spools, Leases

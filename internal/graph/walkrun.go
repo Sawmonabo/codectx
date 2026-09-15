@@ -276,6 +276,19 @@ func (e *Engine) rankImpactPass(ctx context.Context, retain *retainedWalk,
 	if err != nil {
 		return nil, err
 	}
+	// Sorted CONSUMED the adopted runs, exactly as it does in pass 1, so the
+	// manifest must stop naming them here too. This request can still mint a
+	// rank continuation over this retained directory after the ranking is
+	// done -- the package-pair ranking that runs next reports the deadline as
+	// `pairs == nil`, which is P7's "nothing extra is persisted" branch -- and
+	// a manifest left naming a removed run resumed into
+	// `external sort adopted run: ... run-000000: no such file or directory`
+	// instead of re-sorting the retained pass-2 input, which is cheap and
+	// yields the identical order.
+	if err := retain.setRankProgress(rankProgress{Pass: 2}); err != nil {
+		_ = run.Close()
+		return nil, err
+	}
 	stats.observe(pass2.PeakLiveRecords())
 	return run, nil
 }
@@ -325,7 +338,7 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 			}
 			return nil
 		}
-		if err := e.rankInterrupted(ctx, addedHere); err != nil {
+		if err := e.rankInterrupted(ctx, addedHere, e.rankStopAfter); err != nil {
 			seen--
 			return err
 		}
@@ -339,11 +352,14 @@ func feedRankPass(ctx context.Context, e *Engine, sorter *pagination.ExternalSor
 // how many records THIS request has put into the current pass, which is what
 // the test hook counts: a hook that counted the whole pass would stop a resumed
 // request at the same record it stopped the first one at and never finish.
-func (e *Engine) rankInterrupted(ctx context.Context, added int) error {
+// stopAfter is the phase's own hook -- rankStopAfter for the two impact passes,
+// pairStopAfter for the package-pair fold -- so a fixture can cut one phase
+// without cutting the other.
+func (e *Engine) rankInterrupted(ctx context.Context, added, stopAfter int) error {
 	if err := ctx.Err(); err != nil {
 		return typedContextError(ctx, err)
 	}
-	if e.rankStopAfter > 0 && added >= e.rankStopAfter {
+	if stopAfter > 0 && added >= stopAfter {
 		return &model.Error{Code: model.CodeQueryDeadline,
 			Message: "graph: the query deadline reached the ranking pass"}
 	}
