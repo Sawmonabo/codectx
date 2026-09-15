@@ -91,7 +91,10 @@ jobs:
           # an escape, Go accepts a forward-slash absolute path on Windows, and
           # bash cannot mkdir a path spelled with backslashes at all -- which is
           # why the configuration directory is normalized the same way.
-          slash() { echo "$1" | sed 's|\\|/|g'; }
+          # Parameter expansion rather than sed: the job's default shell is
+          # bash on all three runners, so no subprocess is needed to swap the
+          # separators.
+          slash() { echo "${1//\\//}"; }
           store="$(slash "$GITHUB_WORKSPACE/.tools")"
           # os.UserConfigDir -- which config.UserConfigPath is built on -- reads
           # %AppData% on Windows. %LocalAppData% is os.UserCacheDir's variable,

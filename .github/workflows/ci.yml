@@ -190,6 +190,10 @@ jobs:
           repo="$2"
           out="$3"
           "$bin" index --repo "$repo" --json > /dev/null
+          # Section 21's own reporter: doctor --offline runs the offline-policy
+          # checks and says what they found. It runs inside the namespace, so
+          # its own checks are audited by the same strace as every other step.
+          "$bin" doctor "$repo" --offline --json > /dev/null
           "$bin" search greet --repo "$repo" --json > /dev/null
           "$bin" context plan --repo "$repo" --actor offline-gate \
             --task "offline runtime check" --phase sweep --seed greet --json > /dev/null
