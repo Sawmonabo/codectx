@@ -33,13 +33,23 @@ import (
 // Ordering. Levels test and set in ascending surrogate order, so a level walks
 // the cache forward and touches each page once instead of thrashing it.
 const (
-	// bitsetFile is the sparse bit file. Bit i of byte j is surrogate j*8+i,
-	// least significant bit first.
-	bitsetFile = "visited.bits"
-	// bitsetManifestFile carries the population count. It is maintained rather
-	// than recomputed because the count is the answer's disclosed visited_count
-	// and scanning the file for it would make an O(1) report cost O(nodes).
-	bitsetManifestFile = "visited.bits.json"
+	// bitsetNodeFile is the sparse NODE bit file. Bit i of byte j is surrogate
+	// j*8+i, least significant bit first. Its manifest count is the answer's
+	// disclosed visited_count.
+	bitsetNodeFile = "visited.bits"
+	// bitsetRelFile is the same structure over RELATION surrogates: the set of
+	// relations the walk has already emitted, which keeps a cycle, an
+	// overlapping level or a DirectionBoth edge whose two endpoints sit on
+	// different levels from being counted and emitted twice.
+	//
+	// It is on disk for the reason the node set is: an in-heap set of admitted
+	// relations is sized by the walk's EDGE count, which on a large repository
+	// is the largest structure a traversal holds.
+	bitsetRelFile = "emitted.bits"
+	// bitsetManifestSuffix names a bit file's manifest. The count is maintained
+	// rather than recomputed because scanning the file for it would make an
+	// O(1) report cost O(nodes).
+	bitsetManifestSuffix = ".json"
 )
 
 const (
@@ -80,12 +90,19 @@ type bitsetPage struct {
 
 // pagedBitset is one request's handle on the set.
 type pagedBitset struct {
+	name string
 	path string
 	f    *os.File
 	// limit is the largest surrogate the pinned generation carries. A ref above
 	// it is a surrogate from another generation and is refused rather than
 	// silently extending the file: the cursor fence exists to make that
 	// impossible, and a bitset that quietly accepted one would hide the breach.
+	//
+	// ZERO means the set has no declared upper bound. Only the RELATION set is
+	// opened that way, because the frozen GraphReader port publishes MaxNode
+	// and no relation counterpart; the generation fence on the cursor is then
+	// the only thing standing between the file and a foreign surrogate, which
+	// is why this is called out here rather than left implicit.
 	limit NodeRef
 
 	pages map[int64]*list.Element // page index -> element holding *bitsetPage
@@ -105,22 +122,23 @@ type pagedBitset struct {
 // adopting the count an earlier page left when it is. maxNode sizes the address
 // space; nothing is allocated for it, because the file is extended lazily by
 // the first write into a region.
-func openBitset(dir string, maxNode NodeRef, probe *heapProbe) (*pagedBitset, error) {
-	path := filepath.Join(dir, bitsetFile)
+func openBitset(dir, name string, maxRef NodeRef, probe *heapProbe) (*pagedBitset, error) {
+	path := filepath.Join(dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, bitsetErr(err)
 	}
 	b := &pagedBitset{
+		name:  name,
 		path:  path,
 		f:     f,
-		limit: maxNode,
+		limit: maxRef,
 		pages: make(map[int64]*list.Element, bitsetCachePages),
 		lru:   list.New(),
 		dir:   dir,
 		probe: probe,
 	}
-	m, err := readBitsetManifest(dir)
+	m, err := readBitsetManifest(dir, name)
 	if err != nil {
 		_ = f.Close()
 		return nil, err
@@ -131,8 +149,8 @@ func openBitset(dir string, maxNode NodeRef, probe *heapProbe) (*pagedBitset, er
 
 // readBitsetManifest reads the count a previous page left. A missing manifest
 // is the zero value, which is the state a set that has admitted nothing is in.
-func readBitsetManifest(dir string) (bitsetManifest, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, bitsetManifestFile))
+func readBitsetManifest(dir, name string) (bitsetManifest, error) {
+	raw, err := os.ReadFile(filepath.Join(dir, name+bitsetManifestSuffix))
 	if os.IsNotExist(err) {
 		return bitsetManifest{Version: bitsetVersion}, nil
 	}
@@ -158,7 +176,7 @@ func (b *pagedBitset) count() uint64 { return b.admitted }
 // lookup: the page holding the bit is read on a miss, so the error is returned
 // rather than folded into a false, which would re-admit a node the walk has
 // already served and put the same entity on two pages.
-func (b *pagedBitset) test(ref NodeRef) (bool, error) {
+func (b *pagedBitset) test(ref uint64) (bool, error) {
 	if ref == 0 {
 		// Zero is never a node (ADR-0002). It has no bit, and answering "not
 		// admitted" would let a caller that lost a surrogate admit a phantom.
@@ -188,12 +206,13 @@ func (b *pagedBitset) test(ref NodeRef) (bool, error) {
 // requires it: the cache is walked forward, so a level in order touches each
 // page once. It is CHECKED rather than assumed, because an unsorted level would
 // merely be slow and nothing downstream would report it.
-func (b *pagedBitset) set(refs []NodeRef) (int64, error) {
+func bitsetSet[T ~uint64](b *pagedBitset, refs []T) (int64, error) {
 	if err := ascendingRefs(refs); err != nil {
 		return 0, err
 	}
 	before := b.grown
-	for _, ref := range refs {
+	for _, r := range refs {
+		ref := uint64(r)
 		if ref == 0 {
 			continue
 		}
@@ -235,15 +254,15 @@ func (b *pagedBitset) sync() error {
 }
 
 // inRange refuses a surrogate the pinned generation does not carry.
-func (b *pagedBitset) inRange(ref NodeRef) error {
-	if ref <= b.limit {
+func (b *pagedBitset) inRange(ref uint64) error {
+	if b.limit == 0 || ref <= uint64(b.limit) {
 		return nil
 	}
 	return internalErr("graph: the visited bitset was handed a node surrogate outside the pinned generation")
 }
 
 // locate maps a surrogate to its page, the byte inside that page and its bit.
-func (b *pagedBitset) locate(ref NodeRef) (page int64, off int, mask byte) {
+func (b *pagedBitset) locate(ref uint64) (page int64, off int, mask byte) {
 	byteAt := int64(ref / 8)
 	return byteAt / bitsetPageBytes, int(byteAt % bitsetPageBytes), byte(1) << (ref % 8)
 }
@@ -299,11 +318,11 @@ func (b *pagedBitset) writeManifest() error {
 	if err != nil {
 		return internalErr("graph: encoding the retained visited bitset manifest: " + err.Error())
 	}
-	tmp := filepath.Join(b.dir, bitsetManifestFile+".tmp")
+	tmp := filepath.Join(b.dir, b.name+bitsetManifestSuffix+".tmp")
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return bitsetErr(err)
 	}
-	if err := os.Rename(tmp, filepath.Join(b.dir, bitsetManifestFile)); err != nil {
+	if err := os.Rename(tmp, filepath.Join(b.dir, b.name+bitsetManifestSuffix)); err != nil {
 		_ = os.Remove(tmp)
 		return bitsetErr(err)
 	}
