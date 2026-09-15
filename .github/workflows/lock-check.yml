@@ -1,0 +1,71 @@
+# The lock-versus-upstream guard. `toollock -check` re-downloads every payload
+# the tool lock names, re-hashes it, and refuses when the bytes being served no
+# longer match the digest the lock pins; it then installs every entry for this
+# platform through the product's own fetcher and extractor.
+#
+# It exists because a published tag is not immutable. An upstream project
+# re-uploaded the assets of an already-published release three hours after the
+# lock recorded their digests, and nothing noticed until a user's first index
+# refused to fetch the analyzer mid-run. The lock was honest when it was
+# written; the only way to learn that it stopped being honest is to look again,
+# on a clock rather than on a push.
+#
+# It is a workflow of its own rather than a job in CI: GitHub's `on:` is
+# workflow-level, so a daily schedule added to the Go gates would run the whole
+# of CI daily, and `-check` downloads gigabytes -- far too much for every push.
+# It is also not a job in the tools matrix, whose weekly three-operating-system
+# run costs about 2.6 GB per leg and must not be retriggered daily.
+name: Lock check
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, 04:00 UTC -- before the weekly tools matrix at 05:00 Monday, so a
+    # re-uploaded asset is reported by the cheap guard first.
+    - cron: "0 4 * * *"
+  push:
+    paths:
+      - "internal/toolchain/tools.lock.json"
+  pull_request:
+    paths:
+      - "internal/toolchain/tools.lock.json"
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: go1.27.1
+
+jobs:
+  lock:
+    name: lock digests still describe what is published
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          check-latest: false
+
+      # -check aborts on the first payload whose served bytes disagree, naming
+      # the entry and platform it was reading ("<tool>/<platform>: ..."), so the
+      # failing step's log names what differs. The scratch directory is the
+      # runner's workspace, which it reclaims with the job; a zip payload spools
+      # past a file there and is deleted as soon as it has been hashed.
+      - name: Re-download every pinned payload and confirm the lock
+        run: go run ./internal/tools/toollock -check -work "$RUNNER_TEMP/toollock"
+
+      # The guard is only worth having if a failure is read. A scheduled run has
+      # no pull request to annotate, so the summary carries the verdict.
+      - name: Record the verdict
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "The tool lock still matches every published payload." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**The tool lock no longer matches what upstream publishes.**" >> "$GITHUB_STEP_SUMMARY"
+            echo "The failing step names the entry and platform that differs." >> "$GITHUB_STEP_SUMMARY"
+            echo "Re-pin it with \`go run ./internal/tools/toollock -tools <name>\`." >> "$GITHUB_STEP_SUMMARY"
+          fi

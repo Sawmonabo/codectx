@@ -29,6 +29,12 @@ type toolEntry struct {
 	State     string   `json:"state"`
 	Languages []string `json:"languages"`
 	Detail    string   `json:"detail,omitempty"`
+	// EntrySHA256 is what the lock pins for this platform's entry executable;
+	// InstalledSHA256 is what the store's bytes hash to, and only `verify`
+	// reads it, because only `verify` rehashes. An operator comparing the two
+	// sees locally what a release gate sees against the publisher.
+	EntrySHA256     string `json:"entry_sha256,omitempty"`
+	InstalledSHA256 string `json:"installed_sha256,omitempty"`
 }
 
 // toolReport is the data payload of `tools status`, `tools prefetch` and
@@ -90,7 +96,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			}
 			// Status is the cheap report: presence and publication, no rehashing,
 			// so it stays usable for every lock entry including the 1.8 GB engine.
-			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), nil), nil)
+			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), nil), false, nil)
 		},
 	}
 
@@ -117,7 +123,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			failure := firstToolFailure(res.Prefetch(cmd.Context(), names))
 			// The rows are the post-condition of the install, so they are read
 			// back from the store rather than assumed from a nil error.
-			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), names), failure)
+			return emitToolReport(cmd, build, args, report(store, res.Status(cmd.Context()), names), false, failure)
 		},
 	}
 	prefetch.Flags().Bool(toolsAllFlag, false, "install every entry the lock carries for this platform")
@@ -144,7 +150,7 @@ func newToolsCommand(build model.BuildInfo) *cobra.Command {
 			if err == nil {
 				err = corruptFailure(data.Tools)
 			}
-			return emitToolReport(cmd, build, args, data, err)
+			return emitToolReport(cmd, build, args, data, true, err)
 		},
 	}
 
@@ -289,6 +295,7 @@ func report(store string, rows []toolchain.Status, only []string) toolReport {
 		out.Tools = append(out.Tools, toolEntry{
 			Name: r.Name, Version: r.Version, State: string(r.State),
 			Languages: languages, Detail: r.Detail,
+			EntrySHA256: r.EntrySHA256, InstalledSHA256: r.InstalledSHA256,
 		})
 	}
 	return out
@@ -361,14 +368,14 @@ func flattenJoined(err error) []error {
 // stdout is exactly what that rule forbids; human output still prints the rows,
 // since they are what the operator asked for and Execute writes the failure to
 // stderr.
-func emitToolReport(cmd *cobra.Command, build model.BuildInfo, args []string, data toolReport, failure error) error {
+func emitToolReport(cmd *cobra.Command, build model.BuildInfo, args []string, data toolReport, digests bool, failure error) error {
 	if jsonRequested(cmd, args) {
 		if failure != nil {
 			return failure
 		}
 		return writeEnvelope(cmd.OutOrStdout(), successEnvelope(build.SchemaVersion, commandName(cmd), data))
 	}
-	if err := writeToolTable(cmd.OutOrStdout(), data); err != nil {
+	if err := writeToolTable(cmd.OutOrStdout(), data, digests); err != nil {
 		return err
 	}
 	return failure
@@ -378,14 +385,23 @@ func emitToolReport(cmd *cobra.Command, build model.BuildInfo, args []string, da
 // toolchain produced -- a name, a version, a state and a language list -- so
 // nothing here needs display sanitization beyond the store path, which is the
 // operator's own.
-func writeToolTable(w io.Writer, data toolReport) error {
+func writeToolTable(w io.Writer, data toolReport, digests bool) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "platform  %s\nstore     %s\n\n", data.Platform, data.Store)
 	tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tVERSION\tSTATE\tLANGUAGES\tDETAIL")
+	header := "NAME\tVERSION\tSTATE\tLANGUAGES\tDETAIL"
+	if digests {
+		header = "NAME\tVERSION\tSTATE\tDIGEST\tLANGUAGES\tDETAIL"
+	}
+	fmt.Fprintln(tw, header)
 	counts := map[string]int{}
 	for _, t := range data.Tools {
 		counts[t.State]++
+		if digests {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", t.Name, t.Version, t.State,
+				digestPhrase(t), strings.Join(t.Languages, ", "), t.Detail)
+			continue
+		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", t.Name, t.Version, t.State,
 			strings.Join(t.Languages, ", "), t.Detail)
 	}
@@ -400,6 +416,28 @@ func writeToolTable(w io.Writer, data toolReport) error {
 	fmt.Fprintf(&b, "\n%d %s: %s\n", len(data.Tools), plural(len(data.Tools), "entry", "entries"),
 		strings.Join(states, ", "))
 	return writeText(w, "%s", b.String())
+}
+
+// digestPhrase renders one entry's two digests for `tools verify`. Both are
+// shown, short, and labelled by where they came from: `lock` is what this
+// binary pins and `disk` what the installed bytes hash to. A dash for `disk`
+// is the drift an operator is looking for -- the store holds nothing this
+// command could hash, so the row beside it says why.
+//
+// Twelve hex characters is a comparison a human makes at a glance; the full
+// digests are in the --json envelope for a machine.
+func digestPhrase(t toolEntry) string {
+	return "lock:" + shortDigest(t.EntrySHA256) + " disk:" + shortDigest(t.InstalledSHA256)
+}
+
+func shortDigest(hex string) string {
+	if hex == "" {
+		return "-"
+	}
+	if len(hex) > 12 {
+		return hex[:12]
+	}
+	return hex
 }
 
 // writeText emits human output, failing the command when stdout cannot take it
