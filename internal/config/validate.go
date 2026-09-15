@@ -49,7 +49,6 @@ func (c Config) validate() error {
 		{"storage.read_connections", int64(c.Storage.ReadConnections)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
-		{"storage.wal_high_water_bytes", c.Storage.WALHighWaterBytes},
 		{"providers.lsp.max_servers", int64(c.Providers.LSP.MaxServers)},
 		{"providers.lsp.max_outstanding_requests", int64(c.Providers.LSP.MaxOutstandingRequests)},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},

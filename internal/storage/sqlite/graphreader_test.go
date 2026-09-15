@@ -295,6 +295,7 @@ func TestPackedGraphReaderStitchesSplitParts(t *testing.T) {
 	restore := store.SetEdgePartBytes(3)
 	defer restore()
 	s, repo, dbPath := graphFixtureStore(t)
+	flushed(t, s)
 	parts := countGraphParts(t, openRawDB(t, dbPath), "out.edges")
 	if parts < 3 {
 		t.Fatalf("out.edges has %d parts; the fixture must span several for this to prove stitching", parts)
@@ -335,6 +336,7 @@ func TestGraphBuildScansUseNoTempBTree(t *testing.T) {
 		t.Fatalf("ActiveGeneration: %v", err)
 	}
 	publishEmptyGeneration(t, s, repo, snap, ff, gen, "b")
+	flushed(t, s)
 	db := openRawDB(t, dbPath)
 	var stats int
 	if err := db.QueryRow(`SELECT count(*) FROM sqlite_stat1`).Scan(&stats); err != nil {
@@ -396,6 +398,7 @@ func explain(t *testing.T, db *sql.DB, query string) string {
 func TestDeleteGenerationCascadesPackedGraph(t *testing.T) {
 	s, repo, dbPath, snap, ff := graphFixtureStoreFull(t)
 	ctx := context.Background()
+	flushed(t, s)
 	db := openRawDB(t, dbPath)
 	before := graphRowCounts(t, db)
 	if before.header != 1 || before.parts == 0 {

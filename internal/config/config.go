@@ -238,7 +238,6 @@ type Storage struct {
 	ReadConnections        int      `toml:"read_connections"`
 	WriterCacheKiB         int      `toml:"writer_cache_kib"`
 	ReaderCacheKiB         int      `toml:"reader_cache_kib"`
-	WALHighWaterBytes      int64    `toml:"wal_high_water_bytes"`
 	ClosedSessionRetention Duration `toml:"closed_session_retention"`
 	QueryCursorTTL         Duration `toml:"query_cursor_ttl"`
 	// Synchronous is the SQLite synchronous mode of the single writer
@@ -662,7 +661,6 @@ func Defaults() Config {
 			ReadConnections:        2,
 			WriterCacheKiB:         8192,
 			ReaderCacheKiB:         4096,
-			WALHighWaterBytes:      67108864,
 			ClosedSessionRetention: Duration(7 * 24 * time.Hour),
 			QueryCursorTTL:         Duration(15 * time.Minute),
 			Synchronous:            SynchronousNormal,

@@ -400,17 +400,22 @@ func (s *Service) checkAccounting(ctx context.Context, deep bool, stats StoreSta
 		strconv.FormatInt(stats.Leases, 10) + " live leases, " +
 		strconv.FormatInt(stats.Sessions, 10) + " read sessions; database " +
 		bytesPhrase(stats.DatabaseBytes) + ", write-ahead log " + bytesPhrase(stats.WALBytes)
-	if high := s.opts.Config.Storage.WALHighWaterBytes; high > 0 && stats.WALBytes > high {
+	if sizer, ok := s.opts.Store.(StoreSizer); ok && stats.WALBytes > sizer.WALBoundBytes() {
 		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckWarn,
 			Detail:      detail,
 			Code:        model.CodeResourceLimit,
-			Remediation: "the write-ahead log is past its high-water mark; run an index or refresh to checkpoint it"}
+			Remediation: walRemediation}
 	}
 	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckPass, Detail: detail}
 }
 
+// walRemediation is what a write-ahead log larger than the store's ingestion
+// group bound means: no run is open, so nothing has folded the log since the
+// last one, and the next index or refresh will.
+const walRemediation = "the write-ahead log is larger than the store's ingestion group bound and has not been checkpointed; run an index or refresh to fold it"
+
 // checkAccountingShallow reports what accounting costs nothing: the two file
-// sizes, and the write-ahead-log high-water warning that is the one actionable
+// sizes, and the write-ahead-log bound warning that is the one actionable
 // fact in this check. The row counts are O(rows) and are reported unverified.
 //
 // The WAL warning is deliberately NOT suppressed by shallow mode. A WAL that
@@ -429,11 +434,11 @@ func (s *Service) checkAccountingShallow(ctx context.Context) model.DoctorCheck 
 	}
 	detail := "database " + bytesPhrase(dbBytes) + ", write-ahead log " + bytesPhrase(walBytes) +
 		"; the generation, unit, blob, lease and session counts are " + shallowUnverified
-	if high := s.opts.Config.Storage.WALHighWaterBytes; high > 0 && walBytes > high {
+	if walBytes > sizer.WALBoundBytes() {
 		return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckWarn,
 			Detail:      detail,
 			Code:        model.CodeResourceLimit,
-			Remediation: "the write-ahead log is past its high-water mark; run an index or refresh to checkpoint it"}
+			Remediation: walRemediation}
 	}
 	return model.DoctorCheck{Name: checkStorageAccount, State: model.CheckUnverified,
 		Detail: detail, Remediation: shallowRemediation}

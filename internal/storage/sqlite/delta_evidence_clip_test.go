@@ -58,6 +58,7 @@ func TestSealClipsEvidenceToTheConfiguredClip(t *testing.T) {
 		t.Fatalf("SealUnit: %v", err)
 	}
 
+	flushed(t, s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

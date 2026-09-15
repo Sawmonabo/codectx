@@ -47,6 +47,7 @@ func TestSealedUnitRoundTripsCanonicalIdsThroughSurrogates(t *testing.T) {
 		t.Fatalf("SealUnit: %v", err)
 	}
 
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

@@ -290,27 +290,6 @@ func fileSize(path string, absentIsZero bool) (int64, error) {
 
 func (s *Store) walBytes() (int64, error) { return fileSize(s.path+"-wal", true) }
 
-// MaintainWAL is the writer-owned passive checkpoint of Section 12.1. It
-// reports the WAL size and whether it still exceeds the configured high-water
-// mark after a passive checkpoint, in which case the caller applies indexing
-// backpressure. It runs between batches, never inside a query.
-func (s *Store) MaintainWAL(ctx context.Context) (walBytes int64, backpressure bool, err error) {
-	if walBytes, err = s.walBytes(); err != nil {
-		return 0, false, err
-	}
-	if walBytes < s.opts.WALHighWaterBytes {
-		return walBytes, false, nil
-	}
-	var busy, logFrames, checkpointed int64
-	if err := s.writer.QueryRowContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
-		return 0, false, wrap("wal_checkpoint", err)
-	}
-	if walBytes, err = s.walBytes(); err != nil {
-		return 0, false, err
-	}
-	return walBytes, walBytes >= s.opts.WALHighWaterBytes || busy != 0, nil
-}
-
 // isNoRows reports a missing row without leaking database/sql to callers.
 func isNoRows(err error) bool { return errors.Is(err, sql.ErrNoRows) }
 

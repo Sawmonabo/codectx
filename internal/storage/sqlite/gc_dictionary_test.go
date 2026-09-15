@@ -23,6 +23,7 @@ func TestNativeKeySweepClearsTheWholeBacklog(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codectx.db")
 	f := newFixture(t, dbPath)
 
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

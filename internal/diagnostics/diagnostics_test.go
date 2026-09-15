@@ -528,6 +528,9 @@ type fakeStore struct {
 	active model.GenerationID
 	blob   model.BlobRecord
 	err    error
+	// walBound is what WALBoundBytes reports; zero means the store's log is
+	// always past it, so a test that wants no warning sets it.
+	walBound int64
 	// deepChecks and checks record what a doctor call actually asked the
 	// store for, which is how a row proves an ordinary call runs no scan.
 	checks     int
@@ -633,6 +636,10 @@ func (f *fakeStore) Stats(context.Context) (StoreStats, error) {
 func (f *fakeStore) StoreSizes(context.Context) (int64, int64, error) {
 	return f.stats.DatabaseBytes, f.stats.WALBytes, f.err
 }
+
+// WALBoundBytes is the fake's ingestion group bound, the size past which a
+// write-ahead log is one nothing has folded.
+func (f *fakeStore) WALBoundBytes() int64 { return f.walBound }
 
 func (f *fakeStore) ActiveGeneration(context.Context, model.RepositoryID) (model.GenerationID, error) {
 	return f.active, f.err

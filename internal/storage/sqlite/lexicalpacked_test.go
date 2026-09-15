@@ -48,6 +48,7 @@ func packedLexicalFixture(t *testing.T) (*fixture, *store.PinnedReader, model.Ge
 
 func TestPackedLexicalMatchesTheLivePath(t *testing.T) {
 	f, r, gen, dbPath := packedLexicalFixture(t)
+	flushed(t, f.s)
 	db := openRawDB(t, dbPath)
 	genID := int64(gen)
 
@@ -161,7 +162,8 @@ func vocabularyTerms(t *testing.T, db *sql.DB) []string {
 // posting instance of the repository, and a sorter over that set is unbounded
 // memory at activation -- the defect ADR-0007 Decision 1 exists to avoid.
 func TestLexicalBuildScanUsesNoTempBTree(t *testing.T) {
-	_, _, _, dbPath := packedLexicalFixture(t)
+	f, _, _, dbPath := packedLexicalFixture(t)
+	flushed(t, f.s)
 	plan := explain(t, openRawDB(t, dbPath), store.LexicalInstanceQuery())
 	t.Logf("instance scan plan:\n%s", plan)
 	if strings.Contains(strings.ToUpper(plan), "TEMP B-TREE") {

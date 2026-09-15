@@ -241,8 +241,18 @@ func (f *fixture) activate(gen, expected model.GenerationID) model.Binding {
 	return b
 }
 
+// flushed commits the store's open ingestion group, so a connection of the
+// test's own, or a reader-pool count, sees what the store has written so far.
+func flushed(t *testing.T, s *store.Store) {
+	t.Helper()
+	if err := s.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+}
+
 func (f *fixture) stats() store.Stats {
 	f.t.Helper()
+	flushed(f.t, f.s)
 	st, err := f.s.Stats(f.ctx)
 	if err != nil {
 		f.t.Fatalf("Stats: %v", err)
@@ -1531,6 +1541,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1587,6 +1598,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1657,6 +1669,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit: %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1717,6 +1730,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 			t.Fatalf("SealUnit(delta): %v", err)
 		}
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -1772,6 +1786,7 @@ func TestDeltaImportInvariants(t *testing.T) {
 		}
 		f.activate(gen1, 0)
 
+		flushed(t, f.s)
 		raw, err := sql.Open("sqlite", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -2052,6 +2067,7 @@ func TestBlobGraceProtocol(t *testing.T) {
 	// directly because the store's own paths refuse it by design: PutSnapshot
 	// only accepts a blob that is already 'ready', which is exactly why the
 	// recheck below is the last line of defence rather than the first.
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)

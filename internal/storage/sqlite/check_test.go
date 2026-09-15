@@ -29,6 +29,7 @@ func TestCheckShallowSkipsTheWholeDatabaseWalk(t *testing.T) {
 	// opens enforces foreign keys, so the row is written on a connection of
 	// this test's own with enforcement off -- which is precisely the on-disk
 	// state a crash or a corrupted page can leave and the check exists to find.
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatalf("open raw connection: %v", err)
@@ -64,6 +65,7 @@ func TestCheckShallowStillFailsAForeignSchema(t *testing.T) {
 	if err := f.s.Check(ctx, false); err != nil {
 		t.Fatalf("shallow Check on a sound store: %v", err)
 	}
+	flushed(t, f.s)
 	raw, err := sql.Open("sqlite", "file:"+path)
 	if err != nil {
 		t.Fatalf("open raw connection: %v", err)
