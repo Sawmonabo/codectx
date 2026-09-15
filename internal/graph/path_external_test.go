@@ -714,3 +714,72 @@ func TestRetryableFailureLeavesAPathContinuationAdoptable(t *testing.T) {
 	}
 	t.Fatal("the retried continuation never completed the search")
 }
+
+// TestPathResumesInsideOneNodeEdgeList is the invariant the packed adjacency
+// introduced: a page whose EDGE budget runs out stops in the middle of one
+// settled node's list, and the position it saves is an entry inside that list,
+// not the node. Before the packed reader the position was a relation id and
+// every batch re-ran its own keyset; now it is an (owner, list index) pair, and
+// the index is the half that can be lost silently -- a resumed page that keeps
+// only the owner re-reads and RE-CHARGES the entries the page before it already
+// spent, which is how a search with a finite edge budget stops converging.
+//
+// The answer, the route list and the cumulative edge count are all compared
+// against the same search run in a single page, so neither a lost entry nor a
+// doubly charged one passes.
+//
+// Mutation (`w.expandAfter = pos` -> `w.expandAfter = EdgePos{Node: pos.Node}`
+// in expandBatch, which keeps the owner and drops the list index): every
+// resumed page re-reads its owner's list from the beginning, the edge budget
+// is spent on the same entries forever, and the search never converges.
+func TestPathResumesInsideOneNodeEdgeList(t *testing.T) {
+	g := pathProofGraph(64)
+	from, to := g.node("s"), g.node("t")
+	kinds := []model.RelationKind{model.RelCalls, model.RelImports}
+
+	whole := pathPagingEngine(t, g, g.reader(), t.TempDir(), newFixtureLeases(), 0)
+	want, err := whole.ShortestPath(context.Background(), model.PathRequest{GenerationID: 1,
+		From: from, To: to, Relations: kinds})
+	if err != nil {
+		t.Fatalf("single-page search: %v", err)
+	}
+
+	e := pathPagingEngine(t, g, g.reader(), t.TempDir(), newFixtureLeases(), 0)
+	// `s` alone owns more than seven entries in this fixture, so every early
+	// page ends INSIDE one node's list rather than between two nodes.
+	e.limits.MaxEdges = 7
+	var got model.PathResult
+	cursor := ""
+	pages := 0
+	for {
+		pages++
+		if pages > 120 {
+			t.Fatalf("the search did not converge in %d pages: the resumed scan is re-reading entries", pages)
+		}
+		req := model.PathRequest{From: from, To: to, Relations: kinds}
+		if cursor == "" {
+			req.GenerationID = 1
+		} else {
+			req.Page = model.PageRequest{Cursor: cursor}
+		}
+		got, err = e.ShortestPath(context.Background(), req)
+		if err != nil {
+			t.Fatalf("page %d: %v", pages, err)
+		}
+		if got.Meta.NextCursor == "" {
+			break
+		}
+		cursor = got.Meta.NextCursor
+	}
+	if pages < 3 {
+		t.Fatalf("the edge budget must force at least 3 pages; it took %d", pages)
+	}
+	if gotSeq, wantSeq := routeSequences(got), routeSequences(want); !reflect.DeepEqual(gotSeq, wantSeq) {
+		t.Fatalf("the edge-budgeted search answered %v over %d pages;\nthe single-page search says %v",
+			gotSeq, pages, wantSeq)
+	}
+	// Convergence is the double-charge detector, and it is asserted by the
+	// page ceiling above rather than by a counter: the answer carries the
+	// visited count but not the edge one, and a resumed scan that re-charges
+	// the entries before its stop never gets past the first list at all.
+}
