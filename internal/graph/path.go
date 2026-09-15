@@ -170,11 +170,14 @@ func (e *Engine) ShortestPath(ctx context.Context, req model.PathRequest) (res m
 		sc.close()
 	}()
 
+	codes, absent := kindCodesFor(e.reader, kinds)
 	w := &pathWalk{
-		adjacency: e.adjacency,
-		kinds:     kinds,
-		direction: direction,
-		maxDepth:  maxDepth,
+		reader:      e.reader,
+		kinds:       kinds,
+		kindCodes:   codes,
+		kindsAbsent: absent,
+		direction:   direction,
+		maxDepth:    maxDepth,
 		// Both work budgets are PER-PAGE, the traversal precedent: a page that
 		// spends one ends there and returns a continuation, and the next page
 		// carries on with a refilled allowance. The cumulative spend is carried
@@ -361,8 +364,20 @@ type pathParent struct {
 // a memory ceiling to protect: exceeding frontierBytes costs another chunk,
 // never a shortened answer.
 type pathWalk struct {
-	adjacency Adjacency
-	kinds     []model.RelationKind
+	// reader is the packed per-generation adjacency (ADR-0005 Decision 1): the
+	// ONE read path for this search's structure. The external Dijkstra scratch
+	// below is unchanged -- Decision 2 moves the path endpoint's adjacency
+	// reads and nothing else.
+	reader GraphReader
+	kinds  []model.RelationKind
+	// kindCodes is walk.kinds in the pinned generation's dictionary. A kind the
+	// generation never sealed has no code and is simply absent, so an empty
+	// kindCodes against a non-empty kinds means "this generation holds no edge
+	// of any requested kind" -- NOT "every kind", which is what a nil slice
+	// means to the port. kindsAbsent is that distinction, made explicit rather
+	// than inferred, because inferring it wrong widens the search silently.
+	kindCodes   []KindCode
+	kindsAbsent bool
 	// direction is the orientation the search relaxes edges in, already
 	// normalized by ShortestPath, so it is never the empty value here. It is
 	// part of the continuation's query hash: a cursor presented to a search
@@ -406,10 +421,13 @@ type pathWalk struct {
 	// reached are still there to settle.
 	bucketCost  int64
 	lastSettled model.NodeID
-	// expandAfter is the keyset position inside the batch of pending nodes
-	// whose edges are being read, mirrored into the scratch so a resumed page
-	// does not re-read -- and re-charge -- edges an earlier page already spent.
-	expandAfter model.RelationID
+	// expandAfter is the scan position inside the batch of pending nodes whose
+	// edges are being read -- the (owner, list index) of the next entry the
+	// packed adjacency must deliver -- mirrored into the scratch so a resumed
+	// page does not re-read, and re-charge, edges an earlier page already
+	// spent. It is a position in the CURRENT batch's scan and is cleared when
+	// that batch is fully expanded.
+	expandAfter EdgePos
 	// peakChunkBytes is the high-water mark of one chunk, the structural
 	// memory assertion a test reads: it must stay inside the frontier budget
 	// (plus the one group that budget is allowed to overshoot for) however
@@ -531,7 +549,11 @@ func (w *pathWalk) loadProgress() error {
 		nil, &after, &pruned); err != nil {
 		return err
 	}
-	w.expandAfter = model.RelationID(after)
+	pos, err := decodeEdgePos(after)
+	if err != nil {
+		return err
+	}
+	w.expandAfter = pos
 	w.depthPruned = pruned != 0
 	return nil
 }
@@ -544,7 +566,7 @@ func (w *pathWalk) saveProgress() error {
 		pruned = 1
 	}
 	return w.sc.exec(w.scCtx, `UPDATE progress SET expand_after = ?, depth_pruned = ? WHERE k = 0`,
-		string(w.expandAfter), pruned)
+		encodeEdgePos(w.expandAfter), pruned)
 }
 
 // markPending records the nodes settled here as owing an expansion.
@@ -708,14 +730,15 @@ func (w *pathWalk) settle(ctx context.Context, cost int64, to model.NodeID, chun
 }
 
 // drain expands every node that has been settled but not yet expanded, in
-// keyset-paged round trips, writing each relaxation into its cost bucket.
-// Nothing is kept in heap between batches: the pending table is the work queue
-// and the bucket table is the priority queue.
+// batched scans of the packed adjacency, writing each relaxation into its cost
+// bucket. Nothing is kept in heap between batches: the pending table is the
+// work queue and the bucket table is the priority queue, and the only heap the
+// scan itself holds is one relaxation batch of at most adjacencyBatch entries.
 //
-// A node leaves `pending` only once its whole edge walk is done, and the walk's
-// own keyset position is saved after every page, so a page that stops here
-// resumes at the edge after the last one it charged -- it neither loses edges
-// nor pays for them twice.
+// A node leaves `pending` only once its whole edge scan is done, and the scan's
+// own position is saved after every batch, so a page that stops here resumes at
+// the edge after the last one it charged -- it neither loses edges nor pays for
+// them twice.
 func (w *pathWalk) drain(ctx context.Context) error {
 	for {
 		if stop, err := w.checkDeadline(ctx); stop || err != nil {
@@ -728,80 +751,212 @@ func (w *pathWalk) drain(ctx context.Context) error {
 		if len(batch) == 0 {
 			return nil
 		}
-		for {
-			rels, err := w.adjacency.Edges(ctx, batch, w.direction, w.kinds, w.expandAfter, adjacencyBatch)
-			if err != nil {
-				return err
-			}
-			// Only an empty page ends the keyset walk: the reader clamps the
-			// requested limit down to model.MaxPageItems, so a short page is
-			// the normal case rather than the end of the edges.
-			if len(rels) == 0 {
-				break
-			}
-			for _, r := range rels {
-				// The bound is checked BEFORE the edge is consumed, so the
-				// saved keyset position still names the last edge this page
-				// actually charged and relaxed.
-				if w.maxEdges.Exceeded(w.pageEdges + 1) {
-					w.edgesHit = true
-					return w.saveProgress()
-				}
-				w.expandAfter = r.ID
-				w.spent++
-				w.pageEdges++
-				// Which endpoint the search CAME FROM depends on the
-				// direction: outgoing relaxes from the edge's from-node to its
-				// to-node, incoming the other way, and DirectionBoth takes
-				// whichever endpoint this batch settled. An edge whose settled
-				// endpoint is ambiguous -- a self-loop, or both endpoints
-				// settled in this batch -- relaxes from the from-node, which is
-				// the orientation the edge itself states.
-				from, to := r.From, r.To
-				if w.direction == model.DirectionIncoming ||
-					(w.direction == model.DirectionBoth && !settledHere(dists, r.From)) {
-					from, to = r.To, r.From
-				}
-				if _, ok := dists[from]; !ok {
-					// Neither endpoint is in this batch: the reader returned an
-					// edge that touches none of the nodes being expanded, which
-					// is nothing this search can relax.
-					continue
-				}
-				if err := w.sc.exec(w.scCtx,
-					`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
-					dists[from]+Cost(r.Kind), string(to), string(r.ID), string(from), string(r.Kind),
-					depths[from]+1); err != nil {
-					return err
-				}
-			}
-			if err := w.saveProgress(); err != nil {
-				return err
-			}
-			if stop, err := w.checkDeadline(ctx); stop || err != nil {
-				return err
-			}
+		stopped, err := w.expandBatch(ctx, batch, dists, depths)
+		if err != nil {
+			return err
+		}
+		if stopped {
+			// A budget or the deadline ended the page mid-batch. The position
+			// saved by expandBatch names the entry that was NOT charged, and
+			// the batch keeps its `pending` rows, so the next page resumes
+			// exactly there.
+			return nil
 		}
 		// The batch is fully expanded: its nodes owe nothing more, and the next
-		// batch starts its own keyset walk from the beginning.
+		// batch starts its own scan from the beginning.
 		for _, n := range batch {
 			if err := w.sc.exec(w.scCtx, `DELETE FROM pending WHERE node = ?`, string(n)); err != nil {
 				return err
 			}
 		}
-		w.expandAfter = ""
+		w.expandAfter = EdgePos{}
 		if err := w.saveProgress(); err != nil {
 			return err
 		}
 	}
 }
 
-// settledHere reports whether this batch settled the node, which is how a
-// DirectionBoth relaxation tells the endpoint the search reached from the one
-// it is reaching.
-func settledHere(dists map[model.NodeID]int64, id model.NodeID) bool {
-	_, ok := dists[id]
-	return ok
+// expandBatch reads the packed lists of one pending batch in ONE resumable
+// scan and relaxes every entry it delivers. It reports whether the page ended
+// before the batch did.
+//
+// The scan is resumable rather than re-startable: the port delivers entries in
+// (owner, list index) order and expandAfter names the next one it owes, so a
+// page that stops on a budget, a deadline or the relaxation of a batch charges
+// each entry exactly once across every page of the search.
+func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
+	dists map[model.NodeID]int64, depths map[model.NodeID]int) (bool, error) {
+	if w.kindsAbsent {
+		// The query names kinds and this generation seals none of them: there
+		// is no edge to read. Reporting it as a finished scan is right -- the
+		// batch owes nothing -- and passing an empty kind list to the port
+		// would instead mean every kind.
+		return false, nil
+	}
+	refs, byRef, err := w.resolveBatch(ctx, batch)
+	if err != nil {
+		return false, err
+	}
+	if len(refs) == 0 {
+		return false, nil
+	}
+	pend := make([]Edge, 0, adjacencyBatch)
+	stopped := false
+	var ferr error
+	flush := func() error {
+		if len(pend) == 0 {
+			return nil
+		}
+		if err := w.relax(ctx, pend, byRef, dists, depths); err != nil {
+			return err
+		}
+		pend = pend[:0]
+		return nil
+	}
+	pos, err := w.reader.Neighbours(ctx, refs, w.direction, w.kindCodes, w.expandAfter,
+		func(e Edge) error {
+			// The bound is checked BEFORE the entry is consumed, so the
+			// position the port reports for a stopped scan still names the
+			// first entry this page did NOT charge.
+			if w.maxEdges.Exceeded(w.pageEdges + 1) {
+				w.edgesHit, stopped = true, true
+				return ErrStopScan
+			}
+			w.spent++
+			w.pageEdges++
+			pend = append(pend, e)
+			if len(pend) < adjacencyBatch {
+				return nil
+			}
+			if ferr = flush(); ferr != nil {
+				return ErrStopScan
+			}
+			// The deadline is checked at a batch boundary, which is the only
+			// place the saved position is consistent with what the buckets
+			// hold. A cancellation is classified by checkDeadline exactly as
+			// it was when each batch was its own round trip.
+			var derr error
+			if stopped, derr = w.checkDeadline(ctx); derr != nil {
+				ferr = derr
+				return ErrStopScan
+			}
+			if stopped {
+				return ErrStopScan
+			}
+			return nil
+		})
+	if err != nil {
+		if ctx.Err() == nil {
+			return false, err
+		}
+		// The port surfaces context errors RAW (graphreader.go); classifying
+		// them is the walk's job, and a deadline that lands inside the scan
+		// ends the page exactly as one that lands between two of them does.
+		// The position the port reports is still the last entry it delivered,
+		// so the tail buffered below is relaxed rather than charged and lost.
+		stop, derr := w.checkDeadline(ctx)
+		if derr != nil {
+			return false, derr
+		}
+		if !stop {
+			return false, err
+		}
+		stopped = true
+	}
+	// The position is adopted before the tail is relaxed and saved after it:
+	// both writes land in the same scratch transaction, so a page never
+	// publishes a position ahead of the relaxations it stands for.
+	w.expandAfter = pos
+	if ferr != nil {
+		return false, ferr
+	}
+	if err := flush(); err != nil {
+		return false, err
+	}
+	return stopped, w.saveProgress()
+}
+
+// resolveBatch maps the batch's canonical node ids onto the surrogates the
+// packed adjacency is keyed by, ASCENDING and duplicate-free as the port
+// requires, and returns the reverse map the relaxation reads owners through.
+//
+// A node the pinned generation does not publish resolves to zero and is
+// dropped: it has no packed list, and the search has nothing to expand for it.
+func (w *pathWalk) resolveBatch(ctx context.Context, batch []model.NodeID) ([]NodeRef,
+	map[NodeRef]model.NodeID, error) {
+	resolved, err := w.reader.Resolve(ctx, batch)
+	if err != nil {
+		return nil, nil, err
+	}
+	byRef := make(map[NodeRef]model.NodeID, len(resolved))
+	refs := make([]NodeRef, 0, len(resolved))
+	for i, ref := range resolved {
+		if ref == 0 {
+			continue
+		}
+		if _, dup := byRef[ref]; dup {
+			continue
+		}
+		byRef[ref] = batch[i]
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i] < refs[j] })
+	return refs, byRef, nil
+}
+
+// relax turns one batch of packed entries into bucket rows. The canonical ids
+// the scratch is keyed by are resolved for the WHOLE batch in two batched
+// primary-key reads before any row is inserted, never one read per entry, and
+// the settle order therefore still ties on the content-derived canonical node
+// id rather than on the rebuild-local surrogate the scan carries.
+//
+// Which endpoint the search came from is the entry's OWNER: the owner is the
+// node this batch settled, whichever direction its list was read in. That is
+// exact where the old edge-shaped read had to guess from the two endpoints,
+// so a self-loop and an edge whose endpoints are both settled in this batch
+// now relax from the node whose expansion actually delivered them.
+func (w *pathWalk) relax(ctx context.Context, pend []Edge, byRef map[NodeRef]model.NodeID,
+	dists map[model.NodeID]int64, depths map[model.NodeID]int) error {
+	rels := make([]RelRef, len(pend))
+	tos := make([]NodeRef, len(pend))
+	for i, e := range pend {
+		rels[i], tos[i] = e.Rel, e.Neighbour
+	}
+	relIDs, err := w.reader.RelationIDs(ctx, rels)
+	if err != nil {
+		return err
+	}
+	toIDs, err := w.reader.NodeIDs(ctx, tos)
+	if err != nil {
+		return err
+	}
+	for i, e := range pend {
+		from, ok := byRef[e.Owner]
+		if !ok {
+			// The port delivered an entry for a node this batch is not
+			// expanding, which is nothing this search can relax.
+			continue
+		}
+		to, rel := toIDs[i], relIDs[i]
+		if to == "" || rel == "" {
+			// An endpoint or a relation the pinned generation does not
+			// publish. It is not an answerable edge, and inserting a bucket
+			// row keyed by an empty id would settle a node that does not
+			// exist.
+			continue
+		}
+		kind, ok := w.reader.Kinds().Kind(e.Kind)
+		if !ok {
+			continue
+		}
+		if err := w.sc.exec(w.scCtx,
+			`INSERT OR IGNORE INTO bucket(cost, node, rel, frm, kind, depth) VALUES(?, ?, ?, ?, ?, ?)`,
+			dists[from]+Cost(kind), string(to), string(rel), string(from), string(kind),
+			depths[from]+1); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // takePending reads the next batch of unexpanded nodes with the settled
