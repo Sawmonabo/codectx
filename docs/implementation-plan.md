@@ -137,6 +137,7 @@
    - [Task 21: Complete End-to-End, Performance, Offline, Documentation, Packaging, and Release Gates](#task-21-complete-end-to-end-performance-offline-documentation-packaging-and-release-gates)
    - [Task 22: Implement the Managed Analyzer Toolchain, Lock, Store, and Full Language Matrix](#task-22-implement-the-managed-analyzer-toolchain-lock-store-and-full-language-matrix)
    - [Task 23: Implement Early Cutoff on Declaration-Only Signature Digests](#task-23-implement-early-cutoff-on-declaration-only-signature-digests)
+   - [Task 24: Scale posture](#task-24-scale-posture)
 - [31. Verification Matrix](#31-verification-matrix)
 - [32. Definition of Done](#32-definition-of-done)
 - [33. Authoritative References](#33-authoritative-references)
@@ -353,7 +354,7 @@ These constraints apply to every task and to all dispatched workers.
 | No paid dependencies | No AI API keys, paid service, cloud database, runtime telemetry endpoint, or outbound core network operation other than lock-pinned tool fetches through the one toolchain owner. Analyzer-internal networking is declared per profile and reported. |
 | Repository safety | No source writes; safe root-relative opens, not string validation alone. Analyzer materializations cannot share writable hard links with source or CAS. |
 | Memory | No whole-repository file list, graph, protobuf index, token corpus, or result set retained in Go heap. Memory admission counts bytes, concurrency, parser processes, SQLite buffers, caches, and output serialization. |
-| Resource limits | Every queue, batch, cache, record, request, traversal, process, temporary tree, and response has an explicit finite bound. Limits never masquerade as complete results. |
+| Resource limits | **Bounded per page, unlimited in total, user-set limits reported.** Every queue, batch, cache, record, request, traversal, process, temporary tree and response is bounded for one page or one batch, so peak memory is a function of page or batch size and never of repository size; no built-in default refuses a repository, skips a file, fails a unit, drops a row or truncates an answer. A count or size bound is a configuration key where `0` (or `"unlimited"`) means no bound and is the default; only a negative value is rejected. Exceeding a user-set limit is always reported — a named file, a reason, a count — never a silent clamp or a silent drop, and a stop that leaves work standing mints a continuation cursor. Limits never masquerade as complete results. |
 | Indexing | One cross-process indexing owner per workspace; completed immutable units may be reused only when their entire input/dependency fingerprint matches. Failed or unsealed units are invisible. |
 | Publication | The active-generation pointer changes atomically only after validation. Optional failure cannot leak partial invalid facts or promote stale evidence as fresh. |
 | Queries | Pin a generation and retention lease at request start; all reads, pages, evidence, and source references use that binding. Public lists are paginated and all graph work is bounded. |
@@ -1513,7 +1514,7 @@ An active generation is coherent with its own snapshot even when the worktree is
 <a id="141-typed-requests-and-bounded-results"></a>
 ### 14.1 Typed Requests and Bounded Results
 
-Every result has a `Binding`, per-capability completeness, `truncated`, a reason when truncated, and a continuation cursor when safe continuation exists. Query deadlines and hard work budgets are distinct from page size. Explicitly resolve ambiguous names; never select the first candidate silently.
+Every result has a `Binding`, per-capability completeness, `truncated`, a reason when truncated, and a continuation cursor when safe continuation exists. Results are **bounded per page, unlimited in total, user-set limits reported**: `MaxVisited` and `MaxEdges` are per-page work budgets rather than ceilings on a walk, so a page that spends one ends with its reason and a continuation cursor and the next page resumes the walk from the persisted frontier, while the reported counts stay cumulative across the pages of that walk. Query deadlines are distinct from both page size and work budgets: a deadline fails the request rather than serving a short page. Explicitly resolve ambiguous names; never select the first candidate silently.
 
 ```go
 type PageRequest struct {
@@ -3188,6 +3189,41 @@ git diff --check
 ```
 
 - [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate.
+
+---
+
+### Task 24: Scale posture
+
+**Deliverable:** No built-in default refuses a repository, skips a file, fails an analysis unit, drops a row or truncates an answer; every count and size bound is a configuration key whose default is unlimited, every legitimate stop is resumable, and peak memory stays a function of page or batch size rather than of repository size.
+
+**Files and ownership:** `internal/config` (`config.Limit` with `0` / `"unlimited"` as one value, `Exceeded`, `ValueOr`, `Min`; the validator loop that now rejects only negative values), `internal/graph` (per-page visited and edge work budgets, the spilling frontier and the server-side spooled resumable continuation), `internal/context` (budget and rank sites reading a bound through `config.Limit` instead of `> 0`), `internal/provider/*` (admission bounds that report a skip instead of failing a unit; progress-based stall detection in place of wall-clock unit timeouts), `internal/process` (the stall watchdog), `internal/search`, `internal/storage/sqlite`, `internal/index`, docs (`docs/configuration.md`, `docs/queries.md`, `docs/context-sessions.md`, `docs/adr/ADR-0001-scale-posture.md`, `docs/research/15-scale-posture.md`).
+
+**Dependencies / consumes:** Task 3 configuration, Task 14 bounded graph traversal and pagination, Task 15 context budgets, Task 11 dependence admission, Task 20 resource accounting.
+
+**Produces / contract:** `config.Limit` as the single owner of the unlimited convention; fifteen configuration keys defaulting to unlimited; per-page `max_visited_nodes` and `max_graph_edges` with a continuation cursor and a page-end reason; `providers.*.stall_timeout` as a progress-based hang detector with failure reason `stalled`; a reported, never silent, breach of any user-set limit.
+
+**Rulings applied:** [ADR-0001 — Scale posture](adr/ADR-0001-scale-posture.md). Bounds were classified before anything changed: lossless cursor pagination, wire and pre-allocation security bounds, and memory admission that defers rather than refuses all stay; scale refusal, work truncation, unit-failing field bounds and row-dropping reports do not. "Unlimited" never means loading a repository into heap.
+
+- [ ] **Step 0: Complete the read, trace, reuse and resource gate.** The full inventory of 69 bounds in the tree, with a class per row, is in `docs/research/15-scale-posture.md`.
+- [ ] **Step 1: Protect the critical behavior with the minimum existing test extension.** The identity of the two unlimited spellings, the strict `Exceeded` comparison and `Min` with unlimited as the top of the lattice; the per-page budget mutation that proves a continuation resumes a walk rather than truncating it; the manifest mutation that proves every budget-excluded file is named with a reason.
+- [ ] **Step 2: Implement the complete production path.** The validator loop inverted, `config.Limit` adopted at every enforcement site, the graph frontier spilled to a continuation spool, the visited and edge budgets made per-page, wall-clock provider timeouts replaced by progress-based stall detection.
+- [ ] **Step 3: Wire consumers, failure handling and documentation.** `docs/configuration.md` lists every key that defaults to unlimited, describes the caller-budget family as the one family of non-zero defaults deliberately kept, documents the stall detectors as hang detectors rather than size limits, and states the one remaining default cap plainly; `docs/queries.md` and `docs/context-sessions.md` carry the same posture.
+- [ ] **Step 4: Run the focused verification below.**
+
+```bash
+go test ./internal/config ./internal/graph ./internal/context -count=1
+go test ./... -count=1
+go vet ./...
+```
+
+- [ ] **Step 5: Review the complete changed files and integration boundary, then commit.** Follow Section 30.1's completion gate.
+
+**What is deferred, and what is still missing.** These are stated as open, not as done:
+
+- **Capsule pagination is deferred to the next wave.** `model.MaxCoverageFilesPerCapsule` (250 000) and the 1 000-record capsule list bound still refuse to seal an over-large capsule. That refusal is explicit (`CTX_RESOURCE_LIMIT`, naming the list and the bound) and never a truncated capsule, but it is **the one known remaining default cap in the tree**. Making the capsule a paginated, resumable surface is a schema append plus changes across the workflow, MCP and CLI layers, and it is scheduled as its own sub-track rather than half-landed here.
+- **The storage-amplification redesign is deferred to the next wave.** It is a separate track with its own verification gate.
+- **Reference-scale miss: indexing memory.** Process-tree peak measured **912.6 MiB** against a **768 MiB** envelope on the 1M-line reference corpus (the cold index itself passed, at 2m56s). Open.
+- **Reference-scale miss: storage amplification.** **16.10×** stored bytes over eligible source bytes against a **3.5×** budget, measured on the corrected ~8 KiB/file reference corpus. Open; bytes-per-indexed-symbol is the primary regression metric the storage track gates on.
 
 ---
 

@@ -207,7 +207,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 			return empty, err
 		}
 		var meta spoolMeta
-		if meta, hits, err = readSpool(ctx, s.spools, cursor, now); err != nil {
+		if meta, hits, restN, err = readSpool(ctx, s.spools, cursor, now, limit); err != nil {
 			return empty, err
 		}
 		// The answer-level truncation the FIRST page computed. A continuation
@@ -215,9 +215,11 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 		// of its own to compute it from and must carry it forward or report a
 		// complete answer for an answer that is not.
 		truncated, reason = meta.Truncated, meta.TruncationReason
-		if len(hits) > limit {
-			rest := hits[limit:]
-			hits, restN, tail = hits[:limit], len(rest), sliceTail(rest)
+		if restN > 0 {
+			// The remainder is streamed from the consumed spool into the next
+			// one rather than carried here: it is the tail of the answer, and
+			// a continuation's heap must be the page, not what follows it.
+			tail = spoolTail(ctx, s.spools, cursor, now, len(hits))
 		}
 	} else {
 		var run *pagination.SortedRun[scored]
@@ -483,19 +485,6 @@ func (s *Service) tailOf(ctx context.Context, reader *sqlite.PinnedReader, run *
 			return err
 		}
 		return flush()
-	}
-}
-
-// sliceTail streams an already-materialised tail, which is what a continuation
-// replayed from a spool still has.
-func sliceTail(hits []model.SearchHit) func(func(model.SearchHit) error) error {
-	return func(yield func(model.SearchHit) error) error {
-		for _, h := range hits {
-			if err := yield(h); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
 }
 
