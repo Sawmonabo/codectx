@@ -151,6 +151,88 @@ records keep the content-derived canonical node id as their total tie-break key 
 B10; the search identity defect of the same day was exactly a root-dependent tie-break), so a fresh
 index and a delta-built index of the same tree serve byte-identical pages.
 
+## Decision 2, amended — a level moves through collect, commit and serve, and the walk holds one page
+
+This amendment replaces the "Atomicity of a page" paragraph above and the per-level structures it
+implied (a spooled frontier level plus a cumulative emitted-relation bitset). Measuring the first
+build of Decision 2 on synthetic wide levels showed heap proportional to the level, not the page:
+the frontier level was held whole while its neighbours were ordered, and an emitted-relation bitset
+grew with the walk. The walk is now a pipeline with exactly two cursor states per level and every
+per-level structure bounded by the page or by `FrontierBytes`.
+
+**Collecting.** The frontier of level *n* is streamed from `admitted.<n-1>` in ascending chunks of
+65 536 surrogates; each chunk is one batched `Neighbours` scan from the reader-reported position of
+the last delivered edge. Each delivered edge passes the direction rule below and is appended in scan
+order to the level's run as a record of (owner state, edge, canonical owner id, canonical neighbour
+id, canonical relation id): the canonical ids are resolved at collect time in one batched read per
+chunk, so no level-sized name table exists. The run is resident up to `FrontierBytes` of encoded
+records and spilled to an append-only file in the retained directory past that. A user deadline
+inside collecting spills the run first and mints a continuation naming the level, the scan
+position and the run length; the next request truncates the run to that length and resumes the
+scan at that position. Nothing is served from a collecting level. Under the unlimited default a
+level that fits leaves no file.
+
+**Commit (the transition, the only point where walk state changes).** The run is sorted by the
+canonical key (neighbour id, owner id, relation id), in memory while resident and by the external
+merge sort otherwise, and written once as the sorted level. A run-length pass over the sorted
+level's neighbour groups admits each unvisited neighbour with its group's cheapest route (the
+content-derived route comparison, ties by relation id) and writes the admitted surrogates
+ascending to `admitted.<n>` first; the visited bits are then set from that file, the frontier bits
+for level *n+1* rebuilt from it, and both synced. A redo reuses `admitted.<n>` if it exists, so a
+crash between the bits and the continuation is idempotent. The transition runs to completion under
+a detached context: a deadline observed inside it would leave a half-committed level, and the
+measured cost of finishing it is bounded by one external sort of one level.
+
+**Serving.** A page is a byte-offset read of the sorted level. The continuation names the level and
+the offset; a resumed leg holds every file its entry cursor names for the leg's duration. Route
+names for a page are resolved at delivery over the page's deduplicated route references through a
+bounded cache. The visited budget, when a caller sets one, is charged per neighbour group as the
+group is served, so a bound of 250 on a 300-wide level returns 250 entries and a cursor, never an
+empty truncated page. A fully served level releases its sorted file, run and admitted file.
+
+**Direction rule.** With V the visited bits (every admitted node, the current frontier included)
+and F the frontier bits, scanning owner X in a walk that follows both directions:
+
+- an outgoing relation X→Y is kept iff Y ∉ V∖F: a neighbour admitted at an earlier level already
+  delivered the relation as its incoming copy while X was unvisited;
+- an incoming relation Y→X is kept iff Y ∉ V: if Y is in the frontier, Y's own outgoing scan
+  delivers the relation this level; if Y was admitted earlier, its scan delivered it at its level.
+
+A single-direction walk sees each relation once by construction and never consults the frontier
+bits. Every relation is therefore listed exactly once per walk from a bitset test alone; the
+per-walk emitted-relation set and the per-level ordering map are deleted, and the served order
+within a level is by canonical neighbour id, then owner id, then relation id, which `docs/queries.md`
+states as the contract.
+
+**Retained directory.** It is created on the first of a bitset page eviction, a run spill or a
+continuation mint, flushing every resident page at that moment; a one-page answer leaves no
+directory. No structure inside it carries a layout version: a directory a build cannot read is
+refused by the continuation token's wire fence, which already names the generation.
+
+**Alternatives considered.**
+
+1. *Keep the whole frontier level in memory and order it there.* Rejected by the measurement above:
+   the level, not the page, set the heap, and a 10⁶-wide level (a hub's second level on a monorepo)
+   is hundreds of megabytes of frontier states.
+2. *Commit the visited bits per page instead of per level.* Rejected: it needs the page cut to be a
+   replayable point in the scan and re-admits nodes across a cut; the idempotent per-level commit
+   costs one file write per level and makes every page cut a pure offset.
+3. *Keep the emitted-relation bitset and test it per edge.* Rejected: it is a second structure that
+   grows with the relation count of the walk, while the direction rule above is a test against bits
+   the walk already maintains.
+4. *Resolve canonical ids at delivery instead of collect time.* Rejected: the sort key must be
+   canonical for pages to be byte-identical across fresh and delta-built indexes of the same tree,
+   so the ids are needed before the sort, and a batched read per chunk costs one primary-key scan.
+
+**Consequences.** Heap above baseline is the sort buffer (≤ `FrontierBytes`), one page, and the
+two bitset page caches, independent of level width and of the reachable set; a guard in the graph
+package walks a 10⁵-wide and a 10⁶-wide level under the default `FrontierBytes` and asserts both
+figures within 2× of each other and the wider one ≤ 4 × `FrontierBytes` plus a stated allowance.
+The continuation payload names {level, state, scan position and run length | offset}; the keyset
+vocabulary of owner and key is deleted from the payload, and the repository map's continuation
+uses the same reader positions. Reader batches are cut at the reader-reported edge position, so a
+page cut is exact and a resumed scan neither repeats nor skips an edge.
+
 ## Decision 3 — ranking stays an external merge sort with a total, content-derived key
 
 The global ranking of impact entries and package pairs keeps the two-pass external merge sort
@@ -169,6 +251,8 @@ Arithmetic: 131 099 edges × ≈7 B decode ≈ 1 MB read and ≈3 ms; membership
 ≈50 ns ≈ 7 ms; frontier spool ≈4 MB; rollup lookups 262 198 array reads; two external sorts over
 ≈130 000 records ≈ 0.4 s; hydration of one page ≈ 20 ms. The walk-only phase is expected above
 10⁵ nodes/s. Activation on the same repository must add ≤ 5 % to the cold index wall.
+The level guard: heap above baseline for a 10⁶-wide level within 2× of a 10⁵-wide one and
+≤ 4 × `FrontierBytes` plus the stated allowance, both walks complete under the test memory cap.
 
 ## Sources
 
