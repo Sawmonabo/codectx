@@ -184,7 +184,9 @@ edge is published once and derived from N occurrences, each with its own key,
 and the emitter re-emits the whole fact as soon as one of those keys changes.
 That is why the keys live in a side table and why `PutKeyedNodes` and
 `PutKeyedRelations` take `keys [][]string`, parallel to the facts: `keys[i]`
-is every key backing `facts[i]`, at least one, each a lowercase hex digest,
+is every key backing `facts[i]`, at least one, each in practice a lowercase hex
+digest — a convention the producers keep but that no model type enforces, which
+is why the column stays TEXT (see ADR-0002, Measurements),
 sorted and without duplicates.
 
 Folding a fact's keys into one was considered and rejected: `Replaced.Keys`
