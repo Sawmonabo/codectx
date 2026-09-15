@@ -191,15 +191,21 @@ after `repository_id` left `relation_ids`, its unique constraint is column-for-c
 index, and the query plans are identical — so the explicit index was redundant rather than merely
 cheap (−21.4 MB on the fixture).
 
-**Sweeping unreferenced `native_keys` rows in this change.** Not shipped. Both child columns are
-unindexed — the alias lookup index carries `native_key_id` second and evidence has no index on it —
-so the sweep degrades to a full pass over the evidence table *per candidate*, inside the write
-transaction, which is the exact pathology this decision exists to remove. Shipping the two indexes
-that would fix it means putting a second index on the largest table in the store in a change whose
-purpose is shrinking it, against roughly 52 711 reclaimable dictionary rows. Recorded as a measured
-trade-off to settle with numbers, not as an oversight; unreferenced `scope_keys` *are* swept, in
-bounded batches, and the `native_keys` sweep is a copy of that statement once the index decision is
-made.
+**Leaving `native_keys` unswept rather than indexing its two child columns.** Rejected, after the
+first pricing of it was found to compare the wrong costs. That pricing weighed the two indexes'
+bytes against the *collector's probe*: with the child columns unindexed the batched predicate plans
+as a full pass over the evidence table per candidate, and the indexes looked like a 2.24 %
+store-size premium paid to make one background pass fast. The probe was never the binding cost.
+`native_keys` is the parent of two foreign keys, every connection enforces them, and SQLite proves
+each deletion by scanning `native_aliases` and `evidence` in full when the child columns lead no
+index — a cost charged to *any* delete on the table, in any phrasing, and invisible to
+`EXPLAIN QUERY PLAN`, which reports only the probe [S14]. Measured at reference shape that is ~27 ms
+per deleted key and linear in the child tables, so a full-vocabulary churn of ~201 k keys is ~90
+minutes inside one write transaction; a per-run budget that keeps a run sane then clears a few
+hundred keys against a backlog three orders of magnitude larger, and the dictionary grows faster
+than it drains. The alternative to the indexes is therefore not a slower sweep but no sweep at all,
+against ~182 B per distinct key stranded on every re-index, monotonically and with no bound. Both
+indexes are added; the sweep is the scope-key statement with a second `NOT EXISTS`.
 
 ---
 
@@ -294,13 +300,36 @@ one.
 The two indexes the sweep needs, built on the after store and measured:
 `idx_alias_native ON native_aliases(native_key_id)` = 6 799 360 B and
 `idx_evidence_native ON evidence(native_key_id)` = 7 352 320 B, together
-**14 151 680 B = 2.24 % of the 632 266 752 B store** — over the 2 % of store
-size that was set as the line an added index may not cross. With them the batched predicate is fully indexed
-(`SEARCH na USING COVERING INDEX idx_alias_native`, `SEARCH e USING COVERING
-INDEX idx_evidence_native`); without them each candidate costs a full pass over
-643 025 evidence rows. The indexes are therefore **not added**
-and the sweep is owed as a bounded batch job per retention run; it is not
-implemented here.
+**14 151 680 B = 2.24 % of the 632 266 752 B store**, the second of them on the
+largest table there. Both are **added**, reversing the earlier refusal: that
+refusal priced them against the collector's probe, while the cost that decides
+the question is foreign-key enforcement on the parent row (the alternatives
+section above). With them the probes and both foreign-key checks are index
+lookups —
+
+```
+DELETE FROM native_keys WHERE id > ? AND id <= ?
+  AND NOT EXISTS (… native_aliases na WHERE na.native_key_id = native_keys.id)
+  AND NOT EXISTS (… evidence e WHERE e.native_key_id = native_keys.id)
+|--SEARCH native_keys USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+|--CORRELATED SCALAR SUBQUERY 1
+|  `--SEARCH na USING COVERING INDEX idx_alias_native (native_key_id=?)
+|--CORRELATED SCALAR SUBQUERY 2
+|  `--SEARCH e USING COVERING INDEX idx_evidence_native (native_key_id=?)
+|--SEARCH native_aliases USING COVERING INDEX idx_alias_native (native_key_id=?)
+`--SEARCH evidence USING COVERING INDEX idx_evidence_native (native_key_id=?)
+```
+
+— the last two lines being the foreign-key checks, which is also the only
+phrasing of this statement in which they are visible at all. Measured on stores
+of the reference shape and of a tenth of it, one run clears the whole backlog:
+201 285 keys in 0.30 s (1.5 µs/key) against 274 807 alias and 477 388 evidence
+rows, and 20 128 keys in 0.02 s (1.0 µs/key) against a tenth of those. The cost
+is flat in child-table size where it was previously linear (2.7 ms/key at the
+small shape, ~27 ms/key at the reference one), which is the property the
+foreign-key check acquires when it can descend an index. The rows-examined
+budget stays as a safety bound; at two rows examined per deletion it admits
+100 M keys per run.
 
 ### Index re-audit, against `EXPLAIN QUERY PLAN` on the after store
 
@@ -389,3 +418,7 @@ CO-ROUTINE, temporary b-trees); how the before/after plan matrix in §4 is read.
 
 *Every figure in this record is drawn from an implementation or verification run that carries the
 plan output, byte attribution or mutation proof for the assertion it supports.*
+
+[S14] https://www.sqlite.org/foreignkeys.html#fk_indexes — an index on the child key columns of a
+      foreign key is what keeps a parent-row delete from scanning the child table; without one
+      SQLite searches the whole child table to prove no reference survives.

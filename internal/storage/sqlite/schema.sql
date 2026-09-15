@@ -524,6 +524,27 @@ CREATE INDEX idx_alias_lookup ON native_aliases(scope_key_id, native_key_id, uni
 -- native_aliases per node, which is quadratic in the size of the unit being
 -- deleted; the same holds for a manifest entry's node.
 CREATE INDEX idx_alias_node ON native_aliases(node_id, unit_id);
+-- The two native-key child columns, indexed so the dictionary can be swept.
+-- native_keys is the PARENT of both foreign keys below, and every connection
+-- runs with foreign_keys=ON, so SQLite must prove no child row survives before
+-- it may delete a dictionary row. Without an index on the child column that
+-- proof is a full scan of the child table PER DELETED ROW -- measured on a
+-- control fixture store (274 807 alias rows, 477 388 evidence rows), ~27 ms
+-- per deleted key, i.e. ~90 minutes to clear a full-vocabulary churn of
+-- ~201 k keys. That cost is charged to any DELETE on native_keys and cannot be
+-- rephrased away; it is also invisible to EXPLAIN QUERY PLAN, which reports
+-- only the collector's own probe. With these two indexes the foreign-key check
+-- and the collector's two NOT EXISTS probes are all index lookups, and the
+-- whole sweep finishes in one run.
+-- The trade-off, measured on the same store: the two indexes hold 6 799 360 B
+-- and 7 352 320 B, together 14 151 680 B = 2.24 % of a 632 266 752 B store,
+-- the second of them on the largest table there. That is the price of a
+-- dictionary that can be collected at all: without the sweep, native_keys plus
+-- its UNIQUE autoindex strands ~182 B per distinct key on every re-index,
+-- monotonically and with no bound (~73 MB per full-vocabulary churn), which
+-- overtakes the indexes' fixed share after the second rebuild.
+CREATE INDEX idx_alias_native ON native_aliases(native_key_id);
+CREATE INDEX idx_evidence_native ON evidence(native_key_id);
 CREATE INDEX idx_context_entries_node ON context_entries(node_id);
 -- The file arm of the same sweep: gc.go's files collection asks, per candidate
 -- file, whether any manifest entry still names it. context_entries carries

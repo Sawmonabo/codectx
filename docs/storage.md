@@ -118,6 +118,21 @@ The identity sweep is indexed on both sides it interrogates
 node costs a full scan of `native_aliases`, which is quadratic in the unit
 being deleted.
 
+The two intern dictionaries are collected by the same tail. A dictionary row
+outlives every unit that referred to it — deleting a unit removes its alias and
+evidence rows, never the interned string — so without these passes a store that
+is rebuilt repeatedly accumulates strings nothing can reach. Each pass is a
+keyset over the dictionary's `id` in batch-sized transactions, and each
+candidate is proved unreferenced by indexed probes: `idx_alias_lookup` for
+scope keys, `idx_alias_native ON native_aliases(native_key_id)` and
+`idx_evidence_native ON evidence(native_key_id)` for native keys. Those two
+indexes are also what SQLite uses to enforce the two foreign keys onto a
+deleted `native_keys` row; without them that check alone is a full scan of both
+child tables per deleted row, which is what would make the dictionary
+uncollectable in practice. The native-key pass carries a rows-examined budget
+as a safety bound: it defers, never skips, so a key a run does not reach is
+still unreferenced on the next one.
+
 ## The two granularities
 
 Two importers produce deltas at two different granularities, and
