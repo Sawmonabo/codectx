@@ -55,6 +55,9 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 	// a resumed page asking for a different one would stop the walk somewhere
 	// the issuing page never did.
 	queryHash := traversalQueryHash(req.Direction, kinds, req.Start, maxDepth.Int(), limit)
+	// stalled marks the walkStalled page: it ends the answer with no cursor,
+	// so the one the caller holds must stay adoptable (impact.go).
+	stalled := false
 	var resume *resumeState
 	if req.Page.Cursor != "" {
 		c, rb, err := e.verifyContinuation(req.Page.Cursor, packageDepsEndpoint, queryHash, deadline)
@@ -72,8 +75,15 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		}
 		// The consumed spool outlives the walk -- the membership probes and the
 		// spill that copies the cumulative set forward both read it -- so the
-		// release is deferred rather than run on the happy path alone.
-		defer resume.Release()
+		// release is deferred rather than run on the happy path alone. The one
+		// exception is the stalled page below, which ends the answer with no
+		// cursor of its own: the cursor the caller holds is the remedy, so the
+		// state it names has to survive this request (impact.go says why).
+		defer func() {
+			if !stalled {
+				resume.Release()
+			}
+		}()
 		b = resume.Budget
 	}
 	// The pass-1 INPUT is retained across requests for the reason walkretain.go
@@ -99,7 +109,7 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil)
+		acc = newImpactAccumulator(req.Start, b, maxVisited, maxEdges, nil, resume)
 		walkErr := e.rollupInto(ctx, &meta, func(sink edgeSink) error {
 			var werr error
 			state, werr = e.runWalkToCompletion(ctx, acc.Seeds(), expandOptions{
@@ -142,7 +152,10 @@ func (e *Engine) PackageDependencies(ctx context.Context, req model.GraphRequest
 		// would publish an order the next page contradicts -- and the walk
 		// continuation carries the frontier AND this leg's pair records forward.
 		if walkStalled(b, state, acc.lastOwner, acc.lastKey, resume) {
-			// No continuation: it would be the one this request was given.
+			// No continuation: it would be the one this request was given, and
+			// it stays adoptable so presenting it again under a longer timeout
+			// resumes this walk.
+			stalled = true
 			markTruncated(&meta, reasonDeadlineStalled)
 			return validatedPairPage(meta, nil)
 		}
