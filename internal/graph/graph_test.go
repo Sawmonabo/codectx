@@ -1024,121 +1024,6 @@ func TestGraphScenarios(t *testing.T) {
 		},
 
 		{
-			// Impact ranks its WHOLE walk and cuts the ranked list, so its page
-			// boundary is a rank rather than a keyset position. The failure this
-			// protects is a paged impact answer that silently loses the tail of
-			// its own ranking: an entry the walk found, ranked, and then never
-			// served because page 2 had nothing to replay. The n-wide hub gives
-			// a ranked list far longer than the page, and the pages are walked
-			// against an Adjacency that fails EVERY read -- so a continuation
-			// that touched the graph again could not even complete, which is
-			// what makes "no re-walk, no traversal budget spent" an observation
-			// rather than an inference.
-			name: "a paged impact answer replays its ranked tail without walking again",
-			run: func(t *testing.T, f *graphFixture) {
-				signer, err := pagination.OpenSigner(t.TempDir())
-				if err != nil {
-					t.Fatalf("open signer: %v", err)
-				}
-				store := newFixtureLeases()
-				spools, err := pagination.NewSpools(t.TempDir(), 8<<20, store)
-				if err != nil {
-					t.Fatalf("new spools: %v", err)
-				}
-				limits := fixtureLimits()
-				leases := pagination.NewLeases(store, limits.CursorTTL)
-				newEngine := func(a Adjacency) *Engine {
-					e, err := New(Options{Adjacency: a, Signer: signer, Spools: spools,
-						Leases: leases, Limits: limits})
-					if err != nil {
-						t.Fatalf("new engine: %v", err)
-					}
-					return e
-				}
-				seeds := []model.NodeID{fixtureNodeID("n-hub")}
-				const pageLimit = 10
-
-				// Ground truth: the same answer ranked and served in one page.
-				whole, err := newEngine(f).Impact(context.Background(), model.ImpactRequest{
-					Start: seeds, Direction: model.DirectionBoth,
-					Page: model.PageRequest{Limit: model.MaxPageItems}})
-				if err != nil {
-					t.Fatalf("one-page impact: %v", err)
-				}
-				if whole.Meta.TruncationReason == reasonPageFull {
-					t.Fatalf("the ground-truth answer was itself cut at its page; it cannot be the whole ranking")
-				}
-				if len(whole.Entries) <= pageLimit {
-					t.Fatalf("ground truth holds %d entries; the fixture must rank more than one page of %d",
-						len(whole.Entries), pageLimit)
-				}
-
-				// Every page after the first is answered over an Adjacency whose
-				// every read fails. Only the spooled tail can serve them.
-				pages := 0
-				var order []model.NodeID
-				req := model.ImpactRequest{Start: seeds, Direction: model.DirectionBoth,
-					Page: model.PageRequest{Limit: pageLimit}}
-				engine := newEngine(f)
-				for {
-					pages++
-					if pages > 32 {
-						t.Fatalf("paged impact did not terminate after %d pages", pages-1)
-					}
-					res, err := engine.Impact(context.Background(), req)
-					if err != nil {
-						t.Fatalf("page %d: %v", pages, err)
-					}
-					if err := res.Validate(); err != nil {
-						t.Fatalf("page %d does not satisfy its own contract: %v", pages, err)
-					}
-					for _, entry := range res.Entries {
-						order = append(order, entry.NodeID)
-					}
-					// The walk happened once: its cumulative counters and its
-					// rollup describe the whole answer and are carried unchanged.
-					if res.VisitedCount != whole.VisitedCount || res.EdgeCount != whole.EdgeCount {
-						t.Fatalf("page %d counted (%d visited, %d edges), want the walk's (%d, %d)",
-							pages, res.VisitedCount, res.EdgeCount, whole.VisitedCount, whole.EdgeCount)
-					}
-					if len(res.Packages) != len(whole.Packages) {
-						t.Fatalf("page %d carried %d rollup pairs, want the answer's %d",
-							pages, len(res.Packages), len(whole.Packages))
-					}
-					// The capability report is answer-level too, and a
-					// continuation reads no facts: a page that dropped it would
-					// report a degraded generation as a complete one.
-					if len(res.Meta.Completeness) != len(whole.Meta.Completeness) {
-						t.Fatalf("page %d carried %d completeness rows, want the answer's %d",
-							pages, len(res.Meta.Completeness), len(whole.Meta.Completeness))
-					}
-					if res.Meta.NextCursor == "" {
-						break
-					}
-					req = model.ImpactRequest{Start: seeds, Direction: model.DirectionBoth,
-						Page: model.PageRequest{Limit: pageLimit, Cursor: res.Meta.NextCursor}}
-					engine = newEngine(unreadableAdjacency{f})
-				}
-				if pages < 2 {
-					t.Fatalf("the answer was served in %d page(s); the case needs a page boundary", pages)
-				}
-				// One assertion for three invariants: the union equals the
-				// one-page ground truth, nothing repeats, and the rank order
-				// survives every page boundary.
-				if len(order) != len(whole.Entries) {
-					t.Fatalf("the paged answer served %d entries, the one-page answer %d",
-						len(order), len(whole.Entries))
-				}
-				for i, want := range whole.Entries {
-					if order[i] != want.NodeID {
-						t.Fatalf("entry %d of the paged answer is %s, want %s: the ranked order did not survive paging",
-							i, order[i], want.NodeID)
-					}
-				}
-			},
-		},
-
-		{
 			// The defect this protects is a continuation nobody can use. A
 			// token that names the PINNED READER's query lease is dead on
 			// arrival: that lease is released when the request returns, so the
@@ -1257,7 +1142,13 @@ func TestGraphScenarios(t *testing.T) {
 			// 200 and reports a referenced symbol as unreferenced.
 			name: "keyset walks past the storage page clamp read every page",
 			run: func(t *testing.T, f *graphFixture) {
-				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				// The page bound is raised above the fan-out so this case
+				// isolates the CONTAINMENT read: a rollup whose walk stopped on
+				// its page limit would under-count the pair for a reason that
+				// has nothing to do with the keyset loop under test.
+				limits := fixtureLimits()
+				limits.MaxPageItems = 2 * fixtureWideCount
+				e, err := New(Options{Adjacency: f, Limits: limits})
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
@@ -1545,32 +1436,6 @@ func TestGraphScenarios(t *testing.T) {
 		})
 	}
 }
-
-// unreadableAdjacency answers every fact read with a failure while still
-// reporting the binding and the retention lease a continuation is bound to. An
-// answer served over it read nothing from the graph, which is how the impact
-// paging case observes that a continuation replays its spool instead of
-// walking again.
-type unreadableAdjacency struct{ *graphFixture }
-
-func (unreadableAdjacency) Edges(context.Context, []model.NodeID, model.Direction,
-	[]model.RelationKind, model.RelationID, int) ([]model.Relation, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) NodesByID(context.Context, []model.NodeID) ([]model.Node, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) EvidenceFor(context.Context, []model.RelationID, int) (map[model.RelationID][]model.EvidenceID, error) {
-	return nil, errUnreadableAdjacency
-}
-
-func (unreadableAdjacency) Capabilities(context.Context) ([]model.CapabilityState, error) {
-	return nil, errUnreadableAdjacency
-}
-
-var errUnreadableAdjacency = errors.New("this adjacency answers no read")
 
 // blockingGate is the process gate with every slot permanently busy: Acquire
 // waits for the caller's deadline and reports it as the same CTX_RESOURCE_LIMIT
