@@ -101,6 +101,13 @@ func (c Config) validate() error {
 		{"workspace.max_dir_entries", c.Workspace.MaxDirEntries},
 		{"workspace.max_depth", c.Workspace.MaxDepth},
 		{"workspace.max_ignored_roots", c.Workspace.MaxIgnoredRoots},
+		{"providers.scip.max_index_bytes", c.Providers.SCIP.MaxIndexBytes},
+		{"providers.scip.max_manifest_bytes", c.Providers.SCIP.MaxManifestBytes},
+		{"providers.scip.max_documents", c.Providers.SCIP.MaxDocuments},
+		{"providers.scip.max_occurrences_per_document", c.Providers.SCIP.MaxOccurrencesPerDocument},
+		{"providers.scip.max_spool_bytes", c.Providers.SCIP.MaxSpoolBytes},
+		{"providers.scip.max_source_file_bytes", c.Providers.SCIP.MaxSourceFileBytes},
+		{"providers.scip.max_materialize_bytes", c.Providers.SCIP.MaxMaterializeBytes},
 	} {
 		if p.v < 0 {
 			return configInvalid("%s is %d; a bound is a positive value, or 0 (%q) for no bound at all",
