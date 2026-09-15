@@ -78,7 +78,13 @@ func (u *unit) pyproject(ctx context.Context) error {
 		name, version = poetry.Name, poetry.Version
 		nameKey, nameFound = layout.key(u.data, "tool.poetry", "name")
 	default:
-		u.malformed()
+		// The file parsed cleanly and declares no package: a pyproject.toml
+		// that carries only [tool.*] linter and formatter configuration, or
+		// only [build-system], is a valid and common file. There is nothing
+		// for this provider to define and nothing is missing, so the
+		// capability is fresh with no facts. Calling it malformed said the
+		// file did not parse as its format, which is a false statement about
+		// it and left a failed capability row on a healthy repository.
 		return nil
 	}
 	if version != "" {
