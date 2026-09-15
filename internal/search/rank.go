@@ -280,10 +280,12 @@ func (c *collector) peakLiveRecords() int { return c.peak }
 // QueryMeta.Truncated / TruncationReason.
 func (c *collector) truncation() (bool, string) { return c.truncated, c.reason }
 
-// maxRangeWindowBytes is the digest §4 bound on one hydration read. It is
-// source.CheckpointBytes: a blob carries a line checkpoint at least every that
-// many bytes, so resolving one offset reads at most one checkpoint interval
-// and never scans a file from byte zero.
+// maxRangeWindowBytes is the size of ONE hydration read, not a bound on the
+// work hydration will do: positionAt walks a span of any length in windows of
+// this size, so no input can make it refuse or truncate an answer and there is
+// nothing here for an operator to raise. It is source.CheckpointBytes because
+// that is the checkpoint spacing, so a file with line boundaries costs exactly
+// one read per endpoint and a file without them costs one read per window.
 const maxRangeWindowBytes = source.CheckpointBytes
 
 // fileReader, blobReader and ContentReader are the three narrow reads range
@@ -416,10 +418,14 @@ func (h *hydrator) positionAt(ctx context.Context, rec model.BlobRecord, idx sou
 		if err != nil {
 			return model.Position{}, nil, err
 		}
-		if len(window) == 0 {
+		// ReadRange returns exactly the interval asked for, so a short read
+		// is a store that no longer holds the blob it recorded; the walk
+		// would otherwise stall or slice past the window it was handed.
+		if uint64(len(window)) != end-w.At() {
 			return model.Position{}, nil, &model.Error{Code: model.CodeSourceIntegrity,
-				Message: "search: the content store returned no bytes at offset " +
-					strconv.FormatUint(w.At(), 10) + " of a " + strconv.FormatInt(rec.Size, 10) + "-byte blob",
+				Message: "search: the content store returned " + strconv.Itoa(len(window)) + " of the " +
+					strconv.FormatUint(end-w.At(), 10) + " bytes at offset " + strconv.FormatUint(w.At(), 10) +
+					" of a " + strconv.FormatInt(rec.Size, 10) + "-byte blob",
 				Remediation: "run `codectx doctor --deep` to verify the content store"}
 		}
 		if consumed := offset - w.At(); consumed < uint64(len(window)) {
