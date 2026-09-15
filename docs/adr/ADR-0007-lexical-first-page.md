@@ -114,14 +114,19 @@ The per-unit lists add their packed bytes to the store, reported in the change's
 build budget stands at 5 % of index wall, and a delta activation must build the lexical structure in
 at most three times the packed adjacency's build on the same store.
 
-## Decision 2 — rank on packed inputs, hydrate only the served page
+## Decision 2 — every candidate attribute comes from the packed per-document stream; no document row is read per candidate
 
-Candidate documents are ranked from the packed postings and the per-document attributes the filters
-need (kind code, path, name and token count, stored once per document in the packed structure),
-and the document rows are hydrated only for the page being served. Today every candidate is hydrated
-before ranking (`Meteor` hydrates 46 487 rows to serve 200). Filters that today run on hydrated rows
-run on the packed attributes; the served page is unchanged because filters and ranking consume the
-same values.
+Ranking needs, per candidate, more than a score: the deterministic tie-break and the deduplication key
+read the document's identity, path, kind, name, qualified name, signature and byte range, and the
+path and kind filters read two of those. Today those fields are hydrated with one document-row read
+per candidate (`Meteor` reads 46 487 rows to serve 200). The packed structure therefore carries, once
+per document and addressable by document ordinal, every field the search package reads from a
+document row: row id, node id, search key, file id, path, kind, name, qualified name, signature,
+start and end byte, token count. Candidates are hydrated from that stream, sequentially, in document
+order, with no SQL statement per candidate; the document-row read path is deleted. The served page
+is unchanged because the values are the same values, and the comparator and the deduplication key
+are untouched. What Decision 2 removes is the per-candidate index descent, not the per-candidate
+data.
 
 ## Decision 3 — the first page from a bounded heap; the full order sorted on the first continuation
 
