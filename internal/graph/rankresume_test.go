@@ -198,3 +198,107 @@ func rankResumeEngine(t *testing.T, f *graphFixture, stopAfter int) (*Engine, st
 	e.probe, e.rankStopAfter = probe, stopAfter
 	return e, spoolDir, probe
 }
+
+// TestRankContinuationAfterACompletedRankAdoptsNoRemovedRun protects the one
+// invariant that made a resumed impact chain fail outright in certification:
+//
+//	CTX_INTERNAL: external sort adopted run: stat .../spool-<id>/run-000000:
+//	no such file or directory
+//
+// A ranking pass that was interrupted persists its spilled runs in the retained
+// directory and names them in the manifest (detachRankPass). pagination.Sorted
+// CONSUMES those runs when the pass finally completes, so the manifest must
+// stop naming them at that instant -- pass 1 does exactly that. Pass 2 did not,
+// and a request that COMPLETED the rank could still mint a rank continuation
+// over the same retained directory: the package-pair ranking that runs next
+// reports the deadline, which is P7's "nothing extra is persisted" branch. The
+// next request then adopted runs that Sorted had already removed and the whole
+// answer -- walked, ranked and on disk -- became unreachable.
+//
+// The chain here forces that window: cut pass 2 so a resumed request adopts
+// runs, then let the impact rank finish while cutting the PAIR fold, then let
+// everything finish. Acceptance is parity, not "no error": the pages must
+// concatenate to the uninterrupted answer in its order.
+func TestRankContinuationAfterACompletedRankAdoptsNoRemovedRun(t *testing.T) {
+	f := newGraphFixture(t)
+	req := model.ImpactRequest{GenerationID: 1,
+		Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	whole, _, _ := rankResumeEngine(t, f, 0)
+	all, err := whole.Impact(context.Background(), req)
+	if err != nil {
+		t.Fatalf("uninterrupted impact: %v", err)
+	}
+	if all.Meta.NextCursor != "" || len(all.Entries) == 0 || len(all.Packages) == 0 {
+		t.Fatalf("ground truth is paged (%v), has %d entries and %d package pair(s): this proof "+
+			"needs one request that walks, ranks and serves the whole answer",
+			all.Meta.NextCursor != "", len(all.Entries), len(all.Packages))
+	}
+
+	// Cut the impact ranking hard enough that pass 2 is interrupted and its
+	// runs land in the retained directory.
+	paged, spoolDir, probe := rankResumeEngine(t, f, 100)
+	var entries []model.ImpactEntry
+	var packages []model.PackageEdge
+	rankCut, pairCut := false, false
+	for pages := 1; ; pages++ {
+		if pages > 200 {
+			t.Fatalf("the rank-split impact did not terminate after %d requests", pages-1)
+		}
+		res, err := paged.Impact(context.Background(), req)
+		if err != nil {
+			t.Fatalf("request %d: %v", pages, err)
+		}
+		if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline {
+			switch {
+			case !rankCut && probe.Rank.PeakLiveRecords != 0:
+				// Pass 2 has now been interrupted: its runs are in the retained
+				// directory and the manifest names them. Let the NEXT request
+				// complete the rank over those runs, and cut the pair fold so
+				// that request still mints a continuation.
+				rankCut = true
+				paged.rankStopAfter, paged.pairStopAfter = 0, 1
+			case rankCut && !pairCut:
+				// That request completed pass 2 -- Sorted removed the adopted
+				// runs -- and stopped in the pair fold. The next one re-enters
+				// rankImpact over the same retained directory.
+				pairCut = true
+				paged.pairStopAfter = 0
+			}
+		}
+		entries = append(entries, res.Entries...)
+		packages = append(packages, res.Packages...)
+		if res.Meta.NextCursor == "" {
+			break
+		}
+		req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+		req.GenerationID = 0
+	}
+	if !rankCut || !pairCut {
+		t.Fatalf("the deadline cut the rank pass (%v) and the pair fold (%v): this proof needs "+
+			"a request that COMPLETES the rank and still mints a continuation", rankCut, pairCut)
+	}
+
+	if len(entries) != len(all.Entries) {
+		t.Fatalf("the split requests served %d affected entit(ies), the uninterrupted answer %d",
+			len(entries), len(all.Entries))
+	}
+	for i, want := range all.Entries {
+		if !reflect.DeepEqual(entries[i], want) {
+			t.Fatalf("at rank %d the resumed ranking reports %+v, the uninterrupted one %+v",
+				i, entries[i], want)
+		}
+	}
+	if len(packages) != len(all.Packages) {
+		t.Fatalf("the split requests carried %d package pair(s), the uninterrupted answer %d",
+			len(packages), len(all.Packages))
+	}
+	for i, want := range all.Packages {
+		if packages[i] != want {
+			t.Fatalf("at rank %d the resumed ranking carries %+v, the uninterrupted one %+v",
+				i, packages[i], want)
+		}
+	}
+	assertNoRetainedState(t, spoolDir)
+}
