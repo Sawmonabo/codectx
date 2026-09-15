@@ -516,13 +516,16 @@ func (c *CAS) SweepOrphans(ctx context.Context, known func(context.Context, []st
 		if !b.IsDir() || !isBucketName(b.Name()) {
 			continue
 		}
-		n, err := c.sweepBucket(ctx, filepath.Join(c.dir, b.Name()), known, now, grace, batch)
+		n, err, stop := c.sweepBucket(ctx, filepath.Join(c.dir, b.Name()), known, now, grace, batch)
 		removed += n
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return removed, errors.Join(append(errs, err)...)
-			}
 			errs = append(errs, err)
+		}
+		// A cancelled context or an index that cannot answer is not this
+		// bucket's problem: walking the remaining 255 would re-ask a store
+		// that is still broken and report the same failure up to 256 times.
+		if stop {
+			break
 		}
 	}
 	return removed, errors.Join(errs...)
@@ -548,64 +551,74 @@ func isBucketName(name string) bool {
 	return true
 }
 
-// sweepBucket walks one bucket in ReadDir chunks. Emptied buckets are left in
-// place: removing one races a concurrent publication that has just created it
-// and is about to link into it.
+// sweepBucket walks one bucket in ReadDir chunks, returning what it removed,
+// what went wrong and whether the whole sweep must stop. Emptied buckets are
+// left in place: removing one races a concurrent publication that has just
+// created it and is about to link into it.
+//
+// Order within a chunk is deliberate: the index is asked about every name the
+// readdir returned -- names cost no syscall -- and only the hashes it reports
+// as UNNAMED are then stat'ed for their age. A healthy store has none, so the
+// pass costs one query per chunk and no lstat at all, instead of one lstat per
+// object in the store on every invocation. The grace still gates every
+// removal; it is only consulted for the objects that could actually go.
 func (c *CAS) sweepBucket(ctx context.Context, dir string, known func(context.Context, []string) (map[string]struct{}, error),
-	now time.Time, grace time.Duration, batch int) (int64, error) {
+	now time.Time, grace time.Duration, batch int) (int64, error, bool) {
 	d, err := os.Open(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil
+			return 0, nil, false
 		}
-		return 0, ioError("CAS sweep", err)
+		return 0, ioError("CAS sweep", err), false
 	}
 	defer d.Close()
 	var removed int64
 	var errs []error
 	for {
 		if err := ctx.Err(); err != nil {
-			return removed, errors.Join(append(errs, model.Canceled(err))...)
+			return removed, errors.Join(append(errs, model.Canceled(err))...), true
 		}
 		ents, err := d.ReadDir(batch)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return removed, errors.Join(append(errs, ioError("CAS sweep", err))...)
+			return removed, errors.Join(append(errs, ioError("CAS sweep", err))...), false
 		}
-		candidates := make([]string, 0, len(ents))
+		// A name path never derives is not this sweep's to judge, and a
+		// directory inside a bucket is not an object.
+		candidates := make([]fs.DirEntry, 0, len(ents))
+		names := make([]string, 0, len(ents))
 		for _, e := range ents {
-			// A name path never derives is not this sweep's to judge, and a
-			// directory inside a bucket is not an object.
 			if e.IsDir() || !model.ValidHexID(e.Name()) {
 				continue
 			}
-			info, statErr := e.Info()
-			if statErr != nil {
-				if errors.Is(statErr, fs.ErrNotExist) {
-					continue
-				}
-				errs = append(errs, ioError("CAS sweep", statErr))
-				continue
-			}
-			// Younger than the grace: a publication whose naming commit may
-			// still be in flight. Dropping this check is what makes the sweep
-			// delete content a generation is about to reference.
-			if info.ModTime().Add(grace).After(now) {
-				continue
-			}
-			candidates = append(candidates, e.Name())
+			candidates = append(candidates, e)
+			names = append(names, e.Name())
 		}
-		if len(candidates) > 0 {
-			named, kerr := known(ctx, candidates)
+		if len(names) > 0 {
+			named, kerr := known(ctx, names)
 			if kerr != nil {
 				// No removal on an unreadable answer: an empty set read as
-				// "nothing is named" would take the whole bucket.
-				return removed, errors.Join(append(errs, kerr)...)
+				// "nothing is named" would delete the whole store.
+				return removed, errors.Join(append(errs, kerr)...), true
 			}
-			for _, hash := range candidates {
-				if _, ok := named[hash]; ok {
+			for _, e := range candidates {
+				if _, ok := named[e.Name()]; ok {
 					continue
 				}
-				if err := c.Remove(hash); err != nil {
+				info, statErr := e.Info()
+				if statErr != nil {
+					if !errors.Is(statErr, fs.ErrNotExist) {
+						errs = append(errs, ioError("CAS sweep", statErr))
+					}
+					continue
+				}
+				// Younger than the grace: a publication whose naming commit
+				// may still be in flight. Dropping this check is what makes
+				// the sweep delete content a generation is about to
+				// reference.
+				if info.ModTime().Add(grace).After(now) {
+					continue
+				}
+				if err := c.Remove(e.Name()); err != nil {
 					errs = append(errs, err)
 					continue
 				}
@@ -616,7 +629,7 @@ func (c *CAS) sweepBucket(ctx context.Context, dir string, known func(context.Co
 			break
 		}
 	}
-	return removed, errors.Join(errs...)
+	return removed, errors.Join(errs...), false
 }
 
 // Open streams the blob described by rec, verifying each 64-KiB block digest
