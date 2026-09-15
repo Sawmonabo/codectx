@@ -27,9 +27,9 @@ import (
 //   - PARITY. The split pages concatenate to the uninterrupted answer, in its
 //     order, with no entity listed twice. A ranking that re-sorted from
 //     scratch would also satisfy this.
-//   - RUN REUSE. The chain adopted runs (AdoptedRuns > 0) and re-added none of
-//     the records they held (ReaddedRecords == 0). This is what a re-sorting
-//     ranking cannot satisfy.
+//   - RUN REUSE. The chain adopted runs (AdoptedRuns > 0) and SKIPPED the
+//     records they already held (SkippedRecords > 0) instead of feeding them
+//     back in. This is what a re-sorting ranking cannot satisfy.
 //
 // Mutation proof: make openImpactSort ignore the manifest's runs (take the
 // NewExternalSort branch unconditionally) and feedRankPass skip nothing (drop
@@ -37,7 +37,7 @@ import (
 // which is what ruling P7 did before this change. PARITY STILL HOLDS and the
 // run-reuse assertion fails:
 //
-//	rankresume_test.go: the resumed ranking adopted 0 run(s) and re-added 0
+//	rankresume_test.go: the resumed ranking adopted 0 run(s) and skipped 0
 //	  record(s): it re-sorted the retained input instead of continuing the sort
 func TestImpactRankResumesTheInterruptedSortItself(t *testing.T) {
 	// rankStopEvery cuts each request's ranking after this many records, and
@@ -156,10 +156,10 @@ func TestImpactRankResumesTheInterruptedSortItself(t *testing.T) {
 	}
 
 	// RUN REUSE.
-	if probe.AdoptedRuns == 0 || probe.ReaddedRecords != 0 {
-		t.Fatalf("the resumed ranking adopted %d run(s) and re-added %d record(s): it re-sorted "+
-			"the retained input instead of continuing the sort",
-			probe.AdoptedRuns, probe.ReaddedRecords)
+	if probe.AdoptedRuns == 0 || probe.SkippedRecords == 0 {
+		t.Fatalf("the resumed ranking adopted %d run(s) and skipped %d record(s) of the retained "+
+			"input: it re-sorted that input instead of continuing the sort",
+			probe.AdoptedRuns, probe.SkippedRecords)
 	}
 	// The retained state -- the input, the adopted runs and the manifest alike
 	// -- is continuation state: once the tail is served none of it may survive.
