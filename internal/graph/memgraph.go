@@ -36,6 +36,10 @@ type MemoryGraph struct {
 
 	relIDs  []model.RelationID // indexed by relation surrogate-1
 	relByID map[model.RelationID]RelRef
+	// evidence is the per-relation evidence count side array, keyed by
+	// canonical id because that is what a fixture declares it with. Nil means
+	// the fixture declared none.
+	evidence map[model.RelationID]int64
 
 	// out and in are indexed by surrogate, so index 0 is the unused zero
 	// surrogate and stays empty. Each list is sorted by (Neighbour, Rel),
@@ -404,9 +408,27 @@ func (g *MemoryGraph) EvidenceCounts(ctx context.Context, rels []RelRef) ([]int6
 		if ref == 0 || int(ref) > len(g.relIDs) {
 			continue
 		}
+		if n, ok := g.evidence[g.relIDs[ref-1]]; ok {
+			out[i] = n
+			continue
+		}
+		// A fixture that declared no evidence at all still describes relations
+		// the analysis derived, so one is the honest floor; a fixture that DID
+		// declare evidence gets its own counts above.
 		out[i] = 1
 	}
 	return out, nil
+}
+
+// WithEvidenceCounts records the evidence backing each relation, so a fixture
+// that declares evidence reports it through the side array the rollup reads.
+//
+// It is a separate call rather than a constructor parameter because the port's
+// evidence count is a per-generation SIDE ARRAY, not part of the graph
+// structure, and most fixtures have no evidence to declare at all.
+func (g *MemoryGraph) WithEvidenceCounts(counts map[model.RelationID]int64) *MemoryGraph {
+	g.evidence = counts
+	return g
 }
 
 // NodesByID hydrates the fixture's nodes in the order asked, skipping an id the
