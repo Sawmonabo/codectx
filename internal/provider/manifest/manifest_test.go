@@ -475,3 +475,58 @@ search package java/pom.xml [0,0) name=svc qn=maven:org.acme:svc
 search package py/pyproject.toml [10,29) name=My_Service qn=pypi:my-service
 search package web/package.json [4,23) name=@acme/web qn=npm:@acme/web
 `
+
+// TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet is the one test of
+// the manifest list bounds. Failure modes it protects: a default build that
+// cuts a large manifest's dependency list (the hard 4096/1024 caps this
+// replaced did exactly that, so a monorepo's go.mod lost modules), and a
+// user-set bound that cuts in silence — the capability must carry the count
+// that crossed it, or the answer claims coverage it does not have.
+func TestDependencyBoundUnlimitedByDefaultAndReportedWhenSet(t *testing.T) {
+	const requires = 5000
+	var b strings.Builder
+	b.WriteString("module example.com/big\n\ngo 1.22\n\nrequire (\n")
+	for i := range requires {
+		fmt.Fprintf(&b, "\texample.com/dep%d v1.0.0\n", i)
+	}
+	b.WriteString(")\n")
+	files := map[string]string{"go.mod": b.String()}
+
+	count := func(t *testing.T, opts manifest.Options) (int, model.CapabilityState) {
+		t.Helper()
+		mf, err := manifest.New(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := providertest.New(t, files)
+		cap := &capture{}
+		states := map[string]model.CapabilityState{}
+		runUnit(t, h, mf, "go.mod", cap, states)
+		n := 0
+		for _, r := range cap.relations {
+			if r.Relation.Kind == model.RelDependsOn {
+				n++
+			}
+		}
+		return n, states[manifest.ID+" "+manifest.CapabilityManifests+" "+filesystem.ScopeKey("go.mod")]
+	}
+
+	n, cs := count(t, manifest.Options{MaxParseFileBytes: 1 << 20})
+	if n != requires {
+		t.Fatalf("the default configuration published %d of %d requires; every count bound defaults to unlimited", n, requires)
+	}
+	if cs.State != model.CapabilityFresh {
+		t.Fatalf("the default configuration reported %s/%s; nothing was cut", cs.State, cs.DiagnosticCode)
+	}
+
+	n, cs = count(t, manifest.Options{MaxParseFileBytes: 1 << 20, MaxDependencies: 100})
+	if n != 100 {
+		t.Fatalf("a bound of 100 published %d requires, want 100", n)
+	}
+	if cs.State != model.CapabilityPartial || cs.DiagnosticCode != model.CodeResourceLimit {
+		t.Fatalf("a cut list reported %s/%s, want partial/%s", cs.State, cs.DiagnosticCode, model.CodeResourceLimit)
+	}
+	if got := cs.Details[manifest.BoundDependencies]; got != "5000 over 100" {
+		t.Fatalf("capability detail %q = %q, want the count that crossed the bound", manifest.BoundDependencies, got)
+	}
+}

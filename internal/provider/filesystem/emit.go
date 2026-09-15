@@ -269,6 +269,20 @@ func (e *Emitter) Capability(capability string, state model.CapabilityStateValue
 	e.states = append(e.states, cs)
 }
 
+// CapabilityDetail adds one bounded diagnostic pair to the state already
+// recorded for capability, so a provider can report what a bound cut and by
+// how much alongside the state that cut it. A capability with no state yet is
+// ignored: a detail without its state would name a degradation nobody
+// declared.
+func (e *Emitter) CapabilityDetail(capability, key, value string) {
+	for i := range e.states {
+		if e.states[i].Capability == capability {
+			e.states[i] = e.states[i].WithDetail(key, value)
+			return
+		}
+	}
+}
+
 // Result is the succeeded result for this unit with its counters and
 // per-file capability states.
 func (e *Emitter) Result() model.ProviderResult {

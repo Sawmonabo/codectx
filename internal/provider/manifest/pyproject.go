@@ -57,7 +57,7 @@ func (u *unit) pyproject(ctx context.Context) error {
 	if overLines {
 		// The layout was not built, so every fact of this manifest is
 		// published without a range. That is a cut, and it is reported.
-		u.overBound()
+		u.degraded(BoundTOMLLines, "layout not built; facts carry no range")
 	}
 	poetry := doc.Tool.Poetry
 	var name, version string
@@ -97,8 +97,7 @@ func (u *unit) pyproject(ctx context.Context) error {
 	requirements := func(table, key string, list []string, kind string, extra ...string) error {
 		arr, found := layout.keyValue(u.data, table, key)
 		for _, req := range list {
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			depName, spec := splitPEP508(req)
@@ -148,8 +147,7 @@ func (u *unit) pyproject(ctx context.Context) error {
 			if n == "python" {
 				continue
 			}
-			if total++; total > MaxDependencies {
-				u.overBound()
+			if total++; u.cut(BoundDependencies, u.deps, int64(total)) {
 				return nil
 			}
 			spec := asString(deps[n])

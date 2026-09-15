@@ -95,6 +95,8 @@ func (c Config) validate() error {
 		{"providers.dependence.max_units_per_family", c.Providers.Dependence.MaxUnitsPerFamily},
 		{"providers.dependence.max_staged_rows", c.Providers.Dependence.MaxStagedRows},
 		{"providers.dependence.max_derived_rows", c.Providers.Dependence.MaxDerivedRows},
+		{"providers.manifest.max_dependencies", c.Providers.Manifest.MaxDependencies},
+		{"providers.manifest.max_entries", c.Providers.Manifest.MaxEntries},
 		{"workflow.max_observation_references", c.Workflow.MaxObservationReferences},
 	} {
 		if p.v < 0 {

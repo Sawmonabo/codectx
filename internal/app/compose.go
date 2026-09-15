@@ -442,7 +442,8 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	if err != nil {
 		return nil, err
 	}
-	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes})
+	mf, err := manifest.New(manifest.Options{MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
+		MaxDependencies: cfg.Providers.Manifest.MaxDependencies, MaxEntries: cfg.Providers.Manifest.MaxEntries})
 	if err != nil {
 		return nil, err
 	}
