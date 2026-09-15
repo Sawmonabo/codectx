@@ -94,6 +94,51 @@ var scenarios = []scenario{
 		},
 	},
 	{
+		// Failure mode: an ordinary doctor skips the whole-database work but
+		// reports the rows it skipped as `pass`, so an operator reads "the
+		// index database passed its integrity checks" off a run that read no
+		// page of it. Ruling QP-A: nothing is dropped from the report and
+		// nothing skipped is claimed as verified -- each such row is
+		// `unverified` and names the flag that verifies it.
+		name: "an ordinary doctor reports the whole-database checks unverified, never passed",
+		run: func(t *testing.T) {
+			ordinary := &fakeStore{}
+			rep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: ordinary}).Doctor(context.Background(), model.DoctorRequest{})
+			if err != nil {
+				t.Fatalf("ordinary Doctor: %v", err)
+			}
+			if ordinary.statCalls != 0 {
+				t.Fatalf("an ordinary doctor made %d Stats calls; the row counts are O(rows) and belong to --deep", ordinary.statCalls)
+			}
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount, checkSourceRetention} {
+				got := checkNamed(t, rep, name)
+				if got.State != model.CheckUnverified {
+					t.Fatalf("%s state is %q, want %q", name, got.State, model.CheckUnverified)
+				}
+				if !strings.Contains(got.Detail, shallowUnverified) {
+					t.Fatalf("%s detail %q does not say it was %q", name, got.Detail, shallowUnverified)
+				}
+			}
+			if rep.State != model.CheckPass {
+				t.Fatalf("report state is %q; a deliberately skipped check is not a defect", rep.State)
+			}
+
+			deep := &fakeStore{}
+			deepRep, err := newTestService(t, Options{Build: model.CurrentBuildInfo(), Store: deep}).Doctor(context.Background(), model.DoctorRequest{Deep: true})
+			if err != nil {
+				t.Fatalf("deep Doctor: %v", err)
+			}
+			if deep.statCalls != 1 {
+				t.Fatalf("a deep doctor made %d Stats calls, want exactly 1", deep.statCalls)
+			}
+			for _, name := range []string{checkStorageIntegrity, checkStorageAccount, checkSourceRetention} {
+				if got := checkNamed(t, deepRep, name); got.State != model.CheckPass {
+					t.Fatalf("deep %s state is %q, want %q", name, got.State, model.CheckPass)
+				}
+			}
+		},
+	},
+	{
 		// Failure mode: the expensive integrity pass runs on every ordinary
 		// call, so `version`, `status` and `search` each pay for a full
 		// database and content-addressed-storage scan. Section 22's last line
@@ -354,6 +399,9 @@ type fakeStore struct {
 	// store for, which is how a row proves an ordinary call runs no scan.
 	checks     int
 	deepChecks int
+	// statCalls records Stats calls. Stats is eleven count(*) scans, so an
+	// ordinary doctor must make none of them.
+	statCalls int
 	// L1: the two optional probes doctor.go asserts for. supplied is what
 	// SuppliedIndexes reports; sampleLimit records the sample size the caller
 	// asked for, so a row can prove --deep widens it.
@@ -425,7 +473,16 @@ func (f *fakeStore) Check(_ context.Context, deep bool) error {
 	return f.err
 }
 
-func (f *fakeStore) Stats(context.Context) (StoreStats, error) { return f.stats, f.err }
+func (f *fakeStore) Stats(context.Context) (StoreStats, error) {
+	f.statCalls++
+	return f.stats, f.err
+}
+
+// StoreSizes is the optional cheap-size probe a shallow accounting check reads
+// instead of Stats. It is two file stats in the real store and counts nothing.
+func (f *fakeStore) StoreSizes(context.Context) (int64, int64, error) {
+	return f.stats.DatabaseBytes, f.stats.WALBytes, f.err
+}
 
 func (f *fakeStore) ActiveGeneration(context.Context, model.RepositoryID) (model.GenerationID, error) {
 	return f.active, f.err
