@@ -84,6 +84,9 @@ type generation struct {
 // attempt captures, plans, builds and publishes exactly once.
 func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
 	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
+	// The plan's whole-snapshot input run is a file under the work directory
+	// for as long as the units that stream from it are running, and no longer.
+	defer func() { _ = g.plan.Close() }()
 	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -164,7 +167,8 @@ func (g *generation) planUnits(ctx context.Context) error {
 	if g.req.Full || g.req.Rebuild {
 		prev = 0
 	}
-	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev, Config: c.opts.Config}
+	in := plan.Inputs{View: g.view, Selection: sel, Store: c.opts.Store, PrevGen: prev,
+		Config: c.opts.Config, TempDir: c.workDir}
 	if prev != 0 {
 		in.CarriedPage = c.carriedPage(prev)
 	}
@@ -403,7 +407,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if applier, ok := c.appliers[u.ProviderID]; ok {
 		previous := g.plan.Previous[plan.Key(u.ProviderID, u.ScopeKey)]
 		req := delta.Request{Generation: g.gen, Previous: previous,
-			Build: build, Inputs: inputsOf(u.Inputs), Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
+			Build: build, Inputs: u.Inputs, Unit: ureq, WorkDir: filepath.Join(c.workDir, u.ProviderID)}
 		// The applier calls CompleteProviderRun itself, on both paths and
 		// under a context that survives cancellation; calling it again here
 		// would fail as "run is not running".
@@ -426,7 +430,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if err != nil {
 		return outcome{}, err
 	}
-	w, err := c.opts.Store.BeginUnit(ctx, g.gen, build, inputsOf(u.Inputs))
+	w, err := c.opts.Store.BeginUnit(ctx, g.gen, build, u.Inputs)
 	if err != nil {
 		return outcome{}, err
 	}
@@ -437,7 +441,7 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	if err := c.opts.Store.CompleteProviderRun(context.WithoutCancel(ctx), result, provider.CodeOf(runErr)); err != nil {
 		runErr = errors.Join(runErr, err)
 	}
-	return outcome{result: result, parsed: int64(len(u.Inputs)), invalidated: invalidated && runErr == nil}, runErr
+	return outcome{result: result, parsed: u.InputCount, invalidated: invalidated && runErr == nil}, runErr
 }
 
 // parsedBy is how many of a delta-built unit's files were actually read. A
@@ -450,7 +454,7 @@ func parsedBy(a delta.Applier, u plan.Unit, out delta.Result) int64 {
 	if a.Kind() == delta.KindSCIP && !out.Full {
 		return out.Delta.Changed
 	}
-	return int64(len(u.Inputs))
+	return u.InputCount
 }
 
 // replacesPredecessor reports whether the previous generation selected a
@@ -635,17 +639,6 @@ func (g *generation) capabilitiesOf(providerID string) []string {
 // require: every walk yields the same inputs, in the ascending FileID order
 // the planner already sorted them into. The slice is the plan's own and is
 // never mutated here.
-func inputsOf(inputs []model.UnitInput) func(yield func(model.UnitInput) error) error {
-	return func(yield func(model.UnitInput) error) error {
-		for _, in := range inputs {
-			if err := yield(in); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
 // healthOf is Section 13.3's whole-generation health. An unavailable optional
 // capability leaves a base generation fresh; anything partial, stale or failed
 // makes it degraded. A generation with no coverage at all is not published:

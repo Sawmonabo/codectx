@@ -538,11 +538,12 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		return model.IndexResult{}, false, err
 	}
 	in := plan.Inputs{View: view, Selection: sel, Store: c.opts.Store, PrevGen: active,
-		CarriedPage: c.carriedPage(active), Config: c.opts.Config}
+		CarriedPage: c.carriedPage(active), Config: c.opts.Config, TempDir: c.workDir}
 	p, err := plan.Build(ctx, in)
 	if err != nil {
 		return model.IndexResult{}, false, err
 	}
+	defer func() { _ = p.Close() }()
 	replacing := make(map[string]model.UnitID, len(sealed))
 	for _, s := range sealed {
 		replacing[plan.Key(s.providerID, s.scopeKey)] = s.unit
