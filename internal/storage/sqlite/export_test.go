@@ -24,3 +24,6 @@ func LexicalInstanceQuery() string { return lexicalInstanceQuery }
 
 // EvidenceCountQuery is the build's third ordered scan.
 func EvidenceCountQuery() string { return evidenceCountQuery() }
+
+// ContainerQuery is the build's ordered container scan.
+func ContainerQuery() string { return containerQuery() }
