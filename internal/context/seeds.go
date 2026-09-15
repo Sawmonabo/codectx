@@ -30,8 +30,10 @@ type seedSet struct {
 	Unresolved bool
 	// cutStages names the Section 15.2 steps already reported as having stopped
 	// at model.MaxSeeds, so one bound that stops several later steps is named
-	// once per step rather than once per skipped identity.
-	cutStages map[originKind]bool
+	// once per step rather than once per skipped identity. The key is the STEP,
+	// not the step's originKind: several steps share one origin, and keying on
+	// the origin reported only the first of them and dropped the rest.
+	cutStages map[string]bool
 }
 
 // noteCut records that a Section 15.2 discovery step stopped at model.MaxSeeds
@@ -46,12 +48,12 @@ type seedSet struct {
 func (s *seedSet) noteCut(origin originKind, step string) {
 	s.Unresolved = true
 	if s.cutStages == nil {
-		s.cutStages = map[originKind]bool{}
+		s.cutStages = map[string]bool{}
 	}
-	if s.cutStages[origin] {
+	if s.cutStages[step] {
 		return
 	}
-	s.cutStages[origin] = true
+	s.cutStages[step] = true
 	s.Excluded = append(s.Excluded, candidate{
 		// The step is the exclusion's Path because ContextReference refuses a
 		// reference that names neither a node, a file nor a path, and the cut
@@ -63,6 +65,39 @@ func (s *seedSet) noteCut(origin originKind, step string) {
 		Excluded: boundReason(fmt.Sprintf(
 			"seed discovery stopped at the %d-seed bound while collecting %s; identities beyond it were never examined",
 			model.MaxSeeds, step)),
+	})
+}
+
+// notePageEnd records that a Section 15.2 discovery step consumed one page of a
+// bounded read and did not continue past it.
+//
+// It is the page-boundary sibling of noteCut: MaxSeeds is a bound on the plan,
+// a page is a bound on one read, and a step that stopped at the second saw less
+// of the repository than the step that stopped at the first. Both leave the
+// plan partial, so both are disclosed as exclusions and both mark the scope
+// incomplete. The continuation cursor is carried in the reason, so a caller who
+// wants the rest knows the read is resumable rather than exhausted.
+func (s *seedSet) notePageEnd(origin originKind, step, cursor string) {
+	s.Unresolved = true
+	if s.cutStages == nil {
+		s.cutStages = map[string]bool{}
+	}
+	key := "page:" + step
+	if s.cutStages[key] {
+		return
+	}
+	s.cutStages[key] = true
+	reason := fmt.Sprintf(
+		"seed discovery read one page of %s and did not continue; matches beyond that page were never examined",
+		step)
+	if cursor != "" {
+		reason += fmt.Sprintf(" (continuation cursor %s)", cursor)
+	}
+	s.Excluded = append(s.Excluded, candidate{
+		// Same reason noteCut uses a step Path: the page end names no entity.
+		Path:     "seed discovery: " + step,
+		Origin:   origin,
+		Excluded: boundReason(reason),
 	})
 }
 
@@ -165,9 +200,12 @@ func (c *Compiler) resolveIdentity(ctx context.Context, reader *sqlite.PinnedRea
 		}
 	}
 
-	nodes, err := c.resolveSymbol(ctx, gen, tok.Text)
+	nodes, next, err := c.resolveSymbol(ctx, gen, tok.Text)
 	if err != nil {
 		return false, err
+	}
+	if next != "" {
+		out.notePageEnd(tok.Origin, "the declarations the task's identities name", next)
 	}
 	if len(nodes) == 0 {
 		return false, nil
@@ -203,9 +241,12 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 		if taken[term] {
 			continue
 		}
-		nodes, err := c.resolveSymbol(ctx, gen, term)
+		nodes, next, err := c.resolveSymbol(ctx, gen, term)
 		if err != nil {
 			return err
+		}
+		if next != "" {
+			out.notePageEnd(originExactResolve, "the declarations the task's free terms name", next)
 		}
 		for _, n := range nodes {
 			add(out, seen, nodeCandidate(n, originExactResolve,
@@ -253,6 +294,13 @@ func (c *Compiler) freeTermSeeds(ctx context.Context, gen model.GenerationID, ta
 			cnd.StartByte = int64(hit.Range.Start.Byte)
 		}
 		add(out, seen, cnd)
+	}
+	if page.Meta.NextCursor != "" {
+		// The lexical tier reads ONE page by design -- it is the weakest
+		// discovery step and paging it to exhaustion would let the task text
+		// dominate the plan -- but stopping there is a fact about the plan, not
+		// an implementation detail, so it is reported rather than assumed.
+		out.notePageEnd(originLexical, "the lexical matches of the task text", page.Meta.NextCursor)
 	}
 	return nil
 }
@@ -327,9 +375,15 @@ func (c *Compiler) changedFileSeeds(ctx context.Context, reader *sqlite.PinnedRe
 // names the pinned generation explicitly and asks for canonical facts only:
 // Section 15.3 admits sealed facts, so the ephemeral LSP overlay is never a
 // seed source.
-func (c *Compiler) resolveSymbol(ctx context.Context, gen model.GenerationID, query string) ([]model.Node, error) {
+//
+// The page's continuation cursor is returned with the nodes: exact resolution
+// reads one page per term, and a term that resolves to more declarations than
+// one page holds has declarations this plan never saw. The caller discloses
+// that as a page-end exclusion rather than treating the page as the whole
+// answer.
+func (c *Compiler) resolveSymbol(ctx context.Context, gen model.GenerationID, query string) ([]model.Node, string, error) {
 	if query == "" {
-		return nil, nil
+		return nil, "", nil
 	}
 	page, err := c.search.Resolve(ctx, model.SymbolRequest{
 		GenerationID:   gen,
@@ -345,11 +399,11 @@ func (c *Compiler) resolveSymbol(ctx context.Context, gen model.GenerationID, qu
 		// failed compile: it falls through to its exclusion reason, which is
 		// what leaves the scope incomplete.
 		if errors.As(err, &typed) && (typed.Code == model.CodeArgumentInvalid || typed.Code == model.CodeResourceLimit) {
-			return nil, nil
+			return nil, "", nil
 		}
-		return nil, contextErr(ctx, err)
+		return nil, "", contextErr(ctx, err)
 	}
-	return page.Items, nil
+	return page.Items, page.Meta.NextCursor, nil
 }
 
 // snapshotFile returns the visible snapshot row for a normalized path, or the
@@ -376,6 +430,31 @@ func (c *Compiler) pageLimit() int {
 		return n
 	}
 	return model.MaxPageItems
+}
+
+// pageLimitNotice is the disclosure that goes with pageLimit's clamp.
+//
+// model.MaxPageItems stays: a page size is a bound on ONE read and on the wire
+// shape of a page, not on the answer -- every identity past it is read by the
+// next page -- so it is not the kind of cap this wave removes. What it stopped
+// being is silent. A configured resources.max_page_items above the wire ceiling
+// is reported as "requested N, effective M" on the manifest, so an operator who
+// raised the setting and saw no change learns why from the answer instead of
+// from the source.
+//
+// It is a pure function of configuration, so the compiler evaluates it once per
+// compile rather than at each of the six pageLimit() call sites -- one notice,
+// not one per read -- and emits it on the manifest-reuse path too, where no
+// read runs but the caller asked for the same page size.
+func (c *Compiler) pageLimitNotice() string {
+	n := c.cfg.Resources.MaxPageItems
+	if n <= 0 || n <= model.MaxPageItems {
+		return ""
+	}
+	note, _ := model.TruncateField(fmt.Sprintf(
+		"resources.max_page_items requested %d, effective %d: a page size bounds one read, not the answer; every identity past a page is read by continuation",
+		n, model.MaxPageItems), model.MaxReasonBytes)
+	return note
 }
 
 // nodeCandidate builds the seed candidate for one resolved declaration. A
