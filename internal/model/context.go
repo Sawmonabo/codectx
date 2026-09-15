@@ -216,9 +216,12 @@ func (e ContextEntry) Validate() error {
 	if err := boundStrings("context_entry.reasons", e.Reasons, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err
 	}
-	if err := boundCount("context_entry.evidence_paths", len(e.EvidencePaths), MaxReasonPathsPerEntry); err != nil {
-		return err
-	}
+	// No count bound on evidence_paths. MaxReasonPathsPerEntry is superseded by
+	// the configured context.max_reason_paths_per_entry limit, which the ranking
+	// lane honours as written -- including unlimited. Refusing an entry here for
+	// carrying more routes than the old model constant would fail a persist for
+	// obeying the operator's own setting, and what an entry cannot enumerate is
+	// already disclosed by its MorePaths reason rather than dropped.
 	for i, path := range e.EvidencePaths {
 		field := indexed("context_entry.evidence_paths", i)
 		if err := boundCount(field, len(path), MaxRelationsPerPath); err != nil {
