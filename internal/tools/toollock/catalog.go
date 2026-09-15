@@ -385,9 +385,11 @@ func catalog() []toolSpec {
 func ty(file string, kind archiveKind) *source {
 	url := "https://github.com/astral-sh/ty/releases/download/" + tyVersion + "/" + file
 	return &source{
-		URL:    url,
-		Kind:   kind,
-		Strip:  0,
-		Digest: digestSpec{Algo: "sha256", URL: url + ".sha256"},
+		URL:   url,
+		Kind:  kind,
+		Strip: 0,
+		// Match by asset name as well: a sidecar is only provenance if it
+		// names the artifact it claims to digest.
+		Digest: digestSpec{Algo: "sha256", URL: url + ".sha256", Match: file},
 	}
 }
