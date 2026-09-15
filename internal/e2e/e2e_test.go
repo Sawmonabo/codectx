@@ -1209,7 +1209,15 @@ func TestE2EProductBoundary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if refreshed.Content == string(live) {
+		// The live bytes are clamped to the window the session pinned before
+		// they are compared: the read is bounded by the size the session
+		// recorded, so an unclamped comparison would differ for the trivial
+		// reason that the file grew and would pass whatever was served.
+		window := live
+		if uint64(len(window)) > refreshed.ByteRange.End {
+			window = window[:refreshed.ByteRange.End]
+		}
+		if refreshed.Content == string(window) {
 			t.Errorf("the pinned session served the live working-tree bytes of %s, not the source it retained", mutatedFile)
 		}
 	}) {
@@ -1308,6 +1316,13 @@ const (
 	mutatedFile      = "src/go/store/store.go"
 	mutationSymbol   = "TinyExtra"
 	mutationBody     = "\n// TinyExtra is added by the incremental-mutation row.\nfunc TinyExtra() string {\n\treturn \"extra\"\n}\n"
+	// The mutation also rewrites a comment near the TOP of the file. An
+	// append alone would leave the first pinnedSize bytes byte-identical, so a
+	// read that wrongly served the LIVE tree -- clamped to the size the session
+	// pinned -- would return exactly the retained bytes and row (b) could not
+	// tell the two apart.
+	mutatedComment = "// TinyStore holds one record."
+	mutatedTo      = "// TinyStore holds one record; amended by the mutation row."
 )
 
 // renderCapsule executes the HUMAN capsule renderer over every Section 17.3
@@ -1382,15 +1397,15 @@ func openRetainedSession(t *testing.T, s *sandbox) (model.SessionRequest, model.
 func mutateStore(t *testing.T, repo string) {
 	t.Helper()
 	path := filepath.Join(repo, mutatedFile)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	before, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("open %s to mutate it: %v", mutatedFile, err)
+		t.Fatalf("read %s to mutate it: %v", mutatedFile, err)
 	}
-	if _, err := f.WriteString(mutationBody); err != nil {
-		f.Close()
+	after := bytes.Replace(before, []byte(mutatedComment), []byte(mutatedTo), 1)
+	if bytes.Equal(after, before) {
+		t.Fatalf("%s does not carry %q, so the mutation would only append", mutatedFile, mutatedComment)
+	}
+	if err := os.WriteFile(path, append(after, mutationBody...), 0o600); err != nil {
 		t.Fatalf("mutate %s: %v", mutatedFile, err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close %s: %v", mutatedFile, err)
 	}
 }
