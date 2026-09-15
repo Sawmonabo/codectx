@@ -40,9 +40,17 @@ import (
 //	  reasonDeadlineStalled and no cursor -- instead of minting the cursor again.
 //
 // Mutations, run and pasted in the lane report:
-//   - walkStalled's call site deleted in impact.go (the deadline checked, and a
-//     continuation minted, before the page's first admission): the no-progress
-//     case pages to the cap and fails.
+//   - walkStalled's call site disabled in impact.go (`if false && walkStalled`),
+//     so a page that admitted nothing mints the continuation anyway: the
+//     no-progress case fails at `page 7: CTX_CURSOR_INVALID: continuation state
+//     has expired`. Not the cap, and stated as measured. The chain does not
+//     spin to pageCap because it runs out of LEASE first: this fixture's clock
+//     jumps two minutes on every adjacency read against a fifteen-minute
+//     CursorTTL, so a chain making no progress burns its TTL in about seven
+//     pages. That end is a typed terminal error and no state is lost -- it is
+//     OpenDir's expiry check, not a directory a re-adoption mislaid -- but it
+//     is the lease ending the chain rather than the walk reporting that it
+//     cannot advance, which is the whole of what the guard adds.
 //   - rankedSpoolHeader made to stream the whole spool instead of stopping after
 //     the header record: the chain reads 880 380 800 bytes of an 8 716 646 byte
 //     spool over 102 pages and (1c) fails.
