@@ -143,3 +143,8 @@ currently empty, semantics-neutral option allowlist), never for memory, publishe
 analysis limits or omitted fact families. Every advertised language (nine languages, six
 frontends; C++ and TSX still to be exercised) runs end to end in Task 22 with real tools. Benchmark
 corpora are pinned by commit in Task 21 as the differential oracle for any future native engine.
+
+The §8 ruling above was generalised from the dependence tier to the whole product on 2026-09-14;
+the decisions, the alternatives weighed against them and the measurements behind them are recorded in
+[ADR-0001 — Scale posture](../adr/ADR-0001-scale-posture.md), with the bound inventory in
+[15-scale-posture.md](15-scale-posture.md).
