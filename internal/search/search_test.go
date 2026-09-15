@@ -756,11 +756,16 @@ type countingCAS struct {
 	cas   *snapshot.CAS
 	reads int
 	bytes uint64
+	// maxRead is the largest single call. The CAS refuses a call over
+	// model.MaxRawChunkBytes, so this is the invariant that keeps hydration
+	// off that ceiling however long the span it resolves.
+	maxRead uint64
 }
 
 func (c *countingCAS) ReadRange(ctx context.Context, rec model.BlobRecord, r model.ByteRange) ([]byte, error) {
 	c.reads++
 	c.bytes += r.End - r.Start
+	c.maxRead = max(c.maxRead, r.End-r.Start)
 	return c.cas.ReadRange(ctx, rec, r)
 }
 
@@ -871,6 +876,55 @@ func legRangeHydration(t *testing.T, _ *fixture) {
 	if sparseCounter.reads < 2 {
 		t.Fatalf("the walk took %d reads over a %d-byte gap with a %d-byte window; it is not walking it",
 			sparseCounter.reads, span.Start, maxRangeWindowBytes)
+	}
+
+	if counter.maxRead > maxRangeWindowBytes {
+		t.Errorf("one hydration read pulled %d bytes, over the %d-byte window", counter.maxRead, maxRangeWindowBytes)
+	}
+
+	// SV2: a file that is ONE LINE of megabytes -- a minified bundle, a
+	// generated data file. No line checkpoint can exist inside it, so
+	// resolving a hit 4.5 MiB in used to ask the CAS for that whole span in
+	// one call and failed the WHOLE answer with CTX_RESOURCE_LIMIT ("byte
+	// range spans 4292608 bytes, over the 1048576-byte read ceiling").
+	head := "// generated -- do not edit\n"
+	longTarget := "func café() string { return foo(bar) }"
+	lead := 4608000 - len(head) // the hit sits 4.5 MiB into the single line
+	longLine := head + strings.Repeat("x", lead) + longTarget + strings.Repeat("y", 1<<19) + "\n"
+	longRec, err := cas.Put(ctx, strings.NewReader(longLine))
+	if err != nil {
+		t.Fatalf("Put(long line): %v", err)
+	}
+	longSpan := model.ByteRange{Start: uint64(len(head) + lead), End: uint64(len(head) + lead + len(longTarget))}
+	if gap := longSpan.Start - checkpointIndex(longRec).CheckpointFor(longSpan.Start).Byte; gap <= model.MaxRawChunkBytes {
+		t.Fatalf("the nearest checkpoint is %d bytes back; the fixture no longer exercises a span over the read ceiling", gap)
+	}
+	lh := newHydrator(
+		stubFiles{file: {ID: file, Path: "web/bundle.min.js", ContentHash: longRec.Hash, Size: longRec.Size}},
+		stubBlobs{longRec.Hash: longRec},
+		&countingCAS{cas: cas})
+	longCounter := lh.content.(*countingCAS)
+	longHits := []model.SearchHit{{FileID: file, Path: "web/bundle.min.js", Kind: model.NodeFunction, Tier: model.TierLexicalFTS}}
+	if err := lh.hydratePage(ctx, longHits, []model.ByteRange{longSpan}); err != nil {
+		t.Fatalf("hydratePage over a %d-byte line: %v: a long line must cost more reads, never a failed answer",
+			len(longLine), err)
+	}
+	wantLong := model.SourceRange{
+		Start: model.Position{Byte: longSpan.Start, Line: 2, Column: uint32(lead)},
+		End:   model.Position{Byte: longSpan.End, Line: 2, Column: uint32(lead + len(longTarget))},
+	}
+	if longHits[0].Range == nil || *longHits[0].Range != wantLong {
+		t.Fatalf("the streamed position is %+v, want %+v", longHits[0].Range, wantLong)
+	}
+	if longCounter.maxRead > maxRangeWindowBytes {
+		t.Errorf("one read pulled %d bytes over a %d-byte span: the span is not being streamed",
+			longCounter.maxRead, longSpan.End-longSpan.Start)
+	}
+	// The end endpoint continues the walk that resolved the start: the whole
+	// resolution reads the span once, not once per endpoint.
+	if longCounter.bytes > longSpan.End+2*maxRangeWindowBytes {
+		t.Errorf("resolving both endpoints read %d bytes to reach byte %d: the walk is restarting",
+			longCounter.bytes, longSpan.End)
 	}
 
 	// Cancellation and deadline are different answers (digest §6).
