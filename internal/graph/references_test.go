@@ -1,11 +1,16 @@
 package graph
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
 // TestReferencePageBoundIsDisclosedNotClamped is the class-G proof for
@@ -43,4 +48,187 @@ func TestReferencePageBoundIsDisclosedNotClamped(t *testing.T) {
 	if !found {
 		t.Fatalf("a page bound clamped from 50 to 5 was not disclosed; notices = %q", page.Meta.Notices)
 	}
+}
+
+// refsEngine builds a reference engine over f with continuations wired, whose
+// reader assigns surrogates in the given order. It returns the engine and the
+// lease store, which is what a test asserting "this answer retained nothing"
+// reads.
+func refsEngine(t *testing.T, f *graphFixture, order MemoryGraphOrder, pageItems int) (*Engine, *fixtureLeases) {
+	t.Helper()
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spools, err := pagination.NewSpools(t.TempDir(), 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxPageItems = pageItems
+	nodes := make([]model.Node, 0, len(f.nodes))
+	for _, n := range f.nodes {
+		nodes = append(nodes, n)
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	reader := NewMemoryGraphOrdered(f.binding, nodes, append([]model.Relation(nil), f.relations...), order)
+	e, err := New(Options{Adjacency: f, Reader: reader, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	return e, store
+}
+
+func refsPage(t *testing.T, e *Engine, node, cursor string) model.Page[model.ReferenceOccurrence] {
+	t.Helper()
+	page, err := e.References(context.Background(), model.ReferenceRequest{
+		NodeID:         fixtureNodeID(node),
+		Operation:      model.ReferenceReferences,
+		SemanticSource: model.SemanticCanonical,
+		Page:           model.PageRequest{Cursor: cursor},
+	})
+	if err != nil {
+		t.Fatalf("References(%s): %v", node, err)
+	}
+	return page
+}
+
+// TestReferencePagesAreIdenticalUnderEitherSurrogateOrder is the identity proof
+// across the surrogate/canonical boundary. The packed reader streams a node's
+// list in SURROGATE order, which the store assigns and may renumber; the
+// answer's order is the canonical relation id and always was. The same fixture
+// read through a reader whose surrogates ascend with the canonical ids and
+// through one whose surrogates REVERSE them must therefore serve the same page,
+// byte for byte -- a caller's saved page cannot be reshuffled by a reindex.
+//
+// Mutation (the sort's comparator made a constant, which leaves the stable sort
+// and the merge's run tie-break holding arrival order -- that is, surrogate
+// order): the reversed page lists the two relations the other way round and
+// this fails.
+func TestReferencePagesAreIdenticalUnderEitherSurrogateOrder(t *testing.T) {
+	f := newGraphFixture(t)
+	canonical, _ := refsEngine(t, f, MemoryGraphOrder{}, 200)
+	reversed, _ := refsEngine(t, f, MemoryGraphOrder{
+		Nodes:     func(a, b model.NodeID) int { return -cmp.Compare(a, b) },
+		Relations: func(a, b model.RelationID) int { return -cmp.Compare(a, b) },
+	}, 200)
+
+	// n-z is called by both n-p and n-q, so its answer holds more than one
+	// relation and an order is observable at all.
+	a, b := refsPage(t, canonical, "n-z", ""), refsPage(t, reversed, "n-z", "")
+	if len(a.Items) < 2 {
+		t.Fatalf("the fixture served %d occurrences for n-z; an order needs at least two", len(a.Items))
+	}
+	wantJSON, gotJSON := mustJSON(t, a.Items), mustJSON(t, b.Items)
+	if wantJSON != gotJSON {
+		t.Fatalf("the reversed surrogate order served a different page\n canonical: %s\n reversed:  %s", wantJSON, gotJSON)
+	}
+}
+
+// TestReferenceSecondPageIsServedByOffset proves the continuation reads its own
+// byte range out of the spool the first page wrote, and walks nothing. The two
+// pages must CONCATENATE to the single-shot answer: the same occurrences, in
+// the same order, each listed exactly once.
+//
+// Mutation (resumedReferencePage opens at offset 0 instead of the cursor's):
+// page two re-serves page one's relation and the duplicate check fails.
+func TestReferenceSecondPageIsServedByOffset(t *testing.T) {
+	f := newGraphFixture(t)
+	// THREE pages, not two: with only two, page two begins at the first record
+	// of the spool, which is where a reader that ignored the offset would start
+	// anyway, and the offset would carry no weight.
+	widenReferences(t, f, "n-z", 2)
+	whole, _ := refsEngine(t, f, MemoryGraphOrder{}, 200)
+	want := refsPage(t, whole, "n-z", "")
+	if len(want.Items) < 4 {
+		t.Fatalf("the fixture served %d occurrences for n-z; three pages need at least four", len(want.Items))
+	}
+
+	// One occurrence per page, so the page ends on the first relation boundary
+	// with the second relation still to come.
+	paged, leases := refsEngine(t, f, MemoryGraphOrder{}, 1)
+	first := refsPage(t, paged, "n-z", "")
+	if first.Meta.NextCursor == "" {
+		t.Fatalf("a page holding %d of %d occurrences offered no continuation", len(first.Items), len(want.Items))
+	}
+	if leases.liveCount() != 1 {
+		t.Fatalf("liveCount = %d, want the one lease the continuation retains", leases.liveCount())
+	}
+	got := append([]model.ReferenceOccurrence(nil), first.Items...)
+	for cursor := first.Meta.NextCursor; cursor != ""; {
+		page := refsPage(t, paged, "n-z", cursor)
+		got, cursor = append(got, page.Items...), page.Meta.NextCursor
+	}
+	if s, w := mustJSON(t, got), mustJSON(t, want.Items); s != w {
+		t.Fatalf("the pages do not concatenate to the single-shot answer\n want: %s\n got:  %s", w, s)
+	}
+	if leases.liveCount() != 0 {
+		t.Fatalf("liveCount = %d after the last page; an exhausted answer must retain nothing", leases.liveCount())
+	}
+}
+
+// TestReferenceListThatFitsOnePageRetainsNothing is the degree-one proof: an
+// answer served whole adopts no spool and mints no lease, so a small reference
+// query pays for its own list and nothing else.
+//
+// Mutation (firstReferencePage spools and mints its lease unconditionally
+// instead of only when relations remain): a lease is live and this fails.
+func TestReferenceListThatFitsOnePageRetainsNothing(t *testing.T) {
+	f := newGraphFixture(t)
+	// n-b is called by n-a and by nothing else.
+	e, leases := refsEngine(t, f, MemoryGraphOrder{}, 200)
+	page := refsPage(t, e, "n-b", "")
+	if len(page.Items) == 0 {
+		t.Fatalf("n-b has no reference occurrences; the case proves nothing")
+	}
+	if page.Meta.NextCursor != "" || page.Meta.Truncated {
+		t.Fatalf("a complete answer offered a continuation (%q) or reported truncation (%v)",
+			page.Meta.NextCursor, page.Meta.Truncated)
+	}
+	if leases.liveCount() != 0 {
+		t.Fatalf("liveCount = %d, want none: a list that fits one page retains nothing", leases.liveCount())
+	}
+}
+
+// widenReferences adds n further evidence-bearing callers of node to the
+// fixture. Their relation ids sort after every declared edge, so no existing
+// scenario's keyset order moves and no other answer gains an occurrence.
+func widenReferences(t *testing.T, f *graphFixture, node string, n int) {
+	t.Helper()
+	var proto model.Evidence
+	for _, r := range f.relations {
+		if rows := f.evidence[r.ID]; len(rows) > 0 {
+			proto = rows[0]
+			break
+		}
+	}
+	if proto.ID == "" {
+		t.Fatalf("the fixture carries no evidence row to model a new one on")
+	}
+	target := fixtureNodeID(node)
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("n-page-src-%d", i)
+		src := fixtureNodeID(name)
+		f.nodes[src] = model.Node{ID: src, Kind: model.NodeFunction, Name: name,
+			QualifiedName: name, Language: "go", SemanticSource: model.SemanticCanonical}
+		rel := model.RelationID(fmt.Sprintf("%064x", 0xf000+i))
+		f.relations = append(f.relations, model.Relation{
+			ID: rel, From: src, Kind: model.RelCalls, To: target})
+		row := proto
+		row.ID = model.EvidenceID(fixtureID(fmt.Sprintf("ev-page-%d", i)))
+		row.RelationID = rel
+		f.evidence[rel] = []model.Evidence{row}
+	}
+	sort.Slice(f.relations, func(i, j int) bool { return f.relations[i].ID < f.relations[j].ID })
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(b)
 }
