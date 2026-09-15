@@ -685,3 +685,37 @@ CREATE TABLE context_capsule_rows (
 -- (session_id, file_id, content_hash). One file therefore yields at most one
 -- coverage row and at most one waiver per session.
 CREATE UNIQUE INDEX idx_capsule_row_key ON context_capsule_rows(session_id, list, row_key);
+
+-- The packed per-generation adjacency (ADR-0005 Decision 1). A generation's
+-- walk reads structure from here and from nowhere else: visibility is resolved
+-- once, at activation, instead of once per candidate edge per page, and the
+-- edge stream is scanned sequentially rather than descended as a b-tree.
+--
+-- It is derived from facts that are already sealed, so it is neither a fact nor
+-- an identity: no provider version and no analysis fingerprint of its own. It
+-- is dropped with the generation it belongs to.
+--
+-- generation_graph is written LAST, after every part, so its presence is the
+-- commit marker: a reader that finds the row is guaranteed every part behind it.
+CREATE TABLE generation_graph (
+    generation_id INTEGER PRIMARY KEY REFERENCES generations(id) ON DELETE CASCADE,
+    max_node INTEGER NOT NULL CHECK(max_node >= 0),
+    max_relation INTEGER NOT NULL CHECK(max_relation >= 0),
+    node_count INTEGER NOT NULL CHECK(node_count >= 0),
+    edge_count INTEGER NOT NULL CHECK(edge_count >= 0),
+    kinds BLOB NOT NULL,
+    node_kinds BLOB NOT NULL,
+    format INTEGER NOT NULL CHECK(format = 1)
+);
+-- One chunk of one stream. The streams are the two directions' offset
+-- directories and edge streams plus the per-node and per-relation side arrays;
+-- `part` is 0-based and the parts of a stream concatenate to it, so a reader
+-- holds a bounded window of parts rather than a whole direction.
+CREATE TABLE generation_graph_parts (
+    generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    stream TEXT NOT NULL CHECK(stream IN ('out.off','out.edges','in.off','in.edges',
+        'node.kind','node.container','node.bytes','rel.evidence')),
+    part INTEGER NOT NULL CHECK(part >= 0),
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(generation_id, stream, part)
+) WITHOUT ROWID;
