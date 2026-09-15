@@ -1352,7 +1352,7 @@ func legRankedSetIsBoundedByItsRunBudget(t *testing.T, f *fixture) {
 	// A ten-fold spool must not move the live set. The accumulating readSpool
 	// this replaced held 1.3-1.8 KiB per remaining match, so 20 000 hits would
 	// stand ~30 MiB above 2 000 here; one page is a constant.
-	if largeHeap > smallHeap+(1<<22) {
+	if largeHeap > smallHeap+(1<<20) {
 		t.Fatalf("a continuation held %d heap bytes over a 2000-hit spool and %d over a 20000-hit one; "+
 			"the live set of a continuation is one page, not the tail", smallHeap, largeHeap)
 	}
