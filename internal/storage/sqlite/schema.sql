@@ -511,3 +511,28 @@ CREATE TABLE watch_heartbeat (
     pending_events INTEGER CHECK(pending_events IS NULL OR pending_events >= 0),
     expires_at TEXT NOT NULL
 );
+
+-- A sealed capsule's record lists (Section 17.3). context_capsules carries the
+-- capsule's identity and its per-list counts; the records themselves live here,
+-- one row each, so sealing a session that observed a repository-sized record
+-- set writes in bounded batches and reading one back is a keyset page rather
+-- than a single JSON blob that must be held whole.
+--
+-- The primary key IS the read order: a page is one (session_id, list) range
+-- scanned by ordinal, which is the list's canonical order, so no sort is
+-- needed and a continuation resumes at an ordinal instead of re-reading.
+-- row_key is the record's own cursor key, unique within a (session_id, list);
+-- the index on it turns a caller's cursor into the ordinal to resume from, and
+-- a cursor naming no row is refused rather than silently restarting the list.
+-- The rows are written inside the same transaction that inserts the capsule, so
+-- a capsule never exists without its records and the seal stays write-once.
+CREATE TABLE context_capsule_rows (
+    session_id BLOB NOT NULL REFERENCES context_capsules(session_id) ON DELETE CASCADE,
+    list TEXT NOT NULL CHECK(list IN ('scope','accepted_facts','rejected_facts','contradictions',
+        'unresolved','scope_review_ids','coverage','waivers')),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    row_key TEXT NOT NULL CHECK(length(row_key) > 0),
+    row_json TEXT NOT NULL,
+    PRIMARY KEY(session_id, list, ordinal)
+) WITHOUT ROWID;
+CREATE UNIQUE INDEX idx_capsule_row_key ON context_capsule_rows(session_id, list, row_key);
