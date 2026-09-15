@@ -234,9 +234,26 @@ func (v *visitedSet) spillable() []model.NodeID {
 	return out
 }
 
-// newlyAdmitted is the name the paging endpoints call spillable by. It is kept
-// so the impact and rollup continuations compile unchanged.
+// newlyAdmitted is the name the paged TRAVERSAL calls spillable by: that
+// endpoint still carries its cumulative set forward in the continuation spool.
 func (v *visitedSet) newlyAdmitted() []model.NodeID { return v.spillable() }
+
+// addedNodes is this leg's OWN admissions, ascending, and nothing else. It is
+// what the append-only run store takes (visitedstore.go): the resumed frontier
+// carried in v.carried belongs to an earlier leg's run already, so including it
+// would write the same node a second time for no answer it can change.
+//
+// Every node that ever reaches a frontier passes through add -- a seed at
+// entry, a neighbour at the moment it is admitted (traverse.go) -- so the runs
+// taken leg by leg hold the whole cumulative set with nothing left out.
+func (v *visitedSet) addedNodes() []model.NodeID {
+	out := make([]model.NodeID, 0, len(v.added))
+	for id := range v.added {
+		out = append(out, id)
+	}
+	sortNodeIDs(out)
+	return out
+}
 
 // sortNodeIDs puts node ids in the frozen ascending order the spool and the
 // emission order share.
@@ -272,49 +289,53 @@ type visitedFilter struct {
 	k    uint32 // probes per key
 }
 
-// visitedFilterBitsPerNode is the target filter density. Sixteen bits per node
-// puts the false-positive rate near 1 in 2 000 at k=11, which turns a level of
-// fresh nodes into zero sweeps rather than one per level; it costs two bytes
-// per admitted node, against the ~70 bytes a node already costs on the spool.
-const visitedFilterBitsPerNode = 16
-
 // visitedFilterBudgetShare is the fraction of Limits.FrontierBytes the filter
 // may claim. The frontier ceiling is the walk's own memory budget, so taking an
 // eighth of it keeps the summary strictly smaller than the level it summarizes
-// while leaving the frontier the bytes it was given.
+// while leaving the frontier the bytes it was given. The share is spent in
+// full, because the geometry is frozen when the walk's first page creates the
+// filter and the size of the walk is not known then.
 const visitedFilterBudgetShare = 8
 
-// newVisitedFilter sizes a filter for estimate nodes within maxBytes of heap.
-// It returns nil when there is nothing to summarize or no budget to do it in;
-// a nil filter answers "may hold" for everything, which is the same behaviour
-// as having no filter at all.
-func newVisitedFilter(estimate, maxBytes int64) *visitedFilter {
+// spoolFilterBits sizes the summary the PAGED TRAVERSAL rebuilds per page from
+// its spool: sixteen bits for every node the cursor says the walk has admitted,
+// clamped to maxBytes of heap and rounded to whole words. That path re-reads
+// the whole set on every page anyway, so its filter is re-derived rather than
+// frozen, and a walk past the clamp simply gets a denser one -- more false
+// positives, more sweeps -- never a refusal or a truncation.
+func spoolFilterBits(estimate, maxBytes int64) uint64 {
 	if estimate <= 0 || maxBytes <= 0 {
-		return nil
+		return 0
 	}
-	words := (estimate*visitedFilterBitsPerNode + 63) / 64
-	if max := maxBytes / 8; words > max {
-		words = max
+	words := (estimate*16 + 63) / 64
+	if maxWords := maxBytes / 8; words > maxWords {
+		words = maxWords
 	}
 	if words <= 0 {
-		return nil
+		return 0
 	}
-	f := &visitedFilter{bits: make([]uint64, words), m: uint64(words) * 64}
-	// k = ln2 * m/n, clamped: one probe is the floor, and past sixteen the
-	// probes cost more than the false positives they remove.
-	k := (f.m * 693) / (uint64(estimate) * 1000)
-	if k < 1 {
-		k = 1
-	}
-	if k > 16 {
-		k = 16
-	}
-	f.k = uint32(k)
-	return f
+	return uint64(words) * 64
 }
 
-// add records that the spooled set holds id.
-func (f *visitedFilter) add(id model.NodeID) {
+// newFrozenVisitedFilter builds a filter of exactly bits bits and k probes.
+// Both are the manifest's frozen geometry (visitedstore.go): a filter re-sized
+// between pages would answer "absent" for a node whose bits were set under the
+// old size, and a false negative here is a node the walk has admitted being
+// admitted again on a later page. bits is a multiple of 64 and k is positive;
+// a zero bit count means there was no budget for a summary at all, which a nil
+// filter already expresses.
+func newFrozenVisitedFilter(bits uint64, k uint32) *visitedFilter {
+	if bits == 0 || k == 0 {
+		return nil
+	}
+	return &visitedFilter{bits: make([]uint64, bits/64), m: bits, k: k}
+}
+
+// addWords records that the retained set holds id and, when dirty is non-nil,
+// names every WORD the probes changed. The persisted filter is a fixed-size
+// file written in place, so a page rewrites those words alone rather than the
+// whole summary (visitedstore.go).
+func (f *visitedFilter) addWords(id model.NodeID, dirty map[uint64]struct{}) {
 	if f == nil {
 		return
 	}
@@ -322,6 +343,9 @@ func (f *visitedFilter) add(id model.NodeID) {
 	for i := uint32(0); i < f.k; i++ {
 		b := (h1 + uint64(i)*h2) % f.m
 		f.bits[b/64] |= 1 << (b % 64)
+		if dirty != nil {
+			dirty[b/64] = struct{}{}
+		}
 	}
 }
 

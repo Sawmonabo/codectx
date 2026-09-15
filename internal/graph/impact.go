@@ -177,7 +177,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 	// the WHOLE retained input once the walk is exhausted.
 	retain := resumeRetained(resume)
 	if retain == nil {
-		if retain, err = openRetainedWalk(e.walkScratchDir()); err != nil {
+		if retain, err = openRetainedWalk(e.walkScratchDir(), e.limits.FrontierBytes/visitedFilterBudgetShare); err != nil {
 			return answer, nil, nil, "", err
 		}
 	}
@@ -217,6 +217,11 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				DeadlineStops:            true,
 				DeadlineResumesEmptyPage: true,
 				Resume:                   resume,
+				// The walk's cumulative admitted-node set, append-only and
+				// persistent: every internal link adds its own admissions to it
+				// directly, so the continuation carries them and the next page
+				// never re-admits a node an earlier link reported.
+				Visited: retain.visited,
 			}, func(fs frontierState, rel model.Relation) error {
 				// The accumulator FIRST: it is what refuses an edge the work
 				// budgets have no room for, and an edge it refused was never
@@ -231,11 +236,6 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 			})
 			return werr
 		}, retain.addPair, e.rollupProbe())
-		if state.ReleaseCarried != nil {
-			// After the continuation below has been spilled: the spill is what
-			// reads the carried stream.
-			defer state.ReleaseCarried()
-		}
 		if err := impactPhaseError(ctx, walkErr, &meta); err != nil {
 			return answer, nil, nil, "", err
 		}
@@ -558,12 +558,10 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 	if len(state.Frontier) == 0 || state.DepthLimited {
 		return "", nil
 	}
-	// The cumulative admitted set is NOT materialized here: only the nodes THIS
-	// page admitted are, and the rest is copied spool to spool.
-	var carried visitedStream
-	if resume != nil {
-		carried = resume.Visited
-	}
+	// The cumulative admitted set is NOT materialized here and NOT copied
+	// forward: only the nodes THIS page admitted are, appended to the retained
+	// run store as one more ascending run (visitedstore.go). Everything earlier
+	// stays exactly where the page that admitted it wrote it.
 	return e.nextTraversalCursor(ctx, b, continuation{
 		Endpoint:  endpoint,
 		QueryHash: queryHash,
@@ -571,8 +569,7 @@ func (e *Engine) continueWalk(ctx context.Context, b *budget, endpoint, queryHas
 		LastOwner: lastOwner,
 		LastKey:   lastKey,
 		Frontier:  state.Frontier,
-		Visited:   state.Admitted.newlyAdmitted(),
-		Carried:   carried,
+		Visited:   state.Admitted.addedNodes(),
 		Retain:    retain,
 	})
 }

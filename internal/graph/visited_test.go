@@ -337,12 +337,12 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 		}
 		return nil
 	}
-	filter := newVisitedFilter(chainNodes, int64(chainNodes*visitedFilterBitsPerNode/8))
+	filter := newFrozenVisitedFilter(spoolFilterBits(chainNodes, chainNodes*2), visitedFilterProbes)
 	if filter == nil {
 		t.Fatal("no membership summary was built for a 20 000-node walk")
 	}
 	for i := 0; i < chainNodes; i++ {
-		filter.add(syntheticID(i))
+		filter.addWords(syntheticID(i), nil)
 	}
 	c := newVisitedSet(chain)
 	c.filter = filter
@@ -378,10 +378,10 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 }
 
 // TestWarmAnswersAStreamOfSeveralAscendingRuns is the Defect B proof. The
-// cumulative set warm sweeps is a CONCATENATION of ascending blocks, not one
-// ascending sequence: runWalkToCompletion appends one block per internal link
-// (visitedScratch) and a resumed walk replays the cursor's spool before them
-// (chainVisited). A merge-join that assumed one global order advanced past a
+// cumulative set warm sweeps is a CONCATENATION of ascending runs, not one
+// ascending sequence: every leg of the walk appends one run of its own
+// admissions to the retained run store (visitedstore.go) and nothing merges
+// them. A merge-join that assumed one global order advanced past a
 // candidate answered by an EARLIER block and then stopped at the first block
 // that ran past the largest candidate, reporting a node the walk had already
 // admitted as absent -- re-admitting it on a later page and reporting the same
@@ -396,20 +396,20 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 // returned on `next >= len(sorted)` again): the first candidate below is
 // reported absent, which is the assertion this test leads with.
 func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
-	scratch, err := newVisitedScratch(t.TempDir())
+	store, err := openVisitedStore(t.TempDir(), 0)
 	if err != nil {
-		t.Fatalf("new visited scratch: %v", err)
+		t.Fatalf("open visited store: %v", err)
 	}
-	defer scratch.release()
-	// Link 1 admitted the high ids, link 2 the low ones. Each block is
+	defer store.close()
+	// Link 1 admitted the high ids, link 2 the low ones. Each run is
 	// ascending; the stream is not.
-	if err := scratch.append([]model.NodeID{"n-0500", "n-0600"}); err != nil {
+	if err := store.appendRun([]model.NodeID{"n-0500", "n-0600"}); err != nil {
 		t.Fatalf("append link 1: %v", err)
 	}
-	if err := scratch.append([]model.NodeID{"n-0100", "n-0200"}); err != nil {
+	if err := store.appendRun([]model.NodeID{"n-0100", "n-0200"}); err != nil {
 		t.Fatalf("append link 2: %v", err)
 	}
-	v := newVisitedSet(chainVisited(nil, scratch.stream))
+	v := newVisitedSet(store.stream)
 	// Both candidates were admitted; the sweep must answer both. n-0100 is the
 	// one the single-order join loses: n-0500 answers the larger candidate and
 	// leaves the join past it, and the pass used to end there.
@@ -421,13 +421,13 @@ func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
 			t.Fatalf("node %s was admitted by the walk but the sweep reported it absent: it would be admitted again and reported twice", id)
 		}
 	}
-	// A node no block holds is still absent: the run-aware join must not turn
+	// A node no run holds is still absent: the run-aware join must not turn
 	// a restart into a false positive.
 	if err := v.warm(context.Background(), []model.NodeID{"n-0300"}); err != nil {
 		t.Fatalf("warm: %v", err)
 	}
 	if v.has("n-0300") {
-		t.Fatal("a node no block holds was reported as already admitted")
+		t.Fatal("a node no run holds was reported as already admitted")
 	}
 }
 
