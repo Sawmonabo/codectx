@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
@@ -135,10 +136,11 @@ type retainedWalk struct {
 	owned bool
 	// chunkSize overrides frontierChunk. It is zero outside tests.
 	chunkSize int
-	// served is the level whose sorted run this request must not delete while
-	// the cursor that names it is still the newest one the caller holds. It is
-	// released when the next cursor is minted (releaseServed).
-	served int
+	// held are the files the cursor this leg was HANDED still names. A
+	// retryable failure tells the caller to present that same cursor again, so
+	// nothing it resumes from may be deleted until the next cursor supersedes
+	// it (releaseHeld). Its size is the entry state's: at most two files.
+	held []string
 	// probe counts what a RESUMED leg decodes to pick the walk up again, for
 	// the invariant that the cost of a resume is a function of the frontier and
 	// never of the cumulative set behind it. It is nil outside tests.
@@ -1023,19 +1025,28 @@ func (w *retainedWalk) hasFrontier(level int) (bool, error) {
 	return found, nil
 }
 
-// holdServed records the served level whose sorted run outlives this leg.
-func (w *retainedWalk) holdServed(level int) { w.served = level }
+// hold marks one file of this directory as the resumed cursor's, so the walk
+// leaves it alone however far past it this leg gets.
+func (w *retainedWalk) hold(name string) { w.held = append(w.held, name) }
 
-// releaseServed deletes that run. It is called when the next continuation is
-// minted: the cursor the caller held is superseded then, so nothing can ask for
-// the level again.
-func (w *retainedWalk) releaseServed() error {
-	if w.served == 0 {
-		return nil
+// isHeld reports whether the walk must leave a file where it is.
+func (w *retainedWalk) isHeld(name string) bool { return slices.Contains(w.held, name) }
+
+// releaseHeld deletes them, except the ones keep names. It is called when the
+// next continuation is minted: the cursor the caller held is superseded then,
+// so a file the NEW cursor does not resume from can go.
+func (w *retainedWalk) releaseHeld(keep []string) error {
+	held := w.held
+	w.held = nil
+	for _, name := range held {
+		if slices.Contains(keep, name) {
+			continue
+		}
+		if err := openRetainFile(w.home, name).remove(); err != nil {
+			return err
+		}
 	}
-	level := w.served
-	w.served = 0
-	return openRetainFile(w.home, levelFileName(sortedLevelPrefix, level)).remove()
+	return nil
 }
 
 // releaseFrontier deletes one level's admitted states. It is called when the

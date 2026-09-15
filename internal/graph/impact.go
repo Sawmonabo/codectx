@@ -224,7 +224,6 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				Kinds:         kinds,
 				MaxDepth:      maxDepth,
 				Budget:        b,
-				BatchSize:     adjacencyBatch,
 				FrontierBytes: e.limits.FrontierBytes,
 				// Ruling P3, both halves: the deadline ends this page, and it
 				// does so even before the page admitted an edge, because the
@@ -234,9 +233,9 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 				DeadlineResumesEmptyPage: true,
 				Resume:                   resume,
 				// The walk's retained state: the frontier it commits level by
-				// level, the cumulative admitted-node bitset, the cumulative
-				// emitted-relation bitset and this answer's pass-1 input, all in
-				// one directory the continuation carries forward by rename.
+				// level, the cumulative admitted-node bitset and this answer's
+				// pass-1 input, all in one directory the continuation carries
+				// forward by rename.
 				Retain: retain,
 				// The per-level canonical resolution the accumulator reads. One
 				// pointer, refilled by the walk before each level's edges are

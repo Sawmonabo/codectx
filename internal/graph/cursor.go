@@ -693,8 +693,8 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	}
 	// There is no spool replay left on the walk vocabulary: validateRanked
 	// refuses a walk continuation that names a spool at all. Everything the
-	// resumed walk needs -- the frontier, the cumulative admitted-node set and
-	// the cumulative emitted-relation set -- is in the retained directory
+	// resumed walk needs -- the level's run, the frontier and the cumulative
+	// admitted-node set -- is in the retained directory
 	// above, and the caller defers Release because the directory is read and
 	// appended to for the whole page.
 	return s, nil
@@ -896,6 +896,23 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	return token, nil
 }
 
+// levelFiles names the retained files a continuation resumes its level out of:
+// the run a COLLECTING level has spilled so far and the frontier its scan
+// reads, or the sorted run a SERVING level is delivered from (ADR-0005).
+func levelFiles(c traversalCursor) []string {
+	if c.Level <= 0 {
+		return nil
+	}
+	switch c.LevelState {
+	case levelCollecting:
+		return []string{levelFileName(rawLevelPrefix, c.Level),
+			levelFileName(admittedLevelPrefix, c.Level-1)}
+	case levelServing:
+		return []string{levelFileName(sortedLevelPrefix, c.Level)}
+	}
+	return nil
+}
+
 // retain hands the pass-1 input this leg appended to the spool store, bound to
 // next exactly as a spool file is, and returns the id the cursor names it by.
 //
@@ -907,9 +924,10 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 	if e.spools == nil {
 		return "", nil
 	}
-	// The level this page was resumed into is superseded by the token about to
-	// be signed, so its sorted run can go now.
-	if err := w.releaseServed(); err != nil {
+	// The state the resumed cursor named is superseded by the token about to be
+	// signed, so every file held for it that the NEW state does not resume from
+	// can go now.
+	if err := w.releaseHeld(levelFiles(next)); err != nil {
 		return "", err
 	}
 	prev := w.prevID
