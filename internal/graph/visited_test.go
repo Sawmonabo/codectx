@@ -375,3 +375,57 @@ func TestWarmStopsWhenEveryCandidateIsAnswered(t *testing.T) {
 		}
 	}
 }
+
+// TestWarmAnswersAStreamOfSeveralAscendingRuns is the Defect B proof. The
+// cumulative set warm sweeps is a CONCATENATION of ascending blocks, not one
+// ascending sequence: runWalkToCompletion appends one block per internal link
+// (visitedScratch) and a resumed walk replays the cursor's spool before them
+// (chainVisited). A merge-join that assumed one global order advanced past a
+// candidate answered by an EARLIER block and then stopped at the first block
+// that ran past the largest candidate, reporting a node the walk had already
+// admitted as absent -- re-admitting it on a later page and reporting the same
+// entity twice.
+//
+// The blocks below are written by the production writer in the order the
+// production walk writes them: a second link whose admissions sort below the
+// first link's is ordinary (the walk admits whatever the graph reaches next),
+// and it is what makes the stream non-monotonic.
+//
+// Mutation (`next = 0` on a descending key deleted, or `errWarmComplete`
+// returned on `next >= len(sorted)` again): the first candidate below is
+// reported absent, which is the assertion this test leads with.
+func TestWarmAnswersAStreamOfSeveralAscendingRuns(t *testing.T) {
+	scratch, err := newVisitedScratch(t.TempDir())
+	if err != nil {
+		t.Fatalf("new visited scratch: %v", err)
+	}
+	defer scratch.release()
+	// Link 1 admitted the high ids, link 2 the low ones. Each block is
+	// ascending; the stream is not.
+	if err := scratch.append([]model.NodeID{"n-0500", "n-0600"}); err != nil {
+		t.Fatalf("append link 1: %v", err)
+	}
+	if err := scratch.append([]model.NodeID{"n-0100", "n-0200"}); err != nil {
+		t.Fatalf("append link 2: %v", err)
+	}
+	v := newVisitedSet(chainVisited(nil, scratch.stream))
+	// Both candidates were admitted; the sweep must answer both. n-0100 is the
+	// one the single-order join loses: n-0500 answers the larger candidate and
+	// leaves the join past it, and the pass used to end there.
+	if err := v.warm(context.Background(), []model.NodeID{"n-0100", "n-0600"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	for _, id := range []model.NodeID{"n-0100", "n-0600"} {
+		if !v.has(id) {
+			t.Fatalf("node %s was admitted by the walk but the sweep reported it absent: it would be admitted again and reported twice", id)
+		}
+	}
+	// A node no block holds is still absent: the run-aware join must not turn
+	// a restart into a false positive.
+	if err := v.warm(context.Background(), []model.NodeID{"n-0300"}); err != nil {
+		t.Fatalf("warm: %v", err)
+	}
+	if v.has("n-0300") {
+		t.Fatal("a node no block holds was reported as already admitted")
+	}
+}

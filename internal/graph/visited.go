@@ -145,13 +145,23 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 		// Every candidate was answered from heap: the level costs no I/O.
 		return nil
 	}
-	// The sweep is a MERGE-JOIN, not a scan: the spool's visited section is
-	// written in ascending NodeID order (cursor.go spill), so the candidates
-	// are sorted once and answered in one ordered pass that ENDS at the first
-	// key past the largest of them. A level whose candidates are all new --
-	// the chain-shaped level the filter above already answers from heap --
-	// therefore costs a prefix of the spool even when a false positive sends
-	// it here, instead of a pass to the end.
+	// The sweep is a MERGE-JOIN, not a scan: the candidates are sorted once and
+	// answered in one ordered pass over the stream, which skips past every
+	// candidate the stream has already gone by instead of probing for it.
+	//
+	// The stream is a CONCATENATION of ascending blocks, not one ascending
+	// sequence: a cursor's spool is written in ascending NodeID order, but a
+	// walk chained in process appends one ascending block per internal link and
+	// a resumed walk replays the cursor's spool and then those blocks
+	// (walkrun.go). A join that assumed one global order would advance past a
+	// candidate in the first block and never look back, reporting a node the
+	// walk HAS admitted as absent -- re-admitting it on a later page and
+	// reporting the same entity twice. So a key below its predecessor is read
+	// for what it is, the start of the next ascending run, and the join
+	// restarts at the smallest unanswered candidate. Per run the cost is the
+	// merge-join's; the pass ends early only when every candidate is answered,
+	// because a run that has passed the largest candidate says nothing about
+	// the runs that follow it.
 	//
 	// Batching SEVERAL levels into one sweep -- the other half of the finding
 	// -- is not available to a BFS: level n+1's candidates are the neighbours
@@ -164,20 +174,28 @@ func (v *visitedSet) warm(ctx context.Context, candidates []model.NodeID) error 
 		sorted = append(sorted, id)
 	}
 	sortNodeIDs(sorted)
-	next := 0
+	next, found, started := 0, 0, false
+	var prev model.NodeID
 	err := v.stream(ctx, func(id model.NodeID) error {
+		if !started || id < prev {
+			next = 0
+		}
+		prev, started = id, true
 		for next < len(sorted) && sorted[next] < id {
-			// No record can answer this candidate any more: the stream is
-			// ascending and has passed it.
+			// No record of THIS run can answer this candidate any more: the run
+			// is ascending and has passed it.
 			next++
 		}
 		if next >= len(sorted) {
-			return errWarmComplete
+			return nil
 		}
 		if sorted[next] == id {
-			v.probed[id] = struct{}{}
+			if _, seen := v.probed[id]; !seen {
+				v.probed[id] = struct{}{}
+				found++
+			}
 			next++
-			if next >= len(sorted) {
+			if found == len(sorted) {
 				return errWarmComplete
 			}
 		}

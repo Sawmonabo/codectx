@@ -1111,3 +1111,113 @@ func TestFrontierCeilingDoesNotShrinkTheImpactAnswer(t *testing.T) {
 		}
 	}
 }
+
+// TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation is the Defect A proof.
+// Ruling P3 makes the query deadline end a PAGE and never the answer, and for
+// impact that has to hold for EVERY deadline, not only one that arrives after
+// the page admitted an edge: the walk's frontier and every record its earlier
+// legs admitted are retained across the request, so a page that served nothing
+// still carries the walk forward. Before this, a deadline that landed before
+// the page's first edge left expand with the raw CTX_QUERY_DEADLINE, which
+// impactPhaseError turned into Truncated with NO cursor -- the retained walk
+// discarded and its remainder unreachable.
+//
+// Mutation (`o.Budget.pageEdges == 0` restored as an unconditional guard in
+// deadlineStop, i.e. DeadlineResumesEmptyPage ignored): the first page below is
+// truncated on the deadline with an empty cursor, which is the assertion this
+// test leads with.
+func TestImpactDeadlineBeforeTheFirstEdgeMintsAContinuation(t *testing.T) {
+	f := newGraphFixture(t)
+	signer, err := pagination.OpenSigner(t.TempDir())
+	if err != nil {
+		t.Fatalf("open signer: %v", err)
+	}
+	store := newFixtureLeases()
+	spoolDir := t.TempDir()
+	spools, err := pagination.NewSpools(spoolDir, 64<<20, store)
+	if err != nil {
+		t.Fatalf("new spools: %v", err)
+	}
+	limits := fixtureLimits()
+	limits.MaxDepth, limits.MaxVisited, limits.MaxEdges = 0, 0, 0
+	limits.MaxPageItems = 100000
+	limits.QueryTimeout = time.Minute
+	limits.FrontierBytes = 16 << 10
+
+	seeds := []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")}
+	base := model.ImpactRequest{GenerationID: 1, Start: seeds,
+		Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls}}
+
+	whole, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+		Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+	if err != nil {
+		t.Fatalf("new engine: %v", err)
+	}
+	all, err := whole.Impact(context.Background(), base)
+	if err != nil {
+		t.Fatalf("unbounded impact: %v", err)
+	}
+	if all.Meta.Truncated || len(all.Entries) == 0 {
+		t.Fatalf("ground truth is truncated (%q) or empty (%d entries)",
+			all.Meta.TruncationReason, len(all.Entries))
+	}
+
+	// Trigger 1 is the defect's own shape: the clock jumps inside the FIRST
+	// adjacency round trip, so the deadline is seen by the very next reader
+	// check, before a single edge has been admitted. Triggers 2 and 3 land the
+	// same stop one and two round trips later.
+	for _, trigger := range []int{1, 2, 3} {
+		t.Run(fmt.Sprintf("trigger-%d", trigger), func(t *testing.T) {
+			clock := time.Now()
+			calls, fired := 0, false
+			slow := slowAdjacency{graphFixture: f, clock: &clock, calls: &calls,
+				trigger: trigger, jump: 2 * time.Minute, fired: &fired}
+			paged, err := New(Options{Adjacency: slow, Signer: signer, Spools: spools,
+				Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits,
+				Now: func() time.Time { return clock }})
+			if err != nil {
+				t.Fatalf("new engine: %v", err)
+			}
+			req := base
+			var entries []model.ImpactEntry
+			for pages := 1; ; pages++ {
+				if pages > 200 {
+					t.Fatalf("the deadline-split impact did not terminate after %d pages", pages-1)
+				}
+				res, err := paged.Impact(context.Background(), req)
+				if err != nil {
+					t.Fatalf("page %d: a deadline threw the answer away instead of ending the page: %v", pages, err)
+				}
+				if res.Meta.Truncated && res.Meta.TruncationReason == reasonDeadline &&
+					res.Meta.NextCursor == "" {
+					t.Fatalf("page %d stopped on the deadline with no cursor after serving %d entries: the rest of the walk is unreachable",
+						pages, len(res.Entries))
+				}
+				entries = append(entries, res.Entries...)
+				if res.Meta.NextCursor == "" {
+					break
+				}
+				req.Page = model.PageRequest{Cursor: res.Meta.NextCursor}
+				req.GenerationID = 0
+			}
+			if len(entries) != len(all.Entries) {
+				t.Fatalf("the pages served %d affected entit(ies), the unbounded walk %d",
+					len(entries), len(all.Entries))
+			}
+			seen := map[model.NodeID]bool{}
+			for i, want := range all.Entries {
+				if entries[i].NodeID != want.NodeID || entries[i].ScoreMicros != want.ScoreMicros ||
+					entries[i].Depth != want.Depth {
+					t.Fatalf("at rank %d the pages report %s (score %d, depth %d), the unbounded walk %s (score %d, depth %d)",
+						i, entries[i].NodeID, entries[i].ScoreMicros, entries[i].Depth,
+						want.NodeID, want.ScoreMicros, want.Depth)
+				}
+				if seen[entries[i].NodeID] {
+					t.Fatalf("node %s is listed twice across the pages", entries[i].NodeID)
+				}
+				seen[entries[i].NodeID] = true
+			}
+			assertNoRetainedState(t, spoolDir)
+		})
+	}
+}
