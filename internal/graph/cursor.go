@@ -193,6 +193,12 @@ const (
 	// rather than a field of the answer record because a rollup bounded only
 	// by MaxRecordsPerResult can exceed the spool's per-record byte bound.
 	spoolRecordPackage = "p"
+	// spoolRecordCapability is one row of the generation's capability report,
+	// individual for the same reason a rollup pair is: a report may legally
+	// carry model.MaxCapabilityStates rows, each with a scope key, a
+	// diagnostic code and up to MaxCapabilityDetails bounded details, which is
+	// several megabytes against the spool's per-record byte bound.
+	spoolRecordCapability = "c"
 )
 
 // spoolRecord is one spilled record. The field names are short because the
@@ -282,7 +288,8 @@ func (e *Engine) verifyContinuation(token, endpoint, queryHash string,
 		return traversalCursor{}, nil, cursorInvalid("cursor was issued by a different endpoint")
 	}
 	if c.QueryHash != queryHash {
-		return traversalCursor{}, nil, cursorInvalid("cursor was issued for a different query")
+		return traversalCursor{}, nil, cursorInvalid(
+			"cursor was issued for a different query: the direction, relation kinds, seeds, depth and page limit that minted it must be repeated on every page")
 	}
 	binding := e.adjacency.Binding()
 	if c.GenerationID != binding.GenerationID || c.AnalysisKey != binding.AnalysisKey {
@@ -307,6 +314,9 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	now := e.now()
 	s := &resumeState{Cursor: c, Budget: b, Visited: map[model.NodeID]struct{}{}}
 	if c.SpoolID == "" {
+		// A pure keyset continuation carries a lease and no spool; it is
+		// consumed here for the same reason a spooled one is below.
+		e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 		return s, nil
 	}
 	if e.spools == nil {
@@ -342,7 +352,35 @@ func (e *Engine) resumeTraversal(ctx context.Context, token, endpoint, queryHash
 	if err != nil {
 		return nil, err
 	}
+	// The continuation is consumed: its frontier and visited set are in memory
+	// now, and the page being built will spill a FRESH spool under a FRESH
+	// lease. Holding the replayed pair until the cursor TTL would pin a
+	// generation against retention -- one lease and one spool per page of every
+	// walk -- for state nothing will read again. Presenting the same token
+	// twice is therefore CTX_CURSOR_INVALID rather than a replayed page, which
+	// is the deliberate trade: the caller's remedy is the continuation this
+	// page hands it.
+	e.releaseConsumed(ctx, c.SpoolID, c.LeaseID)
 	return s, nil
+}
+
+// releaseConsumed ends a replayed continuation's spool and its cursor-owned
+// lease. It takes the two identifiers rather than a cursor so EVERY paged
+// endpoint can end its own continuation whatever payload shape carries it --
+// a traversal cursor, a ranked one, or a page that spills no spool at all and
+// passes an empty spoolID.
+//
+// The engine has no logger, and neither release can fail a page that is still
+// being built, so a failure is left to the lease's own TTL and the spool sweep
+// rather than raised: this is reclamation, not an invariant the answer depends
+// on.
+func (e *Engine) releaseConsumed(ctx context.Context, spoolID, leaseID string) {
+	if spoolID != "" && e.spools != nil {
+		_ = e.spools.Release(spoolID)
+	}
+	if leaseID != "" && e.leases != nil {
+		_ = e.leases.Release(context.WithoutCancel(ctx), leaseID)
+	}
 }
 
 // nextTraversalCursor writes a FRESH spool for c's frontier and visited set and

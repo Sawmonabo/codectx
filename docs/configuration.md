@@ -177,6 +177,14 @@ it with user-private permissions when it first opens the database. When the data
 directory does lie inside the workspace, it is excluded from traversal
 unconditionally.
 
+## `[retention]` — the process-level collector
+
+All **user** trust.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `blob_grace` | `"24h"` | How long a blob that nothing references waits, once trashed, before the collector rechecks reachability and deletes its row and its content-addressed object. It is the safety margin that protects a reader which pinned a generation in the instant the manifest naming a blob went away, not a throughput knob: shortening it narrows that protection, lengthening it only delays reclaim. Must be positive — a zero window would delete an object in the same pass that trashed it. |
+
 ## `[tools]` — the managed analyzer toolchain
 
 All **user** trust, and a project file that sets any key here is rejected with

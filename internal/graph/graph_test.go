@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"testing"
@@ -110,6 +111,13 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	for _, name := range []string{"n-a", "n-b", "n-c", "n-hub", "n-p", "n-q", "n-z"} {
 		addNode(name, model.NodeFunction, name)
 	}
+	// n-d is pkg-app's TOP-LEVEL declaration, attached with `defines` rather
+	// than `contains` -- which is how a provider actually emits one
+	// (internal/provider/treesitter/facts.go reserves `contains` for a nested
+	// declaration). Without one such node the fixture's containers hold only
+	// `contains` children and a map counted over `contains` alone passes here
+	// while reporting SymbolCount 0 for every package of a real repository.
+	addNode("n-d", model.NodeFunction, "n-d")
 	addNode("n-var", model.NodeVariable, "n-var")
 	addNode("n-sink", model.NodeFunction, "n-sink")
 	for i := 0; i < fixtureLeafCount; i++ {
@@ -212,6 +220,8 @@ func newGraphFixture(t *testing.T) *graphFixture {
 	// sorts beyond the first clamped page. A walk that ended on a short page
 	// never reads it and reports a referenced symbol as unreferenced.
 	edges = append(edges, edge{"n-ref-caller", model.RelCalls, "n-ref"})
+	// Declared last so every relation id above keeps the position it had.
+	edges = append(edges, edge{"pkg-app", model.RelDefines, "n-d"})
 
 	// evidenceRow is a whole evidence row, not just its id: an occurrence's
 	// precision class, file and byte range live here and nowhere else, so a
@@ -352,6 +362,33 @@ func (f *graphFixture) NodesByID(ctx context.Context, ids []model.NodeID) ([]mod
 	return out, nil
 }
 
+// Containers is the optional graph.ContainerReader seam: the visible container
+// nodes of kinds, keyset-ordered by NodeID after `after`, clamped exactly as
+// the shipped reader clamps a page. The fixture implements it because the app
+// adapter must, and because a repository map has no seed to hang off -- an
+// Adjacency without it can list no container at all.
+func (f *graphFixture) Containers(ctx context.Context, kinds []model.NodeKind,
+	after model.NodeID, limit int) ([]model.Node, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	want := make(map[model.NodeKind]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	var out []model.Node
+	for _, n := range f.nodes {
+		if want[n.Kind] && n.ID > after {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if l := fixtureEdgePageLimit(limit); len(out) > l {
+		out = out[:l]
+	}
+	return out, nil
+}
+
 // EvidenceFor hydrates the evidence IDENTITIES backing a page of relations in
 // one call -- the frozen Adjacency port, which is all a traversal needs.
 func (f *graphFixture) EvidenceFor(ctx context.Context, relations []model.RelationID, limit int) (map[model.RelationID][]model.EvidenceID, error) {
@@ -417,11 +454,19 @@ type fixtureLeases struct {
 
 func newFixtureLeases() *fixtureLeases { return &fixtureLeases{live: map[string]time.Time{}} }
 
-func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease) error {
+func (l *fixtureLeases) AcquireLease(_ context.Context, lease model.Lease, _ string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.live[lease.ID] = lease.ExpiresAt
 	return nil
+}
+
+// liveCount is how many leases are still held. A continuation is used once, so
+// a walk read to exhaustion must end with none of its own.
+func (l *fixtureLeases) liveCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.live)
 }
 
 func (l *fixtureLeases) RenewLease(_ context.Context, id string, expiresAt time.Time) error {
@@ -908,6 +953,71 @@ func TestGraphScenarios(t *testing.T) {
 		},
 
 		{
+			// A continuation is state, and state that is never reclaimed is a
+			// leak with a 15-minute half-life: every page of every walk in the
+			// process mints a cursor lease and spills a spool, and once the page
+			// after it has been served neither will be read again. Left to their
+			// TTL they pin a generation retention may not collect -- the 118
+			// unreleased leases obligation 6 names. This walks a multi-page
+			// traversal to exhaustion and asks what it left behind: nothing.
+			name: "a walk read to exhaustion releases every continuation it consumed",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				store := newFixtureLeases()
+				spoolDir := t.TempDir()
+				spools, err := pagination.NewSpools(spoolDir, 1<<20, store)
+				if err != nil {
+					t.Fatalf("new spools: %v", err)
+				}
+				limits := fixtureLimits()
+				limits.MaxDepth = 2
+				limits.MaxPageItems = 400
+				e, err := New(Options{Adjacency: f, Signer: signer, Spools: spools,
+					Leases: pagination.NewLeases(store, limits.CursorTTL), Limits: limits})
+				if err != nil {
+					t.Fatalf("new engine: %v", err)
+				}
+				req := model.GraphRequest{GenerationID: 1,
+					Start:     []model.NodeID{fixtureNodeID("n-a"), fixtureNodeID("n-wide")},
+					Direction: model.DirectionOutgoing, Relations: []model.RelationKind{model.RelCalls},
+					Page: model.PageRequest{Limit: 120}}
+				pages := 0
+				for {
+					res, err := e.Neighbors(context.Background(), req)
+					if err != nil {
+						t.Fatalf("page %d: %v", pages+1, err)
+					}
+					pages++
+					if res.Meta.NextCursor == "" {
+						break
+					}
+					if pages > 8 {
+						t.Fatalf("paged walk did not terminate after %d pages", pages)
+					}
+					req.GenerationID = 0
+					req.Page = model.PageRequest{Limit: 120, Cursor: res.Meta.NextCursor}
+				}
+				if pages < 2 {
+					t.Fatalf("the walk answered in %d page(s); this row needs a continuation to consume", pages)
+				}
+				if live := store.liveCount(); live != 0 {
+					t.Fatalf("a walk of %d pages left %d live cursor leases, want 0; each holds a generation against retention until its TTL",
+						pages, live)
+				}
+				left, err := os.ReadDir(spoolDir)
+				if err != nil {
+					t.Fatalf("read spool dir: %v", err)
+				}
+				if len(left) != 0 {
+					t.Fatalf("a walk of %d pages left %d spool file(s) behind, want 0", pages, len(left))
+				}
+			},
+		},
+
+		{
 			// Impact ranks its WHOLE walk and cuts the ranked list, so its page
 			// boundary is a rank rather than a keyset position. The failure this
 			// protects is a paged impact answer that silently loses the tail of
@@ -988,6 +1098,13 @@ func TestGraphScenarios(t *testing.T) {
 					if len(res.Packages) != len(whole.Packages) {
 						t.Fatalf("page %d carried %d rollup pairs, want the answer's %d",
 							pages, len(res.Packages), len(whole.Packages))
+					}
+					// The capability report is answer-level too, and a
+					// continuation reads no facts: a page that dropped it would
+					// report a degraded generation as a complete one.
+					if len(res.Meta.Completeness) != len(whole.Meta.Completeness) {
+						t.Fatalf("page %d carried %d completeness rows, want the answer's %d",
+							pages, len(res.Meta.Completeness), len(whole.Meta.Completeness))
 					}
 					if res.Meta.NextCursor == "" {
 						break
@@ -1232,6 +1349,130 @@ func TestGraphScenarios(t *testing.T) {
 					case <-time.After(10 * time.Second):
 						t.Fatalf("%s is still waiting for a gate slot 10s into a %s query timeout: the deadline does not wrap the gate wait",
 							c.name, timeout)
+					}
+				}
+			},
+		},
+
+		// T20-L5 OVERVIEW rows
+		{
+			// Protects the silent-omission failure mode: the repository map's
+			// per-container aggregates are read through a keyset loop over
+			// containment edges, and a loop that stops at the first clamped
+			// page -- or at a flat page ceiling -- reports a package with 260
+			// members as a package with 200. A repo-map that omits members is
+			// not read as incomplete; it is read as the repository's shape.
+			name: "overview/a container past the storage page clamp is rolled up completely",
+			run: func(t *testing.T, f *graphFixture) {
+				e, err := New(Options{Adjacency: f, Limits: fixtureLimits()})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				got, err := e.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID})
+				if err != nil {
+					t.Fatalf("Overview: %v", err)
+				}
+				if err := got.Validate(); err != nil {
+					t.Fatalf("result does not satisfy its own contract: %v", err)
+				}
+				if got.Meta.Truncated {
+					t.Fatalf("a map the fixture fits inside every bound reports truncated: %q",
+						got.Meta.TruncationReason)
+				}
+				byID := map[model.NodeID]model.OverviewItem{}
+				for _, item := range got.Items {
+					byID[item.NodeID] = item
+				}
+				wide, ok := byID[fixtureNodeID("pkg-wide-b")]
+				if !ok {
+					t.Fatalf("pkg-wide-b is absent from a map of %d containers", len(got.Items))
+				}
+				if wide.SymbolCount != fixtureWideCount {
+					t.Fatalf("pkg-wide-b holds %d symbols, want %d: the containment read stopped early",
+						wide.SymbolCount, fixtureWideCount)
+				}
+				app, ok := byID[fixtureNodeID("pkg-app")]
+				if !ok {
+					t.Fatalf("pkg-app is absent from the map")
+				}
+				// pkg-app contains n-a, n-b, n-hub and n-p, DEFINES the
+				// top-level n-d, and imports pkg-lib: an aggregate that counted
+				// the import would report structure the container does not
+				// hold, and one that read `contains` alone would drop n-d --
+				// which is every top-level declaration of a real repository,
+				// and so the difference between a measured symbol column and a
+				// confident zero.
+				if app.SymbolCount != 5 || app.FileCount != 0 {
+					t.Fatalf("pkg-app holds %d symbols and %d files, want 5 and 0",
+						app.SymbolCount, app.FileCount)
+				}
+				// The other half of the same failure mode: when the edge budget
+				// cannot cover one page's children, the counts that WERE
+				// accumulated are short by an unknown amount, so the map must
+				// refuse rather than hand back numbers no caller can tell from
+				// measured ones.
+				starved := fixtureLimits()
+				starved.MaxEdges = 1
+				se, err := New(Options{Adjacency: f, Limits: starved})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				page, err := se.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID})
+				var typed *model.Error
+				if !errors.As(err, &typed) || typed.Code != model.CodeResourceLimit {
+					t.Fatalf("a map whose containment budget is spent returned (%+v, %v), want a %s refusal",
+						page.Items, err, model.CodeResourceLimit)
+				}
+			},
+		},
+		{
+			// Protects the straddled-generation failure mode: every page of one
+			// map must be bound to the generation page 1 pinned, and page 2 must
+			// start where the cursor said and nowhere else. A continuation that
+			// re-pinned, or that restarted the keyset, would splice two
+			// repositories into one map without saying so.
+			name: "overview/page 2 keeps page 1's generation and starts at its keyset",
+			run: func(t *testing.T, f *graphFixture) {
+				signer, err := pagination.OpenSigner(t.TempDir())
+				if err != nil {
+					t.Fatalf("open signer: %v", err)
+				}
+				limits := fixtureLimits()
+				e, err := New(Options{Adjacency: f, Signer: signer,
+					Leases: pagination.NewLeases(newFixtureLeases(), limits.CursorTTL), Limits: limits})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				const perPage = 2
+				first, err := e.Overview(context.Background(), model.OverviewRequest{
+					GenerationID: f.binding.GenerationID,
+					Page:         model.PageRequest{Limit: perPage}})
+				if err != nil {
+					t.Fatalf("page 1: %v", err)
+				}
+				if len(first.Items) != perPage || first.Meta.NextCursor == "" {
+					t.Fatalf("page 1 returned %d items and cursor %q, want %d items and a continuation",
+						len(first.Items), first.Meta.NextCursor, perPage)
+				}
+				second, err := e.Overview(context.Background(), model.OverviewRequest{
+					Page: model.PageRequest{Limit: perPage, Cursor: first.Meta.NextCursor}})
+				if err != nil {
+					t.Fatalf("page 2: %v", err)
+				}
+				if err := second.Validate(); err != nil {
+					t.Fatalf("page 2 does not satisfy its own contract: %v", err)
+				}
+				if second.Meta.Binding != first.Meta.Binding {
+					t.Fatalf("page 2 is bound to %+v, page 1 to %+v: the map straddles a generation change",
+						second.Meta.Binding, first.Meta.Binding)
+				}
+				last := first.Items[len(first.Items)-1].NodeID
+				for _, item := range second.Items {
+					if item.NodeID <= last {
+						t.Fatalf("page 2 lists %s at or before page 1's last container %s: the keyset restarted",
+							item.NodeID, last)
 					}
 				}
 			},

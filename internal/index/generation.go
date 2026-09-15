@@ -187,6 +187,9 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		return model.IndexResult{}, err
 	}
 	g.coverage()
+	if err := g.c.recordSuppliedIndexes(ctx, g.gen); err != nil {
+		return model.IndexResult{}, err
+	}
 	states, _ := g.caps.finish(g.c.log)
 	health := healthOf(states)
 	binding, err := g.c.opts.Store.Activate(ctx, g.gen, g.prev, health, states, NormalizationVersion)
@@ -194,6 +197,7 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		return model.IndexResult{}, err
 	}
 	g.c.retain(ctx)
+	g.c.collect(ctx)
 	// Deferred work is enqueued only after the base generation is published:
 	// Section 11.6 is explicit that nothing dependence-shaped runs before base
 	// readiness, and ruling Q9 makes the background tick run it even when no
@@ -645,4 +649,34 @@ func healthOf(states []model.CapabilityState) model.GenerationHealth {
 		}
 	}
 	return health
+}
+
+// recordSuppliedIndexes records every index this run was handed against the
+// generation about to be published, resolved or not.
+//
+// It runs while the generation is still staging, so a run that never activates
+// leaves no row behind, and its failure fails the publish: a generation
+// activated without the record would answer "this generation was built with no
+// supplied index" for a run that supplied one, which is the false report the
+// record exists to prevent.
+//
+// Resolution is asked of the generation rather than of the filesystem: the
+// question is not whether a file exists now but whether this generation holds
+// the unit that path produced. A path that matched nothing selects no unit and
+// is recorded unresolved, which is the case the doctor check reports.
+func (c *Coordinator) recordSuppliedIndexes(ctx context.Context, gen model.GenerationID) error {
+	for _, si := range c.opts.SuppliedIndexes {
+		resolved := true
+		if _, err := c.opts.Store.SelectedUnit(ctx, gen, si.ProviderID, si.ScopeKey); err != nil {
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Details["reason"] != sqlite.ReasonNotFound {
+				return err
+			}
+			resolved = false
+		}
+		if err := c.opts.Store.RecordSuppliedIndex(ctx, gen, si.Path, resolved); err != nil {
+			return err
+		}
+	}
+	return nil
 }

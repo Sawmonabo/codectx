@@ -152,6 +152,31 @@ func (w *watchState) reconciledAt(t time.Time) {
 	w.mu.Unlock()
 }
 
+// observe reads what the running watch loops know, under w.mu: whether a watch
+// is active, whether its coverage is complete notification coverage, how many
+// notification events are pending, and when a pass last completed.
+//
+// pending and at are absent rather than zero when nothing measured them. A
+// periodic-only watch has no notification queue to count and a watch that has
+// completed no pass has no pass time; `0` and the epoch would state that the
+// watch is caught up. The two readers below -- the in-process status projection
+// and the cross-process heartbeat -- must answer from one rule, because a
+// second copy of it would let `codectx status` in this process and `codectx
+// status` in another disagree about the same watch.
+func (w *watchState) observe() (active bool, complete bool, pending *int64, at time.Time) {
+	at = w.reconciled
+	if w.source != nil {
+		coverageComplete, pendingPaths, lastReconciled := w.source.Coverage()
+		complete = coverageComplete
+		n := int64(pendingPaths)
+		pending = &n
+		if lastReconciled.After(at) {
+			at = lastReconciled
+		}
+	}
+	return w.active > 0, complete, pending, at
+}
+
 // project fills the Section 13.2 watch fields. With a notification watcher
 // running they are the watcher's own Coverage(); without one WatchComplete is
 // false and the warning says so, because reporting complete coverage for
@@ -160,15 +185,11 @@ func (w *watchState) reconciledAt(t time.Time) {
 func (w *watchState) project(st *model.IndexStatus) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	st.WatchActive = w.active > 0
-	at := w.reconciled
-	if w.source != nil {
-		complete, pending, lastReconciled := w.source.Coverage()
-		st.WatchComplete = complete
-		st.PendingPaths = int64(pending)
-		if lastReconciled.After(at) {
-			at = lastReconciled
-		}
+	active, complete, pending, at := w.observe()
+	st.WatchActive = active
+	st.WatchComplete = complete
+	if pending != nil {
+		st.PendingPaths = *pending
 	}
 	if !at.IsZero() {
 		st.LastReconciledAt = &at
@@ -177,6 +198,19 @@ func (w *watchState) project(st *model.IndexStatus) {
 		st.Warnings = append(st.Warnings,
 			"watch coverage is incomplete: not every directory the traversal admits carries a filesystem notification watch, so changes under the rest are seen only at the next periodic reconciliation")
 	}
+}
+
+// heartbeat is what this watch publishes for another process to read: when its
+// last pass completed and how many events are pending, both absent when nothing
+// measured them.
+func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, _, pending, at := w.observe()
+	if !at.IsZero() {
+		lastPass = &at
+	}
+	return lastPass, pending
 }
 
 // capabilityReport accumulates one generation's capability rows and publishes
@@ -397,11 +431,69 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 	return boundStates(out, log)
 }
 
+// foldToPrimaryKey brings the assembled list inside the one row per
+// (provider_id, capability, scope_key) that generation_capabilities is keyed
+// by -- its primary key does not carry the state. The three assembly buckets
+// above key their own rows by state as well, and the bound's own collapse
+// keys by state too, so one provider capability reaches here more than once at
+// one scope in four shapes, each of which failed the insert and took `codectx
+// index` down on a constraint error instead of publishing the degraded
+// generation it had built:
+//
+//   - a sibling unit that succeeded folds a `fresh` row to the workspace scope
+//     (add) while the unit that failed publishes the `failed` fold here;
+//   - the planner's and the registry's `partial` degradations are workspace
+//     scoped too (plan.builder.partial, provider detection), so they collide
+//     with that same `failed` fold;
+//   - a carried scope whose key is itself the workspace scope -- a dependence
+//     family planned as one whole-workspace unit -- publishes `stale` beside
+//     either of those;
+//   - above the bound, collapseScopes folds by provider capability AND state
+//     and rewrites every fold's scope to the workspace scope, so two states of
+//     one provider capability that fold separately come back out as two
+//     workspace-scoped rows (collapseCarried can add a third). That shape is
+//     regenerated after the first fold, which is why boundStates folds again
+//     on the far side of the collapse rather than trusting its input.
+//
+// The most severe row survives, ranked by the same severityRank boundStates
+// truncates by: Section 13.3 lets a report under-claim and never over-claim.
+// The fold keeps the first occurrence of a key and never reorders, so the
+// published row is a function of the set and not of the order the concurrent
+// unit workers reported in -- the determinism the exemplar choices above exist
+// for, because these rows fold into the AnalysisKey.
+//
+// It does not make addDeferred's demotion redundant. That one deletes the
+// fresh row so that reported() stops finding it and the deferred row is added
+// at all; without the delete the capability publishes one `fresh` row, alone,
+// and this fold has nothing to out-rank it with.
+func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
+	at := make(map[string]int, len(rows))
+	out := make([]model.CapabilityState, 0, len(rows))
+	for _, c := range rows {
+		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
+		if i, ok := at[key]; ok {
+			if severityRank(c.State) < severityRank(out[i].State) {
+				out[i] = c
+			}
+			continue
+		}
+		at[key] = len(out)
+		out = append(out, c)
+	}
+	return out
+}
+
 // boundStates brings an assembled capability list inside
 // model.MaxCapabilityStates and reports how many rows it had to omit. It is
 // the one place the bound is applied: the indexing path calls it through
 // finish, and Status calls it after folding in the composition-time rows, so a
 // published list can never exceed the bound its own contract validates against.
+//
+// It is also the one place the primary key of generation_capabilities is
+// closed. Every caller's list is folded to one row per (provider, capability,
+// scope) on the way in, and folded again on the far side of collapseScopes,
+// which keys by state and rewrites each fold to the workspace scope and so
+// regenerates the very duplicates the first fold removed.
 //
 // When rows must go, the degradations stay. The list is first folded to one
 // row per provider capability and state, and only if that is still too long is
@@ -409,9 +501,11 @@ func (r *capabilityReport) finish(log *slog.Logger) ([]model.CapabilityState, in
 // and cut from the tail. Truncating the assembly order instead would drop the
 // failures and carries, which are appended last, and keep the fresh rows:
 // Section 13.3 allows a report to under-claim and never to over-claim.
+// Truncation only removes rows, so the folded key stays closed.
 func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.CapabilityState, int) {
+	out = foldToPrimaryKey(out)
 	if len(out) > model.MaxCapabilityStates {
-		out = collapseScopes(out)
+		out = foldToPrimaryKey(collapseScopes(out))
 	}
 	if len(out) <= model.MaxCapabilityStates {
 		return out, 0

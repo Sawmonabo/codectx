@@ -127,6 +127,34 @@ func (a adjacency) EvidenceRows(ctx context.Context, relations []model.RelationI
 	return rows, nil
 }
 
+// Containers is graph.ContainerReader, the OPTIONAL enumeration seam the
+// repository map needs: every other method here reads facts hanging off node
+// ids the caller already holds, and a map has no such seed. It drops the
+// storage-only fields for the same reason NodesByID does.
+//
+// The value receiver is load-bearing. internal/graph discovers this seam by
+// type-asserting the Adjacency it was handed, and a pointer receiver would drop
+// the method from adjacency's method set: the assertion would fail at run time
+// and Overview would refuse every request with a wiring error. The compile-time
+// assertion below is what catches that instead.
+func (a adjacency) Containers(ctx context.Context, kinds []model.NodeKind,
+	after model.NodeID, limit int) ([]model.Node, error) {
+	stored, err := a.reader.Containers(ctx, kinds, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	nodes := make([]model.Node, 0, len(stored))
+	for _, s := range stored {
+		nodes = append(nodes, s.Node)
+	}
+	return nodes, nil
+}
+
+// The seam is asserted here rather than at the point of use, so a receiver or
+// signature that drifts fails this package's build instead of silently
+// disabling the repository map at run time.
+var _ graph.ContainerReader = adjacency{}
+
 func (a adjacency) Capabilities(ctx context.Context) ([]model.CapabilityState, error) {
 	return a.reader.Capabilities(ctx)
 }

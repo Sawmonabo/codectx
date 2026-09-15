@@ -60,6 +60,30 @@ coordinator exists.
   import did not admit. `IndexUnit` is `Import` with no previous manifest, which
   is all the `provider.Provider` interface can express.
 
+### A refresh without `--scip-index`
+
+The supplied index is an input of the **composition**, not of the request: it
+reaches this provider through the workspace open, so a run that does not pass
+`--scip-index` constructs a provider with no import path at all. `Detect` then
+declares no import input and `Scopes` returns no `import:` key, so the plan
+carries no import unit and the generation it publishes holds none.
+
+The honest answer to "does a refresh without `--scip-index` invalidate the
+imported units?" is therefore **no, and something more inconvenient than yes**:
+the sealed unit is not invalidated, deleted or marked stale — it stays in the
+store and is reused verbatim by a later run that supplies the same index with
+the same inputs — but it is **not a member of the new generation**, so the
+symbols it contributed stop being answerable the moment that generation becomes
+active. The capability is not reported as degraded either, because from the
+plan's point of view nothing was requested and nothing failed.
+
+Two operational consequences follow. Pass `--scip-index` on **every** run that
+should keep the imported symbols, including plain `codectx refresh`. And if
+cross-file symbols disappear after a refresh, run `codectx doctor`: its
+`supplied_index` check reports what the active generation was actually built
+with, which is the one place the difference between "no index was supplied" and
+"a supplied path matched nothing" is visible.
+
 ## Decoding
 
 Top-level and nested protobuf wire fields are walked by a bounded reader

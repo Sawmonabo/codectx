@@ -14,7 +14,11 @@ const DefaultCursorTTL = 15 * time.Minute
 // the retention_leases rows and the transactions around them; this package
 // supplies only TTL policy and identifiers.
 type LeaseStore interface {
-	AcquireLease(ctx context.Context, lease model.Lease) error
+	// AcquireLease records the lease. ownerRef names the owner it is taken
+	// for, so the lease can be released when that owner ends; an owner with no
+	// stable identity of its own passes "". At most one live lease exists per
+	// owner, and the store refuses a second one rather than pinning twice.
+	AcquireLease(ctx context.Context, lease model.Lease, ownerRef string) error
 	RenewLease(ctx context.Context, id string, expiresAt time.Time) error
 	ReleaseLease(ctx context.Context, id string) error
 	// LeaseExpiry reports when a live lease expires; a released or unknown
@@ -41,8 +45,20 @@ func NewLeases(store LeaseStore, ttl time.Duration) *Leases {
 }
 
 // Acquire retains gen (and optionally its snapshot) for one TTL on behalf of
-// kind and returns the lease, whose ID a cursor carries.
+// kind and returns the lease, whose ID a cursor carries. The lease is owned by
+// nothing but the token that carries its id: it ends when that token's holder
+// releases it, or with its TTL.
 func (l *Leases) Acquire(ctx context.Context, gen model.GenerationID, snapshot model.SnapshotID, kind model.LeaseOwnerKind) (model.Lease, error) {
+	return l.AcquireFor(ctx, gen, snapshot, kind, "")
+}
+
+// AcquireFor is Acquire for an owner that outlives the call and can be found
+// again -- a read session, whose lease must end when the session closes rather
+// than on the TTL. A second acquire for one owner is refused by the store, so
+// an idempotent re-open leaves the one lease the owner already holds instead
+// of pinning its generation a second time.
+func (l *Leases) AcquireFor(ctx context.Context, gen model.GenerationID, snapshot model.SnapshotID,
+	kind model.LeaseOwnerKind, ownerRef string) (model.Lease, error) {
 	id, err := model.NewRandomID()
 	if err != nil {
 		return model.Lease{}, err
@@ -51,7 +67,7 @@ func (l *Leases) Acquire(ctx context.Context, gen model.GenerationID, snapshot m
 	if err := lease.Validate(); err != nil {
 		return model.Lease{}, err
 	}
-	if err := l.store.AcquireLease(ctx, lease); err != nil {
+	if err := l.store.AcquireLease(ctx, lease, ownerRef); err != nil {
 		return model.Lease{}, err
 	}
 	return lease, nil

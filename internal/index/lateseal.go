@@ -587,7 +587,13 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 		g.coverage()
 		states, _ = g.caps.finish(c.log)
 		health = healthOf(states)
-		binding, err = c.opts.Store.Activate(ctx, pubGen, active, health, states, NormalizationVersion)
+		// The publication generation is a new row, so it carries none of the
+		// working generation's supplied-index record: it is re-recorded here
+		// or the sealed generation reports no supplied index at all.
+		err = c.recordSuppliedIndexes(ctx, pubGen)
+		if err == nil {
+			binding, err = c.opts.Store.Activate(ctx, pubGen, active, health, states, NormalizationVersion)
+		}
 	}
 	if err != nil {
 		if abortErr := c.opts.Store.Abort(context.WithoutCancel(ctx), pubGen); abortErr != nil {
@@ -604,6 +610,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	// same lock the indexing runs hold rather than collecting one of them.
 	c.run.Lock()
 	c.retain(ctx)
+	c.collect(ctx)
 	c.run.Unlock()
 	return model.IndexResult{Binding: binding, Health: health, Status: model.GenerationActive,
 		Completeness: states, UnitsReused: g.reused, UnitsBuilt: g.built, UnitsCarried: g.carried,
