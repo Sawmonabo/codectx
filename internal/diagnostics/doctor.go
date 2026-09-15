@@ -343,7 +343,8 @@ func (s *Service) checkStorage(ctx context.Context, deep bool) model.DoctorCheck
 //
 // It reports the CONFIGURED mode, which is the live one by construction:
 // sqlite.Open switches on this same config value (A11), so there is no second
-// spelling the database could be running under. Diagnostics reads no pragma of
+// spelling the database could be running under, and an unset value is the same
+// `normal` sqlite.Options.withDefaults applies. Diagnostics reads no pragma of
 // its own because StoreReader is frozen and carries none.
 func (s *Service) synchronousPhrase() string {
 	mode := s.opts.Config.Storage.Synchronous
