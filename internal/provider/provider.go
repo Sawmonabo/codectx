@@ -162,8 +162,10 @@ type Resolver interface {
 // Sink receives a unit's facts. Ownership of a handed-off slice transfers to
 // the sink: the provider must not retain or mutate it afterwards. A call
 // blocks while the sink's retained-byte reservation is exhausted and returns
-// promptly on cancellation; a single record over the configured limit is a
-// CTX_RESOURCE_LIMIT failure, not a bypass.
+// promptly on cancellation. A single record over a user-set
+// resources.max_provider_record_bytes is admitted and counted as a degradation
+// the unit's capability rows report; it never fails the unit. What bounds the
+// heap is the batch reservation and the shared pool, not that key.
 //
 // Hand a node fact to the sink before any relation, alias or search document
 // that references its identity. Batch flush timing is not under the
