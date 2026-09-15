@@ -39,12 +39,23 @@ import (
 // to zero and is rejected, so the two token shapes can never be interchanged
 // even though both are signed with pagination.PurposeCursor.
 //
-// Version 2 retires the ranked spool vocabulary: a version-1 token issued by an
-// impact page that spilled a ranked tail names a spool this build cannot
-// replay, and resuming it would serve an empty continuation instead of the rest
-// of the answer. It is refused as CTX_CURSOR_INVALID, which a caller re-runs
-// the query for, rather than answered short.
-const traversalCursorVersion = 2
+// Version 2 retired the ranked spool vocabulary of version 1. Version 3
+// reintroduces one -- a different one: ruling P2's ranked tail, where the walk
+// has already run to completion and the spool holds the globally RANKED
+// remainder of the answer rather than a per-page chunk.
+//
+// The version is bumped even though the ranked fields below are purely
+// additive -- a version-2 token would decode with Ranked false and route to the
+// walk replay perfectly well -- because what an impact or rollup continuation
+// MEANS changed, and nothing in a token's shape distinguishes the two
+// contracts. A version-2 impact cursor was minted by a page that ranked its own
+// chunk and left the walk unfinished; resuming it here would finish the walk
+// and rank only what is left, so the caller would receive one answer ordered
+// two different ways and never be told. The version is therefore the only
+// honest refusal. It ends in-flight neighbours and traversal cursors too, which
+// is accepted: a cursor is short-lived, and CTX_CURSOR_INVALID's remedy is to
+// re-run the query, which returns the whole answer under one contract.
+const traversalCursorVersion = 3
 
 // queryHashDomain is the Section 9.1 hash domain for the normalized
 // query/filter/ordering hash a traversal cursor is bound to.
@@ -82,6 +93,20 @@ type traversalCursor struct {
 	// Depth is the hop count the issuing page stopped at, so a resumed walk
 	// measures MaxDepth from the original seeds rather than from its frontier.
 	Depth int `json:"depth"`
+	// Ranked marks the ranked-tail continuation of ruling P2: the walk is over,
+	// the answer is globally ordered, and SpoolID names the records ranked
+	// after the page that minted this token. It is an explicit discriminator
+	// rather than an inference from the other fields, because the two
+	// vocabularies -- a walk to resume and an order to continue -- are read by
+	// different code and must never be fed each other's spool.
+	Ranked bool `json:"ranked,omitempty"`
+	// RankOffset is how many records of that spool the next page skips, and
+	// RankServed/RankTotal the cumulative answer facts the page discloses.
+	// An offset is carried instead of a sort key because Spools.Open streams
+	// from the start and cannot seek; see rankedTail (impactrank.go).
+	RankOffset int   `json:"rank_offset,omitempty"`
+	RankServed int64 `json:"rank_served,omitempty"`
+	RankTotal  int64 `json:"rank_total,omitempty"`
 	// Visited and Edges are CUMULATIVE across every page of this traversal.
 	Visited   int64     `json:"visited"`
 	Edges     int64     `json:"edges"`
@@ -123,8 +148,37 @@ func (c traversalCursor) validate() error {
 	if c.Depth < 0 || c.Visited < 0 || c.Edges < 0 {
 		return cursorInvalid("cursor carries a negative depth or budget")
 	}
+	if err := c.validateRanked(); err != nil {
+		return err
+	}
 	if c.ExpiresAt.IsZero() {
 		return cursorInvalid("cursor has no expiry")
+	}
+	return nil
+}
+
+// validateRanked enforces the ruling P2 half of the payload: the ranked fields
+// are meaningful only on a ranked continuation and meaningless -- and so
+// refused -- on a walk one, which is what keeps a tampered token from steering
+// a walk resume into a ranked spool or the reverse.
+func (c traversalCursor) validateRanked() error {
+	if !c.Ranked {
+		if c.RankOffset != 0 || c.RankServed != 0 || c.RankTotal != 0 {
+			return cursorInvalid("a walk continuation carries a ranked position")
+		}
+		return nil
+	}
+	if c.SpoolID == "" {
+		return cursorInvalid("a ranked continuation names no result spool")
+	}
+	if c.LastOwner != "" || c.LastKey != "" {
+		return cursorInvalid("a ranked continuation carries a traversal keyset position")
+	}
+	if c.RankOffset < 0 || c.RankServed < 0 || c.RankTotal < 0 {
+		return cursorInvalid("cursor carries a negative ranked position")
+	}
+	if c.RankServed > c.RankTotal || int64(c.RankOffset) > c.RankTotal {
+		return cursorInvalid("cursor continues past the end of the ranked answer")
 	}
 	return nil
 }
@@ -184,16 +238,55 @@ func traversalQueryHash(direction model.Direction, kinds []model.RelationKind,
 // not admit again). Every paged endpoint -- neighbours, impact and the package
 // rollup alike -- resumes a WALK, so there is one vocabulary and one replay.
 //
-// A second, ranked vocabulary ("a", "e", "p", "c") existed while impact ranked
-// its whole walk on the first page and replayed the cut tail from the spool.
-// That shape is gone: impact answers one page of the walk at a time, so there
-// is no pre-computed tail to replay. The payload version below is bumped with
-// its removal, which is what stops a token minted by a build that wrote a
-// ranked spool from resuming over a reader that no longer understands one.
+// Ruling P2 adds a THIRD kind, and one spool shape that is not a walk at all.
+// An impact or rollup request runs its walk to completion, ranks the whole
+// answer, serves the first page and spools the globally ranked remainder; that
+// spool's leading record is `r`, and every record after it is a bare ranked
+// record (impactrank.go's codec), not one of these envelopes. The marker is
+// what makes the two spool shapes self-identifying: the traversal replay below
+// refuses an `r` record through its default branch, so a ranked spool can never
+// be replayed as a frontier, and readRankedHeader refuses an `f` or `v` one.
+//
+// "p" is reserved for the ShortestPath continuation (lane P-d) and is not
+// implemented here.
+//
+// The older ranked vocabulary of payload version 1 ("a", "e", "p", "c") is
+// gone and is not revived: it spooled a per-page chunk, which is the shape
+// ruling P2 replaces.
 const (
 	spoolRecordFrontier = "f"
 	spoolRecordVisited  = "v"
+	spoolRecordRanked   = "r"
 )
+
+// rankedHeader is the leading record of a ranked-tail spool: the marker above
+// and the size of the whole ranked answer, so a continuation can disclose the
+// total without counting the spool it is about to stream.
+type rankedHeader struct {
+	Kind  string `json:"k"`
+	Total int64  `json:"total"`
+}
+
+// encodeRankedHeader renders that record.
+func encodeRankedHeader(total int64) ([]byte, error) {
+	b, err := json.Marshal(rankedHeader{Kind: spoolRecordRanked, Total: total})
+	if err != nil {
+		return nil, &model.Error{Code: model.CodeInternal,
+			Message: "continuation state encoding: " + err.Error()}
+	}
+	return b, nil
+}
+
+// decodeRankedHeader reads it back. A record that is not this build's ranked
+// header is CTX_CURSOR_INVALID rather than a page served from a spool whose
+// shape this build guessed at.
+func decodeRankedHeader(record []byte) (rankedHeader, error) {
+	var h rankedHeader
+	if err := json.Unmarshal(record, &h); err != nil || h.Kind != spoolRecordRanked || h.Total < 0 {
+		return rankedHeader{}, cursorInvalid("the cursor names a result page this build cannot replay")
+	}
+	return h, nil
+}
 
 // spoolRecord is one spilled record. The field names are short because the
 // spool byte budget is shared across every live continuation in the process.
