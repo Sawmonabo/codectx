@@ -148,7 +148,7 @@ func checkLimits(l Limits) error {
 // CTX_VERSION_CONFLICT. The phase gate, the manifest's generation and snapshot
 // and the session's file scope are the store's too, so none of it is repeated
 // here.
-func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (model.SessionID, error) {
+func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manifest model.ManifestID) (_ model.SessionID, err error) {
 	if err := req.Validate(); err != nil {
 		return "", err
 	}
@@ -163,6 +163,12 @@ func (s *Service) OpenSession(ctx context.Context, req model.PlanRequest, manife
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage session open", err) }()
 
 	session, err := s.sessions.OpenSession(ctx, model.SessionOpen{
 		ID:              model.SessionID(id),
@@ -239,7 +245,7 @@ func (s *Service) retain(ctx context.Context, rec sqlite.SessionRecord) error {
 // session-level counts are NOT reported here: workflow.Service.Status is the one
 // producer of a model.SessionStatus (ruling VF1), and the facade pairs this page
 // with it.
-func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (model.Page[model.FileCoverage], error) {
+func (s *Service) Status(ctx context.Context, req model.SessionRequest, page model.PageRequest) (_ model.Page[model.FileCoverage], err error) {
 	var emptyPage model.Page[model.FileCoverage]
 	if err := req.Validate(); err != nil {
 		return emptyPage, err
@@ -250,6 +256,12 @@ func (s *Service) Status(ctx context.Context, req model.SessionRequest, page mod
 
 	ctx, cancel := model.QueryDeadline(ctx, s.limits.QueryTimeout)
 	defer cancel()
+	// This surface's answer is one bounded read (or one mutation): between two
+	// pages it accumulates nothing, and its continuation cursor -- where it has
+	// one -- is minted from the last item served, never from a deadline. There
+	// is therefore nothing for a continuation to resume PAST, so an expired
+	// deadline is answered as itself, naming the setting that installed it.
+	defer func() { err = model.ClassifyQueryDeadline(ctx, "coverage status", err) }()
 	// statusLimit already keeps the request one record below the wire ceiling,
 	// so a clamp here would be a caller asking for more than the ceiling. It is
 	// reported rather than applied silently.
