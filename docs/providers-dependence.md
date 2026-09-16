@@ -22,7 +22,7 @@ fields, query results — it is "the engine".
 | `data_flows_to` | `data_flows_to` | `reaching_def`, `reaching_def capture` |
 | `reads` | `reads` | `assignment` |
 | `writes` | `writes` | `assignment` |
-| `calls` | `calls` | `call` |
+| `calls` | `calls` | `call`, `call speculated` |
 
 Every fact is `static_analysis` precision with exact byte ranges. A dependence
 edge does not claim a proven end-to-end source-to-sink flow; data dependence
@@ -38,6 +38,23 @@ recorded as unconditionally reachable when it is control-dependent on the `?`
 succeeding, and labeled `break`/`continue` bind to the innermost loop. The
 control-dependence and data-dependence facts for Rust are therefore complete
 over the graph the frontend emits, not over the language's semantics.
+
+Where a call site names a callee the engine could not find, the engine invents
+one: a method with no definition anywhere in the graph, emitted so the site has
+a target. The import keeps it — it is how a call into another unit binds by
+full name — and says what it is. Its call edge carries the `call speculated`
+detail instead of `call`, and the callee node carries
+`{"resolution":"speculated","candidates":1}` where a declaration from outside
+the unit carries `{"resolution":"import","candidates":1}`. A graph answer
+(`codectx_callees`, `codectx_callers`) returns nodes and relations and never
+the evidence behind them, which is why the node itself has to say it: without
+that, an invented callee reads as a real dependency of the source.
+
+A method taken as a value — assigned to a variable, passed as an argument,
+bound by a `def` or `function` statement — is bound by the export to the method
+it names, and the import anchors it there. Every fact derived through such a
+reference names the method the value carries, which is how a dependence on a
+function reached through a variable is published at all.
 
 `reads` and `writes` come from this provider alone: no SCIP indexer sets a
 write role, and syntax cannot resolve the target of an assignment.

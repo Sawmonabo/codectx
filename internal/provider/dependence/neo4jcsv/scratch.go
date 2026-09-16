@@ -32,6 +32,12 @@ const (
 	labelParamIn   = "METHOD_PARAMETER_IN"
 	labelTypeDecl  = "TYPE_DECL"
 
+	// speculatedParent is the namespace the export parks an invented callee
+	// under: a method it emitted with no definition anywhere in the graph,
+	// so that a call site whose target it could not find still has one. A
+	// callee under it is a guess, not a dependency the source states.
+	speculatedParent = "<speculatedMethods>"
+
 	edgeCall        = "CALL"
 	edgeContains    = "CONTAINS"
 	edgeCDG         = "CDG"
@@ -101,7 +107,7 @@ type graphNode struct {
 	filename, code, methodFullName, typeFullName    string
 	closureBinding                                  string
 	line, lineEnd, col, argIndex                    nullable
-	isExternal                                      bool
+	isExternal, speculated                          bool
 }
 
 // scratch is the on-disk staging database of one import. Everything the
@@ -167,7 +173,8 @@ CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 CREATE TABLE node_in(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, label TEXT NOT NULL, name TEXT NOT NULL,
 	full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
 	line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
-	method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL);
+	method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL,
+	speculated INTEGER NOT NULL);
 CREATE TABLE code(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, code TEXT NOT NULL);
 CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER NOT NULL, dst INTEGER NOT NULL);
 `
@@ -394,11 +401,11 @@ func (s *scratch) putNode(ctx context.Context, n graphNode) error {
 		return nil
 	}
 	err := s.exec(ctx, `INSERT INTO node_in(id, label, name, full_name, canonical_name, signature, filename,
-		line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, speculated)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.id, n.label, n.name, n.fullName, n.canonicalName, n.signature, n.filename,
 		n.line.value(), n.lineEnd.value(), n.col.value(), n.argIndex.value(),
-		boolInt(n.isExternal), n.methodFullName, n.typeFullName, n.closureBinding)
+		boolInt(n.isExternal), n.methodFullName, n.typeFullName, n.closureBinding, boolInt(n.speculated))
 	if err != nil {
 		return err
 	}
@@ -451,9 +458,10 @@ func (s *scratch) order(ctx context.Context) error {
 		{"nodes", `CREATE TABLE nodes(id INTEGER PRIMARY KEY, label TEXT NOT NULL, name TEXT NOT NULL,
 			full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
 			line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
-			method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL)`},
+			method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL,
+			speculated INTEGER NOT NULL)`},
 		{"nodes", `INSERT OR IGNORE INTO nodes SELECT id, label, name, full_name, canonical_name, signature, filename,
-			line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding
+			line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding, speculated
 			FROM node_in ORDER BY id, seq`},
 		{"nodes", `CREATE INDEX nodes_by_label ON nodes(label, id)`},
 		{"code", `CREATE INDEX code_by_id ON code(id)`},
@@ -576,8 +584,10 @@ func (s *scratch) project(ctx context.Context) error {
 		{"projection", `CREATE TABLE proj(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, from_e INTEGER NOT NULL,
 			to_e INTEGER NOT NULL, site INTEGER NOT NULL, op TEXT NOT NULL, detail TEXT NOT NULL, target_name TEXT NOT NULL)`},
 		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
-			SELECT 'calls', a.owner, an.target, c.id, '', '` + detailCall + `', '' FROM nodes c
+			SELECT 'calls', a.owner, an.target, c.id, '',
+				CASE WHEN t.speculated = 1 THEN '` + detailCallSpeculated + `' ELSE '` + detailCall + `' END, '' FROM nodes c
 			JOIN attr a ON a.id = c.id JOIN anchors an ON an.node = c.id JOIN ents o ON o.id = a.owner
+			JOIN nodes t ON t.id = an.target
 			WHERE c.label = '` + labelCall + `' AND c.method_full_name NOT LIKE '<operator>.%' AND an.target <> a.owner`},
 		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
 			SELECT 'control_depends_on', ad.target, ac.target, e.dst, '', '` + detailCDG + `', '' FROM edges e
