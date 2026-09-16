@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -405,6 +406,156 @@ func measure(t *testing.T, target time.Duration, n int, op func()) string {
 // process-tree resident set it observed, in bytes. The parent is excluded: the
 // product runs as a descendant of this test binary (see the file comment), so
 // the descendant sum is the product's whole tree.
+// subjectPeak is treePeak for a row whose subject is ONE spawned process: it
+// samples that pid and its descendants and nothing else.
+//
+// treePeak roots the tree at the test process, which is right for a row that
+// measures work this binary does and wrong for a row that measures a child:
+// every other descendant the harness happens to be holding -- the shared
+// fixture's own workspace, a toolchain process, another row's leftovers -- is
+// summed into the subject's figure. The idle-mcp row missed its budget by
+// 60 MiB of parser workers belonging to the fixture, not to the server it
+// names, which is a measurement that charges one process's memory to another.
+func subjectPeak(tb testing.TB, pid int, op func()) uint64 {
+	tb.Helper()
+	var peak uint64
+	sample := func() {
+		if sum, ok := subjectTreeRSSBytes(pid); ok && sum > peak {
+			peak = sum
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		op()
+	}()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-done:
+			sample()
+			return peak
+		case <-tick.C:
+			sample()
+		}
+	}
+}
+
+// subjectTreeRSSBytes sums the resident set of root and every process below it
+// in one sweep of /proc, so the figures describe one instant. It reports false
+// where /proc is unreadable rather than a smaller number, exactly as the
+// product's own sampler does: a confidently wrong measurement is worse than a
+// missing one.
+func subjectTreeRSSBytes(root int) (uint64, bool) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0, false
+	}
+	type rec struct {
+		parent int
+		bytes  uint64
+	}
+	page := uint64(os.Getpagesize())
+	all := make(map[int]rec, len(entries))
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// Field 2 is the executable name in parentheses and may itself contain
+		// spaces, so the split starts after the last ')'.
+		cut := strings.LastIndexByte(string(raw), ')')
+		if cut < 0 {
+			continue
+		}
+		fields := strings.Fields(string(raw)[cut+1:])
+		const ppidIndex, rssIndex = 1, 21
+		if len(fields) <= rssIndex {
+			continue
+		}
+		parent, err := strconv.Atoi(fields[ppidIndex])
+		if err != nil {
+			continue
+		}
+		pages, err := strconv.ParseUint(fields[rssIndex], 10, 64)
+		if err != nil {
+			continue
+		}
+		all[pid] = rec{parent: parent, bytes: pages * page}
+	}
+	self, ok := all[root]
+	if !ok {
+		return 0, false
+	}
+	total := self.bytes
+	for pid, r := range all {
+		if pid == root {
+			continue
+		}
+		for hops := 0; hops < 16; hops++ {
+			if r.parent == root {
+				total += all[pid].bytes
+				break
+			}
+			next, ok := all[r.parent]
+			if !ok {
+				break
+			}
+			r = next
+		}
+	}
+	return total, true
+}
+
+// workersHeldByThisProcess counts the parser workers this test binary itself
+// has running: a worker is this executable re-executed, so it is a child whose
+// own executable is this one. A budget row that measures a CHILD must open its
+// window with none of these alive, or the harness's own workspace is part of
+// the subject's figure whatever the row does.
+func workersHeldByThisProcess(tb testing.TB) int {
+	tb.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		tb.Fatalf("resolve this executable: %v", err)
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	me := os.Getpid()
+	var n int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 || pid == me {
+			continue
+		}
+		raw, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		cut := strings.LastIndexByte(string(raw), ')')
+		if cut < 0 {
+			continue
+		}
+		fields := strings.Fields(string(raw)[cut+1:])
+		if len(fields) < 2 {
+			continue
+		}
+		if parent, err := strconv.Atoi(fields[1]); err != nil || parent != me {
+			continue
+		}
+		if target, err := os.Readlink("/proc/" + e.Name() + "/exe"); err == nil && target == self {
+			n++
+		}
+	}
+	return n
+}
+
 func treePeak(tb testing.TB, op func()) uint64 {
 	tb.Helper()
 	sampler := diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{})
@@ -674,7 +825,14 @@ var budgetRows = []budgetRow{
 			// Settle: opening the workspace and standing the server up is
 			// startup, not idle, so it happens outside the sampled window.
 			time.Sleep(idleMCPSettle)
-			peak := treePeak(t, func() { time.Sleep(idleMCPSample) })
+			// The subject is the server, so the harness must be holding no
+			// parser workers of its own when the window opens: the pool drains
+			// when the parse stage ends, so the shared fixture's workspace has
+			// none left after its index.
+			if held := workersHeldByThisProcess(t); held != 0 {
+				t.Fatalf("the harness holds %d parser worker(s) of its own as the window opens; they would be measured as the server's", held)
+			}
+			peak := subjectPeak(t, cmd.Process.Pid, func() { time.Sleep(idleMCPSample) })
 			_ = stdin.Close()
 			if err := cmd.Wait(); err != nil {
 				t.Fatalf("mcp serve exited non-zero (%v)", err)
