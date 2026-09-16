@@ -116,7 +116,13 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 	g := &generation{c: c, req: req, started: c.now(), caps: c.newCapabilityReport()}
 	g.ledgerRun = c.newRun(ledger.KindIndex)
 	ctx = g.ledgerRun.Context(ctx)
-	defer func() { g.ledgerRun.Finish(endOutcome(err)) }()
+	defer func() {
+		// Reported again at the finish so a pass that failed still states what
+		// it got through, not zeros. The publish path reports at activation as
+		// well, which is what a live reader sees while retention still runs.
+		g.report()
+		g.ledgerRun.Finish(endOutcome(err))
+	}()
 	// The plan's whole-snapshot input run is a file under the work directory
 	// for as long as the units that stream from it are running, and no longer.
 	defer func() { _ = g.plan.Close() }()
