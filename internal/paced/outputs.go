@@ -1,6 +1,7 @@
 package paced
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -44,9 +45,12 @@ var writeRange = WriteRange
 // window per file is in flight from the pacer, and the pacer runs at the
 // disk's rate, never ahead of it.
 //
-// The files are the caller's named outputs read one level deep, which is the
-// same set the stall watchdog sums: a step's output file, or its output
-// directory, whose entries are a property of the writer's own vocabulary.
+// The files are every regular file under the caller's named outputs: a step's
+// output file, or its output directory and everything below it. The depth is
+// the writer's own vocabulary and nothing makes it flat, so a sweep that read
+// only the top level would leave a child that writes into a subdirectory
+// entirely unpaced -- the burst this exists to remove, with the pacer running
+// beside it and counting nothing.
 type Outputs struct {
 	paths []string
 	stop  chan struct{}
@@ -114,16 +118,20 @@ func (o *Outputs) sweep(final bool) {
 			o.hand(path, final)
 			continue
 		}
-		entries, err := os.ReadDir(path)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue
+		// The whole tree, and re-walked on every sweep: a writer creates
+		// its directories part way through its run, so one that was not
+		// there at the first sweep is reached at the next.
+		_ = filepath.WalkDir(path, func(p string, entry fs.DirEntry, err error) error {
+			// An entry that cannot be read, or that the writer removed
+			// between the walk and the read, is the absence of a signal
+			// rather than a failure: the rest of the tree still has windows
+			// owed to the disk.
+			if err != nil || entry.IsDir() {
+				return nil
 			}
-			o.hand(filepath.Join(path, entry.Name()), final)
-		}
+			o.hand(p, final)
+			return nil
+		})
 	}
 }
 
