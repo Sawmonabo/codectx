@@ -114,6 +114,21 @@ func attribute(p Purpose, n int64) {
 // exits with removals still queued has not yet accounted them, because it has
 // not yet freed them. The next process to claim the same set frees them and
 // accounts them as its own.
+// QueueForRemoval renames path into the to-free set that serves it, so the
+// space is given back off the caller's path, and reports whether it did.
+//
+// It is the form for a caller that must not wait and must not free where it
+// stands: the engine's file system shim, whose delete the engine makes while
+// it holds the database file. Emptying a file there at the pace holds that
+// lock for as long as the file has windows, and every other process's first
+// read waits it out. The rename is the whole of what such a caller needs --
+// the name is gone when it returns -- and the reclaimer gives the space back
+// at the same pace afterwards.
+//
+// A path no set serves cannot be renamed anywhere, and freeing it is then the
+// caller's own.
+func QueueForRemoval(path string) bool { return queue("", path) }
+
 func RemoveFor(p Purpose, path string) error {
 	if queue(p, path) {
 		return nil
