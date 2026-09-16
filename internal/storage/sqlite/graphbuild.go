@@ -100,7 +100,7 @@ func partSizeFor(stream string) int {
 		return arrayPartEntries * nodeBytesEntryBytes
 	case streamRelEvidence:
 		return arrayPartEntries * evidenceEntryBytes
-	case streamTermDir, streamTermText, streamPostList:
+	case streamTermDir, streamTermText, streamPostList, streamDocDir, streamDocAttr:
 		return lexPartBytes
 	default:
 		return 0
