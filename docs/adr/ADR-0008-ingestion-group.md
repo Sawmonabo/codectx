@@ -177,9 +177,12 @@ corpus with every foreign writer off: freed this run 0 bytes. What still frees d
 stays to be taken from the arena: the engine's own temporary sort files, which it creates and
 deletes through the shim (the shim can pool them); walk retention, whose state machine reads a
 file's existence as walk state; the per-unit materialized trees and the indexer run directories;
-and the foreign outputs themselves (an indexer's index, the dependence export), which are the
-follow-up that never touches the disk. An operator command empties the arena on request; nothing
-else does.
+the foreign outputs themselves (an indexer's index, the dependence export); and six surfaces a
+later review found freed by the code and missing from this list: a published blob when its
+snapshot is collected, the trim of a blob's staging surface at publication, a sort run the walk
+adopted and removes itself, a retained search directory, the capture staging, and every journal the
+engine deletes through the shim. The fourth amendment below places all of these behind one paced
+reclaimer. An operator command empties the arena on request; nothing else does.
 
 ### Decision 5, amended a fourth time 2026-09-16: what still frees is freed at the pace the host tolerates
 
