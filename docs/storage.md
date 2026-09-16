@@ -441,21 +441,25 @@ writer connection, so both queued behind a run's group and were refused
 Opened without a writer, the fingerprint is compared on the reader pool -- the
 same comparison, and a cache with no tables is reported as the workspace that
 was never built rather than as a fingerprint that failed to match -- and the
-pin takes no lease. A lease retains a generation against collection, and while a
-generation is active collection never accepts it, so such a process pins only
-the active generation; a superseded generation named explicitly is refused,
-because that is the case a lease plainly does protect and this process cannot
-take one.
+pin takes no lease.
 
-That leaves one window, and it is open on purpose. A generation stops being
-active the moment another process activates the next one, and the retention pass
-that follows an activation collects what is then superseded. A query held across
-that moment by a writerless process can therefore find rows it could still read a
-moment earlier gone -- fewer results, not wrong ones, and each individual read is
-still one consistent log snapshot. Closing it means holding one read transaction
-open for the life of the pin, the way the postings pool already does for a
-candidate walk, so the log snapshot retains the generation instead of a row; the
-lease is not the only way to hold a generation still.
+**A pin without a lease is a snapshot, and a snapshot is what a query needs.**
+Every read such a reader serves runs in one deferred read transaction of its
+own, so within a call the log snapshot is fixed: a collection running in another
+process at that moment cannot take rows out from under the read, and the answer
+in hand is the whole answer for the generation it was bound to. The pin
+therefore accepts any published generation, superseded as readily as active; the
+lease was retaining rows against a hazard the snapshot already excludes.
+
+What the snapshot does not span is the gap BETWEEN calls, and that gap has an
+answer rather than a hole. A continuation names the generation its token was
+minted against, and both continuable endpoints pin that generation rather than
+the current one. If the retention pass behind another process's activation has
+collected it, the pin finds no row, and the caller is told so in the family a
+continuation is refused in -- `CTX_CURSOR_INVALID`, re-run from the first page
+-- and not as though the argument it never typed were malformed. A generation
+named by hand with `--generation` still meets the argument refusal, which is the
+answer that case asks for.
 
 Every mutating entry point on such a store refuses with `CTX_INTERNAL`: it is
 reachable only by composing a command that changes the workspace with the

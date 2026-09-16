@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/pagination"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // The two Section 14.4 endpoint names. A cursor minted by one is rejected by
@@ -321,4 +322,23 @@ func (s *Service) consumed(ctx context.Context, c pagination.Cursor) {
 func releaseSpool(spools *pagination.Spools, sp *pagination.Spool) {
 	sp.Close()
 	spools.Release(sp.ID())
+}
+
+// resumePinFailure types the failure a CONTINUATION meets when the generation
+// its token pins has been collected between the page that minted it and the
+// page presenting it. Both endpoints here pin the generation the TOKEN names,
+// not the active one, so this is the across-call end of the snapshot a
+// writerless pin holds: within a call nothing can be collected under the read,
+// across calls the generation can go, and the caller must be told which it is.
+//
+// The store refuses a generation with no row as an invalid ARGUMENT, which is
+// the right answer for an operator who typed --generation and the wrong one for
+// a caller that presented a token: nothing about its argument is malformed, the
+// position it names is simply gone, and what it needs to be told is to start
+// again from the first page.
+func resumePinFailure(resumed bool, err error) error {
+	if !resumed || !sqlite.IsGenerationCollected(err) {
+		return err
+	}
+	return cursorInvalid("the generation this cursor pins has been collected; re-run from the first page")
 }

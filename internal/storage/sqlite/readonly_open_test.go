@@ -101,3 +101,91 @@ func TestReadOnlyStoreReadsWhileAnotherHoldsTheWriteTransaction(t *testing.T) {
 		t.Fatalf("read-only refusal does not name the cause: %v", err)
 	}
 }
+
+// A writerless pin is a SNAPSHOT, not a lease, and the two things that follow
+// from that are what this protects.
+//
+// A query that cannot take a lease used to be refused any generation but the
+// active one, which made a continuation unanswerable the moment the run it was
+// minted against published the next generation -- the exact instant a second
+// process is most likely to be asking. It is allowed now because the lease was
+// never what a read needed: Store.read runs one deferred read transaction per
+// call, so within a call the log snapshot is fixed and a collection in another
+// process cannot take rows out from under the read.
+//
+// Across calls the generation really can go, and that is the second half: the
+// pin that finds no row must be recognisable as a COLLECTED generation, because
+// that is what a continuation naming it turns into CTX_CURSOR_INVALID. Reported
+// as an ordinary invalid argument it would tell the caller it typed something
+// wrong, when what it presented was a token this process handed it.
+//
+// Mutation that fails this test: restore the read-only refusal of a
+// non-active generation in PinGeneration, or drop the generation_state detail
+// from the missing-generation refusal.
+func TestReadOnlyPinHoldsASupersededGenerationAndNamesItsCollection(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codectx.db")
+	f := newFixture(t, dbPath)
+
+	a := f.file("pkg/a.go", "package pkg\nfunc A() {}\n")
+	snap := f.snapshot("one", a)
+	gen, err := f.s.BeginGeneration(ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration: %v", err)
+	}
+	run := f.run(gen)
+	f.unit(gen, run, a)
+	if err := f.s.CompleteProviderRun(ctx, model.ProviderResult{RunID: run, State: model.RunSucceeded, RecordsEmitted: 1, BytesProcessed: 24}, ""); err != nil {
+		t.Fatalf("CompleteProviderRun: %v", err)
+	}
+	f.activate(gen, 0)
+
+	// A second generation is published, which is what supersedes the first.
+	a2 := f.file("pkg/a.go", "package pkg\nfunc A() { changed() }\n")
+	snap2 := f.snapshot("two", a2)
+	gen2, err := f.s.BeginGeneration(ctx, f.repo, snap2.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration(2): %v", err)
+	}
+	run2 := f.run(gen2)
+	f.unit(gen2, run2, a2)
+	if err := f.s.CompleteProviderRun(ctx, model.ProviderResult{RunID: run2, State: model.RunSucceeded, RecordsEmitted: 1, BytesProcessed: 24}, ""); err != nil {
+		t.Fatalf("CompleteProviderRun(2): %v", err)
+	}
+	f.activate(gen2, gen)
+
+	reader, err := store.Open(ctx, dbPath, store.Options{ReadOnly: true, BusyTimeout: 500 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("read-only Open: %v", err)
+	}
+	defer reader.Close()
+
+	pinned, err := reader.PinGeneration(ctx, f.repo, gen, time.Minute)
+	if err != nil {
+		t.Fatalf("a writerless pin of the superseded generation a continuation names was refused: %v", err)
+	}
+	if pinned.LeaseID() != "" {
+		t.Fatalf("a read-only pin took retention lease %q", pinned.LeaseID())
+	}
+	nodes, err := pinned.NodesInFile(ctx, a.id, 0, "", 10)
+	if err != nil {
+		t.Fatalf("NodesInFile through a writerless pin of a superseded generation: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("the superseded generation answered %d nodes, want 1", len(nodes))
+	}
+	pinned.Close()
+
+	// The other process collects it. Nothing retains it -- that is the point of
+	// a pin that takes no lease -- so the collection succeeds.
+	if err := f.s.DeleteGeneration(ctx, gen); err != nil {
+		t.Fatalf("DeleteGeneration: %v", err)
+	}
+	_, err = reader.PinGeneration(ctx, f.repo, gen, time.Minute)
+	if err == nil {
+		t.Fatal("a pin of a collected generation was accepted")
+	}
+	if !store.IsGenerationCollected(err) {
+		t.Fatalf("a pin of a collected generation is not recognisable as one, so a continuation cannot answer CTX_CURSOR_INVALID: %v", err)
+	}
+}

@@ -217,7 +217,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 	}
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
-		return empty, err
+		return empty, resumePinFailure(req.Page.Cursor != "", err)
 	}
 	defer reader.Close()
 	binding := reader.Binding()
@@ -979,7 +979,7 @@ func (s *Service) Resolve(ctx context.Context, req model.SymbolRequest) (model.P
 	}
 	reader, err := s.store.PinGeneration(ctx, s.repo, generation, s.ttl)
 	if err != nil {
-		return empty, err
+		return empty, resumePinFailure(req.Page.Cursor != "", err)
 	}
 	defer reader.Close()
 	binding := reader.Binding()

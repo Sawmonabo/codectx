@@ -77,6 +77,7 @@ type fixture struct {
 	opts    Options
 	nodes   map[string]model.NodeID
 	files   map[string]model.FileID
+	hashes  map[string]string
 }
 
 // newFixture builds and activates the corpus. It runs at every lane's entry so
@@ -106,6 +107,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("OpenCAS: %v", err)
 	}
 	hashes := make(map[string]string, len(fixtureDocs))
+	f.hashes = hashes
 	files := make([]model.FileVersion, 0, len(fixtureDocs))
 	for _, d := range fixtureDocs {
 		rec, err := cas.Put(ctx, strings.NewReader(d.body))
@@ -158,7 +160,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("BeginProviderRun: %v", err)
 	}
 	for _, d := range fixtureDocs {
-		f.publish(run, d, hashes[d.path])
+		f.publish(f.gen, run, d, hashes[d.path])
 	}
 	f.binding, err = st.Activate(ctx, f.gen, 0, model.HealthFresh,
 		[]model.CapabilityState{{ProviderID: fixtureProviderID, Capability: "structure", Scope: "workspace", State: model.CapabilityFresh}},
@@ -183,8 +185,8 @@ func newFixture(t *testing.T) *fixture {
 }
 
 // publish seals one file-scoped unit carrying d's node fact and its lexical
-// documents into the staging generation.
-func (f *fixture) publish(run model.ProviderRunID, d doc, hash string) {
+// documents into the staging generation gen.
+func (f *fixture) publish(gen model.GenerationID, run model.ProviderRunID, d doc, hash string) {
 	f.t.Helper()
 	fileID := f.files[d.path]
 	nodeID := f.nodes[d.path]
@@ -198,7 +200,7 @@ func (f *fixture) publish(run model.ProviderRunID, d doc, hash string) {
 	spec.ID = model.NewUnitID(spec, fixtureConfigHash)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: fixtureConfigHash, OriginRunID: run,
 		SourceBinding: model.SourceBindingVerified}
-	w, err := f.store.BeginUnit(f.ctx, f.gen, build,
+	w, err := f.store.BeginUnit(f.ctx, gen, build,
 		func(yield func(model.UnitInput) error) error { return yield(input) })
 	if err != nil {
 		f.t.Fatalf("BeginUnit(%s): %v", d.path, err)
@@ -290,6 +292,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/a_writerless_process_serves_one_page_and_mints_no_cursor", legReadOnlyServesOnePage},
+		{"fix/a_cursor_naming_a_collected_generation_is_a_cursor_failure", legCollectedGenerationIsACursorFailure},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
 		// FX-H-G rows
@@ -2171,4 +2174,90 @@ func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
 		t.Fatalf("the hit is served at byte %d, want the precedence winner's %d; the winner is the LATER "+
 			"declaration, so serving %d is the first-declaration reading", hit.Range.Start.Byte, winner, loser)
 	}
+}
+
+// legCollectedGenerationIsACursorFailure proves the across-call end of a pin
+// that holds its generation by snapshot rather than by lease. Both endpoints
+// here pin the generation the TOKEN names, so a continuation presented after
+// the retention pass behind another process's activation has collected that
+// generation finds no row at all.
+//
+// The answer owed there is the cursor's own family: the caller typed nothing,
+// it presented a token this service minted, and what it must be told is to
+// re-run from the first page. Reported as CTX_ARGUMENT_INVALID -- which is what
+// the store raises, correctly, for an operator who named the generation by hand
+// -- it reads as a command line typed wrong, and a caller paging through an
+// answer while an index publishes has no way to tell that it should simply
+// start again.
+//
+// Mutation: make resumePinFailure return err unchanged. The leg then fails with
+// CTX_ARGUMENT_INVALID.
+func legCollectedGenerationIsACursorFailure(t *testing.T, f *fixture) {
+	s := newService(t, f.opts)
+	first, err := s.Search(f.ctx, model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}})
+	if err != nil {
+		t.Fatalf("Search(page 1): %v", err)
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a bounded page over three matching documents minted no continuation")
+	}
+	// The chain is walked to its end, which releases every cursor lease along
+	// it: a continuation is single-use, so the token page 1 handed back is now
+	// one a caller may still present and nothing retains its generation for.
+	// That is the only state in which the generation a live token names can be
+	// collected, and it is an ordinary one -- a caller that retries a page it
+	// has already followed.
+	cursor := first.Meta.NextCursor
+	for cursor != "" {
+		page, err := s.Search(f.ctx, model.SearchRequest{Query: "handle",
+			Page: model.PageRequest{Limit: 1, Cursor: cursor}})
+		if err != nil {
+			t.Fatalf("Search(continuation): %v", err)
+		}
+		cursor = page.Meta.NextCursor
+	}
+	// Another process publishes the next generation, which supersedes the one
+	// the cursor names, and collects it.
+	st := f.opts.Store
+	gen2, err := st.BeginGeneration(f.ctx, f.repo, f.binding.SnapshotID, model.H("semantic-next"), "main")
+	if err != nil {
+		t.Fatalf("BeginGeneration(2): %v", err)
+	}
+	// The sealed unit of the first generation is reused rather than rebuilt,
+	// which is what an incremental run does: the second generation differs from
+	// the first only in the membership it publishes.
+	if err := st.AttachUnit(f.ctx, gen2, f.unitOf(fixtureDocs[0])); err != nil {
+		t.Fatalf("AttachUnit: %v", err)
+	}
+	if _, err := st.Activate(f.ctx, gen2, f.gen, model.HealthFresh, nil, "norm-v1"); err != nil {
+		t.Fatalf("Activate(2): %v", err)
+	}
+	if err := st.DeleteGeneration(f.ctx, f.gen); err != nil {
+		t.Fatalf("DeleteGeneration: %v", err)
+	}
+	_, err = s.Search(f.ctx, model.SearchRequest{Query: "handle",
+		Page: model.PageRequest{Limit: 1, Cursor: first.Meta.NextCursor}})
+	if err == nil {
+		t.Fatal("a continuation over a collected generation was served")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
+		t.Fatalf("a continuation whose generation was collected failed as %v, want CTX_CURSOR_INVALID", err)
+	}
+	if !strings.Contains(typed.Message, "first page") {
+		t.Errorf("the refusal does not tell the caller what to do: %q", typed.Message)
+	}
+}
+
+// unitOf is the id of the file-scoped unit publish seals for d, recomputed from
+// the same spec rather than remembered, so it cannot drift from what was built.
+func (f *fixture) unitOf(d doc) model.UnitID {
+	f.t.Helper()
+	h := model.NewUnitInputHasher()
+	if err := h.Add(model.UnitInput{FileID: f.files[d.path], ContentHash: f.hashes[d.path]}); err != nil {
+		f.t.Fatalf("UnitInputHasher.Add(%s): %v", d.path, err)
+	}
+	spec := model.UnitSpec{ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
+		ScopeKey: d.path, InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
+	return model.NewUnitID(spec, fixtureConfigHash)
 }
