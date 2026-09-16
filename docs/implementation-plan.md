@@ -889,7 +889,7 @@ One parse handles exactly one language, so the coordinator schedules one unit pe
 
 The provider never delays base readiness. Nothing runs before the base generation is active, and nothing is installed when the workspace is opened: the backend construction resolves the analysis payload only if the store already holds it, keeps the payload's pinned identity otherwise, and the first unit that needs the engine fetches it at unit time. With `providers.dependence.enabled = "auto"` (the default), the coordinator then enqueues every dependence unit as low-priority background work under the resource governor; a query that asks for a dependence fact promotes its units to the front of that queue and answers with a typed `pending` capability (unit count, position, estimate) until they seal. A one-shot building command is not exempt from that queue: `codectx index` and `codectx refresh` alike print their own generation as soon as it activates, then drain the deferred queue to empty, printing one line per publication, and exit. An interrupted run keeps that generation and every generation already published and reports the pending unit count; `providers.dependence.enabled = false` is the opt-out, and there is no flag that skips the drain while still planning the work. `true` blocks the index on the units; `false` disables the provider. A sealed dependence unit never mutates the active generation: the coordinator builds a new generation from the active generation's units plus the sealed unit, validates it, and activates it atomically through the same path a refresh uses (Section 13.1); seals landing in one scheduler tick coalesce into one generation, and the `pending` answer becomes a real answer exactly at activation. The parsed graph is cached per unit under the private data directory and reused across generations, so unchanged code pays nothing on refresh. The cache key is the complete semantic closure: the unit's source file hashes, its manifest and lock files (`go.mod`/`go.sum`, `package.json`/lockfile/`tsconfig.json`, `pyproject.toml`/`requirements*.txt`, `Cargo.toml`/`Cargo.lock`, `compile_commands.json` and include paths), the frontend argv including excludes and the definition cap, the engine payload digest, and the runtime payload digest. Any of these changing invalidates the unit.
 
-Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin, further bounded only by an explicit user limit (`unit_memory_ceiling_bytes` set by the user; `0` means machine-derived). Only that explicit user limit may reject a unit before it runs. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. Heavy analyzers run one at a time by default (`max_concurrent_heavy_analyzers = 1`); the scheduler admits a second only when the sum of reservations fits the machine-derived allocation. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-round3-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. The provider captures stderr, parses any remaining skip warnings, and publishes `data_flows_to` as `partial` with the count and the skipped method names.
+Memory is governed per process tree, not per Go heap, and never at the expense of results. The engine's frontend honors a heap cap through its environment and a cap is lossless: on every repository measured (239k-line Go, 443k- and 1.8M-line C, 81k-line TypeScript, 1.5M-line Java, 506k-line Python) a capped run produced the same facts as the default run or no graph at all. A heap cap is not a memory cap: resident memory above the cap is frontend-specific (Go/TypeScript/Java 0.1–0.5 GB, Python about 1.9 GB, C/C++ about 2.6 GB, plus a fixed ~0.8 GB helper for Rust), so the scheduler computes a reservation = heap cap + per-frontend allowance + helper allowance and uses it to order and co-schedule work, not to refuse it. There is no default memory ceiling: the heap cap is sized from the unit's byte count with headroom (a cap near the live set costs time instead of memory: 3.6× slower on the Java repository) up to the machine-derived allocation, which is free memory minus the base index's footprint minus a safety margin and never more than half of what the machine had available. Nothing rejects a unit for the memory it asks for: there is no ceiling and no setting that could be one, and the allocation only bounds the cap. On an out-of-memory exit the provider retries exactly once at the machine-derived allocation, and only when that allocation exceeds the failed cap; if the first attempt already had the maximum, it skips the retry (a doomed retry cost 100 s on the 1.05M-line Python tree) and reports `failed: memory` with the observed figures and the unit's estimated requirement. How many heavy analyzers run at once is decided by that one observation of the machine and by nothing else: the scheduler admits each while the summed reservations of everything already running plus this one fit the allocation, with no count beside the sum, and a unit whose reservation exceeds the whole allocation runs alone rather than never. The same allocation admits the external indexers and the language servers, so one process's children are weighed against one figure. The export step gets its own reservation (it scales with the graph, not the source: 2 GB of CSV for the 1.8M-line C repository) and the CSV is deleted after import. Engine failures are classified, never guessed: an out-of-memory exit is `failed: memory`; a deterministic pass crash (reproduced on a 137k-line Go module and a 324k-line TypeScript tree) is `failed: engine` with the failing pass name from stderr; a helper crash that the orchestrator hides behind a zero exit and a near-empty graph (reproduced on a 183k-line Rust workspace) is detected by the `Process exited with code` stderr line or a zero file count for a non-empty unit and is also `failed: engine`. Every result is validated for non-emptiness before it is admitted. Subdivision exists only as the last-resort recovery from a reproducible engine crash, never for memory. The full frontend-native unit always runs first. On a crash the provider reruns the same unit once with the frontend's allowlist of semantics-neutral options (a fixed per-frontend list maintained in the backend and verified in Task 22; today that list is empty for all six frontends, because every known option such as the Rust helper's `--no-sysroot` changes results) to prove the crash is reproducible and not transient. Only then does it split the unit along the next frontend-native boundary. A subdivided unit is never presented as equivalent: every capability it publishes carries `partial` with reason `subdivided`, the failed unit id, the backend failure (pass name and exception class), and the affected capabilities. The honesty test is per capability, measured in Section 8 of the round-3 research: control and data dependence survive splitting almost intact (99.7–99.9% of edges on the TypeScript corpus), so they are published `partial: subdivided`; engine `calls` from a subdivided TypeScript unit keep under half of their resolved targets, so they are published `partial: subdivided` and consumers are pointed at the syntax-plus-SCIP `calls` path, which never depended on the engine. If a subdivided run cannot produce an honest useful result for any capability, the unit fails with `failed: engine` instead. The engine's per-method definition cap is raised in the pinned argv to `--max-num-def 40000` (measured uncapped on a 1.05M-line Python tree: +23% parse time, +3% memory, zero skipped methods, every other fact count identical; see `docs/research/10-round3-empirical.md` Section 9a) and is part of the cache key; there is no second parse at a higher limit. The provider captures stderr, parses any remaining skip warnings, and publishes `data_flows_to` as `partial` with the count and the skipped method names.
 
 Reads and writes are published by this provider from the graph's assignment operators: the written operand with a resolved reference becomes `writes`, other resolved identifier uses become `reads`, both at `static_analysis` precision. No SCIP indexer sets a write role and syntax alone cannot resolve the target, so this is the only honest source. Provenance is never lost behind the neutral name: every evidence row's `provider_version` carries the adapter version and the engine payload digest, `Detection.ObservedVersion` reports the engine version and payload digest (never the engine name) to `status`, `doctor` and the ledger, and `docs/providers-dependence.md` maps digests to releases.
 
@@ -2002,7 +2002,6 @@ max_search_file_bytes = 0      # 0 = unlimited; a value you set reports each ski
 [index]
 # 0 = choose from available CPUs and memory reservations, never "unlimited".
 workers = 0
-max_parser_workers = 2
 batch_records = 1000
 batch_bytes = 4194304
 queue_bytes = 16777216
@@ -2016,12 +2015,15 @@ retain_refs = 8                # lifecycle retention, not a row drop; 0 keeps ev
 max_retained_bytes = 0
 
 [resources]
-base_memory_budget_bytes = 805306368
+# How much runs at once is not here and is not settable. Heavy children -- an
+# analysis engine run, an external indexer, a language server -- are admitted
+# while the sum of the memory they reserve fits the machine-derived allocation
+# (available memory less this process's own footprint and a safety margin, and
+# never more than half of what was available); one larger than the whole
+# allocation runs alone. The parser workers and the query and traversal gates
+# come from the machine's cores. Nothing there refuses work: it waits.
 query_memory_bytes = 33554432
 cache_bytes = 33554432
-max_concurrent_queries = 4
-max_concurrent_graph_queries = 2
-max_concurrent_heavy_analyzers = 1
 max_temp_bytes = 0
 min_free_disk_bytes = 1073741824
 max_metadata_response_bytes = 262144
@@ -2053,7 +2055,8 @@ fetch_timeout = "10m"
 [providers.tree_sitter]
 enabled = true
 languages = ["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]
-worker_idle_ttl = "60s"
+# Parser workers start on demand and exit when the indexing stage ends, so a
+# machine that has stopped indexing holds none. There is no idle timer.
 
 [providers.scip]
 enabled = "auto"
@@ -2062,8 +2065,15 @@ stall_timeout = "5m"           # hang detector: no stdout/stderr/CPU/output grow
 
 [providers.lsp]
 enabled = "auto"
-request_timeout = "15s"
-max_servers = 1
+# Hang detector for one request: the connection moving no bytes in either
+# direction for this long. There is no deadline on an answer -- a server still
+# indexing a monorepo before its first reply is working, not wedged.
+stall_timeout = "5m"
+# How many servers run at once is the machine's: each is admitted against the
+# same allocation by what its pinned definition reserves. One that does not fit
+# waits, or an idle server is stopped to make room; another project's server
+# already running is never a refusal. Every server of one snapshot reads one
+# shared materialization of it, rooted at its own project directory.
 max_outstanding_requests = 8
 idle_ttl = "60s"
 
@@ -2074,10 +2084,10 @@ enabled = "auto"
 timeout = "0s"                 # no wall-clock limit
 stall_timeout = "5m"           # hang detector, as for scip
 cache_bytes = 4294967296
+# The smallest heap cap a unit is given. There is no ceiling: nothing rejects a
+# unit for the memory it asks for, and the machine-derived allocation only
+# bounds the cap.
 unit_memory_floor_bytes = 805306368
-# 0 = machine-derived (free memory minus base footprint minus safety margin).
-# Only a non-zero user value may reject a unit before it runs.
-unit_memory_ceiling_bytes = 0
 
 [context]
 default_phase = "sweep"

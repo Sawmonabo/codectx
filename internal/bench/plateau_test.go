@@ -107,7 +107,7 @@ func TestParserResourcePlateau(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 1, WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		MaxWorkers: 1, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: t.TempDir(),
 	})
 	if err != nil {
@@ -263,7 +263,7 @@ func TestIncrementalReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	ts, err := treesitter.New(treesitter.Options{MaxWorkers: 2, MaxParseFileBytes: cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL: time.Minute, ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
+		ParseTimeout: time.Minute, WorkerMemoryBytes: 256 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}}, Runner: runner, WorkDir: parsers})
 	if err != nil {
 		t.Fatal(err)

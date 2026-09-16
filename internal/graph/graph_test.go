@@ -1426,7 +1426,7 @@ func (blockingGate) Acquire(ctx context.Context) error {
 	<-ctx.Done()
 	return &model.Error{Code: model.CodeResourceLimit, Retryable: true,
 		Message:     "every graph query slot was busy for the whole request deadline",
-		Remediation: "retry when fewer queries are running, or raise resources.max_concurrent_graph_queries"}
+		Remediation: "retry when fewer traversals are running; how many run at once is derived from this machine's cores and is not a setting"}
 }
 
 func (blockingGate) Release() {}
