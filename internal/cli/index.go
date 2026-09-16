@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -131,7 +132,13 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 							return err
 						}
 					}
+					// Subscribed here and stopped the moment the run returns.
+					// The stop is a barrier, so nothing printed below can race
+					// a progressive line on the same writer, and a stage that
+					// finishes late can never land after the envelope.
+					stopStages := progressiveStages(cmd, args, ws)
 					result, err := svc.Index(ctx, req)
+					stopStages()
 					if err != nil {
 						return err
 					}
@@ -535,6 +542,73 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 	return v, nil
 }
 
+// progressiveStages prints one line per top-level stage of the run as it
+// finishes, so a long index says what it is doing while it does it instead of
+// staying silent until the completion block.
+//
+// The rows are the ones the run ledger recorded, reached through the workspace:
+// nothing here measures anything, and nothing here opens a ledger -- the file
+// has a single writer, and a second would contend with the run these lines
+// describe. A workspace that composed no ledger prints nothing.
+//
+// Only the run's own top-level stages are printed. A unit nested inside a stage
+// is already counted in it, and a line per unit would bury the stage the time
+// actually went to. No share of the run is printed either: the run's own wall
+// is not known until it ends, and a share computed from nothing would be a
+// number the operator could not trust.
+//
+// The returned stop is called before ANY other output of this command, and is
+// a barrier: when it returns, no progressive line is being written and none
+// will start, whatever the ledger goes on publishing. That is what keeps these
+// lines and the result off each other on one writer, and keeps a stage that
+// finishes late out of the single --json envelope.
+func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (stop func()) {
+	machine := jsonRequested(cmd, args)
+	// A --json consumer's stdout carries the one envelope and nothing else, so
+	// the progressive lines take the stderr channel the refresh lines already
+	// take for the same reason.
+	w := cmd.OutOrStdout()
+	if machine {
+		w = cmd.ErrOrStderr()
+	}
+	// The mutex, and not a flag, is what makes stop a barrier: a flag would
+	// stop the NEXT line and leave one already being written racing the
+	// result below on the same writer.
+	var mu sync.Mutex
+	var done bool
+	ws.Spans(func(row model.StageRecord) {
+		mu.Lock()
+		defer mu.Unlock()
+		if done || row.ParentSeq != nil {
+			return
+		}
+		if machine {
+			writeText(w, "stage %s wall_ms=%d outcome=%s in=%d out=%d\n", //nolint:errcheck // a progress line lost to a closed pipe must not fail the run; the result below reports the same failure.
+				row.Stage, row.WallMS, row.Outcome, row.ItemsIn, row.ItemsOut)
+			return
+		}
+		writeText(w, "stage       %s %s%s, %s, in %d, out %d\n", //nolint:errcheck // as above.
+			row.Stage, stageProgressScope(row), wallMetric(row.WallMS, row.Running, row.FinishedAt),
+			stageOutcome(row), row.ItemsIn, row.ItemsOut)
+	})
+	return func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	}
+}
+
+// stageProgressScope is the scope a progressive line names, with the separator
+// it needs, and nothing at all for a stage that has no scope: a bare "-" in
+// running prose reads as a missing value rather than as a stage that is simply
+// not about one scope.
+func stageProgressScope(row model.StageRecord) string {
+	if row.ScopeKey == "" {
+		return ""
+	}
+	return row.ScopeKey + " "
+}
+
 // emitIndexProgress renders one completed run as progress rather than as the
 // result: human output on stdout, and for a --json consumer one log line on
 // stderr, because the envelope that run belongs to has not been written yet.
@@ -550,7 +624,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeCapabilities(&b, result.Completeness)
-	writeIndexRunLedger(&b, result.Run, result.Stages)
+	writeIndexRunLedger(&b, result.Run, result.Stages, result.StagesOmitted)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
 }
 
@@ -561,7 +635,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 // the run. A unit nested under a stage is already counted inside it, so listing
 // both would report shares that add up to more than the run and leave the
 // operator unable to see which stage the time actually went to.
-func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord, omitted int64) {
 	if run == nil {
 		return
 	}
@@ -576,6 +650,13 @@ func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []mode
 		fmt.Fprintf(b, "stage       %s %s, %s of the run, %s, in %d, out %d\n",
 			stage.Stage, wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
 			shareMetric(stage.ShareOfWall), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
+	}
+	// The run recorded more stages than one result carries. Saying how many is
+	// what keeps the lines above a page of the run's accounting rather than a
+	// silently short list read as the whole of it.
+	if omitted > 0 {
+		fmt.Fprintf(b, "omitted     %d further %s beyond this result's page\n",
+			omitted, plural(int(omitted), "stage was recorded", "stages were recorded"))
 	}
 }
 
@@ -710,7 +791,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
 	flushTableInto(tw)
-	writeRunLedger(b, r.Run, r.Stages)
+	writeRunLedger(b, r.Run, r.Stages, r.StagesOmitted)
 }
 
 // writeRunLedger renders the recorded run and its stages: what the run cost,
@@ -724,7 +805,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 // a long time" are different facts, and a live stage whose elapsed time printed
 // like a measurement would tell an operator that a stalled stage had finished
 // fast.
-func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord, omitted int64) {
 	if run == nil {
 		return
 	}
@@ -758,6 +839,14 @@ func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.Sta
 		}
 	}
 	flushTableInto(tw)
+	// The run recorded more stages than one page carries. A table that did not
+	// say how many it dropped would present a page of the run's accounting as
+	// the whole of it, and an operator reading it would draw the shares and the
+	// costliest stage from a list that is missing rows.
+	if omitted > 0 {
+		fmt.Fprintf(b, "  omitted     %d further %s beyond this page\n",
+			omitted, plural(int(omitted), "stage was recorded", "stages were recorded"))
+	}
 	// Accounting the bounded bus refused rather than made the run wait for it.
 	// Above zero the stages above are known to be an incomplete account of the
 	// run, and a table that did not say so would read as the whole of it.

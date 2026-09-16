@@ -1,0 +1,16 @@
+2026-09-16 16:25:14.374 WARN  RecoverForJavaScriptFile  Unhandled field structure (BLOCK,new Ek(null)),(FIELD_IDENTIFIER,context) @ client/lib/gojs/go.js#L1308
+2026-09-16 16:25:14.374 WARN  RecoverForJavaScriptFile  Unable to assign identifier 'k' to field load '<unknown>' @ client/lib/gojs/go.js#L1308
+2026-09-16 16:25:18.049 ERROR ObjectPropertyCallLinker  Pass io.joern.x2cpg.frontendspecific.jssrc2cpg.ObjectPropertyCallLinker failed
+java.lang.RuntimeException: Assignment statement with 3 arguments
+	at io.shiftleft.semanticcpg.language.operatorextension.nodemethods.AssignmentMethods$.source$extension(AssignmentMethods.scala:15) ~[io.joern.semanticcpg-4.0.627.jar:4.0.627]
+	at io.shiftleft.semanticcpg.language.operatorextension.AssignmentTraversal$.source$extension$$anonfun$1(AssignmentTraversal.scala:16) ~[io.joern.semanticcpg-4.0.627.jar:4.0.627]
+	at scala.collection.Iterator$$anon$9.next(Iterator.scala:598) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at scala.collection.Iterator$$anon$6.hasNext(Iterator.scala:494) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at flatgraph.traversal.GenericSteps$.and$extension$$anonfun$1$$anonfun$1(Language.scala:226) ~[io.joern.flatgraph-core_3-0.1.34.jar:0.1.34]
+	at scala.collection.IterableOnceOps.forall(IterableOnce.scala:646) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at scala.collection.IterableOnceOps.forall$(IterableOnce.scala:336) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at scala.collection.AbstractIterable.forall(Iterable.scala:941) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at flatgraph.traversal.GenericSteps$.and$extension$$anonfun$1(Language.scala:225) ~[io.joern.flatgraph-core_3-0.1.34.jar:0.1.34]
+	at scala.collection.Iterator$$anon$6.hasNext(Iterator.scala:495) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at scala.collection.Iterator$$anon$9.hasNext(Iterator.scala:597) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]
+	at scala.collection.IterableOnceOps.foreach(IterableOnce.scala:632) ~[org.scala-lang.scala-library-3.8.3.jar:3.8.3]

@@ -95,8 +95,14 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 // with a measured wall: a stage whose span is never ended reads as running for
 // ever and its cost is simply missing from the breakdown.
 //
+// The three activation stages are asserted for a second reason: each of them
+// used to log its own duration, and those lines were removed once the span
+// carried the same wall. Removing a log line must not remove the fact it
+// carried, so a missing span here is the information going silently missing.
+//
 // Mutation proof: delete the `walk.End(...)` call in generation.capture and the
-// walk stage reads as unfinished.
+// walk stage reads as unfinished; or drop the lexical_build span's End in
+// buildLexical and that stage reads unfinished too.
 func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 	f := newFixture(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
 	res, err := f.c.Index(f.ctx, model.IndexRequest{})
@@ -115,14 +121,19 @@ func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
 			view.Run.FileCount, view.Run.UnitsSucceeded, res.FilesCaptured,
 			res.UnitsReused+res.UnitsBuilt+res.UnitsCarried)
 	}
+	// The stages activation opens for itself, spelled where they are opened:
+	// internal/storage/sqlite opens them under the activation span, so this
+	// package cannot name their constants.
+	inner := map[string]bool{"lexical_compaction": true, "adjacency": true, "lexical_build": true}
 	stages := map[string]ledger.SpanRow{}
 	for _, span := range view.Spans {
-		if span.ParentSeq == nil || span.Stage == stageWalk {
+		if span.ParentSeq == nil || span.Stage == stageWalk || inner[span.Stage] {
 			stages[span.Stage] = span
 		}
 	}
 	for _, want := range []string{stageCapture, stageWalk, stagePlan, stageAttachReused,
-		stageAttachCarried, stageBuild, stageCoverage, stageActivation, stageRetention} {
+		stageAttachCarried, stageBuild, stageCoverage, stageActivation, stageRetention,
+		"lexical_compaction", "adjacency", "lexical_build"} {
 		span, ok := stages[want]
 		if !ok {
 			t.Errorf("the run recorded no %q stage", want)

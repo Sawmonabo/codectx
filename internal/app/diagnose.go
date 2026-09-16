@@ -135,15 +135,15 @@ var _ diagnostics.WatchHeartbeatReader = storeReader{}
 type runLedger struct{ dir string }
 
 func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
-	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, error) {
+	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, int64, error) {
 	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
 	if err != nil || !recorded {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer reader.Close()
 	view, found, err := reader.LatestRun(ctx, string(repo), int64(generation))
 	if err != nil || !found {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	run := model.RunRecord{
 		RunID:               view.Run.RunID,
@@ -165,31 +165,9 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 	}
 	stages := make([]model.StageRecord, 0, len(view.Spans))
 	for _, span := range view.Spans {
-		stages = append(stages, model.StageRecord{
-			Seq:             span.Seq,
-			ParentSeq:       span.ParentSeq,
-			Stage:           span.Stage,
-			ScopeKey:        span.ScopeKey,
-			Provider:        span.Provider,
-			StartedAt:       span.StartedAt,
-			FinishedAt:      span.FinishedAt,
-			WallMS:          span.WallMS,
-			Running:         span.Running,
-			CPUUserMS:       span.CPUUserMS,
-			CPUSysMS:        span.CPUSysMS,
-			CPUUnattributed: span.CPUUnattributed,
-			PeakRSSBytes:    span.PeakRSSBytes,
-			ReadBytes:       span.ReadBytes,
-			WriteBytes:      span.WriteBytes,
-			ItemsIn:         span.ItemsIn,
-			ItemsOut:        span.ItemsOut,
-			Outcome:         string(span.Outcome),
-			DiagnosticCode:  span.DiagnosticCode,
-			Failure:         span.Failure,
-			ShareOfWall:     span.ShareOfWall,
-		})
+		stages = append(stages, stageRecord(span))
 	}
-	return &run, stages, nil
+	return &run, stages, view.SpansOmitted, nil
 }
 
 var _ diagnostics.RunLedger = runLedger{}
