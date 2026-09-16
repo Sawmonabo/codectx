@@ -602,9 +602,11 @@ func (s *Store) abandonGroupLocked() {
 // across several groups, or one that was never checkpointed.
 func (s *Store) WALBoundBytes() int64 { return 2 * int64(s.opts.WriterCacheKiB) << 10 }
 
-// Flush commits the open ingestion group, if any. The coordinator calls it
-// where a run's work must be on disk without a publication: before it hands
-// deferred units to a later publication and before the process exits.
+// Flush commits the open ingestion group, if any. Nothing in the indexing path
+// calls it: a run's work reaches the disk with its publication, and Close
+// commits whatever a process leaves open. It exists for a caller that opens a
+// connection of its own -- a test or a tool reading the database file beside
+// the store -- and must see what the store has written so far.
 func (s *Store) Flush(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return wrap("flush", err)
