@@ -477,27 +477,58 @@ system the process registers as its default: after each 8 MiB window
 written to a file the writer waits for the previous window to reach the
 disk and submits the new one, so at most one window is in flight per file
 and the disk receives a commit at its own rate rather than as one burst at
-the sync ([ADR-0008](adr/ADR-0008-ingestion-group.md), decision 5). Freeing
-is windowed the same way: the file system shim truncates a log or a journal
-the engine frees one window at a time, and every file the process removes
-itself -- a spool, a sort's runs, a staging tree, an analyzer's export -- goes
-through `internal/paced`, which shrinks a file larger than the window one
-window per step before it unlinks it. Windowed freeing bounds what the machine
-submits but not what its host owes: where the filesystem discards freed blocks
-and the machine's disk is a sparse image, a free of several gigabytes becomes
-host-side work the machine can neither observe nor wait for, and about a minute
-later some request in flight waits a minute for it. So a run reuses space and
-frees almost nothing: it frees the leftovers of a dead run at its start, and
-what it does free is windowed. The bytes a process has freed are reported in the
-resources block as `freed_bytes`, and what the freeing was for as
-`freed_by_purpose`. At activation and abort the
-writer's page cache is released to the process, so a long-lived server does
-not keep a run's working set resident. The engine's temporary files -- the
-spill files of a sort larger than its cache, a statement journal past its
-memory threshold, a temporary table too large for memory -- are created
-under `<data_dir>/tmp`, which the process names at start-up, so they live on
-the disk the user gave the data and never on a memory-backed system temp
-directory.
+the sync ([ADR-0008](adr/ADR-0008-ingestion-group.md), decision 5). Freeing is the other half, and it is not the same problem. Windowing bounds
+what the machine submits; it does not bound what its host owes. Where the
+filesystem discards freed blocks and the machine's disk is a sparse image, a
+free of several gigabytes becomes host-side work the machine can neither
+observe nor wait for, and about a minute later some request in flight waits a
+minute for it. Measured both ways: 5 GB freed in one burst hung the disk for
+64 s; the same 5 GB freed as 8 MiB windows, each followed by a data sync and a
+250 ms wait, hung nothing ([ADR-0008](adr/ADR-0008-ingestion-group.md),
+decision 5).
+
+So the process frees nothing where it is asked to. A removal **renames** its
+file or tree into a to-free set -- a rename frees nothing and costs a directory
+entry -- and returns; the caller goes on. **One reclaimer per process** gives
+the space back on its own goroutine, a window at a time, each window followed
+by a data sync and that wait, for as long as the process runs. The pace is a
+constant of `internal/paced`, not a setting: it is a measurement of this class
+of host, and there is nothing for an operator to tune. Bytes are charged to one
+budget whichever way they were released, so a burst of whole-file unlinks of
+small files -- a materialized tree of thousands of source files -- is given
+back at the same rate as one large file, and a caller that frees in place
+spends the same windows as the reclaimer.
+
+The to-free sets are on the disk, inside the pool instance the process claims,
+so a run that exits or crashes with removals queued leaves them for the next
+process to take over and finish at the same pace. Nothing is ever freed faster
+because it is old.
+
+Three figures in the resources block follow from this. `freed_bytes` is what
+the process has actually given back, counted byte by byte as each truncation
+and each unlink released it. `freed_by_purpose` is the labelled part of that
+same counter, split by what the removal was for, so the two cannot disagree.
+`pending_free_bytes` is what has been removed and not yet released: between the
+rename and the release the space belongs to neither the pool nor the freed
+total, and reporting only the other two would leave it invisible.
+
+At activation and abort the writer's page cache is released to the process, so
+a long-lived server does not keep a run's working set resident.
+
+The engine's own temporary files -- the spill files of a sort larger than its
+cache, a statement journal past its memory threshold, a temporary table too
+large for memory -- are **pooled** as well. The engine asks its file system for
+an unnamed file to be unlinked on close; the shim answers with a surface from
+the pool and the close gives it back holding its bytes, so a sort neither
+creates nor frees a file of the size it just spilled. The engine sees an empty
+file: the shim keeps that tenant's own length for the surface and answers
+reads, the file size and truncations from it, so a read past what this sort
+wrote is the short read a file system gives at the end of a file rather than
+the previous sort's records, and the engine shortening its temporary back to
+zero is a reset of that length rather than a free. With no pool named -- a
+process that opens no store -- the engine creates its own under
+`<data_dir>/tmp`, which the process names at start-up, so they live on the disk
+the user gave the data and never on a memory-backed system temp directory.
 ### The scratch pool
 
 Freeing is the expensive act, so the working files a store writes for its own
@@ -505,11 +536,25 @@ later reading are not freed at all. They are taken from a **scratch pool** under
 the directory they belong to and given back to it: an external sort's runs and
 its merged output, a lexical seal's staging database, the surface a blob is
 streamed into while it is hashed, a shortest-path search's state, an index
-import's symbol spool. `Take` hands out an existing file of the asked-for
-purpose, opened for overwrite at offset zero and **never truncated**, or creates
-one; `Release` returns it for the next taker. A file keeps whatever length its
-largest tenant gave it, and re-indexing an unchanged repository or answering a
-second query of the same shape therefore frees nothing at all.
+import's symbol spool, a dependence import's staging database, and the
+engine's own temporaries. `Take` hands out an existing file of the asked-for
+purpose, opened for overwrite at offset zero, or creates one; `Release` returns
+it for the next taker. **Nothing truncates a surface to reuse it**: a file
+keeps whatever length its largest tenant gave it, and re-indexing an unchanged
+repository or answering a second query of the same shape therefore frees
+nothing at all. The one truncation in the pool is the content store's, which
+trims a staged blob to the length its record states *before* the object is
+published -- the published object is that file, and a reader proves an object
+by its length ([snapshots.md](snapshots.md#the-content-addressed-store)) -- and
+that trim is windowed and charged to the same budget as every other free.
+
+A surface the pool cannot open is not handed out. `Take` opens the file it is
+about to lease, and one it cannot open leaves the pool *and* the disk: the pool
+is a stack, so a surface that had become unopenable would otherwise be handed
+to every later taker of its purpose, and be found again by the sweep after a
+restart. A tenant that finds the surface's own contents unusable -- an image a
+crash left mid-write, whose tables cannot be dropped -- retires it the same
+way.
 
 Because nothing truncates, **the file's length is not the data's length**. Every
 tenant carries its own logical length — a header, a record count, a byte count
@@ -530,20 +575,34 @@ never accumulated and never swept.
 The disk the pools hold is reported in the resources block as `scratch_bytes`,
 and it is the other half of `freed_bytes`: what would have been freed and
 re-created over and over is space the store is holding instead. It shrinks only
-when an operator asks for the pools to be emptied — there is no timer, no size
-threshold and no configuration key, because reuse has no knob. Emptying skips
-any instance a live process still holds, and reports what it did not empty for
-that reason rather than reporting a smaller figure.
+when an operator asks for the pools to be emptied, with **`codectx gc`** —
+there is no timer, no size threshold and no configuration key, because reuse
+has no knob and a threshold would be this product choosing, on the operator's
+behalf, a moment to stall their host. `gc` prints what each pool holds by
+purpose before it empties it, says that freeing a large amount of space can
+stall some virtual hosts for about a minute, and drains through the same
+reclaimer at the same pace. Emptying skips any instance a live process still
+holds, and reports what it did not empty for that reason rather than reporting
+a smaller figure.
 
-Outputs of foreign writers are outside the pool and are the only frees a run
-makes. An indexer's index file and a dependence engine's export have a layout
-and a length this product does not choose, so they cannot be written over and
-are removed — windowed, and accounted to `freed_by_purpose` as
-`analyzer-output`. So is a materialized source tree (`materialization`): a unit
-materializes only its own files, and an analyzer writes into the tree it was
-given, so one tree cannot be handed to the next unit. State a run left for a
-caller that never came back is removed by the sweep that reclaims its lease
-(`lease-reclamation`), not by the run.
+### What a run still frees
+
+Everything below goes through the reclaimer: renamed aside, given back a
+window at a time with a data sync and a wait between windows, charged to one
+budget and counted in `freed_bytes`. This is the whole list.
+
+| What | Why it is not pooled | Purpose |
+| --- | --- | --- |
+| An indexer's index file, a dependence engine's export directory | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
+| A materialized source tree | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
+| A published blob a retention sweep collected, and an orphan the sweep found | The object is content the store no longer names | — |
+| The trim of a staged blob before it is published | The published object is that file and a reader proves it by its length | — |
+| A walk's retained level files and its retained directory | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
+| A continuation's spool and a retained search directory a lease reclaimed | State a run left for a caller that never came back | `lease-reclamation` |
+| Sort runs a sort adopted from a continuation | They are that continuation's files, not the pool's | — |
+| A capture's staging database | It belongs to exactly one capture | — |
+| The engine's journals, and the log when a checkpoint truncates it | The engine chooses when they exist | — |
+| The pools themselves, on `codectx gc` | An operator asked | `scratch-collection` |
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.
