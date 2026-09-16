@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -61,9 +62,6 @@ type Options struct {
 	// MaxParseFileBytes is workspace.max_parse_file_bytes; a larger file is
 	// reported unavailable, never streamed.
 	MaxParseFileBytes config.Limit
-	// WorkerIdleTTL is tree_sitter.worker_idle_ttl: how long an idle worker
-	// is kept before it is stopped.
-	WorkerIdleTTL time.Duration
 	// MaxCalleeReferences is tree_sitter.max_callee_references: how many
 	// distinct cross-file callee names one file may mint nodes for. Unlimited
 	// by default; past a user-set bound the call is counted into the file's
@@ -95,7 +93,6 @@ type Options struct {
 
 const (
 	defaultMaxWorkers   = 2
-	defaultIdleTTL      = 60 * time.Second
 	defaultParseTimeout = 60 * time.Second
 	defaultWorkerMemory = 256 << 20
 )
@@ -106,6 +103,39 @@ type Provider struct {
 	opts      Options
 	languages map[string]lang.Language
 	pool      *pool
+
+	// stage counts the parse callers in flight. The parser workers stay warm
+	// for exactly as long as that count is above zero: the last caller to
+	// leave drains the pool, so a run that has stopped parsing holds no worker
+	// process at all. See pool.drain for why this is not a timer.
+	stageMu sync.Mutex
+	stage   int
+}
+
+// enterStage registers one unit's parse work and leaveStage gives it back,
+// draining the pool when the last unit leaves. They bracket the UNIT rather
+// than the parse, so a worker is reused across the files of a unit and across
+// units that overlap in time, and exits when the last of them is done.
+//
+// A stage is an indexing stage and nothing else. ParseProbe is deliberately
+// outside it: a probe is one diagnostic parse, and bracketing each one would
+// launch and reap a process per probe, which is both slower than the work and
+// blind to whether a worker leaks across parses. A probe joins whatever stage
+// is running and its worker is released by that stage's drain, or by Close.
+func (p *Provider) enterStage() {
+	p.stageMu.Lock()
+	p.stage++
+	p.stageMu.Unlock()
+}
+
+func (p *Provider) leaveStage() {
+	p.stageMu.Lock()
+	last := p.stage == 1
+	p.stage--
+	p.stageMu.Unlock()
+	if last {
+		p.pool.drain()
+	}
 }
 
 // New validates options and builds the provider. Nothing is started until the
@@ -120,9 +150,6 @@ func New(o Options) (*Provider, error) {
 	// is where a file that exceeds it is reported unavailable.
 	if o.MaxParseFileBytes.Exceeded(wire.MaxSourceBytes) {
 		return nil, invalidOption(fmt.Sprintf("max parse file bytes %d exceed the worker's %d-byte source ceiling", o.MaxParseFileBytes, wire.MaxSourceBytes))
-	}
-	if o.WorkerIdleTTL <= 0 {
-		o.WorkerIdleTTL = defaultIdleTTL
 	}
 	if o.ParseTimeout <= 0 {
 		o.ParseTimeout = defaultParseTimeout
@@ -153,7 +180,7 @@ func New(o Options) (*Provider, error) {
 		langs[l.Name] = l
 	}
 	return &Provider{opts: o, languages: langs,
-		pool: newPool(o.Runner, o.Worker, o.WorkDir, o.MaxWorkers, o.WorkerIdleTTL, o.ParseTimeout, o.WorkerMemoryBytes)}, nil
+		pool: newPool(o.Runner, o.Worker, o.WorkDir, o.MaxWorkers, o.ParseTimeout, o.WorkerMemoryBytes)}, nil
 }
 
 func invalidOption(msg string) *model.Error {
@@ -209,6 +236,8 @@ func (p *Provider) Close() { p.pool.close() }
 // size limit, not UTF-8, or not a supported language); an unhealthy worker is
 // replaced and the parse retried once; anything else fails the unit.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	p.enterStage()
+	defer p.leaveStage()
 	relPath, ok := strings.CutPrefix(req.Unit.ScopeKey, ScopePrefix)
 	if !ok || relPath == "" {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeArgumentInvalid, Message: "treesitter units are scoped to one file as \"file:<path>\"",
@@ -359,7 +388,8 @@ type Probe struct {
 // ParseProbe parses src as the file at relPath through the real worker path
 // and reports the extraction counts. It is the diagnostic surface behind
 // doctor-style checks and the resource plateau benchmark: the same pool,
-// framing, validation and retry as IndexUnit, with no unit or sink.
+// framing, validation and retry as IndexUnit, with no unit or sink -- and, as
+// enterStage records, no stage of its own.
 func (p *Provider) ParseProbe(ctx context.Context, relPath string, src []byte) (Probe, error) {
 	l, ok := p.LanguageOf(model.FileVersion{Path: relPath})
 	if !ok {

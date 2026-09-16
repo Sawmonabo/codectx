@@ -305,9 +305,8 @@ type Manifest struct {
 // subcommand of this same binary with bundled grammars, so `enabled` is a plain
 // boolean: there is no external executable to approve.
 type TreeSitter struct {
-	Enabled       bool     `toml:"enabled"`
-	Languages     []string `toml:"languages"`
-	WorkerIdleTTL Duration `toml:"worker_idle_ttl"`
+	Enabled   bool     `toml:"enabled"`
+	Languages []string `toml:"languages"`
 	// MaxCalleeReferences is how many distinct cross-file callee names the
 	// user wants one file to mint nodes for. Unlimited by default: a
 	// generated file names what it names, and the count is bounded by the
@@ -675,7 +674,6 @@ func Defaults() Config {
 			TreeSitter: TreeSitter{
 				Enabled:             true,
 				Languages:           []string{"go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"},
-				WorkerIdleTTL:       Duration(60 * time.Second),
 				MaxCalleeReferences: Unlimited,
 				MaxRecordsPerFile:   Unlimited,
 			},

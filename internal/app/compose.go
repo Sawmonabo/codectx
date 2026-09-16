@@ -461,7 +461,6 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		Languages:           cfg.Providers.TreeSitter.Languages,
 		MaxWorkers:          parserWorkers,
 		MaxParseFileBytes:   cfg.Workspace.MaxParseFileBytes,
-		WorkerIdleTTL:       cfg.Providers.TreeSitter.WorkerIdleTTL.Std(),
 		MaxCalleeReferences: cfg.Providers.TreeSitter.MaxCalleeReferences,
 		MaxRecordsPerFile:   cfg.Providers.TreeSitter.MaxRecordsPerFile,
 		MaxEvidencePerFact:  evidenceClip(cfg),

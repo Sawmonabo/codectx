@@ -290,7 +290,6 @@ directories and network posture are product code, not configuration.
 |---|---|---|---|
 | `tree_sitter.enabled` | `true` | user | Structural parsing with the grammars bundled in this binary. It runs as a private subcommand of this same binary, so there is no external executable to approve. |
 | `tree_sitter.languages` | `["go", "javascript", "typescript", "tsx", "python", "java", "rust", "c", "cpp"]` | project | Languages to parse. |
-| `tree_sitter.worker_idle_ttl` | `"60s"` | user | Idle time before a parser worker is stopped. |
 | `tree_sitter.max_callee_references` | `0` (unlimited) | user | How many distinct cross-file callee names one file may mint nodes for — the callees that are not declarations of that file. Unlimited by default: a generated or minified file names what it names, and the count is bounded by the file itself, whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory rather than the repository's. A set value mints no further placeholder node past the bound; each such call is counted and the file's `structure` capability is reported partial with `CTX_COVERAGE_INCOMPLETE`. |
 | `tree_sitter.max_records_per_file` | `0` (unlimited) | user | How many declarations, imports or references — each counted separately — one file may yield. Unlimited by default: it replaces three fixed worker ceilings (20000 declarations, 4000 imports, 60000 references), and a generated or vendored file that crosses one is a property of the repository rather than a fault. What a file yields is bounded by the file itself, whose size `workspace.max_parse_file_bytes` already bounds, so unlimited here costs one file's memory rather than the repository's. A set value stops that record set, reports the file's `structure` capability partial, and is applied by the extracting worker and by the parent that reads its frames from the one configured number, so raising it can never make the parent reject a healthy worker's output. |
 | `scip.enabled` | `"auto"` | user | `true`, `false` or `"auto"`. |
@@ -594,7 +593,7 @@ other list. An analyzer's environment allowlist is in the analysis fingerprint
 for the same reason: a profile that gains a variable can resolve different
 dependencies from identical source.
 
-Operational settings — worker counts, batch sizes, cache sizes, idle TTLs, the
+Operational settings — batch sizes, cache sizes, the
 data directory, retention, the tool store location and its fetch budgets,
 transport and logging — are in none of them. They change how the work is
 scheduled or where it is kept, never what it concludes.
