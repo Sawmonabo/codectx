@@ -81,7 +81,7 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspace(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
+			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
 			if err != nil {
 				return err
 			}
@@ -111,10 +111,16 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			// The logger is the process's one diagnostic channel and it is
 			// bound to stderr: a byte of ours on stdout corrupts the framing.
 			log := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-			svc := ws.Services()
+			// Two facades over one workspace, and the split is the point: the
+			// refresh tool and the session tools write, so they are the
+			// writing facade; the exploration tools only ask questions, so
+			// they are the reader facade, which reaches no write transaction
+			// and therefore neither commits this session's own refresh early
+			// nor waits behind it.
+			svc, read := ws.Services(), ws.ReadServices()
 			server, err := mcpserver.New(mcpserver.Options{
 				Index:   svc,
-				Explore: svc,
+				Explore: read,
 				Context: svc,
 				Config:  cfg,
 				Build:   build,
