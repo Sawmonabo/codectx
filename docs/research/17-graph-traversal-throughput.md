@@ -28,7 +28,7 @@ brief's 3 800 nodes/s refers to.
 | **R-large** (`codectx-gperf/store`, the 1.36 GiB reference) | 1 464 328 192 | 477 602 | 739 529 | **8 017** | 5.91 |
 | R-mid (`codectx-cert/.../fe42192f…`) | 700 219 392 | 201 850 | 344 703 | 320 | 4.08 |
 
-### 1.1 The plan defect, as SQLite reports it
+### 1.1 The plan defect, as the engine reports it
 
 That read is served today by the store's packed adjacency lists, streamed by
 `graphReader.Neighbours` (ADR-0002, ADR-0007). What follows measured the per-batch edge statement —
@@ -77,7 +77,7 @@ Two EQP runs on R-large isolate the cause (full query otherwise identical):
 - surrogate `from_node_id IN (…)` **+ `ORDER BY ri.canonical`** → temp B-tree **still present**, so
   the IN-list form is not the cause;
 - surrogate `from_node_id IN (…)` **+ `ORDER BY ri.from_node_id, ri.kind, ri.to_node_id`** →
-  **`USE TEMP B-TREE FOR ORDER BY` is gone**; SQLite serves the order from
+  **`USE TEMP B-TREE FOR ORDER BY` is gone**; the engine serves the order from
   `sqlite_autoindex_relation_ids_2` [S24].
 
 The chunk must be sent as **ascending surrogate ids** for the planner to fuse the IN-list with the
@@ -94,7 +94,7 @@ Model: Aggarwal–Vitter, `scan(N)=Θ(N/(D·B))`, `sort(N)=Θ((N/(D·B)) log_{M/
 is Θ(M/B), so one merge pass covers any repository index. Two caveats this store forces:
 **(i)** a B-tree point lookup is `O(log_B N)`, not `O(1)`, so every "+V unstructured accesses" term
 carries a log factor (mitigated, not removed, by mmap-resident interior pages); **(ii)** the effective
-`B` is SQLite's 4 KiB page, so level dedup and ranking must run on **our own spool files with large
+`B` is the engine's 4 KiB page, so level dedup and ranking must run on **our own spool files with large
 blocks**, never through the B-tree. *Premise correction: there is no Meyer–Zeh external-memory BFS —
 the sublinear-I/O BFS line is Munagala–Ranade → Mehlhorn–Meyer; Meyer–Zeh is SSSP [S4].*
 
@@ -107,7 +107,7 @@ the sublinear-I/O BFS line is Munagala–Ranade → Mehlhorn–Meyer; Meyer–Ze
 | Direction-optimising BFS [S7] | switch top-down→bottom-up at `m_f > m_u/α`, back at `n_f < V/β`, tuned **α=14, β=24**; **1.4–3.8×** on real social graphs (3.3–7.8× synthetic) | **Rejected — §2.1.** Also needs a reverse in-edge index. |
 | Sparse/dense frontier switch [S8] | array-of-ids vs bool-array over `V`, switching at `|U| + Σdeg(U) > |E|/20`; sparse pushes out-edges, dense pulls in-edges | **Partly, and cheaply.** The sparse side is free; the dense side is the §4 bitset. The dense/pull path needs the reverse index. |
 | Δ-stepping [S9] | light/heavy bucket relaxation; `O(V+E+d·L)` average-case sequential time for random weights; `Δ=1`→Dial, `Δ=∞`→Bellman–Ford | **Yes, for `path.go`.** Buckets are disk-backed spool queues, relaxations are keyed lookups, and it is explicitly tolerant of re-relaxation — a better fit than external Dijkstra with a tournament tree. It loses when no good Δ exists (long weighted chains). |
-| Sharded out-of-core engines [S10][S11][S12] | trade random access for sequential shard scans; sequential/random bandwidth ratio measured at **500× on disk, 30× on SSD** [S11] | **Only if a flat blob exists.** They are the §3 design argument, not a drop-in; bespoke tiled formats [S35] are a whole storage layer (30 h preprocessing at trillion scale) and are irrelevant unless SQLite is replaced. |
+| Sharded out-of-core engines [S10][S11][S12] | trade random access for sequential shard scans; sequential/random bandwidth ratio measured at **500× on disk, 30× on SSD** [S11] | **Only if a flat blob exists.** They are the §3 design argument, not a drop-in; bespoke tiled formats [S35] are a whole storage layer (30 h preprocessing at trillion scale) and are irrelevant unless the engine is replaced. |
 
 ### 2.1 Direction-optimising BFS does not apply — the degree data says why
 
