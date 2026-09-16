@@ -622,22 +622,36 @@ a smaller figure.
 
 ### What a run still frees
 
-Everything below goes through the reclaimer: renamed aside, given back a
-window at a time with a data sync and a wait between windows, charged to one
-budget and counted in `freed_bytes`. This is the whole list.
+Everything below is given back a window at a time, with a data sync and a wait
+between windows, charged to one budget and counted in `freed_bytes`. The two
+halves differ in who waits. A **removal** is renamed aside and freed by the
+reclaimer, off the run's path. An **in-place** free is a truncation of a file
+the caller keeps, or an unlink the caller must have completed when it returns,
+so it happens where it is asked for and the caller waits the windows it spends
+-- at the same rate, never faster.
 
-| What | Why it is not pooled | Purpose |
-| --- | --- | --- |
-| An indexer's index file, a dependence engine's export directory | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
-| A materialized source tree | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
-| A published blob a retention sweep collected, and an orphan the sweep found | The object is content the store no longer names | — |
-| The trim of a staged blob before it is published | The published object is that file and a reader proves it by its length | — |
-| A walk's retained level files and its retained directory | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
-| A continuation's spool and a retained search directory a lease reclaimed | State a run left for a caller that never came back | `lease-reclamation` |
-| Sort runs a sort adopted from a continuation | They are that continuation's files, not the pool's | — |
-| A capture's staging database | It belongs to exactly one capture | — |
-| The engine's journals, and the log when a checkpoint truncates it | The engine chooses when they exist | — |
-| The pools themselves, on `codectx gc` | An operator asked | `scratch-collection` |
+| What | How | Why it is not pooled | Purpose |
+| --- | --- | --- | --- |
+| An indexer's index file, a dependence engine's export directory | Removal | A foreign writer chose its layout and its length, so it cannot be written over | `analyzer-output` |
+| A materialized source tree | Removal | A unit materializes only its own files and an analyzer writes into the tree it was given, so one tree cannot be handed to the next unit | `materialization` |
+| A published blob a retention sweep collected, and an orphan the sweep found | Removal | The object is content the store no longer names | — |
+| The trim of a staged blob before it is published | In place | The published object is that file and a reader proves it by its length, so it must be that length before the publication, not after | — |
+| The staging name of a blob that has just been published | In place, freeing nothing | Two names of one object; the object stays and the unlink gives no blocks back | — |
+| A walk's retained level files and its retained directory | Removal | The existence of a level's admitted file is that level's commit record, so a pooled file that always exists could not carry it | — |
+| A retained level cut back to the byte count a resumed cursor carried | In place | The file goes on being appended to, so there is nothing to rename away | — |
+| A walk's frontier set cleared at a level transition | In place | The set is rebuilt into the same file for the next level | — |
+| A continuation's spool and a retained search directory a lease reclaimed | Removal | State a run left for a caller that never came back | `lease-reclamation` |
+| Sort runs a sort adopted from a continuation | Removal | They are that continuation's files, not the pool's | — |
+| A capture's staging database | Removal | It belongs to exactly one capture | — |
+| A dependence import's key set, emptied before the next is written over it | In place | The file keeps its name across imports | — |
+| A tool payload reset before a download is retried | In place | The staging file is written again from the start | — |
+| The engine's journals, and the log when a checkpoint truncates it | In place | The engine's own delete is waiting on it, so it must be empty when the call returns | — |
+| The pools themselves, on `codectx gc` | Removal | An operator asked | `scratch-collection` |
+
+The list is enforced, not narrated: a test walks the source tree and fails on
+any `os.Remove`, `os.RemoveAll`, `os.Truncate` or file `Truncate` outside the
+pacing package that is neither routed through it nor written down beside it
+with its reason.
 
 [ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.

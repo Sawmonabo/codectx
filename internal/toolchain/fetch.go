@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // This file is the product's entire outbound network surface (Section 21). It
@@ -231,7 +232,9 @@ func (f *fetcher) attempt(ctx context.Context, name string, target *url.URL, p P
 // rewind resets the staging file before a retry so a partial body from a failed
 // attempt cannot be prefixed to the next one.
 func rewind(dst *os.File) error {
-	if err := dst.Truncate(0); err != nil {
+	// At the pace: a tool payload is as large as the archive, and a retry
+	// that freed all of it at once would hand the host that whole length.
+	if err := paced.ShrinkFile(dst, 0); err != nil {
 		return ioError("tool payload reset", err)
 	}
 	if _, err := dst.Seek(0, io.SeekStart); err != nil {
