@@ -1350,12 +1350,20 @@ func (s *Store) Activate(ctx context.Context, gen, expectedActive model.Generati
 	// The two conditions an activation loses a race on are read FIRST, before
 	// any work: the pointer the caller believes is published, and the frozen
 	// membership being non-empty. Each is one row, and the cascade below is
-	// thousands of committed merges -- so a coordinator that has already been
-	// overtaken pays a read rather than a rebuild of the segment set. It is a
-	// fast fail and nothing more: both conditions are checked again inside the
-	// activation transaction below, which is where they decide anything, so a
-	// pointer that moves between this read and that transaction is caught
-	// there exactly as before.
+	// thousands of committed merges -- so a coordinator that has ALREADY been
+	// overtaken pays a read rather than a rebuild of the segment set.
+	//
+	// That is the whole of what it spares, and it is worth saying exactly:
+	// this reaches only a caller whose pointer had already moved when it got
+	// here. Two activations that start together both pass this read and both
+	// pay the cascade; the one that loses fails on the re-check inside the
+	// activation transaction below, having merged. Sparing that one too would
+	// need the two to be serialized against each other, which is a lock held
+	// across a rebuild of the segment set, and a lock that long is a worse
+	// bargain than the merges it saves. Correctness does not depend on any of
+	// it: both conditions are checked again inside the transaction, which is
+	// where they decide anything, so a pointer that moves between this read
+	// and that transaction is caught there exactly as before.
 	// readOwn, not read: the generation this is about may still be in the
 	// store's open ingestion group, which the reader pool cannot see.
 	if err := s.readOwn(ctx, func(tx *sql.Tx) error {

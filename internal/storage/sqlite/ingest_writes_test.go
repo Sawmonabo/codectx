@@ -344,8 +344,13 @@ func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testin
 // unrollbackable ingestion. A loser that pays the cascade before reading the
 // row rebuilds a repository's segment set for an activation that was never
 // going to happen -- work no operator asked for, on the disk the wave is
-// about. The checks therefore run first, and the cascade is reached only by an
-// activation that can still publish.
+// about. The checks therefore run first.
+//
+// What that spares is exactly this caller and no other: one that had already
+// been overtaken when it arrived. Two activations that start together both
+// pass the preflight and both pay the cascade, and the loser fails on the
+// re-check inside the activation transaction; sparing it as well would need a
+// lock held across the rebuild, which costs more than the merges it saves.
 //
 // Mutation that fails it: move the cascade back before the preflight (call
 // compactBeforeActivation first) and the loser's merges insert segments before
