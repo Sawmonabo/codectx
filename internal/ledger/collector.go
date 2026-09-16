@@ -27,18 +27,25 @@ func (l *Ledger) collect() {
 	// running holds every span whose start has been written and whose end has
 	// not, so each flush can snapshot its counters. A span whose end event was
 	// dropped by a full bus stays here and is closed as interrupted at stop.
+	// A span that is only planned is not in it: nothing is counting yet, and a
+	// row waiting for work has nothing to snapshot.
 	running := map[*Span]struct{}{}
+	// sweep holds the runs that have ended and whose rows left 'planned' have
+	// not all been closed yet. A run stays here until a sweep comes back
+	// short, so one flush closes at most a batch of them and a run that
+	// planned thousands of units cannot hand a subscriber all of them at once.
+	sweep := map[*Run]struct{}{}
 
 	for {
 		select {
 		case e := <-l.bus:
 			batch = append(batch, e)
 			if len(batch) >= flushEvents {
-				l.flush(batch, running)
+				l.flush(batch, running, sweep)
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			l.flush(batch, running)
+			l.flush(batch, running, sweep)
 			batch = batch[:0]
 		case <-l.quit:
 			// Take what is already buffered -- it was recorded before the
@@ -50,11 +57,11 @@ func (l *Ledger) collect() {
 				case e := <-l.bus:
 					batch = append(batch, e)
 					if len(batch) >= flushEvents {
-						l.flush(batch, running)
+						l.flush(batch, running, sweep)
 						batch = batch[:0]
 					}
 				default:
-					l.flush(batch, running)
+					l.flush(batch, running, sweep)
 					l.finalize(running)
 					return
 				}
@@ -67,15 +74,21 @@ func (l *Ledger) collect() {
 // transaction, then publishes the spans that finished in it. Subscribers are
 // called after the commit, so a subscriber never reports a row a reader could
 // not yet see.
-func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
+func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) {
 	now := time.Now()
-	if len(batch) == 0 && len(running) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
+	if len(batch) == 0 && len(running) == 0 && len(sweep) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
 		return
 	}
 	ctx := context.Background()
 	var finished []SpanRow
+	var swept []*Run
 	err := l.writeTx(ctx, func(tx *sql.Tx) error {
+		finished, swept = finished[:0], swept[:0]
 		for _, e := range batch {
+			if e.kind == eventFinish {
+				sweep[e.run] = struct{}{}
+				continue
+			}
 			run := e.span.run
 			if err := l.ensureRun(ctx, tx, run); err != nil {
 				return err
@@ -89,11 +102,14 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 				if err := insertSpan(ctx, tx, e.span, outcome); err != nil {
 					return err
 				}
-				running[e.span] = struct{}{}
+				if !e.planned {
+					running[e.span] = struct{}{}
+				}
 			case eventBegin:
 				if err := beginSpan(ctx, tx, e.span); err != nil {
 					return err
 				}
+				running[e.span] = struct{}{}
 			case eventEnd:
 				row, err := endSpan(ctx, tx, e)
 				if err != nil {
@@ -110,13 +126,32 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 				return wrap("snapshot span counters", err)
 			}
 		}
+		// A run that has ended closes the rows nothing ever started, a batch per
+		// flush, and their endings join the batch's own on the way to the
+		// subscribers: one path ends every span.
+		for run := range sweep {
+			rows, more, err := sweepPlanned(ctx, tx, run)
+			if err != nil {
+				return err
+			}
+			finished = append(finished, rows...)
+			if !more {
+				swept = append(swept, run)
+			}
+		}
 		if err := l.refreshLiveness(ctx, tx, now); err != nil {
 			return err
 		}
 		return l.updateRuns(ctx, tx)
 	})
 	if err != nil {
+		// The sweep is left pending and the rows unpublished: the transaction
+		// that would have closed them rolled back, so the next flush does it
+		// again rather than announcing endings the file does not hold.
 		return
+	}
+	for _, run := range swept {
+		delete(sweep, run)
 	}
 	for _, row := range finished {
 		l.notify(row)
@@ -130,7 +165,9 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 func (l *Ledger) finalize(running map[*Span]struct{}) {
 	ctx := context.Background()
 	now := time.Now()
+	var swept []SpanRow
 	l.finalErr = l.writeTx(ctx, func(tx *sql.Tx) error {
+		swept = swept[:0]
 		l.runsMu.Lock()
 		runs := append([]*Run(nil), l.runs...)
 		l.runsMu.Unlock()
@@ -153,18 +190,85 @@ func (l *Ledger) finalize(running map[*Span]struct{}) {
 				return wrap("close open spans", err)
 			}
 			// A row still 'planned' when its run stops is work nothing ever
-			// started. It is not interrupted -- no measurement was cut off --
-			// it was never admitted, and that is the reason it carries.
-			if _, err := tx.ExecContext(ctx,
-				`UPDATE spans SET outcome = 'unavailable', diagnostic_code = ?, failure_json = ?
-				 WHERE run_id = ? AND outcome = 'planned'`,
-				model.CodeProviderUnavailable, ReasonNotAdmitted, run.id); err != nil {
-				return wrap("close unadmitted spans", err)
+			// started -- a run whose finish never reached the collector, or one
+			// that never finished at all. It is closed here by the same sweep
+			// the run's own end uses, a batch at a time, so the endings a
+			// stopping ledger discovers are published like every other.
+			for {
+				rows, more, err := sweepPlanned(ctx, tx, run)
+				if err != nil {
+					return err
+				}
+				swept = append(swept, rows...)
+				if !more {
+					break
+				}
 			}
 		}
 		return l.updateRuns(ctx, tx)
 	})
+	if l.finalErr == nil {
+		for _, row := range swept {
+			l.notify(row)
+		}
+	}
 	clear(running)
+}
+
+// sweepPlanned closes one batch of the rows a run left 'planned' and returns
+// them as the subscribers see them, plus whether the run may hold more. A
+// planned row is work nothing ever started: it is not interrupted -- no
+// measurement was cut off -- it was never admitted, and that is the reason it
+// carries. It gets no finish time and no wall, because nobody measured one.
+//
+// The batch is the collector's own flush batch, so the endings of a run that
+// planned thousands of units reach a subscriber at the rate every other ending
+// does instead of all at once.
+func sweepPlanned(ctx context.Context, tx *sql.Tx, run *Run) ([]SpanRow, bool, error) {
+	const query = `SELECT s.seq, p.seq, s.stage, s.scope_key, s.provider, s.started_at, s.items_in, s.items_out
+		FROM spans s LEFT JOIN spans p ON p.id = s.parent_id
+		WHERE s.run_id = ? AND s.outcome = 'planned' ORDER BY s.seq LIMIT ?`
+	rows, err := tx.QueryContext(ctx, query, run.id, flushEvents)
+	if err != nil {
+		return nil, false, wrap("find unadmitted spans", err)
+	}
+	var out []SpanRow
+	for rows.Next() {
+		row := SpanRow{RunID: run.idHex, Outcome: OutcomeUnavailable,
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ReasonNotAdmitted}
+		var parent sql.NullInt64
+		var started string
+		if err := rows.Scan(&row.Seq, &parent, &row.Stage, &row.ScopeKey, &row.Provider, &started,
+			&row.ItemsIn, &row.ItemsOut); err != nil {
+			rows.Close()
+			return nil, false, wrap("find unadmitted spans", err)
+		}
+		if parent.Valid {
+			seq := parent.Int64
+			row.ParentSeq = &seq
+		}
+		if row.StartedAt, err = parseTime(started); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		out = append(out, row)
+	}
+	// Closed before the updates: the transaction runs one statement at a time,
+	// so the page must be read out before a write on the same rows.
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, false, wrap("find unadmitted spans", err)
+	}
+	for _, row := range out {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE spans SET outcome = ?, diagnostic_code = ?, failure_json = ?
+			 WHERE run_id = ? AND seq = ?`,
+			string(OutcomeUnavailable), model.CodeProviderUnavailable, ReasonNotAdmitted,
+			run.id, row.Seq); err != nil {
+			return nil, false, wrap("close unadmitted spans", err)
+		}
+	}
+	return out, len(out) == flushEvents, nil
 }
 
 // ensureRun writes the run row the first time one of its spans is written, so
