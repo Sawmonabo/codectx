@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 
@@ -268,6 +270,11 @@ func (l *keyLines) close() {
 func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	if err := s.commit(ctx); err != nil {
 		return KeySet{}, err
+	}
+	// The previous run's key set is emptied a window at a time, the way the
+	// process frees anything larger than a window, before it is written over.
+	if err := paced.Shrink(path, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return KeySet{}, internalErr("import keys: %v", err)
 	}
 	f, err := os.Create(path)
 	if err != nil {
