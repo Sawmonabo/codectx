@@ -99,6 +99,14 @@ CREATE TABLE provider_runs (
     status TEXT NOT NULL CHECK(status IN ('running','succeeded','partial','skipped','timed_out','failed','canceled')),
     counters_json TEXT NOT NULL DEFAULT '{}',
     diagnostic_code TEXT NOT NULL DEFAULT '',
+    -- failure_json is the typed reason a run produced no unit: its scope key,
+    -- message and bounded details, including the tool output the capability
+    -- row and the log line both exclude. It is empty for every run that did
+    -- not fail. It lives on the run rather than on the unit because a failed
+    -- unit has no sealed row to carry it, and it is reachable for exactly as
+    -- long as the generation that failed is retained: deleting that
+    -- generation nulls generation_id, and the sweep then removes the run.
+    failure_json TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL,
     completed_at TEXT
 );

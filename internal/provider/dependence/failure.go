@@ -113,7 +113,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	// its child wrote to standard error has discarded the one record of what
 	// went wrong, which is what a 7.5 KB crash on a real repository did.
 	if o.StderrTail != "" {
-		err = err.WithDetail("stderr_tail", truncate(o.StderrTail, model.MaxDetailBytes))
+		err = err.WithDetail(model.DetailStderrTail, truncate(o.StderrTail, model.MaxDetailBytes))
 	}
 	// The observed peak is the tree's, sampled while it ran: what the failed
 	// unit actually used, against what it was admitted for. It is reported for
@@ -138,6 +138,33 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	}
 	return err
 }
+
+// crashDecision is how the provider established that an engine crash
+// reproduces. A subdivided unit publishes it beside the failing pass, so an
+// operator reading the report knows why one crash cost a second parse of the
+// whole unit and another did not, instead of inferring it from a duration.
+type crashDecision string
+
+const (
+	// crashNamed is a crash whose own diagnostics identify the defect: the
+	// failing pass and the exception class are both on the child's standard
+	// error, which is a deterministic analysis fault and reproduces.
+	crashNamed crashDecision = "named pass and exception, taken on first sight"
+	// crashConfirmed is a crash that named neither -- a signal death, a step
+	// that left no graph, an exit with nothing said about a pass -- and was
+	// therefore observed a second time before anything was split.
+	crashConfirmed crashDecision = "failure class observed twice"
+)
+
+// reproducibleOnSight reports whether a crashed step said enough about itself
+// to be believed the first time. A named failing pass with a named exception
+// class is a deterministic fault in that pass: re-running the same argv over
+// the same source only re-proves it, at the cost of a second full parse of the
+// unit -- which is what a real run spent three minutes and twenty-two seconds
+// doing. Anything less -- a signal death, heap exhaustion, an exit that named
+// no pass -- may be the machine rather than the source, and keeps the one
+// confirmation the plan allows.
+func reproducibleOnSight(o Outcome) bool { return o.Pass != "" && o.Exception != "" }
 
 // publication is everything a succeeded unit publishes about how complete it
 // is. A unit that ran whole and skipped nothing publishes five fresh rows and
