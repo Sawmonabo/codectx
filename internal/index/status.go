@@ -59,7 +59,7 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	states = composedStates(states, c.opts.States)
+	states = composedStates(states, c.composedStates())
 	states, aggregated := boundStates(states, c.log)
 	coherence, warnings, err := c.coherence(ctx, snap)
 	if err != nil {
@@ -260,15 +260,16 @@ func newCapabilityReport() *capabilityReport {
 }
 
 // newCapabilityReport seeds a report with the composition-time rows of
-// Options.States. A provider that could not be constructed never reaches the
-// registry, so nothing on the indexing path would otherwise report its
-// capabilities at all, and the operator would have to run a second, different
-// command to learn that a capability is unavailable. Seeding here rather than
-// merging above this package is what puts those rows inside the
-// MaxCapabilityStates bound instead of past it.
+// Options.States, minus those of a provider the configuration disabled. A
+// provider that could not be constructed never reaches the registry, so
+// nothing on the indexing path would otherwise report its capabilities at all,
+// and the operator would have to run a second, different command to learn that
+// a capability is unavailable. Seeding here rather than merging above this
+// package is what puts those rows inside the MaxCapabilityStates bound instead
+// of past it.
 func (c *Coordinator) newCapabilityReport() *capabilityReport {
 	r := newCapabilityReport()
-	for _, st := range c.opts.States {
+	for _, st := range c.composedStates() {
 		r.add(st)
 	}
 	return r
