@@ -114,8 +114,22 @@ type WorkspaceProber interface {
 	FreeDiskBytes(ctx context.Context, dir string) (*uint64, error)
 }
 
+// RunLedger is the read surface the resource block needs from the run ledger:
+// the latest run recorded for this repository and one page of its stages, as
+// the model carries them.
+//
+// It is stated here as a narrow interface for the same reason StoreReader is:
+// this package must not import the ledger any more than it imports the store,
+// and the composition root adapts the one to the other. A nil run is the honest
+// answer for a workspace that has recorded no run, which is what a reader of a
+// cache built before anything was instrumented sees.
+type RunLedger interface {
+	LatestRun(ctx context.Context, repo model.RepositoryID, generation model.GenerationID) (*model.RunRecord, []model.StageRecord, error)
+}
+
 // Options are the dependencies of a Service. Every field is required except
-// Now, which defaults to time.Now.
+// Now, which defaults to time.Now, and Ledger, whose absence is reported as a
+// resource block with no run rows rather than as a failure.
 type Options struct {
 	Config config.Config
 	Build  model.BuildInfo
@@ -127,9 +141,13 @@ type Options struct {
 	// READability only -- Section 6 forbids this product writing anything into
 	// the repository, so the write probe the data directory gets must never be
 	// aimed at the workspace.
-	Root      string
-	Sampler   Sampler
-	Store     StoreReader
+	Root    string
+	Sampler Sampler
+	Store   StoreReader
+	// Ledger reads the run ledger beside the index store. It is optional
+	// because a workspace that has recorded no run must still report its
+	// resources; a nil one leaves the run and stage rows out of the block.
+	Ledger    RunLedger
 	Toolchain ToolchainReporter
 	Workspace WorkspaceProber
 	// Now is the clock every check and the report's CheckedAt read (L1). A
