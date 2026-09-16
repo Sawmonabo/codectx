@@ -132,6 +132,10 @@ type Run struct {
 	// its generation, its outcome, its dropped count -- so an idle flush
 	// writes nothing at all rather than rewriting rows that have not moved.
 	dirty atomic.Bool
+	// discarded marks a run whose rows have been deleted and which this
+	// process must therefore stop writing: the collector skips its events
+	// rather than re-creating the row behind the delete.
+	discarded atomic.Bool
 
 	mu      sync.Mutex
 	started time.Time
@@ -412,8 +416,9 @@ func (l *Ledger) DeleteRuns(ctx context.Context, generationIDs []int64) error {
 
 // DeleteOverlayRuns removes the overlay runs of processes that are no longer
 // running: an overlay run has no generation, so nothing else would ever
-// collect it. A process that exits cleanly calls it for its own; the next
-// collection pass calls it for the ones that did not.
+// collect it. A process that exits cleanly removes its own through DiscardRun,
+// which is ordered against its own writer; this is the collection pass's call
+// for the ones that did not.
 func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 	if l == nil || len(runIDs) == 0 {
 		return nil
@@ -438,6 +443,37 @@ func (l *Ledger) DeleteOverlayRuns(ctx context.Context, runIDs []string) error {
 			}
 		}
 		return nil
+	})
+}
+
+// DiscardRun deletes a run and everything recorded under it, and stops this
+// process recording it at all. It is what a run that exists only for the life
+// of one process does at clean exit: the per-process overlay a language
+// server's start hangs under belongs to no generation, so the retention that
+// deletes a generation's runs would never reach it and the file would keep one
+// run and its spans per process for ever.
+//
+// The run is forgotten BEFORE the delete, and forgotten for good: an event of
+// its still on the bus, and the interrupted-marking pass a stopping ledger
+// makes over every run it knows, would otherwise write the row back in behind
+// the delete. The delete itself takes the writer, so a flush already in
+// progress finishes first and this sees the row it wrote.
+func (l *Ledger) DiscardRun(ctx context.Context, run *Run) error {
+	if l == nil || run == nil {
+		return nil
+	}
+	run.discarded.Store(true)
+	l.runsMu.Lock()
+	for i, r := range l.runs {
+		if r == run {
+			l.runs = append(l.runs[:i], l.runs[i+1:]...)
+			break
+		}
+	}
+	l.runsMu.Unlock()
+	return l.writeTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM runs WHERE run_id = ?`, run.id)
+		return wrap("discard the run", err)
 	})
 }
 

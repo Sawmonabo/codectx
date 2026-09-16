@@ -545,6 +545,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		RequestStallTimeout:    cfg.Providers.LSP.StallTimeout.Std(),
 		IdleTTL:                cfg.Providers.LSP.IdleTTL.Std(),
 		MaxOverlayBytes:        cfg.Providers.LSP.MaxOverlayBytes,
+		// The one ledger this process opened. The manager never opens its own:
+		// the ledger file has a single collector, and a second writer on it is
+		// what the whole separate-database design exists to avoid.
+		Ledger: s.ledger,
 	}); err != nil {
 		return nil, err
 	}
