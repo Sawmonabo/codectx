@@ -212,6 +212,23 @@ the code with its measurement beside it, not a setting: a user tunes nothing, an
 tolerate more loses at most the minutes a large export takes to drain behind a run that has already
 moved on.
 
+### Decision 5, amended a fifth time 2026-09-16: one pace per host, and a reclaimer that never stalls or bursts
+
+The first index with the reclaimer finished with nothing worse than 84 ms on an independent write, the
+export directory draining behind the run at the measured pace. A review of the reclaimer then found
+what the run had not exercised. The pace was per charger: every caller that gave bytes back waited on
+its own, so several at once handed the host several windows per interval, and two processes over one
+store handed it twice the rate. The rate the host tolerates is the host's, not a process's: the pace is
+therefore taken per cache root, through one lock every process over that root takes for each window
+it frees, so the sum of what this product frees on a host never exceeds the measured rate however many
+runs, servers and chargers share it. A file the process may unlink but not truncate -- every published
+blob is one -- was unlinked whole and charged afterwards, which is the burst itself; it is charged its
+full size first and unlinked after. One queued entry the reclaimer could not free was retried without
+pause and stopped everything behind it; a failure is recorded, the next entry is taken, and the failed
+one waits for the next wake, disclosed beside the pending bytes. The three truncations that still
+freed in place outside the reclaimer are governed, and an enumeration test keeps the list of in-place
+frees from drifting again.
+
 ### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
 
 The statement journal's threshold is also the size of the chunks the engine's memory journal
