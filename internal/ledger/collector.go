@@ -39,13 +39,18 @@ func (l *Ledger) collect() {
 	for {
 		select {
 		case e := <-l.bus:
+			if e.kind == eventFlush {
+				e.ack <- l.barrier(batch, running, sweep)
+				batch = batch[:0]
+				continue
+			}
 			batch = append(batch, e)
 			if len(batch) >= flushEvents {
-				l.flush(batch, running, sweep)
+				_ = l.flush(batch, running, sweep)
 				batch = batch[:0]
 			}
 		case <-ticker.C:
-			l.flush(batch, running, sweep)
+			_ = l.flush(batch, running, sweep)
 			batch = batch[:0]
 		case <-l.quit:
 			// Take what is already buffered -- it was recorded before the
@@ -55,13 +60,18 @@ func (l *Ledger) collect() {
 			for {
 				select {
 				case e := <-l.bus:
+					if e.kind == eventFlush {
+						e.ack <- l.barrier(batch, running, sweep)
+						batch = batch[:0]
+						continue
+					}
 					batch = append(batch, e)
 					if len(batch) >= flushEvents {
-						l.flush(batch, running, sweep)
+						_ = l.flush(batch, running, sweep)
 						batch = batch[:0]
 					}
 				default:
-					l.flush(batch, running, sweep)
+					_ = l.flush(batch, running, sweep)
 					l.finalize(running)
 					return
 				}
@@ -70,14 +80,27 @@ func (l *Ledger) collect() {
 	}
 }
 
+// barrier is what a Flush waits on: the batch is written, and then the runs
+// that have ended are swept until none has a planned row left. One flush
+// closes at most a batch of them, so a run that planned more units than a
+// batch would otherwise answer a reader with rows still marked planned -- work
+// the run is finished with, shown as work waiting to begin.
+func (l *Ledger) barrier(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
+	err := l.flush(batch, running, sweep)
+	for err == nil && len(sweep) > 0 {
+		err = l.flush(nil, running, sweep)
+	}
+	return err
+}
+
 // flush writes one batch and the counter snapshot of every running span in one
 // transaction, then publishes the spans that finished in it. Subscribers are
 // called after the commit, so a subscriber never reports a row a reader could
 // not yet see.
-func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) {
+func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run]struct{}) error {
 	now := time.Now()
 	if len(batch) == 0 && len(running) == 0 && len(sweep) == 0 && !l.anyDirty() && !l.anyRefreshDue(now) {
-		return
+		return nil
 	}
 	ctx := context.Background()
 	var finished []SpanRow
@@ -156,8 +179,10 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	if err != nil {
 		// The sweep is left pending and the rows unpublished: the transaction
 		// that would have closed them rolled back, so the next flush does it
-		// again rather than announcing endings the file does not hold.
-		return
+		// again rather than announcing endings the file does not hold. The
+		// failure is returned for the barrier a caller may be waiting on and
+		// is otherwise nobody's: the run has already happened.
+		return err
 	}
 	for _, run := range swept {
 		delete(sweep, run)
@@ -165,6 +190,7 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	for _, row := range finished {
 		l.notify(row)
 	}
+	return nil
 }
 
 // finalize is the last write of a stopping ledger: every span still open is

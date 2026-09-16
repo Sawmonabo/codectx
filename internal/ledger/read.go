@@ -167,6 +167,36 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 		ORDER BY live DESC, (generation_id IS NOT NULL AND generation_id = ?) DESC, started_at DESC
 		LIMIT 1`
 	now := time.Now()
+	return r.read(ctx, now, r.db.QueryRowContext(ctx, query, formatTime(now), repo, generationID))
+}
+
+// Run is the run with this identifier, and false when the file holds none: the
+// answer for a caller that knows which run it is asking about. A run reports
+// on itself through this and not through LatestRun, which answers with the
+// live run of the repository -- and a process can have a second run of its own
+// live, a deferred publication beside an index, which would then answer for
+// the run that asked.
+//
+// It judges liveness, bounds its spans and reports what it omitted exactly as
+// LatestRun does; the two differ in which row they select and in nothing else.
+func (r *Reader) Run(ctx context.Context, runID string) (RunView, bool, error) {
+	id, err := model.DecodeID(runID)
+	if err != nil {
+		return RunView{}, false, err
+	}
+	const query = `SELECT run_id, kind, repository_id, generation_id, started_at, finished_at, outcome,
+		file_count, source_bytes, units_planned, units_succeeded, units_failed, units_subdivided,
+		events_dropped, process_peak_rss_bytes, (outcome = 'running' AND expires_at > ?) AS live
+		FROM runs WHERE run_id = ?`
+	now := time.Now()
+	return r.read(ctx, now, r.db.QueryRowContext(ctx, query, formatTime(now), id))
+}
+
+// read turns one selected run row and its page of spans into a view. It is the
+// one place the two queries' rows are interpreted, so what a run reads as --
+// interrupted rather than running, no wall where nobody measured one -- cannot
+// depend on which of them asked.
+func (r *Reader) read(ctx context.Context, now time.Time, row *sql.Row) (RunView, bool, error) {
 	var live bool
 	var view RunView
 	var raw, rawRepo []byte
@@ -175,14 +205,14 @@ func (r *Reader) LatestRun(ctx context.Context, repositoryID string, generationI
 	var finished sql.NullString
 	var kind, outcome string
 	var peak sql.NullInt64
-	err = r.db.QueryRowContext(ctx, query, formatTime(now), repo, generationID).Scan(&raw, &kind, &rawRepo, &generation, &started, &finished, &outcome,
+	err := row.Scan(&raw, &kind, &rawRepo, &generation, &started, &finished, &outcome,
 		&view.Run.FileCount, &view.Run.SourceBytes, &view.Run.UnitsPlanned, &view.Run.UnitsSucceeded,
 		&view.Run.UnitsFailed, &view.Run.UnitsSubdivided, &view.Run.EventsDropped, &peak, &live)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RunView{}, false, nil
 	}
 	if err != nil {
-		return RunView{}, false, wrap("latest run", err)
+		return RunView{}, false, wrap("read the run", err)
 	}
 	view.Run.RunID = hex.EncodeToString(raw)
 	view.Run.Kind = Kind(kind)
