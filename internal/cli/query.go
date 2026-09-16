@@ -178,11 +178,13 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 			"are per-page work budgets that refill on each page rather than ceilings on the whole " +
 			"traversal. A page that spends one ends there, and --timeout ends a page the same way, " +
 			"so a page-end reason is never a claim that the answer is all there is.\n\n" +
-			"Whether that page comes with a continuation depends on what the walk has to keep. " +
-			"This command writes nothing, so it can carry a position forward only in the token " +
-			"itself: a walk whose whole position fits there returns a cursor, and a walk that " +
-			"would have to retain a frontier on disk ends the answer instead and says so in its " +
-			"truncation reason. Narrow the walk -- fewer seeds, less --depth -- to see the rest.\n\n" +
+			"Every page that has more to give comes with a continuation: a walk whose whole " +
+			"position fits the token carries it there, and one that has to keep a frontier keeps " +
+			"it on disk beside the workspace, which this command writes even while another " +
+			"process is indexing. Pass the printed cursor back with --cursor to take the next " +
+			"page. Continuation state is reclaimed on its own deadline, so a cursor left unused " +
+			"for longer than the configured cursor lifetime is refused and the walk is re-run " +
+			"from the first page.\n\n" +
 			"The walk is answered from sealed canonical facts. --semantic-source is accepted so " +
 			"that asking for the overlay is refused explicitly rather than answered from canonical " +
 			"facts under an lsp label; there is no overlay call hierarchy in this build.\n\n" +
@@ -251,10 +253,11 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 			"An exhausted --depth, --visited or --timeout is reported as truncation together with " +
 			"whatever routes were found; it is never reported as \"no path exists\". A target that " +
 			"is genuinely unreachable returns no routes and is not marked truncated.\n\n" +
-			"A page ends on --timeout or on the --visited budget. It carries no continuation: " +
-			"resuming this search would mean keeping its half-explored frontier on disk, and this " +
-			"command writes nothing. The routes found so far are returned, marked truncated with " +
-			"the reason; raise --visited or --timeout to let one page reach the target.\n\n" +
+			"A page ends on --timeout or on the --visited budget and carries a continuation: the " +
+			"half-explored frontier is kept beside the workspace and the printed cursor resumes " +
+			"the same search where it stopped. The routes found so far are returned, marked " +
+			"truncated with the reason; pass the cursor back with --cursor, or raise --visited " +
+			"or --timeout to let one page reach the target.\n\n" +
 			"This command takes no --limit or --edges: a route set is bounded by the reason-path " +
 			"cap, not paged.\n\n" +
 			"--direction chooses which way edges are followed. The default, outgoing, answers " +
@@ -717,10 +720,9 @@ func addTraversalFlags(cmd *cobra.Command, edges, acrossPages bool) {
 	cmd.Flags().Int(queryDepthFlag, 0, "maximum hops from the nearest start node"+zeroBoundHelp)
 	// The two paging endpoints refill these budgets per page; impact expands its
 	// walk in one request, so there the same flag is a ceiling on the whole
-	// answer. Whether a spent budget comes back with a cursor is not the
-	// budget's business -- it depends on whether the walk's position fits the
-	// token -- so the flag says only that the budget is per page, and the
-	// command's own help states the continuation rule once.
+	// answer. Spending a per-page budget is exactly what mints a continuation,
+	// so the flag says only that the budget is per page and the command's own
+	// help states the continuation rule once.
 	cumulative := " for the whole walk"
 	if acrossPages {
 		cumulative = " per page"
