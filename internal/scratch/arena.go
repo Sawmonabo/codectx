@@ -74,6 +74,9 @@ const (
 	SortRun Purpose = "sort-run"
 	// LexicalStage is a lexical seal's staging database, one per seal slot.
 	LexicalStage Purpose = "lexical-stage"
+	// ImportSpool is one index import's native-symbol map and occurrence
+	// spool, in a database.
+	ImportSpool Purpose = "import-spool"
 	// PathSearch is one shortest-path search's external-memory state: the
 	// settled set, the parent edges and the cost buckets, in a database.
 	PathSearch Purpose = "path-search"
@@ -122,6 +125,21 @@ var (
 	arenasMu sync.Mutex
 	arenas   = map[string]*Arena{}
 )
+
+// All is every arena this process has opened, in no particular order. A
+// store's surfaces are pooled under more than one directory -- the data
+// directory, the continuation store's, a provider's work directory -- so the
+// disk a run is holding rather than freeing is the sum over all of them, and
+// disclosing one of them would understate it.
+func All() []*Arena {
+	arenasMu.Lock()
+	defer arenasMu.Unlock()
+	out := make([]*Arena, 0, len(arenas))
+	for _, a := range arenas {
+		out = append(out, a)
+	}
+	return out
+}
 
 // For returns the arena of the given directory, creating it on first use.
 // Callers that already hold the directory a surface belongs under — every
