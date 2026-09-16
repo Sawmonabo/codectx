@@ -76,6 +76,18 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 	return open(ctx, repo, openOptions{mode: modeQuery})
 }
 
+// OpenWorkspaceForServer composes the workspace for the one process that both
+// indexes and answers questions: it takes the workspace lock and keeps the
+// writer, exactly as OpenWorkspace does, and opens a second, read-only handle
+// on the same database beside it. Workspace.ReadServices is the facade bound to
+// that handle, and it is what the server's read tools must be served through:
+// they then answer while this process's own refresh writes, without committing
+// its ingestion group early and without waiting behind it.
+func OpenWorkspaceForServer(ctx context.Context, repo string, o OpenOptions) (*Workspace, error) {
+	return open(ctx, repo, openOptions{mode: modeServe, wait: o.Wait, rebuild: o.Rebuild,
+		scipImport: o.SCIPImport, scipManifest: o.SCIPManifest})
+}
+
 func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 	s, err := openStack(ctx, repo, o)
 	if err != nil {
@@ -173,12 +185,35 @@ func (w *Workspace) Config() config.Config { return w.s.cfg }
 // requires it, so a report promotes nothing and reports the deferred capability
 // rows instead (Section 11.6).
 func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.Engine, func() error, error) {
-	reader, err := w.s.store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
+	return w.query(ctx, gen, false)
+}
+
+// query is Query with the choice of handle made explicit. readOnly selects the
+// composition's reader handle, which in a modeServe process is a second handle
+// on the same database with no writer connection: the pin takes no retention
+// lease and reaches no write transaction, so a tool call cannot commit or wait
+// on the ingestion group this process's own refresh has open.
+//
+// A read-only engine is given NO lease store, which is the engine's own
+// documented "continuations are not offered" ending: every mint site returns an
+// empty token and the answer is reported truncated. Handing it the writer's
+// lease store instead would put the cursor lease -- a write -- back on the very
+// transaction this handle exists to stay off, and handing it a lease store over
+// the reader would fail the page rather than end it.
+func (w *Workspace) query(ctx context.Context, gen model.GenerationID, readOnly bool) (*graph.Engine, func() error, error) {
+	store, leases, mayPromote := w.s.store, w.s.leases, w.s.lock != nil
+	if readOnly && w.s.queryStore != w.s.store {
+		// The reader handle, no lease store, and no promoter: promotion builds
+		// a deferred capability, which is a write. A read tool in a serving
+		// process reports the deferred rows exactly as a report does.
+		store, leases, mayPromote = w.s.queryStore, nil, false
+	}
+	reader, err := store.PinGeneration(ctx, w.s.repo, gen, w.s.cfg.Storage.QueryCursorTTL.Std())
 	if err != nil {
 		return nil, nil, err
 	}
 	var promote graph.Promoter
-	if w.s.lock != nil {
+	if mayPromote {
 		promote = promoter{coord: w.coord}
 	}
 	// The packed per-generation adjacency is the structure every traversal
@@ -195,7 +230,7 @@ func (w *Workspace) Query(ctx context.Context, gen model.GenerationID) (*graph.E
 		Promoter:  promote,
 		Signer:    w.s.signer,
 		Spools:    w.s.spools,
-		Leases:    w.s.leases,
+		Leases:    leases,
 		Gate:      w.s.gate,
 		Limits:    graphLimits(w.s.cfg),
 		Now:       time.Now,
