@@ -317,6 +317,8 @@ func endOutcome(err error) ledger.Outcome {
 // either would hide the one full-build reason an operator acts on.
 func unitOutcome(res outcome, err error) ledger.Outcome {
 	switch {
+	case err != nil && absent(provider.CodeOf(err)):
+		return ledger.OutcomeUnavailable
 	case err != nil:
 		return ledger.OutcomeFailed
 	case res.subdivided:
@@ -325,6 +327,40 @@ func unitOutcome(res outcome, err error) ledger.Outcome {
 		return ledger.OutcomeOK
 	}
 }
+
+// unitEnding is how a unit ended on a path that never reached its provider: a
+// unit already sealed under the same key is attached rather than rebuilt, and
+// anything else here failed before the run.
+func unitEnding(err error) ledger.Outcome {
+	switch {
+	case err == nil:
+		return ledger.OutcomeReused
+	case absent(provider.CodeOf(err)):
+		return ledger.OutcomeUnavailable
+	default:
+		return ledger.OutcomeFailed
+	}
+}
+
+// absent reports whether a diagnostic code says the unit reached no output
+// because something it needed was not there -- a provider with nothing to run
+// against, or a tool this machine cannot supply -- rather than because work
+// that ran went wrong. The two are the difference between "this machine cannot
+// do it" and "this repository broke it", and an operator acts on them
+// differently.
+func absent(code string) bool {
+	switch code {
+	case model.CodeProviderUnavailable, model.CodeToolOffline, model.CodeToolUnsupportedPlatform,
+		model.CodeToolFetchFailed, model.CodeToolDigestMismatch, model.CodeToolCorrupt,
+		model.CodeToolOverrideInvalid:
+		return true
+	}
+	return false
+}
+
+// reasonDeferred is what a unit's row says when this run handed it to the
+// background sealer instead of running it.
+const reasonDeferred = "the unit is deferred to background work after activation"
 
 // int64Ptr is the address of a count a span reports at its end. Measured's
 // fields are pointers because an unavailable measurement is absent and never
@@ -409,6 +445,11 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	walkErr := g.eachUnit(func(u plan.Unit) error {
 		g.planned++
 		span.AddIn(1)
+		// The unit's row exists from the moment the plan names it, before
+		// admission and before any provider is reached. A unit that never
+		// runs is then a row that says so with its reason, instead of a
+		// capability reported unavailable that nothing can substantiate.
+		unitSpan := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
 		if u.ProviderID != current {
 			if group != nil {
 				err := group.wait()
@@ -420,13 +461,17 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			current = u.ProviderID
 		}
 		if u.Deferred {
+			// Not this run's work: it is queued for the background sealer,
+			// which records it under its own run. Leaving the row planned
+			// would have this run report it as never admitted.
+			unitSpan.End(ledger.OutcomeSkipped, ledger.Measured{Failure: reasonDeferred}, nil)
 			deferred = append(deferred, u)
 			return nil
 		}
 		if group == nil {
 			group = g.newUnitGroup(ctx)
 		}
-		return group.submit(u)
+		return group.submit(u, unitSpan)
 	})
 	err = walkErr
 	if walkErr != nil {
@@ -478,21 +523,26 @@ func (g *generation) newUnitGroup(ctx context.Context) *unitGroup {
 // submit admits one unit against the group's worker slots, blocking while they
 // are all busy. A group whose first fatal failure has already cancelled it
 // stops admitting and reports that failure, which ends the plan walk.
-func (u *unitGroup) submit(unit plan.Unit) error {
+func (u *unitGroup) submit(unit plan.Unit, span *ledger.Span) error {
 	select {
 	case u.sem <- struct{}{}:
 	case <-u.ctx.Done():
 		u.wg.Wait()
-		if u.fatal != nil {
-			return u.fatal
+		err := u.fatal
+		if err == nil {
+			err = model.Canceled(u.ctx.Err())
 		}
-		return model.Canceled(u.ctx.Err())
+		// The group stopped admitting before this unit had a worker, so it
+		// never reached its work and says exactly that.
+		span.End(ledger.OutcomeUnavailable, ledger.Measured{
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		return err
 	}
 	u.wg.Add(1)
 	go func() {
 		defer u.wg.Done()
 		defer func() { <-u.sem }()
-		if err := u.g.unit(u.ctx, unit); err != nil {
+		if err := u.g.unit(u.ctx, unit, span); err != nil {
 			u.once.Do(func() { u.fatal = err; u.cancel() })
 		}
 	}()
@@ -510,15 +560,25 @@ func (u *unitGroup) wait() error {
 // unit builds one unit. The returned error is nonnil only when the failure
 // must abort the whole generation: a required provider's unit, a storage
 // failure, or a cancellation.
-func (g *generation) unit(ctx context.Context, u plan.Unit) error {
+func (g *generation) unit(ctx context.Context, u plan.Unit, span *ledger.Span) (err error) {
+	// Every path out of this call closes the unit's planned row. run closes it
+	// first for a unit that reached a provider and End is idempotent, so this
+	// states the outcome only for the paths that never do: the attach of a
+	// unit already sealed, and the failures before the run.
+	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
 	spec, err := u.Spec(g.c.cfgHash)
 	if err != nil {
 		return err
 	}
 	if u.Heavy {
-		release, err := g.c.sched.Admit(ctx, u.Reservation)
-		if err != nil {
-			return err
+		release, admitErr := g.c.sched.Admit(ctx, u.Reservation)
+		if admitErr != nil {
+			// The admission gate refused or was cancelled, so the unit never
+			// reached its work: unavailable with that reason, not a failure of
+			// a provider that was never asked.
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return admitErr
 		}
 		defer release()
 	}
@@ -541,12 +601,12 @@ func (g *generation) unit(ctx context.Context, u plan.Unit) error {
 		g.mu.Unlock()
 		return nil
 	}
-	out, err := g.run(ctx, u, spec)
-	if err == nil {
+	out, runErr := g.run(ctx, u, spec, span)
+	if runErr == nil {
 		g.record(u, out)
 		return nil
 	}
-	return g.failure(ctx, u, out.result, err)
+	return g.failure(ctx, u, out.result, runErr)
 }
 
 // outcome is one unit's run: what the provider reported, how many files it
@@ -563,13 +623,13 @@ type outcome struct {
 
 // run executes one unit through its delta applier when the provider has one,
 // and through the provider runtime otherwise.
-func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) (res outcome, err error) {
+func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec, span *ledger.Span) (res outcome, err error) {
 	c := g.c
-	// One span per unit, under the build stage. The providers' own inner
-	// spans find it in the context they are handed and nest under it without
-	// naming it, so a unit's cost is the sum of parts recorded by code that
-	// knows nothing about this package.
-	ctx, span := ledger.StartProvider(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
+	// The unit's span was opened when the plan named it and begins here: the
+	// providers' own inner spans find it in the context they are handed and
+	// nest under it without naming it, so a unit's cost is the sum of parts
+	// recorded by code that knows nothing about this package.
+	ctx = span.Begin(ctx)
 	defer func() {
 		m := ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}
 		if err != nil {
