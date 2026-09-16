@@ -156,12 +156,19 @@ type IndexStatus struct {
 	Completeness       []CapabilityState  `json:"completeness"`
 	FileCount          uint64             `json:"file_count"`
 	SourceBytes        uint64             `json:"source_bytes"`
-	WatchActive        bool               `json:"watch_active"`
-	WatchComplete      bool               `json:"watch_complete"`
-	PendingPaths       int64              `json:"pending_paths"`
-	LastReconciledAt   *time.Time         `json:"last_reconciled_at,omitempty"`
-	ActivatedAt        *time.Time         `json:"activated_at,omitempty"`
-	Warnings           []string           `json:"warnings,omitempty"`
+	// Watchers is every watching process whose heartbeat is live for this
+	// workspace, freshest deadline first, read from the store and so visible
+	// to a process that is not watching. WatchActive and the three fields
+	// under it are this process's own watch and stay that way: a reporting
+	// process cannot see another one's notification coverage, only what that
+	// one published.
+	Watchers         []WatchProcess `json:"watchers,omitempty"`
+	WatchActive      bool           `json:"watch_active"`
+	WatchComplete    bool           `json:"watch_complete"`
+	PendingPaths     int64          `json:"pending_paths"`
+	LastReconciledAt *time.Time     `json:"last_reconciled_at,omitempty"`
+	ActivatedAt      *time.Time     `json:"activated_at,omitempty"`
+	Warnings         []string       `json:"warnings,omitempty"`
 	// Resources is the Section 23 accounting block. It is nil on an ordinary
 	// status so a cheap call stays cheap; Task 20 populates it.
 	Resources *ResourceReport `json:"resources,omitempty"`
@@ -169,6 +176,49 @@ type IndexStatus struct {
 	// the same configuration on the same terms: the providers that are off,
 	// once, and absent when none is.
 	ProvidersDisabled []string `json:"providers_disabled,omitempty"`
+}
+
+// WatchProcess is one watching process, as it published itself. Section 13.2's
+// watch coverage is reported per watcher because a workspace can be watched by
+// more than one process at a time -- a `codectx watch` in a terminal and an
+// editor's server -- and one figure for all of them would name a state no
+// process is in.
+//
+// SessionID is the watch's identity and PID the process running it. The pid
+// alone does not identify a watch: an operating system reuses a pid, and one
+// process can hold two watches.
+//
+// LastBeatAt is when that watcher last published itself. LastPassAt and
+// PendingEvents are absent when nothing measured them, which is what keeps the
+// three answers apart for each watcher separately: no entry at all is a watch
+// that is not running, an entry with no pass time is a watch that is running
+// and covering nothing -- waiting for whichever process holds the workspace --
+// and an entry with one is a watch that is covering this workspace.
+type WatchProcess struct {
+	SessionID     string     `json:"session_id"`
+	PID           int        `json:"pid"`
+	LastBeatAt    time.Time  `json:"last_beat_at"`
+	LastPassAt    *time.Time `json:"last_pass_at,omitempty"`
+	PendingEvents *int64     `json:"pending_events,omitempty"`
+}
+
+// Validate checks one watcher entry.
+func (w WatchProcess) Validate() error {
+	if err := requireID("watch_process.session_id", w.SessionID); err != nil {
+		return err
+	}
+	if w.PID <= 0 {
+		return invalid("watch_process.pid %d is not a process id", w.PID)
+	}
+	if w.LastBeatAt.IsZero() {
+		return invalid("watch_process.last_beat_at is required")
+	}
+	if w.PendingEvents != nil {
+		if err := requireNonNegative("watch_process.pending_events", *w.PendingEvents); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ResourceReport is the resource accounting Section 23 requires status to
@@ -386,6 +436,18 @@ func (s IndexStatus) Validate() error {
 	}
 	if err := requireNonNegative("index_status.pending_paths", s.PendingPaths); err != nil {
 		return err
+	}
+	// A response bound, which Section 6 requires of every list: the store's own
+	// read is bounded at the same page width, so a workspace with more live
+	// watchers than one page holds is a producer defect and not a refusal of a
+	// legitimately busy workspace.
+	if err := boundPage("index_status.watchers", len(s.Watchers)); err != nil {
+		return err
+	}
+	for _, w := range s.Watchers {
+		if err := w.Validate(); err != nil {
+			return err
+		}
 	}
 	if err := boundStrings("index_status.warnings", s.Warnings, MaxReasonsPerEntry, MaxReasonBytes); err != nil {
 		return err

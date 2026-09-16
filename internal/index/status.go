@@ -161,6 +161,11 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
 		FileCount: snap.FileCount, SourceBytes: snap.SourceBytes, Warnings: warnings,
 		ProvidersDisabled: disabledProviders(r.opts.Config)}
+	watchers, err := r.watchers(ctx)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	st.Watchers = watchers
 	if r.watch != nil {
 		r.watch.project(&st)
 	}
@@ -168,6 +173,38 @@ func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
 		r.retention.project(&st)
 	}
 	return st, nil
+}
+
+// watchers lists the watching processes whose heartbeat is live, freshest
+// deadline first (Section 13.2).
+//
+// It is read from the store and not from watchState, so it answers in a process
+// that is watching nothing: a `codectx status` in another terminal is exactly
+// the reader this list exists for, and it has no in-process watch to project.
+// A watcher that has completed no pass is listed with no pass time rather than
+// omitted -- a watch waiting for whichever process holds the workspace is
+// running, and dropping it would report the workspace as one no watch has ever
+// run in.
+//
+// A row past its writer's own deadline is left out: its process stopped
+// refreshing, and listing it would report a watch that is no longer running.
+// That the watch stopped is what the doctor's `watch_heartbeat` check reports;
+// this list states who is watching now.
+func (r *StatusReader) watchers(ctx context.Context) ([]model.WatchProcess, error) {
+	rows, err := r.opts.Store.WatchHeartbeats(ctx, r.opts.Repo)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	var out []model.WatchProcess
+	for _, hb := range rows {
+		if !hb.Live(now) {
+			continue
+		}
+		out = append(out, model.WatchProcess{SessionID: hb.SessionID, PID: hb.WriterPID,
+			LastBeatAt: hb.BeatAt, LastPassAt: hb.LastPassAt, PendingEvents: hb.PendingEvents})
+	}
+	return out, nil
 }
 
 // coherence answers what the active generation is coherent with (Section
