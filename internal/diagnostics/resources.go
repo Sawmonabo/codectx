@@ -96,7 +96,7 @@ func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 	if err != nil {
 		generation = 0
 	}
-	run, stages, err := s.opts.Ledger.LatestRun(ctx, s.opts.Repo, generation)
+	run, stages, omitted, err := s.opts.Ledger.LatestRun(ctx, s.opts.Repo, generation)
 	if err != nil || run == nil {
 		return
 	}
@@ -106,7 +106,7 @@ func (s *Service) runLedger(ctx context.Context, report *model.ResourceReport) {
 		}
 		return cmp.Compare(a.Seq, b.Seq)
 	})
-	report.Run, report.Stages = run, stages
+	report.Run, report.Stages, report.StagesOmitted = run, stages, omitted
 }
 
 // scratchBytes discloses the disk the store's scratch pools hold, which is
