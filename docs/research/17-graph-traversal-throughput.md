@@ -30,7 +30,11 @@ brief's 3 800 nodes/s refers to.
 
 ### 1.1 The plan defect, as SQLite reports it
 
-`EXPLAIN QUERY PLAN` on `edgesBatchQuery`'s exact shape, R-large and R-mid alike:
+That read is served today by the store's packed adjacency lists, streamed by
+`graphReader.Neighbours` (ADR-0002, ADR-0007). What follows measured the per-batch edge statement —
+canonical → surrogate translation inside, one row per edge out.
+
+`EXPLAIN QUERY PLAN` on that statement's exact shape, R-large and R-mid alike:
 
 ```
 |--SEARCH sn USING COVERING INDEX sqlite_autoindex_node_ids_1 (canonical=?)
@@ -77,8 +81,10 @@ Two EQP runs on R-large isolate the cause (full query otherwise identical):
   `sqlite_autoindex_relation_ids_2` [S24].
 
 The chunk must be sent as **ascending surrogate ids** for the planner to fuse the IN-list with the
-ORDER BY prefix [S24]. Surrogates exist (ADR-0002); `edgesBatchQuery` translates canonical→surrogate
-internally today and deliberately never lets one out.
+ORDER BY prefix [S24]. Surrogates exist (ADR-0002); the per-batch edge statement translated
+canonical → surrogate inside and never let a surrogate out. The read now travels over packed
+adjacency lists whose entries are surrogate deltas, so the ordering the plan had to be coaxed into
+is the storage order itself (ADR-0007).
 
 ---
 
