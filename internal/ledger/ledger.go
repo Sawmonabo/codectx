@@ -37,13 +37,20 @@ const (
 	liveWindow = 120 * flushInterval
 )
 
-// eventKind distinguishes the two things a run's goroutine tells the collector.
+// eventKind distinguishes the things a run's goroutine tells the collector.
 type eventKind int
 
 const (
 	eventStart eventKind = iota
 	eventBegin
 	eventEnd
+	// eventFinish says a run has ended. It crosses the bus rather than being
+	// read off the run struct so that the collector sees it behind every end
+	// the run already published: the bus is first-in-first-out and one
+	// goroutine drains it, so by the time this arrives every span that did end
+	// has been written, and the rows still 'planned' are exactly the work
+	// nothing ever started.
+	eventFinish
 )
 
 // An event is what crosses the bus. It is small and owns nothing the producing
@@ -52,6 +59,9 @@ const (
 type event struct {
 	kind eventKind
 	span *Span
+	// run is set instead of span on an event about the run itself, which
+	// belongs to no span.
+	run *Run
 	// planned marks a start event whose row is written as 'planned' rather
 	// than 'running': the work exists but nothing has begun it.
 	planned  bool
@@ -248,7 +258,10 @@ func (r *Run) Report(t Totals) {
 	r.dirty.Store(true)
 }
 
-// Finish records how the run ended. Spans still open when the ledger stops are
+// Finish records how the run ended, and tells the collector so, because the
+// end of a run is itself an ending to record: the units the plan named that
+// nothing ever started are closed here, through the same publication every
+// other span end goes through. Spans still open when the ledger stops are
 // written interrupted regardless of what the run says about itself.
 func (r *Run) Finish(outcome Outcome) {
 	if r == nil {
@@ -260,6 +273,7 @@ func (r *Run) Finish(outcome Outcome) {
 	r.finished = &now
 	r.mu.Unlock()
 	r.dirty.Store(true)
+	r.ledger.publish(event{kind: eventFinish, run: r})
 }
 
 // Dropped is how many of this run's events the bus refused. It is on the run
@@ -279,8 +293,12 @@ func (l *Ledger) publish(e event) {
 	select {
 	case l.bus <- e:
 	default:
-		e.span.run.dropped.Add(1)
-		e.span.run.dirty.Store(true)
+		run := e.run
+		if run == nil {
+			run = e.span.run
+		}
+		run.dropped.Add(1)
+		run.dirty.Store(true)
 	}
 }
 
