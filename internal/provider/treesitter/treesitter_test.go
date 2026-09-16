@@ -474,11 +474,20 @@ func TestStructuralParseIsRecordedPerWorker(t *testing.T) {
 		t.Fatalf("stop the ledger: %v", err)
 	}
 	mu.Lock()
-	got := slices.Clone(rows)
+	all := slices.Clone(rows)
 	mu.Unlock()
+	// Only the parse stage's own spans. A unit records other stages of its own
+	// -- its seal is one -- and counting those here would make this assertion
+	// fail whenever a unit gains a stage, which is not what it is guarding.
+	var got []ledger.SpanRow
+	for _, row := range all {
+		if row.Stage == "structural_parse" {
+			got = append(got, row)
+		}
+	}
 	if len(got) != 3 {
-		t.Fatalf("six parsed files on two workers recorded %d spans, want 3 -- one per worker process plus the "+
-			"unit stage's total: a span per file makes the ledger grow with the repository", len(got))
+		t.Fatalf("six parsed files on two workers recorded %d structural_parse spans, want 3 -- one per worker "+
+			"process plus the unit stage's total: a span per file makes the ledger grow with the repository", len(got))
 	}
 	var total, child, probe ledger.SpanRow
 	for _, row := range got {
