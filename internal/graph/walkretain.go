@@ -137,10 +137,12 @@ type retainedWalk struct {
 	owned bool
 	// chunkSize overrides frontierChunk. It is zero outside tests.
 	chunkSize int
-	// held are the files the cursor this leg was HANDED still names. A
-	// retryable failure tells the caller to present that same cursor again, so
-	// nothing it resumes from may be deleted until the next cursor supersedes
-	// it (releaseHeld). Its size is the entry state's: at most two files.
+	// held are the files no failure of this page may delete: the ones the
+	// cursor this leg was HANDED still names, and the ones the levels this leg
+	// has served whole leave behind. A retryable failure tells the caller to
+	// present that same cursor again, so nothing the walk behind it reads may
+	// be deleted until the next cursor supersedes it (releaseHeld). Its size is
+	// the entry state's plus two names per level this page served out.
 	held []string
 	// probe counts what a RESUMED leg decodes to pick the walk up again, for
 	// the invariant that the cost of a resume is a function of the frontier and
@@ -1077,9 +1079,15 @@ func (w *retainedWalk) hasFrontier(level int) (bool, error) {
 	return found, nil
 }
 
-// hold marks one file of this directory as the resumed cursor's, so the walk
-// leaves it alone however far past it this leg gets.
-func (w *retainedWalk) hold(name string) { w.held = append(w.held, name) }
+// hold marks one file of this directory as one no failure of this page may
+// delete, so the walk leaves it alone however far past it this leg gets. A name
+// already held is not added twice: a leg resumed into a level it then serves
+// whole holds that level's run at both points.
+func (w *retainedWalk) hold(name string) {
+	if !w.isHeld(name) {
+		w.held = append(w.held, name)
+	}
+}
 
 // isHeld reports whether the walk must leave a file where it is.
 func (w *retainedWalk) isHeld(name string) bool { return slices.Contains(w.held, name) }
@@ -1099,11 +1107,4 @@ func (w *retainedWalk) releaseHeld(keep []string) error {
 		}
 	}
 	return nil
-}
-
-// releaseFrontier deletes one level's admitted states. It is called when the
-// level AFTER it has been served whole: that level's own admitted file is the
-// next frontier, so nothing reads this one again.
-func (w *retainedWalk) releaseFrontier(level int) error {
-	return openRetainFile(w.home, levelFileName(admittedLevelPrefix, level)).remove()
 }

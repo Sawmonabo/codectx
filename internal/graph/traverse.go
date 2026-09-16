@@ -703,19 +703,20 @@ func (w *levelWalk) serve(ctx context.Context, st *walkState) (bool, error) {
 	if err := w.closeGroup(); err != nil {
 		return false, err
 	}
-	// The level has been served whole: the frontier it was collected from is
-	// released, its own sorted run with it, and the level after it begins. What
-	// the cursor this leg was handed still names is held back -- see entryLevel.
-	if !o.Retain.isHeld(levelFileName(sortedLevelPrefix, st.Level)) {
-		if err := w.sorted.release(); err != nil {
-			return false, err
-		}
+	// The level has been served whole: this leg is finished with its sorted run
+	// and with the frontier it was collected from, and the level after it
+	// begins. Neither is DELETED here. A retryable failure later in this page
+	// sends the caller back to the cursor this leg was handed, which resumes
+	// behind both of them -- deleting them at once is what made that retry
+	// answer CTX_STORAGE_CORRUPT for a level the walk itself had served it
+	// from. They are held for the page instead, and the mint of the next
+	// continuation, which is what supersedes that cursor, removes every one of
+	// them the new cursor does not resume from (releaseHeld).
+	if err := w.sorted.finished(); err != nil {
+		return false, err
 	}
-	if frontier := levelFileName(admittedLevelPrefix, st.Level-1); !o.Retain.isHeld(frontier) {
-		if err := o.Retain.releaseFrontier(st.Level - 1); err != nil {
-			return false, err
-		}
-	}
+	o.Retain.hold(levelFileName(sortedLevelPrefix, st.Level))
+	o.Retain.hold(levelFileName(admittedLevelPrefix, st.Level-1))
 	w.sorted = nil
 	st.Level, st.LevelState, st.LevelOffset = st.Level+1, levelCollecting, 0
 	return false, nil

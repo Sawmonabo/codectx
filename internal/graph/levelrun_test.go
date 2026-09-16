@@ -257,11 +257,22 @@ func TestSortedLevelResumesAtTheReportedOffset(t *testing.T) {
 		}
 	}
 
-	if err := s.release(); err != nil {
-		t.Fatalf("release: %v", err)
+	// A leg that has served the level whole is FINISHED with it and holds it:
+	// the cursor its caller may present again resumes behind this level, so the
+	// delete belongs to the continuation that supersedes that cursor.
+	path := filepath.Join(w.home.path, levelFileName(sortedLevelPrefix, 3))
+	if err := s.finished(); err != nil {
+		t.Fatalf("finished: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(w.home.path, levelFileName(sortedLevelPrefix, 3))); !os.IsNotExist(err) {
-		t.Fatalf("the sorted level survived release: %v", err)
+	w.hold(levelFileName(sortedLevelPrefix, 3))
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("a level a retry may still read was deleted when the leg finished with it: %v", err)
+	}
+	if err := w.releaseHeld(nil); err != nil {
+		t.Fatalf("releaseHeld: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("the sorted level survived the continuation that superseded it: %v", err)
 	}
 }
 
