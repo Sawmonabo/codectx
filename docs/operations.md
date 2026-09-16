@@ -115,7 +115,7 @@ Four kinds of command, by what they may change:
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
 | **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
 | **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
-| **Both** | Taken at the first refresh, then held | The refresh's own; its exploration tools write nothing | `mcp serve` |
+| **Both** | Held for each refresh, and for a watch | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
@@ -159,11 +159,18 @@ writing.
 
 Its startup takes no lock and performs no write, so a server starts and answers
 beside an index that is already running in another terminal. The workspace lock
-is taken at the first refresh and held for the rest of the session. A refresh
-asked for while another process holds the workspace is refused
-`CTX_WORKSPACE_BUSY` -- that one tool call, not the session: every
-question-answering tool keeps answering throughout, and the watch loop, when it
-is on, takes the lock on a later pass instead of ending the session.
+is taken for the duration of a refresh and given back when it ends, so a
+session that is idle between refreshes holds nothing and the person's own
+`codectx index` runs while the server stays connected. A refresh asked for
+while another process holds the workspace is refused `CTX_WORKSPACE_BUSY` --
+that one tool call, not the session: every question-answering tool keeps
+answering throughout.
+
+A server started with `--watch` is the exception: its first pass takes the lock
+and it keeps it while it watches, because that session is already keeping the
+index fresh and a second process indexing the same workspace would be doing
+that work twice. A pass that cannot have the lock is logged and retried on the
+next interval; it never ends the session.
 
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by

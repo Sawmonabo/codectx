@@ -943,7 +943,9 @@ func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
 // heldLock presents a lock the fixture already holds as the coordinator's
 // Locker. The composition root's own implementation takes the lock when a
 // build needs it; a fixture that took it in its setup has nothing left to
-// take, so Hold is the lock itself.
+// take and nothing to give back, so Hold is the lock itself.
 type heldLock struct{ l *snapshot.WorkspaceLock }
 
-func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, error) { return h.l, nil }
+func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+	return h.l, func() error { return nil }, nil
+}

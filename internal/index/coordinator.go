@@ -20,10 +20,13 @@
 // generation and leaves the previously published one exactly as it was; a
 // cancellation does the same and releases every reservation it took.
 //
-// The cross-process workspace lock is held by the caller (internal/app) for
-// the whole life of the coordinator and handed in through Options: capture,
-// indexing, publication and retention are all one owner's work, and
-// reacquiring it per stage would let a collector run between two of them.
+// The cross-process workspace lock comes from the caller (internal/app)
+// through Options.Lock and is taken for the whole of one building operation:
+// capture, indexing, publication and retention are all one owner's work, and
+// reacquiring it per stage would let a collector run between two of them. It
+// is given back when that operation ends -- a watch gives it back when it
+// stops watching -- so a process that is idle between operations owns nothing
+// and another process may index.
 package index
 
 import (
@@ -79,13 +82,17 @@ const maxWorkers = 8
 // Locker is where a coordinator gets the cross-process workspace lock of
 // Sections 12.3 and 13.2.
 //
-// Hold is idempotent and returns the ONE lock the composition root holds for
-// this process, so a caller never closes what it is handed and two concurrent
-// builds can never end up with two locks on one workspace. A workspace another
-// process is indexing is reported as the typed, retryable CTX_WORKSPACE_BUSY
-// snapshot.LockWorkspace produces.
+// Hold takes the lock for the operation that is about to build and returns the
+// release that gives it back; release runs exactly once, on every path,
+// including the one where the operation failed partway. Holds NEST: the
+// composition root hands out one lock for the process and releases it when the
+// last holder has, so a capture inside a refresh, or a refresh inside a watch,
+// takes no second lock and cannot release one another still needs.
+//
+// A workspace another process is indexing is reported as the typed, retryable
+// CTX_WORKSPACE_BUSY snapshot.LockWorkspace produces, and nothing is held.
 type Locker interface {
-	Hold(ctx context.Context) (*snapshot.WorkspaceLock, error)
+	Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error)
 }
 
 // Options are the coordinator's dependencies. Every field except Lock,
@@ -297,20 +304,70 @@ func (c *Coordinator) buildable() error {
 	return nil
 }
 
-// hold is buildable plus the lock itself: the composition either already holds
-// it or takes it here, and a workspace another process is indexing answers the
-// typed, retryable CTX_WORKSPACE_BUSY of snapshot.LockWorkspace.
+// hold is buildable plus the lock itself, for the duration of ONE operation:
+// the caller releases it when that operation ends, so an idle session owns
+// nothing and the person's own `codectx index` is not refused for as long as
+// a server happens to be running. A workspace another process is building in
+// answers the typed, retryable CTX_WORKSPACE_BUSY of snapshot.LockWorkspace.
 //
-// Every entry point that builds calls this, and Watch deliberately does not:
-// a session that watches must survive a workspace that is busy right now, so
-// its patience is the reconcile interval it already has -- each pass asks
-// again through Refresh, and a pass that cannot have the lock is logged and
-// retried rather than ending the session.
-func (c *Coordinator) hold(ctx context.Context) (*snapshot.WorkspaceLock, error) {
+// Every entry point that builds calls this, and Watch deliberately does not at
+// its entry: a session that watches must survive a workspace that is busy
+// right now, so its patience is the reconcile interval it already has -- each
+// pass asks again, and a pass that cannot have the lock is logged and retried
+// rather than ending the session. A watch that HAS taken it keeps it for as
+// long as it watches, which is the one operation whose duration is the
+// session's (watchHold below).
+func (c *Coordinator) hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	if err := c.buildable(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return c.opts.Lock.Hold(ctx)
+}
+
+// watchHold makes this watch the workspace's owner for as long as it watches.
+// It is taken at the first pass rather than at Watch's entry, and a pass that
+// cannot have it leaves the watch running: the workspace is busy now, and the
+// next pass asks again.
+//
+// A watch holds across passes rather than per pass because it IS the session
+// that is keeping the index fresh -- the one case where another process's
+// index would be doing the same work -- and because releasing between passes
+// would hand the workspace away in every gap it has.
+func (c *Coordinator) watchHold(ctx context.Context) error {
+	c.watch.mu.Lock()
+	held := c.watch.release != nil
+	c.watch.mu.Unlock()
+	if held {
+		return nil
+	}
+	_, release, err := c.hold(ctx)
+	if err != nil {
+		return err
+	}
+	c.watch.mu.Lock()
+	if c.watch.release != nil {
+		// A concurrent pass got there first. Give this one back at once:
+		// one watch session holds one reference, never two.
+		c.watch.mu.Unlock()
+		return release()
+	}
+	c.watch.release = release
+	c.watch.mu.Unlock()
+	return nil
+}
+
+// watchReleased gives back whatever watchHold took. It runs when the watch
+// loop returns, by whichever path, and is a no-op for a watch that never got
+// the lock at all.
+func (c *Coordinator) watchReleased() error {
+	c.watch.mu.Lock()
+	release := c.watch.release
+	c.watch.release = nil
+	c.watch.mu.Unlock()
+	if release == nil {
+		return nil
+	}
+	return release()
 }
 
 // Repository is the identity this coordinator derived for the workspace root.
@@ -335,9 +392,11 @@ func (c *Coordinator) Close() error {
 // deleted the store it was handed would be destroying state its caller still
 // owns.
 func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
-	if _, err := c.hold(ctx); err != nil {
+	_, release, err := c.hold(ctx)
+	if err != nil {
 		return model.IndexResult{}, err
 	}
+	defer release()
 	if err := req.Validate(); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -351,9 +410,11 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 // notification that named the wrong file, or named none at all, changes what
 // this run costs and never what it concludes (Section 13.2).
 func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexResult, error) {
-	if _, err := c.hold(ctx); err != nil {
+	_, release, err := c.hold(ctx)
+	if err != nil {
 		return model.IndexResult{}, err
 	}
+	defer release()
 	// The hint is recorded and deliberately not acted on: narrowing the
 	// capture to it is exactly the mistake Section 13.2 names, because a
 	// notification can miss a timestamp-preserving write and Git status alone
@@ -389,6 +450,14 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 	}
 	c.watch.enter(c.opts.Watcher)
 	defer c.watch.leave()
+	// The workspace this watch owns while it watches, taken at its first pass
+	// and given back here however the loop ends.
+	defer func() {
+		if err := c.watchReleased(); err != nil {
+			logTyped(c.log, "the workspace lock this watch held was not released cleanly", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+	}()
 	// Evaluated now and deferred as its result: the beat starts here and the
 	// withdrawal it returns runs when this watch ends.
 	defer c.beatHeartbeat(ctx)()
@@ -510,6 +579,16 @@ func (c *Coordinator) publishHeartbeat(ctx context.Context) {
 // end of the watch: the prior generation is still published and the next batch
 // or tick tries again.
 func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(model.IndexResult)) (model.IndexResult, bool) {
+	// The lock first, and kept for the rest of the watch. A workspace another
+	// process is building in is not this pass's failure: the pass is skipped,
+	// the next one asks again, and the session keeps running.
+	if err := c.watchHold(ctx); err != nil {
+		if ctx.Err() == nil {
+			logTyped(c.log, "this pass could not take the workspace; another process holds it and the next pass will ask again", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+		return model.IndexResult{}, false
+	}
 	res, err := c.Refresh(ctx, paths)
 	if err != nil {
 		if ctx.Err() == nil {

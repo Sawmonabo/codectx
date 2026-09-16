@@ -221,7 +221,8 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 	// The connect is the first assertion: it starts the server process and
 	// completes the protocol handshake, which the old composition could not
 	// reach at all while another process held the workspace.
-	session := s.mcpSession(t, ctx)
+	session, closeSession := s.mcpServer(t, ctx)
+	t.Cleanup(closeSession)
 
 	tools := []struct {
 		name string
@@ -276,6 +277,59 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
 		if err != nil || res.IsError {
 			t.Fatalf("%s no longer answers after the external index ended: the busy refusal took the session with it (err %v)", tool.name, err)
+		}
+	}
+	// That session is ended here, deliberately: the other half of coexistence
+	// is asked of a session of its own, with one server on the workspace.
+	closeSession()
+	serverReleasesTheWorkspaceAfterARefresh(t, ctx, s, tools)
+}
+
+// serverReleasesTheWorkspaceAfterARefresh is the other half of the same
+// promise: the person's own `codectx index` runs while an agent's server is
+// connected and answering.
+//
+// Failure mode it protects: the server takes the workspace lock at its first
+// refresh and KEEPS it for the rest of the session, so an idle agent server
+// makes `codectx index` in a terminal answer busy for as long as that server
+// lives -- the same coexistence defect from the other side. Mutation that must
+// fail it is quoted in this lane's report: hold the lock for the session in
+// internal/app/compose.go (drop the release, or never decrement) and the
+// external index below is refused.
+//
+// The session runs with --watch=false, which is the product's own distinction
+// and not an accommodation: a watching session is the one operation whose
+// duration IS the session, and it holds the workspace deliberately because it
+// is already keeping the index fresh.
+func serverReleasesTheWorkspaceAfterARefresh(t *testing.T, ctx context.Context, s *sandbox, tools []struct {
+	name string
+	args any
+}) {
+	t.Helper()
+	session, closeSession := s.mcpServer(t, ctx, "--watch=false")
+	t.Cleanup(closeSession)
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "codectx_refresh_index", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("codectx_refresh_index failed at the transport on an unheld workspace: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("codectx_refresh_index was refused on a workspace nothing else holds: %s", contentText(res))
+	}
+
+	// The assertion: the person's own index, as a further process, while that
+	// same session is still connected.
+	if env, code := s.run(t, "index"); !env.OK || code != 0 {
+		t.Fatalf("`codectx index` was refused (exit %d) while a connected server sat idle: %+v -- "+
+			"the server is holding the workspace lock past the refresh that took it", code, env.Error)
+	}
+	// And the session is still answering afterwards, so what it gave up was
+	// the lock and not the workspace.
+	for _, tool := range tools {
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
+		if err != nil || res.IsError {
+			t.Fatalf("%s no longer answers after another process indexed beside the session (err %v)", tool.name, err)
 		}
 	}
 }

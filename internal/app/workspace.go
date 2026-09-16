@@ -19,8 +19,9 @@ import (
 
 // Workspace is one opened workspace: the composed stack plus the index
 // coordinator over it. Opened for indexing it is the single cross-process owner
-// of Section 13.2 -- the workspace lock is held from the open, or from the
-// first build in a serving session, until it closes -- so exactly one of
+// of Section 13.2 -- the workspace lock is held from the open in a command
+// whose whole life is one run, and for the duration of each operation in a
+// serving session -- so exactly one of
 // `index`, `refresh`, `watch` and the MCP server builds at a time and a second
 // caller is told the workspace is busy rather than becoming a second writer.
 // Opened for a report it holds no lock and can build nothing.
@@ -93,9 +94,10 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 // same database beside the writer, and it takes NEITHER the workspace lock nor
 // a single write to open. An agent's server must come up and answer beside an
 // index the person started in a terminal, so the lock, the startup recovery
-// and the collection pass are taken at the first operation that needs them --
-// the refresh tool, or a watch pass -- and a workspace that is busy then
-// refuses that one operation rather than the session. Workspace.ReadServices is the facade bound to
+// and the collection pass are taken by the operation that needs them -- the
+// refresh tool, or a watch pass -- and given back when it ends, and a
+// workspace that is busy then refuses that one operation rather than the
+// session. Workspace.ReadServices is the facade bound to
 // that handle, and it is what the server's read tools must be served through:
 // they then answer while this process's own refresh writes, without committing
 // its ingestion group early and without waiting behind it.
