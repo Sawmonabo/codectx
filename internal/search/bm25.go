@@ -96,9 +96,10 @@ type statsEntry struct {
 // conservative so the cache cannot exceed it in practice.
 const statsEntryOverhead = 64
 
-// defaultStatsCacheBytes is the cache's ceiling. A query contributes at most
-// resources.max_query_terms (32) entries, so this holds thousands of distinct
-// query terms and still cannot grow with the repository.
+// defaultStatsCacheBytes is the cache's ceiling. A query contributes one entry
+// per distinct term it carries, and resources.max_query_terms is unlimited by
+// default, so this constant -- not the query -- is what bounds the cache: it
+// holds thousands of distinct query terms and cannot grow with the repository.
 const defaultStatsCacheBytes = 1 << 20
 
 // statsCache caches per-term document frequencies under an explicit byte cap.
