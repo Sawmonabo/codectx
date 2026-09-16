@@ -561,6 +561,11 @@ func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
 // the watch: the watch itself is still reconciling this workspace, and the row
 // is how another process reports on it. The row then expires, so a reader is
 // told the coverage is unknown rather than shown a figure that stopped moving.
+//
+// What the row claims is watchState.heartbeat's rule: a watch that has completed
+// no pass -- one still waiting for the workspace another process holds --
+// publishes its presence and no figures, so a reader tells it apart from a watch
+// that is covering this workspace and from one that never ran.
 func (c *Coordinator) publishHeartbeat(ctx context.Context) {
 	lastPass, pending := c.watch.heartbeat()
 	err := c.opts.Store.RecordWatchHeartbeat(ctx, c.repo, sqlite.WatchHeartbeat{
