@@ -154,6 +154,68 @@ func TestActivationMergesATierIntoOneSegment(t *testing.T) {
 	comparePackedToLive(t, f, r, gen, db)
 }
 
+// One merge reads a bounded number of segments, so a tier holding more than
+// that is brought within the ratio by REPEATED merges, each of which may read
+// a segment an earlier one produced. A first index of a large repository seals
+// tens of thousands of segments into the smallest tier; a compaction that
+// stopped after one merge would leave the tier arbitrarily far from the ratio,
+// and one that read the whole tier at once would hold a part of three streams
+// for every one of them. This is the shape neither of the tier fixtures above
+// reaches: more segments in one tier than a single merge takes.
+func TestATierWiderThanOneMergeIsMergedRepeatedlyUntilItMeetsTheRatio(t *testing.T) {
+	defer store.SetLexicalMergeRatio(1)()
+	dbPath := t.TempDir() + "/codectx.db"
+	f := newFixture(t, dbPath)
+	const units = 6 // more than lexMergeFanIn, so one merge cannot finish the tier
+	files := make([]fileFixture, 0, units)
+	for i := 0; i < units; i++ {
+		files = append(files, tierFile(f, i))
+	}
+	snap := f.snapshot("one", files...)
+	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := f.run(gen)
+	for i, ff := range files {
+		w := f.beginScopeKey(gen, run, configHash, fmt.Sprintf("scope-%d", i), ff)
+		f.fillFile(w, run, ff)
+		if err := f.s.SealUnit(f.ctx, w); err != nil {
+			t.Fatalf("SealUnit(%s): %v", ff.path, err)
+		}
+	}
+	f.activate(gen, 0)
+	flushed(t, f.s)
+	db := openRawDB(t, dbPath)
+
+	set := segmentSet(t, db, int64(gen))
+	if len(set) != 1 {
+		t.Fatalf("a tier of %d segments was left as %d; the merges stopped before the tier met the ratio", units, len(set))
+	}
+	var docs int64
+	if err := db.QueryRow(`SELECT doc_count FROM lexical_segments WHERE id = ?`, set[0]).Scan(&docs); err != nil {
+		t.Fatal(err)
+	}
+	if docs != units {
+		t.Fatalf("the surviving segment packs %d documents, want the %d the tier held", docs, units)
+	}
+	// A merge whose input was itself a merge's output must re-point that
+	// output's rows too, not only the rows of the segments a seal folded.
+	var stale int64
+	if err := db.QueryRow(`SELECT count(*) FROM search_units WHERE segment_id IS NOT NULL AND segment_id <> ?`,
+		set[0]).Scan(&stale); err != nil {
+		t.Fatal(err)
+	}
+	if stale != 0 {
+		t.Fatalf("%d documents still name a segment a later merge absorbed", stale)
+	}
+	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	comparePackedToLive(t, f, r, gen, db)
+}
+
 // A unit that leaves a generation is not gone: it can be attached to a later
 // one at any time, and it must then find its postings where its rows point. A
 // merge that dropped the documents the activating generation merely HIDES would
@@ -222,6 +284,26 @@ func TestAMergeKeepsHiddenDocumentsSoAReattachedUnitStillAnswers(t *testing.T) {
 		t.Fatalf("the merged segment carries documents %v; the hidden document %d was dropped and no row of the store can rebuild it",
 			packed, hiddenDoc[0])
 	}
+	// The count a reader subtracts. The merged bytes hold three documents and
+	// this generation owns two of them, so a reader that trusted the packed
+	// doc_count would report a document frequency one too high for every term
+	// the retired unit indexed.
+	var hidden int64
+	if err := db.QueryRow(`SELECT hidden FROM generation_segments WHERE generation_id = ? AND segment_id = ?`,
+		int64(gen2), segmentSet(t, db, int64(gen2))[0]).Scan(&hidden); err != nil {
+		t.Fatal(err)
+	}
+	if hidden != 1 {
+		t.Fatalf("the merged segment reports %d hidden documents; the retired unit's one document is hidden in it", hidden)
+	}
+	// Exact frequencies over merged bytes that carry a hidden document: this is
+	// the only shape where a reader must walk the postings against the bitmap
+	// instead of trusting the packed counts.
+	r2, err := f.s.PinGeneration(f.ctx, f.repo, gen2, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration(gen2): %v", err)
+	}
+	comparePackedToLive(t, f, r2, gen2, db)
 
 	// The third generation attaches the retired unit again. Its documents must
 	// come back exactly once each, beside the units that stayed.
