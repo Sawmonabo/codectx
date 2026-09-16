@@ -815,12 +815,28 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 	}
 	pos, err := w.reader.Neighbours(ctx, refs, w.direction, w.kindCodes, w.expandAfter,
 		func(e Edge) error {
-			// The bound is checked BEFORE the entry is consumed, so the
-			// position the port reports for a stopped scan still names the
-			// first entry this page did NOT charge.
+			// Both stops are checked BEFORE the entry is consumed, so the
+			// position the port reports for a stopped scan -- the entry it
+			// just delivered -- still names the first entry this page did NOT
+			// charge, and the page that resumes there charges it once.
 			if w.maxEdges.Exceeded(w.pageEdges + 1) {
 				w.edgesHit, stopped = true, true
 				return ErrStopScan
+			}
+			// The deadline is checked at a batch boundary -- an empty pend is
+			// exactly one -- which is the only place the saved position is
+			// consistent with what the buckets hold. A cancellation is
+			// classified by checkDeadline exactly as it was when each batch
+			// was its own round trip.
+			if len(pend) == 0 {
+				var derr error
+				if stopped, derr = w.checkDeadline(ctx); derr != nil {
+					ferr = derr
+					return ErrStopScan
+				}
+				if stopped {
+					return ErrStopScan
+				}
 			}
 			w.spent++
 			w.pageEdges++
@@ -829,18 +845,6 @@ func (w *pathWalk) expandBatch(ctx context.Context, batch []model.NodeID,
 				return nil
 			}
 			if ferr = flush(); ferr != nil {
-				return ErrStopScan
-			}
-			// The deadline is checked at a batch boundary, which is the only
-			// place the saved position is consistent with what the buckets
-			// hold. A cancellation is classified by checkDeadline exactly as
-			// it was when each batch was its own round trip.
-			var derr error
-			if stopped, derr = w.checkDeadline(ctx); derr != nil {
-				ferr = derr
-				return ErrStopScan
-			}
-			if stopped {
 				return ErrStopScan
 			}
 			return nil
