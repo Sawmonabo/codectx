@@ -408,7 +408,7 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		// A symbolic link, a socket or a device holds no blocks of its own.
 		return os.Remove(path)
 	}
-	return r.freeFile(path, st.Size(), p, set)
+	return r.freeFile(path, st, p, set)
 }
 
 // freeFile empties one regular file a window at a time and then unlinks it.
@@ -419,13 +419,34 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 // truncation or with the unlink: a thousand small files freed at once cost
 // the filesystem what one large file of the same bytes costs, and the
 // measurement that set FreeInterval counted bytes, not calls.
-func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) error {
+//
+// The bytes an unlink will release are charged BEFORE the unlink, never
+// after. Emptying a file needs write on the file and unlinking it needs write
+// only on the directory, so a file the process may remove but may not
+// truncate reaches the unlink at its full length -- every published blob is
+// one of those, being made read-only at publication, and nothing bounds a
+// blob's size. Charging after the unlink would hand the host that whole
+// length in one act and wait for it afterwards, which is the burst the pace
+// exists to prevent: the wait has to come first, so the length is given back
+// over its own size's worth of windows and the unlink is the last thing that
+// happens.
+//
+// Attribution goes the other way: the counter is credited only once the name
+// is actually gone, so what an operator reads as given back is never bytes
+// that are still on the disk.
+func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, set *os.File) error {
+	size := st.Size()
 	var shrinkErr error
-	if size > Window {
-		var left int64
-		left, shrinkErr = r.empty(path, size, p, set)
-		size = left
+	switch {
+	case !shrinkable(st):
+		// Another name reaches this object, so unlinking this one gives
+		// nothing back: the object and its blocks stay. There is nothing to
+		// pace and nothing to attribute.
+		size = 0
+	case size > Window:
+		size, shrinkErr = r.empty(path, size, p, set)
 	}
+	r.charge(size, set)
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -433,16 +454,19 @@ func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) e
 		return err
 	}
 	attribute(p, size)
-	r.charge(size, set)
 	return shrinkErr
 }
 
 // empty truncates one regular file towards zero a window at a time, syncing
 // its data and charging the pace after each window, and reports the length
-// left on it. A file the process may unlink but may not truncate is left
-// whole, at its full length, for the unlink to free: pacing is how a removal
-// is performed, never whether it is allowed. Its bytes are charged all the
-// same. So is a file another name still reaches: see shrinkable.
+// the unlink that follows will still have to give back. A file the process
+// may unlink but may not truncate is left whole, at its full length, for the
+// unlink to free: pacing is how a removal is performed, never whether it is
+// allowed, and its full length is what the unlink then owes the pace.
+//
+// A file another name still reaches is left whole too, and owes nothing: the
+// object outlives this name, so the unlink gives no blocks back and a wait
+// for them would be a wait for nothing. See shrinkable.
 func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	switch {
@@ -458,7 +482,7 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 		return size, err
 	}
 	if !shrinkable(st) {
-		return size, nil
+		return 0, nil
 	}
 	cur := size
 	for cur > 0 {

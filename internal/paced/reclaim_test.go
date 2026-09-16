@@ -272,3 +272,82 @@ func TestAQueuedEntryThatCannotBeFreedDoesNotStopTheOnesBehindIt(t *testing.T) {
 		t.Fatalf("after the retry, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
+
+// waitFor polls until the condition holds or the bound passes, and reports
+// whether it held. It is how a test observes the reclaimer stopped at a
+// window boundary without racing it.
+func waitFor(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
+// The requirement: a file the process may unlink but may not truncate must
+// wait its own size's worth of windows BEFORE it is unlinked. Every published
+// blob is such a file -- a content-addressed store makes its objects
+// read-only at publication and nothing bounds a blob's size, so the largest
+// file in a repository is one of them -- and the unlink of a whole one hands
+// the host its entire length in a single act. On a host that discards freed
+// blocks into a sparse image that is the burst which stalls every writer on
+// the machine for about a minute, a minute later, with nothing inside the
+// machine able to observe or wait for it. Charging the pace after the unlink
+// waits for space that has already gone.
+//
+// Mutation: charge after the unlink (move r.charge below os.Remove in
+// freeFile) and the whole file is gone before the reclaimer's first wait.
+func TestAFileThatCannotBeTruncatedWaitsItsSizeBeforeItIsUnlinked(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability opens a read-only file for writing, " +
+			"so the file this test is built on is truncated a window at a time and it would pass vacuously")
+	}
+	served := t.TempDir()
+	set := filepath.Join(served, "to-free")
+	RegisterToFree(served, func() (string, error) { return set, os.MkdirAll(set, 0o700) })
+	waits, release := gateSleep(t)
+
+	const windows = 4
+	path := filepath.Join(served, "published")
+	writeFile(t, path, windows*Window)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	freedBefore := FreedByPurpose()[Materialization]
+	if err := RemoveFor(Materialization, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if !waitFor(10*time.Second, func() bool { return len(waits()) > 0 }) {
+		t.Fatal("the reclaimer never reached a wait for a file it cannot truncate")
+	}
+	pending, err := PendingFreeBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(windows) * Window; pending != want {
+		t.Fatalf("at the reclaimer's first wait %d bytes of %d await freeing: "+
+			"a file that cannot be truncated was handed to the host before the pace waited for it", pending, want)
+	}
+	if got := FreedByPurpose()[Materialization] - freedBefore; got != 0 {
+		t.Fatalf("%d bytes are counted as given back while the file is still whole on the disk", got)
+	}
+
+	release()
+	mustDrain(t, 10*time.Second)
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("the file survived its removal: %v", err)
+	}
+	if got := len(waits()); got != windows {
+		t.Fatalf("the file's %d windows were given back over %d waits; want one wait per window", windows, got)
+	}
+	if got := FreedByPurpose()[Materialization] - freedBefore; got != int64(windows)*Window {
+		t.Fatalf("attributed %d bytes to the purpose; want %d", got, int64(windows)*Window)
+	}
+	if pending, err := PendingFreeBytes(); err != nil || pending != 0 {
+		t.Fatalf("after draining, %d bytes await freeing (%v); want none", pending, err)
+	}
+}

@@ -499,6 +499,16 @@ small files -- a materialized tree of thousands of source files -- is given
 back at the same rate as one large file, and a caller that frees in place
 spends the same windows as the reclaimer.
 
+A file the process may unlink but may not truncate -- every published blob is
+one, the store making its objects read-only at publication, and nothing bounds
+a blob's size -- reaches the unlink whole, so the unlink is what gives its
+whole length back in one act. Those bytes are therefore charged **before** the
+unlink: the removal waits its own size's worth of windows and the unlink is
+the last thing that happens, rather than the first. A file another name still
+reaches owes nothing either way, because unlinking one of an object's names
+gives no blocks back; it is neither paced nor counted until the last name
+goes.
+
 The to-free sets are on the disk, inside the pool instance the process claims,
 so a run that exits or crashes with removals queued leaves them for the next
 process to take over and finish at the same pace. Nothing is ever freed faster
