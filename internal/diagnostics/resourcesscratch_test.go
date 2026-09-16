@@ -40,13 +40,17 @@ import (
 func TestTheResourcesBlockDisclosesEveryPoolAndWhatWasFreedFor(t *testing.T) {
 	const each = 128 << 10
 	var held int64
-	for range 2 {
-		lease, f, err := scratch.For(t.TempDir()).TakeFile(scratch.SortRun)
+	// Two directories, and the import staging surface among them: it is the
+	// largest single file the product writes, and while it was pooled outside
+	// the arena the figure whose own comment says a partial sum "is the one
+	// thing this figure exists to rule out" did not count it at all.
+	for _, p := range []scratch.Purpose{scratch.SortRun, scratch.ImportStaging} {
+		lease, f, err := scratch.For(t.TempDir()).TakeFile(p)
 		if err != nil {
-			t.Fatalf("take: %v", err)
+			t.Fatalf("take %s: %v", p, err)
 		}
 		if _, err := f.Write(make([]byte, each)); err != nil {
-			t.Fatalf("write: %v", err)
+			t.Fatalf("write %s: %v", p, err)
 		}
 		lease.Release()
 		held += each
