@@ -17,15 +17,19 @@ import (
 // computed, because their declared types differ by platform (Bavail is uint64
 // on linux/amd64, int64 or uint32 elsewhere) and some filesystems report a
 // negative Bavail once the reserve is over-consumed; read as unsigned that is
-// a near-2^64 "free" figure. A non-positive field, or a product that would not
-// round-trip through int64, is reported as unmeasured.
+// a near-2^64 "free" figure. A NEGATIVE Bavail, a non-positive block size, or
+// a product that would not round-trip through int64, is reported as unmeasured.
+//
+// Zero is not: a filesystem with no block available to this user is the one
+// state the measurement exists to report, and calling it unmeasurable would
+// hide the full disk behind "could not be measured".
 func Available(dir string) (uint64, bool) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(dir, &st); err != nil {
 		return 0, false
 	}
 	avail, size := int64(st.Bavail), int64(st.Bsize)
-	if avail <= 0 || size <= 0 {
+	if avail < 0 || size <= 0 {
 		return 0, false
 	}
 	if avail > math.MaxInt64/size {

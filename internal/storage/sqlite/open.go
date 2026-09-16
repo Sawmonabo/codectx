@@ -756,10 +756,13 @@ const (
 // measures the space free under the database at the moment of the failure
 // and says which it saw: with less than one ingestion group free the refusal
 // is a full disk's and the error stays CTX_DISK_FULL, naming the figure; with
-// more, the disk is not full, the device or its driver refused the operation,
-// and the error becomes CTX_INTERNAL carrying the engine's message and code
-// and the figure that rules a full disk out. A disk the platform cannot
-// measure keeps CTX_DISK_FULL and says the measurement was unavailable.
+// more, the error becomes CTX_INTERNAL carrying the engine's message and code
+// and the figure. It states what was measured and stops there: free space
+// under the directory is blind to a user quota, a container limit and another
+// filesystem mounted underneath, so a refusal with gigabytes free may still be
+// the writer's own limit rather than the device, and the remediation lists all
+// three. A disk the platform cannot measure keeps CTX_DISK_FULL and says the
+// measurement was unavailable.
 // Every other error passes through unchanged.
 func (s *Store) attribute(err error) error {
 	var typed *model.Error
@@ -783,8 +786,9 @@ func (s *Store) attribute(err error) error {
 	default:
 		settled.Code = model.CodeInternal
 		settled.Details[detailFreeBytes] = strconv.FormatUint(free, 10)
-		settled.Message += fmt.Sprintf("; %d bytes are free under %s, so the disk is not full: the device or its driver refused the operation", free, dir)
-		settled.Remediation = "check the kernel log for the device holding " + dir
+		settled.Message += fmt.Sprintf("; %d bytes were free under %s when the write was refused", free, dir)
+		settled.Remediation = "check for a quota on the writing user, a limit on the container or filesystem holding " +
+			dir + ", and the kernel log for its device"
 	}
 	return settled
 }
