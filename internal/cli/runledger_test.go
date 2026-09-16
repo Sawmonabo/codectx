@@ -278,8 +278,13 @@ func ledgerCommand() (*cobra.Command, *bytes.Buffer) {
 // suppresses every line of the run it is meant to follow. That is why the run
 // id here appears only after the subscription, exactly as it does in a command.
 //
+// The third is the mirror of the second: one index call can open a second run
+// when an attempt re-captures after a version conflict, so an id latched from
+// the first row suppresses every stage of the attempt that actually published.
+//
 // Mutation: capture the id at subscribe time -- bind runID from ws.IndexRunID()
 // before ws.Spans and compare against it -- and the followed run's line is gone.
+// Latching it on first use instead leaves the re-capture's stage unprinted.
 func TestProgressiveLinesFollowOnlyThisCommandsRun(t *testing.T) {
 	ws := &fakeStageSource{}
 	cmd, out := ledgerCommand()
@@ -289,12 +294,26 @@ func TestProgressiveLinesFollowOnlyThisCommandsRun(t *testing.T) {
 	ws.runID = "mine"
 	ws.emit(model.StageRecord{RunID: "mine", Stage: "walk", ItemsIn: 1, ItemsOut: 1})
 	ws.emit(model.StageRecord{RunID: "another", Stage: "collection", ItemsIn: 9, ItemsOut: 9})
-	stop()
+	// Not stopped yet: stop is a barrier that ends the block, and the third
+	// case below is the same command still running.
 	printed := out.String()
 	if !strings.Contains(printed, "walk") {
 		t.Fatalf("the followed run's stage is missing from the progressive lines:\n%s", printed)
 	}
 	if strings.Contains(printed, "collection") {
 		t.Fatalf("another run's stage was printed as this command's work:\n%s", printed)
+	}
+	// The attempt re-captures: the same command is now publishing under a new
+	// run, and it is that run whose stages the operator is waiting to see.
+	ws.runID = "retry"
+	ws.emit(model.StageRecord{RunID: "retry", Stage: "activation", ItemsIn: 2, ItemsOut: 2})
+	ws.emit(model.StageRecord{RunID: "mine", Stage: "retention", ItemsIn: 3, ItemsOut: 3})
+	stop()
+	printed = out.String()
+	if !strings.Contains(printed, "activation") {
+		t.Fatalf("the re-captured run's stage is missing: an attempt that published printed nothing:\n%s", printed)
+	}
+	if strings.Contains(printed, "retention") {
+		t.Fatalf("the abandoned attempt's stage was printed as this command's work:\n%s", printed)
 	}
 }
