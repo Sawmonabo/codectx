@@ -481,6 +481,48 @@ func (a *Arena) createLocked(instance string, p Purpose) (string, *os.File, erro
 // the pool grows every time the run removes something.
 func (a *Arena) Bytes() (int64, error) { return dirBytes(a.root) }
 
+// BytesByPurpose splits Bytes over the purposes the surfaces were taken for,
+// across every instance this arena's directory holds -- this process's and
+// those of processes that are no longer running. It is what an operator is
+// shown before being asked to give the space back: "12 GB of scratch" is a
+// number to be alarmed by, and "11 GB of it is sort runs one query spilled" is
+// a number to decide on.
+//
+// The purposes are read from the disk rather than from the constant list, so a
+// directory left by a build that pooled something this one does not is
+// reported under its own name instead of vanishing from a total that still
+// counts it.
+func (a *Arena) BytesByPurpose() (map[Purpose]int64, error) {
+	out := map[Purpose]int64{}
+	instances, err := os.ReadDir(a.root)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return out, nil
+		}
+		return nil, err
+	}
+	for _, in := range instances {
+		if !in.IsDir() {
+			continue
+		}
+		purposes, err := os.ReadDir(filepath.Join(a.root, in.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, pe := range purposes {
+			if !pe.IsDir() || paced.IsToFreeDir(pe.Name()) {
+				continue
+			}
+			n, err := dirBytes(filepath.Join(a.root, in.Name(), pe.Name()))
+			if err != nil {
+				return nil, err
+			}
+			out[Purpose(pe.Name())] += n
+		}
+	}
+	return out, nil
+}
+
 // ErrInUse refuses to empty an arena while something holds a surface of it.
 var ErrInUse = errors.New("scratch arena in use")
 
