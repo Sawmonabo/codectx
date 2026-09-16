@@ -113,7 +113,7 @@ func failure(class FailureClass, scopeKey string, o Outcome, r Reservation) *mod
 	// its child wrote to standard error has discarded the one record of what
 	// went wrong, which is what a 7.5 KB crash on a real repository did.
 	if o.StderrTail != "" {
-		err = err.WithDetail("stderr_tail", truncate(o.StderrTail, model.MaxDetailBytes))
+		err = err.WithDetail(model.DetailStderrTail, truncate(o.StderrTail, model.MaxDetailBytes))
 	}
 	// The observed peak is the tree's, sampled while it ran: what the failed
 	// unit actually used, against what it was admitted for. It is reported for
