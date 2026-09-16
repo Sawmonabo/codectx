@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -546,7 +547,65 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeCapabilities(&b, result.Completeness)
+	writeIndexRunLedger(&b, result.Run, result.Stages)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
+}
+
+// writeIndexRunLedger appends what the run cost and which of its stages that
+// cost went to, in this block's label-and-value idiom.
+//
+// Only the run's own top-level stages are listed, and each with its share of
+// the run. A unit nested under a stage is already counted inside it, so listing
+// both would report shares that add up to more than the run and leave the
+// operator unable to see which stage the time actually went to.
+func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+	if run == nil {
+		return
+	}
+	fmt.Fprintf(b, "run         %s in %s, %d planned, %d succeeded, %d failed, %d subdivided\n",
+		run.Outcome, wallMetric(run.WallMS, run.Outcome == runOutcomeRunning, run.FinishedAt),
+		run.UnitsPlanned, run.UnitsSucceeded, run.UnitsFailed, run.UnitsSubdivided)
+	if run.EventsDropped > 0 {
+		fmt.Fprintf(b, "incomplete  %d accounting %s dropped; the stages below are not the whole run\n",
+			run.EventsDropped, plural(int(run.EventsDropped), "event was", "events were"))
+	}
+	for _, stage := range topLevelStagesByWall(stages) {
+		fmt.Fprintf(b, "stage       %s %s, %s of the run, %s, in %d, out %d\n",
+			stage.Stage, wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
+			shareMetric(stage.ShareOfWall), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
+	}
+}
+
+// topLevelStagesByWall is the run's own stages, costliest first, with the run's
+// ordinal breaking a tie so two runs of the same shape print the same lines. It
+// sorts a copy: the result it is given is the one the envelope carries, and
+// reordering that would make the human block and the --json rows two orders of
+// one list.
+func topLevelStagesByWall(stages []model.StageRecord) []model.StageRecord {
+	top := make([]model.StageRecord, 0, len(stages))
+	for _, stage := range stages {
+		if stage.ParentSeq == nil {
+			top = append(top, stage)
+		}
+	}
+	slices.SortStableFunc(top, func(a, b model.StageRecord) int {
+		if order := cmp.Compare(b.WallMS, a.WallMS); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Seq, b.Seq)
+	})
+	return top
+}
+
+// shareMetric renders a stage's share of its run. A share of zero is not a
+// measured zero: it is what a run whose own wall was never measured leaves
+// behind, and printing "0%" beside a stage with a real wall would claim the
+// stage took none of a run it plainly took time out of.
+func shareMetric(share float64) string {
+	if share <= 0 {
+		return metricUnavailable
+	}
+	return fmt.Sprintf("%.0f%%", share*100)
 }
 
 // writeIndexStatus renders the human status block. Every value is one the
