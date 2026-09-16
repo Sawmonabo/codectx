@@ -34,8 +34,20 @@ func (c Cursor) Validate() error {
 	if c.GenerationID <= 0 {
 		return cursorInvalid("cursor does not pin a generation")
 	}
-	if !model.ValidHexID(string(c.AnalysisKey)) || !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID) {
-		return cursorInvalid("cursor analysis key, query hash and lease id must be well-formed identifiers")
+	if !model.ValidHexID(string(c.AnalysisKey)) || !model.ValidHexID(c.QueryHash) {
+		return cursorInvalid("cursor analysis key and query hash must be well-formed identifiers")
+	}
+	// A cursor that names a SPOOL must name the lease that keeps that spool
+	// readable. A pure keyset cursor retains nothing on disk: it carries its
+	// whole position in the token, and the generation it pins is held by the
+	// read snapshot of whichever call presents it, so it may carry no lease at
+	// all. That is what lets a process with no writer -- one answering while
+	// another indexes -- hand back a continuation instead of stopping.
+	if c.SpoolID != "" && !model.ValidHexID(c.LeaseID) {
+		return cursorInvalid("a cursor naming a spool must name the lease that retains it")
+	}
+	if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
+		return cursorInvalid("cursor lease id is malformed")
 	}
 	if len(c.LastKey) > maxLastKeyBytes {
 		return cursorInvalid("cursor sort key exceeds its bound; use a spool")

@@ -113,15 +113,15 @@ Three kinds of command, by what they may change:
 | | Workspace lock | Database writes | Commands |
 |---|---|---|---|
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
-| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep`, `symbol`, the graph walks |
-| **Answering** | None | **None at all** | `status`, `search`, `repomap`, `doctor` |
+| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep`, the graph walks |
+| **Answering** | None | **None at all** | `status`, `search`, `symbol`, `repomap`, `doctor` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
 
-`symbol` and the graph walks are in the recording row for one reason: their
-continuations are not yet written to end the way `search`'s does below, so they
-keep the writer until they are.
+The graph walks are in the recording row for one reason: their continuations
+retain a spool directory whose reclamation is governed by a cursor lease, and a
+lease is a write. They keep the writer until that is settled.
 
 A command in the answering row opens the store without a writer connection. It
 answers throughout another process's `index` or `watch` -- that is the promise
@@ -136,6 +136,11 @@ Two consequences an operator sees:
   needs a cursor lease and a spool, which are writes, so the answer is served
   and marked truncated, with a reason naming the hits beyond it, rather than
   carrying a token the process could not honour.
+* `symbol` pages in full from such a process. Its continuation carries its whole
+  position in the token and retains nothing on disk, so it needs no lease: the
+  generation it names is held by the read snapshot of whichever call presents
+  it, and a generation collected in between is answered `CTX_CURSOR_INVALID`,
+  re-run from the first page.
 * `doctor --deep` is in the recording row, not the answering one: the search
   index's own integrity check is spelled as an insert into the index, so a deep
   report needs the writer. It still takes no workspace lock.

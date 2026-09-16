@@ -89,7 +89,7 @@ func newSymbolCommand(build model.BuildInfo) *cobra.Command {
 			// owns the open, the close, the --timeout deadline and the typing
 			// of a bare context failure.
 			var result model.Page[model.Node]
-			if err := runService(cmd, openForReport(),
+			if err := runService(cmd, openForQuery(),
 				func(ctx context.Context, _ *app.Workspace, svc *app.Services) error {
 					var err error
 					result, err = svc.Symbol(ctx, req)

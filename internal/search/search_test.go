@@ -292,7 +292,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
 		{"fix/a_writerless_process_serves_one_page_and_mints_no_cursor", legReadOnlyServesOnePage},
-		{"fix/a_cursor_naming_a_collected_generation_is_a_cursor_failure", legCollectedGenerationIsACursorFailure},
+		{"fix/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
 		// FX-H-G rows
@@ -2176,7 +2176,7 @@ func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
 	}
 }
 
-// legCollectedGenerationIsACursorFailure proves the across-call end of a pin
+// TestSearchContinuationOverACollectedGeneration proves the across-call end of a pin
 // that holds its generation by snapshot rather than by lease. Both endpoints
 // here pin the generation the TOKEN names, so a continuation presented after
 // the retention pass behind another process's activation has collected that
@@ -2192,7 +2192,10 @@ func legTwoOffsetNodeServesThePrecedenceWinner(t *testing.T, _ *fixture) {
 //
 // Mutation: make resumePinFailure return err unchanged. The leg then fails with
 // CTX_ARGUMENT_INVALID.
-func legCollectedGenerationIsACursorFailure(t *testing.T, f *fixture) {
+// It collects a generation, so it runs on a fixture of its own rather than as a
+// leg of the shared-corpus scenario.
+func TestSearchContinuationOverACollectedGeneration(t *testing.T) {
+	f := newFixture(t)
 	s := newService(t, f.opts)
 	first, err := s.Search(f.ctx, model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}})
 	if err != nil {
@@ -2260,4 +2263,64 @@ func (f *fixture) unitOf(d doc) model.UnitID {
 	spec := model.UnitSpec{ProviderID: fixtureProviderID, ProviderVersion: fixtureProviderVersion,
 		ScopeKey: d.path, InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
 	return model.NewUnitID(spec, fixtureConfigHash)
+}
+
+// legWriterlessSymbolPagesInFull proves that `symbol` keeps PAGING from a
+// process that opened the store read-only -- the composition that answers while
+// another process is indexing.
+//
+// Unlike search's, this continuation writes nothing: it carries its whole
+// position in the token and retains no spool, so the only thing it ever needed
+// a lease for was to retain the generation it names. The read snapshot of the
+// call that presents it does that, and a generation collected in between is
+// answered in the cursor's family. Requiring the lease anyway made an answer
+// larger than one page unreachable for the whole length of an index -- a
+// symbol query that silently stops after its first page is the failure this
+// guards.
+//
+// Mutation: drop the reader.Continuable() branch in keysetNext so the lease is
+// always acquired. The leg then fails with the read-only store's refusal.
+func legWriterlessSymbolPagesInFull(t *testing.T, f *fixture) {
+	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("read-only Open: %v", err)
+	}
+	t.Cleanup(func() { ro.Close() })
+	opts := f.opts
+	opts.Store = ro
+	opts.Leases = pagination.NewLeases(ro, pagination.DefaultCursorTTL)
+	s := newService(t, opts)
+
+	req := model.SymbolRequest{Query: "Handle", Operation: model.SymbolResolve,
+		SemanticSource: model.SemanticCanonical, Page: model.PageRequest{Limit: 1}}
+	first, err := s.Resolve(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless symbol query failed instead of answering: %v", err)
+	}
+	if len(first.Items) != 1 {
+		t.Fatalf("page 1 served %d nodes, want 1", len(first.Items))
+	}
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a writerless symbol query stopped after one page of a longer answer")
+	}
+	seen := len(first.Items)
+	cursor := first.Meta.NextCursor
+	for cursor != "" {
+		req.Page.Cursor = cursor
+		page, err := s.Resolve(f.ctx, req)
+		if err != nil {
+			t.Fatalf("a writerless symbol continuation failed: %v", err)
+		}
+		seen += len(page.Items)
+		cursor = page.Meta.NextCursor
+	}
+	whole := model.SymbolRequest{Query: "Handle", Operation: model.SymbolResolve,
+		SemanticSource: model.SemanticCanonical}
+	all, err := s.Resolve(f.ctx, whole)
+	if err != nil {
+		t.Fatalf("Resolve(unpaged): %v", err)
+	}
+	if seen != len(all.Items) {
+		t.Fatalf("paging a writerless symbol query reached %d nodes, want the %d the one-shot answer has", seen, len(all.Items))
+	}
 }
