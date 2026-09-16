@@ -340,3 +340,70 @@ func TestUnlimitedSpoolBudgetRefusesNothingAndStillReadsBack(t *testing.T) {
 		t.Fatalf("read back %d records; the single %d-byte record must reassemble whole", len(got), len(big))
 	}
 }
+
+// TestALeaselessSpoolIsReclaimedByAnyProcessesSweep protects the reclamation
+// predicate of continuation state written by a process that records no lease.
+//
+// Failure mode: a process answering while another indexes writes a spool it
+// cannot bind to a lease row, and the entry is then governed by nothing --
+// every sweep reads its header, finds no lease to ask about, and leaves it
+// where it is. That is an unbounded disk leak in the one directory
+// resources.max_temp_bytes is supposed to bound, and it is invisible to every
+// token-level check because the token itself works. The second store here is
+// the whole point: it shares only the directory, holds no reservation and no
+// lease row for the entry, and stands for the `gc` or `index` run in another
+// process that has to be able to reclaim what this one left.
+func TestALeaselessSpoolIsReclaimedByAnyProcessesSweep(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	now := time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC)
+	writer, err := pagination.NewSpools(dir, 0, &leaseTable{expiry: map[string]time.Time{}})
+	if err != nil {
+		t.Fatalf("NewSpools: %v", err)
+	}
+	cursor := pagination.Cursor{Endpoint: "graph", GenerationID: 7,
+		AnalysisKey: model.AnalysisKey(model.H("analysis", "a")), QueryHash: model.H("query", "q"),
+		ExpiresAt: now.Add(15 * time.Minute)}
+	sp, err := writer.Create(cursor)
+	if err != nil {
+		t.Fatalf("Create without a lease: %v", err)
+	}
+	cursor.SpoolID = sp.ID()
+	if err := sp.Append([]byte("tail-1")); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if err := sp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Another process over the same directory: no reservation, no lease row.
+	other, err := pagination.NewSpools(dir, 0, &leaseTable{expiry: map[string]time.Time{}})
+	if err != nil {
+		t.Fatalf("NewSpools(second process): %v", err)
+	}
+	var records []string
+	if err := other.Open(ctx, cursor, now.Add(time.Minute), func(rec []byte) error {
+		records = append(records, string(rec))
+		return nil
+	}); err != nil {
+		t.Fatalf("a second process could not read a live leaseless spool: %v", err)
+	}
+	if len(records) != 1 || records[0] != "tail-1" {
+		t.Fatalf("records = %q, want the appended tail", records)
+	}
+	if live, err := other.Sweep(ctx, now.Add(time.Minute)); err != nil || live == 0 {
+		t.Fatalf("Sweep before the header's expiry = %d live bytes %v; want the spool kept", live, err)
+	}
+	live, err := other.Sweep(ctx, now.Add(16*time.Minute))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if live != 0 {
+		t.Fatalf("a leaseless spool survived a sweep past its recorded expiry: %d live bytes remain", live)
+	}
+	if err := other.Open(ctx, cursor, now.Add(16*time.Minute), func([]byte) error { return nil }); err == nil {
+		t.Fatal("Open served a leaseless spool past its recorded expiry")
+	} else if typed, ok := err.(*model.Error); !ok || typed.Code != model.CodeCursorInvalid {
+		t.Fatalf("Open past the recorded expiry = %v, want %s", err, model.CodeCursorInvalid)
+	}
+}

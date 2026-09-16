@@ -183,20 +183,15 @@ func (c traversalCursor) validate() error {
 	if !model.ValidHexID(c.QueryHash) {
 		return cursorInvalid("cursor query hash must be a well-formed identifier")
 	}
-	// A cursor that names RETAINED STATE -- a spool of ranked records or a
-	// retained walk directory -- must name the lease that keeps it readable:
-	// the spool store gates every adoption on that lease's expiry, so state
-	// named by a leaseless cursor would have no reclamation predicate and
-	// would sit on disk until the cache was removed by hand. A PURE KEYSET
-	// cursor retains nothing: it carries its whole position in the token, and
-	// the generation it names is held by the read snapshot of whichever call
-	// presents it. That is what lets a process which writes nothing -- one
-	// answering while another indexes -- hand back a continuation at all.
-	if c.SpoolID != "" || c.RetainID != "" {
-		if !model.ValidHexID(c.LeaseID) {
-			return cursorInvalid("a cursor naming retained state must name the lease that retains it")
-		}
-	} else if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
+	// A cursor may name no lease. A PURE KEYSET cursor retains nothing: it
+	// carries its whole position in the token, and the generation it names is
+	// held by the read snapshot of whichever call presents it. RETAINED STATE
+	// -- a spool of ranked records or a retained walk directory -- named by a
+	// leaseless cursor is bound to this cursor's own expiry, which the spool
+	// store stamps into the entry's header and reclaims it by. That is what
+	// lets a process which writes nothing -- one answering while another
+	// indexes -- hand back a continuation of either shape.
+	if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
 		return cursorInvalid("cursor lease id is malformed")
 	}
 	// The analysis key is only bounded here, not required to be canonical hex:
@@ -778,16 +773,12 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// rather than resuming without them. A pure keyset continuation carries its
 	// whole position in the token and needs neither.
 	needsRetain := c.More || c.WalkDone
-	// A process that writes nothing can mint neither the cursor lease nor the
-	// directory the resumed walk would read, and a directory adopted without a
-	// lease would have nothing to reclaim it. So it continues ONLY the shape
-	// that retains nothing, and every other shape ends here: the page in hand
-	// is served and the answer reports what it did not reach, rather than
-	// naming state it could not keep.
+	// A process that writes nothing to the database records no cursor lease. It
+	// still retains the directory -- that is a filesystem write -- and the
+	// entry is bound to this cursor's expiry instead, which every page of the
+	// walk re-stamps as it re-adopts the directory. So both shapes continue
+	// here; only the lease is conditional.
 	retains := e.leases.Retains()
-	if !retains && (needsRetain || c.Retain != nil) {
-		return "", nil
-	}
 	if needsRetain && (c.Retain == nil || e.spools == nil) {
 		return "", nil
 	}

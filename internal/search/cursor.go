@@ -189,8 +189,13 @@ func (c searchCursor) validate() error {
 		return cursorInvalid("cursor was issued by a different endpoint")
 	case c.GenerationID <= 0:
 		return cursorInvalid("cursor does not pin a generation")
-	case !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID):
-		return cursorInvalid("cursor query hash and lease id must be well-formed identifiers")
+	case !model.ValidHexID(c.QueryHash):
+		return cursorInvalid("cursor query hash must be a well-formed identifier")
+	case c.LeaseID != "" && !model.ValidHexID(c.LeaseID):
+		// A continuation minted by a process that records no lease names none:
+		// the spool it names is bound to this cursor's expiry instead, which is
+		// the predicate pagination.Spools.live applies to a leaseless entry.
+		return cursorInvalid("cursor lease id is malformed")
 	case !model.ValidHexID(string(c.AnalysisKey)):
 		return cursorInvalid("cursor does not name an analysis key")
 	case !model.ValidHexID(c.SpoolID):
