@@ -97,9 +97,9 @@ parser workers), read by the Task 20 host sampler.
 ### What one parser worker costs
 
 The parser worker count is a CONCURRENCY figure, not a resident cost: the
-pool starts no process until a unit demands one and reaps an idle worker after
-`tree_sitter.worker_idle_ttl`, so a process that parses nothing holds no worker
-(`TestPoolLazyAndReaped`), and the number alive at any moment is the concurrent
+pool starts no process until a unit demands one and drains every worker when the
+last unit returns, so a process that has stopped parsing holds no worker at all
+(`TestPoolLazyAndDrainedWhenTheStageEnds`), and the number alive is the concurrent
 parse demand rather than the ceiling. What one live worker costs was measured on
 the measuring host from `/proc/<pid>/smaps_rollup`, on a worker that had sent its
 hello and parsed nothing: **18.2 MiB RSS, 9.4 MiB PSS**.

@@ -336,7 +336,11 @@ truncation, never sent oversize.
   reaped it, so an idle worker and one still shutting down both still count. A
   unit reuses an idle worker, starts one when the pool is under its bound, or
   waits (promptly returning on cancellation) until a worker goes idle or a
-  process exits; it then reads the hello within 30 seconds. Bounding callers
+  process exits; it then reads the hello within 30 seconds. A worker stays warm
+  only while there is parse work in flight: the last unit to finish drains the
+  pool, so a process that has stopped parsing holds none. There is no idle
+  timer, because a timer would only choose how long a resting machine carries
+  one worker per core to save the milliseconds a restart costs. Bounding callers
   instead would let a caller start a fresh worker while an expiring one still
   held its runner slot and memory reservation, and the runner would then refuse
   an admission the pool itself caused.

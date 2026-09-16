@@ -137,7 +137,6 @@ func (c Config) validate() error {
 		{"storage.closed_session_retention", c.Storage.ClosedSessionRetention},
 		{"storage.query_cursor_ttl", c.Storage.QueryCursorTTL},
 		{"retention.blob_grace", c.Retention.BlobGrace},
-		{"providers.tree_sitter.worker_idle_ttl", c.Providers.TreeSitter.WorkerIdleTTL},
 		{"providers.scip.stall_timeout", c.Providers.SCIP.StallTimeout},
 		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
