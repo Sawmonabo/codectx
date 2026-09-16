@@ -112,7 +112,9 @@ func run(t *testing.T, src, export string, opts neo4jcsv.Options) (neo4jcsv.Repo
 			o.UnitScopeKey, o.ProjectRoot = req.Unit.ScopeKey, t.TempDir()
 			o.Limits = providertest.Limits
 			o.Repository, o.Unit, o.Run, o.Content = req.Binding.RepositoryID, req.Unit, req.Run, req.Content
-			o.ScratchDir = t.TempDir()
+			if o.ScratchDir == "" {
+				o.ScratchDir = t.TempDir()
+			}
 			rep, importErr = neo4jcsv.Import(ctx, export, req.Resolver, recorder{Sink: sink, c: &c}, o)
 			if importErr != nil {
 				return model.ProviderResult{}, importErr
@@ -917,5 +919,71 @@ func TestDerivedRowsOverAUserSetBoundImportsAndReports(t *testing.T) {
 	if bounded.DerivedRows != whole.DerivedRows || bounded.Relations != whole.Relations {
 		t.Fatalf("the bounded import published less than the unbounded one: derived %d/%d relations %d/%d",
 			bounded.DerivedRows, whole.DerivedRows, bounded.Relations, whole.Relations)
+	}
+}
+
+// TestOneStagingDatabaseIsReusedAcrossImports runs two imports through one
+// scratch directory and looks at what they left behind.
+//
+// Requirement: a run reuses the space it holds and frees nothing in the middle
+// of its work. A staging database created and deleted per import frees
+// hundreds of megabytes per unit; on a host that discards freed blocks into a
+// sparse image, that free stalls every process on the machine for about a
+// minute, minutes later, with nothing able to observe or wait for it. One file
+// per slot, emptied by dropping its tables so the engine writes over its own
+// free list, frees nothing at all and the file never shrinks.
+//
+// Mutation that fails it: give each import its own staging database again --
+// take a fresh slot per import and remove the file when the import ends.
+func TestOneStagingDatabaseIsReusedAcrossImports(t *testing.T) {
+	scratch := t.TempDir()
+	staged := func() []os.DirEntry {
+		t.Helper()
+		entries, err := os.ReadDir(scratch)
+		if err != nil {
+			t.Fatalf("scratch: %v", err)
+		}
+		var dbs []os.DirEntry
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".db") {
+				dbs = append(dbs, e)
+			}
+		}
+		return dbs
+	}
+	sizeOf := func(e os.DirEntry) int64 {
+		t.Helper()
+		info, err := e.Info()
+		if err != nil {
+			t.Fatalf("scratch entry: %v", err)
+		}
+		return info.Size()
+	}
+
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: scratch}); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	first := staged()
+	if len(first) != 1 {
+		t.Fatalf("the first import left %d staging databases, want exactly one", len(first))
+	}
+	firstSize := sizeOf(first[0])
+	if firstSize == 0 {
+		t.Fatalf("the first import left an empty staging database: nothing was staged in it")
+	}
+
+	if _, _, _, err := run(t, filepath.Join("testdata", "src", "c"), filepath.Join("testdata", "c"), neo4jcsv.Options{Language: "c", ScratchDir: scratch}); err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	second := staged()
+	if len(second) != 1 {
+		t.Fatalf("the second import left %d staging databases, want the one the first created", len(second))
+	}
+	if second[0].Name() != first[0].Name() {
+		t.Fatalf("the second import staged into %q, not the %q the first created: the file was not reused",
+			second[0].Name(), first[0].Name())
+	}
+	if got := sizeOf(second[0]); got < firstSize {
+		t.Errorf("the staging database shrank from %d to %d bytes: its pages were freed rather than recycled", firstSize, got)
 	}
 }
