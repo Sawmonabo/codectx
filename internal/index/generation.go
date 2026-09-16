@@ -390,6 +390,11 @@ func unitOutcome(res outcome, err error) ledger.Outcome {
 // unitEnding is how a unit ended on a path that never reached its provider: a
 // unit already sealed under the same key is attached rather than rebuilt, and
 // anything else here failed before the run.
+//
+// Success means attached and nothing else, because the two other ways a unit
+// returns no error -- a run that succeeded, and an optional provider's failure
+// that the generation absorbs -- have both already closed the span with their
+// own outcome, and a span records one end.
 func unitEnding(err error) ledger.Outcome {
 	switch {
 	case err == nil:
