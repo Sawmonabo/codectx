@@ -125,15 +125,22 @@ func (o *Outputs) sweep(final bool) {
 // well. A platform without range writeback has nothing finer than the file's
 // own sync, which the final sweep issues once per file.
 func (o *Outputs) hand(path string, final bool) {
+	// The kind is settled BEFORE the open, never after it. The entries of a
+	// writer's output directory are the writer's own vocabulary, and opening
+	// a named pipe blocks until a writer arrives: an open-first pacer would
+	// wedge its poll goroutine on the first one, and Stop -- which the runner
+	// defers after every child exits and which joins that goroutine -- would
+	// hang the run with nothing to time it out. Only a regular file has a
+	// range this can hand to the disk, so anything else is skipped here.
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return
-	}
 	end, sent := info.Size(), o.sent[path]
 	for end-sent >= Window {
 		if !WriteRange(int(f.Fd()), sent, Window) {
