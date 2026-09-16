@@ -1,11 +1,6 @@
 package paced
 
-import (
-	"io/fs"
-	"os"
-	"path/filepath"
-	"sync"
-)
+import "sync"
 
 // A Purpose names what a removal was for. The set is small and closed on
 // purpose: an operator reading the resources block should be able to tell at a
@@ -42,15 +37,17 @@ var (
 	freed   = map[Purpose]int64{}
 )
 
-// FreedByPurpose is the bytes this process has removed for each purpose since
-// it started, as measured before each removal.
+// FreedByPurpose is the bytes this process has actually given back to the
+// filesystem for each purpose since it started, counted as they were released
+// rather than when the removal was asked for. Space a removal has queued and
+// the reclaimer has not reached yet is not here; it is PendingFreeBytes.
 //
 // It does not add up to what Steps reports. Steps counts every window the
 // pacer handed back, including removals no call site names -- a caller's own
 // temporary file, a test's fixture -- while this accounts only the removals
-// the product labels, and it accounts their length rather than their windows.
-// The two answer different questions on purpose: Steps says how much freeing
-// this process did, and this says what the freeing was for.
+// the product labels, and it accounts bytes rather than whole windows. The two
+// answer different questions on purpose: Steps says how much freeing this
+// process did, and this says what the freeing was for.
 func FreedByPurpose() map[Purpose]int64 {
 	freedMu.Lock()
 	defer freedMu.Unlock()
@@ -71,29 +68,28 @@ func attribute(p Purpose, n int64) {
 	freedMu.Unlock()
 }
 
-// RemoveFor removes one file as Remove does and attributes its length to p.
+// RemoveFor removes one file or empty directory as Remove does and attributes
+// the bytes it releases to p. RemoveAllFor does the same for a tree.
+//
+// The removal renames the path into the to-free set that serves it and
+// returns; the reclaimer frees it, and attributes it, as the space actually
+// goes back to the filesystem. So the purpose travels with the path -- it is
+// the name of the directory the path is renamed into -- and a process that
+// exits with removals still queued has not yet accounted them, because it has
+// not yet freed them. The next process to claim the same set frees them and
+// accounts them as its own.
 func RemoveFor(p Purpose, path string) error {
-	if st, err := os.Lstat(path); err == nil && st.Mode().IsRegular() {
-		attribute(p, st.Size())
+	if queue(p, path) {
+		return nil
 	}
-	return Remove(path)
+	return freeInPlace(p, path)
 }
 
-// RemoveAllFor removes a tree as RemoveAll does and attributes the length of
-// every regular file in it to p. The measurement is taken before the removal,
-// so a tree that vanishes underneath it is accounted as what was there when it
-// was read, which is the honest figure either way.
+// RemoveAllFor removes a tree as RemoveAll does and attributes the bytes it
+// releases to p. Symbolic links are removed, never followed.
 func RemoveAllFor(p Purpose, dir string) error {
-	var total int64
-	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
-			return nil //nolint:nilerr // a tree that cannot be read is removed anyway
-		}
-		if info, err := d.Info(); err == nil {
-			total += info.Size()
-		}
+	if queue(p, dir) {
 		return nil
-	})
-	attribute(p, total)
-	return RemoveAll(dir)
+	}
+	return freeInPlace(p, dir)
 }
