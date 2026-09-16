@@ -6,25 +6,30 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"log/slog"
+	"maps"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
-// The packed per-generation term statistics, built once at activation
-// (ADR-0007 Decision 1). Visibility is resolved HERE, once, into a document
-// bitmap; one bare instance scan of the vocabulary is then folded against it
-// and streamed into three chunked streams. Nothing here holds the vocabulary:
-// heap is one part plus one term's posting list plus the bitmap.
+// The packed lexical structure (ADR-0007 Decision 1). A SEGMENT is an
+// immutable packed structure over one set of documents: a term directory in
+// term order, the term text it points into, and the posting lists, whose
+// documents ascend by rowid. A segment is folded once, by the seal of the unit
+// whose documents it holds, from the token instances that unit's own tokenizer
+// pass already produced. An activation names segments; it never rebuilds them,
+// so publishing a one-file delta costs the delta's own segment and not a
+// rewrite of the whole structure.
 //
-// Without it a query pays three b-tree descents per posting instance -- the
-// vocabulary row, the document row and the generation-membership probe -- on
-// every term of every request, and a temporary b-tree for each term's document
-// frequency.
+// Without the packed form a query pays three b-tree descents per posting
+// instance -- the vocabulary row, the document row and the generation-membership
+// probe -- on every term of every request, and a temporary b-tree for each
+// term's document frequency.
 
 // Lexical stream names. They are the `stream` column of
-// generation_lexical_parts and are duplicated in that table's CHECK
+// lexical_segment_parts and are duplicated in that table's CHECK
 // constraint; change both together.
 const (
 	streamTermDir  = "term.dir"
@@ -72,18 +77,102 @@ func lexicalColumnCode(c SearchColumn) byte {
 	return 0
 }
 
-// lexicalInstanceQuery is the one bare scan the build folds. There is
-// deliberately no ORDER BY: the instance vocabulary emits its rows in term
-// order, and asking SQLite for that order materializes the whole vocabulary in
-// a temporary b-tree before the first row -- unbounded memory for a structure
-// whose point is that it is streamed. The order the scan actually delivers is
-// verified as it arrives rather than trusted.
-const lexicalInstanceQuery = `SELECT v.term, v.doc, v.col FROM search_vocab v`
+// foldUnitSegment folds the sealing unit's staged token instances into one
+// immutable segment and records the unit as its owner. It runs inside the
+// seal's transaction, so a unit becomes sealed and gains its segment together
+// or neither. A unit that published no document gets no segment and answers
+// zero.
+func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexicalStage) (int64, error) {
+	docs, err := stage.docCount(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if docs == 0 {
+		return 0, nil
+	}
+	if err := stage.commit(ctx); err != nil {
+		return 0, err
+	}
+	// The segment row is inserted FIRST so the engine assigns its id and the
+	// parts can be keyed by it as they stream. Seals run in parallel over one
+	// writer, so deriving the id from max(id) + 1 would hand two units the
+	// same segment.
+	res, err := tx.ExecContext(ctx, `INSERT INTO lexical_segments(term_count, doc_count, bytes) VALUES(0, ?, 0)`, docs)
+	if err != nil {
+		return 0, wrap("lexical_segments", err)
+	}
+	segment, err := res.LastInsertId()
+	if err != nil {
+		return 0, wrap("lexical_segments", err)
+	}
+	w := &lexicalWriter{
+		dir:  newPartWriter(ctx, tx, segmentKey(segment), streamTermDir),
+		text: newPartWriter(ctx, tx, segmentKey(segment), streamTermText),
+		list: newPartWriter(ctx, tx, segmentKey(segment), streamPostList),
+	}
+	rows, err := stage.db.QueryContext(ctx, stageOrderedRead)
+	if err != nil {
+		return 0, wrap("lexical staging", err)
+	}
+	defer rows.Close()
+	// RawBytes aliases the driver's own buffer, so the fold allocates nothing
+	// per row; a term is copied only when it changes.
+	var term, col sql.RawBytes
+	var doc, n int64
+	for rows.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, model.Canceled(err)
+		}
+		if err := rows.Scan(&term, &doc, &col, &n); err != nil {
+			return 0, wrap("lexical staging", err)
+		}
+		column, ok := searchColumns[string(col)]
+		if !ok {
+			return 0, corrupt("lexical staging names column %q, which search_fts does not declare", string(col))
+		}
+		if err := w.add(term, doc, lexicalColumnCode(column), n); err != nil {
+			return 0, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, wrap("lexical staging", err)
+	}
+	if err := w.close(); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE lexical_segments SET term_count = ?, bytes = ? WHERE id = ?`,
+		w.terms, w.dir.total+w.text.total+w.list.total, segment); err != nil {
+		return 0, wrap("lexical_segments", err)
+	}
+	// The documents the fold just packed name their segment. They are exactly
+	// the unit's rows that no earlier fold claimed: a carried document arrived
+	// with its predecessor's segment already on it, and a batch whose ingestion
+	// failed left no row here at all.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE search_units SET segment_id = ?1 WHERE unit_id = ?2 AND segment_id IS NULL`,
+		segment, unitRow); err != nil {
+		return 0, wrap("search_units", err)
+	}
+	return segment, nil
+}
 
-// buildLexical writes the packed term statistics for gen. It runs inside
-// Activate's transaction, after the packed adjacency and before the active
-// pointer flips, so a generation is published only with the structure every
-// lexical query reads and a failed build fails the activation.
+// buildLexical records the generation's segment set. It runs inside Activate's
+// transaction, after the packed adjacency and before the active pointer flips,
+// so a generation is published only with the structure every lexical query
+// reads.
+//
+// The set is DERIVED, never copied: it is the distinct segments the live rows
+// of the generation's member units point at, in segment-id order.
+// search_units.segment_id is the source of truth -- a seal writes it over the
+// documents it folded, a carry-over copies it forward with doc_id, and a
+// compaction re-points it -- so a generation inherits its predecessor's
+// segments by that rule rather than by copying its set, and no segment can be
+// named beside the one that absorbed its documents.
+//
+// An activation therefore writes one row per segment, the visible-document
+// bitmap and whatever compaction was due, never a rewrite of the whole packed
+// structure: publishing a one-file delta costs the delta's own segment plus,
+// occasionally, one tier merge.
 func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	// ADR-0007 holds this pass to 5 % of the index wall clock. That bound is
 	// only checkable if the operator can see the pass on its own, so its start
@@ -94,68 +183,68 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	started := time.Now()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	slog.Default().Info("packed lexical build started", "generation", gen)
-	var terms, instances int64
+	slog.Default().Info("packed lexical activation started", "generation", gen)
+	var segments, merges int64
 	defer func() {
 		runtime.ReadMemStats(&after)
-		slog.Default().Info("packed lexical build finished",
+		slog.Default().Info("packed lexical activation finished",
 			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
-			"terms", terms, "instances", instances,
-			// Signed: a build that ends after a collection leaves less live
+			"segments", segments, "merges", merges,
+			// Signed: a pass that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.
 			"heap_delta_bytes", int64(after.HeapInuse)-int64(before.HeapInuse))
 	}()
 
-	visible, docCount, tokenTotal, err := visibleDocuments(ctx, tx, gen)
+	visible, docCount, tokenTotal, live, err := visibleDocuments(ctx, tx, gen)
 	if err != nil {
 		return err
 	}
-	w := &lexicalWriter{
-		dir:  newPartWriter(ctx, tx, gen, lexicalPartsTable, streamTermDir),
-		text: newPartWriter(ctx, tx, gen, lexicalPartsTable, streamTermText),
-		list: newPartWriter(ctx, tx, gen, lexicalPartsTable, streamPostList),
-	}
-	rows, err := tx.QueryContext(ctx, lexicalInstanceQuery)
+	// Segment-id order. The set comes out of a map because the one pass that
+	// resolves it is over DOCUMENTS, and asking the engine for a sorted
+	// distinct segment instead would materialize the set in a temporary b-tree
+	// at the moment that publishes facts to every reader.
+	ids := slices.Sorted(maps.Keys(live))
+	stats, err := segmentStats(ctx, tx, ids)
 	if err != nil {
-		return wrap("search_vocab", err)
-	}
-	defer rows.Close()
-	// RawBytes aliases the driver's own buffer, so a 90-million-row scan
-	// allocates nothing per row; a term is copied only when it changes.
-	var term, col sql.RawBytes
-	var doc int64
-	for rows.Next() {
-		if err := ctx.Err(); err != nil {
-			return model.Canceled(err)
-		}
-		if err := rows.Scan(&term, &doc, &col); err != nil {
-			return wrap("search_vocab", err)
-		}
-		instances++
-		if !visible.has(doc) {
-			continue
-		}
-		column, ok := searchColumns[string(col)]
-		if !ok {
-			return corrupt("search_vocab names column %q, which search_fts does not declare", string(col))
-		}
-		if err := w.add(term, doc, lexicalColumnCode(column)); err != nil {
-			return err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return wrap("search_vocab", err)
-	}
-	if err := w.close(); err != nil {
 		return err
 	}
-	terms = w.terms
-	// The commit row is written last: its presence is what tells a reader every
-	// part behind it is durable.
+	ids, merges, err = compactSegments(ctx, tx, ids, live, stats)
+	if err != nil {
+		return err
+	}
+
+	var covered int64
+	for ord, id := range ids {
+		hidden := stats[id].docs - live[id]
+		if hidden < 0 {
+			return corrupt("generation %d holds %d documents of segment %d, which packed %d",
+				gen, live[id], id, stats[id].docs)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO generation_segments(generation_id, segment_id, ord, hidden) VALUES(?, ?, ?, ?)`,
+			gen, id, ord, hidden); err != nil {
+			return wrap("generation_segments", err)
+		}
+		covered += live[id]
+	}
+	segments = int64(len(ids))
+	// Every visible document of a generation lies in exactly ONE of its
+	// segments. The set is assembled from the segments its own documents point
+	// at, so a document whose row points at a segment the set dropped would
+	// simply never be read -- a term would silently miss it on every query,
+	// with no failing check anywhere.
+	if covered != docCount {
+		return corrupt("generation %d carries %d documents but its %d segments hold %d of them",
+			gen, docCount, segments, covered)
+	}
+	// The commit row is written last: its presence is what tells a reader the
+	// whole segment set behind it is durable. The bitmap travels with it, so a
+	// reader takes the generation's visible documents as activation resolved
+	// them instead of scanning them again for every pinned generation.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO generation_lexical(generation_id, doc_count, token_total, term_count) VALUES(?, ?, ?, ?)`,
-		gen, docCount, tokenTotal, w.terms); err != nil {
+		`INSERT INTO generation_lexical(generation_id, doc_count, token_total, visible) VALUES(?, ?, ?, ?)`,
+		gen, docCount, tokenTotal, visible.bits); err != nil {
 		return wrap("generation_lexical", err)
 	}
 	return nil
@@ -163,8 +252,9 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 
 // docBitmap is the generation's visible document set, resolved once. A
 // document id is the contentless index's own key, dense in practice, so a bit
-// per id costs a byte per eight documents -- the whole reason the build can
-// fold the instance scan without a membership probe per instance.
+// per id costs a byte per eight documents -- which is what lets a read skip a
+// document an inherited segment still holds without a membership probe per
+// posting.
 type docBitmap struct {
 	bits []byte
 	max  int64
@@ -181,34 +271,53 @@ func (b *docBitmap) set(doc int64) {
 	b.bits[doc>>3] |= 1 << uint(doc&7)
 }
 
-// visibleDocuments resolves the generation's visible documents into a bitmap
-// and returns the document statistics the scorer needs, in one pass each.
-func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, int64, int64, error) {
+// generationDocumentQuery is the one pass that resolves a generation's
+// documents, and with them its segment set. There is deliberately no ORDER BY
+// and no DISTINCT: the set is folded in the caller's map, and asking the engine
+// for either would materialize every document of the generation in a temporary
+// b-tree.
+const generationDocumentQuery = `SELECT su.doc_id, su.segment_id FROM search_units su
+	WHERE EXISTS (SELECT 1 FROM generation_units gu
+		WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`
+
+// visibleDocuments resolves the generation's visible documents into a bitmap,
+// the document statistics the scorer needs, and how many documents of each
+// segment the generation still carries -- all from ONE pass over the
+// generation's documents, which is the only place the segment a document lies
+// in is known per document. The live counts are what the hidden count on
+// generation_segments is derived from, they are the generation's segment set
+// itself, and activation stores the bitmap, so no reader repeats this pass.
+func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, int64, int64, map[int64]int64, error) {
 	var docCount, tokenTotal, maxDoc int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(su.token_count), 0), coalesce(max(su.doc_id), 0)
 		FROM search_units su WHERE EXISTS (SELECT 1 FROM generation_units gu
 			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`, gen).
 		Scan(&docCount, &tokenTotal, &maxDoc); err != nil {
-		return nil, 0, 0, wrap("search_units", err)
+		return nil, 0, 0, nil, wrap("search_units", err)
 	}
 	b := &docBitmap{bits: make([]byte, maxDoc/8+1), max: maxDoc}
-	rows, err := tx.QueryContext(ctx, `SELECT su.doc_id FROM search_units su
-		WHERE EXISTS (SELECT 1 FROM generation_units gu
-			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`, gen)
+	live := map[int64]int64{}
+	rows, err := tx.QueryContext(ctx, generationDocumentQuery, gen)
 	if err != nil {
-		return nil, 0, 0, wrap("search_units", err)
+		return nil, 0, 0, nil, wrap("search_units", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var doc int64
-		if err := rows.Scan(&doc); err != nil {
-			return nil, 0, 0, wrap("search_units", err)
+		var segment sql.NullInt64
+		if err := rows.Scan(&doc, &segment); err != nil {
+			return nil, 0, 0, nil, wrap("search_units", err)
 		}
 		if doc >= 0 && doc <= maxDoc {
 			b.set(doc)
 		}
+		// A sealed unit's documents always name a segment; a NULL is a document
+		// of a unit that is still building, which no generation carries.
+		if segment.Valid {
+			live[segment.Int64]++
+		}
 	}
-	return b, docCount, tokenTotal, wrap("search_units", rows.Err())
+	return b, docCount, tokenTotal, live, wrap("search_units", rows.Err())
 }
 
 // lexicalWriter folds the instance scan into the three streams. It holds one
@@ -220,10 +329,14 @@ type lexicalWriter struct {
 
 	term    []byte
 	haveTrm bool
-	df      int64
-	listBuf []byte
-	textOff int64
-	listOff int64
+	// prev is the last term the directory received, from either path, so the
+	// order guard holds across a verbatim copy as well as a folded term.
+	prev     []byte
+	havePrev bool
+	df       int64
+	listBuf  []byte
+	textOff  int64
+	listOff  int64
 
 	doc     int64
 	last    int64
@@ -234,26 +347,28 @@ type lexicalWriter struct {
 	scratch [binary.MaxVarintLen64]byte
 }
 
-// add folds one instance row. Terms and, within a term, documents must not go
-// backwards: the streamed directory is ordered by construction and a reader
-// binary-searches it, so an out-of-order scan would silently produce a
+// add folds one input row: how many times a term occurs in one column of one
+// document. Within a term, documents must not go backwards; terms must not go
+// backwards either, which writeEntry checks for both this path and the merge's
+// verbatim one. The streamed directory is ordered by construction and a reader
+// binary-searches it, so an out-of-order write would silently produce a
 // directory no lookup can trust.
-func (w *lexicalWriter) add(term []byte, doc int64, code byte) error {
+func (w *lexicalWriter) add(term []byte, doc int64, code byte, n int64) error {
 	if code == 0 {
-		return internal("packed lexical build received an unknown column code")
+		return internal("packed lexical fold received an unknown column code")
+	}
+	if n <= 0 {
+		return corrupt("lexical staging counts term %q in document %d %d times", string(term), doc, n)
 	}
 	switch {
 	case !w.haveTrm || !bytes.Equal(w.term, term):
-		if w.haveTrm && bytes.Compare(term, w.term) < 0 {
-			return corrupt("search_vocab emitted term %q after term %q", string(term), string(w.term))
-		}
 		if err := w.flushTerm(); err != nil {
 			return err
 		}
 		w.term = append(w.term[:0], term...)
 		w.haveTrm = true
 	case doc < w.doc:
-		return corrupt("search_vocab emitted term %q at document %d after document %d", string(term), doc, w.doc)
+		return corrupt("packed lexical fold emitted term %q at document %d after document %d", string(term), doc, w.doc)
 	}
 	if !w.haveDoc || doc != w.doc {
 		if err := w.flushDoc(); err != nil {
@@ -261,7 +376,7 @@ func (w *lexicalWriter) add(term []byte, doc int64, code byte) error {
 		}
 		w.doc, w.haveDoc = doc, true
 	}
-	w.counts[code]++
+	w.counts[code] += n
 	return nil
 }
 
@@ -306,7 +421,7 @@ func (w *lexicalWriter) appendUvarint(dst []byte, v uint64) []byte {
 	return append(dst, w.scratch[:n]...)
 }
 
-// flushTerm commits the term the scan just left: its bytes to term.text, its
+// flushTerm commits the term the fold just left: its bytes to term.text, its
 // posting list to post.list and the entry that points at both to term.dir.
 func (w *lexicalWriter) flushTerm() error {
 	if !w.haveTrm {
@@ -316,33 +431,61 @@ func (w *lexicalWriter) flushTerm() error {
 		return err
 	}
 	if w.df == 0 {
-		// Every instance of this term is in a document the generation does not
-		// carry. It is not a term of this generation and takes no entry.
-		w.resetTerm()
-		return nil
+		return internal("packed lexical fold left term " + string(w.term) + " with no document")
 	}
-	if len(w.term) > int(^uint16(0)) {
-		return corrupt("search_vocab carries a term of %d bytes", len(w.term))
+	if err := w.writeEntry(w.term, w.listBuf, w.df); err != nil {
+		return err
+	}
+	w.resetTerm()
+	return nil
+}
+
+// copyTerm writes a term whose posting bytes are taken verbatim from one input
+// segment: the merge copies them unread, so the term's documents, their groups
+// and their deltas are exactly the bytes that were packed. The caller has
+// established that no other input carries the term and that this one holds no
+// dead document, which is what makes an unread copy equal to a decoded merge.
+func (w *lexicalWriter) copyTerm(term, list []byte, df int64) error {
+	if err := w.flushTerm(); err != nil {
+		return err
+	}
+	if df == 0 || len(list) == 0 {
+		return internal("packed lexical merge was asked to copy term " + string(term) + " with no document")
+	}
+	return w.writeEntry(term, list, df)
+}
+
+// writeEntry appends one term to the three streams and is the ONE place the
+// directory's order is established: a term that does not follow the previous
+// one would produce a directory a binary search cannot trust, whichever path
+// wrote it.
+func (w *lexicalWriter) writeEntry(term, list []byte, df int64) error {
+	if w.havePrev && bytes.Compare(term, w.prev) <= 0 {
+		return corrupt("packed lexical fold wrote term %q after term %q", string(term), string(w.prev))
+	}
+	if len(term) > int(^uint16(0)) {
+		return corrupt("packed lexical fold carries a term of %d bytes", len(term))
 	}
 	var entry [termEntryBytes]byte
 	binary.LittleEndian.PutUint64(entry[termEntryTextOff:], uint64(w.textOff))
 	binary.LittleEndian.PutUint64(entry[termEntryListOff:], uint64(w.listOff))
-	binary.LittleEndian.PutUint32(entry[termEntryListLen:], uint32(len(w.listBuf)))
-	binary.LittleEndian.PutUint32(entry[termEntryDF:], uint32(w.df))
-	binary.LittleEndian.PutUint16(entry[termEntryTextLen:], uint16(len(w.term)))
-	if err := w.text.write(w.term); err != nil {
+	binary.LittleEndian.PutUint32(entry[termEntryListLen:], uint32(len(list)))
+	binary.LittleEndian.PutUint32(entry[termEntryDF:], uint32(df))
+	binary.LittleEndian.PutUint16(entry[termEntryTextLen:], uint16(len(term)))
+	if err := w.text.write(term); err != nil {
 		return err
 	}
-	if err := w.list.write(w.listBuf); err != nil {
+	if err := w.list.write(list); err != nil {
 		return err
 	}
 	if err := w.dir.write(entry[:]); err != nil {
 		return err
 	}
-	w.textOff += int64(len(w.term))
-	w.listOff += int64(len(w.listBuf))
+	w.textOff += int64(len(term))
+	w.listOff += int64(len(list))
 	w.terms++
-	w.resetTerm()
+	w.prev = append(w.prev[:0], term...)
+	w.havePrev = true
 	return nil
 }
 

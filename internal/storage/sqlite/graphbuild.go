@@ -38,12 +38,29 @@ const (
 	streamRelEvidence   = "rel.evidence"
 )
 
-// graphPartsTable and lexicalPartsTable are the two chunked-stream tables one
-// partWriter serves.
+// The chunked-stream tables one partWriter serves. They have the same shape --
+// key, stream, part, bytes -- and differ only in which row the parts hang off,
+// so a partKey names the table and that key column together.
 const (
 	graphPartsTable   = "generation_graph_parts"
-	lexicalPartsTable = "generation_lexical_parts"
+	segmentPartsTable = "lexical_segment_parts"
 )
+
+// partKey is the row a chunked stream belongs to.
+type partKey struct {
+	table  string
+	column string
+	id     int64
+}
+
+func graphKey(gen int64) partKey {
+	return partKey{table: graphPartsTable, column: "generation_id", id: gen}
+}
+
+// segmentKey names one immutable lexical segment's streams.
+func segmentKey(segment int64) partKey {
+	return partKey{table: segmentPartsTable, column: "segment_id", id: segment}
+}
 
 // Part sizes. These are INTERNAL layout constants, not user limits: they bound
 // the working set of a build or a read, and no count of nodes, edges or bytes
@@ -104,10 +121,10 @@ func isContainerKind(kind string) bool { return slices.Contains(containerKinds, 
 type partWriter struct {
 	ctx context.Context
 	tx  *sql.Tx
-	gen int64
-	// table is the parts table the stream belongs to: the adjacency's or the
-	// lexical structure's. Both chunk the same way, so one writer serves both.
-	table  string
+	// key is the row the stream belongs to: a generation's adjacency, or one
+	// immutable lexical segment. Both chunk the same way, so one writer
+	// serves both.
+	key    partKey
 	stream string
 	size   int
 	buf    []byte
@@ -115,9 +132,9 @@ type partWriter struct {
 	total  int64
 }
 
-func newPartWriter(ctx context.Context, tx *sql.Tx, gen int64, table, stream string) *partWriter {
+func newPartWriter(ctx context.Context, tx *sql.Tx, key partKey, stream string) *partWriter {
 	size := partSizeFor(stream)
-	return &partWriter{ctx: ctx, tx: tx, gen: gen, table: table, stream: stream, size: size, buf: make([]byte, 0, size)}
+	return &partWriter{ctx: ctx, tx: tx, key: key, stream: stream, size: size, buf: make([]byte, 0, size)}
 }
 
 func (w *partWriter) write(b []byte) error {
@@ -141,9 +158,9 @@ func (w *partWriter) flush() error {
 		return nil
 	}
 	if _, err := w.tx.ExecContext(w.ctx,
-		`INSERT INTO `+w.table+`(generation_id, stream, part, bytes) VALUES(?, ?, ?, ?)`,
-		w.gen, w.stream, w.part, w.buf); err != nil {
-		return wrap(w.table, err)
+		`INSERT INTO `+w.key.table+`(`+w.key.column+`, stream, part, bytes) VALUES(?, ?, ?, ?)`,
+		w.key.id, w.stream, w.part, w.buf); err != nil {
+		return wrap(w.key.table, err)
 	}
 	w.part++
 	w.buf = w.buf[:0]
@@ -171,7 +188,7 @@ type arrayWriter struct {
 
 func newArrayWriter(ctx context.Context, tx *sql.Tx, gen int64, stream string, width int) *arrayWriter {
 	zero := make([]byte, width)
-	return &arrayWriter{w: newPartWriter(ctx, tx, gen, graphPartsTable, stream), width: width, zero: zero, fill: zero}
+	return &arrayWriter{w: newPartWriter(ctx, tx, graphKey(gen), stream), width: width, zero: zero, fill: zero}
 }
 
 // set writes value at index, padding every skipped index with zeros. Indexes
@@ -430,7 +447,7 @@ func buildDirection(ctx context.Context, tx *sql.Tx, gen int64, maxNode uint64,
 		offStream, edgeStream, query = streamOutOffsets, streamOutEdges, outgoingEdgeQuery()
 	}
 	offsets := newArrayWriter(ctx, tx, gen, offStream, offsetEntryBytes)
-	edges := newPartWriter(ctx, tx, gen, graphPartsTable, edgeStream)
+	edges := newPartWriter(ctx, tx, graphKey(gen), edgeStream)
 
 	rows, err := tx.QueryContext(ctx, query)
 	if err != nil {

@@ -1286,6 +1286,13 @@ const deltaScope = "pkg"
 // full re-import of the same snapshot can coexist and be compared.
 func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cfg string, files ...fileFixture) *store.UnitWriter {
 	f.t.Helper()
+	return f.beginScopeKey(gen, run, cfg, deltaScope, files...)
+}
+
+// beginScopeKey is beginScope with the provider scope named, so one generation
+// can carry several units: a generation selects one unit per (provider, scope).
+func (f *fixture) beginScopeKey(gen model.GenerationID, run model.ProviderRunID, cfg, scope string, files ...fileFixture) *store.UnitWriter {
+	f.t.Helper()
 	inputs := make([]model.UnitInput, 0, len(files))
 	h := model.NewUnitInputHasher()
 	for _, ff := range files {
@@ -1297,7 +1304,7 @@ func (f *fixture) beginScope(gen model.GenerationID, run model.ProviderRunID, cf
 			f.t.Fatal(err)
 		}
 	}
-	spec := model.UnitSpec{ProviderID: providerID, ProviderVersion: providerVersion, ScopeKey: deltaScope,
+	spec := model.UnitSpec{ProviderID: providerID, ProviderVersion: providerVersion, ScopeKey: scope,
 		InputHash: h.Sum(), DependencyHash: model.DependencyHash(nil)}
 	spec.ID = model.NewUnitID(spec, cfg)
 	build := model.UnitBuild{Spec: spec, AnalysisConfigHash: cfg, OriginRunID: run, SourceBinding: model.SourceBindingVerified}
