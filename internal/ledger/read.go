@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"io/fs"
+	"os"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -87,28 +89,38 @@ type RunView struct {
 // this is what makes the live view cost the run nothing.
 type Reader struct{ db *sql.DB }
 
-// OpenReader opens the ledger beside the index store in dir for reading. It
-// verifies the schema fingerprint, so a reader never half-reads a file written
-// by a different schema.
-func OpenReader(ctx context.Context, dir string) (*Reader, error) {
+// OpenReader opens the ledger beside the index store in dir for reading, and
+// verifies its schema fingerprint so a reader never half-reads a file written
+// by another schema.
+//
+// It reports false, and no error, for a workspace that has never recorded a
+// run: there is nothing to read and nothing to report as broken. The
+// connection is read-only, so asking never creates the file.
+func OpenReader(ctx context.Context, dir string) (*Reader, bool, error) {
 	path := Path(dir)
-	db, err := openPool(path, readerPragmas(), "deferred", 2)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, internal("stat " + path + ": " + err.Error())
+	}
+	db, err := openPool(path, readerPragmas(), "deferred", 2, true)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var fingerprint string
 	if err := db.QueryRowContext(ctx, `SELECT fingerprint FROM ledger_meta WHERE singleton = 1`).Scan(&fingerprint); err != nil {
 		db.Close()
-		return nil, wrap("read the ledger schema", err)
+		return nil, false, wrap("read the ledger schema", err)
 	}
 	if fingerprint != Fingerprint {
 		db.Close()
-		return nil, &model.Error{Code: model.CodeSchemaMismatch,
+		return nil, false, &model.Error{Code: model.CodeSchemaMismatch,
 			Message:     "run ledger schema fingerprint " + fingerprint + " does not match this binary's " + Fingerprint,
 			Details:     map[string]string{"path": path},
 			Remediation: "delete the run ledger beside the index cache, or rebuild the cache with `codectx index --rebuild`"}
 	}
-	return &Reader{db: db}, nil
+	return &Reader{db: db}, true, nil
 }
 
 // Close releases the reader's connections.

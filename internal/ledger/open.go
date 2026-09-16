@@ -91,17 +91,36 @@ func writerPragmas() []pragma {
 }
 
 // readerPragmas is every other process's. query_only is what makes a reader
-// structurally unable to disturb a live run.
+// structurally unable to disturb a live run, and the connection is opened
+// read-only besides, so it cannot even create the file.
+//
+// It carries neither journal_mode nor synchronous: both are properties of
+// writing, a read-only connection cannot set either, and asking one to would
+// fail on exactly the file a reader is there to read.
 func readerPragmas() []pragma {
-	return append(commonPragmas(), pragma{"synchronous", "NORMAL", "1"}, pragma{"query_only", "ON", "1"})
+	busy := strconv.FormatInt(busyTimeout.Milliseconds(), 10)
+	return []pragma{
+		{"busy_timeout", busy, busy},
+		{"foreign_keys", "ON", "1"},
+		{"temp_store", "FILE", "1"},
+		{"mmap_size", "0", "0"},
+		{"query_only", "ON", "1"},
+	}
 }
 
-func openPool(path string, pragmas []pragma, txlock string, maxConns int) (*sql.DB, error) {
+// openPool opens the file. readOnly opens it in the engine's own read-only
+// mode, which is what stops a reader on a workspace that has never been
+// indexed from creating an empty ledger: query_only refuses writes through
+// SQL, it does not stop the file being made.
+func openPool(path string, pragmas []pragma, txlock string, maxConns int, readOnly bool) (*sql.DB, error) {
 	q := url.Values{}
 	for _, p := range pragmas {
 		q.Add("_pragma", p.name+"("+p.set+")")
 	}
 	q.Set("_txlock", txlock)
+	if readOnly {
+		q.Set("mode", "ro")
+	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
 	base, err := sqlite.NewConnector(dsn)
 	if err != nil {
