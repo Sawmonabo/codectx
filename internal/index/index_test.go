@@ -844,7 +844,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// no member for it: the unit seals into a later publication.
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan: plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published := g.caps.finish(f.c.log)
@@ -864,7 +864,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	g = &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan:   plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published = g.caps.finish(f.c.log)

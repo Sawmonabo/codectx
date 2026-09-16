@@ -235,7 +235,7 @@ func TestCoverageReportsAFailedDeferredScopeAsPartial(t *testing.T) {
 		}
 		return nil
 	}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(t.Context()); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -282,7 +282,7 @@ func TestCoverageKeepsAProviderWithNoMemberFailed(t *testing.T) {
 	}
 	// What the indexing path does when an optional provider's unit fails.
 	g.caps.addFailure(id, capability, scope, model.CodeProviderOutputInvalid)
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(t.Context()); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	rows := g.caps.finish(slog.New(slog.NewTextHandler(io.Discard, nil)))

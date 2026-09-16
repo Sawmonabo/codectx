@@ -599,7 +599,7 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	var health model.GenerationHealth
 	err = l.attach(ctx, g, replacing)
 	if err == nil {
-		err = g.coverage()
+		err = g.coverage(ctx)
 	}
 	if err == nil {
 		states = g.caps.finish(c.log)
