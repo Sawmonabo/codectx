@@ -26,6 +26,10 @@ import (
 type segmentRef struct {
 	id        int64
 	termCount int64
+	// docCount is how many documents the segment packed, which is also how
+	// many entries its document directory carries -- the range a hydration
+	// binary-searches.
+	docCount int64
 	// hidden is how many of the segment's documents this generation does not
 	// carry. Zero -- the common case, and the only case for a segment the
 	// generation's own units folded -- is what lets a document frequency
@@ -55,6 +59,15 @@ type lexicalIndex struct {
 	r *PinnedReader
 	*lexicalMeta
 	cache map[partSlot]*partWindow
+	// docLo is where the next hydration starts its search in each segment's
+	// document directory. A candidate walk delivers rowids in ascending order
+	// for the whole query, so the searched range shrinks as the walk advances
+	// instead of covering the segment again for every page.
+	docLo map[int64]int64
+	// docLast is the rowid the last hydration answered, so a caller that goes
+	// backwards is served from the whole directory again rather than from a
+	// range that no longer contains its document.
+	docLast int64
 }
 
 // partSlot names one stream of one segment. The window MUST be keyed by the
@@ -70,7 +83,7 @@ type partSlot struct {
 // deliberately no ORDER BY: generation_segments is a WITHOUT ROWID table keyed
 // by (generation_id, ord), so a scan of its primary key already delivers the
 // generation's segments in read order.
-const generationLexicalQuery = `SELECT gs.segment_id, s.term_count, gs.hidden
+const generationLexicalQuery = `SELECT gs.segment_id, s.term_count, s.doc_count, gs.hidden
 	FROM generation_segments gs JOIN lexical_segments s ON s.id = gs.segment_id
 	WHERE gs.generation_id = ?1`
 
@@ -103,7 +116,7 @@ func (r *PinnedReader) lexical(ctx context.Context) (*lexicalMeta, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var s segmentRef
-			if err := rows.Scan(&s.id, &s.termCount, &s.hidden); err != nil {
+			if err := rows.Scan(&s.id, &s.termCount, &s.docCount, &s.hidden); err != nil {
 				return wrap("generation_segments", err)
 			}
 			m.segments = append(m.segments, s)
@@ -125,7 +138,7 @@ func (r *PinnedReader) openLexical(ctx context.Context) (*lexicalIndex, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &lexicalIndex{r: r, lexicalMeta: m, cache: map[partSlot]*partWindow{}}, nil
+	return &lexicalIndex{r: r, lexicalMeta: m, cache: map[partSlot]*partWindow{}, docLo: map[int64]int64{}}, nil
 }
 
 // part returns one part of a segment's stream through the request's bounded
@@ -500,4 +513,125 @@ func (s *PackedStream) Next(ctx context.Context, limit int) ([]TermOccurrence, e
 		return nil, nil
 	}
 	return out, nil
+}
+
+// documentEntryAt decodes one entry of a segment's document directory: the
+// document it names and the slice of the attribute stream holding its record.
+func (x *lexicalIndex) documentEntryAt(ctx context.Context, segment, index int64) (doc, off int64, length int, err error) {
+	raw, err := x.readAt(ctx, segment, streamDocDir, index*docEntryBytes, docEntryBytes)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return int64(binary.LittleEndian.Uint64(raw[docEntryRowID:])),
+		int64(binary.LittleEndian.Uint64(raw[docEntryAttrOff:])),
+		int(binary.LittleEndian.Uint32(raw[docEntryAttrLen:])), nil
+}
+
+// findDocument binary-searches one segment's document directory for a rowid,
+// starting at lo -- where the walk left this segment -- and answers the entry's
+// ordinal. A segment that does not hold the document answers ok=false: every
+// visible document lies in exactly one segment of the generation, so the other
+// segments are simply asked next.
+func (x *lexicalIndex) findDocument(ctx context.Context, seg segmentRef, rowid, lo int64) (index, off int64, length int, ok bool, err error) {
+	hi := seg.docCount
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		doc, at, n, err := x.documentEntryAt(ctx, seg.id, mid)
+		if err != nil {
+			return 0, 0, 0, false, err
+		}
+		switch {
+		case doc == rowid:
+			return mid, at, n, true, nil
+		case doc < rowid:
+			lo = mid + 1
+		default:
+			hi = mid
+		}
+	}
+	return lo, 0, 0, false, nil
+}
+
+// PackedDocuments hydrates a page of candidates from the segments' packed
+// per-document attribute streams (ADR-0007 Decision 2). It issues NO statement
+// per candidate: the fields are read out of the same parts the query is already
+// reading, through the session's window, so a page of 200 hits costs the parts
+// its documents lie in rather than 200 index descents into the document table.
+//
+// The answer is in the requested order, and a rowid the generation does not
+// make visible is omitted rather than zeroed -- a document an inherited segment
+// still holds but whose unit left the generation is not a document of this
+// generation at all.
+func (p *PostingSession) PackedDocuments(ctx context.Context, rowids []int64) ([]SearchDocument, error) {
+	if len(rowids) == 0 {
+		return nil, nil
+	}
+	if len(rowids) > model.MaxPageItems {
+		return nil, invalid("search document hydration asked for %d rowids, limit %d", len(rowids), model.MaxPageItems)
+	}
+	if p.tx == nil {
+		return nil, internal("posting session is already closed")
+	}
+	if p.lex == nil {
+		x, err := p.r.openLexical(ctx)
+		if err != nil {
+			return nil, err
+		}
+		p.lex = x
+	}
+	x := p.lex
+	out := make([]SearchDocument, 0, len(rowids))
+	for _, id := range rowids {
+		if id <= 0 {
+			return nil, invalid("search document rowid %d is not positive", id)
+		}
+		if id < x.docLast {
+			clear(x.docLo)
+		}
+		x.docLast = id
+		if !x.visible.has(id) {
+			continue
+		}
+		d, ok, err := x.document(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		// A visible document the generation's segments do not hold is a
+		// structure no query could serve: the candidate would be scored and
+		// then vanish from the page it was ranked into.
+		if !ok {
+			return nil, corrupt("generation %d makes document %d visible but no segment of it packs the document's attributes",
+				p.r.gen, id)
+		}
+		out = append(out, d)
+	}
+	return out, nil
+}
+
+// document reads one visible document's attributes out of whichever segment
+// holds it, advancing that segment's search bound past the entry it found.
+func (x *lexicalIndex) document(ctx context.Context, rowid int64) (SearchDocument, bool, error) {
+	for _, seg := range x.segments {
+		index, off, length, ok, err := x.findDocument(ctx, seg, rowid, x.docLo[seg.id])
+		if err != nil {
+			return SearchDocument{}, false, err
+		}
+		if !ok {
+			// Where the search stopped is where the next, larger candidate
+			// starts: the directory ascends, so nothing before it can hold one.
+			x.docLo[seg.id] = index
+			continue
+		}
+		record, err := x.readAt(ctx, seg.id, streamDocAttr, off, length)
+		if err != nil {
+			return SearchDocument{}, false, err
+		}
+		x.docLo[seg.id] = index + 1
+		d, err := decodeDocument(rowid, record)
+		if err != nil {
+			return SearchDocument{}, false, err
+		}
+		return d, true, nil
+	}
+	return SearchDocument{}, false, nil
 }

@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -125,6 +126,70 @@ func comparePackedToLive(t *testing.T, f *fixture, r *store.PinnedReader, gen mo
 		packedSeq := drainCounts(t, f, packed, term)
 		if packedSeq != liveSeq {
 			t.Fatalf("term %q packed occurrences\n%s\nlive occurrences\n%s", term, packedSeq, liveSeq)
+		}
+	}
+	comparePackedDocuments(t, f, session, gen, db)
+}
+
+// comparePackedDocuments holds the per-document attribute stream to the rows it
+// was packed from. Every field a search hit is served from -- its identity, its
+// file, its path, kind, name, qualified name, signature, byte range and token
+// count -- now comes from the packed bytes instead of a document-row read, so a
+// field that drifts, or one dropped from the stream, serves a hit naming
+// another document's path or byte range on a page no ordering rule would
+// betray. The comparison is over EVERY visible document of the generation, in
+// the pages a candidate walk hydrates in.
+func comparePackedDocuments(t *testing.T, f *fixture, session *store.PostingSession, gen model.GenerationID, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query(`SELECT su.doc_id, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
+			su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count
+		FROM search_units su LEFT JOIN node_ids ni ON ni.id = su.node_id
+		WHERE EXISTS (SELECT 1 FROM generation_units gu
+			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?)
+		ORDER BY su.doc_id`, int64(gen))
+	if err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	defer rows.Close()
+	var want []store.SearchDocument
+	for rows.Next() {
+		var d store.SearchDocument
+		var key, node, file []byte
+		var start, end int64
+		if err := rows.Scan(&d.RowID, &key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName,
+			&d.Signature, &start, &end, &d.TokenCount); err != nil {
+			t.Fatalf("live document: %v", err)
+		}
+		d.ID, d.FileID = hex.EncodeToString(key), model.FileID(hex.EncodeToString(file))
+		if node != nil {
+			d.NodeID = model.NodeID(hex.EncodeToString(node))
+		}
+		d.Bytes = model.ByteRange{Start: uint64(start), End: uint64(end)}
+		want = append(want, d)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	if len(want) == 0 {
+		t.Fatal("the generation holds no visible document; the comparison would prove nothing")
+	}
+	for from := 0; from < len(want); from += model.MaxPageItems {
+		page := want[from:min(from+model.MaxPageItems, len(want))]
+		ids := make([]int64, len(page))
+		for i, d := range page {
+			ids[i] = d.RowID
+		}
+		got, err := session.PackedDocuments(f.ctx, ids)
+		if err != nil {
+			t.Fatalf("PackedDocuments: %v", err)
+		}
+		if len(got) != len(page) {
+			t.Fatalf("hydrated %d of %d documents", len(got), len(page))
+		}
+		for i := range page {
+			if got[i] != page[i] {
+				t.Fatalf("document %d packed as\n%+v\nbut its row holds\n%+v", page[i].RowID, got[i], page[i])
+			}
 		}
 	}
 }
@@ -446,6 +511,7 @@ func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 	}{
 		{"the activation's pass over its documents", store.GenerationDocumentQuery(), []any{genID}},
 		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery(), []any{genID}},
+		{"the seal's read of the attributes it packs per document", store.SegmentAttributeQuery(), []any{segment}},
 		{"the merge's walk of the documents a segment still holds", store.SegmentDocumentQuery(), []any{segment}},
 		{"the merge's re-point of an absorbed segment's rows", store.RepointSegmentStatement(), []any{segment, segment}},
 	} {
@@ -455,4 +521,75 @@ func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 			t.Fatalf("%s builds a temporary b-tree:\n%s", q.what, plan)
 		}
 	}
+}
+
+// TestHydrationReadsNoDocumentRow proves the cost ADR-0007 Decision 2 exists to
+// remove: a candidate's fields come from the packed per-document stream, not
+// from one document-row read per candidate. Every document row is clobbered
+// after the generation is published and the same page is hydrated again -- if a
+// single field were still read from a row, the page would carry the clobbered
+// value. The former path read one row per candidate, tens of thousands of rows
+// to serve one page of two hundred.
+func TestHydrationReadsNoDocumentRow(t *testing.T) {
+	f, r, gen, dbPath := packedLexicalFixture(t)
+	flushed(t, f.s)
+	db := openRawDB(t, dbPath)
+	ids := visibleDocumentIDs(t, db, int64(gen))
+	if len(ids) == 0 {
+		t.Fatal("the fixture published no visible document")
+	}
+	before := hydrate(t, f, r, ids)
+	if _, err := db.Exec(`UPDATE search_units SET path = 'clobbered', kind = 'clobbered',
+		name = 'clobbered', qualified_name = 'clobbered', signature = 'clobbered',
+		start_byte = 0, end_byte = 0, token_count = 0`); err != nil {
+		t.Fatalf("clobber the document rows: %v", err)
+	}
+	after := hydrate(t, f, r, ids)
+	if len(after) != len(before) {
+		t.Fatalf("hydrated %d documents after the rows were clobbered, %d before", len(after), len(before))
+	}
+	for i := range before {
+		if after[i] != before[i] {
+			t.Fatalf("document %d hydrated as\n%+v\nafter its row was clobbered; the page was served from the row, not from the packed stream\nbefore\n%+v",
+				before[i].RowID, after[i], before[i])
+		}
+	}
+}
+
+// hydrate serves one page of candidates the way the lexical tier does.
+func hydrate(t *testing.T, f *fixture, r *store.PinnedReader, ids []int64) []store.SearchDocument {
+	t.Helper()
+	session, err := r.OpenPostings(f.ctx)
+	if err != nil {
+		t.Fatalf("OpenPostings: %v", err)
+	}
+	defer session.Close()
+	docs, err := session.PackedDocuments(f.ctx, ids)
+	if err != nil {
+		t.Fatalf("PackedDocuments: %v", err)
+	}
+	return docs
+}
+
+// visibleDocumentIDs is the generation's visible documents in candidate order.
+func visibleDocumentIDs(t *testing.T, db *sql.DB, gen int64) []int64 {
+	t.Helper()
+	rows, err := db.Query(`SELECT su.doc_id FROM search_units su WHERE EXISTS (SELECT 1 FROM generation_units gu
+		WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?) ORDER BY su.doc_id`, gen)
+	if err != nil {
+		t.Fatalf("visible documents: %v", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("visible document: %v", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("visible documents: %v", err)
+	}
+	return out
 }
