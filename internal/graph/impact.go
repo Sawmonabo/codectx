@@ -550,14 +550,21 @@ func (e *Engine) spillRankedCursor(ctx context.Context, b *budget, endpoint, que
 		return "", nil
 	}
 	binding := e.adjacency.Binding()
-	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return "", err
+	// The lease is conditional, the spool is not: a process that writes nothing
+	// to the database still spills the remainder, and the spool it creates is
+	// bound to this cursor's expiry rather than to a lease row.
+	var leaseID string
+	if e.leases.Retains() {
+		lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		leaseID = lease.ID
 	}
 	next := traversalCursor{
 		Version: traversalCursorVersion, Endpoint: endpoint,
 		GenerationID: binding.GenerationID, AnalysisKey: binding.AnalysisKey,
-		QueryHash: queryHash, LeaseID: lease.ID, Ranked: true,
+		QueryHash: queryHash, LeaseID: leaseID, Ranked: true,
 		RankServed: served, RankTotal: header.Total,
 		PairServed: pairServed, PairTotal: header.PairTotal,
 		Visited: b.visited, Edges: b.edges,
@@ -565,50 +572,56 @@ func (e *Engine) spillRankedCursor(ctx context.Context, b *budget, endpoint, que
 	}
 	id, rankOff, pairOff, err := e.spillRanked(next, header, tails...)
 	if err != nil {
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", e.releaseLease(ctx, leaseID, err)
 	}
 	next.SpoolID, next.RankOffset, next.PairOffset = id, rankOff, pairOff
 	token, err := e.signRanked(next)
 	if err != nil {
 		e.releaseConsumed(ctx, id, "")
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", e.releaseLease(ctx, leaseID, err)
 	}
 	return token, nil
 }
 
 // continueRankedCursor mints the cursor for the page after a LATER page. It
-// names the SAME spool and the SAME lease -- renewed, because the spool's
-// liveness is its lease's (pagination.Spools.OpenAt) and the answer is not over
-// -- and carries the byte offsets the page it follows stopped at. It writes
-// nothing: that is what makes a ranked page O(page) rather than O(remaining).
+// names the SAME spool and the SAME lease and carries the byte offsets the page
+// it follows stopped at. It writes nothing to the database: that is what makes
+// a ranked page O(page) rather than O(remaining).
+//
+// A LEASED spool is renewed on every page, because its liveness is its lease's
+// (pagination.Spools.live) and the answer is not over. A leaseless spool -- and
+// a leased one presented to a process that writes nothing -- has no renewal:
+// the token carries forward the expiry its header was stamped with, so the
+// whole ranking is reachable for that one window and a page asked for after it
+// is the typed CTX_CURSOR_INVALID.
 func (e *Engine) continueRankedCursor(ctx context.Context, b *budget, c traversalCursor,
 	served, pairServed, rankOff, pairOff int64, meta *model.QueryMeta) (string, error) {
 	if !e.canContinue(meta) {
 		return "", nil
-	}
-	if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
-		return "", err
 	}
 	next := c
 	next.Version = traversalCursorVersion
 	next.RankServed, next.PairServed = served, pairServed
 	next.RankOffset, next.PairOffset = rankOff, pairOff
 	next.Visited, next.Edges = b.visited, b.edges
-	next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	if c.LeaseID != "" && e.leases.Retains() {
+		if _, err := e.leases.Renew(ctx, c.LeaseID); err != nil {
+			return "", err
+		}
+		next.ExpiresAt = e.now().Add(e.limits.CursorTTL).UTC().Truncate(time.Second)
+	}
 	return e.signRanked(next)
 }
 
 // canContinue reports whether this engine can mint a ranked continuation at
-// all. Without a signer or a spool store, and in a process that retains
-// nothing -- one that opened the workspace read-only, so it can record neither
-// the cursor lease nor the renewal a later page needs -- the answer stops with
-// this page and SAYS so, exactly as a walk that cannot spill its frontier does.
-// It is only consulted with a ranked remainder still unserved -- every caller
-// checks that first -- so the stop always cuts the answer, and returning an
-// empty token alone left the caller reading a complete-looking page of a longer
-// ranking. Marking it is what makes the cut visible.
+// all. Without a signer or a spool store the answer stops with this page and
+// SAYS so, exactly as a walk that cannot spill its frontier does. It is only
+// consulted with a ranked remainder still unserved -- every caller checks that
+// first -- so the stop always cuts the answer, and returning an empty token
+// alone left the caller reading a complete-looking page of a longer ranking.
+// Marking it is what makes the cut visible.
 func (e *Engine) canContinue(meta *model.QueryMeta) bool {
-	if e.signer == nil || e.spools == nil || !e.leases.Retains() {
+	if e.signer == nil || e.spools == nil {
 		markTruncated(meta, reasonNoContinuation)
 		return false
 	}
@@ -843,12 +856,12 @@ func impactPhaseError(ctx context.Context, err error, meta *model.QueryMeta) err
 const reasonDeadline = "query deadline reached"
 
 // reasonNoContinuation is the truncation reason for a ranked answer whose
-// remainder cannot be paged: either this engine was built without the
-// continuation machinery, or the process retains nothing at all because it
-// opened the workspace read-only. The records exist and the ranking is
-// complete; what is missing is the token that would hand the rest of them
-// back, so the page that is served is a prefix and must say it is one.
-const reasonNoContinuation = "this answer was served by a process that retains no continuation state, " +
+// remainder cannot be paged: this engine was built without the continuation
+// machinery, so it has neither a signer to bind a token to nor a spool store to
+// spill the remainder into. The records exist and the ranking is complete; what
+// is missing is the token that would hand the rest of them back, so the page
+// that is served is a prefix and must say it is one.
+const reasonNoContinuation = "this answer was served by an endpoint that retains no continuation state, " +
 	"so the ranked records beyond this page are not reachable; narrow the walk's depth or its node bound " +
 	"to bring the answer within one page"
 
