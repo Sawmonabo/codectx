@@ -30,8 +30,6 @@
 package pacedvfs
 
 import (
-	"errors"
-	"io/fs"
 	"sync"
 	"unsafe"
 
@@ -198,12 +196,16 @@ func xOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOutFlags uin
 	return sqlite3.SQLITE_OK
 }
 
-// xDelete removes a file the way paced.Remove does: a file larger than a
-// window is shrunk a window at a time before the wrapped delete unlinks it,
-// so the log's reset and a journal's removal never free gigabytes at once.
+// xDelete removes a file the way paced.Remove does, through the same helper:
+// a file larger than a window is shrunk a window at a time before the wrapped
+// delete unlinks it, so the log's reset and a journal's removal never free
+// gigabytes at once, while a small journal -- the common case, deleted at
+// every commit in rollback mode -- is unlinked whole rather than paying an
+// open, a truncate and a sync for four kilobytes. The engine also deletes
+// speculatively, naming files that are not there; that is not a failure.
 func xDelete(tls *libc.TLS, pVfs, zName uintptr, syncDir int32) int32 {
 	if zName != 0 {
-		if err := paced.Shrink(libc.GoString(zName), 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.ShrinkForRemoval(libc.GoString(zName)); err != nil {
 			return sqlite3.SQLITE_IOERR_DELETE
 		}
 	}

@@ -80,6 +80,42 @@ func TestRemoveAllShrinksEveryLargeFileBeforeUnlinkingTheTree(t *testing.T) {
 	}
 }
 
+// The requirement: pacing decides HOW a removal frees space, never whether the
+// removal happens. Emptying a file needs write on the file; unlinking it needs
+// write only on the directory, so a large read-only file inside a writable
+// directory -- an analyzer's output tree is full of them -- must still be
+// removed. Thirty-three call sites were converted to this package, and a
+// refusal here would leave a run unable to clear its own scratch.
+// Mutation: drop fs.ErrPermission from ShrinkForRemoval's tolerated failures
+// and the removal fails with "permission denied".
+func TestARemovalIsNotRefusedForAFileTheProcessMayUnlinkButNotTruncate(t *testing.T) {
+	dir := t.TempDir()
+	tree := filepath.Join(dir, "tree")
+	if err := os.MkdirAll(tree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := filepath.Join(tree, "big")
+	writeFile(t, readOnly, Window+1)
+	if err := os.Chmod(readOnly, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveAll(tree); err != nil {
+		t.Fatalf("removing a tree holding a read-only large file: %v", err)
+	}
+	if _, err := os.Lstat(tree); !os.IsNotExist(err) {
+		t.Fatalf("the tree survived its removal: %v", err)
+	}
+
+	single := filepath.Join(dir, "single")
+	writeFile(t, single, Window+1)
+	if err := os.Chmod(single, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := Remove(single); err != nil {
+		t.Fatalf("removing a read-only large file: %v", err)
+	}
+}
+
 func TestShrinkStopsAtTheRequestedSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "f")
 	writeFile(t, path, 4*Window)

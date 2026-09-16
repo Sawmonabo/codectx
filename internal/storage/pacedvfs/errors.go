@@ -24,6 +24,14 @@ var (
 	logBytes    atomic.Int64
 )
 
+// Windows reports how many window waits this file system has issued since the
+// process started: one per window of bytes written to a file through it. It is
+// what says the shim is between the engine and the disk -- a database opened
+// before the registration writes through the engine's own file system and
+// moves nothing here -- so a package that opens its own database asserts on it
+// rather than on the order its packages happened to initialize in.
+func Windows() int64 { return windows.Load() }
+
 // Truncations reports how many windows this file system has freed one at a
 // time since the process started. A run that reuses its space instead of
 // freeing it leaves this at zero, which is what the diagnostics disclose and

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -69,8 +70,9 @@ func sealRepository(t *testing.T, path string, units, perUnit int) *fixture {
 }
 
 // sealRepositoryInto seals units file-scoped units of perUnit facts each into
-// f's store, calling after (when given) once each unit is sealed.
-func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, after func()) {
+// f's store, calling after (when given) once each unit is sealed, and returns
+// the staging generation they were sealed into.
+func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, after func()) model.GenerationID {
 	t.Helper()
 	files := make([]fileFixture, units)
 	for i := range files {
@@ -147,6 +149,7 @@ func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, after func
 			after()
 		}
 	}
+	return gen
 }
 
 // TestIngestionWritesAreProportionalToStoredBytes seals a repository's worth
@@ -251,5 +254,70 @@ func TestIngestionGroupCommitsWhenTheCacheWouldSpill(t *testing.T) {
 	// commit itself appends.
 	if bound := int64(2*cacheKiB) << 10; peakLog > bound {
 		t.Errorf("the log reached %.1f MiB under a %d KiB writer cache: the group is not bounded by the cache", float64(peakLog)/(1<<20), cacheKiB)
+	}
+}
+
+// TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion seals a
+// first index's worth of units -- one segment per unit, so the geometric
+// partitioning owes the generation a long cascade of merges -- and activates
+// it while sampling the log.
+//
+// Requirement: the group's commit decision fires only at the end of an
+// ingestion call, so a compaction cascade run inside the activation's own call
+// would have no commit point and nothing in the group's accounting would bound
+// its log; WALBoundBytes, which is stated as the largest log an ingestion group
+// leaves behind, would not be a bound on an activation. A first index of a
+// large repository owes thousands of merges. The merges therefore run as their
+// own ingestion calls before the activation, which commits between them, and
+// the activation itself only names the set they left.
+//
+// Mutation that fails it: run the merges inside the activation's call again
+// (drop compactBeforeActivation and compact from buildLexical) and the
+// activation commits once.
+func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testing.T) {
+	const cacheKiB = 2048
+	path := t.TempDir() + "/activate.db"
+	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
+	gen := sealRepositoryInto(t, f, envInt(t, "CODECTX_INGEST_UNITS", 600), envInt(t, "CODECTX_INGEST_FACTS", 40), nil)
+	// The seals' own group is committed first, so what is counted below is the
+	// activation's alone.
+	if err := f.s.Flush(f.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	before := f.s.Commits()
+	var peak int64
+	done := make(chan struct{})
+	sampled := make(chan struct{})
+	go func() {
+		defer close(sampled)
+		for {
+			if st, err := os.Stat(path + "-wal"); err == nil && st.Size() > peak {
+				peak = st.Size()
+			}
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	f.activate(gen, 0)
+	close(done)
+	<-sampled
+	commits := f.s.Commits() - before
+	t.Logf("activation commits=%d peak log=%.1f MiB", commits, float64(peak)/(1<<20))
+	if commits < 2 {
+		t.Fatalf("the activation committed %d time(s): its compaction cascade never reached the group's commit decision, so nothing bounds its log", commits)
+	}
+	// The commit decision falls at the END of an ingestion call, so the frames
+	// of the merge that crosses the bound are already in the log when the group
+	// commits: a cascade run one merge per call peaks at the bound plus one
+	// merge, never at the cascade. Measured on this fixture: 4.0 MiB bound,
+	// 4.01 MiB peak with the merges as their own calls, 23.4 MiB with the
+	// cascade inside the activation's one call -- and that figure grows with
+	// the repository, which is what no bound would mean.
+	if limit := 2 * f.s.WALBoundBytes(); peak > limit {
+		t.Fatalf("the log reached %.1f MiB during the activation; one merge past the %.1f MiB group bound is %.1f MiB",
+			float64(peak)/(1<<20), float64(f.s.WALBoundBytes())/(1<<20), float64(limit)/(1<<20))
 	}
 }
