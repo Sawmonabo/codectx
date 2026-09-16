@@ -340,7 +340,11 @@ CREATE TABLE search_units (
     -- carried unit own exactly the segments that hold at least one of its
     -- carried documents rather than every segment its predecessor ever owned.
     -- The reference is NO ACTION: a segment a document still names must not be
-    -- collectable.
+    -- collectable. It is the SOURCE OF TRUTH for which segments a generation
+    -- reads and for which segments are garbage: a compaction re-points every
+    -- row of its inputs at the merged segment, so no row names an absorbed
+    -- segment afterwards and a retired unit that is attached again finds its
+    -- documents where its rows point.
     segment_id INTEGER REFERENCES lexical_segments(id),
     UNIQUE(unit_id, search_key),
     FOREIGN KEY(unit_id, node_id) REFERENCES node_facts(unit_id, node_id),
@@ -609,6 +613,12 @@ CREATE INDEX idx_search_unit ON search_units(unit_id, rowid);
 -- it, and every read resolves a document by doc_id. Without this index both
 -- are a scan of search_units per probe.
 CREATE INDEX idx_search_doc ON search_units(doc_id);
+-- The segment arm of the same column. An activation walks the documents of
+-- each segment it is about to merge, re-points every row of the merged inputs
+-- and the collector asks, per candidate segment, whether any row still names
+-- it; all three are a scan of search_units per segment without this index, and
+-- carrying doc_id in it makes the walk index-only.
+CREATE INDEX idx_search_segment ON search_units(segment_id, doc_id);
 CREATE INDEX idx_session_expiry ON read_sessions(expires_at, workflow_state);
 CREATE INDEX idx_issued_session ON issued_chunks(session_id, confirmed_at, expires_at);
 CREATE INDEX idx_observations_session ON session_observations(session_id, scope_version, kind);
@@ -772,24 +782,13 @@ CREATE TABLE lexical_segment_parts (
     PRIMARY KEY(segment_id, stream, part)
 ) WITHOUT ROWID;
 
--- The units whose documents a segment holds. A segment a sealing unit wrote
--- names that one unit; a merged segment names every unit whose documents
--- survived the merge. It is what lets an activation decide that a segment it
--- already carries covers a member unit's documents.
-CREATE TABLE segment_units (
-    segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
-    unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
-    PRIMARY KEY(segment_id, unit_id)
-) WITHOUT ROWID;
--- The reverse direction: the segments that hold a unit's documents, which is
--- how an activation walks its members' segments in member order without a sort.
-CREATE INDEX idx_segment_units_unit ON segment_units(unit_id, segment_id);
-
--- The segment set of one generation, in read order. A generation names
--- segments; nothing is rewritten to publish it, and a retained generation keeps
--- its own rows when a later generation merges the same segments away. The
--- reference is RESTRICT rather than CASCADE: a segment a generation still names
--- must not be collectable while that row exists.
+-- The segment set of one generation, in read order. The set is DERIVED at
+-- activation from search_units.segment_id -- the distinct segments the live
+-- rows of the generation's member units point at -- and recorded here so a
+-- reader resolves it with one scan; nothing is rewritten to publish it, and a
+-- retained generation keeps its own rows when a later generation merges the
+-- same segments away. The reference is RESTRICT rather than CASCADE: a segment
+-- a generation still names must not be collectable while that row exists.
 CREATE TABLE generation_segments (
     generation_id INTEGER NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
     segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE RESTRICT,

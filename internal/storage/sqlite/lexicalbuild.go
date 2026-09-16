@@ -6,7 +6,9 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"log/slog"
+	"maps"
 	"runtime"
+	"slices"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -74,15 +76,6 @@ func lexicalColumnCode(c SearchColumn) byte {
 	}
 	return 0
 }
-
-// generationSegmentQuery walks the generation's member units in membership
-// order and, for each, the segments that hold its documents. There is
-// deliberately no ORDER BY: generation_units is keyed by (generation_id,
-// unit_id) and segment_units carries an index by unit, so the membership order
-// is the order the two b-trees already deliver. Asking the engine for it would
-// materialize the whole set in a temporary b-tree instead.
-const generationSegmentQuery = `SELECT su.segment_id FROM generation_units gu
-	JOIN segment_units su ON su.unit_id = gu.unit_id WHERE gu.generation_id = ?1`
 
 // foldUnitSegment folds the sealing unit's staged token instances into one
 // immutable segment and records the unit as its owner. It runs inside the
@@ -160,41 +153,27 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 		segment, unitRow); err != nil {
 		return 0, wrap("search_units", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO segment_units(segment_id, unit_id) VALUES(?, ?)`,
-		segment, unitRow); err != nil {
-		return 0, wrap("segment_units", err)
-	}
 	return segment, nil
 }
-
-// predecessorSegmentQuery reads a generation's own segment set in read order.
-// There is deliberately no ORDER BY: generation_segments is a WITHOUT ROWID
-// table keyed by (generation_id, ord), so a scan of its primary key already
-// delivers the segments in that order.
-const predecessorSegmentQuery = `SELECT segment_id FROM generation_segments WHERE generation_id = ?1`
 
 // buildLexical records the generation's segment set. It runs inside Activate's
 // transaction, after the packed adjacency and before the active pointer flips,
 // so a generation is published only with the structure every lexical query
 // reads.
 //
-// The set is the PREDECESSOR generation's set, in its own read order, plus the
-// segments of this generation's members that it does not already hold. An
-// activation therefore writes one row per segment and the visible-document
-// bitmap, never a packed structure: publishing a one-file delta costs the
-// delta's own segment, not a rewrite of everything the store already packed.
-// predecessor is zero for a first index, which starts from its members' own
-// segments alone.
+// The set is DERIVED, never copied: it is the distinct segments the live rows
+// of the generation's member units point at, in segment-id order.
+// search_units.segment_id is the source of truth -- a seal writes it over the
+// documents it folded, a carry-over copies it forward with doc_id, and a
+// compaction re-points it -- so a generation inherits its predecessor's
+// segments by that rule rather than by copying its set, and no segment can be
+// named beside the one that absorbed its documents.
 //
-// A document lies in exactly ONE segment -- search_units.segment_id names it,
-// and a carry-over copies that column forward -- so a member's segment that
-// the inherited set already holds must NOT be added again: two copies of one
-// segment in one set deliver every one of its documents twice, which the
-// posting merge refuses as a corrupt structure. An inherited segment none of
-// this generation's documents lies in is dropped instead of carried: it can
-// answer nothing, and carrying it would grow the set a query binary-searches
-// with every delta forever.
-func buildLexical(ctx context.Context, tx *sql.Tx, gen, predecessor int64) error {
+// An activation therefore writes one row per segment, the visible-document
+// bitmap and whatever compaction was due, never a rewrite of the whole packed
+// structure: publishing a one-file delta costs the delta's own segment plus,
+// occasionally, one tier merge.
+func buildLexical(ctx context.Context, tx *sql.Tx, gen int64) error {
 	// ADR-0007 holds this pass to 5 % of the index wall clock. That bound is
 	// only checkable if the operator can see the pass on its own, so its start
 	// and end are logged rather than hidden inside the activation's total, and
@@ -204,84 +183,57 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen, predecessor int64) error
 	started := time.Now()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	slog.Default().Info("packed lexical activation started", "generation", gen, "predecessor", predecessor)
-	var segments, inherited int64
+	slog.Default().Info("packed lexical activation started", "generation", gen)
+	var segments, merges int64
 	defer func() {
 		runtime.ReadMemStats(&after)
 		slog.Default().Info("packed lexical activation finished",
 			"generation", gen, "duration_ms", time.Since(started).Milliseconds(),
-			"segments", segments, "inherited", inherited,
+			"segments", segments, "merges", merges,
 			// Signed: a pass that ends after a collection leaves less live
 			// heap than it found, and an unsigned subtraction would report that
 			// as eighteen exabytes.
 			"heap_delta_bytes", int64(after.HeapInuse)-int64(before.HeapInuse))
 	}()
 
-	var ids []int64
-	seen := map[int64]bool{}
-	collect := func(what, query string, arg int64) error {
-		rows, err := tx.QueryContext(ctx, query, arg)
-		if err != nil {
-			return wrap(what, err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				return wrap(what, err)
-			}
-			if seen[id] {
-				continue
-			}
-			seen[id] = true
-			ids = append(ids, id)
-		}
-		if err := rows.Err(); err != nil {
-			return wrap(what, err)
-		}
-		return wrap(what, rows.Close())
-	}
-	if predecessor != 0 {
-		if err := collect("generation_segments", predecessorSegmentQuery, predecessor); err != nil {
-			return err
-		}
-		inherited = int64(len(ids))
-	}
-	if err := collect("segment_units", generationSegmentQuery, gen); err != nil {
-		return err
-	}
-
 	visible, docCount, tokenTotal, live, err := visibleDocuments(ctx, tx, gen)
 	if err != nil {
 		return err
 	}
-	held, err := segmentDocCounts(ctx, tx, ids)
+	// Segment-id order. The set comes out of a map because the one pass that
+	// resolves it is over DOCUMENTS, and asking the engine for a sorted
+	// distinct segment instead would materialize the set in a temporary b-tree
+	// at the moment that publishes facts to every reader.
+	ids := slices.Sorted(maps.Keys(live))
+	stats, err := segmentStats(ctx, tx, ids)
 	if err != nil {
 		return err
 	}
-	ord, covered := 0, int64(0)
-	for _, id := range ids {
-		if live[id] == 0 {
-			continue
-		}
-		hidden := held[id] - live[id]
+	ids, merges, err = compactSegments(ctx, tx, ids, live, stats)
+	if err != nil {
+		return err
+	}
+
+	var covered int64
+	for ord, id := range ids {
+		hidden := stats[id].docs - live[id]
 		if hidden < 0 {
 			return corrupt("generation %d holds %d documents of segment %d, which packed %d",
-				gen, live[id], id, held[id])
+				gen, live[id], id, stats[id].docs)
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO generation_segments(generation_id, segment_id, ord, hidden) VALUES(?, ?, ?, ?)`,
 			gen, id, ord, hidden); err != nil {
 			return wrap("generation_segments", err)
 		}
-		ord++
 		covered += live[id]
 	}
-	segments = int64(ord)
+	segments = int64(len(ids))
 	// Every visible document of a generation lies in exactly ONE of its
-	// segments. The set is assembled from the units' ownership, so a document
-	// whose segment no member owns would simply never be read -- a term would
-	// silently miss it on every query, with no failing check anywhere.
+	// segments. The set is assembled from the segments its own documents point
+	// at, so a document whose row points at a segment the set dropped would
+	// simply never be read -- a term would silently miss it on every query,
+	// with no failing check anywhere.
 	if covered != docCount {
 		return corrupt("generation %d carries %d documents but its %d segments hold %d of them",
 			gen, docCount, segments, covered)
@@ -296,27 +248,6 @@ func buildLexical(ctx context.Context, tx *sql.Tx, gen, predecessor int64) error
 		return wrap("generation_lexical", err)
 	}
 	return nil
-}
-
-// segmentDocCounts reads how many documents each of the candidate segments
-// packed. It is one point lookup per segment on the segments' primary key --
-// the set is a function of the generation's units, never of its documents --
-// and it is what turns a per-segment live count into the hidden count a
-// document frequency uses to skip the posting walk.
-func segmentDocCounts(ctx context.Context, tx *sql.Tx, ids []int64) (map[int64]int64, error) {
-	out := make(map[int64]int64, len(ids))
-	for _, id := range ids {
-		var n int64
-		err := tx.QueryRowContext(ctx, `SELECT doc_count FROM lexical_segments WHERE id = ?`, id).Scan(&n)
-		if isNoRows(err) {
-			return nil, corrupt("generation names lexical segment %d, which does not exist", id)
-		}
-		if err != nil {
-			return nil, wrap("lexical_segments", err)
-		}
-		out[id] = n
-	}
-	return out, nil
 }
 
 // docBitmap is the generation's visible document set, resolved once. A
@@ -340,13 +271,22 @@ func (b *docBitmap) set(doc int64) {
 	b.bits[doc>>3] |= 1 << uint(doc&7)
 }
 
+// generationDocumentQuery is the one pass that resolves a generation's
+// documents, and with them its segment set. There is deliberately no ORDER BY
+// and no DISTINCT: the set is folded in the caller's map, and asking the engine
+// for either would materialize every document of the generation in a temporary
+// b-tree.
+const generationDocumentQuery = `SELECT su.doc_id, su.segment_id FROM search_units su
+	WHERE EXISTS (SELECT 1 FROM generation_units gu
+		WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`
+
 // visibleDocuments resolves the generation's visible documents into a bitmap,
 // the document statistics the scorer needs, and how many documents of each
 // segment the generation still carries -- all from ONE pass over the
 // generation's documents, which is the only place the segment a document lies
 // in is known per document. The live counts are what the hidden count on
-// generation_segments is derived from, and activation stores the bitmap, so no
-// reader repeats this pass.
+// generation_segments is derived from, they are the generation's segment set
+// itself, and activation stores the bitmap, so no reader repeats this pass.
 func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, int64, int64, map[int64]int64, error) {
 	var docCount, tokenTotal, maxDoc int64
 	if err := tx.QueryRowContext(ctx, `SELECT count(*), coalesce(sum(su.token_count), 0), coalesce(max(su.doc_id), 0)
@@ -357,9 +297,7 @@ func visibleDocuments(ctx context.Context, tx *sql.Tx, gen int64) (*docBitmap, i
 	}
 	b := &docBitmap{bits: make([]byte, maxDoc/8+1), max: maxDoc}
 	live := map[int64]int64{}
-	rows, err := tx.QueryContext(ctx, `SELECT su.doc_id, su.segment_id FROM search_units su
-		WHERE EXISTS (SELECT 1 FROM generation_units gu
-			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?1)`, gen)
+	rows, err := tx.QueryContext(ctx, generationDocumentQuery, gen)
 	if err != nil {
 		return nil, 0, 0, nil, wrap("search_units", err)
 	}
@@ -391,10 +329,14 @@ type lexicalWriter struct {
 
 	term    []byte
 	haveTrm bool
-	df      int64
-	listBuf []byte
-	textOff int64
-	listOff int64
+	// prev is the last term the directory received, from either path, so the
+	// order guard holds across a verbatim copy as well as a folded term.
+	prev     []byte
+	havePrev bool
+	df       int64
+	listBuf  []byte
+	textOff  int64
+	listOff  int64
 
 	doc     int64
 	last    int64
@@ -405,11 +347,12 @@ type lexicalWriter struct {
 	scratch [binary.MaxVarintLen64]byte
 }
 
-// add folds one staged row: how many times a term occurs in one column of one
-// document. Terms and, within a term, documents must not go backwards: the
-// streamed directory is ordered by construction and a reader binary-searches
-// it, so an out-of-order read would silently produce a directory no lookup can
-// trust.
+// add folds one input row: how many times a term occurs in one column of one
+// document. Within a term, documents must not go backwards; terms must not go
+// backwards either, which writeEntry checks for both this path and the merge's
+// verbatim one. The streamed directory is ordered by construction and a reader
+// binary-searches it, so an out-of-order write would silently produce a
+// directory no lookup can trust.
 func (w *lexicalWriter) add(term []byte, doc int64, code byte, n int64) error {
 	if code == 0 {
 		return internal("packed lexical fold received an unknown column code")
@@ -419,16 +362,13 @@ func (w *lexicalWriter) add(term []byte, doc int64, code byte, n int64) error {
 	}
 	switch {
 	case !w.haveTrm || !bytes.Equal(w.term, term):
-		if w.haveTrm && bytes.Compare(term, w.term) < 0 {
-			return corrupt("lexical staging emitted term %q after term %q", string(term), string(w.term))
-		}
 		if err := w.flushTerm(); err != nil {
 			return err
 		}
 		w.term = append(w.term[:0], term...)
 		w.haveTrm = true
 	case doc < w.doc:
-		return corrupt("lexical staging emitted term %q at document %d after document %d", string(term), doc, w.doc)
+		return corrupt("packed lexical fold emitted term %q at document %d after document %d", string(term), doc, w.doc)
 	}
 	if !w.haveDoc || doc != w.doc {
 		if err := w.flushDoc(); err != nil {
@@ -493,28 +433,59 @@ func (w *lexicalWriter) flushTerm() error {
 	if w.df == 0 {
 		return internal("packed lexical fold left term " + string(w.term) + " with no document")
 	}
-	if len(w.term) > int(^uint16(0)) {
-		return corrupt("lexical staging carries a term of %d bytes", len(w.term))
+	if err := w.writeEntry(w.term, w.listBuf, w.df); err != nil {
+		return err
+	}
+	w.resetTerm()
+	return nil
+}
+
+// copyTerm writes a term whose posting bytes are taken verbatim from one input
+// segment: the merge copies them unread, so the term's documents, their groups
+// and their deltas are exactly the bytes that were packed. The caller has
+// established that no other input carries the term and that this one holds no
+// dead document, which is what makes an unread copy equal to a decoded merge.
+func (w *lexicalWriter) copyTerm(term, list []byte, df int64) error {
+	if err := w.flushTerm(); err != nil {
+		return err
+	}
+	if df == 0 || len(list) == 0 {
+		return internal("packed lexical merge was asked to copy term " + string(term) + " with no document")
+	}
+	return w.writeEntry(term, list, df)
+}
+
+// writeEntry appends one term to the three streams and is the ONE place the
+// directory's order is established: a term that does not follow the previous
+// one would produce a directory a binary search cannot trust, whichever path
+// wrote it.
+func (w *lexicalWriter) writeEntry(term, list []byte, df int64) error {
+	if w.havePrev && bytes.Compare(term, w.prev) <= 0 {
+		return corrupt("packed lexical fold wrote term %q after term %q", string(term), string(w.prev))
+	}
+	if len(term) > int(^uint16(0)) {
+		return corrupt("packed lexical fold carries a term of %d bytes", len(term))
 	}
 	var entry [termEntryBytes]byte
 	binary.LittleEndian.PutUint64(entry[termEntryTextOff:], uint64(w.textOff))
 	binary.LittleEndian.PutUint64(entry[termEntryListOff:], uint64(w.listOff))
-	binary.LittleEndian.PutUint32(entry[termEntryListLen:], uint32(len(w.listBuf)))
-	binary.LittleEndian.PutUint32(entry[termEntryDF:], uint32(w.df))
-	binary.LittleEndian.PutUint16(entry[termEntryTextLen:], uint16(len(w.term)))
-	if err := w.text.write(w.term); err != nil {
+	binary.LittleEndian.PutUint32(entry[termEntryListLen:], uint32(len(list)))
+	binary.LittleEndian.PutUint32(entry[termEntryDF:], uint32(df))
+	binary.LittleEndian.PutUint16(entry[termEntryTextLen:], uint16(len(term)))
+	if err := w.text.write(term); err != nil {
 		return err
 	}
-	if err := w.list.write(w.listBuf); err != nil {
+	if err := w.list.write(list); err != nil {
 		return err
 	}
 	if err := w.dir.write(entry[:]); err != nil {
 		return err
 	}
-	w.textOff += int64(len(w.term))
-	w.listOff += int64(len(w.listBuf))
+	w.textOff += int64(len(term))
+	w.listOff += int64(len(list))
 	w.terms++
-	w.resetTerm()
+	w.prev = append(w.prev[:0], term...)
+	w.havePrev = true
 	return nil
 }
 
