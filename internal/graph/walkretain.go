@@ -371,7 +371,10 @@ func (r *retainFile) truncate(n int64) error {
 		r.bytes = 0
 		return nil
 	}
-	if err := os.Truncate(r.path(), n); err != nil {
+	// Cut back at the pace: a retained level is as large as the level it
+	// holds, and a resume that freed all of it at once would be a burst on
+	// the resumed request's own path.
+	if err := paced.Shrink(r.path(), n); err != nil {
 		if os.IsNotExist(err) && n == 0 {
 			r.bytes = 0
 			return nil

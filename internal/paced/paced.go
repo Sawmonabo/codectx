@@ -106,6 +106,14 @@ func Shrink(path string, size int64) error {
 		return err
 	}
 	defer f.Close()
+	return ShrinkFile(f, size)
+}
+
+// ShrinkFile is Shrink on a file the caller already holds open: the frontier
+// bitset cleared at a level transition, a tool payload reset before a retry.
+// Reopening by name to shrink would race whoever renamed it in the meantime,
+// and the caller's own descriptor is the file it means.
+func ShrinkFile(f *os.File, size int64) error {
 	st, err := f.Stat()
 	if err != nil {
 		return err
