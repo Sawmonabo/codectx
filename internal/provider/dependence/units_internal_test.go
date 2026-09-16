@@ -9,11 +9,14 @@ import (
 )
 
 // TestChildProjectsKeepsEveryPart pins the one invariant of the subdivision
-// boundary: every source-bearing subdirectory of a crashed unit is returned.
-// The list used to be sliced to a fixed 512 with no word said, so the tail of
-// a large unit's source was never parsed by the only run that could still
-// analyse it and the unit sealed looking merely subdivided. No other assertion
-// sees a dropped part.
+// boundary.
+//
+// Requirement: every source-bearing subdirectory of a crashed unit is returned.
+//
+// Mutation that fails it: slice the list to a fixed 512 with no word said. The
+// tail of a large unit's source is then never parsed by the only run that could
+// still analyse it, and the unit seals looking merely subdivided. No other
+// assertion sees a dropped part.
 func TestChildProjectsKeepsEveryPart(t *testing.T) {
 	root := t.TempDir()
 	const parts = 600

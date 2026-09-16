@@ -49,9 +49,7 @@ type StoredAlias struct {
 // MaxAliasLookup is the BATCH size of one alias-lookup read, not a cap on the
 // answer. LookupAliases pages the matching identities with a keyset on the
 // ordering columns and returns every one of them, so a key aliased to more
-// identities than this costs more round trips and loses nothing. It keeps its
-// former value so a caller that passes it asks for the same batch it used to
-// ask for as a ceiling.
+// identities than this costs more round trips and loses nothing.
 const MaxAliasLookup = model.MaxAmbiguousCandidates + 2
 
 // aliasUnitChunk bounds the `IN (...)` fan-out of ONE statement. A lookup over

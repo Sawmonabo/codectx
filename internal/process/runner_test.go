@@ -115,11 +115,15 @@ func waitForPID(t *testing.T, path string) int {
 }
 
 // TestOutputOverTheCapCompletesAndIsFlagged protects the invariant that a
-// capture bound bounds memory and nothing else. A child that produces three
-// times the bound must still run to completion and still have every record it
-// wrote consumed; only the bytes this package would otherwise have to hold are
-// dropped, and only for a stream it is capturing. Terminating the tree instead
-// -- what this runner used to do -- turns a large repository into a refusal.
+// capture bound bounds memory and nothing else.
+//
+// Requirement: a child that produces three times the bound still runs to
+// completion and still has every record it wrote consumed; only the bytes this
+// package would otherwise have to hold are dropped, and only for a stream it is
+// capturing.
+//
+// Mutation that fails it: terminate the process tree at the capture bound,
+// which turns a large repository into a refusal.
 func TestOutputOverTheCapCompletesAndIsFlagged(t *testing.T) {
 	requireExecutable(t, "/bin/sh")
 	runner, dir := testRunner(t)
@@ -434,12 +438,16 @@ func TestLiveSubprocessCountUnwindsOnFailure(t *testing.T) {
 }
 
 // TestAdmissionWaitsForHeadroom protects the class-C rule for the runner's
-// byte budgets: a run that does not fit the REMAINING budget waits for
-// headroom and then runs, and only a reservation larger than the whole
-// user-set budget is refused. The failure it guards against is the one the
-// budgets used to have -- a second analysis unit refused outright because a
-// first was still holding memory, which turns capacity that exists a second
-// later into a failed unit.
+// byte budgets.
+//
+// Requirement: a run that does not fit the REMAINING budget waits for headroom
+// and then runs, and only a reservation larger than the whole user-set budget
+// is refused.
+//
+// Mutation that fails it: refuse a reservation that does not fit the remaining
+// budget. A second analysis unit is then refused outright because a first is
+// still holding memory, which turns capacity that exists a second later into a
+// failed unit.
 func TestAdmissionWaitsForHeadroom(t *testing.T) {
 	requireExecutable(t, "/bin/sh")
 	runner, err := NewRunner(Limits{MaxConcurrent: 4, MemoryBudgetBytes: 1000, DiskBudgetBytes: 1 << 30})

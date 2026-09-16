@@ -502,8 +502,8 @@ project's installed distributions through the interpreter and pip, and
 `rust-analyzer` loads `cargo metadata`. Where the toolchain is absent, that
 language has no precise index — the profile exits non-zero and the unit fails
 with `CTX_PROVIDER_UNAVAILABLE` — and the structural and dependence providers
-still cover it. `scip-java` used to belong to that list, through Maven or
-Gradle; it no longer does (see below).
+still cover it. `scip-java` is not in that list: it compiles the snapshot with
+the managed JDK's own `javac` and needs no host build tool (see below).
 
 `<input>` is the private materialization root, which is also the child's
 working directory; `<output>` and `<work>` are under the run directory, outside
