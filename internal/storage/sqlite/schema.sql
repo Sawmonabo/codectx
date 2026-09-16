@@ -652,10 +652,19 @@ CREATE TABLE generation_supplied_indexes (
     resolved INTEGER NOT NULL CHECK(resolved IN (0, 1)),
     PRIMARY KEY(generation_id, path)
 );
--- The live watch heartbeat of one repository: what a `codectx index --watch`
--- process in another terminal knows, published where a second process can read
--- it. Without the row, a reporting process has no cross-process source for the
--- pending-event count and no way to say whether a watch is running at all.
+-- The live watch heartbeats of one repository: one row per watching process,
+-- published where a second process can read them. Without these rows, a
+-- reporting process has no cross-process source for the pending-event count and
+-- no way to say whether a watch is running at all.
+--
+-- The key is the repository AND the writer's own session identity, because a
+-- workspace can be watched by more than one process at once -- a `codectx
+-- watch` in a terminal and an editor's server, say -- and one row per
+-- repository would have each one overwrite the other's claim, so whichever beat
+-- last would be the only watch anybody could see. `session_id` is minted once
+-- per watch, from the same random-identifier source every other operational id
+-- uses, and not the pid: an operating system reuses a pid, so a row keyed by
+-- one could be claimed by an unrelated process that inherited the number.
 --
 -- `expires_at` is written by the watcher itself, not derived by the reader from
 -- configuration: a reader whose `[index]` block differs from the watcher's --
@@ -664,22 +673,33 @@ CREATE TABLE generation_supplied_indexes (
 -- writer states its own deadline and refreshes it while it lives, so an expired
 -- row means the process that owned it stopped refreshing, which is the only
 -- signal of process death that works on every platform this product supports
--- (a pid can be reused, and probing one is neither portable nor race-free).
+-- (a pid can be reused, and probing one is neither portable nor race-free). It
+-- is the same rule the run ledger states a run's liveness by, and a second rule
+-- for whether a process is still there would drift from it.
+--
+-- `beat_at` is when the writer last published this row, and is reported beside
+-- the watcher rather than judged: liveness is `expires_at` and nothing else.
+-- Deriving one from the other would be the reader recomputing the writer's
+-- window, which is exactly what `expires_at` exists to prevent.
 --
 -- `pending_events` and `last_pass_at` are nullable because absent and zero are
 -- different answers here as everywhere else: a watch driven only by periodic
 -- reconciliation has no notification queue to count, and a watch that has not
 -- completed a pass yet has no pass time -- neither is "0 pending" or "the epoch".
 --
--- One row per repository, replaced in place: this is liveness, not history.
+-- One row per watching process, replaced in place: this is liveness, not
+-- history. A row whose writer died is deleted by the next beat published for
+-- the repository, by the same elapsed-stamp rule a reader judges it by.
 CREATE TABLE watch_heartbeat (
-    repository_id BLOB PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,
+    repository_id BLOB NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 32),
     writer_pid INTEGER NOT NULL CHECK(writer_pid > 0),
+    beat_at TEXT NOT NULL,
     last_pass_at TEXT,
     pending_events INTEGER CHECK(pending_events IS NULL OR pending_events >= 0),
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY(repository_id, session_id)
 );
-
 -- A sealed capsule's record lists (Section 17.3). context_capsules carries the
 -- capsule's identity and its per-list counts; the records themselves live here,
 -- one row each, so sealing a session that observed a repository-sized record

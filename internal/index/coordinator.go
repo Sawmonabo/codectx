@@ -452,7 +452,15 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 	if interval <= 0 {
 		return invalid("watch needs a positive reconcile interval")
 	}
-	c.watch.enter(c.opts.Watcher)
+	// The watch's own identity, minted once here: the heartbeat row is keyed by
+	// it, so two watching processes -- a terminal's `codectx watch` and an
+	// editor's server -- each keep their own row instead of overwriting one
+	// another's. It is not the pid, which the operating system reuses.
+	session, err := model.NewRandomID()
+	if err != nil {
+		return err
+	}
+	c.watch.enter(c.opts.Watcher, session)
 	defer c.watch.leave()
 	// The heartbeat row names this repository, and on a workspace nothing has
 	// ever indexed there is no repository row for it to name: every beat would
@@ -556,7 +564,7 @@ func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
 		// would be refused by the very cancellation it is reacting to.
 		clearCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), watchHeartbeatInterval)
 		defer cancel()
-		if err := c.opts.Store.ClearWatchHeartbeat(clearCtx, c.repo); err != nil {
+		if err := c.opts.Store.ClearWatchHeartbeat(clearCtx, c.repo, c.watch.session()); err != nil {
 			logTyped(c.log, "the watch heartbeat could not be withdrawn; another process will report this watch as running until it expires",
 				err, "component", component, "repository_id", string(c.repo))
 		}
@@ -573,12 +581,15 @@ func (c *Coordinator) beatHeartbeat(ctx context.Context) func() {
 // publishes its presence and no figures, so a reader tells it apart from a watch
 // that is covering this workspace and from one that never ran.
 func (c *Coordinator) publishHeartbeat(ctx context.Context) {
-	lastPass, pending := c.watch.heartbeat()
+	session, lastPass, pending := c.watch.heartbeat()
+	now := c.now()
 	err := c.opts.Store.RecordWatchHeartbeat(ctx, c.repo, sqlite.WatchHeartbeat{
+		SessionID:     session,
 		WriterPID:     os.Getpid(),
+		BeatAt:        now,
 		LastPassAt:    lastPass,
 		PendingEvents: pending,
-		ExpiresAt:     c.now().Add(watchHeartbeatTTL),
+		ExpiresAt:     now.Add(watchHeartbeatTTL),
 	})
 	if err != nil && ctx.Err() == nil {
 		logTyped(c.log, "the watch heartbeat could not be published; another process cannot report on this watch",
