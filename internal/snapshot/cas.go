@@ -19,6 +19,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/source"
 )
 
@@ -204,14 +205,14 @@ func (b *Batch) put(ctx context.Context, r io.Reader, want string) (model.BlobRe
 		// The identical blob is already staged in this group and will be
 		// published and synced by the same flush, before the same barrier.
 		tmp.Close()
-		os.Remove(tmp.Name())
+		paced.Remove(tmp.Name())
 		return rec, nil
 	}
 	dir := filepath.Dir(final)
 	if _, ok := b.dirty[dir]; !ok {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			tmp.Close()
-			os.Remove(tmp.Name())
+			paced.Remove(tmp.Name())
 			return model.BlobRecord{}, ioError("CAS bucket", err)
 		}
 		b.dirty[dir] = struct{}{}
@@ -252,7 +253,7 @@ func (b *Batch) Barrier(ctx context.Context) error {
 func (b *Batch) Discard() {
 	for i := range b.open {
 		b.open[i].f.Close()
-		os.Remove(b.open[i].f.Name())
+		paced.Remove(b.open[i].f.Name())
 	}
 	b.open = b.open[:0]
 	clear(b.pending)
@@ -276,7 +277,7 @@ func (b *Batch) flush(ctx context.Context) error {
 		// both fail harmlessly.
 		for i := range group {
 			group[i].f.Close()
-			os.Remove(group[i].f.Name())
+			paced.Remove(group[i].f.Name())
 		}
 	}()
 	if err := ctx.Err(); err != nil {
@@ -336,7 +337,7 @@ func (c *CAS) stage(ctx context.Context, r io.Reader, want string) (model.BlobRe
 	defer func() {
 		if !keep {
 			tmp.Close()
-			os.Remove(tmp.Name())
+			paced.Remove(tmp.Name())
 		}
 	}()
 
@@ -451,7 +452,7 @@ func (c *CAS) Remove(hash string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return ioError("CAS remove", err)
 	}
 	return nil

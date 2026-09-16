@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // gcBatchUnits bounds one collection transaction.
@@ -331,7 +332,7 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 			return err
 		}
 		for _, id := range gone {
-			if rmErr := os.Remove(s.stagePath(id)); rmErr != nil && !os.IsNotExist(rmErr) {
+			if rmErr := paced.Remove(s.stagePath(id)); rmErr != nil && !os.IsNotExist(rmErr) {
 				return internal("lexical staging: " + rmErr.Error())
 			}
 		}

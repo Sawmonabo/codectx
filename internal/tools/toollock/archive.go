@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -107,7 +108,7 @@ func extractTarGz(src, dst string, strip int) error {
 			if err := os.MkdirAll(filepath.Dir(target), dirMode); err != nil {
 				return err
 			}
-			_ = os.Remove(target)
+			_ = paced.Remove(target)
 			if err := os.Symlink(hdr.Linkname, target); err != nil {
 				return err
 			}
@@ -178,7 +179,7 @@ func extractZip(src, dst string, strip int) error {
 			if err := confinedLink(path.Dir(clean), link); err != nil {
 				return fmt.Errorf("%s: %w", src, err)
 			}
-			_ = os.Remove(target)
+			_ = paced.Remove(target)
 			if err := os.Symlink(link, target); err != nil {
 				return err
 			}

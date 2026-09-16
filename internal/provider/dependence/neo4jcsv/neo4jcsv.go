@@ -42,6 +42,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 )
 
@@ -301,7 +302,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if err != nil {
 		return rep, internalErr("import scratch directory: %v", err)
 	}
-	defer os.RemoveAll(dir)
+	defer paced.RemoveAll(dir)
 
 	sc, err := openScratch(ctx, filepath.Join(dir, "stage.db"), opts.StagingCacheKiB, opts.MaxStagedRows)
 	if err != nil {

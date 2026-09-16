@@ -92,7 +92,7 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_SOURCE_INTEGRITY` | A stored source block did not match its recorded hash. | Same as above: re-index. Do not keep serving from the store — retained bytes are what every answer cites. |
 | `CTX_NO_ACTIVE_GENERATION` | The workspace is initialized but nothing has been published yet, or the last run failed before publication. | Run `codectx index`. A failed or unsealed unit is invisible by design, so a partial run leaves no half-visible state to clean up. |
 | `CTX_WORKSPACE_BUSY` | Another process holds the workspace lock, or a live lease or retained session still references what was asked for. | **Retryable.** Wait and retry. The workspace lock is an advisory OS file lock, so it is released by the kernel if its holder dies — there is no stale lock file to remove by hand. |
-| `CTX_DISK_FULL` | Free space is below `resources.min_free_disk_bytes`, or a temporary budget was exhausted. | See "Disk pressure" below. |
+| `CTX_DISK_FULL` | Free space is below `resources.min_free_disk_bytes`, a temporary budget was exhausted, or the filesystem refused a database write with less than one ingestion group free under the data directory. The message carries the engine's own result and the free space measured at the failure. | See "Disk pressure" below. |
 | `CTX_RESOURCE_LIMIT` / `CTX_MINIMUM_BUDGET` | A bounded operation hit its ceiling, or the configured budgets cannot satisfy the minimum this build needs. | Narrow the request, or raise the relevant `[resources]` key. `CTX_MINIMUM_BUDGET` means the configuration itself does not hold together. |
 | `CTX_PROVIDER_UNAVAILABLE` | A provider is not usable — not installed, unsupported platform, or refused as too old. | The detail names the provider and the reason. Either install or enable it, or disable it; the index is still published without it, with that capability reported degraded. |
 | `CTX_BINARY_CONTENT` | A file is not text, so it has no lexical index. | Nothing to fix. The file is still retained and still served byte for byte; only searching inside it is meaningless. |
@@ -176,7 +176,14 @@ unreadable sweeps on the next pass.
 
 Free space is checked against `resources.min_free_disk_bytes` (default
 `1073741824`). Below it, indexing pauses and writes return a typed
-`CTX_DISK_FULL` rather than a partial store. **Disk pressure never evicts the
+`CTX_DISK_FULL` rather than a partial store. A database write the
+filesystem refuses is settled against the disk at that moment: the engine
+reports a full disk and a failing device with the same result codes, so the
+store measures the free space under the data directory and reports
+`CTX_DISK_FULL` only when less than one ingestion group is free; with more
+free the disk is not full, and the error is `CTX_INTERNAL` carrying the
+engine's message and code and the measured figure, with the kernel log as the
+place to look for the device's refusal. **Disk pressure never evicts the
 source an open session is reading** — degrading an answer is not an acceptable
 way to free space.
 

@@ -36,6 +36,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -539,7 +540,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if err != nil {
 			return Report{}, internal("scip run directory: " + err.Error())
 		}
-		defer os.RemoveAll(runDir)
+		defer paced.RemoveAll(runDir)
 		workDir = runDir
 		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir, &im.seen)
 		if err != nil {

@@ -35,6 +35,7 @@ import (
 	"syscall"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 const (
@@ -79,7 +80,7 @@ func Sweep(dataDir string) error {
 			if !strings.HasPrefix(e.Name(), dir.prefix) {
 				continue
 			}
-			if err := os.Remove(filepath.Join(dir.path, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := paced.Remove(filepath.Join(dir.path, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				errs = append(errs, ioError("recovery cleanup", err))
 			}
 		}

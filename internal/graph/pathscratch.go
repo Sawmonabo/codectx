@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"modernc.org/sqlite"
 )
 
@@ -287,7 +288,7 @@ func (s *pathScratch) close() error {
 		s.db = nil
 	}
 	if s.dir != "" {
-		err := os.RemoveAll(s.dir)
+		err := paced.RemoveAll(s.dir)
 		s.dir = ""
 		if err != nil {
 			return internalErr("path scratch cleanup: " + err.Error())

@@ -26,6 +26,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 var (
@@ -190,7 +192,7 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 
 		start := time.Now()
 		treeDir := filepath.Join(work, "tree", spec.Name+"-"+plat)
-		_ = os.RemoveAll(treeDir)
+		_ = paced.RemoveAll(treeDir)
 
 		var (
 			provenance, upstreamDigest string
@@ -233,7 +235,7 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 			}
 			payloadURL, payloadSum, payloadSize = pp.Src.URL, sum, size
 			if !*flagKeep {
-				_ = os.Remove(dl)
+				_ = paced.Remove(dl)
 			}
 		case pp.Build != nil && pp.Build.Kind == "npm":
 			provenance = "built"
@@ -244,7 +246,7 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 			dir, built := npmDirs[spec2.ID]
 			if !built {
 				dir = filepath.Join(work, "npm", spec2.ID)
-				_ = os.RemoveAll(dir)
+				_ = paced.RemoveAll(dir)
 				if err := buildNPM(ctx, spec2, dir); err != nil {
 					return entry, err
 				}
@@ -324,10 +326,10 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 
 		if !*flagKeep {
 			if outPath != "" {
-				_ = os.Remove(outPath)
+				_ = paced.Remove(outPath)
 			}
 			if pp.Build == nil || pp.Build.Kind != "npm" {
-				_ = os.RemoveAll(treeDir)
+				_ = paced.RemoveAll(treeDir)
 			}
 		}
 	}
@@ -353,7 +355,7 @@ func realizeTool(ctx context.Context, work string, spec toolSpec) (Entry, error)
 	}
 	if !*flagKeep {
 		for _, d := range npmDirs {
-			_ = os.RemoveAll(d)
+			_ = paced.RemoveAll(d)
 		}
 	}
 	return entry, nil

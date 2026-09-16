@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
@@ -720,7 +721,7 @@ func (c *Compiler) checkpointAt(ctx context.Context, b model.Binding, requestHas
 		Scalars:     scalars,
 	}
 	fail := func(err error) (string, error) {
-		_ = os.RemoveAll(dir)
+		_ = paced.RemoveAll(dir)
 		return "", err
 	}
 	for _, name := range names {

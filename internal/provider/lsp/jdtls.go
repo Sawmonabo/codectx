@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // platformConfigDirs are the jdtls payload's per-platform Equinox
@@ -66,7 +68,7 @@ func seedPlatformConfig(payloadRoot, workDir string) error {
 	if err != nil {
 		return unavailable("the language server configuration directory cannot be created: %v", err)
 	}
-	defer os.RemoveAll(staging)
+	defer paced.RemoveAll(staging)
 	budget := int64(maxPlatformConfigBytes)
 	if err := copyConfigTree(src, staging, &budget); err != nil {
 		return err

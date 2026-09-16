@@ -79,12 +79,16 @@ bounded by the writer's page cache; nothing commits per batch.
    times the bytes stored, measured, in write calls the kernel absorbs on a short run and flushes
    on a long one. The store sets the engine's spill threshold to 64 MiB before the first
    connection, one batch's pages, released with the savepoint.
-5. **Paced writeback.** While a group is open and until its commit and checkpoint have finished,
-   the store asks the kernel every hundred milliseconds to begin writing the dirty pages of the
-   log and the database, the way a database's bytes-per-sync and checkpoint-flush settings do. It
-   never waits and never changes what is durable when; it spreads a group's disk traffic over
-   the time the group takes wherever the writer is slower than the disk, and it starts the
-   commit's traffic during the commit's own append rather than at the sync that ends it.
+5. **Bounded writes in flight.** Every file the engine writes -- the log, the database at
+   checkpoint, journals, sort spills -- reaches the disk through a file-system shim
+   (`internal/storage/pacedvfs`) registered as the process default: after every window of
+   8 MiB written to a file, the writer waits for the window before it to reach the disk and
+   submits the new one. At most one window is in flight per file and at most two are dirty,
+   whatever the transaction's size, so a commit's traffic is a stream at the disk's own rate
+   with a bounded queue, never a burst. It changes nothing about what is durable when: the
+   engine's own syncs still decide that, and find the file already written. The window is a
+   layout constant, not a limit: it bounds what is outstanding, never what is written or how
+   fast the disk may run. (Amended; see below.)
 6. **Exclusive writers.** State that must be visible to every connection the moment the call
    returns (sessions, leases, heartbeats, retention, the planner's statistics, generation pins)
    keeps its own transaction. It announces itself, the next ingestion call commits the group, and
@@ -96,7 +100,56 @@ bounded by the writer's page cache; nothing commits per batch.
 8. **Requirements, as tests.** The store's ingestion test asserts that the bytes the engine writes
    and the bytes sent to disk are each at most four times the bytes stored; a second test gives
    the writer a 2 MiB cache and asserts the log never exceeds twice the cache; a third writes
-   64 MiB under the pacer and asserts none of it is still dirty when the file is truncated.
+   64 MiB through the engine in one transaction and asserts that at most two windows of it are
+   still dirty when the file is truncated, and that a wait was issued.
+
+### Decision 5, amended 2026-09-16: the writer waits on the disk
+
+The decision as first taken asked the kernel every hundred milliseconds to begin writing the
+log's and the database's dirty pages and never waited. Two uncapped indexes of a 6 270-file
+repository on a virtual machine that bounces every disk request through a 64 MB pool
+(`swiotlb=force`) showed what that leaves: the group's commit appended 897 MB of log and the
+checkpoint copied 892 MB into the database inside four seconds, the kernel logged the pool
+exhausted twenty-two times in each run, and in the second run the whole machine stalled for
+sixty seconds (I/O stall 94 %, memory stall 45 %) with the product's own write counter flat --
+the host was draining a backlog the interval pacer had merely started. Bytes were write-once
+as measured; the rate and the depth were not bounded by anything.
+
+An interval pacer cannot bound them: the commit writes at memory speed, so by the time the
+next tick fires the whole group is dirty, and the sync that ends the checkpoint submits all of
+it as deep as the device queue allows. Alternative 4 below was rejected on the ground that a
+bound "would need the writer to wait on the disk, which is a rate limit and a knob". The first
+half is right and is now the decision; the second is wrong: a writer that waits for the
+previous window before submitting the next runs at exactly the disk's rate with a fixed window
+outstanding -- the way TCP's sender is clocked by acknowledgements and the way a database's
+strict bytes-per-sync and checkpoint-flush settings are implemented -- and has no rate and no
+setting. The window is a layout constant of the shim.
+
+The shim wraps the engine's own file system rather than pacing named files from outside,
+because the writes that burst are the engine's -- the log's frames, the checkpoint's pages,
+a spilled statement journal, a sort's runs -- and only the file system sees every one of
+them. On a platform without range writeback the wait is the wrapped file's own sync, which
+with at most two windows dirty is a bounded wait.
+
+### Decision 5, amended again 2026-09-16: freeing is windowed like writing
+
+The third uncapped index, with the shim in place, kept the dirty set under 5 MB and the pool
+never exhausted through the 1.8 GB commit -- and then stalled the host anyway, twice, at the
+two moments the run frees space: the log's reset after the checkpoint and the removal of the
+analyzer's export and staging (4.4 GB) at the end. The root filesystem is mounted to discard
+freed blocks as they are freed (`discard`), so one unlink of a multi-gigabyte file hands the
+device every discard at once, and every other process's sync waits behind them. Writing was
+bounded; freeing was not.
+
+Freeing is therefore windowed the same way: a file larger than the window is truncated down
+one window at a time with a data sync between steps, so the filesystem frees, and the device
+discards, one window at a time, and only then is the file unlinked. The shim does this for the engine's own truncations and
+deletions (a log reset, a rollback or statement journal's removal), and `internal/paced` does
+it for every file the process removes itself (a spool, a sort's runs, a staging tree, an
+export). This is the delete scheduler of a log-structured storage engine, whose
+`bytes_max_delete_chunk` "ftruncate[s] the file by this size each time, rather than dropping
+the whole file"; the window is the same layout constant as the write window and there is no
+rate and no setting.
 
 ## What the numbers must show
 
@@ -135,11 +188,10 @@ its host's disk path.
    kernel's expiry, or under paced writeback, each rewrite reaches the disk, and the cost grows
    with the run.
 4. *A pacer that bounds the kernel's dirty set to a constant.* Steel-man: it would make a group's
-   commit invisible to the host. Rejected as a promise: a group's commit appends its pages at
-   memory speed, faster than any disk, so an interval pacer can only start the traffic early; a
-   bound would need the writer to wait on the disk, which is a rate limit and a knob. The pacer
-   is kept for what it does deliver (decision 5); the burst that remains is one group, sequential,
-   at the disk's own rate.
+   commit invisible to the host. First rejected as a promise, on the ground that the writer would
+   have to wait on the disk and that this is a rate limit and a knob; adopted by the amendment
+   of decision 5 after measurement, since a writer clocked by the disk has no rate and no
+   setting, and the interval pacer that was kept instead left the burst it was meant to remove.
 5. *A staging database per run, attached and merged at activation.* Steel-man: the run's writes
    would be sequential appends into an empty file with no index maintenance, and the main
    database would stay untouched until the merge. Rejected: the merge inserts every row into the
@@ -194,8 +246,19 @@ the reference repository's size is expected to reach.
 - SQLite source, wal.c — https://sqlite.org/src/file?name=src/wal.c (a page already in the log for
   the current transaction is rewritten in place; the frame checksums after it are recomputed at
   commit).
-- sync_file_range(2) — https://man7.org/linux/man-pages/man2/sync_file_range.2.html (initiating
-  writeback of a range without waiting for it).
+- sync_file_range(2) — https://man7.org/linux/man-pages/man2/sync_file_range.2.html
+  (SYNC_FILE_RANGE_WAIT_BEFORE then SYNC_FILE_RANGE_WRITE: wait for the pages already
+  submitted, then submit the dirty ones -- one window in flight).
+- SQLite, "The OS Backend (VFS) To SQLite" — https://sqlite.org/vfs.html (a shim VFS wraps the
+  default one and intercepts its file methods).
+- Linux kernel, "DMA and swiotlb" — https://docs.kernel.org/core-api/swiotlb.html (the bounce-buffer
+  pool every disk request of a virtual machine may have to pass through).
+- Log-structured storage engine, `SstFileManager` and its delete scheduler,
+  `bytes_max_delete_chunk` —
+  https://github.com/facebook/rocksdb/blob/main/include/rocksdb/sst_file_manager.h (a file
+  larger than the chunk is truncated by the chunk each time rather than dropped whole).
+- ext4 `discard` mount option — https://www.kernel.org/doc/html/latest/admin-guide/ext4.html
+  (with `discard`, the filesystem issues discard commands to the device when blocks are freed).
 - RocksDB Tuning Guide, bytes_per_sync and wal_bytes_per_sync —
   https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide (paced writeback of files being
   written, for the same reason).

@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"sort"
 	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
@@ -885,7 +885,7 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 	}
 	if err != nil {
 		if prev == "" {
-			_ = os.RemoveAll(dir)
+			_ = paced.RemoveAll(dir)
 		}
 		if pagination.IsBudgetExhausted(err) {
 			return "", errRetentionBudget("walk")

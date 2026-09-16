@@ -10,7 +10,7 @@ import (
 
 	"modernc.org/sqlite"
 
-	"github.com/Sawmonabo/codectx/internal/writeback"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // A unit's lexical staging. Every token instance the unit publishes is written
@@ -23,7 +23,11 @@ import (
 //
 // Nothing here is durable. The file is private to one unit, single-writer and
 // deleted at seal, at Abandon and at Fail; losing it to a crash loses only a
-// unit that is not sealed and therefore does not exist.
+// unit that is not sealed and therefore does not exist. Its writes reach the
+// disk through the process's paced file system like every other connection's
+// (ADR-0008), and its removal frees the file one window at a time through
+// internal/paced, so a unit that staged gigabytes does not hand the filesystem
+// every freed extent at once.
 
 // lexicalStageCacheKiB is the staging database's page cache. It is the buffer
 // the engine sorts the seal-time read in, so a unit whose vocabulary fits it is
@@ -54,12 +58,11 @@ const stageOrderedRead = `SELECT t.term, d.doc_id, t.col, t.n
 
 // lexicalStage is one building unit's staging database.
 type lexicalStage struct {
-	db    *sql.DB
-	path  string
-	pacer *writeback.Pacer
-	stmt  map[string]*sql.Stmt
-	inTx  bool
-	rows  int64
+	db   *sql.DB
+	path string
+	stmt map[string]*sql.Stmt
+	inTx bool
+	rows int64
 	// batch is the PutSearchUnits call the rows being staged belong to. A
 	// document number is only unique inside one tokenizer pass, so the batch
 	// is half of its key.
@@ -94,7 +97,7 @@ func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalSt
 		return nil, internal("lexical staging directory: " + err.Error())
 	}
 	path := s.stagePath(unitRow)
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := paced.Remove(path); err != nil && !os.IsNotExist(err) {
 		return nil, internal("lexical staging: " + err.Error())
 	}
 	q := url.Values{}
@@ -112,10 +115,10 @@ func (s *Store) openLexicalStage(ctx context.Context, unitRow int64) (*lexicalSt
 	db.SetMaxIdleConns(1)
 	if _, err := db.ExecContext(ctx, stageSchema); err != nil {
 		db.Close()
-		os.Remove(path)
+		paced.Remove(path)
 		return nil, wrap("lexical staging", err)
 	}
-	return &lexicalStage{db: db, path: path, pacer: writeback.Start(path), stmt: map[string]*sql.Stmt{}}, nil
+	return &lexicalStage{db: db, path: path, stmt: map[string]*sql.Stmt{}}, nil
 }
 
 // exec runs one reused statement inside the staging transaction, opening the
@@ -197,10 +200,9 @@ func (g *lexicalStage) close() error {
 	for _, st := range g.stmt {
 		st.Close()
 	}
-	g.pacer.Stop()
 	err := g.db.Close()
 	g.db = nil
-	if rmErr := os.Remove(g.path); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
+	if rmErr := paced.Remove(g.path); rmErr != nil && !os.IsNotExist(rmErr) && err == nil {
 		err = rmErr
 	}
 	if err != nil {
