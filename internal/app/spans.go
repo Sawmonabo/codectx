@@ -133,6 +133,16 @@ func logSpan(logger *slog.Logger) func(model.StageRecord) {
 		if row.PeakRSSBytes != nil {
 			attrs = append(attrs, "peak_rss_bytes", *row.PeakRSSBytes)
 		}
+		// Transferred bytes are counters the platform may not keep at all, and
+		// a stage that ran no child has none: the same absent-never-zero rule
+		// the attributes above keep, because a zero here would read as a stage
+		// that moved nothing rather than as a figure nobody took.
+		if row.ReadBytes != nil {
+			attrs = append(attrs, "read_bytes", *row.ReadBytes)
+		}
+		if row.WriteBytes != nil {
+			attrs = append(attrs, "write_bytes", *row.WriteBytes)
+		}
 		if row.DiagnosticCode != "" {
 			attrs = append(attrs, "diagnostic_code", row.DiagnosticCode)
 		}

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/index/delta"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/ledger"
@@ -191,7 +192,12 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 		// Reported again at the finish so a pass that failed still states what
 		// it got through, not zeros. The publish path reports at activation as
 		// well, which is what a live reader sees while retention still runs.
-		g.report()
+		// The peak is read HERE and not at the activation report: retention,
+		// collection and the reclaim below all run after activation, and a
+		// high-water mark read before them would silently leave them out. It
+		// is the kernel's mark for the whole process, so a freed byte cannot
+		// lower it and reading it before the reclaim loses nothing.
+		g.report(diagnostics.PeakParentRSSBytes())
 		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
 		c.attachRunLedger(ctx, &res, g.ledgerRun, err)
@@ -349,7 +355,10 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 	if err != nil {
 		return model.IndexResult{}, err
 	}
-	g.report()
+	// No peak yet: the run has not ended, and a mark taken here would be
+	// reported as the run's own while retention and collection are still to
+	// come. The finish above reports it.
+	g.report(nil)
 	g.c.retain(ctx)
 	g.c.collect(ctx)
 	// Deferred work is enqueued only after the base generation is published:
@@ -413,16 +422,21 @@ func (c *Coordinator) attachRunLedger(ctx context.Context, res *model.IndexResul
 // report hands the run row its totals. It is called once activation has
 // succeeded, when every count the result publishes is final, so the ledger's
 // figures and model.IndexResult's are the same counters and cannot disagree.
-func (g *generation) report() {
+//
+// peak is the process's high-water resident size, and is nil everywhere but at
+// the run's end: it is a measurement of the whole run, so only the caller that
+// knows the run is over has one to give.
+func (g *generation) report(peak *uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.ledgerRun.Report(ledger.Totals{
-		FileCount:       int64(g.snap.FileCount),
-		SourceBytes:     int64(g.snap.SourceBytes),
-		UnitsPlanned:    g.planned,
-		UnitsSucceeded:  g.reused + g.carried + g.built,
-		UnitsFailed:     g.failed,
-		UnitsSubdivided: g.subdivided,
+		FileCount:           int64(g.snap.FileCount),
+		SourceBytes:         int64(g.snap.SourceBytes),
+		UnitsPlanned:        g.planned,
+		UnitsSucceeded:      g.reused + g.carried + g.built,
+		UnitsFailed:         g.failed,
+		UnitsSubdivided:     g.subdivided,
+		ProcessPeakRSSBytes: peak,
 	})
 }
 

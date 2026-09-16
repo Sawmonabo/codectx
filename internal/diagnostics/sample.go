@@ -94,7 +94,7 @@ func NewHostSampler(opts HostSamplerOptions) *HostSampler {
 	return &HostSampler{
 		opts:          opts,
 		parentRSS:     parentRSSBytes,
-		peakParentRSS: peakParentRSSBytes,
+		peakParentRSS: PeakParentRSSBytes,
 		treeRSS:       descendantRSSBytes,
 		dirBytes:      directoryBytes,
 	}
@@ -246,11 +246,20 @@ func parentRSSBytes() *uint64 {
 	return &bytes
 }
 
-// peakParentRSSBytes reads this process's high-water resident set size from the
+// PeakParentRSSBytes reads this process's high-water resident set size from the
 // VmHWM line of /proc/self/status, in kibibytes. It is the kernel's own peak,
 // not a figure this application sampled, so it covers the whole life of the
-// process including work that finished before any sampler started.
-func peakParentRSSBytes() *uint64 {
+// process including work that finished before any sampler started -- and so,
+// in a long-lived server, work of earlier runs than the one asking.
+//
+// It is exported because it is the ONE reader of that file in the product: a
+// run reports its own process peak through it at its end, and a second reader
+// would be a second answer to the same question.
+//
+// It returns nil, and never zero, where the file cannot be read or does not
+// carry the line: a platform that does not account for this has no peak, which
+// is not a peak of nothing.
+func PeakParentRSSBytes() *uint64 {
 	raw, err := os.ReadFile("/proc/self/status")
 	if err != nil {
 		return nil
