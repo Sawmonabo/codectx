@@ -1,0 +1,4 @@
+167503724544,TYPE_DECL,,w.js::program,METHOD,helper,0,w.js,w.js::program:helper,<empty>,ANY,false,1,helper,,,1
+167503724545,TYPE_DECL,,w.js::program,METHOD,run,0,w.js,w.js::program:run,<empty>,ANY,false,2,run,,,1
+167503724546,TYPE_DECL,,w.js:<global>,NAMESPACE_BLOCK,:program,0,w.js,w.js::program,<empty>,ANY,false,1,:program,,,1
+167503724547,TYPE_DECL,,<global>,NAMESPACE_BLOCK,<empty>,,<unknown>,ANY,<empty>,,true,,ANY,,,-1
