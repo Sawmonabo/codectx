@@ -308,8 +308,8 @@ const DetailStderrTail = "stderr_tail"
 
 // reservedCapabilityDetails is the set the constants above name. It is an
 // array so its length is a compile-time constant: the provider budget below is
-// derived from it, and a fifth reserved key must move that budget in the same
-// edit that adds the key.
+// derived from it, and every reserved key added must move that budget in the
+// same edit that adds the key.
 var reservedCapabilityDetails = [...]string{
 	DetailScopes,
 	DetailUnitsFailed,
