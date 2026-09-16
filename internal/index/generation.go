@@ -194,6 +194,7 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 		g.report()
 		recordReclaim(ctx, freedBefore)
 		g.ledgerRun.Finish(endOutcome(err))
+		c.attachRunLedger(ctx, &res, g.ledgerRun, err)
 	}()
 	// The plan's whole-snapshot input run is a file under the work directory
 	// for as long as the units that stream from it are running, and no longer.
@@ -362,6 +363,51 @@ func (g *generation) publish(ctx context.Context) (model.IndexResult, error) {
 		UnitsInvalidated: g.invalidated, FilesParsed: g.parsed, FilesCaptured: int64(g.snap.FileCount),
 		Runs: runs, RunsOmitted: omitted,
 		StartedAt: g.started, CompletedAt: g.c.now()}, nil
+}
+
+// RunLedgerReader reads one recorded run back as the model carries it: the run
+// row, one page of its stages, and how many stages that page left out. It is
+// an interface here and satisfied in the composition, so the one conversion
+// from a recorded span to a stage row stays where every other surface's
+// conversion is and this package never grows a second.
+type RunLedgerReader interface {
+	Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error)
+}
+
+// attachRunLedger states on a result what the run that produced it just did:
+// the run row and its stages, read back from the ledger by that run's own id.
+// Both a pass and a deferred publication report through it, each with its own
+// run, which is the whole point of reading by id.
+//
+// It reads after the finish, and behind a flush, because finishing a run only
+// moves in-memory state: the row turns terminal at the collector's next write,
+// so a read without the barrier would render a finished run as still running
+// and leave out the stages that ended last. And it reads BY ID, because the
+// latest run of this repository may be another run of this same process -- a
+// deferred publication is live while an index runs -- which would answer for
+// the run that asked.
+//
+// A failed pass attaches nothing: its result is discarded by the caller, and
+// the run it recorded is read through the status surfaces like any other. A
+// failure to flush or to read leaves the result without a run rather than with
+// half of one, and says so in the log: the block is an account of the run, and
+// an account that is silently partial is worse than one that is absent.
+func (c *Coordinator) attachRunLedger(ctx context.Context, res *model.IndexResult, run *ledger.Run, runErr error) {
+	if runErr != nil || c.opts.RunLedgerReader == nil || run.ID() == "" {
+		return
+	}
+	if err := c.opts.Ledger.Flush(ctx); err != nil {
+		logTyped(c.log, "the run could not report on itself: its accounting was not written", err,
+			"component", component, "run_id", run.ID())
+		return
+	}
+	row, stages, omitted, err := c.opts.RunLedgerReader.Run(ctx, run.ID())
+	if err != nil {
+		logTyped(c.log, "the run could not report on itself: its accounting could not be read", err,
+			"component", component, "run_id", run.ID())
+		return
+	}
+	res.Run, res.Stages, res.StagesOmitted = row, stages, omitted
 }
 
 // report hands the run row its totals. It is called once activation has

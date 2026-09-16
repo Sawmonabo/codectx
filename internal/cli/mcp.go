@@ -122,8 +122,13 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 				// ledger this workspace composed. It never opens a ledger of
 				// its own: the file has a single writer, and a second one would
 				// contend with the very run these notifications describe.
-				Spans:  ws.Spans,
-				Logger: log,
+				// IndexRun names the run those stages belong to, so a call
+				// following an index counts its stages and not those of the
+				// per-process overlay run a language server's start opens
+				// beside it.
+				Spans:    ws.Spans,
+				IndexRun: ws.IndexRunID,
+				Logger:   log,
 			})
 			if err != nil {
 				return err

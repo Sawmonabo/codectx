@@ -414,3 +414,73 @@ func TestSpansPastOnePageAreCountedAsOmitted(t *testing.T) {
 			beyond, view.SpansOmitted)
 	}
 }
+
+// TestARunReadsItsOwnRowsAndNotAnotherLiveRuns protects the answer a run gets
+// when it reports on itself.
+//
+// One process holds one ledger and more than one live run: a deferred
+// publication ticks while an index runs. The latest-run query sorts a live run
+// first, so a run that asked for "the latest run of this repository" would be
+// handed the other one and would report another run's stages as its own -- a
+// completion block about work the caller never asked for. Asking by id is what
+// makes the answer the run's own.
+//
+// Flush is what makes the answer complete: the finish and the last spans are
+// in-memory state until the collector writes them, so the run reads as still
+// running until the barrier has returned.
+func TestARunReadsItsOwnRowsAndNotAnotherLiveRuns(t *testing.T) {
+	l, dir := openLedger(t)
+	defer l.Stop()
+	index, indexCtx := newRun(t, l)
+	deferredRun, err := l.NewRun(ledger.KindDeferred, repositoryID)
+	if err != nil {
+		t.Fatalf("new deferred run: %v", err)
+	}
+	_, publishing := ledger.Start(deferredRun.Context(context.Background()), "collection", "")
+	publishing.AddOut(2)
+
+	_, activation := ledger.Start(indexCtx, "activation", "")
+	activation.AddIn(9)
+	activation.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	index.Report(ledger.Totals{FileCount: 4})
+	index.Finish(ledger.OutcomeOK)
+	// The deferred run stays live and unfinished, exactly as a tick that is
+	// still publishing when the index returns.
+	if err := l.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
+	if err != nil || !open {
+		t.Fatalf("open the reader: %v, present=%v", err, open)
+	}
+	defer reader.Close()
+	view, found, err := reader.Run(context.Background(), index.ID())
+	if err != nil || !found {
+		t.Fatalf("read the run by id: %v, found=%v", err, found)
+	}
+	if view.Run.RunID != index.ID() || view.Run.Kind != ledger.KindIndex {
+		t.Fatalf("asking for run %s answered with run %s of kind %q: the run was handed another run's account",
+			index.ID(), view.Run.RunID, view.Run.Kind)
+	}
+	if view.Run.Outcome != ledger.OutcomeOK || view.Run.FinishedAt == nil {
+		t.Errorf("the run reads %q with finished_at %v after the flush its finish crossed: a run that has ended reads as live",
+			view.Run.Outcome, view.Run.FinishedAt)
+	}
+	if len(view.Spans) != 1 || view.Spans[0].Stage != "activation" || view.Spans[0].RunID != index.ID() {
+		t.Fatalf("the run's spans are %+v, want its own single activation: the page carries another run's stages or not its own",
+			view.Spans)
+	}
+	// The hazard is real and not hypothetical: the other run is what the
+	// latest-run query answers with while it is live.
+	latestView, found, err := reader.LatestRun(context.Background(), repositoryID, 0)
+	if err != nil || !found {
+		t.Fatalf("latest run: %v, found=%v", err, found)
+	}
+	if latestView.Run.RunID != deferredRun.ID() {
+		t.Fatalf("the latest run is %s, want the live deferred run %s; the fixture no longer poses the hazard the read by id exists for",
+			latestView.Run.RunID, deferredRun.ID())
+	}
+	publishing.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	deferredRun.Finish(ledger.OutcomeOK)
+}

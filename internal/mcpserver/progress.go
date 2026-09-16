@@ -96,12 +96,18 @@ type reporter struct {
 	session *mcp.ServerSession
 	token   any
 	log     *slog.Logger
+	// indexRun names the run this call is following. It is resolved on the
+	// rows themselves rather than when the call starts, because the client's
+	// progress token arrives before the coordinator has opened the run.
+	indexRun func() (string, bool)
 
 	rows chan model.StageRecord
 	quit chan struct{}
 	done chan struct{}
 
 	// Sender-goroutine state, touched nowhere else.
+	// runID is the run this call latched onto, empty until it has.
+	runID    string
 	finished float64
 	sent     float64
 	lastSent time.Time
@@ -120,12 +126,13 @@ func (h *handlers) watchSpans(ctx context.Context, req *mcp.CallToolRequest) (st
 		return func() {}
 	}
 	r := &reporter{
-		session: req.Session,
-		token:   req.Params.GetProgressToken(),
-		log:     h.log,
-		rows:    make(chan model.StageRecord, listenerDepth),
-		quit:    make(chan struct{}),
-		done:    make(chan struct{}),
+		session:  req.Session,
+		token:    req.Params.GetProgressToken(),
+		log:      h.log,
+		indexRun: h.indexRun,
+		rows:     make(chan model.StageRecord, listenerDepth),
+		quit:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	remove := h.spans.listen(r.rows)
 	go r.run(ctx)
@@ -165,8 +172,10 @@ func (r *reporter) run(ctx context.Context) {
 func (r *reporter) deliver(ctx context.Context, row model.StageRecord) {
 	// Only a stage the run opened at its top level moves the bar: a unit's
 	// inner steps are rows of the same run, and counting them would make the
-	// figure depend on how finely a provider happens to be instrumented.
-	if row.ParentSeq == nil {
+	// figure depend on how finely a provider happens to be instrumented. And
+	// only a stage of the run this call is following: the rows arrive from
+	// every run this process records.
+	if row.ParentSeq == nil && r.following(row.RunID) {
 		r.finished++
 	}
 	r.logRow(ctx, row)
@@ -198,6 +207,28 @@ func (r *reporter) deliver(ctx context.Context, row model.StageRecord) {
 	}
 	r.sent = r.finished
 	r.lastSent = time.Now()
+}
+
+// following reports whether a row belongs to the indexing run this call is
+// following. The run is resolved from the process's ledger on the first row
+// that arrives once one is open -- the call is made before the coordinator
+// opens its run -- and then held for the rest of the call, so the rows this
+// run publishes after it has finished still count and the overlay run's rows
+// never latch it: an overlay run is not an indexing run, so the lookup never
+// answers with one.
+//
+// Until a run is resolved nothing is counted. A bar that has not started is
+// what a client sees for the moment before the run opens; counting rows that
+// may belong to another run would be the untruth this exists to prevent.
+func (r *reporter) following(runID string) bool {
+	if r.runID == "" {
+		id, ok := r.indexRun()
+		if !ok || id == "" {
+			return false
+		}
+		r.runID = id
+	}
+	return runID == r.runID
 }
 
 // logRow sends the finished stage as a log message, so an agent watching the

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
+	"github.com/Sawmonabo/codectx/internal/index"
 	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
@@ -145,6 +146,28 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 	if err != nil || !found {
 		return nil, nil, 0, err
 	}
+	return runRecord(view)
+}
+
+// Run is the run with this identifier, which is how a run that has just ended
+// reports on itself: it knows its own id, and the latest run of the repository
+// may be another live run of this same process.
+func (l runLedger) Run(ctx context.Context, runID string) (*model.RunRecord, []model.StageRecord, int64, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, nil, 0, err
+	}
+	defer reader.Close()
+	view, found, err := reader.Run(ctx, runID)
+	if err != nil || !found {
+		return nil, nil, 0, err
+	}
+	return runRecord(view)
+}
+
+// runRecord is the one place a read run becomes the rows the model carries,
+// whichever question selected it.
+func runRecord(view ledger.RunView) (*model.RunRecord, []model.StageRecord, int64, error) {
 	run := model.RunRecord{
 		RunID:               view.Run.RunID,
 		Kind:                string(view.Run.Kind),
@@ -171,6 +194,9 @@ func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
 }
 
 var _ diagnostics.RunLedger = runLedger{}
+
+// And the reader a run reports on itself through.
+var _ index.RunLedgerReader = runLedger{}
 
 // toolchainReporter adapts *toolchain.Resolver to diagnostics.ToolchainReporter.
 // Resolver.Status returns its rows directly and reports no error; the interface
