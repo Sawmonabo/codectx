@@ -1,0 +1,4 @@
+94489280512,LOCAL,,helper,0,,<empty>,1,helper,,,0,,w.js::program:helper
+94489280513,LOCAL,,run,0,,<empty>,2,run,,,0,,w.js::program:run
+94489280514,LOCAL,,f,8,(x: ANY) => ANY;w.js::program:helper,<empty>,3,f,,,0,(x: ANY) => ANY,ANY
+94489280515,LOCAL,w.js::program:run:helper,helper,12,,<empty>,3,helper,,,0,,w.js::program:helper

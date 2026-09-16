@@ -320,6 +320,7 @@ func importCSVFile(ctx context.Context, sc *scratch, path, label string, edge bo
 		n.col = optInt(cols.get(rec, "COLUMN_NUMBER"))
 		n.argIndex = optInt(cols.get(rec, "ARGUMENT_INDEX"))
 		n.isExternal = strings.EqualFold(strings.TrimSpace(cols.get(rec, "IS_EXTERNAL")), "true")
+		n.speculated = cols.get(rec, "AST_PARENT_FULL_NAME") == speculatedParent
 		if err := sc.putNode(ctx, n); err != nil {
 			return br.consumed, err
 		}
