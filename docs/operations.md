@@ -164,10 +164,10 @@ committed with nobody reading.
 
 What an agent sees for it:
 
-* Those tools answer **one page** during a session, for the same reason the
-  answering row does: a continuation needs a cursor lease and a spool, and both
-  are writes.
-* The status report is not one of them: it is a single bounded answer, so
+* The **paged** ones among them answer **one page** during a session, for the
+  same reason the answering row does: a continuation needs a cursor lease and a
+  spool, and both are writes.
+* The status report is not paged: it is a single bounded answer, so
   `codectx_index_status` answers during the session's own refresh -- including
   what that session's watch covers and a retention sweep that did not finish,
   which the serving process knows in memory and reads from no handle at all.
