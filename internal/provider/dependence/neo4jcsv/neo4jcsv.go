@@ -35,14 +35,12 @@ package neo4jcsv
 import (
 	"context"
 	"fmt"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 )
 
@@ -101,7 +99,8 @@ const (
 // row is invalid without the unit, provider version and origin run, a
 // RelationID cannot be derived without the repository, and a byte range
 // cannot be verified without the pinned bytes. ScratchDir is where the
-// on-disk staging database lives; it is removed before Import returns.
+// on-disk staging database lives; the file is reused by every later import
+// through the same slot and is never removed by an import.
 type Options struct {
 	// Language is the source language recorded on fileless nodes, normally
 	// the export's META_DATA LANGUAGE. A located node takes its language from
@@ -158,8 +157,11 @@ type Options struct {
 	Run model.ProviderRunID
 	// Content is the pinned snapshot view every source byte is read from.
 	Content model.SnapshotView
-	// ScratchDir is the private directory the staging database is created
-	// in. Empty means the process temp directory.
+	// ScratchDir is the private directory the staging databases live in. An
+	// import takes a slot there, empties the slot's file and gives it back;
+	// the file is created once and written over by every later import, and
+	// only the provider's sweep of a dead run removes it. Empty means the
+	// process temp directory.
 	ScratchDir string
 	// StagingCacheKiB is the staging database's page cache, the user's
 	// `providers.dependence.staging_cache_kib`. It bounds the memory one
@@ -167,8 +169,9 @@ type Options struct {
 	// selects the default.
 	StagingCacheKiB int
 	// KeysPath is where the fresh key set is written. Empty means a file
-	// beside the staging database, which is deleted with it; a caller that
-	// wants to keep the key set for the next refresh must name a path.
+	// beside the staging database, written over by the next import through
+	// that slot; a caller that wants to keep the key set for the next refresh
+	// must name a path.
 	KeysPath string
 	// OnPhase, when set, is called as each phase of the import completes,
 	// with the phase's name: the provider logs them with their durations, and
@@ -298,13 +301,10 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	if res == nil || sink == nil {
 		return rep, argumentInvalid("import needs both a resolver and a sink")
 	}
-	dir, err := os.MkdirTemp(opts.ScratchDir, "dependence-import-")
-	if err != nil {
-		return rep, internalErr("import scratch directory: %v", err)
-	}
-	defer paced.RemoveAll(dir)
+	stage := takeStagingSlot(opts.ScratchDir)
+	defer releaseStagingSlot(opts.ScratchDir, stage)
 
-	sc, err := openScratch(ctx, filepath.Join(dir, "stage.db"), opts.StagingCacheKiB, opts.MaxStagedRows)
+	sc, err := openScratch(ctx, stage, opts.StagingCacheKiB, opts.MaxStagedRows)
 	if err != nil {
 		return rep, err
 	}
@@ -352,7 +352,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	opts.phase(PhaseRelationsStaged)
 	keysPath := opts.KeysPath
 	if keysPath == "" {
-		keysPath = filepath.Join(dir, "keys")
+		keysPath = stage + ".keys"
 	}
 	fresh, err := sc.saveKeys(ctx, keysPath)
 	if err != nil {

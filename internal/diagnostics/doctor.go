@@ -410,9 +410,12 @@ func (s *Service) checkAccounting(ctx context.Context, deep bool, stats StoreSta
 }
 
 // walRemediation is what a write-ahead log larger than the store's ingestion
-// group bound means: no run is open, so nothing has folded the log since the
-// last one, and the next index or refresh will.
-const walRemediation = "the write-ahead log is larger than the store's ingestion group bound and has not been checkpointed; run an index or refresh to fold it"
+// group bound means: either nothing has folded it since the last run, which
+// the next index or refresh does, or a reader once held its frames open across
+// several groups and the file keeps that high-water length. The log is rewound
+// in place and reused rather than freed, so folding its frames does not shrink
+// the file.
+const walRemediation = "the write-ahead log is larger than the store's ingestion group bound: run an index or refresh to fold any frames it still holds. The file keeps the length its largest log reached and is written over rather than freed, so it does not shrink"
 
 // checkAccountingShallow reports what accounting costs nothing: the two file
 // sizes, and the write-ahead-log bound warning that is the one actionable

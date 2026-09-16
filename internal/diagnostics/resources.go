@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
 // Resources is the Section 23 accounting block `status --resources` and
@@ -15,6 +17,13 @@ import (
 // promised itself. Every one of them keeps the Section 23 rule that an
 // unavailable metric is absent and never zero -- a nil field says "not measured
 // on this host", a zero says "measured, and it is zero".
+//
+// The space this process has freed is the one figure here that is neither
+// measured on the host nor read from the store: it is counted where the
+// freeing happens, in the window-at-a-time truncations the process's own
+// removals and its file-system shim make, because a run that reuses its space
+// instead of freeing it is the design and a reader outside the process cannot
+// see the difference any other way.
 //
 // The pending-event count is the one figure here that a second process could
 // not report at all until a watch published a heartbeat: the sampler measures
@@ -38,6 +47,7 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.DatabaseBytes = nonNegativeBytes(stats.DatabaseBytes)
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
+	report.FreedBytes = nonNegativeBytes((paced.Steps() + pacedvfs.Truncations()) * paced.Window)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
 	if err := report.Validate(); err != nil {

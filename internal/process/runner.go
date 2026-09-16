@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // Spec is one child process to run. Every bound is explicit: Section 6 requires
@@ -97,6 +98,10 @@ type Spec struct {
 	// Naming them is not optional for a quiet tool: without this signal such a
 	// tool's only progress is its CPU time, which no platform but Linux
 	// samples, so a StallTimeout would terminate it mid-work.
+	//
+	// They are also what the runner paces: a run that names its outputs has
+	// them handed to the disk one window at a time while the child writes
+	// them, instead of left dirty until the kernel submits the lot at once.
 	ProgressFiles []string
 	// MemoryReservationBytes and DiskReservationBytes are the resources this
 	// run is admitted against. They are accounting inputs, not enforcement: a
@@ -517,6 +522,14 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	// no goroutine this package starts outlives the run that started it.
 	watchdog := startStallWatchdog(spec.StallTimeout, outPipe, errPipe, sampler, spec.ProgressFiles)
 	defer watchdog.stopWatching()
+	// A child writes its answer at memory speed and nothing of it reaches the
+	// disk until the kernel's flusher wakes and submits the lot, which stalls
+	// every other process on the machine. Every run that names its outputs has
+	// them handed to the disk one window at a time while it writes them, and
+	// the pacer's final pass, which runs before this function returns, drains
+	// what the child left.
+	outputs := paced.StartOutputs(spec.ProgressFiles)
+	defer outputs.Stop()
 
 	waiter := newWaiter(cmd)
 	reason, unreaped := waitForExit(ctx, deadline, job, cmd, spec, watchdog, waiter)

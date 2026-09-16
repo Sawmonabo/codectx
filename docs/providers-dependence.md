@@ -249,8 +249,12 @@ allocation  = MemAvailable - base footprint - safety margin
   memory the frontend keeps outside the heap, measured in §10: C/C++ 2.6 GB,
   Python 1.9 GB, Go 0.3–0.5 GB, Java 0.1–0.4 GB, TypeScript/JavaScript 0.3 GB,
   Rust 0.25 GB plus a fixed ~0.8 GB helper outside the heap.
-* Export gets its own, smaller cap and its own reservation: it scales with the
-  graph, not the source, and the export is deleted after import.
+* Export gets its own, smaller heap cap and its own reservation: it scales with
+  the graph, not the source, and the export is deleted after import. Its size
+  is not capped: an export the disk cannot hold is a disk that is full, which
+  the store reports as one. While the child writes it, the runner hands the
+  export to the disk one window at a time, so it reaches the disk as it is
+  written rather than as one burst when the kernel's flusher wakes.
 * `unit_memory_ceiling_bytes = 0` means machine-derived. Only an explicit
   non-zero value rejects a unit before it runs.
 * On a host that does not publish available memory, the allocation is reported
@@ -488,7 +492,8 @@ never be mis-diffed against a fresh one.
 ## The staging database
 
 The importer stages the whole export in a private SQLite database under
-`<data_dir>/dependence/scratch/` and derives the unit's facts from it by
+`<data_dir>/dependence/scratch/`, one file per slot, and derives the unit's
+facts from it by
 ordered query, so a fact is a function of the export's content and never of
 the order its files were read. The staging is written the way a bulk load
 writes: every table is appended in the order its rows arrive, with no
@@ -515,10 +520,25 @@ in memory and a larger one spills once to a temporary file under the data
 directory's `tmp/`. [ADR-0009](adr/ADR-0009-import-staging.md) records the
 measurements and the alternatives.
 
+A staging file is created once and reused. An import takes a slot in the
+scratch directory, empties the slot's file by dropping its tables -- which
+returns their pages to the file's own free list, with automatic vacuuming off,
+so the file never shrinks -- and gives the slot back when it ends. Dropping is
+also what makes the schema creation idempotent: each phase of an import creates
+the structures it fills, and a reused file already holds them. A slot rather
+than one fixed path is what keeps this correct whether or not imports through
+one provider overlap: a staging database is opened with an exclusive lock, so
+two concurrent imports must have two files. Nothing removes a staging file
+during a run. Creating and deleting hundreds of megabytes per unit is what the
+run must not do: where the filesystem discards freed blocks and the machine's
+disk is a sparse image, a free of several gigabytes stalls every process on the
+machine about a minute later, unobservably.
+
 ## Privacy and cleanup
 
-Materializations, graphs not selected for the cache, exports and the
-importer's staging database are removed on every termination path. All of them
+Materializations, graphs not selected for the cache and exports are removed on
+every termination path; the importer's staging files are emptied and reused
+instead, and only the sweep below removes them. All of them
 live under the provider's own private roots — `<data_dir>/dependence/runs/` for
 the per-run directories and `<data_dir>/dependence/scratch/` for the staging
 databases — never under the system temp directory: the staging database holds
