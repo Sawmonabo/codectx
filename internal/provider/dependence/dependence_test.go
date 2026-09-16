@@ -217,12 +217,14 @@ func TestFailedUnitAdmitsNoFacts(t *testing.T) {
 			parses: 2,
 		},
 		{
-			// The zero-exit helper crash: the engine reports success and
-			// writes a graph with nothing in it.
-			name:    "an export with no methods for a unit that has source is an engine failure",
+			// Both steps exited cleanly and the export holds no method. It is
+			// classified as what it is rather than as a crash, and it names
+			// the family and the file count so a reader can compare what the
+			// unit declared against what the frontend admitted.
+			name:    "an export with no methods for a unit that has source is not worded as a crash",
 			backend: &fakeBackend{deadExport: true},
 			code:    model.CodeProviderOutputInvalid,
-			detail:  map[string]string{"failure_class": "engine"},
+			detail:  map[string]string{"failure_class": "empty_export", "family": "go", "source_files": "1"},
 			parses:  1,
 		},
 		{

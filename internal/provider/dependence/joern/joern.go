@@ -208,8 +208,9 @@ func (b *Backend) Parse(ctx context.Context, req dependence.ParseRequest) (depen
 	// quiet, its stdout is discarded, and on a platform with no tree sampling
 	// there is no CPU signal either, so without naming the output a parse of a
 	// large project would be terminated as stalled mid-work.
-	return stepOutcome(b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputPath}))
+	res, err := b.run(ctx, e, e.ParseArgv[0], args, filepath.Dir(req.OutputPath),
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputPath})
+	return stepOutcome(res, err, []string{filepath.Dir(req.OutputPath), req.SourceDir})
 }
 
 // Export writes the graph out as the single Neo4j CSV export the importer
@@ -229,8 +230,9 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 	// The export directory fills with the CSV files the importer reads; their
 	// growth is this step's progress, for the same reason the parse names its
 	// graph.
-	outcome, err := stepOutcome(b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
-		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputDir}))
+	res, err := b.run(ctx, e, e.ExportArgv[0], args, filepath.Dir(req.OutputDir),
+		req.HeapCapBytes, req.ReservationBytes, req.Timeout, req.StallTimeout, []string{req.OutputDir})
+	outcome, err := stepOutcome(res, err, []string{filepath.Dir(req.OutputDir), filepath.Dir(req.GraphPath)})
 	if err != nil {
 		return dependence.ExportOutcome{}, err
 	}
@@ -245,16 +247,16 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 // classifier has to read, and discarding it would turn every classified
 // failure class into one untyped "the tool failed". A child that never
 // started, a denied executable or a broken output stream stays an error.
-func stepOutcome(res process.Result, err error) (dependence.Outcome, error) {
+func stepOutcome(res process.Result, err error, private []string) (dependence.Outcome, error) {
 	if err == nil {
-		return classify(res), nil
+		return classify(res, private), nil
 	}
 	var typed *model.Error
 	if errors.As(err, &typed) && (typed.Code == model.CodeProviderUnavailable || typed.Code == model.CodeProviderTimeout) {
 		// Distinguish "ran and failed" from "never started": the latter leaves
 		// a zero result, which would classify as an unremarkable success.
 		if res.ExitCode != 0 || res.StderrBytes > 0 || res.TimedOut {
-			return classify(res), nil
+			return classify(res, private), nil
 		}
 	}
 	return dependence.Outcome{}, err

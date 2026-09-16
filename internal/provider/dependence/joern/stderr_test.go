@@ -3,8 +3,10 @@ package joern
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
@@ -61,7 +63,7 @@ func TestClassify(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := classify(process.Result{Stderr: []byte(c.stderr), ExitCode: c.exit, TimedOut: c.timedOut,
-				StderrBytes: int64(len(c.stderr))})
+				StderrBytes: int64(len(c.stderr))}, nil)
 			if got.Class != c.want {
 				t.Errorf("class = %q, want %q", got.Class, c.want)
 			}
@@ -88,4 +90,42 @@ func fixture(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+// TestClassifyKeepsTheChildsLastWords protects the evidence a failed unit
+// leaves behind. Failure mode: a unit crashed on a real repository, its 7,584
+// bytes of standard error were counted and thrown away, and the only record
+// left was the count -- so nothing outside a rerun could say what the child
+// had reported. The tail must survive, bounded to what one error detail
+// carries, and it must not carry the private directories this run made for the
+// child: a diagnostic an operator reads is not the place to publish where the
+// repository was materialized.
+func TestClassifyKeepsTheChildsLastWords(t *testing.T) {
+	const private = "/var/data/codectx/abc123/work/run-7"
+	stderr := "the first line, far enough back to be cut\n" +
+		strings.Repeat("filler that pushes the interesting lines past the bound\n", 64) +
+		"java.nio.file.InvalidPathException: Malformed input or input contains unmappable characters: " +
+		private + "/out/createXngagement.js.json\n" +
+		"\tat java.base/sun.nio.fs.UnixPath.encode(UnixPath.java:145)\n"
+
+	got := classify(process.Result{Stderr: []byte(stderr), ExitCode: 1, StderrBytes: int64(len(stderr))},
+		[]string{private})
+	if got.Class != dependence.FailureEngine {
+		t.Fatalf("class = %q, want an engine failure", got.Class)
+	}
+	if !strings.Contains(got.StderrTail, "InvalidPathException") {
+		t.Errorf("the tail lost the child's last words: %q", got.StderrTail)
+	}
+	if !strings.Contains(got.StderrTail, "UnixPath.encode") {
+		t.Errorf("the tail lost the last line of the trace: %q", got.StderrTail)
+	}
+	if strings.Contains(got.StderrTail, private) {
+		t.Errorf("the tail publishes a private run directory: %q", got.StderrTail)
+	}
+	if strings.Contains(got.StderrTail, "the first line") {
+		t.Errorf("the tail is not bounded to the last of the stream: %q", got.StderrTail)
+	}
+	if len(got.StderrTail) > model.MaxDetailBytes {
+		t.Errorf("the tail is %d bytes, more than one error detail carries", len(got.StderrTail))
+	}
 }
