@@ -605,7 +605,7 @@ func (g *generation) unit(ctx context.Context, u plan.Unit) error {
 		g.record(u, out)
 		return nil
 	}
-	return g.failure(ctx, u, out.result, err)
+	return g.failure(ctx, u, out, err)
 }
 
 // outcome is one unit's run: what the provider reported, how many files it
@@ -618,6 +618,11 @@ type outcome struct {
 	// subdivided reports the one full-build reason that is not an
 	// invalidation, which the run row counts separately from a failure.
 	subdivided bool
+	// span is the unit's own span. It is still open when the unit failed:
+	// the failure path ends it with the one typed reason it also writes to
+	// the provider-run row, so the two records of one failure cannot
+	// disagree about it.
+	span *ledger.Span
 }
 
 // run executes one unit through its delta applier when the provider has one,
@@ -630,12 +635,16 @@ func (g *generation) run(ctx context.Context, u plan.Unit, spec model.UnitSpec) 
 	// knows nothing about this package.
 	ctx, span := ledger.StartProvider(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
 	defer func() {
-		m := ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}
+		// The span travels out on every path, because a unit that failed is
+		// ended by the failure path instead: that is where the typed reason
+		// is built, and typing the same error here as well would produce two
+		// records of one failure that can disagree.
+		res.span = span
 		if err != nil {
-			m.DiagnosticCode = string(provider.CodeOf(err))
-			m.Failure = err.Error()
+			return
 		}
-		span.End(unitOutcome(res, err), m, err)
+		span.End(unitOutcome(res, nil),
+			ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(res.parsed)}, nil)
 	}()
 	p, ok := c.opts.Registry.Lookup(u.ProviderID)
 	if !ok {
@@ -807,7 +816,15 @@ func (g *generation) record(u plan.Unit, out outcome) {
 // failure decides what one unit's failure does to the generation. A required
 // provider takes the generation down; an optional one publishes a failed
 // capability and the generation continues degraded (Section 13.3).
-func (g *generation) failure(ctx context.Context, u plan.Unit, res model.ProviderResult, cause error) error {
+func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, cause error) error {
+	res := out.result
+	// The unit's span ends here whatever its failure does to the generation:
+	// one left open reads as interrupted and the unit's cost simply vanishes
+	// from the breakdown. recordFailure ends it first, with the reason it also
+	// writes to the run row, and an end is once-only -- so this is the backstop
+	// for the two exits below, neither of which records a row to agree with.
+	m := ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
+	defer func() { out.span.End(ledger.OutcomeFailed, m, cause) }()
 	if ctx.Err() != nil && errors.Is(cause, ctx.Err()) {
 		return cause
 	}
@@ -815,7 +832,7 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 	if !ok || p.Descriptor().Required {
 		return cause
 	}
-	f := g.recordFailure(ctx, u, res, cause)
+	f := g.recordFailure(ctx, u, out, cause)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.failed++
@@ -851,10 +868,19 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, res model.Provide
 // of ordinary logs. The tail is on the run row alone. The scope key is the
 // only identifier logged; a provider's own source bytes and native keys never
 // reach a log line at all.
-func (g *generation) recordFailure(ctx context.Context, u plan.Unit, res model.ProviderResult, cause error) unitFailure {
+func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome, cause error) unitFailure {
+	res := out.result
 	f := typedFailure(cause)
+	stored := model.RunFailure{ScopeKey: u.ScopeKey, Code: f.code, Message: f.message, Details: f.details}
+	// One value, two records: the unit's span publishes the reason the run row
+	// publishes, so the ledger and the store can never disagree about why a
+	// unit failed. The error is not handed to End -- it would fill the span
+	// from the error's own text, which is what typedFailure deliberately drops
+	// for an untyped error, and the two records would then diverge on exactly
+	// the failures nobody has a safe message for.
+	out.span.End(ledger.OutcomeFailed, ledger.Measured{ItemsIn: int64Ptr(u.InputCount),
+		ItemsOut: int64Ptr(out.parsed), DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
 	if res.RunID != "" {
-		stored := model.RunFailure{ScopeKey: u.ScopeKey, Code: f.code, Message: f.message, Details: f.details}
 		// Under a context that survives the cancellation the failure may have
 		// arrived with: a reason dropped because the run was cancelled is the
 		// case the operator most needs the row for.

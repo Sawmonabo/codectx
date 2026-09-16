@@ -401,7 +401,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			return model.Canceled(ctx.Err())
 		}
 		work.plan.Previous[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = d.previous
-		unit, res, err := l.runOne(ctx, work, d)
+		unit, out, err := l.runOne(ctx, work, d)
 		l.finished()
 		if err != nil {
 			// One background unit's failure does not stop the others, and it
@@ -409,7 +409,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 			// stale from its carried predecessor. The reason is kept on the
 			// run row and logged by the same path the foreground uses, so a
 			// deferred failure is as diagnosable as a foreground one.
-			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = work.recordFailure(ctx, d.unit, res, err)
+			b.failed[plan.Key(d.unit.ProviderID, d.unit.ScopeKey)] = work.recordFailure(ctx, d.unit, out, err)
 			continue
 		}
 		b.sealed = append(b.sealed, sealedUnit{providerID: d.unit.ProviderID, scopeKey: d.unit.ScopeKey, unit: unit})
@@ -449,34 +449,34 @@ func (l *lateSealer) setPublishing(on bool) {
 // analyzer admission gate.
 // The provider result is answered on both paths: a failure's result carries
 // the run the provider actually opened, which is where the reason is kept.
-func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, model.ProviderResult, error) {
+func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, outcome, error) {
 	started := l.c.now()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
-		return "", model.ProviderResult{}, err
+		return "", outcome{}, err
 	}
 	state, exists, err := l.c.opts.Store.UnitState(ctx, spec.ID)
 	if err != nil {
-		return "", model.ProviderResult{}, err
+		return "", outcome{}, err
 	}
 	if exists && state == model.UnitSealed {
 		// An earlier tick sealed it and could not publish; the unit is
 		// immutable, so it is published now rather than rebuilt.
-		return spec.ID, model.ProviderResult{}, nil
+		return spec.ID, outcome{}, nil
 	}
 	if d.unit.Heavy {
 		release, err := l.c.sched.Admit(ctx, d.unit.Reservation)
 		if err != nil {
-			return "", model.ProviderResult{}, err
+			return "", outcome{}, err
 		}
 		defer release()
 	}
 	out, err := work.run(ctx, d.unit, spec)
 	if err != nil {
-		return "", out.result, err
+		return "", out, err
 	}
 	l.observe(l.c.now().Sub(started))
-	return spec.ID, out.result, nil
+	return spec.ID, out, nil
 }
 
 // observe folds one completed unit's duration into the running mean Pending
