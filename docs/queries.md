@@ -54,9 +54,13 @@ each listed exactly once. That order is a property of the facts alone — it doe
 not move when a reindex renumbers the store's internal identifiers — so a
 `refs` cursor kept across pages resumes the list a caller already saw. The
 first page reads the symbol's whole list once and retains everything it did not
-serve; a list that fits one page retains nothing at all. Each `refs` page renews
-that retention and issues a cursor with a fresh `resources.cursor_ttl`, so a long
-reference list is not bounded by the TTL its first page was minted under. A
+serve; a list that fits one page retains nothing at all. A page served by a
+process that holds the writer renews that retention and issues a cursor with a
+fresh `resources.cursor_ttl`, so a long reference list is not bounded by the TTL
+its first page was minted under. A process that writes nothing to the database
+records no retention lease and renews nothing: its pages carry forward the
+expiry the first one stamped on the retained list, which is reachable for that
+one TTL and `CTX_CURSOR_INVALID` after it. A
 `refs` cursor carries a versioned payload: one minted by a build that spelled it
 differently answers `CTX_CURSOR_INVALID` rather than being read with today's
 field meanings.
@@ -192,12 +196,14 @@ costs another slice and nothing else: there is no memory truncation reason, and
 a `path` answer is never shortened because the search ran out of heap. A `path` page ends on the
 deadline or on the per-page `--visited` budget with a cursor: the search's whole
 state — settled set, parent DAG, cost buckets and the nodes it has settled but
-not yet expanded — is retained under the cursor's own lease and reopened by the
+not yet expanded — is retained under the cursor's own deadline and reopened by the
 next page, which carries on settling buckets rather than starting again. The
 answer is exact once the final page arrives; the depth bound is the one stop
 that is reported rather than resumed, because it is part of the query the cursor
 is bound to. A retained search is reclaimed when its lease expires, like any
-other continuation state.
+other continuation state; a search retained by a process that records no lease
+is reclaimed on the expiry stamped into the state itself, which every page
+re-stamps as it hands its directory over.
 
 **Zero on a flag is not "unlimited"; zero in the configuration is.** A zero
 `--depth`, `--visited` or `--edges` takes the configured bound, and a positive
@@ -341,7 +347,10 @@ A cursor pins the generation, the analysis key and the query with its filters.
 Resubmitting a continuation with a different query or filter set, or against a
 re-analysed generation, is `CTX_CURSOR_INVALID` rather than a quietly different
 answer under a continued page number. Continuation state is retained by a lease
-that each page renews, and it is released as soon as the walk reaches its end.
+that each page renews where the process holds the writer, and by the expiry
+recorded in the state itself where it does not; either way it is released as
+soon as the walk reaches its end, and reclaimed on its deadline by the next
+sweep in any process if the walk is abandoned.
 
 ## Configuration these commands read
 

@@ -147,11 +147,11 @@ func IsGenerationCollected(err error) bool {
 // Binding is the generation every result from this reader is qualified by.
 func (r *PinnedReader) Binding() model.Binding { return r.binding }
 
-// Continuable reports whether a query served through this reader may hand back
-// a continuation. A continuation is a cursor lease and a spool, both writes, and
-// a process that opened the store read-only can make neither: such a query
-// serves its first page and says there is no continuation, rather than minting
-// a token it could not honour.
+// Continuable reports whether a query served through this reader may record a
+// retention LEASE. A process that opened the store read-only cannot: it still
+// hands back a continuation -- the spool is a filesystem write and the token is
+// signed, not stored -- but that continuation names no lease and the state it
+// names is reclaimed by the expiry its header carries instead.
 func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
 
 // RetainsLeases is Continuable for a caller that holds the lease store rather

@@ -20,8 +20,18 @@ import (
 
 // Spools manages bounded, disk-backed continuation state for traversals whose
 // frontier cannot live in a token (Section 14.3). Each spool is a private
-// 0600 file under dir bound to one lease, generation and query; it lives
-// exactly as long as its lease and counts against one shared byte budget.
+// 0600 file under dir bound to one generation and query, and it counts against
+// one shared byte budget.
+//
+// Its LIFETIME has two spellings, and every entry carries which one applies in
+// its own header. A spool created by a process that can record a retention
+// lease is bound to that lease and lives exactly as long as it, so a renewal
+// extends the spool with the token. A process that writes nothing to the
+// database records no lease and binds the spool to the expiry its cursor
+// carries instead: the header's own ExpiresAt is then the reclamation
+// predicate. Both are decided by (*Spools).live, which is why a sweep in any
+// process reclaims a spool left by any other -- the leaseless predicate reads
+// the header and nothing else.
 type Spools struct {
 	dir      string
 	maxBytes int64
@@ -49,8 +59,12 @@ type reservation struct {
 }
 
 // SpoolHeader binds a spool to the cursor that references it. Open rejects a
-// spool whose header disagrees with the presenting cursor. ExpiresAt is the
-// expiry at creation and is informational: liveness is the lease's.
+// spool whose header disagrees with the presenting cursor.
+//
+// LeaseID is empty for a spool whose creating process could record no lease.
+// ExpiresAt is the expiry the creating cursor carried: liveness is the lease's
+// while there is one, and this field's while there is not. Cursor.Validate
+// refuses a zero expiry, so a stamped header always carries a decidable one.
 type SpoolHeader struct {
 	// Version fences the on-disk shape. It is kept, unlike the per-structure
 	// versions this greenfield deletes, because a spool is NOT reachable only
@@ -457,11 +471,11 @@ func (s *Spools) OpenAt(ctx context.Context, c Cursor, now time.Time, offset int
 		h.AnalysisKey != c.AnalysisKey || h.QueryHash != c.QueryHash {
 		return 0, cursorInvalid("spool does not belong to this cursor")
 	}
-	expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
+	live, err := s.live(ctx, h, now)
 	if err != nil {
 		return 0, err
 	}
-	if !now.Before(expiry) {
+	if !live {
 		return 0, cursorInvalid("continuation state has expired")
 	}
 	if offset > at {
@@ -627,15 +641,17 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 			// live; anything older is a crashed Create.
 			dead = now.Sub(info.ModTime()) > headerlessGrace
 		} else {
-			expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
+			live, err := s.live(ctx, h, now)
 			if err != nil {
 				var typed *model.Error
 				if !errors.As(err, &typed) || typed.Code != model.CodeCursorInvalid {
 					return 0, err
 				}
+				// A lease the store no longer holds is a released or expired
+				// one, which is what makes its spool reclaimable.
 				dead = true
 			} else {
-				dead = !now.Before(expiry)
+				dead = !live
 			}
 		}
 		if dead {
@@ -682,6 +698,28 @@ func (s *Spools) spoolHeader(path string) (SpoolHeader, bool) {
 	defer f.Close()
 	h, _, err := readHeader(bufio.NewReader(f), s.recordCeiling())
 	return h, err == nil
+}
+
+// live reports whether the entry described by h is still readable at now. It
+// is the ONE reclamation predicate of this store, consulted by OpenAt, OpenDir
+// and Sweep alike, so an entry a reader is refused is exactly an entry a sweep
+// removes.
+//
+// A leased entry asks the lease store, because a renewal makes the expiry the
+// header was stamped with stale. A LEASELESS entry -- one written by a process
+// that could record no lease -- is live until the expiry its own header
+// carries, which is the expiry of the cursor that created it. That predicate
+// touches no database, so the spool is reclaimed by the next sweep in any
+// process rather than depending on the one that wrote it ever running again.
+func (s *Spools) live(ctx context.Context, h SpoolHeader, now time.Time) (bool, error) {
+	if h.LeaseID == "" {
+		return now.Before(h.ExpiresAt), nil
+	}
+	expiry, err := s.leases.LeaseExpiry(ctx, h.LeaseID)
+	if err != nil {
+		return false, err
+	}
+	return now.Before(expiry), nil
 }
 
 func (s *Spools) diskBytes() (int64, error) {

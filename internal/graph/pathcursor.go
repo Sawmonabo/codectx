@@ -81,8 +81,14 @@ func (c pathCursor) validate() error {
 	if c.GenerationID <= 0 {
 		return cursorInvalid("cursor does not pin a generation")
 	}
-	if !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID) || !model.ValidHexID(c.ScratchID) {
-		return cursorInvalid("cursor query hash, lease id and scratch id must be well-formed identifiers")
+	if !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.ScratchID) {
+		return cursorInvalid("cursor query hash and scratch id must be well-formed identifiers")
+	}
+	// A search retained by a process that records no lease names none: the
+	// state directory is bound to this cursor's expiry, which each page
+	// re-stamps as it adopts the directory it committed.
+	if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
+		return cursorInvalid("cursor lease id is malformed")
 	}
 	if c.AnalysisKey == "" || len(c.AnalysisKey) > model.MaxIdentifierBytes {
 		return cursorInvalid("cursor does not name an analysis key")
@@ -218,17 +224,11 @@ func terminalRetention(err error) error {
 // cursor-owned lease and signs the continuation for the page after it.
 //
 // It returns an empty token, and no error, whenever the answer must stop rather
-// than continue: a workspace that offers no continuations, a process that
-// retains nothing, and a shared spool budget that cannot hold the state. In
-// every case the caller reports Truncated with no NextCursor, which is the
-// contract a page stop already has.
+// than continue: a workspace that offers no continuations, and a shared spool
+// budget that cannot hold the state. In both cases the caller reports Truncated
+// with no NextCursor, which is the contract a page stop already has.
 func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash string, w *pathWalk) (string, error) {
-	// A process that writes nothing takes the third stop: it can record no
-	// cursor lease, and the search state it would hand to the spool store is
-	// reclaimed on that lease's expiry, so adopting the directory without one
-	// would leak it. The return is BEFORE sc.detach(), so the directory is
-	// never handed over and the request's own deferred close removes it.
-	if e.signer == nil || e.spools == nil || !e.leases.Retains() {
+	if e.signer == nil || e.spools == nil {
 		return "", nil
 	}
 	binding := e.adjacency.Binding()
@@ -237,9 +237,19 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 	// swept out from under it. The lease expires with the cursor, so the state
 	// directory is reclaimed by the ordinary sweep even if no one ever asks for
 	// the next page.
-	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return "", err
+	//
+	// A process that writes nothing to the database records none, and the
+	// directory it adopts is reclaimed by the expiry stamped into its header
+	// instead -- the same deadline, carried by the state itself rather than by
+	// a row. Every page adopts a fresh directory, so that deadline advances
+	// with the search exactly as a renewed lease's does.
+	var leaseID string
+	if e.leases.Retains() {
+		lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		leaseID = lease.ID
 	}
 	next := pathCursor{
 		Kind:         spoolRecordPath,
@@ -248,7 +258,7 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 		GenerationID: binding.GenerationID,
 		AnalysisKey:  binding.AnalysisKey,
 		QueryHash:    queryHash,
-		LeaseID:      lease.ID,
+		LeaseID:      leaseID,
 		BucketCost:   w.bucketCost,
 		LastNode:     w.lastSettled,
 		Visited:      w.visited,
@@ -263,7 +273,7 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 		// detach() commits before it can fail, so a failure here leaves the
 		// page's writes committed but no directory a continuation could name:
 		// not this request's to resume from either way, so terminal too.
-		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
+		return "", terminalRetention(e.releaseLease(ctx, leaseID, err))
 	}
 	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
 	if err != nil {
@@ -274,22 +284,22 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 			// Reported, never silent: ending the answer here with no token
 			// under whichever WORK budget happened to be set told the caller to
 			// raise a bound that was not the one that stopped it.
-			return "", terminalRetention(e.releaseLease(ctx, lease.ID, errRetentionBudget("search")))
+			return "", terminalRetention(e.releaseLease(ctx, leaseID, errRetentionBudget("search")))
 		}
-		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
+		return "", terminalRetention(e.releaseLease(ctx, leaseID, err))
 	}
 	next.ScratchID = id
 	if err := next.validate(); err != nil {
-		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
+		return "", terminalRetention(e.releaseLease(ctx, leaseID, err))
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
-		return "", terminalRetention(e.releaseLease(ctx, lease.ID,
+		return "", terminalRetention(e.releaseLease(ctx, leaseID,
 			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()}))
 	}
 	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
 	if err != nil {
-		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
+		return "", terminalRetention(e.releaseLease(ctx, leaseID, err))
 	}
 	return token, nil
 }
