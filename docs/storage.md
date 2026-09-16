@@ -461,10 +461,17 @@ records the prior image of every page a savepoint touches, stays in memory up
 to 64 MiB, one batch's worth, instead of being rewritten to a temporary file
 at every batch (fifteen times the bytes stored, measured); when it does spill,
 the shim hands its chunks to the file system in pieces the engine's own write
-path accepts whole. And the log is
-truncated whenever the engine resets it, so the store can tell a group's first
-frame from the log's size and header, and a run never leaves a log the size of
-its largest group on disk. The group's commit and the checkpoint that follows
+path accepts whole. And the log is rewound in
+place rather than truncated when the engine resets it: no journal size limit is
+set, so the file keeps its high-water length -- bounded by the log the largest
+group leaves -- and every later group writes over the space it already holds. A
+writer that truncated its log at every reset would hand the filesystem the whole
+log's blocks several times in one run, in the middle of its work. Because a
+rewind writes inside the file the log already holds, its size no longer says
+whether the writer's page cache has begun spilling; the file system shim sees
+every write the engine makes, and the engine names a log in the open flags, so
+the shim counts the bytes written to a log and the store marks that count when a
+group begins. The group's commit and the checkpoint that follows
 reach the disk as every write of the engine does, through the paced file
 system the process registers as its default: after each 8 MiB window
 written to a file the writer waits for the previous window to reach the
@@ -475,9 +482,14 @@ is windowed the same way: the file system shim truncates a log or a journal
 the engine frees one window at a time, and every file the process removes
 itself -- a spool, a sort's runs, a staging tree, an analyzer's export -- goes
 through `internal/paced`, which shrinks a file larger than the window one
-window per step before it unlinks it, so a filesystem that discards freed
-blocks as they are freed never receives gigabytes of discards from one
-commit. At activation and abort the
+window per step before it unlinks it. Windowed freeing bounds what the machine
+submits but not what its host owes: where the filesystem discards freed blocks
+and the machine's disk is a sparse image, a free of several gigabytes becomes
+host-side work the machine can neither observe nor wait for, and about a minute
+later some request in flight waits a minute for it. So a run reuses space and
+frees almost nothing: it frees the leftovers of a dead run at its start, and
+what it does free is windowed. The bytes a process has freed are reported in the
+resources block as `freed_bytes`. At activation and abort the
 writer's page cache is released to the process, so a long-lived server does
 not keep a run's working set resident. The engine's temporary files -- the
 spill files of a sort larger than its cache, a statement journal past its
