@@ -81,7 +81,7 @@ bounded by the writer's page cache; nothing commits per batch.
    connection, one batch's pages, released with the savepoint.
 5. **Bounded writes in flight.** Every file the engine writes -- the log, the database at
    checkpoint, journals, sort spills -- reaches the disk through a file-system shim
-   (`internal/storage/paced`) registered as the process default: after every window of
+   (`internal/storage/pacedvfs`) registered as the process default: after every window of
    8 MiB written to a file, the writer waits for the window before it to reach the disk and
    submits the new one. At most one window is in flight per file and at most two are dirty,
    whatever the transaction's size, so a commit's traffic is a stream at the disk's own rate
