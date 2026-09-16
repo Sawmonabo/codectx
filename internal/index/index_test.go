@@ -1165,6 +1165,118 @@ func (busyLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, er
 		Message: "another codectx process holds the workspace indexing lock"}
 }
 
+// TestEveryWatchingProcessIsListedByItsOwnHeartbeat protects the fact that a
+// heartbeat is per watching process.
+//
+// Failure mode one: two watches of one workspace -- a terminal's `codectx
+// watch` and an editor's server, the ordinary arrangement -- share one row, so
+// each beat overwrites the other's claim and every reporting process sees one
+// watch where two are running. Whichever watch beat last is the only one an
+// operator can see, and stopping it reads as the workspace having no watch at
+// all while the other still runs.
+//
+// Failure mode two: a watch that stops withdraws more than its own claim, so a
+// person pressing Ctrl-C in one terminal makes the watch still running in the
+// other invisible -- an index that IS being kept fresh reported as one that is
+// not, which is the readiness answer Section 13.2 exists to give.
+//
+// The two watches here run in one process, so the rows are told apart by their
+// session identity and not by a pid: a pid is reused, and one process can hold
+// two watches.
+func TestEveryWatchingProcessIsListedByItsOwnHeartbeat(t *testing.T) {
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	ctx := f.ctx
+	if _, err := f.c.Index(ctx, model.IndexRequest{}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	// Both watches are refused the workspace for the whole test, so neither
+	// builds and neither completes a pass: what is asserted below is the
+	// listing itself, and a waiting watch is a watch that must be listed.
+	f.locker = busyLock{}
+	watch := func() (*Coordinator, context.CancelFunc, chan error) {
+		c := f.coordinator(f.providers(false))
+		watchCtx, stop := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		go func() { done <- c.Watch(watchCtx, nil) }()
+		return c, stop, done
+	}
+	read := func() []sqlite.WatchHeartbeat {
+		t.Helper()
+		got, err := f.store.WatchHeartbeats(ctx, f.c.Repository())
+		if err != nil {
+			t.Fatalf("WatchHeartbeats: %v", err)
+		}
+		return got
+	}
+	// Waiting for rows to ARRIVE is a wait; every assertion about a row that
+	// must still be there is a single read. A watch republishes its row on its
+	// own interval, so a poll would let a withdrawal that deleted every row be
+	// repaired by the surviving watch's next beat and report as correct.
+	rows := func(want int) []sqlite.WatchHeartbeat {
+		t.Helper()
+		var got []sqlite.WatchHeartbeat
+		for deadline := time.Now().Add(10 * time.Second); ; {
+			if got = read(); len(got) == want || time.Now().After(deadline) {
+				return got
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+
+	first, stopFirst, firstDone := watch()
+	second, stopSecond, secondDone := watch()
+	t.Cleanup(func() { stopSecond() })
+	published := rows(2)
+	if len(published) != 2 {
+		t.Fatalf("two watching processes published %d rows; each watch must publish its own", len(published))
+	}
+	if published[0].SessionID == published[1].SessionID {
+		t.Fatalf("both watches published the session %s, so one overwrote the other", published[0].SessionID)
+	}
+	for _, hb := range published {
+		if hb.WriterPID != os.Getpid() || hb.BeatAt.IsZero() {
+			t.Fatalf("a watcher row must name the process that wrote it and when, got pid %d at %v", hb.WriterPID, hb.BeatAt)
+		}
+	}
+	st, err := f.status(first)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(st.Watchers) != 2 {
+		t.Fatalf("status listed %d watching processes of the two that are running: %+v", len(st.Watchers), st.Watchers)
+	}
+	for _, w := range st.Watchers {
+		if w.LastPassAt != nil || w.PendingEvents != nil {
+			t.Fatalf("a watch that never held the workspace was listed as covering it: %+v", w)
+		}
+	}
+
+	// One watch stops. Its own claim goes and the other's stays: the workspace
+	// is still being watched, and a reader must still be told so.
+	stopFirst()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	surviving := read()
+	if len(surviving) != 1 {
+		t.Fatalf("one watch of two stopped and %d rows remain; it must withdraw its own claim and no other", len(surviving))
+	}
+	if surviving[0].SessionID != second.watch.session() {
+		t.Fatalf("the row that survived is %s, not the watch still running", surviving[0].SessionID)
+	}
+	st, err = f.status(second)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if len(st.Watchers) != 1 || st.Watchers[0].SessionID != second.watch.session() {
+		t.Fatalf("status must list the one watch still running, got %+v", st.Watchers)
+	}
+	stopSecond()
+	if err := <-secondDone; err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+}
+
 // TestAWaitingWatchPublishesNoCoverage protects the heartbeat's three-way
 // distinction, whose collapse in either direction is silent and costly.
 //
