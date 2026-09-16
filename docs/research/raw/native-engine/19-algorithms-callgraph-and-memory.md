@@ -544,8 +544,9 @@ private SQLite database at **6.6× the export**, with a 256 MiB cache, a pooled 
 lock and a retirement rule (`04-requirements-and-engine-cost.md`; ADR-0009). Peak staging disk for
 the largest of those is therefore ≈32.7 GB (4.95 × 6.6). A native engine emits facts in projection
 order, in process, one function at a time, so **the CSV, the staging database, its cache, its pool,
-its lock and its retirement rule have no equivalent**, and with them go 3,446 non-test and 1,428
-test Go lines.
+its lock and its retirement rule have no equivalent**, and with them goes the 4,874-line importer
+package less the 339-line fact-key comparator that relocates to the oracle — a net **4,535** lines
+(`15-requirements-audit.md`).
 
 **What the peaks become.**
 

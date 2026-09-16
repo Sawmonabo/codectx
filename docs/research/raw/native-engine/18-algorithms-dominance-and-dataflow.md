@@ -213,6 +213,20 @@ this, with its own generic dominator routine — `CfgDominatorPass.scala:20-21` 
 | `.../controlflow/cfgdominator/DomTreeAdapter.scala:5-9` | `x2cpg/.../passes/controlflow/cfgdominator/DomTreeAdapter.scala:5-9` |
 | `.../controlflow/cfgdominator/CfgDominatorPass.scala:20-21,26` | `x2cpg/.../passes/controlflow/cfgdominator/CfgDominatorPass.scala:20-21,26` |
 
+### The alternative, steel-manned, and the trade-off accepted
+
+**Keep the generic library and hand it a reversed view.** This is proved above to work, and it is the
+cheaper change: no dominator code in the repository at all, and the reversal is three lines. It is
+declined on §1's grounds and only those — at the measured function sizes the allocation profile
+decides, and that implementation allocates one heap node with its own map bucket per CFG node plus
+three maps per call, against one flat slice for the same algorithm written directly.
+
+**The trade-off accepted, stated plainly:** the exit augmentation of step 3 is not something the
+engine does, so the native control-dependence set will differ from the engine's **by design** — a
+one-sided surplus on functions with unreachable-from-exit regions (infinite loops, `noreturn` tails).
+The differential band must *expect* that surplus and account for it as a named cause rather than
+scoring it as divergence. That is the price of computing the textbook set instead of the engine's.
+
 ---
 
 ## 3. Control dependence — which formulation
@@ -329,9 +343,13 @@ is a subset of the CFG nodes and **D ≤ N**.
 **The quadratic is the decisive term.** With `in` and `out` held as N rows of ⌈D/64⌉ 64-bit words,
 `2 × N × ⌈D/64⌉ × 8` bytes, at D = N:
 
+Both columns below are the **dataflow structures alone**; §6.3's `M_sparse` is the whole per-function
+footprint (CSRs, orders, the post-dominance frontier, the SSA values and the scratch), so the two
+tables do not compare like with like and are not meant to.
+
 | N | dense `in`+`out` | SSA def-use (≈ 8U + 8N, U ≤ 2N) |
 |---|---|---|
-| 100 | 12.5 KiB | ≈ 2.3 KiB |
+| 100 | 3.1 KiB | ≈ 2.3 KiB |
 | 1,000 | 250 KiB | ≈ 23 KiB |
 | 7,518 (the measured generated extreme) | **13.5 MiB** | ≈ 176 KiB |
 | 10,000 | 24.0 MiB | ≈ 234 KiB |
@@ -346,6 +364,20 @@ carry a term that reaches 2.33 GiB on one function. The engine does not have thi
 by dropping every `REACHING_DEF` edge of an over-budget method (doc 10 §(b)). Adopting the dense
 formulation means either reinstating that cap, which contradicts §7.1's no-caps property, or
 accepting the quadratic. The sparse formulation makes the question disappear.
+
+### The alternative, steel-manned, and the trade-off accepted
+
+**Port the dense pass as written.** The case for it is genuinely strong: it gives exact oracle parity
+with the engine at every gate, because it *is* the engine's formulation; it raises no φ-depth question
+at the product's depth-8 projection; and its quadratic is a **solved production problem**, not an open
+one — the engine bounds it at 40,000 definitions and publishes the overrun as `partial` with the
+skipped method names, which is an honest, already-shipped degradation.
+
+It is declined because that solution is exactly the cap the no-caps posture forbids, and because the
+bound's price is dropping *every* reaching-definition edge of the affected method rather than
+degrading smoothly. **The trade-off accepted:** the oracle band for `data_flows_to` becomes
+two-directional and per-cause rather than a single absolute difference, and the port owns φ-operand
+resolution — real work the dense formulation would not have needed.
 
 ### What the choice costs at the product's boundary
 
@@ -502,14 +534,19 @@ Per-function structures, all `int32`/`uint64` and all from one arena:
 | `pidom []int32` | 4N |
 | post-dominance frontier, CSR (`Σ|PDF|` ≤ E in the common case) | 4(N+1) + 4·Σ|PDF| |
 | SSA values + operand lists (§4) | ≈ 8U, U ≤ 2N |
+| strongly-connected-component scratch for the §2 exit augmentation (`index`, `lowlink`, stack) | 12N |
+| the emitted control-dependence pair list, before copy-out | ≤ 8·Σ\|PDF\| |
+| §6.2's worklist, visited and frontier bitsets | 32·⌈N/64⌉ |
 | `in`/`out` **only if the dense formulation is used** | 16 · N · ⌈D/64⌉ |
 
 A CFG node has at most two successors except at a switch, so E ≤ 2N + S where S is the total switch
 arity; taking E ≤ 2N covers everything but switch-heavy code and S is additive, not multiplicative.
 Substituting E ≤ 2N, Σ|PDF| ≤ 2N and U ≤ 2N:
 
-> **M_sparse(N) ≤ 76·N + 32 bytes** (the decided design)
-> **M_dense(N) ≤ 76·N + 16·N·⌈D/64⌉ + 32 bytes** (the engine's formulation, for comparison)
+the rows sum to 92.5N + 44 bytes, and rounding up for alignment headroom:
+
+> **M_sparse(N) ≤ 96·N + 64 bytes** (the decided design)
+> **M_dense(N) ≤ 96·N + 16·N·⌈D/64⌉ + 64 bytes** (the engine's formulation, for comparison)
 
 **Is D capped?** **No.** D is not bounded by a policy constant here — the engine's `--max-num-def`
 (4000 default, 40000 in the product) is a cap whose price is dropping every `REACHING_DEF` edge of the
@@ -526,15 +563,27 @@ research did not do it. The bound is therefore tabulated in N so it holds under 
 
 | N | M_sparse | M_dense (D = N) |
 |---|---|---|
-| 10² | 7.6 KB | 18.4 KB |
-| 10³ | 76 KB | 332 KB |
-| 10⁴ | 760 KB | 24.7 MB |
-| 10⁵ | 7.6 MB | 2.34 GB |
+| 10² | 9.4 KiB | 12.6 KiB |
+| 10³ | 93.8 KiB | 344 KiB |
+| 10⁴ | **0.92 MiB** | 24.87 MiB |
+| 10⁵ | 9.16 MiB | **2.34 GiB** |
 
 At N = 10⁴, which covers the measured 7,518-line extreme under any lines-to-nodes factor up to ≈1.3,
-**the decided design needs 760 KB per worker for the function's structures**, plus one file's CST.
-Even at N = 10⁵ — a lines-to-nodes factor of 13 on that same function — it needs 7.6 MB. The dense
-formulation needs 2.34 GB at the same point, which is the whole argument of §4 in one row.
+**the decided design needs 0.92 MiB per worker for the function's structures**, plus one file's CST.
+Even at N = 10⁵ — a lines-to-nodes factor of 13 on that same function — it needs 9.16 MiB. The dense
+formulation needs 2.34 GiB at the same point, which is the whole argument of §4 in one row. Both
+columns are binary units throughout.
+
+### 6.3a The alternative to the arena, steel-manned
+
+**No arena: allocate per function and let the collector do its job.** This is the idiomatic answer, it
+has no lifetime hazard, no manual reset to get wrong, and no risk of a stale slice outliving its
+function. It is declined only because the multiplier is on the order of 10⁶ functions per large
+repository, and what the arena saves is the collector's scan set rather than the allocation itself.
+**The trade-off accepted:** manual lifetime discipline inside one worker, in exchange for a
+steady-state allocation rate near zero. If the function count for a run ever falls to the order of
+10⁴, this decision should be revisited, because at that multiplier the saving stops paying for the
+hazard.
 
 ### 6.4 Arena allocation
 
@@ -583,6 +632,13 @@ adjacent lane's, and the two have to be reconciled by multiplying this bound by 
 adding the CST residency.
 
 ---
+
+**Go runtime and toolchain citations for §6.2 and §6.4** (Go 1.27.1 toolchain source, read on this
+host): pointer-free spans are skipped by the mark phase (`runtime/mgcmark.go:1690-1692`) and carry no
+pointer bitmap (`runtime/mbitmap.go:142-144`); the collector's pacing is driven by the heap growth
+ratio (`runtime/mgcpacer.go:93-94,145-149`); the word-level population count and trailing-zero
+primitives are compiler intrinsics on this architecture (`math/bits/bits.go:90,140`, with the
+intrinsic set asserted at `cmd/compile/internal/ssagen/intrinsics_test.go:140,152,308,323`).
 
 ## Sources
 
