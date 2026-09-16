@@ -36,9 +36,11 @@ type counts struct {
 	// test can read what actually reached the sink rather than what the
 	// export held.
 	sig map[string]string
-	// id is the identity each published node resolved to, by node name, and
-	// meta the metadata it carried.
-	id   map[string]model.NodeID
+	// id holds the identities published under one `<kind>:<name>`: keyed by
+	// kind because a fixture may publish a method and a variable of one name,
+	// and a list because a name may be declared in several scopes. meta is the
+	// metadata each node carried, by node name.
+	id   map[string][]model.NodeID
 	meta map[string]string
 	// edges are the published edges themselves, so a test can ask which
 	// entities one names rather than only how many were published.
@@ -48,19 +50,25 @@ type counts struct {
 func newCounts() counts {
 	return counts{rel: map[model.RelationKind]int{}, node: map[model.NodeKind]int{},
 		alias: map[string]string{}, detail: map[string]int{}, relKey: map[string][]string{},
-		sig: map[string]string{}, id: map[string]model.NodeID{}, meta: map[string]string{}}
+		sig: map[string]string{}, id: map[string][]model.NodeID{}, meta: map[string]string{}}
 }
 
 // has reports whether the edge from -> to of kind k was published, naming its
-// endpoints by the node names they were published under.
+// endpoints `<node kind>:<name>` as they were published.
 func (c counts) has(kind model.RelationKind, from, to string) bool {
-	src, okFrom := c.id[from]
-	dst, okTo := c.id[to]
-	if !okFrom || !okTo {
-		return false
-	}
 	for _, e := range c.edges {
-		if e.Kind == kind && e.From == src && e.To == dst {
+		if e.Kind == kind && slices.Contains(c.id[from], e.From) && slices.Contains(c.id[to], e.To) {
+			return true
+		}
+	}
+	return false
+}
+
+// names reports whether any edge of kind k has a node published under the given
+// `<kind>:<name>` at either end.
+func (c counts) names(kind model.RelationKind, node string) bool {
+	for _, e := range c.edges {
+		if e.Kind == kind && (slices.Contains(c.id[node], e.From) || slices.Contains(c.id[node], e.To)) {
 			return true
 		}
 	}
@@ -88,7 +96,8 @@ func (r recorder) PutKeyedNodes(ctx context.Context, f []model.NodeFact, keys []
 	for _, n := range f {
 		r.c.node[n.Node.Kind]++
 		r.c.sig[n.Node.Name] = n.Node.Signature
-		r.c.id[n.Node.Name] = n.Node.ID
+		key := string(n.Node.Kind) + ":" + n.Node.Name
+		r.c.id[key] = append(r.c.id[key], n.Node.ID)
 		r.c.meta[n.Node.Name] = string(n.Node.Metadata)
 	}
 	if d, ok := r.Sink.(provider.DeltaSink); ok {
@@ -221,7 +230,7 @@ func TestImport(t *testing.T) {
 			// any call made through that value -- is silently dropped. The
 			// export's METHOD_REF for `run` is the only node here whose REF
 			// edge names a method rather than a declaration.
-			if !c.has(model.RelDataFlowsTo, "<global>", "run") {
+			if !c.has(model.RelDataFlowsTo, "function:<global>", "function:run") {
 				t.Errorf("the method the reference names is not an endpoint of the flow that reaches it; "+
 					"the method reference did not anchor (edges = %d)", len(c.edges))
 			}
@@ -290,6 +299,34 @@ func TestImport(t *testing.T) {
 				model.RelReads, model.RelWrites)
 			if c.detail["cdg"] == 0 || c.detail["call"] == 0 {
 				t.Errorf("evidence details = %v; want cdg and call", c.detail)
+			}
+		},
+	}, {
+		// Failure mode: a method reached through a variable (`const f =
+		// helper; f(i)`) leaves no fact at all, because the method reference
+		// the export binds to the method never anchors. What the export does
+		// NOT carry is the call: `f(i)` is bound to an invented callee named
+		// `f`, never to `helper`, so the dependence on `helper` exists only as
+		// the flow of the method value into the name that is called.
+		name: "javascript method reached through a value", src: "src/jsvalue", export: "jsvalue",
+		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
+				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
+			}
+			if !c.has(model.RelCalls, "function:run", "function:f") || c.names(model.RelCalls, "function:helper") {
+				t.Errorf("the call through the value resolved to something other than the export's invented callee")
+			}
+		},
+	}, {
+		// Same shape in Python, where the export binds the call site to
+		// nothing at all rather than to an invented callee.
+		name: "python method reached through a value", src: "src/pyvalue", export: "pyvalue",
+		check: func(t *testing.T, rep neo4jcsv.Report, c counts) {
+			if !c.has(model.RelDataFlowsTo, "function:helper", "variable:helper") {
+				t.Errorf("the referenced method is not the source of the value's flow; the method reference did not anchor")
+			}
+			if c.rel[model.RelCalls] != 0 {
+				t.Errorf("calls = %d; the export binds this call site to no callee at all", c.rel[model.RelCalls])
 			}
 		},
 	}, {

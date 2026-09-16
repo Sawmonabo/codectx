@@ -1,0 +1,9 @@
+107374182400,METHOD,<empty>,<empty>,function helper(x) { return x + 1; },0,36,w.js,w.js::program:helper,<empty>,,false,1,1,helper,,,1,
+107374182401,METHOD,w.js::program,TYPE_DECL,:program,0,0,w.js,w.js::program,<empty>,,false,1,6,:program,,,1,
+107374182402,METHOD,<empty>,<empty>,"function run(i) {
+  const f = helper;
+  return f(i);
+}",0,1,w.js,w.js::program:run,<empty>,,false,2,5,run,,,1,
+107374182403,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.addition,<empty>,,true,,,<operator>.addition,,,0,
+107374182404,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
+107374182405,METHOD,w.js::program,TYPE_DECL,<empty>,,,<empty>,w.js::program:f,<empty>,,true,,,f,,,0,
