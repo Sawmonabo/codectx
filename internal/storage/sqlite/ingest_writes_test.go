@@ -308,20 +308,28 @@ func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testin
 	close(done)
 	<-sampled
 	commits := f.s.Commits() - before
-	t.Logf("activation commits=%d peak log=%.1f MiB", commits, float64(peak)/(1<<20))
+	t.Logf("activation commits=%d peak log=%d B bound=%d B over=%d B", commits, peak, f.s.WALBoundBytes(), peak-f.s.WALBoundBytes())
 	if commits < 2 {
 		t.Fatalf("the activation committed %d time(s): its compaction cascade never reached the group's commit decision, so nothing bounds its log", commits)
 	}
 	// The commit decision falls at the END of an ingestion call, so the frames
 	// of the merge that crosses the bound are already in the log when the group
-	// commits: a cascade run one merge per call peaks at the bound plus one
-	// merge, never at the cascade. Measured on this fixture: 4.0 MiB bound,
-	// 4.01 MiB peak with the merges as their own calls, 23.4 MiB with the
-	// cascade inside the activation's one call -- and that figure grows with
-	// the repository, which is what no bound would mean.
-	if limit := 2 * f.s.WALBoundBytes(); peak > limit {
-		t.Fatalf("the log reached %.1f MiB during the activation; one merge past the %.1f MiB group bound is %.1f MiB",
-			float64(peak)/(1<<20), float64(f.s.WALBoundBytes())/(1<<20), float64(limit)/(1<<20))
+	// commits: a cascade run one merge per call peaks at the bound plus THAT
+	// ONE MERGE, never at the cascade. The bound asserted here is therefore the
+	// group bound plus one merge's frames, and nothing looser -- a bound that
+	// left room for a second merge would pass a cascade.
+	//
+	// Measured on this fixture, identically across repeated runs: 4 194 304 B
+	// bound, 4 202 432 B peak, an overshoot of 8 128 B, which is the two frames
+	// the crossing merge added. Eight frames is the assertion, four times what
+	// this fixture reaches and far below the 23.4 MiB the same fixture reaches
+	// when the cascade runs inside the activation's one call -- and that figure
+	// grows with the repository, which is what no bound would mean.
+	const walFrameBytes = 4096 + 24 // one page, plus the log frame's header
+	const mergeFrames = 8
+	if limit := f.s.WALBoundBytes() + mergeFrames*walFrameBytes; peak > limit {
+		t.Fatalf("the log reached %d B during the activation; the %d B group bound plus one merge's %d frames is %d B",
+			peak, f.s.WALBoundBytes(), mergeFrames, limit)
 	}
 }
 
