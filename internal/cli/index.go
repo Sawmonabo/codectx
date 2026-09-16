@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -546,12 +548,19 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 		{"temp", byteMetric(r.TempBytes)},
 		{"content store", byteMetric(r.CASBytes)},
 		{"freed this run", byteMetric(r.FreedBytes)},
+		{"scratch held", byteMetric(r.ScratchBytes)},
 		{"live subprocesses", countMetric(r.LiveSubprocesses)},
 		{"pending events", countMetric(r.PendingEvents)},
 		{"units reused", countMetric(r.UnitsReused)},
 		{"units parsed", countMetric(r.UnitsParsed)},
 	} {
 		fmt.Fprintf(tw, "  %s\t%s\n", row.label, row.value)
+	}
+	// What the freeing was for, under the figure it breaks down. Sorted so
+	// two runs of the same shape print the same lines.
+	for _, purpose := range slices.Sorted(maps.Keys(r.FreedByPurpose)) {
+		n := r.FreedByPurpose[purpose]
+		fmt.Fprintf(tw, "    freed for %s\t%s\n", purpose, byteMetric(&n))
 	}
 	flushTableInto(tw)
 }

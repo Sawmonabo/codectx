@@ -169,8 +169,8 @@ complete.
 ## The content-addressed store
 
 ```text
-<data>/cas/tmp/            private files being written
-<data>/cas/<hh>/<sha256>   published immutable blobs (0400)
+<data>/scratch/<n>/content-temp/   pooled surfaces a blob is staged into
+<data>/cas/<hh>/<sha256>          published immutable blobs (0400)
 ```
 
 A put streams a file through `source.BuildIndex`, which computes the
@@ -195,8 +195,8 @@ single largest cost of an index, and the parent process spends the run parked
 in the filesystem's journal rather than reading or parsing.
 
 A capture therefore opens one `CAS.NewBatch` and stages every blob into it. A
-staged blob's bytes are written to `cas/tmp/put-*` and its descriptor held
-open; when the sync window fills, the group is fsynced concurrently (a
+staged blob's bytes are written into a surface taken from the data
+directory's scratch pool and its descriptor held open; when the sync window fills, the group is fsynced concurrently (a
 journalling filesystem folds concurrent fsyncs into shared commits, which is
 the whole saving), each temporary is then made read-only and linked into its
 bucket, and the descriptors are closed. `Batch.Barrier`, called immediately
@@ -206,7 +206,7 @@ prefix, instead of one per blob.
 
 Publication happens after the fsync, never before, and that is what keeps a
 crash recoverable: an interrupted capture leaves nothing in the buckets, only
-temporaries that `Sweep` removes. A bucket entry whose bytes had not reached
+bytes in a pooled surface that the next capture writes over. A bucket entry whose bytes had not reached
 the disk would survive a crash as a short file and fail every later capture of
 the same content as an integrity error. Content the capture meets twice inside
 one window is written once and synced once, and content an earlier generation
@@ -221,11 +221,22 @@ number of files captured. `Repair` keeps the single-blob `CAS.Put`, which
 syncs and publishes before it returns: it writes into a manifest that is
 already committed, so there is no later barrier for it to order against.
 
-Unpublished temporaries live under `cas/tmp/put-*`. A capture writes them
-under the workspace lock. `Sweep` removes whatever is there, so a `Repair`
-that runs without the lock can lose its temporary to a concurrent sweep; the
-publication then fails with a retryable `CTX_WORKSPACE_BUSY` rather than
-corrupting anything, and the caller retries (or repairs under the lock).
+A capture cannot know whether the store already holds a file's content until
+it has read the file and hashed it, so it stages **every** file in the
+workspace. That staging surface comes from the scratch pool, which is what
+makes re-indexing an unchanged repository free nothing: content already
+published gives the surface straight back at its length, as do a blob staged
+twice in one group, an abandoned batch and every error path. Only a blob that
+really is published gives up its slot, and then the surface *is* the object —
+the pool keeps its blocks and only the temporary's directory entry goes,
+unpaced, because pacing a removal empties the file first.
+
+The pool never truncates, so a surface may carry the tail of a larger blob
+staged into it earlier and a published object is proved by its length. The
+excess is trimmed a window at a time before the object exists, so the only disk
+a capture gives back is the difference between one blob and the largest that
+shared its slot. There is nothing for `Sweep` to remove: a crashed capture's
+unpublished bytes sit in a surface the next run writes over.
 
 The block digests and checkpoints are persisted with `storage.PutBlob` before
 the manifest row that names the blob is written, and `PutSnapshot` refuses a

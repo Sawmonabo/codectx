@@ -539,7 +539,7 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		if err != nil {
 			return Report{}, internal("scip run directory: " + err.Error())
 		}
-		defer paced.RemoveAll(runDir)
+		defer paced.RemoveAllFor(paced.Materialization, runDir)
 		output, manifestSHA, err := p.runProfile(ctx, prof, req.Content, runDir, &im.seen)
 		if err != nil {
 			return Report{}, err

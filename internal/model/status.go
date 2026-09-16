@@ -167,9 +167,29 @@ type ResourceReport struct {
 	// with nothing able to observe or wait for it. This is what makes that
 	// claim checkable from outside. It is counted in windows, so it is the
 	// window count times the window rather than a byte-exact figure.
-	FreedBytes  *uint64 `json:"freed_bytes,omitempty"`
-	UnitsReused *int64  `json:"units_reused,omitempty"`
-	UnitsParsed *int64  `json:"units_parsed,omitempty"`
+	FreedBytes *uint64 `json:"freed_bytes,omitempty"`
+	// ScratchBytes is the disk the store's scratch pools hold: every working
+	// file this process writes for its own later reading -- sort runs,
+	// staging databases, blob staging surfaces, a search's state -- at its
+	// current length, taken or free.
+	//
+	// It is the other half of FreedBytes and the reason that figure is small.
+	// The product does not remove these files when it finishes with them; it
+	// hands them back to the pool and writes over them next time, so what
+	// would have been freed and re-created over and over is disclosed here
+	// instead as space the store is holding. It shrinks only when an operator
+	// asks for the pools to be emptied.
+	ScratchBytes *uint64 `json:"scratch_bytes,omitempty"`
+	// FreedByPurpose says what the freeing this process did was for, in bytes
+	// measured before each removal, keyed by internal/paced.Purpose. A
+	// well-behaved run frees the outputs of foreign writers it cannot write
+	// over, the source trees it copied for them, and the leftovers of runs
+	// whose caller never came back -- and nothing else. It does not add up to
+	// FreedBytes, which counts every window the pacer handed back including
+	// removals no call site names; see paced.FreedByPurpose.
+	FreedByPurpose map[string]uint64 `json:"freed_by_purpose,omitempty"`
+	UnitsReused    *int64            `json:"units_reused,omitempty"`
+	UnitsParsed    *int64            `json:"units_parsed,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -192,6 +212,7 @@ func (r ResourceReport) Validate() error {
 		{"resources.temp_bytes", r.TempBytes},
 		{"resources.cas_bytes", r.CASBytes},
 		{"resources.freed_bytes", r.FreedBytes},
+		{"resources.scratch_bytes", r.ScratchBytes},
 	} {
 		if f.value == nil {
 			continue

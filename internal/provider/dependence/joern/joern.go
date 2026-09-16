@@ -220,7 +220,7 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 		return dependence.ExportOutcome{}, err
 	}
 	// The engine refuses an output directory that already exists.
-	if err := paced.RemoveAll(req.OutputDir); err != nil {
+	if err := paced.RemoveAllFor(paced.AnalyzerOutput, req.OutputDir); err != nil {
 		return dependence.ExportOutcome{}, &model.Error{Code: model.CodeInternal,
 			Message: "the previous analysis export could not be removed: " + err.Error()}
 	}

@@ -262,7 +262,7 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
 	if err != nil {
 		// The state is this request's to clean up until the store takes it.
-		_ = paced.RemoveAll(dir)
+		_ = paced.RemoveAllFor(paced.LeaseReclamation, dir)
 		if pagination.IsBudgetExhausted(err) {
 			// The shared continuation budget cannot hold this search's state.
 			// Reported, never silent: ending the answer here with no token
