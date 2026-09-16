@@ -28,7 +28,7 @@ func TestRemoveFreesALargeFileOneWindowAtATime(t *testing.T) {
 	dir := t.TempDir()
 	large := filepath.Join(dir, "large")
 	writeFile(t, large, 3*Window+Window/2)
-	before := Steps()
+	before := steps.Load()
 	if err := Remove(large); err != nil {
 		t.Fatal(err)
 	}
@@ -37,17 +37,17 @@ func TestRemoveFreesALargeFileOneWindowAtATime(t *testing.T) {
 	}
 	// 3.5 windows: 3 whole windows and the half that remains are freed in
 	// four steps, the last being the truncation to zero.
-	if got := Steps() - before; got != 4 {
+	if got := steps.Load() - before; got != 4 {
 		t.Fatalf("freed %d windows one at a time; want 4", got)
 	}
 
 	small := filepath.Join(dir, "small")
 	writeFile(t, small, Window)
-	before = Steps()
+	before = steps.Load()
 	if err := Remove(small); err != nil {
 		t.Fatal(err)
 	}
-	if got := Steps() - before; got != 0 {
+	if got := steps.Load() - before; got != 0 {
 		t.Fatalf("a file no larger than the window took %d steps; it is unlinked whole", got)
 	}
 }
@@ -64,7 +64,7 @@ func TestRemoveAllShrinksEveryLargeFileBeforeUnlinkingTheTree(t *testing.T) {
 	if err := os.Symlink(filepath.Join(tree, "a"), filepath.Join(tree, "link")); err != nil {
 		t.Fatal(err)
 	}
-	before := Steps()
+	before := steps.Load()
 	if err := RemoveAll(tree); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestRemoveAllShrinksEveryLargeFileBeforeUnlinkingTheTree(t *testing.T) {
 		t.Fatalf("the tree survived its removal: %v", err)
 	}
 	// a: 2 windows and a byte, three steps; b: a window and a byte, two.
-	if got := Steps() - before; got != 5 {
+	if got := steps.Load() - before; got != 5 {
 		t.Fatalf("freed %d windows one at a time; want 5", got)
 	}
 	if err := RemoveAll(filepath.Join(dir, "absent")); err != nil {
@@ -123,7 +123,7 @@ func TestARemovalIsNotRefusedForAFileTheProcessMayUnlinkButNotTruncate(t *testin
 func TestShrinkStopsAtTheRequestedSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "f")
 	writeFile(t, path, 4*Window)
-	before := Steps()
+	before := steps.Load()
 	if err := Shrink(path, Window+3); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestShrinkStopsAtTheRequestedSize(t *testing.T) {
 		t.Fatalf("size after Shrink is %d; want %d", st.Size(), Window+3)
 	}
 	// 4W -> 3W -> 2W -> W+3: three steps, the last one partial.
-	if got := Steps() - before; got != 3 {
+	if got := steps.Load() - before; got != 3 {
 		t.Fatalf("freed %d windows; want 3", got)
 	}
 }

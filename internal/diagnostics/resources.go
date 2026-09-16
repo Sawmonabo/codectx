@@ -6,7 +6,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/scratch"
-	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
 // Resources is the Section 23 accounting block `status --resources` and
@@ -21,10 +20,12 @@ import (
 //
 // The space this process has freed is the one figure here that is neither
 // measured on the host nor read from the store: it is counted where the
-// freeing happens, in the window-at-a-time truncations the process's own
-// removals and its file-system shim make, because a run that reuses its space
-// instead of freeing it is the design and a reader outside the process cannot
-// see the difference any other way.
+// freeing happens, byte by byte as each truncation and each unlink releases
+// them, because a run that reuses its space instead of freeing it is the
+// design and a reader outside the process cannot see the difference any other
+// way. It is one counter -- the process's own removals, the reclaimer's, and
+// the file-system shim's all add to it -- disclosed here twice: whole as
+// freed_bytes, and split by what the removal was for as freed_by_purpose.
 //
 // The pending-event count is the one figure here that a second process could
 // not report at all until a watch published a heartbeat: the sampler measures
@@ -48,7 +49,7 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.DatabaseBytes = nonNegativeBytes(stats.DatabaseBytes)
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
-	report.FreedBytes = nonNegativeBytes((paced.Steps() + pacedvfs.Truncations()) * paced.Window)
+	report.FreedBytes = nonNegativeBytes(paced.FreedBytes())
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
@@ -70,22 +71,28 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 // would leave it invisible. Summing the two would be worse -- the pool would
 // appear to grow every time the run removed something.
 //
-// A pool that cannot be read leaves the figure absent rather than short: a
-// partial sum here would read as "the run is holding less than it is", which
-// is the one thing this figure exists to rule out. The purposes the freeing
-// WAS for are reported beside it, and an empty map is left absent because a
-// process that has freed nothing for any named purpose has nothing to say
-// rather than a measured zero per purpose.
+// A pool that cannot be read leaves the held figure absent rather than short:
+// a partial sum there would read as "the run is holding less than it is",
+// which is the one thing that figure exists to rule out. It leaves the others
+// alone: what the run has freed and what it is waiting to free are counted in
+// the process, not read off the disk, so an unreadable pool says nothing about
+// them. The purposes the freeing WAS for are reported beside it, and an empty
+// map is left absent because a process that has freed nothing for any named
+// purpose has nothing to say rather than a measured zero per purpose.
 func scratchBytes(report *model.ResourceReport) {
 	var total int64
+	readable := true
 	for _, a := range scratch.All() {
 		n, err := a.Bytes()
 		if err != nil {
-			return
+			readable = false
+			break
 		}
 		total += n
 	}
-	report.ScratchBytes = nonNegativeBytes(total)
+	if readable {
+		report.ScratchBytes = nonNegativeBytes(total)
+	}
 	if pending, err := paced.PendingFreeBytes(); err == nil {
 		report.PendingFreeBytes = nonNegativeBytes(pending)
 	}

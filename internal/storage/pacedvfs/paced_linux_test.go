@@ -198,14 +198,14 @@ func TestAJournalIsDeletedOneWindowAtATime(t *testing.T) {
 	// table's pre-image and is the size of the table when the commit
 	// deletes it. (Deleting the rows would not: a whole-table delete frees
 	// the pages without reading them.)
-	before := paced.Steps()
+	before := paced.FreedBytes()
 	if _, err := db.Exec(`UPDATE t SET b = randomblob(length(b))`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(path + "-journal"); !os.IsNotExist(err) {
 		t.Fatalf("the journal survived the commit: %v", err)
 	}
-	if got := paced.Steps() - before; got < 7 {
-		t.Fatalf("the journal was freed in %d windowed steps; a 64 MiB journal takes at least 7", got)
+	if got := paced.FreedBytes() - before; got < 7*paced.Window {
+		t.Fatalf("the journal's removal freed %d bytes through the pacer; a 64 MiB journal frees at least %d", got, 7*paced.Window)
 	}
 }

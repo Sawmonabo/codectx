@@ -344,6 +344,13 @@ func (r *reclaimer) freeEntry(path string, p Purpose) error {
 // freeTree frees one path, depth first: a directory's children are freed
 // before the directory itself, so nothing is unlinked while it still holds
 // space.
+//
+// A tree removal is never all-or-nothing. One child that cannot be freed --
+// a device error, a read-only mount, a file another process is executing --
+// does not leave the rest of the tree behind; the walk goes on, every child
+// that can go goes, and the first failure is reported once the walk is over.
+// Leaving the whole tree because of one file is the leak a removal exists to
+// prevent.
 func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 	st, err := os.Lstat(path)
 	if err != nil {
@@ -357,12 +364,16 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		if err != nil {
 			return err
 		}
+		var first error
 		for _, e := range entries {
-			if err := r.freeTree(filepath.Join(path, e.Name()), p, set); err != nil {
-				return err
+			if err := r.freeTree(filepath.Join(path, e.Name()), p, set); err != nil && first == nil {
+				first = err
 			}
 		}
-		return os.Remove(path)
+		if err := os.Remove(path); err != nil && first == nil {
+			first = err
+		}
+		return first
 	}
 	if !st.Mode().IsRegular() {
 		// A symbolic link, a socket or a device holds no blocks of its own.
@@ -372,16 +383,18 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 }
 
 // freeFile empties one regular file a window at a time and then unlinks it.
+// A file that could not be emptied is unlinked all the same -- the shrink is
+// best effort, the unlink is not -- and its bytes are charged to the pace
+// whichever of the two released them.
 // Every byte it releases is charged to the pace, whether it went by
 // truncation or with the unlink: a thousand small files freed at once cost
 // the filesystem what one large file of the same bytes costs, and the
 // measurement that set FreeInterval counted bytes, not calls.
 func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) error {
+	var shrinkErr error
 	if size > Window {
-		left, err := r.empty(path, size, p, set)
-		if err != nil {
-			return err
-		}
+		var left int64
+		left, shrinkErr = r.empty(path, size, p, set)
 		size = left
 	}
 	if err := os.Remove(path); err != nil {
@@ -392,7 +405,7 @@ func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) e
 	}
 	attribute(p, size)
 	r.charge(size, set)
-	return nil
+	return shrinkErr
 }
 
 // empty truncates one regular file towards zero a window at a time, syncing

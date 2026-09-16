@@ -8,8 +8,9 @@ import "sync"
 // need again.
 //
 // It is the set of removals this product labels, not the set it makes. A
-// removal with no purpose here is not a removal that did not happen -- see
-// FreedByPurpose on what Steps counts that this does not.
+// removal with no purpose here is not a removal that did not happen: its
+// bytes are in FreedBytes like any other, they simply have no name to appear
+// under in FreedByPurpose.
 type Purpose string
 
 const (
@@ -34,20 +35,47 @@ const (
 
 var (
 	freedMu sync.Mutex
-	freed   = map[Purpose]int64{}
+	// freed is the one counter of bytes this process has given back. Its
+	// total is FreedBytes and its labelled part is FreedByPurpose, so the two
+	// figures cannot disagree: they are the same additions, read two ways.
+	freed      = map[Purpose]int64{}
+	freedTotal int64
 )
 
-// FreedByPurpose is the bytes this process has actually given back to the
-// filesystem for each purpose since it started, counted as they were released
-// rather than when the removal was asked for. Space a removal has queued and
-// the reclaimer has not reached yet is not here; it is PendingFreeBytes.
+// FreedBytes is the bytes this process has actually given back to the
+// filesystem since it started, counted as each truncation and each unlink
+// released them, not as whole windows: a file smaller than the window is
+// unlinked without a windowed step and still frees its length, and the last
+// step of a shrink frees the remainder rather than a window.
 //
-// It does not add up to what Steps reports. Steps counts every window the
-// pacer handed back, including removals no call site names -- a caller's own
-// temporary file, a test's fixture -- while this accounts only the removals
-// the product labels, and it accounts bytes rather than whole windows. The two
-// answer different questions on purpose: Steps says how much freeing this
-// process did, and this says what the freeing was for.
+// It is what the freeing cost, not what the removals asked for. Space a
+// removal has queued and the reclaimer has not reached is not here; it is
+// PendingFreeBytes.
+func FreedBytes() int64 {
+	freedMu.Lock()
+	defer freedMu.Unlock()
+	return freedTotal
+}
+
+// Freed records n bytes a caller has just released by its own truncation --
+// the shrink that trims a pooled surface, the engine's shim shortening a file
+// -- and makes that caller wait the pace those bytes owe before it goes on.
+//
+// The budget is the process's: bytes freed here and bytes freed by the
+// reclaimer spend the same windows, so a run cannot outrun the pace by
+// splitting its freeing across both.
+func Freed(n int64) {
+	attribute("", n)
+	reclaim.charge(n, nil)
+}
+
+// FreedByPurpose is the part of FreedBytes whose removal named a purpose,
+// split by that purpose: not how much freeing this process did, which is
+// FreedBytes, but what the freeing was for. It is counted as the bytes were
+// released rather than when the removal was asked for, so it never exceeds
+// FreedBytes and falls short of it by exactly the removals no call site
+// names -- a caller's own temporary file, the engine's own shortening of a
+// file it owns.
 func FreedByPurpose() map[Purpose]int64 {
 	freedMu.Lock()
 	defer freedMu.Unlock()
@@ -58,13 +86,19 @@ func FreedByPurpose() map[Purpose]int64 {
 	return out
 }
 
-// attribute records n bytes freed for p.
+// attribute records n bytes freed, for p when the removal named one. An
+// unnamed removal still counts towards the total: the figure an operator
+// reads as "what this run freed" must not depend on whether the call site
+// had a label for it.
 func attribute(p Purpose, n int64) {
 	if n <= 0 {
 		return
 	}
 	freedMu.Lock()
-	freed[p] += n
+	freedTotal += n
+	if p != "" {
+		freed[p] += n
+	}
 	freedMu.Unlock()
 }
 
