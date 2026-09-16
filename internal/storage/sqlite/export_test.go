@@ -3,6 +3,9 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"maps"
+	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
 )
@@ -88,4 +91,58 @@ func (s *Store) SetFreeBytes(fn func(dir string) (uint64, bool)) func() {
 	prev := s.freeBytes
 	s.freeBytes = fn
 	return func() { s.freeBytes = prev }
+}
+
+// SegmentPostingDocuments decodes the document rowids one segment's posting
+// lists actually carry, so a test can prove a document is GONE from the packed
+// bytes rather than merely hidden by a bitmap. It reassembles the segment's
+// term directory and posting stream, which is why it is a test hook: a
+// production read holds a bounded window of parts, never a whole stream.
+func SegmentPostingDocuments(db *sql.DB, segment int64) ([]int64, error) {
+	stream := func(name string) ([]byte, error) {
+		rows, err := db.Query(`SELECT bytes FROM lexical_segment_parts
+			WHERE segment_id = ? AND stream = ? ORDER BY part`, segment, name)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []byte
+		for rows.Next() {
+			var b []byte
+			if err := rows.Scan(&b); err != nil {
+				return nil, err
+			}
+			out = append(out, b...)
+		}
+		return out, rows.Err()
+	}
+	dir, err := stream(streamTermDir)
+	if err != nil {
+		return nil, err
+	}
+	lists, err := stream(streamPostList)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[int64]bool{}
+	for off := 0; off+termEntryBytes <= len(dir); off += termEntryBytes {
+		e := dir[off:]
+		listOff := int64(binary.LittleEndian.Uint64(e[termEntryListOff:]))
+		listLen := int64(binary.LittleEndian.Uint32(e[termEntryListLen:]))
+		if listOff+listLen > int64(len(lists)) {
+			return nil, corrupt("segment %d term at %d points past its posting stream", segment, off)
+		}
+		c := &postingCursor{raw: lists[listOff : listOff+listLen], segment: segment}
+		for {
+			live, err := c.next()
+			if err != nil {
+				return nil, err
+			}
+			if !live {
+				break
+			}
+			seen[c.doc] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(seen)), nil
 }

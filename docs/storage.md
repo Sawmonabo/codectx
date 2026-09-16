@@ -556,20 +556,22 @@ frequency, and all of that is paid again on every request. It is segmented
 because a structure rebuilt per generation costs the whole corpus at every
 activation, including the activation that publishes one saved file.
 
-**The four tables.** `lexical_segments` carries one row per segment: its term
-count, its document count and its packed bytes. `lexical_segment_parts` carries
-the bytes, one row per chunk of one stream, keyed by segment, stream name and a
-0-based part number whose parts concatenate to the stream. `segment_units` names
-the units whose documents a segment holds — one unit for a segment a seal wrote,
-and every surviving unit for a merged one. `generation_segments` is one
-generation's set in read order, each row carrying how many of that segment's
-documents the generation hides; its reference to a segment is `RESTRICT`, so a
-segment a generation still names cannot be collected. Alongside them,
-`generation_lexical` carries one row per generation — the visible document count,
-the total token length and the visible-document bitmap — and cascades from
-`generations`. A fifth column, on `search_units`, names the segment a document
-was folded into; it is the document's, not the row's, so a carry-over copies it
-forward with the document rowid.
+**The three tables and the column that ties them together.** `lexical_segments`
+carries one row per segment: its term count, its document count and its packed
+bytes. `lexical_segment_parts` carries the bytes, one row per chunk of one
+stream, keyed by segment, stream name and a 0-based part number whose parts
+concatenate to the stream. `generation_segments` is one generation's set in read
+order, each row carrying how many of that segment's documents the generation
+hides; its reference to a segment is `RESTRICT`, so a segment a generation still
+names cannot be collected. Alongside them, `generation_lexical` carries one row
+per generation — the visible document count, the total token length and the
+visible-document bitmap — and cascades from `generations`.
+
+`search_units.segment_id` is the **source of truth** for both: it names the
+segment a document was folded into, it is the document's rather than the row's,
+so a carry-over copies it forward with the document rowid, and a compaction
+re-points it. A generation's set is derived from it and a segment's garbage
+status is decided by it; there is no ownership table.
 
 The three streams of a segment are `term.dir`, a fixed-width directory in term
 order holding each term's document frequency and the slices of the other two
@@ -594,16 +596,17 @@ store issues, and it runs over one unit's rows in a database of its own, so no
 sorter over the corpus ever exists. A unit that publishes no document folds no
 segment.
 
-**What an activation does.** It records the generation's segment set and nothing
-else. The set is the **predecessor's** set, in the predecessor's own read order,
-plus its members' segments that the inherited set does not already hold — a delta
-unit owns both, because a carried document keeps its document rowid and therefore
-its segment, so naming such a segment again would offer every document in it
-twice. An inherited segment holding none of this generation's documents is
-dropped instead of carried; it can answer nothing. Nothing is rewritten to carry a
-document forward, and a document whose unit has left the generation is hidden by
-the generation's visible-document bitmap rather than removed from the segment
-that still holds it.
+**What an activation does.** It records the generation's segment set and, when a
+tier is full, merges one. The set is **derived**: the distinct segments the live
+documents of the generation's member units point at, in segment-id order. A
+delta inherits its predecessor's segments through the documents it carried —
+each keeps its document rowid and therefore its segment — so inheritance needs
+no copy, a segment holding none of this generation's documents is simply never
+named, and every visible document lies in exactly one named segment by
+construction. Nothing is rewritten to carry a document forward, and a document
+whose unit has left the generation is hidden by the generation's
+visible-document bitmap rather than removed from the segment that still holds
+it.
 
 One pass over the generation's documents produces all three per-document answers
 at once: the bitmap, which is stored so no reader scans them again; the
@@ -613,6 +616,30 @@ packed is the hidden count stored per named segment. The pass's start and end ar
 logged on their own, so an operator can see it rather than infer it from the
 activation's total, and it holds the same 5 % share of the index wall clock the
 adjacency build is held to.
+
+**Compaction.** A seal folds one segment per unit, so without merging them the
+segment count would be the count of units the store has ever sealed and every
+term of every query would pay one binary search per segment. Segments are
+grouped into size tiers by packed bytes, each tier `r` times as wide as the one
+below; while a tier holds more than `r` segments its segments are merged into
+one, and a segment more than half of whose documents are dead is rewritten
+alone. The merge streams the inputs' parts on (term, document rowid), copies a
+term's posting bytes verbatim when only one input carries it and that input has
+no dead document, and writes the merged parts through the ingestion group, so
+nothing of a segment is ever resident whole. The tier width, the ratio and how
+many inputs one merge reads are internal layout constants: they decide how often
+already-packed bytes are rewritten, never what may be stored or answered.
+
+A merge is a **soft** deletion. It KEEPS a document the activating generation
+merely hides: that document's unit left the generation but can be attached to a
+later one at any time, and because the index is contentless its postings are the
+only copy of the text it was indexed with. It DROPS only dead documents — rowids
+no `search_units` row names any more, because the unit holding them was
+collected. It re-points every row of its inputs, the members' and the retired
+units' alike, in the same activation, so afterwards no row names an input, a
+reattached unit finds its documents where its rows point, and a segment can never
+be named beside the one that absorbed it. A generation published earlier keeps
+its own rows and reads the inputs until it is collected.
 
 **What a read does.** A term is one binary search per segment, and the segments'
 posting streams are merged by document rowid, so the candidate walk still
@@ -625,10 +652,11 @@ the posting list against the bitmap,
 because a frequency that counted hidden documents would make a ranking depend on
 the store's history instead of on the code.
 
-A segment no retained generation names and no live unit owns is deleted in the
-same transaction as the generation or the unit that released it — which is exact
-because ownership is read off the documents themselves, so a segment every one of
-whose documents a carry chain has dropped stops being owned. A build that died
+A segment that no retained generation names and that no document points at is
+deleted in the same transaction as the generation or the unit that released it —
+which is exact because both tests are read off the documents themselves, so a
+segment every one of whose documents a carry chain has dropped, and one a merge
+has emptied by re-pointing its rows, both stop being reachable. A build that died
 before its seal is collected the same way, and its staging database is removed
 with it; the `tmp` directory is never swept on its own, because several processes
 may share one data directory and a live build's staging is indistinguishable from
