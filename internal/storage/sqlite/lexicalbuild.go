@@ -97,13 +97,23 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 	// parts can be keyed by it as they stream. Seals run in parallel over one
 	// writer, so deriving the id from max(id) + 1 would hand two units the
 	// same segment.
-	res, err := tx.ExecContext(ctx, `INSERT INTO lexical_segments(term_count, doc_count, bytes) VALUES(0, ?, 0)`, docs)
+	res, err := tx.ExecContext(ctx, `INSERT INTO lexical_segments(term_count, doc_count, bytes) VALUES(0, 0, 0)`)
 	if err != nil {
 		return 0, wrap("lexical_segments", err)
 	}
 	segment, err := res.LastInsertId()
 	if err != nil {
 		return 0, wrap("lexical_segments", err)
+	}
+	// The documents the fold packs name their segment FIRST, because the
+	// attribute stream below is read back through that column: they are exactly
+	// the unit's rows that no earlier fold claimed -- a carried document arrived
+	// with its predecessor's segment already on it, and a batch whose ingestion
+	// failed left no row here at all.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE search_units SET segment_id = ?1 WHERE unit_id = ?2 AND segment_id IS NULL`,
+		segment, unitRow); err != nil {
+		return 0, wrap("search_units", err)
 	}
 	w := &lexicalWriter{
 		dir:  newPartWriter(ctx, tx, segmentKey(segment), streamTermDir),
@@ -140,18 +150,25 @@ func foldUnitSegment(ctx context.Context, tx *sql.Tx, unitRow int64, stage *lexi
 	if err := w.close(); err != nil {
 		return 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE lexical_segments SET term_count = ?, bytes = ? WHERE id = ?`,
-		w.terms, w.dir.total+w.text.total+w.list.total, segment); err != nil {
-		return 0, wrap("lexical_segments", err)
+	// Every field a candidate is served from is packed here, once per document
+	// (ADR-0007 Decision 2), so a search hydrates its page from the segment it
+	// is already reading instead of one document-row read per candidate.
+	packed, docBytes, err := foldUnitDocuments(ctx, tx, segment)
+	if err != nil {
+		return 0, err
 	}
-	// The documents the fold just packed name their segment. They are exactly
-	// the unit's rows that no earlier fold claimed: a carried document arrived
-	// with its predecessor's segment already on it, and a batch whose ingestion
-	// failed left no row here at all.
+	// The attribute stream and the posting lists must name the same documents:
+	// a posting whose document has no record would be a candidate nothing can
+	// hydrate, and a record no posting names would be packed bytes no query can
+	// reach. The staged documents are the ones the fold wrote postings for.
+	if packed != docs {
+		return 0, corrupt("unit %d staged %d lexical documents but packed the attributes of %d",
+			unitRow, docs, packed)
+	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE search_units SET segment_id = ?1 WHERE unit_id = ?2 AND segment_id IS NULL`,
-		segment, unitRow); err != nil {
-		return 0, wrap("search_units", err)
+		`UPDATE lexical_segments SET term_count = ?, doc_count = ?, bytes = ? WHERE id = ?`,
+		w.terms, packed, w.dir.total+w.text.total+w.list.total+docBytes, segment); err != nil {
+		return 0, wrap("lexical_segments", err)
 	}
 	return segment, nil
 }

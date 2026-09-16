@@ -31,9 +31,11 @@ func IncomingEdgeQuery() string { return incomingEdgeQuery() }
 // The scans the packed lexical structure streams, exported so the query-plan
 // test asserts the SQL that ships: the activation's one pass over its
 // documents, which resolves its segment set with them; a reader's walk of that
-// set; and the two the compaction adds -- the walk of the documents an input
-// segment still holds and the re-point of an absorbed segment's rows.
+// set; the seal's read of the attributes it packs once per document; and the
+// two the compaction adds -- the walk of the documents an input segment still
+// holds and the re-point of an absorbed segment's rows.
 func GenerationDocumentQuery() string { return generationDocumentQuery }
+func SegmentAttributeQuery() string   { return segmentAttributeQuery }
 func GenerationLexicalQuery() string  { return generationLexicalQuery }
 func SegmentDocumentQuery() string    { return segmentDocumentQuery }
 func RepointSegmentStatement() string { return repointSegmentStatement }

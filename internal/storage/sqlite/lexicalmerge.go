@@ -45,8 +45,8 @@ const (
 	lexTierBytes = 4 << 20
 
 	// lexMergeFanIn is how many segments one merge reads at once. It is what
-	// bounds the merge's heap: one part of each of the three streams per
-	// input, plus the writer's three, so (lexMergeFanIn + 1) * 3 * lexPartBytes
+	// bounds the merge's heap: one part of each of a segment's five streams per
+	// input, plus the writer's, so (lexMergeFanIn + 1) * 5 * lexPartBytes
 	// whatever the size of the tier. A tier holding more than this is merged by
 	// repeated merges of that many segments, not by one merge of all of them:
 	// a first index of a large repository seals tens of thousands of segments
@@ -197,7 +197,7 @@ func dueMerge(ids []int64, stats map[int64]segmentStat) []int64 {
 // that named an input at it. It returns the new segment and how many documents
 // it holds.
 //
-// Nothing of a segment is held whole: the inputs' three streams are read
+// Nothing of a segment is held whole: the inputs' streams are read
 // sequentially, one part of each resident at a time, and the output is written
 // through the same part writer a seal uses, inside the activation's own
 // transaction and therefore under the ingestion group's write discipline
@@ -288,7 +288,21 @@ func mergeSegments(ctx context.Context, tx *sql.Tx, inputs []int64,
 	if err := w.close(); err != nil {
 		return 0, 0, 0, err
 	}
-	packed := w.dir.total + w.text.total + w.list.total
+	// The merged segment carries the attributes of the documents it kept, each
+	// record copied verbatim from the input that packed it, so a candidate is
+	// hydrated from the merged bytes exactly as it was from the input's.
+	packedDocs, docBytes, err := mergeDocuments(ctx, tx, inputs, stats, keep, merged)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	// A row pointing at an input whose directory does not hold its document
+	// would leave a candidate the merged segment cannot hydrate, and the
+	// re-point below would make that permanent.
+	if packedDocs != kept {
+		return 0, 0, 0, corrupt("packed lexical merge kept %d documents but packed the attributes of %d",
+			kept, packedDocs)
+	}
+	packed := w.dir.total + w.text.total + w.list.total + docBytes
 	if _, err := tx.ExecContext(ctx, `UPDATE lexical_segments SET term_count = ?, bytes = ? WHERE id = ?`,
 		w.terms, packed, merged); err != nil {
 		return 0, 0, 0, wrap("lexical_segments", err)

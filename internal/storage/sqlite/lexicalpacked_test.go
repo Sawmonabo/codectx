@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -125,6 +126,70 @@ func comparePackedToLive(t *testing.T, f *fixture, r *store.PinnedReader, gen mo
 		packedSeq := drainCounts(t, f, packed, term)
 		if packedSeq != liveSeq {
 			t.Fatalf("term %q packed occurrences\n%s\nlive occurrences\n%s", term, packedSeq, liveSeq)
+		}
+	}
+	comparePackedDocuments(t, f, session, gen, db)
+}
+
+// comparePackedDocuments holds the per-document attribute stream to the rows it
+// was packed from. Every field a search hit is served from -- its identity, its
+// file, its path, kind, name, qualified name, signature, byte range and token
+// count -- now comes from the packed bytes instead of a document-row read, so a
+// field that drifts, or one dropped from the stream, serves a hit naming
+// another document's path or byte range on a page no ordering rule would
+// betray. The comparison is over EVERY visible document of the generation, in
+// the pages a candidate walk hydrates in.
+func comparePackedDocuments(t *testing.T, f *fixture, session *store.PostingSession, gen model.GenerationID, db *sql.DB) {
+	t.Helper()
+	rows, err := db.Query(`SELECT su.doc_id, su.search_key, ni.canonical, su.file_id, su.path, su.kind, su.name,
+			su.qualified_name, su.signature, su.start_byte, su.end_byte, su.token_count
+		FROM search_units su LEFT JOIN node_ids ni ON ni.id = su.node_id
+		WHERE EXISTS (SELECT 1 FROM generation_units gu
+			WHERE gu.unit_id = su.unit_id AND gu.generation_id = ?)
+		ORDER BY su.doc_id`, int64(gen))
+	if err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	defer rows.Close()
+	var want []store.SearchDocument
+	for rows.Next() {
+		var d store.SearchDocument
+		var key, node, file []byte
+		var start, end int64
+		if err := rows.Scan(&d.RowID, &key, &node, &file, &d.Path, &d.Kind, &d.Name, &d.QualifiedName,
+			&d.Signature, &start, &end, &d.TokenCount); err != nil {
+			t.Fatalf("live document: %v", err)
+		}
+		d.ID, d.FileID = hex.EncodeToString(key), model.FileID(hex.EncodeToString(file))
+		if node != nil {
+			d.NodeID = model.NodeID(hex.EncodeToString(node))
+		}
+		d.Bytes = model.ByteRange{Start: uint64(start), End: uint64(end)}
+		want = append(want, d)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("live documents: %v", err)
+	}
+	if len(want) == 0 {
+		t.Fatal("the generation holds no visible document; the comparison would prove nothing")
+	}
+	for from := 0; from < len(want); from += model.MaxPageItems {
+		page := want[from:min(from+model.MaxPageItems, len(want))]
+		ids := make([]int64, len(page))
+		for i, d := range page {
+			ids[i] = d.RowID
+		}
+		got, err := session.PackedDocuments(f.ctx, ids)
+		if err != nil {
+			t.Fatalf("PackedDocuments: %v", err)
+		}
+		if len(got) != len(page) {
+			t.Fatalf("hydrated %d of %d documents", len(got), len(page))
+		}
+		for i := range page {
+			if got[i] != page[i] {
+				t.Fatalf("document %d packed as\n%+v\nbut its row holds\n%+v", page[i].RowID, got[i], page[i])
+			}
 		}
 	}
 }
@@ -446,6 +511,7 @@ func TestLexicalBuildScansUseNoTempBTree(t *testing.T) {
 	}{
 		{"the activation's pass over its documents", store.GenerationDocumentQuery(), []any{genID}},
 		{"a reader's walk of the generation's segment set", store.GenerationLexicalQuery(), []any{genID}},
+		{"the seal's read of the attributes it packs per document", store.SegmentAttributeQuery(), []any{segment}},
 		{"the merge's walk of the documents a segment still holds", store.SegmentDocumentQuery(), []any{segment}},
 		{"the merge's re-point of an absorbed segment's rows", store.RepointSegmentStatement(), []any{segment, segment}},
 	} {
