@@ -318,8 +318,8 @@ Sizing, in Scala lines measured at the pinned tag and Go lines estimated from th
 Held out of the sums on purpose: a 633-line closure-and-capture scope manager, because the
 scope/binding resolver row already prices it; and 1,628 lines belonging to three frontends the product
 never invokes. The familiar "5,413" figure for type recovery is the aggregate of two directories, not
-the product's cost. The deletion credit is 4,874 lines of package source less the 339-line comparator
-that relocates to the oracle; 99 lines of Go fixture source go with it.
+the product's cost. The deletion credit is **4,535**: the package is 4,874 lines of source, less the
+339-line comparator that relocates to the oracle; 99 lines of Go fixture source go with it.
 
 Engine cost on the reference repository (13,222 files, 6,663 parsed, 555,588 call sites; largest unit
 4,984 files / 157.2 MB):
