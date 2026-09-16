@@ -26,7 +26,9 @@ func register(s *mcp.Server, h *handlers) {
 	addTool(s, "codectx_index_status", "Index status",
 		"Active generation, health, coherence and capability completeness. Set resources=true for the accounting block.", h.indexStatus)
 	addTool(s, "codectx_refresh_index", "Refresh index",
-		"Build an incremental generation over the current workspace.", h.refreshIndex)
+		"Build an incremental generation over the current workspace. Pass a progress token to "+
+			"receive one progress notification per finished stage, at most one a second; ask for a "+
+			"logging level to receive each finished stage as a log message carrying its row.", h.refreshIndex)
 	addTool(s, "codectx_repo_overview", "Repository overview",
 		"Bounded repository, package, module and language map.", h.repoOverview)
 	addTool(s, "codectx_search", "Search",

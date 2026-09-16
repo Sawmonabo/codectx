@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -790,5 +792,81 @@ func TestANamedCrashIsSubdividedWithoutASecondParse(t *testing.T) {
 		if got := row.Details["backend_failure"]; got != want {
 			t.Errorf("%s reports backend_failure=%q, want %q", c, got, want)
 		}
+	}
+}
+
+// inLedgerRun attaches a run to the unit's context, which is what the
+// coordinator does in a real index run. The provider finds it there and needs
+// to know nothing about it.
+type inLedgerRun struct {
+	provider.Provider
+	run *ledger.Run
+}
+
+func (w inLedgerRun) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
+	return w.Provider.IndexUnit(w.run.Context(ctx), req, sink)
+}
+
+// TestAChildsCostReachesTheSpanThatRanIt protects the claim the run ledger
+// exists to make: that the product can say which part of a unit was expensive
+// and why. The analyzer's steps are child processes and the runner measures
+// every one of them, but the measurements travel only as far as the neutral
+// outcome carries them -- so a step that dropped them would leave the
+// expensive units of a run reading as costless, with nothing in the record to
+// say the figure was never taken rather than taken and zero.
+//
+// It asserts both halves: the measured figures reach the span of the step that
+// ran the child, and a figure the platform did not sample is ABSENT on that
+// span rather than an observed zero.
+//
+// Mutation proof: drop the measured values when ending the parse span
+// (`span.End(spanOutcome(out), ledger.Measured{}, nil)` in provider.parse) and
+// the parse stage reports no processor time.
+func TestAChildsCostReachesTheSpanThatRanIt(t *testing.T) {
+	led, err := ledger.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	var mu sync.Mutex
+	rows := map[string]ledger.SpanRow{}
+	led.Subscribe(func(r ledger.SpanRow) {
+		mu.Lock()
+		defer mu.Unlock()
+		rows[r.Stage] = r
+	})
+	h := providertest.New(t, repo)
+	run, err := led.NewRun(ledger.KindIndex, string(h.Repo))
+	if err != nil {
+		t.Fatalf("open a run: %v", err)
+	}
+	// The tree peak and the processor time were sampled; the transferred bytes
+	// were not, which is the platform this provider also runs on.
+	const userMS, sysMS, peak = 90, 40, int64(700) << 20
+	b := &fakeBackend{parse: dependence.Outcome{CPUUserMS: userMS, CPUSysMS: sysMS,
+		PeakBytes: peak, IOUnsampled: true}}
+	p := inLedgerRun{Provider: newProviderIn(t, b, t.TempDir()), run: run}
+	if _, _, err := h.Run(t, p, rootScope, []string{"app.go", "go.mod"}); err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	run.Finish(ledger.OutcomeOK)
+	if err := led.Stop(); err != nil {
+		t.Fatalf("stop the ledger: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	got, ok := rows["parse"]
+	if !ok {
+		t.Fatalf("the unit recorded no parse stage; it recorded %v", slices.Sorted(maps.Keys(rows)))
+	}
+	if got.CPUUserMS == nil || got.CPUSysMS == nil || *got.CPUUserMS != userMS || *got.CPUSysMS != sysMS {
+		t.Errorf("the parse stage reports processor time %v/%v (%q), want the child's %d/%d ms",
+			got.CPUUserMS, got.CPUSysMS, got.CPUUnattributed, userMS, sysMS)
+	}
+	if got.PeakRSSBytes == nil || *got.PeakRSSBytes != uint64(peak) {
+		t.Errorf("the parse stage reports a tree peak of %v, want the child's %d bytes", got.PeakRSSBytes, peak)
+	}
+	if got.ReadBytes != nil || got.WriteBytes != nil {
+		t.Errorf("the parse stage reports %v/%v transferred bytes for a child nothing counted them for: "+
+			"an unsampled figure must be absent, never an observed zero", got.ReadBytes, got.WriteBytes)
 	}
 }

@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
@@ -639,9 +640,15 @@ func (p *Provider) Import(ctx context.Context, req provider.UnitRequest, sink pr
 		return Report{}, im.decorate(err)
 	}
 	defer im.sc.close()
-	if err := im.run(ctx, open); err != nil {
+	// In-process work beside every other unit of the run, so no processor time
+	// is attributed to it: Go has no per-goroutine CPU and a share of the
+	// process counters would be a guess.
+	importCtx, span := ledger.Start(ctx, stageImport, req.Unit.ScopeKey)
+	if err := im.run(importCtx, open); err != nil {
+		span.End(ledger.OutcomeFailed, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, err)
 		return Report{}, im.decorate(err)
 	}
+	span.End(ledger.OutcomeOK, ledger.Measured{CPUUnattributed: ledger.CPUOverlapped}, nil)
 	rep := im.report()
 	// False readiness. Every one of the six indexers needs the project's own
 	// dependency context (research note 4), and four of them exit 0 having
