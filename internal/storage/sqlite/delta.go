@@ -73,15 +73,20 @@ const MaxDeltaStateBytes = 64 << 20
 //
 // A producer's stream may read the store — the dependence applier's Files is a
 // merge join against Store.UnitInputs — and it is drained from inside
-// CarryOver's write transaction, on the single writer connection. Such a
-// stream takes a connection from the reader pool (read_connections, default 2)
-// once per page of its own scan, and the write transaction stays open across
-// every one of those round-trips. WAL readers never wait on the writer, so
-// this cannot deadlock; it does mean a saturated reader pool stalls the
-// carry-over, and the open write transaction blocks every other writer in the
-// process for as long as the walk lasts. A producer whose stream reads the
-// store must therefore keep those reads bounded and proportional to the unit
-// it is replacing, and must not discover this nesting by measuring a stall.
+// CarryOver's ingestion call, on the single writer connection. Such a stream
+// sees the store as of the last commit: it takes a connection from the reader
+// pool (read_connections, default 2) once per page of its own scan, and the
+// ingestion group stays open across every one of those round-trips. What a
+// stream reads is the predecessor unit, sealed and committed before this run
+// began, so the last commit is the state it needs; a stream must never call a
+// read that runs on the group's own connection, because the ingestion call
+// draining it holds that connection and the two would wait on each other.
+// WAL readers never wait on the writer, so the pool reads cannot deadlock; a
+// saturated reader pool stalls the carry-over, and the open group blocks
+// every other writer in the process for as long as the walk lasts. A producer
+// whose stream reads the store must therefore keep those reads bounded and
+// proportional to the unit it is replacing, and must not discover this
+// nesting by measuring a stall.
 type Replaced struct {
 	// Files are the per-path evidence buckets the import replaced or dropped.
 	// Each must be a valid FileID.
@@ -117,10 +122,10 @@ type CarryOverStats struct {
 // batches and before SealUnit: every insert it issues yields to a row already
 // present, so the fresh import always wins over its predecessor.
 //
-// The whole body runs in one write transaction on the single writer
-// connection, and draining Replaced's three streams happens inside it: a
-// producer stream that reads the store runs nested in this transaction and on
-// another connection (see Replaced).
+// The whole body is one ingestion call on the single writer connection, and
+// draining Replaced's three streams happens inside it: a producer stream that
+// reads the store runs nested in this call and on the reader pool, seeing the
+// last commit (see Replaced).
 //
 // Carrying a row asserts that its source has not changed, so the whole call is
 // refused unless every file the previous unit located facts in, and that
@@ -674,10 +679,13 @@ const unitInputsPage = 1000
 // The first failure ends the sequence: it is yielded with a zero UnitInput and
 // nothing follows it.
 //
-// Each page is one read transaction on the reader pool. The dependence delta
-// applier walks this from inside UnitWriter.CarryOver's write transaction, so
-// those reads are nested inside the writer's and compete for reader
-// connections with the rest of the process; see Replaced.
+// Each page is one read transaction on the reader pool, so the stream sees
+// the last commit and not the ingestion group in progress: the unit it reads
+// is a predecessor, sealed and committed before the run that reads it began.
+// The dependence delta applier walks this from inside UnitWriter.CarryOver's
+// ingestion call, which holds the group's connection, so those reads are
+// nested inside the writer's and compete for reader connections with the
+// rest of the process; see Replaced.
 func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[model.UnitInput, error] {
 	return func(yield func(model.UnitInput, error) bool) {
 		fail := func(err error) { yield(model.UnitInput{}, err) }
@@ -687,7 +695,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 			return
 		}
 		var row int64
-		if err := s.readOwn(ctx, func(tx *sql.Tx) error {
+		if err := s.read(ctx, func(tx *sql.Tx) error {
 			var state model.UnitState
 			err := tx.QueryRowContext(ctx, `SELECT id, state FROM units WHERE unit_key = ?`, key).Scan(&row, &state)
 			if isNoRows(err) {
@@ -708,7 +716,7 @@ func (s *Store) UnitInputs(ctx context.Context, unit model.UnitID) iter.Seq2[mod
 		page := make([]model.UnitInput, 0, unitInputsPage)
 		for {
 			var last []byte
-			if err := s.readOwn(ctx, func(tx *sql.Tx) error {
+			if err := s.read(ctx, func(tx *sql.Tx) error {
 				page = page[:0]
 				last = nil
 				rows, err := tx.QueryContext(ctx, `SELECT file_id, content_hash, executable FROM unit_inputs
