@@ -665,9 +665,10 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 //     regenerated after the first fold, which is why boundStates folds again
 //     on the far side of the collapse rather than trusting its input.
 //
-// The most severe row survives, ranked by the same severityRank boundStates
-// truncates by: Section 13.3 lets a report under-claim and never over-claim.
-// The fold keeps the first occurrence of a key and never reorders, so the
+// The most severe row survives, ranked by outranks: Section 13.3 lets a report
+// under-claim and never over-claim. The fold keeps the first occurrence of a
+// key and never reorders its output, but which of two rows on one key supplies
+// the surviving state and diagnostic code is decided by outranks alone, so the
 // published row is a function of the set and not of the order the concurrent
 // unit workers reported in -- the determinism the exemplar choices above exist
 // for, because these rows fold into the AnalysisKey.
@@ -683,7 +684,7 @@ func foldToPrimaryKey(rows []model.CapabilityState) []model.CapabilityState {
 		key := c.ProviderID + "\x00" + c.Capability + "\x00" + c.Scope
 		if i, ok := at[key]; ok {
 			survivor, other := out[i], c
-			if severityRank(c.State) < severityRank(out[i].State) {
+			if outranks(c, out[i]) {
 				survivor, other = c, out[i]
 			}
 			merged := mergeDetails(survivor, other)
@@ -730,7 +731,7 @@ func foldCollapsed(rows []model.CapabilityState) []model.CapabilityState {
 		}
 		scopes := countDetail(out[i]) + countDetail(c)
 		survivor, other := out[i], c
-		if severityRank(c.State) < severityRank(out[i].State) {
+		if outranks(c, out[i]) {
 			survivor, other = c, out[i]
 		}
 		// mergeDetails already sums the numeric details the two rows share --
@@ -777,6 +778,40 @@ func boundStates(out []model.CapabilityState, log *slog.Logger) ([]model.Capabil
 		return out, true
 	}
 	return out, false
+}
+
+// outranks reports whether a must supply the surviving state and diagnostic
+// code when a and b fold onto one primary key. It is a strict total order on
+// the rows that can collide there, which is what makes a fold's result a
+// function of the set rather than of the order the rows arrived in.
+//
+// Severity decides it first. It ties in one shape that actually occurs: a
+// provider with one failed scope and another that published is `partial`, and
+// the planner's and the registry's own degradations are `partial` and
+// workspace-scoped too, so the two meet on one key with equal rank. The row
+// that NAMES A FAILED SCOPE carries the code there. It is the more specific
+// assertion -- it points at a scope and says what happened to it, while a
+// planner or registry degradation speaks about the provider as a whole -- and
+// the details union either way, so the scope key and the failed-unit count
+// survive whichever row wins.
+//
+// The last comparison is the diagnostic code itself, so two rows that are
+// alike in both respects still fold the same way in either order.
+func outranks(a, b model.CapabilityState) bool {
+	if ra, rb := severityRank(a.State), severityRank(b.State); ra != rb {
+		return ra < rb
+	}
+	if fa, fb := namesFailedScope(a), namesFailedScope(b); fa != fb {
+		return fa
+	}
+	return a.DiagnosticCode < b.DiagnosticCode
+}
+
+// namesFailedScope reports whether a row is one of the failure folds: those
+// are the only rows that carry a count of the units that failed behind them,
+// beside the scope key of the exemplar they name.
+func namesFailedScope(s model.CapabilityState) bool {
+	return s.Details[unitsFailedDetail] != ""
 }
 
 // severityRank orders capability states by how much a reader must act on them.
