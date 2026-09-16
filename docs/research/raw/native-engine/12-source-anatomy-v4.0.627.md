@@ -103,14 +103,14 @@ Derived from the layer definitions, not from grepping pass names. The pipeline o
 | `.../cfgdominator/{CfgAdapter,CpgCfgAdapter,ReverseCpgCfgAdapter,DomTreeAdapter}.scala` | 6 / 13 / 13 / 10 | ″ |
 | `.../codepencegraph/CdgPass.scala` | **68** | **`control_depends_on` (CDG edges)** |
 | `.../codepencegraph/CpgPostDomTreeAdapter.scala` | 11 | ″ |
-| **Control-flow subtotal** | **1,294** | |
+| **Control-flow subtotal** (`passes/controlflow/`, the 12 files above; the 39-line layer definition is orchestration and sits outside the directory) | **1,294** | |
 | **OssDataFlow layer** — `dataflowengineoss/.../layers/dataflows/OssDataFlow.scala` | 26 | orchestration |
 | `dataflowengineoss/.../passes/reachingdef/` (7 files) | **962** | **`data_flows_to` (REACHING_DEF)** |
 | **CallGraph layer** — `x2cpg/.../layers/CallGraph.scala` | 30 | orchestration |
 | `.../passes/callgraph/DynamicCallLinker.scala` | 226 | **`calls`** |
 | `.../passes/callgraph/StaticCallLinker.scala` | 41 | **`calls`** |
 | `.../passes/callgraph/MethodRefLinker.scala` | 30 | METHOD_REF → REF |
-| `.../passes/callgraph/NaiveCallLinker.scala` | 29 | **not in the layer** — dead weight |
+| `.../passes/callgraph/NaiveCallLinker.scala` | 29 | **not in the CallGraph layer, but live**: it is in the JS and the Python post-processing chains (`frontendspecific/jssrc2cpg/package.scala:14`, `frontendspecific/pysrc2cpg/package.scala:21`), the two the product runs post-processing for, and its untyped bare-name joins are published at `static_analysis` precision |
 | **Base layer** — `x2cpg/.../layers/Base.scala` | 39 | orchestration |
 | `.../passes/base/ContainsEdgePass.scala` | 50 | **CONTAINS** (read by `CdgPass.scala:35`) |
 | `.../passes/base/MethodStubCreator.scala` | 178 | METHOD stubs → `calls` targets |
@@ -120,8 +120,8 @@ Derived from the layer definitions, not from grepping pass names. The pipeline o
 | `.../passes/base/FileCreationPass.scala` | 58 | **dead weight** (FILE not staged) |
 | `.../passes/base/NamespaceCreator.scala` | 27 | **dead weight** |
 | `.../passes/base/ParameterIndexCompatPass.scala` | 22 | AST hygiene |
-| `.../passes/base/TypeRefPass.scala` | 30 | TYPE_REF |
-| `.../passes/base/TypeEvalPass.scala` | 43 | **dead weight** (EVAL_TYPE not staged) |
+| `.../passes/base/TypeRefPass.scala` | 30 | REF edges **from** TYPE nodes to their TYPE_DECL — not staged, but the second hop of `evalType` |
+| `.../passes/base/TypeEvalPass.scala` | 43 | **not staged, not dead**: EVAL_TYPE is the first hop of `baseNode.evalType` (`EvalTypeAccessors.scala:44`), on which `FieldAccessLinkerPass` depends. Dead weight in the product's staging, load-bearing in the pipeline |
 | **TypeRelations layer** — `x2cpg/.../layers/TypeRelations.scala` | 28 | orchestration |
 | `.../passes/typerelations/TypeHierarchyPass.scala` | 33 | **dead weight** (INHERITS_FROM) |
 | `.../passes/typerelations/AliasLinkerPass.scala` | 28 | **dead weight** (ALIAS_OF) |
@@ -152,7 +152,7 @@ overlay layers; it runs from each generator's `applyPostProcessingPasses` at `Jo
 |---|---|---|
 | `JsSrcCpgGenerator.scala:36` | yes | JS/TS CALL edges resolvable |
 | `PythonSrcCpgGenerator.scala:26` | yes | Python CALL edges resolvable |
-| `JavaSrcCpgGenerator.scala:26` | yes | Java |
+| `JavaSrcCpgGenerator.scala:16,26-30` | **gated, so no on the pinned argv** | the override runs type recovery only under `--enable-type-recovery`, which reaches the generator through the frontend-args delimiter alone; the product passes no frontend args, so **Java gets no type recovery**. Four of the six product frontends have none, not three |
 | `CCpgGenerator.scala` (25 lines) | **no** | C/C++ falls back to `CpgGenerator.scala:57-58` no-op |
 | `GoCpgGenerator.scala` (48 lines) | **no** | **Go gets no type recovery** |
 | `RustCpgGenerator.scala` (20 lines) | **no** | **Rust gets no type recovery** |
@@ -337,8 +337,9 @@ Joern.
 | **rust2cpg** | `RustVisitor.scala` — no separate statements file | **1,960** |
 
 Shared, language-independent floor a port must reimplement once: `CfgCreator.scala` 773 +
-`Cfg.scala` 197 + `CfgCreationPass.scala` 27 + cfgdominator (7 files) 208 + codepencegraph (2 files)
-79 = **1,284 lines**, plus `reachingdef/` **962** and the callgraph linkers **297**.
+`Cfg.scala` 197 + `CfgCreationPass.scala` 27 + cfgdominator (7 files) 218 + codepencegraph (2 files)
+79 = **1,294 lines** — the whole of `passes/controlflow/`, 12 files, confirmed by
+`find … -exec cat {} + | wc -l` — plus `reachingdef/` **962** and the callgraph linkers **297**.
 
 ---
 
