@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/retention"
@@ -41,8 +42,21 @@ func (c *Coordinator) retain(ctx context.Context) {
 	policy := sqlite.RetentionPolicy{RetainRefs: c.opts.Config.Index.RetainRefs.Int(),
 		MaxRetainedBytes: c.opts.Config.Index.MaxRetainedBytes.Value()}
 	// The sweep must finish even when the caller's context is already ending:
-	// a half-swept store is the one state retention must not leave behind.
-	report, err := c.opts.Store.RetainByRef(context.WithoutCancel(ctx), c.repo, policy, c.now())
+	// a half-swept store is the one state retention must not leave behind. The
+	// span is opened on that same uncancellable context, or a run cancelled
+	// while retention is sweeping would record no retention at all.
+	ctx = context.WithoutCancel(ctx)
+	ctx, span := ledger.Start(ctx, stageRetention, "")
+	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
+	span.AddOut(int64(report.GenerationsSwept))
+	// A deleted generation's ledger rows go with it. The ledger keeps its own
+	// file, so nothing else would ever collect them and the file would grow
+	// for as long as the workspace is indexed.
+	if delErr := c.opts.Ledger.DeleteRuns(ctx, report.GenerationsDeleted); delErr != nil {
+		logTyped(c.log, "the swept generations' ledger rows could not be deleted", delErr,
+			"component", component, "repository_id", string(c.repo))
+	}
+	span.End(endOutcome(err), ledger.Measured{}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
 			"component", component, "repository_id", string(c.repo))
@@ -85,7 +99,10 @@ func (c *Coordinator) collect(ctx context.Context) {
 	if c.opts.Collector == nil {
 		return
 	}
-	report, err := c.opts.Collector.Collect(context.WithoutCancel(ctx))
+	ctx = context.WithoutCancel(ctx)
+	ctx, span := ledger.Start(ctx, stageCollection, "")
+	report, err := c.opts.Collector.Collect(ctx)
+	span.End(endOutcome(err), ledger.Measured{}, err)
 	if err != nil {
 		logTyped(c.log, "the collection pass did not finish", err,
 			"component", component, "repository_id", string(c.repo))

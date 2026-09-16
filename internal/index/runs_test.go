@@ -1,6 +1,7 @@
 package index
 
 import (
+	"context"
 	"log/slog"
 	"strconv"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
@@ -76,5 +78,88 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 	}
 	if b.RetryDeadline != 90*time.Second {
 		t.Errorf("the capture builder's RetryDeadline is %s, want the configured 90s", b.RetryDeadline)
+	}
+}
+
+// TestLedgerRecordsEveryStageAndAgreesWithTheResult protects the one invariant
+// the run ledger exists for: the ledger and the published result cannot
+// disagree about what the run did. Both are meant to read the counters the
+// stages already keep, so a stage that counts into the ledger separately from
+// the result would let `status --resources` report a run the result contradicts
+// -- and an operator has no way to tell which of the two is lying.
+//
+// It also asserts that every top-level stage this fixture exercises finished
+// with a measured wall: a stage whose span is never ended reads as running for
+// ever and its cost is simply missing from the breakdown.
+//
+// Mutation proof: delete the `walk.End(...)` call in generation.capture and the
+// walk stage reads as unfinished.
+func TestLedgerRecordsEveryStageAndAgreesWithTheResult(t *testing.T) {
+	f := newFixture(t, map[string]string{"main.go": "package main\n\nfunc main() {}\n"})
+	res, err := f.c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	view := f.latestRun(res.Binding.GenerationID)
+	if view.Run.Outcome != ledger.OutcomeOK || view.Run.GenerationID == nil ||
+		*view.Run.GenerationID != int64(res.Binding.GenerationID) {
+		t.Fatalf("the run row is %+v, want an ok run attached to generation %d",
+			view.Run, res.Binding.GenerationID)
+	}
+	if view.Run.FileCount != res.FilesCaptured ||
+		view.Run.UnitsSucceeded != res.UnitsReused+res.UnitsBuilt+res.UnitsCarried {
+		t.Fatalf("the run row counts %d files and %d succeeded units; the result publishes %d files and %d",
+			view.Run.FileCount, view.Run.UnitsSucceeded, res.FilesCaptured,
+			res.UnitsReused+res.UnitsBuilt+res.UnitsCarried)
+	}
+	stages := map[string]ledger.SpanRow{}
+	for _, span := range view.Spans {
+		if span.ParentSeq == nil || span.Stage == stageWalk {
+			stages[span.Stage] = span
+		}
+	}
+	for _, want := range []string{stageCapture, stageWalk, stagePlan, stageAttachReused,
+		stageAttachCarried, stageBuild, stageCoverage, stageActivation, stageRetention} {
+		span, ok := stages[want]
+		if !ok {
+			t.Errorf("the run recorded no %q stage", want)
+			continue
+		}
+		if span.FinishedAt == nil || span.Running {
+			t.Errorf("the %q stage reads unfinished (%+v): its cost is missing from the breakdown", want, span)
+		}
+	}
+	if got := stages[stageCapture]; got.ItemsOut != res.FilesCaptured {
+		t.Errorf("the capture stage counted %d files out; the result publishes %d captured",
+			got.ItemsOut, res.FilesCaptured)
+	}
+	if got := stages[stageBuild]; got.ItemsOut != res.UnitsBuilt {
+		t.Errorf("the build stage counted %d units out; the result publishes %d built",
+			got.ItemsOut, res.UnitsBuilt)
+	}
+}
+
+// TestRunThatNeverReachedAGenerationIsStillRecorded protects a run that failed
+// before publication from being an invisible run. The generation id does not
+// exist until BeginGeneration returns, so a ledger keyed on it would record
+// nothing at all for a failure in the capture, the plan or the ref -- which is
+// exactly the run an operator is investigating. The run id is allocated at the
+// start of the attempt instead, and the generation is attached later or never.
+//
+// Mutation proof: move the newRun/Context/Finish block in generation.attempt to
+// after BeginGeneration and this fails with no run recorded at all.
+func TestRunThatNeverReachedAGenerationIsStillRecorded(t *testing.T) {
+	f := newFixture(t, map[string]string{"main.go": "package main\n"})
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if _, err := f.c.Index(ctx, model.IndexRequest{}); err == nil {
+		t.Fatal("a cancelled index reported success")
+	}
+	view := f.latestRun(0)
+	if view.Run.GenerationID != nil {
+		t.Errorf("the failed run carries generation %d; it never opened one", *view.Run.GenerationID)
+	}
+	if view.Run.Outcome != ledger.OutcomeFailed {
+		t.Errorf("the failed run's outcome is %q, want %q", view.Run.Outcome, ledger.OutcomeFailed)
 	}
 }
