@@ -641,9 +641,9 @@ func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 			continue
 		}
 		// The counts come from the generation's node-kind and source-byte side
-		// arrays, read once per batch of children. Nothing is hydrated: the
-		// old map read a whole model.Node per child to look at two fields of
-		// it, which is what made its second page refuse at the deadline
+		// arrays, read once per batch of children. Nothing is hydrated:
+		// reading a whole model.Node per child to look at two fields of it
+		// costs a page its deadline on the second page of a large map
 		// (ADR-0005).
 		complete, err := scanNeighbours(ctx, reader, chunk, model.DirectionOutgoing,
 			kinds, remaining, b, func(owners, children []NodeRef) error {

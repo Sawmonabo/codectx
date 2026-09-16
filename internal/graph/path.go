@@ -911,10 +911,10 @@ func (w *pathWalk) resolveBatch(ctx context.Context, batch []model.NodeID) ([]No
 // id rather than on the rebuild-local surrogate the scan carries.
 //
 // Which endpoint the search came from is the entry's OWNER: the owner is the
-// node this batch settled, whichever direction its list was read in. That is
-// exact where the old edge-shaped read had to guess from the two endpoints,
-// so a self-loop and an edge whose endpoints are both settled in this batch
-// now relax from the node whose expansion actually delivered them.
+// node this batch settled, whichever direction its list was read in. It is
+// exact where guessing from the two endpoints is not: a self-loop, and an edge
+// whose endpoints are both settled in this batch, relax from the node whose
+// expansion actually delivered them.
 func (w *pathWalk) relax(ctx context.Context, pend []Edge, byRef map[NodeRef]model.NodeID,
 	dists map[model.NodeID]int64, depths map[model.NodeID]int) error {
 	rels := make([]RelRef, len(pend))

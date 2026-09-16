@@ -163,12 +163,12 @@ func TestWalkHoldsOnePostingStatementPerToken(t *testing.T) {
 	}
 }
 
-// TestOneDocumentReadPerRowidPage is the regression guard for the duplicated
-// hydration: the tier and its consumer used to fetch the SAME rowid page from
-// SearchDocuments twice, once for TokenCount and once for path/kind/name. One
-// read per rowid page must now carry both, so the walk issues exactly as many
+// TestOneDocumentReadPerRowidPage guards the document read budget against a
+// duplicated hydration: one read per rowid page must carry both the token
+// count a score is computed from and the path/kind/name the hit serves, never
+// one SearchDocuments call for each. The walk therefore issues exactly as many
 // document reads as it has candidate pages, and the emitted hit carries the
-// document's servable facts as well as the length its score was computed from.
+// document's servable facts as well as that length.
 func TestOneDocumentReadPerRowidPage(t *testing.T) {
 	const docs = 3 * matchPageSize
 	src := newFakePostings(docs, 2)
