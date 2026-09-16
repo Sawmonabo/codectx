@@ -441,6 +441,7 @@ func (s *sortedLevel) each(from int64, fn func(levelRecord, int64) error) error 
 // records is how many records the level holds.
 func (s *sortedLevel) records() int64 { return s.count }
 
-// release deletes the level. It is called when the level has been served
-// whole; the walk never reads it again.
-func (s *sortedLevel) release() error { return s.file.remove() }
+// finished closes the level's writer, which is all a leg that has served it
+// whole may do to it: the file itself is HELD until the continuation that
+// supersedes the cursor this leg was handed is minted (retainedWalk.held).
+func (s *sortedLevel) finished() error { return s.file.close() }
