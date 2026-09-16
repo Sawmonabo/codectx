@@ -267,13 +267,27 @@ func detect(ctx context.Context, p Provider, d model.ProviderDescriptor, mode co
 	if det.Available {
 		return "", det.DiagnosticCode, det.Details, det
 	}
-	// The details belong to the available case alone: an inactive provider's
-	// whole reason is its diagnostic code, and Select publishes no partial row
-	// for it to carry them.
+	// The per-input details belong to the available case alone: they are one
+	// pair per language whose payload is missing, and an inactive provider
+	// plans nothing for any of them. What does survive is the one phrase that
+	// says why, because a bare diagnostic code names a category and not a
+	// finding.
+	why := unavailableReason(det)
 	if mode == config.Auto {
-		return model.CapabilityUnavailable, det.DiagnosticCode, nil, Detection{}
+		return model.CapabilityUnavailable, det.DiagnosticCode, why, Detection{}
 	}
-	return model.CapabilityFailed, det.DiagnosticCode, nil, Detection{}
+	return model.CapabilityFailed, det.DiagnosticCode, why, Detection{}
+}
+
+// unavailableReason is the detail map an inactive detection publishes: its own
+// reason, or none at all when the provider gave none. It is one pair, so it
+// cannot crowd out anything, and it is absent rather than empty so a reader
+// never sees a reason key with nothing behind it.
+func unavailableReason(det Detection) map[string]string {
+	if det.Reason == "" {
+		return nil
+	}
+	return map[string]string{"reason": model.TruncateDetail(det.Reason)}
 }
 
 // CodeOf extracts the Section 22 code an error carries for a diagnostic

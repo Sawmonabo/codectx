@@ -221,14 +221,19 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 	}
 
 	// The same run proves the other half of the boundary: a Spec that names no
-	// environment gives the child none. An os/exec Cmd with a nil Env inherits
-	// the parent's, which would hand every analyzer this process's tokens,
-	// proxy settings and paths.
+	// environment gives the child none of the parent's. An os/exec Cmd with a
+	// nil Env inherits the parent's, which would hand every analyzer this
+	// process's tokens, proxy settings and paths.
+	//
+	// It also proves what the child does get: the UTF-8 locale. A child with
+	// no locale names files through an ASCII path encoding and cannot open a
+	// source file whose name holds a letter outside ASCII at all -- measured
+	// against the real analysis payload, one such file failed a whole project.
 	requireExecutable(t, "/bin/sh")
 	t.Setenv("CODECTX_TEST_SECRET", "leaked")
 	result, err = runner.Run(context.Background(), Spec{
 		Path:           "/bin/sh",
-		Args:           []string{"-c", `echo "${CODECTX_TEST_SECRET-absent}"`},
+		Args:           []string{"-c", `echo "${CODECTX_TEST_SECRET-absent}" "${LC_ALL-none}" "${LANG-none}"`},
 		Dir:            dir,
 		MaxStdoutBytes: 4096,
 		MaxStderrBytes: 4096,
@@ -238,8 +243,9 @@ func TestArgvReachesTheChildLiterally(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if strings.TrimSpace(string(result.Stdout)) != "absent" {
-		t.Fatalf("child saw %q for an unlisted variable, want it absent", result.Stdout)
+	locale := utf8Locale()
+	if want := "absent " + locale + " " + locale; strings.TrimSpace(string(result.Stdout)) != want {
+		t.Fatalf("child saw %q, want %q: an unlisted variable absent and the UTF-8 locale set", result.Stdout, want)
 	}
 }
 

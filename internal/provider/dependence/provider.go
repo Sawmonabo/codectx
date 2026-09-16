@@ -653,6 +653,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
 		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
 		"tree_peak_bytes", peakForLog(out))
+	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	if out.Class == FailureNone {
 		if info, err := os.Stat(graph); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
 			// A zero exit with no graph is the helper crash the orchestrator
@@ -685,13 +686,23 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
 		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes)
+	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	if out.Class != FailureNone {
 		return ExportOutcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
 	}
 	if unit.Files > 0 && !out.Live {
-		out.Outcome.Class = FailureEngine
-		return ExportOutcome{}, failure(FailureEngine, unit.ScopeKey, out.Outcome, res).
-			WithDetail("reason", "the analysis produced no methods for a unit that has source")
+		// Both steps exited cleanly and the export holds no method. That is
+		// not a crash and must not be worded as one: a frontend whose own
+		// defaults exclude the directories a project keeps its sources in
+		// skips every file it was given and leaves exactly this. What the
+		// reader needs is which family it was and how many files the unit
+		// declared, so the two can be compared against what the frontend
+		// admits.
+		out.Outcome.Class = FailureEmptyExport
+		return ExportOutcome{}, failure(FailureEmptyExport, unit.ScopeKey, out.Outcome, res).
+			WithDetail("family", string(unit.Family)).
+			WithDetail("source_files", itoa(unit.Files)).
+			WithRemediation("check whether the frontend of this language family excludes the directories this project's sources are in")
 	}
 	return out, nil
 }

@@ -230,6 +230,12 @@ var Kinds = []Kind{KindClang, KindGo, KindJava, KindPython, KindRust, KindTypeSc
 type Profile struct {
 	Kind Kind
 	Tool toolchain.Tool
+	// Root is the root-relative project directory this unit indexes; the
+	// empty string is the workspace root. The indexer runs over that
+	// directory of the materialization, and the document paths its index
+	// carries are relative to it, so it is also what the importer prefixes
+	// them with to get back to workspace-relative paths.
+	Root string
 }
 
 // Name is the profile's name on every surface: the scope key, the diagnostic
@@ -416,23 +422,37 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		return "", "", p.profileError(prof, "", err)
 	}
 	defer mat.Close()
+	// The copy is the whole snapshot; the indexer is pointed at this unit's
+	// own project inside it. The two are not the same decision: a project
+	// resolves symbols through files outside itself (a parent `tsconfig`, a
+	// sibling module, a lock file above it), so narrowing the COPY would
+	// change what the index can say, while narrowing what the indexer is RUN
+	// over is what makes the unit a project rather than a repository.
+	input := mat.Root()
+	if prof.Root != "" {
+		input = filepath.Join(mat.Root(), filepath.FromSlash(prof.Root))
+		if info, err := os.Stat(input); err != nil || !info.IsDir() {
+			return "", "", p.profileError(prof, "", &model.Error{Code: model.CodeProviderUnavailable,
+				Message: "the snapshot holds no project directory at " + prof.Root})
+		}
+	}
 	switch prof.Kind {
 	case KindClang:
-		if err := normalizeCompileCommands(mat.Root(), p.limits.MaxManifestBytes, seen); err != nil {
+		if err := normalizeCompileCommands(input, p.limits.MaxManifestBytes, seen); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	case KindJava:
 		// Refused before the JVM starts, not diagnosed from its exit status.
-		if err := requireJavaSources(mat.Root()); err != nil {
+		if err := requireJavaSources(input); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
-		if err := writeScipJavaConfig(mat.Root()); err != nil {
+		if err := writeScipJavaConfig(input); err != nil {
 			return "", "", p.profileError(prof, "", err)
 		}
 	}
 	output := filepath.Join(runDir, "index.scip")
 	manifestPath := filepath.Join(runDir, "inputs.manifest")
-	path, args := prof.argv(argPaths{InputDir: mat.Root(), OutputFile: output, WorkDir: runDir})
+	path, args := prof.argv(argPaths{InputDir: input, OutputFile: output, WorkDir: runDir})
 	// The configured value is authoritative: zero, the default, is no wall
 	// clock at all, and the profile's own figure is a built-in ceiling that
 	// would otherwise reinstate the refusal the configuration removed. A
@@ -443,7 +463,7 @@ func (p *Provider) runProfile(ctx context.Context, prof Profile, view model.Snap
 		timeout = spec
 	}
 	_, err = p.runner.Run(ctx, process.Spec{
-		Path: path, Args: args, Dir: mat.Root(), Env: prof.env(p.lookupEnv),
+		Path: path, Args: args, Dir: input, Env: prof.env(p.lookupEnv),
 		MaxStdoutBytes: maxToolOutputBytes, MaxStderrBytes: maxToolOutputBytes,
 		Timeout: timeout, StallTimeout: p.stallTimeout, Grace: toolGrace, ProgressFiles: []string{output},
 		MemoryReservationBytes: prof.spec().memoryBudgetBytes, DiskReservationBytes: prof.spec().diskBudgetBytes,
@@ -490,6 +510,11 @@ func (p *Provider) profileError(prof Profile, manifestSHA string, err error) err
 	typed = typed.WithDetail("profile", prof.Name()).
 		WithDetail("tool", prof.Tool.Fingerprint()).
 		WithDetail("network", string(prof.Network()))
+	if prof.Root != "" {
+		// Which project failed. One indexer runs over several projects of one
+		// repository, so the profile name alone no longer identifies the run.
+		typed = typed.WithDetail("project", model.TruncateDetail(prof.Root))
+	}
 	if manifestSHA != "" {
 		typed = typed.WithDetail("input_manifest_sha256", manifestSHA)
 	}

@@ -7,7 +7,7 @@ decoder.
 | Input | Unit scope key | Source binding |
 |---|---|---|
 | A supplied `.scip` file inside the snapshot (`Options.Import`, the explicit import request field), optionally with an input-hash manifest (`Options.Manifest`) | `import:<root-relative path>` (`scip.ImportScope`) | `verified` only when every document that names a snapshot file proves its bytes; otherwise `unverified` |
-| One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>` (`scip.ProfileScope`) | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
+| One of the six managed indexer profiles (`scip-go`, `scip-typescript`, `scip-python`, `scip-java`, `rust-analyzer`, `scip-clang`), whose pinned payload codectx runs against a private materialization of the snapshot | `profile:<profile name>:<project directory>` (`scip.ProfileScope`), one unit per triggering directory | `verified` by construction: the run binds its inputs by hash, and the digest of that input manifest is reported on every diagnostic the profile path returns |
 
 The descriptor is `scip`, version `3`, capabilities `precise_definitions`,
 `precise_references`, `precise_implementations`, invalidation scope
@@ -26,7 +26,15 @@ coordinator exists.
 - `Detect` inspects declared inputs only through the confined root: the
   import path, and the trigger manifests of each profile (`go.mod`;
   `package.json`/`tsconfig.json`; `pom.xml`/`build.gradle`/`build.gradle.kts`)
-  together with the profile payload's state. It never runs a tool.
+  together with the profile payload's state. It never runs a tool. It walks
+  the **whole** workspace for those manifests, not just its root, under the
+  snapshot's own exclusion policy, so a dependency directory's manifests are
+  never seen and a repository that keeps its projects in subdirectories is
+  detected at all. A root-only check reported a monorepo with six indexable
+  projects as having none. The walk is bounded like every other detection;
+  when the bound cuts the list, the detection says so under
+  `unplanned_projects`, because a project dropped in silence is one nobody
+  indexes and nobody is told about.
   Nothing usable is `CTX_PROVIDER_UNAVAILABLE`. When at least one language is
   indexable the detection is available, and `Detection.Details` still names
   every other triggered language and why it is not: the toolchain's own
@@ -38,7 +46,22 @@ coordinator exists.
   repository with `go.mod` and `Cargo.toml` on a machine with no usable
   `rust-analyzer` would be reported available, plan `scip-go` only, and say
   nothing anywhere about Rust.
-- `Scopes(detection)` lists the unit scope keys to plan. A profile this
+- `Scopes(detection)` lists the unit scope keys to plan: `import:<path>` for a
+  supplied index, and `profile:<indexer>:<project directory>` for one project
+  of one indexer, the empty directory being the workspace root. **One unit per
+  triggering directory.** Go modules and Maven or Gradle modules nest — a
+  `go.mod` inside another module's tree is its own project and the nearest
+  trigger above a file is the project that owns it — and every other kind takes
+  the outermost trigger and never splits below it, because the whole program is
+  what makes its symbols resolvable: a `tsconfig` project split by subdirectory
+  loses more than half of the calls that resolve to its own methods
+  (`docs/research/10-round3-empirical.md` §8). A workspace root that triggers
+  is a project like any other, planned beside the projects below it. A trigger
+  inside a dependency directory is not a project and never reaches the rule:
+  those directories are excluded from the snapshot. A project whose scope key
+  does not fit the identity bound is refused rather than truncated, because two
+  deep directories with a long common prefix cut to the same key and one
+  project's facts would be attributed to the other. A profile this
   machine cannot supply at all — no payload for this platform, a corrupt store
   entry, an invalid override — plans no unit, so a missing tool never costs a
   snapshot materialization or a failed unit. A profile whose payload the lock
@@ -508,17 +531,29 @@ with `CTX_PROVIDER_UNAVAILABLE` — and the structural and dependence providers
 still cover it. `scip-java` is not in that list: it compiles the snapshot with
 the managed JDK's own `javac` and needs no host build tool (see below).
 
-`<input>` is the private materialization root, which is also the child's
-working directory; `<output>` and `<work>` are under the run directory, outside
-the materialization.
+`<input>` is the unit's project directory inside the private materialization,
+which is also the child's working directory; `<output>` and `<work>` are under
+the run directory, outside the materialization.
 
-**A profile's private copy is the whole workspace, deliberately.** The
-materialization is not narrowed to the files a unit "owns": a precise indexer
-resolves symbols through the project's own dependency context — the module
-graph, the package manifests, the installed distributions, the headers — and
-the unit's scope is the workspace, so a narrower copy would produce an index
-that describes less than the unit claims. The call site says so explicitly
-rather than leaving it to an omitted selection. The launcher prefix comes from
+**A profile's private copy is the whole workspace, deliberately — and the
+indexer is run over one project inside it.** The two are different decisions.
+The materialization is not narrowed to the files a unit "owns": a precise
+indexer resolves symbols through the project's own dependency context — the
+module graph, the package manifests, the installed distributions, the headers,
+a `tsconfig` above it — so a narrower copy would produce an index that
+describes less than the unit claims. What the indexer is *run over* is the
+unit's project, which is what makes the unit a project rather than a
+repository. The call site says so explicitly rather than leaving it to an
+omitted selection.
+
+**Document paths are prefixed back to the workspace.** An indexer writes
+document paths relative to what it was run over: `scip-go` run in `sub/`
+writes `a.go`, not `sub/a.go` (measured against the pinned payload). The
+import prepends the unit's project directory to every document path once, as
+the document is decoded, so every path the import resolves, stores and
+publishes is workspace-relative whatever project the unit is. Without it every
+document would fail to resolve against the snapshot and the unit would trip
+the false-readiness refusal below. The launcher prefix comes from
 the lock: a self-contained binary runs as itself, a Node-hosted indexer runs
 as `<managed node> <entry>`, and `scip-java`'s launcher runs with `JAVA_HOME`
 pointing at the managed JDK. The child's environment is exactly the

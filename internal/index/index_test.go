@@ -516,7 +516,7 @@ func TestIncrementalScenario(t *testing.T) {
 		// the whole of the path that failed: it must reach "nothing to
 		// publish" over the generation that superseded gen, not
 		// CTX_ARGUMENT_INVALID over the one that is gone.
-		if _, _, err = f.c.late.publish(ctx, snap, sel, refNone, nil); err != nil {
+		if _, _, err = f.c.late.publish(ctx, snap, sel, refNone, batch{}); err != nil {
 			t.Fatalf("the deferred publication pinned a stale generation: %v", err)
 		}
 	})

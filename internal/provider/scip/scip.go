@@ -26,6 +26,7 @@ package scip
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -102,8 +103,34 @@ const (
 // path.
 func ImportScope(path string) string { return scopeImport + path }
 
-// ProfileScope is the unit scope key of an approved indexer profile.
-func ProfileScope(name string) string { return scopeProfile + name }
+// ProfileScope is the unit scope key of an approved indexer profile rooted at
+// one project directory. The empty root is the workspace root itself, so a
+// repository whose only project is at the root keeps the shortest key there
+// is for it.
+func ProfileScope(name, root string) string { return scopeProfile + name + ":" + root }
+
+// ProfileRoot is the project directory a profile scope key of kind k names,
+// and whether the key is one of that kind at all. It is how a caller outside
+// this package reads a key without owning its spelling.
+func ProfileRoot(key string, k Kind) (string, bool) {
+	name, root, ok := splitProfileScope(key)
+	if !ok || name != string(k) {
+		return "", false
+	}
+	return root, true
+}
+
+// splitProfileScope takes a profile scope key apart into the indexer name and
+// the project directory it is rooted at. The kind name holds no colon, so the
+// first one separates them and every later one belongs to the directory.
+func splitProfileScope(key string) (name, root string, ok bool) {
+	rest, isProfile := strings.CutPrefix(key, scopeProfile)
+	if !isProfile {
+		return "", "", false
+	}
+	name, root, ok = strings.Cut(rest, ":")
+	return name, root, ok
+}
 
 // Limits bound one import. Every field is a user-set bound
 // (providers.scip.*) whose zero value is unlimited, which is the default:
@@ -333,17 +360,42 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 	if p.importPath != "" && recognized[p.importPath] {
 		out = append(out, ImportScope(p.importPath))
 	}
+	byKind := triggersByKind(det.InputPaths)
 	for _, k := range p.runnableKinds() {
 		// A kind this machine cannot index precisely at all plans no unit: a
 		// planned unit materializes the whole snapshot before the run and would
 		// then fail on a payload Detect already reported as absent, with its
 		// typed reason. A deferred kind does plan one -- its payload is pinned
 		// for this platform and the unit fetches it.
-		for _, trig := range Triggers(k) {
-			if recognized[trig] {
-				out = append(out, ProfileScope(string(k)))
-				break
+		for _, root := range projectRoots(k, byKind[k]) {
+			key := ProfileScope(string(k), root)
+			if len(key) > model.MaxScopeKeyBytes {
+				// A key that does not fit is refused as a project, never
+				// truncated: two deep directories with a long common prefix
+				// cut to the same key, and every fact of one would then be
+				// attributed to the other. The project is left to the unit
+				// that encloses it, or to none, and the refusal is counted so
+				// the capability cannot be published fresh.
+				continue
 			}
+			out = append(out, key)
+		}
+	}
+	return out
+}
+
+// triggersByKind groups the trigger paths detection recognized by the kind
+// each one triggers, ignoring anything that is not a trigger (the supplied
+// index is in the same list).
+func triggersByKind(inputs []string) map[Kind][]string {
+	out := map[Kind][]string{}
+	for _, in := range inputs {
+		base := in
+		if i := strings.LastIndexByte(in, '/'); i >= 0 {
+			base = in[i+1:]
+		}
+		if k, ok := triggerKind[base]; ok {
+			out[k] = append(out[k], in)
 		}
 	}
 	return out
@@ -353,7 +405,7 @@ func (p *Provider) Scopes(det provider.Detection) []string {
 // manifests that trigger an approved profile, through the confined root. It
 // never runs a tool. An absent index and no installed approved indexer is
 // honest absence (CTX_PROVIDER_UNAVAILABLE).
-func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Policy) (provider.Detection, error) {
+func (p *Provider) Detect(ctx context.Context, root workspace.Root, policy workspace.Policy) (provider.Detection, error) {
 	det := provider.Detection{Capabilities: capabilities}
 	if p.importPath != "" {
 		if info, err := root.Lstat(p.importPath); err == nil && info.Mode().IsRegular() {
@@ -361,23 +413,36 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 			det.InputPaths = append(det.InputPaths, p.importPath)
 		}
 	}
+	// The whole workspace is walked, not just its root. A repository keeps its
+	// projects where its own toolchains expect them, which for a monorepo is
+	// never the root: a root-only check planned nothing at all for a
+	// repository with six indexable projects in subdirectories. The walk is
+	// the policy's own -- it descends into nothing the snapshot excludes, so a
+	// dependency directory's manifests are never seen -- and it is bounded by
+	// provider.MaxDetectionInputs like every other detection.
+	triggers, truncated, err := p.walkTriggers(ctx, root, policy)
+	if err != nil {
+		return provider.Detection{}, err
+	}
 	for _, k := range p.runnableKinds() {
-		triggered := false
-		for _, trig := range Triggers(k) {
-			if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
-				triggered = true
-				det.InputPaths = append(det.InputPaths, trig)
-			}
+		if len(triggers[k]) == 0 {
+			continue
 		}
-		if triggered {
-			det.Available = true
-			if slices.Contains(p.deferred, k) {
-				// The kind is recorded as pending rather than as a refusal:
-				// Select publishes a degraded capability row for a CTX_ value and
-				// nothing for this one, which is why the spelling differs.
-				det = det.WithDetail(string(k), markerDeferred)
-			}
+		det.Available = true
+		det.InputPaths = append(det.InputPaths, triggers[k]...)
+		if slices.Contains(p.deferred, k) {
+			// The kind is recorded as pending rather than as a refusal:
+			// Select publishes a degraded capability row for a CTX_ value and
+			// nothing for this one, which is why the spelling differs.
+			det = det.WithDetail(string(k), markerDeferred)
 		}
+	}
+	if truncated {
+		// The bound cut the list, so some project of some kind has no unit.
+		// Nothing is refused silently: this is the one place that knows a
+		// project was dropped, and the detail is what makes the capability
+		// visibly short of the repository rather than quietly so.
+		det = det.WithDetail("unplanned_projects", "the workspace holds more project manifests than one detection carries; the projects past the bound are not indexed precisely")
 	}
 	// A language this workspace triggers whose indexer this machine cannot
 	// supply is named here with the toolchain's own reason, whether or not some
@@ -387,7 +452,7 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 	// unit for the missing kind, so no capability row ever carries the reason
 	// either.
 	for _, u := range p.missing {
-		if triggeredKind(root, u.kind) {
+		if len(triggers[u.kind]) > 0 {
 			det = det.WithDetail(string(u.kind), u.code)
 		}
 	}
@@ -402,10 +467,15 @@ func (p *Provider) Detect(_ context.Context, root workspace.Root, _ workspace.Po
 	if !det.Available {
 		// The single diagnostic code of an unavailable detection is the first
 		// triggered kind's reason; Details above carries every one of them.
+		// Details do not survive an unavailable detection, so the finding
+		// itself goes on Reason, which does: a bare CTX_PROVIDER_UNAVAILABLE
+		// on a repository full of projects reads as a broken provider.
 		det.DiagnosticCode = model.CodeProviderUnavailable
+		det.Reason = "no project manifest of a language this build indexes precisely is in the workspace"
 		for _, u := range p.missing {
-			if triggeredKind(root, u.kind) {
+			if len(triggers[u.kind]) > 0 {
 				det.DiagnosticCode = u.code
+				det.Reason = "the precise indexer for " + string(u.kind) + " is not usable on this machine"
 				break
 			}
 		}
@@ -427,7 +497,7 @@ func (p *Provider) Verify(ctx context.Context, view model.SnapshotView, scopeKey
 		// not by which bytes the payload has: codectx invokes the indexer
 		// itself. A deferred payload is therefore not fetched here -- Verify
 		// runs before the unit is opened, and a fetch belongs to the run.
-		if _, err := p.profileKind(scopeKey); err != nil {
+		if _, _, err := p.profileKind(scopeKey); err != nil {
 			return "", err
 		}
 		return model.SourceBindingVerified, nil
@@ -614,34 +684,69 @@ func (p *Provider) runnableKinds() []Kind {
 	return out
 }
 
-// triggeredKind reports whether the workspace holds a trigger of one kind. It
-// reads metadata through the confined root and nothing else.
-func triggeredKind(root workspace.Root, k Kind) bool {
-	for _, trig := range kindSpecs[k].triggers {
-		if info, err := root.Lstat(trig); err == nil && info.Mode().IsRegular() {
-			return true
+// walkTriggers collects, per kind this build can run, the root-relative
+// project manifests the workspace holds, in the walk's own order. It reads the
+// tree through the confined root under the snapshot's own policy and runs no
+// tool.
+//
+// The bound is provider.MaxDetectionInputs over all kinds together, which is
+// the bound the detection itself carries; the walk stops there and says so,
+// because a list cut in silence is a project nobody indexes and nobody is
+// told about.
+func (p *Provider) walkTriggers(ctx context.Context, root workspace.Root, policy workspace.Policy) (map[Kind][]string, bool, error) {
+	out := make(map[Kind][]string, len(Kinds))
+	found, truncated := 0, false
+	err := workspace.Walk(ctx, root, policy, func(f workspace.File) error {
+		base := f.Path
+		if i := strings.LastIndexByte(f.Path, '/'); i >= 0 {
+			base = f.Path[i+1:]
 		}
+		// Every kind this build knows is collected, not only the ones it can
+		// run: a language whose indexer this machine cannot supply must be
+		// named with its own reason, and only the presence of its manifests
+		// says the repository contains it at all.
+		k, ok := triggerKind[base]
+		if !ok {
+			return nil
+		}
+		if found >= provider.MaxDetectionInputs {
+			truncated = true
+			return errDetectionFull
+		}
+		out[k] = append(out[k], f.Path)
+		found++
+		return nil
+	})
+	if err != nil && !errors.Is(err, errDetectionFull) {
+		return nil, false, err
 	}
-	return false
+	return out, truncated, nil
 }
+
+// errDetectionFull ends a bounded detection walk without making an early stop
+// look like a failure.
+var errDetectionFull = errors.New("detection input bound reached")
 
 // profileKind resolves a profile scope key to the kind it names, without
 // reaching for a payload. A kind this build knows but whose payload did not
 // resolve reports the toolchain's own code, so a unit planned before a payload
 // was lost fails with the reason rather than with "unknown profile".
-func (p *Provider) profileKind(scopeKey string) (Kind, error) {
-	name := strings.TrimPrefix(scopeKey, scopeProfile)
+func (p *Provider) profileKind(scopeKey string) (Kind, string, error) {
+	name, root, ok := splitProfileScope(scopeKey)
+	if !ok {
+		return "", "", invalid("scip unit scope " + scopeKey + " names no indexer profile and no project")
+	}
 	for _, k := range p.runnableKinds() {
 		if string(k) == name {
-			return k, nil
+			return k, root, nil
 		}
 	}
 	for _, u := range p.missing {
 		if string(u.kind) == name {
-			return "", u.err
+			return "", "", u.err
 		}
 	}
-	return "", invalid("scip unit scope names profile " + name + ", which is not a SCIP indexer this build knows")
+	return "", "", invalid("scip unit scope names profile " + name + ", which is not a SCIP indexer this build knows")
 }
 
 // profileFor is profileKind followed by the payload. A kind the store already
@@ -651,12 +756,13 @@ func (p *Provider) profileKind(scopeKey string) (Kind, error) {
 // -- the same failure it would have had at construction, now only for a
 // language this repository actually contains.
 func (p *Provider) profileFor(ctx context.Context, scopeKey string) (Profile, error) {
-	k, err := p.profileKind(scopeKey)
+	k, root, err := p.profileKind(scopeKey)
 	if err != nil {
 		return Profile{}, err
 	}
 	for _, prof := range p.profiles {
 		if prof.Kind == k {
+			prof.Root = root
 			return prof, nil
 		}
 	}
@@ -667,7 +773,7 @@ func (p *Provider) profileFor(ctx context.Context, scopeKey string) (Profile, er
 	if err != nil {
 		return Profile{}, err
 	}
-	return Profile{Kind: k, Tool: t}, nil
+	return Profile{Kind: k, Tool: t, Root: root}, nil
 }
 
 // importFile resolves an import scope key to the pinned snapshot file it
