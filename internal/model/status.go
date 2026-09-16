@@ -617,6 +617,11 @@ type RunRecord struct {
 	// where the platform does not expose it. The stage rows carry null here
 	// because a resident-size delta across overlapping work measures the
 	// process and not the stage.
+	//
+	// It is the process's peak and not the run's: the kernel's mark covers the
+	// whole life of the process, so a process that has served earlier runs may
+	// report a peak one of those set. A one-shot command's run and process are
+	// the same life and the distinction does not arise there.
 	ProcessPeakRSSBytes *uint64 `json:"process_peak_rss_bytes,omitempty"`
 }
 
