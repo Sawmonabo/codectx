@@ -81,8 +81,9 @@ type SuppliedIndexReader interface {
 	SuppliedIndexes(ctx context.Context, gen model.GenerationID) ([]SuppliedIndex, error)
 }
 
-// WatchHeartbeat is what a running watch published about itself, read from the
-// store by a process that is not the one watching.
+// WatchHeartbeat is what one running watch published about itself, read from
+// the store by a process that is not the one watching. A workspace can be
+// watched by more than one process, and each publishes its own.
 //
 // ExpiresAt is the writer's own deadline and the only liveness signal this
 // package consults. A watching process refreshes it while it lives, so an
@@ -100,20 +101,34 @@ type WatchHeartbeat struct {
 	ExpiresAt     time.Time
 }
 
-// WatchHeartbeatReader reports the repository's watch heartbeat, and whether
-// one exists at all -- absent and expired are different answers. Like
+// Live is this package's one statement of whether the process that published a
+// row is still refreshing it: the writer's own unelapsed deadline against the
+// reader's clock, which is the rule the store and the run ledger both judge a
+// writer's liveness by. No pid is probed.
+func (hb WatchHeartbeat) Live(now time.Time) bool { return hb.ExpiresAt.After(now) }
+
+// WatchHeartbeatReader reports every watch heartbeat the repository holds,
+// expired rows included -- absent and expired are different answers. Like
 // SuppliedIndexReader it is optional, exported, and converts rather than
 // forwards, so the composition root asserts it at compile time instead of
 // leaving a signature drift to show up as a check that is unavailable forever.
 type WatchHeartbeatReader interface {
-	WatchHeartbeat(ctx context.Context, repo model.RepositoryID) (WatchHeartbeat, bool, error)
+	WatchHeartbeats(ctx context.Context, repo model.RepositoryID) ([]WatchHeartbeat, error)
 }
 
-// liveWatch reports the heartbeat of a watch that is running now: the row
-// exists and the writer's own deadline has not passed. An expired row is a
-// watch that stopped, and is reported as no watch at all rather than as
-// coverage -- a figure from a dead process would read as "the watch is caught
-// up" for as long as nobody rebooted it.
+// liveWatch chooses the one heartbeat this package reports on, and says whether
+// it is live. A row that has expired is a watch that stopped, and is never
+// reported as coverage -- a figure from a dead process would read as "the watch
+// is caught up" for as long as nobody rebooted it.
+//
+// The choice over several watching processes is what keeps the three answers
+// apart at this surface. A live watch that has completed a pass is preferred
+// over a live one that has not: with an editor's server waiting behind a
+// terminal's watch, reporting the waiting one would say nothing covers this
+// workspace while something does. The row chosen is one watcher's own coherent
+// pair of figures, never a total synthesized across processes, which would name
+// a pending count no process ever published. With no live row at all the
+// freshest row is returned so an expired one can be warned about.
 //
 // The second result separates "no heartbeat is live" from "this build cannot
 // tell", which the two callers render differently.
@@ -122,14 +137,33 @@ func (s *Service) liveWatch(ctx context.Context) (hb WatchHeartbeat, live bool, 
 	if !isReader {
 		return WatchHeartbeat{}, false, false
 	}
-	hb, found, err := reader.WatchHeartbeat(ctx, s.opts.Repo)
+	rows, err := reader.WatchHeartbeats(ctx, s.opts.Repo)
 	if err != nil {
 		return WatchHeartbeat{}, false, false
 	}
-	if !found {
-		return WatchHeartbeat{}, false, true
+	now := s.opts.Now()
+	waiting := -1
+	for i, row := range rows {
+		if !row.Live(now) {
+			continue
+		}
+		if row.LastPassAt != nil {
+			return row, true, true
+		}
+		if waiting < 0 {
+			waiting = i
+		}
 	}
-	return hb, hb.ExpiresAt.After(s.opts.Now()), true
+	switch {
+	case waiting >= 0:
+		return rows[waiting], true, true
+	case len(rows) == 0:
+		return WatchHeartbeat{}, false, true
+	default:
+		// The rows are freshest-deadline first, so this is the watch that
+		// stopped refreshing most recently.
+		return rows[0], false, true
+	}
 }
 
 // captureReader reports when the capture behind a generation was taken -- the

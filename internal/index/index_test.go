@@ -1215,20 +1215,20 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	watchCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
 	go func() { done <- c.Watch(watchCtx, nil) }()
-	var hb sqlite.WatchHeartbeat
-	var found bool
+	var rows []sqlite.WatchHeartbeat
 	for deadline := time.Now().Add(10 * time.Second); ; {
-		if hb, found, err = f.store.WatchHeartbeat(ctx, c.Repository()); err != nil {
-			t.Fatalf("WatchHeartbeat: %v", err)
+		if rows, err = f.store.WatchHeartbeats(ctx, c.Repository()); err != nil {
+			t.Fatalf("WatchHeartbeats: %v", err)
 		}
-		if found || time.Now().After(deadline) {
+		if len(rows) > 0 || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	if !found {
+	if len(rows) == 0 {
 		t.Fatal("a watch that is waiting for the workspace published no row at all, so it cannot be told from a workspace no watch ever ran in")
 	}
+	hb := rows[0]
 	if hb.WriterPID != os.Getpid() {
 		t.Fatalf("the row must name this watch's process, got %d", hb.WriterPID)
 	}
@@ -1252,7 +1252,7 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	if _, _, marked := w.Coverage(); marked.IsZero() {
 		t.Fatal("the watcher never marked itself reconciled, so the steady state went unexercised")
 	}
-	if lastPass, pending := c.watch.heartbeat(); lastPass != nil || pending != nil {
+	if _, lastPass, pending := c.watch.heartbeat(); lastPass != nil || pending != nil {
 		t.Fatalf("a watch that never held the workspace published %v / %v after the watcher reconciled itself", lastPass, pending)
 	}
 	stop()
