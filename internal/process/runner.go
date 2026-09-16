@@ -163,6 +163,47 @@ type Result struct {
 	// memory, so PeakTreeBytes is unavailable rather than zero. A caller that
 	// publishes the figure must omit it, not publish a zero.
 	TreeUnsampled bool
+	// ReadBytes and WriteBytes are the bytes the whole process group
+	// transferred through the kernel, summed over its members by the last
+	// sweep that still found the tree running.
+	//
+	// Three properties a reader has to know. The figure is a sample and not an
+	// exit-time total: it is the state of the counters at most one sampling
+	// period before the tree exited, and whatever the tree transferred after
+	// that sweep is not in it. It counts bytes where the process called the
+	// kernel, so it includes what a child wrote into its own pipes and what
+	// the page cache absorbed, and it is therefore not disk volume. And the
+	// group sum is not monotonic across sweeps: a worker that exits takes its
+	// counters with it, so a tree whose workers finish before its leader
+	// reports less than it moved.
+	ReadBytes  int64
+	WriteBytes int64
+	// IOUnsampled reports that no sweep ever read the counters -- a platform
+	// with no per-process counters at all, or a group whose members were all
+	// unreadable -- so the two figures are unavailable rather than zero. A
+	// caller that publishes them must omit them rather than publish an
+	// observed zero (Section 22).
+	IOUnsampled bool
+}
+
+// unmeasured is the starting Result of every run: each figure this package
+// measures is marked absent, so a run that ends before its measurement exists
+// reports nothing observed rather than an observed zero (Section 22). Each
+// flag is cleared only where its figure has actually been read.
+func unmeasured() Result {
+	return Result{CPUUnsampled: true, TreeUnsampled: true, IOUnsampled: true}
+}
+
+// treeSample is what the sweeps of one run's process group yielded.
+type treeSample struct {
+	// peakBytes is the highest summed resident set size any sweep observed.
+	peakBytes int64
+	// readBytes and writeBytes are the group's transferred byte counters as of
+	// the last sweep that found a member with readable counters; ioSampled
+	// reports that such a sweep happened at all.
+	readBytes  int64
+	writeBytes int64
+	ioSampled  bool
 }
 
 // treeSampleInterval is how often the process tree's resident memory is summed
@@ -262,11 +303,11 @@ func NewRunner(limits Limits) (*Runner, error) {
 // output stream reaches its limit.
 func (r *Runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err := spec.validate(); err != nil {
-		return Result{}, err
+		return unmeasured(), err
 	}
 	release, err := r.reserve(ctx, spec)
 	if err != nil {
-		return Result{}, err
+		return unmeasured(), err
 	}
 	defer release()
 	return r.run(ctx, spec)
@@ -432,9 +473,7 @@ func (r *Runner) release(w *admission) {
 
 func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	started := time.Now()
-	// Every measured field starts unavailable, so a run that fails before the
-	// measurement exists reports it as absent rather than as an observed zero.
-	result := Result{CPUUnsampled: true}
+	result := unmeasured()
 
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
@@ -581,8 +620,12 @@ func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 
 	// The tree has exited, so the last sweep has already happened; stopping
 	// joins the sampling goroutine before its peak is read.
-	result.PeakTreeBytes = sampler.stopSampling()
+	sample := sampler.stopSampling()
+	result.PeakTreeBytes = sample.peakBytes
 	result.TreeUnsampled = !treeSampled
+	result.ReadBytes = sample.readBytes
+	result.WriteBytes = sample.writeBytes
+	result.IOUnsampled = !sample.ioSampled
 	result.Duration = time.Since(started)
 	result.Stdout, result.StdoutBytes = outPipe.captured()
 	result.Stderr, result.StderrBytes = errPipe.captured()
