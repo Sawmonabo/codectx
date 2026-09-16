@@ -613,7 +613,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeCapabilities(&b, result.Completeness)
-	writeIndexRunLedger(&b, result.Run, result.Stages)
+	writeIndexRunLedger(&b, result.Run, result.Stages, result.StagesOmitted)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
 }
 
@@ -624,7 +624,7 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 // the run. A unit nested under a stage is already counted inside it, so listing
 // both would report shares that add up to more than the run and leave the
 // operator unable to see which stage the time actually went to.
-func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord, omitted int64) {
 	if run == nil {
 		return
 	}
@@ -639,6 +639,13 @@ func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []mode
 		fmt.Fprintf(b, "stage       %s %s, %s of the run, %s, in %d, out %d\n",
 			stage.Stage, wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
 			shareMetric(stage.ShareOfWall), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
+	}
+	// The run recorded more stages than one result carries. Saying how many is
+	// what keeps the lines above a page of the run's accounting rather than a
+	// silently short list read as the whole of it.
+	if omitted > 0 {
+		fmt.Fprintf(b, "omitted     %d further %s beyond this result's page\n",
+			omitted, plural(int(omitted), "stage was recorded", "stages were recorded"))
 	}
 }
 
@@ -773,7 +780,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
 	flushTableInto(tw)
-	writeRunLedger(b, r.Run, r.Stages)
+	writeRunLedger(b, r.Run, r.Stages, r.StagesOmitted)
 }
 
 // writeRunLedger renders the recorded run and its stages: what the run cost,
@@ -787,7 +794,7 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 // a long time" are different facts, and a live stage whose elapsed time printed
 // like a measurement would tell an operator that a stalled stage had finished
 // fast.
-func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord, omitted int64) {
 	if run == nil {
 		return
 	}
@@ -818,6 +825,14 @@ func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.Sta
 		}
 	}
 	flushTableInto(tw)
+	// The run recorded more stages than one page carries. A table that did not
+	// say how many it dropped would present a page of the run's accounting as
+	// the whole of it, and an operator reading it would draw the shares and the
+	// costliest stage from a list that is missing rows.
+	if omitted > 0 {
+		fmt.Fprintf(b, "  omitted     %d further %s beyond this page\n",
+			omitted, plural(int(omitted), "stage was recorded", "stages were recorded"))
+	}
 	// Accounting the bounded bus refused rather than made the run wait for it.
 	// Above zero the stages above are known to be an incomplete account of the
 	// run, and a table that did not say so would read as the whole of it.
