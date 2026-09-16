@@ -566,13 +566,14 @@ it holds, and an activation merely names the segments its generation reads.
 It exists in packed form because the live posting path costs three b-tree
 descents per posting **instance** — the vocabulary row, the document row and the
 generation membership probe — plus a temporary b-tree per term for the document
-frequency, and all of that is paid again on every request. It is segmented
+frequency, and one further document-row read per **candidate** to serve the
+page, and all of that is paid again on every request. It is segmented
 because a structure rebuilt per generation costs the whole corpus at every
 activation, including the activation that publishes one saved file.
 
 **The three tables and the column that ties them together.** `lexical_segments`
-carries one row per segment: its term count, its document count and its packed
-bytes. `lexical_segment_parts` carries the bytes, one row per chunk of one
+carries one row per segment: its term count, its document count — which is also
+how many entries its document directory holds — and its packed bytes. `lexical_segment_parts` carries the bytes, one row per chunk of one
 stream, keyed by segment, stream name and a 0-based part number whose parts
 concatenate to the stream. `generation_segments` is one generation's set in read
 order, each row carrying how many of that segment's documents the generation
@@ -587,13 +588,15 @@ so a carry-over copies it forward with the document rowid, and a compaction
 re-points it. A generation's set is derived from it and a segment's garbage
 status is decided by it; there is no ownership table.
 
-The three streams of a segment are `term.dir`, a fixed-width directory in term
-order holding each term's document frequency and the slices of the other two
-streams that belong to it; `term.text`, the concatenated term bytes; and
-`post.list`, each term's per-document, column-ascending `(column, count)`
-sequence, documents ascending by rowid and encoded as deltas. A term lookup is a
-binary search over the fixed-width directory, so a query reads a bounded window
-of parts rather than a vocabulary.
+The streams of a segment are `term.dir`, a fixed-width directory in term order
+holding each term's document frequency and the slices of the term streams that
+belong to it; `term.text`, the concatenated term bytes; `post.list`, each term's
+per-document, column-ascending `(column, count)` sequence, documents ascending by
+rowid and encoded as deltas; and the per-document attributes, `doc.dir`, a
+fixed-width directory in ascending document rowid, with `doc.attr`, the records
+it points into. A term lookup is a binary search over the fixed-width term
+directory and a candidate's attributes are a binary search over the document
+directory, so a query reads a bounded window of parts rather than a vocabulary.
 
 `generation_lexical` is written **last**, after every `generation_segments` row,
 for the same reason the graph header is: a reader that finds it is guaranteed
@@ -654,6 +657,17 @@ units' alike, in the same activation, so afterwards no row names an input, a
 reattached unit finds its documents where its rows point, and a segment can never
 be named beside the one that absorbed it. A generation published earlier keeps
 its own rows and reads the inputs until it is collected.
+
+**What a candidate is served from.** Every field a search hit carries — its
+identity, its node, its file, its path, kind, name, qualified name and signature,
+its byte range and its token count — is packed once per document, by the seal
+that folds the segment, from the rows it has just claimed; a merge copies each
+kept record verbatim. A page of candidates is hydrated from those bytes inside
+the posting session that is already reading the segment, in ascending document
+order, so a query issues no statement per candidate and no document row is read
+to hydrate a page ([ADR-0007](adr/ADR-0007-lexical-first-page.md),
+Decision 2). A rowid the generation does not make visible is omitted from the
+page rather than served empty.
 
 **What a read does.** A term is one binary search per segment, and the segments'
 posting streams are merged by document rowid, so the candidate walk still
