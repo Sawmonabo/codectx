@@ -6,11 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
-	"log/slog"
 	"maps"
 	"slices"
-	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
 
@@ -118,8 +117,8 @@ func segmentStats(ctx context.Context, tx *sql.Tx, ids []int64) (map[int64]segme
 }
 
 // compactBeforeActivation runs the staging generation's due merges before the
-// call that publishes it, and reports what they cost. The pass is logged on
-// its own, as the activation's own build is, because a cost hidden inside an
+// call that publishes it, and reports what they cost. The pass is a span of
+// its own, as the activation's own builds are, because a cost hidden inside an
 // activation's total cannot be told from the publication itself.
 func (s *Store) compactBeforeActivation(ctx context.Context, gen model.GenerationID) error {
 	var row int64
@@ -133,12 +132,9 @@ func (s *Store) compactBeforeActivation(ctx context.Context, gen model.Generatio
 	}); err != nil {
 		return err
 	}
-	started := time.Now()
+	_, span := ledger.Start(ctx, stageLexicalCompaction, "")
 	merges, err := s.compactGeneration(ctx, row)
-	if merges > 0 || err != nil {
-		slog.Default().Info("packed lexical compaction finished", "generation", gen,
-			"duration_ms", time.Since(started).Milliseconds(), "merges", merges)
-	}
+	span.End(spanOutcome(err), ledger.Measured{CPUUnattributed: ledger.CPUOverlapped, ItemsOut: &merges}, err)
 	return err
 }
 
