@@ -19,15 +19,20 @@ reconstructed by hand from log timestamps. A person can do that with a terminal 
 agent driving the product over MCP cannot, and neither can a script, and neither can the product
 itself when asked why a run is taking a long time *while it is still taking it*.
 
-Six stages already log a duration, each in its own shape and none of them aggregated:
+What the product had instead, when this was decided, was scattered. Six stages each logged a
+duration, every one in its own shape and none of them aggregated:
 `internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
 `internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:258` and
 `internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
-needs are already taken and thrown away: the child process tree's peak resident memory is sampled
-every 250 ms by `internal/process/treesample_linux.go:55` and reaches only the dependence
-provider's memory governor; the reaped child's `rusage` is reachable at
-`internal/process/runner.go:607` and is read by nothing at all; the tree's summed CPU
-ticks are kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
+needs were already being taken and thrown away: the child process tree's peak resident memory was
+sampled every 250 ms by `internal/process/treesample_linux.go:55` and reached only the dependence
+provider's memory governor; the reaped child's `rusage` was reachable at
+`internal/process/runner.go:607` and was read by nothing at all; the tree's summed CPU ticks were
+kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
+
+The decision below replaced all of it. Those six duration lines are gone, and each of those three
+measurements now has a reader, so this paragraph describes the state that motivated the decision and
+not the state of the tree.
 
 ## Decision
 
@@ -100,10 +105,12 @@ would spill or an exclusive writer waits ([ADR-0008](ADR-0008-ingestion-group.md
 until that commit, so a ledger inside it could not answer a question about a run in progress --
 which is half of the requirement.
 
-`Store.Activate` (`internal/storage/sqlite/units.go:1429`) holds an exclusive transaction around
-lexical compaction, the adjacency build and the lexical build (`:1484`, `:1590`, `:1596`). Any
-other writer on that file waits or fails busy for its duration, which is exactly the window an
-operator most wants the ledger to be answering in.
+`Store.Activate` (`internal/storage/sqlite/units.go:1429`) opens an exclusive transaction at
+`:1488` and holds it around the adjacency build and the lexical build (`:1590`, `:1596`). Lexical
+compaction runs just before that transaction (`:1484`) as its own bounded ingestion rather than
+inside it, so the exclusive window is narrower than the whole of activation -- and still wide enough
+to matter. Any other writer on that file waits or fails busy for its duration, which is exactly the
+window an operator most wants the ledger to be answering in.
 
 There is a third reason that is not about contention. The main schema's text is hashed into a
 fingerprint (`internal/storage/sqlite/schema.go:31`) that is folded into every analysis key
