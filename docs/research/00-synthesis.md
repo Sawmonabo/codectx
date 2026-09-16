@@ -148,3 +148,7 @@ The §8 ruling above was generalised from the dependence tier to the whole produ
 the decisions, the alternatives weighed against them and the measurements behind them are recorded in
 [ADR-0001 — Scale posture](../adr/ADR-0001-scale-posture.md), with the bound inventory in
 [15-scale-posture.md](15-scale-posture.md).
+
+The future native engine the §8 ruling names as the successor is planned, sized and phased in
+[20-native-engine-post-mvp.md](20-native-engine-post-mvp.md) (raw evidence under
+`raw/native-engine/`). It does not start before the MVP ships and it does not reverse the ruling.

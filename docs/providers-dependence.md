@@ -19,15 +19,25 @@ fields, query results — it is "the engine".
 | Capability | Relation | Evidence detail |
 |---|---|---|
 | `control_depends_on` | `control_depends_on` | `cdg` |
-| `data_flows_to` | `data_flows_to` | `reaching_def`, `reaching_def capture`, `global` |
+| `data_flows_to` | `data_flows_to` | `reaching_def`, `reaching_def capture` |
 | `reads` | `reads` | `assignment` |
 | `writes` | `writes` | `assignment` |
 | `calls` | `calls` | `call` |
 
 Every fact is `static_analysis` precision with exact byte ranges. A dependence
 edge does not claim a proven end-to-end source-to-sink flow; data dependence
-that crosses a method boundary through a closure or a global says so in its
-own evidence detail rather than borrowing the intraprocedural label.
+that crosses a method boundary through a closure or a global carries the
+`reaching_def capture` detail rather than borrowing the intraprocedural label;
+the export gives a global no marker of its own, so globals and captures share
+that detail.
+
+Precision names the origin of a fact, not a proof of soundness, and one
+language carries a known gap: the Rust frontend lowers the try operator (`?`)
+to a plain call with no control structure, so every statement after a `?` is
+recorded as unconditionally reachable when it is control-dependent on the `?`
+succeeding, and labeled `break`/`continue` bind to the innermost loop. The
+control-dependence and data-dependence facts for Rust are therefore complete
+over the graph the frontend emits, not over the language's semantics.
 
 `reads` and `writes` come from this provider alone: no SCIP indexer sets a
 write role, and syntax cannot resolve the target of an assignment.
