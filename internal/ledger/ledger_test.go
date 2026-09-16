@@ -60,6 +60,49 @@ func latestIfAny(t *testing.T, dir string) (ledger.RunView, bool) {
 	return view, ok
 }
 
+// TestUnopenedLedgerRecordsNothing protects the package's rule that
+// instrumentation is unconditionally callable. A composition with no ledger --
+// any test of a package that records, or a process where opening the ledger
+// file failed -- must be able to open runs and spans that do nothing. Without
+// it every one of the dozens of stage sites needs its own nil check, and the
+// first one anybody forgets panics the run it was there to measure.
+func TestUnopenedLedgerRecordsNothing(t *testing.T) {
+	var l *ledger.Ledger
+	run, err := l.NewRun(ledger.KindIndex, repositoryID)
+	if err != nil || run != nil {
+		t.Fatalf("a ledger that records nothing opened run %v (%v), want no run and no failure", run, err)
+	}
+	base := context.Background()
+	ctx := run.Context(base)
+	if ctx != base {
+		t.Fatal("a run that records nothing put itself in the context")
+	}
+	spanCtx, span := ledger.Start(ctx, "seal", "")
+	span.AddIn(3)
+	span.End(ledger.OutcomeOK, ledger.Measured{}, nil)
+	run.AttachGeneration(7)
+	run.Report(ledger.Totals{FileCount: 1})
+	run.Finish(ledger.OutcomeOK)
+	l.Subscribe(func(ledger.SpanRow) { t.Error("a ledger that records nothing published a span") })
+	if span != nil || spanCtx != ctx || run.ID() != "" || run.Dropped() != 0 {
+		t.Fatalf("span %v, run id %q, dropped %d: a run that records nothing reported something",
+			span, run.ID(), run.Dropped())
+	}
+	overlay, err := l.OverlayRuns(ctx)
+	if len(overlay) != 0 || err != nil {
+		t.Fatalf("overlay runs %v (%v), want none and no failure", overlay, err)
+	}
+	if err := l.DeleteRuns(ctx, []int64{7}); err != nil {
+		t.Fatalf("delete runs: %v", err)
+	}
+	if err := l.DeleteOverlayRuns(ctx, []string{repositoryID}); err != nil {
+		t.Fatalf("delete overlay runs: %v", err)
+	}
+	if err := l.Stop(); err != nil {
+		t.Fatalf("stop a ledger that was never opened: %v", err)
+	}
+}
+
 // TestSpanTreeRoundTrips protects the recording itself: if parents, order or
 // counts did not survive the bus and the collector, every surface built on
 // these rows would attribute a run's cost to the wrong stage, which is the
