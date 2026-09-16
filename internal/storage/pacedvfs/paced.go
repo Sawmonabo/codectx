@@ -219,11 +219,25 @@ func xRead(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 // xWrite hands the bytes to the wrapped file and, once a window of them has
 // accumulated, waits for the window before it and submits this one. The wait
 // is the whole point: it is where the writer's pace becomes the disk's.
+// unixWritePiece is the most the wrapped file system writes in one call: it
+// keeps only seventeen bits of a write's length, so a longer write would be
+// cut to its low bits and a multiple of 128 KiB would become a write of
+// nothing, which the engine reports as a full disk. The engine's memory
+// journal writes chunks the size of the statement-journal spill threshold
+// when it spills, so a threshold past this limit reaches the file system
+// only through this split.
+const unixWritePiece = 1 << 16
+
 func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	m := innerMethods(pFile)
-	rc := (*(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxWrite})))(tls, wrapped(pFile), zBuf, iAmt, iOfst)
-	if rc != sqlite3.SQLITE_OK {
-		return rc
+	write := *(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxWrite}))
+	var rc int32
+	for done := int32(0); done < iAmt; {
+		n := min(iAmt-done, unixWritePiece)
+		if rc = write(tls, wrapped(pFile), zBuf+uintptr(done), n, iOfst+int64(done)); rc != sqlite3.SQLITE_OK {
+			return rc
+		}
+		done += n
 	}
 	h := (*header)(ptr(pFile))
 	h.since += int64(iAmt)

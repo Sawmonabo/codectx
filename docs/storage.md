@@ -459,7 +459,9 @@ place, tens of times each, which the page cache of the kernel hides on a short
 run and the disk pays on a long one. The engine's statement journal, which
 records the prior image of every page a savepoint touches, stays in memory up
 to 64 MiB, one batch's worth, instead of being rewritten to a temporary file
-at every batch (fifteen times the bytes stored, measured). And the log is
+at every batch (fifteen times the bytes stored, measured); when it does spill,
+the shim hands its chunks to the file system in pieces the engine's own write
+path accepts whole. And the log is
 truncated whenever the engine resets it, so the store can tell a group's first
 frame from the log's size and header, and a run never leaves a log the size of
 its largest group on disk. The group's commit and the checkpoint that follows

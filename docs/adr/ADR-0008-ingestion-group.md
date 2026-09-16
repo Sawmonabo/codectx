@@ -151,6 +151,17 @@ export). This is the delete scheduler of a log-structured storage engine, whose
 the whole file"; the window is the same layout constant as the write window and there is no
 rate and no setting.
 
+### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
+
+The statement journal's threshold is also the size of the chunks the engine's memory journal
+allocates and, when the journal spills, writes to its file one call each; and the engine's own
+unix file system keeps only seventeen bits of a write's length, so a 64 MiB chunk reaches it as
+a write of nothing and comes back as "database or disk is full" (measured: the fourth uncapped
+index of the 6 270-file repository died of exactly that at its activation, the first statement to
+journal more than the threshold inside a savepoint, with 881 GB free). The shim therefore hands
+the wrapped write every call in 64 KiB pieces, whatever length the engine asks for. The threshold
+stays where decision 3 put it; the write path is what had the limit.
+
 ## What the numbers must show
 
 The ingestion test after the change, the group flushed and the log folded into the database before
@@ -241,6 +252,10 @@ the reference repository's size is expected to reach.
   passive checkpoint does, releasing the cache).
 - Configuration options, SQLITE_CONFIG_STMTJRNL_SPILL — https://sqlite.org/c3ref/c_config_covering_index_scan.html
   (the statement journal's in-memory threshold, settable only before the engine initialises).
+- SQLite source, memjournal.c — https://sqlite.org/src/file?name=src/memjournal.c (a positive
+  threshold is the journal's chunk size; a spilled journal is written one chunk per call).
+- SQLite source, os_unix.c, seekAndWriteFd — https://sqlite.org/src/file?name=src/os_unix.c (a
+  write's length is masked to seventeen bits; a write of nothing is reported as a full disk).
 - Temporary disk files used by SQLite, statement journals — https://sqlite.org/tempfiles.html
   (what a savepoint records and when the journal spills to a file).
 - SQLite source, wal.c — https://sqlite.org/src/file?name=src/wal.c (a page already in the log for
