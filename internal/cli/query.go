@@ -91,7 +91,7 @@ func newRefsCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.Page[model.ReferenceOccurrence]
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				// Names are resolved against the same generation the answer
 				// will pin, so a name and an id name the same node in one
 				// invocation. An argument that is already an id passes through.
@@ -201,7 +201,7 @@ func newCallCommand(build model.BuildInfo, name string, direction model.Directio
 				return err
 			}
 			var result model.GraphResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -285,7 +285,7 @@ func newPathCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.PathResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
@@ -352,7 +352,7 @@ func newImpactCommand(build model.BuildInfo) *cobra.Command {
 				return err
 			}
 			var result model.ImpactResult
-			if err := runService(cmd, openForReport(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
+			if err := runService(cmd, openForQuery(), func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 				nodes, err := ws.ResolveNodes(ctx, gen, args)
 				if err != nil {
 					return err
