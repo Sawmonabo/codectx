@@ -474,6 +474,14 @@ func materialize(root string) error {
 	if err := os.WriteFile(filepath.Join(root, "c", "compile_commands.json"), []byte(compdb), 0o644); err != nil {
 		return err
 	}
+	// The JavaScript leg's whole point is a project with no compiler
+	// configuration, and the TypeScript profile's argv makes the indexer write
+	// the configuration it infers into the directory it is pointed at. A
+	// materialization that is kept (--keep) or reused (--work) would carry that
+	// file into the next run, where the leg would pass while proving nothing.
+	if err := os.Remove(filepath.Join(root, "js", "tsconfig.json")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 
 	// The same shape the Java profile's writeScipJavaConfig emits: the input
 	// directory is both the source root and the only source directory, and
