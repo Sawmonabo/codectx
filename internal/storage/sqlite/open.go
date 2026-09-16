@@ -168,6 +168,10 @@ type Store struct {
 	group        *sql.Tx
 	writerMu     sync.Mutex
 	writerWanted atomic.Int32
+	// commits counts the ingestion groups this store has committed. It is a
+	// disclosure of how a long cascade was broken up, read by the test that
+	// holds the activation's compaction to the group bound.
+	commits atomic.Int64
 	// groupLog is the count of bytes written to a write-ahead log through the
 	// process's file system when the open group began. Nothing reaches the log
 	// while a group's dirty pages fit the writer's page cache, so a count that
@@ -544,6 +548,7 @@ func (s *Store) commitGroupLocked() error {
 	s.group = nil
 	err := tx.Commit()
 	if err == nil {
+		s.commits.Add(1)
 		// The engine checkpoints on its own once the log holds a thousand
 		// frames; a group smaller than that would otherwise leave its frames
 		// for the next group to stack on. A checkpoint that finds a reader on
