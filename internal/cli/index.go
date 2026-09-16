@@ -345,9 +345,11 @@ func newWatchCommand(build model.BuildInfo) *cobra.Command {
 			"than a partial list of paths, and a host that cannot notify falls back " +
 			"to the periodic pass alone. Which of the two is covering the workspace " +
 			"is reported by a status call made inside this process; a separate " +
-			"`codectx status` process cannot see this session's coverage and always " +
-			"reports the watch as off, though `status --resources` and `doctor` do " +
-			"report this watch from its persisted heartbeat. Work an optional " +
+			"`codectx status` process cannot see this session's coverage and " +
+			"reports its own watch as off, but it does list this watch among the " +
+			"watching processes, from the heartbeat this one publishes and " +
+			"refreshes, as `status --resources` and `doctor` also report it. " +
+			"Work an optional " +
 			"provider deferred keeps " +
 			"publishing for the whole session, and the workspace lock is held " +
 			"throughout: one writer, never two.",
@@ -748,6 +750,7 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	if s.LastReconciledAt != nil {
 		fmt.Fprintf(&b, "reconciled  %s\n", s.LastReconciledAt.Format(time.RFC3339))
 	}
+	writeWatchers(&b, s.Watchers)
 	writeProvidersDisabled(&b, s.ProvidersDisabled)
 	writeCapabilities(&b, s.Completeness)
 	for _, warning := range s.Warnings {
@@ -760,6 +763,39 @@ func writeIndexStatus(w io.Writer, s model.IndexStatus) error {
 	}
 	b.WriteString("\n")
 	return writeText(w, "%s", b.String())
+}
+
+// writeWatchers lists the watching processes whose heartbeats are live, which
+// is what the line above cannot say: `watch` is this process's own watch, and a
+// `codectx status` run in another terminal is watching nothing however many
+// watches the workspace has.
+//
+// The list is printed even when it is empty, for the reason the resource block
+// prints every row: a section that vanished with its contents would leave an
+// operator unable to tell "nothing is watching this workspace" from "this
+// output does not report watches". Each watcher is named by its own session and
+// process, and a watcher that has completed no pass is shown as covering
+// nothing rather than with a figure it never published -- it is running and
+// waiting for whichever process holds the workspace, which is neither coverage
+// nor an absent watch.
+func writeWatchers(b *strings.Builder, watchers []model.WatchProcess) {
+	if len(watchers) == 0 {
+		b.WriteString("watchers    none\n")
+		return
+	}
+	fmt.Fprintf(b, "watchers    %d live\n", len(watchers))
+	for _, w := range watchers {
+		fmt.Fprintf(b, "  pid %d  session %s  beat %s  ", w.PID, w.SessionID, w.LastBeatAt.Format(time.RFC3339))
+		if w.LastPassAt == nil {
+			b.WriteString("no pass completed, covering nothing yet\n")
+			continue
+		}
+		fmt.Fprintf(b, "last pass %s", w.LastPassAt.Format(time.RFC3339))
+		if w.PendingEvents != nil {
+			fmt.Fprintf(b, ", %d pending %s", *w.PendingEvents, plural(int(*w.PendingEvents), "event", "events"))
+		}
+		b.WriteString("\n")
+	}
 }
 
 // metricUnavailable is how an unmeasured metric renders. Section 22 requires an
