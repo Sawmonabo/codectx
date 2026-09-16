@@ -450,3 +450,113 @@ func (e eventLog) pid() int {
 	}
 	return pid
 }
+
+// A repository whose projects live in subdirectories gets one server per
+// project, each rooted at its own directory.
+//
+// A language server resolves a project from the directory it was started in.
+// Rooted at the workspace root of a monorepo, it is handed a directory whose
+// manifest declares none of the projects beneath it: it builds no project
+// model and answers about a file with whatever that file alone tells it, which
+// is a silently degraded answer labelled exactly like a good one. The overlay
+// therefore keys a server by the project as well as by the snapshot and the
+// profile, and the label it publishes carries that project too.
+//
+// Mutation: drop `root` from serverKey (or set RootURI back to
+// s.uris.rootURI()) -> "two projects share one server (1 running)" / the two
+// overlays' input digests are equal.
+func TestServersAreRootedAtTheirOwnProjects(t *testing.T) {
+	h := providertest.New(t, map[string]string{
+		"app/go.mod":  "module app\n",
+		"app/main.go": mainGo,
+		"svc/go.mod":  "module svc\n",
+		"svc/main.go": mainGo,
+	})
+	appFile := h.File(t, "app/main.go")
+	svcFile := h.File(t, "svc/main.go")
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 2, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODECTX_LSP_FAKE", "1")
+	t.Setenv("CODECTX_LSP_FAKE_ENCODING", "utf-16")
+	resolver := offlineResolver(t, map[string]toolchain.Override{
+		"gopls": {Executable: exe, Version: "1.2.3", Checksum: fileDigest(t, exe)},
+	})
+	ctx := context.Background()
+	profile, err := Resolve(ctx, resolver, config.Defaults(), "gopls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.EnvAllowlist = append(profile.EnvAllowlist, "CODECTX_LSP_FAKE", "CODECTX_LSP_FAKE_ENCODING")
+	mgr, err := New(Options{Runner: runner, DataDir: h.Policy.DataDir, MaxServers: 2, IdleTTL: time.Minute,
+		StopTimeout: 500 * time.Millisecond, RequestTimeout: 10 * time.Second, StartTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Close()
+
+	// The project of a file is the deepest directory above it that declares
+	// one, read from the pinned snapshot and not from the live checkout.
+	open := func(t *testing.T, path string) (*Overlay, Profile) {
+		t.Helper()
+		root, err := profile.ProjectRoot(ctx, h.View, path)
+		if err != nil {
+			t.Fatalf("ProjectRoot(%s): %v", path, err)
+		}
+		p := profile
+		p.Root = root
+		ov, err := mgr.Open(ctx, h.View, p)
+		if err != nil {
+			t.Fatalf("Open(%s): %v", path, err)
+		}
+		return ov, p
+	}
+	appOv, appProfile := open(t, "app/main.go")
+	defer appOv.Close()
+	svcOv, svcProfile := open(t, "svc/main.go")
+	defer svcOv.Close()
+
+	if appProfile.Root != "app" || svcProfile.Root != "svc" {
+		t.Fatalf("project roots = %q / %q, want \"app\" / \"svc\"", appProfile.Root, svcProfile.Root)
+	}
+	if got := mgr.Servers(); got != 2 {
+		t.Fatalf("two projects share one server (%d running), want one server per project", got)
+	}
+	if appOv.Binding().InputDigest == svcOv.Binding().InputDigest {
+		t.Fatalf("both projects' answers carry input digest %q, so nothing tells them apart",
+			appOv.Binding().InputDigest)
+	}
+	for _, c := range []struct {
+		name string
+		p    Profile
+	}{{"app", appProfile}, {"svc", svcProfile}} {
+		events := eventLog{t: t, path: filepath.Join(c.p.workDir(h.Policy.DataDir), "events.log")}
+		got := events.wait("root=")
+		if !strings.HasSuffix(got, "/"+c.name) {
+			t.Fatalf("the %s server was started at %q, want its own project directory", c.name, got)
+		}
+	}
+
+	// Each server answers about a position in its own project, and the answer
+	// binds to that project's file.
+	byteOf := func(needle string) uint64 { return uint64(strings.Index(mainGo, needle)) }
+	appDef, err := appOv.Definition(ctx, At{File: appFile.ID, Byte: byteOf("y = 1")}, 10)
+	if err != nil {
+		t.Fatalf("app Definition: %v", err)
+	}
+	svcDef, err := svcOv.Definition(ctx, At{File: svcFile.ID, Byte: byteOf("y = 1")}, 10)
+	if err != nil {
+		t.Fatalf("svc Definition: %v", err)
+	}
+	if len(appDef.Items) != 1 || appDef.Items[0].Path != "app/main.go" {
+		t.Fatalf("app definition = %+v, want exactly app/main.go", appDef.Items)
+	}
+	if len(svcDef.Items) != 1 || svcDef.Items[0].Path != "svc/main.go" {
+		t.Fatalf("svc definition = %+v, want exactly svc/main.go", svcDef.Items)
+	}
+}

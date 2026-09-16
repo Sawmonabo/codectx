@@ -90,6 +90,11 @@ type server struct {
 type serverKey struct {
 	snapshot model.SnapshotID
 	profile  string
+	// root is the root-relative project directory the server was started at.
+	// It is part of the key because a server rooted at one project of a
+	// monorepo cannot answer about another: sharing one server across projects
+	// is what made a workspace-root server answer about none of them.
+	root string
 }
 
 // pipeStream joins the server's stdout (read side) and stdin (write side)
@@ -128,7 +133,7 @@ func startServer(ctx context.Context, m *Manager, view model.SnapshotView, p Pro
 		// while an unbounded cache would make the overlay's peak a function of
 		// the repository.
 		docCacheBytes: m.opts.MaxOverlayBytes.ValueOr(DefaultDocCacheBytes),
-		key:           serverKey{snapshot: snap.ID, profile: p.Name},
+		key:           serverKey{snapshot: snap.ID, profile: p.Name, root: p.Root},
 		profile:       p, view: view, opts: m.opts, manager: m,
 		mat:    mat,
 		uris:   materializationURI{root: mat.Root()},
@@ -240,8 +245,8 @@ func (s *server) initialize(ctx context.Context, snap model.Snapshot) error {
 	defer cancel()
 	params := initializeParams{
 		ClientInfo:       clientInfo{Name: "codectx", Version: model.CurrentBuildInfo().Version},
-		RootURI:          s.uris.rootURI(),
-		WorkspaceFolders: []workspaceFolder{{URI: s.uris.rootURI(), Name: "snapshot"}},
+		RootURI:          s.uris.uri(s.profile.Root),
+		WorkspaceFolders: []workspaceFolder{{URI: s.uris.uri(s.profile.Root), Name: "project"}},
 		Capabilities: clientCapabilities{
 			General: generalCapabilities{PositionEncodings: offeredEncodings},
 			TextDocument: textDocumentCapabilities{

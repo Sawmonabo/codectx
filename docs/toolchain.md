@@ -207,19 +207,19 @@ payload for this platform is skipped rather than failed. Each completed fetch
 logs one record — tool, version, digest, bytes, elapsed — on stderr, and the
 report of what is now installed goes to stdout.
 
-`--for-repo PATH` installs what that repository's **root** selects, which on a Go
+`--for-repo PATH` installs what that repository selects, which on a Go
 repository is four payloads rather than fourteen. The selection is read from the
 mappings that already decide it — the SCIP indexers' trigger manifests, the
 language servers' root markers, the dependence families' project markers, and
 the path-to-language table for the source check below — plus each selected
 entry's `runtime` from the lock, so no second copy of any of them exists
-anywhere in the CLI. Everything is read at the repository root, by metadata or
-by filename, through the confined root handle for the markers and as one listing
-of the root directory for the sources: nothing is opened, nothing is started,
-and nothing below the root is walked, so the work is bounded by the number of
-markers plus the entries of one directory rather than by the size of the
-repository. A root that selects nothing is an argument error rather than a
-silent no-op.
+anywhere in the CLI. The whole repository is read, by filename only, through one
+traversal under the configuration's own traversal policy: nothing is opened and
+nothing is started, a manifest inside an excluded tree (`node_modules`,
+`vendor`, a build directory) is not a project and selects nothing, and the walk
+ends as soon as every marker has been seen and a source found, because at that
+moment the answer is complete. A repository that selects nothing is an argument
+error rather than a silent no-op.
 
 `prefetch` also removes every payload directory the lock does not name — the
 `unlisted` rows of `verify`. Its post-condition is a store holding what this
@@ -227,35 +227,31 @@ binary pins, and bytes no lock entry vouches for are not part of that. It leaves
 superseded **versions** of pinned tools alone; reclaiming those is `gc`'s job,
 because another workspace may still be resolving one.
 
-The root is the whole of what the command can see, and that is the planner's
-answer for two of the three providers but not the third:
+What the command sees is what the planners see, for all three providers:
 
-- **SCIP and LSP are root-only too.** Both detect from manifests at the
-  repository root, so what `--for-repo` selects for them is exactly what an
-  index run resolves. A nested `svc/pom.xml` selects no Java payload here, and
-  it selects none at index time either.
+- **The precise indexers and the language servers are planned per project.**
+  Both find their manifests anywhere the traversal admits, so what `--for-repo`
+  selects for them is exactly what an index run resolves. A nested
+  `svc/pom.xml` selects the Java payloads here, and it plans a unit and roots a
+  server at `svc/` at index time. A repository whose every project sits in a
+  subdirectory — the ordinary monorepo — selected nothing at all while a
+  root-only check decided this.
 - **The dependence provider walks for sources.** Its C/C++ family declares no
-  project marker at all — its unit is the repository itself, planned
-  unconditionally — and its other families' units are found by walking the
-  tree. `--for-repo` therefore selects the graph engine and its JDK on three
-  signals: a project marker of one of the other families at the root
-  (`go.mod`, `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
+  project marker at all — its unit is the repository itself — and its other
+  families' units are found by walking the tree. `--for-repo` therefore selects
+  the graph engine and its JDK on either of two signals anywhere in the
+  repository: a project marker of one of the other families (`go.mod`,
+  `pom.xml`, `build.gradle`, `build.gradle.kts`, `tsconfig.json`,
   `jsconfig.json`, `package.json`, `pyproject.toml`, `setup.py`, `setup.cfg`,
-  `Cargo.toml`), a C or C++ build declaration at the root (`CMakeLists.txt` or
-  `compile_commands.json`, which also cover the out-of-source layout with
-  sources under `src/`; a bare `Makefile` does not count, since it is common at
-  roots of every language), or a source file of any of the families lying at
-  the root itself. This over-selects in one direction only: a root carrying
-  `CMakeLists.txt` or a project marker with no source of that family anywhere
-  in the tree still prefetches the engine, because the planner gates on sources
-  while this command reads only the root.
+  `Cargo.toml`), or a source file of any of the families. The C and C++ family
+  is selected by its sources, which is what the planner gates on; a build
+  declaration with no source of that family anywhere selects nothing, because
+  no unit would analyse it.
 
-  One root shape is therefore still under-served and fetches the graph engine
-  and its JDK at index time after a `--for-repo` prefetch reported success: a
-  root that declares nothing at all while its sources live further down.
-  Closing it would need a walk, which this command refuses so a prefetch's
-  work stays bounded. When prefetching for an air-gapped runner from that
-  shape, name the tools explicitly or use `--all`.
+The Git ignore predicate an index run installs on top of the traversal policy is
+not built here — it needs a Git process runner this command has none of — so the
+walk may see a handful of paths a capture excludes. That direction can only
+select a payload the repository does not need; it can never miss one.
 
 ```console
 $ codectx tools prefetch --for-repo .
@@ -336,7 +332,7 @@ codectx tools verify           # rehash the store against the lock
 
 `prefetch --all` installs every entry the lock carries **for this platform**;
 there is no target flag, for the same reason there is no cross-built bundle.
-`--for-repo PATH` narrows it to what that repository's root actually selects,
+`--for-repo PATH` narrows it to what that repository actually selects,
 which is usually a much smaller store.
 
 With `[tools] offline = true` every fetch becomes a typed refusal that opens no

@@ -538,23 +538,43 @@ func (p *Provider) build(ctx context.Context, req provider.UnitRequest, unit Uni
 	if outcome.Class == FailureEngine {
 		// A reproducible crash is the only thing subdivision is for. Every
 		// capability of the result then says so.
-		report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, outcome)
-		if err != nil {
-			return publication{}, ImportReport{}, err
-		}
-		return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(outcome),
-			OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily.Value()}, report, nil
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, outcome)
 	}
 
-	exp, err := p.export(ctx, req, unit, res, run, graph)
+	exp, crash, err := p.export(ctx, req, unit, res, run, graph)
 	if err != nil {
 		return publication{}, ImportReport{}, err
+	}
+	if crash.Class == FailureEngine {
+		// The parse produced a graph and the engine then died writing it out,
+		// twice, on its own exception. That is the same condition subdivision
+		// recovers from on the parse side and it has the same recovery: the
+		// whole unit's export is dead while its children's are not, measured
+		// on a 4,984-file project whose export died at every heap cap while
+		// every subdivided part of it exported. Reporting it as a failed unit
+		// threw away facts the engine could still produce.
+		return p.recoverBySubdivision(ctx, req, unit, res, run, source, sink, crash)
 	}
 	report, err := p.importExport(ctx, req, unit, source, unit.Root, run.path("export"), sink, opts)
 	if err != nil {
 		return publication{}, ImportReport{}, err
 	}
 	return publication{Skipped: outcome.SkippedMethods, SkippedCount: outcome.SkippedCount + exp.SkippedCount}, report, nil
+}
+
+// recoverBySubdivision splits the unit after a reproducible engine crash --
+// in the parse or in the export -- and renders what the caller publishes: a
+// partial result naming the subdivided scope and the failing pass and
+// exception, never a failed unit.
+func (p *Provider) recoverBySubdivision(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
+	run *runDir, source string, sink provider.Sink, crash Outcome) (publication, ImportReport, error) {
+
+	report, overParts, err := p.subdivide(ctx, req, unit, res, run, source, sink, crash)
+	if err != nil {
+		return publication{}, ImportReport{}, err
+	}
+	return publication{Subdivided: unit.ScopeKey, BackendFailed: backendFailure(crash),
+		OverUnitsPerFamily: overParts, UnitsPerFamilyBound: p.opts.MaxUnitsPerFamily.Value()}, report, nil
 }
 
 // graphFor reuses a cached graph whose semantic closure matches, or parses a
@@ -669,26 +689,44 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 // with source files whose export carries no methods is the zero-exit helper
 // crash of research Section 6: the exit code is a lie there, and the only
 // honest signal is the empty result.
+//
+// The second return is a reproducible engine crash the caller must subdivide
+// on, exactly as graphFor returns one for the parse. An export that dies on
+// the engine's own exception is not a property of the unit's memory or of its
+// deadline -- those keep their own failure paths here -- and it is not a
+// verdict on the unit's source either: the children of a project whose whole
+// export dies export cleanly. Confirming it costs one more export of a graph
+// already on disk; the engine exposes no neutral option for this step, so the
+// confirmation is the same argv a second time and what it yields is a second
+// observation of the same class, which is what subdivision rests on.
 func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
-	run *runDir, graph string) (ExportOutcome, error) {
+	run *runDir, graph string) (ExportOutcome, Outcome, error) {
 
-	dir := run.path("export")
-	timeout, err := remaining(ctx)
+	out, err := p.runExport(ctx, req, unit, res, run, graph)
 	if err != nil {
-		return ExportOutcome{}, err
+		return ExportOutcome{}, Outcome{}, err
 	}
-	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: dir,
-		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
-	if err != nil {
-		return ExportOutcome{}, err
+	if out.Class == FailureEngine && out.Exception != "" {
+		confirm, err := p.runExport(ctx, req, unit, res, run, graph)
+		if err != nil {
+			return ExportOutcome{}, Outcome{}, err
+		}
+		switch {
+		case confirm.Class == FailureEngine && confirm.Exception != "":
+			// Nothing of this export is usable; the children write their own
+			// directories and the failed one would otherwise sit on the disk
+			// for the rest of the run.
+			if err := paced.RemoveAllFor(paced.AnalyzerOutput, run.path("export")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				slog.Error("a failed dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
+			}
+			return ExportOutcome{}, confirm.Outcome, nil
+		case confirm.Class != FailureNone:
+			return ExportOutcome{}, Outcome{}, failure(confirm.Class, unit.ScopeKey, confirm.Outcome, res)
+		}
+		out = confirm
 	}
-	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
-		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
-		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes)
-	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	if out.Class != FailureNone {
-		return ExportOutcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
+		return ExportOutcome{}, Outcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
 	}
 	if unit.Files > 0 && !out.Live {
 		// Both steps exited cleanly and the export holds no method. That is
@@ -699,11 +737,33 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		// declared, so the two can be compared against what the frontend
 		// admits.
 		out.Outcome.Class = FailureEmptyExport
-		return ExportOutcome{}, failure(FailureEmptyExport, unit.ScopeKey, out.Outcome, res).
+		return ExportOutcome{}, Outcome{}, failure(FailureEmptyExport, unit.ScopeKey, out.Outcome, res).
 			WithDetail("family", string(unit.Family)).
 			WithDetail("source_files", itoa(unit.Files)).
 			WithRemediation("check whether the frontend of this language family excludes the directories this project's sources are in")
 	}
+	return out, Outcome{}, nil
+}
+
+// runExport is one export step: the engine run, its log line and its observed
+// peak. It classifies nothing -- export above decides what each class means.
+func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
+	run *runDir, graph string) (ExportOutcome, error) {
+
+	timeout, err := remaining(ctx)
+	if err != nil {
+		return ExportOutcome{}, err
+	}
+	out, err := p.backend.Export(ctx, ExportRequest{GraphPath: graph, OutputDir: run.path("export"),
+		HeapCapBytes: res.ExportHeapCapBytes, ReservationBytes: res.ExportBytes(), Timeout: timeout, StallTimeout: p.opts.StallTimeout})
+	if err != nil {
+		return ExportOutcome{}, err
+	}
+	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
+		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
+		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes, "pass", out.Pass, "exception", out.Exception)
+	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
 	return out, nil
 }
 

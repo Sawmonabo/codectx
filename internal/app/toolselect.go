@@ -1,12 +1,12 @@
 package app
 
 import (
+	"context"
 	"errors"
-	"io"
-	"maps"
-	"os"
+	"path"
 	"sort"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
@@ -22,40 +22,81 @@ import (
 // package that runs it, never on a command surface.
 const cpgKind = "cpg"
 
-// SelectedTools is the lock entries the manifests and sources at one repository's
-// root select. It reads the mappings that already decide them -- the SCIP
-// indexers' triggers, the language servers' root markers, the dependence
-// families' project markers, and lang.Of/dependence.FamilyOf for the source
-// check below -- from the packages that own them. There is deliberately no
-// table here: a second copy of the mapping that decides what gets downloaded is
-// exactly the drift policy.md forbids.
+// SelectedTools is the lock entries one repository's own manifests and sources
+// select. It reads the mappings that already decide them -- the SCIP indexers'
+// triggers, the language servers' root markers, the dependence families'
+// project markers, and lang.Of/dependence.FamilyOf for the source check below
+// -- from the packages that own them. There is deliberately no table here: a
+// second copy of the mapping that decides what gets downloaded is exactly the
+// drift policy.md forbids.
 //
-// The answer is the root's answer, not the planner's. Markers are read at the
-// repository root, through the confined handle and by metadata alone, which is
-// the same rule lsp.Definition.Detect applies: a present marker selects a
-// payload, it never starts anything, and nothing below the root is walked. That
-// matches the SCIP and LSP providers, which are root-only too, but it does not
-// match the dependence provider, which walks the tree for sources; sources
-// under a root that declares nothing are therefore outside what this command
-// can see, and docs/toolchain.md says so.
-func SelectedTools(path string) ([]string, error) {
-	root, err := workspace.Discover(path)
+// The answer is the whole repository's answer, not its root directory's. A
+// repository does not keep its projects at its root: every `package.json` of a
+// measured monorepo sits in a subdirectory, so a root-only marker check
+// resolved no indexer payload at all while each of that repository's projects
+// had an indexer and a language server to run. The traversal is the
+// workspace's own, under the configuration's traversal policy, so a manifest
+// inside a dependency directory or any other excluded tree is never seen --
+// the same tree the precise and dependence planners walk, which is what makes
+// what this command installs and what an index needs one question.
+//
+// The Git ignore predicate snapshot.TraversalPolicy adds is not installed
+// here: building it needs a Git process runner this command has none of, and
+// without it the walk sees a few paths a capture would exclude. That direction
+// only ever selects a payload the repository may not need; the direction this
+// command must never take is missing one.
+func SelectedTools(dir string) ([]string, error) {
+	root, err := workspace.Discover(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
 
-	lock := toolchain.Embedded()
-	selected := make(map[string]bool, len(lock.Tools))
-	present := func(marker string) bool {
-		info, err := root.Lstat(marker)
-		return err == nil && info.Mode().IsRegular()
+	cfg, err := config.Load(root.Path)
+	if err != nil {
+		return nil, err
 	}
-	// A tool is selected by the first of its markers that exists; which one it
-	// was does not change the payload.
-	add := func(name string, markers []string) {
-		for _, marker := range markers {
-			if present(marker) {
+	lock := toolchain.Embedded()
+
+	// The marker names every mapping below asks about, collected before the
+	// walk so that one traversal answers all of them.
+	markers := map[string]bool{}
+	for _, kind := range scip.Kinds {
+		for _, t := range scip.Triggers(kind) {
+			markers[t] = true
+		}
+	}
+	for _, def := range lsp.Definitions() {
+		for _, m := range def.RootMarkers {
+			markers[m] = true
+		}
+	}
+	// The dependence provider is the one provider a marker pass alone
+	// under-serves. Its C/C++ family declares no project marker at all, and the
+	// other families' units are found by walking for sources, so a directory
+	// carrying nothing but sources still runs the graph engine at index time.
+	// Marker-only selection therefore left a C or C++ repository without the
+	// engine or its runtime, and the user discovered that mid-index on the
+	// offline runner prefetching exists to serve. Either signal selects the
+	// engine: a project marker of any family, or a source file of any family.
+	for _, family := range dependence.Families {
+		for _, m := range dependence.ProjectMarkers(family) {
+			markers[m] = true
+		}
+	}
+
+	present, hasDependenceSource, err := repositorySignals(root, cfg.TraversalPolicy(), markers)
+	if err != nil {
+		return nil, err
+	}
+
+	selected := make(map[string]bool, len(lock.Tools))
+	// A tool is selected by the first of its markers the repository holds;
+	// which one it was, and which directory holds it, does not change the
+	// payload.
+	add := func(name string, names []string) {
+		for _, marker := range names {
+			if present[marker] {
 				selected[name] = true
 				return
 			}
@@ -67,30 +108,17 @@ func SelectedTools(path string) ([]string, error) {
 	for _, def := range lsp.Definitions() {
 		add(def.Name, def.RootMarkers)
 	}
-	// The dependence provider is the one provider a marker pass alone
-	// under-serves. Its C/C++ family declares no project marker at all -- its
-	// unit is the repository itself, planned unconditionally -- and the other
-	// families' units are found by walking for sources, so a root carrying
-	// nothing but sources still runs the graph engine at index time. Marker-only
-	// selection therefore left a C or C++ repository without the engine or its
-	// runtime, and the user discovered that mid-index on the offline runner
-	// prefetching exists to serve. Either signal at the root selects the engine:
-	// a project marker of any family, or a source file of any family. This is
-	// still no walk -- one listing of the root directory, bounded below.
-	//
-	// Two root shapes remain under-served and docs/toolchain.md names both: a
-	// root that declares nothing and holds no source of its own, and a root
-	// declaring only a C or C++ build (CMakeLists.txt, compile_commands.json,
-	// Makefile) with its sources under src/ -- those three are the C/C++
-	// family's closure markers, which dependence does not export, not project
-	// markers. Closing the second needs a ClosureMarkers accessor beside
-	// ProjectMarkers; hardcoding the three names here is the drift this
-	// function exists to avoid.
 	if cpg := cpgEntries(lock); len(cpg) > 0 {
-		wanted := rootDeclaresDependenceProject(present)
-		if !wanted {
-			if wanted, err = rootHasDependenceSource(root); err != nil {
-				return nil, err
+		wanted := hasDependenceSource
+		for _, family := range dependence.Families {
+			if wanted {
+				break
+			}
+			for _, marker := range dependence.ProjectMarkers(family) {
+				if present[marker] {
+					wanted = true
+					break
+				}
 			}
 		}
 		if wanted {
@@ -102,7 +130,8 @@ func SelectedTools(path string) ([]string, error) {
 	// The runtimes come from the lock's own `runtime` field rather than from a
 	// second mapping: a Node-hosted indexer cannot run without node, and the
 	// point of prefetching is that nothing is fetched later.
-	for name := range maps.Clone(selected) {
+	runtimes := make([]string, 0, 2)
+	for name := range selected {
 		entry, ok := lock.Tools[name]
 		if !ok {
 			// Every name above is a lock entry by construction, so a miss is a
@@ -111,10 +140,13 @@ func SelectedTools(path string) ([]string, error) {
 				Message: "a profile names a tool the embedded lock does not carry: " + name}
 		}
 		if entry.Runtime != "" {
-			selected[entry.Runtime] = true
+			runtimes = append(runtimes, entry.Runtime)
 		}
 	}
-	// An empty selection is an ANSWER, not a failure. A root that selects
+	for _, name := range runtimes {
+		selected[name] = true
+	}
+	// An empty selection is an ANSWER, not a failure. A repository that selects
 	// nothing gives the doctor no toolchain row to report; only
 	// `tools prefetch --for-repo` treats it as a user error, because that
 	// command was asked to install something and has nothing to install.
@@ -126,96 +158,41 @@ func SelectedTools(path string) ([]string, error) {
 	return names, nil
 }
 
-// rootDeclaresDependenceProject reports whether the repository root carries a
-// project marker of any family the dependence provider analyses, read through
-// the same metadata-only predicate every other marker uses.
-func rootDeclaresDependenceProject(present func(string) bool) bool {
-	for _, family := range dependence.Families {
-		for _, marker := range dependence.ProjectMarkers(family) {
-			if present(marker) {
-				return true
-			}
-		}
-	}
-	// The C/C++ family declares no project marker at all; its build files are
-	// closure markers, and a root carrying a C/C++ build declaration (the
-	// out-of-source CMake layout keeps every source under src/) declares the
-	// family. Only the two that declare a C/C++ build are admitted: a Makefile
-	// is ubiquitous in Go, Python and Rust roots and would fetch the engine for
-	// a repository that never resolves it; go.sum or yarn.lock alone must not
-	// select the engine when the project marker beside them already decides it.
-	// A CMakeLists.txt at a root with no C/C++ source anywhere still selects
-	// the engine -- the planner gates on sources, this command on the root --
-	// and docs/toolchain.md says so.
-	for _, marker := range dependence.ClosureMarkers(dependence.FamilyC) {
-		if marker == "Makefile" {
-			continue
-		}
-		if present(marker) {
-			return true
-		}
-	}
-	return false
-}
-
-const (
-	// rootListingBatch is how many directory entries the source check holds at
-	// once. Nothing is retained beyond one batch: the answer is a single bit and
-	// the first source file decides it.
-	rootListingBatch = 512
-	// There is no bound on the number of entries the loop below reads. The
-	// listing is batched at rootListingBatch and keeps no entry, so its peak
-	// cost is ONE batch regardless of how many names the root holds; refusing a
-	// large root made the toolchain probe -- and with it the whole prefetch --
-	// fail on a repository that is merely big.
-)
-
-// rootHasDependenceSource reports whether the repository root itself holds a
-// source file of a family the dependence provider analyses. It answers the half
-// of the selection markers cannot: the C/C++ family declares no project marker,
-// so a C or C++ repository is invisible to the marker pass even though the
-// planner always gives it a unit.
+// repositorySignals walks the workspace once and answers the two questions the
+// selection asks of it: which of the marker file names the repository holds
+// anywhere the traversal admits, and whether it holds a source file of a
+// language family the dependence provider analyses.
 //
-// The classification is not a table here either: lang.Of names the language of
-// a path and dependence.FamilyOf names the family that analyses that language,
-// both read from the packages that own them.
-//
-// The root is opened by its own absolute path rather than through the confined
-// handle because there is nothing to confine: Root.Path is the directory
-// os.OpenRoot itself opened, no user-controlled component is joined to it, and
-// workspace.Root exposes no listing of its own (its checkPath refuses "." by
-// design). Only entry names are used, and a non-regular entry -- a directory,
-// or a symlink, which is never followed -- selects nothing.
-func rootHasDependenceSource(root workspace.Root) (bool, error) {
-	dir, err := os.Open(root.Path)
-	if err != nil {
-		return false, listingError(err.Error())
+// Nothing repository-sized is retained: the set of marker names is fixed by
+// the packages that own them before the walk begins, and the source question
+// is one bit. The walk ends as soon as every marker has been seen and a source
+// has been found, because at that moment the answer is complete -- that is the
+// question being over, not a bound on how much of the repository is read.
+func repositorySignals(root workspace.Root, policy workspace.Policy, markers map[string]bool) (map[string]bool, bool, error) {
+	present := make(map[string]bool, len(markers))
+	source := false
+	err := workspace.Walk(context.Background(), root, policy, func(f workspace.File) error {
+		base := path.Base(f.Path)
+		if markers[base] {
+			present[base] = true
+		}
+		if !source && dependence.FamilyOf(lang.Of(base)) != "" {
+			source = true
+		}
+		if source && len(present) == len(markers) {
+			return errSignalsComplete
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errSignalsComplete) {
+		return nil, false, err
 	}
-	defer dir.Close()
-	for {
-		entries, err := dir.ReadDir(rootListingBatch)
-		if errors.Is(err, io.EOF) {
-			return false, nil
-		}
-		if err != nil {
-			return false, listingError(err.Error())
-		}
-		for _, e := range entries {
-			if !e.Type().IsRegular() {
-				continue
-			}
-			if dependence.FamilyOf(lang.Of(e.Name())) != "" {
-				return true, nil
-			}
-		}
-	}
+	return present, source, nil
 }
 
-func listingError(cause string) *model.Error {
-	return (&model.Error{Code: model.CodeArgumentInvalid,
-		Message: "the repository root cannot be listed: " + cause}).
-		WithRemediation("pass --for-repo a readable repository root, or name the tools to install")
-}
+// errSignalsComplete ends the selection walk once nothing later in the
+// repository could change its answer.
+var errSignalsComplete = errors.New("every tool-selection signal is decided")
 
 // cpgEntries are the lock entries of the kind the dependence provider runs.
 // Asking the inventory which entry that is keeps the engine's name out of this
