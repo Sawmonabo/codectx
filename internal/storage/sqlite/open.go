@@ -168,11 +168,11 @@ type Store struct {
 	group        *sql.Tx
 	writerMu     sync.Mutex
 	writerWanted atomic.Int32
-	// groupLog is the write-ahead log as it was when the open group began.
-	// Nothing reaches the log while a group's dirty pages fit the writer's
-	// page cache, so a log that differs from this is one the cache has
-	// started spilling into.
-	groupLog logMark
+	// groupLog is the count of bytes written to a write-ahead log through the
+	// process's file system when the open group began. Nothing reaches the log
+	// while a group's dirty pages fit the writer's page cache, so a count that
+	// has moved since is one the cache has started spilling into.
+	groupLog int64
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -219,20 +219,20 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
 	}
-	// The writer truncates the log whenever the engine resets it, so the
-	// log's size tells the store whether a group has started spilling (a
-	// group that never spills writes nothing to the log until it commits) and
-	// a run never leaves a log the size of its largest group on disk.
-	const journalSizeLimit = "0"
 	// The writer is the only connection whose synchronous mode is a choice,
 	// because it is the only connection that commits. Readers keep FULL.
 	writerSync, err := synchronousPragma(opts.Synchronous)
 	if err != nil {
 		return nil, err
 	}
+	// Nothing sets a journal size limit: the engine's default rewinds the log
+	// in place at every reset rather than truncating it, so the file keeps its
+	// high-water length -- bounded by the log the largest group leaves -- and
+	// every later group writes over the space it already holds. A run that
+	// truncated its log at each reset would hand the filesystem gigabytes of
+	// freed blocks in the middle of its work.
 	writerPragmas := slices.Concat(common, []pragma{
 		writerSync,
-		{"journal_size_limit", journalSizeLimit, journalSizeLimit},
 		{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
 	readerPragmas := slices.Concat(common, []pragma{
 		{"synchronous", "FULL", "2"},
@@ -492,7 +492,7 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 			return wrap("begin", err)
 		}
 		s.group = tx
-		s.groupLog = s.logMark()
+		s.groupLog = pacedvfs.LogBytes()
 	}
 	tx := s.group
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -528,36 +528,10 @@ func (s *Store) commitGroupIfDueLocked(force bool) error {
 	if s.group == nil {
 		return nil
 	}
-	if !force && s.writerWanted.Load() == 0 && s.logMark() == s.groupLog {
+	if !force && s.writerWanted.Load() == 0 && pacedvfs.LogBytes() == s.groupLog {
 		return nil
 	}
 	return s.commitGroupLocked()
-}
-
-// logMark identifies the state of the write-ahead log by its size and its
-// header. A group's first frame either restarts the log, which rewrites the
-// header with a new salt and checkpoint sequence while the file keeps its
-// old length until the commit truncates it, or, when a reader still holds the
-// old frames, appends past them and grows the file; one of the two changes
-// either way, and neither changes while no frame is written.
-type logMark struct {
-	size   int64
-	header [32]byte
-}
-
-func (s *Store) logMark() logMark {
-	var m logMark
-	f, err := os.Open(s.path + "-wal")
-	if err != nil {
-		m.size = -1
-		return m
-	}
-	defer f.Close()
-	if st, err := f.Stat(); err == nil {
-		m.size = st.Size()
-	}
-	_, _ = f.ReadAt(m.header[:], 0)
-	return m
 }
 
 // commitGroupLocked commits the open group, if any, folds its log into the
@@ -597,9 +571,10 @@ func (s *Store) abandonGroupLocked() {
 
 // WALBoundBytes is the largest write-ahead log an ingestion group leaves
 // behind: the writer's page cache, which the group fills before it commits,
-// plus one batch of spilled pages. The engine truncates the log when it resets
-// it, so a log past this bound with no run open is one a reader kept open
-// across several groups, or one that was never checkpointed.
+// plus one batch of spilled pages. The log is rewound in place at every reset
+// and keeps its high-water length, so a log past this bound is one whose
+// frames a group actually reached: a reader kept the old ones open across
+// several groups, or the log was never checkpointed.
 func (s *Store) WALBoundBytes() int64 { return 2 * int64(s.opts.WriterCacheKiB) << 10 }
 
 // Flush commits the open ingestion group, if any. Nothing in the indexing path
