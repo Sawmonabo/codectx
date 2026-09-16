@@ -417,6 +417,13 @@ func (w *UnitWriter) copyFacts(ctx context.Context, tx *sql.Tx, prevRow int64, r
 // -- from the content store over [start_byte, end_byte) -- would index source
 // text no producer ever published as a document body, silently changing every
 // carried document's lexical hits, BM25 length and snippets.
+//
+// segment_id travels with doc_id, so a carried document arrives already packed
+// and already naming the segment it lies in. That column is what makes the
+// carried documents part of the new generation's segment set without anything
+// being rewritten, and it is why a compaction re-points every row it absorbs:
+// a carry that copied an absorbed segment forward would name it beside the one
+// that holds the same documents.
 func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow int64, stats *CarryOverStats) error {
 	res, err := tx.ExecContext(ctx, `INSERT INTO search_units(unit_id, search_key, node_id, file_id, path, kind,
 		name, qualified_name, signature, start_byte, end_byte, token_count, doc_id, segment_id)
@@ -434,23 +441,6 @@ func (w *UnitWriter) copySearchUnits(ctx context.Context, tx *sql.Tx, prevRow in
 		return wrap("search_units", err)
 	}
 	stats.SearchUnits = n
-	if n == 0 {
-		return nil
-	}
-	// The carried documents keep their doc_id and the segment it was folded
-	// into, so they are already packed and nothing is rewritten to carry one
-	// forward. Ownership is read back off the rows that were just written, not
-	// off the predecessor's own ownership: a unit owns EXACTLY the segments
-	// that hold at least one of its documents, so a segment whose documents a
-	// carry chain has all dropped stops being owned and becomes collectable.
-	// The unit's own re-emitted documents are not named here -- their segment
-	// is NULL until the seal folds them.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO segment_units(segment_id, unit_id)
-		SELECT DISTINCT su.segment_id, ?1 FROM search_units su
-		WHERE su.unit_id = ?1 AND su.segment_id IS NOT NULL
-		ON CONFLICT(segment_id, unit_id) DO NOTHING`, w.rowID); err != nil {
-		return wrap("segment_units", err)
-	}
 	return nil
 }
 

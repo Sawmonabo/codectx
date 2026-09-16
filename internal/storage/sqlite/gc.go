@@ -324,8 +324,9 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 				}
 			}
 			deleted, gone = len(ids), ids
-			// The deleted units' segment_units rows cascaded away with them, so
-			// the segments nothing owns or names go in the same transaction.
+			// The deleted units' search_units rows cascaded away with them, so
+			// the segments no row points at and no generation names go in the
+			// same transaction.
 			return collectUnreferencedSegments(ctx, tx)
 		})
 		if err != nil {
@@ -342,12 +343,16 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 	}
 }
 
-// collectUnreferencedSegments deletes every lexical segment no retained
-// generation names and no live unit owns. A segment survives its unit only
-// while a generation still reads it, and survives its generation only while a
-// unit could still be attached to a new one, so the two tests together are
-// what makes a segment collectable. Its parts and its segment_units rows
-// cascade with it.
+// collectUnreferencedSegments deletes every lexical segment that no retained
+// generation names and that no document still points at. A segment survives
+// its generation only while some document lies in it -- the unit holding that
+// document may be attached to a new generation at any time, and it must find
+// its postings where its rows point -- and it survives its last document only
+// while a retained generation still reads it. The two tests together are what
+// makes a segment collectable, and they are what collects a segment a
+// compaction emptied: the merge re-points every row of its inputs, so an
+// absorbed segment is left named only by the generations that were published
+// before it, and it goes when the last of them does. Its parts cascade with it.
 //
 // It runs in the caller's transaction: a generation or a unit that goes away
 // and the segments that go away with it are one atomic change, so no reader
@@ -355,7 +360,7 @@ func (s *Store) collectUnits(ctx context.Context, query string, arg int64) error
 func collectUnreferencedSegments(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, `DELETE FROM lexical_segments
 		WHERE NOT EXISTS (SELECT 1 FROM generation_segments gs WHERE gs.segment_id = lexical_segments.id)
-		AND NOT EXISTS (SELECT 1 FROM segment_units su WHERE su.segment_id = lexical_segments.id)`)
+		AND NOT EXISTS (SELECT 1 FROM search_units su WHERE su.segment_id = lexical_segments.id)`)
 	return wrap("lexical_segments", err)
 }
 
