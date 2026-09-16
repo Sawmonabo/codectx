@@ -560,6 +560,27 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 		t.Errorf("retry cap = %d, want none: the failed attempt already peaked at the whole allocation", got)
 	}
 
+	// The host keeps at least half of what was available when the run began.
+	// Failure mode: an allocation of "everything but two gigabytes" handed one
+	// analyzer a 42 GB heap cap on a 47 GB machine, which then serialized
+	// every other unit behind it and left nothing for the editor, the agents
+	// and the browser the person is using while they index.
+	if small.AllocationBytes > plenty.AvailableBytes/2 {
+		t.Errorf("allocation %d of %d available leaves the host less than half",
+			small.AllocationBytes, plenty.AvailableBytes)
+	}
+	// And the cap comes from what the unit needs, not from what the machine
+	// has: the largest JavaScript project measured ran at full speed under
+	// 4 GiB, so a 157 MB one must not be handed the whole allocation.
+	big := g.Reserve(dependence.FamilyJavaScript, 157<<20, plenty)
+	if big.HeapCapBytes >= big.AllocationBytes {
+		t.Errorf("a 157 MB JavaScript unit was capped at the allocation (%d of %d): the cap is sized to the machine, not to the need",
+			big.HeapCapBytes, big.AllocationBytes)
+	}
+	if big.HeapCapBytes < 4<<30 {
+		t.Errorf("a 157 MB JavaScript unit was capped at %d, below the 4 GiB the measured project needed", big.HeapCapBytes)
+	}
+
 	huge := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
 	if huge.HeapCapBytes != huge.AllocationBytes {
 		t.Errorf("cap %d is not bounded by the machine-derived allocation %d", huge.HeapCapBytes, huge.AllocationBytes)

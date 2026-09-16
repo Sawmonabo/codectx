@@ -5,6 +5,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/scratch"
 )
 
@@ -50,6 +51,11 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
 	report.FreedBytes = nonNegativeBytes(paced.FreedBytes())
+	// What this process handed its heavy analyzers, and what they used. It is
+	// read from the provider's own record rather than from the store because
+	// it is process accounting: a unit's reservation and the peak its tree
+	// reached belong to the run that started it, not to a stored generation.
+	report.AnalyzerUnits = dependence.ObservedUnits()
 	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
