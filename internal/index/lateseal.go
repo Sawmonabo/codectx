@@ -449,8 +449,13 @@ func (l *lateSealer) setPublishing(on bool) {
 // analyzer admission gate.
 // The provider result is answered on both paths: a failure's result carries
 // the run the provider actually opened, which is where the reason is kept.
-func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (model.UnitID, outcome, error) {
+func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUnit) (id model.UnitID, res outcome, err error) {
 	started := l.c.now()
+	// The row exists before the unit is admitted, and the deferred close below
+	// gives it a terminal state on every path this call can take; run closes
+	// it first for a unit that reached its provider.
+	span := ledger.Plan(ctx, d.unit.ProviderID, d.unit.ScopeKey, d.unit.ProviderID)
+	defer func() { span.End(unitEnding(err), ledger.Measured{}, err) }()
 	spec, err := d.unit.Spec(l.c.cfgHash)
 	if err != nil {
 		return "", outcome{}, err
@@ -465,13 +470,19 @@ func (l *lateSealer) runOne(ctx context.Context, work *generation, d deferredUni
 		return spec.ID, outcome{}, nil
 	}
 	if d.unit.Heavy {
-		release, err := l.c.sched.Admit(ctx, d.unit.Reservation)
-		if err != nil {
-			return "", outcome{}, err
+		release, admitErr := l.c.sched.Admit(ctx, d.unit.Reservation)
+		if admitErr != nil {
+			// The gate refused or was cancelled, so the unit never reached its
+			// work: unavailable with that reason, not a failure of a provider
+			// that was never asked. Ending the span here wins over the deferred
+			// close, which takes the first terminal state a span is given.
+			span.End(ledger.OutcomeUnavailable, ledger.Measured{
+				DiagnosticCode: provider.CodeOf(admitErr), Failure: ledger.ReasonNotAdmitted}, nil)
+			return "", outcome{}, admitErr
 		}
 		defer release()
 	}
-	out, err := work.run(ctx, d.unit, spec)
+	out, err := work.run(ctx, d.unit, spec, span)
 	if err != nil {
 		return "", out, err
 	}

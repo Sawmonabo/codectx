@@ -42,6 +42,7 @@ type eventKind int
 
 const (
 	eventStart eventKind = iota
+	eventBegin
 	eventEnd
 )
 
@@ -49,8 +50,11 @@ const (
 // goroutine keeps writing to except the span's counters, which are atomics the
 // collector reads rather than fields it copies.
 type event struct {
-	kind     eventKind
-	span     *Span
+	kind eventKind
+	span *Span
+	// planned marks a start event whose row is written as 'planned' rather
+	// than 'running': the work exists but nothing has begun it.
+	planned  bool
 	outcome  Outcome
 	measured Measured
 	endWall  time.Time

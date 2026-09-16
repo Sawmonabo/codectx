@@ -827,12 +827,15 @@ func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.Sta
 			cpuMetric(stage), byteMetric(stage.PeakRSSBytes),
 			stage.ItemsIn, stage.ItemsOut, stageOutcome(stage))
 	}
-	// What a failed stage failed with, under the row that reports it failed: a
-	// table column cannot hold it, and an outcome of `failed` with the reason
-	// only in --json would leave the operator reading the table to guess.
+	// Why a stage or a unit reached no output, under the row that reports it:
+	// a table column cannot hold it, and an outcome with the reason only in
+	// --json would leave the operator reading the table to guess. The outcome
+	// is repeated rather than assumed, because a unit whose tool is absent is
+	// unavailable and not failed, and its scope is named because a provider
+	// can have many units unavailable for different reasons at once.
 	for _, stage := range stages {
 		if stage.Failure != "" {
-			fmt.Fprintf(tw, "    %s failed\t%s\n", stage.Stage, stage.Failure)
+			fmt.Fprintf(tw, "    %s %s %s\t%s\n", stage.Stage, stageScope(stage), stage.Outcome, stage.Failure)
 		}
 	}
 	flushTableInto(tw)
