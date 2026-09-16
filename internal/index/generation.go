@@ -117,6 +117,14 @@ type generation struct {
 	planned    int64
 	failed     int64
 	subdivided int64
+
+	// walked is how many of the plan's units the build walk reached, and
+	// walkDone says it reached all of them. Together they are where a run that
+	// ended early resumes the plan to account for what it never got to: the
+	// unit sequence is re-iterable and answers in one fixed order, so the
+	// units past walked are exactly the ones nothing ever started.
+	walked   int64
+	walkDone bool
 }
 
 // unitFailure is the typed reason one unit did not seal: the diagnostic
@@ -191,6 +199,11 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (res 
 	// The plan's whole-snapshot input run is a file under the work directory
 	// for as long as the units that stream from it are running, and no longer.
 	defer func() { _ = g.plan.Close() }()
+	// Registered after the close above and so running before it: the account
+	// below walks the plan's units, which must not be called once the plan is
+	// closed. It is what makes a run that died between the plan and the build
+	// still say what it had planned.
+	defer func() { g.accountUnwalkedUnits(ctx) }()
 	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
 		return model.IndexResult{}, err
 	}
@@ -523,13 +536,11 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 	// Plan.Units answers in Selection.Active order -- which is what makes a
 	// provider change the end of its group.
 	walkErr := g.eachUnit(func(u plan.Unit) error {
-		g.planned++
-		span.AddIn(1)
-		// The unit's row exists from the moment the plan names it, before
-		// admission and before any provider is reached. A unit that never
-		// runs is then a row that says so with its reason, instead of a
-		// capability reported unavailable that nothing can substantiate.
-		unitSpan := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
+		// The previous provider's group is drained before this unit is
+		// counted or given a row: a group whose failure ends the walk here
+		// leaves this unit one the walk never reached, which is what the
+		// end-of-run account writes the row for. Counting it first would
+		// leave a row nothing ever closed.
 		if u.ProviderID != current {
 			if group != nil {
 				err := group.wait()
@@ -540,6 +551,14 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 			}
 			current = u.ProviderID
 		}
+		g.planned++
+		g.walked++
+		span.AddIn(1)
+		// The unit's row exists from the moment the plan names it, before
+		// admission and before any provider is reached. A unit that never
+		// runs is then a row that says so with its reason, instead of a
+		// capability reported unavailable that nothing can substantiate.
+		unitSpan := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
 		if u.Deferred {
 			// Not this run's work: it is queued for the background sealer,
 			// which records it under its own run. Leaving the row planned
@@ -554,6 +573,11 @@ func (g *generation) build(ctx context.Context) (_ []plan.Unit, err error) {
 		return group.submit(u, unitSpan)
 	})
 	err = walkErr
+	if walkErr == nil {
+		// The walk reached every unit the plan named, so nothing is left for
+		// the end-of-run account to pick up.
+		g.walkDone = true
+	}
 	if walkErr != nil {
 		// A group left running by the failing walk is drained before the error
 		// is reported, so no unit outlives the call that started it. Its own
@@ -579,6 +603,49 @@ func (g *generation) eachUnit(yield func(plan.Unit) error) error {
 		return nil
 	}
 	return g.plan.Units(yield)
+}
+
+// accountUnwalkedUnits gives every unit the plan named but the build walk
+// never reached a row that says so, at the end of the run that planned them.
+//
+// A run that dies after the plan is derived and before the walk gets to a unit
+// -- a ref that could not be read, a generation that could not be opened, a
+// required provider's first unit failing and cancelling the rest -- would
+// otherwise leave those units with no trace at all, which is exactly the
+// invisibility the planned-unit row exists to remove, in the run an operator
+// most wants to account for. Each row is written already terminal: nothing
+// started the unit, so there is no wall to measure and no provider to name a
+// reason, and the ledger's own reason for work that was never admitted is what
+// it carries.
+//
+// The plan's unit sequence is re-iterable and answers in one fixed order, so
+// resuming it past the units the walk reached names exactly the ones it did
+// not. It must not be called after the plan is closed.
+func (g *generation) accountUnwalkedUnits(ctx context.Context) {
+	if g.walkDone {
+		return
+	}
+	var seen int64
+	err := g.eachUnit(func(u plan.Unit) error {
+		seen++
+		if seen <= g.walked {
+			return nil
+		}
+		span := ledger.Plan(ctx, u.ProviderID, u.ScopeKey, u.ProviderID)
+		span.End(ledger.OutcomeUnavailable, ledger.Measured{
+			DiagnosticCode: model.CodeProviderUnavailable, Failure: ledger.ReasonNotAdmitted}, nil)
+		g.mu.Lock()
+		g.planned++
+		g.mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		// The plan's own sequence could not be re-read, so this run cannot say
+		// what it had left to do. The operator is told that much rather than
+		// being left with a unit count that quietly stops short.
+		logTyped(g.c.log, "the units this run never reached could not be accounted for", err,
+			"component", component, "run_id", g.ledgerRun.ID())
+	}
 }
 
 // unitGroup runs one provider's units with bounded concurrency as the plan
