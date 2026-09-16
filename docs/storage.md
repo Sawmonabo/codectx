@@ -337,12 +337,14 @@ fact of the new unit, which is exactly the condition `SealUnit` enforces.
 
 ## Delta state
 
-`UnitWriter.PutDeltaState(kind, payload)` stores the artifact the *next*
+`UnitWriter.PutDeltaState(kind, reader)` stores the artifact the *next*
 refresh needs in order to diff without recomputing this one: the SCIP
-`DocumentManifest`, the dependence `KeySet`. The payload is opaque to storage
-and bounded by `MaxDeltaStateBytes`. It shares the unit's lifetime exactly, so
-a retired unit takes its manifest with it and no refresh can diff against state
-whose facts were collected. `Store.DeltaState` reads it back;
+`DocumentManifest`, the dependence `KeySet`. The payload is opaque to storage,
+read from the file it was produced in and stored as a sequence of 1 MiB parts,
+so an artifact the size of a large unit is never held whole and has no bound.
+It shares the unit's lifetime exactly, so a retired unit takes its manifest
+with it and no refresh can diff against state whose facts were collected.
+`Store.DeltaState(unit, kind, writer)` streams it back into a file;
 `Store.SelectedUnit` finds the predecessor — the unit the previous generation
 selected for the same provider and scope.
 
@@ -461,10 +463,19 @@ at every batch (fifteen times the bytes stored, measured). And the log is
 truncated whenever the engine resets it, so the store can tell a group's first
 frame from the log's size and header, and a run never leaves a log the size of
 its largest group on disk. The group's commit and the checkpoint that follows
-are paced: while a group is open and until its checkpoint has finished, the
-store asks the kernel every hundred milliseconds to begin writing the log's
-and the database's dirty pages, so the disk receives them as they are
-produced rather than as one burst at the sync. At activation and abort the
+reach the disk as every write of the engine does, through the paced file
+system the process registers as its default: after each 8 MiB window
+written to a file the writer waits for the previous window to reach the
+disk and submits the new one, so at most one window is in flight per file
+and the disk receives a commit at its own rate rather than as one burst at
+the sync ([ADR-0008](adr/ADR-0008-ingestion-group.md), decision 5). Freeing
+is windowed the same way: the file system shim truncates a log or a journal
+the engine frees one window at a time, and every file the process removes
+itself -- a spool, a sort's runs, a staging tree, an analyzer's export -- goes
+through `internal/paced`, which shrinks a file larger than the window one
+window per step before it unlinks it, so a filesystem that discards freed
+blocks as they are freed never receives gigabytes of discards from one
+commit. At activation and abort the
 writer's page cache is released to the process, so a long-lived server does
 not keep a run's working set resident. The engine's temporary files -- the
 spill files of a sort larger than its cache, a statement journal past its

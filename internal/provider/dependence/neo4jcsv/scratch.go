@@ -9,7 +9,7 @@ import (
 	"modernc.org/sqlite"
 
 	"github.com/Sawmonabo/codectx/internal/config"
-	"github.com/Sawmonabo/codectx/internal/writeback"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
 // Export labels this import consumes. A mapped label produces facts or is an
@@ -118,9 +118,8 @@ type graphNode struct {
 // table, and the first design of this scratch did both, at thirty to forty
 // times the export's bytes (ADR-0009).
 type scratch struct {
-	db    *sql.DB
-	pacer *writeback.Pacer
-	rows  int64
+	db   *sql.DB
+	rows int64
 	// maxRows is the user's `providers.dependence.max_staged_rows`, unlimited for
 	// unlimited. It never stops the staging: crossing it sets overRows once,
 	// which the import reports.
@@ -169,9 +168,10 @@ const defaultCacheKiB = 256 << 10
 
 // openScratch creates the import's staging database. Durability is
 // deliberately off: the file is private, single-writer and deleted with the
-// import's scratch directory. Its dirty pages are paced to disk while the
-// import runs, so a phase that fills the page cache at memory speed hands the
-// disk its pages steadily rather than in one burst at the commit.
+// import's scratch directory. Its pages reach the disk through the paced
+// file system every connection of the process uses, so a phase that fills
+// the page cache at memory speed hands the disk its pages at the disk's
+// own rate rather than in one burst at the commit.
 func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.Limit) (*scratch, error) {
 	if cacheKiB <= 0 {
 		cacheKiB = defaultCacheKiB
@@ -182,6 +182,9 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 		q.Add("_pragma", p)
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
+	if err := pacedvfs.Register(); err != nil {
+		return nil, internalErr("import scratch: %v", err)
+	}
 	connector, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		return nil, internalErr("import scratch connector: %v", err)
@@ -193,7 +196,7 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 		db.Close()
 		return nil, internalErr("import scratch schema: %v", err)
 	}
-	return &scratch{db: db, pacer: writeback.Start(path), maxRows: maxRows,
+	return &scratch{db: db, maxRows: maxRows,
 		unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
 }
 
@@ -206,7 +209,6 @@ func (s *scratch) close() error {
 	for _, st := range s.stmt {
 		st.Close()
 	}
-	s.pacer.Stop()
 	return s.db.Close()
 }
 

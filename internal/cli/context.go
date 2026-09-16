@@ -16,6 +16,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/app"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/workspace"
 	"github.com/spf13/cobra"
 )
@@ -1607,7 +1608,7 @@ func writeCapsuleFile(path string, capsule model.Capsule, pager capsuleRowPager)
 	}
 	// The path was created by this command, so removing it destroys nothing the
 	// operator had.
-	_ = os.Remove(path)
+	_ = paced.Remove(path)
 	if writeErr != nil {
 		// A refusal this function raised itself (a list that streamed short)
 		// already carries its own code and remediation and is reported as it

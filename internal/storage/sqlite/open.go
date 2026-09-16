@@ -21,8 +21,9 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/writeback"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -146,6 +147,7 @@ func (o Options) withDefaults() Options {
 // pool and a private in-memory connection for query tokenization.
 type Store struct {
 	path      string
+	freeBytes func(dir string) (uint64, bool) // the disk measurement a refused write is settled against
 	opts      Options
 	writer    *sql.DB
 	readers   *sql.DB
@@ -171,9 +173,6 @@ type Store struct {
 	// page cache, so a log that differs from this is one the cache has
 	// started spilling into.
 	groupLog logMark
-	// pacer runs while a group is open and through its commit, so the
-	// group's log and the checkpoint reach the disk steadily.
-	pacer *writeback.Pacer
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -211,7 +210,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return nil, internal("database directory: " + err.Error())
 	}
-	s := &Store{path: abs, opts: opts}
+	s := &Store{path: abs, opts: opts, freeBytes: diskfree.Available}
 	busy := strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10)
 	common := []pragma{
 		{"busy_timeout", busy, busy},
@@ -297,6 +296,9 @@ func openPool(path string, pragmas []pragma, txlock string, maxConns int) (*sql.
 		dsn = ":memory:?" + q.Encode()
 	} else {
 		dsn = (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
+	}
+	if err := pacedvfs.Register(); err != nil {
+		return nil, internal(err.Error())
 	}
 	base, err := sqlite.NewConnector(dsn)
 	if err != nil {
@@ -413,7 +415,7 @@ func (s *Store) Close() error {
 // commit appends each one to the log exactly once; a group that spilled
 // would write hot pages to the log again and again, in place, and would
 // rewrite every frame's checksum at commit, so the log would no longer be an
-// append-only file the pacer can stream to disk. A commit writes the group's
+// append-only file the disk receives as one sequential stream. A commit writes the group's
 // distinct pages once to the log and the checkpoint copies them once more,
 // so the bytes an index run sends to disk are the distinct pages its groups
 // touch, not the rows it stores; content-addressed identities land on pages
@@ -462,14 +464,14 @@ func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 // outlives any one caller: a caller whose context ends loses its own
 // statement, never the run.
 func (s *Store) ingest(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	return s.ingestGroup(ctx, false, fn)
+	return s.attribute(s.ingestGroup(ctx, false, fn))
 }
 
 // ingestAndCommit is ingest followed by the group's commit, whether fn
 // succeeded or was rolled back, for the calls whose outcome must be durable
 // when they return: a generation's activation or abort.
 func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	err := s.ingestGroup(ctx, true, fn)
+	err := s.attribute(s.ingestGroup(ctx, true, fn))
 	// The run is over: the writer's page cache, which the run filled with
 	// its groups, goes back to the process so a long-lived server does not
 	// keep a run's working set resident.
@@ -491,7 +493,6 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 		}
 		s.group = tx
 		s.groupLog = s.logMark()
-		s.pacer = writeback.Start(s.path, s.path+"-wal")
 	}
 	tx := s.group
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -575,11 +576,9 @@ func (s *Store) commitGroupLocked() error {
 		// the log folds what it can and is not a failure of the commit.
 		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
 	}
-	s.pacer.Stop()
-	s.pacer = nil
 	s.writerMu.Unlock()
 	if err != nil {
-		return wrap("commit", err)
+		return s.attribute(wrap("commit", err))
 	}
 	return nil
 }
@@ -593,8 +592,6 @@ func (s *Store) abandonGroupLocked() {
 	tx := s.group
 	s.group = nil
 	tx.Rollback()
-	s.pacer.Stop()
-	s.pacer = nil
 	s.writerMu.Unlock()
 }
 
@@ -632,7 +629,7 @@ func (s *Store) readOwn(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.groupMu.Lock()
 	if s.group != nil {
 		defer s.groupMu.Unlock()
-		return fn(s.group)
+		return s.attribute(fn(s.group))
 	}
 	s.groupMu.Unlock()
 	return s.read(ctx, fn)
@@ -655,10 +652,10 @@ func (s *Store) writerQueryRow(ctx context.Context, query string, dest ...any) e
 func (s *Store) read(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	tx, err := s.readers.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return wrap("begin read", err)
+		return s.attribute(wrap("begin read", err))
 	}
 	defer tx.Rollback()
-	return fn(tx)
+	return s.attribute(fn(tx))
 }
 
 // exec1 runs a statement that must affect exactly one row.
@@ -711,10 +708,8 @@ func wrap(op string, err error) error {
 	}
 	var se *sqlite.Error
 	if errors.As(err, &se) {
-		if outOfSpace(se.Code()) {
-			return &model.Error{Code: model.CodeDiskFull,
-				Message:     "database write failed: the filesystem could not grow the database or its write-ahead log",
-				Remediation: "free space under the data directory; if it has space, the filesystem rejected the write and the data directory may need to move"}
+		if refusedWrite(se.Code()) {
+			return writeRefused(op, se.Code(), se.Error())
 		}
 		switch se.Code() & 0xff {
 		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED:
@@ -729,22 +724,23 @@ func wrap(op string, err error) error {
 	return internal(op + ": " + err.Error())
 }
 
-// outOfSpace reports whether an extended result code says the filesystem had no
-// room for a write. SQLITE_FULL is the obvious one, but it is not the one a
-// full disk usually produces. Growing the -shm file of the
-// write-ahead index raises SQLITE_IOERR_SHMSIZE (4874) and growing the database
-// or the log itself raises the write/sync/truncate members of the same family,
-// whose PRIMARY code is SQLITE_IOERR (10) -- so a switch on `code & 0xff` sees
-// only SQLITE_IOERR, matches no arm, and reports CTX_INTERNAL for a disk that
-// is simply full (proved on a filled tmpfs: connect failed with 4874).
+// refusedWrite reports whether an extended result code says the filesystem
+// refused to grow or persist the database, its log or its shared-memory
+// index. SQLITE_FULL is the obvious one, but it is not the one a full disk
+// usually produces: growing the -shm file raises SQLITE_IOERR_SHMSIZE (4874)
+// and growing the database or the log raises the write/sync/truncate members
+// of the same family, whose PRIMARY code is SQLITE_IOERR (10) -- so a switch
+// on `code & 0xff` would see only SQLITE_IOERR and report CTX_INTERNAL for a
+// disk that is simply full (proved on a filled tmpfs: connect failed with
+// 4874).
 //
 // The full extended code is therefore tested, and only the members a space
 // exhaustion actually raises are listed: SQLITE_IOERR_READ, _CORRUPTFS, _DATA
-// and the locking members must keep falling through to their own families,
-// because a read failure or a corrupt filesystem is not a full one. These
-// members can also be raised by failing hardware, which is why the remediation
-// names both causes rather than asserting the disk is full.
-func outOfSpace(code int) bool {
+// and the locking members keep falling through to their own families, because
+// a read failure or a corrupt filesystem is not a full one. The same members
+// are also what a failing device raises, which is why the store settles the
+// two by measuring the disk (see Store.attribute) rather than by the code.
+func refusedWrite(code int) bool {
 	switch code {
 	case sqlite3.SQLITE_FULL,
 		sqlite3.SQLITE_IOERR_WRITE,
@@ -759,6 +755,63 @@ func outOfSpace(code int) bool {
 	// primary code is what a non-extended build reports), so the primary code
 	// is tested too rather than only the exact constant.
 	return code&0xff == sqlite3.SQLITE_FULL
+}
+
+// writeRefused is the error for a write the filesystem refused, before the
+// store has measured the disk. It carries the engine's own message and code
+// so that whichever family it settles into, the reader sees what the engine
+// saw and never a cause the store guessed.
+func writeRefused(op string, code int, engineMessage string) *model.Error {
+	return &model.Error{Code: model.CodeDiskFull,
+		Message: fmt.Sprintf("%s: the filesystem refused the write: %s (engine code %d)", op, engineMessage, code),
+		Details: map[string]string{detailEngineCode: strconv.Itoa(code), detailEngineMessage: engineMessage}}
+}
+
+// detailEngineCode and detailEngineMessage carry the engine's result on a
+// refused write; their presence is what marks the error as not yet settled
+// against the disk.
+const (
+	detailEngineCode    = "engine_code"
+	detailEngineMessage = "engine_message"
+	detailFreeBytes     = "free_bytes"
+)
+
+// attribute settles a refused write against the disk. The engine reports a
+// full disk and a failing device with the same result codes, so the store
+// measures the space free under the database at the moment of the failure
+// and says which it saw: with less than one ingestion group free the refusal
+// is a full disk's and the error stays CTX_DISK_FULL, naming the figure; with
+// more, the disk is not full, the device or its driver refused the operation,
+// and the error becomes CTX_INTERNAL carrying the engine's message and code
+// and the figure that rules a full disk out. A disk the platform cannot
+// measure keeps CTX_DISK_FULL and says the measurement was unavailable.
+// Every other error passes through unchanged.
+func (s *Store) attribute(err error) error {
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeDiskFull || typed.Details[detailEngineCode] == "" {
+		return err
+	}
+	dir := filepath.Dir(s.path)
+	free, ok := s.freeBytes(dir)
+	settled := &model.Error{Code: typed.Code, Message: typed.Message, Details: map[string]string{}}
+	for k, v := range typed.Details {
+		settled.Details[k] = v
+	}
+	switch {
+	case !ok:
+		settled.Message += "; the free space under " + dir + " could not be measured"
+		settled.Remediation = "check the free space and the device under " + dir
+	case free < uint64(s.opts.WriterCacheKiB)<<10:
+		settled.Details[detailFreeBytes] = strconv.FormatUint(free, 10)
+		settled.Message += fmt.Sprintf("; %d bytes are free under %s, less than one ingestion group", free, dir)
+		settled.Remediation = "free space under " + dir
+	default:
+		settled.Code = model.CodeInternal
+		settled.Details[detailFreeBytes] = strconv.FormatUint(free, 10)
+		settled.Message += fmt.Sprintf("; %d bytes are free under %s, so the disk is not full: the device or its driver refused the operation", free, dir)
+		settled.Remediation = "check the kernel log for the device holding " + dir
+	}
+	return settled
 }
 
 // idBlob decodes a public hex identifier to the 32 bytes SQLite stores.

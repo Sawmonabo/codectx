@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
@@ -176,7 +176,7 @@ func (c *Compiler) releaseState(ctx context.Context, stateID, leaseID string) {
 // every path that does not hand it over.
 func (c *Compiler) nextStateCursor(ctx context.Context, b model.Binding, requestHash string, pass int, dir string) (string, error) {
 	if !c.continuationsAvailable() {
-		_ = os.RemoveAll(dir)
+		_ = paced.RemoveAll(dir)
 		return "", nil
 	}
 	// The call's own context is already past its deadline on the path that
@@ -189,7 +189,7 @@ func (c *Compiler) nextStateCursor(ctx context.Context, b model.Binding, request
 	// nobody resumes is reclaimed by the ordinary sweep.
 	lease, err := c.leases.Acquire(mintCtx, b.GenerationID, b.SnapshotID, model.LeaseCursor)
 	if err != nil {
-		_ = os.RemoveAll(dir)
+		_ = paced.RemoveAll(dir)
 		return "", err
 	}
 	next := contextCursor{
@@ -206,7 +206,7 @@ func (c *Compiler) nextStateCursor(ctx context.Context, b model.Binding, request
 	id, err := c.spools.AdoptDir(next.spoolCursor(), dir)
 	if err != nil {
 		// The state is this call's to clean up until the store takes it.
-		_ = os.RemoveAll(dir)
+		_ = paced.RemoveAll(dir)
 		if pagination.IsBudgetExhausted(err) {
 			// The shared continuation budget is full: the answer ends here,
 			// truncated and without a token, exactly as a spooled page does.

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
 )
 
@@ -114,13 +115,13 @@ func runtimeInstallCheck(ctx context.Context, lock Lock, only map[string]bool, f
 	if err != nil {
 		return err
 	}
-	if err := os.RemoveAll(store); err != nil {
+	if err := paced.RemoveAll(store); err != nil {
 		return err
 	}
 	if !*flagKeep {
 		// The installed trees are several gigabytes and prove nothing once the
 		// run has passed.
-		defer func() { _ = os.RemoveAll(store) }()
+		defer func() { _ = paced.RemoveAll(store) }()
 	}
 	if err := os.MkdirAll(store, dirMode); err != nil {
 		return err
@@ -281,7 +282,7 @@ func checkZip(r io.Reader, p Payload) (string, error) {
 	}
 	defer func() {
 		tmp.Close()
-		_ = os.Remove(tmp.Name())
+		_ = paced.Remove(tmp.Name())
 	}()
 	size, err := io.Copy(tmp, r)
 	if err != nil {

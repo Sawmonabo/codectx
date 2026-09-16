@@ -1212,8 +1212,9 @@ CREATE TABLE evidence (
 CREATE TABLE unit_delta_state (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
+    part INTEGER NOT NULL,
     payload BLOB NOT NULL,
-    PRIMARY KEY(unit_id, kind)
+    PRIMARY KEY(unit_id, kind, part)
 ) WITHOUT ROWID;
 CREATE TABLE native_aliases (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,

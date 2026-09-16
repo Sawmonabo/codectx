@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"iter"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -53,10 +54,13 @@ import (
 // only while the node they target is still a fact of the new unit — exactly
 // the condition SealUnit enforces.
 
-// MaxDeltaStateBytes bounds one stored delta-state payload. A provider's
-// manifest or key set is a bounded derivative of the unit it describes; a
-// payload past this is a producer defect, not a large repository.
-const MaxDeltaStateBytes = 64 << 20
+// deltaStatePart is the size of one stored part of a delta-state artifact.
+// An artifact is written and read as a sequence of parts so that a manifest
+// or key set the size of a large unit never sits whole in the process: the
+// producer streams it from the file it was built in, and a refresh streams it
+// back into one. A part is one row's blob, small enough to pass through the
+// engine's bind buffer and the writer's cache without spilling on its own.
+const deltaStatePart = 1 << 20
 
 // Replaced names everything of the previous unit that the current import has
 // already re-emitted or that no longer exists. Everything else is carried.
@@ -634,51 +638,83 @@ func (w *UnitWriter) clipEvidence(ctx context.Context, tx *sql.Tx) error {
 // PutDeltaState stores one provider-owned incremental-refresh artifact with
 // the unit it describes: the SCIP DocumentManifest, the dependence KeySet, or
 // whatever a later provider needs to diff its next run without recomputing the
-// previous one. The payload is opaque to storage. It shares the unit's
-// lifetime exactly, so a retired unit takes its manifest with it and no
-// refresh can diff against state whose facts were collected.
-func (w *UnitWriter) PutDeltaState(ctx context.Context, kind string, payload []byte) error {
+// previous one. The payload is opaque to storage and read from src in parts,
+// so an artifact is never held whole; there is no bound on its size. It
+// shares the unit's lifetime exactly, so a retired unit takes its artifact
+// with it and no refresh can diff against state whose facts were collected.
+// A second call under the same kind replaces the first.
+func (w *UnitWriter) PutDeltaState(ctx context.Context, kind string, src io.Reader) error {
 	if w.done {
 		return conflict("unit %s is no longer building", w.build.Spec.ID)
 	}
 	if kind == "" || len(kind) > model.MaxIdentifierBytes {
 		return invalid("delta state kind is required and bounded to %d bytes", model.MaxIdentifierBytes)
 	}
-	if len(payload) == 0 {
-		return invalid("delta state %q is empty", kind)
-	}
-	if len(payload) > MaxDeltaStateBytes {
-		return &model.Error{Code: model.CodeResourceLimit,
-			Message: fmt.Sprintf("delta state %q is %d bytes, limit %d", kind, len(payload), MaxDeltaStateBytes)}
-	}
 	return w.s.ingest(ctx, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `INSERT INTO unit_delta_state(unit_id, kind, payload) VALUES(?, ?, ?)
-			ON CONFLICT(unit_id, kind) DO UPDATE SET payload = excluded.payload`, w.rowID, kind, payload)
-		return wrap("unit_delta_state", err)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM unit_delta_state WHERE unit_id = ? AND kind = ?`, w.rowID, kind); err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		buf := make([]byte, deltaStatePart)
+		for part := int64(0); ; part++ {
+			n, err := io.ReadFull(src, buf)
+			if n > 0 {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO unit_delta_state(unit_id, kind, part, payload) VALUES(?, ?, ?, ?)`,
+					w.rowID, kind, part, buf[:n]); err != nil {
+					return wrap("unit_delta_state", err)
+				}
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if part == 0 && n == 0 {
+					return invalid("delta state %q is empty", kind)
+				}
+				return nil
+			}
+			if err != nil {
+				return internal("delta state " + kind + ": " + err.Error())
+			}
+		}
 	})
 }
 
-// DeltaState reads back what a sealed unit stored under kind. A unit that
-// stored none is CTX_ARGUMENT_INVALID with reason not_found, so a refresh can
-// tell "no previous state, import in full" from a failure.
-func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string) ([]byte, error) {
+// DeltaState streams what a sealed unit stored under kind into dst, part by
+// part, in one read transaction so the artifact is the one the unit sealed. A
+// unit that stored none is CTX_ARGUMENT_INVALID with reason not_found, so a
+// refresh can tell "no previous state, import in full" from a failure.
+func (s *Store) DeltaState(ctx context.Context, unit model.UnitID, kind string, dst io.Writer) error {
 	key, err := idBlob("unit_id", string(unit))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var payload []byte
-	err = s.readOwn(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT ds.payload FROM unit_delta_state ds JOIN units u ON u.id = ds.unit_id
-			WHERE u.unit_key = ? AND ds.kind = ?`, key, kind).Scan(&payload)
-		if isNoRows(err) {
+	return s.readOwn(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT ds.part, ds.payload FROM unit_delta_state ds JOIN units u ON u.id = ds.unit_id
+			WHERE u.unit_key = ? AND ds.kind = ? ORDER BY ds.part`, key, kind)
+		if err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		defer rows.Close()
+		var next int64
+		for rows.Next() {
+			var part int64
+			var payload []byte
+			if err := rows.Scan(&part, &payload); err != nil {
+				return wrap("unit_delta_state", err)
+			}
+			if part != next {
+				return corrupt("unit %s delta state %q: part %d follows part %d", unit, kind, part, next-1)
+			}
+			next++
+			if _, err := dst.Write(payload); err != nil {
+				return internal("delta state " + kind + ": " + err.Error())
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return wrap("unit_delta_state", err)
+		}
+		if next == 0 {
 			return notFound("unit %s stored no delta state of kind %q", unit, kind)
 		}
-		return wrap("unit_delta_state", err)
+		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return payload, nil
 }
 
 // unitInputsPage bounds one page of a UnitInputs scan. The iterator reads a

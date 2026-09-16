@@ -172,12 +172,37 @@ func workDir(req Request) (string, error) {
 // writeState spills a stored delta-state payload to a file the provider's own
 // loader can open. Both loaders validate what they read, so a corrupt payload
 // is refused there rather than trusted here.
-func writeState(dir, name string, payload []byte) (string, error) {
+// previousState streams the predecessor's artifact of kind into a file
+// named name under dir and returns its path. A predecessor that stored none
+// returns an empty path and no error.
+func previousState(ctx context.Context, store *sqlite.Store, dir, name string, unit model.UnitID, kind string) (string, error) {
 	p := filepath.Join(dir, name)
-	if err := os.WriteFile(p, payload, 0o600); err != nil {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return "", internal("delta state: " + err.Error())
 	}
+	err = store.DeltaState(ctx, unit, kind, f)
+	if closeErr := f.Close(); err == nil && closeErr != nil {
+		err = internal("delta state: " + closeErr.Error())
+	}
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
 	return p, nil
+}
+
+// putState stores one of this unit's delta-state artifacts from the file it
+// was produced in, streaming it so the artifact is never held whole.
+func putState(ctx context.Context, w *sqlite.UnitWriter, kind, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return internal("delta state " + kind + ": " + err.Error())
+	}
+	defer f.Close()
+	return w.PutDeltaState(ctx, kind, f)
 }
 
 func invalid(format string, args ...any) *model.Error {

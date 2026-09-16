@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"sort"
 	"strconv"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
@@ -261,7 +261,7 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
 	if err != nil {
 		// The state is this request's to clean up until the store takes it.
-		_ = os.RemoveAll(dir)
+		_ = paced.RemoveAll(dir)
 		if pagination.IsBudgetExhausted(err) {
 			// The shared continuation budget cannot hold this search's state.
 			// Reported, never silent: ending the answer here with no token

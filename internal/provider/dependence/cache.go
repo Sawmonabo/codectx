@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // maxCacheEntries bounds the directory scan retention performs, so a corrupted
@@ -135,7 +136,7 @@ func (c *Cache) Put(key, graph string) bool {
 		return false
 	}
 	if err := os.Chmod(dst, 0o600); err != nil {
-		_ = os.Remove(dst)
+		_ = paced.Remove(dst)
 		return false
 	}
 	c.evict(dst)
@@ -193,7 +194,7 @@ func (c *Cache) evict(keep string) {
 		if e.path == keep {
 			continue
 		}
-		if err := os.Remove(e.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.Remove(e.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
 		total -= e.size

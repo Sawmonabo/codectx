@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // component is the slog component every entry of this package carries.
@@ -204,7 +205,7 @@ func (c *Collector) sweepServerVersions(ctx context.Context, root, name, pinnedD
 			errs = append(errs, c.sweepConfigStaging(filepath.Join(dir, e.Name()), now))
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := paced.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, sweepError("a superseded language-server work directory was not removed", err))
 			continue
 		}
@@ -244,7 +245,7 @@ func (c *Collector) sweepConfigStaging(workDir string, now time.Time) error {
 		if now.Sub(info.ModTime()) < serverConfigStagingGrace {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(workDir, e.Name())); err != nil {
+		if err := paced.RemoveAll(filepath.Join(workDir, e.Name())); err != nil {
 			errs = append(errs, sweepError("an abandoned language-server staging directory was not removed", err))
 			continue
 		}
