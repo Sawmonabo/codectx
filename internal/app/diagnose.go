@@ -12,6 +12,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -121,6 +122,77 @@ func (r storeReader) WatchHeartbeat(ctx context.Context, repo model.RepositoryID
 
 // The same compile-time assertion, for the same reason.
 var _ diagnostics.WatchHeartbeatReader = storeReader{}
+
+// runLedger adapts the run ledger beside the index store to
+// diagnostics.RunLedger, and is the one place a recorded run becomes the rows
+// the model carries.
+//
+// It opens the ledger for each call rather than holding a connection open,
+// because the report is a one-shot answer and the open is read-only: a status
+// surface must be able to read a run that another process is writing and must
+// never become a second writer of the file. A workspace that has recorded no
+// run reports no rows and no failure, which is the reader's own answer.
+type runLedger struct{ dir string }
+
+func (l runLedger) LatestRun(ctx context.Context, repo model.RepositoryID,
+	generation model.GenerationID) (*model.RunRecord, []model.StageRecord, error) {
+	reader, recorded, err := ledger.OpenReader(ctx, l.dir)
+	if err != nil || !recorded {
+		return nil, nil, err
+	}
+	defer reader.Close()
+	view, found, err := reader.LatestRun(ctx, string(repo), int64(generation))
+	if err != nil || !found {
+		return nil, nil, err
+	}
+	run := model.RunRecord{
+		RunID:               view.Run.RunID,
+		Kind:                string(view.Run.Kind),
+		RepositoryID:        view.Run.RepositoryID,
+		GenerationID:        view.Run.GenerationID,
+		StartedAt:           view.Run.StartedAt,
+		FinishedAt:          view.Run.FinishedAt,
+		WallMS:              view.Run.WallMS,
+		Outcome:             string(view.Run.Outcome),
+		FileCount:           view.Run.FileCount,
+		SourceBytes:         view.Run.SourceBytes,
+		UnitsPlanned:        view.Run.UnitsPlanned,
+		UnitsSucceeded:      view.Run.UnitsSucceeded,
+		UnitsFailed:         view.Run.UnitsFailed,
+		UnitsSubdivided:     view.Run.UnitsSubdivided,
+		EventsDropped:       view.Run.EventsDropped,
+		ProcessPeakRSSBytes: view.Run.ProcessPeakRSSBytes,
+	}
+	stages := make([]model.StageRecord, 0, len(view.Spans))
+	for _, span := range view.Spans {
+		stages = append(stages, model.StageRecord{
+			Seq:             span.Seq,
+			ParentSeq:       span.ParentSeq,
+			Stage:           span.Stage,
+			ScopeKey:        span.ScopeKey,
+			Provider:        span.Provider,
+			StartedAt:       span.StartedAt,
+			FinishedAt:      span.FinishedAt,
+			WallMS:          span.WallMS,
+			Running:         span.Running,
+			CPUUserMS:       span.CPUUserMS,
+			CPUSysMS:        span.CPUSysMS,
+			CPUUnattributed: span.CPUUnattributed,
+			PeakRSSBytes:    span.PeakRSSBytes,
+			ReadBytes:       span.ReadBytes,
+			WriteBytes:      span.WriteBytes,
+			ItemsIn:         span.ItemsIn,
+			ItemsOut:        span.ItemsOut,
+			Outcome:         string(span.Outcome),
+			DiagnosticCode:  span.DiagnosticCode,
+			Failure:         span.Failure,
+			ShareOfWall:     span.ShareOfWall,
+		})
+	}
+	return &run, stages, nil
+}
+
+var _ diagnostics.RunLedger = runLedger{}
 
 // toolchainReporter adapts *toolchain.Resolver to diagnostics.ToolchainReporter.
 // Resolver.Status returns its rows directly and reports no error; the interface
