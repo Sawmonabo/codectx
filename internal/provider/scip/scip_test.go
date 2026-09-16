@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -975,5 +976,73 @@ func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
 	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Errorf("Scopes = %v, want %v", got, want)
+	}
+}
+
+// documentWithText is documentRecord plus the Document.text field. A document
+// that carries the pinned file's own bytes is what makes an import's binding
+// verified, which is the binding under which a coordinate that misses those
+// bytes fails the unit instead of being skipped.
+func documentWithText(path, language string, encoding uint64, text string, occurrences ...[]byte) []byte {
+	return appendBytes(documentRecord(path, language, encoding, occurrences...), 5, []byte(text))
+}
+
+// TestOccurrenceMustDescribeThePinnedBytes protects the wrong-bytes guarantee
+// at the granularity the guarantee is made: every occurrence, not one probe
+// per document.
+//
+// Failure mode, silent and measured on a real project: on a line indented with
+// spaces followed by a tab an indexer can count columns to a different tab stop
+// than the file does, so an occurrence's range is shifted a few columns, stays
+// inside its line, converts to a valid rune-aligned extent and is published at
+// compiler precision over source that is not the symbol. Nothing downstream can
+// detect it — the range is in bounds, the file is the right file, and the fact
+// simply names the wrong bytes.
+//
+// Both publication paths are covered because each has its own strength of
+// proof: a declaration must select exactly the identifier it names, while a
+// reference — which legitimately sits on an alias or an operator — must at
+// least start on a token boundary. The document leaves its position encoding
+// unspecified, so the per-document encoding probe runs and passes on the first
+// definition, which is correct in both cases; the shifted occurrence is the
+// second one. Mutation that must fail this test: probe once per document (drop
+// the range check from occurrenceRange), which republishes the defect.
+func TestOccurrenceMustDescribeThePinnedBytes(t *testing.T) {
+	// Line 5 is the FX-I-T-c shape: two spaces then a tab. "browser" sits at
+	// columns [10,17) of it; "Start" at columns [5,10) of line 4.
+	const src = "package tabs\n\ntype Server struct{ port int }\n\nfunc Start(browser string) string {\n  \treturn browser + browser\n}\n"
+	const (
+		symServer  = "scip-go gomod example.com/mod . pkg/Server#"
+		symStart   = "scip-go gomod example.com/mod . pkg/Start()."
+		symBrowser = "scip-go gomod example.com/mod . pkg/Start().(browser)"
+	)
+	cases := []struct {
+		name    string
+		shifted []byte
+	}{
+		// A declaration on a clean token boundary that is not its own name:
+		// the columns of the parameter, not of the function.
+		{"definition", occurrenceRecord(symStart, 1, 4, 11, 18)},
+		// Five columns to the right of "browser" and still inside the line:
+		// "er + br", which starts in the middle of an identifier.
+		{"reference", occurrenceRecord(symBrowser, 0, 5, 15, 22)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files := fixture(t)
+			files["pkg/tabs.go"] = src
+			files["tabs.scip"] = string(miniIndex("scip-go", "0.2.7",
+				documentWithText("pkg/tabs.go", "go", 0, src,
+					occurrenceRecord(symServer, 1, 2, 5, 11), tc.shifted)))
+
+			h := providertest.New(t, files)
+			p := newProvider(t, "tabs.scip")
+			_, _, err := h.Run(t, p, scip.ImportScope("tabs.scip"), append([]string{"tabs.scip", "pkg/tabs.go"}, sourcePaths...))
+			var typed *model.Error
+			if !errors.As(err, &typed) || typed.Code != model.CodeProviderOutputInvalid ||
+				!strings.Contains(typed.Message, "does not describe the pinned source bytes") {
+				t.Fatalf("shifted %s occurrence: err = %v, want CTX_PROVIDER_OUTPUT_INVALID naming the pinned source bytes", tc.name, err)
+			}
+		})
 	}
 }

@@ -10,7 +10,10 @@
 // ran did not install what it reported. It then indexes a nine-language
 // fixture -- Go, TypeScript, TSX, JavaScript, Python, Java, C, C++ and Rust,
 // every one of them carrying non-ASCII identifiers and string literals -- and
-// requires each indexer to name the documents it was given.
+// requires each indexer to name the documents it was given. One of the
+// projects carries no compiler configuration at all, because a matrix whose
+// every project is configured proves the argv only for the configured half of
+// a repository.
 //
 // Two deliberate limits, so nobody reads more into a green run than it proves:
 //
@@ -112,6 +115,18 @@ var indexChecks = []check{
 	{
 		kind: scip.KindTypeScript, languages: []string{"typescript", "tsx", "javascript"}, dir: "ts",
 		documents: []string{"src/sample.ts", "src/sample.tsx", "src/sample.js"},
+	},
+	{
+		// A project whose only manifest is package.json: no tsconfig.json, no
+		// jsconfig.json, nothing that says how to compile it. Two of the three
+		// triggers of the TypeScript profile name exactly this project, and the
+		// leg above cannot prove it because its fixture carries a tsconfig.json
+		// -- which is why an argv that failed every configuration-less project
+		// passed this matrix and shipped. The languages it covers are already
+		// covered by that leg; what this one proves is the profile's own
+		// argument array over a project with no compiler configuration.
+		kind: scip.KindTypeScript, languages: []string{"javascript"}, dir: "js",
+		documents: []string{"src/index.js"},
 	},
 	{
 		kind: scip.KindPython, languages: []string{"python"}, dir: "py",
@@ -457,6 +472,14 @@ func materialize(root string) error {
 ]
 `, cDir, cDir)
 	if err := os.WriteFile(filepath.Join(root, "c", "compile_commands.json"), []byte(compdb), 0o644); err != nil {
+		return err
+	}
+	// The JavaScript leg's whole point is a project with no compiler
+	// configuration, and the TypeScript profile's argv makes the indexer write
+	// the configuration it infers into the directory it is pointed at. A
+	// materialization that is kept (--keep) or reused (--work) would carry that
+	// file into the next run, where the leg would pass while proving nothing.
+	if err := os.Remove(filepath.Join(root, "js", "tsconfig.json")); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
