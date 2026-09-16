@@ -99,3 +99,38 @@ func TestARemovalReturnsWithNothingFreedAndTheReclaimerPacesTheFreeing(t *testin
 		t.Fatalf("after draining, %d bytes await freeing (%v); want none", pending, err)
 	}
 }
+
+// The requirement: emptying a file before unlinking it must never empty an
+// object another name still reaches. A content-addressed store publishes a
+// blob by linking its staging file to the object's final name, so from the
+// link until the staging name is removed the two are one object; shrinking the
+// staging name there would leave the published blob on the disk, named by its
+// content hash, holding none of it. A reader would serve the wrong bytes for a
+// hash that says what they must be.
+//
+// Mutation: make shrinkable always report true and the published object is
+// emptied by the removal of the name beside it.
+func TestARemovalNeverEmptiesAnObjectAnotherNameStillReaches(t *testing.T) {
+	dir := t.TempDir()
+	published := filepath.Join(dir, "blob")
+	const size = 2 * Window
+	writeFile(t, published, size)
+	staged := filepath.Join(dir, "staged")
+	if err := os.Link(published, staged); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RemoveFor(Materialization, staged); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+		t.Fatalf("the removed name survived: %v", err)
+	}
+	st, err := os.Stat(published)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Size() != size {
+		t.Fatalf("the published object is %d bytes after the name beside it was removed; want %d", st.Size(), int64(size))
+	}
+}

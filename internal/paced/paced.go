@@ -58,7 +58,7 @@ const Window = 8 << 20
 // write on the FILE, unlinking it needs write on the DIRECTORY holding it, so
 // a process may be entitled to remove a file it may not truncate. Pacing is
 // how a removal is performed, never whether it is allowed, so such a file is
-// unlinked whole.
+// unlinked whole. So is a file another name still reaches: see shrinkable.
 func ShrinkForRemoval(path string) error {
 	st, err := os.Lstat(path)
 	if err != nil {
