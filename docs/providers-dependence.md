@@ -22,7 +22,7 @@ fields, query results — it is "the engine".
 | `data_flows_to` | `data_flows_to` | `reaching_def`, `reaching_def capture` |
 | `reads` | `reads` | `assignment` |
 | `writes` | `writes` | `assignment` |
-| `calls` | `calls` | `call` |
+| `calls` | `calls` | `call`, `call speculated` |
 
 Every fact is `static_analysis` precision with exact byte ranges. A dependence
 edge does not claim a proven end-to-end source-to-sink flow; data dependence
@@ -38,6 +38,61 @@ recorded as unconditionally reachable when it is control-dependent on the `?`
 succeeding, and labeled `break`/`continue` bind to the innermost loop. The
 control-dependence and data-dependence facts for Rust are therefore complete
 over the graph the frontend emits, not over the language's semantics.
+
+Where a call site names a callee the engine could not find, the engine invents
+one: a method with no definition anywhere in the graph, emitted so the site has
+a target. The import keeps it — it is how a call into another unit binds by
+full name — and says what it is. Its call edge carries the `call speculated`
+detail instead of `call`, and the callee node carries
+`{"resolution":"speculated","candidates":1}` where a declaration from outside
+the unit carries `{"resolution":"import","candidates":1}`. A graph answer
+(`codectx_callees`, `codectx_callers`) returns nodes and relations and never
+the evidence behind them, which is why the node itself has to say it: without
+that, an invented callee reads as a real dependency of the source.
+
+A method taken as a value — assigned to a variable, passed as an argument,
+bound by a `def` or `function` statement — is bound by the export to the method
+it names, and the import anchors it there, so every fact derived through such a
+reference names the method the value carries. That flow is how a dependence on
+a function reached through a variable is published at all, and it is all that
+is published: the call through the value is **not** a `calls` edge to the
+referenced method. The engine binds such a call site to an invented callee
+named after the variable (JavaScript) or to no callee at all (Python), never to
+the method the value holds, so a `calls` edge naming it would be this product's
+inference from reachability rather than a fact the analysis produced. It is
+published as the data dependence it is, and a consumer of `codectx_callees`
+follows `data_flows_to` to find the function a variable was called through.
+
+`control_depends_on` is a single-hop join, not a walk: the engine's control
+dependence edge is published wherever both of its endpoints anchor to a
+published entity, and nothing is followed from there. `data_flows_to` is the
+other shape — a def-use walk, bounded at eight hops, from one anchored node
+through the lowering nodes between it and the next one — so a control
+dependence answer is exactly as deep as the graph the engine emitted, while a
+data flow answer is as deep as that bound allows. Because both endpoints must
+anchor, a control dependence whose controlling node is the `if`, `while`,
+`switch` or `try` node itself is not published at all: what survives is a
+dependence between two resolved call sites or declarations.
+
+Every language with a `try` statement — C++, Java, JavaScript, TypeScript, TSX,
+and Python's `try`/`except`/`else` — carries a second known gap, in that
+control dependence. The engine's control-flow graph models the exceptional exit
+of a whole `try` body as one edge from the body's **last** statement into each
+handler, and wires an explicit `throw` (Python `raise`) to the method's exit
+rather than to a handler. So a call in a handler is published as
+`control_depends_on` the last call of the `try` body, which is the wrong
+controlling statement whenever an earlier call is the one that could have
+thrown, and an explicit throw inside a `try` creates no control dependence on
+the handler that catches it. The product publishes the control-flow graph the
+engine emits and has no pass of its own that could thread a throw destination
+through it, so it cannot correct this.
+
+For a consumer of `codectx_impact` and `codectx_dependency_path` the
+consequence is a plausible-looking wrong controller rather than a missing
+fact: inside a `try`, the dependence on the handler is real and both endpoints
+are real calls, but the statement named as the controller is not the one that
+throws. C and Go have no exception construct and are unaffected; Rust's `?` is
+the separate caveat above.
 
 `reads` and `writes` come from this provider alone: no SCIP indexer sets a
 write role, and syntax cannot resolve the target of an assignment.

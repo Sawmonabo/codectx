@@ -1,0 +1,5 @@
+107374182400,METHOD,<empty>,<empty>,<empty>,1,15,w.py,w.py:<module>,<empty>,,false,1,6,<module>,0,76,1,
+107374182401,METHOD,<empty>,<empty>,<empty>,1,0,w.py,w.py:<module>.helper,<empty>,,false,1,3,helper,0,33,1,
+107374182402,METHOD,<empty>,<empty>,<empty>,1,15,w.py,w.py:<module>.run,<empty>,,false,4,6,run,33,76,3,
+107374182403,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.addition,<empty>,,true,,,<operator>.addition,,,0,
+107374182404,METHOD,<global>,NAMESPACE_BLOCK,<empty>,,,<empty>,<operator>.assignment,<empty>,,true,,,<operator>.assignment,,,0,
