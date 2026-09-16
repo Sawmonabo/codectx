@@ -52,9 +52,11 @@ type limits struct {
 	// which is the speculative infrastructure policy.md forbids, and at 256 KiB
 	// it would refuse every source chunk above that.
 	maxParamsBytes int64
-	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency
-	// (index.max_parser_workers): a query gate and an indexing gate are
-	// different resources and sharing one would let either starve the other.
+	// calls bounds outstanding tool calls INDEPENDENTLY of parser concurrency:
+	// a query gate and an indexing gate are different resources and sharing one
+	// would let either starve the other. Both are derived from this machine's
+	// cores (config.QuerySlots, config.ParserWorkers) and neither refuses a
+	// call -- a call that finds no slot waits.
 	calls chan struct{}
 	// graph additionally bounds the traversal tools, which are the expensive
 	// ones. A traversal holds a slot in both.
@@ -80,8 +82,6 @@ func newLimits(cfg config.Config) (limits, error) {
 		v   int64
 	}{
 		{"resources.max_metadata_response_bytes", r.MaxMetadataResponseBytes},
-		{"resources.max_concurrent_queries", int64(r.MaxConcurrentQueries)},
-		{"resources.max_concurrent_graph_queries", int64(r.MaxConcurrentGraphQueries)},
 		{"resources.max_page_items", int64(r.MaxPageItems)},
 		// resources.query_timeout is deliberately absent: zero is its
 		// "unlimited" spelling and its default, and a tool call that carries no
@@ -97,8 +97,8 @@ func newLimits(cfg config.Config) (limits, error) {
 	}
 	return limits{
 		maxParamsBytes: r.MaxMetadataResponseBytes,
-		calls:          make(chan struct{}, r.MaxConcurrentQueries),
-		graph:          make(chan struct{}, r.MaxConcurrentGraphQueries),
+		calls:          make(chan struct{}, config.QuerySlots()),
+		graph:          make(chan struct{}, config.GraphSlots()),
 		timeout:        r.QueryTimeout.Std(),
 	}, nil
 }

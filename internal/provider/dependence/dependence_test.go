@@ -558,12 +558,12 @@ func edited(files map[string]string, path, content string) map[string]string {
 }
 
 // TestGovernorRetriesOnceAndOnlyHigher protects the memory ruling: there is no
-// default ceiling, a retry happens only when it could succeed, and only an
-// explicit user ceiling rejects work. Failure mode: a retry at the cap that
-// just failed costs a full parse and cannot succeed; a bound invented when the
-// machine is unreadable is a default memory ceiling by another name.
+// ceiling at all, and a retry happens only when it could succeed. Failure
+// mode: a retry at the cap that just failed costs a full parse and cannot
+// succeed; a bound invented when the machine is unreadable is a default memory
+// ceiling by another name.
 func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
-	g := dependence.NewGovernor(0, 0)
+	g := dependence.NewGovernor(0)
 	plenty := dependence.Machine{AvailableBytes: 32 << 30, Observed: true}
 
 	small := g.Reserve(dependence.FamilyGo, 1<<20, plenty)
@@ -620,52 +620,73 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 	if unknown.HeapCapBytes != unknown.EstimatedBytes {
 		t.Error("an unobserved machine bounded the cap; that would be a default memory ceiling")
 	}
-	if g.Reject(unknown, rootScope) != nil {
-		t.Error("a machine-derived allocation rejected a unit; only an explicit user ceiling may")
+}
+
+// TestAdmissionIsTheAllocationAndNeverACount protects the rule that how much
+// heavy work runs at once is decided by one observation of the machine: heavy
+// children are admitted while the sum of their reservations fits the
+// machine-derived allocation, and nothing counts them. Failure mode: a count
+// serialises every analysis unit on a machine with room for four of them, and
+// on a small machine a count admits work whose summed reservations the host
+// cannot hold.
+//
+// Mutation: give Scheduler a maxHeavy of 1 again -- add `maxHeavy int` set to
+// 1 by NewScheduler and `if s.admitted >= s.maxHeavy { return }` at the head of
+// pump -> "a 32 GiB machine admitted 1 of four 4 GiB reservations at once; how
+// much runs at once is being decided by a count, not by the allocation".
+func TestAdmissionIsTheAllocationAndNeverACount(t *testing.T) {
+	// The reservation is built directly so the figures in this test are the
+	// ones being asserted about, not a family estimate that would move with a
+	// re-measurement.
+	const fourGiB = 4 << 30
+	unit := dependence.Reservation{HeapCapBytes: fourGiB}
+	if unit.Bytes() != fourGiB {
+		t.Fatalf("reservation is %d bytes, want %d; this test's arithmetic no longer holds", unit.Bytes(), fourGiB)
 	}
 
-	capped := dependence.NewGovernor(0, 1<<30)
-	if capped.Reject(capped.Reserve(dependence.FamilyC, 1<<30, plenty), rootScope) == nil {
-		t.Error("an explicit ceiling did not reject a unit that does not fit it")
-	}
-
-	// Admission is the other half of the same ruling: a reservation orders and
-	// serializes heavy work, and two heavy analyzers run together only when
-	// their reservations sum inside the machine-derived allocation. Failure
-	// mode: admission grants two heavy analyzers whose summed reservations
-	// exceed the allocation, so an indexing run OOM-kills the machine.
-	//
-	// maxHeavy is 2 here on purpose: at the default of 1 the count alone would
-	// serialize the second unit and the memory gate would never be exercised.
-	sched := plan.NewScheduler(2, plenty)
-	heavy := g.Reserve(dependence.FamilyPython, 1<<30, plenty)
-	if 2*heavy.Bytes() <= heavy.AllocationBytes {
-		t.Fatalf("two %d-byte reservations fit the %d-byte allocation; this row no longer proves the gate",
-			heavy.Bytes(), heavy.AllocationBytes)
-	}
-	release, err := sched.Admit(context.Background(), heavy)
-	if err != nil {
-		t.Fatalf("Admit: %v", err)
+	// 32 GiB available: the allocation is half of it, 16 GiB, which is exactly
+	// four of these reservations.
+	big := plan.NewScheduler(dependence.Machine{AvailableBytes: 32 << 30, Observed: true})
+	var releases []func()
+	for i := 0; i < 4; i++ {
+		admitted, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		release, err := big.Admit(admitted, unit)
+		cancel()
+		if err != nil {
+			t.Fatalf("a 32 GiB machine admitted %d of four 4 GiB reservations at once; how much runs at once is being decided by a count, not by the allocation", i)
+		}
+		releases = append(releases, release)
 	}
 	blocked, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, err := sched.Admit(blocked, heavy); err == nil {
-		t.Error("admission granted a second heavy analyzer whose reservation does not fit beside the first")
+	if _, err := big.Admit(blocked, unit); err == nil {
+		t.Error("a fifth 4 GiB reservation was admitted into a 16 GiB allocation")
 	}
-	// The first slot back is what lets the queue move: a reservation never
-	// refuses work, it only orders it.
-	release()
-	release() // releasing twice must not free a slot that was never taken
-	second, err := sched.Admit(context.Background(), heavy)
+	// A waiter is never refused, only ordered: one release lets it through.
+	releases[0]()
+	fifth, err := big.Admit(context.Background(), unit)
 	if err != nil {
-		t.Fatalf("Admit after release: %v", err)
+		t.Fatalf("the waiting reservation was not admitted once room was given back: %v", err)
 	}
-	stillBlocked, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	fifth()
+	for _, release := range releases[1:] {
+		release()
+	}
+
+	// The same reservation on an 8 GiB machine: the allocation is 4 GiB, so
+	// exactly one runs, and it runs because an idle scheduler admits any single
+	// unit whatever it reserves -- work is never refused for memory.
+	small := plan.NewScheduler(dependence.Machine{AvailableBytes: 8 << 30, Observed: true})
+	release, err := small.Admit(context.Background(), unit)
+	if err != nil {
+		t.Fatalf("an 8 GiB machine admitted nothing: %v", err)
+	}
+	second, cancel2 := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel2()
-	if _, err := sched.Admit(stillBlocked, heavy); err == nil {
-		t.Error("releasing one admission twice freed a slot that was never taken")
+	if _, err := small.Admit(second, unit); err == nil {
+		t.Error("an 8 GiB machine admitted two 4 GiB reservations at once")
 	}
-	second()
+	release()
 }
 
 // splittable is one module whose own subdirectory holds source, so the unit
