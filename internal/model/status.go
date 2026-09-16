@@ -411,3 +411,26 @@ func (r DoctorReport) Validate() error {
 	}
 	return nil
 }
+
+// ScratchCollection is what one operator request to give the pooled scratch
+// space back did: what each pool held, by what its surfaces were taken for,
+// and what was actually released.
+//
+// Held and freed are reported separately and are not the same number. Held is
+// what the pools were carrying when the request arrived; freed is what the
+// filesystem was actually given back, which excludes an instance another live
+// process still owns.
+type ScratchCollection struct {
+	Pools      []ScratchPool `json:"pools"`
+	HeldBytes  uint64        `json:"held_bytes"`
+	FreedBytes uint64        `json:"freed_bytes"`
+}
+
+// ScratchPool is one pool of ScratchCollection: the directory it serves, what
+// it held by purpose, and what went.
+type ScratchPool struct {
+	Directory     string            `json:"directory"`
+	HeldBytes     uint64            `json:"held_bytes"`
+	HeldByPurpose map[string]uint64 `json:"held_by_purpose,omitempty"`
+	FreedBytes    uint64            `json:"freed_bytes"`
+}
