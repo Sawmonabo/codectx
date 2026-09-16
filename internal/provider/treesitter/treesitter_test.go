@@ -64,7 +64,7 @@ func newProvider(t *testing.T) *treesitter.Provider {
 		t.Fatal(err)
 	}
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerIdleTTL: 2 * time.Second, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -334,23 +334,27 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 	return strconv.Itoa(i+1) + "-" + strconv.Itoa(i+len(token))
 }
 
-// TestPoolLazyAndReaped pins the two lifetime properties an idle server's
-// footprint rests on, and that nothing else asserts: the pool starts NO
-// worker process until a unit demands one, and an idle worker is reaped by
-// its TTL rather than held until Close.
+// TestPoolLazyAndDrainedWhenTheStageEnds pins the two lifetime properties an
+// idle process's footprint rests on, and that nothing else asserts: the pool
+// starts NO worker until a unit demands one, and every worker has EXITED by
+// the time the last unit returns -- with no wait, because nothing is waited on.
 //
-// They are what makes index.max_parser_workers a concurrency CEILING and not
-// a resident cost: a worker process costs ~18 MiB of resident set before it
-// has parsed anything (PERF-4 measured it; the binary's mapped pages
-// dominate), so a pool that spawned
-// its ceiling eagerly, or never reaped, would charge ceiling x 18 MiB to
-// every process that holds a provider -- an MCP server serving queries most
-// of all. TestResourceBudgets/idle-mcp-rss is the end-to-end figure; this is
-// the invariant underneath it.
+// They are what makes the worker count a concurrency FIGURE and not a resident
+// cost: a worker process costs ~18 MiB of resident set before it has parsed
+// anything (the binary's mapped pages dominate), and the count is now one per
+// core, so a pool that spawned its ceiling eagerly, or held workers after the
+// work, would charge cores x 18 MiB -- about 320 MB on a sixteen-core host --
+// to every process holding a provider, for as long as it held them. A timer
+// here would only choose how long that lasts, which is why there is none.
 //
-// Failure mode: pre-warming the pool in New, or dropping expire's stop, both
-// leave every product test passing and the idle footprint multiplied.
-func TestPoolLazyAndReaped(t *testing.T) {
+// Failure mode: pre-warming the pool in New, or returning a worker to an idle
+// set that nothing empties until Close, both leave every product test passing
+// and a resting machine carrying the whole ceiling.
+//
+// Mutation: put the timer back -- keep `w.timer = time.AfterFunc(idleTTL, ...)`
+// in release and drop the drain from leaveStage -> "the parse stage ended with
+// 2 worker process(es) still alive".
+func TestPoolLazyAndDrainedWhenTheStageEnds(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -362,9 +366,8 @@ func TestPoolLazyAndReaped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const idleTTL = 500 * time.Millisecond
 	p, err := treesitter.New(treesitter.Options{
-		MaxWorkers: 2, WorkerIdleTTL: idleTTL, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
+		MaxWorkers: 2, ParseTimeout: 30 * time.Second, WorkerMemoryBytes: 64 << 20,
 		Worker: treesitter.WorkerCommand{Path: exe, Args: []string{wire.Subcommand}},
 		Runner: runner, WorkDir: t.TempDir(),
 	})
@@ -389,25 +392,17 @@ func TestPoolLazyAndReaped(t *testing.T) {
 	if _, err := provider.RunUnit(context.Background(), p, u.Request, cap, providertest.Limits, h.Pool); err != nil {
 		t.Fatalf("RunUnit: %v", err)
 	}
-	if s := p.Stats(); s.WorkersStarted == 0 || s.Processes > 2 {
-		t.Fatalf("after one unit %+v; want a worker started on demand and no more than the ceiling alive", s)
+	// Read immediately, with no sleep and no poll: the drain runs on the last
+	// caller's way out of the unit, so by the time RunUnit has returned the
+	// processes are already reaped. A poll here would pass against a timer too.
+	s := p.Stats()
+	if s.WorkersStarted == 0 {
+		t.Fatalf("after one unit %+v; a worker must be started on demand", s)
 	}
-
-	// The reaper is a timer, so the wait is a poll with a generous ceiling
-	// rather than a single sleep of the TTL: a loaded host may fire it late,
-	// and a test that failed on that would be flaky rather than strict.
-	deadline := time.Now().Add(30 * idleTTL)
-	for {
-		s := p.Stats()
-		if s.Processes == 0 {
-			if s.WorkersExited != s.WorkersStarted {
-				t.Fatalf("no worker is live but %d started and %d exited", s.WorkersStarted, s.WorkersExited)
-			}
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("after %s idle %+v; the idle TTL must return the pool to the parent-only footprint without Close", 30*idleTTL, s)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if s.Processes != 0 {
+		t.Fatalf("the parse stage ended with %d worker process(es) still alive: %+v", s.Processes, s)
+	}
+	if s.WorkersExited != s.WorkersStarted {
+		t.Fatalf("no worker is live but %d started and %d exited", s.WorkersStarted, s.WorkersExited)
 	}
 }

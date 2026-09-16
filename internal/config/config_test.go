@@ -125,7 +125,7 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 		},
 		{
 			name:     "zero is not unlimited",
-			user:     "[resources]\nmax_concurrent_queries = 0\n",
+			user:     "[storage]\nread_connections = 0\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
@@ -159,10 +159,11 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// 0 means the machine-derived allocation; a negative value is not a
-			// third meaning, and admitting one would size every unit from it.
-			name:     "a negative dependence memory ceiling is rejected",
-			user:     "[providers.dependence]\nunit_memory_ceiling_bytes = -1\n",
+			// How much runs at once is derived from the machine, so the keys
+			// that used to set it are unknown keys now and there is no
+			// extension namespace to absorb them.
+			name:     "a retired concurrency key is an unknown key",
+			user:     "[resources]\nmax_concurrent_heavy_analyzers = 4\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 	} {
@@ -381,5 +382,36 @@ func TestToolStoreIsSharedByEveryWorkspace(t *testing.T) {
 	// store behind on a host that has never installed a payload.
 	if _, err := os.Stat(want); !os.IsNotExist(err) {
 		t.Fatalf("Load created the tool store: stat = %v, want not-exist", err)
+	}
+}
+
+// TestCPUBoundWorkIsSizedFromTheMachine protects the rule that no typed-in
+// number decides how much CPU-bound work runs at once. Failure mode: a fixed
+// worker or slot count leaves a sixteen-core machine running two parsers while
+// a two-core laptop is oversubscribed, and neither figure is anything a user
+// or an agent can be asked to tune.
+//
+// Mutation: return a constant from parserWorkersFor -- `func
+// parserWorkersFor(cpus int) int { return 2 }` -> "16 CPUs give 2 parser
+// workers, want 16: the count is not coming from the machine".
+func TestCPUBoundWorkIsSizedFromTheMachine(t *testing.T) {
+	for _, cpus := range []int{16, 2, 1} {
+		if got := parserWorkersFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d parser workers, want %d: the count is not coming from the machine", cpus, got, cpus)
+		}
+		if got := querySlotsFor(cpus); got != cpus {
+			t.Errorf("%d CPUs give %d query slots, want %d", cpus, got, cpus)
+		}
+		// A traversal holds a query slot as well, so half the cores answer them
+		// and the rest stay free for the cheap calls interleaved with them --
+		// but never fewer than one, or a single-core machine answers no
+		// traversal at all.
+		want := cpus / 2
+		if want < 1 {
+			want = 1
+		}
+		if got := graphSlotsFor(cpus); got != want {
+			t.Errorf("%d CPUs give %d traversal slots, want %d", cpus, got, want)
+		}
 	}
 }
