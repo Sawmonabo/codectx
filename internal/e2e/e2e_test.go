@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -220,8 +221,23 @@ func data[T any](t *testing.T, env envelope, code int) T {
 // session. Nothing else in a row may take that lock while this is open.
 func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSession {
 	t.Helper()
+	session, closeSession := s.mcpServer(t, ctx)
+	t.Cleanup(closeSession)
+	return session
+}
+
+// mcpServer is mcpSession with the extra `mcp serve` arguments a row needs and
+// the close in the caller's hands. A row that starts a second server must be
+// able to end the first one where it says so rather than at the end of the
+// test: a session that is still connected is still a process on this
+// workspace, and two of them is a different scenario from one.
+//
+// The close is idempotent, so a caller may end the session early and still let
+// the cleanup it registered run.
+func (s *sandbox) mcpServer(t *testing.T, ctx context.Context, extra ...string) (*mcp.ClientSession, func()) {
+	t.Helper()
 	var stderr bytes.Buffer
-	cmd := exec.Command(binary, "mcp", "serve", "--repo", s.Repo)
+	cmd := exec.Command(binary, append([]string{"mcp", "serve", "--repo", s.Repo}, extra...)...)
 	cmd.Env = s.Environ
 	cmd.Stderr = &stderr
 	client := mcp.NewClient(&mcp.Implementation{Name: "codectx-e2e", Version: "0.0.0-test"}, nil)
@@ -229,12 +245,14 @@ func (s *sandbox) mcpSession(t *testing.T, ctx context.Context) *mcp.ClientSessi
 	if err != nil {
 		t.Fatalf("connect to `codectx mcp serve` over stdio: %v\nserver stderr:\n%s", err, stderr.String())
 	}
-	t.Cleanup(func() {
-		if err := session.Close(); err != nil {
-			t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
-		}
-	})
-	return session
+	var once sync.Once
+	return session, func() {
+		once.Do(func() {
+			if err := session.Close(); err != nil {
+				t.Errorf("close mcp session: %v\nserver stderr:\n%s", err, stderr.String())
+			}
+		})
+	}
 }
 
 // callTool calls one tool and decodes the Section 19 answer envelope out of the

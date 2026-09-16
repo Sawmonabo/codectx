@@ -218,10 +218,11 @@ func (g *generation) capture(ctx context.Context) error {
 	// The caller took the lock before this generation began; asking for it
 	// again is how the builder names the one this process holds, and it
 	// acquires nothing a second time.
-	lock, err := c.hold(ctx)
+	lock, release, err := c.hold(ctx)
 	if err != nil {
 		return err
 	}
+	defer release()
 	b := g.captureBuilder(lock)
 	snap, err := b.Build(ctx)
 	if err != nil {

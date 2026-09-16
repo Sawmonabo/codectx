@@ -231,6 +231,10 @@ type stack struct {
 	lockMu   sync.Mutex
 	lockWait time.Duration
 	builds   bool
+	// holders is how many operations are holding the lock right now. The
+	// composition that locks at its open holds one for its whole life; the
+	// server's operations take one each and give it back when they end.
+	holders  int
 	resolver *toolchain.Resolver
 	toolDir  string
 	lsp      *lsp.Manager
@@ -383,6 +387,10 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, o.wait); err != nil {
 			return nil, err
 		}
+		// The composition itself is the first holder: this run's whole life is
+		// the run, so nothing an operation does inside it may give the lock
+		// away, and Close is what gives it up.
+		s.holders = 1
 	}
 	// The content store opens before the database: it holds no lock and no
 	// state of its own.
@@ -968,51 +976,78 @@ func (s *stack) collect(ctx context.Context) {
 		"orphan_sweep", report.OrphanSweepPhrase())
 }
 
-// Hold is the stack's index.Locker: the ONE cross-process workspace lock this
-// process holds, taken here if the composition did not take it at its open.
+// Hold is the stack's index.Locker: it lends the ONE cross-process workspace
+// lock of this process to one operation and hands back the release that gives
+// it up again.
 //
-// Everything the workspace owner must do before it builds happens here, under
-// the lock and exactly once: startup recovery, which fails the staging
-// generations an earlier crash abandoned, and the startup collection pass. In
-// a composition that locks at its open both have already run there, and the
-// first branch is all that is left.
+// Holds are COUNTED, not taken one per caller. The first holder acquires and
+// the last one to give it back closes it, so a capture inside a refresh and a
+// refresh inside a watch share the lock the outermost of them took, and no
+// inner operation can release one an outer one still needs. A composition that
+// locks at its open (an indexing command, whose whole life is the run) starts
+// with that one reference and gives it up in Close.
+//
+// Everything the workspace owner must do before it builds happens on the way
+// in, under the lock and exactly once per acquisition: startup recovery, which
+// fails the staging generations an earlier crash abandoned, and the startup
+// collection pass.
 //
 // The lifetime is the point. The lock is published to the stack only once the
-// acquisition has fully succeeded, so a failure here releases what it took and
-// leaves nothing for Close to release -- and a success hands Close the one
-// thing it must release, exactly once. The mutex is held across the whole
-// acquisition, so two tool calls that race to be the first builder produce one
-// lock and one recovery, not two: LockWorkspace locks per open file, so two
-// acquisitions in one process would BOTH succeed and the second would be a
-// lock nobody closes.
-func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, error) {
+// acquisition has fully succeeded, so a failure releases what it took and
+// leaves nothing to release twice; the release a caller is handed runs its
+// decrement exactly once however often the caller calls it; and the mutex is
+// held across the whole acquisition, so two tool calls racing to be the first
+// builder produce one lock and one recovery. LockWorkspace locks per open
+// file, so two acquisitions in one process would BOTH succeed and the second
+// would be a lock nobody closes.
+func (s *stack) Hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	s.lockMu.Lock()
 	defer s.lockMu.Unlock()
-	if s.lock != nil {
-		return s.lock, nil
-	}
 	if !s.builds {
-		return nil, &model.Error{Code: model.CodeInternal,
+		return nil, nil, &model.Error{Code: model.CodeInternal,
 			Message: "this workspace was opened for reading and cannot take the workspace indexing lock"}
 	}
-	// wait <= 0 tries exactly once, which is what the serving composition
-	// passes: an agent asking for a refresh while the person's own index runs
-	// is answered now, with the retryable refusal, rather than held for the
-	// length of a lock wait.
-	lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.lockWait)
-	if err != nil {
-		return nil, err
+	if s.lock == nil {
+		// wait <= 0 tries exactly once, which is what the serving composition
+		// passes: an agent asking for a refresh while the person's own index
+		// runs is answered now, with the retryable refusal, rather than held
+		// for the length of a lock wait.
+		lock, err := snapshot.LockWorkspace(ctx, s.dataDir, s.lockWait)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := s.store.Recover(ctx, time.Now()); err != nil {
+			// Acquired, then failed: release it here and leave s.lock nil, so
+			// the next build starts from a clean state and nothing of this
+			// attempt is left for Close.
+			lock.Close()
+			return nil, nil, err
+		}
+		s.lock = lock
+		s.collect(ctx)
 	}
-	if err := s.store.Recover(ctx, time.Now()); err != nil {
-		// Acquired, then failed: release it here and leave s.lock nil, so the
-		// next build takes the lock again from a clean state and Close has
-		// nothing of this attempt to release.
-		lock.Close()
-		return nil, err
+	s.holders++
+	var once sync.Once
+	return s.lock, func() error {
+		var err error
+		once.Do(func() { err = s.release() })
+		return err
+	}, nil
+}
+
+// release gives up one hold and closes the lock when the last one is gone. An
+// idle session must own nothing: a server that has finished a refresh is not a
+// reason for the person's own `codectx index` to be refused.
+func (s *stack) release() error {
+	s.lockMu.Lock()
+	defer s.lockMu.Unlock()
+	s.holders--
+	if s.holders > 0 || s.lock == nil {
+		return nil
 	}
-	s.lock = lock
-	s.collect(ctx)
-	return s.lock, nil
+	err := s.lock.Close()
+	s.lock = nil
+	return err
 }
 
 // locker is what the coordinator is composed with: this stack when it may
@@ -1342,9 +1377,12 @@ func (s *stack) Close() error {
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}
-	// Under the same mutex the acquisition takes: the lock may have been taken
-	// by a tool call rather than by the open, and this is the one release.
+	// Under the same mutex the acquisition takes. This is the composition's own
+	// reference -- the whole of it for a run that locked at its open -- and the
+	// backstop for an operation that ended without giving its hold back: a lock
+	// left held outlives this process for every other one on the workspace.
 	s.lockMu.Lock()
+	s.holders = 0
 	if s.lock != nil {
 		errs = append(errs, s.lock.Close())
 		s.lock = nil
