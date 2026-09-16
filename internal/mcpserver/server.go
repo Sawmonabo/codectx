@@ -55,6 +55,18 @@ type Options struct {
 	// reports no progress, which is what a composition that records nothing
 	// should be: the tools are unaffected.
 	Spans func(func(model.StageRecord))
+	// IndexRun answers with the identifier of the indexing run this process
+	// is recording at this moment, and false when it is recording none. It is
+	// what lets a call that is following one run tell that run's stages from
+	// the stages of the per-process overlay run a language server's start
+	// opens, which is recorded concurrently with an indexing run in this same
+	// process: without it, a server start would advance the progress bar of a
+	// run it has nothing to do with.
+	//
+	// It is required whenever Spans is set, and refused otherwise: a span
+	// source with no way to name its indexing run could only report every
+	// run's stages as this call's progress.
+	IndexRun func() (string, bool)
 	// Logger MUST write to stderr. stdout is the SDK's framing channel; a
 	// single byte of ours on it corrupts the session. Nil means "build the
 	// stderr logger yourself".
@@ -88,6 +100,12 @@ func New(opts Options) (*Server, error) {
 			Message: "mcpserver.New requires all three facade services",
 		}
 	}
+	if opts.Spans != nil && opts.IndexRun == nil {
+		return nil, &model.Error{
+			Code:    model.CodeArgumentInvalid,
+			Message: "mcpserver.New requires IndexRun beside Spans: a call following an indexing run must be able to tell its stages from another run's",
+		}
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -115,6 +133,7 @@ func New(opts Options) (*Server, error) {
 	// need a source that could be unsubscribed.
 	if opts.Spans != nil {
 		s.h.spans = newSpanHub()
+		s.h.indexRun = opts.IndexRun
 		opts.Spans(s.h.spans.publish)
 	}
 	s.mcp = mcp.NewServer(

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1325,11 +1326,11 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 			// bar; the nested one is a stage of the same run and must not.
 			nested := int64(0)
 			rows := []model.StageRecord{
-				{Seq: 0, Stage: "walk", WallMS: 10, Outcome: "ok", ItemsIn: 12, ItemsOut: 12},
-				{Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", WallMS: 20, Outcome: "ok"},
-				{Seq: 2, ParentSeq: &nested, Stage: "parse", WallMS: 5, Outcome: "ok"},
-				{Seq: 3, Stage: "seal", WallMS: 30, Outcome: "ok"},
-				{Seq: 4, Stage: "activation", WallMS: 1, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 0, Stage: "walk", WallMS: 10, Outcome: "ok", ItemsIn: 12, ItemsOut: 12},
+				{RunID: indexRunID, Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", WallMS: 20, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 2, ParentSeq: &nested, Stage: "parse", WallMS: 5, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 3, Stage: "seal", WallMS: 30, Outcome: "ok"},
+				{RunID: indexRunID, Seq: 4, Stage: "activation", WallMS: 1, Outcome: "ok"},
 			}
 			var publish func(model.StageRecord)
 			f := &fakeServices{}
@@ -1350,7 +1351,7 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 				time.Sleep(settle)
 				return model.IndexResult{FilesParsed: 12}, nil
 			}
-			s, hook := newSpanTestServer(f)
+			s, hook := newSpanTestServer(f, func() (string, bool) { return indexRunID, true })
 			publish = hook
 			c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, &mcp.ClientOptions{
 				ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
@@ -1384,7 +1385,7 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 				t.Fatalf("refresh_index reported a tool error: %s", firstText(res))
 			}
 			// A stage published after the run answered must reach nobody.
-			publish(model.StageRecord{Seq: 5, Stage: "retention", WallMS: 2, Outcome: "ok"})
+			publish(model.StageRecord{RunID: indexRunID, Seq: 5, Stage: "retention", WallMS: 2, Outcome: "ok"})
 			time.Sleep(settle)
 
 			mu.Lock()
@@ -1447,20 +1448,105 @@ func TestRefreshReportsStagesLive(t *testing.T) {
 	}
 }
 
+// indexRunID and overlayRunID are the two runs one process records at the same
+// time: the indexing run a client's call is following, and the per-process
+// overlay run a language server's start hangs under.
+const (
+	indexRunID   = "1111111111111111111111111111111111111111111111111111111111111111"
+	overlayRunID = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
+// TestAnotherRunsStageDoesNotAdvanceThisRunsProgress guards the truthfulness
+// of the progress a client drives its bar with.
+//
+// Failure mode: under `mcp serve` one process records BOTH runs, and a
+// language server that starts while an index is going publishes a top-level
+// stage of its own. Counted, it advances the bar of a run it has nothing to do
+// with -- the client is told that work it asked about got further than it did,
+// and the protocol's increasing-progress contract cannot tell the two apart.
+// The overlay stage here finishes BEFORE the indexing run is even open, which
+// is what a reporter that simply followed the first row it saw would latch on.
+func TestAnotherRunsStageDoesNotAdvanceThisRunsProgress(t *testing.T) {
+	const settle = 300 * time.Millisecond
+	var (
+		mu       sync.Mutex
+		progress []mcp.ProgressNotificationParams
+	)
+	// The client's call, and its progress token, arrive before the coordinator
+	// opens the run: until it does, the process is recording no indexing run.
+	var opened atomic.Bool
+	var publish func(model.StageRecord)
+	index := func(seq int64, stage string) model.StageRecord {
+		return model.StageRecord{RunID: indexRunID, Seq: seq, Stage: stage, WallMS: 5, Outcome: "ok"}
+	}
+	overlay := func(seq int64) model.StageRecord {
+		return model.StageRecord{RunID: overlayRunID, Seq: seq, Stage: "server_start", WallMS: 5, Outcome: "ok"}
+	}
+	f := &fakeServices{}
+	f.refreshFn = func(_ context.Context, _ model.IndexRequest) (model.IndexResult, error) {
+		publish(overlay(0))
+		opened.Store(true)
+		publish(index(0, "capture"))
+		time.Sleep(settle)
+		publish(overlay(1))
+		publish(index(1, "walk"))
+		time.Sleep(progressInterval)
+		publish(index(2, "activation"))
+		time.Sleep(settle)
+		return model.IndexResult{}, nil
+	}
+	s, hook := newSpanTestServer(f, func() (string, bool) {
+		if !opened.Load() {
+			return "", false
+		}
+		return indexRunID, true
+	})
+	publish = hook
+	c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			progress = append(progress, *req.Params)
+			mu.Unlock()
+		},
+	})
+	cs := connectClient(t, s, c)
+	params := &mcp.CallToolParams{Name: "codectx_refresh_index", Arguments: emptyInput{}}
+	params.SetProgressToken("run-1")
+	res, err := cs.CallTool(t.Context(), params)
+	if err != nil {
+		t.Fatalf("tools/call codectx_refresh_index raised a protocol error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("refresh_index reported a tool error: %s", firstText(res))
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(progress) != 2 {
+		t.Fatalf("progress notifications = %d, want 2: one per interval over the indexing run's three stages", len(progress))
+	}
+	// Three indexing stages finished and two overlay ones did. The figures the
+	// client saw count the first and none of the second.
+	if progress[0].Progress != 1 || progress[1].Progress != 3 {
+		t.Errorf("progress values = %v then %v, want 1 then 3: a stage of another run of this process advanced the bar of the run the client asked about",
+			progress[0].Progress, progress[1].Progress)
+	}
+}
+
 // newSpanTestServer builds a server whose span source is the returned
 // function, which is what an indexing run's collector calls as each stage
 // finishes.
-func newSpanTestServer(f *fakeServices) (*mcp.Server, func(model.StageRecord)) {
+func newSpanTestServer(f *fakeServices, indexRun func() (string, bool)) (*mcp.Server, func(model.StageRecord)) {
 	h := newTestHandlers(f)
 	var publish func(model.StageRecord)
 	s, err := New(Options{
-		Index:   h.index,
-		Explore: h.explore,
-		Context: h.context,
-		Config:  h.cfg,
-		Build:   h.build,
-		Logger:  h.log,
-		Spans:   func(fn func(model.StageRecord)) { publish = fn },
+		Index:    h.index,
+		Explore:  h.explore,
+		Context:  h.context,
+		Config:   h.cfg,
+		Build:    h.build,
+		Logger:   h.log,
+		Spans:    func(fn func(model.StageRecord)) { publish = fn },
+		IndexRun: indexRun,
 	})
 	if err != nil {
 		panic(err)

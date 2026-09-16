@@ -105,7 +105,7 @@ func (f *spanFanout) stop(logger *slog.Logger) {
 // and measurements.
 func logSpan(logger *slog.Logger) func(model.StageRecord) {
 	return func(row model.StageRecord) {
-		attrs := []any{"component", "ledger", "stage", row.Stage, "seq", row.Seq,
+		attrs := []any{"component", "ledger", "run_id", row.RunID, "stage", row.Stage, "seq", row.Seq,
 			"items_in", row.ItemsIn, "items_out", row.ItemsOut, "outcome", row.Outcome}
 		// A stage that never ran -- a planned unit closed as unavailable when
 		// the run ended -- has no finish and therefore no wall. Logging its
@@ -146,6 +146,7 @@ func logSpan(logger *slog.Logger) func(model.StageRecord) {
 // disagree about what a run cost by mapping it differently.
 func stageRecord(span ledger.SpanRow) model.StageRecord {
 	return model.StageRecord{
+		RunID:           span.RunID,
 		Seq:             span.Seq,
 		ParentSeq:       span.ParentSeq,
 		Stage:           span.Stage,
