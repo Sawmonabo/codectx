@@ -291,7 +291,7 @@ func TestSearchRankingScenario(t *testing.T) {
 		{"fix/exact_path_tier_owns_its_files_nodes", legExactPathTierOwnsItsFile},
 		{"fix/a_continuation_carries_the_answer_level_truncation", legContinuationTruncation},
 		{"fix/a_full_spool_ends_the_page_not_the_query", legSpoolExhaustionEndsThePage},
-		{"fix/a_writerless_process_serves_one_page_and_mints_no_cursor", legReadOnlyServesOnePage},
+		{"fix/a_writerless_search_pages_in_full", legWriterlessSearchPagesInFull},
 		{"fix/a_writerless_symbol_query_pages_in_full", legWriterlessSymbolPagesInFull},
 		{"fix/symbol_resolves_a_canonical_node_id", legSymbolByCanonicalID},
 
@@ -1442,17 +1442,21 @@ func legSpoolExhaustionEndsThePage(t *testing.T, f *fixture) {
 	}
 }
 
-// legReadOnlyServesOnePage proves the rule a continuation cannot break: a
-// process that opened the store read-only -- which is how `codectx search`
-// answers while another process is indexing -- can write neither the cursor
-// lease nor the spool a continuation is made of, so it must serve the page it
-// has and say the answer stops there. Minting a token it could not honour would
-// hand the caller a continuation that fails on use, which is worse than an
-// answer that admits it is partial.
+// legWriterlessSearchPagesInFull proves that a search answered by a process
+// that opened the store read-only -- which is how `codectx search` answers
+// while another process is indexing -- pages through its WHOLE answer, across
+// separate calls, and reaches the same hits the unpaged answer holds.
 //
-// Mutation: make PinnedReader.Continuable report true unconditionally, and this
-// leg fails with CTX_INTERNAL out of the lease the read-only store refuses.
-func legReadOnlyServesOnePage(t *testing.T, f *fixture) {
+// Failure mode: such a process serves page one and mints no continuation, so a
+// person searching during an index silently sees a prefix of the ranking with
+// no way to reach the rest. The spool a continuation needs is a filesystem
+// write, which this process can make; only the retention lease is a database
+// write, and the entry is bound to the cursor's own expiry instead.
+//
+// Mutation: drop the spool write -- make rawWriter.start return before
+// spools.Create, leaving w.spool nil -- and the continuation the first page
+// hands back names nothing, so page two fails instead of serving the tail.
+func legWriterlessSearchPagesInFull(t *testing.T, f *fixture) {
 	ro, err := sqlite.Open(f.ctx, f.dbPath, sqlite.Options{ReadOnly: true})
 	if err != nil {
 		t.Fatalf("read-only Open: %v", err)
@@ -1463,21 +1467,47 @@ func legReadOnlyServesOnePage(t *testing.T, f *fixture) {
 	opts.Leases = pagination.NewLeases(ro, pagination.DefaultCursorTTL)
 	s := newService(t, opts)
 	req := model.SearchRequest{Query: "handle", Page: model.PageRequest{Limit: 1}}
-	page, err := s.Search(f.ctx, req)
+	first, err := s.Search(f.ctx, req)
 	if err != nil {
 		t.Fatalf("a writerless process failed the query instead of answering it: %v", err)
 	}
-	if len(page.Items) != 1 {
-		t.Fatalf("page 1 served %d hits, want the 1 it had in hand", len(page.Items))
+	if len(first.Items) != 1 {
+		t.Fatalf("page 1 served %d hits, want the 1 it asked for", len(first.Items))
 	}
-	if page.Meta.NextCursor != "" {
-		t.Error("a process that cannot write a spool still minted a continuation")
+	if first.Meta.NextCursor == "" {
+		t.Fatal("a writerless search stopped after one page of a longer answer")
 	}
-	if !page.Meta.Truncated {
-		t.Fatal("an answer with an unreachable tail did not report itself truncated")
+	seen := len(first.Items)
+	// The SECOND call is the point: the token was minted with no lease row, and
+	// the process that presents it back reads the spool by the expiry its
+	// header carries.
+	req.Page.Cursor = first.Meta.NextCursor
+	second, err := s.Search(f.ctx, req)
+	if err != nil {
+		t.Fatalf("a writerless continuation failed instead of serving page two: %v", err)
 	}
-	if !strings.Contains(page.Meta.TruncationReason, "writes nothing") {
-		t.Errorf("truncation reason = %q, want the cause named", page.Meta.TruncationReason)
+	if len(second.Items) != 1 {
+		t.Fatalf("page 2 served %d hits, want 1", len(second.Items))
+	}
+	if second.Items[0].NodeID == first.Items[0].NodeID {
+		t.Fatal("page 2 served page 1's hit again")
+	}
+	seen += len(second.Items)
+	for cursor := second.Meta.NextCursor; cursor != ""; {
+		req.Page.Cursor = cursor
+		page, err := s.Search(f.ctx, req)
+		if err != nil {
+			t.Fatalf("a writerless continuation failed: %v", err)
+		}
+		seen += len(page.Items)
+		cursor = page.Meta.NextCursor
+	}
+	whole, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
+	if err != nil {
+		t.Fatalf("Search(unpaged): %v", err)
+	}
+	if seen != len(whole.Items) {
+		t.Fatalf("paging a writerless search reached %d hits, want the %d the one-shot answer has", seen, len(whole.Items))
 	}
 }
 
