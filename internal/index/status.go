@@ -11,16 +11,22 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/vcs/git"
+	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
-// statusLeaseTTL is how long the status read pins the generation it projects.
-// It is short because nothing is served from the pin: it exists so the
-// generation cannot be collected between the pointer read and the capability
-// read (Section 12.3).
+// statusLeaseTTL is how long the status read asks to pin the generation it
+// projects. It is short because nothing is served from the pin: on a handle
+// that can write it exists so the generation cannot be collected between the
+// pointer read and the capability read (Section 12.3). A read-only handle
+// records no retention lease at all, so there the pin is the read snapshot
+// alone and a generation collected mid-report ends it typed rather than
+// projecting bytes from two instants.
 const statusLeaseTTL = 30 * time.Second
 
 // maxStatusChanges bounds the worktree comparison. Status answers one bit --
@@ -31,21 +37,99 @@ const maxStatusChanges = 1
 // errWorktreeChanged stops the bounded worktree comparison at its first hit.
 var errWorktreeChanged = errors.New("index: worktree changed")
 
+// StatusOptions are what a status report reads. Store is the handle the report
+// is answered from and Repo the identity it is scoped by; Git and Root are the
+// worktree comparison, and States the composition-time capability rows.
+//
+// Repo is supplied rather than derived so the derivation keeps exactly one
+// spelling in the process -- Coordinator.New's -- and a reader built beside a
+// coordinator answers about the same repository by construction.
+type StatusOptions struct {
+	Root   workspace.Root
+	Config config.Config
+	Store  *sqlite.Store
+	Git    *git.Git
+	Repo   model.RepositoryID
+	States []model.CapabilityState
+	Logger *slog.Logger
+}
+
+// StatusReader answers the Sections 13.2/13.3 status report from ONE store
+// handle. It is the one producer of that report: `codectx status` and the
+// server's codectx_index_status both reach this body, so the two can never
+// drift into different answers about one generation.
+//
+// It is separate from Coordinator because a status report is a read and needs
+// none of what a coordinator owns -- no capture, no provider runtime, no delta
+// appliers, no deferred sealer, no work directory. That is what lets the one
+// process that indexes and answers at the same time serve this report from its
+// read-only handle: that handle has no writer connection, so a status call
+// cannot commit the ingestion group the same process's own refresh has open,
+// and cannot queue behind it.
+type StatusReader struct {
+	opts StatusOptions
+	log  *slog.Logger
+	// watch and retention are the in-process state of the coordinator that
+	// built this reader: a running watch's coverage and the last retention
+	// sweep that did not finish. Both are nil for a reader built without one,
+	// and neither performs a store call, so which handle the report is read
+	// from does not change what they project.
+	watch     *watchState
+	retention *retentionState
+}
+
+// NewStatusReader validates the dependencies and builds the reader.
+func NewStatusReader(o StatusOptions) (*StatusReader, error) {
+	switch {
+	case o.Store == nil:
+		return nil, invalid("a status reader needs a store handle")
+	case o.Repo == "":
+		return nil, invalid("a status reader needs the repository identity")
+	case o.Root.HasGit && o.Git == nil:
+		return nil, invalid("the workspace is a Git repository but no git executable is available")
+	}
+	r := &StatusReader{opts: o, log: o.Logger}
+	if r.log == nil {
+		r.log = slog.Default()
+	}
+	return r, nil
+}
+
+// StatusReader is this coordinator's status path over the given store handle,
+// carrying everything the coordinator knows: the repository identity it
+// derived, the composition-time capability rows, and its own watch and
+// retention state.
+//
+// The handle is a parameter because the serving composition answers this
+// report from its read-only handle while the coordinator itself writes through
+// the other one. Passing the coordinator's own store returns the path
+// `codectx status` takes.
+func (c *Coordinator) StatusReader(store *sqlite.Store) (*StatusReader, error) {
+	r, err := NewStatusReader(StatusOptions{Root: c.opts.Root, Config: c.opts.Config, Store: store,
+		Git: c.opts.Git, Repo: c.repo, States: c.opts.States, Logger: c.log})
+	if err != nil {
+		return nil, err
+	}
+	r.watch, r.retention = &c.watch, &c.retention
+	return r, nil
+}
+
 // Status projects the active generation (Sections 13.2, 13.3). It runs no
 // provider, captures nothing and never publishes: a status call on a busy
-// workspace is a read, which is why it is the one entry point legal without
-// the workspace indexing lock.
+// workspace is a read, which is why it is legal without the workspace indexing
+// lock.
 //
-// The composition-time rows of Options.States are folded into the published
-// completeness and the whole list is brought back inside its bound here, so a
-// capability whose provider could not be constructed is reported even by a
-// generation published before it failed, and the answer still validates.
-func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
-	gen, err := c.opts.Store.ActiveGeneration(ctx, c.repo)
+// The composition-time rows of StatusOptions.States are folded into the
+// published completeness and the whole list is brought back inside its bound
+// here, so a capability whose provider could not be constructed is reported
+// even by a generation published before it failed, and the answer still
+// validates.
+func (r *StatusReader) Status(ctx context.Context) (model.IndexStatus, error) {
+	gen, err := r.opts.Store.ActiveGeneration(ctx, r.opts.Repo)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	pinned, err := c.opts.Store.PinGeneration(ctx, c.repo, gen, statusLeaseTTL)
+	pinned, err := r.opts.Store.PinGeneration(ctx, r.opts.Repo, gen, statusLeaseTTL)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
@@ -55,13 +139,13 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	snap, err := c.opts.Store.Snapshot(ctx, binding.SnapshotID)
+	snap, err := r.opts.Store.Snapshot(ctx, binding.SnapshotID)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
-	states = composedStates(states, c.opts.States)
-	states, aggregated := boundStates(states, c.log)
-	coherence, warnings, err := c.coherence(ctx, snap)
+	states = composedStates(states, r.opts.States)
+	states, aggregated := boundStates(states, r.log)
+	coherence, warnings, err := r.coherence(ctx, snap)
 	if err != nil {
 		return model.IndexStatus{}, err
 	}
@@ -76,8 +160,12 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 	st := model.IndexStatus{Binding: binding, Health: healthOf(states), Coherence: coherence,
 		CaptureConsistency: snap.CaptureConsistency, Completeness: states,
 		FileCount: snap.FileCount, SourceBytes: snap.SourceBytes, Warnings: warnings}
-	c.watch.project(&st)
-	c.retention.project(&st)
+	if r.watch != nil {
+		r.watch.project(&st)
+	}
+	if r.retention != nil {
+		r.retention.project(&st)
+	}
 	return st, nil
 }
 
@@ -89,18 +177,18 @@ func (c *Coordinator) Status(ctx context.Context) (model.IndexStatus, error) {
 // than compared: the comparison would be a full walk of the repository, and
 // Section 13.3 forbids inferring freshness. The warning says the check was not
 // performed, which is the honest answer.
-func (c *Coordinator) coherence(ctx context.Context, snap model.Snapshot) (model.Coherence, []string, error) {
-	if !c.opts.Root.HasGit || c.opts.Git == nil {
+func (r *StatusReader) coherence(ctx context.Context, snap model.Snapshot) (model.Coherence, []string, error) {
+	if !r.opts.Root.HasGit || r.opts.Git == nil {
 		return model.CoherenceSnapshot, []string{"worktree coherence is not checked for a workspace that is not a Git repository"}, nil
 	}
-	head, err := c.opts.Git.Head(ctx, c.opts.Root.Path)
+	head, err := r.opts.Git.Head(ctx, r.opts.Root.Path)
 	if err != nil {
 		return "", nil, err
 	}
 	if head != snap.HeadObjectID {
 		return model.CoherenceWorktreeChange, nil, nil
 	}
-	err = c.opts.Git.Status(ctx, c.opts.Root.Path, c.opts.Config.Workspace.IncludeUntracked, maxStatusChanges,
+	err = r.opts.Git.Status(ctx, r.opts.Root.Path, r.opts.Config.Workspace.IncludeUntracked, maxStatusChanges,
 		func(git.Change) error { return errWorktreeChanged })
 	if errors.Is(err, errWorktreeChanged) {
 		return model.CoherenceWorktreeChange, nil, nil

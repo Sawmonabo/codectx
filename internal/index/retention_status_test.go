@@ -34,7 +34,7 @@ func TestRefusedRetentionPolicyReachesStatus(t *testing.T) {
 	if _, err := c.Refresh(f.ctx, nil); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	st, err := c.Status(f.ctx)
+	st, err := f.status(c)
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
