@@ -196,11 +196,17 @@ func (c *Coordinator) attempt(ctx context.Context, req model.IndexRequest) (mode
 // its own function so the operator settings it carries -- index.capture_max_retries
 // and index.capture_retry_deadline, the only escape hatch from a worktree that
 // never settles -- are reachable by a test without running a capture.
-func (g *generation) captureBuilder() *snapshot.Builder {
+//
+// The workspace lock is passed in rather than read from the options: this
+// composition may have taken it at its first build rather than at its open,
+// and the builder must be handed the lock this run actually holds. A nil one
+// would make the builder take a second lock of its own and release it under
+// the run.
+func (g *generation) captureBuilder(lock *snapshot.WorkspaceLock) *snapshot.Builder {
 	c := g.c
 	return &snapshot.Builder{Root: c.opts.Root, Policy: c.policy, Repository: c.repo,
 		SourcePolicyHash: c.opts.Config.SourcePolicyHash(), Store: c.opts.Store, CAS: c.opts.CAS,
-		Git: c.opts.Git, Lock: c.opts.Lock, Logger: c.log,
+		Git: c.opts.Git, Lock: lock, Logger: c.log,
 		MaxRetries:    c.opts.Config.Index.CaptureMaxRetries.Value(),
 		RetryDeadline: c.opts.Config.Index.CaptureRetryDeadline.Std()}
 }
@@ -209,7 +215,14 @@ func (g *generation) captureBuilder() *snapshot.Builder {
 // active pointer it will publish over.
 func (g *generation) capture(ctx context.Context) error {
 	c := g.c
-	b := g.captureBuilder()
+	// The caller took the lock before this generation began; asking for it
+	// again is how the builder names the one this process holds, and it
+	// acquires nothing a second time.
+	lock, err := c.hold(ctx)
+	if err != nil {
+		return err
+	}
+	b := g.captureBuilder(lock)
 	snap, err := b.Build(ctx)
 	if err != nil {
 		return err

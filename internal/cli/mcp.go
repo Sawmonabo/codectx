@@ -44,8 +44,11 @@ func newMCPCommand(build model.BuildInfo) *cobra.Command {
 // unlike every other command here, which opens a report workspace per
 // invocation. That is forced by what the tool set does: codectx_refresh_index
 // publishes generations, so the process must be the Section 13.2 cross-process
-// owner and hold the workspace lock for its lifetime, and a *Services is valid
-// only for the workspace it was made from. The facade is documented safe for
+// owner from its first refresh onwards, and a *Services is valid only for the
+// workspace it was made from. The lock that ownership means is taken at that
+// first refresh rather than at startup, so the exploration tools -- which need
+// neither it nor the writer -- answer from the moment the session opens,
+// including while another process indexes. The facade is documented safe for
 // concurrent use over one workspace (services.go, Task 19 Q2), which is what
 // lets the bounded set of concurrent tool calls share this single instance.
 //
@@ -60,10 +63,13 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 		Use:   "serve",
 		Short: "Run the MCP server over stdio for one workspace",
 		Long: "Serves one workspace over stdio until the client disconnects or the " +
-			"process is interrupted. The workspace lock is held for the whole " +
-			"session -- one writer, never two -- so a workspace another `codectx " +
-			"index`, `refresh` or `watch` already holds is reported as busy at " +
-			"startup instead of being waited on forever.\n\n" +
+			"process is interrupted. Startup takes no workspace lock and writes " +
+			"nothing, so the server comes up and answers beside an index another " +
+			"process is already running. The lock is taken at the first refresh " +
+			"and held for the rest of the session -- one writer, never two -- so " +
+			"a refresh asked for while another `codectx index`, `refresh` or " +
+			"`watch` holds the workspace is the only thing reported as busy, and " +
+			"the questions keep being answered throughout.\n\n" +
 			"Results and errors travel as MCP tool answers on the protocol " +
 			"stream; logs and startup failures go to stderr.",
 		Args: func(cmd *cobra.Command, args []string) error {

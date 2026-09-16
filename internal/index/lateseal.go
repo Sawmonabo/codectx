@@ -763,7 +763,7 @@ func (c *Coordinator) Pending() Pending {
 // unit and its publication, and a caller that closed the coordinator there
 // would cancel a completed batch away.
 func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult)) error {
-	if err := c.writable(); err != nil {
+	if _, err := c.hold(ctx); err != nil {
 		return err
 	}
 	l := c.late
@@ -811,7 +811,7 @@ func (c *Coordinator) Drain(ctx context.Context, progress func(model.IndexResult
 // not queued answers zero units: it is not pending, and the active generation
 // already holds whatever it has.
 func (c *Coordinator) Promote(ctx context.Context, providerID, scopeKey string) (Pending, error) {
-	if err := c.writable(); err != nil {
+	if _, err := c.hold(ctx); err != nil {
 		return Pending{}, err
 	}
 	if err := ctx.Err(); err != nil {

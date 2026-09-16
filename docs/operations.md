@@ -115,7 +115,7 @@ Four kinds of command, by what they may change:
 | **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
 | **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep` |
 | **Answering** | None | **None at all** | `status`, `search`, `symbol`, `refs`, `callers`, `callees`, `path`, `impact`, `repomap`, `doctor` |
-| **Both** | Held for the session | The refresh's own; its exploration tools write nothing | `mcp serve` |
+| **Both** | Taken at the first refresh, then held | The refresh's own; its exploration tools write nothing | `mcp serve` |
 
 `tools status` is in neither row: it opens the managed-tool store and no
 database at all.
@@ -153,9 +153,17 @@ Two consequences an operator sees:
 ### The one process that is both
 
 The MCP server is the only process in both rows at once. `codectx mcp serve`
-holds the workspace lock for the whole session and keeps the writer, because
-`codectx_refresh_index` publishes generations; and it answers an agent's
-questions from the same process while that refresh is writing.
+keeps the writer, because `codectx_refresh_index` publishes generations; and it
+answers an agent's questions from the same process while that refresh is
+writing.
+
+Its startup takes no lock and performs no write, so a server starts and answers
+beside an index that is already running in another terminal. The workspace lock
+is taken at the first refresh and held for the rest of the session. A refresh
+asked for while another process holds the workspace is refused
+`CTX_WORKSPACE_BUSY` -- that one tool call, not the session: every
+question-answering tool keeps answering throughout, and the watch loop, when it
+is on, takes the lock on a later pass instead of ending the session.
 
 It therefore opens **two handles on one database**: the writer, and a read-only
 handle beside it, opened after the writer so there is a schema to verify by
