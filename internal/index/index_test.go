@@ -567,9 +567,11 @@ func TestIncrementalScenario(t *testing.T) {
 		}
 		report := func(order []int) model.CapabilityState {
 			r := newCapabilityReport()
+			agg := &providerFailures{}
 			for _, i := range order {
-				r.addFailure(scip.ID, "references", failures[i].scope, failures[i].code)
+				agg.add(failures[i].scope, unitFailure{code: failures[i].code})
 			}
+			r.addFailures(scip.ID, "references", agg)
 			states := r.finish(f.c.log)
 			for _, st := range states {
 				if st.ProviderID == scip.ID {
@@ -612,7 +614,7 @@ func TestIncrementalScenario(t *testing.T) {
 			Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
 			DiagnosticCode: model.CodeProviderOutputInvalid})
 		r.addCarried(scip.ID, "references", provider.ScopeWorkspace, 1, 2)
-		r.addFailure(scip.ID, "references", "pkg:java:", model.CodeProviderTimeout)
+		r.addFailures(scip.ID, "references", oneFailure("pkg:java:", model.CodeProviderTimeout))
 		states := r.finish(f.c.log)
 		var rows []model.CapabilityState
 		for _, s := range states {
