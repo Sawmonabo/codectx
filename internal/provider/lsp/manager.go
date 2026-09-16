@@ -27,6 +27,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
+	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
 
 // Options bound one Manager. Every bound is finite; a zero value takes the
@@ -98,12 +99,29 @@ type Manager struct {
 	used    int64
 	free    chan struct{}
 	servers map[serverKey]*entry
+	// mats holds one materialization per snapshot, shared read-only by every
+	// server of that snapshot. A server only ever READS the tree -- everything
+	// it writes goes to its own private working directory -- so a copy each
+	// would be servers x the whole snapshot on disk for nothing, which on a
+	// large monorepo with several projects is several full copies of the
+	// repository.
+	mats map[model.SnapshotID]*materialization
 	// live holds every server whose process tree has not yet been reaped,
 	// including servers that failed and were forgotten. Close waits on it, so
 	// "Close returns once every process tree is reaped" is true of a failed
 	// server too, not only of the ones still holding a slot.
 	live   map[*server]struct{}
 	closed bool
+}
+
+// materialization is one snapshot's shared tree: ready is closed once the fill
+// attempt finished, with either mat or err set, and refs counts the servers
+// rooted inside it. The tree is removed when the last of them has exited.
+type materialization struct {
+	ready chan struct{}
+	mat   *snapshot.Materialization
+	err   error
+	refs  int
 }
 
 // entry is one server slot: ready is closed once the start attempt finished,
@@ -184,7 +202,8 @@ func New(opts Options) (*Manager, error) {
 		return nil, invalid("lsp max_frame_bytes %d exceeds max_overlay_bytes %s", opts.MaxFrameBytes, opts.MaxOverlayBytes)
 	}
 	return &Manager{opts: opts, free: make(chan struct{}),
-		servers: make(map[serverKey]*entry), live: make(map[*server]struct{})}, nil
+		servers: make(map[serverKey]*entry), live: make(map[*server]struct{}),
+		mats: make(map[model.SnapshotID]*materialization)}, nil
 }
 
 // Open returns an overlay over view answered by profile at profile.Root,
@@ -301,6 +320,68 @@ func (m *Manager) slot(ctx context.Context, key serverKey, bytes int64) (*entry,
 			return nil, false, model.Canceled(ctx.Err())
 		}
 	}
+}
+
+// materialize returns the snapshot's shared tree, filling it on the first
+// call and taking a reference for the caller. Every reference is given back
+// through releaseMat.
+func (m *Manager) materialize(ctx context.Context, view model.SnapshotView) (*snapshot.Materialization, error) {
+	id := view.Header().ID
+	m.mu.Lock()
+	shared, ok := m.mats[id]
+	if ok {
+		shared.refs++
+		m.mu.Unlock()
+		select {
+		case <-shared.ready:
+		case <-ctx.Done():
+			m.releaseMat(id)
+			return nil, model.Canceled(ctx.Err())
+		}
+		if shared.err != nil {
+			m.releaseMat(id)
+			return nil, shared.err
+		}
+		return shared.mat, nil
+	}
+	shared = &materialization{ready: make(chan struct{}), refs: 1}
+	m.mats[id] = shared
+	m.mu.Unlock()
+	shared.mat, shared.err = snapshot.Materialize(ctx, view, model.FileSelection{}, snapshot.MaterializeOptions{
+		Dir: snapshot.MaterializeDir(m.opts.DataDir), MaxBytes: m.opts.MaxOverlayBytes.Value(),
+	})
+	close(shared.ready)
+	if shared.err != nil {
+		// A failed fill must not be handed to the next caller: releasing the
+		// starter's own reference removes it, so the next Open tries again.
+		err := shared.err
+		m.releaseMat(id)
+		return nil, err
+	}
+	return shared.mat, nil
+}
+
+// releaseMat gives one reference back and removes the tree once the last
+// server rooted in it has exited. Removal goes through Materialization.Close,
+// which is the arena's own paced release.
+func (m *Manager) releaseMat(id model.SnapshotID) error {
+	m.mu.Lock()
+	shared, ok := m.mats[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	shared.refs--
+	if shared.refs > 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	delete(m.mats, id)
+	m.mu.Unlock()
+	if shared.mat == nil {
+		return nil
+	}
+	return shared.mat.Close()
 }
 
 // dropLocked removes an entry and gives its room back exactly once, waking
