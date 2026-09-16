@@ -44,8 +44,10 @@ type Workspace struct {
 // pair -- and four positional parameters that must agree read worse than one
 // value that carries the agreement.
 type OpenOptions struct {
-	// Wait is how long the open waits for the workspace lock before reporting
-	// CTX_WORKSPACE_BUSY; Wait <= 0 tries once.
+	// Wait is how long the acquisition of the workspace lock retries before
+	// reporting CTX_WORKSPACE_BUSY; Wait <= 0 tries once. The acquisition is
+	// the open itself for an indexing command and the first build for a
+	// server, so this is what either of those waits.
 	Wait time.Duration
 	// Rebuild opens an explicitly requested new cache beside the configured
 	// one and leaves the existing database untouched (Section 12.2).
