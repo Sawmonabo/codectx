@@ -722,8 +722,8 @@ func wrap(op string, err error) error {
 }
 
 // outOfSpace reports whether an extended result code says the filesystem had no
-// room for a write. SQLITE_FULL is the obvious one and was the only one mapped;
-// it is not the one a full disk usually produces. Growing the -shm file of the
+// room for a write. SQLITE_FULL is the obvious one, but it is not the one a
+// full disk usually produces. Growing the -shm file of the
 // write-ahead index raises SQLITE_IOERR_SHMSIZE (4874) and growing the database
 // or the log itself raises the write/sync/truncate members of the same family,
 // whose PRIMARY code is SQLITE_IOERR (10) -- so a switch on `code & 0xff` sees

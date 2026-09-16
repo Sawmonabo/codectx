@@ -1354,8 +1354,8 @@ func legExactTiersHoldOnePage(t *testing.T, _ *fixture) {
 		return count, held
 	}
 	// Correctness first: every node matches both the prefix tier and the
-	// exact_name tier, and each must be emitted ONCE -- the duplicate the set
-	// used to suppress is suppressed by supersededByLowerTier instead.
+	// exact_name tier, and each must be emitted ONCE -- supersededByLowerTier
+	// suppresses the duplicate, with no candidate-sized seen set.
 	small, smallHeap := walk(20_000)
 	if small != 20_000 {
 		t.Fatalf("a 20000-declaration prefix tier emitted %d candidates, want each exactly once", small)

@@ -28,6 +28,9 @@ var graphFixtureKeys = map[model.NodeID]string{
 	graphtest.Leaf:   graphtest.NodeKey("pkg/b#leaf"),
 	graphtest.Orphan: graphtest.NodeKey("pkg/a#orphan"),
 	graphtest.FileF:  graphtest.NodeKey("pkg/a/f.go"),
+	graphtest.ModM:   graphtest.NodeKey("mod/m"),
+	graphtest.TopT:   graphtest.NodeKey("mod/m#top"),
+	graphtest.NestN:  graphtest.NodeKey("mod/m#top.nested"),
 }
 
 // graphFixtureStore builds the conformance fixture through the normal store
@@ -62,7 +65,7 @@ func graphFixtureStoreFull(t *testing.T) (*store.Store, model.RepositoryID, stri
 		t.Fatalf("EnsureRepository: %v", err)
 	}
 	src := "package a\n"
-	ff := putFixtureFile(t, s, repo, "pkg/a/f.go", src)
+	ff := putFixtureFile(t, s, repo, graphtest.FixtureFilePath, src)
 	snap := putFixtureSnapshot(t, s, repo, ff, len(src))
 
 	gen, err := s.BeginGeneration(ctx, repo, snap.ID, model.H("semantic"), "main")
@@ -76,7 +79,8 @@ func graphFixtureStoreFull(t *testing.T) (*store.Store, model.RepositoryID, stri
 
 	// Ordered so PkgB is interned before PkgA.
 	ordered := []model.NodeID{graphtest.PkgB, graphtest.PkgA, graphtest.DirD, graphtest.Hub,
-		graphtest.Leaf, graphtest.Orphan, graphtest.FileF}
+		graphtest.Leaf, graphtest.Orphan, graphtest.FileF, graphtest.ModM, graphtest.TopT,
+		graphtest.NestN}
 	byID := map[model.NodeID]model.Node{}
 	for _, n := range graphtest.Nodes() {
 		byID[n.ID] = n

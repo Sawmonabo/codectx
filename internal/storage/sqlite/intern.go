@@ -213,8 +213,7 @@ func (in *dbInterner) scopeKey(ctx context.Context, tx *sql.Tx, key string) (sco
 // walked until the stored key equals the incoming key (a hit) or a free id is
 // reached (a miss, which this method then claims). Ids are therefore stable for
 // the life of the database and across a cache flush, exactly as the contract in
-// ids.go requires -- more strongly than before, since they no longer depend on
-// insertion order at all.
+// ids.go requires, and they do not depend on insertion order at all.
 func (in *dbInterner) nativeKey(ctx context.Context, tx *sql.Tx, key string) (nativeRef, error) {
 	cacheKey := string(nativeKeyTag) + key
 	if ref, ok := in.strings.get(cacheKey); ok {

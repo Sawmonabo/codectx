@@ -199,16 +199,17 @@ func TestChangedFileSeedsKeepReadingPastTheFirstPage(t *testing.T) {
 	}
 }
 
-// TestTheWalkRootWidthIsTheConfiguredLimit protects finding B2's invariant: how
-// WIDE the boundary walk starts is the user-set context.max_start_nodes, and
-// that key is unlimited by default.
+// TestTheWalkRootWidthIsTheConfiguredLimit protects finding B2's invariant.
 //
-// Failure mode it guards: the root width used to be the hard constant
-// model.MaxStartNodes = 64, so a task naming 65 resolvable identities explored
-// 64 of them on every repository with no key to raise it and no count saying
-// how many roots went unexplored. No compiler fixture exceeds 64 seeds, so
-// nothing else in this package walks past that edge -- the default half of this
-// row is the one that catches a constant reintroduced anywhere in foldSeeds.
+// Requirement: how WIDE the boundary walk starts is the user-set
+// context.max_start_nodes, and that key is unlimited by default.
+//
+// Mutation that fails it: bound the root width by the constant
+// model.MaxStartNodes = 64. A task naming 65 resolvable identities then
+// explores 64 of them on every repository, with no key to raise the width and
+// no count saying how many roots went unexplored. No compiler fixture exceeds
+// 64 seeds, so nothing else in this package walks past that edge -- the default
+// half of this row is the one that catches such a constant in foldSeeds.
 func TestTheWalkRootWidthIsTheConfiguredLimit(t *testing.T) {
 	const seeds = 65
 	admit := func(t *testing.T, cfg config.Config) *seedIngest {
