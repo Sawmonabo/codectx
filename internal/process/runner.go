@@ -186,11 +186,16 @@ type Result struct {
 	IOUnsampled bool
 }
 
-// unmeasured is the starting Result of every run: each figure this package
+// Unmeasured is the starting Result of every run: each figure this package
 // measures is marked absent, so a run that ends before its measurement exists
 // reports nothing observed rather than an observed zero (Section 22). Each
 // flag is cleared only where its figure has actually been read.
-func unmeasured() Result {
+//
+// It is exported because a caller that refuses a run before this package ever
+// sees it -- an argument the caller itself rejects -- must return the same
+// nothing-observed value. A bare Result would say the child ran and used no
+// processor time, no memory and no bytes, which is a measurement nobody made.
+func Unmeasured() Result {
 	return Result{CPUUnsampled: true, TreeUnsampled: true, IOUnsampled: true}
 }
 
@@ -303,11 +308,11 @@ func NewRunner(limits Limits) (*Runner, error) {
 // output stream reaches its limit.
 func (r *Runner) Run(ctx context.Context, spec Spec) (Result, error) {
 	if err := spec.validate(); err != nil {
-		return unmeasured(), err
+		return Unmeasured(), err
 	}
 	release, err := r.reserve(ctx, spec)
 	if err != nil {
-		return unmeasured(), err
+		return Unmeasured(), err
 	}
 	defer release()
 	return r.run(ctx, spec)
@@ -473,7 +478,7 @@ func (r *Runner) release(w *admission) {
 
 func (r *Runner) run(ctx context.Context, spec Spec) (Result, error) {
 	started := time.Now()
-	result := unmeasured()
+	result := Unmeasured()
 
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
