@@ -122,13 +122,14 @@ type Provider struct {
 // launch and reap a process per probe, which is both slower than the work and
 // blind to whether a worker leaks across parses. A probe joins whatever stage
 // is running and its worker is released by that stage's drain, or by Close.
-func (p *Provider) enterStage() {
+func (p *Provider) enterStage(ctx context.Context) {
 	p.stageMu.Lock()
 	p.stage++
 	p.stageMu.Unlock()
+	p.pool.enterStage(ctx)
 }
 
-func (p *Provider) leaveStage() {
+func (p *Provider) leaveStage(ctx context.Context) {
 	p.stageMu.Lock()
 	last := p.stage == 1
 	p.stage--
@@ -136,6 +137,10 @@ func (p *Provider) leaveStage() {
 	if last {
 		p.pool.drain()
 	}
+	// After the drain: a worker's span ends when the runner has reaped it, so
+	// the total this may close is closed over children that have all recorded
+	// what they cost.
+	p.pool.leaveStage(ctx)
 }
 
 // New validates options and builds the provider. Nothing is started until the
@@ -236,8 +241,8 @@ func (p *Provider) Close() { p.pool.close() }
 // size limit, not UTF-8, or not a supported language); an unhealthy worker is
 // replaced and the parse retried once; anything else fails the unit.
 func (p *Provider) IndexUnit(ctx context.Context, req provider.UnitRequest, sink provider.Sink) (model.ProviderResult, error) {
-	p.enterStage()
-	defer p.leaveStage()
+	p.enterStage(ctx)
+	defer p.leaveStage(ctx)
 	relPath, ok := strings.CutPrefix(req.Unit.ScopeKey, ScopePrefix)
 	if !ok || relPath == "" {
 		return model.ProviderResult{}, &model.Error{Code: model.CodeArgumentInvalid, Message: "treesitter units are scoped to one file as \"file:<path>\"",
@@ -351,6 +356,7 @@ func (p *Provider) parse(ctx context.Context, req wire.Request, src []byte) (*ex
 		}
 		ex, err := p.pool.parse(ctx, w, req, src)
 		if err == nil {
+			p.pool.count(ctx, w, ex)
 			p.pool.release(w, true)
 			return ex, nil
 		}
