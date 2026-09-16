@@ -173,7 +173,11 @@ type stack struct {
 	// so a report -- which takes no lock and may run beside an index -- reads
 	// the file through internal/ledger's read-only reader and never opens a
 	// writer of its own. A nil ledger records nothing and is legal everywhere.
-	ledger   *ledger.Ledger
+	ledger *ledger.Ledger
+	// spans is the one hop off the collector's goroutine. Every surface that
+	// renders a finished stage subscribes here, so the process holds exactly
+	// one ledger subscription however many surfaces are listening.
+	spans    *spanFanout
 	cas      *snapshot.CAS
 	registry *provider.Registry
 	pool     *provider.Pool
@@ -369,6 +373,12 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 		if s.ledger, err = ledger.Open(ctx, s.dataDir); err != nil {
 			return nil, err
 		}
+		// One subscription for the process. The structured line is registered
+		// here, where the logger lives; the command line and the MCP server
+		// add theirs through Workspace.Spans.
+		s.spans = newSpanFanout()
+		s.ledger.Subscribe(s.spans.publish)
+		s.spans.subscribe(logSpan(s.logger))
 	}
 
 	// The cursor key and the query spools are workspace-private state under the
@@ -1165,6 +1175,10 @@ func (s *stack) Close() error {
 	// store, so the last flush and the interrupted marks are written while the
 	// process is still whole.
 	errs = append(errs, s.ledger.Stop())
+	// After the ledger, never before: stopping it is what publishes the last
+	// finished spans, and a fanout closed first would drop exactly the rows a
+	// run's final stages produced.
+	s.spans.stop(s.logger)
 	if s.store != nil {
 		errs = append(errs, s.store.Close())
 	}
