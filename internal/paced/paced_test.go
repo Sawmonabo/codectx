@@ -89,6 +89,10 @@ func TestRemoveAllShrinksEveryLargeFileBeforeUnlinkingTheTree(t *testing.T) {
 // Mutation: drop fs.ErrPermission from ShrinkForRemoval's tolerated failures
 // and the removal fails with "permission denied".
 func TestARemovalIsNotRefusedForAFileTheProcessMayUnlinkButNotTruncate(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("a process with the override capability opens a read-only file for writing, " +
+			"so the tolerated failure this test proves is never reached and it would pass vacuously")
+	}
 	dir := t.TempDir()
 	tree := filepath.Join(dir, "tree")
 	if err := os.MkdirAll(tree, 0o755); err != nil {
