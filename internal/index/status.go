@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -229,10 +230,24 @@ type capabilityReport struct {
 }
 
 // failureRow aggregates every failed unit of one provider capability: how many
-// failed, one exemplar scope, and the diagnostic they carried.
+// failed, how many were planned, one exemplar scope with the reason it carried,
+// and a bounded sample of the scope keys that failed behind the row.
 type failureRow struct {
 	providerID, capability, scope, code string
-	units                               int
+	// message and details are the exemplar scope's typed reason. The code
+	// alone cannot tell an analyzer that could not be started from one that
+	// exited nonzero, and the particulars a provider attached -- which
+	// profile, which tool, which project, what exit status -- are what an
+	// operator acts on. The standard-error tail is excluded: it is raw
+	// analyzer output and lives on the run row alone.
+	message string
+	details map[string]string
+	// scopes is the bounded, sorted sample of the failed scope keys, and
+	// planned is how many units the plan gave this provider. "Two failed" is
+	// a different report depending on whether two or two hundred were tried.
+	scopes  []string
+	planned int
+	units   int
 	// covered records that another scope of this provider capability DID
 	// publish into this generation. A capability with facts in it is partial,
 	// never failed: Section 13.3 lets a report under-claim, and reporting a
@@ -319,6 +334,18 @@ const (
 	scopesDetail = model.DetailScopes
 	// unitsFailedDetail counts the units that failed behind one row.
 	unitsFailedDetail = model.DetailUnitsFailed
+	// unitsPlannedDetail counts the units the plan gave the provider behind
+	// one row.
+	unitsPlannedDetail = model.DetailUnitsPlanned
+	// failedScopesDetail names the scopes that failed behind one row. It is
+	// deliberately absent from scopeNamingDetails: it is the SET of failed
+	// scopes rather than the exemplar the row's diagnostic code belongs to,
+	// so two rows folding onto one primary key must union their sets. Keeping
+	// the receiving row's value, as a scope-naming detail does, would publish
+	// one row's failed scopes as though they were all of them.
+	failedScopesDetail = model.DetailFailedScopes
+	// failureMessageDetail carries the exemplar scope's safe message.
+	failureMessageDetail = model.DetailFailureMessage
 	// truncatedDetail names the merged details that did not fit
 	// model.MaxDetailBytes, so a clipped value is never published as if it
 	// were whole.
@@ -533,25 +560,30 @@ func (r *capabilityReport) addDeferred(providerID, capability string) {
 		Details:        map[string]string{"reason": "units_deferred"}})
 }
 
-// addFailure records one failed unit of an optional provider.
-func (r *capabilityReport) addFailure(providerID, capability, scope, code string) {
-	key := providerID + "\x00" + capability
-	row, ok := r.failures[key]
-	switch {
-	case !ok:
-		row = &failureRow{providerID: providerID, capability: capability, scope: scope, code: code}
-		r.failures[key] = row
-	case scope < row.scope:
-		// The exemplar is the lexicographically first scope, never the first
-		// to arrive: the units of one provider are built concurrently, and
-		// both details_json and diagnostic_code fold into the AnalysisKey, so
-		// an arrival-ordered exemplar would key two identical runs
-		// differently. The code travels with the scope it belongs to -- a
-		// published row naming one scope's key and another scope's failure
-		// reason is arrival-ordered again, in a shape that also misreports.
-		row.scope, row.code = scope, code
+// addFailures records one provider capability's failed units. The aggregate
+// arrives whole rather than one unit at a time, because the row publishes
+// figures -- how many failed of how many planned, which scopes -- that only
+// the coverage pass, which sees every unit of one provider at once, can count.
+//
+// The exemplar is the aggregate's lexicographically first scope, never the
+// first to arrive: the units of one provider are built concurrently, and both
+// details_json and diagnostic_code fold into the AnalysisKey, so an
+// arrival-ordered exemplar would key two identical runs differently. The code,
+// message and details travel with the scope they belong to -- a published row
+// naming one scope's key and another scope's reason is arrival-ordered again,
+// in a shape that also misreports.
+func (r *capabilityReport) addFailures(providerID, capability string, f *providerFailures) {
+	if f == nil || len(f.named) == 0 {
+		return
 	}
-	row.units++
+	exemplar := f.named[0]
+	scopes := make([]string, 0, len(f.named))
+	for _, s := range f.named {
+		scopes = append(scopes, s.scopeKey)
+	}
+	r.failures[providerID+"\x00"+capability] = &failureRow{providerID: providerID, capability: capability,
+		scope: exemplar.scopeKey, code: exemplar.failure.code, message: exemplar.failure.message,
+		details: exemplar.failure.details, scopes: scopes, planned: f.planned, units: f.units}
 }
 
 // coveredElsewhere records that this provider capability has a scope that did
@@ -595,6 +627,54 @@ func (r *capabilityReport) reported(providerID, capability string) bool {
 	return false
 }
 
+// publish builds the one capability row that stands for every failed unit of
+// one provider capability.
+//
+// A capability with facts in this generation is `partial`; one with none is
+// `failed` and never `unavailable`. That choice is load-bearing: healthOf
+// makes partial, stale and failed degrade the generation and deliberately
+// leaves unavailable fresh, because `unavailable` is the state of a capability
+// nobody attempted -- no units planned, or units still deferred. A provider
+// whose every planned unit failed WAS attempted and is broken, so reporting it
+// unavailable would publish a fresh generation over a provider that answers
+// nothing.
+//
+// The details are written in sorted key order. A detail map past the provider
+// budget drops its overflow, and which entry overflows must not depend on map
+// iteration order: these details fold into the AnalysisKey, where two
+// identical runs must key identically.
+func (f *failureRow) publish() model.CapabilityState {
+	state := model.CapabilityFailed
+	if f.covered {
+		state = model.CapabilityPartial
+	}
+	row := model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
+		Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
+		Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units),
+			scopeKeyDetail: model.TruncateDetail(f.scope)}}
+	if f.planned > 0 {
+		row = row.WithDetail(unitsPlannedDetail, strconv.Itoa(f.planned))
+	}
+	if len(f.scopes) > 0 {
+		row = row.WithDetail(failedScopesDetail, strings.Join(f.scopes, detailSeparator))
+		if f.units > len(f.scopes) {
+			// The list is a sample, not the set: units_failed carries the
+			// count and this flag says the names are not all of them, which
+			// is the same disclosure a merge that had to cut a value makes.
+			row = row.WithDetail(truncatedDetail, failedScopesDetail)
+		}
+	}
+	if f.message != "" {
+		row = row.WithDetail(failureMessageDetail, f.message)
+	}
+	for _, k := range slices.Sorted(maps.Keys(f.details)) {
+		if k != model.DetailStderrTail {
+			row = row.WithDetail(k, f.details[k])
+		}
+	}
+	return row
+}
+
 // finish publishes the bounded list and how many rows the bound omitted. The
 // per-scope carry rows are collapsed per provider capability before anything is
 // dropped, because a stale capability with an aggregate distance is still an
@@ -615,13 +695,7 @@ func (r *capabilityReport) finish(log *slog.Logger) []model.CapabilityState {
 		return compareString(a.capability, b.capability)
 	})
 	for _, f := range failures {
-		state := model.CapabilityFailed
-		if f.covered {
-			state = model.CapabilityPartial
-		}
-		out = append(out, model.CapabilityState{ProviderID: f.providerID, Capability: f.capability,
-			Scope: provider.ScopeWorkspace, State: state, DiagnosticCode: f.code,
-			Details: map[string]string{unitsFailedDetail: strconv.Itoa(f.units), scopeKeyDetail: model.TruncateDetail(f.scope)}})
+		out = append(out, f.publish())
 	}
 	carried := slices.Clone(r.carried)
 	slices.SortFunc(carried, func(a, b model.CapabilityState) int {

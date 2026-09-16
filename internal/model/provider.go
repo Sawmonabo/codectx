@@ -282,17 +282,42 @@ const (
 	// DetailDetailsOmitted counts the provider details WithDetail dropped
 	// because the map was full.
 	DetailDetailsOmitted = "details_omitted"
+	// DetailUnitsPlanned counts the units the plan gave the provider behind
+	// one row, which is what makes DetailUnitsFailed readable: "two failed"
+	// is a different report of the same capability depending on whether two
+	// or two hundred were attempted.
+	DetailUnitsPlanned = "units_planned"
+	// DetailFailedScopes names the scopes that failed behind one row. It is a
+	// multi-valued detail and is deliberately NOT a scope-naming key: the
+	// exemplar `scope_key` names the one scope whose diagnostic code the row
+	// publishes, while this one is the set, and a merge of two rows must
+	// union the sets rather than keep the receiving row's.
+	DetailFailedScopes = "failed_scopes"
+	// DetailFailureMessage carries the safe message of the typed error the
+	// exemplar scope failed with, so a reader learns what happened and not
+	// only which family it belongs to.
+	DetailFailureMessage = "failure_message"
 )
+
+// DetailStderrTail is the detail key under which a provider discloses the tail
+// of a failed tool's standard error. It is NOT a reserved fold key and it is
+// never published on a capability row or a log line: it is raw analyzer
+// output, which Section 6 keeps out of both. It is spelled here because the
+// producer and the fold that must exclude it are in different packages.
+const DetailStderrTail = "stderr_tail"
 
 // reservedCapabilityDetails is the set the constants above name. It is an
 // array so its length is a compile-time constant: the provider budget below is
-// derived from it, and a fifth reserved key must move that budget in the same
-// edit that adds the key.
+// derived from it, and every reserved key added must move that budget in the
+// same edit that adds the key.
 var reservedCapabilityDetails = [...]string{
 	DetailScopes,
 	DetailUnitsFailed,
 	DetailDetailsTruncated,
 	DetailDetailsOmitted,
+	DetailUnitsPlanned,
+	DetailFailedScopes,
+	DetailFailureMessage,
 }
 
 // DetailEvidenceClipped is the capability detail key under which a provider
@@ -454,6 +479,44 @@ func (r ProviderResult) Validate() error {
 	}
 	if err := boundSigned64("provider_result.bytes_processed", r.BytesProcessed); err != nil {
 		return err
+	}
+	return nil
+}
+
+// RunFailure is the typed reason one provider run did not produce its unit,
+// kept on the run row so an operator can ask why a scope has no facts long
+// after the log line scrolled away. It holds what the capability row cannot:
+// the scope key the run was about (a run row is keyed by provider, not by
+// scope) and the raw tool output, which the fold and the log both exclude.
+type RunFailure struct {
+	ScopeKey string            `json:"scope_key"`
+	Code     string            `json:"code"`
+	Message  string            `json:"message"`
+	Details  map[string]string `json:"details,omitempty"`
+}
+
+// Validate bounds every field a run failure persists, so a provider's own text
+// can never grow the row with the size of its output.
+func (f RunFailure) Validate() error {
+	if err := requireField("run_failure.code", f.Code, MaxIdentifierBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.scope_key", f.ScopeKey, MaxScopeKeyBytes); err != nil {
+		return err
+	}
+	if err := boundField("run_failure.message", f.Message, MaxDetailBytes); err != nil {
+		return err
+	}
+	if len(f.Details) > MaxErrorDetails {
+		return invalid("run_failure.details holds more than %d entries", MaxErrorDetails)
+	}
+	for k, v := range f.Details {
+		if err := requireField("run_failure.details key", k, MaxIdentifierBytes); err != nil {
+			return err
+		}
+		if err := boundField("run_failure.details["+k+"]", v, MaxDetailBytes); err != nil {
+			return err
+		}
 	}
 	return nil
 }
