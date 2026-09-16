@@ -756,7 +756,8 @@ CREATE TABLE generation_lexical (
 );
 
 -- A lexical segment is an immutable packed structure over a set of documents:
--- the term directory, the term text it points into and the posting lists, each
+-- the term directory, the term text it points into, the posting lists and the
+-- per-document attributes of the documents they name, each
 -- chunked into lexical_segment_parts. A segment is written once, by the seal of
 -- the unit whose documents it holds, and is never rewritten; an activation
 -- names segments, it does not rebuild them (ADR-0007 Decision 1).
@@ -771,12 +772,16 @@ CREATE TABLE lexical_segments (
 -- directory in term order -- term slice, document frequency and the slice of
 -- `post.list` holding that term's per-document (column, count) sequence --
 -- `term.text` the concatenated term bytes it points into, and `post.list` the
--- posting lists themselves, whose documents ascend by rowid. `part` is 0-based
+-- posting lists themselves, whose documents ascend by rowid. `doc.dir` is the
+-- fixed-width document directory in ascending document rowid and `doc.attr`
+-- the attribute records it points into: every field a search candidate is
+-- served from, packed once per document, so a page of candidates is hydrated
+-- from these bytes instead of one document-row read each (ADR-0007 Decision 2). `part` is 0-based
 -- and the parts of a stream concatenate to it, so a reader holds a bounded
 -- window of parts rather than a whole vocabulary.
 CREATE TABLE lexical_segment_parts (
     segment_id INTEGER NOT NULL REFERENCES lexical_segments(id) ON DELETE CASCADE,
-    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list')),
+    stream TEXT NOT NULL CHECK(stream IN ('term.dir','term.text','post.list','doc.dir','doc.attr')),
     part INTEGER NOT NULL CHECK(part >= 0),
     bytes BLOB NOT NULL,
     PRIMARY KEY(segment_id, stream, part)
