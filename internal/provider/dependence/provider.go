@@ -117,6 +117,10 @@ type Options struct {
 	// is the only thing an entry count can honestly do: the files are the
 	// import's input, not its output.
 	MaxExportFiles config.Limit
+	// StagingCacheKiB is the user's `providers.dependence.staging_cache_kib`,
+	// the page cache of one import's staging database; 0 selects the
+	// importer's default.
+	StagingCacheKiB int
 }
 
 // Provider is the dependence provider.Provider. One instance serves a process
@@ -700,9 +704,9 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 // module, or one part of a subdivided unit — needs its own root prefixed back
 // on, or every fact it publishes binds to a path the snapshot does not have
 // and the unit seals with nothing in it. ScratchDir keeps the staging database,
-// which holds source-derived graph content and was measured at 649 MB for a
-// 64 MB export, inside the provider's private data directory instead of the
-// system temp directory.
+// which holds source-derived graph content a few times the export's size,
+// inside the provider's private data directory instead of the system temp
+// directory.
 //
 // Language is the source language recorded on the export's fileless nodes
 // only; a located node takes its language from the snapshot file. The family
@@ -734,7 +738,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 		Language: string(unit.Family), UnitScopeKey: unit.ScopeKey, ProjectRoot: source, UnitRoot: unitRoot,
 		Limits: p.opts.Limits, Repository: req.Binding.RepositoryID, Unit: req.Unit, Run: req.Run,
 		Content: req.Content, ScratchDir: scratch, MaxStagedRows: p.opts.MaxStagedRows, OnPhase: onPhase,
-		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles,
+		MaxDerivedRows: p.opts.MaxDerivedRows, MaxExportFiles: p.opts.MaxExportFiles, StagingCacheKiB: p.opts.StagingCacheKiB,
 		MaxEvidencePerFact: p.opts.MaxEvidencePerFact,
 		PreviousKeys:       opts.PreviousKeys, KeysPath: opts.KeysPath})
 	if err != nil {

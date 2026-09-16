@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"net/url"
+	"strconv"
 
 	"modernc.org/sqlite"
 
 	"github.com/Sawmonabo/codectx/internal/config"
+	"github.com/Sawmonabo/codectx/internal/writeback"
 )
 
 // Export labels this import consumes. A mapped label produces facts or is an
@@ -20,6 +22,7 @@ const (
 	labelMetaData  = "META_DATA"
 	labelIdent     = "IDENTIFIER"
 	labelFieldIdMe = "FIELD_IDENTIFIER"
+	labelMethodRef = "METHOD_REF"
 	labelLocal     = "LOCAL"
 	labelMember    = "MEMBER"
 	labelParamIn   = "METHOD_PARAMETER_IN"
@@ -40,7 +43,7 @@ const (
 var stagedNodeLabels = map[string]bool{
 	labelMethod: true, labelCall: true, labelIdent: true, labelFieldIdMe: true,
 	labelLocal: true, labelMember: true, labelParamIn: true, labelTypeDecl: true,
-	"METHOD_PARAMETER_OUT": true, "METHOD_RETURN": true, "METHOD_REF": true, "LITERAL": true,
+	"METHOD_PARAMETER_OUT": true, "METHOD_RETURN": true, labelMethodRef: true, "LITERAL": true,
 	"BLOCK": true, "RETURN": true, "CONTROL_STRUCTURE": true, "JUMP_TARGET": true,
 	"CLOSURE_BINDING": true, "TYPE_REF": true, "UNKNOWN": true,
 	"ARRAY_INITIALIZER": true, "TEMPLATE_DOM": true,
@@ -89,11 +92,12 @@ func (n nullable) value() any {
 
 // graphNode is one decoded node row of interest.
 type graphNode struct {
-	id, label, name, fullName, canonicalName, signature string
-	filename, code, methodFullName, typeFullName        string
-	closureBinding                                      string
-	line, lineEnd, col, argIndex                        nullable
-	isExternal                                          bool
+	id                                              int64
+	label, name, fullName, canonicalName, signature string
+	filename, code, methodFullName, typeFullName    string
+	closureBinding                                  string
+	line, lineEnd, col, argIndex                    nullable
+	isExternal                                      bool
 }
 
 // scratch is the on-disk staging database of one import. Everything the
@@ -101,18 +105,31 @@ type graphNode struct {
 // joins is resolved by a query, never dropped by a lookup window; and every
 // emission is an ordered query, so the facts are a function of the export's
 // content and not of the order its files were read.
+//
+// Every table is written the way a bulk load writes: rows are appended in
+// the order they arrive, to a table with no secondary index, and every
+// structure a later phase reads in another order is built afterwards in one
+// pass -- a sorted copy or an index, each produced by the engine's external
+// merge sort and written once, front to back. Nothing updates a row after it
+// is written and nothing inserts into the middle of a b-tree larger than the
+// page cache. That is what keeps the staging's disk traffic a small constant
+// times the export's bytes: a random-keyed insert into a b-tree larger than
+// the cache costs a page write per row, and a whole-table update costs the
+// table, and the first design of this scratch did both, at thirty to forty
+// times the export's bytes (ADR-0009).
 type scratch struct {
-	db   *sql.DB
-	rows int64
+	db    *sql.DB
+	pacer *writeback.Pacer
+	rows  int64
 	// maxRows is the user's `providers.dependence.max_staged_rows`, unlimited for
 	// unlimited. It never stops the staging: crossing it sets overRows once,
 	// which the import reports.
 	maxRows  config.Limit
 	overRows bool
-	// derivedRows is how many relation occurrences project() derived. It is a
-	// count, never a bound: the projection is not truncated and the unit is
-	// not failed for it. Import compares it against the user's
-	// `providers.dependence.max_derived_rows` and reports the crossing.
+	// derivedRows is how many distinct relation occurrences the projection
+	// derived. It is a count, never a bound: the projection is not truncated
+	// and the unit is not failed for it. Import compares it against the
+	// user's `providers.dependence.max_derived_rows` and reports the crossing.
 	derivedRows  int64
 	unknown      map[string]uint64
 	unknownN     uint64
@@ -128,54 +145,40 @@ type scratch struct {
 	stmt map[string]*sql.Stmt
 }
 
+// scratchSchema holds the tables the load phase appends to. Everything else
+// is created by the phase that fills it, after the tables it reads are
+// complete, so that each is written in one ordered pass.
 const scratchSchema = `
-CREATE TABLE files(path TEXT PRIMARY KEY, file_id TEXT NOT NULL, content_hash TEXT NOT NULL, size INTEGER NOT NULL, language TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE nodes(id TEXT PRIMARY KEY, label TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', full_name TEXT NOT NULL DEFAULT '',
-	canonical_name TEXT NOT NULL DEFAULT '', signature TEXT NOT NULL DEFAULT '', filename TEXT NOT NULL DEFAULT '',
-	line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, code TEXT NOT NULL DEFAULT '',
-	is_external INTEGER NOT NULL DEFAULT 0, method_full_name TEXT NOT NULL DEFAULT '', type_full_name TEXT NOT NULL DEFAULT '',
-	closure_binding TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
-CREATE TABLE edges(label TEXT NOT NULL, src TEXT NOT NULL, dst TEXT NOT NULL, variable TEXT NOT NULL DEFAULT '',
-	PRIMARY KEY(label, src, dst, variable)) WITHOUT ROWID;
-CREATE INDEX edges_by_dst ON edges(label, dst);
-CREATE INDEX nodes_by_label ON nodes(label, id);
-CREATE INDEX nodes_by_type ON nodes(label, full_name);
-CREATE INDEX nodes_by_position ON nodes(filename, COALESCE(line, -1), id);
+CREATE TABLE files(id INTEGER PRIMARY KEY, path TEXT NOT NULL, file_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+	size INTEGER NOT NULL, language TEXT NOT NULL);
+CREATE UNIQUE INDEX files_by_path ON files(path);
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE ents(id TEXT PRIMARY KEY, kind TEXT NOT NULL, external INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
-CREATE TABLE anchors(node TEXT PRIMARY KEY, target TEXT NOT NULL) WITHOUT ROWID;
-CREATE TABLE proj(kind TEXT NOT NULL, from_e TEXT NOT NULL, to_e TEXT NOT NULL, site TEXT NOT NULL,
-	op TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', target_name TEXT NOT NULL DEFAULT '',
-	PRIMARY KEY(kind, from_e, to_e, site, op, target_name)) WITHOUT ROWID;
-CREATE TABLE loc(id TEXT PRIMARY KEY, ok INTEGER NOT NULL, path TEXT NOT NULL DEFAULT '', file_id TEXT NOT NULL DEFAULT '',
-	content_hash TEXT NOT NULL DEFAULT '', language TEXT NOT NULL DEFAULT '', range_json TEXT NOT NULL DEFAULT '') WITHOUT ROWID;
-CREATE TABLE ident(ent TEXT PRIMARY KEY, node_id TEXT NOT NULL, fact_json TEXT NOT NULL, alias_json TEXT NOT NULL, key TEXT NOT NULL) WITHOUT ROWID;
--- ident is keyed on the entity, but emitNodes pages it by node id and picks
--- the smallest entity of each. Without this index every page is a full table
--- scan plus a temp sort of the whole table, and the smallest-entity subquery
--- is a second full scan per surviving row: quadratic in the unit's identity
--- count, and 85% of a whole import measured on a 64 MB export. With it both
--- become index seeks.
-CREATE INDEX ident_by_node ON ident(node_id, ent);
--- members is the (type, field name) -> declaration map memberOf looks a field
--- access up in. It is materialized once by project() because the join behind
--- it — TYPE_DECL to its MEMBER children by AST, filtered on an unindexed
--- m.name — is executed once per field-access write site and was the largest
--- remaining cost of an import after the index above.
-CREATE TABLE members(type_full_name TEXT NOT NULL, name TEXT NOT NULL, id TEXT NOT NULL,
-	PRIMARY KEY(type_full_name, name)) WITHOUT ROWID;
-CREATE TABLE rels(rel_id TEXT NOT NULL, ev_id TEXT NOT NULL, from_id TEXT NOT NULL, kind TEXT NOT NULL, to_id TEXT NOT NULL,
-	ev_json TEXT NOT NULL, key TEXT NOT NULL, PRIMARY KEY(rel_id, ev_id)) WITHOUT ROWID;
-CREATE TABLE keys(key TEXT PRIMARY KEY, changed INTEGER NOT NULL DEFAULT 1) WITHOUT ROWID;
-CREATE TABLE walk(start TEXT NOT NULL, node TEXT NOT NULL, depth INTEGER NOT NULL, PRIMARY KEY(start, node)) WITHOUT ROWID;
+CREATE TABLE node_in(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, label TEXT NOT NULL, name TEXT NOT NULL,
+	full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
+	line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
+	method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL);
+CREATE TABLE code(seq INTEGER PRIMARY KEY, id INTEGER NOT NULL, code TEXT NOT NULL);
+CREATE TABLE edge_in(seq INTEGER PRIMARY KEY, label TEXT NOT NULL, src INTEGER NOT NULL, dst INTEGER NOT NULL);
 `
+
+// defaultCacheKiB is the staging database's page cache when the caller sets
+// none. It bounds the memory one import holds for its staging and it is the
+// buffer the engine sorts in, so a table smaller than it is sorted without a
+// spill file.
+const defaultCacheKiB = 256 << 10
 
 // openScratch creates the import's staging database. Durability is
 // deliberately off: the file is private, single-writer and deleted with the
-// import's scratch directory.
-func openScratch(ctx context.Context, path string, maxRows config.Limit) (*scratch, error) {
+// import's scratch directory. Its dirty pages are paced to disk while the
+// import runs, so a phase that fills the page cache at memory speed hands the
+// disk its pages steadily rather than in one burst at the commit.
+func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.Limit) (*scratch, error) {
+	if cacheKiB <= 0 {
+		cacheKiB = defaultCacheKiB
+	}
 	q := url.Values{}
-	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)", "cache_size(-32768)"} {
+	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "locking_mode(EXCLUSIVE)",
+		"cache_size(-" + strconv.Itoa(cacheKiB) + ")"} {
 		q.Add("_pragma", p)
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
@@ -190,7 +193,8 @@ func openScratch(ctx context.Context, path string, maxRows config.Limit) (*scrat
 		db.Close()
 		return nil, internalErr("import scratch schema: %v", err)
 	}
-	return &scratch{db: db, maxRows: maxRows, unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
+	return &scratch{db: db, pacer: writeback.Start(path), maxRows: maxRows,
+		unknown: map[string]uint64{}, stmt: map[string]*sql.Stmt{}}, nil
 }
 
 // commitEvery is how many staged rows one staging transaction holds before it
@@ -202,6 +206,7 @@ func (s *scratch) close() error {
 	for _, st := range s.stmt {
 		st.Close()
 	}
+	s.pacer.Stop()
 	return s.db.Close()
 }
 
@@ -242,6 +247,22 @@ func (s *scratch) commit(ctx context.Context) error {
 	return nil
 }
 
+// run commits the staging transaction and executes one derivation statement
+// on its own: a bulk INSERT ... SELECT or a CREATE INDEX, each of which the
+// engine runs as one ordered pass.
+func (s *scratch) run(ctx context.Context, what, query string, args ...any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := s.commit(ctx); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		return internalErr("import %s: %v", what, err)
+	}
+	return nil
+}
+
 // staged counts one staged row and commits the staging transaction at every
 // commitEvery rows.
 //
@@ -277,27 +298,31 @@ func (s *scratch) putNode(ctx context.Context, n graphNode) error {
 		}
 		return nil
 	}
-	err := s.exec(ctx, `INSERT OR IGNORE INTO nodes(id, label, name, full_name, canonical_name, signature, filename,
-		line, line_end, col, arg_index, code, is_external, method_full_name, type_full_name, closure_binding)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	err := s.exec(ctx, `INSERT INTO node_in(id, label, name, full_name, canonical_name, signature, filename,
+		line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		n.id, n.label, n.name, n.fullName, n.canonicalName, n.signature, n.filename,
-		n.line.value(), n.lineEnd.value(), n.col.value(), n.argIndex.value(), n.code,
+		n.line.value(), n.lineEnd.value(), n.col.value(), n.argIndex.value(),
 		boolInt(n.isExternal), n.methodFullName, n.typeFullName, n.closureBinding)
 	if err != nil {
 		return err
 	}
+	if n.code != "" {
+		if err := s.exec(ctx, `INSERT INTO code(id, code) VALUES(?, ?)`, n.id, n.code); err != nil {
+			return err
+		}
+	}
 	return s.staged(ctx)
 }
 
-func (s *scratch) putEdge(ctx context.Context, src, dst, label, variable string) error {
+func (s *scratch) putEdge(ctx context.Context, src, dst int64, label string) error {
 	if !stagedEdgeLabels[label] {
 		if !knownEdgeLabels[label] {
 			s.countUnknown(label)
 		}
 		return nil
 	}
-	if err := s.exec(ctx, `INSERT OR IGNORE INTO edges(label, src, dst, variable) VALUES(?,?,?,?)`,
-		label, src, dst, variable); err != nil {
+	if err := s.exec(ctx, `INSERT INTO edge_in(label, src, dst) VALUES(?,?,?)`, label, src, dst); err != nil {
 		return err
 	}
 	return s.staged(ctx)
@@ -305,6 +330,55 @@ func (s *scratch) putEdge(ctx context.Context, src, dst, label, variable string)
 
 func (s *scratch) putMeta(ctx context.Context, key, value string) error {
 	return s.exec(ctx, `INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)`, key, value)
+}
+
+// putFile records one manifest entry; a path the manifest repeats keeps its
+// last version. The manifest is small beside the export and arrives in path
+// order, so its path index is appended to.
+func (s *scratch) putFile(ctx context.Context, path, fileID, hash string, size int64, language string) error {
+	return s.exec(ctx, `INSERT OR REPLACE INTO files(path, file_id, content_hash, size, language) VALUES(?,?,?,?,?)`,
+		path, fileID, hash, size, language)
+}
+
+// order turns the appended export into the structures the projection reads:
+// the node table keyed by id, the edge table in (type, source, target) order
+// with a reversed copy for the two types read by their target, and the
+// label index over the nodes. Every one is written in one pass from the
+// engine's sort. A node id the export repeated keeps its first row.
+//
+// AST edges are kept only where they reach a member, a local or a parameter:
+// the export's CONTAINS edges reach statements and expressions but never a
+// declaration, so those are the AST edges that attribute a declaration to
+// its container, and everything else in AST is structure this import never
+// reads.
+func (s *scratch) order(ctx context.Context) error {
+	steps := [...]struct{ what, query string }{
+		{"nodes", `CREATE TABLE nodes(id INTEGER PRIMARY KEY, label TEXT NOT NULL, name TEXT NOT NULL,
+			full_name TEXT NOT NULL, canonical_name TEXT NOT NULL, signature TEXT NOT NULL, filename TEXT NOT NULL,
+			line INTEGER, line_end INTEGER, col INTEGER, arg_index INTEGER, is_external INTEGER NOT NULL,
+			method_full_name TEXT NOT NULL, type_full_name TEXT NOT NULL, closure_binding TEXT NOT NULL)`},
+		{"nodes", `INSERT OR IGNORE INTO nodes SELECT id, label, name, full_name, canonical_name, signature, filename,
+			line, line_end, col, arg_index, is_external, method_full_name, type_full_name, closure_binding
+			FROM node_in ORDER BY id, seq`},
+		{"nodes", `CREATE INDEX nodes_by_label ON nodes(label, id)`},
+		{"code", `CREATE INDEX code_by_id ON code(id)`},
+		{"edges", `CREATE TABLE edges(label TEXT NOT NULL, src INTEGER NOT NULL, dst INTEGER NOT NULL,
+			PRIMARY KEY(label, src, dst)) WITHOUT ROWID`},
+		{"edges", `INSERT OR IGNORE INTO edges SELECT label, src, dst FROM edge_in
+			WHERE label <> '` + edgeAST + `' OR dst IN (SELECT id FROM nodes WHERE label IN ('` +
+			labelMember + `', '` + labelLocal + `', '` + labelParamIn + `'))
+			ORDER BY label, src, dst, seq`},
+		{"edges", `CREATE TABLE edges_rev(label TEXT NOT NULL, dst INTEGER NOT NULL, src INTEGER NOT NULL,
+			PRIMARY KEY(label, dst, src)) WITHOUT ROWID`},
+		{"edges", `INSERT OR IGNORE INTO edges_rev SELECT label, dst, src FROM edges
+			WHERE label IN ('` + edgeContains + `', '` + edgeAST + `') ORDER BY label, dst, src`},
+	}
+	for _, st := range steps {
+		if err := s.run(ctx, st.what, st.query); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // project derives the published entities, their anchors and every relation
@@ -326,81 +400,94 @@ func (s *scratch) putMeta(ctx context.Context, key, value string) error {
 //     reachability the engine computed, never a proven source-to-sink flow,
 //     and a walk that leaves the defining method is published as a capture.
 //
+// Every derived table is keyed by node id and filled in that order, so each
+// is one appended pass; a node's attributes live in a table of their own
+// rather than in columns updated on the node row.
+//
 // Reads and writes need the shape of an assignment's written operand and are
 // derived in Go (rw.go).
 func (s *scratch) project(ctx context.Context) error {
-	if err := s.commit(ctx); err != nil {
-		return err
-	}
-	steps := []string{
-		// AST is staged only to attribute a declaration to its container:
-		// the export's CONTAINS edges reach statements and expressions but
-		// never a local, a parameter or a member. Everything else in AST is
-		// structure this import never reads and is dropped before it costs a
-		// join.
-		`DELETE FROM edges WHERE label = 'AST' AND NOT EXISTS(SELECT 1 FROM nodes d
-			WHERE d.id = edges.dst AND d.label IN ('MEMBER', 'LOCAL', 'METHOD_PARAMETER_IN'))`,
+	steps := [...]struct{ what, query string }{
+		// Every file name the export mentions, once, so a node's file is one
+		// integer in its attribute row.
+		{"paths", `CREATE TABLE paths(id INTEGER PRIMARY KEY, path TEXT NOT NULL)`},
+		{"paths", `INSERT INTO paths(path) SELECT DISTINCT filename FROM nodes WHERE filename <> '' ORDER BY filename`},
+		{"paths", `CREATE UNIQUE INDEX paths_by_path ON paths(path)`},
 		// Every node is attributed to the method that contains it; a method
-		// owns itself. A node with several containers takes the smallest id so
-		// the attribution is a function of the export alone.
-		`UPDATE nodes SET owner = COALESCE((SELECT MIN(k.src) FROM edges k JOIN nodes m ON m.id = k.src AND m.label = 'METHOD'
-			WHERE k.label = 'CONTAINS' AND k.dst = nodes.id), '')`,
-		`UPDATE nodes SET owner = id WHERE label = 'METHOD'`,
-		// A member is contained by its type, not by a method; the type is
-		// what owns it for attribution and for the fact key.
-		`UPDATE nodes SET owner = COALESCE((SELECT MIN(a.src) FROM edges a JOIN nodes t ON t.id = a.src AND t.label = 'TYPE_DECL'
-			WHERE a.label = 'AST' AND a.dst = nodes.id), '') WHERE label = 'MEMBER' AND owner = ''`,
+		// owns itself. A node with several containers takes the smallest id
+		// so the attribution is a function of the export alone. A member is
+		// contained by its type, not by a method; the type is what owns it
+		// for attribution and for the fact key.
+		{"owners", `CREATE TABLE owners(id INTEGER PRIMARY KEY, owner INTEGER)`},
+		{"owners", `INSERT INTO owners SELECT n.id, CASE WHEN n.label = '` + labelMethod + `' THEN n.id ELSE COALESCE(
+			(SELECT MIN(k.src) FROM edges_rev k JOIN nodes m ON m.id = k.src AND m.label = '` + labelMethod + `'
+				WHERE k.label = '` + edgeContains + `' AND k.dst = n.id),
+			CASE WHEN n.label = '` + labelMember + `' THEN
+				(SELECT MIN(a.src) FROM edges_rev a JOIN nodes t ON t.id = a.src AND t.label = '` + labelTypeDecl + `'
+				WHERE a.label = '` + edgeAST + `' AND a.dst = n.id) END) END
+			FROM nodes n ORDER BY n.id`},
 		// A local or a parameter is reached by AST, not by CONTAINS: it takes
 		// the owner of its syntactic parent (the method itself for a
-		// parameter, the method's block for a local).
-		`UPDATE nodes SET owner = COALESCE((SELECT MIN(p.owner) FROM edges a JOIN nodes p ON p.id = a.src
-			WHERE a.label = 'AST' AND a.dst = nodes.id AND p.owner <> ''), '')
-			WHERE label IN ('LOCAL', 'METHOD_PARAMETER_IN') AND owner = ''`,
-		// A call site or identifier carries no FILENAME of its own; it lies in
-		// the file of the method that contains it.
-		`UPDATE nodes SET filename = COALESCE((SELECT m.filename FROM nodes m WHERE m.id = nodes.owner), '')
-			WHERE filename = '' AND owner <> ''`,
-		`INSERT OR IGNORE INTO ents(id, kind, external) SELECT id, 'method', is_external FROM nodes
-			WHERE label = 'METHOD' AND full_name NOT LIKE '<operator>.%'`,
+		// parameter, the method's block for a local). A call site or
+		// identifier carries no file of its own; it lies in the file of the
+		// method that contains it.
+		{"attributes", `CREATE TABLE attr(id INTEGER PRIMARY KEY, owner INTEGER, path INTEGER)`},
+		{"attributes", `INSERT INTO attr SELECT x.id, x.owner,
+			(SELECT p.id FROM paths p WHERE p.path = COALESCE(NULLIF(x.filename, ''),
+				(SELECT m.filename FROM nodes m WHERE m.id = x.owner), ''))
+			FROM (SELECT n.id, n.filename, CASE WHEN n.label IN ('` + labelLocal + `', '` + labelParamIn + `') AND o.owner IS NULL
+				THEN (SELECT MIN(p.owner) FROM edges_rev a JOIN owners p ON p.id = a.src
+					WHERE a.label = '` + edgeAST + `' AND a.dst = n.id AND p.owner IS NOT NULL)
+				ELSE o.owner END AS owner
+				FROM nodes n JOIN owners o ON o.id = n.id) x ORDER BY x.id`},
 		// Only declarations of a published container: the parameters of the
 		// operator stubs the frontend invents for lowering are machinery, not
 		// entities, and publishing them would be noise with no source.
-		`INSERT OR IGNORE INTO ents(id, kind, external) SELECT n.id, 'decl', 0 FROM nodes n
-			WHERE n.label IN ('LOCAL', 'METHOD_PARAMETER_IN', 'MEMBER')
-			AND (EXISTS (SELECT 1 FROM ents m WHERE m.id = n.owner)
-				OR EXISTS (SELECT 1 FROM nodes t WHERE t.id = n.owner AND t.label = 'TYPE_DECL'))`,
-		`INSERT OR IGNORE INTO anchors(node, target) SELECT id, id FROM ents`,
-		`INSERT OR IGNORE INTO anchors(node, target) SELECT c.id, MIN(e.dst) FROM nodes c
-			JOIN edges e ON e.label = 'CALL' AND e.src = c.id JOIN ents t ON t.id = e.dst
-			WHERE c.label = 'CALL' AND c.method_full_name NOT LIKE '<operator>.%' GROUP BY c.id`,
-		`INSERT OR IGNORE INTO anchors(node, target) SELECT i.id, MIN(e.dst) FROM nodes i
-			JOIN edges e ON e.label = 'REF' AND e.src = i.id JOIN ents d ON d.id = e.dst AND d.kind = 'decl'
-			WHERE i.label IN ('IDENTIFIER', 'FIELD_IDENTIFIER', 'METHOD_REF') GROUP BY i.id`,
-		`INSERT OR IGNORE INTO proj(kind, from_e, to_e, site, op, detail, target_name)
-			SELECT 'calls', c.owner, a.target, c.id, '', '` + detailCall + `', '' FROM nodes c
-			JOIN anchors a ON a.node = c.id JOIN ents o ON o.id = c.owner
-			WHERE c.label = 'CALL' AND c.method_full_name NOT LIKE '<operator>.%' AND a.target <> c.owner`,
-		`INSERT OR IGNORE INTO proj(kind, from_e, to_e, site, op, detail, target_name)
-			SELECT 'control_depends_on', ad.target, ac.target, e.dst, '', '` + detailCDG + `', '' FROM edges e
-			JOIN anchors ac ON ac.node = e.src JOIN anchors ad ON ad.node = e.dst
-			WHERE e.label = 'CDG' AND ac.target <> ad.target`,
+		{"entities", `CREATE TABLE ents(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, external INTEGER NOT NULL)`},
+		{"entities", `INSERT INTO ents SELECT id, '` + kindMethod + `', is_external FROM nodes
+			WHERE label = '` + labelMethod + `' AND full_name NOT LIKE '<operator>.%'
+			UNION ALL SELECT n.id, '` + kindDecl + `', 0 FROM nodes n JOIN attr a ON a.id = n.id
+			WHERE n.label IN ('` + labelLocal + `', '` + labelParamIn + `', '` + labelMember + `')
+			AND EXISTS (SELECT 1 FROM nodes m WHERE m.id = a.owner
+				AND ((m.label = '` + labelMethod + `' AND m.full_name NOT LIKE '<operator>.%') OR m.label = '` + labelTypeDecl + `'))
+			ORDER BY 1`},
+		{"anchors", `CREATE TABLE anchors(node INTEGER PRIMARY KEY, target INTEGER NOT NULL)`},
+		{"anchors", `INSERT INTO anchors SELECT id, id FROM ents
+			UNION ALL SELECT c.id, MIN(e.dst) FROM nodes c
+				JOIN edges e ON e.label = '` + edgeCall + `' AND e.src = c.id JOIN ents t ON t.id = e.dst
+				WHERE c.label = '` + labelCall + `' AND c.method_full_name NOT LIKE '<operator>.%' GROUP BY c.id
+			UNION ALL SELECT i.id, MIN(e.dst) FROM nodes i
+				JOIN edges e ON e.label = '` + edgeRef + `' AND e.src = i.id JOIN ents d ON d.id = e.dst AND d.kind = '` + kindDecl + `'
+				WHERE i.label IN ('` + labelIdent + `', '` + labelFieldIdMe + `', '` + labelMethodRef + `') GROUP BY i.id
+			ORDER BY 1`},
 		// The field-access map, built in one pass instead of one join per
 		// write site. A type with two members of the same name takes the
 		// smallest id, which is the same choice the per-site query made, so
 		// the map is a function of the export alone.
-		`INSERT OR IGNORE INTO members(type_full_name, name, id)
-			SELECT t.full_name, m.name, MIN(m.id) FROM nodes t
-			JOIN edges a ON a.label = 'AST' AND a.src = t.id
-			JOIN nodes m ON m.id = a.dst AND m.label = 'MEMBER'
-			WHERE t.label = 'TYPE_DECL' AND t.full_name <> '' AND m.name <> ''
-			GROUP BY t.full_name, m.name`,
+		{"members", `CREATE TABLE members(type_full_name TEXT NOT NULL, name TEXT NOT NULL, id INTEGER NOT NULL,
+			PRIMARY KEY(type_full_name, name)) WITHOUT ROWID`},
+		{"members", `INSERT OR IGNORE INTO members SELECT t.full_name, m.name, MIN(m.id) FROM nodes t
+			JOIN edges a ON a.label = '` + edgeAST + `' AND a.src = t.id
+			JOIN nodes m ON m.id = a.dst AND m.label = '` + labelMember + `'
+			WHERE t.label = '` + labelTypeDecl + `' AND t.full_name <> '' AND m.name <> ''
+			GROUP BY t.full_name, m.name`},
+		// Occurrences are appended as each derivation produces them; the
+		// sorted, de-duplicated copy every later phase reads is built once
+		// they are all in (occurrences()).
+		{"projection", `CREATE TABLE proj(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, from_e INTEGER NOT NULL,
+			to_e INTEGER NOT NULL, site INTEGER NOT NULL, op TEXT NOT NULL, detail TEXT NOT NULL, target_name TEXT NOT NULL)`},
+		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
+			SELECT 'calls', a.owner, an.target, c.id, '', '` + detailCall + `', '' FROM nodes c
+			JOIN attr a ON a.id = c.id JOIN anchors an ON an.node = c.id JOIN ents o ON o.id = a.owner
+			WHERE c.label = '` + labelCall + `' AND c.method_full_name NOT LIKE '<operator>.%' AND an.target <> a.owner`},
+		{"projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
+			SELECT 'control_depends_on', ad.target, ac.target, e.dst, '', '` + detailCDG + `', '' FROM edges e
+			JOIN anchors ac ON ac.node = e.src JOIN anchors ad ON ad.node = e.dst
+			WHERE e.label = '` + edgeCDG + `' AND ac.target <> ad.target`},
 	}
-	for _, q := range steps {
-		if err := ctx.Err(); err != nil {
+	for _, st := range steps {
+		if err := s.run(ctx, st.what, st.query); err != nil {
 			return err
-		}
-		if _, err := s.db.ExecContext(ctx, q); err != nil {
-			return internalErr("import projection: %v", err)
 		}
 	}
 	return s.projectDataFlow(ctx)
@@ -414,18 +501,29 @@ func (s *scratch) project(ctx context.Context) error {
 // recursive CTE. The frontier of each level is only the unanchored nodes the
 // previous level reached, which is a small set, whereas the recursive form
 // re-evaluates its stop condition for every row it queues and did not finish
-// in forty minutes on one unit's quarter of a million def-use edges.
+// in forty minutes on one unit's quarter of a million def-use edges. Each
+// level is read through the depth index, whose entries a level appends, and
+// the level's new pairs are inserted in start order, so a leaf of the walk
+// is rewritten at most once per level.
 func (s *scratch) projectDataFlow(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO walk(start, node, depth)
-		SELECT a.node, e.dst, 1 FROM anchors a JOIN edges e ON e.label = 'REACHING_DEF' AND e.src = a.node`); err != nil {
-		return internalErr("import projection: %v", err)
+	steps := [...]string{
+		`CREATE TABLE walk(start INTEGER NOT NULL, node INTEGER NOT NULL, depth INTEGER NOT NULL,
+			PRIMARY KEY(start, node)) WITHOUT ROWID`,
+		`CREATE INDEX walk_by_depth ON walk(depth, start, node)`,
+		`INSERT OR IGNORE INTO walk SELECT a.node, e.dst, 1 FROM anchors a
+			JOIN edges e ON e.label = '` + edgeReachingDef + `' AND e.src = a.node`,
+	}
+	for _, q := range steps {
+		if err := s.run(ctx, "projection", q); err != nil {
+			return err
+		}
 	}
 	for depth := 2; depth <= maxDataFlowDepth; depth++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO walk(start, node, depth)
-			SELECT w.start, e.dst, ? FROM walk w JOIN edges e ON e.label = 'REACHING_DEF' AND e.src = w.node
+			SELECT w.start, e.dst, ? FROM walk w JOIN edges e ON e.label = '`+edgeReachingDef+`' AND e.src = w.node
 			WHERE w.depth = ? AND NOT EXISTS (SELECT 1 FROM anchors x WHERE x.node = w.node)`, depth, depth-1)
 		if err != nil {
 			return internalErr("import projection: %v", err)
@@ -434,20 +532,19 @@ func (s *scratch) projectDataFlow(ctx context.Context) error {
 			break
 		}
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO proj(kind, from_e, to_e, site, op, detail, target_name)
+	return s.run(ctx, "projection", `INSERT INTO proj(kind, from_e, to_e, site, op, detail, target_name)
 		SELECT 'data_flows_to', a1.target, a2.target, w.node, '',
-			CASE WHEN (SELECT owner FROM nodes WHERE id = w.start) <> (SELECT owner FROM nodes WHERE id = w.node)
+			CASE WHEN (SELECT owner FROM attr WHERE id = w.start) IS NOT (SELECT owner FROM attr WHERE id = w.node)
 				OR EXISTS (SELECT 1 FROM nodes n WHERE n.id IN (a1.target, a2.target) AND n.closure_binding <> '')
 			THEN '`+detailReachDefCB+`' ELSE '`+detailReachDef+`' END, ''
 		FROM walk w JOIN anchors a1 ON a1.node = w.start JOIN anchors a2 ON a2.node = w.node
 		WHERE a1.target <> a2.target`)
-	if err != nil {
-		return internalErr("import projection: %v", err)
-	}
-	return nil
 }
 
-// countDerived records how many relation occurrences the projection derived.
+// occurrences builds the sorted, de-duplicated projection every later phase
+// reads: one row per distinct (kind, endpoints, site, operator, target
+// name), keeping the first derived detail, in the order the relation staging
+// pages it. It records how many rows that is.
 //
 // An occurrence count is a property of the analysed source, so it never
 // refuses the export and never truncates the projection: the occurrences live
@@ -456,8 +553,20 @@ func (s *scratch) projectDataFlow(ctx context.Context) error {
 // who set `providers.dependence.max_derived_rows` is told the import crossed
 // it -- Report.DerivedRows and Report.OverDerivedRows carry it out to the
 // provider, which logs it and publishes it on the unit's capability rows.
-func (s *scratch) countDerived(ctx context.Context) error {
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM proj`).Scan(&s.derivedRows); err != nil {
+func (s *scratch) occurrences(ctx context.Context) error {
+	steps := [...]string{
+		`CREATE TABLE projs(kind TEXT NOT NULL, from_e INTEGER NOT NULL, to_e INTEGER NOT NULL, site INTEGER NOT NULL,
+			op TEXT NOT NULL, target_name TEXT NOT NULL, detail TEXT NOT NULL,
+			PRIMARY KEY(kind, from_e, to_e, site, op, target_name)) WITHOUT ROWID`,
+		`INSERT OR IGNORE INTO projs SELECT kind, from_e, to_e, site, op, target_name, detail FROM proj
+			ORDER BY kind, from_e, to_e, site, op, target_name, seq`,
+	}
+	for _, q := range steps {
+		if err := s.run(ctx, "projection", q); err != nil {
+			return err
+		}
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM projs`).Scan(&s.derivedRows); err != nil {
 		return internalErr("import projection: %v", err)
 	}
 	return nil
