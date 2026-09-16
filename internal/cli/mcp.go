@@ -87,7 +87,13 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{Wait: indexLockWait})
+			// No lock wait: the open takes no lock, and the wait it would
+			// carry is what a refresh would spend before answering. A client
+			// asking for a refresh while the person's own index runs is
+			// answered now, with the retryable refusal it can act on, rather
+			// than held silent for a wait that cannot outlast that run; the
+			// watch loop takes the lock on a later pass of its own.
+			ws, err := app.OpenWorkspaceForServer(cmd.Context(), repo, app.OpenOptions{})
 			if err != nil {
 				return err
 			}
