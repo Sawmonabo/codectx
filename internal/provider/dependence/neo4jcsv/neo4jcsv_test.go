@@ -245,6 +245,20 @@ func TestImport(t *testing.T) {
 			if rep.UnresolvedWrites == 0 {
 				t.Errorf("no unresolved write shape reported; a guessed target would be published as a precise write")
 			}
+			// Failure mode: the export marks a callee it invented -- a method
+			// it emitted with no definition anywhere in the graph, so that an
+			// unresolved site still has a target -- and the import drops the
+			// mark, so a consumer of the callees answer cannot tell a guess
+			// from a real dependency. `__ecma.Array:` is the invented callee
+			// of this export.
+			if c.detail["call speculated"] == 0 {
+				t.Errorf("evidence details = %v; the call edge to an invented callee is indistinguishable from a real one", c.detail)
+			}
+			// A traversal answers with nodes and relations and never with the
+			// evidence behind them, so the node has to carry it too.
+			if !strings.Contains(c.meta["__ecma.Array:"], `"resolution":"speculated"`) {
+				t.Errorf("the invented callee's node metadata = %q, want a speculated resolution", c.meta["__ecma.Array:"])
+			}
 		},
 	}, {
 		name: "python reads and writes", src: "src/pythonsrc", export: "pythonsrc",

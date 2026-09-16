@@ -58,6 +58,10 @@ const (
 	detailReachDefCB = "reaching_def capture"
 	detailAssignment = "assignment"
 	detailCall       = "call"
+	// detailCallSpeculated is a call whose callee the export invented: a
+	// method with no definition in the graph, emitted so the site has a
+	// target. The edge is published, and says so.
+	detailCallSpeculated = "call speculated"
 )
 
 // Bounds of one import. They are contract ceilings, not tunables: an export

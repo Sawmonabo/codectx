@@ -429,7 +429,7 @@ type entity struct {
 	code                             string
 	file                             sql.NullInt64
 	line, lineEnd, col               sql.NullInt64
-	external                         bool
+	external, speculated             bool
 }
 
 // identify resolves every kept entity to canonical identity through the
@@ -457,7 +457,7 @@ func (e *emitter) identify(ctx context.Context) error {
 	after := int64(math.MinInt64)
 	for {
 		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.id, t.kind, n.label, n.name, n.canonical_name, n.full_name, n.signature,
-			n.line, n.line_end, n.col, t.external, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
+			n.line, n.line_end, n.col, t.external, n.speculated, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
 			l.range_text, COALESCE(f.path, ''), COALESCE(o.full_name, ''),
 			COALESCE((SELECT c.code FROM code c WHERE c.id = t.id ORDER BY c.seq LIMIT 1), '')
 			FROM ents t JOIN nodes n ON n.id = t.id JOIN loc l ON l.node = t.id
@@ -469,13 +469,13 @@ func (e *emitter) identify(ctx context.Context) error {
 		var page []entity
 		for rows.Next() {
 			var it entity
-			var ext int64
+			var ext, spec int64
 			if err := rows.Scan(&it.id, &it.kind, &it.label, &it.name, &it.canonical, &it.fullName, &it.signature, &it.line, &it.lineEnd, &it.col,
-				&ext, &it.file, &it.fileID, &it.hash, &it.lang, &it.rng, &it.relPath, &it.ownerFullName, &it.code); err != nil {
+				&ext, &spec, &it.file, &it.fileID, &it.hash, &it.lang, &it.rng, &it.relPath, &it.ownerFullName, &it.code); err != nil {
 				rows.Close()
 				return internalErr("import identify: %v", err)
 			}
-			it.external = ext != 0
+			it.external, it.speculated = ext != 0, spec != 0
 			page = append(page, it)
 		}
 		rows.Close()
@@ -593,7 +593,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		return err
 	}
 	node := res.Node
-	if meta := resolutionMetadata(res, it.external, it.kind == kindUnresolved); meta != nil {
+	if meta := resolutionMetadata(res, it.external, it.kind == kindUnresolved, it.speculated); meta != nil {
 		node.Metadata = meta
 	}
 	detail := detailCall
@@ -713,12 +713,21 @@ func rangeDigest(ranges ...string) string {
 	return strings.Join(parts, "|")
 }
 
-func resolutionMetadata(res model.Resolution, external, unresolved bool) json.RawMessage {
+// resolutionMetadata is the node metadata that tells a consumer of the graph
+// answers what kind of identity this is: one the export could not bind, one it
+// bound several ways, one it invented, or one that lives outside the unit.
+// Nothing else carries that distinction to a caller, because a traversal
+// answers with nodes and relations and never with the evidence behind them.
+func resolutionMetadata(res model.Resolution, external, unresolved, speculated bool) json.RawMessage {
 	switch {
 	case unresolved || res.Basis == model.MatchUnresolved:
 		return json.RawMessage(`{"resolution":"unresolved","candidates":0}`)
 	case len(res.Ambiguous) > 0:
 		return json.RawMessage(`{"resolution":"ambiguous","candidates":` + strconv.Itoa(len(res.Ambiguous)+1) + `}`)
+	case speculated:
+		// The export invented this callee, so it is not an import: nothing in
+		// the graph defines it and nothing says the source depends on it.
+		return json.RawMessage(`{"resolution":"speculated","candidates":1}`)
 	case external:
 		return json.RawMessage(`{"resolution":"import","candidates":1}`)
 	}
