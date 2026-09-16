@@ -35,7 +35,7 @@ const readerCeiling = 3 * time.Second
 // calibrates it -- with the read-only open removed the readers below must fail
 // busy, and if they do not, the padding is too small rather than the product
 // correct.
-const padPerFile = 3000
+const padPerFile = 6000
 
 // readerPause separates one reader cycle from the next. See the call sites.
 const readerPause = 50 * time.Millisecond
@@ -114,13 +114,17 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 		indexed <- err
 	}()
 
+	// Two sets of walls, because only one of them is evidence: the LAST cycle
+	// may have run after the child exited, and a wall measured with no writer
+	// in the workspace says nothing about reading during a run. Only the
+	// strictly-inside walls carry the ceiling.
 	worst := make(map[string]time.Duration, len(readers))
+	after := make(map[string]time.Duration, len(readers))
 	cycles := 0
 	for running := true; running; {
+		cycle := make(map[string]time.Duration, len(readers))
 		for _, r := range readers {
-			if wall := s.readDuringIndex(t, r.name, r.args...); wall > worst[r.name] {
-				worst[r.name] = wall
-			}
+			cycle[r.name] = s.readDuringIndex(t, r.name, r.args...)
 		}
 		// A pause between cycles, because the readers are readers and not a
 		// load generator: six execs per cycle with no gap saturates the cores
@@ -136,14 +140,17 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 				t.Fatalf("the indexing child failed while the readers ran: %v", err)
 			}
 			running = false
+			merge(after, cycle)
 		default:
 			// The child outlived a whole cycle: every reader in it answered
 			// strictly inside the run.
 			cycles++
+			merge(worst, cycle)
 		}
 	}
 	for _, r := range readers {
-		t.Logf("reader %-18s worst wall %s", r.name, worst[r.name])
+		t.Logf("reader %-18s worst wall %s inside the run, %s in the cycle that outlived it",
+			r.name, worst[r.name], after[r.name])
 		if worst[r.name] > readerCeiling {
 			t.Errorf("%s took %s during a live index, over the %s ceiling: it waited on the writer",
 				r.name, worst[r.name], readerCeiling)
@@ -263,13 +270,28 @@ func (s *sandbox) readDuringIndex(t *testing.T, name string, args ...string) tim
 	return wall
 }
 
-// padFixture appends the same number of trivially parseable symbols to each
-// generated source file, so an index run has work to do for long enough that a
-// second process can be inside it. Each round takes its own symbol numbers, at
-// a fixed width, so every round appends the same number of bytes and the two
-// measured index walls are comparable.
+// merge folds one cycle's walls into the worst seen so far.
+func merge(worst, cycle map[string]time.Duration) {
+	for name, wall := range cycle {
+		if wall > worst[name] {
+			worst[name] = wall
+		}
+	}
+}
+
+// padFixture rewrites the fixture and appends the same number of trivially
+// parseable symbols to each generated source file, so an index run has work to
+// do for long enough that a second process can be inside it.
+//
+// It REGENERATES first, and that is what makes the two index walls comparable:
+// appending onto an already-padded file would leave the second measured run
+// parsing twice the first one's bytes, and the difference between the two walls
+// would be about the workload rather than about the readers. Each round takes
+// its own symbol numbers at a fixed width, so every round leaves every file the
+// same size while changing every byte range a fingerprint covers.
 func padFixture(t *testing.T, repo string, round int) {
 	t.Helper()
+	generateTinyRepo(t, repo)
 	first := (round-1)*padPerFile + 1
 	pad := map[string]func(int) string{
 		filepath.Join("src", "go", "store", "store.go"): func(n int) string {
