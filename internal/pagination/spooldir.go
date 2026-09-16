@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // A retained STATE DIRECTORY is continuation state whose producer builds it as
@@ -153,7 +154,7 @@ func (s *Spools) ReadoptDir(c Cursor, prevID string) (string, error) {
 		if prev != nil {
 			_ = replaceDirHeader(from, prev)
 		} else {
-			_ = os.Remove(filepath.Join(from, spoolDirHeader))
+			_ = paced.Remove(filepath.Join(from, spoolDirHeader))
 		}
 		s.transferBack(id, prevID, delta)
 		return "", internalErr("spool adopt: " + err.Error())
@@ -244,7 +245,7 @@ func replaceDirHeader(dir string, frame []byte) error {
 		return internalErr("spool adopt: " + err.Error())
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, spoolDirHeader)); err != nil {
-		_ = os.Remove(tmp)
+		_ = paced.Remove(tmp)
 		return internalErr("spool adopt: " + err.Error())
 	}
 	return nil

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"modernc.org/sqlite"
 )
 
@@ -99,7 +100,7 @@ func (s *scratch) close() error {
 		s.db = nil
 	}
 	if s.dir != "" {
-		err := os.RemoveAll(s.dir)
+		err := paced.RemoveAll(s.dir)
 		s.dir = ""
 		if err != nil {
 			return internal("scip scratch cleanup: " + err.Error())

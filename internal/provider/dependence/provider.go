@@ -15,6 +15,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/lang"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -475,7 +476,7 @@ func sweepPrivate(dataDir string) {
 		var swept, failed int
 		for _, e := range entries {
 			path := filepath.Join(root, e.Name())
-			if err := os.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			if err := paced.RemoveAll(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				failed++
 				slog.Error("a stale dependence working directory was not removed", "component", component, "error", err)
 				continue
@@ -493,7 +494,7 @@ func sweepPrivate(dataDir string) {
 func (r *runDir) path(name string) string { return filepath.Join(r.root, name) }
 
 func (r *runDir) close(req provider.UnitRequest) {
-	if err := os.RemoveAll(r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.RemoveAll(r.root); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence run directory was not removed", "component", component,
 			"run", string(req.Run), "error", err)
 	}
@@ -627,7 +628,7 @@ func (p *Provider) graphFor(ctx context.Context, req provider.UnitRequest, unit 
 func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Unit, res Reservation,
 	source, graph string, extra []string) (Outcome, error) {
 
-	_ = os.Remove(graph)
+	_ = paced.Remove(graph)
 	timeout, err := remaining(ctx)
 	if err != nil {
 		return Outcome{}, err
@@ -744,7 +745,7 @@ func (p *Provider) importExport(ctx context.Context, req provider.UnitRequest, u
 	if err != nil {
 		return ImportReport{}, err
 	}
-	if err := os.RemoveAll(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.RemoveAll(dir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		slog.Error("a dependence export was not removed", "component", component, "run", string(req.Run), "error", err)
 	}
 	return report, nil
@@ -821,7 +822,7 @@ func (p *Provider) subdivide(ctx context.Context, req provider.UnitRequest, unit
 		}
 		total = merge(total, report)
 		admitted++
-		_ = os.Remove(graph)
+		_ = paced.Remove(graph)
 	}
 	if admitted == 0 {
 		return ImportReport{}, 0, failure(FailureEngine, unit.ScopeKey, crash, res).

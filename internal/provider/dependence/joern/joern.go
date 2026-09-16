@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 )
@@ -219,7 +220,7 @@ func (b *Backend) Export(ctx context.Context, req dependence.ExportRequest) (dep
 		return dependence.ExportOutcome{}, err
 	}
 	// The engine refuses an output directory that already exists.
-	if err := os.RemoveAll(req.OutputDir); err != nil {
+	if err := paced.RemoveAll(req.OutputDir); err != nil {
 		return dependence.ExportOutcome{}, &model.Error{Code: model.CodeInternal,
 			Message: "the previous analysis export could not be removed: " + err.Error()}
 	}

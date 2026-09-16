@@ -255,8 +255,9 @@ CREATE TABLE evidence (
 CREATE TABLE unit_delta_state (
     unit_id INTEGER NOT NULL REFERENCES units(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
+    part INTEGER NOT NULL,
     payload BLOB NOT NULL,
-    PRIMARY KEY(unit_id, kind)
+    PRIMARY KEY(unit_id, kind, part)
 ) WITHOUT ROWID;
 -- Intern dictionaries. A WITHOUT ROWID table re-stores its whole primary
 -- key inside every secondary index, so a wide PK is paid for once per index.

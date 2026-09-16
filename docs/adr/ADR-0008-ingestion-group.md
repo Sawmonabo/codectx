@@ -131,6 +131,26 @@ a spilled statement journal, a sort's runs -- and only the file system sees ever
 them. On a platform without range writeback the wait is the wrapped file's own sync, which
 with at most two windows dirty is a bounded wait.
 
+### Decision 5, amended again 2026-09-16: freeing is windowed like writing
+
+The third uncapped index, with the shim in place, kept the dirty set under 5 MB and the pool
+never exhausted through the 1.8 GB commit -- and then stalled the host anyway, twice, at the
+two moments the run frees space: the log's reset after the checkpoint and the removal of the
+analyzer's export and staging (4.4 GB) at the end. The root filesystem is mounted to discard
+freed blocks as they are freed (`discard`), so one unlink of a multi-gigabyte file hands the
+device every discard at once, and every other process's sync waits behind them. Writing was
+bounded; freeing was not.
+
+Freeing is therefore windowed the same way: a file larger than the window is truncated down
+one window at a time with a data sync between steps, so the filesystem frees, and the device
+discards, one window at a time, and only then is the file unlinked. The shim does this for the engine's own truncations and
+deletions (a log reset, a rollback or statement journal's removal), and `internal/paced` does
+it for every file the process removes itself (a spool, a sort's runs, a staging tree, an
+export). This is the delete scheduler of a log-structured storage engine, whose
+`bytes_max_delete_chunk` "ftruncate[s] the file by this size each time, rather than dropping
+the whole file"; the window is the same layout constant as the write window and there is no
+rate and no setting.
+
 ## What the numbers must show
 
 The ingestion test after the change, the group flushed and the log folded into the database before
@@ -233,6 +253,12 @@ the reference repository's size is expected to reach.
   default one and intercepts its file methods).
 - Linux kernel, "DMA and swiotlb" — https://docs.kernel.org/core-api/swiotlb.html (the bounce-buffer
   pool every disk request of a virtual machine may have to pass through).
+- Log-structured storage engine, `SstFileManager` and its delete scheduler,
+  `bytes_max_delete_chunk` —
+  https://github.com/facebook/rocksdb/blob/main/include/rocksdb/sst_file_manager.h (a file
+  larger than the chunk is truncated by the chunk each time rather than dropped whole).
+- ext4 `discard` mount option — https://www.kernel.org/doc/html/latest/admin-guide/ext4.html
+  (with `discard`, the filesystem issues discard commands to the device when blocks are freed).
 - RocksDB Tuning Guide, bytes_per_sync and wal_bytes_per_sync —
   https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide (paced writeback of files being
   written, for the same reason).

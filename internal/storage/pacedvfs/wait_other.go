@@ -1,6 +1,6 @@
 //go:build !linux
 
-package paced
+package pacedvfs
 
 // waitMode selects the wrapped file's own sync as the wait on a platform
 // without range writeback: with at most two windows dirty it is a bounded

@@ -2,7 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
-	"github.com/Sawmonabo/codectx/internal/storage/paced"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"os"
 	"strings"
 	"unsafe"
@@ -89,7 +89,7 @@ func SetTempDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return internal("engine temporary directory: " + err.Error())
 	}
-	if err := paced.Register(); err != nil {
+	if err := pacedvfs.Register(); err != nil {
 		return internal(err.Error())
 	}
 	db, err := sql.Open("sqlite", ":memory:")

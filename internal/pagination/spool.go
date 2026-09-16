@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // Spools manages bounded, disk-backed continuation state for traversals whose
@@ -278,7 +279,7 @@ func (s *Spools) Create(c Cursor) (*Spool, error) {
 // discard abandons a spool that failed during Create.
 func (sp *Spool) discard() {
 	sp.file.Close()
-	os.Remove(sp.path)
+	paced.Remove(sp.path)
 	sp.owner.forget(sp.header.SpoolID, sp.written)
 	sp.file, sp.w = nil, nil
 }
@@ -575,7 +576,7 @@ func (s *Spools) remove(id string) error {
 	// RemoveAll rather than Remove: a retained state directory is one entry of
 	// this store like any spool file, and leaving it behind would leak the
 	// whole search state of every page that ended early.
-	if err := os.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := paced.RemoveAll(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return internalErr("spool release: " + err.Error())
 	}
 	s.forget(id, size)
@@ -638,7 +639,7 @@ func (s *Spools) Sweep(ctx context.Context, now time.Time) (liveBytes int64, err
 			}
 		}
 		if dead {
-			if rerr := os.RemoveAll(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			if rerr := paced.RemoveAll(path); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 				errs = append(errs, internalErr("spool sweep: "+rerr.Error()))
 				live[id] = entryBytes(path, info)
 			}

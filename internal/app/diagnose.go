@@ -11,7 +11,9 @@ import (
 	"syscall"
 
 	"github.com/Sawmonabo/codectx/internal/diagnostics"
+	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
@@ -181,7 +183,7 @@ func (workspaceProber) Writable(ctx context.Context, dir string) error {
 	}
 	name := f.Name()
 	closeErr := f.Close()
-	rmErr := os.Remove(name)
+	rmErr := paced.Remove(name)
 	if closeErr != nil {
 		// Close reports the write-back failure on the filesystems that defer
 		// it, so it is answered before the removal's own error.
@@ -261,7 +263,11 @@ func (workspaceProber) FreeDiskBytes(ctx context.Context, dir string) (*uint64, 
 	if dir == "" {
 		return nil, nil
 	}
-	return freeDiskBytes(dir)
+	free, ok := diskfree.Available(dir)
+	if !ok {
+		return nil, nil
+	}
+	return &free, nil
 }
 
 // snapshotSweeper adapts the package-level snapshot.Sweep to the collector's

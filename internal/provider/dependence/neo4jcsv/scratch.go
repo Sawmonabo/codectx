@@ -9,7 +9,7 @@ import (
 	"modernc.org/sqlite"
 
 	"github.com/Sawmonabo/codectx/internal/config"
-	"github.com/Sawmonabo/codectx/internal/storage/paced"
+	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
 // Export labels this import consumes. A mapped label produces facts or is an
@@ -182,7 +182,7 @@ func openScratch(ctx context.Context, path string, cacheKiB int, maxRows config.
 		q.Add("_pragma", p)
 	}
 	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: q.Encode()}).String()
-	if err := paced.Register(); err != nil {
+	if err := pacedvfs.Register(); err != nil {
 		return nil, internalErr("import scratch: %v", err)
 	}
 	connector, err := sqlite.NewConnector(dsn)

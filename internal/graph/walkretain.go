@@ -16,6 +16,7 @@ import (
 	"slices"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/pagination"
 )
 
@@ -280,7 +281,7 @@ func (w *retainedWalk) detach() (string, error) {
 func (w *retainedWalk) discard() {
 	_ = w.close()
 	if w.owned && w.home.exists() {
-		_ = os.RemoveAll(w.home.path)
+		_ = paced.RemoveAll(w.home.path)
 	}
 	w.home = existingDir("")
 }
@@ -378,7 +379,7 @@ func (r *retainFile) remove() error {
 		return err
 	}
 	r.bytes = 0
-	if err := os.Remove(r.path()); err != nil && !os.IsNotExist(err) {
+	if err := paced.Remove(r.path()); err != nil && !os.IsNotExist(err) {
 		return internalErr("graph: the retained walk input: " + err.Error())
 	}
 	return nil
@@ -573,7 +574,7 @@ func (w *retainedWalk) setRankProgress(p rankProgress) error {
 		return internalErr("graph: the retained ranking manifest: " + err.Error())
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, retainRankFile)); err != nil {
-		_ = os.Remove(tmp)
+		_ = paced.Remove(tmp)
 		return internalErr("graph: the retained ranking manifest: " + err.Error())
 	}
 	return nil

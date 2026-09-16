@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // The document manifest is the per-document membership of one sealed SCIP
@@ -147,7 +148,7 @@ func (m *DocumentManifest) Save(dst string) error {
 	if err != nil {
 		return internal("scip document manifest: " + err.Error())
 	}
-	defer os.Remove(tmp.Name())
+	defer paced.Remove(tmp.Name())
 	if _, err := io.Copy(tmp, src); err != nil {
 		tmp.Close()
 		return internal("scip document manifest: " + err.Error())
@@ -174,7 +175,7 @@ func (m *DocumentManifest) Close() error {
 	}
 	name := m.name
 	m.owned = false
-	if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+	if err := paced.Remove(name); err != nil && !os.IsNotExist(err) {
 		return internal("scip document manifest: " + err.Error())
 	}
 	return nil

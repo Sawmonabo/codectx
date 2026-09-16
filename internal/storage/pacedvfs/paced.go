@@ -27,22 +27,23 @@
 // The window is a layout constant of this package, not a limit: it bounds
 // what is outstanding, never what is written or how fast the disk is allowed
 // to run.
-package paced
+package pacedvfs
 
 import (
+	"errors"
+	"io/fs"
 	"sync"
 	"unsafe"
 
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"modernc.org/libc"
 	"modernc.org/libc/sys/types"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
-// Window is the number of bytes written to one file between two waits. It is
-// small enough that a host with a small bounce-buffer pool never sees more
-// than a few thousand pages in flight and large enough that a sequential
-// device stays busy between submissions.
-const Window = 8 << 20
+// Window is the number of bytes written to one file between two waits, the
+// process's one disk window.
+const Window = paced.Window
 
 // Name is the file system's registered name. Registration also makes it the
 // process default, so a connection opened without naming a file system uses
@@ -138,7 +139,7 @@ func register() {
 		registerErr = errNoMemory
 		return
 	}
-	// Every method but xOpen is the wrapped file system's own, called with
+	// Every method but xOpen and xDelete is the wrapped file system's own, called with
 	// our pointer: those methods read nothing from the file system object
 	// that differs between the two, and pAppData is copied so the ones that
 	// read it (the wrapped open's locking-style finder) find what they expect.
@@ -150,6 +151,9 @@ func register() {
 	dst.FxOpen = *(*uintptr)(unsafe.Pointer(&struct {
 		f func(*libc.TLS, uintptr, uintptr, uintptr, int32, uintptr) int32
 	}{xOpen}))
+	dst.FxDelete = *(*uintptr)(unsafe.Pointer(&struct {
+		f func(*libc.TLS, uintptr, uintptr, int32) int32
+	}{xDelete}))
 	if rc := sqlite3.Xsqlite3_vfs_register(tls, outer, 1); rc != sqlite3.SQLITE_OK {
 		libc.Xfree(tls, outer)
 		libc.Xfree(tls, name)
@@ -185,6 +189,19 @@ func xOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOutFlags uin
 	h.FpMethods = uintptr(unsafe.Pointer(&methods))
 	h.mode, h.fd = waitMode(wrapped(pFile), zName)
 	return sqlite3.SQLITE_OK
+}
+
+// xDelete removes a file the way paced.Remove does: a file larger than a
+// window is shrunk a window at a time before the wrapped delete unlinks it,
+// so the log's reset and a journal's removal never free gigabytes at once.
+func xDelete(tls *libc.TLS, pVfs, zName uintptr, syncDir int32) int32 {
+	if zName != 0 {
+		if err := paced.Shrink(libc.GoString(zName), 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return sqlite3.SQLITE_IOERR_DELETE
+		}
+	}
+	del := (*sqlite3.Tsqlite3_vfs)(ptr(inner)).FxDelete
+	return (*(*func(*libc.TLS, uintptr, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{del})))(tls, inner, zName, syncDir)
 }
 
 func xClose(tls *libc.TLS, pFile uintptr) int32 {
@@ -230,9 +247,30 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	return rc
 }
 
+// xTruncate shrinks a file a window at a time, syncing between steps, so
+// that freeing a large log hands the filesystem one window of freed space
+// at a time.
 func xTruncate(tls *libc.TLS, pFile uintptr, size int64) int32 {
 	m := innerMethods(pFile)
-	return (*(*func(*libc.TLS, uintptr, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxTruncate})))(tls, wrapped(pFile), size)
+	truncate := *(*func(*libc.TLS, uintptr, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxTruncate}))
+	sync := *(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxSync}))
+	fileSize := *(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxFileSize}))
+	var cur int64
+	if rc := fileSize(tls, wrapped(pFile), uintptr(unsafe.Pointer(&cur))); rc != sqlite3.SQLITE_OK {
+		return rc
+	}
+	for cur-size > Window {
+		cur -= Window
+		if rc := truncate(tls, wrapped(pFile), cur); rc != sqlite3.SQLITE_OK {
+			return rc
+		}
+		if rc := sync(tls, wrapped(pFile), sqlite3.SQLITE_SYNC_NORMAL); rc != sqlite3.SQLITE_OK {
+			return rc
+		}
+		truncations.Add(1)
+	}
+	(*header)(ptr(pFile)).since = 0
+	return truncate(tls, wrapped(pFile), size)
 }
 
 func xSync(tls *libc.TLS, pFile uintptr, flags int32) int32 {

@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/dependence/neo4jcsv"
@@ -60,7 +60,7 @@ func (a *dependenceApplier) Apply(ctx context.Context, req Request) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
-	defer os.RemoveAll(dir)
+	defer paced.RemoveAll(dir)
 
 	prev, reason, err := a.previous(ctx, req, dir)
 	if err != nil {
@@ -248,16 +248,12 @@ func (a *dependenceApplier) previous(ctx context.Context, req Request, dir strin
 	if req.Previous == "" {
 		return nil, FullNoPredecessor, nil
 	}
-	rawKeys, err := a.state(ctx, req.Previous, KindDependenceKeys)
+	keysFile, err := previousState(ctx, a.store, dir, "previous-keys", req.Previous, KindDependenceKeys)
 	if err != nil {
 		return nil, "", err
 	}
-	if rawKeys == nil {
+	if keysFile == "" {
 		return nil, FullNoState, nil
-	}
-	keysFile, err := writeState(dir, "previous-keys", rawKeys)
-	if err != nil {
-		return nil, "", err
 	}
 	keys, err := neo4jcsv.LoadKeySet(keysFile)
 	if err != nil {
@@ -273,26 +269,4 @@ func (a *dependenceApplier) previous(ctx context.Context, req Request, dir strin
 		return nil, FullNoState, nil
 	}
 	return &keys, "", nil
-}
-
-// state reads one delta-state payload, reporting a missing one as nil.
-func (a *dependenceApplier) state(ctx context.Context, unit model.UnitID, kind string) ([]byte, error) {
-	raw, err := a.store.DeltaState(ctx, unit, kind)
-	if err != nil {
-		if isNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return raw, nil
-}
-
-// putState stores one of this unit's delta-state artifacts from the file it
-// was produced in.
-func putState(ctx context.Context, w *sqlite.UnitWriter, kind, path string) error {
-	payload, err := os.ReadFile(path)
-	if err != nil {
-		return internal("delta state " + kind + ": " + err.Error())
-	}
-	return w.PutDeltaState(ctx, kind, payload)
 }

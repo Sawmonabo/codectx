@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // A walk's cumulative admitted-node set is a BITSET over the generation's node
@@ -350,7 +351,7 @@ func (b *pagedBitset) writeManifest() error {
 		return bitsetErr(err)
 	}
 	if err := os.Rename(tmp, filepath.Join(dir, b.name+bitsetManifestSuffix)); err != nil {
-		_ = os.Remove(tmp)
+		_ = paced.Remove(tmp)
 		return bitsetErr(err)
 	}
 	b.grown += int64(len(raw))

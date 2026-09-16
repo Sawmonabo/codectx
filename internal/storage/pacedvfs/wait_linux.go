@@ -1,10 +1,11 @@
 //go:build linux
 
-package paced
+package pacedvfs
 
 import (
 	"sync/atomic"
 
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"golang.org/x/sys/unix"
 	"modernc.org/libc"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -40,10 +41,5 @@ func waitMode(inner uintptr, zName uintptr) (int32, int32) {
 	return byRange, fd
 }
 
-// waitRange waits for the pages of fd already submitted to the disk and then
-// submits every page dirtied since, so that one window is in flight at a
-// time. It reports false where the file system cannot do that, and the
-// caller falls back to the wrapped sync.
-func waitRange(fd int32) bool {
-	return unix.SyncFileRange(int(fd), 0, 0, unix.SYNC_FILE_RANGE_WAIT_BEFORE|unix.SYNC_FILE_RANGE_WRITE) == nil
-}
+// waitRange is the process's window wait on the file's own descriptor.
+func waitRange(fd int32) bool { return paced.WaitWindow(int(fd)) }
