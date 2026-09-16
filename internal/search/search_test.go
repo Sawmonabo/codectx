@@ -1770,22 +1770,23 @@ func legPageClampIsReported(t *testing.T, f *fixture) {
 	}
 }
 
-// legStreamedWalkParity proves the streamed tail is the same answer, in the
-// same order, as the unpaginated one. rank no longer materialises the answer:
-// the first page is drained from the ranked run and the remainder is streamed
-// into the continuation spool by tailOf, which is the one path with no other
-// assertion over it. A tail that skipped, repeated or reordered a record --
-// an off-by-one in its skip, or a chunk flush that dropped its buffer --
-// would show up here and nowhere else.
+// legStreamedWalkParity proves a paged walk is the same answer, in the same
+// order, as the unpaginated one. The tail is never materialised: every
+// candidate is laid into the raw spool as it passes, the first continuation
+// sorts that spool and writes the ordered remainder skipping the records page
+// one already served, and every later page seeks to its own byte offset. A
+// record that was skipped, repeated or reordered -- an off-by-one in that skip
+// against the served count, or a codec that did not round trip -- would show
+// up here and nowhere else.
 //
 // It asserts the WHOLE hit, field for field: Reasons, Kind, Name,
 // QualifiedName and Signature survive the spool round trip or they are lost
 // for every page but the first, and Range must come back identical although
-// the continuation -- not the first page -- is now what hydrates it.
+// the continuation -- not the first page -- is what hydrates it.
 //
-// The corpus walk reaches one chunk; the second half drives tailOf itself past
-// its model.MaxPageItems chunk boundary, which is the arm a small corpus can
-// never reach and where a flush that dropped or repeated its buffer would hide.
+// The corpus walk runs the whole continuation path on a small answer; the
+// second half drives the page heap over a candidate set whose ties span the
+// page boundary, which is the arm a small corpus can never reach.
 func legStreamedWalkParity(t *testing.T, f *fixture) {
 	s := newService(t, f.opts)
 	whole, err := s.Search(f.ctx, model.SearchRequest{Query: "handle"})
