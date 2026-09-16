@@ -198,6 +198,10 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			"the query, cache and queue reservations, live subprocesses and pending events, " +
 			"database, WAL, temporary and content bytes, unit reuse and parse counts, and " +
 			"what each heavy analysis unit was reserved, capped and observed to peak at. " +
+			"It also reports the run this repository last recorded -- the one still going if " +
+			"a run is going, otherwise the one that produced the active generation -- and the " +
+			"stages it spent its time in, costliest first, with a stage that is still going " +
+			"reported as running with the time it has been going rather than as a finished wall. " +
 			"It is not reported by default because measuring it costs more than the rest of " +
 			"this report put together. A metric this host cannot measure is reported as " +
 			"unavailable, never as zero.",
@@ -580,6 +584,139 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
 	flushTableInto(tw)
+	writeRunLedger(b, r.Run, r.Stages)
+}
+
+// writeRunLedger renders the recorded run and its stages: what the run cost,
+// and where it spent that cost. The run row comes first because a stage's
+// share of a run means nothing without the run it is a share of, and the
+// stages follow in the order the report assembled them -- wall descending --
+// so the table and the --json rows are the same rows in the same order.
+//
+// A stage that is still going is rendered as running with the time it has been
+// going, never as a finished wall. "This is taking a long time" and "this took
+// a long time" are different facts, and a live stage whose elapsed time printed
+// like a measurement would tell an operator that a stalled stage had finished
+// fast.
+func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+	if run == nil {
+		return
+	}
+	b.WriteString("\nrun\n")
+	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
+	fmt.Fprint(tw, "  stage\tscope\twall\tcpu\tpeak\tin\tout\toutcome\n")
+	// The run's own row carries the counts the run keeps for itself: the files
+	// it took in and the units it got out. Its processor time is not a figure
+	// anything measures for the process as a whole, so the column is
+	// unavailable here rather than a sum of the stages that would silently
+	// omit every stage whose time could not be attributed.
+	fmt.Fprintf(tw, "  run\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+		runScope(run), wallMetric(run.WallMS, run.Outcome == runOutcomeRunning, run.FinishedAt),
+		metricUnavailable, byteMetric(run.ProcessPeakRSSBytes),
+		run.FileCount, run.UnitsSucceeded, run.Outcome)
+	for _, stage := range stages {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+			stage.Stage, stageScope(stage), wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
+			cpuMetric(stage), byteMetric(stage.PeakRSSBytes),
+			stage.ItemsIn, stage.ItemsOut, stageOutcome(stage))
+	}
+	// What a failed stage failed with, under the row that reports it failed: a
+	// table column cannot hold it, and an outcome of `failed` with the reason
+	// only in --json would leave the operator reading the table to guess.
+	for _, stage := range stages {
+		if stage.Failure != "" {
+			fmt.Fprintf(tw, "    %s failed\t%s\n", stage.Stage, stage.Failure)
+		}
+	}
+	flushTableInto(tw)
+	// Accounting the bounded bus refused rather than made the run wait for it.
+	// Above zero the stages above are known to be an incomplete account of the
+	// run, and a table that did not say so would read as the whole of it.
+	if run.EventsDropped > 0 {
+		fmt.Fprintf(b, "  incomplete  %d accounting %s dropped; the stages above are not the whole run\n",
+			run.EventsDropped, plural(int(run.EventsDropped), "event was", "events were"))
+	}
+}
+
+// runOutcomeRunning is the one outcome spelling a renderer has to recognise:
+// it is what makes a run's elapsed time elapsed rather than measured.
+const runOutcomeRunning = "running"
+
+// wallMetric renders a span's or a run's time: its measurement once it has
+// finished, its elapsed time so far while it is running, and unavailable for
+// one that ended without anything measuring it. The last is a real case -- a
+// run whose process died leaves no finish, and rendering its zero as "0s"
+// would present the run an operator is investigating as one that took no time.
+func wallMetric(wallMS int64, running bool, finishedAt *time.Time) string {
+	switch {
+	case running:
+		return "running " + millisMetric(wallMS)
+	case finishedAt == nil:
+		return metricUnavailable
+	}
+	return millisMetric(wallMS)
+}
+
+// millisMetric renders a measured millisecond count as a duration, in the same
+// idiom every other duration in this package is rendered in.
+func millisMetric(ms int64) string {
+	return (time.Duration(ms) * time.Millisecond).Round(time.Millisecond).String()
+}
+
+// cpuMetric renders a stage's processor time. The two halves are measured
+// together or not at all, so they are summed; a stage with neither says why it
+// has neither, because "the platform does not sample this" and "this stage ran
+// beside other work, so the process counters do not measure it" are different
+// answers and only the second means the number could never exist.
+func cpuMetric(stage model.StageRecord) string {
+	if stage.CPUUserMS == nil && stage.CPUSysMS == nil {
+		if stage.CPUUnattributed != "" {
+			return metricUnavailable + " (" + stage.CPUUnattributed + ")"
+		}
+		return metricUnavailable
+	}
+	var total int64
+	if stage.CPUUserMS != nil {
+		total += *stage.CPUUserMS
+	}
+	if stage.CPUSysMS != nil {
+		total += *stage.CPUSysMS
+	}
+	return millisMetric(total)
+}
+
+// runScope names what the run produced. A run that never reached a generation
+// says so rather than printing a zero that would read as generation zero.
+func runScope(run *model.RunRecord) string {
+	if run.GenerationID == nil {
+		return "no generation"
+	}
+	return fmt.Sprintf("generation %d", *run.GenerationID)
+}
+
+// stageScope names what a stage was working on. Both parts are optional -- a
+// whole-run stage has no scope and an in-process one has no provider -- so a
+// stage with neither prints a placeholder rather than an empty column that
+// would run into the next one.
+func stageScope(stage model.StageRecord) string {
+	switch {
+	case stage.ScopeKey != "" && stage.Provider != "":
+		return stage.ScopeKey + " (" + stage.Provider + ")"
+	case stage.ScopeKey != "":
+		return stage.ScopeKey
+	case stage.Provider != "":
+		return stage.Provider
+	}
+	return "-"
+}
+
+// stageOutcome renders a stage's outcome with the diagnostic code that names
+// the failure class, where there is one.
+func stageOutcome(stage model.StageRecord) string {
+	if stage.DiagnosticCode != "" {
+		return stage.Outcome + " (" + stage.DiagnosticCode + ")"
+	}
+	return stage.Outcome
 }
 
 func byteMetric(v *uint64) string {
