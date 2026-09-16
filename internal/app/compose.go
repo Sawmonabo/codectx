@@ -652,16 +652,16 @@ func makeRebuildDir(dataDir string, now time.Time) (string, error) {
 
 // openDependence builds the dependence provider, or reports its absence.
 //
-// The provider is not constructed when the configuration disables it, and it
-// cannot be constructed when the analysis payload does not resolve. Neither is
-// an error: an optional tool that is off or absent must not fail a healthy base
-// generation (Section 11.1). What it must not do is disappear -- so the reason
-// becomes a capability row the coordinator publishes, which is the difference
-// between "this capability is unavailable, here is why" and a capability the
-// report never mentions.
+// A provider the configuration disables is not constructed and records no
+// capability row: work nobody asked for is not an unavailable capability, and
+// the run names every disabled provider once, in providers_disabled. A
+// provider that is enabled but cannot be constructed, because its analysis
+// payload does not resolve, is different: that is an optional tool that is
+// absent, which must not fail a healthy base generation (Section 11.1) and
+// must not disappear either, so its reason becomes the capability row the
+// coordinator publishes.
 func (s *stack) openDependence(ctx context.Context, runner *process.Runner) provider.Provider {
 	if s.cfg.Providers.Dependence.Enabled == config.Disabled {
-		s.dependenceAbsent(model.CapabilityUnavailable, "", nil)
 		return nil
 	}
 	// Nothing here installs anything any more: the locator reports the pinned
