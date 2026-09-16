@@ -116,7 +116,17 @@ actually active on this host, in addition to refusing every fetch.
 | `fresh` | This generation holds the capability's facts and nothing degraded it. |
 | `partial` | Some scope of this capability published facts into this generation and at least one other did not. The facts that are there are complete for the scopes that sealed. |
 | `failed` | The capability was attempted and no scope of it published facts into this generation. It is never reported `unavailable`: that would leave the generation healthy over a provider that answers nothing. |
-| `unavailable` | Nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload, the provider is disabled), or its units are still deferred to background work. |
+| `unavailable` | It was wanted and nobody attempted it — no unit was planned (the tool is not installed, the platform has no payload), or its units are still deferred to background work. The row says which. |
+
+A provider you turned off in the configuration has **no row here at all**, in
+any state. It was planned for nothing, so there is nothing to report about it
+per capability, and eight `unavailable` rows for three disabled providers would
+read as eight failures of work nobody asked for. What is off is said once
+instead: `status` and the result of an indexing run both carry
+`providers_disabled`, the provider names in a stable order, absent when nothing
+is disabled, and the text output prints them on a `disabled` line above the
+capability summary. An indexing run also logs the same list once, at its start,
+under `component=index`.
 
 A `partial` or `failed` row carries the shape of the failure, not just its
 code:
