@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/index/plan"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
@@ -347,8 +348,17 @@ func (l *lateSealer) tick(ctx context.Context, snap model.SnapshotID,
 // deliver, never announced from here: this may be the background loop's
 // goroutine.
 func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
-	sel provider.Selection, ref string) error {
+	sel provider.Selection, ref string) (err error) {
 	c := l.c
+	// A deferred publication opens generations of its own, so it is a run in
+	// its own right and not spans of the index run that queued it -- which had
+	// ended long before this tick started. Its spans are keyed by the run id
+	// and outlive the work generation, which is aborted on every path: the
+	// reason a deferred unit failed is therefore still there after the tick,
+	// where a row written against the aborted generation would not be.
+	run := c.newRun(ledger.KindDeferred)
+	ctx = run.Context(ctx)
+	defer func() { run.Finish(endOutcome(err)) }()
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
 		return err
@@ -602,6 +612,11 @@ func (l *lateSealer) publishOnce(ctx context.Context, snap model.SnapshotID, sel
 	if err != nil {
 		return model.IndexResult{}, false, err
 	}
+	// The run is linked to the generation it publishes INTO, never to the work
+	// generation, which is aborted on every path: a run linked to a generation
+	// that no longer exists would be swept with it, taking the record of what
+	// the tick did.
+	ledger.RunFromContext(ctx).AttachGeneration(int64(pubGen))
 	g := &generation{c: c, view: view, sel: sel, plan: p, gen: pubGen, prev: active,
 		snap: captured, started: started, caps: c.newCapabilityReport(),
 		failedScopes: b.failed, failures: l.foregroundFailures()}
