@@ -426,10 +426,11 @@ unit's batches of facts, evidence, aliases and search documents, the seal, the
 membership rows, the packed builds and the activation itself -- joins one
 write transaction, the **ingestion group**, instead of committing on its own.
 Inside the group each call runs in a savepoint, so a refused batch rolls back
-alone and the units already in the group are kept. The group commits when its
-write-ahead log reaches 1 GiB, when another writer needs the database (a
+alone and the units already in the group are kept. The group commits the
+moment the writer's page cache (`storage.writer_cache_kib`, 1 GiB) would
+spill a dirty page to the log; when another writer needs the database (a
 session, a lease, a heartbeat, a retention sweep: each ends the group before
-it runs and never waits longer than one batch), at activation or abort, and
+it runs and never waits longer than one batch); at activation or abort; and
 when the store closes. Readers on the reader pool see a run's units at those
 commits and not before; the ingestion side reads its own writes (unit states,
 aliases of dependency units, the snapshot and blobs a capture recorded) on
@@ -443,10 +444,30 @@ row, plus the root and interior pages of every b-tree it touched. Committing
 per batch therefore sent to disk about forty-six pages per commit plus
 seven-tenths of a page per fact, measured: the reference repository's index
 wrote 47 GB for a 624 MB database, and the store's ingestion test wrote 1 854
-MiB for 41 MiB stored. One group per run writes each dirtied page once per
-group: the same test writes 74 MiB for 73 MiB stored, and a run's disk traffic
-is bounded by the pages it touches, not by the number of batches it commits.
-[ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurement, the
+MiB for 41 MiB stored. One group per cache-full writes each dirtied page once
+per group, and a group whose pages all fit the cache writes nothing at all
+until its commit: the same test now writes 73 MiB for 73 MiB stored, by the
+engine and to the disk alike, and a run's disk traffic is bounded by the
+pages its groups touch, not by the number of batches it commits.
+
+Three engine settings make the group behave that way. The writer's page cache
+is the group's bound rather than the log's size, because a group that outgrows
+its cache spills dirty pages to the log and rewrites the hot ones there in
+place, tens of times each, which the page cache of the kernel hides on a short
+run and the disk pays on a long one. The engine's statement journal, which
+records the prior image of every page a savepoint touches, stays in memory up
+to 64 MiB, one batch's worth, instead of being rewritten to a temporary file
+at every batch (fifteen times the bytes stored, measured). And the log is
+truncated whenever the engine resets it, so the store can tell a group's first
+frame from the log's size and header, and a run never leaves a log the size of
+its largest group on disk. The group's commit and the checkpoint that follows
+are paced: while a group is open and until its checkpoint has finished, the
+store asks the kernel every hundred milliseconds to begin writing the log's
+and the database's dirty pages, so the disk receives them as they are
+produced rather than as one burst at the sync. At activation and abort the
+writer's page cache is released to the process, so a long-lived server does
+not keep a run's working set resident.
+[ADR-0008](adr/ADR-0008-ingestion-group.md) records the measurements, the
 alternatives and the residual cost that remains for hash-keyed indexes.
 
 ## Durability after a power loss

@@ -59,8 +59,13 @@ const (
 
 func newFixture(t *testing.T, dbPath string) *fixture {
 	t.Helper()
+	return newFixtureWithOptions(t, dbPath, store.Options{})
+}
+
+func newFixtureWithOptions(t *testing.T, dbPath string, opts store.Options) *fixture {
+	t.Helper()
 	ctx := context.Background()
-	s, err := store.Open(ctx, dbPath, store.Options{})
+	s, err := store.Open(ctx, dbPath, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

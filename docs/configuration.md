@@ -216,7 +216,7 @@ All **user** trust.
 | `data_dir` | `""` | Absolute path for all cache and state. Empty resolves to a user-private per-workspace directory (below). |
 | `busy_timeout` | `"5s"` | SQLite busy timeout. |
 | `read_connections` | `2` | Reader connections in the bounded pool. |
-| `writer_cache_kib` | `8192` | Writer page cache. |
+| `writer_cache_kib` | `1048576` | Writer page cache. An index run commits in groups this size: the group commits the moment the cache would spill (see [storage](storage.md#how-an-index-run-commits)), so this is also the memory an index run holds for its writes and the largest log it leaves behind. |
 | `reader_cache_kib` | `4096` | Per-reader page cache. |
 | `closed_session_retention` | `"7d"` | How long closed sessions are retained before pruning. |
 | `query_cursor_ttl` | `"15m"` | Lifetime of a signed query cursor and its retention lease, **and of a source receipt**. A `codectx search` or `codectx symbol` continuation takes its own retention lease for this long, so the generation the first page was read from stays collectable only once the token it printed has expired. The same value bounds how long a receipt `codectx context read` issued may be echoed back to `codectx context acknowledge`: lowering it to shorten cursor retention shortens that window too, and a receipt echoed after it has expired is rejected as `CTX_CURSOR_INVALID`. |

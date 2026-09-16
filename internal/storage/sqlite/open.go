@@ -32,7 +32,7 @@ import (
 type Options struct {
 	BusyTimeout     time.Duration // busy_timeout, default 5s
 	ReadConnections int           // read_connections, default 2
-	WriterCacheKiB  int           // writer_cache_kib, default 8192
+	WriterCacheKiB  int           // writer_cache_kib, default 1 GiB; also the ingestion group bound
 	ReaderCacheKiB  int           // reader_cache_kib, default 4096
 	BatchRecords    int           // index.batch_records, default 1000
 	BatchBytes      int64         // index.batch_bytes, default 4 MiB
@@ -118,7 +118,7 @@ func (o Options) withDefaults() Options {
 		o.ReadConnections = 2
 	}
 	if o.WriterCacheKiB <= 0 {
-		o.WriterCacheKiB = 8192
+		o.WriterCacheKiB = defaultWriterCacheKiB
 	}
 	if o.ReaderCacheKiB <= 0 {
 		o.ReaderCacheKiB = 4096
@@ -152,7 +152,7 @@ type Store struct {
 	tokenizer *sql.DB
 
 	// The ingestion group: one write transaction that every ingestion call
-	// joins, so a run commits when the log has grown by ingestGroupBytes, when
+	// joins, so a run commits when the writer's page cache would spill, when
 	// another writer needs the database, at activation, and at close -- never
 	// per batch. groupMu guards group and every statement issued on it.
 	// writerMu is held by whichever holds the single writer connection: an
@@ -165,6 +165,14 @@ type Store struct {
 	group        *sql.Tx
 	writerMu     sync.Mutex
 	writerWanted atomic.Int32
+	// groupLog is the write-ahead log as it was when the open group began.
+	// Nothing reaches the log while a group's dirty pages fit the writer's
+	// page cache, so a log that differs from this is one the cache has
+	// started spilling into.
+	groupLog logMark
+	// pacer runs while a group is open and through its commit, so the
+	// group's log and the checkpoint reach the disk steadily.
+	pacer *writebackPacer
 	// Version is the embedded engine's sqlite_version() as observed at open.
 	Version string
 	// SourceID is sqlite_source_id() as observed at open.
@@ -191,6 +199,9 @@ func parseTime(s string) (time.Time, error) {
 // CTX_SCHEMA_MISMATCH on a foreign schema. A rebuild is a different path chosen
 // by the caller; this function never alters an incompatible database.
 func Open(ctx context.Context, path string, opts Options) (*Store, error) {
+	if engineConfigErr != nil {
+		return nil, engineConfigErr
+	}
 	opts = opts.withDefaults()
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -208,6 +219,11 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 		{"temp_store", "FILE", "1"},
 		{"mmap_size", "0", "0"},
 	}
+	// The writer truncates the log whenever the engine resets it, so the
+	// log's size tells the store whether a group has started spilling (a
+	// group that never spills writes nothing to the log until it commits) and
+	// a run never leaves a log the size of its largest group on disk.
+	const journalSizeLimit = "0"
 	// The writer is the only connection whose synchronous mode is a choice,
 	// because it is the only connection that commits. Readers keep FULL.
 	writerSync, err := synchronousPragma(opts.Synchronous)
@@ -216,6 +232,7 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	}
 	writerPragmas := slices.Concat(common, []pragma{
 		writerSync,
+		{"journal_size_limit", journalSizeLimit, journalSizeLimit},
 		{"cache_size", "-" + strconv.Itoa(opts.WriterCacheKiB), "-" + strconv.Itoa(opts.WriterCacheKiB)}})
 	readerPragmas := slices.Concat(common, []pragma{
 		{"synchronous", "FULL", "2"},
@@ -388,17 +405,22 @@ func (s *Store) Close() error {
 	return first
 }
 
-// ingestGroupBytes is the write-ahead log size at which an open ingestion
-// group commits. A commit writes every page the group dirtied once to the log
-// and the checkpoint copies it once more, so the bytes an index run sends to
-// disk are the number of distinct pages its groups touch, not the number of
-// rows it stores. Content-addressed identities land on pages spread across
-// their whole index, and a page pays for itself only when a group lands many
-// rows on it: 1 GiB of log is about 262 000 pages, the size of the hash-keyed
-// index set of a reference store of 100 000 files, so a group that large
-// touches each such page several times before paying for it. The bound is
-// disk, not memory: the writer's page cache spills to the log as it fills.
-const ingestGroupBytes = 1 << 30
+// defaultWriterCacheKiB is the writer connection's page cache, and with it
+// the size of an ingestion group: the group commits the moment the cache
+// would spill a dirty page to the log. Up to that point every page the group
+// dirties lives in the cache, however many times it is dirtied, and the
+// commit appends each one to the log exactly once; a group that spilled
+// would write hot pages to the log again and again, in place, and would
+// rewrite every frame's checksum at commit, so the log would no longer be an
+// append-only file the pacer can stream to disk. A commit writes the group's
+// distinct pages once to the log and the checkpoint copies them once more,
+// so the bytes an index run sends to disk are the distinct pages its groups
+// touch, not the rows it stores; content-addressed identities land on pages
+// spread across their whole index, and a page pays for itself only when a
+// group lands many rows on it, which a group the size of the index does. The
+// cache is allocated as it fills, so a small run never takes the whole
+// budget, and the run returns it at activation.
+const defaultWriterCacheKiB = 1 << 20
 
 // write runs fn in one immediate write transaction of its own on the single
 // writer connection, committed before it returns. It is the path for state
@@ -434,7 +456,7 @@ func (s *Store) write(ctx context.Context, fn func(tx *sql.Tx) error) error {
 // ingest runs fn inside the ingestion group, opening the group when none is
 // open. fn is atomic on its own -- it runs inside a savepoint, so a refused
 // batch rolls back alone and the units already in the group are kept -- and
-// the group commits when its log reaches ingestGroupBytes or an exclusive
+// the group commits when the writer's page cache would spill or an exclusive
 // writer is waiting. The group's transaction is begun under a context that
 // outlives any one caller: a caller whose context ends loses its own
 // statement, never the run.
@@ -446,7 +468,14 @@ func (s *Store) ingest(ctx context.Context, fn func(tx *sql.Tx) error) error {
 // succeeded or was rolled back, for the calls whose outcome must be durable
 // when they return: a generation's activation or abort.
 func (s *Store) ingestAndCommit(ctx context.Context, fn func(tx *sql.Tx) error) error {
-	return s.ingestGroup(ctx, true, fn)
+	err := s.ingestGroup(ctx, true, fn)
+	// The run is over: the writer's page cache, which the run filled with
+	// its groups, goes back to the process so a long-lived server does not
+	// keep a run's working set resident.
+	s.writerMu.Lock()
+	_, _ = s.writer.ExecContext(context.WithoutCancel(ctx), `PRAGMA shrink_memory`)
+	s.writerMu.Unlock()
+	return err
 }
 
 func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx) error) error {
@@ -460,6 +489,8 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 			return wrap("begin", err)
 		}
 		s.group = tx
+		s.groupLog = s.logMark()
+		s.startPacer()
 	}
 	tx := s.group
 	if _, err := tx.ExecContext(ctx, `SAVEPOINT ingest`); err != nil {
@@ -489,26 +520,46 @@ func (s *Store) ingestGroup(ctx context.Context, commit bool, fn func(tx *sql.Tx
 }
 
 // commitGroupIfDueLocked commits the open group when the caller asks for it,
-// when an exclusive writer is waiting, or when the log has reached
-// ingestGroupBytes. groupMu is held.
+// when an exclusive writer is waiting, or when the writer's page cache has
+// begun spilling to the log. groupMu is held.
 func (s *Store) commitGroupIfDueLocked(force bool) error {
 	if s.group == nil {
 		return nil
 	}
-	if !force && s.writerWanted.Load() == 0 {
-		wal, err := s.walBytes()
-		if err != nil {
-			return err
-		}
-		if wal < ingestGroupBytes {
-			return nil
-		}
+	if !force && s.writerWanted.Load() == 0 && s.logMark() == s.groupLog {
+		return nil
 	}
 	return s.commitGroupLocked()
 }
 
-// commitGroupLocked commits the open group, if any, and releases the writer
-// connection. groupMu is held.
+// logMark identifies the state of the write-ahead log by its size and its
+// header. A group's first frame either restarts the log, which rewrites the
+// header with a new salt and checkpoint sequence while the file keeps its
+// old length until the commit truncates it, or, when a reader still holds the
+// old frames, appends past them and grows the file; one of the two changes
+// either way, and neither changes while no frame is written.
+type logMark struct {
+	size   int64
+	header [32]byte
+}
+
+func (s *Store) logMark() logMark {
+	var m logMark
+	f, err := os.Open(s.path + "-wal")
+	if err != nil {
+		m.size = -1
+		return m
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err == nil {
+		m.size = st.Size()
+	}
+	_, _ = f.ReadAt(m.header[:], 0)
+	return m
+}
+
+// commitGroupLocked commits the open group, if any, folds its log into the
+// database, and releases the writer connection. groupMu is held.
 func (s *Store) commitGroupLocked() error {
 	if s.group == nil {
 		return nil
@@ -516,6 +567,14 @@ func (s *Store) commitGroupLocked() error {
 	tx := s.group
 	s.group = nil
 	err := tx.Commit()
+	if err == nil {
+		// The engine checkpoints on its own once the log holds a thousand
+		// frames; a group smaller than that would otherwise leave its frames
+		// for the next group to stack on. A checkpoint that finds a reader on
+		// the log folds what it can and is not a failure of the commit.
+		_, _ = s.writer.ExecContext(context.Background(), `PRAGMA wal_checkpoint(PASSIVE)`)
+	}
+	s.stopPacer()
 	s.writerMu.Unlock()
 	if err != nil {
 		return wrap("commit", err)
@@ -532,14 +591,16 @@ func (s *Store) abandonGroupLocked() {
 	tx := s.group
 	s.group = nil
 	tx.Rollback()
+	s.stopPacer()
 	s.writerMu.Unlock()
 }
 
-// WALBoundBytes is the write-ahead log size at which an open ingestion group
-// commits, and so the largest log a run leaves behind before the checkpoint
-// folds it; a diagnostic that finds a larger log with no run open has found one
-// that was never checkpointed.
-func (s *Store) WALBoundBytes() int64 { return ingestGroupBytes }
+// WALBoundBytes is the largest write-ahead log an ingestion group leaves
+// behind: the writer's page cache, which the group fills before it commits,
+// plus one batch of spilled pages. The engine truncates the log when it resets
+// it, so a log past this bound with no run open is one a reader kept open
+// across several groups, or one that was never checkpointed.
+func (s *Store) WALBoundBytes() int64 { return 2 * int64(s.opts.WriterCacheKiB) << 10 }
 
 // Flush commits the open ingestion group, if any. The coordinator calls it
 // where a run's work must be on disk without a publication: before it hands
