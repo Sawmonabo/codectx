@@ -1249,6 +1249,37 @@ func TestE2EProductBoundary(t *testing.T) {
 
 		refreshEnv, refreshCode := s.run(t, "refresh")
 		result := data[model.IndexResult](t, refreshEnv, refreshCode)
+		// The run states what it did. A run that has just returned is
+		// finished, and its accounting has to say so: the collector holds a
+		// finished run in memory until its next write, so without the barrier
+		// the coordinator waits on, this reads as a run still going and its
+		// last stages are missing. `running` here is the failure mode --
+		// a completed index reported as live, with an incomplete stage list
+		// presented as the whole of it.
+		if result.Run == nil {
+			t.Fatalf("the refresh reported no run; the result carries no account of what it did")
+		}
+		if result.Run.Outcome == "running" || result.Run.FinishedAt == nil {
+			t.Errorf("the run the refresh reported is %q with finished_at %v: a run that has returned is over",
+				result.Run.Outcome, result.Run.FinishedAt)
+		}
+		// Activation is one of the last stages a run opens, so a result that
+		// carries it carries the stages that ended after the collector's last
+		// periodic write, and every row belongs to the run reported above and
+		// not to another run of the same process.
+		activated := false
+		for _, stage := range result.Stages {
+			if stage.RunID != result.Run.RunID {
+				t.Fatalf("a stage of run %s was reported under run %s", stage.RunID, result.Run.RunID)
+			}
+			if stage.Stage == "activation" {
+				activated = true
+			}
+		}
+		if !activated {
+			t.Errorf("the run reported %d stages and none of them is the activation it just performed",
+				len(result.Stages))
+		}
 		if result.Binding.GenerationID <= pinned.Binding.GenerationID {
 			t.Fatalf("the refresh published generation %d; the session is pinned to %d and a change was made",
 				result.Binding.GenerationID, pinned.Binding.GenerationID)

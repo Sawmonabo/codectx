@@ -358,7 +358,20 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 	// where a row written against the aborted generation would not be.
 	run := c.newRun(ledger.KindDeferred)
 	ctx = run.Context(ctx)
-	defer func() { run.Finish(endOutcome(err)) }()
+	// The publication is remembered for a Drain to deliver only once this run
+	// has ended and has read itself back: the result a Drain hands out states
+	// what THIS deferred run did, never the index run's account, and a run
+	// still going is not what a publication that has activated looks like.
+	var res model.IndexResult
+	published := false
+	defer func() {
+		run.Finish(endOutcome(err))
+		if err != nil || !published {
+			return
+		}
+		c.attachRunLedger(ctx, &res, run, err)
+		l.record(res)
+	}()
 	view, err := snapshot.OpenView(ctx, c.opts.Store, c.opts.CAS, snap)
 	if err != nil {
 		return err
@@ -419,7 +432,7 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		return nil
 	}
 	l.setPublishing(true)
-	res, published, err := l.publish(ctx, snap, sel, ref, b)
+	res, published, err = l.publish(ctx, snap, sel, ref, b)
 	l.setPublishing(false)
 	abort()
 	if err != nil {
@@ -430,9 +443,6 @@ func (l *lateSealer) tickHeld(ctx context.Context, snap model.SnapshotID,
 		c.log.Warn("a deferred publication failed and its sealed units are abandoned",
 			"component", component, "repository_id", string(c.repo), "units", len(b.sealed))
 		return err
-	}
-	if published {
-		l.record(res)
 	}
 	return nil
 }
