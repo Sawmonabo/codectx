@@ -106,8 +106,15 @@ func (f *spanFanout) stop(logger *slog.Logger) {
 func logSpan(logger *slog.Logger) func(model.StageRecord) {
 	return func(row model.StageRecord) {
 		attrs := []any{"component", "ledger", "stage", row.Stage, "seq", row.Seq,
-			"wall_ms", row.WallMS, "items_in", row.ItemsIn, "items_out", row.ItemsOut,
-			"outcome", row.Outcome}
+			"items_in", row.ItemsIn, "items_out", row.ItemsOut, "outcome", row.Outcome}
+		// A stage that never ran -- a planned unit closed as unavailable when
+		// the run ended -- has no finish and therefore no wall. Logging its
+		// zero would report a measurement nobody took, and a reader cannot
+		// tell that zero from a stage that genuinely cost nothing, so the
+		// attribute is absent instead.
+		if row.FinishedAt != nil {
+			attrs = append(attrs, "wall_ms", row.WallMS)
+		}
 		if row.ScopeKey != "" {
 			attrs = append(attrs, "scope_key", row.ScopeKey)
 		}
