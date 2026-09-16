@@ -362,17 +362,24 @@ func (r *reclaimer) nextEntry() (string, Purpose, bool) {
 // freeEntry gives one queued file or tree back to the filesystem at the pace,
 // attributing every byte it releases to the purpose the removal named.
 func (r *reclaimer) freeEntry(path string, p Purpose) error {
-	set, err := os.Open(filepath.Dir(filepath.Dir(path)))
+	// The directory the entry itself will leave, which is the one whose
+	// commit carries the entry's own removal.
+	parent, err := os.Open(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	defer set.Close()
-	return r.freeTree(path, p, set)
+	defer parent.Close()
+	return r.freeTree(path, p, parent)
 }
 
 // freeTree frees one path, depth first: a directory's children are freed
 // before the directory itself, so nothing is unlinked while it still holds
-// space.
+// space. parent is the directory holding path, open, because that is the
+// directory whose journal commit carries this removal's freed extents to the
+// device -- the wait the pace makes would otherwise be a wait for a free that
+// had not left the filesystem yet. Descending opens each directory in turn,
+// so a nested file's free is committed by a sync of the directory IT leaves,
+// not of the set at the top of the tree.
 //
 // A tree removal is never all-or-nothing. One child that cannot be freed --
 // a device error, a read-only mount, a file another process is executing --
@@ -380,7 +387,7 @@ func (r *reclaimer) freeEntry(path string, p Purpose) error {
 // that can go goes, and the first failure is reported once the walk is over.
 // Leaving the whole tree because of one file is the leak a removal exists to
 // prevent.
-func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
+func (r *reclaimer) freeTree(path string, p Purpose, parent *os.File) error {
 	st, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -393,12 +400,17 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		if err != nil {
 			return err
 		}
+		here, err := os.Open(path)
+		if err != nil {
+			return err
+		}
 		var first error
 		for _, e := range entries {
-			if err := r.freeTree(filepath.Join(path, e.Name()), p, set); err != nil && first == nil {
+			if err := r.freeTree(filepath.Join(path, e.Name()), p, here); err != nil && first == nil {
 				first = err
 			}
 		}
+		here.Close()
 		if err := os.Remove(path); err != nil && first == nil {
 			first = err
 		}
@@ -408,7 +420,7 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 		// A symbolic link, a socket or a device holds no blocks of its own.
 		return os.Remove(path)
 	}
-	return r.freeFile(path, st, p, set)
+	return r.freeFile(path, st, p, parent)
 }
 
 // freeFile empties one regular file a window at a time and then unlinks it.
@@ -434,7 +446,7 @@ func (r *reclaimer) freeTree(path string, p Purpose, set *os.File) error {
 // Attribution goes the other way: the counter is credited only once the name
 // is actually gone, so what an operator reads as given back is never bytes
 // that are still on the disk.
-func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, set *os.File) error {
+func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, dir *os.File) error {
 	size := st.Size()
 	var shrinkErr error
 	switch {
@@ -444,9 +456,9 @@ func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, set *os.Fil
 		// pace and nothing to attribute.
 		size = 0
 	case size > Window:
-		size, shrinkErr = r.empty(path, size, p, set)
+		size, shrinkErr = r.empty(path, size, p, dir)
 	}
-	r.charge(size, set)
+	r.charge(size, dir)
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -467,7 +479,7 @@ func (r *reclaimer) freeFile(path string, st fs.FileInfo, p Purpose, set *os.Fil
 // A file another name still reaches is left whole too, and owes nothing: the
 // object outlives this name, so the unlink gives no blocks back and a wait
 // for them would be a wait for nothing. See shrinkable.
-func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int64, error) {
+func (r *reclaimer) empty(path string, size int64, p Purpose, dir *os.File) (int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	switch {
 	case err == nil:
@@ -495,7 +507,7 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 		}
 		steps.Add(1)
 		attribute(p, cur-next)
-		r.charge(cur-next, set)
+		r.charge(cur-next, dir)
 		cur = next
 	}
 	return 0, nil
@@ -505,21 +517,22 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 // window of them has been spent. Freed extents reach the device when the
 // filesystem journals the change, so a wait with nothing synced would be a
 // wait for nothing: the truncation path has already synced the file's data,
-// and for an unlink the directory the entry left is synced here, which is the
+// and for an unlink the directory the entry leaves -- dir, the file's own
+// parent, not the set at the top of the tree -- is synced here, which is the
 // journal commit that carries the freed extents with it.
 //
 // The budget is the process's, not one removal's: a caller freeing in place
 // and the reclaimer's own goroutine spend the same window, so two of them
 // never hand the disk two windows at once.
-func (r *reclaimer) charge(n int64, set *os.File) {
+func (r *reclaimer) charge(n int64, dir *os.File) {
 	r.spentMu.Lock()
 	r.spent += n
 	waits := r.spent / Window
 	r.spent -= waits * Window
 	r.spentMu.Unlock()
 	for ; waits > 0; waits-- {
-		if set != nil {
-			_ = set.Sync()
+		if dir != nil {
+			_ = dir.Sync()
 		}
 		r.sleep(FreeInterval)
 	}
