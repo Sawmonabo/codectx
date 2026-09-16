@@ -49,6 +49,13 @@ func (c *Coordinator) retain(ctx context.Context) {
 	ctx, span := ledger.Start(ctx, stageRetention, "")
 	report, err := c.opts.Store.RetainByRef(ctx, c.repo, policy, c.now())
 	span.AddOut(int64(report.GenerationsSwept))
+	// A deleted generation's ledger rows go with it. The ledger keeps its own
+	// file, so nothing else would ever collect them and the file would grow
+	// for as long as the workspace is indexed.
+	if delErr := c.opts.Ledger.DeleteRuns(ctx, report.GenerationsDeleted); delErr != nil {
+		logTyped(c.log, "the swept generations' ledger rows could not be deleted", delErr,
+			"component", component, "repository_id", string(c.repo))
+	}
 	span.End(endOutcome(err), ledger.Measured{}, err)
 	if err != nil {
 		logTyped(c.log, "retention could not sweep the store", err,
