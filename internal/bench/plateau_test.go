@@ -286,7 +286,7 @@ func TestIncrementalReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := index.New(index.Options{Root: root, Config: cfg, Store: store, Registry: registry,
-		CAS: cas, Lock: lock, Pool: pool})
+		CAS: cas, Lock: heldLock{lock}, Pool: pool})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,4 +321,14 @@ func TestIncrementalReuse(t *testing.T) {
 	if refreshFor*4 > coldFor {
 		t.Fatalf("the no-op refresh took %s against a %s cold index; reuse is not paying for itself", refreshFor, coldFor)
 	}
+}
+
+// heldLock presents a lock this benchmark already holds as the coordinator's
+// Locker. The composition root's own implementation takes the lock when a
+// build needs it; a run that took it in its setup has nothing left to
+// take and nothing to give back, so Hold is the lock itself.
+type heldLock struct{ l *snapshot.WorkspaceLock }
+
+func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+	return h.l, func() error { return nil }, nil
 }

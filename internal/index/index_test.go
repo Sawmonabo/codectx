@@ -199,7 +199,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 		f.t.Fatal(err)
 	}
 	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
-		Lock: f.lock, Pool: pool})
+		Lock: heldLock{f.lock}, Pool: pool})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
@@ -938,4 +938,14 @@ func TestSuppliedIndexRecordedWhenUnresolved(t *testing.T) {
 // that assembles a plan by hand supplies the same shape over one unit.
 func oneUnit(u plan.Unit) func(yield func(plan.Unit) error) error {
 	return func(yield func(plan.Unit) error) error { return yield(u) }
+}
+
+// heldLock presents a lock the fixture already holds as the coordinator's
+// Locker. The composition root's own implementation takes the lock when a
+// build needs it; a fixture that took it in its setup has nothing left to
+// take and nothing to give back, so Hold is the lock itself.
+type heldLock struct{ l *snapshot.WorkspaceLock }
+
+func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+	return h.l, func() error { return nil }, nil
 }

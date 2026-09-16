@@ -70,7 +70,7 @@ func TestCaptureBuilderCarriesTheConfiguredRetryBudget(t *testing.T) {
 	cfg.Index.CaptureMaxRetries = config.Limit(3)
 	cfg.Index.CaptureRetryDeadline = config.Duration(90 * time.Second)
 	g := &generation{c: &Coordinator{opts: Options{Config: cfg}, log: slog.Default()}}
-	b := g.captureBuilder()
+	b := g.captureBuilder(nil)
 	if b.MaxRetries != 3 {
 		t.Errorf("the capture builder's MaxRetries is %d, want the configured 3", b.MaxRetries)
 	}
