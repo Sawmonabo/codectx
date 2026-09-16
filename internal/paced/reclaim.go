@@ -400,7 +400,7 @@ func (r *reclaimer) freeFile(path string, size int64, p Purpose, set *os.File) e
 // left on it. A file the process may unlink but may not truncate is left
 // whole, at its full length, for the unlink to free: pacing is how a removal
 // is performed, never whether it is allowed. Its bytes are charged all the
-// same.
+// same. So is a file another name still reaches: see shrinkable.
 func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int64, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	switch {
@@ -411,6 +411,13 @@ func (r *reclaimer) empty(path string, size int64, p Purpose, set *os.File) (int
 		return size, err
 	}
 	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return size, err
+	}
+	if !shrinkable(st) {
+		return size, nil
+	}
 	cur := size
 	for cur > 0 {
 		next := max(cur-Window, 0)
