@@ -145,6 +145,32 @@ Two consequences an operator sees:
   index's own integrity check is spelled as an insert into the index, so a deep
   report needs the writer. It still takes no workspace lock.
 
+### The one process that is both
+
+The MCP server is the only process in both rows at once. `codectx mcp serve`
+holds the workspace lock for the whole session and keeps the writer, because
+`codectx_refresh_index` publishes generations; and it answers an agent's
+questions from the same process while that refresh is writing.
+
+It therefore opens **two handles on one database**: the writer, and a read-only
+handle beside it, opened after the writer so there is a schema to verify by
+reading. The exploration tools -- search, the repository overview, symbol
+lookup, references and the graph walks -- are served through the read-only
+handle. They pin no generation on the writer, so a tool call no longer commits
+the session's own refresh mid-group nor queues behind it; the run commits the
+same ingestion groups it would have committed with nobody reading.
+
+What an agent sees for it:
+
+* Those tools answer **one page** during a session, for the same reason the
+  answering row does: a continuation needs a cursor lease and a spool, and both
+  are writes.
+* `codectx_index_status` and the session tools (`codectx_context_*`,
+  `codectx_read_source`) still go through the writer -- the session tools
+  record rows, which is what they are for, and the status projection still pins
+  through the writer. Called during the session's own refresh, they wait for
+  the group the run has open.
+
 ## Retention, collection and the grace window
 
 Nothing is deleted implicitly by a query. Reclamation happens in one **collection

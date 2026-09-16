@@ -150,6 +150,17 @@ const (
 	// while `status`, `search`, `symbol`, the graph walks, `repomap` and
 	// `doctor` change nothing at all.
 	modeQuery
+	// modeServe composes for the one process that is BOTH: the MCP server
+	// indexes on request and answers questions for the same client, in the
+	// same process, at the same time. It takes the workspace lock and keeps
+	// the writer, like modeIndex, and opens a SECOND, read-only handle on the
+	// same database for the read path. Without it every tool call pinned a
+	// generation through the writer, and pinning writes a retention lease:
+	// that write force-commits whatever ingestion group the session's own
+	// refresh has open and then waits behind the writer, so one agent query
+	// both cut the run's group short and blocked on it. The reader handle has
+	// no writer connection at all, so a tool call cannot reach either.
+	modeServe
 )
 
 // openOptions are the composition's variable inputs. They are one struct
@@ -173,6 +184,13 @@ type openOptions struct {
 	// imports no supplied index, which is what every open did before the flags.
 	scipImport, scipManifest string
 }
+
+// indexing reports whether this composition may build generations: it takes the
+// cross-process workspace lock, runs startup recovery, watches the worktree and
+// schedules collection. Both the indexing commands and the server are that
+// composition; what distinguishes the server is the reader handle it opens
+// beside the writer, not what it is allowed to build.
+func (o openOptions) indexing() bool { return o.mode == modeIndex || o.mode == modeServe }
 
 // stack is everything a workspace owns below the coordinator. It exists apart
 // from Workspace so the composition -- configuration, directories, the lock,
@@ -213,6 +231,13 @@ type stack struct {
 	repo     model.RepositoryID
 	search   *search.Service
 	coverage *coverage.Service
+	// queryStore and querySearch are the read path's half of a modeServe
+	// composition: a second store handle on the same database, opened with no
+	// writer connection, and the search service over it. In every other mode
+	// they ALIAS store and search, so every read site names them
+	// unconditionally and only the server's open has two of anything.
+	queryStore  *sqlite.Store
+	querySearch *search.Service
 	// workflow is the Section 17 guard, review and capsule service the facade
 	// routes every session mutation through. INT wires it.
 	workflow *workflow.Service
@@ -326,7 +351,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// remediation ("wait for the running process to finish") that a watch never
 	// satisfies. internal/index refuses its building entry points when Lock is
 	// nil, so the absence is enforced there rather than trusted here.
-	if o.mode == modeIndex {
+	if o.indexing() {
 		if s.lock, err = snapshot.LockWorkspace(ctx, s.dataDir, o.wait); err != nil {
 			return nil, err
 		}
@@ -360,6 +385,22 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	}); err != nil {
 		return nil, err
 	}
+	s.queryStore = s.store
+	if o.mode == modeServe {
+		// AFTER the writer, never before: the read-only handle verifies the
+		// schema by reading it, and on a cache that has never been written
+		// there is nothing to read until the writer's open has created it.
+		if s.queryStore, err = sqlite.Open(ctx, filepath.Join(s.dataDir, databaseName), sqlite.Options{
+			BusyTimeout:     cfg.Storage.BusyTimeout.Std(),
+			ReadConnections: cfg.Storage.ReadConnections,
+			ReaderCacheKiB:  cfg.Storage.ReaderCacheKiB,
+			MaxJSONBytes:    cfg.Context.MaxManifestBytes.Value(),
+			Synchronous:     cfg.Storage.Synchronous,
+			ReadOnly:        true,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	// Recovery runs under the lock and before anything reads a generation, so
 	// a staging generation an earlier crash abandoned is failed and collected
 	// rather than inherited. It is a write -- Abort on every staging generation
@@ -368,7 +409,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// index. Skipping it costs a report nothing, because Store.Recover never
 	// touches the active pointer and Coordinator.Status reads only the active
 	// generation.
-	if o.mode == modeIndex {
+	if o.indexing() {
 		if err = s.store.Recover(ctx, time.Now()); err != nil {
 			return nil, err
 		}
@@ -557,7 +598,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 	// is honoured by the next generation's own traversal, which recomputes it,
 	// but not by the watch set, which keeps this snapshot of it until the
 	// workspace is reopened. Watcher.Coverage's doc names that window.
-	if o.mode == modeIndex {
+	if o.indexing() {
 		policy, perr := snapshot.TraversalPolicy(ctx, cfg.TraversalPolicy(), root, s.git)
 		if perr != nil {
 			return nil, perr
@@ -575,7 +616,7 @@ func openStack(ctx context.Context, repo string, o openOptions) (s *stack, err e
 			return nil, err
 		}
 	}
-	if err = s.openCollector(ctx, o.mode == modeIndex); err != nil {
+	if err = s.openCollector(ctx, o.indexing()); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -743,6 +784,29 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 		return err
 	}
 	s.search = svc
+	s.querySearch = svc
+	if s.queryStore != s.store {
+		// The same service over the reader handle. A generation pinned through
+		// it takes no retention lease, and PinnedReader.Continuable() is false
+		// there, so a search served this way answers one page and hands back no
+		// cursor rather than minting one it would have to write.
+		read, err := search.New(search.Options{
+			Store:     s.queryStore,
+			Repo:      repo,
+			Signer:    s.signer,
+			Spools:    s.spools,
+			Leases:    s.leases,
+			Content:   s.cas,
+			Resources: s.cfg.Resources,
+			CursorTTL: s.cfg.Storage.QueryCursorTTL.Std(),
+			Now:       time.Now,
+			Logger:    s.logger,
+		})
+		if err != nil {
+			return err
+		}
+		s.querySearch = read
+	}
 	if err := s.openCoverage(); err != nil {
 		return err
 	}
@@ -1156,6 +1220,15 @@ func (s *stack) Close() error {
 	}
 	if s.search != nil {
 		errs = append(errs, s.search.Close())
+	}
+	// The reader half closes before the writer half it reads beside, and only
+	// when it is a handle of its own: in every other mode these alias the
+	// writing pair and are already closed above and below.
+	if s.querySearch != nil && s.querySearch != s.search {
+		errs = append(errs, s.querySearch.Close())
+	}
+	if s.queryStore != nil && s.queryStore != s.store {
+		errs = append(errs, s.queryStore.Close())
 	}
 	if s.lsp != nil {
 		errs = append(errs, s.lsp.Close())
