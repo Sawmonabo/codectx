@@ -212,6 +212,13 @@ In order, when you are short on space:
    so you can judge the space before giving it back. There is no timer and no
    threshold: this is the only thing that shrinks `scratch_bytes`.
 
+   What it leaves it names. A pool instance a running process owns is skipped
+   whole -- emptying it would take that run's working files out from under it
+   -- and appears as `left_alone` with what it holds and why; a queued removal
+   the filesystem refused appears as `stuck_frees` with the reason. Together
+   they are why freed can fall short of held without the request having
+   failed.
+
    The space is given back a window at a time, with a sync and a wait between
    windows, which is slow on purpose. Freeing a large amount at once leaves a
    virtualized host owing work it does not report, and about a minute later

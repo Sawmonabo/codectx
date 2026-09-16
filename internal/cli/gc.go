@@ -102,6 +102,10 @@ func runGC(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 				Message: "emptying the scratch pool " + a.Root() + ": " + err.Error()}
 		}
 		pool.FreedBytes = uint64(max(collected.FreedBytes, 0))
+		for _, left := range collected.LeftAlone {
+			pool.LeftAlone = append(pool.LeftAlone, model.UntouchedInstance{Instance: left.Instance,
+				HeldBytes: uint64(max(left.HeldBytes, 0)), Reason: left.Reason})
+		}
 		for _, stuck := range collected.Stuck {
 			pool.StuckFrees = append(pool.StuckFrees,
 				model.StuckFree{Entry: stuck.Entry, Reason: stuck.Reason})
@@ -168,9 +172,12 @@ func writeGCReport(w io.Writer, r model.ScratchCollection) error {
 		for _, purpose := range slices.Sorted(maps.Keys(p.HeldByPurpose)) {
 			fmt.Fprintf(tw, "  %s\t%d bytes\t\n", purpose, p.HeldByPurpose[purpose])
 		}
-		// A removal the filesystem refused is why freed can fall short of
-		// held; unnamed it would read as this command having quietly done
-		// less than it said.
+		// An instance a running process owns is left as it is, and is most of
+		// what held minus freed comes to; unnamed it would read as this
+		// command having quietly done less than it said.
+		for _, left := range p.LeftAlone {
+			fmt.Fprintf(tw, "  left instance %s\t%d bytes\t%s\n", left.Instance, left.HeldBytes, left.Reason)
+		}
 		for _, stuck := range p.StuckFrees {
 			fmt.Fprintf(tw, "  could not free %s\t%s\t\n", stuck.Entry, stuck.Reason)
 		}

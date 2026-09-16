@@ -544,6 +544,21 @@ var ErrInUse = errors.New("scratch arena in use")
 type Collection struct {
 	FreedBytes int64
 	Stuck      []paced.Stuck
+	// LeftAlone names the instances this collection did not touch because a
+	// live process holds their claim, and what each of them is holding. An
+	// instance is a whole pool, so a collection that reported only its freed
+	// bytes would read as having emptied everything it counted.
+	LeftAlone []Untouched
+}
+
+// An Untouched is one instance a collection left exactly as it was.
+type Untouched struct {
+	// Instance is the instance directory's own name inside the pool.
+	Instance string
+	// HeldBytes is the disk that instance is holding.
+	HeldBytes int64
+	// Reason is why it was left.
+	Reason string
 }
 
 // surface a tenant is writing would corrupt that tenant's work, and it leaves
@@ -574,9 +589,18 @@ func (a *Arena) Empty() (Collection, error) {
 		}
 		dir := filepath.Join(a.root, e.Name())
 		if dir != instance {
-			free, err := a.emptyIdleLocked(dir)
+			free, idle, err := a.emptyIdleLocked(dir)
 			if err != nil {
 				return out, err
+			}
+			if !idle {
+				held, err := dirBytes(dir)
+				if err != nil {
+					return out, err
+				}
+				out.LeftAlone = append(out.LeftAlone, Untouched{Instance: e.Name(), HeldBytes: held,
+					Reason: "a running process holds this instance and its surfaces are that run's working files"})
+				continue
 			}
 			out.FreedBytes += free
 			continue
@@ -616,30 +640,31 @@ func (a *Arena) Empty() (Collection, error) {
 }
 
 // emptyIdleLocked removes one instance directory if no live process holds its
-// claim, and reports the bytes it freed. An instance a running process owns is
-// left exactly as it is.
-func (a *Arena) emptyIdleLocked(dir string) (int64, error) {
+// claim, and reports the bytes it freed and whether it was idle. An instance
+// a running process owns is left exactly as it is, and reported as left:
+// emptying it would take the working files out from under that run.
+func (a *Arena) emptyIdleLocked(dir string) (int64, bool, error) {
 	f, err := os.OpenFile(filepath.Join(dir, lockName), os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer f.Close()
 	held, err := fslock.TryLock(f)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	if !held {
-		return 0, nil
+		return 0, false, nil
 	}
 	defer fslock.Unlock(f)
 	n, err := dirBytes(dir)
 	if err != nil {
-		return 0, err
+		return 0, true, err
 	}
 	if err := paced.RemoveAllFor(paced.ScratchCollection, dir); err != nil {
-		return 0, err
+		return 0, true, err
 	}
-	return n, nil
+	return n, true, nil
 }
 
 // dirBytes is the length of every regular file under dir except the claims
