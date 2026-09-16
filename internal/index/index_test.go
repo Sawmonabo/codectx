@@ -72,6 +72,10 @@ type fixture struct {
 	lock    *snapshot.WorkspaceLock
 	cfg     config.Config
 	c       *Coordinator
+	// locker is what the coordinators this fixture builds take the workspace
+	// from. It is the fixture's own held lock unless a scenario is about the
+	// taking and giving back itself, which needs a source it can count.
+	locker Locker
 }
 
 func newFixture(t *testing.T, files map[string]string) *fixture {
@@ -199,8 +203,12 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	locker := f.locker
+	if locker == nil {
+		locker = heldLock{f.lock}
+	}
 	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
-		Lock: heldLock{f.lock}, Pool: pool})
+		Lock: locker, Pool: pool})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
@@ -949,6 +957,105 @@ type heldLock struct{ l *snapshot.WorkspaceLock }
 
 func (h heldLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	return h.l, func() error { return nil }, nil
+}
+
+// countingLock is the composition root's counted Hold as a fixture can count
+// it: it hands out the lock the fixture already holds and records how many
+// holds are outstanding, so an operation that leaked one is visible as a
+// balance that never comes back to zero. refuse makes every hold answer the
+// way snapshot.LockWorkspace answers a caller that cannot have the workspace.
+type countingLock struct {
+	l  *snapshot.WorkspaceLock
+	mu sync.Mutex
+	// outstanding is holds taken minus holds given back; taken is every hold
+	// this lock granted, so a beat that never asked is not read as a beat that
+	// asked and gave back.
+	outstanding int
+	taken       int
+	refuse      error
+}
+
+func (c *countingLock) Hold(context.Context) (*snapshot.WorkspaceLock, func() error, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refuse != nil {
+		return nil, nil, c.refuse
+	}
+	c.outstanding++
+	c.taken++
+	var once sync.Once
+	return c.l, func() error {
+		once.Do(func() {
+			c.mu.Lock()
+			c.outstanding--
+			c.mu.Unlock()
+		})
+		return nil
+	}, nil
+}
+
+func (c *countingLock) counts() (outstanding, taken int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.outstanding, c.taken
+}
+
+// TestAWatchGivesTheWorkspaceBackWhenTheBeatEnds protects the lifetime of the
+// workspace lock a watching session takes.
+//
+// Failure mode: a beat takes the cross-process workspace lock and returns
+// without giving it back on one of its exits -- the ordinary one, the refused
+// one, or the one where the beat failed or was cancelled partway. A watching
+// server that leaks it on any of them holds the workspace for the rest of its
+// session, so the person's own `codectx index` in a terminal is refused for as
+// long as that server lives, and nothing reports it: every later beat of that
+// session succeeds, because the lock it is leaking is its own.
+func TestAWatchGivesTheWorkspaceBackWhenTheBeatEnds(t *testing.T) {
+	lock := &countingLock{}
+	f := newCountedFixture(t, lock)
+
+	// The ordinary exit: a beat that built and published.
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); !ok {
+		t.Fatal("the first beat did not complete, so the ordinary exit went unexercised")
+	}
+	if outstanding, taken := lock.counts(); outstanding != 0 || taken == 0 {
+		t.Fatalf("after a beat that built, %d holds are outstanding of %d taken", outstanding, taken)
+	}
+
+	// The refused exit: the workspace belongs to another process for this
+	// beat. Nothing was taken, so nothing may be given back either.
+	before := func() int { _, taken := lock.counts(); return taken }()
+	lock.refuse = &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: "the index running in process 4242 holds the workspace indexing lock"}
+	if _, ok := f.c.reconcile(f.ctx, nil, nil); ok {
+		t.Fatal("a beat completed on a workspace another process holds")
+	}
+	if outstanding, taken := lock.counts(); outstanding != 0 || taken != before {
+		t.Fatalf("after a refused beat, %d holds are outstanding and %d were taken (was %d)", outstanding, taken, before)
+	}
+
+	// The exit where the beat failed partway: the workspace is free again and
+	// the beat is cancelled inside its own refresh.
+	lock.refuse = nil
+	beat, stop := context.WithCancel(f.ctx)
+	stop()
+	if _, ok := f.c.reconcile(beat, nil, nil); ok {
+		t.Fatal("a cancelled beat completed, so the failure exit went unexercised")
+	}
+	if outstanding, _ := lock.counts(); outstanding != 0 {
+		t.Fatalf("after a beat that was cancelled partway, %d holds are outstanding", outstanding)
+	}
+}
+
+// newCountedFixture is newFixture with the counting workspace source in place
+// before the first coordinator is built.
+func newCountedFixture(t *testing.T, lock *countingLock) *fixture {
+	t.Helper()
+	f := newFixture(t, map[string]string{"pkg/a.go": goFile("pkg", "A", "")})
+	lock.l = f.lock
+	f.locker = lock
+	f.c = f.coordinator(f.providers(false))
+	return f
 }
 
 // busyLock is a workspace another process holds for as long as this fixture

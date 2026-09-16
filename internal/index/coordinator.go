@@ -24,9 +24,9 @@
 // through Options.Lock and is taken for the whole of one building operation:
 // capture, indexing, publication and retention are all one owner's work, and
 // reacquiring it per stage would let a collector run between two of them. It
-// is given back when that operation ends -- a watch gives it back when it
-// stops watching -- so a process that is idle between operations owns nothing
-// and another process may index.
+// is given back when that operation ends -- a watch gives it back when the
+// beat that took it ends -- so a process that is idle between operations owns
+// nothing and another process may index.
 package index
 
 import (
@@ -312,62 +312,16 @@ func (c *Coordinator) buildable() error {
 //
 // Every entry point that builds calls this, and Watch deliberately does not at
 // its entry: a session that watches must survive a workspace that is busy
-// right now, so its patience is the reconcile interval it already has -- each
-// pass asks again, and a pass that cannot have the lock is logged and retried
-// rather than ending the session. A watch that HAS taken it keeps it for as
-// long as it watches, which is the one operation whose duration is the
-// session's (watchHold below).
+// right now, so its patience is the reconcile interval it already has. The
+// operation a watch holds for is ONE BEAT -- reconcile takes it where it is
+// about to build and gives it back when that beat ends, by whichever path --
+// so a watching session that is between beats owns nothing at all and a beat
+// that cannot have the workspace is skipped rather than ending the session.
 func (c *Coordinator) hold(ctx context.Context) (*snapshot.WorkspaceLock, func() error, error) {
 	if err := c.buildable(); err != nil {
 		return nil, nil, err
 	}
 	return c.opts.Lock.Hold(ctx)
-}
-
-// watchHold makes this watch the workspace's owner for as long as it watches.
-// It is taken at the first pass rather than at Watch's entry, and a pass that
-// cannot have it leaves the watch running: the workspace is busy now, and the
-// next pass asks again.
-//
-// A watch holds across passes rather than per pass because it IS the session
-// that is keeping the index fresh -- the one case where another process's
-// index would be doing the same work -- and because releasing between passes
-// would hand the workspace away in every gap it has.
-func (c *Coordinator) watchHold(ctx context.Context) error {
-	c.watch.mu.Lock()
-	held := c.watch.release != nil
-	c.watch.mu.Unlock()
-	if held {
-		return nil
-	}
-	_, release, err := c.hold(ctx)
-	if err != nil {
-		return err
-	}
-	c.watch.mu.Lock()
-	if c.watch.release != nil {
-		// A concurrent pass got there first. Give this one back at once:
-		// one watch session holds one reference, never two.
-		c.watch.mu.Unlock()
-		return release()
-	}
-	c.watch.release = release
-	c.watch.mu.Unlock()
-	return nil
-}
-
-// watchReleased gives back whatever watchHold took. It runs when the watch
-// loop returns, by whichever path, and is a no-op for a watch that never got
-// the lock at all.
-func (c *Coordinator) watchReleased() error {
-	c.watch.mu.Lock()
-	release := c.watch.release
-	c.watch.release = nil
-	c.watch.mu.Unlock()
-	if release == nil {
-		return nil
-	}
-	return release()
 }
 
 // Repository is the identity this coordinator derived for the workspace root.
@@ -450,21 +404,13 @@ func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) e
 	}
 	c.watch.enter(c.opts.Watcher)
 	defer c.watch.leave()
-	// The workspace this watch owns while it watches, taken at its first pass
-	// and given back here however the loop ends.
-	defer func() {
-		if err := c.watchReleased(); err != nil {
-			logTyped(c.log, "the workspace lock this watch held was not released cleanly", err,
-				"component", component, "repository_id", string(c.repo))
-		}
-	}()
 	// The heartbeat row names this repository, and on a workspace nothing has
 	// ever indexed there is no repository row for it to name: every beat would
 	// be refused by the foreign key and logged, and a second process asking
 	// whether a watch covers this workspace would be told nothing does. The
 	// identity is recorded here, before the first beat, by the same call the
-	// build path makes -- a watch IS the owner of this workspace for as long as
-	// it runs, and it has the lock to say so.
+	// build path makes: a watch that has completed no beat must still be
+	// nameable by a process asking whether this workspace is covered.
 	if err := c.opts.Store.EnsureRepository(ctx, c.repo, c.opts.Root.Path); err != nil {
 		return err
 	}
@@ -594,16 +540,28 @@ func (c *Coordinator) publishHeartbeat(ctx context.Context) {
 // end of the watch: the prior generation is still published and the next batch
 // or tick tries again.
 func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(model.IndexResult)) (model.IndexResult, bool) {
-	// The lock first, and kept for the rest of the watch. A workspace another
-	// process is building in is not this pass's failure: the pass is skipped,
-	// the next one asks again, and the session keeps running.
-	if err := c.watchHold(ctx); err != nil {
+	// The workspace is taken for THIS beat and given back when the beat ends,
+	// by whichever path it ends: a watching session that is between beats owns
+	// nothing, so the person's own `codectx index` runs beside it. A workspace
+	// another process is building in is not this beat's failure -- the beat is
+	// skipped, the next one asks again, and the session keeps running.
+	_, release, err := c.hold(ctx)
+	if err != nil {
 		if ctx.Err() == nil {
 			logTyped(c.log, "this pass could not take the workspace; another process holds it and the next pass will ask again", err,
 				"component", component, "repository_id", string(c.repo))
 		}
 		return model.IndexResult{}, false
 	}
+	// Deferred and not a tail call: emit below is the caller's code, and a beat
+	// that panicked through it would otherwise hold the workspace for the rest
+	// of the session.
+	defer func() {
+		if err := release(); err != nil {
+			logTyped(c.log, "the workspace this pass held was not given back cleanly", err,
+				"component", component, "repository_id", string(c.repo))
+		}
+	}()
 	res, err := c.Refresh(ctx, paths)
 	if err != nil {
 		if ctx.Err() == nil {
