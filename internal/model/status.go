@@ -159,8 +159,16 @@ type ResourceReport struct {
 	WALBytes              *uint64 `json:"wal_bytes,omitempty"`
 	TempBytes             *uint64 `json:"temp_bytes,omitempty"`
 	CASBytes              *uint64 `json:"cas_bytes,omitempty"`
-	UnitsReused           *int64  `json:"units_reused,omitempty"`
-	UnitsParsed           *int64  `json:"units_parsed,omitempty"`
+	// FreedBytes is the disk space this process has given back to the
+	// filesystem since it started, one window at a time. A run reuses the
+	// space it holds and frees only the leftovers of a dead run at its start,
+	// because on a host that discards freed blocks into a sparse image a
+	// multi-gigabyte free stalls every process on the machine, minutes later,
+	// with nothing able to observe or wait for it. This is what makes that
+	// claim checkable from outside.
+	FreedBytes  *uint64 `json:"freed_bytes,omitempty"`
+	UnitsReused *int64  `json:"units_reused,omitempty"`
+	UnitsParsed *int64  `json:"units_parsed,omitempty"`
 }
 
 // Validate enforces the signed-64 storage bound on every measured byte count
@@ -182,6 +190,7 @@ func (r ResourceReport) Validate() error {
 		{"resources.wal_bytes", r.WALBytes},
 		{"resources.temp_bytes", r.TempBytes},
 		{"resources.cas_bytes", r.CASBytes},
+		{"resources.freed_bytes", r.FreedBytes},
 	} {
 		if f.value == nil {
 			continue
