@@ -57,8 +57,12 @@ func (s *Store) initSchema(ctx context.Context) error {
 // read-only: the same comparison, run on the reader pool, so a report never
 // begins a write transaction to learn whether it may read. It creates nothing.
 // A cache that holds no tables is one no run has ever built here -- a read-only
-// open of a missing database leaves a zero-byte file behind -- and is reported
-// as the absent workspace it is, not as a fingerprint that failed to match.
+// open of a missing database leaves a zero-byte file behind. That is the
+// workspace that exists but has published nothing, which is what the writing
+// open produced too: it created the schema, and the first pin then found no
+// active generation. Reporting it as a fingerprint that failed to match, or as
+// a workspace that was never discovered, would send the operator to the wrong
+// remedy.
 func (s *Store) verifySchema(ctx context.Context) error {
 	return s.read(ctx, func(tx *sql.Tx) error {
 		var tables int
@@ -66,9 +70,9 @@ func (s *Store) verifySchema(ctx context.Context) error {
 			return wrap("sqlite_master", err)
 		}
 		if tables == 0 {
-			return &model.Error{Code: model.CodeWorkspaceNotFound,
-				Message:     "no index cache has been built at " + s.path,
-				Remediation: "run `codectx index` to build one"}
+			return &model.Error{Code: model.CodeNoActiveGeneration,
+				Message:     "nothing has been published in this workspace yet",
+				Remediation: "run `codectx index`"}
 		}
 		return s.checkFingerprint(ctx, tx)
 	})

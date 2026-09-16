@@ -441,11 +441,21 @@ writer connection, so both queued behind a run's group and were refused
 Opened without a writer, the fingerprint is compared on the reader pool -- the
 same comparison, and a cache with no tables is reported as the workspace that
 was never built rather than as a fingerprint that failed to match -- and the
-pin takes no lease. A lease retains a generation against collection, and the
-**active** generation is the one generation collection never accepts, so on the
-active generation the lease retained nothing. Such a process therefore pins only
+pin takes no lease. A lease retains a generation against collection, and while a
+generation is active collection never accepts it, so such a process pins only
 the active generation; a superseded generation named explicitly is refused,
-because that is the case a lease does protect and this process cannot take one.
+because that is the case a lease plainly does protect and this process cannot
+take one.
+
+That leaves one window, and it is open on purpose. A generation stops being
+active the moment another process activates the next one, and the retention pass
+that follows an activation collects what is then superseded. A query held across
+that moment by a writerless process can therefore find rows it could still read a
+moment earlier gone -- fewer results, not wrong ones, and each individual read is
+still one consistent log snapshot. Closing it means holding one read transaction
+open for the life of the pin, the way the postings pool already does for a
+candidate walk, so the log snapshot retains the generation instead of a row; the
+lease is not the only way to hold a generation still.
 
 Every mutating entry point on such a store refuses with `CTX_INTERNAL`: it is
 reachable only by composing a command that changes the workspace with the
