@@ -547,12 +547,13 @@ func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(m
 	// skipped, the next one asks again, and the session keeps running.
 	_, release, err := c.hold(ctx)
 	if err != nil {
-		if ctx.Err() == nil {
-			logTyped(c.log, "this pass could not take the workspace; another process holds it and the next pass will ask again", err,
-				"component", component, "repository_id", string(c.repo))
-		}
+		c.skipped(ctx, err)
 		return model.IndexResult{}, false
 	}
+	// The workspace was free for this beat, so whatever episode of skipping was
+	// open has ended: the next beat that is refused is a new one and is
+	// reported again.
+	c.watch.tookWorkspace()
 	// Deferred and not a tail call: emit below is the caller's code, and a beat
 	// that panicked through it would otherwise hold the workspace for the rest
 	// of the session.
@@ -580,6 +581,44 @@ func (c *Coordinator) reconcile(ctx context.Context, paths []string, emit func(m
 		emit(res)
 	}
 	return res, true
+}
+
+// skipped reports a beat that did not run because it could not take the
+// workspace.
+//
+// A workspace another process is building in is the ordinary case and is
+// reported ONCE per episode, at debug, naming the holder the refusal carries:
+// a watch skipping for the length of someone else's index would otherwise
+// write a line per beat, and the person who started that index does not need
+// one. Anything else refused the acquisition itself -- startup recovery, the
+// collection pass -- which every beat repeats and nothing else reports, so it
+// is warned about every time.
+func (c *Coordinator) skipped(ctx context.Context, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeWorkspaceBusy {
+		logTyped(c.log, "this pass could not take the workspace and did not run", err,
+			"component", component, "repository_id", string(c.repo))
+		return
+	}
+	if !c.watch.beginSkipping() {
+		return
+	}
+	args := []any{"component", component, "repository_id", string(c.repo),
+		"diagnostic_code", typed.Code}
+	// Absent rather than empty: a holder that recorded nothing is what
+	// snapshot.LockWorkspace reports, and `holder_pid=""` would read as a
+	// process this beat identified and could not name.
+	if pid := typed.Details[snapshot.DetailHolderPID]; pid != "" {
+		args = append(args, snapshot.DetailHolderPID, pid)
+	}
+	if operation := typed.Details[snapshot.DetailHolderOperation]; operation != "" {
+		args = append(args, snapshot.DetailHolderOperation, operation)
+	}
+	c.log.Debug("this pass was skipped: another process holds the workspace, and the next pass will see whatever it published",
+		args...)
 }
 
 // ref is the ref this generation is built from (ruling Q3): the branch when

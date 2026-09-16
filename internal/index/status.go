@@ -210,9 +210,15 @@ func (r *StatusReader) coherence(ctx context.Context, snap model.Snapshot) (mode
 // without one the only coverage is periodic reconciliation, which is never
 // complete notification coverage, and what is reported is exactly that.
 type watchState struct {
-	mu         sync.Mutex
-	active     int
-	source     *watch.Watcher
+	mu     sync.Mutex
+	active int
+	source *watch.Watcher
+	// skipping is true while this watch is inside a held-lock episode: a run
+	// of beats that could not take the workspace because another process has
+	// it. It makes the episode reportable once instead of once per beat, and a
+	// beat that takes the workspace clears it, so the next episode is reported
+	// again.
+	skipping   bool
 	reconciled time.Time
 }
 
@@ -223,6 +229,7 @@ type watchState struct {
 func (w *watchState) enter(source *watch.Watcher) {
 	w.mu.Lock()
 	w.active++
+	w.skipping = false
 	if source != nil {
 		w.source = source
 	}
@@ -235,6 +242,25 @@ func (w *watchState) leave() {
 	if w.active == 0 {
 		w.source = nil
 	}
+	w.mu.Unlock()
+}
+
+// beginSkipping opens a held-lock episode and reports whether this beat is the
+// one that opened it; every later beat of the same episode reports false.
+func (w *watchState) beginSkipping() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.skipping {
+		return false
+	}
+	w.skipping = true
+	return true
+}
+
+// tookWorkspace ends whatever episode was open.
+func (w *watchState) tookWorkspace() {
+	w.mu.Lock()
+	w.skipping = false
 	w.mu.Unlock()
 }
 
