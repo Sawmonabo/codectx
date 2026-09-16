@@ -566,7 +566,7 @@ func (p *pool) exchange(w *worker, req wire.Request, src []byte) (*extraction, e
 // value that cannot be measured is -1, never zero.
 type Stats struct {
 	// Processes is every worker process the runner has not yet reaped: busy,
-	// idle and shutting down alike. It never exceeds index.max_parser_workers.
+	// idle and shutting down alike. It never exceeds Options.MaxWorkers.
 	Processes int `json:"processes"`
 	// IdleWorkers is the reusable subset of Processes, and BusyWorkers the
 	// rest: parsing for a caller, or on their way out. The two are reported

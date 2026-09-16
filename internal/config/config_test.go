@@ -125,7 +125,7 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 		},
 		{
 			name:     "zero is not unlimited",
-			user:     "[resources]\nmax_concurrent_queries = 0\n",
+			user:     "[storage]\nread_connections = 0\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
@@ -159,10 +159,11 @@ func TestLoadTrustAndBudgets(t *testing.T) {
 			wantCode: model.CodeConfigInvalid,
 		},
 		{
-			// 0 means the machine-derived allocation; a negative value is not a
-			// third meaning, and admitting one would size every unit from it.
-			name:     "a negative dependence memory ceiling is rejected",
-			user:     "[providers.dependence]\nunit_memory_ceiling_bytes = -1\n",
+			// How much runs at once is derived from the machine, so the keys
+			// that used to set it are unknown keys now and there is no
+			// extension namespace to absorb them.
+			name:     "a retired concurrency key is an unknown key",
+			user:     "[resources]\nmax_concurrent_heavy_analyzers = 4\n",
 			wantCode: model.CodeConfigInvalid,
 		},
 	} {

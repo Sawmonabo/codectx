@@ -189,7 +189,7 @@ type stack struct {
 	// name. It is built once per stack rather than per request so every cursor
 	// in the process retains its generation for the same configured window.
 	leases *pagination.Leases
-	// gate is the process-scoped max_concurrent_graph_queries semaphore. One
+	// gate is the process-scoped traversal semaphore, sized from the cores. One
 	// graph engine is built per request, so the bound cannot live on the engine.
 	gate *graphGate
 	// repo, search and coverage are set by openQueries once the coordinator has
@@ -1200,13 +1200,6 @@ func openResolver(cfg config.Config, stderr io.Writer) (*toolchain.Resolver, str
 	// The reported path is the resolver's own, so the report can never name a
 	// store other than the one it read.
 	return res, res.StoreDir(), nil
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 func maxInt64(a, b int64) int64 {

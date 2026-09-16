@@ -55,7 +55,7 @@ type Options struct {
 	// Languages restricts the supported set (config tree_sitter.languages);
 	// empty means every pinned language.
 	Languages []string
-	// MaxWorkers is index.max_parser_workers: the most parser subprocesses
+	// MaxWorkers is one per CPU (config.ParserWorkers): the most parser subprocesses
 	// alive at once.
 	MaxWorkers int
 	// MaxParseFileBytes is workspace.max_parse_file_bytes; a larger file is
