@@ -83,7 +83,6 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	var finished []SpanRow
 	var swept []*Run
 	err := l.writeTx(ctx, func(tx *sql.Tx) error {
-		finished, swept = finished[:0], swept[:0]
 		for _, e := range batch {
 			if e.kind == eventFinish {
 				sweep[e.run] = struct{}{}
@@ -167,7 +166,6 @@ func (l *Ledger) finalize(running map[*Span]struct{}) {
 	now := time.Now()
 	var swept []SpanRow
 	l.finalErr = l.writeTx(ctx, func(tx *sql.Tx) error {
-		swept = swept[:0]
 		l.runsMu.Lock()
 		runs := append([]*Run(nil), l.runs...)
 		l.runsMu.Unlock()
