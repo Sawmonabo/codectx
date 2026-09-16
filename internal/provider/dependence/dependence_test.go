@@ -49,7 +49,12 @@ type fakeBackend struct {
 	deadExport bool
 	// noGraph makes a nominally clean parse leave no graph.
 	noGraph bool
-	parses  int
+	// wholeExportCrash is the engine crash the WHOLE unit's export dies on
+	// while every subdivided part's export succeeds -- the measured shape of a
+	// 4,984-file project whose export died at every heap cap.
+	wholeExportCrash dependence.Outcome
+	parses           int
+	exports          int
 }
 
 func (b *fakeBackend) Engine() dependence.Engine {
@@ -74,7 +79,13 @@ func (b *fakeBackend) Parse(_ context.Context, req dependence.ParseRequest) (dep
 }
 
 func (b *fakeBackend) Export(_ context.Context, req dependence.ExportRequest) (dependence.ExportOutcome, error) {
+	b.exports++
 	out := b.export
+	// A subdivided part's graph is "graph-<n>"; anything else is the whole
+	// unit's graph, which after a clean parse may be the cache's own entry.
+	if b.wholeExportCrash.Class != dependence.FailureNone && !strings.HasPrefix(filepath.Base(req.GraphPath), "graph-") {
+		return dependence.ExportOutcome{Outcome: b.wholeExportCrash}, nil
+	}
 	if out.Class != dependence.FailureNone {
 		return out, nil
 	}
@@ -644,4 +655,67 @@ func TestGovernorRetriesOnceAndOnlyHigher(t *testing.T) {
 		t.Error("releasing one admission twice freed a slot that was never taken")
 	}
 	second()
+}
+
+// splittable is one module whose own subdirectory holds source, so the unit
+// has a frontend-native boundary to be split along.
+var splittable = map[string]string{
+	"go.mod":         "module example.com/app\n\ngo 1.27\n",
+	"app.go":         "package app\n\nfunc Run(x int) int {\n\ty := x + 1\n\treturn y\n}\n",
+	"inner/inner.go": "package inner\n\nfunc Helper() int { return 1 }\n",
+}
+
+// A unit the engine cannot export is recovered by subdivision, not reported as
+// a crashed unit.
+//
+// Failure mode: a project whose parse succeeds at every heap cap and whose
+// export then dies on the engine's own exception -- measured on a real
+// 4,984-file project, whose every subdivided part exported cleanly -- was
+// published as a failed unit. Every fact the engine could still produce for
+// that project was thrown away, and five capabilities went unavailable for a
+// repository the engine could analyse. The recovery is the one a reproducible
+// parse crash already has, and the result must say what it is: partial, naming
+// the subdivided scope and the failing pass and exception, never memory and
+// never a crash of the unit.
+//
+// Mutation: in export, return failure(out.Class, ...) for the engine class
+// instead of confirming and handing the crash back ->
+// "the unit failed: CTX_PROVIDER_OUTPUT_INVALID: the dependence unit failed:
+// the analysis backend crashed"
+func TestADeadExportIsRecoveredBySubdivision(t *testing.T) {
+	b := &fakeBackend{wholeExportCrash: dependence.Outcome{Class: dependence.FailureEngine,
+		Pass: "Base", Exception: "java.util.NoSuchElementException", ExitCode: 1}}
+	h := providertest.New(t, splittable)
+	result, unit, err := h.Run(t, newProvider(t, b), rootScope, []string{"app.go", "go.mod", "inner/inner.go"})
+	if err != nil {
+		t.Fatalf("the unit failed: %v", err)
+	}
+	if result.State != model.RunSucceeded {
+		t.Fatalf("run state = %s, want succeeded: subdivision is a recovery, not a failure", result.State)
+	}
+	if state, ok := h.UnitState(t, unit); !ok || state != model.UnitSealed {
+		t.Fatalf("unit state = %q, want sealed: the parts the engine could export are facts", state)
+	}
+	// The dead export is confirmed before anything is split, exactly as a
+	// parse crash is: one export of the whole unit, one confirmation of it,
+	// and one per subdivided part.
+	if b.exports != 3 {
+		t.Errorf("the unit cost %d export steps, want 3 (the export, its confirmation, one part)", b.exports)
+	}
+	rows := byCapability(result.Capabilities)
+	for _, c := range dependence.Capabilities {
+		row := rows[c]
+		if row.State != model.CapabilityPartial {
+			t.Errorf("%s = %q, want partial: a subdivided unit is never fresh", c, row.State)
+		}
+		if row.DiagnosticCode == model.CodeResourceLimit {
+			t.Errorf("%s reports %q: a dead export is not memory", c, row.DiagnosticCode)
+		}
+		if row.Details["subdivided"] != rootScope {
+			t.Errorf("%s names subdivided=%q, want %q", c, row.Details["subdivided"], rootScope)
+		}
+		if got := row.Details["backend_failure"]; got != "Base/java.util.NoSuchElementException" {
+			t.Errorf("%s reports backend_failure=%q, want the failing pass and its exception", c, got)
+		}
+	}
 }
