@@ -114,6 +114,81 @@ The per-unit lists add their packed bytes to the store, reported in the change's
 build budget stands at 5 % of index wall, and a delta activation must build the lexical structure in
 at most three times the packed adjacency's build on the same store.
 
+### Decision 1, amended a second time: the packed form is a set of immutable segments; activation names them
+
+The first amendment was implemented and measured, and it failed the requirement it was chosen for:
+an activation's cost must be proportional to what changed. On the reference repository the seal
+folds cost 58.9 s and wrote 118 GB, because "tokenised a second time into a temporary index table"
+meant a second full text index per unit, whose own internal merges rewrote the same postings
+repeatedly; the activation then merged all 20 038 units' lists in three passes, 86.2 s — worse than
+the 46.15 s whole-store build it replaced. Merging every unit at every activation is the same
+whole-store rewrite in a different shape: on a monorepo, one saved file would rewrite gigabytes,
+which is exactly the write amplification ADR-0008 and ADR-0009 removed from the ingestion path.
+
+So the unit of the packed form becomes a **segment**, and an activation stops producing one.
+
+- **A segment is an immutable packed structure over a set of documents**: the three streams of the
+  original Decision 1 (`term.dir`, `term.text`, `post.list`) plus the per-document attribute stream
+  of Decision 2, chunked into parts exactly as before, with postings inside a segment ascending by
+  document rowid. `lexical_segments` carries a segment's term and document counts and its packed
+  bytes; `lexical_segment_parts` holds the chunks; `segment_units` names the units whose documents
+  it holds; `generation_segments` is one generation's set, in read order. There is no
+  generation-level parts table any more.
+- **The seal folds one segment per unit, from the tokenizer pass the seal already makes.** There is
+  no second tokenisation and no second index. The pass that counts a batch's tokens reads its
+  grouped instance vocabulary once and serves both answers from it: the per-document token counts,
+  and one staged row per `(term, document, column)` group. The rows are appended, in arrival order,
+  to a staging database of the unit's own under the data directory's temporary directory — never
+  into the workspace database, whose write-ahead log would carry every staged row a second time —
+  with durability off and no index during the load, paced to disk while the unit builds (ADR-0009).
+  At seal, ONE ordered read of that staging, resolved against the document rowids the ingestion
+  transaction assigned, is folded by the same writer that wrote the generation-wide form. That read
+  is the only `ORDER BY` any plan of this store issues; the engine's external merge sort performs it,
+  bounded by the staging's page cache and spilling under the same temporary directory. The staging is
+  deleted at seal, at Abandon and at Fail. A unit that publishes no document folds no segment.
+- **Activation adds segments; it never rebuilds.** A generation's set is its predecessor's set plus
+  the segments of members whose documents no inherited segment already holds, recorded in
+  `generation_segments`. A generation with no predecessor takes its members' segments alone. A
+  delta's carried documents keep their document rowid and therefore the segment they were folded
+  into, so the carrying unit is recorded as an owner of that segment and nothing is rewritten to
+  carry a document forward. The invariant, tested: every visible document of a generation lies in
+  exactly ONE of its segments.
+- **Visibility is a per-generation document bitmap.** A document of an inherited segment whose unit
+  left the generation is hidden by the bitmap; the segment is not rewritten to remove it.
+- **Compaction by geometric partitioning, at activation, amortised.** While a size tier holds more
+  than `r` segments, that tier's segments are merged into one — a streaming merge on
+  (term, document rowid) that copies a term's posting bytes verbatim when only one input holds the
+  term and drops hidden documents — as is any segment more than half of whose documents are hidden.
+  The merged segment replaces its inputs in the activating generation's set ONLY; a retained
+  generation keeps its own rows and is never touched. A document therefore pays O(log_r N) merges
+  over its life, and a one-file delta pays for one small segment plus, occasionally, one tier merge.
+- **Reads merge segments by document rowid.** A term is one binary search per segment over that
+  segment's directory; the per-segment posting streams are merged so the candidate walk still
+  receives one strictly ascending sequence of rowids, and a document two segments both claim is
+  reported as a corrupt store rather than scored twice. Document frequency stays EXACT: a generation
+  that hides nothing answers from the directory entries, and otherwise the posting is walked against
+  the bitmap. Approximate frequencies that count hidden documents are rejected: a ranking would then
+  depend on the store's history, and a delta-built store would not answer identically to a fresh one
+  over the same tree.
+- **Garbage.** A segment no retained generation names and no live unit owns is deleted in the same
+  transaction as the generation or the unit that released it.
+
+**Consequences.** Each document is tokenised exactly once, on the path that already tokenised it, so
+the seal's added cost is one staged row per `(term, document, column)` group and no second index.
+Activation writes the generation's segment list and, when a tier is full, one merged segment; it
+never touches a byte of a segment it merely inherits, which is what makes a delta activation's cost
+proportional to the delta. In exchange, a read pays one directory search per segment instead of one,
+and a generation that has hidden documents pays a posting walk for a document frequency — both
+bounded by the segment count, which compaction holds at O(log_r N). The build budget stands at 5 % of
+index wall, and a delta activation must build the lexical structure in at most three times the packed
+adjacency's build on the same store.
+
+**Alternative considered.** *Keeping one structure per generation and rewriting it incrementally* —
+the strongest competing shape, because a single sorted run is the cheapest possible read. Rejected:
+any in-place rewrite of a sorted run is proportional to the run, not to the change, so it reproduces
+exactly the cost this amendment exists to remove, and it cannot leave a retained generation's bytes
+untouched. The trade-off accepted is the read-side merge across segments.
+
 ## Decision 2 — every candidate attribute comes from the packed per-document stream; no document row is read per candidate
 
 Ranking needs, per candidate, more than a score: the deterministic tie-break and the deduplication key
@@ -163,6 +238,13 @@ plan test mutation-proved.
 - SQLite, The Query Optimizer Overview — https://www.sqlite.org/optoverview.html (correlated scalar subqueries and temporary b-trees for `DISTINCT`).
 - Vitter, External Memory Algorithms and Data Structures: Dealing with Massive Data — https://www.ittc.ku.edu/~jsv/Papers/Vit.IO_survey.pdf (external merge sort; why a single sorted run served by offset is the right shape for later pages).
 - Knuth, The Art of Computer Programming vol. 3, §5.2.3 (heapsort and selection with a bounded heap) — https://www-cs-faculty.stanford.edu/~knuth/taocp.html (the bounded heap serves exactly the first page of the same total order).
+- Nicholas Lester, Alistair Moffat, Justin Zobel, "Fast on-line index construction by geometric partitioning", CIKM 2005 — https://doi.org/10.1145/1099554.1099739 (the tiered merge schedule and its O(log_r N) amortised cost per document).
+- Justin Zobel, Alistair Moffat, "Inverted files for text search engines", ACM Computing Surveys 38(2), 2006 — https://doi.org/10.1145/1132956.1132959 (index maintenance strategies; why rebuild-in-place is proportional to the index).
+- Stefan Büttcher, Charles L. A. Clarke, Brad Lushman, "Hybrid index maintenance for growing text collections", SIGIR 2006 — https://doi.org/10.1145/1148170.1148233 (merging short and long posting lists under different schedules).
+- Patrick O'Neil, Edward Cheng, Dieter Gawlick, Elizabeth O'Neil, "The Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica 33, 1996 — https://www.cs.umb.edu/~poneil/lsmtree.pdf (immutable runs merged on a size schedule instead of updated in place).
+- "TieredMergePolicy", search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/index/TieredMergePolicy.html (a production tiered merge schedule).
+- "Lucene90LiveDocsFormat", search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/codecs/lucene90/Lucene90LiveDocsFormat.html (deletions as a live-document bitset, dropped at merge).
+- Index file formats, segments, search-engine library documentation, version 9.9 — https://lucene.apache.org/core/9_9_0/core/org/apache/lucene/codecs/lucene99/package-summary.html (an index as a set of immutable segments).
 
 ## Measurement record
 
