@@ -830,9 +830,9 @@ func (s *stack) openQueries(repo model.RepositoryID) error {
 	s.querySearch = svc
 	if s.queryStore != s.store {
 		// The same service over the reader handle. A generation pinned through
-		// it takes no retention lease, and PinnedReader.Continuable() is false
-		// there, so a search served this way answers one page and hands back no
-		// cursor rather than minting one it would have to write.
+		// it takes no retention lease, so a search served this way reaches no
+		// write transaction; it still pages in full, because a continuation
+		// carries its own recorded expiry rather than a lease row.
 		read, err := search.New(search.Options{
 			Store:     s.queryStore,
 			Repo:      repo,
