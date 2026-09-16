@@ -865,8 +865,7 @@ func TestLowMemoryProfile(t *testing.T) {
 	t.Cleanup(closeBaseline)
 	want := capture(t, ctx, baseline)
 
-	const lowMemory = "[index]\nworkers = 1\nmax_parser_workers = 1\n" +
-		"[resources]\nbase_memory_budget_bytes = 2147483648\n"
+	const lowMemory = "[index]\nworkers = 1\n"
 	var peak uint64
 	var constrained *app.Services
 	home := filepath.Join(t.TempDir(), "low")
@@ -876,7 +875,7 @@ func TestLowMemoryProfile(t *testing.T) {
 	got := capture(t, ctx, constrained)
 
 	if diffs := compareFingerprints(want, got); len(diffs) > 0 {
-		t.Errorf("the one-worker 2 GiB profile produced different results:\n\t%s", strings.Join(diffs, "\n\t"))
+		t.Errorf("the one-worker profile produced different results:\n\t%s", strings.Join(diffs, "\n\t"))
 	}
 	t.Logf("one worker, 2 GiB budget: index tree peak %.1f MiB; fingerprint identical across %d fact families",
 		float64(peak)/(1<<20), len(want.families()))

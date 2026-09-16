@@ -339,7 +339,7 @@ func callsiteOf(t *testing.T, src []byte, token string) string {
 // worker process until a unit demands one, and an idle worker is reaped by
 // its TTL rather than held until Close.
 //
-// They are what makes index.max_parser_workers a concurrency CEILING and not
+// They are what makes the worker count a concurrency FIGURE and not
 // a resident cost: a worker process costs ~18 MiB of resident set before it
 // has parsed anything (PERF-4 measured it; the binary's mapped pages
 // dominate), so a pool that spawned

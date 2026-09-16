@@ -31,8 +31,8 @@ type handlers struct {
 	context app.ContextService
 
 	// cfg carries the Section 20 bounds. L1's limitMiddleware reads
-	// resources.max_metadata_response_bytes, max_concurrent_queries,
-	// max_concurrent_graph_queries and query_timeout from it; L4's readSource
+	// resources.max_metadata_response_bytes and query_timeout from it, and the
+	// two gate sizes from the machine's cores; L4's readSource
 	// reads max_source_response_bytes.
 	cfg   config.Config
 	build model.BuildInfo

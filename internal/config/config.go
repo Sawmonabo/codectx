@@ -149,14 +149,14 @@ type Index struct {
 	// Workers is the only setting where 0 is meaningful: it selects the count
 	// from available CPUs and memory reservations, which is still a finite
 	// bound and never "unlimited".
-	Workers           int   `toml:"workers"`
-	BatchRecords      int   `toml:"batch_records"`
-	BatchBytes        int64 `toml:"batch_bytes"`
-	QueueBytes        int64 `toml:"queue_bytes"`
-	WatchPendingPaths int   `toml:"watch_pending_paths"`
-	WatchPendingBytes int64 `toml:"watch_pending_bytes"`
-	WatchDebounce     Duration
-	ReconcileInterval Duration
+	Workers           int      `toml:"workers"`
+	BatchRecords      int      `toml:"batch_records"`
+	BatchBytes        int64    `toml:"batch_bytes"`
+	QueueBytes        int64    `toml:"queue_bytes"`
+	WatchPendingPaths int      `toml:"watch_pending_paths"`
+	WatchPendingBytes int64    `toml:"watch_pending_bytes"`
+	WatchDebounce     Duration `toml:"watch_debounce"`
+	ReconcileInterval Duration `toml:"reconcile_interval"`
 	// RetainRefs is retention by ref, not by snapshot count (Section 12.4):
 	// the results of the last N distinct refs the user actually indexed stay
 	// on disk, so switching A -> B -> C -> A finds A's units and reuses them
