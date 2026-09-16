@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -121,4 +122,123 @@ func waitForSpan(t *testing.T, l *Ledger, run *Run) {
 		}
 		time.Sleep(flushInterval / 5)
 	}
+}
+
+// TestSweepsOnlyRunsWhoseWriterIsGone protects the liveness predicate both
+// sweeps share. The failure mode: a sweep with no predicate deletes the ledger
+// of a process that is still running -- the overlay run of another process's
+// language servers, or an index run that has not reached its generation yet --
+// so the record of live work disappears from under the surface reading it,
+// while the rows nothing else can reach (a finished run that published no
+// generation) must still go, or periodic ticks accumulate them without bound.
+func TestSweepsOnlyRunsWhoseWriterIsGone(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	l, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatalf("open the ledger: %v", err)
+	}
+	defer func() {
+		if err := l.Stop(); err != nil {
+			t.Errorf("stop the ledger: %v", err)
+		}
+	}()
+
+	serving, err := l.NewRun(KindOverlay, liveRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	abandoned, err := l.NewRun(KindOverlay, liveRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	// A run row exists from its first span, so each of these records the one
+	// span its kind is opened for.
+	for _, run := range []*Run{serving, abandoned} {
+		_, span := Start(run.Context(ctx), "server_start", "")
+		span.End(OutcomeOK, Measured{}, nil)
+	}
+	// A tick that published nothing: it ended, so no generation will ever be
+	// attached and the generation-keyed deletion can never reach its row.
+	barren, err := l.NewRun(KindDeferred, liveRepository)
+	if err != nil {
+		t.Fatalf("new run: %v", err)
+	}
+	_, sealed := Start(barren.Context(ctx), "seal", "")
+	sealed.End(OutcomeOK, Measured{}, nil)
+	barren.Finish(OutcomeOK)
+	waitForRuns(t, l, 3)
+	// What a process killed while serving leaves behind: a deadline its writer
+	// never renewed, on a row that still says 'running'.
+	if err := l.writeTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE runs SET expires_at = ? WHERE run_id = ?`,
+			formatTime(time.Now().Add(-liveWindow)), abandoned.id)
+		return err
+	}); err != nil {
+		t.Fatalf("backdate the abandoned run's liveness: %v", err)
+	}
+
+	ids, err := l.OverlayRuns(ctx)
+	if err != nil {
+		t.Fatalf("overlay runs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != abandoned.ID() {
+		t.Fatalf("the sweep offers %v, want only the abandoned overlay run %s: "+
+			"the overlay run of a process that is still serving must never be swept",
+			ids, abandoned.ID())
+	}
+	if err := l.DeleteOverlayRuns(ctx, ids); err != nil {
+		t.Fatalf("delete overlay runs: %v", err)
+	}
+	if err := l.DeleteRunsWithoutGeneration(ctx); err != nil {
+		t.Fatalf("delete runs without a generation: %v", err)
+	}
+	left := runIDs(t, l)
+	if len(left) != 1 || left[0] != serving.ID() {
+		t.Fatalf("after both sweeps the ledger holds %v, want only the live overlay run %s "+
+			"(the abandoned overlay run and the tick that published no generation are the rows "+
+			"nothing else would ever collect)", left, serving.ID())
+	}
+}
+
+// waitForRuns blocks until the collector has written n run rows; before that
+// flush there is legitimately nothing in the file to sweep.
+func waitForRuns(t *testing.T, l *Ledger, n int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * flushInterval)
+	for {
+		var runs int
+		if err := l.db.QueryRowContext(context.Background(), `SELECT count(*) FROM runs`).Scan(&runs); err != nil {
+			t.Fatalf("count the runs: %v", err)
+		}
+		if runs >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the collector wrote %d of %d run rows within %s", runs, n, 30*flushInterval)
+		}
+		time.Sleep(flushInterval / 5)
+	}
+}
+
+// runIDs reads back the run ids the file still holds.
+func runIDs(t *testing.T, l *Ledger) []string {
+	t.Helper()
+	rows, err := l.db.QueryContext(context.Background(), `SELECT run_id FROM runs ORDER BY started_at`)
+	if err != nil {
+		t.Fatalf("read the runs: %v", err)
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			t.Fatalf("read the runs: %v", err)
+		}
+		ids = append(ids, hex.EncodeToString(raw))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read the runs: %v", err)
+	}
+	return ids
 }
