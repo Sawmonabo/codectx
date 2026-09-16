@@ -51,6 +51,13 @@ type IndexResult struct {
 	RunsOmitted int64     `json:"runs_omitted"`
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at"`
+	// Run is this indexing run as the run ledger recorded it, and Stages is
+	// one page of its span tree in the order the stages were opened. Both are
+	// absent where the run recorded nothing. They are the same rows status
+	// reports, so the ledger's counts and the counts above cannot disagree
+	// about what the run did.
+	Run    *RunRecord    `json:"run,omitempty"`
+	Stages []StageRecord `json:"stages,omitempty"`
 }
 
 // Validate enforces the result shape.
@@ -88,6 +95,9 @@ func (r IndexResult) Validate() error {
 		if err := run.Validate(); err != nil {
 			return err
 		}
+	}
+	if err := validateRunLedger("index_result", r.Run, r.Stages); err != nil {
+		return err
 	}
 	return nil
 }
@@ -221,6 +231,13 @@ type ResourceReport struct {
 	AnalyzerUnits []AnalyzerUnit `json:"analyzer_units,omitempty"`
 	UnitsReused   *int64         `json:"units_reused,omitempty"`
 	UnitsParsed   *int64         `json:"units_parsed,omitempty"`
+	// Run is the latest recorded run for this repository -- the live one if a
+	// run is going, otherwise the one that produced the active generation --
+	// and Stages is one page of its stages. Run is carried beside Stages
+	// because a stage's share of the run is unreadable without the run it is
+	// a share of.
+	Run    *RunRecord    `json:"run,omitempty"`
+	Stages []StageRecord `json:"stages,omitempty"`
 }
 
 // An AnalyzerUnit is one heavy unit's memory accounting. AllocationBytes and
@@ -310,6 +327,9 @@ func (r ResourceReport) Validate() error {
 				return err
 			}
 		}
+	}
+	if err := validateRunLedger("resources", r.Run, r.Stages); err != nil {
+		return err
 	}
 	return nil
 }
@@ -516,4 +536,189 @@ type UntouchedInstance struct {
 	Instance  string `json:"instance"`
 	HeldBytes uint64 `json:"held_bytes"`
 	Reason    string `json:"reason"`
+}
+
+// A RunRecord is one recorded run of the coordinator as the run ledger holds
+// it: what the run was, which generation it produced, what it cost and what it
+// got through. It is the row every surface reports first, because a stage's
+// share of the run means nothing without it.
+//
+// The measured fields are pointers and the counters are not, and that split is
+// deliberate: a counter the run keeps itself is always available and zero is a
+// real answer, while ProcessPeakRSSBytes is a platform measurement that a host
+// may not expose, where absent must not read as a process using no memory.
+type RunRecord struct {
+	// RunID is the run's 32-byte identifier, hex-encoded. It exists from the
+	// coordinator's first stage, which is earlier than any generation, so it
+	// and not the generation is what names a run.
+	RunID string `json:"run_id"`
+	// Kind is `index`, `deferred` or `overlay`: an ordinary indexing run, a
+	// deferred publication, or the per-process run that carries work with no
+	// generation of its own.
+	Kind string `json:"kind"`
+	// RepositoryID is the repository the run indexed, hex-encoded.
+	RepositoryID string `json:"repository_id"`
+	// GenerationID is the generation this run produced, absent until the run
+	// reaches one and for ever on a run that failed before it. A run without
+	// a generation is still a run, and this is how it says so.
+	GenerationID *int64    `json:"generation_id,omitempty"`
+	StartedAt    time.Time `json:"started_at"`
+	// FinishedAt is absent while the run is still going.
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// WallMS is the run's elapsed time: its measured wall once FinishedAt is
+	// set, and its elapsed time so far while it is live.
+	WallMS int64 `json:"wall_ms"`
+	// Outcome is one of `running`, `ok`, `failed`, `subdivided`, `reused`,
+	// `skipped` or `interrupted`; `interrupted` is a run whose process ended
+	// without finishing it.
+	Outcome         string `json:"outcome"`
+	FileCount       int64  `json:"file_count"`
+	SourceBytes     int64  `json:"source_bytes"`
+	UnitsPlanned    int64  `json:"units_planned"`
+	UnitsSucceeded  int64  `json:"units_succeeded"`
+	UnitsFailed     int64  `json:"units_failed"`
+	UnitsSubdivided int64  `json:"units_subdivided"`
+	// EventsDropped counts the accounting events the bounded bus refused
+	// because the collector was behind. A run never waits on its own
+	// accounting, so the loss is counted rather than prevented: above zero,
+	// the stage rows are known to be incomplete and a reader must say so.
+	EventsDropped int64 `json:"events_dropped"`
+	// ProcessPeakRSSBytes is the peak resident size of this process, absent
+	// where the platform does not expose it. The stage rows carry null here
+	// because a resident-size delta across overlapping work measures the
+	// process and not the stage.
+	ProcessPeakRSSBytes *uint64 `json:"process_peak_rss_bytes,omitempty"`
+}
+
+// A StageRecord is one span of a run: a stage, a unit, a provider step or a
+// worker, with the part of the run's cost that is attributable to it. Per-file
+// work is never a stage; a worker's row aggregates its files.
+//
+// Every field the platform measures is a pointer, so an unavailable figure is
+// absent and never zero (Section 23). The counters ItemsIn and ItemsOut are
+// not, because they are the stage's own tally.
+type StageRecord struct {
+	// Seq is the run's own ordinal for this stage, in the order the stages
+	// were opened; ParentSeq is the ordinal of the stage this one nests
+	// under, absent at the run's top level. The tree is carried as ordinals
+	// because that is what both the recording and the reading side know.
+	Seq       int64     `json:"seq"`
+	ParentSeq *int64    `json:"parent_seq,omitempty"`
+	Stage     string    `json:"stage"`
+	ScopeKey  string    `json:"scope_key,omitempty"`
+	Provider  string    `json:"provider,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	// FinishedAt is absent while the stage is running and on a stage that was
+	// still open when its run ended.
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// WallMS is the stage's measured wall once it has finished, and its
+	// elapsed time so far while Running is true. Running is carried beside it
+	// precisely so that a live stage's partial time is never presented as a
+	// final measurement.
+	WallMS  int64 `json:"wall_ms"`
+	Running bool  `json:"running,omitempty"`
+	// CPUUserMS and CPUSysMS are absent where no processor time can be
+	// attributed to this stage, and CPUUnattributed then names why:
+	// `overlapped` for in-process work that ran beside other goroutines,
+	// where the process-wide counters measure the process rather than the
+	// stage, and `unsampled` for a platform that does not expose them.
+	CPUUserMS       *int64  `json:"cpu_user_ms,omitempty"`
+	CPUSysMS        *int64  `json:"cpu_sys_ms,omitempty"`
+	CPUUnattributed string  `json:"cpu_unattributed,omitempty"`
+	PeakRSSBytes    *uint64 `json:"peak_rss_bytes,omitempty"`
+	ReadBytes       *uint64 `json:"read_bytes,omitempty"`
+	WriteBytes      *uint64 `json:"write_bytes,omitempty"`
+	ItemsIn         int64   `json:"items_in"`
+	ItemsOut        int64   `json:"items_out"`
+	// Outcome takes the same spellings as RunRecord.Outcome.
+	Outcome        string `json:"outcome"`
+	DiagnosticCode string `json:"diagnostic_code,omitempty"`
+	// Failure is the retained detail of a failed stage: the typed error's
+	// message and details as the ledger stored them.
+	Failure string `json:"failure,omitempty"`
+	// ShareOfWall is this stage's wall as a fraction of its run's. It is
+	// computed where the rows are read, so that every surface divides the
+	// same way rather than each recomputing it.
+	ShareOfWall float64 `json:"share_of_wall,omitempty"`
+}
+
+// validateRunLedger enforces the shape of a run row and its page of stage
+// rows. Both surfaces that carry them -- the completed run an index reports
+// and the latest run status reports -- have the same bound and the same
+// non-negativity rules, so they share one check rather than drifting apart.
+func validateRunLedger(field string, run *RunRecord, stages []StageRecord) *Error {
+	if run != nil {
+		for _, c := range []struct {
+			name  string
+			value int64
+		}{
+			{field + ".run.wall_ms", run.WallMS},
+			{field + ".run.file_count", run.FileCount},
+			{field + ".run.source_bytes", run.SourceBytes},
+			{field + ".run.units_planned", run.UnitsPlanned},
+			{field + ".run.units_succeeded", run.UnitsSucceeded},
+			{field + ".run.units_failed", run.UnitsFailed},
+			{field + ".run.units_subdivided", run.UnitsSubdivided},
+			{field + ".run.events_dropped", run.EventsDropped},
+		} {
+			if err := requireNonNegative(c.name, c.value); err != nil {
+				return err
+			}
+		}
+		if run.ProcessPeakRSSBytes != nil {
+			if err := boundSigned64(field+".run.process_peak_rss_bytes", *run.ProcessPeakRSSBytes); err != nil {
+				return err
+			}
+		}
+	}
+	if err := boundPage(field+".stages", len(stages)); err != nil {
+		return err
+	}
+	for i, s := range stages {
+		at := indexed(field+".stages", i)
+		for _, c := range []struct {
+			name  string
+			value int64
+		}{
+			{at + ".seq", s.Seq},
+			{at + ".wall_ms", s.WallMS},
+			{at + ".items_in", s.ItemsIn},
+			{at + ".items_out", s.ItemsOut},
+		} {
+			if err := requireNonNegative(c.name, c.value); err != nil {
+				return err
+			}
+		}
+		for _, c := range []struct {
+			name  string
+			value *int64
+		}{
+			{at + ".parent_seq", s.ParentSeq},
+			{at + ".cpu_user_ms", s.CPUUserMS},
+			{at + ".cpu_sys_ms", s.CPUSysMS},
+		} {
+			if c.value == nil {
+				continue
+			}
+			if err := requireNonNegative(c.name, *c.value); err != nil {
+				return err
+			}
+		}
+		for _, c := range []struct {
+			name  string
+			value *uint64
+		}{
+			{at + ".peak_rss_bytes", s.PeakRSSBytes},
+			{at + ".read_bytes", s.ReadBytes},
+			{at + ".write_bytes", s.WriteBytes},
+		} {
+			if c.value == nil {
+				continue
+			}
+			if err := boundSigned64(c.name, *c.value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
