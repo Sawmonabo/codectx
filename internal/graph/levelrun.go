@@ -363,8 +363,7 @@ func (c *levelCollector) finishSpilled(ctx context.Context, out *retainFile) err
 	if err != nil {
 		return err
 	}
-	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "levelsort"),
-		levelFileName("level", c.level), 0,
+	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "levelsort"), 0,
 		func(r levelRecord) ([]byte, error) { return encodeLevelRecord(r), nil },
 		decodeLevelRecord, compareLevelRecord)
 	if err != nil {

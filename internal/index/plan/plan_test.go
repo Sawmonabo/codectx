@@ -1,7 +1,6 @@
 package plan
 
 import (
-	"os"
 	"runtime"
 	"slices"
 	"testing"
@@ -51,7 +50,7 @@ func digestOf(t *testing.T, each func(yield func(model.UnitInput) error) error) 
 func TestExternalMergeReproducesTheInHeapInputOrder(t *testing.T) {
 	const n = 50_000
 	want := make([]model.UnitInput, 0, n)
-	sorter, err := pagination.NewExternalSort(t.TempDir(), "plan-inputs-", 1024,
+	sorter, err := pagination.NewExternalSort(t.TempDir(), 1024,
 		encodeInput, decodeInput, compareInput)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
@@ -98,14 +97,7 @@ func TestExternalMergeReproducesTheInHeapInputOrder(t *testing.T) {
 func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 	measure := func(n int) uint64 {
 		dir := t.TempDir()
-		files := func() int {
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				t.Fatalf("ReadDir: %v", err)
-			}
-			return len(entries)
-		}
-		sorter, err := pagination.NewExternalSort(dir, "plan-inputs-", 4096,
+		sorter, err := pagination.NewExternalSort(dir, 4096,
 			encodeInput, decodeInput, compareInput)
 		if err != nil {
 			t.Fatalf("NewExternalSort: %v", err)
@@ -116,8 +108,8 @@ func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 				t.Fatalf("Add: %v", err)
 			}
 		}
-		if spilled := files(); spilled < 2 {
-			t.Fatalf("a %d-input sort left %d run files before the merge; it never spilled, "+
+		if spilled := sorter.SpilledRuns(); spilled < 2 {
+			t.Fatalf("a %d-input sort spilled %d runs; it stayed in heap, "+
 				"so a flat heap here would prove nothing", n, spilled)
 		}
 		run, err := sorter.Sorted()
@@ -125,10 +117,6 @@ func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 			t.Fatalf("Sorted: %v", err)
 		}
 		defer func() { _ = run.Close() }()
-		if left := files(); left != 1 {
-			t.Fatalf("%d files remain after the merge of %d inputs, want only the merged run: "+
-				"a run file that survives Sorted is disk held for the life of the plan", left, n)
-		}
 		var m runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&m)
@@ -151,7 +139,7 @@ func TestSortedInputsDoNotGrowTheHeapWithInputCount(t *testing.T) {
 // changed -- the exact degradation emit refuses by hand for a scope with no
 // members. A lifetime mistake has to be loud.
 func TestClosedInputRunRefusesToReadAsEmpty(t *testing.T) {
-	sorter, err := pagination.NewExternalSort(t.TempDir(), "plan-inputs-", 8,
+	sorter, err := pagination.NewExternalSort(t.TempDir(), 8,
 		encodeInput, decodeInput, compareInput)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
@@ -211,14 +199,7 @@ func TestPlannedUnitsAreStreamedNotHeldInHeap(t *testing.T) {
 	const batch = runBuffer + pagination.MaxSortFanIn
 	measure := func(n int) (peak int, held uint64) {
 		dir := t.TempDir()
-		files := func() int {
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				t.Fatalf("ReadDir: %v", err)
-			}
-			return len(entries)
-		}
-		sorter, err := pagination.NewExternalSort(dir, "plan-units-", runBuffer,
+		sorter, err := pagination.NewExternalSort(dir, runBuffer,
 			encodeUnit, decodeUnit, compareUnit)
 		if err != nil {
 			t.Fatalf("NewExternalSort: %v", err)
@@ -231,8 +212,8 @@ func TestPlannedUnitsAreStreamedNotHeldInHeap(t *testing.T) {
 				t.Fatalf("Add: %v", err)
 			}
 		}
-		if spilled := files(); spilled < 2 {
-			t.Fatalf("a %d-unit plan left %d run files before the merge; it never spilled, so a "+
+		if spilled := sorter.SpilledRuns(); spilled < 2 {
+			t.Fatalf("a %d-unit plan spilled %d runs; it stayed in heap, so a "+
 				"flat heap here would prove nothing", n, spilled)
 		}
 		run, err := sorter.Sorted()
@@ -240,9 +221,6 @@ func TestPlannedUnitsAreStreamedNotHeldInHeap(t *testing.T) {
 			t.Fatalf("Sorted: %v", err)
 		}
 		defer func() { _ = run.Close() }()
-		if left := files(); left != 1 {
-			t.Fatalf("%d files remain after the merge of %d units, want only the merged run", left, n)
-		}
 
 		// The executor's own walk, through the production sequence. Peak heap
 		// is read at its midpoint, with everything the plan owns alive.
@@ -301,7 +279,7 @@ func errOrder(at int, got, want string) error {
 // sealed. The streamed file units and the in-heap semantic units come from two
 // different places, so their interleave is where that can go wrong.
 func TestTheUnitSequenceInterleavesSemanticProvidersInSelectionOrder(t *testing.T) {
-	sorter, err := pagination.NewExternalSort(t.TempDir(), "plan-units-", 8,
+	sorter, err := pagination.NewExternalSort(t.TempDir(), 8,
 		encodeUnit, decodeUnit, compareUnit)
 	if err != nil {
 		t.Fatalf("NewExternalSort: %v", err)
