@@ -54,7 +54,13 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		return nil, err
 	}
 	r := &PinnedReader{s: s, repo: repoRaw, lease: leaseID}
-	err = s.write(ctx, func(tx *sql.Tx) error {
+	// A read-only process cannot take the lease, so it resolves the generation
+	// on the reader pool instead -- no write transaction, nothing for the
+	// writer of another process to be waited on for -- and pins only the ACTIVE
+	// generation, which retention cannot collect: DeleteGeneration accepts only
+	// a failed or superseded generation. A superseded generation named
+	// explicitly is refused rather than read without the lease that retains it.
+	resolve := func(tx *sql.Tx) error {
 		id := int64(gen)
 		if id == 0 {
 			if err := activeGeneration(ctx, tx, repoRaw, &id); err != nil {
@@ -75,6 +81,16 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 			return &model.Error{Code: model.CodeNoActiveGeneration,
 				Message: "generation " + string(status) + " has never been published and cannot be pinned"}
 		}
+		if s.opts.ReadOnly {
+			if status != model.GenerationActive {
+				return invalid("generation %d is %s; a process that opened the workspace read-only can pin only the active generation, because it cannot take the lease that would retain an older one", id, status)
+			}
+			r.lease = ""
+			r.gen = id
+			r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
+				GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
+			return nil
+		}
 		// Through insertLease, never a statement of its own: a query lease is
 		// a retention_leases row like any other, and a second write path here
 		// is one model.Lease.Validate never sees.
@@ -91,7 +107,12 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 		r.binding = model.Binding{RepositoryID: repo, SnapshotID: model.SnapshotID(idHex(snapshot)),
 			GenerationID: model.GenerationID(id), AnalysisKey: model.AnalysisKey(idHex(key))}
 		return nil
-	})
+	}
+	if s.opts.ReadOnly {
+		err = s.read(ctx, resolve)
+	} else {
+		err = s.write(ctx, resolve)
+	}
 	if err != nil {
 		return nil, err
 	}

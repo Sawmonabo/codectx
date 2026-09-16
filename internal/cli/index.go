@@ -216,7 +216,7 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			if err := req.Validate(); err != nil {
 				return err
 			}
-			return runService(cmd, openForReport(),
+			return runService(cmd, openForQuery(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
 					// A provider that could not be constructed publishes no
 					// detection row of its own. Those rows are folded in by the

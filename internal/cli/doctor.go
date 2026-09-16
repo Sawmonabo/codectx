@@ -129,7 +129,16 @@ func runDoctor(cmd *cobra.Command, args []string, build model.BuildInfo) error {
 // report this command refused to print is a diagnosis the operator never sees.
 func doctorReport(ctx context.Context, build model.BuildInfo, root string,
 	req model.DoctorRequest) (model.DoctorReport, error) {
-	ws, openErr := app.OpenWorkspaceForReport(ctx, root)
+	// A shallow report only reads, so it opens without a writer connection and
+	// answers throughout another process's index. A deep report does not: the
+	// search index's own integrity check is spelled as an insert into the
+	// virtual table and needs the writer, so --deep opens the report
+	// composition, which still takes no workspace lock.
+	open := app.OpenWorkspaceForQuery
+	if req.Deep {
+		open = app.OpenWorkspaceForReport
+	}
+	ws, openErr := open(ctx, root)
 	if openErr != nil {
 		return unopenableReport(build, req, openErr, time.Now().UTC()), nil
 	}
