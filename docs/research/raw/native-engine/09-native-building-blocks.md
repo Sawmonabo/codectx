@@ -26,19 +26,29 @@ last-activity are as observed at fetch time.
 | gonum.org/v1/gonum/graph/flow | https://pkg.go.dev/gonum.org/v1/gonum/graph/flow | Go | `BSD-3-Clause` | v0.17.0 @ 2025-12-29 | `Dominators` / `DominatorsSLT` (Lengauer-Tarjan) on any `graph.Directed`; tree exposes only Root/DominatorOf/DominatedBy — no frontier | **LIBRARY** (language-agnostic) |
 | alon.kr/x/graph | https://pkg.go.dev/alon.kr/x/graph | Go | **`GPL-3.0`** | v0.0.0-20250319… @ 2025-03-19 | the only Go `DominatorFrontier` found | **NOT USABLE** (licence) |
 
-**Import rather than write (3):** `gonum.org/v1/gonum/graph/flow` — BSD-3, Lengauer-Tarjan over any
+**Available to import rather than write (3) — superseded by the decision in
+`18-algorithms-dominance-and-dataflow.md` §1, which writes the dominator core in the repository:** `gonum.org/v1/gonum/graph/flow` — BSD-3, Lengauer-Tarjan over any
 directed graph, so it is language-agnostic and serves all six families;
 `github.com/tree-sitter/go-tree-sitter` — already pinned at v0.25.0 in this worktree's `go.mod`, so
 the smacker-vs-official question is settled for us; and, for the Go family alone, `x/tools`
 `go/ssa`+`go/callgraph` (BSD-3) or `honnef.co/go/tools/go/ir` (MIT).
 
-**The verified negative that sizes the build:** no permissively-licensed Go package in this set
-exposes **post-dominators or a dominance frontier**. `go/ssa` and honnef `ir` both stop at the
+**The verified negative, correctly qualified:** no permissively-licensed Go package in this set
+exposes post-dominators or a dominance frontier **in its public API**. That is not the same as "no
+source exists": `go/ssa`'s `lift.go:99-106` computes a Cytron dominance frontier over the recurrence
+at `:79-97`, unexported, in about 28 lines of BSD-3 source that can be ported rather than imported
+(`18-algorithms-dominance-and-dataflow.md`). The build is sized against porting, not against
+inventing. `go/ssa` and honnef `ir` both stop at the
 forward dominator tree; gonum stops at `DominatorOf`/`DominatedBy`. The one Go package that does
 compute a frontier is GPL-3.0 and single-author v0.0.0. So the must-write list is exactly:
 post-dominator tree, dominance frontier, Ferrante control dependence — on top of gonum's dominator
-core. (Running gonum on reversed CFG edges to obtain post-dominators is this note's inference from
-the generic `graph.Directed` signature, **not** a documented gonum feature.)
+core. (Running gonum on reversed CFG edges to obtain post-dominators was this note's inference from the
+generic `graph.Directed` signature. It is now **verified from the module cache**: both entry points
+consult exactly one `graph.Directed` method, `From`, so a reversed view is sound
+— `18-algorithms-dominance-and-dataflow.md` §2 carries the proof and the exit-node requirement.
+**The decision taken there is nonetheless to write Cooper-Harvey-Kennedy in the repository rather than
+import gonum**, so the shared core adds **no module at all**; the rows below record what was available,
+not what is taken.)
 
 **Looks usable, isn't:** stack-graphs is archived *and* its `stack-graphs/Cargo.toml` declares no
 `cdylib`/`staticlib` — there is no C ABI to cgo against, so the only route is shelling out to the
