@@ -180,8 +180,24 @@ func (c traversalCursor) validate() error {
 	if c.GenerationID <= 0 {
 		return cursorInvalid("cursor does not pin a generation")
 	}
-	if !model.ValidHexID(c.QueryHash) || !model.ValidHexID(c.LeaseID) {
-		return cursorInvalid("cursor query hash and lease id must be well-formed identifiers")
+	if !model.ValidHexID(c.QueryHash) {
+		return cursorInvalid("cursor query hash must be a well-formed identifier")
+	}
+	// A cursor that names RETAINED STATE -- a spool of ranked records or a
+	// retained walk directory -- must name the lease that keeps it readable:
+	// the spool store gates every adoption on that lease's expiry, so state
+	// named by a leaseless cursor would have no reclamation predicate and
+	// would sit on disk until the cache was removed by hand. A PURE KEYSET
+	// cursor retains nothing: it carries its whole position in the token, and
+	// the generation it names is held by the read snapshot of whichever call
+	// presents it. That is what lets a process which writes nothing -- one
+	// answering while another indexes -- hand back a continuation at all.
+	if c.SpoolID != "" || c.RetainID != "" {
+		if !model.ValidHexID(c.LeaseID) {
+			return cursorInvalid("a cursor naming retained state must name the lease that retains it")
+		}
+	} else if c.LeaseID != "" && !model.ValidHexID(c.LeaseID) {
+		return cursorInvalid("cursor lease id is malformed")
 	}
 	// The analysis key is only bounded here, not required to be canonical hex:
 	// resumeTraversal compares it for equality with the pinned binding's key,
@@ -706,7 +722,11 @@ func (e *Engine) releaseConsumed(ctx context.Context, spoolID, leaseID string) {
 	if spoolID != "" && e.spools != nil {
 		_ = e.spools.Release(spoolID)
 	}
-	if leaseID != "" && e.leases != nil {
+	// Only a process that can record a lease may end one. A writerless process
+	// presented a continuation another process minted leaves the lease alone:
+	// its TTL, and the spool sweep the next writer-bearing process runs, are
+	// what reclaim it.
+	if leaseID != "" && e.leases.Retains() {
 		_ = e.leases.Release(context.WithoutCancel(ctx), leaseID)
 	}
 }
@@ -737,10 +757,8 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// bounded local write -- one lease row and one spill of a frontier that the
 	// frontier byte ceiling already bounds -- not another read of the graph.
 	ctx = context.WithoutCancel(ctx)
-	if e.signer == nil || e.leases == nil {
-		// No signer, or no lease store to retain the generation the resumed
-		// page will read: a token minted here would resume over facts nothing
-		// is holding.
+	if e.signer == nil {
+		// Nothing to bind a token to.
 		return "", nil
 	}
 	// The visited and edge bounds are PER-PAGE work budgets, so they do not
@@ -760,6 +778,16 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	// rather than resuming without them. A pure keyset continuation carries its
 	// whole position in the token and needs neither.
 	needsRetain := c.More || c.WalkDone
+	// A process that writes nothing can mint neither the cursor lease nor the
+	// directory the resumed walk would read, and a directory adopted without a
+	// lease would have nothing to reclaim it. So it continues ONLY the shape
+	// that retains nothing, and every other shape ends here: the page in hand
+	// is served and the answer reports what it did not reach, rather than
+	// naming state it could not keep.
+	retains := e.leases.Retains()
+	if !retains && (needsRetain || c.Retain != nil) {
+		return "", nil
+	}
 	if needsRetain && (c.Retain == nil || e.spools == nil) {
 		return "", nil
 	}
@@ -772,9 +800,13 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	if err != nil {
 		return "", err
 	}
-	lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return "", err
+	var leaseID string
+	if retains {
+		lease, err := e.leases.Acquire(ctx, binding.GenerationID, binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return "", err
+		}
+		leaseID = lease.ID
 	}
 	next := traversalCursor{
 		Version:      traversalCursorVersion,
@@ -782,7 +814,7 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 		GenerationID: binding.GenerationID,
 		AnalysisKey:  binding.AnalysisKey,
 		QueryHash:    c.QueryHash,
-		LeaseID:      lease.ID,
+		LeaseID:      leaseID,
 		LevelPos:     c.LevelPos,
 		Level:        c.Level,
 		LevelState:   c.LevelState,
@@ -804,30 +836,30 @@ func (e *Engine) nextTraversalCursor(ctx context.Context, b *budget, c continuat
 	if c.Retain != nil {
 		id, err := e.retain(next, c.Retain)
 		if err != nil {
-			return "", e.releaseLease(ctx, lease.ID, err)
+			return "", e.releaseLease(ctx, leaseID, err)
 		}
 		if id == "" {
 			// The shared continuation byte budget cannot hold it; the answer
 			// ends without a token, which is the contract a page that cannot
 			// spill has.
-			return "", e.releaseLease(ctx, lease.ID, nil)
+			return "", e.releaseLease(ctx, leaseID, nil)
 		}
 		next.RetainID = id
 	}
 	if err := next.validate(); err != nil {
 		e.releaseConsumed(ctx, next.RetainID, "")
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", e.releaseLease(ctx, leaseID, err)
 	}
 	payload, err := json.Marshal(next)
 	if err != nil {
 		e.releaseConsumed(ctx, next.RetainID, "")
-		return "", e.releaseLease(ctx, lease.ID,
+		return "", e.releaseLease(ctx, leaseID,
 			&model.Error{Code: model.CodeInternal, Message: "cursor encoding: " + err.Error()})
 	}
 	token, err := e.signer.Sign(pagination.PurposeCursor, payload, next.ExpiresAt)
 	if err != nil {
 		e.releaseConsumed(ctx, next.RetainID, "")
-		return "", e.releaseLease(ctx, lease.ID, err)
+		return "", e.releaseLease(ctx, leaseID, err)
 	}
 	return token, nil
 }
@@ -905,6 +937,11 @@ func (e *Engine) retain(next traversalCursor, w *retainedWalk) (string, error) {
 // its TTL is something the operator is told about. errors.As still finds the
 // typed cause, so the joined error keeps its Section 8 code.
 func (e *Engine) releaseLease(ctx context.Context, id string, cause error) error {
+	if id == "" {
+		// A leaseless continuation retained nothing, so there is nothing to
+		// give back; the caller's failure path is otherwise identical.
+		return cause
+	}
 	if err := e.leases.Release(context.WithoutCancel(ctx), id); err != nil {
 		return errors.Join(cause, &model.Error{Code: model.CodeInternal,
 			Message: "a continuation lease could not be released: " + err.Error()})

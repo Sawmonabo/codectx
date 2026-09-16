@@ -218,11 +218,17 @@ func terminalRetention(err error) error {
 // cursor-owned lease and signs the continuation for the page after it.
 //
 // It returns an empty token, and no error, whenever the answer must stop rather
-// than continue: a workspace that offers no continuations, and a shared spool
-// budget that cannot hold the state. In both cases the caller reports Truncated
-// with no NextCursor, which is the contract a page stop already has.
+// than continue: a workspace that offers no continuations, a process that
+// retains nothing, and a shared spool budget that cannot hold the state. In
+// every case the caller reports Truncated with no NextCursor, which is the
+// contract a page stop already has.
 func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash string, w *pathWalk) (string, error) {
-	if e.signer == nil || e.leases == nil || e.spools == nil {
+	// A process that writes nothing takes the third stop: it can record no
+	// cursor lease, and the search state it would hand to the spool store is
+	// reclaimed on that lease's expiry, so adopting the directory without one
+	// would leak it. The return is BEFORE sc.detach(), so the directory is
+	// never handed over and the request's own deferred close removes it.
+	if e.signer == nil || e.spools == nil || !e.leases.Retains() {
 		return "", nil
 	}
 	binding := e.adjacency.Binding()
