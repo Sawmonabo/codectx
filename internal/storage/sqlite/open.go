@@ -619,7 +619,10 @@ func (s *Store) Flush(ctx context.Context) error {
 // It is the read path of the ingestion side -- unit states, aliases of
 // dependency units, the snapshot and blobs a capture just recorded -- whose
 // callers reason about what this run has already stored. Query paths read
-// through read and never see a group in progress.
+// through read and never see a group in progress. It holds the group for the
+// length of fn, so it is never called from inside an ingestion call: a
+// producer stream an ingestion call drains reads through the pool instead
+// (UnitInputs), and sees the last commit.
 func (s *Store) readOwn(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	s.groupMu.Lock()
 	if s.group != nil {
