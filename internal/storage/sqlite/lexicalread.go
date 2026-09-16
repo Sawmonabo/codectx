@@ -51,14 +51,40 @@ type lexicalMeta struct {
 	visible *docBitmap
 }
 
-// lexicalIndex is one call's bounded view of that shape: the shared metadata
-// plus a small window of parts of its own. It holds no vocabulary -- the window
-// is at most partsPerStream parts of one stream of one segment -- and the
-// window is per call, so two concurrent reads never share a cache entry.
+// lexPartsLive bounds the parts the WHOLE lexical part cache holds at once. It
+// is an INTERNAL working-set constant, not a user limit: a read whose working
+// set is wider re-reads parts from the store, and nothing is ever refused,
+// truncated or answered differently because of it.
+//
+// Derivation: the deepest simultaneous need of one read is one part of each of
+// the five lexical streams for the three segments a term lookup and the
+// hydration that follows it alternate between, plus the one part a value
+// straddling a part boundary continues into. The bound is over the cache and
+// the victim is a whole slot, so a generation naming eighty segments holds
+// what one naming four holds -- lexPartsLive * lexPartBytes, 16 MiB at the
+// shipped part size. A bound applied per slot instead held
+// segments * streams * lexPartsLive parts and so grew without limit with the
+// segment count, which is the one thing ADR-0007's stated cost -- one part
+// plus one term's list -- does not allow.
+const lexPartsLive = 5*3 + 1
+
+// lexicalIndex is one posting session's bounded view of that shape: the shared
+// metadata plus a part cache of its own. It holds no vocabulary -- the cache is
+// at most lexPartsLive parts across every stream of every segment -- and the
+// cache belongs to the caller that opened it, so two concurrent reads never
+// share an entry.
 type lexicalIndex struct {
 	r *PinnedReader
 	*lexicalMeta
 	cache map[partSlot]*partWindow
+	// slots is the cache's eviction order, least recently used first. A victim
+	// is a whole slot: a read that has moved on from a segment's stream has
+	// moved on from every part of it, and freeing one part of a slot nobody
+	// will touch again only defers the next eviction.
+	slots []partSlot
+	// live is how many parts the cache holds and peak the most it ever held,
+	// which is what says the bound is over the cache rather than the slot.
+	live, peak int
 	// docLo is where the next hydration starts its search in each segment's
 	// document directory. A candidate walk delivers rowids in ascending order
 	// for the whole query, so the searched range shrinks as the walk advances
@@ -148,9 +174,12 @@ func (x *lexicalIndex) part(ctx context.Context, segment int64, stream string, i
 	slot := partSlot{segment: segment, stream: stream}
 	w := x.cache[slot]
 	if w == nil {
-		w = &partWindow{size: partSizeFor(stream), parts: map[int][]byte{}}
+		w = &partWindow{size: partSizeFor(stream), limit: lexPartsLive, parts: map[int][]byte{}}
 		x.cache[slot] = w
 	}
+	// Touched before anything can be evicted, so the slot being read is the
+	// most recent one and is never its own victim.
+	x.touch(slot)
 	if b, ok := w.parts[index]; ok {
 		if i := slices.Index(w.order, index); i >= 0 {
 			w.order = append(slices.Delete(w.order, i, i+1), index)
@@ -169,13 +198,41 @@ func (x *lexicalIndex) part(ctx context.Context, segment int64, stream string, i
 	if err != nil {
 		return nil, err
 	}
-	for len(w.order) >= partsPerStream {
+	for len(w.order) >= w.limit {
 		delete(w.parts, w.order[0])
 		w.order = w.order[1:]
+		x.live--
 	}
 	w.parts[index] = raw
 	w.order = append(w.order, index)
+	x.live++
+	x.evict()
+	if x.live > x.peak {
+		x.peak = x.live
+	}
 	return raw, nil
+}
+
+// touch makes slot the most recently used one.
+func (x *lexicalIndex) touch(slot partSlot) {
+	if i := slices.Index(x.slots, slot); i >= 0 {
+		x.slots = append(slices.Delete(x.slots, i, i+1), slot)
+		return
+	}
+	x.slots = append(x.slots, slot)
+}
+
+// evict drops whole slots, least recently used first, until the cache is
+// within its bound. The slot being read is the most recent one and the last
+// slot is never dropped, so a read whose own stream is wider than the bound
+// keeps what it is reading and pays a re-read for what it is not.
+func (x *lexicalIndex) evict() {
+	for x.live > lexPartsLive && len(x.slots) > 1 {
+		victim := x.slots[0]
+		x.slots = x.slots[1:]
+		x.live -= len(x.cache[victim].parts)
+		delete(x.cache, victim)
+	}
 }
 
 // readAt copies n bytes from a segment's stream starting at off, stitching
