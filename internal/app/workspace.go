@@ -26,6 +26,15 @@ import (
 type Workspace struct {
 	s     *stack
 	coord *index.Coordinator
+	// status is the one status path of this process, bound to the
+	// composition's READER handle. In every mode but the server's that handle
+	// IS the writer, so this is the path `codectx status` has always taken; in
+	// the server it is the second, read-only handle, which is what keeps
+	// codectx_index_status -- the one question an agent asks while a refresh
+	// runs -- off the writer. Pinning a generation through the writer records
+	// a retention lease, and that write commits the refresh's ingestion group
+	// early and then queues the tool call behind it.
+	status *index.StatusReader
 }
 
 // OpenOptions are the caller-supplied inputs of an indexing open. They are one
@@ -126,7 +135,13 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		s.Close()
 		return nil, err
 	}
-	w := &Workspace{s: s, coord: coord}
+	status, err := coord.StatusReader(s.queryStore)
+	if err != nil {
+		coord.Close()
+		s.Close()
+		return nil, err
+	}
+	w := &Workspace{s: s, coord: coord, status: status}
 	// The compiler is composed last because its graph factory is w.Query, so
 	// it cannot exist before the workspace it queries through.
 	if err := s.openCompiler(w.Query); err != nil {
