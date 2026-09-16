@@ -310,10 +310,14 @@ func (w *watchState) project(st *model.IndexStatus) {
 func (w *watchState) heartbeat() (lastPass *time.Time, pending *int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_, _, pending, at := w.observe()
-	if at.IsZero() {
+	// w.reconciled and not observe's merged time: the watcher marks itself
+	// reconciled on its own rescans and polling ticks, which happen whether or
+	// not this watch ever had the workspace. Only w.reconciled is a pass this
+	// coordinator completed while holding it.
+	if w.reconciled.IsZero() {
 		return nil, nil
 	}
+	_, _, pending, at := w.observe()
 	return &at, pending
 }
 
