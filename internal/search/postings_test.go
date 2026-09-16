@@ -18,7 +18,7 @@ type fakePostings struct {
 	opened   map[string]int  // TermOccurrences calls per term
 	sessions int             // OpenPostings calls
 	live     map[string]bool // streams still open
-	docCalls int             // SearchDocuments calls
+	docCalls int             // PackedDocuments calls
 	docRows  int             // rowids asked for across those calls
 }
 
@@ -46,7 +46,7 @@ func (f *fakePostings) Match(_ context.Context, _ string, after int64, limit int
 	return out, nil
 }
 
-func (f *fakePostings) SearchDocuments(_ context.Context, rowids []int64) ([]sqlite.SearchDocument, error) {
+func (f *fakePostings) PackedDocuments(_ context.Context, rowids []int64) ([]sqlite.SearchDocument, error) {
 	f.docCalls++
 	f.docRows += len(rowids)
 	out := make([]sqlite.SearchDocument, 0, len(rowids))
@@ -166,7 +166,7 @@ func TestWalkHoldsOnePostingStatementPerToken(t *testing.T) {
 // TestOneDocumentReadPerRowidPage guards the document read budget against a
 // duplicated hydration: one read per rowid page must carry both the token
 // count a score is computed from and the path/kind/name the hit serves, never
-// one SearchDocuments call for each. The walk therefore issues exactly as many
+// one hydration call for each. The walk therefore issues exactly as many
 // document reads as it has candidate pages, and the emitted hit carries the
 // document's servable facts as well as that length.
 func TestOneDocumentReadPerRowidPage(t *testing.T) {

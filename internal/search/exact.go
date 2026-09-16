@@ -32,8 +32,9 @@ var _ exactReader = (*sqlite.PinnedReader)(nil)
 // its file's normalized path.
 //
 // It carries the node rather than a search_fts rowid on purpose: an exact-tier
-// candidate has no lexical rowid, so SearchDocuments cannot hydrate it ("missing
-// rowids are omitted" would drop it silently). Everything model.SearchHit needs
+// candidate has no lexical rowid, so the packed hydration cannot serve it -- no
+// segment holds a document for it, and a rowid nothing packs is omitted, which
+// would drop the candidate silently. Everything model.SearchHit needs
 // except Q10's Range is already here — Kind, Name, QualifiedName, Signature,
 // FileID and Bytes on the node, Path beside it.
 type exactHit struct {

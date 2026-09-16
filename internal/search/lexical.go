@@ -22,7 +22,6 @@ type lexicalSource interface {
 	DocumentFrequency(ctx context.Context, terms []string) ([]int64, error)
 	OpenPostings(ctx context.Context) (postingSession, error)
 	Match(ctx context.Context, expression string, after int64, limit int) ([]int64, error)
-	SearchDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
 }
 
 // postingSession is one held-open read transaction over the posting lists of a
@@ -39,6 +38,12 @@ type postingSession interface {
 	// already resolved.
 	TermOccurrences(ctx context.Context, term string) (occurrenceStream, error)
 	TermCounts(ctx context.Context, term string) (occurrenceStream, error)
+	// PackedDocuments hydrates a page of candidates from the same packed
+	// segments the term streams are read from (ADR-0007 Decision 2). It
+	// belongs to the session rather than to the reader because the walk's
+	// candidates ascend for the whole query: one part window serves every
+	// page, and no document row is read for a candidate at all.
+	PackedDocuments(ctx context.Context, rowids []int64) ([]sqlite.SearchDocument, error)
 	Close() error
 }
 
@@ -51,7 +56,7 @@ type occurrenceStream interface {
 
 // readerPostings adapts *sqlite.PinnedReader to lexicalSource. Storage returns
 // concrete stream types, which Go does not match against the interfaces above,
-// so the two posting constructors are re-typed here and nothing else is.
+// so the posting constructors are re-typed here and nothing else is.
 type readerPostings struct{ *sqlite.PinnedReader }
 
 // OpenPostings begins a posting session as the interface spells it.
@@ -106,10 +111,9 @@ func (t lexicalTerm) phrase() bool { return len(t.tokens) > 1 }
 func (t lexicalTerm) key() string { return strings.Join(t.tokens, " ") }
 
 // lexicalHit is one scored lexical candidate. It carries the document the
-// score was computed from: the tier already reads every column of that row to
-// get TokenCount, so handing the same row on costs nothing and spares the
-// consumer a second SearchDocuments round trip over the identical rowid page
-// (QPERF-4 §5). Doc is carried BY VALUE, not as a pointer into the tier's
+// score was computed from: the tier already hydrates every field of that
+// document to get TokenCount, so handing the same document on costs nothing and
+// spares the consumer a second hydration over the identical rowid page. Doc is carried BY VALUE, not as a pointer into the tier's
 // per-page slice, so an emit that outlives the page cannot alias a reused row.
 // Occurrences is the number of matched term instances in this document, folded
 // across query terms and indexed columns — L4 sums it when deduplication folds
@@ -134,7 +138,7 @@ type lexicalOutcome struct {
 const truncatedOffsetsReason = "phrase frequencies are a lower bound: a document's term offsets exceeded the per-document offset cap"
 
 // matchPageSize is the candidate window. It is also the hydration batch, so it
-// must not exceed model.MaxPageItems, which SearchDocuments requires.
+// must not exceed model.MaxPageItems, which the packed hydration requires.
 const matchPageSize = model.MaxPageItems
 
 // occurrencePageSize is the posting-list page. It must NOT exceed
@@ -226,13 +230,13 @@ func (l *lexicalTier) search(ctx context.Context, src lexicalSource, key model.A
 			return out, nil
 		}
 		after = rowids[len(rowids)-1]
-		// One read per rowid page, carrying everything both consumers need:
+		// One hydration per rowid page, carrying everything both consumers need:
 		// TokenCount for the score here, path/kind/name/identity for the ranker
-		// downstream. SearchDocuments answers in the requested order and omits
-		// rowids the generation does not make visible, so walking docs is the
-		// rowid walk minus exactly the rows that have no document length to score
-		// against.
-		docs, err := src.SearchDocuments(ctx, rowids)
+		// downstream, read from the packed segments rather than one document row
+		// per candidate. It answers in the requested order and omits rowids the
+		// generation does not make visible, so walking docs is the rowid walk
+		// minus exactly the documents that have no length to score against.
+		docs, err := session.PackedDocuments(ctx, rowids)
 		if err != nil {
 			return out, err
 		}
