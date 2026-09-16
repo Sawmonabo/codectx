@@ -66,27 +66,48 @@ func newLadderFixture(t *testing.T, levels int) *graphFixture {
 // interruptedReader fails one read of the current page with a RETRYABLE error,
 // whose whole remedy is "present this cursor again".
 //
-// It interrupts the naming of relation routes rather than an adjacency read,
-// because that is the only read a level's SERVE makes: a page interrupted
-// during an adjacency read has not begun serving the level it just committed,
-// and the state this case is about is a level committed and not yet served out.
+// Which read it interrupts decides which state the page is left in, so both
+// reads a page makes are available: naming a relation's route is the only read
+// a SERVE makes, so a failure there leaves the level the page just committed
+// unserved; an adjacency read belongs to a level's scan, so a failure there
+// leaves every level before it served whole.
 type interruptedReader struct {
 	GraphReader
-	fail   bool
-	failAt int // the RelationIDs call of this page the failure lands on, from one
-	calls  int
-	served int // failures actually injected, so a search cannot pass by never failing
+	fail      bool
+	adjacency bool // interrupt a level's scan rather than the naming of a route
+	failAt    int  // the read of this page the failure lands on, from one
+	calls     int
+	served    int // failures actually injected, so a search cannot pass by never failing
+}
+
+// interrupt reports whether this read is the one to fail.
+func (r *interruptedReader) interrupt(adjacency bool) error {
+	if r.adjacency != adjacency {
+		return nil
+	}
+	r.calls++
+	if !r.fail || r.calls < max(1, r.failAt) {
+		return nil
+	}
+	r.fail = false
+	r.served++
+	return &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
+		Message: "the graph store was contended for this read"}
 }
 
 func (r *interruptedReader) RelationIDs(ctx context.Context, refs []RelRef) ([]model.RelationID, error) {
-	r.calls++
-	if r.fail && r.calls >= max(1, r.failAt) {
-		r.fail = false
-		r.served++
-		return nil, &model.Error{Code: model.CodeWorkspaceBusy, Retryable: true,
-			Message: "the relation dictionary was contended for this read"}
+	if err := r.interrupt(false); err != nil {
+		return nil, err
 	}
 	return r.GraphReader.RelationIDs(ctx, refs)
+}
+
+func (r *interruptedReader) Neighbours(ctx context.Context, refs []NodeRef, direction model.Direction,
+	kinds []KindCode, from EdgePos, fn func(Edge) error) (EdgePos, error) {
+	if err := r.interrupt(true); err != nil {
+		return EdgePos{}, err
+	}
+	return r.GraphReader.Neighbours(ctx, refs, direction, kinds, from, fn)
 }
 
 // walkLeg is one traversal engine over its own scratch, so two runs of the same
