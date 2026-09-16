@@ -186,6 +186,7 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}, sweep map[*Run
 	}
 	for _, run := range swept {
 		delete(sweep, run)
+		l.retire(run)
 	}
 	for _, row := range finished {
 		l.notify(row)

@@ -341,6 +341,28 @@ func (l *Ledger) anyRefreshDue(now time.Time) bool {
 	return false
 }
 
+// retire drops a run the collector has finished with: it has ended, its rows
+// and its totals are written, and the sweep of what it never started is done.
+//
+// The list has to be bounded because a long-lived process opens a run per
+// refresh and never closes the ledger -- a server would otherwise hold one
+// entry per run it has ever done, and the two per-flush walks over this list
+// would grow with it for the life of the process. What a retired run is still
+// asked for is read from the database by its identifier, not from here.
+//
+// It is called only from the collector, after the flush that completed the
+// run's sweep, so nothing is still writing the run when it goes.
+func (l *Ledger) retire(run *Run) {
+	l.runsMu.Lock()
+	defer l.runsMu.Unlock()
+	for i, held := range l.runs {
+		if held == run {
+			l.runs = append(l.runs[:i], l.runs[i+1:]...)
+			return
+		}
+	}
+}
+
 // anyDirty reports whether any run row has moved since the last flush wrote
 // it. It is what lets an idle collector open no transaction at all.
 func (l *Ledger) anyDirty() bool {
