@@ -680,7 +680,7 @@ func (p *Provider) parse(ctx context.Context, req provider.UnitRequest, unit Uni
 		return Outcome{}, err
 	}
 	slog.Info("dependence parse finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"family", string(unit.Family), "exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"family", string(unit.Family), "exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"pass", out.Pass, "skipped_methods", out.SkippedCount, "heap_cap_bytes", res.HeapCapBytes,
 		"reservation_bytes", res.ParseBytes(), "stderr_bytes", out.StderrBytes,
 		"tree_peak_bytes", peakForLog(out))
@@ -782,7 +782,7 @@ func (p *Provider) runExport(ctx context.Context, req provider.UnitRequest, unit
 	// to the unit, whose own span records it.
 	span.End(spanOutcome(out.Outcome), measured(out.Outcome), nil)
 	slog.Info("dependence export finished", "component", component, "unit", string(req.Unit.ID), "scope", unit.ScopeKey,
-		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
+		"exit_code", out.ExitCode, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
 		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes, "pass", out.Pass, "exception", out.Exception)
 	Observe(unit.ScopeKey, unit.Family, res, out.PeakBytes, out.PeakUnsampled)
