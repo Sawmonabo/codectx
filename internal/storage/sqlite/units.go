@@ -10,8 +10,27 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 )
+
+// The stages of an activation that are recorded on their own. Each runs inside
+// the activation, not as a phase the coordinator can bracket, so its span is
+// opened here, under the activation span the caller already holds.
+const (
+	stageLexicalCompaction = "lexical_compaction"
+	stageAdjacency         = "adjacency"
+	stageLexicalBuild      = "lexical_build"
+)
+
+// spanOutcome is how an activation stage reports itself: a span that returned
+// an error failed, and every other return is a success.
+func spanOutcome(err error) ledger.Outcome {
+	if err != nil {
+		return ledger.OutcomeFailed
+	}
+	return ledger.OutcomeOK
+}
 
 // Hash domains for the aggregate digests folded into AnalysisKey (Section 9.1).
 const (
