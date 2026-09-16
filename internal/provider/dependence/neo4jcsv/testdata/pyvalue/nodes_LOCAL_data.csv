@@ -1,0 +1,4 @@
+94489280512,LOCAL,,helper,1,,<empty>,1,helper,,,5,,ANY
+94489280513,LOCAL,,run,1,,<empty>,4,run,,,6,,ANY
+94489280514,LOCAL,w.py:<module>.run:helper,helper,9,,<empty>,5,helper,,,1,,ANY
+94489280515,LOCAL,,f,5,,<empty>,5,f,,,2,,ANY
