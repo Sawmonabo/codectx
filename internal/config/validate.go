@@ -29,18 +29,13 @@ func (c Config) validate() error {
 		key string
 		v   int64
 	}{
-		{"index.max_parser_workers", int64(c.Index.MaxParserWorkers)},
 		{"index.batch_records", int64(c.Index.BatchRecords)},
 		{"index.batch_bytes", c.Index.BatchBytes},
 		{"index.queue_bytes", c.Index.QueueBytes},
 		{"index.watch_pending_paths", int64(c.Index.WatchPendingPaths)},
 		{"index.watch_pending_bytes", c.Index.WatchPendingBytes},
-		{"resources.base_memory_budget_bytes", c.Resources.BaseMemoryBudgetBytes},
 		{"resources.query_memory_bytes", c.Resources.QueryMemoryBytes},
 		{"resources.cache_bytes", c.Resources.CacheBytes},
-		{"resources.max_concurrent_queries", int64(c.Resources.MaxConcurrentQueries)},
-		{"resources.max_concurrent_graph_queries", int64(c.Resources.MaxConcurrentGraphQueries)},
-		{"resources.max_concurrent_heavy_analyzers", int64(c.Resources.MaxConcurrentHeavy)},
 		{"resources.min_free_disk_bytes", c.Resources.MinFreeDiskBytes},
 		{"resources.max_metadata_response_bytes", c.Resources.MaxMetadataResponseBytes},
 		{"resources.max_source_response_bytes", c.Resources.MaxSourceResponseBytes},
@@ -49,7 +44,6 @@ func (c Config) validate() error {
 		{"storage.read_connections", int64(c.Storage.ReadConnections)},
 		{"storage.writer_cache_kib", int64(c.Storage.WriterCacheKiB)},
 		{"storage.reader_cache_kib", int64(c.Storage.ReaderCacheKiB)},
-		{"providers.lsp.max_servers", int64(c.Providers.LSP.MaxServers)},
 		{"providers.lsp.max_outstanding_requests", int64(c.Providers.LSP.MaxOutstandingRequests)},
 		{"providers.dependence.cache_bytes", c.Providers.Dependence.CacheBytes},
 		{"providers.dependence.unit_memory_floor_bytes", c.Providers.Dependence.UnitMemoryFloorBytes},
@@ -132,12 +126,6 @@ func (c Config) validate() error {
 		return configInvalid("index.max_evidence_per_fact is %d; a fact record holds at most %d evidence occurrences",
 			c.Index.MaxEvidencePerFact.Value(), model.MaxEvidencePerFact)
 	}
-	// providers.dependence.unit_memory_ceiling_bytes is a reservation ceiling
-	// whose 0 means "derive the allocation from the machine", not "unlimited",
-	// so it is neither a Limit nor required to be positive.
-	if v := c.Providers.Dependence.UnitMemoryCeilingBytes; v < 0 {
-		return configInvalid("providers.dependence.unit_memory_ceiling_bytes is %d; use 0 for the machine-derived allocation", v)
-	}
 	for _, d := range []struct {
 		key string
 		v   Duration
@@ -149,9 +137,8 @@ func (c Config) validate() error {
 		{"storage.closed_session_retention", c.Storage.ClosedSessionRetention},
 		{"storage.query_cursor_ttl", c.Storage.QueryCursorTTL},
 		{"retention.blob_grace", c.Retention.BlobGrace},
-		{"providers.tree_sitter.worker_idle_ttl", c.Providers.TreeSitter.WorkerIdleTTL},
 		{"providers.scip.stall_timeout", c.Providers.SCIP.StallTimeout},
-		{"providers.lsp.request_timeout", c.Providers.LSP.RequestTimeout},
+		{"providers.lsp.stall_timeout", c.Providers.LSP.StallTimeout},
 		{"providers.lsp.idle_ttl", c.Providers.LSP.IdleTTL},
 		{"providers.dependence.stall_timeout", c.Providers.Dependence.StallTimeout},
 		{"tools.fetch_timeout", c.Tools.FetchTimeout},
@@ -276,12 +263,14 @@ func (c Config) validateBudgets() error {
 		return configInvalid("resources.max_provider_record_bytes %s exceeds index.batch_bytes %d; one record must fit one batch",
 			c.Resources.MaxProviderRecordBytes, c.Index.BatchBytes)
 	}
-	if c.Resources.MaxConcurrentGraphQueries > c.Resources.MaxConcurrentQueries {
-		return configInvalid("resources.max_concurrent_graph_queries %d exceeds resources.max_concurrent_queries %d",
-			c.Resources.MaxConcurrentGraphQueries, c.Resources.MaxConcurrentQueries)
-	}
-	concurrent, err := mulNoOverflow("resources.max_concurrent_queries * resources.query_memory_bytes",
-		int64(c.Resources.MaxConcurrentQueries), c.Resources.QueryMemoryBytes)
+	// The process's own reservations must fit the footprint the machine-derived
+	// allocation subtracts for it before handing the rest to its children.
+	// Overrunning it is not a narrow budget: it is an allocation computed
+	// against a figure this process does not live within, so every child is
+	// admitted against memory that is already spoken for. How many queries run
+	// at once comes from the cores, so the check is against this machine.
+	concurrent, err := mulNoOverflow("query slots * resources.query_memory_bytes",
+		int64(QuerySlots()), c.Resources.QueryMemoryBytes)
 	if err != nil {
 		return err
 	}
@@ -289,9 +278,9 @@ func (c Config) validateBudgets() error {
 	if err != nil {
 		return err
 	}
-	if baseline > c.Resources.BaseMemoryBudgetBytes {
-		return configInvalid("query, cache and queue reservations need %d bytes, over resources.base_memory_budget_bytes %d",
-			baseline, c.Resources.BaseMemoryBudgetBytes)
+	if baseline > BaseFootprintBytes {
+		return configInvalid("query, cache and queue reservations need %d bytes, over the %d-byte base footprint of this process",
+			baseline, BaseFootprintBytes)
 	}
 	// resources.max_temp_bytes is a BOUND, not a reservation: 0 is unlimited
 	// and is the default, a negative value is rejected, and the pairing against
@@ -316,12 +305,6 @@ func (c Config) validateBudgets() error {
 	if c.Context.MaxManifestBytes.Exceeded(c.Context.DefaultMaxBytes) {
 		return configInvalid("context.default_max_bytes %d exceeds context.max_manifest_bytes %s",
 			c.Context.DefaultMaxBytes, c.Context.MaxManifestBytes)
-	}
-	// A ceiling under the floor is not a narrow budget, it is a provider that
-	// rejects every unit before it runs while reporting a configured limit.
-	if ceiling := c.Providers.Dependence.UnitMemoryCeilingBytes; ceiling > 0 && ceiling < c.Providers.Dependence.UnitMemoryFloorBytes {
-		return configInvalid("providers.dependence.unit_memory_ceiling_bytes %d is below providers.dependence.unit_memory_floor_bytes %d; every unit would be rejected before it runs",
-			ceiling, c.Providers.Dependence.UnitMemoryFloorBytes)
 	}
 	// The token estimate is derived from bytes, so its arithmetic must not
 	// overflow before the compiler ever runs.

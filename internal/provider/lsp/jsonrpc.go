@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -55,6 +56,15 @@ type conn struct {
 	writer   io.Writer
 	maxFrame int64
 	handler  serverRequestHandler
+
+	// moved counts every byte this connection has read from or written to the
+	// server. It is the progress signal a request is watched against: a server
+	// that is still sending frames -- a partial result, a progress
+	// notification, a log line -- or still being written to is working, however
+	// long its answer takes, and only a connection on which nothing at all
+	// moves is hung. Section 20.2's wall-clock request deadline could not tell
+	// a monorepo's first request from a wedged server; this can.
+	moved atomic.Int64
 
 	writeMu sync.Mutex
 	// written counts the bytes sent inside the current window, and windowStart
@@ -119,6 +129,9 @@ func (c *conn) run() error {
 	go c.writeReplies()
 	for {
 		payload, err := readFrame(c.reader, c.maxFrame)
+		if len(payload) > 0 {
+			c.moved.Add(int64(len(payload)))
+		}
 		if err != nil {
 			return err
 		}
@@ -345,7 +358,57 @@ func (c *conn) write(msg message) error {
 		}
 		c.written += int64(len(payload))
 	}
+	c.moved.Add(int64(len(payload)))
 	return writeFrame(c.writer, payload)
+}
+
+// watchProgress returns a context that ends when the connection has moved no
+// bytes in either direction for window, a predicate that reports whether it
+// was the detector that ended it, and a stop function that must be called on
+// every path. A zero or negative window is no detector at all and hands the
+// caller's own context straight back.
+//
+// The predicate is what keeps the outcome honest: the context ends by
+// cancellation either way, and without it a hung server would be reported as
+// the caller cancelling.
+func (c *conn) watchProgress(ctx context.Context, window time.Duration) (context.Context, func() bool, context.CancelFunc) {
+	if window <= 0 {
+		return ctx, func() bool { return false }, func() {}
+	}
+	var stalled atomic.Bool
+	watched, cancel := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	go func() {
+		// Sampling at the window itself would let a server that went quiet just
+		// after a sample survive for nearly twice it; a quarter of the window
+		// bounds that overshoot the way the subprocess watchdog does.
+		poll := max(window/4, 10*time.Millisecond)
+		ticker := time.NewTicker(poll)
+		defer ticker.Stop()
+		last, quietSince := c.moved.Load(), time.Now()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-watched.Done():
+				return
+			case now := <-ticker.C:
+				if seen := c.moved.Load(); seen != last {
+					last, quietSince = seen, now
+					continue
+				}
+				if now.Sub(quietSince) >= window {
+					stalled.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return watched, stalled.Load, func() {
+		close(stop)
+		cancel()
+	}
 }
 
 // fail latches the connection and releases every pending call with err. It
