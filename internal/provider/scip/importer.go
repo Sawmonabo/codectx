@@ -2,7 +2,6 @@ package scip
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -806,8 +805,7 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 			if err != nil {
 				return err
 			}
-			name, ok := sym.probeName()
-			if !ok {
+			if _, ok := sym.probeName(); !ok {
 				return nil
 			}
 			// This occurrence decides the document: a symbol that names an
@@ -818,10 +816,13 @@ func (im *importer) encodingHolds(ctx context.Context, ds *docSource) (bool, err
 				return nil
 			}
 			rng, cerr := ds.cur.SourceRange(uint32(r[0])+1, uint32(r[1]), uint32(r[2])+1, uint32(r[3]), ds.enc)
-			if cerr != nil || rng.End.Byte > uint64(len(ds.data)) || rng.Start.Byte > rng.End.Byte {
+			if cerr != nil {
 				return nil
 			}
-			holds = string(ds.data[rng.Start.Byte:rng.End.Byte]) == name
+			// The same predicate every occurrence of the document will be held
+			// to, so an encoding cannot be proved by one rule and its
+			// occurrences refused by another.
+			holds = onPinnedBytes(ds.data, sym, &rng, true) == ""
 			return nil
 		})
 	return holds, err
@@ -869,21 +870,15 @@ func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, erro
 // of 93,167 occurrences of one Java project, in 79 of its 223 documents, over
 // lines indented with spaces followed by a tab).
 //
-// So every occurrence is checked, not one per document. The per-document
-// encoding probe (encodingHolds) answers a different question with a different
-// outcome, and the two are deliberately not merged: it decides whether an
-// encoding the index never stated may be used at all, so a document it cannot
-// prove is skipped and counted — an unproven guess must not fail a unit that
-// the index never claimed. Here the index has claimed: it says this range
-// describes these bytes, and a range that does not is refused, which fails the
-// unit closed under a verified binding and skips the occurrence under an
-// unverified one.
-func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) (*model.SourceRange, error) {
+// So every occurrence is checked, not one per document. definition says the
+// occurrence declares its symbol, which is what makes the strict form of the
+// check available; see onPinnedBytes.
+func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32, definition bool) (*model.SourceRange, error) {
 	rng, err := im.rangeOf(ds, r)
 	if err != nil || rng == nil {
 		return nil, err
 	}
-	if msg := onPinnedBytes(ds.data, sym, rng); msg != "" {
+	if msg := onPinnedBytes(ds.data, sym, rng, definition); msg != "" {
 		return nil, im.badRange(ds, msg)
 	}
 	return rng, nil
@@ -892,20 +887,20 @@ func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) (*mod
 // onPinnedBytes reports why an occurrence's range does not describe the bytes
 // it claims, or "" when it does. Two checks, one byte comparison each:
 //
-//   - a symbol whose last descriptor is a name the grammar spells literally
-//     (symbol.probeName) must find that identifier at the start of the range,
-//     ending on a token boundary. The range is allowed to be wider than the
-//     name because a real occurrence is: scip-python puts the whole
-//     `OrderedDict as OD` alias clause of an aliased import on the symbol
-//     OrderedDict (measured), so requiring equality would refuse every Python
-//     project that aliases an import;
-//   - every other range — a local symbol, an escaped name, a package or
-//     synthetic descriptor, all of which name nothing the source spells — must
-//     at least start on a token boundary, which a shifted column rarely does.
+//   - a definition occurrence whose symbol's last descriptor is a name the
+//     grammar spells literally (symbol.probeName) must select exactly that
+//     identifier: a declaration is written where its name is written;
+//   - every other range must at least start on a token boundary. A reference
+//     is not required to spell its symbol's name, and measured, does not: an
+//     aliased import puts the occurrence on the alias (`HashSet as Set` is a
+//     reference to HashSet over the bytes `Set`) or on the whole alias clause
+//     (`OrderedDict as OD`), and an operator is a reference to the method it
+//     desugars to (`+` to `add`). A range that starts inside an identifier
+//     token, which is what a shifted column usually produces, is refused.
 //
-// Nothing is adjusted and nothing is guessed: the range either describes the
-// identifier or it is refused.
-func onPinnedBytes(data []byte, sym symbol, rng *model.SourceRange) string {
+// Nothing is adjusted and nothing is guessed: the range either describes what
+// it claims or it is refused.
+func onPinnedBytes(data []byte, sym symbol, rng *model.SourceRange, definition bool) string {
 	if rng.Start.Byte > rng.End.Byte || rng.End.Byte > uint64(len(data)) {
 		return "the range ends past the pinned bytes"
 	}
@@ -913,14 +908,8 @@ func onPinnedBytes(data []byte, sym symbol, rng *model.SourceRange) string {
 	if len(text) > 0 && identifierByte(text[0]) && rng.Start.Byte > 0 && identifierByte(data[rng.Start.Byte-1]) {
 		return "the range starts inside an identifier token"
 	}
-	name, ok := sym.probeName()
-	switch {
-	case !ok:
-		return ""
-	case !bytes.HasPrefix(text, []byte(name)):
-		return "the range does not select the identifier the symbol names"
-	case len(text) > len(name) && identifierByte(text[len(name)]):
-		return "the range does not select the identifier the symbol names"
+	if name, ok := sym.probeName(); definition && ok && string(text) != name {
+		return "the definition does not select the identifier its symbol names"
 	}
 	return ""
 }
@@ -962,7 +951,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
-	rng, err := im.occurrenceRange(ds, sym, r)
+	rng, err := im.occurrenceRange(ds, sym, r, true)
 	if err != nil || rng == nil {
 		return err
 	}
@@ -1148,7 +1137,7 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
-			rng, err := im.occurrenceRange(ds, sym, r)
+			rng, err := im.occurrenceRange(ds, sym, r, false)
 			if err != nil || rng == nil {
 				return err
 			}

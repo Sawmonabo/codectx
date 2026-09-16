@@ -297,16 +297,21 @@ does, so the range is shifted a few columns, stays inside its line, converts to
 a valid rune-aligned extent, and names source that is not the symbol. Measured
 on one Java project: 1,183 of 93,167 occurrences, in 79 of its 223 documents.
 
-The per-occurrence proof is two byte comparisons. A symbol whose last
-descriptor is a name the grammar spells literally must find that identifier at
-the **start** of its range, ending on a token boundary; every other range — a
-`local` symbol, an escaped name, a package or synthetic descriptor — must at
-least start on a token boundary. The range may be wider than the name because a
-real one is: an aliased import puts the whole `OrderedDict as OD` clause on the
-imported symbol (measured), so demanding equality would refuse every project
-that aliases an import. Measured cost on the fixtures of the per-platform
-matrix, over the indexes the pinned indexers produce: 9 ns per occurrence and
-no allocation.
+The per-occurrence proof is one byte comparison, in two strengths. A
+**definition** occurrence whose symbol's last descriptor is a name the grammar
+spells literally must select exactly that identifier: a declaration is written
+where its name is written, which is the same rule the encoding probe above
+applies — one predicate, so an encoding cannot be proved by one rule while its
+occurrences are held to another. Every other range must start on a token
+boundary, which is what a shifted column usually fails. A reference is
+deliberately **not** required to spell its symbol's name, because measured, it
+does not: an aliased import puts the occurrence on the alias (`HashSet as Set`
+is a reference to `HashSet` over the bytes `Set`) or on the whole alias clause
+(`OrderedDict as OD`), and an operator is a reference to the method it desugars
+to (`+` to `add`). Measured over the indexes the six pinned indexers produce
+from the fixtures of the per-platform matrix — 308 occurrences, all nine
+languages — the proof refuses none of them, at ~8 ns per occurrence and no
+allocation.
 
 The two proofs deliberately have different outcomes. The encoding probe decides
 whether an encoding the index never stated may be used at all, so a document it
