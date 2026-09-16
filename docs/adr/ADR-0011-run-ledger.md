@@ -73,6 +73,13 @@ disguised as a feature.
 A running span exposes atomic counters the stage increments as it goes, so progress costs one
 atomic add per item and no channel traffic at all.
 
+A run's writer states on the run row the deadline it undertakes to renew while it lives, and
+renews it on the flush the collector already performs. That is the only way a second process can
+tell a run still being written from one whose process died: a row that says it is running says
+nothing about whether anyone is still writing it, and probing a process id is neither portable nor
+free of races. The same question is already answered this way for the watch heartbeat, and a second
+mechanism for it would be one too many.
+
 **One collector goroutine** owns the store side, batching and flushing on a short interval or a
 batch bound, whichever comes first, and snapshotting the counters of every running span so that a
 reader in another process sees progress. A crash loses at most one flush interval of rows, and a
@@ -113,9 +120,12 @@ generation they describe out of existence when retention deletes it.
 1. **`codectx index`**: one progressive line per finished top-level span through the existing
    output path (`internal/cli/index.go:469`), and on completion the run row and the top stages by
    wall time with their share. Under `--json`, the same rows in the one envelope.
-2. **`codectx status --resources`**: the ledger of the latest run for this repository -- the
-   running one if a run is live, otherwise the one that produced the active generation -- as a
-   table sorted by wall time with the run row first. **`--follow`** re-renders on an interval until
+2. **`codectx status --resources`**: the ledger of the latest run for this repository -- the live
+   one if a run is live, live meaning its writer has renewed the deadline it publishes on the run
+   row and not merely that the row still says running, otherwise the one that produced the active
+   generation. A run whose writer died without stopping its ledger reads as interrupted, with its
+   still-open spans interrupted and no wall nobody measured. The rows are shown as a table sorted
+   by wall time with the run row first. **`--follow`** re-renders on an interval until
    interrupted, which is the live view from a second terminal, and costs the run nothing because it
    only reads.
 3. **MCP**: `codectx_index_status` with `resources=true` returns the same rows, because
