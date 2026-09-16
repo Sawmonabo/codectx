@@ -551,10 +551,14 @@ the bytes, one row per chunk of one stream, keyed by segment, stream name and a
 0-based part number whose parts concatenate to the stream. `segment_units` names
 the units whose documents a segment holds — one unit for a segment a seal wrote,
 and every surviving unit for a merged one. `generation_segments` is one
-generation's set in read order; its reference to a segment is `RESTRICT`, so a
+generation's set in read order, each row carrying how many of that segment's
+documents the generation hides; its reference to a segment is `RESTRICT`, so a
 segment a generation still names cannot be collected. Alongside them,
-`generation_lexical` carries one row per generation — the visible document count
-and the total token length — and cascades from `generations`.
+`generation_lexical` carries one row per generation — the visible document count,
+the total token length and the visible-document bitmap — and cascades from
+`generations`. A fifth column, on `search_units`, names the segment a document
+was folded into; it is the document's, not the row's, so a carry-over copies it
+forward with the document rowid.
 
 The three streams of a segment are `term.dir`, a fixed-width directory in term
 order holding each term's document frequency and the slices of the other two
@@ -580,27 +584,44 @@ sorter over the corpus ever exists. A unit that publishes no document folds no
 segment.
 
 **What an activation does.** It records the generation's segment set and nothing
-else: its members' segments, and — for a delta — the segments its carried
-documents already live in, since a carried document keeps its document rowid and
-therefore its segment. Nothing is rewritten to carry a document forward, and a
-document whose unit has left the generation is hidden by the generation's
-visible-document bitmap rather than removed from the segment that still holds it.
-The pass's start and end are logged on their own, so an operator can see it
-rather than infer it from the activation's total, and it holds the same 5 % share
-of the index wall clock the adjacency build is held to.
+else. The set is the **predecessor's** set, in the predecessor's own read order,
+plus its members' segments that the inherited set does not already hold — a delta
+unit owns both, because a carried document keeps its document rowid and therefore
+its segment, so naming such a segment again would offer every document in it
+twice. An inherited segment holding none of this generation's documents is
+dropped instead of carried; it can answer nothing. Nothing is rewritten to carry a
+document forward, and a document whose unit has left the generation is hidden by
+the generation's visible-document bitmap rather than removed from the segment
+that still holds it.
+
+One pass over the generation's documents produces all three per-document answers
+at once: the bitmap, which is stored so no reader scans them again; the
+generation's document and token statistics; and how many documents of each named
+segment the generation still carries, whose shortfall against what the segment
+packed is the hidden count stored per named segment. The pass's start and end are
+logged on their own, so an operator can see it rather than infer it from the
+activation's total, and it holds the same 5 % share of the index wall clock the
+adjacency build is held to.
 
 **What a read does.** A term is one binary search per segment, and the segments'
 posting streams are merged by document rowid, so the candidate walk still
 receives one strictly ascending sequence. Every visible document of a generation
 lies in exactly one of its segments; a document two segments both claim is
 reported as a corrupt store rather than delivered — and scored — twice. The
-document frequency is exact: a generation that hides nothing sums the segments'
-directory entries, and otherwise the posting list is walked against the bitmap,
+document frequency is exact: a segment the generation hides no document of
+answers from its directory entry, and one that hides some is counted by walking
+the posting list against the bitmap,
 because a frequency that counted hidden documents would make a ranking depend on
 the store's history instead of on the code.
 
 A segment no retained generation names and no live unit owns is deleted in the
-same transaction as the generation or the unit that released it.
+same transaction as the generation or the unit that released it — which is exact
+because ownership is read off the documents themselves, so a segment every one of
+whose documents a carry chain has dropped stops being owned. A build that died
+before its seal is collected the same way, and its staging database is removed
+with it; the `tmp` directory is never swept on its own, because several processes
+may share one data directory and a live build's staging is indistinguishable from
+a dead one's.
 
 A **phrase** keeps the live posting path. The packed form stores counts, not
 offsets, and a phrase has to test adjacency; storing offsets would put a second

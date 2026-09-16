@@ -146,15 +146,30 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   is the only `ORDER BY` any plan of this store issues; the engine's external merge sort performs it,
   bounded by the staging's page cache and spilling under the same temporary directory. The staging is
   deleted at seal, at Abandon and at Fail. A unit that publishes no document folds no segment.
-- **Activation adds segments; it never rebuilds.** A generation's set is its predecessor's set plus
-  the segments of members whose documents no inherited segment already holds, recorded in
-  `generation_segments`. A generation with no predecessor takes its members' segments alone. A
-  delta's carried documents keep their document rowid and therefore the segment they were folded
-  into, so the carrying unit is recorded as an owner of that segment and nothing is rewritten to
-  carry a document forward. The invariant, tested: every visible document of a generation lies in
-  exactly ONE of its segments.
-- **Visibility is a per-generation document bitmap.** A document of an inherited segment whose unit
-  left the generation is hidden by the bitmap; the segment is not rewritten to remove it.
+- **Activation adds segments; it never rebuilds.** A generation's set is its predecessor's set, in
+  the predecessor's own read order, plus the segments of its members that the inherited set does not
+  already hold, recorded in `generation_segments`. A generation with no predecessor takes its
+  members' segments alone. An inherited segment none of the generation's documents lies in is
+  dropped rather than carried: it can answer nothing, and carrying it would grow the set a query
+  binary-searches with every delta forever. The invariant, tested: every visible document of a
+  generation lies in exactly ONE of its segments — so a member's segment that is already inherited
+  must NOT be named a second time, or every document in it is offered by two cursors of the same
+  merge and counted twice in every score.
+- **A document names the segment it was folded into.** The fold records it on the document's row, and
+  a delta's carried documents keep their document rowid and that column together, so nothing is
+  rewritten to carry a document forward. It is what makes ownership EXACT: a unit owns precisely the
+  segments that hold at least one of its documents, read back from the rows a carry just wrote rather
+  than inherited wholesale from the predecessor's own ownership. Without it a carry chain only ever
+  grows a unit's ownership, and a segment every one of whose documents has been dropped stops being
+  collectable.
+- **Visibility is a per-generation document bitmap, stored with the generation.** A document of an
+  inherited segment whose unit left the generation is hidden by the bitmap; the segment is not
+  rewritten to remove it. Activation resolves the bitmap in the one pass it already makes over the
+  generation's documents and stores it, so no reader scans those documents again to rebuild it, and
+  that same pass counts how many documents of each named segment the generation still carries. The
+  difference from what the segment packed is stored per named segment, which is what lets a document
+  frequency answer from the term directory for every segment that hides nothing and walk the posting
+  only for the ones that do.
 - **Compaction by geometric partitioning, at activation, amortised.** While a size tier holds more
   than `r` segments, that tier's segments are merged into one — a streaming merge on
   (term, document rowid) that copies a term's posting bytes verbatim when only one input holds the
@@ -171,7 +186,11 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
   depend on the store's history, and a delta-built store would not answer identically to a fresh one
   over the same tree.
 - **Garbage.** A segment no retained generation names and no live unit owns is deleted in the same
-  transaction as the generation or the unit that released it.
+  transaction as the generation or the unit that released it. A build that died between its first
+  documents and its seal is collected the same way, and its staging database goes with it: the
+  temporary directory is never swept blindly, because several processes may share one data directory
+  and a live build's staging is indistinguishable from a dead one's, so the file is removed where the
+  unit is already known to be dead.
 
 **Consequences.** Each document is tokenised exactly once, on the path that already tokenised it, so
 the seal's added cost is one staged row per `(term, document, column)` group and no second index.
@@ -179,7 +198,10 @@ Activation writes the generation's segment list and, when a tier is full, one me
 never touches a byte of a segment it merely inherits, which is what makes a delta activation's cost
 proportional to the delta. In exchange, a read pays one directory search per segment instead of one,
 and a generation that has hidden documents pays a posting walk for a document frequency — both
-bounded by the segment count, which compaction holds at O(log_r N). The build budget stands at 5 % of
+bounded by the segment count, which compaction holds at O(log_r N). The compaction ratio `r` is an
+INTERNAL layout constant, like the part size: no count of segments, documents or terms is ever
+refused because of it, and a store whose tiers are fuller simply merges sooner. The build budget
+stands at 5 % of
 index wall, and a delta activation must build the lexical structure in at most three times the packed
 adjacency's build on the same store.
 
