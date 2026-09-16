@@ -49,8 +49,14 @@ func (h *handlers) indexStatus(ctx context.Context, _ *mcp.CallToolRequest, in m
 // IndexService.Index is not the alternative: that would make a build-a-new-
 // generation operation — one that, for rebuild, creates a new cache — reachable
 // through a tool whose name does not say so.
-func (h *handlers) refreshIndex(ctx context.Context, _ *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
+func (h *handlers) refreshIndex(ctx context.Context, req *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, result[model.IndexResult], error) {
 	var zero result[model.IndexResult]
+	// The run reports itself while it goes: progress for a client that passed
+	// a progress token, a log message per finished stage for one that set a
+	// logging level (progress.go). Stopped before the answer is returned, so
+	// nothing about this run reaches the client after the result that ends
+	// it.
+	defer h.watchSpans(ctx, req)()
 	// The request is not Validate()d here: IndexRequest.Validate rejects only
 	// the full+rebuild combination, and all three fields are fixed false, so the
 	// branch could never fire. Refresh validates the request it is given.

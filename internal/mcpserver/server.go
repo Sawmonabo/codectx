@@ -44,6 +44,17 @@ type Options struct {
 	Config config.Config
 	// Build supplies the schema version every result envelope carries.
 	Build model.BuildInfo
+	// Spans registers a function to be called with every stage of an
+	// indexing run as it finishes, and is how codectx_refresh_index reports
+	// progress and logs stages while a run is going. It takes the rows in
+	// their model shape rather than a recorder of its own, so what a client
+	// is told a stage cost is the same row codectx_index_status returns and
+	// the CLI prints -- there is no second accounting here.
+	//
+	// It is called ONCE, while the server is built. Nil is a server that
+	// reports no progress, which is what a composition that records nothing
+	// should be: the tools are unaffected.
+	Spans func(func(model.StageRecord))
 	// Logger MUST write to stderr. stdout is the SDK's framing channel; a
 	// single byte of ours on it corrupts the session. Nil means "build the
 	// stderr logger yourself".
@@ -98,6 +109,14 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.limits = lim
+	// One subscription for the process, fanned out per call: the source
+	// publishes on a goroutine whose progress every live reader waits on, so
+	// nothing downstream of it may block, and a per-call subscription would
+	// need a source that could be unsubscribed.
+	if opts.Spans != nil {
+		s.h.spans = newSpanHub()
+		opts.Spans(s.h.spans.publish)
+	}
 	s.mcp = mcp.NewServer(
 		&mcp.Implementation{
 			Name:        "codectx",
