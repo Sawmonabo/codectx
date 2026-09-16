@@ -75,11 +75,11 @@ func TestReadOnlyStoreReadsWhileAnotherHoldsTheWriteTransaction(t *testing.T) {
 	if pinned.Binding().GenerationID != gen {
 		t.Fatalf("pinned generation = %d, want the active %d", pinned.Binding().GenerationID, gen)
 	}
-	// The pin took no lease: that is the write it used to perform, and a lease
+	// The pin wrote no lease row: that is the write it used to perform, and a
 	// row here would mean the reader had taken the writer connection after all.
-	if pinned.LeaseID() != "" {
-		t.Fatalf("a read-only pin took retention lease %q", pinned.LeaseID())
-	}
+	// Counted in the database rather than asked of the reader, so the assertion
+	// survives the reader having no opinion about leases at all.
+	wantNoLeaseRow(t, ctx, f)
 	// And it reads: the unsealed second generation is invisible, the published
 	// one answers.
 	nodes, err := pinned.NodesInFile(ctx, a.id, 0, "", 10)
@@ -164,9 +164,7 @@ func TestReadOnlyPinHoldsASupersededGenerationAndNamesItsCollection(t *testing.T
 	if err != nil {
 		t.Fatalf("a writerless pin of the superseded generation a continuation names was refused: %v", err)
 	}
-	if pinned.LeaseID() != "" {
-		t.Fatalf("a read-only pin took retention lease %q", pinned.LeaseID())
-	}
+	wantNoLeaseRow(t, ctx, f)
 	nodes, err := pinned.NodesInFile(ctx, a.id, 0, "", 10)
 	if err != nil {
 		t.Fatalf("NodesInFile through a writerless pin of a superseded generation: %v", err)
@@ -187,5 +185,19 @@ func TestReadOnlyPinHoldsASupersededGenerationAndNamesItsCollection(t *testing.T
 	}
 	if !store.IsGenerationCollected(err) {
 		t.Fatalf("a pin of a collected generation is not recognisable as one, so a continuation cannot answer CTX_CURSOR_INVALID: %v", err)
+	}
+}
+
+// wantNoLeaseRow fails unless the database holds no retention lease. It reads
+// through the fixture's writing store because the count is a fact about the
+// database, not about the reader under test.
+func wantNoLeaseRow(t *testing.T, ctx context.Context, f *fixture) {
+	t.Helper()
+	st, err := f.s.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.Leases != 0 {
+		t.Fatalf("a writerless pin left %d retention leases", st.Leases)
 	}
 }
