@@ -72,7 +72,7 @@ bounded by the writer's page cache; nothing commits per batch.
    under paced writeback: under an 8 MiB cache the store's ingestion test wrote 65 MiB of log
    frames and dirtied 555 MiB of them. The store detects a group's first frame from the log's
    size and header (the writer's journal size limit is zero, so the engine truncates the log at
-   each reset, and a reset rewrites the header's salt and sequence), and commits.
+   each reset, and a reset rewrites the header's salt and sequence), and commits. (Amended; see below.)
 4. **Statement journal in memory.** Each savepoint records the prior image of every page its batch
    touches; content-addressed rows touch a fresh page each. The engine's default moves that
    journal to a temporary file past 64 KiB, rewritten from offset zero at every batch: fifteen
@@ -136,14 +136,16 @@ with at most two windows dirty is a bounded wait.
 With the shim in place an uncapped index of the 6 270-file repository kept dirty pages under 8 MB through a
 3.4 GB build, and an independent 4 KiB write and data-sync beside it never waited more than 245 ms (at the
 892 MB checkpoint) -- and the host still stalled for 64 s, once, 27 s after the run had freed 6 GB (the
-export's removal and the log's reset). (Amended; see below.) The same 64 s stall followed every multi-gigabyte free in the earlier
+export's removal among them: the log itself shrank 895 MB there, and most of those extents were
+earlier frees reaching the device at that commit). The same 64 s stall followed every multi-gigabyte free in the earlier
 runs. It was then reproduced without the product: a script wrote 5 GB one window at a time in 6 s (850 MB/s,
 so a completed write is host-cached, not on a disk), idled two minutes with no stall, freed the file one
 window at a time in 3.6 s, and 72 s later the independent write waited 64 s. The root filesystem discards
 freed blocks as they are freed, and the host keeps the machine's disk as a sparse image, so a free becomes
 host-side work the virtual machine can neither observe nor wait for: the device reports every discard complete
 in microseconds and the hang arrives a minute later, on whatever request is in flight then. A free of under a
-gigabyte caused nothing in two minutes; five and six gigabytes caused the stall.
+gigabyte caused nothing in two minutes and a free of two gigabytes nothing in three; five and six
+gigabytes caused the stall.
 
 Windowed freeing (the delete scheduler discipline) therefore bounds what the guest submits but not what the
 host owes, and no discipline the guest can apply does: the signal it would need is on the other side of the
