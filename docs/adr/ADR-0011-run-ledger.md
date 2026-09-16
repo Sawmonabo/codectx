@@ -154,8 +154,12 @@ process tree: unrecorded median 110.1 MiB (range 105.6-113.5), recorded median 1
 104.7-112.5); the paired difference was -1.5 MiB median, spread -6.4 to +4.3 MiB, sign not stable,
 which is within noise. Flushing the last rows at stop cost 3-5 ms, outside the run.
 
-The wall figure is small, positive and at the edge of what the host it was taken on can resolve: the
-same measurement repeated gave paired medians from +1.7% to +12.2%, and the machine was never idle.
+The wall figure is small, positive and at the edge of what the host it was taken on can resolve. Run
+three times under this rule, the measurement returned above noise twice and within noise once, with
+paired medians from +1.7% to +12.2%; the machine was never idle while any of them was taken. Opening
+the ledger is outside the timed run, and is bounded with it: the difference over the whole child
+process was +33.9 ms against the run's +26.5 ms, so opening, stopping and the process itself account
+for about 7 ms of which stopping is 3-5.
 It is recorded as a cost at the noise floor rather than cleared, and is to be re-measured on a quiet
 machine before it is either dismissed or treated as the defect a cost above noise would be. The
 figure is reproduced by `go test -run TestLedgerCost ./internal/bench`.
