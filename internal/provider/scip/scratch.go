@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
-	"github.com/Sawmonabo/codectx/internal/paced"
+	arena "github.com/Sawmonabo/codectx/internal/scratch"
 	"modernc.org/sqlite"
 )
 
@@ -18,17 +18,44 @@ import (
 // with a fixed page-cache bound, so forward and external references are
 // resolved without an in-memory symbol table and a document of any size is
 // grouped into relation facts without holding its occurrences. Everything in
-// it is derived from the index bytes and is removed with the run directory.
+// it is derived from the index bytes and none of it outlives the import.
+//
+// The file is a surface of the provider's scratch pool, taken for the import
+// and given back at its length. It used to be created per import and removed
+// at the end of it, so indexing a repository unit by unit handed the
+// filesystem one import's spool after another in the middle of its work. On a
+// host that discards freed blocks under a sparse virtual disk that stalls
+// every writer on the machine for about a minute, a minute later.
+//
+// SQLite's own transient sorts still spill under temp_store=FILE and are
+// created and removed by the library through the paced shim, which is where
+// that boundary is drawn for every database this product opens.
 //
 // The whole import runs in one transaction on one connection: with the
-// journal off there is nothing to recover, and the file is deleted afterwards
-// whatever happened.
+// journal off there is nothing to recover, and the surface is emptied on the
+// way in whatever happened to the import before it.
 type scratch struct {
-	dir   string
+	lease *arena.Lease
 	db    *sql.DB
 	tx    *sql.Tx
 	bytes int64
 }
+
+// scratchEmpty is run before the schema. The surface is never truncated --
+// that is the point of pooling it -- so it arrives holding the import before
+// it, and a CREATE TABLE IF NOT EXISTS would leave that import's documents,
+// symbols and occurrences in place for this one to publish as its own facts.
+// Dropping the tables returns their pages to the database's own free list,
+// which this import writes over, and gives the filesystem nothing back.
+const scratchEmpty = `
+DROP TABLE IF EXISTS docs;
+DROP TABLE IF EXISTS occ;
+DROP TABLE IF EXISTS sym;
+DROP TABLE IF EXISTS rel;
+DROP TABLE IF EXISTS defs;
+DROP TABLE IF EXISTS edges;
+DROP TABLE IF EXISTS manifest;
+`
 
 const scratchSchema = `
 CREATE TABLE docs(idx INTEGER PRIMARY KEY, path TEXT NOT NULL, lang TEXT NOT NULL, enc INTEGER NOT NULL,
@@ -47,8 +74,11 @@ CREATE TABLE edges(frm TEXT NOT NULL, kind TEXT NOT NULL, dst TEXT NOT NULL, fil
 CREATE TABLE manifest(path TEXT PRIMARY KEY, hash TEXT NOT NULL) WITHOUT ROWID;
 `
 
-// openScratch creates the scratch database in a fresh private directory
-// under parent. What it spools is counted, not capped: see scratch.charge.
+// openScratch opens the scratch database on a surface of the pool under
+// parent, which is the provider's own work directory and never a run's: a run
+// directory is removed when the run ends, and a pool inside one would be
+// created and freed exactly as often as the file it was meant to keep. What
+// it spools is counted, not capped: see scratch.charge.
 func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	if !filepath.IsAbs(parent) {
 		return nil, invalid("the scip work directory must be an absolute private path")
@@ -56,16 +86,16 @@ func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return nil, internal("scip work directory: " + err.Error())
 	}
-	dir, err := os.MkdirTemp(parent, "scip-")
+	lease, err := arena.For(parent).Take(arena.ImportSpool)
 	if err != nil {
-		return nil, internal("scip scratch directory: " + err.Error())
+		return nil, internal("scip scratch surface: " + err.Error())
 	}
-	s := &scratch{dir: dir}
+	s := &scratch{lease: lease}
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(OFF)", "synchronous(OFF)", "temp_store(FILE)", "mmap_size(0)", "cache_size(-4096)"} {
 		q.Add("_pragma", p)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(dir, "scratch.db"), RawQuery: q.Encode()}).String()
+	dsn := (&url.URL{Scheme: "file", Path: lease.Path(), RawQuery: q.Encode()}).String()
 	connector, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		s.close()
@@ -74,7 +104,7 @@ func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	s.db = sql.OpenDB(connector)
 	s.db.SetMaxOpenConns(1)
 	s.db.SetMaxIdleConns(1)
-	if _, err := s.db.ExecContext(ctx, scratchSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, scratchEmpty+scratchSchema); err != nil {
 		s.close()
 		return nil, internal("scip scratch schema: " + err.Error())
 	}
@@ -85,8 +115,8 @@ func openScratch(ctx context.Context, parent string) (*scratch, error) {
 	return s, nil
 }
 
-// close discards the transaction and removes the directory. It is safe to
-// call more than once.
+// close discards the transaction and gives the surface back to the pool at
+// its length, freeing nothing. It is safe to call more than once.
 func (s *scratch) close() error {
 	if s == nil {
 		return nil
@@ -99,12 +129,9 @@ func (s *scratch) close() error {
 		s.db.Close()
 		s.db = nil
 	}
-	if s.dir != "" {
-		err := paced.RemoveAll(s.dir)
-		s.dir = ""
-		if err != nil {
-			return internal("scip scratch cleanup: " + err.Error())
-		}
+	if s.lease != nil {
+		s.lease.Release()
+		s.lease = nil
 	}
 	return nil
 }

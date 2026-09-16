@@ -254,8 +254,9 @@ func (e *Engine) nextPathCursor(ctx context.Context, sc *pathScratch, queryHash 
 	// resume a search that has forgotten half its work.
 	dir, err := sc.detach()
 	if err != nil {
-		// detach() failing leaves the state neither committed nor this
-		// request's to resume from, so this one is terminal too.
+		// detach() commits before it can fail, so a failure here leaves the
+		// page's writes committed but no directory a continuation could name:
+		// not this request's to resume from either way, so terminal too.
 		return "", terminalRetention(e.releaseLease(ctx, lease.ID, err))
 	}
 	id, err := e.spools.AdoptDir(next.spoolCursor(), dir)
