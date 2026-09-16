@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -304,6 +307,18 @@ func connect(t *testing.T, s *mcp.Server) *mcp.ClientSession {
 // invariant is asserted on every other session instead.
 func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSession {
 	t.Helper()
+	return connectWith(t, s, mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, nil), wantClean)
+}
+
+// connectClient is connect over a client the caller configured, which is how a
+// row that must observe SERVER-SENT notifications gets its handlers installed.
+func connectClient(t *testing.T, s *mcp.Server, c *mcp.Client) *mcp.ClientSession {
+	t.Helper()
+	return connectWith(t, s, c, true)
+}
+
+func connectWith(t *testing.T, s *mcp.Server, c *mcp.Client, wantClean bool) *mcp.ClientSession {
+	t.Helper()
 	ctx := t.Context()
 	clientT, serverT := mcp.NewInMemoryTransports()
 	// The server session outlives t.Context(), which is canceled just BEFORE
@@ -313,7 +328,6 @@ func connectSession(t *testing.T, s *mcp.Server, wantClean bool) *mcp.ClientSess
 	if err != nil {
 		t.Fatalf("server connect: %v", err)
 	}
-	c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, nil)
 	cs, err := c.Connect(ctx, clientT, nil)
 	if err != nil {
 		t.Fatalf("client connect: %v", err)
@@ -595,6 +609,71 @@ var scenarios = []scenario{
 	},
 
 	// L2 rows.
+	{
+		// Failure mode: the MCP surface grows a second shape for the run
+		// ledger. codectx_index_status has no special case for resources: it
+		// hands model.StatusRequest to the same IndexStatus the CLI calls and
+		// returns the answer whole, so the run and stage rows a client reads
+		// are the ones the service produced. A handler that built its own row
+		// list -- or projected, reordered or trimmed the service's -- would let
+		// the two surfaces disagree about what a run cost, and neither would be
+		// wrong on its face. The row also pins the JSON PATH: the MCP envelope
+		// puts model.IndexStatus directly in data, one level shallower than the
+		// CLI's, so the rows live at data.resources.stages and a consumer that
+		// assumed the CLI's path would read nothing.
+		name: "index_status carries the service's own ledger rows at data.resources.stages",
+		facade: func(f *fakeServices) {
+			f.indexStatusFn = func(_ context.Context, r model.StatusRequest) (model.IndexStatus, error) {
+				if !r.Resources {
+					return model.IndexStatus{}, unset("IndexStatus: resources was not forwarded")
+				}
+				return model.IndexStatus{Resources: ledgerReport()}, nil
+			}
+		},
+		tool: "codectx_index_status",
+		args: model.StatusRequest{Resources: true},
+		check: func(t *testing.T, res *mcp.CallToolResult) {
+			if res.IsError {
+				t.Fatalf("index_status reported a tool error: %s", firstText(res))
+			}
+			var got result[model.IndexStatus]
+			decode(t, res, &got)
+			want := ledgerReport()
+			if got.Data.Resources == nil {
+				t.Fatalf("data.resources is absent; the service reported %+v", want)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Run, want.Run) {
+				t.Errorf("data.resources.run = %+v, want the service's row %+v", got.Data.Resources.Run, want.Run)
+			}
+			if !reflect.DeepEqual(got.Data.Resources.Stages, want.Stages) {
+				t.Errorf("data.resources.stages = %+v, want the service's rows %+v", got.Data.Resources.Stages, want.Stages)
+			}
+			// The path itself, read from the wire rather than from the typed
+			// envelope, so a renamed or re-nested field is caught here and not
+			// only by a client in the field.
+			var wire struct {
+				Data struct {
+					Resources struct {
+						Stages []struct {
+							Stage   string `json:"stage"`
+							WallMS  int64  `json:"wall_ms"`
+							ItemsIn int64  `json:"items_in"`
+						} `json:"stages"`
+					} `json:"resources"`
+				} `json:"data"`
+			}
+			decode(t, res, &wire)
+			if len(wire.Data.Resources.Stages) != len(want.Stages) {
+				t.Fatalf("data.resources.stages carried %d rows, want %d", len(wire.Data.Resources.Stages), len(want.Stages))
+			}
+			for i, s := range wire.Data.Resources.Stages {
+				if s.Stage != want.Stages[i].Stage || s.WallMS != want.Stages[i].WallMS || s.ItemsIn != want.Stages[i].ItemsIn {
+					t.Errorf("data.resources.stages[%d] = %+v, want %+v", i, s, want.Stages[i])
+				}
+			}
+		},
+	},
+
 	{
 		// Failure mode: an LSP overlay answer reaches the model looking like a
 		// sealed canonical fact. Two ways that happens, both guarded here: the
@@ -1110,6 +1189,34 @@ func decode(t *testing.T, res *mcp.CallToolResult, v any) {
 	}
 }
 
+// ledgerReport is the run ledger one fake IndexStatus reports, built the same
+// way on both sides of the assertion so the row compares the wire against the
+// service's own rows rather than against a second hand-written shape.
+func ledgerReport() *model.ResourceReport {
+	started := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	finished := started.Add(2 * time.Second)
+	generation := int64(9)
+	return &model.ResourceReport{
+		Run: &model.RunRecord{
+			RunID:          "5f2b",
+			Kind:           "index",
+			RepositoryID:   "a1b2",
+			GenerationID:   &generation,
+			StartedAt:      started,
+			FinishedAt:     &finished,
+			WallMS:         2000,
+			Outcome:        "ok",
+			FileCount:      12,
+			UnitsPlanned:   2,
+			UnitsSucceeded: 2,
+		},
+		Stages: []model.StageRecord{
+			{Seq: 0, Stage: "walk", StartedAt: started, WallMS: 500, Outcome: "ok", ItemsIn: 12, ItemsOut: 12, ShareOfWall: 0.25},
+			{Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", StartedAt: started, WallMS: 1500, Outcome: "ok", ItemsIn: 12, ItemsOut: 340, ShareOfWall: 0.75},
+		},
+	}
+}
+
 // firstText returns the first text content block, which is where the SDK puts a
 // tool error's message.
 func firstText(res *mcp.CallToolResult) string {
@@ -1179,6 +1286,188 @@ func oversizedArgumentsRow() scenario {
 // truncates the list, and one that is offered on the last page hands the client
 // a cursor onto an empty page. Walking a multi-page list to exhaustion and
 // comparing the records to the sealed list catches both.
+// ---------------------------------------------------------------------------
+// The live view of a run.
+// ---------------------------------------------------------------------------
+
+// TestRefreshReportsStagesLive drives one codectx_refresh_index call while the
+// run publishes finished stages, over a real client session, and asserts the
+// rule a client driving a progress bar depends on.
+//
+// Failure mode: the bar goes backwards, repeats a value, floods, or keeps
+// moving after the run is over -- any of which makes the figure unusable
+// without the client knowing it. The rate limit must cost a NOTIFICATION and
+// never a count, so a value a client sees is always the true number of
+// finished top-level stages; and a client that passed no progress token must
+// be sent nothing at all, so following progress stays something a client asks
+// for rather than something it is charged.
+func TestRefreshReportsStagesLive(t *testing.T) {
+	// settle is how long a row is given to cross the in-memory transport and
+	// be recorded by the client. It is a test's own pause, not a product
+	// timeout: the rule under test is about ORDER and VALUES, and a row that
+	// took longer than this would fail the row's counts rather than pass it.
+	const settle = 300 * time.Millisecond
+	for _, tc := range []struct {
+		name         string
+		token        any
+		wantProgress bool
+	}{
+		{name: "a progress token is followed", token: "run-1", wantProgress: true},
+		{name: "no progress token means no progress notifications", token: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu       sync.Mutex
+				progress []mcp.ProgressNotificationParams
+				logs     []mcp.LoggingMessageParams
+			)
+			// The rows the run publishes. Only the top-level ones move the
+			// bar; the nested one is a stage of the same run and must not.
+			nested := int64(0)
+			rows := []model.StageRecord{
+				{Seq: 0, Stage: "walk", WallMS: 10, Outcome: "ok", ItemsIn: 12, ItemsOut: 12},
+				{Seq: 1, Stage: "engine_unit", ScopeKey: "pkg/one", WallMS: 20, Outcome: "ok"},
+				{Seq: 2, ParentSeq: &nested, Stage: "parse", WallMS: 5, Outcome: "ok"},
+				{Seq: 3, Stage: "seal", WallMS: 30, Outcome: "ok"},
+				{Seq: 4, Stage: "activation", WallMS: 1, Outcome: "ok"},
+			}
+			var publish func(model.StageRecord)
+			f := &fakeServices{}
+			f.refreshFn = func(_ context.Context, _ model.IndexRequest) (model.IndexResult, error) {
+				// One row, then a pause long enough for the notification it
+				// causes to cross the in-memory transport. The first one is
+				// not rate limited.
+				publish(rows[0])
+				time.Sleep(settle)
+				// These three fall inside the same interval as the first, so
+				// they are reported by the NEXT notification's value and not
+				// by three more notifications.
+				publish(rows[1])
+				publish(rows[2])
+				publish(rows[3])
+				time.Sleep(progressInterval)
+				publish(rows[4])
+				time.Sleep(settle)
+				return model.IndexResult{FilesParsed: 12}, nil
+			}
+			s, hook := newSpanTestServer(f)
+			publish = hook
+			c := mcp.NewClient(&mcp.Implementation{Name: "codectx-test", Version: "0.0.0-test"}, &mcp.ClientOptions{
+				ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+					mu.Lock()
+					progress = append(progress, *req.Params)
+					mu.Unlock()
+				},
+				LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
+					mu.Lock()
+					logs = append(logs, *req.Params)
+					mu.Unlock()
+				},
+			})
+			cs := connectClient(t, s, c)
+			params := &mcp.CallToolParams{Name: "codectx_refresh_index", Arguments: emptyInput{}}
+			// The level a client wants travels on the request itself, beside
+			// the progress token: under the protocol this session negotiates,
+			// a call's own _meta level is what decides whether the server's
+			// log messages are sent, and a session-wide logging/setLevel is
+			// replaced by it on every request. Asking here is therefore how a
+			// client asks at all.
+			params.SetMeta(map[string]any{mcp.MetaKeyLogLevel: "info"})
+			if tc.token != nil {
+				params.SetProgressToken(tc.token)
+			}
+			res, err := cs.CallTool(t.Context(), params)
+			if err != nil {
+				t.Fatalf("tools/call codectx_refresh_index raised a protocol error: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("refresh_index reported a tool error: %s", firstText(res))
+			}
+			// A stage published after the run answered must reach nobody.
+			publish(model.StageRecord{Seq: 5, Stage: "retention", WallMS: 2, Outcome: "ok"})
+			time.Sleep(settle)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if !tc.wantProgress {
+				if len(progress) != 0 {
+					t.Fatalf("a call that passed no progress token was sent %d progress notifications", len(progress))
+				}
+				if len(logs) != 5 {
+					t.Errorf("log messages = %d, want the 5 stages published during the call", len(logs))
+				}
+				return
+			}
+			if len(progress) != 2 {
+				t.Fatalf("progress notifications = %d, want 2: one per interval, and none after the run answered", len(progress))
+			}
+			last := 0.0
+			for i, p := range progress {
+				if p.ProgressToken != tc.token {
+					t.Errorf("progress[%d] token = %v, want the token the client passed %v", i, p.ProgressToken, tc.token)
+				}
+				if p.Progress <= last {
+					t.Fatalf("progress[%d] = %v, which does not increase on %v: a bar that goes backwards or stands still",
+						i, p.Progress, last)
+				}
+				if p.Total != 0 {
+					t.Errorf("progress[%d] carried total %v; the number of stages a run will open is not known to a finished stage",
+						i, p.Total)
+				}
+				if p.Message == "" {
+					t.Errorf("progress[%d] carried no message; a client shows the stage that finished", i)
+				}
+				last = p.Progress
+			}
+			// The rate limit cost a notification, not a count: three more
+			// top-level stages finished inside the first interval, and the
+			// next value accounts for all of them.
+			if progress[0].Progress != 1 || progress[1].Progress != 4 {
+				t.Errorf("progress values = %v then %v, want 1 then 4: every finished top-level stage counted, the nested one not",
+					progress[0].Progress, progress[1].Progress)
+			}
+			if len(logs) != 5 {
+				t.Fatalf("log messages = %d, want one per stage published during the call and none after", len(logs))
+			}
+			if logs[0].Level != "info" {
+				t.Errorf("log level = %q, want info", logs[0].Level)
+			}
+			var row model.StageRecord
+			raw, err := json.Marshal(logs[0].Data)
+			if err != nil {
+				t.Fatalf("re-marshal the log message data: %v", err)
+			}
+			if err := json.Unmarshal(raw, &row); err != nil {
+				t.Fatalf("a log message did not carry a stage row as structured data: %v", err)
+			}
+			if row.Stage != rows[0].Stage || row.WallMS != rows[0].WallMS || row.ItemsIn != rows[0].ItemsIn {
+				t.Errorf("logged row = %+v, want the published row %+v", row, rows[0])
+			}
+		})
+	}
+}
+
+// newSpanTestServer builds a server whose span source is the returned
+// function, which is what an indexing run's collector calls as each stage
+// finishes.
+func newSpanTestServer(f *fakeServices) (*mcp.Server, func(model.StageRecord)) {
+	h := newTestHandlers(f)
+	var publish func(model.StageRecord)
+	s, err := New(Options{
+		Index:   h.index,
+		Explore: h.explore,
+		Context: h.context,
+		Config:  h.cfg,
+		Build:   h.build,
+		Logger:  h.log,
+		Spans:   func(fn func(model.StageRecord)) { publish = fn },
+	})
+	if err != nil {
+		panic(err)
+	}
+	return s.mcp, func(row model.StageRecord) { publish(row) }
+}
+
 func TestCapsuleCursorWalkReachesEveryRecord(t *testing.T) {
 	sessionID := model.SessionID(strings.Repeat("a", 64))
 	sealed := make([]model.FactReference, 5)
