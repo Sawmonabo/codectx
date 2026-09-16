@@ -112,6 +112,13 @@ func (d *dirMaker) ensure() (string, error) {
 // retainedWalk is one request's handle on that directory.
 type retainedWalk struct {
 	home *dirMaker
+	// pool is the directory whose scratch pool this walk's sorts take their
+	// run files from: the store's, which every walk shares, and never this
+	// walk's own directory. A pool is claimed with a lock held for the
+	// process's life and registered with the space reclaimer, so a pool per
+	// walk would be two descriptors and three permanent entries per request
+	// in a server that never restarts.
+	pool string
 	// prevID is the store id this directory was adopted under by the page that
 	// created or last extended it, empty for a directory this request created.
 	// The re-adoption that carries it to the next page charges only the bytes
@@ -164,7 +171,7 @@ func openRetainedWalk(parent string, max walkBounds, probe *heapProbe) (*retaine
 	if err != nil {
 		return nil, err
 	}
-	w := &retainedWalk{home: home, owned: true}
+	w := &retainedWalk{home: home, pool: parent, owned: true}
 	w.open()
 	if err = w.openSets(max, probe); err != nil {
 		w.discard()
@@ -176,7 +183,7 @@ func openRetainedWalk(parent string, max walkBounds, probe *heapProbe) (*retaine
 // reopenRetainedWalk reopens the input an earlier leg retained, for append. The
 // directory belongs to the spool store, which is what releases it.
 func reopenRetainedWalk(dir, prevID string, max walkBounds, probe *heapProbe) (*retainedWalk, error) {
-	w := &retainedWalk{home: existingDir(dir), prevID: prevID}
+	w := &retainedWalk{home: existingDir(dir), pool: filepath.Dir(dir), prevID: prevID}
 	w.open()
 	if err := w.openSets(max, probe); err != nil {
 		w.discard()
@@ -829,11 +836,12 @@ func (w *retainedWalk) writeAdmitted(ctx context.Context, s *sortedLevel, file *
 		return 0, internalErr("graph: the admitted level: " + err.Error())
 	}
 
-	dir, err := w.home.ensure()
-	if err != nil {
+	// The retained directory must exist before the admitted file is written
+	// into it; the sort's runs come from the store's pool, not from here.
+	if _, err := w.home.ensure(); err != nil {
 		return 0, err
 	}
-	sorter, err := pagination.NewExternalSort(filepath.Join(dir, "admitsort"), 0,
+	sorter, err := pagination.NewExternalSort(w.pool, 0,
 		func(fs frontierState) ([]byte, error) { return encodeFrontierState(fs), nil },
 		decodeFrontierState,
 		func(a, b frontierState) int { return cmp.Compare(a.Node, b.Node) })
