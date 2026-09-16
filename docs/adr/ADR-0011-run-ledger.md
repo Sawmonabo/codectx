@@ -20,13 +20,13 @@ agent driving the product over MCP cannot, and neither can a script, and neither
 itself when asked why a run is taking a long time *while it is still taking it*.
 
 Six stages already log a duration, each in its own shape and none of them aggregated:
-`internal/storage/sqlite/lexicalbuild.go:209`, `internal/storage/sqlite/graphbuild.go:253`,
-`internal/storage/sqlite/lexicalmerge.go:140`, `internal/snapshot/builder.go:289` and
-`internal/provider/dependence/provider.go:672` and `:763`. Three of the measurements the ledger
+`internal/storage/sqlite/lexicalbuild.go:205`, `internal/storage/sqlite/graphbuild.go:249`,
+`internal/storage/sqlite/lexicalmerge.go:135`, `internal/index/generation.go:258` and
+`internal/provider/dependence/provider.go:675` and `:772`. Three of the measurements the ledger
 needs are already taken and thrown away: the child process tree's peak resident memory is sampled
-every 250 ms by `internal/process/treesample_linux.go:36` and reaches only the dependence
+every 250 ms by `internal/process/treesample_linux.go:55` and reaches only the dependence
 provider's memory governor; the reaped child's `rusage` is reachable at
-`internal/process/runner.go:539` and `:739` and is read by nothing at all; the tree's summed CPU
+`internal/process/runner.go:607` and is read by nothing at all; the tree's summed CPU
 ticks are kept by the same sampler and consumed only as a liveness signal by the stall watchdog.
 
 ## Decision
@@ -100,14 +100,14 @@ would spill or an exclusive writer waits ([ADR-0008](ADR-0008-ingestion-group.md
 until that commit, so a ledger inside it could not answer a question about a run in progress --
 which is half of the requirement.
 
-`Store.Activate` (`internal/storage/sqlite/units.go:1331`) holds an exclusive transaction around
-lexical compaction, the adjacency build and the lexical build (`:1386`, `:1492`, `:1498`). Any
+`Store.Activate` (`internal/storage/sqlite/units.go:1429`) holds an exclusive transaction around
+lexical compaction, the adjacency build and the lexical build (`:1484`, `:1590`, `:1596`). Any
 other writer on that file waits or fails busy for its duration, which is exactly the window an
 operator most wants the ledger to be answering in.
 
 There is a third reason that is not about contention. The main schema's text is hashed into a
-fingerprint (`internal/storage/sqlite/schema.go:18`) that is folded into every analysis key
-(`units.go:1503`), so adding a table there re-keys every analysis unit in the product and
+fingerprint (`internal/storage/sqlite/schema.go:31`) that is folded into every analysis key
+(`units.go:1601`), so adding a table there re-keys every analysis unit in the product and
 invalidates every existing cache. A diagnostic table is not worth that, and never will be.
 
 So the ledger is its own file beside the store, with its own schema and fingerprint, its own
@@ -118,7 +118,7 @@ generation they describe out of existence when retention deletes it.
 ### 4. The same rows answer on four surfaces
 
 1. **`codectx index`**: one progressive line per finished top-level span through the existing
-   output path (`internal/cli/index.go:469`), and on completion the run row and the top stages by
+   output path (`internal/cli/index.go:565`), and on completion the run row and the top stages by
    wall time with their share. Under `--json`, the same rows in the one envelope.
 2. **`codectx status --resources`**: the ledger of the latest run for this repository -- the live
    one if a run is live, live meaning its writer has renewed the deadline it publishes on the run
