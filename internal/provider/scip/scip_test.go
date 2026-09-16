@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -909,5 +910,70 @@ func TestOverLimitSignatureIsTruncatedNotDropped(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("an over-limit signature was dropped whole; it must be truncated to its ceiling and flagged")
+	}
+}
+
+// TestScopesPlanAUnitPerProjectDirectory protects precise indexing on a
+// repository that keeps its projects where its own toolchains expect them.
+//
+// Failure mode: triggers were looked for at the workspace root only, so a
+// monorepo whose every `package.json` and `go.mod` sits in a subdirectory
+// planned ZERO precise units -- `precise_definitions`,
+// `precise_references` and `precise_implementations` unavailable for the whole
+// repository, with six indexers installed and a project for each of them.
+//
+// It also holds the two rules a per-directory plan needs. A project nested
+// inside another project of a kind that does not nest belongs to the outer
+// one: a TypeScript project split by subdirectory loses more than half of the
+// calls that resolve to its own methods. A Go module nested inside another
+// one is its own project, because the toolchain says so.
+//
+// Mutation proof: in walkTriggers, stop the walk after the workspace root and
+// the assertion fails with no scopes at all.
+func TestScopesPlanAUnitPerProjectDirectory(t *testing.T) {
+	ctx := context.Background()
+	exe, sum := testBinaryDigest(t)
+	h := providertest.New(t, map[string]string{
+		"go.mod":                       "module m\n",
+		"a.go":                         "package m\n",
+		"tools/build/go.mod":           "module m/tools/build\n",
+		"tools/build/b.go":             "package build\n",
+		"app/package.json":             "{}\n",
+		"app/a.ts":                     "export const a = 1;\n",
+		"app/packages/ui/package.json": "{}\n",
+		"app/packages/ui/u.ts":         "export const u = 1;\n",
+		"vendorPortal/package.json":    "{}\n",
+		"vendorPortal/v.ts":            "export const v = 1;\n",
+	})
+	runner, err := process.NewRunner(process.Limits{MaxConcurrent: 1, MemoryBudgetBytes: 16 << 30, DiskBudgetBytes: 16 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := scip.New(ctx, scip.Options{WorkDir: t.TempDir(), Runner: runner,
+		Resolver: managedResolver(t, map[string]toolchain.Override{
+			"scip-go":         {Executable: exe, Version: "1", Checksum: sum},
+			"scip-typescript": {Executable: exe, Version: "1", Checksum: sum},
+		})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	det, err := p.Detect(ctx, h.Root, h.Policy)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if !det.Available {
+		t.Fatal("Detect reports unavailable for a workspace holding four indexable projects")
+	}
+	got := p.Scopes(det)
+	slices.Sort(got)
+	want := []string{
+		scip.ProfileScope("scip-go", ""),
+		scip.ProfileScope("scip-go", "tools/build"),
+		scip.ProfileScope("scip-typescript", "app"),
+		scip.ProfileScope("scip-typescript", "vendorPortal"),
+	}
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("Scopes = %v, want %v", got, want)
 	}
 }
