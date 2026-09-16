@@ -164,6 +164,16 @@ func readHolder(f *os.File) (holder, bool) {
 	return holder{pid: pid, operation: operation}, true
 }
 
+// DetailHolderPID and DetailHolderOperation are the keys the busy refusal
+// carries the holder under. They are named here, where the record is written,
+// so a reader that acts on the holder -- a watch reporting the beat it
+// skipped -- reads the same key this writes rather than a second spelling of
+// it that can drift.
+const (
+	DetailHolderPID       = "holder_pid"
+	DetailHolderOperation = "holder_operation"
+)
+
 // busy builds the refusal a waiter reports, naming the holder when one recorded
 // itself. An unrecorded holder is stated as such: the lock is held either way,
 // and inventing a holder would be worse than admitting there is no name.
@@ -175,5 +185,5 @@ func busy(h holder, recorded bool) *model.Error {
 		return e
 	}
 	e.Message = "the " + h.operation + " running in process " + strconv.Itoa(h.pid) + " holds the workspace indexing lock"
-	return e.WithDetail("holder_pid", strconv.Itoa(h.pid)).WithDetail("holder_operation", h.operation)
+	return e.WithDetail(DetailHolderPID, strconv.Itoa(h.pid)).WithDetail(DetailHolderOperation, h.operation)
 }
