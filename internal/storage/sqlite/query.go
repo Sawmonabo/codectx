@@ -122,6 +122,13 @@ func (s *Store) PinGeneration(ctx context.Context, repo model.RepositoryID, gen 
 // Binding is the generation every result from this reader is qualified by.
 func (r *PinnedReader) Binding() model.Binding { return r.binding }
 
+// Continuable reports whether a query served through this reader may hand back
+// a continuation. A continuation is a cursor lease and a spool, both writes, and
+// a process that opened the store read-only can make neither: such a query
+// serves its first page and says there is no continuation, rather than minting
+// a token it could not honour.
+func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
+
 // LeaseID is the retention lease this reader holds; cursors carry it.
 func (r *PinnedReader) LeaseID() string { return r.lease }
 

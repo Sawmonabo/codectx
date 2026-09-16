@@ -106,6 +106,40 @@ actually active on this host, in addition to refusing every fetch.
 | `CTX_CURSOR_INVALID` | A continuation token or a source receipt was malformed, tampered with, or older than `storage.query_cursor_ttl`. | Re-run the query from the first page. |
 | `CTX_INTERNAL` | A composition or producer defect. | Report it with the command you ran. It is not an operator-fixable state. |
 
+## Which commands write, and which never do
+
+Three kinds of command, by what they may change:
+
+| | Workspace lock | Database writes | Commands |
+|---|---|---|---|
+| **Indexing** | Held for the session | The run's own | `index`, `watch`, `init`, `tools prefetch`, `tools gc` |
+| **Recording** | None | Session, receipt and manifest rows of its own | `context ...`, the coverage and workflow mutations, `gc`, `doctor --deep`, `symbol`, the graph walks |
+| **Answering** | None | **None at all** | `status`, `search`, `repomap`, `doctor` |
+
+`tools status` is in neither row: it opens the managed-tool store and no
+database at all.
+
+`symbol` and the graph walks are in the recording row for one reason: their
+continuations are not yet written to end the way `search`'s does below, so they
+keep the writer until they are.
+
+A command in the answering row opens the store without a writer connection. It
+answers throughout another process's `index` or `watch` -- that is the promise
+`status --help` makes -- and it delays that run by nothing, because a
+write-ahead log reader never waits on a writer. It is also why such a command
+never reports `CTX_WORKSPACE_BUSY`: it takes no lock and begins no write that
+could queue behind one.
+
+Two consequences an operator sees:
+
+* A `search` answer from such a process is a **single page**. A continuation
+  needs a cursor lease and a spool, which are writes, so the answer is served
+  and marked truncated, with a reason naming the hits beyond it, rather than
+  carrying a token the process could not honour.
+* `doctor --deep` is in the recording row, not the answering one: the search
+  index's own integrity check is spelled as an insert into the index, so a deep
+  report needs the writer. It still takes no workspace lock.
+
 ## Retention, collection and the grace window
 
 Nothing is deleted implicitly by a query. Reclamation happens in one **collection
