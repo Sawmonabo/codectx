@@ -357,34 +357,48 @@ func TestADeltaActivationPacksOnlyTheDocumentsItsOwnUnitPublished(t *testing.T) 
 	}
 }
 
-// A build that dies between its first documents and its seal leaves a staging
-// database nothing will ever read again. The directory it sits in is shared by
-// every unit of every process using this data directory, so it is never swept
-// blindly -- the file goes where the dead unit is already known to be dead. If
-// it did not, a workspace that crashes repeatedly grows a second copy of its
-// token instances, on the operator's data disk, forever.
-func TestRecoveringACrashedBuildRemovesItsLexicalStaging(t *testing.T) {
+// A staging database is a SLOT of the store's scratch pool, not a file of the
+// unit that staged into it, so recovery collects none: the slot a crashed
+// build left is emptied and written over by the next unit that stages, and the
+// next process inherits the whole pool (internal/scratch proves inheritance).
+//
+// Recovery must therefore leave the pool alone. The staging directory is
+// shared by every unit of every process using this data directory, and a
+// collection that reached into it would eventually remove a slot another
+// process's live build is staging into -- sealing a segment short of that
+// unit's token instances, with every invariant the segment checks satisfied
+// and no error to report. Removing the slots would also hand the filesystem
+// their extents in the middle of a run, which is the stall this pool exists to
+// remove.
+func TestRecoveryLeavesTheLexicalStagingPoolAlone(t *testing.T) {
 	dbPath := t.TempDir() + "/codectx.db"
 	f := newFixture(t, dbPath)
 	a := f.file("pkg/a.go", "package pkg\nfunc Alpha() { Alpha() }\n")
-	snap := f.snapshot("one", a)
+	b := f.file("pkg/b.go", "package pkg\nfunc Beta() { Beta() }\n")
+	snap := f.snapshot("one", a, b)
 	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatal(err)
 	}
 	run := f.run(gen)
 	// Deliberately neither sealed, abandoned nor failed: this is the writer a
-	// killed process leaves behind.
-	w := f.begin(gen, run, a)
-	f.fill(w, run, a)
-	staging := filepath.Join(filepath.Dir(dbPath), "tmp", "lexical-*.db")
+	// killed process leaves behind, holding a slot.
+	dead := f.begin(gen, run, a)
+	f.fill(dead, run, a)
+
+	// A second unit of the same generation, holding a slot of its own: what
+	// recovery must not do is reach into the pool and take slots with the rows.
+	f.fill(f.begin(gen, run, b), run, b)
+
+	staging := filepath.Join(filepath.Dir(dbPath), "scratch", "*", "lexical-stage", "*")
 	before, err := filepath.Glob(staging)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(before) != 1 {
-		t.Fatalf("a building unit left %d staging databases, want the one it stages its token instances in", len(before))
+	if len(before) != 2 {
+		t.Fatalf("two building units hold %d staging slots, want one each", len(before))
 	}
+
 	// Recovery looks for staging generations on the reader pool, which cannot
 	// see an ingestion group the store still holds open.
 	flushed(t, f.s)
@@ -395,8 +409,8 @@ func TestRecoveringACrashedBuildRemovesItsLexicalStaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after) != 0 {
-		t.Fatalf("recovery left %v behind; the unit is gone and nothing will ever read or remove them", after)
+	if len(after) != len(before) {
+		t.Fatalf("recovery left %v of the %v the pool held: it is collecting staging slots again", after, before)
 	}
 }
 

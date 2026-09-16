@@ -716,7 +716,7 @@ func (w *UnitWriter) PutSearchUnits(ctx context.Context, docs []model.SearchUnit
 		return err
 	}
 	if w.lex == nil {
-		stage, err := w.s.openLexicalStage(ctx, w.rowID)
+		stage, err := w.s.openLexicalStage(ctx)
 		if err != nil {
 			return err
 		}
@@ -1160,9 +1160,9 @@ func (w *UnitWriter) Fail(ctx context.Context) error {
 	})
 }
 
-// closeStage releases the unit's lexical staging and deletes its file. Every
-// path that ends a building unit -- seal, Abandon, Fail -- calls it, so a
-// staging database never outlives the unit it belongs to.
+// closeStage gives the unit's lexical staging slot back to the store's scratch
+// pool. Every path that ends a building unit -- seal, Abandon, Fail -- calls
+// it, so a slot is never held past the unit that took it.
 func (w *UnitWriter) closeStage() error {
 	if w.lex == nil {
 		return nil
