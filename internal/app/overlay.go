@@ -51,13 +51,18 @@ func overlayProviderID(profile string) string {
 // snapshot. close releases both, in reverse.
 type overlayRoute struct {
 	reader  *sqlite.PinnedReader
+	view    model.SnapshotView
+	profile lsp.Profile
 	overlay *lsp.Overlay
 	binding model.Binding
 	limit   int
 }
 
-// openOverlay resolves the profile, pins the generation and opens the server
-// over the pinned snapshot.
+// pinOverlay resolves the profile and pins the generation the server will be
+// opened over. The server itself is started by attachServer, once the file the
+// request is about is known: which project a server is rooted at is decided by
+// that file, and a reference request only learns it after reading the node
+// through the pinned reader.
 //
 // The profile is resolved FIRST, before anything is pinned: an unresolvable
 // payload surfaces the toolchain's own CTX_TOOL_* error verbatim (offline, an
@@ -67,7 +72,7 @@ type overlayRoute struct {
 //
 // Every failure after the pin releases it, so the only way out of this function
 // with a lease held is a returned route the caller closes.
-func (s *stack) openOverlay(ctx context.Context, gen model.GenerationID, profile string, page model.PageRequest) (*overlayRoute, error) {
+func (s *stack) pinOverlay(ctx context.Context, gen model.GenerationID, profile string, page model.PageRequest) (*overlayRoute, error) {
 	if profile == "" {
 		return nil, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "a semantic_source=lsp request must name the language server profile that answers it"}
@@ -97,12 +102,38 @@ func (s *stack) openOverlay(ctx context.Context, gen model.GenerationID, profile
 		reader.Close()
 		return nil, err
 	}
-	overlay, err := s.lsp.Open(ctx, view, resolved)
-	if err != nil {
-		reader.Close()
-		return nil, err
+	return &overlayRoute{reader: reader, view: view, profile: resolved,
+		binding: binding, limit: s.overlayLimit(page.Limit)}, nil
+}
+
+// attachServer starts, or shares, the server rooted at the project that owns
+// file, and puts the overlay on the route.
+//
+// The project is the file's own: a monorepo's server rooted at the workspace
+// root is handed a directory whose manifest describes none of the projects
+// under it. A request that names no file -- a workspace-symbol query, which is
+// about the repository rather than about a position in it -- is answered by
+// the server at the project the workspace root itself declares, which is the
+// empty project root.
+func (s *stack) attachServer(ctx context.Context, r *overlayRoute, file model.FileID) error {
+	if file != "" {
+		rc, fv, err := r.view.Open(ctx, file)
+		if err != nil {
+			return err
+		}
+		rc.Close()
+		root, err := r.profile.ProjectRoot(ctx, r.view, fv.Path)
+		if err != nil {
+			return err
+		}
+		r.profile.Root = root
 	}
-	return &overlayRoute{reader: reader, overlay: overlay, binding: binding, limit: s.overlayLimit(page.Limit)}, nil
+	overlay, err := s.lsp.Open(ctx, r.view, r.profile)
+	if err != nil {
+		return err
+	}
+	r.overlay = overlay
+	return nil
 }
 
 // closeOverlay releases the server handle and then the generation pin. Both run
@@ -112,6 +143,15 @@ func (s *stack) openOverlay(ctx context.Context, gen model.GenerationID, profile
 // retention lease and a silent failure there is a generation pinned against
 // retention with nothing to say so.
 func (s *stack) closeOverlay(r *overlayRoute) {
+	if r.overlay == nil {
+		// The route was pinned but no server was ever attached: the pin is
+		// still held and releasing it is the whole of the close.
+		if err := r.reader.Close(); err != nil {
+			s.logger.Warn("a pinned generation reader could not be released",
+				"component", "app", "error", err.Error())
+		}
+		return
+	}
 	if err := r.overlay.Close(); err != nil {
 		s.logger.Warn("a language server overlay handle could not be closed",
 			"component", "app", "error", err.Error())
@@ -198,11 +238,14 @@ func (s *stack) overlaySymbols(ctx context.Context, req model.SymbolRequest) (mo
 		return model.Page[model.Node]{}, &model.Error{Code: model.CodeInternal,
 			Message: "app: a canonical symbol request reached the language server overlay route"}
 	}
-	route, err := s.openOverlay(ctx, req.GenerationID, req.Profile, req.Page)
+	route, err := s.pinOverlay(ctx, req.GenerationID, req.Profile, req.Page)
 	if err != nil {
 		return model.Page[model.Node]{}, err
 	}
 	defer s.closeOverlay(route)
+	if err := s.attachServer(ctx, route, req.FileID); err != nil {
+		return model.Page[model.Node]{}, err
+	}
 
 	var (
 		nodes     []model.Node
@@ -351,7 +394,7 @@ func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceReques
 		return model.Page[model.ReferenceOccurrence]{}, &model.Error{Code: model.CodeInternal,
 			Message: "app: a canonical reference request reached the language server overlay route"}
 	}
-	route, err := s.openOverlay(ctx, req.GenerationID, req.Profile, req.Page)
+	route, err := s.pinOverlay(ctx, req.GenerationID, req.Profile, req.Page)
 	if err != nil {
 		return model.Page[model.ReferenceOccurrence]{}, err
 	}
@@ -364,6 +407,11 @@ func (s *stack) overlayReferences(ctx context.Context, req model.ReferenceReques
 	if stored.Node.FileID == "" || stored.Bytes == nil {
 		return model.Page[model.ReferenceOccurrence]{}, &model.Error{Code: model.CodeArgumentInvalid,
 			Message: "the node has no declaration site in the pinned snapshot, so the language server overlay has no position to query"}
+	}
+	// The declaration site is the position queried, so it is also the file
+	// whose project roots the server.
+	if err := s.attachServer(ctx, route, stored.Node.FileID); err != nil {
+		return model.Page[model.ReferenceOccurrence]{}, err
 	}
 	at := lsp.At{File: stored.Node.FileID, Byte: stored.Bytes.Start}
 

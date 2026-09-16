@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,7 +14,6 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/toolchain"
-	"github.com/Sawmonabo/codectx/internal/workspace"
 )
 
 // Definition is everything this build knows about one supported language
@@ -165,18 +165,62 @@ func Definitions() []Definition {
 	return out
 }
 
-// Detect reports which of the definition's root markers exist in the
-// workspace. It inspects metadata through the confined root only, runs
-// nothing, and its answer is a hint for choosing among the supported servers:
-// a present marker never starts anything.
-func (d Definition) Detect(root workspace.Root) []string {
-	var found []string
-	for _, marker := range d.RootMarkers {
-		if info, err := root.Lstat(marker); err == nil && info.Mode().IsRegular() {
-			found = append(found, marker)
-		}
+// ProjectRoot is the directory this server is rooted at when it answers about
+// the snapshot file at rel: the DEEPEST directory at or above that file which
+// holds one of the definition's root markers, spelled root-relative, with the
+// empty string meaning the workspace root itself.
+//
+// A repository does not keep its projects at its root. Rooted at the workspace
+// root of a monorepo, a server is handed a directory whose manifest describes
+// none of the projects under it: it resolves no dependency, builds no project
+// model and answers about a file with whatever it can infer from that file
+// alone. Each project therefore gets its own server, rooted where the
+// language's own toolchain expects to be started.
+//
+// The deepest marker wins because that is the project that owns the file: a
+// module inside a workspace is its own project, and the workspace manifest
+// above it describes the aggregate, not the module. A file with no marker
+// above it belongs to the workspace root, which is the honest answer for a
+// repository that declares nothing.
+//
+// The answer comes from the pinned snapshot's own manifest, never from the
+// live checkout: the server is materialized from that snapshot, so a marker
+// the working tree has and the snapshot does not names a directory the server
+// would find empty. Nothing repository-sized is retained -- the scan keeps one
+// string.
+func (d Definition) ProjectRoot(ctx context.Context, view model.SnapshotView, rel string) (string, error) {
+	markers := make(map[string]bool, len(d.RootMarkers))
+	for _, m := range d.RootMarkers {
+		markers[m] = true
 	}
-	return found
+	best := ""
+	err := view.EachFile(ctx, model.FileSelection{}, func(fv model.FileVersion) error {
+		if !markers[path.Base(fv.Path)] {
+			return nil
+		}
+		dir := ""
+		if i := strings.LastIndexByte(fv.Path, '/'); i >= 0 {
+			dir = fv.Path[:i]
+		}
+		if len(dir) > len(best) && underDir(rel, dir) {
+			best = dir
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return best, nil
+}
+
+// underDir reports whether the root-relative path rel lies at or under the
+// root-relative directory dir; the empty dir is the workspace root and
+// contains everything.
+func underDir(rel, dir string) bool {
+	if dir == "" {
+		return true
+	}
+	return strings.HasPrefix(rel, dir+"/")
 }
 
 // Profile is a runnable server: a Definition joined with the payload the
@@ -189,6 +233,12 @@ type Profile struct {
 	// (the binary itself, or the managed Node or JDK and the pinned entry) and
 	// its Env carries what that launcher needs.
 	Tool toolchain.Tool
+	// Root is the root-relative project directory this server is started at,
+	// as ProjectRoot answers it; the empty string is the workspace root. It is
+	// part of the server's identity: two projects of one repository answered by
+	// one server name is two servers, two private working directories and two
+	// overlay input digests.
+	Root string
 }
 
 // Resolve returns the named server's runnable profile. The overlay must be
@@ -257,9 +307,20 @@ func Resolve(ctx context.Context, resolver *toolchain.Resolver, cfg config.Confi
 // (Tool.FingerprintDigest) because this is a path component: the rendered
 // fingerprint embeds that same user-supplied version verbatim, and a version of
 // ".." would name the data directory's parent.
+// The last component is the project the server is rooted at, because what
+// lives under -data is that project's own workspace index: two projects
+// sharing one directory is two servers writing one index of two different
+// programs. It is a digest of the root-relative directory rather than the
+// directory itself, for the same reason the payload identity is a digest: a
+// snapshot path is not a legal path component and ".." would name the data
+// directory's parent.
 func (p Profile) workDir(dataDir string) string {
-	return filepath.Join(dataDir, workDirName, p.Name, p.Tool.FingerprintDigest())
+	return filepath.Join(dataDir, workDirName, p.Name, p.Tool.FingerprintDigest(), model.H(domainServerProject, p.Root)[:16])
 }
+
+// domainServerProject separates the project-directory digest above from every
+// other hash this build computes.
+const domainServerProject = "lsp-server-project"
 
 // argv is the complete argument array after the launcher: the resolved
 // payload's own prefix supplies argv[0] and, for a runtime-hosted payload, the
@@ -352,6 +413,11 @@ func inputDigest(snap model.Snapshot, p Profile, serverVersion, encoding string)
 	h.AddString(string(snap.ID))
 	h.AddString(snap.ManifestHash)
 	h.AddString(p.Name)
+	// The project the server was rooted at: two projects of one repository
+	// answered by one server name are two different questions, and without
+	// this their labels would be byte-identical while the answers came from
+	// two different programs.
+	h.AddString(p.Root)
 	h.AddString(p.Tool.Fingerprint())
 	h.AddString(serverVersion)
 	h.AddString(encoding)

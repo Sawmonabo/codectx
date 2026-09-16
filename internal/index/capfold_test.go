@@ -293,3 +293,56 @@ func TestCoverageKeepsAProviderWithNoMemberFailed(t *testing.T) {
 		t.Errorf("capability state %q, want failed: every unit of this provider failed", rows[0].State)
 	}
 }
+
+// A partial failure row meeting a planner or registry partial row on one
+// primary key publishes the failed scope's diagnostic code, in either order.
+//
+// Failure mode: both rows are `partial` and workspace-scoped, so they tie on
+// severity. With the tie broken by arrival order, the code published for a
+// provider with a failed scope is whichever of two concurrently produced rows
+// reached the fold first -- and that code folds into details_json and from
+// there into the AnalysisKey, so two identical runs key differently and the
+// reader is told "the planner degraded this" about a capability whose real
+// news is that a scope failed.
+//
+// Mutation: restore the order-dependent tie
+// (`if severityRank(c.State) < severityRank(out[i].State)`) ->
+// "forward published CTX_PROVIDER_UNAVAILABLE and reverse
+// CTX_PROVIDER_OUTPUT_INVALID: the fold depends on arrival order"
+func TestCapabilityFoldTieNamesTheFailedScope(t *testing.T) {
+	t.Parallel()
+	failed := model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+		Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
+		DiagnosticCode: model.CodeProviderOutputInvalid,
+		Details:        map[string]string{unitsFailedDetail: "1", scopeKeyDetail: "pkg:go:a"}}
+	planner := model.CapabilityState{ProviderID: scip.ID, Capability: "references",
+		Scope: provider.ScopeWorkspace, State: model.CapabilityPartial,
+		DiagnosticCode: model.CodeProviderUnavailable,
+		Details:        map[string]string{"reason": "plan.builder.partial"}}
+
+	fold := func(rows ...model.CapabilityState) model.CapabilityState {
+		t.Helper()
+		out := foldToPrimaryKey(rows)
+		if len(out) != 1 {
+			t.Fatalf("the fold published %d rows, want one row on one primary key", len(out))
+		}
+		return out[0]
+	}
+	forward := fold(planner, failed)
+	reverse := fold(failed, planner)
+	if forward.DiagnosticCode != reverse.DiagnosticCode {
+		t.Fatalf("forward published %s and reverse %s: the fold depends on arrival order",
+			forward.DiagnosticCode, reverse.DiagnosticCode)
+	}
+	if forward.DiagnosticCode != model.CodeProviderOutputInvalid {
+		t.Fatalf("the published code is %s, want the failed scope's %s",
+			forward.DiagnosticCode, model.CodeProviderOutputInvalid)
+	}
+	// The details union whichever row won, so the failed scope and its count
+	// are still named and the planner's reason is not lost.
+	for key, want := range map[string]string{scopeKeyDetail: "pkg:go:a", unitsFailedDetail: "1", "reason": "plan.builder.partial"} {
+		if got := forward.Details[key]; got != want {
+			t.Errorf("the published row reports %s=%q, want %q", key, got, want)
+		}
+	}
+}
