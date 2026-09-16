@@ -197,11 +197,18 @@ func (s *Services) Refresh(ctx context.Context, req model.IndexRequest) (model.I
 // caller asked for resources, so answering without them would report a
 // measurement as absent when it was refused. Absence inside the block still
 // means "not measurable on this host", which is the sampler's own contract.
+//
+// It answers through the composition's READER handle on both facades, not only
+// on the read one. The report is a read in every composition, and the MCP
+// status tool is registered against the writing facade beside refresh -- so a
+// split that followed the facade would leave the single most likely question
+// an agent asks during a refresh, "is the index still running?", the one call
+// that pins on the writer and commits that refresh's ingestion group early.
 func (s *Services) IndexStatus(ctx context.Context, req model.StatusRequest) (model.IndexStatus, error) {
 	if err := req.Validate(); err != nil {
 		return model.IndexStatus{}, err
 	}
-	st, err := s.w.coord.Status(ctx)
+	st, err := s.w.status.Status(ctx)
 	if err != nil {
 		return model.IndexStatus{}, s.fail("index status", err)
 	}

@@ -207,6 +207,17 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 	return c
 }
 
+// status answers through the given coordinator's own store handle, which is
+// the path `codectx status` takes: one StatusReader over the writing handle.
+func (f *fixture) status(c *Coordinator) (model.IndexStatus, error) {
+	f.t.Helper()
+	r, err := c.StatusReader(f.store)
+	if err != nil {
+		return model.IndexStatus{}, err
+	}
+	return r.Status(f.ctx)
+}
+
 func (f *fixture) write(path, content string) {
 	f.t.Helper()
 	abs := filepath.Join(f.repoDir, filepath.FromSlash(path))
@@ -459,7 +470,7 @@ func TestIncrementalScenario(t *testing.T) {
 		var st model.IndexStatus
 		for deadline := time.Now().Add(10 * time.Second); ; {
 			var err error
-			if st, err = f.c.Status(ctx); err != nil {
+			if st, err = f.status(f.c); err != nil {
 				t.Fatalf("status: %v", err)
 			}
 			if st.WatchActive || time.Now().After(deadline) {

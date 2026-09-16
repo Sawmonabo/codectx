@@ -2,17 +2,19 @@ package sqlite_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Sawmonabo/codectx/internal/index"
 	store "github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
 // A process that indexes and answers questions at the same time -- the MCP
-// server, whose refresh tool writes while its exploration tools read for the
-// same client -- must not let a read change what the run writes.
+// server, whose refresh tool writes while an agent's tools read for the same
+// client -- must not let a read change what the run writes.
 //
 // The failure this protects: a read served through the WRITING handle pins its
 // generation, and a pin writes a retention lease. That write force-commits
@@ -25,12 +27,19 @@ import (
 // opens -- touches no write transaction, so the run commits exactly the groups
 // it would have committed alone.
 //
+// What reads throughout the run here is the product's own status path,
+// index.StatusReader.Status: the report codectx_index_status answers, and the
+// single most likely question an agent asks while a refresh runs. It is driven
+// rather than restated so this measures the store calls the product makes and
+// keeps making -- its pin and capability read are also what an exploration tool
+// performs, so the exploration half is measured by the same loop.
+//
 // Two handles over one file are two independent connection sets, which is what
 // the serving process's two halves are to the engine.
 //
-// Mutation that fails this test: pin through the writing handle (`f.s`) instead
-// of the reader, which is the composition the server had before the read path
-// was split off. The counts then differ.
+// Mutation that fails this test: build the status reader over the WRITING
+// handle (`f.s`) instead of the reader, which is where the status report was
+// served from before this split. The counts then differ.
 func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 	// A writer cache small enough that the run below spills it several times,
 	// so "the same number of groups" is a count with something in it.
@@ -48,7 +57,7 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 
 		// A published generation for the read side to pin, and its group
 		// committed, so nothing of the setup is counted below.
-		f.activate(sealRepositoryInto(t, f, 2, 4, "published", nil), 0)
+		published := f.activate(sealRepositoryInto(t, f, 2, 4, "published", nil), 0)
 		if err := f.s.Flush(ctx); err != nil {
 			t.Fatalf("Flush: %v", err)
 		}
@@ -61,6 +70,15 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 			t.Fatalf("the reader handle could not be opened beside the writer: %v", err)
 		}
 		defer reader.Close()
+
+		// The status path as the serving composition binds it: over the
+		// read-only handle, with no workspace root and no git executable, so
+		// the report is the store read alone and the worktree comparison --
+		// which is not a store call and not what this measures -- is skipped.
+		status, err := index.NewStatusReader(index.StatusOptions{Store: reader, Repo: f.repo})
+		if err != nil {
+			t.Fatalf("the status reader could not be built over the reader handle: %v", err)
+		}
 
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
@@ -75,15 +93,13 @@ func TestConcurrentReadsDoNotCommitTheRunsIngestionGroupEarly(t *testing.T) {
 						return
 					default:
 					}
-					pinned, err := reader.PinGeneration(ctx, f.repo, 0, time.Minute)
+					st, err := status.Status(ctx)
 					if err != nil {
 						readErr = err
 						return
 					}
-					_, err = pinned.Capabilities(ctx)
-					pinned.Close()
-					if err != nil {
-						readErr = err
+					if st.Binding.GenerationID != published.GenerationID {
+						readErr = errors.New("the status answered a binding other than the published generation")
 						return
 					}
 					reads++
