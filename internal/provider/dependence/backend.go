@@ -136,6 +136,24 @@ type Outcome struct {
 	StderrBytes   int64
 	PeakBytes     int64
 	PeakUnsampled bool
+	// CPUUserMS and CPUSysMS are the processor time the step's child consumed,
+	// in milliseconds. CPUUnsampled reports that no processor time was
+	// obtained -- the child never started, or was killed and never reaped --
+	// so the two figures are unavailable rather than zero and a caller that
+	// publishes them must omit them (Section 22).
+	CPUUserMS    int64
+	CPUSysMS     int64
+	CPUUnsampled bool
+	// ReadBytes and WriteBytes are the bytes the step's process group
+	// transferred through the kernel, as the last sweep that still found the
+	// tree running summed them. They count bytes where the process called the
+	// kernel, so they are not disk volume, and they are a sample taken at most
+	// one sampling period before the tree exited rather than an exit-time
+	// total. IOUnsampled reports that no sweep ever read the counters, so the
+	// two figures are unavailable rather than zero.
+	ReadBytes   int64
+	WriteBytes  int64
+	IOUnsampled bool
 	// StderrTail is the last of what the child wrote to its standard error,
 	// bounded to what one error detail carries and cut at a line boundary,
 	// with the private paths of this run reduced to their names. It is the

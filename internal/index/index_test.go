@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -36,9 +37,11 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/index/plan"
 	"github.com/Sawmonabo/codectx/internal/index/watch"
+	"github.com/Sawmonabo/codectx/internal/ledger"
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/process"
 	"github.com/Sawmonabo/codectx/internal/provider"
+	"github.com/Sawmonabo/codectx/internal/provider/dependence"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
 	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
@@ -73,6 +76,7 @@ type fixture struct {
 	cas     *snapshot.CAS
 	lock    *snapshot.WorkspaceLock
 	cfg     config.Config
+	ledger  *ledger.Ledger
 	c       *Coordinator
 	// locker is what the coordinators this fixture builds take the workspace
 	// from. It is the fixture's own held lock unless a scenario is about the
@@ -137,8 +141,36 @@ func newFixture(t *testing.T, files map[string]string) *fixture {
 		t.Fatalf("LockWorkspace: %v", err)
 	}
 	t.Cleanup(func() { f.lock.Close() })
+	// The run ledger the composition root opens beside the store, so every
+	// coordinator this fixture builds records its runs exactly as a real one
+	// does and a test can read them back through the same reader status uses.
+	if f.ledger, err = ledger.Open(ctx, f.dataDir); err != nil {
+		t.Fatalf("ledger.Open: %v", err)
+	}
+	t.Cleanup(func() { f.ledger.Stop() })
 	f.c = f.coordinator(f.providers(false))
 	return f
+}
+
+// latestRun reads back what the ledger recorded for the run that just ran.
+func (f *fixture) latestRun(generation model.GenerationID) ledger.RunView {
+	f.t.Helper()
+	if err := f.ledger.Stop(); err != nil {
+		f.t.Fatalf("ledger.Stop: %v", err)
+	}
+	reader, ok, err := ledger.OpenReader(f.ctx, f.dataDir)
+	if err != nil || !ok {
+		f.t.Fatalf("OpenReader: ok=%v err=%v", ok, err)
+	}
+	f.t.Cleanup(func() { reader.Close() })
+	view, ok, err := reader.LatestRun(f.ctx, string(f.c.repo), int64(generation))
+	if err != nil {
+		f.t.Fatalf("LatestRun: %v", err)
+	}
+	if !ok {
+		f.t.Fatal("the ledger holds no run for this repository: an index run recorded nothing")
+	}
+	return view
 }
 
 // providers builds the registry. withSCIP adds the optional provider over a
@@ -214,7 +246,7 @@ func (f *fixture) coordinator(providers []provider.Provider) *Coordinator {
 		locker = heldLock{f.lock}
 	}
 	c, err := New(Options{Root: root, Config: f.cfg, Store: f.store, Registry: registry, CAS: f.cas,
-		Lock: locker, Pool: pool, Logger: f.logger})
+		Lock: locker, Pool: pool, Logger: f.logger, Ledger: f.ledger})
 	if err != nil {
 		f.t.Fatalf("New: %v", err)
 	}
@@ -551,7 +583,13 @@ func TestIncrementalScenario(t *testing.T) {
 		// A supplied index that is not a SCIP index at all: the optional
 		// provider plans its unit and cannot produce it.
 		f.write("index.scip", "this is not a scip index\n")
+		// Enabled for this case only: a provider the configuration turns off
+		// plans nothing and publishes nothing, so a disabled one could never
+		// exercise a failure of the provider at all.
+		disabled := f.cfg.Providers.SCIP.Enabled
+		f.cfg.Providers.SCIP.Enabled = config.Auto
 		opt := f.coordinator(f.providers(true))
+		f.cfg.Providers.SCIP.Enabled = disabled
 		res, err := opt.Index(ctx, model.IndexRequest{})
 		if err != nil {
 			t.Fatalf("index with a broken optional provider: %v", err)
@@ -872,7 +910,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	// no member for it: the unit seals into a later publication.
 	g := &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan: plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published := g.caps.finish(f.c.log)
@@ -892,7 +930,7 @@ func TestDeferredUnitsAreNotCoverage(t *testing.T) {
 	g = &generation{c: f.c, caps: newCapabilityReport(), sel: sel,
 		plan:   plan.Plan{Units: oneUnit(plan.Unit{ProviderID: d.ID, ScopeKey: "scope", Deferred: true})},
 		sealed: map[string]bool{plan.Key(d.ID, "scope"): true}}
-	if err := g.coverage(); err != nil {
+	if err := g.coverage(ctx); err != nil {
 		t.Fatalf("coverage: %v", err)
 	}
 	published = g.caps.finish(f.c.log)
@@ -1220,5 +1258,70 @@ func TestAWaitingWatchPublishesNoCoverage(t *testing.T) {
 	stop()
 	if err := <-done; err != nil {
 		t.Fatalf("watch: %v", err)
+	}
+}
+
+// TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce guards the
+// failure mode a report full of `unavailable` rows is: a provider the
+// operator turned off was planned for nothing and then reported once per
+// declared capability -- three providers off is eight rows -- which reads to a
+// person as eight failures and tells an agent it is holding a degraded index
+// rather than a configured one. What is off must be said once, in one field,
+// and nowhere else.
+//
+// The distinction the rows must not blur is the other half: `unavailable`
+// stays the record of a provider that IS enabled and reached no output, with
+// the reason it did not. That is why an enabled provider's rows are asserted
+// here too -- a filter that swallowed them would pass every other assertion.
+func TestDisabledProvidersPublishNoCapabilityRowAndAreNamedOnce(t *testing.T) {
+	f := newFixture(t, map[string]string{"go.mod": "module example.com/off\n\ngo 1.27\n", "a.go": "package a\n"})
+	// The fixture's configuration disables scip, lsp and dependence; this
+	// registry holds the scip provider, so selection is asked about a
+	// provider that is registered AND off.
+	c := f.coordinator(f.providers(true))
+	// What the composition root records for a provider it could not build --
+	// and it never even tries to build one the configuration disabled, which
+	// is the second way these rows reached the report.
+	for _, capability := range dependence.Capabilities {
+		c.opts.States = append(c.opts.States, model.CapabilityState{ProviderID: dependence.ProviderID,
+			Capability: capability, Scope: provider.ScopeWorkspace, State: model.CapabilityUnavailable,
+			DiagnosticCode: model.CodeProviderUnavailable})
+	}
+	res, err := c.Index(f.ctx, model.IndexRequest{})
+	if err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if err := res.Validate(); err != nil {
+		t.Fatalf("the result does not validate: %v", err)
+	}
+	st, err := f.status(c)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if err := st.Validate(); err != nil {
+		t.Fatalf("the status does not validate: %v", err)
+	}
+	off := []string{"scip", "lsp", "dependence"}
+	for _, surface := range []struct {
+		name     string
+		disabled []string
+		states   []model.CapabilityState
+	}{
+		{"the index result", res.ProvidersDisabled, res.Completeness},
+		{"status", st.ProvidersDisabled, st.Completeness},
+	} {
+		if !slices.Equal(surface.disabled, off) {
+			t.Errorf("%s names %v as disabled, want %v: a reader with no capability rows has nothing to read the absence from",
+				surface.name, surface.disabled, off)
+		}
+		for _, s := range surface.states {
+			if slices.Contains(off, s.ProviderID) {
+				t.Errorf("%s reports %s %s as %q: work nobody asked for is not an unavailable capability",
+					surface.name, s.ProviderID, s.Capability, s.State)
+			}
+		}
+		if !slices.ContainsFunc(surface.states, func(s model.CapabilityState) bool { return s.ProviderID == filesystem.ID }) {
+			t.Errorf("%s reports no row for an enabled provider at all: the exclusion is not confined to what is off", surface.name)
+		}
 	}
 }
