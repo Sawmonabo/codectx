@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	_ "modernc.org/sqlite"
 )
 
@@ -86,7 +87,7 @@ func (s *staging) Close() error {
 	}
 	err := s.db.Close()
 	s.db = nil
-	rerr := os.Remove(s.path)
+	rerr := paced.Remove(s.path)
 	if err != nil {
 		return internal("staging close: %v", err)
 	}

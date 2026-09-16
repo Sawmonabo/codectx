@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // MaterializeOptions bound one private materialization.
@@ -84,13 +85,13 @@ func (m *Materialization) Close() error {
 		return nil
 	}
 	m.once.Do(func() {
-		if err := os.RemoveAll(m.root); err != nil {
+		if err := paced.RemoveAll(m.root); err != nil {
 			m.err = ioError("materialization cleanup", err)
 		}
 		if m.owner != nil {
 			fslock.Unlock(m.owner)
 			m.owner.Close()
-			if err := os.Remove(m.owner.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) && m.err == nil {
+			if err := paced.Remove(m.owner.Name()); err != nil && !errors.Is(err, fs.ErrNotExist) && m.err == nil {
 				m.err = ioError("materialization cleanup", err)
 			}
 		}
@@ -125,7 +126,7 @@ func Materialize(ctx context.Context, view model.SnapshotView, sel model.FileSel
 	}
 	if held, err := fslock.TryLock(owner); err != nil || !held {
 		owner.Close()
-		os.Remove(owner.Name())
+		paced.Remove(owner.Name())
 		if err == nil {
 			err = errors.New("fresh lock file is already locked")
 		}
@@ -231,12 +232,12 @@ func sweepMaterializations(dir string) error {
 			}
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := paced.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
 		fslock.Unlock(f)
 		f.Close()
-		if err := os.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := paced.Remove(lockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			errs = append(errs, ioError("materialization sweep", err))
 		}
 	}

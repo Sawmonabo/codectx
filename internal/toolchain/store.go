@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/fslock"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // store is the private tool store. Installs are atomic -- fetch and extract
@@ -136,10 +137,10 @@ func (s *store) install(ctx context.Context, f *fetcher, name string, e Entry, p
 		return err
 	}
 	defer func() {
-		os.RemoveAll(staging)
+		paced.RemoveAll(staging)
 		// Leave no empty per-tool staging parent behind: it is indistinguishable
 		// from an abandoned one, and GC would report collecting it every time.
-		os.Remove(s.stagingDir(name))
+		paced.Remove(s.stagingDir(name))
 	}()
 
 	archive, err := os.OpenFile(filepath.Join(staging, "payload"), os.O_RDWR|os.O_CREATE|os.O_EXCL, storeFilePerm)
@@ -161,7 +162,7 @@ func (s *store) install(ctx context.Context, f *fetcher, name string, e Entry, p
 	// The archive is dead weight once unpacked, and a large payload is unpacked
 	// beside it; releasing it here halves the peak disk an install needs.
 	archive.Close()
-	if err := os.Remove(filepath.Join(staging, "payload")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := paced.Remove(filepath.Join(staging, "payload")); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return ioError("tool payload staging cleanup", err)
 	}
 
@@ -185,7 +186,7 @@ func (s *store) publish(name, version, tree, digest string) error {
 	if err := os.MkdirAll(filepath.Dir(final), storeDirPerm); err != nil {
 		return ioError("tool store directory", err)
 	}
-	if err := os.RemoveAll(final); err != nil {
+	if err := paced.RemoveAll(final); err != nil {
 		return ioError("tool store cleanup", err)
 	}
 	if err := os.Rename(tree, final); err != nil {
@@ -371,7 +372,7 @@ func (s *store) collectTool(ctx context.Context, lock Lock, e fs.DirEntry) (int,
 		// Neither a plain file nor a name outside the lock's alphabet is
 		// something this package writes, so there is no install to serialize
 		// against and nothing that could be holding a lock on it.
-		if err := os.RemoveAll(filepath.Join(s.dir, name)); err != nil {
+		if err := paced.RemoveAll(filepath.Join(s.dir, name)); err != nil {
 			return 0, ioError("tool store cleanup", err)
 		}
 		return 1, nil
@@ -388,7 +389,7 @@ func (s *store) collectTool(ctx context.Context, lock Lock, e fs.DirEntry) (int,
 
 	entry, pinned := lock.Tools[name]
 	if !pinned {
-		if err := os.RemoveAll(s.toolDir(name)); err != nil {
+		if err := paced.RemoveAll(s.toolDir(name)); err != nil {
 			return 0, ioError("tool store cleanup", err)
 		}
 		return 1, nil
@@ -409,7 +410,7 @@ func (s *store) collectTool(ctx context.Context, lock Lock, e fs.DirEntry) (int,
 		if keep {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(s.toolDir(name), v.Name())); err != nil {
+		if err := paced.RemoveAll(filepath.Join(s.toolDir(name), v.Name())); err != nil {
 			errs = append(errs, ioError("tool store cleanup", err))
 			continue
 		}
@@ -437,7 +438,7 @@ func (s *store) sweepStaging(ctx context.Context) (int, error) {
 			return removed, model.Canceled(err)
 		}
 		if validToolName(t.Name()) != nil {
-			if err := os.RemoveAll(filepath.Join(root, t.Name())); err != nil {
+			if err := paced.RemoveAll(filepath.Join(root, t.Name())); err != nil {
 				errs = append(errs, ioError("tool staging cleanup", err))
 			} else {
 				removed++
@@ -453,7 +454,7 @@ func (s *store) sweepStaging(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(root, t.Name())); err != nil {
+		if err := paced.RemoveAll(filepath.Join(root, t.Name())); err != nil {
 			errs = append(errs, ioError("tool staging cleanup", err))
 		} else {
 			removed++

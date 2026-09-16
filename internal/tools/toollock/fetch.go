@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // maxDownloadBytes bounds every upstream read. The largest pinned distribution
@@ -64,11 +66,11 @@ func downloadOnce(ctx context.Context, url, dest string) (string, int64, error) 
 		err = cerr
 	}
 	if err != nil {
-		os.Remove(dest)
+		paced.Remove(dest)
 		return "", 0, err
 	}
 	if n > maxDownloadBytes {
-		os.Remove(dest)
+		paced.Remove(dest)
 		return "", 0, fmt.Errorf("GET %s: body above %d-byte cap", url, int64(maxDownloadBytes))
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil

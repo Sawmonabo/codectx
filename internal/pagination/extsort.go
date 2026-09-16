@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"slices"
+
+	"github.com/Sawmonabo/codectx/internal/paced"
 )
 
 // External sort — a disk-backed sort for a sequence too long to hold in heap.
@@ -326,19 +328,19 @@ func (s *ExternalSort[T]) spill() error {
 	for _, v := range s.buf {
 		if err := s.writeRecord(w, v); err != nil {
 			f.Close()
-			os.Remove(f.Name())
+			paced.Remove(f.Name())
 			s.err = err
 			return err
 		}
 	}
 	if err := w.Flush(); err != nil {
 		f.Close()
-		os.Remove(f.Name())
+		paced.Remove(f.Name())
 		s.err = internalErr("external sort run: " + err.Error())
 		return s.err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(f.Name())
+		paced.Remove(f.Name())
 		s.err = internalErr("external sort run: " + err.Error())
 		return s.err
 	}
@@ -417,7 +419,7 @@ func (s *ExternalSort[T]) Sorted() (*SortedRun[T], error) {
 		err = internalErr("external sort output: " + closeErr.Error())
 	}
 	if err != nil {
-		os.Remove(out.Name())
+		paced.Remove(out.Name())
 		return nil, err
 	}
 	return &SortedRun[T]{path: out.Name(), decode: s.decode, count: n}, nil
@@ -495,11 +497,11 @@ func (s *ExternalSort[T]) mergeToRun(group []string) (string, error) {
 		err = internalErr("external sort run: " + closeErr.Error())
 	}
 	if err != nil {
-		os.Remove(f.Name())
+		paced.Remove(f.Name())
 		return "", err
 	}
 	for _, name := range group {
-		os.Remove(name)
+		paced.Remove(name)
 	}
 	return f.Name(), nil
 }
@@ -583,7 +585,7 @@ func (s *ExternalSort[T]) pop(h *mergeHeap[T], readers []*runReader[T]) (T, erro
 
 func (s *ExternalSort[T]) removeRuns() {
 	for _, name := range s.runs {
-		os.Remove(name)
+		paced.Remove(name)
 	}
 	s.runs = nil
 	s.buf, s.bufBytes = nil, 0
@@ -727,7 +729,7 @@ func (r *SortedRun[T]) Close() error {
 	if path == "" {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := paced.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return internalErr("external sort output: " + err.Error())
 	}
 	return nil

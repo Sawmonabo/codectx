@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"os"
 	"path/filepath"
 
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/paced"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/scip"
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
@@ -48,7 +48,7 @@ func (a *scipApplier) Apply(ctx context.Context, req Request) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	defer os.RemoveAll(dir)
+	defer paced.RemoveAll(dir)
 
 	previous, reason, err := a.previous(ctx, req, dir)
 	if err != nil {
@@ -134,11 +134,7 @@ func (a *scipApplier) Apply(ctx context.Context, req Request) (Result, error) {
 		if err := rep.Manifest.Save(fresh); err != nil {
 			return err
 		}
-		payload, err := os.ReadFile(fresh)
-		if err != nil {
-			return internal("scip document manifest: " + err.Error())
-		}
-		return w.PutDeltaState(ctx, KindSCIP, payload)
+		return putState(ctx, w, KindSCIP, fresh)
 	}
 	return b.run(ctx)
 }
@@ -174,16 +170,12 @@ func (a *scipApplier) previous(ctx context.Context, req Request, dir string) (*s
 	if req.Previous == "" {
 		return nil, FullNoPredecessor, nil
 	}
-	raw, err := a.store.DeltaState(ctx, req.Previous, KindSCIP)
+	name, err := previousState(ctx, a.store, dir, "previous-manifest", req.Previous, KindSCIP)
 	if err != nil {
-		if isNotFound(err) {
-			return nil, FullNoState, nil
-		}
 		return nil, "", err
 	}
-	name, err := writeState(dir, "previous-manifest", raw)
-	if err != nil {
-		return nil, "", err
+	if name == "" {
+		return nil, FullNoState, nil
 	}
 	m, err := scip.LoadDocumentManifest(name)
 	if err != nil {
