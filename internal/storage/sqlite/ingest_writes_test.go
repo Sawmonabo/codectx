@@ -3,6 +3,7 @@
 package sqlite_test
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -65,20 +66,22 @@ func envInt(t *testing.T, name string, fallback int) int {
 func sealRepository(t *testing.T, path string, units, perUnit int) *fixture {
 	t.Helper()
 	f := newFixture(t, path)
-	sealRepositoryInto(t, f, units, perUnit, nil)
+	sealRepositoryInto(t, f, units, perUnit, "", nil)
 	return f
 }
 
 // sealRepositoryInto seals units file-scoped units of perUnit facts each into
 // f's store, calling after (when given) once each unit is sealed, and returns
-// the staging generation they were sealed into.
-func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, after func()) model.GenerationID {
+// the staging generation they were sealed into. salt varies the file bodies,
+// so a second call into the same store seals units of its own rather than
+// re-sealing the first call's.
+func sealRepositoryInto(t *testing.T, f *fixture, units, perUnit int, salt string, after func()) model.GenerationID {
 	t.Helper()
 	files := make([]fileFixture, units)
 	for i := range files {
-		files[i] = f.file(fmt.Sprintf("pkg%d/file%d.go", i%37, i), fmt.Sprintf("package p%d\n// unit %d\n%s", i%37, i, strings.Repeat("x", 32*perUnit+32)))
+		files[i] = f.file(fmt.Sprintf("pkg%d/file%d.go", i%37, i), fmt.Sprintf("package p%d\n// unit %d%s\n%s", i%37, i, salt, strings.Repeat("x", 32*perUnit+32)))
 	}
-	snap := f.snapshot("ingest", files...)
+	snap := f.snapshot("ingest"+salt, files...)
 	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
 	if err != nil {
 		t.Fatalf("BeginGeneration: %v", err)
@@ -236,7 +239,7 @@ func TestIngestionGroupCommitsWhenTheCacheWouldSpill(t *testing.T) {
 	path := dir + "/ingest.db"
 	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
 	var peakLog int64
-	sealRepositoryInto(t, f, 300, 40, func() {
+	sealRepositoryInto(t, f, 300, 40, "", func() {
 		if st, err := os.Stat(path + "-wal"); err == nil && st.Size() > peakLog {
 			peakLog = st.Size()
 		}
@@ -278,7 +281,7 @@ func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testin
 	const cacheKiB = 2048
 	path := t.TempDir() + "/activate.db"
 	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
-	gen := sealRepositoryInto(t, f, envInt(t, "CODECTX_INGEST_UNITS", 600), envInt(t, "CODECTX_INGEST_FACTS", 40), nil)
+	gen := sealRepositoryInto(t, f, envInt(t, "CODECTX_INGEST_UNITS", 600), envInt(t, "CODECTX_INGEST_FACTS", 40), "", nil)
 	// The seals' own group is committed first, so what is counted below is the
 	// activation's alone.
 	if err := f.s.Flush(f.ctx); err != nil {
@@ -305,19 +308,76 @@ func TestTheActivationsCompactionCascadeIsBoundedLikeAnyOtherIngestion(t *testin
 	close(done)
 	<-sampled
 	commits := f.s.Commits() - before
-	t.Logf("activation commits=%d peak log=%.1f MiB", commits, float64(peak)/(1<<20))
+	t.Logf("activation commits=%d peak log=%d B bound=%d B over=%d B", commits, peak, f.s.WALBoundBytes(), peak-f.s.WALBoundBytes())
 	if commits < 2 {
 		t.Fatalf("the activation committed %d time(s): its compaction cascade never reached the group's commit decision, so nothing bounds its log", commits)
 	}
 	// The commit decision falls at the END of an ingestion call, so the frames
 	// of the merge that crosses the bound are already in the log when the group
-	// commits: a cascade run one merge per call peaks at the bound plus one
-	// merge, never at the cascade. Measured on this fixture: 4.0 MiB bound,
-	// 4.01 MiB peak with the merges as their own calls, 23.4 MiB with the
-	// cascade inside the activation's one call -- and that figure grows with
-	// the repository, which is what no bound would mean.
-	if limit := 2 * f.s.WALBoundBytes(); peak > limit {
-		t.Fatalf("the log reached %.1f MiB during the activation; one merge past the %.1f MiB group bound is %.1f MiB",
-			float64(peak)/(1<<20), float64(f.s.WALBoundBytes())/(1<<20), float64(limit)/(1<<20))
+	// commits: a cascade run one merge per call peaks at the bound plus THAT
+	// ONE MERGE, never at the cascade. The bound asserted here is therefore the
+	// group bound plus one merge's frames, and nothing looser -- a bound that
+	// left room for a second merge would pass a cascade.
+	//
+	// Measured on this fixture, identically across repeated runs: 4 194 304 B
+	// bound, 4 202 432 B peak, an overshoot of 8 128 B, which is the two frames
+	// the crossing merge added. Eight frames is the assertion, four times what
+	// this fixture reaches and far below the 23.4 MiB the same fixture reaches
+	// when the cascade runs inside the activation's one call -- and that figure
+	// grows with the repository, which is what no bound would mean.
+	const walFrameBytes = 4096 + 24 // one page, plus the log frame's header
+	const mergeFrames = 8
+	if limit := f.s.WALBoundBytes() + mergeFrames*walFrameBytes; peak > limit {
+		t.Fatalf("the log reached %d B during the activation; the %d B group bound plus one merge's %d frames is %d B",
+			peak, f.s.WALBoundBytes(), mergeFrames, limit)
+	}
+}
+
+// TestAnActivationOvertakenByAnotherPaysNoMerges publishes one generation and
+// then asks the store to publish a second while still naming the first
+// generation's predecessor as the pointer it saw -- the loser of an activation
+// race, deterministically.
+//
+// Requirement: the conditions an activation loses on are a pointer comparison
+// and a membership count, one row each, while the compaction cascade the
+// activation owes is thousands of merges, each its own committed and
+// unrollbackable ingestion. A loser that pays the cascade before reading the
+// row rebuilds a repository's segment set for an activation that was never
+// going to happen -- work no operator asked for, on the disk the wave is
+// about. The checks therefore run first, and the cascade is reached only by an
+// activation that can still publish.
+//
+// Mutation that fails it: move the cascade back before the preflight (call
+// compactBeforeActivation first) and the loser's merges insert segments before
+// the version conflict is read.
+func TestAnActivationOvertakenByAnotherPaysNoMerges(t *testing.T) {
+	f := newFixture(t, t.TempDir()+"/overtaken.db")
+	first := sealRepositoryInto(t, f, 40, 4, "", nil)
+	f.activate(first, 0)
+	second := sealRepositoryInto(t, f, 40, 4, " again", nil)
+	if err := f.s.Flush(f.ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	before, err := f.s.LexicalSegments(f.ctx)
+	if err != nil {
+		t.Fatalf("LexicalSegments: %v", err)
+	}
+	// Zero is the pointer this caller believes is published; the first
+	// generation is, so this activation has already been overtaken.
+	_, err = f.s.Activate(f.ctx, second, 0, model.HealthFresh, fixtureCaps, "norm-v1")
+	if err == nil {
+		t.Fatal("the overtaken activation published over a pointer it had not seen")
+	}
+	var typed *model.Error
+	if !errors.As(err, &typed) || typed.Code != model.CodeVersionConflict {
+		t.Fatalf("the overtaken activation failed with %v; want a version conflict", err)
+	}
+	after, err := f.s.LexicalSegments(f.ctx)
+	if err != nil {
+		t.Fatalf("LexicalSegments: %v", err)
+	}
+	if after != before {
+		t.Fatalf("the overtaken activation merged %d segment(s) before reading the pointer it lost on "+
+			"(segments %d -> %d)", after-before, before, after)
 	}
 }

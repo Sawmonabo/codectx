@@ -607,3 +607,88 @@ func visibleDocumentIDs(t *testing.T, db *sql.DB, gen int64) []int64 {
 	}
 	return out
 }
+
+// The requirement: ADR-0007 states the cost of reading the packed term
+// statistics as one part plus one term's list, and the part cache is what has
+// to keep that true. Bounding it INSIDE each (segment, stream) slot, with
+// slots that are never removed, bounds nothing a caller can predict: one call
+// then holds segments x streams x parts, so a generation naming more segments
+// costs proportionally more heap at the moment that answers a query, and the
+// segment count is a property of the store's history rather than of the query.
+// The bound is therefore over the whole cache and the victim is a whole slot,
+// which is what makes the figure the same for a generation naming four
+// segments and one naming eighty.
+//
+// The part size is shrunk so a fixture of this size spans as many parts as a
+// repository does at the shipped size.
+//
+// Mutation: bound the slots only (drop the x.evict() call in part) and the
+// peak rises with the segment set past the cache's bound.
+func TestTheLexicalPartCacheIsBoundedAcrossTheWholeSegmentSet(t *testing.T) {
+	defer store.SetLexPartBytes(128)()
+	dbPath := t.TempDir() + "/lexcache.db"
+	f := newFixture(t, dbPath)
+	files := make([]fileFixture, 24)
+	for i := range files {
+		files[i] = f.file(fmt.Sprintf("pkg/f%d.go", i),
+			fmt.Sprintf("package pkg\nfunc F%d() { alpha beta gamma delta epsilon %d }\n", i, i))
+	}
+	snap := f.snapshot("cache", files...)
+	gen, err := f.s.BeginGeneration(f.ctx, f.repo, snap.ID, model.H("semantic"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := f.run(gen)
+	// One unit per file, so the generation names a segment per file before the
+	// cascade folds them: the shape a first index publishes.
+	for i, ff := range files {
+		w := f.beginScopeKey(gen, run, configHash, fmt.Sprintf("scope-%d", i), ff)
+		f.fillFile(w, run, ff)
+		if err := f.s.SealUnit(f.ctx, w); err != nil {
+			t.Fatalf("SealUnit(%d): %v", i, err)
+		}
+	}
+	f.activate(gen, 0)
+	flushed(t, f.s)
+	db := openRawDB(t, dbPath)
+	r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
+	if err != nil {
+		t.Fatalf("PinGeneration: %v", err)
+	}
+	session, err := r.OpenPostings(f.ctx)
+	if err != nil {
+		t.Fatalf("OpenPostings: %v", err)
+	}
+	defer session.Close()
+
+	// A term lookup walks every segment's directory and text; a hydration
+	// probes every segment's document directory and reads one attribute
+	// record. Together they touch every stream of every segment, which is the
+	// working set the bound is about.
+	for _, term := range vocabularyTerms(t, db) {
+		if _, err := session.TermCounts(f.ctx, term); err != nil {
+			t.Fatalf("TermCounts(%q): %v", term, err)
+		}
+	}
+	ids := visibleDocumentIDs(t, db, int64(gen))
+	if len(ids) == 0 {
+		t.Fatal("the fixture published no visible document; the walk below would touch nothing")
+	}
+	if _, err := session.PackedDocuments(f.ctx, ids); err != nil {
+		t.Fatalf("PackedDocuments: %v", err)
+	}
+
+	segments, err := f.s.LexicalSegments(f.ctx)
+	if err != nil {
+		t.Fatalf("LexicalSegments: %v", err)
+	}
+	peak := session.LexicalPartsPeak()
+	t.Logf("segment rows %d, peak resident parts %d, bound %d", segments, peak, store.LexicalPartsLive())
+	if peak == 0 {
+		t.Fatal("the reader held no part at all; the walk above did not reach the packed streams")
+	}
+	if peak > store.LexicalPartsLive() {
+		t.Fatalf("the reader held %d parts at once over a store of %d segment rows; the cache's bound is %d parts",
+			peak, segments, store.LexicalPartsLive())
+	}
+}

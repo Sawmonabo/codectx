@@ -38,7 +38,7 @@ func TestTheLogIsRewoundAndNeverTruncated(t *testing.T) {
 	f := newFixtureWithOptions(t, path, store.Options{WriterCacheKiB: cacheKiB})
 
 	var high int64
-	sealRepositoryInto(t, f, 600, 40, func() {
+	sealRepositoryInto(t, f, 600, 40, "", func() {
 		st, err := os.Stat(path + "-wal")
 		if err != nil {
 			return
