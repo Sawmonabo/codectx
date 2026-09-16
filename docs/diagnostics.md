@@ -132,7 +132,9 @@ and the figure kept is **the last sweep that still found the tree** -- an
 exiting process takes its counters with it, so there is no exit-time total to
 read. They count bytes the process asked the kernel for, so a pipe write and a
 page-cache write both count and the figure is not disk volume. The same sweep
-supplies a child span's peak resident memory.
+supplies a child span's peak resident memory. Both figures reach `--json` and
+the MCP row only: the table and the log line below carry the eight columns
+shown there and not these two.
 
 **An interrupted run shows no wall.** A run states on its own row a deadline
 its writer promises to renew while it lives. A reader that finds the deadline
@@ -212,7 +214,7 @@ An attribute nothing measured is absent rather than zero, `wall_ms` included:
 a stage with no `wall_ms` never finished. This is what a log shipper or a
 proof recorder reads.
 
-### Over MCP
+### The run ledger over MCP
 
 `codectx_index_status` with `resources: true` answers with the same run the CLI
 reads -- one model, not a projection of it. The rows arrive at
