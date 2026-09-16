@@ -450,7 +450,7 @@ func (a *Arena) Empty() (int64, error) {
 			if !pe.IsDir() {
 				continue
 			}
-			if err := paced.RemoveAll(filepath.Join(dir, pe.Name())); err != nil {
+			if err := paced.RemoveAllFor(paced.ScratchCollection, filepath.Join(dir, pe.Name())); err != nil {
 				return freed, err
 			}
 		}
@@ -481,7 +481,7 @@ func (a *Arena) emptyIdleLocked(dir string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := paced.RemoveAll(dir); err != nil {
+	if err := paced.RemoveAllFor(paced.ScratchCollection, dir); err != nil {
 		return 0, err
 	}
 	return n, nil

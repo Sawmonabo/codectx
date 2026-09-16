@@ -5,6 +5,7 @@ import (
 
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/paced"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 )
 
@@ -48,12 +49,45 @@ func (s *Service) Resources(ctx context.Context) (model.ResourceReport, error) {
 		report.WALBytes = nonNegativeBytes(stats.WALBytes)
 	}
 	report.FreedBytes = nonNegativeBytes((paced.Steps() + pacedvfs.Truncations()) * paced.Window)
+	scratchBytes(&report)
 	s.pendingWatchEvents(ctx, &report)
 	s.reservations(&report)
 	if err := report.Validate(); err != nil {
 		return model.ResourceReport{}, err
 	}
 	return report, nil
+}
+
+// scratchBytes discloses the disk the store's scratch pools hold, which is
+// the space this run kept instead of freeing. It is summed over every pool
+// this process has opened, because a store's surfaces are pooled under more
+// than one directory -- the data directory, the continuation store's, a
+// provider's work directory -- and reporting one of them would understate it.
+//
+// A pool that cannot be read leaves the figure absent rather than short: a
+// partial sum here would read as "the run is holding less than it is", which
+// is the one thing this figure exists to rule out. The purposes the freeing
+// WAS for are reported beside it, and an empty map is left absent because a
+// process that has freed nothing for any named purpose has nothing to say
+// rather than a measured zero per purpose.
+func scratchBytes(report *model.ResourceReport) {
+	var total int64
+	for _, a := range scratch.All() {
+		n, err := a.Bytes()
+		if err != nil {
+			return
+		}
+		total += n
+	}
+	report.ScratchBytes = nonNegativeBytes(total)
+	if byPurpose := paced.FreedByPurpose(); len(byPurpose) > 0 {
+		report.FreedByPurpose = make(map[string]uint64, len(byPurpose))
+		for p, n := range byPurpose {
+			if n > 0 {
+				report.FreedByPurpose[string(p)] = uint64(n)
+			}
+		}
+	}
 }
 
 // pendingWatchEvents fills the pending-event count from the live watch
