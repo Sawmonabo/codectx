@@ -22,10 +22,15 @@ import (
 //
 // The inputs are the real engine's own bytes, captured from Joern 4.0.627 runs
 // recorded in the lane report; only absolute paths were rewritten so the
-// fixtures carry no developer's home directory. The pass-crash line is built
-// from the `Pass %s failed in %.0f ms` format string read out of
+// fixtures carry no developer's home directory. The timed pass-crash line is
+// built from the `Pass %s failed in %.0f ms` format string read out of
 // io.shiftleft.passes.CpgPassBase in the pinned payload, with the throwable
-// the release logs alongside it.
+// the release logs alongside it. linker-pass-crash.stderr is the head of a
+// real crash's standard error, recorded from a parse of the two source files
+// that reproduce it; its pass line is the untimed `Pass <name> failed` form,
+// which an earlier parser did not match — so a crash the product could have
+// recognised as reproducible on sight recorded an empty pass name and was
+// parsed a second time for nothing.
 func TestClassify(t *testing.T) {
 	const passCrash = "2026-09-13 23:10:01.001 WARN  CfgCreationPass           Pass CfgCreationPass failed in 3410 ms\n" +
 		"java.util.NoSuchElementException: next on empty iterator\n" +
@@ -54,6 +59,10 @@ func TestClassify(t *testing.T) {
 		{name: "a pass crash names the pass and the exception",
 			stderr: passCrash, exit: 1, want: dependence.FailureEngine,
 			pass: "CfgCreationPass", exception: "java.util.NoSuchElementException"},
+		{name: "an untimed pass crash names the pass too",
+			stderr: fixture(t, "linker-pass-crash.stderr"), exit: 1, want: dependence.FailureEngine,
+			pass:      "io.joern.x2cpg.frontendspecific.jssrc2cpg.ObjectPropertyCallLinker",
+			exception: "java.lang.RuntimeException"},
 		{name: "a helper crash hidden behind a zero exit is still an engine failure",
 			stderr: "2026-09-13 23:11:00.000 ERROR ExternalCommand$          Process exited with code 101.\n",
 			want:   dependence.FailureEngine},
