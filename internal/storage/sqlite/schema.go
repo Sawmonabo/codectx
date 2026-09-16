@@ -78,6 +78,37 @@ func (s *Store) verifySchema(ctx context.Context) error {
 	})
 }
 
+// adoptSchema is the writer-deferred open's schema check (Options.LazyWriter):
+// the same comparison verifySchema runs, on the reader pool, with one
+// difference -- a cache that holds no tables is CREATED here rather than
+// reported as a workspace that has published nothing.
+//
+// That difference is safe and is the whole reason the check can be a read. A
+// cache with no tables is one no writing open has ever completed against, so
+// no run can be holding a transaction on it; every cache a run IS writing has
+// its schema already, and there this open writes nothing and waits for
+// nothing. The empty case is the one write an empty cache needs, and the
+// alternative -- deferring it too -- would leave the read-only handle opened
+// beside this one with no schema to verify.
+func (s *Store) adoptSchema(ctx context.Context) error {
+	empty := false
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table'`).Scan(&tables); err != nil {
+			return wrap("sqlite_master", err)
+		}
+		if tables == 0 {
+			empty = true
+			return nil
+		}
+		return s.checkFingerprint(ctx, tx)
+	})
+	if err != nil || !empty {
+		return err
+	}
+	return s.initSchema(ctx)
+}
+
 // checkFingerprint compares the stored schema identity with this binary's. It
 // is the one place the comparison lives, so the writing and the read-only opens
 // cannot come to different conclusions about the same database.
