@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -188,10 +190,9 @@ func TestE2EReadsAnswerDuringALiveIndex(t *testing.T) {
 // run has ended. The server is started exactly as an agent starts it, with the
 // watch loop at its shipped default: a watch that ended the session on a busy
 // workspace would fail here rather than in the field.
-// It is a sandbox of its own, not a further leg of the row above: the server
-// that row leaves connected holds the workspace lock for the rest of its
-// session, so an external index started beside it would be refused -- which is
-// the product working, and the opposite of what this row must set up.
+// It is a sandbox of its own, not a further leg of the row above: the row above
+// leaves a server connected and a published generation of its own, and this one
+// must start from a workspace whose only index is the one it runs itself.
 func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 	s := newSandbox(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
@@ -221,7 +222,7 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 	// The connect is the first assertion: it starts the server process and
 	// completes the protocol handshake, which the old composition could not
 	// reach at all while another process held the workspace.
-	session, closeSession := s.mcpServer(t, ctx)
+	session, _, closeSession := s.mcpServer(t, ctx)
 	t.Cleanup(closeSession)
 
 	tools := []struct {
@@ -297,16 +298,15 @@ func TestE2EServerStartsDuringAnotherProcessIndex(t *testing.T) {
 // internal/app/compose.go (drop the release, or never decrement) and the
 // external index below is refused.
 //
-// The session runs with --watch=false, which is the product's own distinction
-// and not an accommodation: a watching session is the one operation whose
-// duration IS the session, and it holds the workspace deliberately because it
-// is already keeping the index fresh.
+// The session runs with --watch=false so that the refresh is the only thing
+// that can have taken the workspace: what a WATCHING session owes is the same
+// promise over its beats, and the row below this one asks it of one.
 func serverReleasesTheWorkspaceAfterARefresh(t *testing.T, ctx context.Context, s *sandbox, tools []struct {
 	name string
 	args any
 }) {
 	t.Helper()
-	session, closeSession := s.mcpServer(t, ctx, "--watch=false")
+	session, _, closeSession := s.mcpServer(t, ctx, "--watch=false")
 	t.Cleanup(closeSession)
 
 	res, err := session.CallTool(ctx, &mcp.CallToolParams{
@@ -360,13 +360,10 @@ func refusedBusy(t *testing.T, ctx context.Context, session *mcp.ClientSession) 
 
 // mcpReadsDuringOwnRefresh is the MCP half, and it is the server's OWN refresh
 // that writes underneath the read tools rather than a separate `codectx index`.
-// That is not a convenience: `codectx mcp serve` holds the Section 13.2
-// workspace lock for its whole session (internal/cli/mcp.go's OpenWorkspaceForServer,
-// internal/app/compose.go's indexing() modes), so a server started while another
-// process is indexing is refused at startup for the lock -- which its own help
-// text promises -- and never reaches a tool call. The concurrency the read
-// tools must survive is therefore the refresh running beside them in the same
-// process, which is what this drives.
+// That is not a convenience: this row is about a read and a write inside ONE
+// process, which is what a server answering while it refreshes is. Another
+// process's index beside a server is the row above, and the reads a session
+// serves through its own refresh are these.
 func mcpReadsDuringOwnRefresh(t *testing.T, ctx context.Context, s *sandbox) {
 	t.Helper()
 	padFixture(t, s.Repo, 3)
@@ -514,4 +511,156 @@ func padFixture(t *testing.T, repo string, round int) {
 			t.Fatalf("widen %s: %v", rel, err)
 		}
 	}
+}
+
+// TestE2EAWatchingServerLeavesTheWorkspaceToThePerson is the product-boundary
+// proof of the other half of coexistence: the half a WATCHING session owes.
+//
+// Failure mode it protects: `mcp.watch` is the shipped default, and a watching
+// session used to take the Section 13.2 workspace lock at its first pass and
+// keep it until the session ended. The person's own `codectx index` in a
+// terminal was then refused CTX_WORKSPACE_BUSY for as long as their agent's
+// server happened to be running -- an idle process holding a workspace it is
+// not building in. Mutation that must fail this row is quoted in this lane's
+// report: give the beat's release back to the session in
+// internal/index/coordinator.go and the index below is refused.
+//
+// The beat BEFORE that index is load-bearing and not setup: a session that has
+// never beaten holds nothing under either behaviour, so a row that indexed
+// straight away would pass against the very defect it exists to catch.
+//
+// What it then asserts is that letting go costs nothing: the watch's next beat
+// REUSES the generation the person's index published rather than rebuilding
+// the workspace itself.
+func TestE2EAWatchingServerLeavesTheWorkspaceToThePerson(t *testing.T) {
+	s := newSandbox(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+
+	if env, code := s.run(t, "index"); !env.OK || code != 0 {
+		t.Fatalf("the first index failed (exit %d): %+v", code, env.Error)
+	}
+	// --watch=true and not the sandbox default: this sandbox turns mcp.watch
+	// off so the other rows compare generations nothing moves underneath, and
+	// this row is about the watching session in particular.
+	session, serverLog, closeSession := s.mcpServer(t, ctx, "--watch=true")
+	t.Cleanup(closeSession)
+
+	touchFixture(t, s.Repo)
+	armed := awaitRefreshPast(t, ctx, serverLog, 0)
+	t.Logf("the watching session completed a beat: generation %d, %d reused, %d built",
+		armed.generation, armed.reused, armed.built)
+
+	// The assertion: the person's own index, as a further process, while that
+	// watching session is connected and has already beaten.
+	env, code := s.run(t, "index")
+	if !env.OK || code != 0 {
+		t.Fatalf("`codectx index` was refused (exit %d) beside a connected watching server: %+v -- "+
+			"the watch is holding the workspace between its beats", code, env.Error)
+	}
+	person := data[model.IndexResult](t, env, code)
+	if int64(person.Binding.GenerationID) <= armed.generation {
+		t.Fatalf("the person's index published generation %d, which is not past the watch's beat at %d",
+			person.Binding.GenerationID, armed.generation)
+	}
+
+	// The next beat: the fixture is rewritten with the content it already has,
+	// so the notification fires and every unit hashes to what the person's
+	// index just sealed. A beat that reuses them is a beat that started from
+	// the generation that index published; one that rebuilt them started from
+	// its own.
+	touchFixture(t, s.Repo)
+	next := awaitRefreshPast(t, ctx, serverLog, int64(person.Binding.GenerationID))
+	t.Logf("the beat after the person's index: generation %d, %d reused, %d built, %d invalidated",
+		next.generation, next.reused, next.built, next.invalidated)
+	if next.reused == 0 || next.built != 0 {
+		t.Fatalf("the beat after the person's index reused %d units and built %d: "+
+			"it rebuilt the workspace rather than reusing the generation that index published",
+			next.reused, next.built)
+	}
+
+	// And the session is still answering, so what it gave up was the workspace
+	// and not the session.
+	for _, tool := range []struct {
+		name string
+		args any
+	}{
+		{"codectx_index_status", model.StatusRequest{}},
+		{"codectx_search", model.SearchRequest{Query: "TinyStore"}},
+	} {
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: tool.name, Arguments: tool.args})
+		if err != nil || res.IsError {
+			t.Fatalf("%s no longer answers after the person indexed beside the watching session (err %v)", tool.name, err)
+		}
+	}
+}
+
+// touchFixture rewrites one generated source file with the content it already
+// holds. The filesystem notification fires on the write, so it is what makes a
+// beat happen now rather than at the next reconcile interval, and the content
+// is unchanged so what that beat does with the published generation is the only
+// thing the caller is measuring.
+func touchFixture(t *testing.T, repo string) {
+	t.Helper()
+	rel := filepath.Join("src", "go", "store", "store.go")
+	body, err := os.ReadFile(filepath.Join(repo, rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, rel), body, 0o600); err != nil {
+		t.Fatalf("rewrite %s: %v", rel, err)
+	}
+}
+
+// refreshed is one "refreshed" record a watching session wrote to its stderr:
+// the generation that beat published and what it did with the units.
+type refreshed struct {
+	generation  int64
+	reused      int64
+	built       int64
+	invalidated int64
+}
+
+// refreshedRecord matches the record `mcp serve` writes for each beat of its
+// watch (internal/cli/mcp.go), as the default text handler renders it.
+var refreshedRecord = regexp.MustCompile(
+	`msg=refreshed generation=(\d+) health=\S+ reused=(\d+) built=(\d+) invalidated=(\d+)`)
+
+// awaitRefreshPast waits for the first beat of the running watch that published
+// a generation past minGeneration, and reports what that beat did.
+//
+// Past a generation rather than "the next record": a beat that was already
+// running when the caller's index started publishes whatever it staged before
+// it, and only a generation greater than the one that index published can have
+// been staged after it.
+func awaitRefreshPast(t *testing.T, ctx context.Context, log *serverLog, minGeneration int64) refreshed {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		for _, m := range refreshedRecord.FindAllStringSubmatch(log.String(), -1) {
+			r := refreshed{generation: mustInt(t, m[1]), reused: mustInt(t, m[2]),
+				built: mustInt(t, m[3]), invalidated: mustInt(t, m[4])}
+			if r.generation > minGeneration {
+				return r
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the watching session reported no beat past generation %d within the wait\nserver stderr:\n%s",
+				minGeneration, log.String())
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for the watch's next beat: %v", ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func mustInt(t *testing.T, text string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		t.Fatalf("a refreshed record carried %q where a number belongs: %v", text, err)
+	}
+	return n
 }

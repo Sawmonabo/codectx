@@ -71,9 +71,11 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			"never a workspace this session keeps while it is idle -- so a " +
 			"refresh asked for while another `codectx index`, `refresh` or " +
 			"`watch` holds the workspace is the only thing reported as busy, and " +
-			"the questions keep being answered throughout. With --watch the " +
-			"session takes the lock at its first pass and keeps it while it " +
-			"watches, because that watch is what keeps the index fresh.\n\n" +
+			"the questions keep being answered throughout. A --watch session " +
+			"is the same rule: it takes the lock for the beat that builds and " +
+			"gives it back when that beat ends, so your own `codectx index` " +
+			"runs beside it and the beat after yours reuses what it " +
+			"published.\n\n" +
 			"Results and errors travel as MCP tool answers on the protocol " +
 			"stream; logs and startup failures go to stderr.",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -96,7 +98,7 @@ func newMCPServeCommand(build model.BuildInfo) *cobra.Command {
 			// asking for a refresh while the person's own index runs is
 			// answered now, with the retryable refusal it can act on, rather
 			// than held silent for a wait that cannot outlast that run; the
-			// watch loop takes the lock on a later pass of its own.
+			// watch loop takes the lock for each beat that builds.
 			// The operation the lock will carry is this session: whatever
 			// the build behind it turns out to be -- a refresh a client asked
 			// for, or a watch pass -- what the person needs to recognise on
