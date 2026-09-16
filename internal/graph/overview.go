@@ -55,10 +55,11 @@ type ContainerReader interface {
 // overviewContainerKinds is the vocabulary of the repository map: the kinds
 // Section 19.2's "repository/package/module/language map" is built from.
 //
-// It is deliberately WIDER than isContainerKind: a rollup asks "which package
-// does this symbol belong to", where a directory would answer a different
-// question, while the map is the structure itself and a repository whose
-// directories were omitted would not be a map of it.
+// It is deliberately WIDER than the rollup's container vocabulary (packages
+// and modules): a rollup asks "which package does this symbol belong to",
+// where a directory would answer a different question, while the map is the
+// structure itself and a repository whose directories were omitted would not
+// be a map of it.
 func overviewContainerKinds() []model.NodeKind {
 	return []model.NodeKind{model.NodeRepository, model.NodeDirectory,
 		model.NodePackage, model.NodeModule, model.NodeNamespace}
@@ -758,7 +759,7 @@ func stripQuoting(s string) string {
 }
 
 // isOverviewContainer reports whether a node kind is part of the repository
-// map. See overviewContainerKinds for why it is wider than isContainerKind.
+// map. See overviewContainerKinds for why it is wider than the rollup's.
 func isOverviewContainer(k model.NodeKind) bool {
 	switch k {
 	case model.NodeRepository, model.NodeDirectory, model.NodePackage,

@@ -633,30 +633,6 @@ func (e *Engine) rollupInto(ctx context.Context, meta *model.QueryMeta,
 	return nil
 }
 
-// evidenceCounts counts the evidence records backing each relation, in bounded
-// batches. A container relation legitimately carries none, which is why a zero
-// evidence count is a valid pair and a zero pair count is not.
-func (e *Engine) evidenceCounts(ctx context.Context, ids []model.RelationID) (map[model.RelationID]int64, error) {
-	out := make(map[model.RelationID]int64, len(ids))
-	for _, batch := range impactChunkRelations(dedupeRelations(append([]model.RelationID(nil), ids...))) {
-		got, err := e.adjacency.EvidenceFor(ctx, batch, model.MaxRelationsPerPath)
-		if err != nil {
-			return nil, err
-		}
-		for id, ev := range got {
-			out[id] = int64(len(ev))
-		}
-	}
-	return out, nil
-}
-
-// isContainerKind reports whether a node kind can be the target of a rollup.
-// Only packages and modules qualify: rolling up to a file or a directory would
-// answer a different question than the one Section 14.3 asks.
-func isContainerKind(k model.NodeKind) bool {
-	return k == model.NodePackage || k == model.NodeModule
-}
-
 // packageLabel is the path-shaped name a rollup reports for a container. A
 // package has no file of its own, so its qualified name is the most specific
 // identifier there is; the plain name is the fallback when nothing qualified it.
