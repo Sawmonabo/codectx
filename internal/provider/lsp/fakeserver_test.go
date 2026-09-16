@@ -124,6 +124,11 @@ func (f *fakeServer) handle(msg message) int {
 			}
 		}
 		f.event("encoding=%s", f.enc)
+		// The directory the client rooted this server at. A monorepo's server
+		// started at the workspace root is started at a directory that
+		// declares none of the projects under it, and nothing else in the
+		// protocol exchange says so.
+		f.event("root=%s", p.RootURI)
 		result := map[string]any{
 			"capabilities": map[string]any{
 				"positionEncoding":       f.enc,
