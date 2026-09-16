@@ -260,15 +260,12 @@ func (l *keyLines) close() {
 }
 
 // saveKeys writes the import's key set: the magic line and every distinct
-// fact key in ascending order, streamed from the scratch so the set is never
-// materialized in the heap.
+// fact key in ascending order, streamed from one pass of the engine's sort
+// over the identity and occurrence tables, so the set is never materialized
+// in the heap or in a table of its own.
 func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	if err := s.commit(ctx); err != nil {
 		return KeySet{}, err
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO keys(key) SELECT key FROM ident WHERE key <> ''
-		UNION SELECT key FROM rels WHERE key <> ''`); err != nil {
-		return KeySet{}, internalErr("import keys: %v", err)
 	}
 	f, err := os.Create(path)
 	if err != nil {
@@ -279,7 +276,9 @@ func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	if _, err := w.WriteString(keySetMagic + "\n"); err != nil {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT key FROM keys ORDER BY key`)
+	rows, err := s.db.QueryContext(ctx, `SELECT key FROM ident WHERE key <> ''
+		UNION SELECT key FROM occ WHERE key <> ''
+		UNION SELECT key FROM occ_sorted WHERE key <> '' ORDER BY 1`)
 	if err != nil {
 		return KeySet{}, internalErr("import keys: %v", err)
 	}
@@ -304,24 +303,22 @@ func (s *scratch) saveKeys(ctx context.Context, path string) (KeySet, error) {
 	return KeySet{path: path, count: n}, nil
 }
 
-// markDelta records, for every fresh key, whether the previous run already
-// published it. A delta import emits only the relations whose key is marked
-// changed; the removed count is what storage must delete.
+// markDelta records every fresh key the previous run did not publish. A delta
+// import emits only the relations one of whose keys is recorded; the removed
+// count is what storage must delete. Diff visits the keys in ascending
+// order, so the table is appended to.
 func (s *scratch) markDelta(ctx context.Context, fresh, prev KeySet) (Delta, error) {
 	if prev.Empty() {
 		return Delta{Changed: fresh.Count()}, nil
 	}
-	// Diff visits only the keys that differ; a key in both sets is unchanged,
-	// so mark every fresh key unchanged first and re-mark the ones Diff
-	// reports as added.
-	if _, err := s.db.ExecContext(ctx, `UPDATE keys SET changed = 0`); err != nil {
-		return Delta{}, internalErr("import delta: %v", err)
+	if err := s.run(ctx, "delta", `CREATE TABLE changed(key TEXT PRIMARY KEY) WITHOUT ROWID`); err != nil {
+		return Delta{}, err
 	}
 	delta, err := fresh.Diff(prev, func(key string, removed bool) error {
 		if removed {
 			return nil
 		}
-		return s.exec(ctx, `UPDATE keys SET changed = 1 WHERE key = ?`, key)
+		return s.exec(ctx, `INSERT OR IGNORE INTO changed(key) VALUES(?)`, key)
 	})
 	if err != nil {
 		return Delta{}, err

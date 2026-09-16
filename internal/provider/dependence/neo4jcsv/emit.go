@@ -64,71 +64,64 @@ func (e *emitter) stageFiles(ctx context.Context) error {
 		if fv.Status == model.FileDeleted {
 			return nil
 		}
-		return e.sc.exec(ctx, `INSERT OR REPLACE INTO files(path, file_id, content_hash, size, language) VALUES(?,?,?,?,?)`,
-			fv.Path, string(fv.ID), fv.ContentHash, fv.Size, fv.Language)
+		return e.sc.putFile(ctx, fv.Path, string(fv.ID), fv.ContentHash, fv.Size, fv.Language)
 	})
 }
 
+// located is one item of the location pass.
+type located struct {
+	seq, id            int64
+	pathID             sql.NullInt64
+	filename           string
+	label, code, name  string
+	line, lineEnd, col sql.NullInt64
+	isExternal         bool
+}
+
+// sourceFile is one snapshot file opened for the location pass: its manifest
+// row, its bytes when they fit the range budget, and whether the path was in
+// the snapshot at all.
+type sourceFile struct {
+	row    sql.NullInt64
+	fv     model.FileVersion
+	found  bool
+	cursor *source.Cursor
+	lines  *lineIndex
+	bytes  bool
+}
+
 // locate resolves every published entity and every occurrence site to the
-// pinned file and byte range it describes. Items are visited file by file so
-// each file is read once; an entity whose path is not in the snapshot is
-// dropped, because a fact bound to the wrong source is worse than no fact.
+// pinned file and byte range it describes. Items are visited in file order
+// and, within a file, in line order, so each file is read once and the line
+// index only ever scans forward; an entity whose path is not in the snapshot
+// is dropped, because a fact bound to the wrong source is worse than no fact.
+//
+// The item list is built once, in that order, and the locations are appended
+// as they are found and then copied once into node order for the phases that
+// join on them.
 func (e *emitter) locate(ctx context.Context) error {
-	if err := e.sc.commit(ctx); err != nil {
-		return err
+	// COALESCE keys the rows the export gave no coordinates ahead of every
+	// real line, and the id tie-break makes the order total.
+	steps := [...]string{
+		`CREATE TABLE todo(seq INTEGER PRIMARY KEY, node INTEGER NOT NULL, path INTEGER)`,
+		`INSERT INTO todo(node, path) SELECT x.id, a.path FROM (SELECT id FROM ents UNION SELECT site FROM projs) x
+			JOIN nodes n ON n.id = x.id JOIN attr a ON a.id = x.id ORDER BY a.path, COALESCE(n.line, -1), x.id`,
+		`CREATE TABLE loc_in(seq INTEGER PRIMARY KEY, node INTEGER NOT NULL, ok INTEGER NOT NULL, file INTEGER, range_text TEXT NOT NULL)`,
 	}
-	if _, err := e.sc.db.ExecContext(ctx, `INSERT OR IGNORE INTO loc(id, ok)
-		SELECT id, -1 FROM ents UNION SELECT site, -1 FROM proj`); err != nil {
-		return internalErr("import locate: %v", err)
-	}
-	after := ""
-	for {
-		files, err := e.pageStrings(ctx, `SELECT DISTINCT n.filename FROM loc l JOIN nodes n ON n.id = l.id
-			WHERE n.filename > ? ORDER BY n.filename LIMIT ?`, after, pageSize)
-		if err != nil {
+	for _, q := range steps {
+		if err := e.sc.run(ctx, "locate", q); err != nil {
 			return err
 		}
-		if len(files) == 0 {
-			return nil
-		}
-		for _, name := range files {
-			if err := e.locateFile(ctx, name); err != nil {
-				return err
-			}
-		}
-		after = files[len(files)-1]
 	}
-}
-
-// located is one item of locateFile's page.
-type located struct {
-	id, label, code, name string
-	line, lineEnd, col    sql.NullInt64
-	isExternal            bool
-}
-
-func (e *emitter) locateFile(ctx context.Context, filename string) error {
-	rel := normalizePath(filename, e.opts.ProjectRoot, e.opts.UnitRoot)
-	fv, data, found, err := e.openSource(ctx, rel)
-	if err != nil {
-		return err
-	}
-	var cursor *source.Cursor
-	var lines *lineIndex
-	if data != nil {
-		cursor, lines = source.NewCursor(data), &lineIndex{data: data}
-	}
-	// Items are paged in line order, not id order, so the shared lineIndex
-	// only ever scans forward. COALESCE keys the rows the export gave no
-	// coordinates ahead of every real line and the id tie-break makes the
-	// boundary total; the cursor starts below every representable line so a
-	// line a malformed export made negative is still visited and refused.
-	afterLine, afterID := int64(math.MinInt64), ""
+	var after int64
+	var current *sourceFile
+	var currentPath sql.NullInt64
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT n.id, n.label, n.code, n.name, n.line, n.line_end, n.col, n.is_external
-			FROM loc l JOIN nodes n ON n.id = l.id
-			WHERE n.filename = ? AND (COALESCE(n.line, -1), n.id) > (?, ?)
-			ORDER BY COALESCE(n.line, -1), n.id LIMIT ?`, filename, afterLine, afterID, pageSize)
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.seq, t.node, t.path, COALESCE(p.path, ''), n.label, n.name,
+			n.line, n.line_end, n.col, n.is_external,
+			COALESCE((SELECT c.code FROM code c WHERE c.id = t.node ORDER BY c.seq LIMIT 1), '')
+			FROM todo t LEFT JOIN paths p ON p.id = t.path JOIN nodes n ON n.id = t.node
+			WHERE t.seq > ? ORDER BY t.seq LIMIT ?`, after, pageSize)
 		if err != nil {
 			return internalErr("import locate: %v", err)
 		}
@@ -136,7 +129,7 @@ func (e *emitter) locateFile(ctx context.Context, filename string) error {
 		for rows.Next() {
 			var it located
 			var ext int64
-			if err := rows.Scan(&it.id, &it.label, &it.code, &it.name, &it.line, &it.lineEnd, &it.col, &ext); err != nil {
+			if err := rows.Scan(&it.seq, &it.id, &it.pathID, &it.filename, &it.label, &it.name, &it.line, &it.lineEnd, &it.col, &ext, &it.code); err != nil {
 				rows.Close()
 				return internalErr("import locate: %v", err)
 			}
@@ -148,23 +141,34 @@ func (e *emitter) locateFile(ctx context.Context, filename string) error {
 			return internalErr("import locate: %v", err)
 		}
 		if len(page) == 0 {
-			return nil
+			break
 		}
 		for _, it := range page {
-			if err := e.locateItem(ctx, it, rel, fv, found, cursor, lines, data != nil); err != nil {
+			if current == nil || it.pathID != currentPath {
+				f, err := e.openSource(ctx, normalizePath(it.filename, e.opts.ProjectRoot, e.opts.UnitRoot))
+				if err != nil {
+					return err
+				}
+				current, currentPath = f, it.pathID
+			}
+			if err := e.locateItem(ctx, it, current); err != nil {
 				return err
 			}
 		}
-		last := page[len(page)-1]
-		afterLine, afterID = -1, last.id
-		if last.line.Valid {
-			afterLine = last.line.Int64
+		after = page[len(page)-1].seq
+	}
+	for _, q := range [...]string{
+		`CREATE TABLE loc(node INTEGER PRIMARY KEY, ok INTEGER NOT NULL, file INTEGER, range_text TEXT NOT NULL)`,
+		`INSERT OR IGNORE INTO loc SELECT node, ok, file, range_text FROM loc_in ORDER BY node, seq`,
+	} {
+		if err := e.sc.run(ctx, "locate", q); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func (e *emitter) locateItem(ctx context.Context, it located, rel string, fv model.FileVersion, found bool,
-	cursor *source.Cursor, lines *lineIndex, haveBytes bool) error {
+func (e *emitter) locateItem(ctx context.Context, it located, f *sourceFile) error {
 	ok, rng := int64(1), ""
 	switch {
 	case it.label == labelMethod && it.isExternal:
@@ -172,7 +176,7 @@ func (e *emitter) locateItem(ctx context.Context, it located, rel string, fv mod
 		// the export gave it one; the identity is structural and the
 		// reconciler binds it to the real declaration by full name.
 		e.external++
-	case !found:
+	case !f.found:
 		// The path is not in the pinned snapshot. A published entity there
 		// cannot be bound to source and is refused; an occurrence site keeps
 		// its relation but carries no source binding.
@@ -183,19 +187,13 @@ func (e *emitter) locateItem(ctx context.Context, it located, rel string, fv mod
 			e.noRange++
 		}
 	default:
-		if r := e.rangeOf(cursor, lines, it); r != nil {
-			raw, _ := json.Marshal(r)
-			rng = string(raw)
-		} else if haveBytes {
+		if r := e.rangeOf(f.cursor, f.lines, it); r != nil {
+			rng = formatRange(r)
+		} else if f.bytes {
 			e.noRange++
 		}
 	}
-	var fileID, hash, lang, storedPath string
-	if found {
-		fileID, hash, lang, storedPath = string(fv.ID), fv.ContentHash, fv.Language, rel
-	}
-	if err := e.sc.exec(ctx, `UPDATE loc SET ok = ?, path = ?, file_id = ?, content_hash = ?, language = ?, range_json = ? WHERE id = ?`,
-		ok, storedPath, fileID, hash, lang, rng, it.id); err != nil {
+	if err := e.sc.exec(ctx, `INSERT INTO loc_in(node, ok, file, range_text) VALUES(?, ?, ?, ?)`, it.id, ok, f.row, rng); err != nil {
 		return err
 	}
 	return e.sc.staged(ctx)
@@ -208,41 +206,46 @@ var entityLabels = map[string]struct{}{
 
 // openSource maps a root-relative path to the snapshot file it names and
 // reads its bytes when they fit the range budget.
-func (e *emitter) openSource(ctx context.Context, rel string) (fv model.FileVersion, data []byte, found bool, err error) {
+func (e *emitter) openSource(ctx context.Context, rel string) (*sourceFile, error) {
+	f := &sourceFile{}
 	if rel == "" {
-		return fv, nil, false, nil
+		return f, nil
 	}
-	var size int64
+	var row, size int64
 	var id, hash, lang string
-	row := e.sc.db.QueryRowContext(ctx, `SELECT file_id, content_hash, size, language FROM files WHERE path = ?`, rel)
-	if err := row.Scan(&id, &hash, &size, &lang); err != nil {
-		if err == sql.ErrNoRows {
-			return fv, nil, false, nil
-		}
-		return fv, nil, false, internalErr("import files: %v", err)
-	}
-	fv = model.FileVersion{ID: model.FileID(id), Path: rel, ContentHash: hash, Size: size, Language: lang}
-	if size > maxRangeFileBytes {
-		return fv, nil, true, nil
-	}
-	rc, got, err := e.opts.Content.Open(ctx, fv.ID)
+	err := e.sc.db.QueryRowContext(ctx, `SELECT id, file_id, content_hash, size, language FROM files WHERE path = ?`, rel).
+		Scan(&row, &id, &hash, &size, &lang)
 	if err != nil {
-		return fv, nil, false, err
+		if err == sql.ErrNoRows {
+			return f, nil
+		}
+		return nil, internalErr("import files: %v", err)
+	}
+	f.row = sql.NullInt64{Int64: row, Valid: true}
+	f.fv = model.FileVersion{ID: model.FileID(id), Path: rel, ContentHash: hash, Size: size, Language: lang}
+	f.found = true
+	if size > maxRangeFileBytes {
+		return f, nil
+	}
+	rc, got, err := e.opts.Content.Open(ctx, f.fv.ID)
+	if err != nil {
+		return nil, err
 	}
 	defer rc.Close()
 	if got.ContentHash != hash {
-		return fv, nil, false, &model.Error{Code: model.CodeSnapshotChanged,
+		return nil, &model.Error{Code: model.CodeSnapshotChanged,
 			Message: "the pinned view returned another version of an analyzed file"}
 	}
-	data, err = io.ReadAll(io.LimitReader(rc, size+1))
+	data, err := io.ReadAll(io.LimitReader(rc, size+1))
 	if err != nil {
-		return fv, nil, false, err
+		return nil, err
 	}
 	if int64(len(data)) != size {
-		return fv, nil, false, &model.Error{Code: model.CodeSourceIntegrity,
+		return nil, &model.Error{Code: model.CodeSourceIntegrity,
 			Message: "retained bytes differ in length from the manifest", Details: map[string]string{"file_id": id}}
 	}
-	return fv, data, true, nil
+	f.cursor, f.lines, f.bytes = source.NewCursor(data), &lineIndex{data: data}, true
+	return f, nil
 }
 
 // normalizePath turns an engine FILENAME into a slash-separated root-relative
@@ -417,26 +420,48 @@ func nativeMethodKey(fullName string) string { return ProviderID + ":method:" + 
 
 // entity is one published graph entity being identified.
 type entity struct {
-	id, kind, label                  string
+	id                               int64
+	kind, label                      string
 	name, canonical, fullName        string
 	signature                        string
 	ownerFullName                    string
 	fileID, hash, lang, rng, relPath string
 	code                             string
+	file                             sql.NullInt64
 	line, lineEnd, col               sql.NullInt64
 	external                         bool
 }
 
 // identify resolves every kept entity to canonical identity through the
-// unit's resolver and stages the node fact, aliases and fact key it
-// publishes.
+// unit's resolver and stages the node, its aliases and its fact key.
+// Entities are visited in id order, so the identity and fact tables are
+// appended to. When every entity is identified, the identities are grouped:
+// one representative entity and the key list per canonical node, in
+// representative order, which is the order the fact table holds; and the
+// identities that several entities resolved to are listed, because their
+// occurrences cannot be grouped in projection order (stageRelations).
 func (e *emitter) identify(ctx context.Context) error {
-	after := ""
+	steps := [...]string{
+		`CREATE TABLE ident(ent INTEGER PRIMARY KEY, node_id TEXT NOT NULL, key TEXT NOT NULL, alias_json TEXT NOT NULL)`,
+		`CREATE TABLE facts(ent INTEGER PRIMARY KEY, node_json TEXT NOT NULL, canonical_key TEXT NOT NULL, file INTEGER,
+			range_text TEXT NOT NULL, native_key TEXT NOT NULL, detail TEXT NOT NULL)`,
+		`CREATE TABLE occ_out(seq INTEGER PRIMARY KEY, rel_id TEXT NOT NULL, ev_id TEXT NOT NULL, from_id TEXT NOT NULL,
+			kind TEXT NOT NULL, to_id TEXT NOT NULL, file INTEGER, range_text TEXT NOT NULL, native_key TEXT NOT NULL,
+			detail TEXT NOT NULL, key TEXT NOT NULL)`,
+	}
+	for _, q := range steps {
+		if err := e.sc.run(ctx, "identify", q); err != nil {
+			return err
+		}
+	}
+	after := int64(math.MinInt64)
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT n.id, t.kind, n.label, n.name, n.canonical_name, n.full_name, n.signature, n.line, n.line_end, n.col,
-			t.external, l.file_id, l.content_hash, l.language, l.range_json, l.path, COALESCE(o.full_name, ''), COALESCE(n.code, '')
-			FROM ents t JOIN nodes n ON n.id = t.id JOIN loc l ON l.id = t.id
-			LEFT JOIN nodes o ON o.id = n.owner
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT t.id, t.kind, n.label, n.name, n.canonical_name, n.full_name, n.signature,
+			n.line, n.line_end, n.col, t.external, l.file, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''), COALESCE(f.language, ''),
+			l.range_text, COALESCE(f.path, ''), COALESCE(o.full_name, ''),
+			COALESCE((SELECT c.code FROM code c WHERE c.id = t.id ORDER BY c.seq LIMIT 1), '')
+			FROM ents t JOIN nodes n ON n.id = t.id JOIN loc l ON l.node = t.id
+			LEFT JOIN files f ON f.id = l.file LEFT JOIN attr a ON a.id = t.id LEFT JOIN nodes o ON o.id = a.owner
 			WHERE l.ok = 1 AND t.id > ? ORDER BY t.id LIMIT ?`, after, pageSize)
 		if err != nil {
 			return internalErr("import identify: %v", err)
@@ -446,7 +471,7 @@ func (e *emitter) identify(ctx context.Context) error {
 			var it entity
 			var ext int64
 			if err := rows.Scan(&it.id, &it.kind, &it.label, &it.name, &it.canonical, &it.fullName, &it.signature, &it.line, &it.lineEnd, &it.col,
-				&ext, &it.fileID, &it.hash, &it.lang, &it.rng, &it.relPath, &it.ownerFullName, &it.code); err != nil {
+				&ext, &it.file, &it.fileID, &it.hash, &it.lang, &it.rng, &it.relPath, &it.ownerFullName, &it.code); err != nil {
 				rows.Close()
 				return internalErr("import identify: %v", err)
 			}
@@ -458,7 +483,7 @@ func (e *emitter) identify(ctx context.Context) error {
 			return internalErr("import identify: %v", err)
 		}
 		if len(page) == 0 {
-			return nil
+			break
 		}
 		for _, it := range page {
 			if err := e.identifyOne(ctx, it); err != nil {
@@ -467,6 +492,19 @@ func (e *emitter) identify(ctx context.Context) error {
 		}
 		after = page[len(page)-1].id
 	}
+	grouping := [...]string{
+		`CREATE INDEX ident_by_node ON ident(node_id, ent, key)`,
+		`CREATE TABLE groups(rep INTEGER PRIMARY KEY, keys TEXT NOT NULL)`,
+		`INSERT INTO groups SELECT MIN(ent), group_concat(key, ' ') FROM ident GROUP BY node_id ORDER BY 1`,
+		`CREATE TABLE merged(node_id TEXT PRIMARY KEY) WITHOUT ROWID`,
+		`INSERT INTO merged SELECT node_id FROM ident GROUP BY node_id HAVING count(*) > 1`,
+	}
+	for _, q := range grouping {
+		if err := e.sc.run(ctx, "identify", q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *emitter) identifyOne(ctx context.Context, it entity) error {
@@ -508,9 +546,10 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	// join keys — a shortened one merges this entity with nothing, or with the
 	// wrong thing — and they are derived from the untruncated name and
 	// qualified name above, so the cuts below must come after they are minted.
+	// A refused entity has no identity row, so no occurrence joins to it.
 	if name == "" || len(native) > model.MaxNativeKeyBytes || len(scope) > model.MaxScopeKeyBytes {
 		e.dropped++
-		return e.sc.exec(ctx, `UPDATE loc SET ok = 0 WHERE id = ?`, it.id)
+		return nil
 	}
 	// The three descriptive fields are cut to their ceiling and counted, into
 	// the candidate only: a clipped name or signature still answers most of
@@ -523,12 +562,12 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		Signature: e.cut("signature", it.signature, model.MaxSignatureBytes),
 		Language:  e.language}
 	cand.QualifiedName = e.cut("qualified_name", qualified, model.MaxQualifiedNameBytes)
-	evFile, evHash, evRange := model.FileID(it.fileID), it.hash, parseRange(it.rng)
+	evFile, evHash := model.FileID(it.fileID), it.hash
 	if it.relPath != "" && it.kind != kindUnresolved {
 		// A located declaration keys on its exact declaration range, which is
 		// how a structural provider and this import mint one identity.
 		cand.Language = it.lang
-		cand.FileID, cand.ContentHash, cand.Range = evFile, evHash, evRange
+		cand.FileID, cand.ContentHash, cand.Range = evFile, evHash, parseRange(it.rng)
 		// The strong key is the declaration-location contract the structural
 		// providers publish for the same declaration. A declaration with no
 		// identifier token or no line has no such key and mints its own
@@ -561,9 +600,10 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	if it.kind != kindMethod {
 		detail = detailAssignment
 	}
-	ev := e.evidence(node.ID, "", evFile, evHash, evRange, qualified, detail)
-	fact := model.NodeFact{Node: node, CanonicalKey: res.CanonicalKey, Evidence: []model.Evidence{ev}}
-	factJSON, err := json.Marshal(fact)
+	// The fact is stored as the node plus the fields its one evidence row is
+	// rebuilt from at emission; the evidence itself repeats the unit, run and
+	// file identities on every row and is minted again from the same fields.
+	nodeJSON, err := json.Marshal(node)
 	if err != nil {
 		return internalErr("import identify: %v", err)
 	}
@@ -581,8 +621,12 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 	keyOwner := e.keyOwner(it.fullName, it.ownerFullName)
 	positional := e.positional(it.fullName, it.ownerFullName, it.rng, it.name, it.signature)
 	key := FactKey(label, keyOwner, it.relPath, "", name, positional, "")
-	if err := e.sc.exec(ctx, `INSERT INTO ident(ent, node_id, fact_json, alias_json, key) VALUES(?,?,?,?,?)`,
-		it.id, string(node.ID), string(factJSON), string(aliasJSON), key); err != nil {
+	if err := e.sc.exec(ctx, `INSERT INTO ident(ent, node_id, key, alias_json) VALUES(?,?,?,?)`,
+		it.id, string(node.ID), key, string(aliasJSON)); err != nil {
+		return err
+	}
+	if err := e.sc.exec(ctx, `INSERT INTO facts(ent, node_json, canonical_key, file, range_text, native_key, detail) VALUES(?,?,?,?,?,?,?)`,
+		it.id, string(nodeJSON), res.CanonicalKey, it.file, it.rng, e.boundedNativeKey(qualified), e.cut("detail", detail, model.MaxDetailBytes)); err != nil {
 		return err
 	}
 	if err := e.sc.staged(ctx); err != nil {
@@ -596,7 +640,7 @@ func (e *emitter) identifyOne(ctx context.Context, it entity) error {
 		// composed key here would write a set the next refresh cannot load.
 		altKey := FactKey("rel:may_refer_to", keyOwner, it.relPath, "ambiguous", string(alt), positional,
 			string(node.ID)+keySep+string(alt))
-		if err := e.stageRelation(ctx, node.ID, model.RelMayReferTo, alt, evFile, evHash, evRange,
+		if err := e.stageRelation(ctx, node.ID, model.RelMayReferTo, alt, it.file, evFile, evHash, it.rng,
 			qualified, detailAssignment, altKey); err != nil {
 			return err
 		}
@@ -611,15 +655,30 @@ const (
 	kindUnresolved = "unres"
 )
 
+// formatRange is the staged form of a verified range: its six coordinates
+// in decimal, which is a fifth of the JSON form and is parsed without one.
+func formatRange(r *model.SourceRange) string {
+	return strconv.FormatUint(r.Start.Byte, 10) + ":" + strconv.FormatUint(uint64(r.Start.Line), 10) + ":" +
+		strconv.FormatUint(uint64(r.Start.Column), 10) + ":" + strconv.FormatUint(r.End.Byte, 10) + ":" +
+		strconv.FormatUint(uint64(r.End.Line), 10) + ":" + strconv.FormatUint(uint64(r.End.Column), 10)
+}
+
+// parseRange reads a staged range; an absent or malformed one is no range.
 func parseRange(raw string) *model.SourceRange {
 	if raw == "" {
 		return nil
 	}
-	var r model.SourceRange
-	if json.Unmarshal([]byte(raw), &r) != nil {
-		return nil
+	var v [6]uint64
+	for i := range v {
+		part, rest, _ := strings.Cut(raw, ":")
+		n, err := strconv.ParseUint(part, 10, 64)
+		if err != nil {
+			return nil
+		}
+		v[i], raw = n, rest
 	}
-	return &r
+	return &model.SourceRange{Start: model.Position{Byte: v[0], Line: uint32(v[1]), Column: uint32(v[2])},
+		End: model.Position{Byte: v[3], Line: uint32(v[4]), Column: uint32(v[5])}}
 }
 
 // keyOwner is the fact key's owner component: the full name of the method (or
@@ -634,22 +693,18 @@ func (e *emitter) keyOwner(fullName, ownerFullName string) string {
 // positional is the fact key's positional component: the ordered byte ranges
 // of the fact, or a content digest when the owning method is a synthetic
 // initializer whose member order the frontend does not fix.
-func (e *emitter) positional(fullName, ownerFullName, rangeJSON string, content ...string) string {
+func (e *emitter) positional(fullName, ownerFullName, rangeText string, content ...string) string {
 	if isInitializer(fullName) || isInitializer(ownerFullName) {
 		return contentDigest(content...)
 	}
-	return rangeDigest(rangeJSON)
+	return rangeDigest(rangeText)
 }
 
-func rangeDigest(rangeJSON ...string) string {
-	parts := make([]string, 0, len(rangeJSON))
-	for _, raw := range rangeJSON {
-		if raw == "" {
-			parts = append(parts, "-")
-			continue
-		}
-		var r model.SourceRange
-		if json.Unmarshal([]byte(raw), &r) != nil {
+func rangeDigest(ranges ...string) string {
+	parts := make([]string, 0, len(ranges))
+	for _, raw := range ranges {
+		r := parseRange(raw)
+		if r == nil {
 			parts = append(parts, "-")
 			continue
 		}
@@ -670,33 +725,70 @@ func resolutionMetadata(res model.Resolution, external, unresolved bool) json.Ra
 	return nil
 }
 
+// boundedNativeKey is the evidence native key for a qualified name: the name
+// itself, or nothing when it is over the model's key ceiling. A shortened
+// key would name another declaration, so an oversize one is left off.
+func (e *emitter) boundedNativeKey(qualified string) string {
+	if len(qualified) > model.MaxNativeKeyBytes {
+		return ""
+	}
+	return qualified
+}
+
+// evidence builds one evidence row from fields already bounded to the model's
+// ceilings. It is called once when an occurrence is staged, to mint the id
+// the occurrence sorts under, and once more when it is emitted, from the same
+// stored fields, so the two agree byte for byte.
 func (e *emitter) evidence(node model.NodeID, rel model.RelationID, file model.FileID, hash string,
 	rng *model.SourceRange, nativeKey, detail string) model.Evidence {
-	if len(nativeKey) > model.MaxNativeKeyBytes {
-		nativeKey = ""
-	}
 	ev := model.Evidence{UnitID: e.opts.Unit.ID, ProviderID: e.opts.Unit.ProviderID, ProviderVersion: e.opts.Unit.ProviderVersion,
 		OriginRunID: e.opts.Run, NodeID: node, RelationID: rel, Precision: model.PrecisionStaticAnalysis,
-		FileID: file, ContentHash: hash, Range: rng, NativeKey: nativeKey,
-		Detail: e.cut("detail", detail, model.MaxDetailBytes)}
+		FileID: file, ContentHash: hash, Range: rng, NativeKey: nativeKey, Detail: detail}
 	ev.ID = model.NewEvidenceID(ev)
 	return ev
 }
 
 // stageRelations turns every projected occurrence whose endpoints both
-// resolved into a relation identity with one evidence row per occurrence.
+// resolved into an occurrence of one canonical edge with the fields its
+// evidence row is minted from.
+//
+// The projection is read in (kind, from entity, to entity, site) order, so
+// the occurrences of one edge arrive together and are appended in that
+// order to the in-order stream, which the emission then reads front to back
+// with no sort at all. Two cases cannot be grouped that way and go to a
+// second, sorted stream: an edge whose endpoint is an identity several
+// entities resolved to, because its occurrences come from several entity
+// pairs; and may_refer_to, whose target an ambiguous resolution names
+// directly rather than through an entity.
+//
+// Occurrences with identical evidence identity collapse to the first staged;
+// distinct ranges stay distinct.
 func (e *emitter) stageRelations(ctx context.Context) error {
-	if err := e.sc.countDerived(ctx); err != nil {
+	if err := e.sc.run(ctx, "relations", `CREATE TABLE occ(seq INTEGER PRIMARY KEY, from_e INTEGER NOT NULL, to_e INTEGER NOT NULL,
+		kind TEXT NOT NULL, file INTEGER, range_text TEXT NOT NULL, native_key TEXT NOT NULL, detail TEXT NOT NULL, key TEXT NOT NULL)`); err != nil {
 		return err
 	}
-	type key struct{ kind, from, to, site, op, target string }
-	var after key
+	type key struct {
+		kind           string
+		from, to, site int64
+		op, target     string
+	}
+	after := key{from: math.MinInt64, to: math.MinInt64, site: math.MinInt64}
+	type group struct {
+		kind     string
+		from, to int64
+	}
+	var open group
+	seen := map[model.EvidenceID]bool{}
 	for {
 		rows, err := e.sc.db.QueryContext(ctx, `SELECT p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name, p.detail,
-			f.node_id, t.node_id, s.file_id, s.content_hash, s.range_json, s.path,
-			COALESCE(o.full_name, ''), COALESCE(c.code, ''), COALESCE(c.name, '')
-			FROM proj p JOIN ident f ON f.ent = p.from_e JOIN ident t ON t.ent = p.to_e JOIN loc s ON s.id = p.site
-			LEFT JOIN nodes c ON c.id = p.site LEFT JOIN nodes o ON o.id = c.owner
+			f.node_id, t.node_id, s.file, COALESCE(fl.file_id, ''), COALESCE(fl.content_hash, ''), s.range_text, COALESCE(fl.path, ''),
+			COALESCE(o.full_name, ''), COALESCE((SELECT c.code FROM code c WHERE c.id = p.site ORDER BY c.seq LIMIT 1), ''),
+			COALESCE(cn.name, ''),
+			EXISTS (SELECT 1 FROM merged m WHERE m.node_id = f.node_id) OR EXISTS (SELECT 1 FROM merged m WHERE m.node_id = t.node_id)
+			FROM projs p JOIN ident f ON f.ent = p.from_e JOIN ident t ON t.ent = p.to_e JOIN loc s ON s.node = p.site
+			LEFT JOIN files fl ON fl.id = s.file LEFT JOIN attr a ON a.id = p.site LEFT JOIN nodes o ON o.id = a.owner
+			LEFT JOIN nodes cn ON cn.id = p.site
 			WHERE (p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name) > (?,?,?,?,?,?)
 			ORDER BY p.kind, p.from_e, p.to_e, p.site, p.op, p.target_name LIMIT ?`,
 			after.kind, after.from, after.to, after.site, after.op, after.target, pageSize)
@@ -706,12 +798,14 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 		type occ struct {
 			key
 			detail, from, to, fileID, hash, rng, relPath, owner, code, siteName string
+			file                                                                sql.NullInt64
+			apart                                                               bool
 		}
 		var page []occ
 		for rows.Next() {
 			var o occ
 			if err := rows.Scan(&o.kind, &o.key.from, &o.key.to, &o.site, &o.op, &o.key.target, &o.detail,
-				&o.from, &o.to, &o.fileID, &o.hash, &o.rng, &o.relPath, &o.owner, &o.code, &o.siteName); err != nil {
+				&o.from, &o.to, &o.file, &o.fileID, &o.hash, &o.rng, &o.relPath, &o.owner, &o.code, &o.siteName, &o.apart); err != nil {
 				rows.Close()
 				return internalErr("import relations: %v", err)
 			}
@@ -722,30 +816,59 @@ func (e *emitter) stageRelations(ctx context.Context) error {
 			return internalErr("import relations: %v", err)
 		}
 		if len(page) == 0 {
-			return nil
+			break
 		}
 		for _, o := range page {
 			kind, ok := relationKinds[o.kind]
 			if !ok {
 				return internalErr("import relations: unknown projection %q", o.kind)
 			}
-			var rng *model.SourceRange
-			if o.rng != "" {
-				var r model.SourceRange
-				if err := json.Unmarshal([]byte(o.rng), &r); err != nil {
-					return internalErr("import relations: %v", err)
-				}
-				rng = &r
-			}
 			factKey := FactKey("rel:"+o.kind, o.owner, o.relPath, o.op, o.key.target,
 				e.positional("", o.owner, o.rng, o.code, o.siteName, o.key.target), o.from+keySep+o.to)
-			if err := e.stageRelation(ctx, model.NodeID(o.from), kind, model.NodeID(o.to), model.FileID(o.fileID),
-				o.hash, rng, o.owner, o.detail, factKey); err != nil {
+			if o.apart || kind == model.RelMayReferTo {
+				if err := e.stageRelation(ctx, model.NodeID(o.from), kind, model.NodeID(o.to), o.file, model.FileID(o.fileID),
+					o.hash, o.rng, o.owner, o.detail, factKey); err != nil {
+					return err
+				}
+				continue
+			}
+			if g := (group{o.kind, o.key.from, o.key.to}); g != open {
+				open = g
+				clear(seen)
+			}
+			nativeKey := e.boundedNativeKey(o.owner)
+			detail := e.cut("detail", o.detail, model.MaxDetailBytes)
+			rel := model.NewRelationID(e.opts.Repository, model.NodeID(o.from), kind, model.NodeID(o.to))
+			ev := e.evidence("", rel, model.FileID(o.fileID), o.hash, parseRange(o.rng), nativeKey, detail)
+			if seen[ev.ID] {
+				continue
+			}
+			seen[ev.ID] = true
+			if err := e.sc.exec(ctx, `INSERT INTO occ(from_e, to_e, kind, file, range_text, native_key, detail, key) VALUES(?,?,?,?,?,?,?,?)`,
+				o.key.from, o.key.to, string(kind), o.file, o.rng, nativeKey, detail, factKey); err != nil {
+				return err
+			}
+			if err := e.sc.staged(ctx); err != nil {
 				return err
 			}
 		}
 		after = page[len(page)-1].key
 	}
+	steps := [...]string{
+		`CREATE TABLE occ_sorted(seq INTEGER PRIMARY KEY, rel_id TEXT NOT NULL, ev_id TEXT NOT NULL, from_id TEXT NOT NULL,
+			kind TEXT NOT NULL, to_id TEXT NOT NULL, file INTEGER, range_text TEXT NOT NULL, native_key TEXT NOT NULL,
+			detail TEXT NOT NULL, key TEXT NOT NULL)`,
+		`CREATE UNIQUE INDEX occ_sorted_by_id ON occ_sorted(rel_id, ev_id)`,
+		`INSERT OR IGNORE INTO occ_sorted(rel_id, ev_id, from_id, kind, to_id, file, range_text, native_key, detail, key)
+			SELECT rel_id, ev_id, from_id, kind, to_id, file, range_text, native_key, detail, key FROM occ_out
+			ORDER BY rel_id, ev_id, seq`,
+	}
+	for _, q := range steps {
+		if err := e.sc.run(ctx, "relations", q); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // relationKinds maps a projection kind to its published relation.
@@ -758,49 +881,69 @@ var relationKinds = map[string]model.RelationKind{
 	"may_refer_to":       model.RelMayReferTo,
 }
 
-// stageRelation stages one occurrence of one canonical edge. Occurrences with
-// identical evidence identity collapse; distinct ranges stay distinct.
+// stageRelation appends one occurrence to the sorted stream, with the
+// identities it sorts under and the fields its evidence row is rebuilt from.
 func (e *emitter) stageRelation(ctx context.Context, from model.NodeID, kind model.RelationKind, to model.NodeID,
-	file model.FileID, hash string, rng *model.SourceRange, nativeKey, detail, factKey string) error {
-	rel := model.Relation{From: from, Kind: kind, To: to}
-	rel.ID = model.NewRelationID(e.opts.Repository, from, kind, to)
-	ev := e.evidence("", rel.ID, file, hash, rng, nativeKey, detail)
-	raw, err := json.Marshal(ev)
-	if err != nil {
-		return internalErr("import relations: %v", err)
-	}
-	if err := e.sc.exec(ctx, `INSERT OR IGNORE INTO rels(rel_id, ev_id, from_id, kind, to_id, ev_json, key)
-		VALUES(?,?,?,?,?,?,?)`, string(rel.ID), string(ev.ID), string(from), string(kind), string(to), string(raw), factKey); err != nil {
+	file sql.NullInt64, fileID model.FileID, hash, rangeText, nativeKey, detail, factKey string) error {
+	rel := model.NewRelationID(e.opts.Repository, from, kind, to)
+	nativeKey = e.boundedNativeKey(nativeKey)
+	detail = e.cut("detail", detail, model.MaxDetailBytes)
+	ev := e.evidence("", rel, fileID, hash, parseRange(rangeText), nativeKey, detail)
+	if err := e.sc.exec(ctx, `INSERT INTO occ_out(rel_id, ev_id, from_id, kind, to_id, file, range_text, native_key, detail, key)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, string(rel), string(ev.ID), string(from), string(kind), string(to),
+		file, rangeText, nativeKey, detail, factKey); err != nil {
 		return err
 	}
 	return e.sc.staged(ctx)
 }
 
-// emitNodes hands every distinct identity to the sink, smallest entity first.
-// Two entities that resolved to one identity publish one fact, because a unit
-// publishes each node once — and that one fact carries the fact keys of every
-// entity behind it. Storage drops a carried fact when ANY of its keys is
-// replaced (Section 11.4), so a key left off here would strand the row it
-// backs: the next refresh would classify that key as changed, storage would
-// keep the old row because the key it kept the row under is not this fact's,
-// and the unit would hold two descriptions of one identity.
+// emitNodes hands every distinct identity to the sink. Two entities that
+// resolved to one identity publish one fact -- the smallest entity's --
+// because a unit publishes each node once, and that one fact carries the
+// fact keys of every entity behind it. Storage drops a carried fact when ANY
+// of its keys is replaced (Section 11.4), so a key left off here would strand
+// the row it backs: the next refresh would classify that key as changed,
+// storage would keep the old row because the key it kept the row under is
+// not this fact's, and the unit would hold two descriptions of one identity.
+//
+// The groups were written in the order of their representative entity, which
+// is the order the fact table holds, so the emission reads both front to
+// back.
 func (e *emitter) emitNodes(ctx context.Context) error {
-	var afterNode, afterEnt string
-	var open *model.NodeFact
-	var openNode string
-	var openKeys []string
-	var facts []model.NodeFact
-	var keys [][]string
-	closeGroup := func() {
-		if open == nil {
-			return
-		}
-		facts = append(facts, *open)
-		keys = append(keys, sortedKeys(openKeys))
-		open, openNode, openKeys = nil, "", nil
+	if err := e.sc.commit(ctx); err != nil {
+		return err
 	}
-	flush := func() error {
-		closeGroup()
+	after := int64(math.MinInt64)
+	for {
+		rows, err := e.sc.db.QueryContext(ctx, `SELECT g.rep, g.keys, f.node_json, f.canonical_key, COALESCE(fl.file_id, ''),
+			COALESCE(fl.content_hash, ''), f.range_text, f.native_key, f.detail
+			FROM groups g JOIN facts f ON f.ent = g.rep LEFT JOIN files fl ON fl.id = f.file
+			WHERE g.rep > ? ORDER BY g.rep LIMIT ?`, after, pageSize)
+		if err != nil {
+			return internalErr("import nodes: %v", err)
+		}
+		var facts []model.NodeFact
+		var keys [][]string
+		var last int64
+		for rows.Next() {
+			var raw, keyList, canonical, fileID, hash, rng, nativeKey, detail string
+			if err := rows.Scan(&last, &keyList, &raw, &canonical, &fileID, &hash, &rng, &nativeKey, &detail); err != nil {
+				rows.Close()
+				return internalErr("import nodes: %v", err)
+			}
+			var node model.Node
+			if err := json.Unmarshal([]byte(raw), &node); err != nil {
+				rows.Close()
+				return internalErr("import nodes: %v", err)
+			}
+			ev := e.evidence(node.ID, "", model.FileID(fileID), hash, parseRange(rng), nativeKey, detail)
+			facts = append(facts, model.NodeFact{Node: node, CanonicalKey: canonical, Evidence: []model.Evidence{ev}})
+			keys = append(keys, sortedKeys(strings.Fields(keyList)))
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return internalErr("import nodes: %v", err)
+		}
 		if len(facts) == 0 {
 			return nil
 		}
@@ -808,56 +951,7 @@ func (e *emitter) emitNodes(ctx context.Context) error {
 			return err
 		}
 		e.nodes += len(facts)
-		facts, keys = nil, nil
-		return nil
-	}
-	for {
-		rows, err := e.sc.db.QueryContext(ctx, `SELECT node_id, ent, fact_json, key FROM ident
-			WHERE (node_id, ent) > (?, ?) ORDER BY node_id, ent LIMIT ?`, afterNode, afterEnt, pageSize)
-		if err != nil {
-			return internalErr("import nodes: %v", err)
-		}
-		type row struct{ node, ent, raw, key string }
-		var page []row
-		for rows.Next() {
-			var r row
-			if err := rows.Scan(&r.node, &r.ent, &r.raw, &r.key); err != nil {
-				rows.Close()
-				return internalErr("import nodes: %v", err)
-			}
-			page = append(page, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return internalErr("import nodes: %v", err)
-		}
-		if len(page) == 0 {
-			return flush()
-		}
-		for _, r := range page {
-			if open == nil || openNode != r.node {
-				closeGroup()
-				var f model.NodeFact
-				if err := json.Unmarshal([]byte(r.raw), &f); err != nil {
-					return internalErr("import nodes: %v", err)
-				}
-				open, openNode = &f, r.node
-			}
-			if r.key != "" {
-				openKeys = append(openKeys, r.key)
-			}
-		}
-		afterNode, afterEnt = page[len(page)-1].node, page[len(page)-1].ent
-		// The identity still open may continue on the next page; everything
-		// before it is complete.
-		if len(facts) >= pageSize {
-			hold, holdNode, holdKeys := open, openNode, openKeys
-			open, openNode, openKeys = nil, "", nil
-			if err := flush(); err != nil {
-				return err
-			}
-			open, openNode, openKeys = hold, holdNode, holdKeys
-		}
+		after = last
 	}
 }
 
@@ -895,37 +989,59 @@ func (e *emitter) putRelations(ctx context.Context, facts []model.RelationFact, 
 	return e.sink.PutRelations(ctx, facts)
 }
 
-// emitAliases publishes each distinct (scope, native key, node) once.
+// emitAliases publishes each distinct (scope, native key, node) once. The
+// distinct sorted list is one pass of the engine's sort, streamed: the loop
+// touches nothing but the sink, so the one scratch connection stays on the
+// stream.
 func (e *emitter) emitAliases(ctx context.Context) error {
-	after := ""
-	for {
-		page, err := e.pageStrings(ctx, `SELECT DISTINCT alias_json FROM ident WHERE alias_json > ? ORDER BY alias_json LIMIT ?`, after, pageSize)
-		if err != nil {
-			return err
-		}
-		if len(page) == 0 {
+	if err := e.sc.commit(ctx); err != nil {
+		return err
+	}
+	rows, err := e.sc.db.QueryContext(ctx, `SELECT DISTINCT alias_json FROM ident ORDER BY alias_json`)
+	if err != nil {
+		return internalErr("import aliases: %v", err)
+	}
+	defer rows.Close()
+	var aliases []model.NativeAlias
+	flush := func() error {
+		if len(aliases) == 0 {
 			return nil
-		}
-		var aliases []model.NativeAlias
-		for _, raw := range page {
-			var a []model.NativeAlias
-			if err := json.Unmarshal([]byte(raw), &a); err != nil {
-				return internalErr("import aliases: %v", err)
-			}
-			aliases = append(aliases, a...)
 		}
 		if err := e.sink.PutAliases(ctx, aliases); err != nil {
 			return err
 		}
 		e.aliases += len(aliases)
-		after = page[len(page)-1]
+		aliases = nil
+		return nil
 	}
+	for n := 0; rows.Next(); n++ {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return internalErr("import aliases: %v", err)
+		}
+		var a []model.NativeAlias
+		if err := json.Unmarshal([]byte(raw), &a); err != nil {
+			return internalErr("import aliases: %v", err)
+		}
+		aliases = append(aliases, a...)
+		if n%pageSize == pageSize-1 {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return internalErr("import aliases: %v", err)
+	}
+	return flush()
 }
 
-// emitRelations streams the staged occurrences grouped by relation and hands
-// each canonical edge, with its bounded evidence list and the fact keys of
-// every occurrence behind it, to the sink. Node facts are always emitted,
-// because they are the identities the kept rows still reference.
+// emitRelations hands each canonical edge, with its bounded evidence list
+// and the fact keys of every occurrence behind it, to the sink: first the
+// in-order stream, read front to back and grouped where the entity pair
+// changes, then the sorted stream, grouped where the relation identity
+// changes. Node facts are always emitted, because they are the identities
+// the kept rows still reference.
 //
 // A delta import filters whole relations, not occurrences: an edge is emitted
 // if ANY of its occurrences carries a key the previous run did not publish,
@@ -937,48 +1053,112 @@ func (e *emitter) emitAliases(ctx context.Context) error {
 //
 // deltaFilter, not this function, decides whether filtering is allowed at all.
 func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
-	filter := ""
-	if delta {
-		filter = ` AND EXISTS (SELECT 1 FROM rels o JOIN keys k ON k.key = o.key
-			WHERE o.rel_id = rels.rel_id AND k.changed = 1)`
+	if err := e.sc.commit(ctx); err != nil {
+		return err
 	}
-	query := `SELECT rel_id, ev_id, from_id, kind, to_id, ev_json, key FROM rels
-		WHERE (rel_id, ev_id) > (?, ?)` + filter + ` ORDER BY rel_id, ev_id LIMIT ?`
-	var afterRel, afterEv string
-	var current *model.RelationFact
-	var currentKeys []string
-	var batch []model.RelationFact
-	var keys [][]string
-	closeGroup := func() {
-		if current == nil {
-			return
-		}
-		batch = append(batch, *current)
-		keys = append(keys, sortedKeys(currentKeys))
-		current, currentKeys = nil, nil
+	b := &relationBatch{e: e, delta: delta}
+	if err := e.emitInOrder(ctx, b); err != nil {
+		return err
 	}
-	flush := func() error {
-		closeGroup()
-		if len(batch) == 0 {
-			return nil
-		}
-		if err := e.putRelations(ctx, batch, keys); err != nil {
+	if err := e.emitSorted(ctx, b); err != nil {
+		return err
+	}
+	return b.flush(ctx)
+}
+
+// relationBatch accumulates the relation being grouped and the batch of
+// finished relations on its way to the sink.
+type relationBatch struct {
+	e     *emitter
+	delta bool
+
+	current     *model.RelationFact
+	currentKeys []string
+	changed     bool
+	batch       []model.RelationFact
+	keys        [][]string
+}
+
+// open starts a new relation group.
+func (b *relationBatch) open(rel model.RelationFact) {
+	b.current, b.currentKeys, b.changed = &rel, nil, false
+}
+
+// add appends one occurrence to the open group.
+func (b *relationBatch) add(ev model.Evidence, key string, changed bool) {
+	// The key is collected even for an occurrence past the evidence bound:
+	// the occurrence still backs this edge, and a key left off would leave
+	// storage carrying the previous row when that occurrence alone changes.
+	if key != "" {
+		b.currentKeys = append(b.currentKeys, key)
+	}
+	b.changed = b.changed || changed
+	if len(b.current.Evidence) >= b.e.opts.MaxEvidencePerFact {
+		b.e.clipped++
+		return
+	}
+	b.current.Evidence = append(b.current.Evidence, ev)
+}
+
+// close finishes the open group: a delta import keeps it only when one of
+// its keys changed.
+func (b *relationBatch) close() {
+	if b.current == nil {
+		return
+	}
+	if !b.delta || b.changed {
+		b.batch = append(b.batch, *b.current)
+		b.keys = append(b.keys, sortedKeys(b.currentKeys))
+	}
+	b.current, b.currentKeys = nil, nil
+}
+
+// flush hands the finished relations to the sink, keeping the open group.
+func (b *relationBatch) flush(ctx context.Context) error {
+	open, openKeys, changed := b.current, b.currentKeys, b.changed
+	b.current, b.currentKeys = nil, nil
+	if len(b.batch) > 0 {
+		if err := b.e.putRelations(ctx, b.batch, b.keys); err != nil {
 			return err
 		}
-		e.relations += len(batch)
-		batch, keys = nil, nil
-		return nil
+		b.e.relations += len(b.batch)
+		b.batch, b.keys = nil, nil
 	}
+	b.current, b.currentKeys, b.changed = open, openKeys, changed
+	return nil
+}
+
+// emitInOrder reads the in-order stream: consecutive occurrences with one
+// (from entity, kind, to entity) are one relation, whose endpoints are the
+// identities of the two entities.
+func (e *emitter) emitInOrder(ctx context.Context, b *relationBatch) error {
+	changed := `0`
+	if b.delta {
+		changed = `EXISTS (SELECT 1 FROM changed c WHERE c.key = o.key)`
+	}
+	query := `SELECT o.seq, o.from_e, o.to_e, o.kind, COALESCE(fl.file_id, ''), COALESCE(fl.content_hash, ''),
+		o.range_text, o.native_key, o.detail, o.key, ` + changed + ` FROM occ o LEFT JOIN files fl ON fl.id = o.file
+		WHERE o.seq > ? ORDER BY o.seq LIMIT ?`
+	type group struct {
+		from, to int64
+		kind     string
+	}
+	var open group
+	after := int64(math.MinInt64)
 	for {
-		rows, err := e.sc.db.QueryContext(ctx, query, afterRel, afterEv, pageSize)
+		rows, err := e.sc.db.QueryContext(ctx, query, after, pageSize)
 		if err != nil {
 			return internalErr("import relations: %v", err)
 		}
-		type row struct{ rel, ev, from, kind, to, raw, key string }
+		type row struct {
+			seq, from, to                                   int64
+			kind, fileID, hash, rng, nativeKey, detail, key string
+			changed                                         bool
+		}
 		var page []row
 		for rows.Next() {
 			var r row
-			if err := rows.Scan(&r.rel, &r.ev, &r.from, &r.kind, &r.to, &r.raw, &r.key); err != nil {
+			if err := rows.Scan(&r.seq, &r.from, &r.to, &r.kind, &r.fileID, &r.hash, &r.rng, &r.nativeKey, &r.detail, &r.key, &r.changed); err != nil {
 				rows.Close()
 				return internalErr("import relations: %v", err)
 			}
@@ -989,64 +1169,100 @@ func (e *emitter) emitRelations(ctx context.Context, delta bool) error {
 			return internalErr("import relations: %v", err)
 		}
 		if len(page) == 0 {
-			return flush()
+			b.close()
+			return nil
 		}
 		for _, r := range page {
-			if current == nil || string(current.Relation.ID) != r.rel {
-				closeGroup()
-				current = &model.RelationFact{Relation: model.Relation{ID: model.RelationID(r.rel),
-					From: model.NodeID(r.from), Kind: model.RelationKind(r.kind), To: model.NodeID(r.to)}}
+			if g := (group{r.from, r.to, r.kind}); b.current == nil || g != open {
+				b.close()
+				from, err := e.identityOf(ctx, r.from)
+				if err != nil {
+					return err
+				}
+				to, err := e.identityOf(ctx, r.to)
+				if err != nil {
+					return err
+				}
+				kind := model.RelationKind(r.kind)
+				b.open(model.RelationFact{Relation: model.Relation{ID: model.NewRelationID(e.opts.Repository, from, kind, to),
+					From: from, Kind: kind, To: to}})
+				open = g
 			}
-			// The key is collected even for an occurrence past the evidence
-			// bound: the occurrence still backs this edge, and a key left off
-			// would leave storage carrying the previous row when that
-			// occurrence alone changes.
-			if r.key != "" {
-				currentKeys = append(currentKeys, r.key)
-			}
-			if len(current.Evidence) >= e.opts.MaxEvidencePerFact {
-				e.clipped++
-				continue
-			}
-			var ev model.Evidence
-			if err := json.Unmarshal([]byte(r.raw), &ev); err != nil {
-				return internalErr("import relations: %v", err)
-			}
-			current.Evidence = append(current.Evidence, ev)
+			b.add(e.evidence("", b.current.Relation.ID, model.FileID(r.fileID), r.hash, parseRange(r.rng), r.nativeKey, r.detail), r.key, r.changed)
 		}
-		afterRel, afterEv = page[len(page)-1].rel, page[len(page)-1].ev
-		// The relation still open may continue on the next page; everything
-		// before it is complete.
-		if len(batch) >= pageSize {
-			open, openKeys := current, currentKeys
-			current, currentKeys = nil, nil
-			if err := flush(); err != nil {
+		after = page[len(page)-1].seq
+		if len(b.batch) >= pageSize {
+			if err := b.flush(ctx); err != nil {
 				return err
 			}
-			current, currentKeys = open, openKeys
 		}
 	}
 }
 
-// pageStrings runs a single-column keyset query.
-func (e *emitter) pageStrings(ctx context.Context, query, after string, limit int) ([]string, error) {
-	rows, err := e.sc.db.QueryContext(ctx, query, after, limit)
-	if err != nil {
-		return nil, internalErr("import scratch: %v", err)
+// identityOf is the canonical node an identified entity resolved to.
+func (e *emitter) identityOf(ctx context.Context, ent int64) (model.NodeID, error) {
+	var id string
+	if err := e.sc.db.QueryRowContext(ctx, `SELECT node_id FROM ident WHERE ent = ?`, ent).Scan(&id); err != nil {
+		return "", internalErr("import relations: entity %d has no identity: %v", ent, err)
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var s string
-		if err := rows.Scan(&s); err != nil {
-			return nil, internalErr("import scratch: %v", err)
+	return model.NodeID(id), nil
+}
+
+// emitSorted reads the sorted stream, grouped where the relation identity
+// changes.
+func (e *emitter) emitSorted(ctx context.Context, b *relationBatch) error {
+	filter := ""
+	if b.delta {
+		filter = ` AND EXISTS (SELECT 1 FROM occ_sorted o JOIN changed k ON k.key = o.key WHERE o.rel_id = r.rel_id)`
+	}
+	query := `SELECT r.rel_id, r.ev_id, r.from_id, r.kind, r.to_id, COALESCE(f.file_id, ''), COALESCE(f.content_hash, ''),
+		r.range_text, r.native_key, r.detail, r.key FROM occ_sorted r LEFT JOIN files f ON f.id = r.file
+		WHERE (r.rel_id, r.ev_id) > (?, ?)` + filter + ` ORDER BY r.rel_id, r.ev_id LIMIT ?`
+	var afterRel, afterEv string
+	for {
+		rows, err := e.sc.db.QueryContext(ctx, query, afterRel, afterEv, pageSize)
+		if err != nil {
+			return internalErr("import relations: %v", err)
 		}
-		out = append(out, s)
+		type row struct{ rel, ev, from, kind, to, fileID, hash, rng, nativeKey, detail, key string }
+		var page []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.rel, &r.ev, &r.from, &r.kind, &r.to, &r.fileID, &r.hash, &r.rng, &r.nativeKey, &r.detail, &r.key); err != nil {
+				rows.Close()
+				return internalErr("import relations: %v", err)
+			}
+			page = append(page, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return internalErr("import relations: %v", err)
+		}
+		if len(page) == 0 {
+			b.close()
+			return nil
+		}
+		for _, r := range page {
+			if b.current == nil || string(b.current.Relation.ID) != r.rel {
+				b.close()
+				b.open(model.RelationFact{Relation: model.Relation{ID: model.RelationID(r.rel),
+					From: model.NodeID(r.from), Kind: model.RelationKind(r.kind), To: model.NodeID(r.to)}})
+			}
+			ev := e.evidence("", model.RelationID(r.rel), model.FileID(r.fileID), r.hash, parseRange(r.rng), r.nativeKey, r.detail)
+			if string(ev.ID) != r.ev {
+				return internalErr("import relations: an occurrence's evidence does not rebuild to the identity it was staged under")
+			}
+			// The filter admitted the whole relation; its keys are all
+			// collected and the group is kept.
+			b.add(ev, r.key, b.delta)
+		}
+		afterRel, afterEv = page[len(page)-1].rel, page[len(page)-1].ev
+		if len(b.batch) >= pageSize {
+			if err := b.flush(ctx); err != nil {
+				return err
+			}
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, internalErr("import scratch: %v", err)
-	}
-	return out, nil
 }
 
 func nullStr(n sql.NullInt64) string {

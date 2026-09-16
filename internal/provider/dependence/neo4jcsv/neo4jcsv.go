@@ -5,10 +5,14 @@
 // CSV: one `nodes_<LABEL>_header.csv` / `nodes_<LABEL>_data.csv` pair per node
 // label and one `edges_<TYPE>_header.csv` / `edges_<TYPE>_data.csv` pair per
 // edge type, beside `*_cypher.csv` load scripts that are not data. Node ids
-// are renumbered on every run and edges may name an id whose node row has not
-// been read yet, so the import stages the whole export in an on-disk scratch
-// database and derives facts by ordered query: a fact is a function of the
-// export's content, never of the order its files were read.
+// are the engine's integer node identities, renumbered on every run, and
+// edges may name an id whose node row has not been read yet, so the import
+// stages the whole export in an on-disk scratch database and derives facts by
+// ordered query: a fact is a function of the export's content, never of the
+// order its files were read. The staging is written the way a bulk load
+// writes -- appended in arrival order, sorted once into each order a later
+// phase reads -- so its disk traffic is a small constant times the export's
+// bytes (ADR-0009).
 //
 // The import publishes the five capabilities of Section 11.6 —
 // control_depends_on, data_flows_to, reads, writes and calls — plus
@@ -156,6 +160,11 @@ type Options struct {
 	// ScratchDir is the private directory the staging database is created
 	// in. Empty means the process temp directory.
 	ScratchDir string
+	// StagingCacheKiB is the staging database's page cache, the user's
+	// `providers.dependence.staging_cache_kib`. It bounds the memory one
+	// import holds for its staging and is the buffer the engine sorts in; 0
+	// selects the default.
+	StagingCacheKiB int
 	// KeysPath is where the fresh key set is written. Empty means a file
 	// beside the staging database, which is deleted with it; a caller that
 	// wants to keep the key set for the next refresh must name a path.
@@ -294,7 +303,7 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 	}
 	defer os.RemoveAll(dir)
 
-	sc, err := openScratch(ctx, filepath.Join(dir, "stage.db"), opts.MaxStagedRows)
+	sc, err := openScratch(ctx, filepath.Join(dir, "stage.db"), opts.StagingCacheKiB, opts.MaxStagedRows)
 	if err != nil {
 		return rep, err
 	}
@@ -314,11 +323,17 @@ func Import(ctx context.Context, exportDir string, res provider.Resolver, sink p
 		return rep, err
 	}
 	opts.phase(PhaseExportStaged)
+	if err := sc.order(ctx); err != nil {
+		return rep, err
+	}
 	if err := sc.project(ctx); err != nil {
 		return rep, err
 	}
 	opts.phase(PhaseProjected)
 	if err := e.deriveReadsWrites(ctx); err != nil {
+		return rep, err
+	}
+	if err := sc.occurrences(ctx); err != nil {
 		return rep, err
 	}
 	opts.phase(PhaseReadsWrites)

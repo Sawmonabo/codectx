@@ -485,6 +485,36 @@ row-identity, and that nothing was re-imported for the untouched files.
 The key algebra is versioned, so a stored set built by an older algebra can
 never be mis-diffed against a fresh one.
 
+## The staging database
+
+The importer stages the whole export in a private SQLite database under
+`<data_dir>/dependence/scratch/` and derives the unit's facts from it by
+ordered query, so a fact is a function of the export's content and never of
+the order its files were read. The staging is written the way a bulk load
+writes: every table is appended in the order its rows arrive, with no
+secondary index during the load, and every structure a later phase reads in
+another order -- the node table keyed by the engine's integer node id, the
+edge tables by source and by target, the per-node attributes, the locations,
+the occurrences -- is built afterwards in one ordered pass of the engine's
+external merge sort. No row is updated after it is written and nothing is
+inserted into the middle of a b-tree larger than the cache. Occurrences are
+derived in projection order, which already groups the occurrences of one
+canonical edge, so the relation emission reads them front to back with no
+sort; only the edges whose endpoint several entities resolved to, and
+`may_refer_to`, take a second, sorted stream.
+
+The result is that an import's disk traffic is a small constant times its
+export -- 6.6× on the synthetic export of the importer's scale test, with a
+staging cache small enough that every sort spills, against 34.5× before --
+and that every byte is written once, sequentially, and paced to the disk
+every hundred milliseconds rather than in a burst at each commit. The page
+cache of the staging database is `providers.dependence.staging_cache_kib`
+(256 MiB by default): it bounds the memory one import holds for its staging
+and is the buffer the engine sorts in, so a table smaller than it is ordered
+in memory and a larger one spills once to a temporary file under the data
+directory's `tmp/`. [ADR-0009](adr/ADR-0009-import-staging.md) records the
+measurements and the alternatives.
+
 ## Privacy and cleanup
 
 Materializations, graphs not selected for the cache, exports and the
@@ -492,7 +522,7 @@ importer's staging database are removed on every termination path. All of them
 live under the provider's own private roots — `<data_dir>/dependence/runs/` for
 the per-run directories and `<data_dir>/dependence/scratch/` for the staging
 databases — never under the system temp directory: the staging database holds
-source-derived graph content and was measured at 649 MB for one 64 MB export.
+source-derived graph content.
 
 `defer` covers every return and every panic but not a `SIGKILL` or a power
 loss, so the provider sweeps both private roots when it is constructed,

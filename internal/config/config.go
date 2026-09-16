@@ -457,6 +457,12 @@ type Dependence struct {
 	// value is the only thing that refuses an import here, and the refusal
 	// names this key.
 	MaxExportFiles Limit `toml:"max_export_files"`
+	// StagingCacheKiB is the page cache of the staging database one unit's
+	// import stages the engine's export in. It bounds the memory an import
+	// holds for its staging, and it is the buffer the engine sorts in when it
+	// builds each ordered copy the import reads, so a table smaller than it
+	// is sorted without a spill file.
+	StagingCacheKiB int `toml:"staging_cache_kib"`
 }
 
 // Tools is the managed analyzer toolchain policy of Section 11.7. The product
@@ -706,6 +712,7 @@ func Defaults() Config {
 				MaxStagedRows:          Unlimited,
 				MaxDerivedRows:         Unlimited,
 				MaxExportFiles:         Unlimited,
+				StagingCacheKiB:        262144,
 			},
 			Manifest: Manifest{MaxDependencies: Unlimited, MaxEntries: Unlimited,
 				MaxTOMLLines: Unlimited, MaxXMLElements: Unlimited},
