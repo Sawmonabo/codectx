@@ -2,6 +2,7 @@ package scip
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -859,6 +860,85 @@ func (im *importer) rangeOf(ds *docSource, r [4]int32) (*model.SourceRange, erro
 	return &rng, nil
 }
 
+// occurrenceRange converts one occurrence's range and proves it against the
+// pinned bytes it claims to describe. A range that converts cleanly is not yet
+// a fact: a column shifted by an indentation the indexer measured differently
+// from the file still lands inside the line, selects a valid rune-aligned
+// extent, and is published at compiler precision over source that is not the
+// symbol — the wrong-bytes class nothing downstream can detect (measured: 1,183
+// of 93,167 occurrences of one Java project, in 79 of its 223 documents, over
+// lines indented with spaces followed by a tab).
+//
+// So every occurrence is checked, not one per document. The per-document
+// encoding probe (encodingHolds) answers a different question with a different
+// outcome, and the two are deliberately not merged: it decides whether an
+// encoding the index never stated may be used at all, so a document it cannot
+// prove is skipped and counted — an unproven guess must not fail a unit that
+// the index never claimed. Here the index has claimed: it says this range
+// describes these bytes, and a range that does not is refused, which fails the
+// unit closed under a verified binding and skips the occurrence under an
+// unverified one.
+func (im *importer) occurrenceRange(ds *docSource, sym symbol, r [4]int32) (*model.SourceRange, error) {
+	rng, err := im.rangeOf(ds, r)
+	if err != nil || rng == nil {
+		return nil, err
+	}
+	if msg := onPinnedBytes(ds.data, sym, rng); msg != "" {
+		return nil, im.badRange(ds, msg)
+	}
+	return rng, nil
+}
+
+// onPinnedBytes reports why an occurrence's range does not describe the bytes
+// it claims, or "" when it does. Two checks, one byte comparison each:
+//
+//   - a symbol whose last descriptor is a name the grammar spells literally
+//     (symbol.probeName) must find that identifier at the start of the range,
+//     ending on a token boundary. The range is allowed to be wider than the
+//     name because a real occurrence is: scip-python puts the whole
+//     `OrderedDict as OD` alias clause of an aliased import on the symbol
+//     OrderedDict (measured), so requiring equality would refuse every Python
+//     project that aliases an import;
+//   - every other range — a local symbol, an escaped name, a package or
+//     synthetic descriptor, all of which name nothing the source spells — must
+//     at least start on a token boundary, which a shifted column rarely does.
+//
+// Nothing is adjusted and nothing is guessed: the range either describes the
+// identifier or it is refused.
+func onPinnedBytes(data []byte, sym symbol, rng *model.SourceRange) string {
+	if rng.Start.Byte > rng.End.Byte || rng.End.Byte > uint64(len(data)) {
+		return "the range ends past the pinned bytes"
+	}
+	text := data[rng.Start.Byte:rng.End.Byte]
+	if len(text) > 0 && identifierByte(text[0]) && rng.Start.Byte > 0 && identifierByte(data[rng.Start.Byte-1]) {
+		return "the range starts inside an identifier token"
+	}
+	name, ok := sym.probeName()
+	switch {
+	case !ok:
+		return ""
+	case !bytes.HasPrefix(text, []byte(name)):
+		return "the range does not select the identifier the symbol names"
+	case len(text) > len(name) && identifierByte(text[len(name)]):
+		return "the range does not select the identifier the symbol names"
+	}
+	return ""
+}
+
+// identifierByte reports whether b can sit inside an identifier token of the
+// languages this provider imports. Every byte of a multi-byte rune is one:
+// identifiers are non-ASCII in several of them, and the question here is only
+// where a token stops, never what the rune is.
+func identifierByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '_', b == '$':
+		return true
+	}
+	return b >= 0x80
+}
+
 // badRange is the typed outcome of a coordinate that misses the pinned
 // bytes: nil under an unverified binding (the caller skips and counts),
 // otherwise CTX_PROVIDER_OUTPUT_INVALID that fails the unit.
@@ -882,7 +962,7 @@ func (im *importer) defineSymbol(ctx context.Context, ds *docSource, symbolText 
 	if err != nil {
 		return err
 	}
-	rng, err := im.rangeOf(ds, r)
+	rng, err := im.occurrenceRange(ds, sym, r)
 	if err != nil || rng == nil {
 		return err
 	}
@@ -1068,7 +1148,7 @@ func (im *importer) referencesOf(ctx context.Context, d docRow) error {
 			if err != nil {
 				return err
 			}
-			rng, err := im.rangeOf(ds, r)
+			rng, err := im.occurrenceRange(ds, sym, r)
 			if err != nil || rng == nil {
 				return err
 			}
