@@ -211,7 +211,7 @@ type collector struct {
 // resources.query_memory_bytes.
 func newCollector(dir string, runBytes int64) (*collector, error) {
 	c := &collector{dir: dir, runBytes: runBytes}
-	sorter, err := newScoredSort(dir, "searchdedup-", runBytes,
+	sorter, err := newScoredSort(dir, runBytes,
 		func(a, b scored) int { return strings.Compare(dedupKey(a.ranked), dedupKey(b.ranked)) })
 	if err != nil {
 		return nil, err
@@ -226,8 +226,8 @@ func newCollector(dir string, runBytes int64) (*collector, error) {
 // the sort is affected. Both passes that exist go through it: the
 // deduplication pass of the first request, and the ranking sort a
 // continuation runs once over the raw candidate spool (ADR-0007 Decision 3).
-func newScoredSort(dir, prefix string, runBytes int64, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
-	sorter, err := pagination.NewExternalSort(dir, prefix, 0, encodeScored, decodeScored, compare)
+func newScoredSort(dir string, runBytes int64, compare func(a, b scored) int) (*pagination.ExternalSort[scored], error) {
+	sorter, err := pagination.NewExternalSort(dir, 0, encodeScored, decodeScored, compare)
 	if err != nil {
 		return nil, err
 	}

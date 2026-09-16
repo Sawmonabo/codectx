@@ -257,7 +257,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	sorter, err := pagination.NewExternalSort(dir, "plan-inputs-", 0, encodeInput, decodeInput, compareInput)
+	sorter, err := pagination.NewExternalSort(dir, 0, encodeInput, decodeInput, compareInput)
 	if err != nil {
 		return Plan{}, err
 	}
@@ -273,7 +273,7 @@ func Build(ctx context.Context, in Inputs) (Plan, error) {
 	// Sorted() removes the runs on the success path; this covers every early
 	// return, which would otherwise leave spill files behind.
 	defer func() { _ = sorter.Close() }()
-	units, err := pagination.NewExternalSort(dir, "plan-units-", 0, encodeUnit, decodeUnit, compareUnit)
+	units, err := pagination.NewExternalSort(dir, 0, encodeUnit, decodeUnit, compareUnit)
 	if err != nil {
 		return Plan{}, err
 	}

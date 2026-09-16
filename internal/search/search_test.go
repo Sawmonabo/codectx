@@ -1565,7 +1565,7 @@ func resultsOf(t *testing.T, c *collector) []scored {
 // bounded heap's first page is compared against.
 func rankOrder(t *testing.T, run *pagination.SortedRun[scored]) ([]scored, error) {
 	t.Helper()
-	sorter, err := newScoredSort(t.TempDir(), "searchrank-", 0, cmpScored)
+	sorter, err := newScoredSort(t.TempDir(), 0, cmpScored)
 	if err != nil {
 		return nil, err
 	}
