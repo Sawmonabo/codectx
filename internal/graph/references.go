@@ -866,7 +866,11 @@ func (e *Engine) firstReferencePage(ctx context.Context, node model.NodeID, walk
 // remainder behind it.
 func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 	pageLimit int) ([]model.ReferenceOccurrence, *referenceCursor, bool, bool, error) {
-	if e.spools == nil || e.leases == nil {
+	// A spool store is what a resumed page reads; a LEASE store is not. An
+	// engine composed without one mints leaseless continuations, so refusing
+	// them here would hand back a token that fails on every use. Every lease
+	// call below is nil-safe or sits behind a lease id the token carries.
+	if e.spools == nil {
 		return nil, nil, false, false, cursorInvalid("continuation state has expired or was released")
 	}
 	sc := c.spoolCursor()
@@ -934,7 +938,7 @@ func (e *Engine) resumedReferencePage(ctx context.Context, c referenceCursor,
 		// that lease's own TTL and the next sweep reclaim it.
 		relErr := e.spools.Release(c.SpoolID)
 		if c.LeaseID != "" && e.leases.Retains() {
-			return b.items, nil, false, b.clipped, e.releaseLease(ctx, c.LeaseID, relErr)
+			relErr = e.releaseLease(ctx, c.LeaseID, relErr)
 		}
 		if relErr != nil {
 			return nil, nil, false, false, relErr
