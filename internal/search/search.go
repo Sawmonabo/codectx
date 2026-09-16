@@ -288,7 +288,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Pa
 func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, run *pagination.SortedRun[scored],
 	limit int, b model.Binding, hash string, now time.Time, truncated bool, reason string) ([]model.SearchHit, string, bool, string, error) {
 	h := &pageHeap{limit: limit}
-	w := &rawWriter{svc: s, binding: b, hash: hash, now: now}
+	w := &rawWriter{svc: s, binding: b, hash: hash, now: now, retains: reader.Continuable()}
 	total := int64(0)
 	err := run.Each(func(v scored) error {
 		if err := ctx.Err(); err != nil {
@@ -309,12 +309,6 @@ func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, ru
 		if !h.full() {
 			return nil
 		}
-		if !reader.Continuable() {
-			// This process cannot retain a continuation, so the walk stops
-			// spooling here and the page in hand is the whole answer.
-			w.unretainable = true
-			return nil
-		}
 		return w.start(ctx, h.items)
 	})
 	if err != nil {
@@ -329,14 +323,6 @@ func (s *Service) firstPage(ctx context.Context, reader *sqlite.PinnedReader, ru
 	spool, err := w.close(ctx)
 	if err != nil {
 		return nil, "", false, "", err
-	}
-	if w.unretainable {
-		// Same shape as the budget refusal below, for a different cause: the
-		// hits of page 1 are in hand and refusing to serve them because this
-		// process holds no writer would be the refusal the scale posture
-		// forbids.
-		dropped := int(total) - len(hits)
-		return hits, "", true, noContinuationReason(dropped), nil
 	}
 	if w.dropped {
 		// A spool budget that is already full must end THIS page, never the
@@ -383,11 +369,11 @@ type rawWriter struct {
 	now     time.Time
 	lease   string
 	spool   *pagination.Spool
-	// unretainable records that this process cannot hold a continuation at all
-	// -- it opened the store read-only, so it can write neither the cursor
-	// lease nor the spool. Unlike dropped it is known before the first spool
-	// write is attempted, so nothing is written and nothing is released.
-	unretainable bool
+	// retains says whether this process can record the cursor-owned lease. A
+	// process that opened the store read-only cannot, and spools anyway: the
+	// spool is a filesystem write, and the entry it creates is bound to the
+	// cursor's own expiry instead of to a lease row.
+	retains bool
 	// dropped records that the shared spool budget refused a record. The walk
 	// continues -- the count of candidates is what the truncation reason names
 	// -- but nothing further is written and the answer carries no continuation.
@@ -396,19 +382,21 @@ type rawWriter struct {
 
 // started reports whether the spool has been opened, or opening it has already
 // been given up on.
-func (w *rawWriter) started() bool { return w.spool != nil || w.dropped || w.unretainable }
+func (w *rawWriter) started() bool { return w.spool != nil || w.dropped }
 
 // start opens the spool and writes every candidate the heap holds.
 func (w *rawWriter) start(ctx context.Context, held []scored) error {
-	lease, err := w.svc.leases.Acquire(ctx, w.binding.GenerationID, w.binding.SnapshotID, model.LeaseCursor)
-	if err != nil {
-		return err
+	if w.retains {
+		lease, err := w.svc.leases.Acquire(ctx, w.binding.GenerationID, w.binding.SnapshotID, model.LeaseCursor)
+		if err != nil {
+			return err
+		}
+		w.lease = lease.ID
 	}
-	w.lease = lease.ID
-	c := w.svc.newSearchCursor(w.binding, w.hash, lease.ID, w.now)
+	c := w.svc.newSearchCursor(w.binding, w.hash, w.lease, w.now)
 	sp, err := w.svc.spools.Create(c.spoolBinding())
 	if err != nil {
-		w.svc.releaseLease(ctx, lease.ID)
+		w.svc.releaseLease(ctx, w.lease)
 		w.lease = ""
 		if pagination.IsBudgetExhausted(err) {
 			w.dropped = true
@@ -516,26 +504,35 @@ func (s *Service) resumedPage(ctx context.Context, reader *sqlite.PinnedReader, 
 	}
 	served := c.Served + int64(len(chunk))
 	if served >= c.Total {
-		// The answer is complete. The spool and the lease it pinned are
-		// released here rather than left to their TTL, so a walk read to
-		// exhaustion holds nothing.
-		if err := s.spools.Release(c.SpoolID); err != nil {
+		// The answer is complete. The spool is released here rather than left
+		// to its deadline, so a walk read to exhaustion holds nothing, and the
+		// lease it pinned goes with it. A process that records no lease ends
+		// only the spool: the row a writer-bearing page minted is not this
+		// process's to end, and its own TTL and the next sweep reclaim it.
+		relErr := s.spools.Release(c.SpoolID)
+		if reader.Continuable() {
 			s.releaseLease(ctx, c.LeaseID)
-			return nil, "", err
 		}
-		s.releaseLease(ctx, c.LeaseID)
+		if relErr != nil {
+			return nil, "", relErr
+		}
 		return hits, "", nil
-	}
-	// The spool's liveness is its lease's and the token's is its own expiry, so
-	// a cursor that carried page one's expiry forward would bound the WHOLE
-	// answer by one CursorTTL: a long answer would stop being reachable part
-	// way through, which is truncation by clock.
-	if _, err := s.leases.Renew(ctx, c.LeaseID); err != nil {
-		return nil, "", err
 	}
 	next := c
 	next.Offset, next.Served = end, served
-	next.ExpiresAt = now.Add(s.ttl).UTC().Truncate(time.Second)
+	// A leased spool's liveness is its lease's, and renewing it on every page
+	// is what keeps a long answer reachable past one cursor TTL. A LEASELESS
+	// spool -- and a leased one presented to a process that writes nothing --
+	// has no renewal: the token carries forward the expiry the spool's header
+	// was stamped with, so the whole answer is reachable for that one window
+	// and a page asked for after it is the typed CTX_CURSOR_INVALID every
+	// continuation already answers when its state is gone.
+	if c.LeaseID != "" && reader.Continuable() {
+		if _, err := s.leases.Renew(ctx, c.LeaseID); err != nil {
+			return nil, "", err
+		}
+		next.ExpiresAt = now.Add(s.ttl).UTC().Truncate(time.Second)
+	}
 	token, err := s.signSearchCursor(next)
 	if err != nil {
 		return nil, "", err
@@ -889,17 +886,6 @@ func reasonFor(t model.SearchTier) string { return "matched the " + string(t) + 
 // were served but the remainder could not be written to the query spool. It
 // names the number of hits that were dropped, which is the fact a caller needs
 // to decide whether to narrow the query or to wait and retry.
-// noContinuationReason is the reason a caller sees when the page was served by
-// a process that changes nothing: a continuation would need a cursor lease and
-// a spool, both writes, and this process holds no writer connection. It names
-// the hits beyond the page so the caller can narrow the query rather than look
-// for a token that is not coming.
-func noContinuationReason(dropped int) string {
-	return "this answer was served by a process that writes nothing, so " + strconv.Itoa(dropped) +
-		" further ranked hits are not reachable and this answer has no continuation; " +
-		"narrow the query, or re-run it when no index run holds the workspace"
-}
-
 func spoolBudgetFullReason(dropped int) string {
 	return "the shared query spool ran out of disk budget, so " + strconv.Itoa(dropped) +
 		" further ranked hits were dropped and this answer has no continuation; " +
