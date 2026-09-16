@@ -209,3 +209,63 @@ func TestAJournalIsDeletedOneWindowAtATime(t *testing.T) {
 		t.Fatalf("the journal's removal freed %d bytes through the pacer; a 64 MiB journal frees at least %d", got, 7*paced.Window)
 	}
 }
+
+// The requirement: a delete the engine makes while it holds the database file
+// gives the space back off that path. The engine unlinks the write-ahead log
+// from inside its WAL close, which holds the database exclusively for the
+// length of the call, so a log emptied there a window at a time locks every
+// other process out for a quarter second per window -- a question-answering
+// process measured 2.03 s inside its first connection, waiting out the eight
+// windows of a 65 MiB log on the busy ladder, while it changed nothing.
+// Mutation: drop the QueueForRemoval branch in xDelete and the close frees the
+// whole log in place, on the engine's path.
+func TestTheLogIsRenamedAwayRatherThanEmptiedUnderTheEnginesLock(t *testing.T) {
+	if err := Register(); err != nil {
+		t.Fatal(err)
+	}
+	served := t.TempDir()
+	set := filepath.Join(served, "set")
+	paced.RegisterToFree(served, func() (string, error) {
+		return set, os.MkdirAll(set, 0o700)
+	})
+	path := filepath.Join(served, "wal.db")
+	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE t(b BLOB)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	fill(t, db, 64)
+	st, err := os.Stat(path + "-wal")
+	if err != nil {
+		db.Close()
+		t.Fatalf("the write-ahead log is not there to be removed: %v", err)
+	}
+	if st.Size() < 7*paced.Window {
+		db.Close()
+		t.Fatalf("the write-ahead log is %d bytes; this proves nothing under one window (%d)",
+			st.Size(), paced.Window)
+	}
+	before := paced.FreedBytes()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + "-wal"); !os.IsNotExist(err) {
+		t.Fatalf("the write-ahead log survived the close under its own name: %v", err)
+	}
+	// The structural fact, not a wall clock: nothing was freed on the path the
+	// engine held the database on. One window of slack, because the reclaimer
+	// runs beside this and may already have taken its first turn.
+	if freed := paced.FreedBytes() - before; freed > paced.Window {
+		t.Fatalf("the close freed %d bytes in place while the engine held the database; "+
+			"a removal there renames and returns", freed)
+	}
+	// And the space is given back, so the rename is a pacing decision and not
+	// a leak.
+	paced.Drain()
+	if freed := paced.FreedBytes() - before; freed < 7*paced.Window {
+		t.Fatalf("the reclaimer gave back %d bytes of a %d-byte log", freed, st.Size())
+	}
+}
