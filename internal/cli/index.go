@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -33,7 +34,20 @@ const (
 	// coordinator already knows, and every `status` paying for it would make
 	// the cheapest report in the tree one of the most expensive.
 	statusResourcesFlag = "resources"
+	// statusFollowFlag turns one status report into a live one. It reads and
+	// writes nothing but its own output, so it costs a run that is going
+	// nothing at all.
+	statusFollowFlag = "follow"
 )
+
+// statusFollowInterval is how often --follow re-renders. One second is the
+// rate a person reading a terminal can actually take in and the rate a script
+// tailing the output can keep up with, and a stage worth watching lasts
+// seconds. It is a constant and not a setting because a report that re-read
+// faster would measure the host more often than the host changes, and one that
+// re-read slower would stop being live -- neither is a choice an operator
+// gains anything by making.
+const statusFollowInterval = time.Second
 
 // indexLockWait is the bounded wait a building command makes for the
 // cross-process workspace lock. Section 13.2 offers a second caller exactly
@@ -198,14 +212,26 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			"the query, cache and queue reservations, live subprocesses and pending events, " +
 			"database, WAL, temporary and content bytes, unit reuse and parse counts, and " +
 			"what each heavy analysis unit was reserved, capped and observed to peak at. " +
+			"It also reports the run this repository last recorded -- the one still going if " +
+			"a run is going, otherwise the one that produced the active generation -- and the " +
+			"stages it spent its time in, costliest first, with a stage that is still going " +
+			"reported as running with the time it has been going rather than as a finished wall. " +
 			"It is not reported by default because measuring it costs more than the rest of " +
 			"this report put together. A metric this host cannot measure is reported as " +
-			"unavailable, never as zero.",
+			"unavailable, never as zero.\n\n" +
+			"--follow reports again every second until it is interrupted, which is the live " +
+			"view from a second terminal while a run is going; with --json it emits one " +
+			"complete envelope per second, each a whole snapshot rather than a change since " +
+			"the last, and with --resources the host is measured again on every one.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resources, err := boolFlag(cmd, statusResourcesFlag)
+			if err != nil {
+				return err
+			}
+			follow, err := boolFlag(cmd, statusFollowFlag)
 			if err != nil {
 				return err
 			}
@@ -218,39 +244,85 @@ func newStatusCommand(build model.BuildInfo) *cobra.Command {
 			}
 			return runService(cmd, openForReport(),
 				func(ctx context.Context, ws *app.Workspace, svc *app.Services) error {
-					// A provider that could not be constructed publishes no
-					// detection row of its own. Those rows are folded in by the
-					// coordinator, before the capability report's own bound is
-					// applied: appending them here pushed Completeness past
-					// model.MaxCapabilityStates, a list IndexStatus.Validate
-					// then rejects.
-					status, err := svc.IndexStatus(ctx, req)
-					if err != nil {
-						return err
+					snapshot := func() error { return writeStatus(ctx, cmd, build, args, ws, svc, req) }
+					if !follow {
+						return snapshot()
 					}
-					// The rows are read from the store, and the whole report
-					// path was composed with fetching refused, so nothing here
-					// can install the tool it is reporting on -- a report that
-					// installed what it reports could only ever say the tool is
-					// installed (ledger 159). The toolchain is not a service
-					// operation, so this row keeps ws.Resolver()/ws.ToolStore().
-					data := statusReport{Index: status,
-						Tools: report(ws.ToolStore(), ws.Resolver().Status(ctx), nil)}
-					out := cmd.OutOrStdout()
-					if jsonRequested(cmd, args) {
-						return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
-					}
-					if err := writeIndexStatus(out, data.Index); err != nil {
-						return err
-					}
-					return writeToolTable(out, data.Tools, false)
+					return followStatus(ctx, statusFollowInterval, snapshot)
 				})
 		},
 	}
 	addRepoFlag(cmd)
 	cmd.Flags().Bool(statusResourcesFlag, false,
 		"also report the Section 23 resource accounting block, which an ordinary status does not measure")
+	cmd.Flags().Bool(statusFollowFlag, false,
+		"re-report every second until interrupted; with --json one complete envelope per second, and with --resources the host is measured again each time")
 	return cmd
+}
+
+// followStatus re-reports every interval until the operator stops it.
+//
+// Section 18.2 allows one envelope per answer, and every pass here is a whole
+// answer: a --json follow emits one complete envelope per interval, each
+// independently parseable, which is what a script tails. A delta would hand
+// that script a partial snapshot to reassemble.
+//
+// The first report goes out before the first wait, because a live view that
+// showed nothing for its first interval would be indistinguishable from one
+// that had failed to start.
+//
+// Unlike `watch`, which reports its cancellation as the typed end of a session
+// that still owed a final envelope, a follow has already delivered every
+// snapshot whole and owes nothing further: the operator stopping it is how it
+// ends, not a way it failed.
+func followStatus(ctx context.Context, interval time.Duration, snapshot func() error) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := snapshot(); err != nil {
+			if isCanceled(err) {
+				return nil
+			}
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+// writeStatus reads one status and renders it, which is one whole answer: the
+// report a plain `status` emits and one pass of a --follow. It is a function
+// rather than a closure over the command because both callers need exactly the
+// same bytes -- a live view whose rows differed from the one-shot report would
+// be a second surface of the same model.
+func writeStatus(ctx context.Context, cmd *cobra.Command, build model.BuildInfo, args []string,
+	ws *app.Workspace, svc *app.Services, req model.StatusRequest) error {
+	// A provider that could not be constructed publishes no detection row of
+	// its own. Those rows are folded in by the coordinator, before the
+	// capability report's own bound is applied: appending them here pushed
+	// Completeness past model.MaxCapabilityStates, a list
+	// IndexStatus.Validate then rejects.
+	status, err := svc.IndexStatus(ctx, req)
+	if err != nil {
+		return err
+	}
+	// The rows are read from the store, and the whole report path was composed
+	// with fetching refused, so nothing here can install the tool it is
+	// reporting on -- a report that installed what it reports could only ever
+	// say the tool is installed (ledger 159). The toolchain is not a service
+	// operation, so this row keeps ws.Resolver()/ws.ToolStore().
+	data := statusReport{Index: status, Tools: report(ws.ToolStore(), ws.Resolver().Status(ctx), nil)}
+	out := cmd.OutOrStdout()
+	if jsonRequested(cmd, args) {
+		return writeEnvelope(out, successEnvelope(build.SchemaVersion, commandName(cmd), data))
+	}
+	if err := writeIndexStatus(out, data.Index); err != nil {
+		return err
+	}
+	return writeToolTable(out, data.Tools, false)
 }
 
 // newWatchCommand builds `codectx watch`.
@@ -478,7 +550,65 @@ func emitIndexProgress(cmd *cobra.Command, args []string, result model.IndexResu
 	fmt.Fprintf(&b, "files       %d captured, %d parsed\nelapsed     %s\n",
 		result.FilesCaptured, result.FilesParsed, result.CompletedAt.Sub(result.StartedAt).Round(time.Millisecond))
 	writeCapabilities(&b, result.Completeness)
+	writeIndexRunLedger(&b, result.Run, result.Stages)
 	return writeText(cmd.OutOrStdout(), "%s", b.String())
+}
+
+// writeIndexRunLedger appends what the run cost and which of its stages that
+// cost went to, in this block's label-and-value idiom.
+//
+// Only the run's own top-level stages are listed, and each with its share of
+// the run. A unit nested under a stage is already counted inside it, so listing
+// both would report shares that add up to more than the run and leave the
+// operator unable to see which stage the time actually went to.
+func writeIndexRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+	if run == nil {
+		return
+	}
+	fmt.Fprintf(b, "run         %s in %s, %d planned, %d succeeded, %d failed, %d subdivided\n",
+		run.Outcome, wallMetric(run.WallMS, run.Outcome == runOutcomeRunning, run.FinishedAt),
+		run.UnitsPlanned, run.UnitsSucceeded, run.UnitsFailed, run.UnitsSubdivided)
+	if run.EventsDropped > 0 {
+		fmt.Fprintf(b, "incomplete  %d accounting %s dropped; the stages below are not the whole run\n",
+			run.EventsDropped, plural(int(run.EventsDropped), "event was", "events were"))
+	}
+	for _, stage := range topLevelStagesByWall(stages) {
+		fmt.Fprintf(b, "stage       %s %s, %s of the run, %s, in %d, out %d\n",
+			stage.Stage, wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
+			shareMetric(stage.ShareOfWall), stageOutcome(stage), stage.ItemsIn, stage.ItemsOut)
+	}
+}
+
+// topLevelStagesByWall is the run's own stages, costliest first, with the run's
+// ordinal breaking a tie so two runs of the same shape print the same lines. It
+// sorts a copy: the result it is given is the one the envelope carries, and
+// reordering that would make the human block and the --json rows two orders of
+// one list.
+func topLevelStagesByWall(stages []model.StageRecord) []model.StageRecord {
+	top := make([]model.StageRecord, 0, len(stages))
+	for _, stage := range stages {
+		if stage.ParentSeq == nil {
+			top = append(top, stage)
+		}
+	}
+	slices.SortStableFunc(top, func(a, b model.StageRecord) int {
+		if order := cmp.Compare(b.WallMS, a.WallMS); order != 0 {
+			return order
+		}
+		return cmp.Compare(a.Seq, b.Seq)
+	})
+	return top
+}
+
+// shareMetric renders a stage's share of its run. A share of zero is not a
+// measured zero: it is what a run whose own wall was never measured leaves
+// behind, and printing "0%" beside a stage with a real wall would claim the
+// stage took none of a run it plainly took time out of.
+func shareMetric(share float64) string {
+	if share <= 0 {
+		return metricUnavailable
+	}
+	return fmt.Sprintf("%.0f%%", share*100)
 }
 
 // writeIndexStatus renders the human status block. Every value is one the
@@ -580,6 +710,139 @@ func writeResources(b *strings.Builder, r model.ResourceReport) {
 			byteMetric(u.AllocationBytes), byteMetric(u.ObservedPeakBytes))
 	}
 	flushTableInto(tw)
+	writeRunLedger(b, r.Run, r.Stages)
+}
+
+// writeRunLedger renders the recorded run and its stages: what the run cost,
+// and where it spent that cost. The run row comes first because a stage's
+// share of a run means nothing without the run it is a share of, and the
+// stages follow in the order the report assembled them -- wall descending --
+// so the table and the --json rows are the same rows in the same order.
+//
+// A stage that is still going is rendered as running with the time it has been
+// going, never as a finished wall. "This is taking a long time" and "this took
+// a long time" are different facts, and a live stage whose elapsed time printed
+// like a measurement would tell an operator that a stalled stage had finished
+// fast.
+func writeRunLedger(b *strings.Builder, run *model.RunRecord, stages []model.StageRecord) {
+	if run == nil {
+		return
+	}
+	b.WriteString("\nrun\n")
+	tw := tabwriter.NewWriter(b, 0, 0, 2, ' ', 0)
+	fmt.Fprint(tw, "  stage\tscope\twall\tcpu\tpeak\tin\tout\toutcome\n")
+	// The run's own row carries the counts the run keeps for itself: the files
+	// it took in and the units it got out. Its processor time is not a figure
+	// anything measures for the process as a whole, so the column is
+	// unavailable here rather than a sum of the stages that would silently
+	// omit every stage whose time could not be attributed.
+	fmt.Fprintf(tw, "  run\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+		runScope(run), wallMetric(run.WallMS, run.Outcome == runOutcomeRunning, run.FinishedAt),
+		metricUnavailable, byteMetric(run.ProcessPeakRSSBytes),
+		run.FileCount, run.UnitsSucceeded, run.Outcome)
+	for _, stage := range stages {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\n",
+			stage.Stage, stageScope(stage), wallMetric(stage.WallMS, stage.Running, stage.FinishedAt),
+			cpuMetric(stage), byteMetric(stage.PeakRSSBytes),
+			stage.ItemsIn, stage.ItemsOut, stageOutcome(stage))
+	}
+	// What a failed stage failed with, under the row that reports it failed: a
+	// table column cannot hold it, and an outcome of `failed` with the reason
+	// only in --json would leave the operator reading the table to guess.
+	for _, stage := range stages {
+		if stage.Failure != "" {
+			fmt.Fprintf(tw, "    %s failed\t%s\n", stage.Stage, stage.Failure)
+		}
+	}
+	flushTableInto(tw)
+	// Accounting the bounded bus refused rather than made the run wait for it.
+	// Above zero the stages above are known to be an incomplete account of the
+	// run, and a table that did not say so would read as the whole of it.
+	if run.EventsDropped > 0 {
+		fmt.Fprintf(b, "  incomplete  %d accounting %s dropped; the stages above are not the whole run\n",
+			run.EventsDropped, plural(int(run.EventsDropped), "event was", "events were"))
+	}
+}
+
+// runOutcomeRunning is the one outcome spelling a renderer has to recognise:
+// it is what makes a run's elapsed time elapsed rather than measured.
+const runOutcomeRunning = "running"
+
+// wallMetric renders a span's or a run's time: its measurement once it has
+// finished, its elapsed time so far while it is running, and unavailable for
+// one that ended without anything measuring it. The last is a real case -- a
+// run whose process died leaves no finish, and rendering its zero as "0s"
+// would present the run an operator is investigating as one that took no time.
+func wallMetric(wallMS int64, running bool, finishedAt *time.Time) string {
+	switch {
+	case running:
+		return "running " + millisMetric(wallMS)
+	case finishedAt == nil:
+		return metricUnavailable
+	}
+	return millisMetric(wallMS)
+}
+
+// millisMetric renders a measured millisecond count as a duration, in the same
+// idiom every other duration in this package is rendered in.
+func millisMetric(ms int64) string {
+	return (time.Duration(ms) * time.Millisecond).Round(time.Millisecond).String()
+}
+
+// cpuMetric renders a stage's processor time. The two halves are measured
+// together or not at all, so they are summed; a stage with neither says why it
+// has neither, because "the platform does not sample this" and "this stage ran
+// beside other work, so the process counters do not measure it" are different
+// answers and only the second means the number could never exist.
+func cpuMetric(stage model.StageRecord) string {
+	if stage.CPUUserMS == nil && stage.CPUSysMS == nil {
+		if stage.CPUUnattributed != "" {
+			return metricUnavailable + " (" + stage.CPUUnattributed + ")"
+		}
+		return metricUnavailable
+	}
+	var total int64
+	if stage.CPUUserMS != nil {
+		total += *stage.CPUUserMS
+	}
+	if stage.CPUSysMS != nil {
+		total += *stage.CPUSysMS
+	}
+	return millisMetric(total)
+}
+
+// runScope names what the run produced. A run that never reached a generation
+// says so rather than printing a zero that would read as generation zero.
+func runScope(run *model.RunRecord) string {
+	if run.GenerationID == nil {
+		return "no generation"
+	}
+	return fmt.Sprintf("generation %d", *run.GenerationID)
+}
+
+// stageScope names what a stage was working on. Both parts are optional -- a
+// whole-run stage has no scope and an in-process one has no provider -- so a
+// stage with neither prints a placeholder rather than an empty column that
+// would run into the next one.
+func stageScope(stage model.StageRecord) string {
+	switch {
+	case stage.ScopeKey != "" && stage.Provider != "":
+		return stage.ScopeKey + " (" + stage.Provider + ")"
+	case stage.ScopeKey != "":
+		return stage.ScopeKey
+	case stage.Provider != "":
+		return stage.Provider
+	}
+	return "-"
+}
+
+// stageOutcome renders a stage's outcome with the diagnostic code that names
+// the failure class, where there is one.
+func stageOutcome(stage model.StageRecord) string {
+	if stage.DiagnosticCode != "" {
+		return stage.Outcome + " (" + stage.DiagnosticCode + ")"
+	}
+	return stage.Outcome
 }
 
 func byteMetric(v *uint64) string {

@@ -772,6 +772,7 @@ func (s *stack) openDiagnostics() error {
 		Root:      s.root.Path,
 		Sampler:   diagnostics.NewHostSampler(diagnostics.HostSamplerOptions{CASDir: snapshot.CASDir(dataDir), TempDirs: diagnosticsTempDirs(dataDir), Processes: s.runners}),
 		Store:     storeReader{Store: s.store},
+		Ledger:    runLedger{dir: dataDir},
 		Toolchain: toolchainReporter{r: s.resolver},
 		Workspace: workspaceProber{},
 		Now:       time.Now,
