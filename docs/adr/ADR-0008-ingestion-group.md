@@ -159,6 +159,28 @@ frees are the sweep of a dead run at start and the export's removal after its im
 an export that never touches the disk. Windowed freeing stays for the frees that remain. What a run freed is
 disclosed by the diagnostics. There is no rate and no setting: reuse has no knob.
 
+### Decision 5, amended a third time 2026-09-16: a pooled scratch arena
+
+The second amendment's principle, applied to the two surfaces it named, left a run of the 6 270-file
+repository freeing at three further moments, each a scratch surface written by the product and
+removed after use, and the host stalled 64 s after the largest. The store therefore owns a scratch
+arena under its data directory: every working file it writes for its own later reading -- a sort
+run, a lexical staging slot, a blob's staging surface, a path search's state, an import's spool -- is
+taken from a per-purpose pool, opened for overwrite at offset zero with no truncation, and released
+back to it; a pooled file carries its own logical length (a sort run records its byte length and is
+read through a limited reader; continuation state carries it too), keeps its high-water size for the
+store's life, and is never removed during a run. The arena is per process, and a purpose a second
+process may read concurrently gets a pool directory keyed by the store's cross-process owner. The
+resources block discloses the disk the pools hold (`scratch_bytes`) and what each labelled removal
+freed (`freed_by_purpose`) beside the pacer's window count (`freed_bytes`). Measured on the e2e
+corpus with every foreign writer off: freed this run 0 bytes. What still frees during a run, and
+stays to be taken from the arena: the engine's own temporary sort files, which it creates and
+deletes through the shim (the shim can pool them); walk retention, whose state machine reads a
+file's existence as walk state; the per-unit materialized trees and the indexer run directories;
+and the foreign outputs themselves (an indexer's index, the dependence export), which are the
+follow-up that never touches the disk. An operator command empties the arena on request; nothing
+else does.
+
 ### Decision 3, amended 2026-09-16: the spilled statement journal reaches the file system in pieces
 
 The statement journal's threshold is also the size of the chunks the engine's memory journal
