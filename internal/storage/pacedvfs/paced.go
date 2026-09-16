@@ -65,6 +65,18 @@ type header struct {
 	// store's spill signal. The engine names the file's role in the open
 	// flags, so no path matching is involved.
 	isLog int32
+	// pooled is set for a temporary served from the scratch arena. See
+	// enginetemp.go.
+	pooled int32
+	// logical is the length a pooled temporary has for the engine: what this
+	// tenant has written, not what the surface holds. Reads past it are short
+	// reads and a truncate moves it, so the previous tenant's bytes are
+	// unreachable without a single byte being written over or freed.
+	logical int64
+	// name is the pooled surface's path, in memory the engine's allocator
+	// owns: the wrapped file system keeps the pointer it was opened with, so
+	// it lives as long as the file and is freed by xClose.
+	name uintptr
 }
 
 const (
@@ -179,6 +191,11 @@ func innerMethods(pFile uintptr) *sqlite3.Tsqlite3_io_methods {
 func xOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOutFlags uintptr) int32 {
 	h := (*header)(ptr(pFile))
 	*h = header{}
+	// A file the engine did not name and asks to have unlinked on close is
+	// its own temporary; it comes from the pool. See enginetemp.go.
+	if zName == 0 && flags&sqlite3.SQLITE_OPEN_DELETEONCLOSE != 0 && openPooled(tls, pFile, flags, pOutFlags) {
+		return sqlite3.SQLITE_OK
+	}
 	open := (*sqlite3.Tsqlite3_vfs)(ptr(inner)).FxOpen
 	rc := (*(*func(*libc.TLS, uintptr, uintptr, uintptr, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{open})))(tls, inner, zName, wrapped(pFile), flags, pOutFlags)
 	if rc != sqlite3.SQLITE_OK {
@@ -194,6 +211,39 @@ func xOpen(tls *libc.TLS, pVfs, zName, pFile uintptr, flags int32, pOutFlags uin
 		h.isLog = 1
 	}
 	return sqlite3.SQLITE_OK
+}
+
+// openPooled answers an unnamed delete-on-close open with a surface from the
+// arena, and reports false when there is no pool, the arena cannot serve one,
+// or the wrapped file system will not open it -- in every one of which the
+// caller falls back to the engine's own temporary.
+//
+// Two flags go before the wrapped open: delete-on-close, because the whole
+// point is that this file is not unlinked, and exclusive, because the surface
+// already exists and exclusive is what asks for a file that does not.
+func openPooled(tls *libc.TLS, pFile uintptr, flags int32, pOutFlags uintptr) bool {
+	lease, ok := takeTemp(pFile)
+	if !ok {
+		return false
+	}
+	name, err := libc.CString(lease.Path())
+	if err != nil {
+		releaseTemp(pFile)
+		return false
+	}
+	open := (*sqlite3.Tsqlite3_vfs)(ptr(inner)).FxOpen
+	flags &^= sqlite3.SQLITE_OPEN_DELETEONCLOSE | sqlite3.SQLITE_OPEN_EXCLUSIVE
+	rc := (*(*func(*libc.TLS, uintptr, uintptr, uintptr, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{open})))(tls, inner, name, wrapped(pFile), flags, pOutFlags)
+	if rc != sqlite3.SQLITE_OK {
+		libc.Xfree(tls, name)
+		releaseTemp(pFile)
+		return false
+	}
+	h := (*header)(ptr(pFile))
+	h.FpMethods = uintptr(unsafe.Pointer(&methods))
+	h.mode, h.fd = waitMode(wrapped(pFile), name)
+	h.pooled, h.logical, h.name = 1, 0, name
+	return true
 }
 
 // xDelete removes a file the way paced.Remove does, through the same helper:
@@ -213,16 +263,50 @@ func xDelete(tls *libc.TLS, pVfs, zName uintptr, syncDir int32) int32 {
 	return (*(*func(*libc.TLS, uintptr, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{del})))(tls, inner, zName, syncDir)
 }
 
+// xClose closes the file and, for a pooled temporary, gives the surface back
+// to the arena at its length. That release is what the engine's
+// delete-on-close becomes: nothing is unlinked and nothing is freed.
 func xClose(tls *libc.TLS, pFile uintptr) int32 {
 	m := innerMethods(pFile)
 	rc := (*(*func(*libc.TLS, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxClose})))(tls, wrapped(pFile))
-	(*header)(ptr(pFile)).FpMethods = 0
+	h := (*header)(ptr(pFile))
+	h.FpMethods = 0
+	if h.pooled != 0 {
+		h.pooled = 0
+		if h.name != 0 {
+			libc.Xfree(tls, h.name)
+			h.name = 0
+		}
+		releaseTemp(pFile)
+	}
 	return rc
 }
 
+// xRead reads from the file, and from a pooled temporary reads only what this
+// tenant wrote: the surface still holds the previous tenant's bytes past that
+// point, and a file system reports the end of a file by filling the rest of
+// the buffer with zeroes and saying the read was short. Handing back what is
+// physically there instead would give the engine another sort's records as
+// its own, which is the one way pooling the engine's temporaries could be
+// worse than letting it create them.
 func xRead(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	m := innerMethods(pFile)
-	return (*(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxRead})))(tls, wrapped(pFile), zBuf, iAmt, iOfst)
+	read := *(*func(*libc.TLS, uintptr, uintptr, int32, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxRead}))
+	h := (*header)(ptr(pFile))
+	if h.pooled == 0 {
+		return read(tls, wrapped(pFile), zBuf, iAmt, iOfst)
+	}
+	avail := min(max(h.logical-iOfst, 0), int64(iAmt))
+	if avail > 0 {
+		if rc := read(tls, wrapped(pFile), zBuf, int32(avail), iOfst); rc != sqlite3.SQLITE_OK {
+			return rc
+		}
+	}
+	if avail == int64(iAmt) {
+		return sqlite3.SQLITE_OK
+	}
+	libc.Xmemset(tls, zBuf+uintptr(avail), 0, types.Size_t(int64(iAmt)-avail))
+	return sqlite3.SQLITE_IOERR_SHORT_READ
 }
 
 // xWrite hands the bytes to the wrapped file and, once a window of them has
@@ -257,6 +341,9 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 	if h.isLog != 0 {
 		logBytes.Add(int64(done))
 	}
+	if h.pooled != 0 {
+		h.logical = max(h.logical, iOfst+int64(done))
+	}
 	h.since += int64(done)
 	if rc != sqlite3.SQLITE_OK || h.since < Window {
 		return rc
@@ -284,6 +371,15 @@ func xWrite(tls *libc.TLS, pFile, zBuf uintptr, iAmt int32, iOfst int64) int32 {
 // with the rest of the process's freeing: a truncation gives space back just
 // as an unlink does, and the host charges for it the same way.
 func xTruncate(tls *libc.TLS, pFile uintptr, size int64) int32 {
+	if h := (*header)(ptr(pFile)); h.pooled != 0 {
+		// A pooled temporary's length is the engine's, not the surface's: the
+		// engine shortening its temporary -- back to zero between two sorts,
+		// most often -- is a reset of what it may read, not a request to give
+		// the disk its blocks back. Shortening the file would free exactly
+		// the space the pool exists to keep.
+		h.logical = min(h.logical, size)
+		return sqlite3.SQLITE_OK
+	}
 	m := innerMethods(pFile)
 	truncate := *(*func(*libc.TLS, uintptr, int64) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxTruncate}))
 	sync := *(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxSync}))
@@ -320,6 +416,10 @@ func xSync(tls *libc.TLS, pFile uintptr, flags int32) int32 {
 }
 
 func xFileSize(tls *libc.TLS, pFile, pSize uintptr) int32 {
+	if h := (*header)(ptr(pFile)); h.pooled != 0 {
+		*(*int64)(ptr(pSize)) = h.logical
+		return sqlite3.SQLITE_OK
+	}
 	m := innerMethods(pFile)
 	return (*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{m.FxFileSize})))(tls, wrapped(pFile), pSize)
 }
