@@ -54,6 +54,14 @@ type Ledger struct {
 	db *sql.DB
 
 	bus chan event
+	// quit is what stops the collector. The bus is never closed: publish's
+	// send is non-blocking, and a non-blocking send on a CLOSED channel fires
+	// its case and panics, so closing the bus would crash any goroutine still
+	// ending a span after Stop -- exactly what a deferred End in a goroutine
+	// outliving its coordinator does. After quit closes, a late event fills
+	// the buffer and is then dropped and counted, which is what a dropped
+	// event already means.
+	quit chan struct{}
 	// writeMu guards the writer connection. The collector holds it for a
 	// flush; the retention calls hold it for a delete. Nothing else writes.
 	writeMu sync.Mutex
@@ -61,6 +69,9 @@ type Ledger struct {
 	done     chan struct{}
 	stopOnce sync.Once
 	stopErr  error
+	// finalErr is the collector's last write, captured so a failure to close
+	// the open spans reaches the caller of Stop instead of vanishing.
+	finalErr error
 
 	subMu sync.Mutex
 	subs  []func(SpanRow)
@@ -118,7 +129,7 @@ func Open(ctx context.Context, dir string) (*Ledger, error) {
 	if err := ensureDir(path); err != nil {
 		return nil, err
 	}
-	db, err := openPool(path, writerPragmas(), "immediate", 1)
+	db, err := openPool(path, writerPragmas(), "immediate", 1, false)
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +137,7 @@ func Open(ctx context.Context, dir string) (*Ledger, error) {
 		db.Close()
 		return nil, err
 	}
-	l := &Ledger{db: db, bus: make(chan event, busDepth), done: make(chan struct{})}
+	l := &Ledger{db: db, bus: make(chan event, busDepth), quit: make(chan struct{}), done: make(chan struct{})}
 	go l.collect()
 	return l, nil
 }
@@ -253,14 +264,18 @@ func (l *Ledger) notify(row SpanRow) {
 	}
 }
 
-// Stop closes the bus, lets the collector drain and flush what is left, writes
+// Stop tells the collector to finish, waits for it to drain and flush what is
+// left, writes
 // every span still open as interrupted and every run's finish, and closes the
 // database. It is safe to call more than once and returns the first failure.
 func (l *Ledger) Stop() error {
 	l.stopOnce.Do(func() {
-		close(l.bus)
+		close(l.quit)
 		<-l.done
-		l.stopErr = l.db.Close()
+		l.stopErr = l.finalErr
+		if err := l.db.Close(); err != nil && l.stopErr == nil {
+			l.stopErr = wrap("close", err)
+		}
 	})
 	return l.stopErr
 }

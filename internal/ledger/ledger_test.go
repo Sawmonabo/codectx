@@ -34,19 +34,30 @@ func newRun(t *testing.T, l *ledger.Ledger) (*ledger.Run, context.Context) {
 
 func latest(t *testing.T, dir string) ledger.RunView {
 	t.Helper()
-	reader, err := ledger.OpenReader(context.Background(), dir)
+	view, ok := latestIfAny(t, dir)
+	if !ok {
+		t.Fatal("the ledger holds no run for this repository")
+	}
+	return view
+}
+
+// latestIfAny is latest for a caller that is polling a live run: before the
+// collector's first flush there is legitimately no row yet.
+func latestIfAny(t *testing.T, dir string) (ledger.RunView, bool) {
+	t.Helper()
+	reader, open, err := ledger.OpenReader(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("open the reader: %v", err)
+	}
+	if !open {
+		t.Fatal("no ledger file was written beside the store")
 	}
 	defer reader.Close()
 	view, ok, err := reader.LatestRun(context.Background(), repositoryID, 0)
 	if err != nil {
 		t.Fatalf("latest run: %v", err)
 	}
-	if !ok {
-		t.Fatal("the ledger holds no run for this repository")
-	}
-	return view
+	return view, ok
 }
 
 // TestSpanTreeRoundTrips protects the recording itself: if parents, order or
@@ -189,8 +200,8 @@ func TestReaderSeesRunningCountersAdvance(t *testing.T) {
 		deadline := time.Now().Add(30 * time.Second)
 		var seen int64
 		for time.Now().Before(deadline) {
-			view := latest(t, dir)
-			if len(view.Spans) == 1 {
+			view, ok := latestIfAny(t, dir)
+			if ok && len(view.Spans) == 1 {
 				seen = view.Spans[0].ItemsIn
 				if seen == wantIn {
 					if !view.Spans[0].Running {

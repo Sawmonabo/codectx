@@ -29,12 +29,7 @@ func (l *Ledger) collect() {
 
 	for {
 		select {
-		case e, ok := <-l.bus:
-			if !ok {
-				l.flush(batch, running)
-				l.finalize(running)
-				return
-			}
+		case e := <-l.bus:
 			batch = append(batch, e)
 			if len(batch) >= flushEvents {
 				l.flush(batch, running)
@@ -43,6 +38,25 @@ func (l *Ledger) collect() {
 		case <-ticker.C:
 			l.flush(batch, running)
 			batch = batch[:0]
+		case <-l.quit:
+			// Take what is already buffered -- it was recorded before the
+			// stop -- and then finish. Anything published after this point
+			// finds a bus nobody drains and is dropped and counted, which is
+			// the same answer a full bus gives.
+			for {
+				select {
+				case e := <-l.bus:
+					batch = append(batch, e)
+					if len(batch) >= flushEvents {
+						l.flush(batch, running)
+						batch = batch[:0]
+					}
+				default:
+					l.flush(batch, running)
+					l.finalize(running)
+					return
+				}
+			}
 		}
 	}
 }
@@ -102,7 +116,7 @@ func (l *Ledger) flush(batch []event, running map[*Span]struct{}) {
 func (l *Ledger) finalize(running map[*Span]struct{}) {
 	ctx := context.Background()
 	now := time.Now()
-	l.writeTx(ctx, func(tx *sql.Tx) error {
+	l.finalErr = l.writeTx(ctx, func(tx *sql.Tx) error {
 		l.runsMu.Lock()
 		runs := append([]*Run(nil), l.runs...)
 		l.runsMu.Unlock()
@@ -241,8 +255,7 @@ func endSpan(ctx context.Context, tx *sql.Tx, e event) (SpanRow, error) {
 	}
 	end := e.endWall
 	row.FinishedAt = &end
-	wall := e.wallMS
-	row.WallMS = &wall
+	row.WallMS = e.wallMS
 	if s.parent >= 0 {
 		parent := s.parent
 		row.ParentSeq = &parent
