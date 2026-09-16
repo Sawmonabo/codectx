@@ -136,6 +136,13 @@ type Outcome struct {
 	StderrBytes   int64
 	PeakBytes     int64
 	PeakUnsampled bool
+	// StderrTail is the last of what the child wrote to its standard error,
+	// bounded to what one error detail carries and cut at a line boundary,
+	// with the private paths of this run reduced to their names. It is the
+	// evidence a failed unit leaves behind: without it the only record of a
+	// crash is its byte count, and a reader has to reproduce the run to learn
+	// what the child said.
+	StderrTail string
 }
 
 // ExportOutcome adds the liveness probe of the produced export. Live reports
