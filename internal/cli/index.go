@@ -9,7 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -132,9 +132,9 @@ func newIndexCommand(build model.BuildInfo) *cobra.Command {
 							return err
 						}
 					}
-					// Subscribed here and stopped the moment the run returns,
-					// so the progressive lines and everything printed below
-					// are written by one goroutine in turn and a stage that
+					// Subscribed here and stopped the moment the run returns.
+					// The stop is a barrier, so nothing printed below can race
+					// a progressive line on the same writer, and a stage that
 					// finishes late can never land after the envelope.
 					stopStages := progressiveStages(cmd, args, ws)
 					result, err := svc.Index(ctx, req)
@@ -557,10 +557,11 @@ func boolFlag(cmd *cobra.Command, name string) (bool, error) {
 // is not known until it ends, and a share computed from nothing would be a
 // number the operator could not trust.
 //
-// The returned stop is called before ANY other output of this command. It is
-// what keeps the progressive lines and the result on one writer without a lock
-// and keeps a late row out of the single --json envelope: after it returns, no
-// further line is written, whatever the ledger goes on publishing.
+// The returned stop is called before ANY other output of this command, and is
+// a barrier: when it returns, no progressive line is being written and none
+// will start, whatever the ledger goes on publishing. That is what keeps these
+// lines and the result off each other on one writer, and keeps a stage that
+// finishes late out of the single --json envelope.
 func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (stop func()) {
 	machine := jsonRequested(cmd, args)
 	// A --json consumer's stdout carries the one envelope and nothing else, so
@@ -570,9 +571,15 @@ func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (st
 	if machine {
 		w = cmd.ErrOrStderr()
 	}
-	var done atomic.Bool
+	// The mutex, and not a flag, is what makes stop a barrier: a flag would
+	// stop the NEXT line and leave one already being written racing the
+	// result below on the same writer.
+	var mu sync.Mutex
+	var done bool
 	ws.Spans(func(row model.StageRecord) {
-		if done.Load() || row.ParentSeq != nil {
+		mu.Lock()
+		defer mu.Unlock()
+		if done || row.ParentSeq != nil {
 			return
 		}
 		if machine {
@@ -584,7 +591,11 @@ func progressiveStages(cmd *cobra.Command, args []string, ws *app.Workspace) (st
 			row.Stage, stageProgressScope(row), wallMetric(row.WallMS, row.Running, row.FinishedAt),
 			stageOutcome(row), row.ItemsIn, row.ItemsOut)
 	})
-	return func() { done.Store(true) }
+	return func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	}
 }
 
 // stageProgressScope is the scope a progressive line names, with the separator
