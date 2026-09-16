@@ -113,14 +113,28 @@ var kindSpecs = map[Kind]kindSpec{
 		diskBudgetBytes:   1 << 30,
 		timeout:           20 * time.Minute,
 	},
-	// scip-typescript reads the project's own node_modules out of the
-	// materialization; it resolves nothing itself, so its posture is denied
-	// and it needs no PATH. The progress bar is disabled because the child's
-	// streams are bounded diagnostics, not a terminal.
+	// scip-typescript resolves nothing of its own: it carries its own compiler
+	// and reads only what the materialization holds, so its posture is denied
+	// and it needs no PATH. Dependency directories are not part of a snapshot,
+	// so a symbol that belongs to an installed package resolves to no
+	// definition; what the unit publishes is the project's own definitions and
+	// the references among them. The progress bar is disabled because the
+	// child's streams are bounded diagnostics, not a terminal.
+	//
+	// --infer-tsconfig is what makes a project the trigger list admits
+	// indexable at all. Two of the three triggers -- jsconfig.json and
+	// package.json -- name a project that has no tsconfig.json, and without
+	// this flag the indexer prints "(missing tsconfig.json)", indexes nothing
+	// and exits 1, so every plain-JavaScript project in a repository fails as a
+	// unit. With it the indexer writes the config it infers into the private
+	// materialization (never the repository) and indexes the project. A project
+	// that already has a tsconfig.json is unaffected: the flag is only consulted
+	// when the file is absent.
 	KindTypeScript: {
 		triggers: []string{"tsconfig.json", "jsconfig.json", "package.json"},
 		args: func(a argPaths) []string {
-			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile, "--no-progress-bar"}
+			return []string{"index", "--cwd", a.InputDir, "--output", a.OutputFile,
+				"--no-progress-bar", "--infer-tsconfig"}
 		},
 		env:               []string{"HOME"},
 		network:           NetworkDenied,
