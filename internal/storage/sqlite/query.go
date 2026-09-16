@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -22,6 +23,16 @@ type PinnedReader struct {
 	repo    []byte
 	gen     int64
 	lease   string
+
+	// The generation's lexical shape -- its segment set, its document
+	// statistics and its visible-document bitmap -- resolved once for the
+	// whole reader. It costs a scan of the generation's documents, and a
+	// single request opens the structure for its statistics, its frequencies
+	// and its postings, so resolving it per call would pay that scan three
+	// times. The mutex is because a reader is pinned once and may be used from
+	// more than one goroutine of the request it serves.
+	lexMu   sync.Mutex
+	lexMeta *lexicalMeta
 }
 
 // PinGeneration resolves gen (zero selects the active generation) and acquires

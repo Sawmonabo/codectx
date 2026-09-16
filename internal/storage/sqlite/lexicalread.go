@@ -29,19 +29,17 @@ type segmentRef struct {
 	docCount  int64
 }
 
-// lexicalIndex is one request's bounded view of a generation's packed term
-// statistics: the commit row, the segment set, the visible-document bitmap and
-// a small window of parts. It holds no vocabulary -- the window is at most
-// partsPerStream parts of one stream of one segment.
-type lexicalIndex struct {
-	r          *PinnedReader
+// lexicalMeta is the pinned generation's lexical shape, resolved once per
+// reader: what segments it reads, how many documents and tokens it carries,
+// and which documents are visible in it. It is immutable once built and shared
+// by every read of that reader.
+type lexicalMeta struct {
 	docCount   int64
 	tokenTotal int64
 	segments   []segmentRef
-	// visible is the generation's visible documents, resolved once when the
-	// structure is opened and shared by every read of it. A document an
-	// inherited segment still holds but whose unit left the generation is
-	// hidden here; nothing is rewritten to hide it.
+	// visible is the generation's visible documents. A document an inherited
+	// segment still holds but whose unit left the generation is hidden here;
+	// nothing is rewritten to hide it.
 	visible *docBitmap
 	// complete says the generation hides no document of any of its segments,
 	// which is the case whenever no unit has left since the segments were
@@ -50,7 +48,16 @@ type lexicalIndex struct {
 	// a document frequency is the directory entry, with no posting list read
 	// at all.
 	complete bool
-	cache    map[partSlot]*partWindow
+}
+
+// lexicalIndex is one call's bounded view of that shape: the shared metadata
+// plus a small window of parts of its own. It holds no vocabulary -- the window
+// is at most partsPerStream parts of one stream of one segment -- and the
+// window is per call, so two concurrent reads never share a cache entry.
+type lexicalIndex struct {
+	r *PinnedReader
+	*lexicalMeta
+	cache map[partSlot]*partWindow
 }
 
 // partSlot names one stream of one segment. The window MUST be keyed by the
@@ -70,15 +77,20 @@ const generationLexicalQuery = `SELECT gs.segment_id, s.term_count, s.doc_count
 	FROM generation_segments gs JOIN lexical_segments s ON s.id = gs.segment_id
 	WHERE gs.generation_id = ?1`
 
-// openLexical opens the packed term statistics of the reader's pinned
-// generation. A generation with no generation_lexical row was never published
-// with one, which is a corrupt store rather than an empty vocabulary: the row
-// is written last, so its absence means the activation did not finish.
-func (r *PinnedReader) openLexical(ctx context.Context) (*lexicalIndex, error) {
-	x := &lexicalIndex{r: r, cache: map[partSlot]*partWindow{}}
+// lexicalMeta resolves the reader's lexical shape, once. A generation with no
+// generation_lexical row was never published with one, which is a corrupt store
+// rather than an empty vocabulary: the row is written last, so its absence
+// means the activation did not finish.
+func (r *PinnedReader) lexical(ctx context.Context) (*lexicalMeta, error) {
+	r.lexMu.Lock()
+	defer r.lexMu.Unlock()
+	if r.lexMeta != nil {
+		return r.lexMeta, nil
+	}
+	m := &lexicalMeta{}
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
 		err := tx.QueryRowContext(ctx, `SELECT doc_count, token_total
-			FROM generation_lexical WHERE generation_id = ?`, r.gen).Scan(&x.docCount, &x.tokenTotal)
+			FROM generation_lexical WHERE generation_id = ?`, r.gen).Scan(&m.docCount, &m.tokenTotal)
 		if isNoRows(err) {
 			return corrupt("generation %d has no packed term statistics; it was published without them", r.gen)
 		}
@@ -97,21 +109,33 @@ func (r *PinnedReader) openLexical(ctx context.Context) (*lexicalIndex, error) {
 				return wrap("generation_segments", err)
 			}
 			held += s.docCount
-			x.segments = append(x.segments, s)
+			m.segments = append(m.segments, s)
 		}
 		if err := rows.Err(); err != nil {
 			return wrap("generation_segments", err)
 		}
-		if x.visible, _, _, err = visibleDocuments(ctx, tx, r.gen); err != nil {
+		if m.visible, _, _, err = visibleDocuments(ctx, tx, r.gen); err != nil {
 			return err
 		}
-		x.complete = held == x.docCount
+		m.complete = held == m.docCount
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	return x, nil
+	r.lexMeta = m
+	return m, nil
+}
+
+// openLexical opens the packed term statistics of the reader's pinned
+// generation for one call: the reader's resolved shape and a part window of
+// this call's own.
+func (r *PinnedReader) openLexical(ctx context.Context) (*lexicalIndex, error) {
+	m, err := r.lexical(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &lexicalIndex{r: r, lexicalMeta: m, cache: map[partSlot]*partWindow{}}, nil
 }
 
 // part returns one part of a segment's stream through the request's bounded
@@ -439,11 +463,14 @@ func (s *PackedStream) Close() error {
 // error means they are exhausted.
 func (s *PackedStream) Next(ctx context.Context, limit int) ([]TermOccurrence, error) {
 	limit = pageLimit(ctx, limit)
-	if err := ctx.Err(); err != nil {
-		return nil, model.Canceled(err)
-	}
 	var out []TermOccurrence
 	for len(s.cursors) > 0 && len(out) < limit {
+		// Checked every iteration, not once: a document the generation hides
+		// advances a cursor and emits nothing, so one refill can walk a whole
+		// posting list without ever filling its page.
+		if err := ctx.Err(); err != nil {
+			return nil, model.Canceled(err)
+		}
 		// The smallest rowid any segment still offers. Every visible document
 		// of a generation lies in exactly ONE of its segments, so two cursors
 		// offering the same document is a structure that would deliver that
