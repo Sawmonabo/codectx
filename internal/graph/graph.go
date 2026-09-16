@@ -446,6 +446,15 @@ type expandOptions struct {
 	// walk, and for an aggregating operation that failure is the whole retained
 	// walk thrown away with no continuation to reach its remainder.
 	DeadlineResumesEmptyPage bool
+	// Mints says a page of this walk can hand its caller a continuation at a
+	// level boundary, so the files a level it served whole leaves behind must
+	// survive until that continuation supersedes the cursor the caller is
+	// holding (walkretain.go hold/releaseHeld). A walk that runs to completion
+	// inside one request mints nothing at its level boundaries: the only
+	// cursor its caller can present again is the one it entered with, whose
+	// files are held on entry, so every level it finishes with is finished
+	// with for good and is removed there.
+	Mints bool
 	// Resume, when non-nil, is the state a continuation restored: the walk
 	// starts from the spooled frontier at the cursor's depth instead of from
 	// seeds, and skips the rows the issuing page already emitted.
