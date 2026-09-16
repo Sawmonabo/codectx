@@ -23,6 +23,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/diskfree"
 	"github.com/Sawmonabo/codectx/internal/model"
+	"github.com/Sawmonabo/codectx/internal/scratch"
 	"github.com/Sawmonabo/codectx/internal/storage/pacedvfs"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -231,6 +232,17 @@ func Open(ctx context.Context, path string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o700); err != nil {
 		return nil, internal("database directory: " + err.Error())
 	}
+	// The engine unlinks the write-ahead log from inside its close, and it
+	// holds the database exclusively for the whole of that call: a log freed
+	// in place there is minutes of held lock on a large one, which every other
+	// process on this workspace waits out at open. Freeing it must therefore be
+	// a rename into the to-free set, and that set exists only where the
+	// directory has been registered. Registering it HERE, from the store that
+	// owns the file, is what makes that true of every process that opens a
+	// database -- rather than only of one that happened to stage a lexical unit
+	// first and claim the arena on the way. The claim itself stays lazy:
+	// nothing is created until something is actually freed.
+	scratch.For(filepath.Dir(abs))
 	s := &Store{path: abs, opts: opts, freeBytes: diskfree.Available}
 	busy := strconv.FormatInt(opts.BusyTimeout.Milliseconds(), 10)
 	common := []pragma{
