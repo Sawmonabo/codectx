@@ -19,10 +19,11 @@ import (
 
 // Workspace is one opened workspace: the composed stack plus the index
 // coordinator over it. Opened for indexing it is the single cross-process owner
-// of Section 13.2 -- the workspace lock is held for its whole lifetime -- so
-// exactly one of `index`, `refresh`, `watch` and the MCP server builds at a
-// time and a second caller is told the workspace is busy rather than becoming a
-// second writer. Opened for a report it holds no lock and can build nothing.
+// of Section 13.2 -- the workspace lock is held from the open, or from the
+// first build in a serving session, until it closes -- so exactly one of
+// `index`, `refresh`, `watch` and the MCP server builds at a time and a second
+// caller is told the workspace is busy rather than becoming a second writer.
+// Opened for a report it holds no lock and can build nothing.
 type Workspace struct {
 	s     *stack
 	coord *index.Coordinator
@@ -86,9 +87,13 @@ func OpenWorkspaceForQuery(ctx context.Context, repo string) (*Workspace, error)
 }
 
 // OpenWorkspaceForServer composes the workspace for the one process that both
-// indexes and answers questions: it takes the workspace lock and keeps the
-// writer, exactly as OpenWorkspace does, and opens a second, read-only handle
-// on the same database beside it. Workspace.ReadServices is the facade bound to
+// indexes and answers questions: it opens a second, read-only handle on the
+// same database beside the writer, and it takes NEITHER the workspace lock nor
+// a single write to open. An agent's server must come up and answer beside an
+// index the person started in a terminal, so the lock, the startup recovery
+// and the collection pass are taken at the first operation that needs them --
+// the refresh tool, or a watch pass -- and a workspace that is busy then
+// refuses that one operation rather than the session. Workspace.ReadServices is the facade bound to
 // that handle, and it is what the server's read tools must be served through:
 // they then answer while this process's own refresh writes, without committing
 // its ingestion group early and without waiting behind it.
@@ -109,7 +114,7 @@ func open(ctx context.Context, repo string, o openOptions) (*Workspace, error) {
 		Registry: s.registry,
 		CAS:      s.cas,
 		Git:      s.git,
-		Lock:     s.lock,
+		Lock:     s.locker(),
 		// The collector is composed at the end of openStack precisely so it can
 		// be handed over here: the coordinator's post-activation path is the
 		// only place in this process that holds both the cross-process

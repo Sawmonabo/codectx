@@ -76,6 +76,18 @@ const domainRepository = "repository-identity-v1"
 // throughput guess; provider.MaxLiveSinks is the structural ceiling above it.
 const maxWorkers = 8
 
+// Locker is where a coordinator gets the cross-process workspace lock of
+// Sections 12.3 and 13.2.
+//
+// Hold is idempotent and returns the ONE lock the composition root holds for
+// this process, so a caller never closes what it is handed and two concurrent
+// builds can never end up with two locks on one workspace. A workspace another
+// process is indexing is reported as the typed, retryable CTX_WORKSPACE_BUSY
+// snapshot.LockWorkspace produces.
+type Locker interface {
+	Hold(ctx context.Context) (*snapshot.WorkspaceLock, error)
+}
+
 // Options are the coordinator's dependencies. Every field except Lock,
 // Watcher, States, Logger and Now is required; the workspace lock is the
 // caller's and is never closed here.
@@ -86,13 +98,20 @@ type Options struct {
 	Registry *provider.Registry
 	CAS      *snapshot.CAS
 	Git      *git.Git
-	// Lock may be nil for a report-only coordinator: Status is legal without
-	// it, because Section 12.3 makes the active generation immutable once
-	// published and a report only reads it. Index, Refresh, Watch, Promote
-	// and Drain refuse with a typed CTX_ARGUMENT_INVALID: they capture, build
-	// and publish, and Section 13.2 gives that to exactly one cross-process
-	// owner.
-	Lock *snapshot.WorkspaceLock
+	// Lock is where the cross-process workspace lock comes from. It may be nil
+	// for a report-only coordinator: Status is legal without it, because
+	// Section 12.3 makes the active generation immutable once published and a
+	// report only reads it. Index, Refresh, Watch, Promote and Drain refuse
+	// with a typed CTX_ARGUMENT_INVALID: they capture, build and publish, and
+	// Section 13.2 gives that to exactly one cross-process owner.
+	//
+	// It is a source and not the lock itself because a composition may hold
+	// the lock from its open (an indexing command, whose whole life is the
+	// run) or take it at the first build (the server, which must come up and
+	// answer beside an index another process is already running). The
+	// coordinator asks for it where it is about to build and never closes it:
+	// it is the composition root's.
+	Lock Locker
 	// Collector is the process-level reclaim pass, scheduled from the same
 	// post-activation points as retention-by-ref because that is the one moment
 	// this process holds both locks the pass requires. It may be nil; see the
@@ -265,16 +284,33 @@ func workerCount(configured int) int {
 	return max(1, min(runtime.NumCPU(), maxWorkers))
 }
 
-// writable refuses an entry point that captures, builds or publishes when the
-// coordinator was opened without the cross-process workspace lock. A
-// report-only coordinator is a legal composition (Section 13.2 gives indexing
-// to one owner, and a report is not indexing), so the refusal belongs at each
-// building method rather than in New, where it would also forbid Status.
-func (c *Coordinator) writable() error {
+// buildable refuses an entry point that captures, builds or publishes when the
+// coordinator was composed without a source for the cross-process workspace
+// lock. A report-only coordinator is a legal composition (Section 13.2 gives
+// indexing to one owner, and a report is not indexing), so the refusal belongs
+// at each building method rather than in New, where it would also forbid
+// Status.
+func (c *Coordinator) buildable() error {
 	if c.opts.Lock == nil {
 		return invalid("this coordinator was opened without the workspace indexing lock")
 	}
 	return nil
+}
+
+// hold is buildable plus the lock itself: the composition either already holds
+// it or takes it here, and a workspace another process is indexing answers the
+// typed, retryable CTX_WORKSPACE_BUSY of snapshot.LockWorkspace.
+//
+// Every entry point that builds calls this, and Watch deliberately does not:
+// a session that watches must survive a workspace that is busy right now, so
+// its patience is the reconcile interval it already has -- each pass asks
+// again through Refresh, and a pass that cannot have the lock is logged and
+// retried rather than ending the session.
+func (c *Coordinator) hold(ctx context.Context) (*snapshot.WorkspaceLock, error) {
+	if err := c.buildable(); err != nil {
+		return nil, err
+	}
+	return c.opts.Lock.Hold(ctx)
 }
 
 // Repository is the identity this coordinator derived for the workspace root.
@@ -299,7 +335,7 @@ func (c *Coordinator) Close() error {
 // deleted the store it was handed would be destroying state its caller still
 // owns.
 func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.IndexResult, error) {
-	if err := c.writable(); err != nil {
+	if _, err := c.hold(ctx); err != nil {
 		return model.IndexResult{}, err
 	}
 	if err := req.Validate(); err != nil {
@@ -315,7 +351,7 @@ func (c *Coordinator) Index(ctx context.Context, req model.IndexRequest) (model.
 // notification that named the wrong file, or named none at all, changes what
 // this run costs and never what it concludes (Section 13.2).
 func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexResult, error) {
-	if err := c.writable(); err != nil {
+	if _, err := c.hold(ctx); err != nil {
 		return model.IndexResult{}, err
 	}
 	// The hint is recorded and deliberately not acted on: narrowing the
@@ -344,7 +380,7 @@ func (c *Coordinator) Refresh(ctx context.Context, paths []string) (model.IndexR
 // which is exactly what makes it the fallback, and its coverage is reported
 // incomplete because periodic reconciliation is not notification coverage.
 func (c *Coordinator) Watch(ctx context.Context, emit func(model.IndexResult)) error {
-	if err := c.writable(); err != nil {
+	if err := c.buildable(); err != nil {
 		return err
 	}
 	interval := c.opts.Config.Index.ReconcileInterval.Std()
