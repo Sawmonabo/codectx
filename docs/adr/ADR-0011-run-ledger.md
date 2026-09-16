@@ -207,6 +207,31 @@ attributed reports none, so the CPU column has holes exactly where concurrency i
 tree is a public shape that the CLI, the MCP tool and the log all depend on, so changing it changes
 all four at once.
 
+### What it costs
+
+`TestLedgerCost` (`internal/bench/ledgercost_test.go`) indexes one generated corpus twice per
+repetition -- once with a recording ledger, once with the coordinator composed without one -- in
+child processes, swapping which arm runs first every repetition so neither arm is systematically
+the one that pays for what the other warmed. Six measured repetitions per arm, one discarded
+warm-up, on a host whose one-minute load average was 0.24 at the start and 0.49 at the end against
+the guard's threshold of 4.0.
+
+| measurement | without the ledger | with it | paired difference |
+| --- | --- | --- | --- |
+| the indexing call | median 994 ms (966..1007) | median 1034 ms (1015..1039) | **+45 ms**, every repetition the same sign |
+| the whole child process | median 1011 ms (988..1024) | median 1058 ms (1037..1063) | **+52 ms**, every repetition the same sign |
+| peak resident set of the tree | median 109.7 MiB (104.6..111.0) | median 108.3 MiB (106.6..113.2) | +1.0 MiB, **within noise** -- the sign is not stable |
+| `Ledger.Stop`, the final flush and join | 0 ms | 3 ms | +3 ms |
+
+The recording arm wrote about 518 spans per run. Read the wall figures as the absolute ones they
+are and not as the percentage: a second is short enough that opening the file, starting the
+collector and the closing flush are most of the 45 ms, and those are paid once per run whatever its
+length. A run of the reference repository's size pays the same fixed cost and a per-span cost on a
+few thousand more spans, against a wall of twenty-six minutes.
+
+The memory column is the one an operator asks about first, and the honest answer is that this
+measurement could not distinguish the ledger's cost from the noise of a 110 MiB process.
+
 ## Sources
 
 - [OpenTelemetry tracing API specification](https://opentelemetry.io/docs/specs/otel/trace/api/)
