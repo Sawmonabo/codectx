@@ -180,3 +180,14 @@ CSV counterpart: locations, identities, node facts and occurrences.
   Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica 33, 1996 —
   https://www.cs.umb.edu/~poneil/lsmtree.pdf
 - Linux, `sync_file_range(2)` — https://man7.org/linux/man-pages/man2/sync_file_range.2.html
+
+## Amended 2026-09-16: one staging database per slot, reused
+
+Creating and removing a staging database per import freed hundreds of megabytes per unit, and on a
+filesystem that discards freed blocks a run's frees are what stall its host (ADR-0008, decision 5,
+second amendment). Each import slot now keeps one staging database for the life of the provider,
+empties it by dropping its tables between imports, and never removes it; the engine recycles the
+freed pages from its free list, so a later import's pages are not laid out as one sequential run
+the way a fresh file's are. The page count and the bytes written per import are unchanged, and the
+bound this record measures still holds on the scale test. The file is removed only by the sweep of a
+dead run at construction.
