@@ -160,14 +160,6 @@ func (r *PinnedReader) Continuable() bool { return !r.s.opts.ReadOnly }
 // pagination.Leases answers it for the whole process.
 func (s *Store) RetainsLeases() bool { return !s.opts.ReadOnly }
 
-// LeaseID is the retention lease this reader holds; cursors carry it.
-func (r *PinnedReader) LeaseID() string { return r.lease }
-
-// Renew extends the reader's lease for a further ttl.
-func (r *PinnedReader) Renew(ctx context.Context, ttl time.Duration) error {
-	return r.s.RenewLease(ctx, r.lease, time.Now().Add(ttl))
-}
-
 // Close releases the lease. It is safe to call more than once.
 func (r *PinnedReader) Close() error {
 	if r.lease == "" {
