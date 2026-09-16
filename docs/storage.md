@@ -529,41 +529,78 @@ The header row is written **last**, after every part. Its presence is therefore
 the commit marker: a reader that finds it is guaranteed every part behind it,
 and a half-written graph is indistinguishable from no graph at all.
 
-## The packed per-generation term statistics
+## The packed lexical segments
 
-The same activation publishes a packed form of the generation's lexical
-statistics, and a single-token search term reads its inputs from that and from
-nothing else ([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1). Like
-the adjacency it is derived from sealed facts, carries no provider version and
-no fingerprint of its own, and is dropped with the generation it describes.
+The lexical statistics a single-token search term reads are packed too, and the
+term reads its inputs from that packed form and from nothing else
+([ADR-0007](adr/ADR-0007-lexical-first-page.md), Decision 1). Unlike the
+adjacency, the packed form is **not** built at activation: it is a set of
+immutable **segments**, each folded once by the seal of the unit whose documents
+it holds, and an activation merely names the segments its generation reads.
 
-It exists because the live posting path costs three b-tree descents per posting
-**instance** — the vocabulary row, the document row and the generation
-membership probe — plus a temporary b-tree per term for the document frequency,
-and all of that is paid again on every request. Resolving visibility once, at
-publication, into a document bitmap and folding one bare instance scan against
-it turns a per-request cost that grows with the corpus into a sequential read of
-one term's list.
+It exists in packed form because the live posting path costs three b-tree
+descents per posting **instance** — the vocabulary row, the document row and the
+generation membership probe — plus a temporary b-tree per term for the document
+frequency, and all of that is paid again on every request. It is segmented
+because a structure rebuilt per generation costs the whole corpus at every
+activation, including the activation that publishes one saved file.
 
-**The two tables.** `generation_lexical` carries one row per generation: the
-visible document count, the total token length and the number of terms.
-`generation_lexical_parts` carries the bytes, one row per chunk of one stream,
-keyed by generation, stream name and a 0-based part number whose parts
-concatenate to the stream. Both cascade from `generations`. The three streams
-are `term.dir`, a fixed-width directory in term order holding each term's
-document frequency and the slices of the other two streams that belong to it;
-`term.text`, the concatenated term bytes; and `post.list`, each term's
-per-document, column-ascending `(column, count)` sequence, documents encoded as
-deltas. A term lookup is a binary search over the fixed-width directory, so a
-query reads a bounded window of parts rather than a vocabulary.
+**The four tables.** `lexical_segments` carries one row per segment: its term
+count, its document count and its packed bytes. `lexical_segment_parts` carries
+the bytes, one row per chunk of one stream, keyed by segment, stream name and a
+0-based part number whose parts concatenate to the stream. `segment_units` names
+the units whose documents a segment holds — one unit for a segment a seal wrote,
+and every surviving unit for a merged one. `generation_segments` is one
+generation's set in read order; its reference to a segment is `RESTRICT`, so a
+segment a generation still names cannot be collected. Alongside them,
+`generation_lexical` carries one row per generation — the visible document count
+and the total token length — and cascades from `generations`.
 
-The commit row is written **last**, after every part, for the same reason the
-graph header is: a reader that finds it is guaranteed every part behind it.
+The three streams of a segment are `term.dir`, a fixed-width directory in term
+order holding each term's document frequency and the slices of the other two
+streams that belong to it; `term.text`, the concatenated term bytes; and
+`post.list`, each term's per-document, column-ascending `(column, count)`
+sequence, documents ascending by rowid and encoded as deltas. A term lookup is a
+binary search over the fixed-width directory, so a query reads a bounded window
+of parts rather than a vocabulary.
 
-The build is one streaming pass — heap is one part, one term's list and the
-bitmap — and it holds the same 5 % share of the index wall clock the adjacency
-build is held to. Its start and end are logged on their own so an operator can
-see the pass rather than infer it from the activation's total.
+`generation_lexical` is written **last**, after every `generation_segments` row,
+for the same reason the graph header is: a reader that finds it is guaranteed
+the whole segment set behind it.
+
+**Where a segment comes from.** A document is tokenised exactly once, by the
+pass that counts its tokens as it is put. That pass stages one row per
+`(term, document, column)` group in a staging database of the unit's own, under
+the data directory's `tmp` — appended in arrival order, durability off, no index
+during the load. At seal, one ordered read of that staging is folded into the
+unit's segment, and the staging is deleted; it is also deleted when the unit is
+abandoned or failed. That ordered read is the only `ORDER BY` any plan of this
+store issues, and it runs over one unit's rows in a database of its own, so no
+sorter over the corpus ever exists. A unit that publishes no document folds no
+segment.
+
+**What an activation does.** It records the generation's segment set and nothing
+else: its members' segments, and — for a delta — the segments its carried
+documents already live in, since a carried document keeps its document rowid and
+therefore its segment. Nothing is rewritten to carry a document forward, and a
+document whose unit has left the generation is hidden by the generation's
+visible-document bitmap rather than removed from the segment that still holds it.
+The pass's start and end are logged on their own, so an operator can see it
+rather than infer it from the activation's total, and it holds the same 5 % share
+of the index wall clock the adjacency build is held to.
+
+**What a read does.** A term is one binary search per segment, and the segments'
+posting streams are merged by document rowid, so the candidate walk still
+receives one strictly ascending sequence. Every visible document of a generation
+lies in exactly one of its segments; a document two segments both claim is
+reported as a corrupt store rather than delivered — and scored — twice. The
+document frequency is exact: a generation that hides nothing sums the segments'
+directory entries, and otherwise the posting list is walked against the bitmap,
+because a frequency that counted hidden documents would make a ranking depend on
+the store's history instead of on the code.
+
+A segment no retained generation names and no live unit owns is deleted in the
+same transaction as the generation or the unit that released it.
 
 A **phrase** keeps the live posting path. The packed form stores counts, not
 offsets, and a phrase has to test adjacency; storing offsets would put a second
