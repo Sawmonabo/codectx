@@ -396,14 +396,24 @@ func unitOutcome(res outcome, err error) ledger.Outcome {
 // that the generation absorbs -- have both already closed the span with their
 // own outcome, and a span records one end.
 func unitEnding(err error) ledger.Outcome {
-	switch {
-	case err == nil:
+	if err == nil {
 		return ledger.OutcomeReused
-	case absent(provider.CodeOf(err)):
-		return ledger.OutcomeUnavailable
-	default:
-		return ledger.OutcomeFailed
 	}
+	return endingFor(provider.CodeOf(err))
+}
+
+// endingFor is the terminal state a unit that produced nothing takes, decided
+// by its diagnostic code alone: a unit that reached no output because
+// something it needed was not there is unavailable, and one that was asked to
+// do its work and could not is failed. Keeping the two apart is the whole
+// value of the row -- "unavailable" that cannot say which scope and why is the
+// assertion this account exists to replace -- so every path that closes a
+// unit's span decides it here rather than naming an outcome directly.
+func endingFor(code string) ledger.Outcome {
+	if absent(code) {
+		return ledger.OutcomeUnavailable
+	}
+	return ledger.OutcomeFailed
 }
 
 // absent reports whether a diagnostic code says the unit reached no output
@@ -889,7 +899,7 @@ func (g *generation) failure(ctx context.Context, u plan.Unit, out outcome, caus
 	// writes to the run row, and an end is once-only -- so this is the backstop
 	// for the two exits below, neither of which records a row to agree with.
 	m := ledger.Measured{ItemsIn: int64Ptr(u.InputCount), ItemsOut: int64Ptr(out.parsed)}
-	defer func() { out.span.End(ledger.OutcomeFailed, m, cause) }()
+	defer func() { out.span.End(endingFor(provider.CodeOf(cause)), m, cause) }()
 	if ctx.Err() != nil && errors.Is(cause, ctx.Err()) {
 		return cause
 	}
@@ -943,7 +953,7 @@ func (g *generation) recordFailure(ctx context.Context, u plan.Unit, out outcome
 	// from the error's own text, which is what typedFailure deliberately drops
 	// for an untyped error, and the two records would then diverge on exactly
 	// the failures nobody has a safe message for.
-	out.span.End(ledger.OutcomeFailed, ledger.Measured{ItemsIn: int64Ptr(u.InputCount),
+	out.span.End(endingFor(stored.Code), ledger.Measured{ItemsIn: int64Ptr(u.InputCount),
 		ItemsOut: int64Ptr(out.parsed), DiagnosticCode: stored.Code, Failure: stored.Message}, nil)
 	if res.RunID != "" {
 		// Under a context that survives the cancellation the failure may have
