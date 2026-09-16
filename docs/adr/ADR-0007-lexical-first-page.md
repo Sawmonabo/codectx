@@ -211,8 +211,10 @@ So the unit of the packed form becomes a **segment**, and an activation stops pr
 
 **Consequences.** Each document is tokenised exactly once, on the path that already tokenised it, so
 the seal's added cost is one staged row per `(term, document, column)` group and no second index.
-Activation writes the generation's segment list and, when a tier is full, one merged segment; it
-never touches a byte of a segment it merely inherits, which is what makes a delta activation's cost
+Activation writes the generation's segment list; when a tier is full, each merge that is due runs as
+its own ingestion call just before the activation, so the log bound holds across a cascade of merges
+(amended 2026-09-16: measured on the 600-unit fixture, 23.4 MiB peak in one call against 4.0 MiB with
+a commit between merges). An activation never touches a byte of a segment it merely inherits, which is what makes a delta activation's cost
 proportional to the delta. In exchange, a read pays one directory search per segment instead of one,
 and a generation that has hidden documents pays a posting walk for a document frequency — both
 bounded by the segment count, which compaction holds at O(log_r N). The compaction ratio `r` is an
