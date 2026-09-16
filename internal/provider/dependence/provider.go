@@ -44,15 +44,16 @@ const (
 // reconciled against.
 var dependsOn = []string{"filesystem", "treesitter"}
 
-// Product-owned bounds on what one unit may leave on disk. Neither is a
-// configuration knob: they are the shapes Section 6 requires a finite bound
-// for, sized from the largest repositories measured in
-// docs/research/10-round3-empirical.md (a 1.8M-line C repository is about 54 MB
-// of source and 2 GB of export; a 1.05M-line Python tree exports 4.95 GB).
-const (
-	maxMaterializationBytes int64 = 4 * giB
-	maxExportBytes          int64 = 16 * giB
-)
+// maxMaterializationBytes is the product-owned bound on what one unit may
+// materialize on disk before it is analysed. It is not a configuration knob:
+// it is the shape Section 6 requires a finite bound for, sized from the
+// largest repositories measured in docs/research/10-round3-empirical.md (a
+// 1.8M-line C repository is about 54 MB of source).
+//
+// The export has no such bound. An export the disk cannot hold is a disk that
+// is full, which the store reports as one; refusing a unit whose export is
+// large would refuse a repository the host can index.
+const maxMaterializationBytes int64 = 4 * giB
 
 // minStepTimeout is the least time an analysis step is started with. A unit
 // whose deadline has all but expired fails as a timeout rather than starting a
@@ -675,12 +676,6 @@ func (p *Provider) export(ctx context.Context, req provider.UnitRequest, unit Un
 		"exit_code", out.ExitCode, "duration", out.Duration, "failure_class", string(out.Class),
 		"export_live", out.Live, "export_bytes", out.Bytes, "heap_cap_bytes", res.ExportHeapCapBytes,
 		"reservation_bytes", res.ExportBytes(), "stderr_bytes", out.StderrBytes)
-	if out.Bytes > maxExportBytes {
-		return ExportOutcome{}, resourceLimit("the dependence export exceeds the bound one unit may write").
-			WithDetail("scope_key", truncate(unit.ScopeKey, model.MaxIdentifierBytes)).
-			WithDetail("export_bytes", itoa(out.Bytes)).WithDetail("limit", "max_export_bytes").
-			WithDetail("bound", itoa(maxExportBytes))
-	}
 	if out.Class != FailureNone {
 		return ExportOutcome{}, failure(out.Class, unit.ScopeKey, out.Outcome, res)
 	}
