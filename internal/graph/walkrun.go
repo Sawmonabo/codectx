@@ -64,7 +64,7 @@ func (e *Engine) runWalkToCompletion(ctx context.Context, seeds []model.NodeID, 
 			Message: "graph expansion requires a retained walk directory"}).
 			WithDetail("operation", "run_walk_to_completion")
 	}
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return walkState{}, err
 	}

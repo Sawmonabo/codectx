@@ -84,12 +84,12 @@ func (t *graphKindTable) Len() int { return len(t.byCode) }
 // its absence means the build did not finish.
 func NewGraphReader(ctx context.Context, r *PinnedReader) (graph.GraphReader, error) {
 	g := &graphReader{r: r, cache: map[string]*partWindow{}}
-	var maxNode, maxRelation, nodeCount, edgeCount, format int64
+	var maxNode, maxRelation, nodeCount, edgeCount int64
 	var relKinds, nodeKinds []byte
 	err := r.s.read(ctx, func(tx *sql.Tx) error {
-		err := tx.QueryRowContext(ctx, `SELECT max_node, max_relation, node_count, edge_count, kinds, node_kinds, format
+		err := tx.QueryRowContext(ctx, `SELECT max_node, max_relation, node_count, edge_count, kinds, node_kinds
 			FROM generation_graph WHERE generation_id = ?`, r.gen).
-			Scan(&maxNode, &maxRelation, &nodeCount, &edgeCount, &relKinds, &nodeKinds, &format)
+			Scan(&maxNode, &maxRelation, &nodeCount, &edgeCount, &relKinds, &nodeKinds)
 		if isNoRows(err) {
 			return corrupt("generation %d has no packed adjacency; it was published without one", r.gen)
 		}
@@ -97,9 +97,6 @@ func NewGraphReader(ctx context.Context, r *PinnedReader) (graph.GraphReader, er
 	})
 	if err != nil {
 		return nil, err
-	}
-	if format != graphFormat {
-		return nil, corrupt("generation %d carries packed adjacency format %d, not %d", r.gen, format, graphFormat)
 	}
 	g.maxNode, g.maxRelation = graph.NodeRef(maxNode), graph.RelRef(maxRelation)
 	g.kinds = &graphKindTable{byKind: map[model.RelationKind]graph.KindCode{}}

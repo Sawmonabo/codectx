@@ -272,7 +272,7 @@ func fixtureEdges(t *testing.T, e *Engine, relations []model.Relation) []Edge {
 		panic(fmt.Sprintf(format, args...))
 	}
 	ctx := context.Background()
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		fail("the fixture engine has no packed reader: %v", err)
 	}

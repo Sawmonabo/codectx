@@ -260,7 +260,7 @@ func (e *Engine) Overview(ctx context.Context, req model.OverviewRequest) (page 
 // primary-key read of a single id, not another enumeration.
 func (e *Engine) containerPosition(ctx context.Context, id model.NodeID) (NodeRef, error) {
 	ctx = context.WithoutCancel(ctx)
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return 0, err
 	}
@@ -284,7 +284,7 @@ func (e *Engine) containerAfter(ctx context.Context, ref NodeRef) (model.NodeID,
 	if ref == 0 {
 		return "", nil
 	}
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return "", err
 	}
@@ -385,7 +385,7 @@ func (e *Engine) containerAncestry(ctx context.Context, ids []model.NodeID, maxD
 // exactly that reason.
 func (e *Engine) containerParents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]model.NodeID, error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +573,7 @@ type containerCounts struct{ files, symbols, bytes int64 }
 func (e *Engine) containerContents(ctx context.Context, ids []model.NodeID,
 	b *budget, meta *model.QueryMeta) (map[model.NodeID]containerCounts,
 	map[model.NodeID]bool, error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return nil, nil, err
 	}

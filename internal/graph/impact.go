@@ -199,7 +199,7 @@ func (e *Engine) walkImpact(ctx context.Context, req model.ImpactRequest, kinds 
 		state walkState
 	)
 	if resume == nil || !resume.Cursor.WalkDone {
-		reader, err := e.consumerReader()
+		reader, err := e.Reader()
 		if err != nil {
 			return answer, nil, nil, "", err
 		}

@@ -704,8 +704,7 @@ CREATE TABLE generation_graph (
     node_count INTEGER NOT NULL CHECK(node_count >= 0),
     edge_count INTEGER NOT NULL CHECK(edge_count >= 0),
     kinds BLOB NOT NULL,
-    node_kinds BLOB NOT NULL,
-    format INTEGER NOT NULL CHECK(format = 1)
+    node_kinds BLOB NOT NULL
 );
 -- One chunk of one stream. The streams are the two directions' offset
 -- directories and edge streams plus the per-node and per-relation side arrays;

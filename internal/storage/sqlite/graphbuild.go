@@ -38,10 +38,6 @@ const (
 	streamRelEvidence   = "rel.evidence"
 )
 
-// graphFormat is the part encoding version. It is stored so a reader refuses a
-// layout it does not understand rather than decoding it as garbage.
-const graphFormat = 1
-
 // graphPartsTable and lexicalPartsTable are the two chunked-stream tables one
 // partWriter serves.
 const (
@@ -355,9 +351,9 @@ func buildGraph(ctx context.Context, tx *sql.Tx, gen int64) error {
 
 	// Written LAST: the row's presence is the commit marker for every part.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generation_graph(generation_id, max_node, max_relation,
-		node_count, edge_count, kinds, node_kinds, format) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		node_count, edge_count, kinds, node_kinds) VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		gen, maxNode, maxRelation, nodeCount, edgeCount,
-		[]byte(strings.Join(relKinds, "\x00")), []byte(strings.Join(nodeKinds, "\x00")), graphFormat); err != nil {
+		[]byte(strings.Join(relKinds, "\x00")), []byte(strings.Join(nodeKinds, "\x00"))); err != nil {
 		return wrap("generation_graph", err)
 	}
 	return nil

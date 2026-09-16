@@ -441,7 +441,7 @@ func (p *pairRollup) flush() error {
 // a whole walk is therefore one batched node read per adjacencyBatch DISTINCT
 // containers, not one per batch of edges.
 func (p *pairRollup) containerLabels(refs []NodeRef) (map[NodeRef]containerLabel, error) {
-	reader, err := p.e.consumerReader()
+	reader, err := p.e.Reader()
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +497,7 @@ func edgeEnds(e Edge) (from, to NodeRef) {
 // generation's side array, in ascending surrogate order so the array's parts
 // are touched sequentially.
 func (p *pairRollup) evidenceCounts(rels []RelRef) (map[RelRef]int64, error) {
-	reader, err := p.e.consumerReader()
+	reader, err := p.e.Reader()
 	if err != nil {
 		return nil, err
 	}

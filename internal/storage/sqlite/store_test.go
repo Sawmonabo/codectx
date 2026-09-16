@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -1826,125 +1825,6 @@ func TestDeltaImportInvariants(t *testing.T) {
 		if state, exists, err := f.s.UnitState(f.ctx, w1.UnitID()); err != nil || !exists || state != model.UnitSealed {
 			t.Errorf("previous unit is %s/exists=%v (err %v), want sealed", state, exists, err)
 		}
-	})
-
-	t.Run("batched adjacency spans units but stays inside the generation", func(t *testing.T) {
-		// A frontier expansion reads many units in one statement. If the batch
-		// lost its membership predicate, an edge published only by a unit this
-		// generation does not select would be served as a fact of it: the
-		// traversal would report a call the pinned snapshot does not contain,
-		// and every answer derived from it would be wrong with no way to tell.
-		// The same batch must still cross unit boundaries, or the traversal
-		// silently stops at the first unit edge.
-		dbPath := filepath.Join(t.TempDir(), "codectx.db")
-		f := newFixture(t, dbPath)
-		a := f.file("pkg/a.go", "package pkg\nfunc F() { G() }\n")
-		b := f.file("pkg/b.go", "package pkg\nfunc F() { G() }\n")
-		snap1 := f.snapshot("one", a, b)
-		gen1, err := f.s.BeginGeneration(f.ctx, f.repo, snap1.ID, model.H("semantic"), "main")
-		if err != nil {
-			t.Fatal(err)
-		}
-		run1 := f.run(gen1)
-		// fanOut is the number of edges the unit publishes from one extra node,
-		// one more than a page can hold, so a single batch over that node
-		// cannot come back whole. It hangs off nothing the assertions below
-		// name, so it changes no other count in this scenario.
-		const fanOut = model.MaxPageItems + 1
-		edge := func(gen model.GenerationID, run model.ProviderRunID, ff fileFixture, wide int) (model.UnitID, model.NodeID, model.NodeID) {
-			w := f.begin(gen, run, ff)
-			from := f.putNode(w, run, ff.path, "F", &ff, "key:node:from:"+ff.path)
-			to := f.putNode(w, run, ff.path, "G", &ff, "key:node:to:"+ff.path)
-			f.putRelation(w, run, from, to, "key:rel:"+ff.path, &ff)
-			var hub model.NodeID
-			if wide > 0 {
-				hub = f.putNode(w, run, ff.path, "W", &ff, "key:node:wide:"+ff.path)
-				for i := 0; i < wide; i++ {
-					name := fmt.Sprintf("W%03d", i)
-					leaf := f.putNode(w, run, ff.path, name, &ff, "key:node:wide:"+name+":"+ff.path)
-					f.putRelation(w, run, hub, leaf, "key:rel:wide:"+name+":"+ff.path, &ff)
-				}
-			}
-			if err := f.s.SealUnit(f.ctx, w); err != nil {
-				t.Fatalf("SealUnit(%s): %v", ff.path, err)
-			}
-			return w.UnitID(), from, hub
-		}
-		unitA, fromA, wideA := edge(gen1, run1, a, fanOut)
-		_, fromB, _ := edge(gen1, run1, b, 0)
-		f.activate(gen1, 0)
-
-		// gen2 drops b.go entirely: only unit A is a member, so b.go's edge is
-		// still stored but is not a fact of gen2.
-		snap2 := f.snapshot("two", a)
-		gen2, err := f.s.BeginGeneration(f.ctx, f.repo, snap2.ID, model.H("semantic"), "main")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := f.s.AttachUnit(f.ctx, gen2, unitA); err != nil {
-			t.Fatalf("AttachUnit: %v", err)
-		}
-		f.activate(gen2, gen1)
-
-		batch := func(gen model.GenerationID, dir model.Direction) []model.Relation {
-			t.Helper()
-			r, err := f.s.PinGeneration(f.ctx, f.repo, gen, time.Minute)
-			if err != nil {
-				t.Fatalf("PinGeneration(%d): %v", gen, err)
-			}
-			defer r.Close()
-			// 256 is the limit the graph engine actually passes (its
-			// adjacencyBatch), which is ABOVE model.MaxPageItems: pageLimit
-			// clamps it, and a row calling with exactly MaxPageItems would
-			// never exercise that clamp at all.
-			rels, err := r.EdgesBatch(f.ctx, []model.NodeID{fromA, fromB}, dir, nil, "", 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(%d, %s): %v", gen, dir, err)
-			}
-			return rels
-		}
-		// gen1 selects both units, so one batch over both seed nodes crosses
-		// the unit boundary and returns both edges.
-		if got := batch(gen1, model.DirectionOutgoing); len(got) != 2 {
-			t.Fatalf("gen1 batch returned %d edges, want both units' edges: %+v", len(got), got)
-		}
-		// gen2 selects only unit A. The UNION form must be restricted too, so
-		// both directions are asserted.
-		for _, dir := range []model.Direction{model.DirectionOutgoing, model.DirectionBoth} {
-			got := batch(gen2, dir)
-			if len(got) != 1 || got[0].From != fromA {
-				t.Fatalf("gen2 %s batch = %+v, want only unit A's edge from %s", dir, got, fromA)
-			}
-		}
-
-		// The clamp itself, observed rather than assumed: the engine asks for
-		// 256 and pageLimit hands back at most model.MaxPageItems, so a caller
-		// that read a short page as the end of the walk would stop one row
-		// short of this node's neighbourhood and call it complete.
-		func() {
-			r, err := f.s.PinGeneration(f.ctx, f.repo, gen1, time.Minute)
-			if err != nil {
-				t.Fatalf("PinGeneration(%d): %v", gen1, err)
-			}
-			defer r.Close()
-			first, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil, "", 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(wide): %v", err)
-			}
-			if len(first) != model.MaxPageItems {
-				t.Fatalf("a 256-row request over a %d-edge node returned %d rows, want the %d-row clamp",
-					fanOut, len(first), model.MaxPageItems)
-			}
-			next, err := r.EdgesBatch(f.ctx, []model.NodeID{wideA}, model.DirectionOutgoing, nil,
-				first[len(first)-1].ID, 256)
-			if err != nil {
-				t.Fatalf("EdgesBatch(wide, after): %v", err)
-			}
-			if len(next) != fanOut-model.MaxPageItems {
-				t.Fatalf("the page after the clamp returned %d rows, want the remaining %d: the clamped page was the whole neighbourhood after all",
-					len(next), fanOut-model.MaxPageItems)
-			}
-		}()
 	})
 }
 

@@ -650,7 +650,7 @@ func (w *retainedWalk) eachFolded(add func(impactRecord) error) error {
 // with the typed defect report the guard carries instead of failing somewhere
 // inside the scan.
 func (e *Engine) openWalkState() (*retainedWalk, error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return nil, err
 	}
@@ -660,7 +660,7 @@ func (e *Engine) openWalkState() (*retainedWalk, error) {
 // reopenWalkState reopens the retained walk a continuation names, through the
 // same guard.
 func (e *Engine) reopenWalkState(dir, prevID string) (*retainedWalk, error) {
-	reader, err := e.consumerReader()
+	reader, err := e.Reader()
 	if err != nil {
 		return nil, err
 	}

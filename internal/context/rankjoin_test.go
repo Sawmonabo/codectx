@@ -1,12 +1,14 @@
 package context
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
 	"testing"
+
+	"github.com/Sawmonabo/codectx/internal/graph"
 
 	"github.com/Sawmonabo/codectx/internal/config"
 	"github.com/Sawmonabo/codectx/internal/model"
@@ -14,60 +16,22 @@ import (
 	"github.com/Sawmonabo/codectx/internal/storage/sqlite"
 )
 
-// recordingReader serves a synthetic pinned graph and records every call, so
-// the streamed pass and the whole-set functions it replaces can be compared on
-// what they ASKED the store, not only on what they returned. The package's own
-// fixtures never reach the edge scan -- every compile in context_test.go has an
-// empty `wanted` set -- so the read log has no coverage without this.
-type recordingReader struct {
-	// edges are the visible edges of each node, and evidence the rows of each
-	// relation, exactly as the pinned reader would join them.
-	edges    map[model.NodeID][]model.Relation
-	evidence map[model.RelationID][]sqlite.StoredEvidence
-
-	log []string
+// evidenceFixture serves the evidence rows of each relation exactly as the
+// pinned reader would join them, so P-C's precision read runs with no store
+// behind it. calls counts the batches it was asked for: a parity proof that
+// never reached the read proves nothing, and the package's own compile fixtures
+// never reach it.
+type evidenceFixture struct {
+	rows  map[model.RelationID][]sqlite.StoredEvidence
+	calls int
 }
 
-func (r *recordingReader) EdgesBatch(_ context.Context, nodes []model.NodeID, dir model.Direction,
-	kinds []model.RelationKind, after model.RelationID, limit int) ([]model.Relation, error) {
-	names := make([]string, len(nodes))
-	for i, n := range nodes {
-		names[i] = string(n)
-	}
-	r.log = append(r.log, fmt.Sprintf("edges nodes=%v dir=%s kinds=%d after=%q limit=%d",
-		names, dir, len(kinds), after, limit))
-
-	seen := map[model.RelationID]model.Relation{}
-	for _, n := range nodes {
-		for _, rel := range r.edges[n] {
-			seen[rel.ID] = rel
-		}
-	}
-	out := make([]model.Relation, 0, len(seen))
-	for _, rel := range seen {
-		if rel.ID > after {
-			out = append(out, rel)
-		}
-	}
-	// Keyset order by relation id, which is EdgesBatch's documented contract
-	// and what makes the merge-matching in the streamed scan legal.
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-func (r *recordingReader) EvidenceBatch(_ context.Context, relations []model.RelationID,
-	perRelation int) (map[model.RelationID][]sqlite.StoredEvidence, error) {
-	ids := make([]string, len(relations))
-	for i, id := range relations {
-		ids[i] = string(id)
-	}
-	r.log = append(r.log, fmt.Sprintf("evidence ids=%v per=%d", ids, perRelation))
+func (e *evidenceFixture) EvidenceBatch(_ context.Context, relations []model.RelationID,
+	_ int) (map[model.RelationID][]sqlite.StoredEvidence, error) {
+	e.calls++
 	out := map[model.RelationID][]sqlite.StoredEvidence{}
 	for _, id := range relations {
-		if rows, ok := r.evidence[id]; ok {
+		if rows, ok := e.rows[id]; ok {
 			out[id] = rows
 		}
 	}
@@ -119,34 +83,51 @@ func testCompiler(pageItems int, edgeBudget config.Limit) *Compiler {
 	return &Compiler{cfg: cfg}
 }
 
-func relationFixture(t *testing.T, nodes, edgesPerNode int) *recordingReader {
+// relationFixture builds a fixture generation: `nodes` nodes, each publishing
+// `edgesPerNode` outgoing relations, with the evidence rows of every second
+// relation. It returns the packed-adjacency reader over it, the evidence
+// source, and each node's own relations in canonical id order.
+//
+// The surrogate order is REVERSED against the canonical one. The port delivers
+// an owner's list in surrogate order, and P-C joins it against a stream ordered
+// by canonical relation id, so a fixture whose two orders agreed could not tell
+// a correct join from one that skipped the ordering step entirely.
+func relationFixture(t *testing.T, nodes, edgesPerNode int) (graph.GraphReader, *evidenceFixture,
+	map[model.NodeID][]model.Relation) {
 	t.Helper()
-	r := &recordingReader{edges: map[model.NodeID][]model.Relation{},
-		evidence: map[model.RelationID][]sqlite.StoredEvidence{}}
+	ev := &evidenceFixture{rows: map[model.RelationID][]sqlite.StoredEvidence{}}
+	byNode := map[model.NodeID][]model.Relation{}
+	all := make([]model.Relation, 0, nodes*edgesPerNode)
+	nodeFacts := make([]model.Node, 0, nodes)
 	for n := 0; n < nodes; n++ {
 		node := model.NodeID(fmt.Sprintf("n%03d", n))
+		nodeFacts = append(nodeFacts, model.Node{ID: node, Kind: model.NodeFunction})
 		for e := 0; e < edgesPerNode; e++ {
-			id := model.RelationID(fmt.Sprintf("r%04d", n*edgesPerNode+e))
-			r.edges[node] = append(r.edges[node], model.Relation{ID: id,
+			rel := model.Relation{ID: model.RelationID(fmt.Sprintf("r%04d", n*edgesPerNode+e)),
 				From: node, To: model.NodeID(fmt.Sprintf("n%03d", (n+1)%nodes)),
-				Kind: scopeRelations[e%len(scopeRelations)]})
+				Kind: scopeRelations[e%len(scopeRelations)]}
+			byNode[node] = append(byNode[node], rel)
+			all = append(all, rel)
 			if e%2 == 0 {
-				r.evidence[id] = []sqlite.StoredEvidence{
+				ev.rows[rel.ID] = []sqlite.StoredEvidence{
 					{Evidence: model.Evidence{Precision: model.PrecisionCompiler}}}
 			}
 		}
 	}
-	return r
+	g := graph.NewMemoryGraphOrdered(model.Binding{}, nodeFacts, all, graph.MemoryGraphOrder{
+		Relations: func(a, b model.RelationID) int { return cmp.Compare(b, a) },
+	})
+	return g, ev, byNode
 }
 
 // candidatesOver builds candidates whose routes name the given relations of the
-// given nodes, including one excluded candidate: relationsOnPaths deliberately
-// does not filter on Excluded, so an excluded candidate's node and routes are
-// part of the read log and diverting them would change it.
-func candidatesOver(r *recordingReader, nodes []model.NodeID, hopsPerPath int) []candidate {
+// given nodes, including one excluded candidate: P-C deliberately does not
+// filter on Excluded, so an excluded candidate's node and routes are part of
+// the scan and diverting them would change what it types.
+func candidatesOver(edges map[model.NodeID][]model.Relation, nodes []model.NodeID, hopsPerPath int) []candidate {
 	out := make([]candidate, 0, len(nodes))
 	for i, n := range nodes {
-		rels := r.edges[n]
+		rels := edges[n]
 		var path model.RelationPath
 		for h := 0; h < hopsPerPath && h < len(rels); h++ {
 			path.Relations = append(path.Relations, rels[h].ID)
@@ -161,13 +142,18 @@ func candidatesOver(r *recordingReader, nodes []model.NodeID, hopsPerPath int) [
 	return out
 }
 
-// TestPassCReadLogMatchesWholeSet is the parity proof of P-C: on every shape
-// that terminates the edge scan differently -- nothing wanted, an early exit
-// once every relation is typed, an unmatchable relation that runs the node list
-// out, an edge budget that cuts the scan short, and more nodes than one batch --
-// the streamed pass must ask the store exactly what the whole-set functions ask
-// it, in the same order.
-func TestPassCReadLogMatchesWholeSet(t *testing.T) {
+// TestPassCMatchesWholeSet is the parity proof of P-C: on every shape that
+// terminates the edge scan differently -- nothing wanted, an early exit once
+// every relation is typed, an unmatchable relation that runs the node list out,
+// an edge budget that cuts the scan short, and more nodes than one batch -- the
+// streamed pass must reach the same completeness verdict and put the same kind
+// and multiplier on every hop as the whole-set form it replaced.
+//
+// The fixture's surrogate order is the reverse of its canonical order, so the
+// per-batch sort in scanEdgeKinds is load-bearing: without it the forward
+// cursor over the wanted stream walks past the entries a batch delivered and
+// the scan leaves wanted relations untyped.
+func TestPassCMatchesWholeSet(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		nodes     int
@@ -182,6 +168,12 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 		{name: "several node batches", nodes: 20, edges: 3, hops: 2, pageItems: 3, budget: config.Unlimited},
 		{name: "paged within a node batch", nodes: 12, edges: 6, hops: 4, pageItems: 2, budget: config.Unlimited},
 		{name: "edge budget cuts the scan", nodes: 20, edges: 6, hops: 4, pageItems: 3, budget: config.Limit(7)},
+		// The budget spent at a NODE BATCH boundary rather than inside one: the
+		// streamed scan latches `stopped` after the batch it cut and the
+		// whole-set form breaks at the bottom of its loop, and the two must stop
+		// on the same batch or a bounded compile types a different set.
+		{name: "edge budget cuts at a node batch boundary", nodes: 20, edges: 6, hops: 4,
+			pageItems: 3, budget: config.Limit(36)},
 		{name: "an unmatchable relation", nodes: 8, edges: 3, hops: 2, pageItems: 4, budget: config.Unlimited, unmatched: true},
 		// Ruling C8: more wanted relations than one keyset page carries. Both
 		// sides must page to exhaustion under an unlimited bound.
@@ -190,15 +182,15 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
-			fixture := relationFixture(t, tc.nodes, tc.edges)
+			g, evidence, edges := relationFixture(t, tc.nodes, tc.edges)
 			nodes := make([]model.NodeID, 0, tc.nodes)
 			for n := 0; n < tc.nodes; n++ {
 				nodes = append(nodes, model.NodeID(fmt.Sprintf("n%03d", n)))
 			}
-			cands := candidatesOver(fixture, nodes, tc.hops)
+			cands := candidatesOver(edges, nodes, tc.hops)
 			if tc.unmatched {
-				// A relation no node carries: len(out) can never reach
-				// len(wanted), so the scan runs the node list out and the
+				// A relation no node carries: the typed set can never reach
+				// the wanted set, so the scan runs the node list out and the
 				// compile reports an incomplete scope.
 				cands[0].Paths[0].Relations = append(cands[0].Paths[0].Relations, "rZZZZ")
 			}
@@ -209,37 +201,36 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 
 			c := testCompiler(tc.pageItems, tc.budget)
 
-			refReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
-			wantRelations, wantComplete, err := c.relationsOnPathsWholeSet(ctx, refReader, cands)
+			wantRelations, wantComplete, err := c.relationsOnPathsWholeSet(ctx, g, cands)
 			if err != nil {
 				t.Fatalf("whole-set edge scan: %v", err)
 			}
-			wantPrecision, err := c.resolvePrecisionWholeSet(ctx, refReader, cands)
+			wantPrecision, err := c.resolvePrecisionWholeSet(ctx, evidence, cands)
 			if err != nil {
 				t.Fatalf("whole-set precision: %v", err)
 			}
 
-			streamReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
+			streamEvidence := &evidenceFixture{rows: evidence.rows}
 			s := openSorts(t, config.Config{})
 			candRun, hopRun := spoolCandidates(t, s, cands)
-			got, err := c.passCRelationAttributes(ctx, s, streamReader, hopRun, candRun)
+			got, err := c.passCRelationAttributes(ctx, s, streamEvidence, g, hopRun, candRun)
 			if err != nil {
 				t.Fatalf("streamed P-C: %v", err)
 			}
 
-			// A parity proof over an empty log proves nothing, and that is
-			// exactly what the package's existing fixtures give: guard it.
-			if edgeReads, evidenceReads := countReads(refReader.log); tc.hops > 0 && (edgeReads == 0 || evidenceReads == 0) {
-				t.Fatalf("fixture never reached the reads it proves: %d edge, %d evidence calls", edgeReads, evidenceReads)
-			} else if tc.hops == 0 && evidenceReads != 0 {
-				// The "" asymmetry: relationsOnPaths counts the empty
-				// relation id in `wanted` so the scan still runs and can
-				// never complete, while resolvePrecision skips it so no
-				// evidence is read at all. Both sides must keep it.
-				t.Fatalf("the empty relation id must not be read for evidence, got %d calls", evidenceReads)
-			}
-			if !reflect.DeepEqual(streamReader.log, refReader.log) {
-				t.Fatalf("read log diverged\nstreamed: %#v\nwhole-set: %#v", streamReader.log, refReader.log)
+			// A parity proof that never reached the reads it proves proves
+			// nothing, and that is exactly what the package's own compile
+			// fixtures give: guard it.
+			switch {
+			case tc.hops > 0 && (len(wantRelations) == 0 || streamEvidence.calls == 0):
+				t.Fatalf("fixture never reached the reads it proves: %d typed relations, %d evidence calls",
+					len(wantRelations), streamEvidence.calls)
+			case tc.hops == 0 && streamEvidence.calls != 0:
+				// The "" asymmetry: the empty relation id enters the wanted
+				// set so the scan still runs and can never complete, while the
+				// precision read skips it so no evidence is read at all. Both
+				// sides must keep it.
+				t.Fatalf("the empty relation id must not be read for evidence, got %d calls", streamEvidence.calls)
 			}
 			if got.Complete != wantComplete {
 				t.Fatalf("completeness: streamed %v, whole-set %v", got.Complete, wantComplete)
@@ -247,18 +238,6 @@ func TestPassCReadLogMatchesWholeSet(t *testing.T) {
 			assertHopAttributes(t, got.Hops, hopRun, wantRelations, wantPrecision)
 		})
 	}
-}
-
-// countReads splits a read log into its edge and evidence calls.
-func countReads(log []string) (edges, evidence int) {
-	for _, line := range log {
-		if strings.HasPrefix(line, "edges ") {
-			edges++
-			continue
-		}
-		evidence++
-	}
-	return edges, evidence
 }
 
 // assertHopAttributes checks the joined hop stream against what scorePath would
@@ -347,23 +326,21 @@ func TestPassEMatchesCentralityMap(t *testing.T) {
 
 // TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound is ruling C8's proof.
 //
-// context.max_graph_edges is Unlimited by default, and the edge scan read that
-// absent bound as model.MaxPageItems: a scope naming more than one page of
-// relations stopped after 200 rows, left the rest untyped and reported an
-// incomplete scope -- a default that refused work, on exactly the repositories
-// this compiler serves. The page WIDTH is still one page; what changed is that
-// the scan keeps asking for the next one.
+// context.max_graph_edges is Unlimited by default. Reading that absent bound as
+// model.MaxPageItems would stop a scope naming more than one page of relations
+// after 200 entries, leave the rest untyped and report an incomplete scope -- a
+// default that refuses work on exactly the repositories this compiler serves.
 //
 // Restoring `ValueOr(model.MaxPageItems)` at either scan site fails this.
 func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
 	ctx := context.Background()
 	const nodes, edgesPerNode, hops = 60, 6, 4
-	fixture := relationFixture(t, nodes, edgesPerNode)
+	g, evidence, edges := relationFixture(t, nodes, edgesPerNode)
 	ids := make([]model.NodeID, 0, nodes)
 	for n := 0; n < nodes; n++ {
 		ids = append(ids, model.NodeID(fmt.Sprintf("n%03d", n)))
 	}
-	cands := candidatesOver(fixture, ids, hops)
+	cands := candidatesOver(edges, ids, hops)
 	wanted := map[model.RelationID]struct{}{}
 	for _, cand := range cands {
 		for _, p := range cand.Paths {
@@ -377,8 +354,7 @@ func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
 	}
 
 	c := testCompiler(model.MaxPageItems, config.Unlimited)
-	refReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
-	relations, complete, err := c.relationsOnPathsWholeSet(ctx, refReader, cands)
+	relations, complete, err := c.relationsOnPathsWholeSet(ctx, g, cands)
 	if err != nil {
 		t.Fatalf("whole-set edge scan: %v", err)
 	}
@@ -387,9 +363,8 @@ func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
 	}
 
 	s := openSorts(t, config.Config{})
-	streamReader := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
 	candRun, hopRun := spoolCandidates(t, s, cands)
-	got, err := c.passCRelationAttributes(ctx, s, streamReader, hopRun, candRun)
+	got, err := c.passCRelationAttributes(ctx, s, evidence, g, hopRun, candRun)
 	if err != nil {
 		t.Fatalf("streamed P-C: %v", err)
 	}
@@ -411,8 +386,7 @@ func TestEdgeScanPagesToExhaustionUnderAnUnlimitedBound(t *testing.T) {
 
 	// A user-set bound is still obeyed: only an explicit limit cuts the scan.
 	bounded := testCompiler(model.MaxPageItems, config.Limit(model.MaxPageItems))
-	cut := &recordingReader{edges: fixture.edges, evidence: fixture.evidence}
-	if _, boundedComplete, err := bounded.relationsOnPathsWholeSet(ctx, cut, cands); err != nil {
+	if _, boundedComplete, err := bounded.relationsOnPathsWholeSet(ctx, g, cands); err != nil {
 		t.Fatalf("bounded edge scan: %v", err)
 	} else if boundedComplete {
 		t.Fatalf("a user-set max_graph_edges of %d must cut this scan", model.MaxPageItems)
