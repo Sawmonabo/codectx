@@ -14,6 +14,7 @@ import (
 	"github.com/Sawmonabo/codectx/internal/model"
 	"github.com/Sawmonabo/codectx/internal/provider"
 	"github.com/Sawmonabo/codectx/internal/provider/filesystem"
+	"github.com/Sawmonabo/codectx/internal/provider/manifest"
 	"github.com/Sawmonabo/codectx/internal/snapshot"
 )
 
@@ -237,5 +238,50 @@ func TestUnitWhoseToolIsAbsentEndsUnavailableWithItsReason(t *testing.T) {
 	if row.DiagnosticCode != model.CodeToolUnsupportedPlatform || !strings.Contains(row.Failure, absentTool) {
 		t.Fatalf("the row for %q carries code %q and reason %q, want the absent tool named",
 			scope, row.DiagnosticCode, row.Failure)
+	}
+}
+
+// TestUnitsTheRunNeverReachedAreStillAccountedFor protects the account of what
+// a run had planned from the failure it is most needed for. The planned-unit
+// row used to be written inside the build walk, so a run that died before the
+// walk reached a unit -- here a required provider's first unit failing and
+// cancelling the rest, which ends the walk at the next provider -- left every
+// unit past that point with no row at all: the plan named them, the run ended,
+// and nothing anywhere says they were ever going to be built.
+//
+// Failure mode: an operator investigating a failed run sees rows for the units
+// that ran and nothing whatever for the ones that did not, so the work the run
+// still owed is indistinguishable from work it never planned.
+//
+// Mutation proof: delete the accountUnwalkedUnits defer in generation.attempt
+// and the manifest unit this run never reached has no row.
+func TestUnitsTheRunNeverReachedAreStillAccountedFor(t *testing.T) {
+	f := newFixture(t, map[string]string{
+		"go.mod": "module example.com/fixture\n\ngo 1.27\n",
+		"a.go":   "package main\n",
+		"b.go":   "package main\n",
+		"c.go":   "package main\n",
+	})
+	providers := f.providers(false)
+	providers[0] = toolAbsentProvider{Provider: providers[0], scope: filesystem.ScopeKey("a.go")}
+	c := f.coordinator(providers)
+	if _, err := c.Index(f.ctx, model.IndexRequest{}); err == nil {
+		t.Fatal("the index reported success although a required provider's unit failed")
+	}
+	view := f.latestRun(0)
+	var reached bool
+	for _, span := range view.Spans {
+		if span.Provider != manifest.ID {
+			continue
+		}
+		reached = true
+		if span.Outcome != ledger.OutcomeUnavailable || span.Failure != ledger.ReasonNotAdmitted {
+			t.Errorf("the unit for %q ended %q with reason %q, want %q with the not-admitted reason",
+				span.ScopeKey, span.Outcome, span.Failure, ledger.OutcomeUnavailable)
+		}
+	}
+	if !reached {
+		t.Fatalf("the run ended with no row for any %s unit: the units it planned and never reached left no trace",
+			manifest.ID)
 	}
 }
